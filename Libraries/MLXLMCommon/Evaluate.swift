@@ -102,6 +102,75 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// KV cache compression scheme. nil = use kvBits (affine quantization) if set.
+    /// "turbo1" through "turbo4" = TurboQuant compression at 1-4 bits.
+    /// When set, kvBits is ignored for cache creation.
+    public var kvScheme: String?
+
+    /// Number of boundary layers to skip at each end (first N + last N stay fp16).
+    /// Matches llama.cpp TurboQuant mode 7. Default 2, set 0 to compress all layers.
+    public var turboBoundarySkip: Int
+
+    /// Additional logit processors applied after built-in penalty processors.
+    /// Use this to inject custom processors (e.g., EOS suppression for thinking models).
+    public nonisolated(unsafe) var additionalProcessors: [any LogitProcessor]
+
+    /// Reasoning effort hint (e.g., "low", "medium", "high")
+    public var reasoningEffort: String?
+
+    /// N-gram size for prompt-lookup speculative decoding. When > 0, the iterator
+    /// searches for matching n-grams in the prompt text and uses continuations as
+    /// draft tokens, verifying them in a single batched forward pass.
+    ///
+    /// **Default: 0 (disabled).** The speculation path is a net-win only when the
+    /// generated text has enough repetition that the trigram table hits with a
+    /// reasonable acceptance rate. For novel prose / summarisation / chat, accept
+    /// rate is often low and the draft work becomes pure overhead. Enable
+    /// explicitly (`ngramSize: 3`, or higher) when your workload has been
+    /// validated to benefit — e.g. code-heavy output or repetitive templates.
+    public var ngramSize: Int
+
+    /// Maximum draft tokens per n-gram speculation round. Defaults to 0 so that
+    /// a bare `GenerateParameters()` disables speculation end-to-end; must be
+    /// set in tandem with `ngramSize` when enabling.
+    public var maxNgramDraftTokens: Int
+
+    /// Token ID marking the start of a thinking phase (e.g., <think> token).
+    /// When set with thinkEndTokenId, log probabilities are tracked separately
+    /// for thinking vs. generation phases in GenerateCompletionInfo.
+    public var thinkStartTokenId: Int32?
+
+    /// Token ID marking the end of a thinking phase (e.g., </think> token).
+    public var thinkEndTokenId: Int32?
+
+    /// When true, the iterator starts already inside the thinking phase.
+    /// Use this when <think> was prepended as an assistant prefix in the prompt
+    /// rather than being generated — so the iterator never sees the start token.
+    public var thinkingPhasePrefilled: Bool
+
+    /// Token ID of the harmony channel marker, typically `<|channel|>` (e.g. 200005
+    /// on the GPT-OSS tokenizer). When set, phase labeling uses a harmony state
+    /// machine: the token immediately following the marker selects the phase via
+    /// ``harmonyThinkingChannelTokenIds`` / ``harmonyGenerationChannelTokenIds``.
+    /// Takes precedence over ``thinkStartTokenId`` / ``thinkEndTokenId``.
+    public var harmonyChannelMarkerTokenId: Int32?
+
+    /// Token IDs whose appearance immediately after the harmony channel marker
+    /// transitions the phase to "think" (e.g. `analysis` → 35644 on GPT-OSS).
+    public var harmonyThinkingChannelTokenIds: [Int32]
+
+    /// Token IDs whose appearance immediately after the harmony channel marker
+    /// transitions the phase to "gen" (e.g. `final` → 17196 on GPT-OSS).
+    public var harmonyGenerationChannelTokenIds: [Int32]
+
+    /// When true, per-token log probs, token IDs, and phase labels are stored
+    /// in the TokenIterator for downstream KLD computation.
+    public var collectPerTokenData: Bool
+
+    /// When true, accumulate log probabilities for perplexity computation.
+    /// Default: false. Set to true when perplexity tracking is needed.
+    public var trackPerplexity: Bool
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -118,7 +187,21 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        kvScheme: String? = nil,
+        turboBoundarySkip: Int = 2,
+        additionalProcessors: [any LogitProcessor] = [],
+        reasoningEffort: String? = nil,
+        ngramSize: Int = 0,
+        maxNgramDraftTokens: Int = 0,
+        thinkStartTokenId: Int32? = nil,
+        thinkEndTokenId: Int32? = nil,
+        thinkingPhasePrefilled: Bool = false,
+        harmonyChannelMarkerTokenId: Int32? = nil,
+        harmonyThinkingChannelTokenIds: [Int32] = [],
+        harmonyGenerationChannelTokenIds: [Int32] = [],
+        collectPerTokenData: Bool = false,
+        trackPerplexity: Bool = false
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -136,6 +219,20 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
+        self.kvScheme = kvScheme
+        self.turboBoundarySkip = turboBoundarySkip
+        self.additionalProcessors = additionalProcessors
+        self.reasoningEffort = reasoningEffort
+        self.ngramSize = ngramSize
+        self.maxNgramDraftTokens = maxNgramDraftTokens
+        self.thinkStartTokenId = thinkStartTokenId
+        self.thinkEndTokenId = thinkEndTokenId
+        self.thinkingPhasePrefilled = thinkingPhasePrefilled
+        self.harmonyChannelMarkerTokenId = harmonyChannelMarkerTokenId
+        self.harmonyThinkingChannelTokenIds = harmonyThinkingChannelTokenIds
+        self.harmonyGenerationChannelTokenIds = harmonyGenerationChannelTokenIds
+        self.collectPerTokenData = collectPerTokenData
+        self.trackPerplexity = trackPerplexity
     }
 
     public func sampler() -> LogitSampler {
@@ -536,6 +633,28 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvBits: Int?
     let kvGroupSize: Int
     let quantizedKVStart: Int
+    let kvScheme: String?
+    let turboBoundarySkip: Int
+
+    // Phase tracking for per-token data capture (cheap Ints / Sets / Bool,
+    // only read at finalize time — no inference-loop cost). Three mutually
+    // exclusive modes:
+    //   • harmonyChannelMarkerTokenId set → harmony channel transitions.
+    //   • thinkStartTokenId + thinkEndTokenId set → bracket pair.
+    //   • neither set → all tokens labelled "gen".
+    let thinkStartTokenId: Int?
+    let thinkEndTokenId: Int?
+    let thinkingPhasePrefilled: Bool
+    let harmonyChannelMarkerTokenId: Int?
+    let harmonyThinkingChannelTokenIds: Set<Int>
+    let harmonyGenerationChannelTokenIds: Set<Int>
+
+    /// Lazy per-token logprob/id capture. Non-nil only when parameters enable
+    /// ``GenerateParameters/trackPerplexity`` or
+    /// ``GenerateParameters/collectPerTokenData``. The `if let` check in
+    /// ``convertToToken(logits:)`` is the only inference-path cost when
+    /// capture is disabled.
+    let perTokenCapture: PerTokenDataCapture?
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
@@ -564,6 +683,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
+        self.turboBoundarySkip = parameters.turboBoundarySkip
+
+        self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
+        self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
+        self.thinkingPhasePrefilled = parameters.thinkingPhasePrefilled
+        self.harmonyChannelMarkerTokenId = parameters.harmonyChannelMarkerTokenId.map { Int($0) }
+        self.harmonyThinkingChannelTokenIds = Set(parameters.harmonyThinkingChannelTokenIds.map { Int($0) })
+        self.harmonyGenerationChannelTokenIds = Set(parameters.harmonyGenerationChannelTokenIds.map { Int($0) })
+        self.perTokenCapture = parameters.needsPerTokenCapture ? PerTokenDataCapture() : nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -597,6 +726,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
+        self.turboBoundarySkip = parameters.turboBoundarySkip
+
+        self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
+        self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
+        self.thinkingPhasePrefilled = parameters.thinkingPhasePrefilled
+        self.harmonyChannelMarkerTokenId = parameters.harmonyChannelMarkerTokenId.map { Int($0) }
+        self.harmonyThinkingChannelTokenIds = Set(parameters.harmonyThinkingChannelTokenIds.map { Int($0) })
+        self.harmonyGenerationChannelTokenIds = Set(parameters.harmonyGenerationChannelTokenIds.map { Int($0) })
+        self.perTokenCapture = parameters.needsPerTokenCapture ? PerTokenDataCapture() : nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -630,6 +769,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
+        self.kvScheme = nil
+        self.turboBoundarySkip = 2
+
+        // The manual init does not carry thinking config or per-token capture.
+        // Callers that need PPL/KLD should use the `parameters:` init instead.
+        self.thinkStartTokenId = nil
+        self.thinkEndTokenId = nil
+        self.thinkingPhasePrefilled = false
+        self.harmonyChannelMarkerTokenId = nil
+        self.harmonyThinkingChannelTokenIds = []
+        self.harmonyGenerationChannelTokenIds = []
+        self.perTokenCapture = nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
@@ -680,7 +831,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             cache: &cache,
             kvBits: kvBits,
             kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart
+            quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme,
+            turboBoundarySkip: turboBoundarySkip
         )
 
         return convertToToken(logits: result.logits)
@@ -798,7 +951,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
                 cache: &cache,
                 kvBits: parameters.kvBits,
                 kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart
+                quantizedKVStart: parameters.quantizedKVStart,
+                kvScheme: parameters.kvScheme,
+                turboBoundarySkip: parameters.turboBoundarySkip
             )
         }
 
