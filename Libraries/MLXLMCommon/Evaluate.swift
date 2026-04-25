@@ -683,7 +683,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
-        self.kvScheme = parameters.kvScheme
+        // Gate turbo on model support — sinks-using models (GPT-OSS) opt out (#85).
+        self.kvScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
         self.turboBoundarySkip = parameters.turboBoundarySkip
 
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
@@ -726,7 +727,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
-        self.kvScheme = parameters.kvScheme
+        // Gate turbo on model support — sinks-using models (GPT-OSS) opt out (#85).
+        self.kvScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
         self.turboBoundarySkip = parameters.turboBoundarySkip
 
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
@@ -946,13 +948,16 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.maxTokens = parameters.maxTokens
         self.numDraftTokens = numDraftTokens
 
+        // Gate turbo on both models supporting it — sinks-using models opt out (#85).
+        let supportsTurbo = mainModel.supportsTurboQuantization && draftModel.supportsTurboQuantization
+        let effectiveScheme = supportsTurbo ? parameters.kvScheme : nil
         self.quantizeKVCache = { cache in
             maybeQuantizeKVCache(
                 cache: &cache,
                 kvBits: parameters.kvBits,
                 kvGroupSize: parameters.kvGroupSize,
                 quantizedKVStart: parameters.quantizedKVStart,
-                kvScheme: parameters.kvScheme,
+                kvScheme: effectiveScheme,
                 turboBoundarySkip: parameters.turboBoundarySkip
             )
         }

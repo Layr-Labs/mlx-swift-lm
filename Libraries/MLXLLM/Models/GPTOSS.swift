@@ -519,19 +519,90 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         return finalWeights
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        var caches: [KVCache] = []
+    /// Fuse pre-quantized checkpoints' separate `.experts.gate_proj.*` and
+    /// `.experts.up_proj.*` tensors into a single `.experts.gate_up_proj.*` set
+    /// (weight, scales, biases) on the output axis. Called when the checkpoint
+    /// already has `gate_proj.weight` keys — i.e. skipped the interleaved
+    /// `gate_up_proj` packing path above.
+    private func fuseGateUpWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var result: [String: MLXArray] = [:]
+        var gateTensors: [String: MLXArray] = [:]
+        var upTensors: [String: MLXArray] = [:]
 
-        for lt in model.layerTypes {
-            if lt == "full_attention" {
-                caches.append(StandardKVCache())
+        for (k, v) in weights {
+            if k.contains(".experts.gate_proj.") {
+                gateTensors[k] = v
+            } else if k.contains(".experts.up_proj.") {
+                upTensors[k] = v
             } else {
-                caches.append(
-                    RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
-                )
+                result[k] = v
             }
         }
 
+        for (gateKey, gateVal) in gateTensors {
+            let upKey = gateKey.replacingOccurrences(of: "gate_proj", with: "up_proj")
+            guard let upVal = upTensors[upKey] else {
+                // Unpaired gate tensor — leave as-is rather than silently drop.
+                result[gateKey] = gateVal
+                continue
+            }
+            let fusedKey = gateKey.replacingOccurrences(of: "gate_proj", with: "gate_up_proj")
+            // weight: [E, outDim, packedIn] → [E, 2*outDim, packedIn]
+            // scales/biases: [E, outDim, groups] → [E, 2*outDim, groups]
+            // bias: [E, outDim] → [E, 2*outDim]
+            result[fusedKey] = concatenated([gateVal, upVal], axis: 1)
+        }
+
+        return result
+    }
+
+    /// Per-model audited prefill chunk default.
+    public var defaultPrefillStepSize: Int { GPTOSSDefaults.prefillStepSize }
+
+    /// Pure attention model — uses larger prefill chunks (2048) since there's no
+    /// GatedDeltaNet sequential bottleneck. Reduces TTFT by processing more
+    /// tokens per step.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let prefillStepSize = windowSize ?? defaultPrefillStepSize
+        var y = input.text
+
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
+            _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[chunkSize...]
+            MLX.Memory.clearCache()
+        }
+
+        return .tokens(y)
+    }
+
+    /// GPT-OSS uses attention sinks, which TurboQuant.compressedAttention
+    /// does not currently support — opt out of in-flight rewrapping in
+    /// `maybeQuantizeKVCache` so `--kv turbo*` falls back gracefully (#85).
+    public var supportsTurboQuantization: Bool { false }
+
+    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        if let scheme = parameters?.kvScheme, scheme.hasPrefix("turbo") {
+            print("[WARN] GPT-OSS does not support kvScheme=\(scheme) (attention sinks); falling back to fp16 KV cache.")
+        }
+
+        var caches: [KVCache] = []
+        for lt in model.layerTypes {
+            if lt == "full_attention" {
+                if let maxKVSize = parameters?.maxKVSize {
+                    // keep: 4 preserves attention-sink tokens for full-attention layers.
+                    caches.append(RotatingKVCache(maxSize: maxKVSize, keep: 4))
+                } else {
+                    caches.append(StandardKVCache())
+                }
+            } else {
+                caches.append(RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0))
+            }
+        }
         return caches
     }
 }
