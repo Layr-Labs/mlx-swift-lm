@@ -39,11 +39,16 @@ public final class BatchedEngine: @unchecked Sendable {
         context: ModelContext,
         config: ContinuousBatchingConfig = ContinuousBatchingConfig()
     ) {
+        let ssdCache = config.ssdCacheConfig.map { SSDCacheManager(config: $0) }
+        let prefixCache = config.prefixCacheConfig.map {
+            PrefixCache(config: $0, ssdCache: ssdCache, modelName: context.configuration.name)
+        }
         let scheduler = Scheduler(
             model: context.model,
             tokenizer: context.tokenizer,
             config: config.schedulerConfig,
-            eosTokenIds: context.configuration.eosTokenIds
+            eosTokenIds: context.configuration.eosTokenIds,
+            prefixCache: prefixCache
         )
         self.init(
             scheduler: scheduler,

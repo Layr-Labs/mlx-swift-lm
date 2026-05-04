@@ -18,15 +18,25 @@ public struct ContinuousBatchingConfig: Sendable {
     public var stepInterval: TimeInterval
     /// How often (in steps) to yield to the event loop.
     public var yieldInterval: Int
+    /// Optional in-memory prefix cache configuration.
+    /// Set to non-nil to enable block-level KV reuse across requests.
+    public var prefixCacheConfig: PrefixCacheConfig?
+    /// Optional SSD cache configuration.
+    /// Requires `prefixCacheConfig` to also be set.
+    public var ssdCacheConfig: SSDCacheConfig?
 
     public init(
         schedulerConfig: SchedulerConfig = SchedulerConfig(),
         stepInterval: TimeInterval = 0.001,
-        yieldInterval: Int = 5
+        yieldInterval: Int = 5,
+        prefixCacheConfig: PrefixCacheConfig? = nil,
+        ssdCacheConfig: SSDCacheConfig? = nil
     ) {
         self.schedulerConfig = schedulerConfig
         self.stepInterval = stepInterval
         self.yieldInterval = yieldInterval
+        self.prefixCacheConfig = prefixCacheConfig
+        self.ssdCacheConfig = ssdCacheConfig
     }
 }
 

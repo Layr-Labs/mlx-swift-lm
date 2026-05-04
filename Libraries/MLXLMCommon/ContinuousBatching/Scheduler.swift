@@ -90,6 +90,9 @@ public final class Scheduler: @unchecked Sendable {
     // Aborts
     private var pendingAbortIds: Set<String> = []
 
+    // Optional prefix cache (in-memory block-level KV reuse).
+    public var prefixCache: PrefixCache?
+
     // Stats
     public private(set) var numRequestsProcessed: Int = 0
     public private(set) var totalPromptTokens: Int = 0
@@ -99,12 +102,14 @@ public final class Scheduler: @unchecked Sendable {
         model: any LanguageModel,
         tokenizer: any Tokenizer,
         config: SchedulerConfig = SchedulerConfig(),
-        eosTokenIds: Set<Int> = []
+        eosTokenIds: Set<Int> = [],
+        prefixCache: PrefixCache? = nil
     ) {
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
         self.eosTokenIds = eosTokenIds
+        self.prefixCache = prefixCache
     }
 
     // MARK: - Request Lifecycle
@@ -202,6 +207,7 @@ public final class Scheduler: @unchecked Sendable {
             removeFinishedRequest(requestId)
         }
 
+        prefixCache?.releaseRequest(requestId)
         request.setFinished(.finishedAborted)
         finishedReqIds.insert(requestId)
         requests.removeValue(forKey: requestId)
@@ -246,10 +252,23 @@ public final class Scheduler: @unchecked Sendable {
             }
             guard let promptTokens = request.promptTokenIds, !promptTokens.isEmpty else { continue }
 
+            // Prefix cache lookup: skip re-prefilling already-cached blocks.
+            var tokensToPrefill = promptTokens
+            var existingCache: [KVCache]? = request.promptCache
+            if let pc = prefixCache {
+                let (cached, remaining) = pc.fetchPrefix(
+                    requestId: request.requestId, tokens: promptTokens)
+                if let cached {
+                    tokensToPrefill = remaining
+                    existingCache = cached.map { $0 as KVCache }
+                    request.cachedTokens = promptTokens.count - remaining.count
+                }
+            }
+
             // External prefill
             let (simpleCaches, seedTokens) = doExternalPrefill(
-                tokens: promptTokens,
-                existingCache: request.promptCache
+                tokens: tokensToPrefill,
+                existingCache: existingCache
             )
 
             let uid = uidCounter
@@ -417,6 +436,19 @@ extension Scheduler {
                 }
                 totalCompletionTokens += request.numOutputTokens
                 numRequestsProcessed += 1
+
+                // Store the completed KV state in the prefix cache for future reuse.
+                // Only works for pure-attention models where all cache layers are KVCacheSimple.
+                if let pc = prefixCache,
+                   let promptTokens = request.promptTokenIds,
+                   let rawCache = resp.promptCache,
+                   rawCache.allSatisfy({ $0 is KVCacheSimple })
+                {
+                    let simpleCaches = rawCache.map { $0 as! KVCacheSimple }
+                    let allTokens = promptTokens + request.outputTokenIds
+                    pc.storePrefix(requestId: rid, tokens: allTokens, layerCaches: simpleCaches)
+                }
+                prefixCache?.releaseRequest(rid)
             } else {
                 // Stream interval check
                 var streamState = activeStreamStates[rid]!
