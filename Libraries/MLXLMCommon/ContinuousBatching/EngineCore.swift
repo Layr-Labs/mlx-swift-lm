@@ -71,6 +71,13 @@ public final class EngineCore: @unchecked Sendable {
     private var _startTime: Date?
     public private(set) var stepsExecuted: Int = 0
 
+    // Steps spent idle after the last active request completed.
+    // After `deferredClearDelay` idle steps we flush the Metal buffer cache
+    // to reclaim GPU memory. The delay prevents races with IOKit's async
+    // completeMemory() callbacks that cause kernel panics on M4 hardware.
+    private var _idleSteps = 0
+    private static let deferredClearDelay = 8
+
     public init(
         scheduler: Scheduler,
         config: ContinuousBatchingConfig = ContinuousBatchingConfig()
@@ -256,6 +263,7 @@ public final class EngineCore: @unchecked Sendable {
     private func engineLoop() async {
         while _running {
             if scheduler.hasRequests() {
+                _idleSteps = 0
                 let output = await withCheckedContinuation { continuation in
                     engineQueue.async { [weak self] in
                         guard let self else {
@@ -282,7 +290,14 @@ public final class EngineCore: @unchecked Sendable {
                     }
                 }
             } else {
-                // No work, yield
+                _idleSteps += 1
+                // Flush the Metal buffer cache after a brief idle window to
+                // reclaim GPU memory. The delay avoids races with IOKit's
+                // async completeMemory() callbacks (M4 kernel-panic fix).
+                if _idleSteps == Self.deferredClearDelay {
+                    Stream().synchronize()
+                    Memory.clearCache()
+                }
                 try? await Task.sleep(nanoseconds: UInt64(config.stepInterval * 1_000_000_000))
             }
 

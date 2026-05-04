@@ -14,6 +14,50 @@
 import Foundation
 import MLX
 
+// MARK: - Repetition-penalty helpers
+
+/// Mutable token-history shared between a request and its penalty sampler.
+final class TokenHistoryHolder: @unchecked Sendable {
+    var tokens: [Int]
+    init(tokens: [Int]) { self.tokens = tokens }
+}
+
+/// Wrap `base` with multiplicative repetition penalty and additive
+/// presence/frequency penalties applied to previously-seen tokens.
+func makeRepetitionSampler(
+    base: @escaping RowSampler,
+    history: TokenHistoryHolder,
+    repetitionPenalty: Float,
+    presencePenalty: Float,
+    frequencyPenalty: Float
+) -> RowSampler {
+    return { @Sendable logits in
+        let tokens = history.tokens
+        guard !tokens.isEmpty else { return base(logits) }
+        let vocab = logits.dim(-1)
+
+        var counts: [Int: Int] = [:]
+        for t in tokens where t >= 0 && t < vocab {
+            counts[t, default: 0] += 1
+        }
+        guard !counts.isEmpty else { return base(logits) }
+
+        // Materialize once, modify in-place, then reconstruct.
+        eval(logits)
+        var flat = logits.reshaped(-1).asArray(Float.self)
+        for (tokenId, count) in counts {
+            var v = flat[tokenId]
+            if repetitionPenalty != 1.0 {
+                v = v > 0 ? v / repetitionPenalty : v * repetitionPenalty
+            }
+            v -= presencePenalty
+            v -= frequencyPenalty * Float(count)
+            flat[tokenId] = v
+        }
+        return base(MLXArray(flat).reshaped(logits.shape))
+    }
+}
+
 // MARK: - SchedulerConfig
 
 public struct SchedulerConfig: Sendable {
@@ -77,6 +121,7 @@ public final class Scheduler: @unchecked Sendable {
     private var activeSamplers: [String: @Sendable (MLXArray) -> MLXArray] = [:]
     private var activeDetokenizers: [String: NaiveStreamingDetokenizer] = [:]
     private var activeStreamStates: [String: RequestStreamState] = [:]
+    private var tokenHistories: [String: TokenHistoryHolder] = [:]
 
     // UID management for GenerationBatch
     private var uidCounter: Int = 0
@@ -131,6 +176,7 @@ public final class Scheduler: @unchecked Sendable {
         activeSamplers.removeValue(forKey: requestId)
         activeDetokenizers.removeValue(forKey: requestId)
         activeStreamStates.removeValue(forKey: requestId)
+        tokenHistories.removeValue(forKey: requestId)
         activeRids.removeAll { $0 == requestId }
         if let uid = ridToUid[requestId] {
             uidToRid.removeValue(forKey: uid)
@@ -215,26 +261,30 @@ public final class Scheduler: @unchecked Sendable {
 
     // MARK: - Schedule + Prefill
 
-    /// Prefill waiting requests one-by-one and merge into shared batched caches.
-    /// Returns the newly scheduled requests.
+    /// Prefill waiting requests and merge into active batch.
+    ///
+    /// Cold requests (no prefix-cache hit) are prefilled as a batch via
+    /// `PromptProcessingBatch`; warm requests (prefix-cache hit) are prefilled
+    /// sequentially and then merged. Returns the newly scheduled requests.
     private func scheduleAndPrefill() -> [Request] {
         guard !waiting.isEmpty else { return [] }
-        let slotCount = activeRids.count
-        let availableSlots = max(0, config.maxNumSeqs - slotCount)
+        let availableSlots = max(0, config.maxNumSeqs - activeRids.count)
         guard availableSlots > 0 else { return [] }
 
+        struct AdmittedEntry {
+            let request: Request
+            let promptTokens: [Int]
+            let tokensToPrefill: [Int]
+            let existingCache: [KVCache]?   // nil = cold, non-nil = warm (prefix hit)
+            let uid: Int
+            let sampler: RowSampler?
+            let machine: SequenceStateMachine
+        }
+
+        var admitted: [AdmittedEntry] = []
         var newScheduled: [Request] = []
-        var newUids: [Int] = []
-        var newSeedTokens: [Int] = []
-        var newMaxTokens: [Int] = []
-        var newSamplers: [RowSampler?] = []
-        var newMachines: [SequenceStateMachine] = []
-        var newTokenLists: [[Int]] = []
 
-        // Batch of per-row KVCacheSimple arrays (one per new request, each [KVCacheSimple] per layer)
-        var newRowCaches: [[KVCacheSimple]] = []
-
-        for _ in 0..<min(availableSlots, waiting.count) {
+        for _ in 0 ..< min(availableSlots, waiting.count) {
             let request = waiting.removeFirst()
 
             // Tokenize
@@ -254,7 +304,7 @@ public final class Scheduler: @unchecked Sendable {
 
             // Prefix cache lookup: skip re-prefilling already-cached blocks.
             var tokensToPrefill = promptTokens
-            var existingCache: [KVCache]? = request.promptCache
+            var existingCache: [KVCache]? = nil
             if let pc = prefixCache {
                 let (cached, remaining) = pc.fetchPrefix(
                     requestId: request.requestId, tokens: promptTokens)
@@ -265,12 +315,6 @@ public final class Scheduler: @unchecked Sendable {
                 }
             }
 
-            // External prefill
-            let (simpleCaches, seedTokens) = doExternalPrefill(
-                tokens: tokensToPrefill,
-                existingCache: existingCache
-            )
-
             let uid = uidCounter
             uidCounter += 1
             uidToRid[uid] = request.requestId
@@ -279,12 +323,27 @@ public final class Scheduler: @unchecked Sendable {
             request.status = .running
             activeRids.append(request.requestId)
 
-            let sampler = makeRowSampler(
-                temperature: request.samplingParams.temperature,
-                topP: request.samplingParams.topP,
-                minP: request.samplingParams.minP,
-                topK: request.samplingParams.topK
+            // Build sampler, wrapping with repetition penalty if needed.
+            let params = request.samplingParams
+            let baseSampler = makeRowSampler(
+                temperature: params.temperature,
+                topP: params.topP,
+                minP: params.minP,
+                topK: params.topK
             )
+            let needsPenalty = params.repetitionPenalty != 1.0
+                || params.presencePenalty != 0.0
+                || params.frequencyPenalty != 0.0
+            let history = TokenHistoryHolder(tokens: promptTokens)
+            tokenHistories[request.requestId] = history
+            let sampler: RowSampler? = needsPenalty
+                ? makeRepetitionSampler(
+                    base: baseSampler, history: history,
+                    repetitionPenalty: params.repetitionPenalty,
+                    presencePenalty: params.presencePenalty,
+                    frequencyPenalty: params.frequencyPenalty)
+                : baseSampler
+
             activeSamplers[request.requestId] = sampler
             activeDetokenizers[request.requestId] = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             activeStreamStates[request.requestId] = RequestStreamState(
@@ -293,59 +352,135 @@ public final class Scheduler: @unchecked Sendable {
 
             totalPromptTokens += request.numPromptTokens
             newScheduled.append(request)
-            newUids.append(uid)
-            newSeedTokens.append(seedTokens.last ?? promptTokens.last ?? 0)
-            newMaxTokens.append(request.maxTokens)
-            newSamplers.append(sampler)
-            newMachines.append(SequenceStateMachine())
-            newTokenLists.append(promptTokens)  // includes all tokens including last
-            newRowCaches.append(simpleCaches)
+            admitted.append(AdmittedEntry(
+                request: request,
+                promptTokens: promptTokens,
+                tokensToPrefill: tokensToPrefill,
+                existingCache: existingCache,
+                uid: uid,
+                sampler: sampler,
+                machine: makeStateMachine(for: request)
+            ))
         }
 
-        guard !newUids.isEmpty else { return newScheduled }
+        guard !admitted.isEmpty else { return newScheduled }
 
-        // Build seed tokens MLXArray
-        let seedArr = MLXArray(newSeedTokens)
+        // Split into cold (no prefix hit) and warm (prefix hit) groups.
+        let cold = admitted.filter { $0.existingCache == nil }
+        let warm = admitted.filter { $0.existingCache != nil }
 
-        // Build per-layer BatchKVCache for just the new rows
-        let numLayers = newRowCaches[0].count
-        let newPerLayer: [any BatchedCache] = (0..<numLayers).map { layer in
-            let layerCaches = newRowCaches.map { $0[layer] }
-            return BatchKVCache.merge(layerCaches)
+        var newGenBatches: [GenerationBatch] = []
+
+        // Cold: batched prefill via PromptProcessingBatch.
+        if !cold.isEmpty {
+            let batchCache = makeBatchedCache(batchSize: cold.count)
+            let ppBatch = PromptProcessingBatch(
+                model: model,
+                uids: cold.map { $0.uid },
+                promptCache: batchCache,
+                tokens: Array(repeating: [], count: cold.count),
+                maxTokens: cold.map { $0.request.maxTokens },
+                prefillStepSize: config.prefillStepSize,
+                samplers: cold.map { $0.sampler },
+                fallbackSampler: greedySampler,
+                stateMachines: cold.map { $0.machine }
+            )
+            let coldGen = ppBatch.generate(lastTokensOf: cold.map { $0.tokensToPrefill })
+            if !coldGen.isEmpty { newGenBatches.append(coldGen) }
         }
+
+        // Warm: sequential prefill for prefix-cache hits.
+        if !warm.isEmpty {
+            var warmRowCaches: [[KVCacheSimple]] = []
+            var warmUids: [Int] = []
+            var warmSeedTokens: [Int] = []
+            var warmMaxTokens: [Int] = []
+            var warmSamplers: [RowSampler?] = []
+            var warmMachines: [SequenceStateMachine] = []
+            var warmTokenLists: [[Int]] = []
+
+            for entry in warm {
+                let (simpleCaches, seedTokens) = doExternalPrefill(
+                    tokens: entry.tokensToPrefill,
+                    existingCache: entry.existingCache
+                )
+                warmRowCaches.append(simpleCaches)
+                warmUids.append(entry.uid)
+                warmSeedTokens.append(seedTokens.last ?? entry.promptTokens.last ?? 0)
+                warmMaxTokens.append(entry.request.maxTokens)
+                warmSamplers.append(entry.sampler)
+                warmMachines.append(entry.machine)
+                warmTokenLists.append(entry.promptTokens)
+            }
+
+            let numLayers = warmRowCaches[0].count
+            let warmPerLayer: [any BatchedCache] = (0 ..< numLayers).map { layer in
+                BatchKVCache.merge(warmRowCaches.map { $0[layer] })
+            }
+            let warmGen = GenerationBatch(
+                model: model,
+                uids: warmUids,
+                seedTokens: MLXArray(warmSeedTokens),
+                promptCache: warmPerLayer,
+                tokens: warmTokenLists,
+                maxTokens: warmMaxTokens,
+                samplers: warmSamplers,
+                fallbackSampler: greedySampler,
+                stateMachines: warmMachines
+            )
+            if !warmGen.isEmpty { newGenBatches.append(warmGen) }
+        }
+
+        guard !newGenBatches.isEmpty else { return newScheduled }
+
+        // Merge all new sub-batches, then extend (or initialize) genBatch.
+        let first = newGenBatches[0]
+        for other in newGenBatches.dropFirst() { first.extend(other) }
 
         if let existing = genBatch {
-            // Extend existing generation batch: creates a temp batch with new
-            // rows and extends the existing batch's caches via extendBatched.
-            let tempBatch = GenerationBatch(
-                model: model,
-                uids: newUids,
-                seedTokens: seedArr,
-                promptCache: newPerLayer,
-                tokens: newTokenLists,
-                maxTokens: newMaxTokens,
-                samplers: newSamplers,
-                fallbackSampler: greedySampler,
-                stateMachines: newMachines
-            )
-            existing.extend(tempBatch)
+            existing.extend(first)
             genBatch = existing
         } else {
-            // Create initial GenerationBatch with the merged per-layer caches
-            genBatch = GenerationBatch(
-                model: model,
-                uids: newUids,
-                seedTokens: seedArr,
-                promptCache: newPerLayer,
-                tokens: newTokenLists,
-                maxTokens: newMaxTokens,
-                samplers: newSamplers,
-                fallbackSampler: greedySampler,
-                stateMachines: newMachines
-            )
+            genBatch = first
         }
 
         return newScheduled
+    }
+
+    // MARK: - scheduleAndPrefill helpers
+
+    /// Build a `SequenceStateMachine` that terminates on EOS tokens and
+    /// any per-request stop strings / stop-token IDs.
+    private func makeStateMachine(for request: Request) -> SequenceStateMachine {
+        var seqs: [(sequence: [Int], next: String?)] = []
+        for id in eosTokenIds { seqs.append((sequence: [id], next: nil)) }
+        for id in request.samplingParams.stopTokenIds where !eosTokenIds.contains(id) {
+            seqs.append((sequence: [id], next: nil))
+        }
+        for s in request.samplingParams.stop where !s.isEmpty {
+            let toks = tokenizer.encode(text: s)
+            if !toks.isEmpty { seqs.append((sequence: toks, next: nil)) }
+        }
+        guard !seqs.isEmpty else { return SequenceStateMachine() }
+        return SequenceStateMachine(states: ["normal": seqs])
+    }
+
+    /// Allocate one batched cache per layer, matching `BatchGenerator.makeBatchedCache`.
+    private func makeBatchedCache(batchSize B: Int) -> [any BatchedCache] {
+        let probe = model.newCache(parameters: nil)
+        let zeroPad = Array(repeating: 0, count: B)
+        return probe.map { layer -> any BatchedCache in
+            if layer is MambaCache {
+                return MambaCache(leftPadding: zeroPad)
+            }
+            if let arrays = layer as? ArraysCache {
+                return ArraysCache(size: arrays.slotCount, leftPadding: zeroPad)
+            }
+            if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
+                return BatchRotatingKVCache(maxSize: maxSize, leftPadding: zeroPad)
+            }
+            return BatchKVCache(leftPadding: zeroPad)
+        }
     }
 
     // MARK: - External Prefill
@@ -404,6 +539,7 @@ extension Scheduler {
             let newText: String
             if !isFinished {
                 request.appendOutputToken(tokenId)
+                tokenHistories[rid]?.tokens.append(tokenId)
                 var detok = activeDetokenizers[rid]!
                 detok.append(token: tokenId)
                 newText = detok.next() ?? ""
@@ -500,6 +636,7 @@ extension Scheduler {
         activeSamplers.removeAll()
         activeDetokenizers.removeAll()
         activeStreamStates.removeAll()
+        tokenHistories.removeAll()
         requests.removeAll()
         finishedReqIds.removeAll()
         genBatch = nil
