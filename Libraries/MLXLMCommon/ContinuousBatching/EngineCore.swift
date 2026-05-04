@@ -208,7 +208,9 @@ public final class EngineCore: @unchecked Sendable {
         prompt: String,
         maxTokens: Int = 256,
         temperature: Float = 0.7,
-        topP: Float = 0.9
+        topP: Float = 0.9,
+        topK: Int = 0,
+        minP: Float = 0.0
     ) async throws -> RequestOutput {
         let request = Request(
             requestId: UUID().uuidString,
@@ -216,7 +218,9 @@ public final class EngineCore: @unchecked Sendable {
             samplingParams: SamplingParams(
                 maxTokens: maxTokens,
                 temperature: temperature,
-                topP: topP
+                topP: topP,
+                topK: topK,
+                minP: minP
             )
         )
 

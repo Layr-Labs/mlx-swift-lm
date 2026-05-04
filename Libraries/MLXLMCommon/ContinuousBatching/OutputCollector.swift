@@ -41,7 +41,21 @@ public final class RequestOutputCollector: @unchecked Sendable {
     /// the new output is merged with the existing one.
     public func put(_ output: RequestOutput) {
         _lock.lock()
-        defer { _lock.unlock() }
+
+        // Fast path: deliver directly to waiting consumers without buffering.
+        // Mirrors omlx's asyncio.Event pattern where get() calls get_nowait()
+        // (which clears self.output) immediately after the event fires.
+        // If we buffered AND delivered, the next getNowait() call would
+        // return a duplicate.
+        if !_waitingContinuations.isEmpty {
+            let continuations = _waitingContinuations
+            _waitingContinuations.removeAll()
+            _lock.unlock()
+            for cont in continuations {
+                cont.resume(returning: output)
+            }
+            return
+        }
 
         if _output == nil {
             _output = output
@@ -50,14 +64,7 @@ public final class RequestOutputCollector: @unchecked Sendable {
         } else {
             _output = output
         }
-
-        // Resume any waiting consumers
-        let continuations = _waitingContinuations
-        _waitingContinuations.removeAll()
-        // Deliver the current output to each waiting consumer
-        for cont in continuations {
-            cont.resume(returning: output)
-        }
+        _lock.unlock()
     }
 
     /// Get output without blocking.

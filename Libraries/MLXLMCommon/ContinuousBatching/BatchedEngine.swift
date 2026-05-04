@@ -97,7 +97,9 @@ public final class BatchedEngine: @unchecked Sendable {
             prompt: prompt,
             maxTokens: maxTokens,
             temperature: temperature,
-            topP: topP
+            topP: topP,
+            topK: topK,
+            minP: minP
         )
         return result.outputText
     }
@@ -107,13 +109,17 @@ public final class BatchedEngine: @unchecked Sendable {
         prompt: String,
         maxTokens: Int = 256,
         temperature: Float = 0.7,
-        topP: Float = 0.9
+        topP: Float = 0.9,
+        topK: Int = 0,
+        minP: Float = 0.0
     ) async throws -> RequestOutput {
         try await core.generate(
             prompt: prompt,
             maxTokens: maxTokens,
             temperature: temperature,
-            topP: topP
+            topP: topP,
+            topK: topK,
+            minP: minP
         )
     }
 

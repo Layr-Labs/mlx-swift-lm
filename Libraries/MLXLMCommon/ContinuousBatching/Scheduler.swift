@@ -465,22 +465,27 @@ public final class Scheduler: @unchecked Sendable {
         return SequenceStateMachine(states: ["normal": seqs])
     }
 
-    /// Allocate one batched cache per layer, matching `BatchGenerator.makeBatchedCache`.
-    private func makeBatchedCache(batchSize B: Int) -> [any BatchedCache] {
-        let probe = model.newCache(parameters: nil)
-        let zeroPad = Array(repeating: 0, count: B)
-        return probe.map { layer -> any BatchedCache in
+    /// Per-layer factory closures, initialised once from a model probe.
+    /// Avoids re-allocating a full set of KV caches on every cold batch.
+    private lazy var cacheFactories: [(Int) -> any BatchedCache] = {
+        model.newCache(parameters: nil).map { layer -> (Int) -> any BatchedCache in
             if layer is MambaCache {
-                return MambaCache(leftPadding: zeroPad)
+                return { MambaCache(leftPadding: Array(repeating: 0, count: $0)) }
             }
             if let arrays = layer as? ArraysCache {
-                return ArraysCache(size: arrays.slotCount, leftPadding: zeroPad)
+                let size = arrays.slotCount
+                return { ArraysCache(size: size, leftPadding: Array(repeating: 0, count: $0)) }
             }
             if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
-                return BatchRotatingKVCache(maxSize: maxSize, leftPadding: zeroPad)
+                return { BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0)) }
             }
-            return BatchKVCache(leftPadding: zeroPad)
+            return { BatchKVCache(leftPadding: Array(repeating: 0, count: $0)) }
         }
+    }()
+
+    /// Allocate one batched cache per layer, matching `BatchGenerator.makeBatchedCache`.
+    private func makeBatchedCache(batchSize B: Int) -> [any BatchedCache] {
+        cacheFactories.map { $0(B) }
     }
 
     // MARK: - External Prefill
@@ -544,6 +549,13 @@ extension Scheduler {
                 detok.append(token: tokenId)
                 newText = detok.next() ?? ""
                 activeDetokenizers[rid] = detok
+            } else if resp.finishReason == "length" {
+                // omlx: append the final token for length-capped generation
+                // (scheduler.py: `elif not is_stop: request.append_output_token(response.token)`).
+                // For stop/EOS finish the stop token is intentionally excluded.
+                request.appendOutputToken(tokenId)
+                tokenHistories[rid]?.tokens.append(tokenId)
+                newText = ""
             } else {
                 newText = ""
             }
