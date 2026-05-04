@@ -500,7 +500,12 @@ public final class Scheduler: @unchecked Sendable {
         let n = tokens.count
         if n <= 1 {
             let cache: [KVCache] = existingCache ?? model.newCache(parameters: nil)
-            let simples = cache.map { $0 as! KVCacheSimple }
+            let simples = cache.compactMap { $0 as? KVCacheSimple }
+            precondition(
+                simples.count == cache.count,
+                "doExternalPrefill: all cache layers must be KVCacheSimple; "
+                    + "hybrid models (Mamba, Jamba) are not supported in the warm prefix path"
+            )
             return (simples, tokens)
         }
 
@@ -519,7 +524,12 @@ public final class Scheduler: @unchecked Sendable {
             processed = chunkEnd
         }
 
-        let simples = cache.map { $0 as! KVCacheSimple }
+        let simples = cache.compactMap { $0 as? KVCacheSimple }
+        precondition(
+            simples.count == cache.count,
+            "doExternalPrefill: all cache layers must be KVCacheSimple; "
+                + "hybrid models (Mamba, Jamba) are not supported in the warm prefix path"
+        )
         return (simples, lastTokens)
     }
 }

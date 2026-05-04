@@ -5,6 +5,14 @@
 //
 // The EngineCore runs the scheduler step loop on a background dispatch queue,
 // while the high-level interface (BatchedEngine) provides the async API.
+//
+// Thread-safety model (mirrors omlx's single-executor design):
+//   omlx routes ALL MLX + scheduler work through a single-worker ThreadPoolExecutor,
+//   making dict access effectively single-threaded.  Here we replicate that by
+//   running all dict mutations (add, cleanup) on `engineQueue` and protecting
+//   reads from external callers with `_lock`.  The engine loop output distribution
+//   also runs inside the engineQueue block so it is serialised with addRequest
+//   and cleanupRequest.
 
 import Foundation
 import MLX
@@ -60,10 +68,13 @@ public final class EngineCore: @unchecked Sendable {
         qos: .userInitiated
     )
 
-    // Output collectors for streaming (vLLM pattern)
+    // Output collectors for streaming (vLLM pattern).
+    // Mutations happen ONLY on engineQueue; reads from external contexts
+    // must hold _lock.  The engine queue operations also hold _lock so that
+    // external reads never race with a concurrent engine-queue write.
     private var outputCollectors: [String: RequestOutputCollector] = [:]
     private var streamStates: [String: RequestStreamState] = [:]
-    private var finishedEvents: [String: DispatchSemaphore] = [:]
+    private let _lock = NSLock()
 
     // Engine state
     private var _running = false
@@ -108,59 +119,75 @@ public final class EngineCore: @unchecked Sendable {
     // MARK: - Request Management
 
     /// Add a request for processing.
+    ///
+    /// Dict setup and scheduler submission both happen on `engineQueue` so that
+    /// state mutations are serialised with the step loop — mirroring omlx's
+    /// `loop.run_in_executor(self._mlx_executor, self.scheduler.add_request, request)`.
     @discardableResult
     public func addRequest(
         _ request: Request
     ) async -> String {
         let rid = request.requestId
-        outputCollectors[rid] = RequestOutputCollector(aggregate: true)
-        streamStates[rid] = RequestStreamState(
-            streamInterval: config.schedulerConfig.streamInterval
-        )
-        finishedEvents[rid] = DispatchSemaphore(value: 0)
-
-        // Submit to scheduler on the engine queue
         await withCheckedContinuation { continuation in
             engineQueue.async { [weak self] in
-                self?.scheduler.addRequest(request)
+                guard let self else { continuation.resume(); return }
+                _lock.lock()
+                outputCollectors[rid] = RequestOutputCollector(aggregate: true)
+                streamStates[rid] = RequestStreamState(
+                    streamInterval: config.schedulerConfig.streamInterval
+                )
+                _lock.unlock()
+                scheduler.addRequest(request)
                 continuation.resume()
             }
         }
-
         return rid
     }
 
     /// Abort a request.
+    ///
+    /// Signals the consumer immediately (the collector is internally locked),
+    /// then defers the scheduler abort to `engineQueue` to avoid racing
+    /// scheduler state — matching omlx's deferred-abort comment.
     public func abortRequest(_ requestId: String) -> Bool {
-        let result = scheduler.abortRequest(requestId)
+        _lock.lock()
+        let collector = outputCollectors[requestId]
+        _lock.unlock()
+        guard let collector else { return false }
 
-        // Signal the consumer
-        if let collector = outputCollectors[requestId] {
-            collector.put(RequestOutput(
-                requestId: requestId,
-                finished: true,
-                finishReason: "abort",
-                error: "Request aborted"
-            ))
+        collector.put(RequestOutput(
+            requestId: requestId,
+            finished: true,
+            finishReason: "abort",
+            error: "Request aborted"
+        ))
+
+        engineQueue.async { [weak self] in
+            self?.scheduler.abortRequest(requestId)
         }
-        finishedEvents[requestId]?.signal()
-
-        return result
+        return true
     }
 
     /// Abort all active requests.
     @discardableResult
     public func abortAllRequests() -> Int {
+        _lock.lock()
         let rids = Array(outputCollectors.keys)
+        _lock.unlock()
+
         for rid in rids {
-            scheduler.abortRequest(rid)
-            outputCollectors[rid]?.put(RequestOutput(
+            engineQueue.async { [weak self] in
+                self?.scheduler.abortRequest(rid)
+            }
+            _lock.lock()
+            let collector = outputCollectors[rid]
+            _lock.unlock()
+            collector?.put(RequestOutput(
                 requestId: rid,
                 finished: true,
                 finishReason: "error",
                 error: "All requests aborted"
             ))
-            finishedEvents[rid]?.signal()
         }
         return rids.count
     }
@@ -172,9 +199,11 @@ public final class EngineCore: @unchecked Sendable {
         requestId: String,
         timeout: TimeInterval? = nil
     ) -> AsyncStream<RequestOutput> {
-        AsyncStream { continuation in
-            let collector = outputCollectors[requestId]
+        _lock.lock()
+        let collector = outputCollectors[requestId]
+        _lock.unlock()
 
+        return AsyncStream { continuation in
             Task {
                 guard let collector else {
                     continuation.finish()
@@ -188,7 +217,6 @@ public final class EngineCore: @unchecked Sendable {
                             break
                         }
                     } else {
-                        // Wait for the next output
                         let output = await collector.get()
                         continuation.yield(output)
                         if output.finished || output.error != nil {
@@ -204,6 +232,10 @@ public final class EngineCore: @unchecked Sendable {
     }
 
     /// Generate a complete response (non-streaming).
+    ///
+    /// Reuses `streamOutputs` rather than a blocking semaphore wait on
+    /// `engineQueue`, eliminating the thread-stall / potential deadlock from
+    /// the original `DispatchSemaphore.wait()` design.
     public func generate(
         prompt: String,
         maxTokens: Int = 256,
@@ -226,71 +258,49 @@ public final class EngineCore: @unchecked Sendable {
 
         let rid = await addRequest(request)
 
-        // Wait for completion
-        guard let event = finishedEvents[rid] else {
-            throw EngineError.missingEvent
-        }
-
-        _ = await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            engineQueue.async {
-                event.wait()
-                cont.resume()
+        for await output in streamOutputs(requestId: rid) {
+            if output.finished || output.error != nil {
+                if let error = output.error {
+                    throw EngineError.generationFailed(error)
+                }
+                return output
             }
         }
 
-        // Drain the collector for the final output
-        guard let collector = outputCollectors[rid] else {
-            throw EngineError.missingOutput
-        }
-
-        var finalOutput: RequestOutput?
-        while let output = collector.getNowait() {
-            finalOutput = output
-        }
-
-        cleanupRequest(rid)
-
-        guard let output = finalOutput else {
-            throw EngineError.missingOutput
-        }
-
-        if let error = output.error {
-            throw EngineError.generationFailed(error)
-        }
-
-        return output
+        throw EngineError.missingOutput
     }
 
     // MARK: - Engine Loop
 
     /// Main engine loop — runs scheduler steps on the engine queue.
+    ///
+    /// Output distribution runs INSIDE the `engineQueue.async` block so that
+    /// all `outputCollectors` access is serialised with `addRequest` and
+    /// `cleanupRequest`, matching omlx's single-executor model.
     private func engineLoop() async {
         while _running {
             if scheduler.hasRequests() {
                 _idleSteps = 0
-                let output = await withCheckedContinuation { continuation in
+                await withCheckedContinuation { continuation in
                     engineQueue.async { [weak self] in
                         guard let self else {
-                            continuation.resume(returning: SchedulerOutput())
+                            continuation.resume()
                             return
                         }
-                        let result = self.scheduler.step()
+                        let output = scheduler.step()
                         stepsExecuted += 1
-                        continuation.resume(returning: result)
-                    }
-                }
 
-                // Distribute outputs to collectors
-                let outputs = output.outputs
-                if !outputs.isEmpty {
-                    for reqOutput in outputs {
-                        if let collector = outputCollectors[reqOutput.requestId] {
-                            collector.put(reqOutput)
+                        // Distribute outputs to collectors inside the queue block.
+                        if !output.outputs.isEmpty {
+                            for reqOutput in output.outputs {
+                                _lock.lock()
+                                let collector = outputCollectors[reqOutput.requestId]
+                                _lock.unlock()
+                                collector?.put(reqOutput)
+                            }
                         }
 
-                        if reqOutput.finished {
-                            finishedEvents[reqOutput.requestId]?.signal()
-                        }
+                        continuation.resume()
                     }
                 }
             } else {
@@ -311,20 +321,29 @@ public final class EngineCore: @unchecked Sendable {
 
     // MARK: - Cleanup
 
+    /// Dispatch cleanup to `engineQueue` so dict mutations are serialised
+    /// with the step loop — the caller (streamOutputs Task) may run on any thread.
     private func cleanupRequest(_ requestId: String) {
-        scheduler.removeFinishedRequest(requestId)
-        outputCollectors.removeValue(forKey: requestId)
-        streamStates.removeValue(forKey: requestId)
-        finishedEvents.removeValue(forKey: requestId)
+        engineQueue.async { [weak self] in
+            guard let self else { return }
+            scheduler.removeFinishedRequest(requestId)
+            _lock.lock()
+            outputCollectors.removeValue(forKey: requestId)
+            streamStates.removeValue(forKey: requestId)
+            _lock.unlock()
+        }
     }
 
     // MARK: - Stats
 
     public func getStats() -> [String: Any] {
+        _lock.lock()
+        let activeRequests = outputCollectors.count
+        _lock.unlock()
         var stats: [String: Any] = [
             "running": _running,
             "steps_executed": stepsExecuted,
-            "active_requests": outputCollectors.count,
+            "active_requests": activeRequests,
         ]
         stats.merge(scheduler.getStats()) { $1 }
         return stats
@@ -334,7 +353,6 @@ public final class EngineCore: @unchecked Sendable {
 // MARK: - Errors
 
 public enum EngineError: Error {
-    case missingEvent
     case missingOutput
     case generationFailed(String)
 }
