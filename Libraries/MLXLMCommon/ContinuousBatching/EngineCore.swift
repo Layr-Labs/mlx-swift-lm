@@ -258,16 +258,19 @@ public final class EngineCore: @unchecked Sendable {
 
         let rid = await addRequest(request)
 
-        for await output in streamOutputs(requestId: rid) {
-            if output.finished || output.error != nil {
-                if let error = output.error {
-                    throw EngineError.generationFailed(error)
+        return try await withTaskCancellationHandler {
+            for await output in streamOutputs(requestId: rid) {
+                if output.finished || output.error != nil {
+                    if let error = output.error {
+                        throw EngineError.generationFailed(error)
+                    }
+                    return output
                 }
-                return output
             }
+            throw EngineError.missingOutput
+        } onCancel: { [weak self] in
+            self?.abortRequest(rid)
         }
-
-        throw EngineError.missingOutput
     }
 
     // MARK: - Engine Loop

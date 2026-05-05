@@ -437,7 +437,7 @@ public final class Scheduler: @unchecked Sendable {
         let first = newGenBatches[0]
         for other in newGenBatches.dropFirst() { first.extend(other) }
 
-        if let existing = genBatch {
+        if let existing = genBatch, !existing.isEmpty {
             existing.extend(first)
             genBatch = existing
         } else {
