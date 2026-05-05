@@ -3,27 +3,14 @@
 // Port of omlx/omlx/scheduler.py — Continuous batching scheduler.
 // https://github.com/jundot/omlx/blob/main/omlx/scheduler.py
 //
-// Request lifecycle:
-//   waiting → prefill (external, per-request KVCacheSimple) →
-//   merging into shared BatchKVCache → batched decode via GenerationBatch
-//   → finished extraction.
-//
-// The model's existing callAsFunction auto-batches with BatchKVCache:
-// one [B, 1] forward pass replaces per-request sequential decode.
-
 import Foundation
 import MLX
 
-// MARK: - Repetition-penalty helpers
-
-/// Mutable token-history shared between a request and its penalty sampler.
 final class TokenHistoryHolder: @unchecked Sendable {
     var tokens: [Int]
     init(tokens: [Int]) { self.tokens = tokens }
 }
 
-/// Wrap `base` with multiplicative repetition penalty and additive
-/// presence/frequency penalties applied to previously-seen tokens.
 func makeRepetitionSampler(
     base: @escaping RowSampler,
     history: TokenHistoryHolder,
@@ -42,7 +29,6 @@ func makeRepetitionSampler(
         }
         guard !counts.isEmpty else { return base(logits) }
 
-        // Materialize once, modify in-place, then reconstruct.
         eval(logits)
         var flat = logits.reshaped(-1).asArray(Float.self)
         for (tokenId, count) in counts {
@@ -58,28 +44,32 @@ func makeRepetitionSampler(
     }
 }
 
-// MARK: - SchedulerConfig
-
 public struct SchedulerConfig: Sendable {
     public var maxNumSeqs: Int
     public var maxNumBatchedTokens: Int
+    /// Tokens processed per prefill chunk. Smaller values give finer interleaving
+    /// with decode at the cost of slightly higher per-step overhead.
     public var prefillStepSize: Int
     public var streamInterval: Int
+    /// Maximum total KV-cache tokens across all running requests (prompt + output).
+    /// When a new admission would exceed this, the running request with the
+    /// largest KV footprint is preempted and re-queued. 0 = unlimited.
+    public var maxKVCacheTokens: Int
 
     public init(
         maxNumSeqs: Int = 64,
         maxNumBatchedTokens: Int = 8192,
-        prefillStepSize: Int = 2048,
-        streamInterval: Int = 1
+        prefillStepSize: Int = 512,
+        streamInterval: Int = 1,
+        maxKVCacheTokens: Int = 0
     ) {
         self.maxNumSeqs = maxNumSeqs
         self.maxNumBatchedTokens = maxNumBatchedTokens
         self.prefillStepSize = prefillStepSize
         self.streamInterval = streamInterval
+        self.maxKVCacheTokens = maxKVCacheTokens
     }
 }
-
-// MARK: - SchedulerOutput
 
 public struct SchedulerOutput: Sendable {
     public var scheduledRequestIds: [String]
@@ -99,11 +89,19 @@ public struct SchedulerOutput: Sendable {
         self.numScheduledTokens = numScheduledTokens
         self.finishedRequestIds = finishedRequestIds
         self.outputs = outputs
-        self.hasWork = hasWork
+        self.hasWork = false
     }
 }
 
-// MARK: - Scheduler
+// Holds a batch of cold sequences being prefilled incrementally across steps.
+private struct PendingPrefill {
+    // Accumulates KV state across prompt() calls.
+    var ppBatch: PromptProcessingBatch
+    // Tokens yet to be forwarded for each sequence (excludes the seed token).
+    var remaining: [[Int]]
+    // Last token of each sequence; used as the seed for GenerationBatch.
+    var seeds: [Int]
+}
 
 public final class Scheduler: @unchecked Sendable {
     public let config: SchedulerConfig
@@ -111,34 +109,29 @@ public final class Scheduler: @unchecked Sendable {
     private let tokenizer: any Tokenizer
     private let eosTokenIds: Set<Int>
 
-    // Queues
     private var waiting: [Request] = []
     private var requests: [String: Request] = [:]
     public private(set) var finishedReqIds: Set<String> = []
 
-    // Active request tracking
     private var activeRids: [String] = []
     private var activeSamplers: [String: @Sendable (MLXArray) -> MLXArray] = [:]
     private var activeDetokenizers: [String: NaiveStreamingDetokenizer] = [:]
     private var activeStreamStates: [String: RequestStreamState] = [:]
     private var tokenHistories: [String: TokenHistoryHolder] = [:]
 
-    // UID management for GenerationBatch
     private var uidCounter: Int = 0
     private var uidToRid: [Int: String] = [:]
     private var ridToUid: [String: Int] = [:]
 
-    // Active generation batch (nil when no requests are running)
-    // Its promptCache holds the shared per-layer batched caches.
     private var genBatch: GenerationBatch?
 
-    // Aborts
+    // In-progress chunked cold prefill.
+    private var pendingPrefill: PendingPrefill?
+
     private var pendingAbortIds: Set<String> = []
 
-    // Optional prefix cache (in-memory block-level KV reuse).
     public var prefixCache: PrefixCache?
 
-    // Stats
     public private(set) var numRequestsProcessed: Int = 0
     public private(set) var totalPromptTokens: Int = 0
     public private(set) var totalCompletionTokens: Int = 0
@@ -156,8 +149,6 @@ public final class Scheduler: @unchecked Sendable {
         self.eosTokenIds = eosTokenIds
         self.prefixCache = prefixCache
     }
-
-    // MARK: - Request Lifecycle
 
     public func addRequest(_ request: Request) {
         requests[request.requestId] = request
@@ -185,38 +176,28 @@ public final class Scheduler: @unchecked Sendable {
     }
 
     public func hasRequests() -> Bool {
-        !waiting.isEmpty || (genBatch != nil && !genBatch!.isEmpty)
+        !waiting.isEmpty || pendingPrefill != nil || (genBatch != nil && !genBatch!.isEmpty)
     }
 
     public func getNumWaiting() -> Int { waiting.count }
     public func getNumRunning() -> Int { genBatch?.batchSize ?? 0 }
 
-    // MARK: - Step
+    // MARK: - Main step
 
     public func step() -> SchedulerOutput {
         var output = SchedulerOutput()
 
-        // 1. Pending aborts
         processPendingAborts()
 
-        // 2. Prefill waiting requests and merge into active batch
-        let newScheduled = scheduleAndPrefill()
-        for r in newScheduled {
-            output.scheduledRequestIds.append(r.requestId)
-            output.numScheduledTokens += r.numPromptTokens
-        }
-        output.hasWork = !newScheduled.isEmpty
-
-        // 3. Batched decode via GenerationBatch
+        // 1. DECODE — advance all in-flight sequences by one token first.
+        //    This ensures running requests are never starved by incoming prefill work.
         if let batch = genBatch, !batch.isEmpty {
             let responses = batch.next()
             output.hasWork = true
 
-            // 4. Convert GenerationBatchResponse → RequestOutput
             let stepOutputs = processGenResponses(responses)
             output.outputs = stepOutputs
 
-            // 5. Track finished
             for r in responses where r.finishReason != nil {
                 let rid = uidToRid[r.uid] ?? ""
                 output.finishedRequestIds.insert(rid)
@@ -224,15 +205,31 @@ public final class Scheduler: @unchecked Sendable {
             cleanupFinished(output.finishedRequestIds)
         }
 
+        // 2. PREFILL — advance the pending cold batch by one chunk, capped by
+        //    whatever token budget remains after decode.  This is the vLLM-style
+        //    shared max_num_batched_tokens budget: decode is served first, prefill
+        //    gets the remainder up to prefillStepSize.
+        let decodedThisStep = genBatch?.batchSize ?? 0
+        advancePendingPrefill(decodeBatchSize: decodedThisStep)
+        if pendingPrefill != nil { output.hasWork = true }
+
+        // 3. ADMIT — warm (prefix-cached) sequences are promoted to genBatch immediately.
+        //    Cold sequences start a new pending-prefill batch; only one cold batch is
+        //    in flight at a time so all staggered arrivals are grouped efficiently.
+        let newScheduled = admitWaiting()
+        for r in newScheduled {
+            output.scheduledRequestIds.append(r.requestId)
+            output.numScheduledTokens += r.numPromptTokens
+        }
+        if !newScheduled.isEmpty || genBatch != nil { output.hasWork = true }
+
         return output
     }
 
-    // MARK: - Aborts
+    // MARK: - Abort handling
 
     private func processPendingAborts() {
-        for rid in pendingAbortIds {
-            doAbortRequest(rid)
-        }
+        for rid in pendingAbortIds { doAbortRequest(rid) }
         pendingAbortIds.removeAll()
     }
 
@@ -244,7 +241,6 @@ public final class Scheduler: @unchecked Sendable {
         }
 
         if let uid = ridToUid[requestId] {
-            // Remove from GenerationBatch
             if let batch = genBatch {
                 let keep = (0..<batch.uids.count).filter { batch.uids[$0] != uid }
                 batch.filter(keep: keep)
@@ -259,14 +255,124 @@ public final class Scheduler: @unchecked Sendable {
         requests.removeValue(forKey: requestId)
     }
 
-    // MARK: - Schedule + Prefill
+    // MARK: - Chunked prefill
 
-    /// Prefill waiting requests and merge into active batch.
+    /// Advance the pending cold-prefill batch by one chunk.
     ///
-    /// Cold requests (no prefix-cache hit) are prefilled as a batch via
-    /// `PromptProcessingBatch`; warm requests (prefix-cache hit) are prefilled
-    /// sequentially and then merged. Returns the newly scheduled requests.
-    private func scheduleAndPrefill() -> [Request] {
+    /// `decodeBatchSize` is the number of tokens already consumed by the decode
+    /// step this cycle.  The prefill chunk is capped at
+    /// `max(1, maxNumBatchedTokens - decodeBatchSize)` so that decode and prefill
+    /// together never exceed the configured token budget.  This mirrors vLLM's
+    /// shared `max_num_batched_tokens` budget.
+    private func advancePendingPrefill(decodeBatchSize: Int = 0) {
+        guard var pp = pendingPrefill else { return }
+
+        let maxRemaining = pp.remaining.map { $0.count }.max() ?? 0
+
+        if maxRemaining == 0 {
+            // All sequences prefilled — transition to decode.
+            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] })
+            mergeIntoGenBatch(gen)
+            pendingPrefill = nil
+            return
+        }
+
+        // Budget: how many prefill tokens we're allowed this step.
+        let prefillBudget = max(1, config.maxNumBatchedTokens - decodeBatchSize)
+        // Chunk size: never exceed the per-step budget or the remaining work.
+        let chunkSize = min(config.prefillStepSize, prefillBudget, maxRemaining)
+        let chunks = pp.remaining.map { Array($0.prefix(chunkSize)) }
+
+        pp.ppBatch.prompt(chunks)
+
+        pp.remaining = zip(pp.remaining, chunks).map { rem, chunk in
+            Array(rem.dropFirst(chunk.count))
+        }
+
+        if pp.remaining.allSatisfy({ $0.isEmpty }) {
+            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] })
+            mergeIntoGenBatch(gen)
+            pendingPrefill = nil
+        } else {
+            pendingPrefill = pp
+        }
+    }
+
+    private func mergeIntoGenBatch(_ gen: GenerationBatch) {
+        if let existing = genBatch, !existing.isEmpty {
+            existing.extend(gen)
+        } else {
+            genBatch = gen
+        }
+    }
+
+    // MARK: - KV-cache budget & preemption
+
+    /// Total non-cached KV tokens currently held by all running requests.
+    private var currentKVTokens: Int {
+        activeRids.compactMap { requests[$0] }
+            .reduce(0) { $0 + $1.numPromptTokens - $1.cachedTokens + $1.numOutputTokens }
+    }
+
+    /// Evict the running request with the largest KV footprint back to the
+    /// front of the waiting queue so its KV cache is freed.
+    /// Returns the preempted request ID, or nil if nothing is running.
+    @discardableResult
+    private func preemptOne() -> String? {
+        guard !activeRids.isEmpty else { return nil }
+
+        // Pick the request with the most KV tokens (frees the most memory).
+        let victim = activeRids
+            .compactMap { rid -> (String, Int)? in
+                guard let r = requests[rid] else { return nil }
+                return (rid, r.numPromptTokens - r.cachedTokens + r.numOutputTokens)
+            }
+            .max(by: { $0.1 < $1.1 })
+            .map { $0.0 }
+
+        guard let rid = victim, let request = requests[rid] else { return nil }
+
+        // Remove from genBatch.
+        if let uid = ridToUid[rid], let batch = genBatch {
+            let keep = (0..<batch.uids.count).filter { batch.uids[$0] != uid }
+            batch.filter(keep: keep)
+        }
+
+        // Tear down per-request scheduler state.
+        activeRids.removeAll { $0 == rid }
+        activeSamplers.removeValue(forKey: rid)
+        activeDetokenizers.removeValue(forKey: rid)
+        activeStreamStates.removeValue(forKey: rid)
+        tokenHistories.removeValue(forKey: rid)
+        if let uid = ridToUid[rid] { uidToRid.removeValue(forKey: uid) }
+        ridToUid.removeValue(forKey: rid)
+
+        // Release any prefix-cache slot so re-admission gets a fresh lookup.
+        prefixCache?.releaseRequest(rid)
+
+        // Reset generation state — output so far is discarded.
+        request.outputTokenIds = []
+        request.outputText = ""
+        request.numComputedTokens = 0
+        request.cachedTokens = 0
+        request.status = .preempted
+
+        // Re-queue at the front so it's the next request admitted.
+        waiting.insert(request, at: 0)
+
+        return rid
+    }
+
+    // MARK: - Admission
+
+    /// Admit waiting requests.
+    /// - Warm sequences (prefix-cache hits) run `doExternalPrefill` and go straight
+    ///   to `genBatch`.
+    /// - Cold sequences are queued into `pendingPrefill` for chunked advancement.
+    ///   Only one cold batch is in flight at a time so staggered arrivals are grouped
+    ///   into the next available batch for efficient GPU utilization.
+    @discardableResult
+    private func admitWaiting() -> [Request] {
         guard !waiting.isEmpty else { return [] }
         let availableSlots = max(0, config.maxNumSeqs - activeRids.count)
         guard availableSlots > 0 else { return [] }
@@ -275,7 +381,7 @@ public final class Scheduler: @unchecked Sendable {
             let request: Request
             let promptTokens: [Int]
             let tokensToPrefill: [Int]
-            let existingCache: [KVCache]?   // nil = cold, non-nil = warm (prefix hit)
+            let existingCache: [KVCache]?
             let uid: Int
             let sampler: RowSampler?
             let machine: SequenceStateMachine
@@ -283,11 +389,11 @@ public final class Scheduler: @unchecked Sendable {
 
         var admitted: [AdmittedEntry] = []
         var newScheduled: [Request] = []
+        let admitCold = pendingPrefill == nil
 
         for _ in 0 ..< min(availableSlots, waiting.count) {
             let request = waiting.removeFirst()
 
-            // Tokenize
             if request.promptTokenIds == nil {
                 let tokens: [Int]
                 if let stringPrompt = request.prompt as? String {
@@ -300,9 +406,10 @@ public final class Scheduler: @unchecked Sendable {
                 request.promptTokenIds = tokens
                 request.numPromptTokens = tokens.count
             }
-            guard let promptTokens = request.promptTokenIds, !promptTokens.isEmpty else { continue }
+            guard let promptTokens = request.promptTokenIds, !promptTokens.isEmpty else {
+                continue
+            }
 
-            // Prefix cache lookup: skip re-prefilling already-cached blocks.
             var tokensToPrefill = promptTokens
             var existingCache: [KVCache]? = nil
             if let pc = prefixCache {
@@ -315,6 +422,25 @@ public final class Scheduler: @unchecked Sendable {
                 }
             }
 
+            let isCold = existingCache == nil
+            if isCold && !admitCold {
+                // A cold batch is already in flight; push back and wait for it to finish.
+                waiting.insert(request, at: 0)
+                break
+            }
+
+            // KV-cache budget check: if admitting this request would push total
+            // in-flight KV tokens over the limit, preempt the heaviest runner first.
+            if config.maxKVCacheTokens > 0 {
+                let newTokens = request.numPromptTokens - request.cachedTokens
+                while config.maxKVCacheTokens > 0
+                    && currentKVTokens + newTokens > config.maxKVCacheTokens
+                    && !activeRids.isEmpty
+                {
+                    preemptOne()
+                }
+            }
+
             let uid = uidCounter
             uidCounter += 1
             uidToRid[uid] = request.requestId
@@ -323,7 +449,6 @@ public final class Scheduler: @unchecked Sendable {
             request.status = .running
             activeRids.append(request.requestId)
 
-            // Build sampler, wrapping with repetition penalty if needed.
             let params = request.samplingParams
             let baseSampler = makeRowSampler(
                 temperature: params.temperature,
@@ -365,31 +490,10 @@ public final class Scheduler: @unchecked Sendable {
 
         guard !admitted.isEmpty else { return newScheduled }
 
-        // Split into cold (no prefix hit) and warm (prefix hit) groups.
         let cold = admitted.filter { $0.existingCache == nil }
         let warm = admitted.filter { $0.existingCache != nil }
 
-        var newGenBatches: [GenerationBatch] = []
-
-        // Cold: batched prefill via PromptProcessingBatch.
-        if !cold.isEmpty {
-            let batchCache = makeBatchedCache(batchSize: cold.count)
-            let ppBatch = PromptProcessingBatch(
-                model: model,
-                uids: cold.map { $0.uid },
-                promptCache: batchCache,
-                tokens: Array(repeating: [], count: cold.count),
-                maxTokens: cold.map { $0.request.maxTokens },
-                prefillStepSize: config.prefillStepSize,
-                samplers: cold.map { $0.sampler },
-                fallbackSampler: greedySampler,
-                stateMachines: cold.map { $0.machine }
-            )
-            let coldGen = ppBatch.generate(lastTokensOf: cold.map { $0.tokensToPrefill })
-            if !coldGen.isEmpty { newGenBatches.append(coldGen) }
-        }
-
-        // Warm: sequential prefill for prefix-cache hits.
+        // Warm: run doExternalPrefill immediately and merge into genBatch.
         if !warm.isEmpty {
             var warmRowCaches: [[KVCacheSimple]] = []
             var warmUids: [Int] = []
@@ -428,29 +532,34 @@ public final class Scheduler: @unchecked Sendable {
                 fallbackSampler: greedySampler,
                 stateMachines: warmMachines
             )
-            if !warmGen.isEmpty { newGenBatches.append(warmGen) }
+            mergeIntoGenBatch(warmGen)
         }
 
-        guard !newGenBatches.isEmpty else { return newScheduled }
-
-        // Merge all new sub-batches, then extend (or initialize) genBatch.
-        let first = newGenBatches[0]
-        for other in newGenBatches.dropFirst() { first.extend(other) }
-
-        if let existing = genBatch, !existing.isEmpty {
-            existing.extend(first)
-            genBatch = existing
-        } else {
-            genBatch = first
+        // Cold: set up pending prefill for chunked advancement.
+        if !cold.isEmpty {
+            let batchCache = makeBatchedCache(batchSize: cold.count)
+            let ppBatch = PromptProcessingBatch(
+                model: model,
+                uids: cold.map { $0.uid },
+                promptCache: batchCache,
+                tokens: Array(repeating: [], count: cold.count),
+                maxTokens: cold.map { $0.request.maxTokens },
+                prefillStepSize: config.prefillStepSize,
+                samplers: cold.map { $0.sampler },
+                fallbackSampler: greedySampler,
+                stateMachines: cold.map { $0.machine }
+            )
+            let remaining = cold.map { entry -> [Int] in
+                let toks = entry.tokensToPrefill
+                return toks.count > 1 ? Array(toks.dropLast()) : []
+            }
+            let seeds = cold.map { $0.tokensToPrefill.last ?? 0 }
+            pendingPrefill = PendingPrefill(ppBatch: ppBatch, remaining: remaining, seeds: seeds)
         }
 
         return newScheduled
     }
 
-    // MARK: - scheduleAndPrefill helpers
-
-    /// Build a `SequenceStateMachine` that terminates on EOS tokens and
-    /// any per-request stop strings / stop-token IDs.
     private func makeStateMachine(for request: Request) -> SequenceStateMachine {
         var seqs: [(sequence: [Int], next: String?)] = []
         for id in eosTokenIds { seqs.append((sequence: [id], next: nil)) }
@@ -465,8 +574,6 @@ public final class Scheduler: @unchecked Sendable {
         return SequenceStateMachine(states: ["normal": seqs])
     }
 
-    /// Per-layer factory closures, initialised once from a model probe.
-    /// Avoids re-allocating a full set of KV caches on every cold batch.
     private lazy var cacheFactories: [(Int) -> any BatchedCache] = {
         model.newCache(parameters: nil).map { layer -> (Int) -> any BatchedCache in
             if layer is MambaCache {
@@ -483,16 +590,10 @@ public final class Scheduler: @unchecked Sendable {
         }
     }()
 
-    /// Allocate one batched cache per layer, matching `BatchGenerator.makeBatchedCache`.
     private func makeBatchedCache(batchSize B: Int) -> [any BatchedCache] {
         cacheFactories.map { $0(B) }
     }
 
-    // MARK: - External Prefill
-
-    /// Run prompt tokens through the model with per-request KVCacheSimple caches.
-    /// Returns (per-layer KVCacheSimple array, leftover tokens list).
-    /// `remaining` tokens includes the last token(s) used as decode seed.
     private func doExternalPrefill(
         tokens: [Int],
         existingCache: [KVCache]?
@@ -534,12 +635,8 @@ public final class Scheduler: @unchecked Sendable {
     }
 }
 
-// MARK: - Response Processing
-
 extension Scheduler {
 
-    /// Convert GenerationBatch responses to RequestOutputs.
-    /// Handles streaming detokenization, finish detection, and stream intervals.
     private func processGenResponses(
         _ responses: [GenerationBatchResponse]
     ) -> [RequestOutput] {
@@ -560,9 +657,6 @@ extension Scheduler {
                 newText = detok.next() ?? ""
                 activeDetokenizers[rid] = detok
             } else if resp.finishReason == "length" {
-                // omlx: append the final token for length-capped generation
-                // (scheduler.py: `elif not is_stop: request.append_output_token(response.token)`).
-                // For stop/EOS finish the stop token is intentionally excluded.
                 request.appendOutputToken(tokenId)
                 tokenHistories[rid]?.tokens.append(tokenId)
                 newText = ""
@@ -570,7 +664,6 @@ extension Scheduler {
                 newText = ""
             }
 
-            // Handle finish
             var output: RequestOutput
 
             if isFinished {
@@ -595,8 +688,6 @@ extension Scheduler {
                 totalCompletionTokens += request.numOutputTokens
                 numRequestsProcessed += 1
 
-                // Store the completed KV state in the prefix cache for future reuse.
-                // Only works for pure-attention models where all cache layers are KVCacheSimple.
                 if let pc = prefixCache,
                    let promptTokens = request.promptTokenIds,
                    let rawCache = resp.promptCache,
@@ -608,7 +699,6 @@ extension Scheduler {
                 }
                 prefixCache?.releaseRequest(rid)
             } else {
-                // Stream interval check
                 var streamState = activeStreamStates[rid]!
                 let shouldSend = streamState.shouldSend(
                     totalTokens: request.numOutputTokens,
@@ -644,8 +734,6 @@ extension Scheduler {
     }
 }
 
-// MARK: - Reset & Stats
-
 extension Scheduler {
 
     public func reset() {
@@ -662,6 +750,7 @@ extension Scheduler {
         requests.removeAll()
         finishedReqIds.removeAll()
         genBatch = nil
+        pendingPrefill = nil
         uidCounter = 0
         uidToRid.removeAll()
         ridToUid.removeAll()
@@ -676,6 +765,7 @@ extension Scheduler {
             "num_requests_processed": numRequestsProcessed,
             "total_prompt_tokens": totalPromptTokens,
             "total_completion_tokens": totalCompletionTokens,
+            "current_kv_tokens": currentKVTokens,
         ]
     }
 }

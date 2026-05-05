@@ -1,4 +1,4 @@
-.PHONY: test test-cb
+.PHONY: test test-cb build-server serve
 
 # Run the full test suite (requires Metal; use xcodebuild so shaders compile).
 test:
@@ -29,3 +29,15 @@ test-cb:
 		-only-testing:MLXLMTests/CBSSDCacheManagerTests \
 		-only-testing:MLXLMTests/CBGenerationBatchShapeTests \
 		2>&1 | grep -E "Test Case|Test Suite|SUCCEEDED|FAILED|error:"
+
+# Build the inference server (release mode for benchmarking).
+build-server:
+	swift build -c release --product mlx-server
+
+# Run the server. Specify the model with MODEL=.
+# Usage: make serve MODEL=/path/to/model [PORT=8080] [HOST=127.0.0.1]
+serve: build-server
+	.build/release/mlx-server \
+		--model $(MODEL) \
+		--port $(or $(PORT),8080) \
+		--host $(or $(HOST),127.0.0.1)

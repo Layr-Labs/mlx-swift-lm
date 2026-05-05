@@ -165,6 +165,18 @@ public final class BatchedEngine: @unchecked Sendable {
 
     // MARK: - Chat Completion
 
+    /// Apply chat template to messages and return the prompt string.
+    /// Falls back to a simple "role: content" format if the template is unavailable.
+    public func buildPrompt(messages: [[String: String]]) -> String {
+        do {
+            let tokenIds = try tokenizer.applyChatTemplate(messages: messages)
+            return tokenizer.decode(tokenIds: tokenIds)
+        } catch {
+            return messages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
+                .joined(separator: "\n") + "\nassistant:"
+        }
+    }
+
     /// Chat completion (non-streaming). Applies chat template.
     public func chat(
         messages: [[String: String]],
