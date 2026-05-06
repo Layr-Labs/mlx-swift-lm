@@ -131,7 +131,7 @@ struct Gemma4MTPTokenIteratorTests {
         let prefillOut = target2.forwardForMTP(
             promptTokens[.newAxis, .ellipsis], cache: cache)
         let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
-                                 .argMax(axis: -1).item(Int32.self))
+                                 .asType(.float32).argMax(axis: -1).item(Int32.self))
         let firstHidden = prefillOut.lastHidden[
             0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         let stream = try runGemma4MTPRounds(
