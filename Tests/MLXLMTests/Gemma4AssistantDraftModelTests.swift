@@ -415,3 +415,28 @@ struct Gemma4AssistantDraftModelSanitizeTests {
         #expect(out.count == 4)  // all four kept
     }
 }
+
+@Suite("Gemma4AssistantDraftModel loading")
+struct Gemma4AssistantDraftModelLoadingTests {
+
+    /// Integration test gated on env var. Loads a pre-downloaded drafter
+    /// directory from disk using the local-path variant of `load`.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment[
+        "MLX_SWIFT_LM_INTEGRATION_DATA_DIR"] != nil))
+    func loadsFromDirectory() async throws {
+        guard let dirPath = ProcessInfo.processInfo.environment[
+            "MLX_SWIFT_LM_INTEGRATION_DATA_DIR"] else { return }
+        // Expect a sub-directory e.g. "gemma-4-E4B-it-assistant-bf16" under
+        // the integration data dir; caller is responsible for pre-downloading.
+        let drafterDir = URL(fileURLWithPath: dirPath)
+            .appending(path: "gemma-4-E4B-it-assistant-bf16")
+        let drafter = try await Gemma4AssistantDraftModel.load(from: drafterDir)
+        // A basic shape check: the first layer's q_proj weight should exist.
+        // We don't assert exact values here; the parity tests do that.
+        let params = drafter.parameters()
+        // Flatten to check a known key exists.
+        let flat = params.flattened()
+        let keys = Set(flat.map(\.0))
+        #expect(keys.contains("model.layers.0.self_attn.q_proj.weight"))
+    }
+}
