@@ -3,7 +3,7 @@
 import Foundation
 
 /// Errors thrown by the Gemma 4 MTP drafter pipeline.
-public enum Gemma4MTPError: LocalizedError, Sendable {
+public enum Gemma4MTPError: LocalizedError, Sendable, Equatable {
     /// The target passed to `generateGemma4MTP` wasn't a `Gemma4TextModel`.
     /// Associated value is the actual type name.
     case unsupportedTarget(String)

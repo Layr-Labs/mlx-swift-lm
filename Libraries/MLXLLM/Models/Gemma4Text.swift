@@ -955,6 +955,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     fileprivate let config: Gemma4TextConfiguration
     fileprivate let model: Gemma4TextModelInner
 
+    /// Read-only accessor for the underlying text configuration. Needed by
+    /// `Gemma4AssistantDraftModel` for its bind-time compatibility checks.
+    public var configuration: Gemma4TextConfiguration { config }
+
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     public init(_ config: Gemma4TextConfiguration) {
@@ -1016,6 +1020,14 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             lastHidden: hidden,
             capturedSharedKV: capture.snapshot()
         )
+    }
+
+    /// Compute the scaled input embedding for `tokens`, matching what the
+    /// inner trunk does in its first step (`embedTokens(inputs) * embedScale`).
+    /// Used by `Gemma4AssistantDraftModel` as the "target embedding" input
+    /// when building its drafter-step input `[target_embed(last_token), last_hidden]`.
+    public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
     }
 
     /// Rewind the target KV caches after a speculative-decoding round.
