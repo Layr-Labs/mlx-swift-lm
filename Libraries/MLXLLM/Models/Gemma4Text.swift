@@ -736,6 +736,11 @@ private class Gemma4TextModelInner: Module {
     let previousKvs: [Int]
     let firstKvSharedLayerIdx: Int
 
+    /// Index of the last non-shared full-attention layer (-1 if none).
+    /// Used by the shared-KV capture hook for the MTP drafter.
+    let lastFullAttentionNonSharedIdx: Int
+    let lastSlidingAttentionNonSharedIdx: Int
+
     init(_ config: Gemma4TextConfiguration, forceSharedKV: Bool = false) {
         self.config = config
         self.embedScale = Float(config.hiddenSize).squareRoot()
@@ -779,12 +784,25 @@ private class Gemma4TextModelInner: Module {
         }
         self.previousKvs = kvMap
 
+        // Capture indices for MTP drafter: the last layer of each type that
+        // still has its own K/V (not shared from an earlier layer).
+        let firstShared = self.firstKvSharedLayerIdx
+        var lastFull = -1
+        var lastSliding = -1
+        for i in 0 ..< firstShared {
+            if config.layerTypes[i] == "full_attention" { lastFull = i }
+            if config.layerTypes[i] == "sliding_attention" { lastSliding = i }
+        }
+        self.lastFullAttentionNonSharedIdx = lastFull
+        self.lastSlidingAttentionNonSharedIdx = lastSliding
+
         super.init()
     }
 
     func callAsFunction(
         _ inputs: MLXArray,
-        cache: [KVCache]? = nil
+        cache: [KVCache]? = nil,
+        capture: Gemma4SharedKVCapture? = nil
     ) -> MLXArray {
         let inputEmbeddings = embedTokens(inputs)
         var h = inputEmbeddings * embedScale
@@ -868,6 +886,14 @@ private class Gemma4TextModelInner: Module {
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
+
+            if let capture = capture {
+                if idx == lastFullAttentionNonSharedIdx {
+                    capture.fullAttention = kvPair
+                } else if idx == lastSlidingAttentionNonSharedIdx {
+                    capture.slidingAttention = kvPair
+                }
+            }
         }
 
         return norm(h)
@@ -912,6 +938,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
         return out
+    }
+
+    /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
+    internal func _testCallInner(
+        _ inputs: MLXArray, cache: [KVCache], capture: Gemma4SharedKVCapture?
+    ) -> MLXArray {
+        model(inputs, cache: cache, capture: capture)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
