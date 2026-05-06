@@ -185,3 +185,106 @@ struct Gemma4AssistantDraftModelTests {
         }
     }
 }
+
+@Suite("Gemma4AssistantDraftModel forward")
+struct Gemma4AssistantDraftModelForwardTests {
+
+    private func drafterConfig(
+        useOrderedEmbeddings: Bool = false
+    ) throws -> Gemma4AssistantConfiguration {
+        let json = """
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": 64,
+            "use_ordered_embeddings": \(useOrderedEmbeddings),
+            "num_centroids": 8,
+            "centroid_intermediate_top_k": 2,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 32,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 4,
+                "sliding_window": 64,
+                "final_logit_softcapping": null,
+                "tie_word_embeddings": true,
+                "vocab_size": 64,
+                "vocab_size_per_layer_input": 64,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["sliding_attention", "sliding_attention",
+                                "sliding_attention", "full_attention"]
+            }
+        }
+        """
+        let data = Data(json.utf8)
+        return try JSONDecoder.json5().decode(
+            Gemma4AssistantConfiguration.self, from: data)
+    }
+
+    /// Build dummy shared-KV (K/V for each layer-type). Shapes:
+    ///   fullAttention: [B, num_key_value_heads, T, global_head_dim]
+    ///   slidingAttention: [B, num_key_value_heads, T, head_dim]
+    /// Here: B=1, kvHeads=1, T=8, both head_dim = 32.
+    private func makeSharedKV(kvLen: Int = 8) -> Gemma4SharedKV {
+        let B = 1, H = 1, D = 32
+        func kv() -> (MLXArray, MLXArray) {
+            let k = MLXArray.ones([B, H, kvLen, D], dtype: .float32) * 0.1
+            let v = MLXArray.ones([B, H, kvLen, D], dtype: .float32) * 0.2
+            return (k, v)
+        }
+        return Gemma4SharedKV(fullAttention: kv(), slidingAttention: kv())
+    }
+
+    @Test func forwardProducesExpectedShapes() throws {
+        let cfg = try drafterConfig()
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        eval(drafter)
+        let inputsEmbeds = MLXArray.zeros([1, 1, 2 * 64], dtype: .float32)
+        let sharedKV = makeSharedKV()
+        let (lastHidden, logits) = drafter(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: sharedKV,
+            positionOffset: .scalar(8)
+        )
+        #expect(lastHidden.shape == [1, 1, 64])   // [B, 1, backbone]
+        #expect(logits.shape == [1, 1, 64])       // [B, 1, vocab]
+    }
+
+    @Test func forwardWithCentroidHeadHasCorrectShapes() throws {
+        let cfg = try drafterConfig(useOrderedEmbeddings: true)
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        eval(drafter)
+        let inputsEmbeds = MLXArray.zeros([1, 1, 2 * 64], dtype: .float32)
+        let sharedKV = makeSharedKV()
+        let (lastHidden, logits) = drafter(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: sharedKV,
+            positionOffset: .scalar(8)
+        )
+        #expect(lastHidden.shape == [1, 1, 64])
+        #expect(logits.shape == [1, 1, 64])
+    }
+
+    @Test func forwardLogitsAreFinite() throws {
+        let cfg = try drafterConfig()
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        eval(drafter)
+        let inputsEmbeds = MLXArray.zeros([1, 1, 2 * 64], dtype: .float32)
+        let sharedKV = makeSharedKV()
+        let (_, logits) = drafter(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: sharedKV,
+            positionOffset: .scalar(8)
+        )
+        // Softcap NOT applied on drafter path, so logits can exceed ±30.
+        // This test just verifies they're not NaN / ±inf on zero input.
+        let absMax = MLX.abs(logits).max().item(Float.self)
+        #expect(absMax.isFinite)
+    }
+}
