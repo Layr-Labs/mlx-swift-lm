@@ -84,11 +84,14 @@ public func runGemma4MTPRounds(
             let k = bs - 1
 
             // --- Draft (k autoregressive steps) ---
+            //
+            // Keep sampled drafts on GPU; concat with bonus for the verify
+            // input in a single eval — avoids K separate CPU syncs per round.
             let driveOffset = targetCache[0].offset
-            var draftTokens: [Int] = []
-            draftTokens.reserveCapacity(k)
             var tok = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]  // [1, 1]
             var h = hidden
+            var draftPerStep: [MLXArray] = []  // each [1, 1]
+            draftPerStep.reserveCapacity(k)
             for _ in 0 ..< k {
                 let tokEmbed = target.embedTokensForDrafter(tok)
                 let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
@@ -97,23 +100,33 @@ public func runGemma4MTPRounds(
                     sharedKV: sharedKV,
                     positionOffset: .scalar(driveOffset)
                 )
-                // Greedy sample: logits is [1, 1, vocab] → squeeze to [1, vocab],
-                // then argMax over last axis → [1] int32.
-                let sampled = logits.squeezed(axis: 1).argMax(axis: -1)
-                asyncEval(sampled)
-                draftTokens.append(Int(sampled.item(Int32.self)))
-                tok = sampled[.newAxis, .ellipsis]  // [1, 1]
+                // Greedy sample: logits [1, 1, vocab] → [1, 1] int32.
+                let sampled = logits.squeezed(axis: 1).argMax(axis: -1)  // [1]
+                let sampled2d = sampled[.newAxis, .ellipsis]  // [1, 1]
+                draftPerStep.append(sampled2d)
+                tok = sampled2d
                 h = newH
             }
 
             // --- Verify ---
-            let verifyIds: [Int32] = [Int32(bonus)] + draftTokens.map { Int32($0) }
-            let verifyInput = MLXArray(verifyIds)[.newAxis, .ellipsis]  // [1, bs]
+            // Concat drafts [1, k] + bonus [1, 1] → [1, bs].
+            let bonusCol = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]  // [1, 1]
+            let verifyInput: MLXArray =
+                draftPerStep.isEmpty
+                ? bonusCol
+                : concatenated([bonusCol] + draftPerStep, axis: 1)
             let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
             // Greedy sample all bs positions: [1, bs, vocab] → [1, bs] int32.
             let mainTokens = verifyOut.logits.argMax(axis: -1)
-            eval(mainTokens)
+            // Materialise drafts + main tokens in a single sync.
+            let draftConcat: MLXArray =
+                draftPerStep.isEmpty
+                ? MLXArray.zeros([1, 0], dtype: .int32)
+                : concatenated(draftPerStep, axis: 1)  // [1, k]
+            eval(mainTokens, draftConcat)
             let mainInts = mainTokens.squeezed(axis: 0).asArray(Int.self)  // [bs]
+            let draftTokens = draftConcat.squeezed(axis: 0).asArray(Int32.self)
+                                         .map { Int($0) }  // [k]
 
             // --- Walk ---
             let (accepted, newTokens) = SpeculativeWalk.single(
@@ -262,12 +275,17 @@ public func runGemma4MTPRoundsBatched(
             let k = bs - 1
 
             // --- Draft (k autoregressive steps) ---
+            //
+            // Keep sampled draft tokens on the GPU instead of materialising
+            // each step as a Swift array. Each step's sampled [B] token
+            // tensor is collected; at the end we stack them [B, k] and
+            // prepend the bonus to form the verify input in one eval.
             let driveOffset = targetCache[0].offset
-            var draftTokensRow: [[Int]] = Array(
-                repeating: [], count: B)
             // Seed token: per-row bonus as [B, 1] int32.
             var tok = MLXArray(bonus.map { Int32($0) }, [B, 1])
             var h = hidden
+            var draftPerStep: [MLXArray] = []  // each is shape [B, 1]
+            draftPerStep.reserveCapacity(k)
             for _ in 0 ..< k {
                 let tokEmbed = target.embedTokensForDrafter(tok)
                 let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
@@ -276,39 +294,41 @@ public func runGemma4MTPRoundsBatched(
                     sharedKV: sharedKV,
                     positionOffset: .scalar(driveOffset)
                 )
-                // Greedy sample per row: logits [B, 1, vocab] → [B]
+                // Greedy sample per row: logits [B, 1, vocab] → [B, 1]
                 let sampled = logits.squeezed(axis: 1).argMax(axis: -1)  // [B]
-                asyncEval(sampled)
-                let sampledInts = sampled.asArray(Int32.self).map { Int($0) }
-                for (bi, s) in sampledInts.enumerated() {
-                    draftTokensRow[bi].append(s)
-                }
-                // Reshape [B] → [B, 1] for next step.
-                tok = sampled.reshaped([B, 1])
+                let sampled2d = sampled.reshaped([B, 1])  // [B, 1]
+                draftPerStep.append(sampled2d)
+                tok = sampled2d
                 h = newH
             }
-            let draftTokensPerRow = draftTokensRow
 
             // --- Verify ---
-            // Build [B, bs] = concat([bonus], draftTokens) per row.
-            var verifyFlat: [Int32] = []
-            verifyFlat.reserveCapacity(B * bs)
-            for bi in 0 ..< B {
-                verifyFlat.append(Int32(bonus[bi]))
-                for t in draftTokensPerRow[bi] {
-                    verifyFlat.append(Int32(t))
-                }
-            }
-            let verifyInput = MLXArray(verifyFlat, [B, bs])
+            // Concat drafts along axis=1 to get [B, k], prepend bonus to
+            // get [B, bs=k+1]. Single eval across the whole verify step.
+            let bonusCol = MLXArray(bonus.map { Int32($0) }, [B, 1])
+            let verifyInput: MLXArray =
+                draftPerStep.isEmpty
+                ? bonusCol
+                : concatenated([bonusCol] + draftPerStep, axis: 1)
             let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
             let mainTokens = verifyOut.logits.argMax(axis: -1)  // [B, bs]
-            eval(mainTokens)
+            // Materialise drafts + main tokens in a single sync.
+            let draftConcat: MLXArray =
+                draftPerStep.isEmpty
+                ? MLXArray.zeros([B, 0], dtype: .int32)
+                : concatenated(draftPerStep, axis: 1)  // [B, k]
+            eval(mainTokens, draftConcat)
             let mainFlat = mainTokens.asArray(Int32.self)
+            let draftFlat = draftConcat.asArray(Int32.self)
             var mainPerRow: [[Int]] = []
+            var draftTokensPerRow: [[Int]] = []
             mainPerRow.reserveCapacity(B)
+            draftTokensPerRow.reserveCapacity(B)
             for bi in 0 ..< B {
-                let start = bi * bs
-                mainPerRow.append(mainFlat[start ..< start + bs].map { Int($0) })
+                let mStart = bi * bs
+                mainPerRow.append(mainFlat[mStart ..< mStart + bs].map { Int($0) })
+                let dStart = bi * k
+                draftTokensPerRow.append(draftFlat[dStart ..< dStart + k].map { Int($0) })
             }
 
             // --- Walk (per-row, with remaining-budget truncation) ---
@@ -368,20 +388,15 @@ public func runGemma4MTPRoundsBatched(
 
             // --- Update state ---
             // Per-row hidden: gather verifyOut.lastHidden[bi, accepted[bi], :]
-            // into a [B, 1, hidden] tensor.
-            // Build by slicing one row at a time and stacking — avoids
-            // relying on advanced multi-MLXArray indexing support.
-            var rowSlices: [MLXArray] = []
-            rowSlices.reserveCapacity(B)
-            for bi in 0 ..< B {
-                let a = accepted[bi]
-                // verifyOut.lastHidden shape: [B, bs, hidden]
-                // Slice → [1, 1, hidden]
-                let slice = verifyOut.lastHidden[
-                    bi ..< bi + 1, a ..< a + 1, 0...]
-                rowSlices.append(slice)
-            }
-            hidden = concatenated(rowSlices, axis: 0)  // [B, 1, hidden]
+            // into a [B, 1, hidden] tensor via takeAlong on axis=1. The
+            // old B-way slice + concat forced B intermediate small ops;
+            // takeAlong runs in one kernel.
+            let hiddenDim = verifyOut.lastHidden.dim(2)
+            let acceptedIdx = MLX.broadcast(
+                MLXArray(accepted.map { Int32($0) }, [B, 1, 1]),
+                to: [B, 1, hiddenDim])
+            hidden = MLX.takeAlong(
+                verifyOut.lastHidden, acceptedIdx, axis: 1)  // [B, 1, hidden]
 
             // Update per-row bonus: last emitted token (or carry forward if
             // the row finished without emitting).

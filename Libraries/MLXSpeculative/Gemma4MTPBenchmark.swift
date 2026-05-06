@@ -19,6 +19,32 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 
+/// Batched benchmark result: per-row token counts + shared timing.
+public struct Gemma4MTPBatchedBenchmarkResult: Sendable {
+    public let batchSize: Int
+    /// Total tokens emitted across all rows (sum).
+    public let totalGenerated: Int
+    public let prefillSeconds: Double
+    public let generationSeconds: Double
+    /// Sum of per-row tokens / generationSeconds. This is the metric that
+    /// matters — it's the aggregate throughput of the system, which is
+    /// what MTP batching is supposed to improve vs single-stream baseline.
+    public var tokensPerSecond: Double {
+        guard generationSeconds > 0 else { return 0 }
+        return Double(totalGenerated) / generationSeconds
+    }
+
+    public init(
+        batchSize: Int, totalGenerated: Int,
+        prefillSeconds: Double, generationSeconds: Double
+    ) {
+        self.batchSize = batchSize
+        self.totalGenerated = totalGenerated
+        self.prefillSeconds = prefillSeconds
+        self.generationSeconds = generationSeconds
+    }
+}
+
 /// One benchmark measurement. Wall-clock times are post-prefill; prefill
 /// is measured separately so MTP speedup is computed against the generation
 /// phase only (MTP doesn't change prefill).
@@ -103,7 +129,12 @@ public func measureMTPThroughput(
     promptTokens: MLXArray,
     maxTokens: Int,
     blockSize: Int
-) async throws -> Gemma4MTPBenchmarkResult {
+) throws -> Gemma4MTPBenchmarkResult {
+    guard blockSize >= 2 && blockSize <= 16 else {
+        throw Gemma4MTPError.invalidBlockSize(blockSize)
+    }
+    try drafter.bind(target: target)
+
     var prompt = promptTokens
     if prompt.ndim == 1 {
         prompt = prompt[.newAxis, .ellipsis]
@@ -112,41 +143,220 @@ public func measureMTPThroughput(
 
     let prefillStart = Date()
     let prefillOut = target.forwardForMTP(prompt, cache: cache)
-    let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
-                             .argMax(axis: -1).item(Int32.self))
+    let firstBonusArr = prefillOut.logits[0..., -1, 0...].argMax(axis: -1)
+    eval(firstBonusArr)
+    var bonus = Int(firstBonusArr.item(Int32.self))
+    var hidden = prefillOut.lastHidden[
+        0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
+    var sharedKV = prefillOut.capturedSharedKV
+    let prefillElapsed = Date().timeIntervalSince(prefillStart)
+
+    // Drive the round loop inline so we can track per-round accept counts
+    // (the AsyncStream<Generation> public API doesn't delimit rounds).
+    let genStart = Date()
+    var emitted = 1  // the prefill bonus counts as the first emitted token
+    var accepts: [Int] = []
+
+    while emitted < maxTokens {
+        let remaining = maxTokens - emitted
+        let bs = min(blockSize, remaining + 1)
+        if bs <= 1 { break }
+        let k = bs - 1
+
+        // Draft k tokens autoregressively, keeping drafts on GPU.
+        let driveOffset = cache[0].offset
+        var tok = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
+        var h = hidden
+        var draftPerStep: [MLXArray] = []
+        draftPerStep.reserveCapacity(k)
+        for _ in 0 ..< k {
+            let tokEmbed = target.embedTokensForDrafter(tok)
+            let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
+            let (newH, logits) = drafter(
+                inputsEmbeds: inputsEmbeds,
+                sharedKV: sharedKV,
+                positionOffset: .scalar(driveOffset))
+            let sampled = logits.squeezed(axis: 1).argMax(axis: -1)
+            let sampled2d = sampled[.newAxis, .ellipsis]
+            draftPerStep.append(sampled2d)
+            tok = sampled2d
+            h = newH
+        }
+
+        // Verify.
+        let bonusCol = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
+        let verifyInput: MLXArray =
+            draftPerStep.isEmpty
+            ? bonusCol
+            : concatenated([bonusCol] + draftPerStep, axis: 1)
+        let verifyOut = target.forwardForMTP(verifyInput, cache: cache)
+        let mainTokens = verifyOut.logits.argMax(axis: -1)
+        let draftConcat: MLXArray =
+            draftPerStep.isEmpty
+            ? MLXArray.zeros([1, 0], dtype: .int32)
+            : concatenated(draftPerStep, axis: 1)
+        eval(mainTokens, draftConcat)
+        let mainInts = mainTokens.squeezed(axis: 0).asArray(Int.self)
+        let draftTokens = draftConcat.squeezed(axis: 0).asArray(Int32.self)
+                                     .map { Int($0) }
+
+        // Walk: count matches up to first mismatch.
+        var accepted = 0
+        while accepted < k && draftTokens[accepted] == mainInts[accepted] {
+            accepted += 1
+        }
+        accepts.append(accepted)
+
+        let emittedThisRound = min(accepted + 1, remaining)
+        emitted += emittedThisRound
+        if emittedThisRound == 0 { break }
+
+        // Rewind cache if any drafts were rejected.
+        if accepted < k {
+            target.rollbackSpeculativeCache(
+                cache, accepted: .scalar(accepted), blockSize: bs)
+        }
+
+        // Update state for next round.
+        hidden = verifyOut.lastHidden[
+            0..., accepted ..< accepted + 1, 0...]
+        bonus = mainInts[accepted]
+        let rejected = k - accepted
+        sharedKV = Gemma4SharedKV.sliceTail(
+            from: verifyOut.capturedSharedKV, rejected: rejected)
+    }
+    let genElapsed = Date().timeIntervalSince(genStart)
+
+    return Gemma4MTPBenchmarkResult(
+        generatedTokens: emitted,
+        prefillSeconds: prefillElapsed,
+        generationSeconds: genElapsed,
+        acceptLengths: accepts
+    )
+}
+
+// MARK: - Batched (B>1) throughput
+
+/// Run target-only greedy generation over B padded prompts, each for
+/// `maxTokens` steps. Uses `BatchKVCache` / `BatchRotatingKVCache` so the
+/// cache semantics match the MTP batched path.
+public func measureBatchedBaselineThroughput(
+    target: Gemma4TextModel,
+    promptTokens: [[Int32]],
+    maxTokens: Int
+) -> Gemma4MTPBatchedBenchmarkResult {
+    let B = promptTokens.count
+    precondition(B >= 1, "Batch size must be >= 1")
+    let maxLen = promptTokens.map(\.count).max() ?? 0
+    // Right-pad with 0s (token id 0). For a throughput bench this is fine;
+    // we're measuring compute, not semantic output. Real applications
+    // would left-pad and track leftPadding per row.
+    let padded = promptTokens.map { row -> [Int32] in
+        row + Array(repeating: Int32(0), count: maxLen - row.count)
+    }
+    let flat = padded.flatMap { $0 }
+    let prompt = MLXArray(flat, [B, maxLen])
+
+    let firstKvShared = target.configuration.numHiddenLayers
+                      - target.configuration.numKvSharedLayers
+    let leftPadding = Array(repeating: 0, count: B)
+    var cache: [KVCache] = []
+    for i in 0 ..< firstKvShared {
+        if target.configuration.layerTypes[i] == "full_attention" {
+            cache.append(BatchKVCache(leftPadding: leftPadding))
+        } else {
+            cache.append(BatchRotatingKVCache(
+                maxSize: target.configuration.slidingWindow,
+                leftPadding: leftPadding))
+        }
+    }
+
+    let prefillStart = Date()
+    var logits = target(prompt, cache: cache)
+    var tok = logits[0..., -1, 0...].argMax(axis: -1)  // [B]
+    eval(tok)
+    let prefillElapsed = Date().timeIntervalSince(prefillStart)
+
+    let genStart = Date()
+    var total = B
+    for _ in 1 ..< maxTokens {
+        let input = tok.reshaped([B, 1])
+        logits = target(input, cache: cache)
+        tok = logits[0..., -1, 0...].argMax(axis: -1)
+        eval(tok)
+        total += B
+    }
+    let genElapsed = Date().timeIntervalSince(genStart)
+
+    return Gemma4MTPBatchedBenchmarkResult(
+        batchSize: B, totalGenerated: total,
+        prefillSeconds: prefillElapsed, generationSeconds: genElapsed)
+}
+
+/// Run MTP over B padded prompts via `runGemma4MTPRoundsBatched`. Returns
+/// aggregate timing — sum of emitted tokens / wall seconds.
+public func measureBatchedMTPThroughput(
+    target: Gemma4TextModel,
+    drafter: Gemma4AssistantDraftModel,
+    promptTokens: [[Int32]],
+    maxTokens: Int,
+    blockSize: Int
+) async throws -> Gemma4MTPBatchedBenchmarkResult {
+    guard blockSize >= 2 && blockSize <= 16 else {
+        throw Gemma4MTPError.invalidBlockSize(blockSize)
+    }
+    try drafter.bind(target: target)
+
+    let B = promptTokens.count
+    let maxLen = promptTokens.map(\.count).max() ?? 0
+    let padded = promptTokens.map { row -> [Int32] in
+        row + Array(repeating: Int32(0), count: maxLen - row.count)
+    }
+    let flat = padded.flatMap { $0 }
+    let prompt = MLXArray(flat, [B, maxLen])
+
+    let firstKvShared = target.configuration.numHiddenLayers
+                      - target.configuration.numKvSharedLayers
+    let leftPadding = Array(repeating: 0, count: B)
+    var cache: [KVCache] = []
+    for i in 0 ..< firstKvShared {
+        if target.configuration.layerTypes[i] == "full_attention" {
+            cache.append(BatchKVCache(leftPadding: leftPadding))
+        } else {
+            cache.append(BatchRotatingKVCache(
+                maxSize: target.configuration.slidingWindow,
+                leftPadding: leftPadding))
+        }
+    }
+
+    let prefillStart = Date()
+    let prefillOut = target.forwardForMTP(prompt, cache: cache)
+    let firstBonusArr = prefillOut.logits[0..., -1, 0...].argMax(axis: -1)
+    eval(firstBonusArr)
+    let bonusPerRow = firstBonusArr.asArray(Int32.self).map { Int($0) }
     let firstHidden = prefillOut.lastHidden[
         0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
     let firstSharedKV = prefillOut.capturedSharedKV
     let prefillElapsed = Date().timeIntervalSince(prefillStart)
 
     let genStart = Date()
-    let stream = try runGemma4MTPRounds(
-        target: target,
-        drafter: drafter,
+    let stream = try runGemma4MTPRoundsBatched(
+        target: target, drafter: drafter,
         targetCache: cache,
-        firstBonus: firstBonus,
-        firstHidden: firstHidden,
+        firstBonus: bonusPerRow, firstHidden: firstHidden,
         firstSharedKV: firstSharedKV,
-        maxTokens: maxTokens,
-        blockSize: blockSize
+        maxTokens: maxTokens, blockSize: blockSize,
+        eosTokenIds: nil
     )
-    var generated = 0
-    for await gen in stream {
-        if case .chunk = gen {
-            generated += 1
+    var total = 0
+    for await step in stream {
+        for slot in step.slots where slot.token != nil {
+            total += 1
         }
     }
     let genElapsed = Date().timeIntervalSince(genStart)
 
-    // NOTE: per-round accept histogram is not currently reconstructible
-    // from the token stream alone (rounds aren't delimited in the
-    // AsyncStream<Generation> surface). Callers that need this should
-    // drive `runGemma4MTPRounds` directly and track it from the round
-    // loop. Left nil here to avoid misleading numbers.
-    return Gemma4MTPBenchmarkResult(
-        generatedTokens: generated,
-        prefillSeconds: prefillElapsed,
-        generationSeconds: genElapsed,
-        acceptLengths: nil
-    )
+    return Gemma4MTPBatchedBenchmarkResult(
+        batchSize: B, totalGenerated: total,
+        prefillSeconds: prefillElapsed, generationSeconds: genElapsed)
 }

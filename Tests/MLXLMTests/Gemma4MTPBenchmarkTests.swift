@@ -134,21 +134,17 @@ struct Gemma4MTPBenchmarkTests {
             let label: String
             let targetDir: String
             let drafterDir: String
-            let blockSize: Int
         }
         let allPairs: [Pair] = [
             Pair(label: "E2B-bf16",
                  targetDir: "gemma-4-e2b-it-bf16",
-                 drafterDir: "gemma-4-E2B-it-assistant-bf16",
-                 blockSize: 4),
+                 drafterDir: "gemma-4-E2B-it-assistant-bf16"),
             Pair(label: "E4B-bf16",
                  targetDir: "gemma-4-e4b-it-bf16",
-                 drafterDir: "gemma-4-E4B-it-assistant-bf16",
-                 blockSize: 4),
+                 drafterDir: "gemma-4-E4B-it-assistant-bf16"),
             Pair(label: "26B-A4B-4bit",
                  targetDir: "gemma-4-26b-a4b-it-4bit",
-                 drafterDir: "gemma-4-26B-A4B-it-assistant-bf16",
-                 blockSize: 4),
+                 drafterDir: "gemma-4-26B-A4B-it-assistant-bf16"),
         ]
         let pairs = allPairs.filter {
             FileManager.default.fileExists(atPath: "\(dataDir)/\($0.targetDir)")
@@ -168,16 +164,16 @@ struct Gemma4MTPBenchmarkTests {
             let decoded = try JSONDecoder().decode([[Int]].self, from: data)
             promptsData = decoded.map { $0.map { Int32($0) } }
         } else {
-            // Degenerate fallback: `Int32($0 * 211 + 7)`. Use MTP_BENCH_PROMPTS
-            // for meaningful numbers.
+            // Degenerate fallback. Use MTP_BENCH_PROMPTS for real numbers.
             promptsData = [(0 ..< 16).map { Int32($0 * 211 + 7) }]
         }
         let maxTokens = 64
         let warmupTokens = 16
+        let blockSizes = [2, 3, 4, 5]
 
         print("\n\n=== Gemma 4 MTP real-model benchmark ===")
-        print("prompts=\(promptsData.count), max_tokens=\(maxTokens), warmup_tokens=\(warmupTokens)")
-        print("model              block  base tok/s  mtp tok/s  speedup")
+        print("prompts=\(promptsData.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
+        print("model              K  base tok/s  mtp tok/s  speedup  accept_avg")
 
         for pair in pairs {
             let targetURL = URL(fileURLWithPath: "\(dataDir)/\(pair.targetDir)")
@@ -188,41 +184,81 @@ struct Gemma4MTPBenchmarkTests {
             let drafter = try await Gemma4AssistantDraftModel.load(from: drafterURL)
             eval(target, drafter)
 
-            // Warmup both paths on the first prompt so the reported numbers
-            // exclude kernel compile / metallib JIT.
+            // Warmup on first prompt with largest block size to exercise
+            // the full drafter path.
             let warmupPrompt = MLXArray(promptsData[0])
             _ = measureBaselineThroughput(
                 target: target, promptTokens: warmupPrompt, maxTokens: warmupTokens)
-            _ = try await measureMTPThroughput(
+            _ = try measureMTPThroughput(
                 target: target, drafter: drafter,
                 promptTokens: warmupPrompt, maxTokens: warmupTokens,
-                blockSize: pair.blockSize)
+                blockSize: blockSizes.max()!)
             MLX.Memory.clearCache()
 
-            // Measure across all prompts, average the tok/s.
+            // Baseline once per prompt (block-size invariant).
             var baseRates: [Double] = []
-            var mtpRates: [Double] = []
             for promptInts in promptsData {
                 let prompt = MLXArray(promptInts)
                 let base = measureBaselineThroughput(
                     target: target, promptTokens: prompt, maxTokens: maxTokens)
                 MLX.Memory.clearCache()
-                let mtp = try await measureMTPThroughput(
-                    target: target, drafter: drafter,
-                    promptTokens: prompt, maxTokens: maxTokens,
-                    blockSize: pair.blockSize)
-                MLX.Memory.clearCache()
                 baseRates.append(base.tokensPerSecond)
-                mtpRates.append(mtp.tokensPerSecond)
             }
             let baseAvg = baseRates.reduce(0, +) / Double(baseRates.count)
-            let mtpAvg = mtpRates.reduce(0, +) / Double(mtpRates.count)
-            let speedup = mtpAvg / max(baseAvg, 1e-9)
-            let baseStr = String(format: "%10.1f", baseAvg)
-            let mtpStr = String(format: "%10.1f", mtpAvg)
-            let spdStr = String(format: "%.2fx", speedup)
+
+            for K in blockSizes {
+                var mtpRates: [Double] = []
+                var allAccepts: [Int] = []
+                for promptInts in promptsData {
+                    let prompt = MLXArray(promptInts)
+                    let mtp = try measureMTPThroughput(
+                        target: target, drafter: drafter,
+                        promptTokens: prompt, maxTokens: maxTokens,
+                        blockSize: K)
+                    MLX.Memory.clearCache()
+                    mtpRates.append(mtp.tokensPerSecond)
+                    allAccepts.append(contentsOf: mtp.acceptLengths ?? [])
+                }
+                let mtpAvg = mtpRates.reduce(0, +) / Double(mtpRates.count)
+                let accAvg = allAccepts.isEmpty
+                    ? 0.0
+                    : Double(allAccepts.reduce(0, +)) / Double(allAccepts.count)
+                let speedup = mtpAvg / max(baseAvg, 1e-9)
+                let baseStr = String(format: "%10.1f", baseAvg)
+                let mtpStr = String(format: "%10.1f", mtpAvg)
+                let spdStr = String(format: "%.2fx", speedup)
+                let accStr = String(format: "%.2f", accAvg)
+                let label = pair.label.padding(toLength: 18, withPad: " ", startingAt: 0)
+                print("\(label) \(K)  \(baseStr) \(mtpStr)   \(spdStr)   \(accStr)/\(K-1)")
+            }
+
+            // Batched (B=4) — the apples-to-apples config vs Python's
+            // headline numbers which use batch=4.
+            let B4 = Array(repeating: promptsData[0], count: 4)
+            let blockForBatch = 4
+            _ = measureBatchedBaselineThroughput(
+                target: target, promptTokens: B4, maxTokens: warmupTokens)
+            _ = try await measureBatchedMTPThroughput(
+                target: target, drafter: drafter,
+                promptTokens: B4, maxTokens: warmupTokens,
+                blockSize: blockForBatch)
+            MLX.Memory.clearCache()
+
+            let batchBase = measureBatchedBaselineThroughput(
+                target: target, promptTokens: B4, maxTokens: maxTokens)
+            MLX.Memory.clearCache()
+            let batchMtp = try await measureBatchedMTPThroughput(
+                target: target, drafter: drafter,
+                promptTokens: B4, maxTokens: maxTokens,
+                blockSize: blockForBatch)
+            MLX.Memory.clearCache()
+            let batchSpeedup = batchMtp.tokensPerSecond
+                             / max(batchBase.tokensPerSecond, 1e-9)
+            let bbStr = String(format: "%10.1f", batchBase.tokensPerSecond)
+            let bmStr = String(format: "%10.1f", batchMtp.tokensPerSecond)
+            let bsStr = String(format: "%.2fx", batchSpeedup)
             let label = pair.label.padding(toLength: 18, withPad: " ", startingAt: 0)
-            print("\(label) \(pair.blockSize)      \(baseStr) \(mtpStr)  \(spdStr) (K=\(pair.blockSize - 1))")
+            print("\(label) 4(B=4) \(bbStr) \(bmStr)   \(bsStr)   -- (aggregate)")
         }
     }
 
