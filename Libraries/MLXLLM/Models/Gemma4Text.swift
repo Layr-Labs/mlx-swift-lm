@@ -314,6 +314,21 @@ public struct Gemma4MTPForward: @unchecked Sendable {
     }
 }
 
+/// Count of accepted speculative tokens per round, either scalar (B=1)
+/// or per-row (`[B]` int32 array, B>1).
+public enum Gemma4AcceptCount: @unchecked Sendable {
+    case scalar(Int)
+    case perRow(MLXArray)
+
+    /// Max accepted across all rows (== the scalar value in the scalar case).
+    func maxAccepted() -> Int {
+        switch self {
+        case .scalar(let n): return n
+        case .perRow(let arr): return Int(arr.max().item(Int32.self))
+        }
+    }
+}
+
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let batchCache = cache as? BatchPositionedKVCache {
@@ -991,6 +1006,59 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             lastHidden: hidden,
             capturedSharedKV: capture.snapshot()
         )
+    }
+
+    /// Rewind the target KV caches after a speculative-decoding round.
+    ///
+    /// Uniformly trims every trimmable cache by `blockSize - max(accepted) - 1`
+    /// (all rows discard their rejected-suffix). In the `.perRow` case,
+    /// additionally calls `BatchKVCache.zeroTailPerRow` on every batched cache
+    /// to clear the per-row divergence where rows accepted fewer tokens than
+    /// the max.
+    ///
+    /// Non-trimmable caches (e.g. a saturated `RotatingKVCache`) are skipped.
+    ///
+    /// - Parameters:
+    ///   - caches: the target's KV caches, typically obtained from `newCache`
+    ///     and then advanced by `forwardForMTP`.
+    ///   - accepted: per-round accept count.
+    ///   - blockSize: the full block size of this speculative round (bonus +
+    ///     k drafts; draft step count k = blockSize - 1).
+    public func rollbackSpeculativeCache(
+        _ caches: [KVCache],
+        accepted: Gemma4AcceptCount,
+        blockSize: Int
+    ) {
+        let maxAccepted = accepted.maxAccepted()
+        let trim = Swift.max(0, blockSize - maxAccepted - 1)
+
+        for cache in caches {
+            guard cache.isTrimmable else { continue }
+            if trim > 0 {
+                _ = cache.trim(trim)
+            }
+        }
+
+        if case .perRow(let perRowAccepted) = accepted, maxAccepted > 0 {
+            // After uniform trim, each batched cache is at length
+            //   postTrimLen = preTrimLen - trim.
+            // Verify-start within that post-trim cache is at
+            //   postTrimLen - (maxAccepted + 1).
+            // Row i keeps tokens through index
+            //   postTrimLen - (maxAccepted + 1) + accepted[i] + 1
+            //   = postTrimLen - (maxAccepted - accepted[i])
+            // We encode this as:
+            //   keepLengths[i] = postTrimLen - (maxAccepted - accepted[i])
+            //                  = postTrimLen - maxAccepted + accepted[i]
+            for cache in caches {
+                guard let batched = cache as? BatchKVCache else { continue }
+                let postTrimLen = batched.offset
+                let keepLengths =
+                    perRowAccepted.asType(.int32)
+                        + Int32(postTrimLen - maxAccepted)
+                batched.zeroTailPerRow(keepLengths: keepLengths)
+            }
+        }
     }
 
     /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
