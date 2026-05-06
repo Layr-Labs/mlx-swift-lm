@@ -852,3 +852,35 @@ public func dynamicRoll(
     let idx = (arange - reshapedShifts) % Int32(n)
     return takeAlong(x, idx, axis: axis)
 }
+
+// MARK: - Speculative-decoding primitives
+
+extension BatchKVCache {
+
+    /// Zero per-row tail positions. For each row `b`, slots
+    /// `[keepLengths[b], _idx)` in both keys and values are set to 0.
+    /// Rows where `keepLengths[b] >= _idx` are left unchanged.
+    ///
+    /// Used by the Gemma 4 MTP round-loop to clear rejected-tail mismatches
+    /// when rows accepted different numbers of tokens within the same
+    /// speculative block.
+    ///
+    /// No-op if the cache is empty (no `update` has been called yet).
+    ///
+    /// - Parameter keepLengths: int array of shape `[B]`. Values should
+    ///   satisfy `0 <= keepLengths[b] <= _idx` for all `b`; out-of-range
+    ///   values just fall back to "no zeroing" (keep >= T) or "zero all"
+    ///   (keep <= 0).
+    public func zeroTailPerRow(keepLengths: MLXArray) {
+        guard let storedK = keys, let storedV = values else { return }
+        let T = storedK.dim(2)
+        let positions = MLXArray(Int32(0) ..< Int32(T))
+            .reshaped([1, 1, T, 1])                          // [1, 1, T, 1]
+        let keep = keepLengths.asType(.int32)
+            .reshaped([-1, 1, 1, 1])                         // [B, 1, 1, 1]
+        let keepMask = positions .< keep                     // [B, 1, T, 1] bool
+        let maskFloat = keepMask.asType(storedK.dtype)
+        keys = storedK * maskFloat
+        values = storedV * maskFloat
+    }
+}
