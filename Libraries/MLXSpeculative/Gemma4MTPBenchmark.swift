@@ -1,18 +1,22 @@
 // Copyright © 2026 Apple Inc.
 //
 // Benchmark primitives for Gemma 4 Multi-Token Prediction (MTP)
-// speculative decoding. Provides a pair of measurement helpers:
+// speculative decoding. Provides four measurement helpers:
 //
-//   - measureBaselineThroughput: no-drafter target-only greedy generation
-//     tokens/sec, from prefill-end through generation-end.
-//   - measureMTPThroughput: drafter-driven MTP generation tokens/sec over
-//     the same prompt, plus per-round accept histogram.
+//   - measureBaselineThroughput: B=1 no-drafter target-only greedy
+//     generation tokens/sec, from prefill-end through generation-end.
+//   - measureMTPThroughput: B=1 drafter-driven MTP generation tokens/sec
+//     + per-round accept histogram (rounds driven inline so round
+//     boundaries are visible).
+//   - measureBatchedBaselineThroughput: B>1 target-only greedy, using
+//     the same BatchKVCache / BatchRotatingKVCache used by MTP B>1.
+//   - measureBatchedMTPThroughput: B>1 MTP via runGemma4MTPRoundsBatched.
 //
 // These are intentionally minimal — no model loading, no CLI, no
-// harness. Callers supply a loaded target `ModelContext` and a bound
-// `Gemma4AssistantDraftModel` plus a prompt, and receive back a
-// `BenchmarkResult`. A full driver (model download, result table,
-// speedup calculation) lives outside this library in a tools target.
+// harness. Callers supply a loaded target + bound drafter + prompt(s)
+// and receive back a `BenchmarkResult`. A full driver (model download,
+// result table, speedup calculation) lives in the test target's
+// `realModelThroughputBenchmark`.
 
 import Foundation
 import MLX

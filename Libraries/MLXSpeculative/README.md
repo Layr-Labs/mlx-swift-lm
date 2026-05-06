@@ -82,12 +82,37 @@ histogram. No model loading or CLI in the library.
 ```swift
 let baseline = measureBaselineThroughput(
     target: target, promptTokens: prompt, maxTokens: 256)
-let mtp = try await measureMTPThroughput(
+let mtp = try measureMTPThroughput(
     target: target, drafter: drafter,
     promptTokens: prompt, maxTokens: 256, blockSize: 4)
 print("MTP speedup: \(mtp.tokensPerSecond / baseline.tokensPerSecond)x")
 print("Accept histogram: \(mtp.acceptLengths ?? [])")
 ```
+
+## Measured throughput (M3, 36 GB)
+
+Single-batch greedy, 3 chat-templated prompts, 64 max_tokens, 16-token
+warmup. Block size swept per model; best configuration shown.
+
+| Model           | Best K | Baseline tok/s | MTP tok/s | Speedup |
+|-----------------|--------|----------------|-----------|---------|
+| E2B-bf16        | 5      | 21.4           | 24.1      | 1.13×   |
+| E4B-bf16        | 5      | 11.5           | 12.5      | 1.08×   |
+| 26B-A4B-4bit    | 3      | 28.7           | 35.9      | 1.25×   |
+
+Per-round accept rates improve with target size, as expected — the
+drafter's predictions align more closely with a larger target's greedy
+output:
+
+| Model           | Accept/K at K=3 | Accept/K at K=4 |
+|-----------------|-----------------|-----------------|
+| E2B-bf16        | 0.64/2 (32%)    | 0.71/3 (24%)    |
+| E4B-bf16        | 0.53/2 (27%)    | 0.61/3 (20%)    |
+| 26B-A4B-4bit    | 1.25/2 (62%)    | 1.42/3 (47%)    |
+
+Reproduce with the `realModelThroughputBenchmark` test — requires
+`MTP_BENCH_DATA_DIR` and `MTP_BENCH_PROMPTS` env vars pointing to
+local model directories and a pre-tokenized prompt fixture JSON.
 
 ## Correctness
 
@@ -112,7 +137,7 @@ algorithm:
 
 Parity is enforced as a hard gate internally (Swift MTP tokens == Swift
 baseline tokens) across four test suites covering E2B / E4B / MoE /
-batched shapes. 142/142 tests pass deterministically.
+batched shapes. 143/143 tests pass deterministically.
 
 ## Architecture notes
 
