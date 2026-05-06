@@ -612,22 +612,27 @@ private class Gemma4MLP: Module {
 
 // MARK: - Decoder Layer
 
-private class Gemma4DecoderLayer: Module {
+/// Gemma 4 decoder layer. Combines `Gemma4Attention` with an MLP (or MoE)
+/// block, the per-layer-input (PLE) path, and residual / layer-scalar
+/// plumbing. Consumed by `Gemma4TextModelInner` and by the Gemma 4 MTP
+/// drafter's trunk in `MLXSpeculative`; not intended as a user-facing
+/// composable layer.
+public class Gemma4DecoderLayer: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
     let layerType: String
     let hiddenSizePerLayerInput: Int
 
-    @ModuleInfo(key: "self_attn") var selfAttn: Gemma4Attention
-    @ModuleInfo var mlp: Gemma4MLP
+    @ModuleInfo(key: "self_attn") fileprivate var selfAttn: Gemma4Attention
+    @ModuleInfo fileprivate var mlp: Gemma4MLP
     @ModuleInfo(key: "input_layernorm") var inputLayernorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayernorm: RMSNorm
     @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayernorm: RMSNorm
     @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayernorm: RMSNorm
 
     // MoE-only modules (26B-A4B); nil on dense variants.
-    @ModuleInfo(key: "router") var router: Gemma4Router?
-    @ModuleInfo(key: "experts") var experts: Gemma4Experts?
+    @ModuleInfo(key: "router") fileprivate var router: Gemma4Router?
+    @ModuleInfo(key: "experts") fileprivate var experts: Gemma4Experts?
     @ModuleInfo(key: "post_feedforward_layernorm_1") var postFeedforwardLayernorm1: RMSNorm?
     @ModuleInfo(key: "pre_feedforward_layernorm_2") var preFeedforwardLayernorm2: RMSNorm?
     @ModuleInfo(key: "post_feedforward_layernorm_2") var postFeedforwardLayernorm2: RMSNorm?
@@ -642,7 +647,7 @@ private class Gemma4DecoderLayer: Module {
 
     let isMoE: Bool
 
-    init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
+    public init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
         self.layerIdx = layerIdx
         self.layerType = config.layerTypes[layerIdx]
@@ -687,7 +692,7 @@ private class Gemma4DecoderLayer: Module {
         super.init()
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
@@ -754,18 +759,23 @@ private class Gemma4DecoderLayer: Module {
 
 // MARK: - Text Model
 
-private class Gemma4TextModelInner: Module {
+/// Inner Gemma 4 trunk: embeddings + per-layer-input (PLE) + 35 decoder
+/// layers + final norm. Public so the Gemma 4 MTP drafter in
+/// `MLXSpeculative` can build its own 4-layer kv-shared trunk; not
+/// intended as a user-facing model — use `Gemma4TextModel` for
+/// standalone inference.
+public class Gemma4TextModelInner: Module {
     let config: Gemma4TextConfiguration
     let embedScale: Float
     let hiddenSizePerLayerInput: Int
 
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-    @ModuleInfo(key: "layers") var layers: [Gemma4DecoderLayer]
-    @ModuleInfo var norm: RMSNorm
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
+    @ModuleInfo(key: "layers") public var layers: [Gemma4DecoderLayer]
+    @ModuleInfo public var norm: RMSNorm
 
     // Per-layer embeddings (PLE)
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: ScaledLinear?
+    @ModuleInfo(key: "per_layer_model_projection") fileprivate var perLayerModelProjection: ScaledLinear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
@@ -777,7 +787,7 @@ private class Gemma4TextModelInner: Module {
     let lastFullAttentionNonSharedIdx: Int
     let lastSlidingAttentionNonSharedIdx: Int
 
-    init(_ config: Gemma4TextConfiguration, forceSharedKV: Bool = false) {
+    public init(_ config: Gemma4TextConfiguration, forceSharedKV: Bool = false) {
         self.config = config
         self.embedScale = Float(config.hiddenSize).squareRoot()
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
@@ -835,7 +845,7 @@ private class Gemma4TextModelInner: Module {
         super.init()
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
         capture: Gemma4SharedKVCapture? = nil
