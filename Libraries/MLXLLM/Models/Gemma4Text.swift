@@ -1154,6 +1154,16 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         model(inputs, cache: cache, capture: capture)
     }
 
+    /// Parse the layer index out of a weight key like
+    /// `"model.layers.15.self_attn.k_proj.weight"`. Returns nil if the key
+    /// doesn't match the expected `...layers.<N>...` pattern.
+    private func extractLayerIdx(from key: String) -> Int? {
+        guard let layersRange = key.range(of: "layers.") else { return nil }
+        let after = key[layersRange.upperBound...]
+        let end = after.firstIndex(of: ".") ?? after.endIndex
+        return Int(after[..<end])
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
         for (k, v) in weights {
@@ -1163,6 +1173,21 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 || k.contains("input_min")
                 || k.contains("output_max")
                 || k.contains("output_min")
+            {
+                continue
+            }
+
+            // Skip k_proj/v_proj/k_norm/v_norm weights for layers that
+            // borrow K/V from an earlier non-shared layer (num_kv_shared_layers
+            // tail). Our `Gemma4Attention.init` doesn't allocate these modules
+            // for shared-KV layers, so the checkpoint's copies would fail the
+            // strict `update(parameters:verify:.all)` check.
+            if let layerIdx = extractLayerIdx(from: k),
+                config.layerUsesSharedKV(layerIdx: layerIdx),
+                k.contains(".self_attn.k_proj.")
+                    || k.contains(".self_attn.v_proj.")
+                    || k.contains(".self_attn.k_norm.")
+                    || k.contains(".self_attn.v_norm.")
             {
                 continue
             }

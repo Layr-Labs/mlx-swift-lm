@@ -51,6 +51,10 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Gemma4TextModel
 
+    /// Public accessor for the inner text model (needed by MTP speculative
+    /// decoding which calls `Gemma4TextModel.forwardForMTP` directly).
+    public var textModel: Gemma4TextModel { languageModel }
+
     public init(_ config: Gemma4Configuration) {
         self._languageModel.wrappedValue = Gemma4TextModel(config.textConfig)
     }
