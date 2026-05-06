@@ -3,21 +3,13 @@
 // Public API entry points for Gemma 4 Multi-Token Prediction (MTP)
 // speculative decoding.
 //
-// Two variants:
-//   - generateGemma4MTP: single-request (B=1) path, returns AsyncStream<Generation>.
-//   - generateGemma4MTPBatched: multi-request (B>1) path, returns
-//     AsyncStream<BatchedGeneration>. (Separate file in later work if
-//     it grows large.)
-//
-// Both wrap the Task 20/21 round-loops with:
-//   - target extraction from ModelContext + cast to Gemma4TextModel
-//     (throws Gemma4MTPError.unsupportedTarget on mismatch).
-//   - prefill via Gemma4TextModel.forwardForMTP to get firstBonus /
-//     firstHidden / firstSharedKV.
-//   - tokenizer-backed .chunk(String) emission (replaces the raw
-//     "<int>" encoding used by the round loop tests).
-//   - .info(GenerateCompletionInfo) at stream end (basic counts).
-//   - EOS detection from ModelConfiguration.eosTokenIds.
+//   - generateGemma4MTP: single-request (B=1) path, returns
+//     AsyncStream<Generation> of decoded text chunks + terminal info.
+//     Internally drives `Gemma4MTPTokenIterator` so greedy and stochastic
+//     (temperature > 0) paths share a single implementation.
+//   - generateGemma4MTPBatched (future): multi-request (B>1) entry point
+//     wrapping `runGemma4MTPRoundsBatched`. Deferred until the batched
+//     path has a clear throughput win.
 
 import Foundation
 import MLX
@@ -26,18 +18,27 @@ import MLXLMCommon
 
 /// Generate text from a Gemma 4 target using a Gemma 4 MTP drafter.
 ///
+/// Internally wraps ``Gemma4MTPTokenIterator`` and a tokenizer-decoding
+/// loop, producing an `AsyncStream<Generation>` that yields decoded text
+/// chunks and a terminal `.info(...)` with counts.
+///
 /// - Parameters:
 ///   - input: prepared language-model input. `input.text.tokens` is used
 ///     for prefill; images/videos are ignored (MTP is text-only).
 ///   - parameters: generation parameters. `maxTokens` caps output length
-///     (defaults to 1024 if nil).
-///   - target: `ModelContext` whose `model` is a `Gemma4TextModel`.
+///     (defaults to 1024 if nil). `temperature > 0` enables stochastic
+///     rejection-based speculative sampling; `temperature == 0` is
+///     greedy and produces byte-identical output to no-drafter baseline.
+///   - target: `ModelContext` whose `model` is a `Gemma4TextModel` (or a
+///     `Gemma4Model` VLM wrapper whose text portion is `Gemma4TextModel`).
 ///     Throws `unsupportedTarget` otherwise.
 ///   - drafter: the loaded Gemma 4 MTP drafter.
 ///   - blockSize: speculative block size (2–16). Default 4.
+///   - rngSeed: seed for stochastic sampling (only consulted when
+///     `parameters.temperature > 0`). Default 0 → seeds from the system
+///     clock.
 /// - Returns: an `AsyncStream<Generation>` yielding `.chunk(String)`
-///   for each emitted token (decoded via the target's tokenizer) and
-///   one terminal `.info(...)` with counts.
+///   (decoded token text) and one terminal `.info(...)`.
 /// - Throws: `Gemma4MTPError.unsupportedTarget`, `.invalidBlockSize`,
 ///   or any error thrown by `drafter.bind(target:)`.
 public func generateGemma4MTP(
@@ -45,62 +46,59 @@ public func generateGemma4MTP(
     parameters: GenerateParameters,
     target: ModelContext,
     drafter: Gemma4AssistantDraftModel,
-    blockSize: Int = 4
+    blockSize: Int = 4,
+    rngSeed: UInt64 = 0
 ) throws -> AsyncStream<Generation> {
-    guard let gemma4 = target.model as? Gemma4TextModel else {
-        throw Gemma4MTPError.unsupportedTarget(String(describing: type(of: target.model)))
-    }
-    guard blockSize >= 2 && blockSize <= 16 else {
-        throw Gemma4MTPError.invalidBlockSize(blockSize)
+    let gemma4: Gemma4TextModel
+    if let t = target.model as? Gemma4TextModel {
+        gemma4 = t
+    } else if let wrapper = target.model as? Gemma4Model {
+        gemma4 = wrapper.textModel
+    } else {
+        throw Gemma4MTPError.unsupportedTarget(
+            String(describing: type(of: target.model)))
     }
 
     let tokenizer = target.tokenizer
     let eosIds = target.configuration.eosTokenIds
-    let maxTokens = parameters.maxTokens ?? 1024
-
-    // Ensure the input is shaped [B, L] — the Gemma4 forward expects that.
-    var prefillTokens = input.text.tokens
-    if prefillTokens.ndim == 1 {
-        prefillTokens = prefillTokens[.newAxis, .ellipsis]
+    var params = parameters
+    if params.maxTokens == nil {
+        params.maxTokens = 1024
     }
+    let promptTokenCount = input.text.tokens.size
 
-    // Prefill: run the target once over the prompt to get the first
-    // bonus + last hidden + shared-KV.
-    let prefillStart = Date()
-    let prefillCache = gemma4.newCache(parameters: parameters)
-    let prefillOut = gemma4.forwardForMTP(prefillTokens, cache: prefillCache)
-
-    // Greedy bonus from the last prefill position.
-    let lastLogits = prefillOut.logits[0..., -1, 0...]
-    let firstBonus = Int(lastLogits.argMax(axis: -1).item(Int32.self))
-    let firstHidden = prefillOut.lastHidden[
-        0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
-    let firstSharedKV = prefillOut.capturedSharedKV
-    let prefillElapsed = Date().timeIntervalSince(prefillStart)
-    let promptTokenCount = prefillTokens.dim(1)
-
-    let generateStart = Date()
-    let intStream = try runGemma4MTPRounds(
+    // Build the iterator outside the stream closure so init errors can
+    // throw synchronously. Prefill runs inside init.
+    var iter = try Gemma4MTPTokenIterator(
+        input: input,
         target: gemma4,
         drafter: drafter,
-        targetCache: prefillCache,
-        firstBonus: firstBonus,
-        firstHidden: firstHidden,
-        firstSharedKV: firstSharedKV,
-        maxTokens: maxTokens,
-        blockSize: blockSize
+        parameters: params,
+        blockSize: blockSize,
+        rngSeed: rngSeed
     )
+    let prefillElapsed = iter.promptPrefillTime
+
+    // Wrap the iterator in a Sendable box so we can move it into the
+    // stream closure without tripping strict concurrency (the iterator
+    // holds MLXArray state which is `@unchecked Sendable`-compatible but
+    // isn't annotated yet).
+    let boxed = IteratorBox(iter: iter)
 
     return AsyncStream<Generation> { continuation in
         let task = Task {
+            let generateStart = Date()
             var tokenCount = 0
             var stopReason: GenerateStopReason = .length
-            for await gen in intStream {
-                guard case .chunk(let s) = gen, let tok = Int(s) else { continue }
+            while let tok = boxed.next() {
                 tokenCount += 1
                 continuation.yield(.chunk(tokenizer.decode(tokenIds: [tok])))
                 if eosIds.contains(tok) {
                     stopReason = .stop
+                    break
+                }
+                if Task.isCancelled {
+                    stopReason = .cancelled
                     break
                 }
             }
@@ -118,5 +116,19 @@ public func generateGemma4MTP(
         continuation.onTermination = { _ in
             task.cancel()
         }
+    }
+}
+
+/// Box wrapping a `Gemma4MTPTokenIterator` so it can be captured by a
+/// `Sendable` closure. The iterator itself holds `MLXArray` state which
+/// is conceptually reference-counted GPU memory — safe to move across
+/// tasks, but the Swift compiler needs an explicit `@unchecked`.
+private final class IteratorBox: @unchecked Sendable {
+    private var iter: Gemma4MTPTokenIterator
+    init(iter: Gemma4MTPTokenIterator) {
+        self.iter = iter
+    }
+    func next() -> Int? {
+        iter.next()
     }
 }
