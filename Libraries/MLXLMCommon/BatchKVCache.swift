@@ -555,6 +555,16 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             self.values = values
             _idx = stepCount
         } else {
+            // Honour any prior `trim(_:)` that decremented `_idx` below the
+            // stored tensor length. Without this slice, a post-trim update
+            // would concatenate onto the old tail and mask K (derived from
+            // `_idx`) would no longer match the actual QK length. This is
+            // the batched analogue of `RotatingKVCache.updateInPlace`'s
+            // offset-aware write.
+            if let storedK = self.keys, storedK.dim(2) > _idx {
+                self.keys = storedK[.ellipsis, ..<_idx, 0...]
+                self.values = self.values![.ellipsis, ..<_idx, 0...]
+            }
             if stepCount > 1 {
                 // Multi-token prefill must keep enough temporary context for
                 // every query in this call. Match RotatingKVCache's concat

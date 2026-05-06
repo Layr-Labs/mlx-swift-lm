@@ -156,3 +156,257 @@ public func runGemma4MTPRounds(
         continuation.finish()
     }
 }
+
+// MARK: - Batched (B > 1) output type
+
+/// Per-step output of the B>1 MTP round loop. Each `slots[i]` maps to
+/// the original batch row `i`.
+public struct BatchedGeneration: Sendable {
+    public let slots: [Slot]
+
+    public struct Slot: Sendable {
+        /// Original index in the input batch.
+        public let row: Int
+        /// Token emitted this step; nil when the row is finished or the
+        /// step didn't produce output for this row.
+        public let token: Int?
+        /// Non-nil on the step where the row finishes.
+        public let finishReason: FinishReason?
+
+        public init(row: Int, token: Int?, finishReason: FinishReason?) {
+            self.row = row
+            self.token = token
+            self.finishReason = finishReason
+        }
+    }
+
+    public enum FinishReason: Sendable {
+        case stop
+        case eos
+        case length
+    }
+
+    public init(slots: [Slot]) {
+        self.slots = slots
+    }
+}
+
+// MARK: - B > 1 round loop
+
+/// Run the Gemma 4 MTP round loop for a batch of requests (B > 1).
+///
+/// Mirrors `runGemma4MTPRounds` but tracks per-row acceptance counts and
+/// per-row finishedness. Rows that finish (reach maxTokens or emit an
+/// EOS token) stay in the batch but stop emitting — their
+/// `BatchedGeneration.Slot.token` becomes nil. The round-loop terminates
+/// when every row is finished.
+///
+/// - Note: Continuous batching (removing finished rows via
+///   `BatchedCache.filterBatched` to shrink the active batch) is a
+///   follow-up optimization and not implemented here. All B rows run
+///   every round regardless of finishedness. This is a correctness-first
+///   v1; throughput optimization is Task 26's remit.
+public func runGemma4MTPRoundsBatched(
+    target: Gemma4TextModel,
+    drafter: Gemma4AssistantDraftModel,
+    targetCache: [KVCache],
+    firstBonus: [Int],
+    firstHidden: MLXArray,
+    firstSharedKV: Gemma4SharedKV,
+    maxTokens: Int,
+    blockSize: Int,
+    eosTokenIds: Set<Int>?
+) throws -> AsyncStream<BatchedGeneration> {
+    guard blockSize >= 2 && blockSize <= 16 else {
+        throw Gemma4MTPError.invalidBlockSize(blockSize)
+    }
+    try drafter.bind(target: target)
+    let B = firstBonus.count
+
+    return AsyncStream<BatchedGeneration> { continuation in
+        // First yield: prefill bonus per row.
+        var firstSlots: [BatchedGeneration.Slot] = []
+        firstSlots.reserveCapacity(B)
+        var emitted = Array(repeating: 1, count: B)
+        var finished = Array(repeating: false, count: B)
+        for (i, b) in firstBonus.enumerated() {
+            if let eosTokenIds, eosTokenIds.contains(b) {
+                finished[i] = true
+                firstSlots.append(.init(row: i, token: b, finishReason: .eos))
+            } else {
+                firstSlots.append(.init(row: i, token: b, finishReason: nil))
+            }
+        }
+        continuation.yield(BatchedGeneration(slots: firstSlots))
+        if finished.allSatisfy({ $0 }) {
+            continuation.finish()
+            return
+        }
+
+        // Mutable state.
+        var bonus: [Int] = firstBonus
+        var hidden = firstHidden
+        var sharedKV = firstSharedKV
+
+        while !finished.allSatisfy({ $0 }) {
+            // Determine this round's block size. Use the min `remaining`
+            // across active (non-finished) rows.
+            let activeRemaining = emitted.enumerated()
+                .filter { !finished[$0.offset] }
+                .map { maxTokens - $0.element }
+            guard let minRemaining = activeRemaining.min(), minRemaining > 0 else {
+                break
+            }
+            let bs = min(blockSize, minRemaining + 1)
+            if bs <= 1 { break }
+            let k = bs - 1
+
+            // --- Draft (k autoregressive steps) ---
+            let driveOffset = targetCache[0].offset
+            var draftTokensRow: [[Int]] = Array(
+                repeating: [], count: B)
+            // Seed token: per-row bonus as [B, 1] int32.
+            var tok = MLXArray(bonus.map { Int32($0) }, [B, 1])
+            var h = hidden
+            for _ in 0 ..< k {
+                let tokEmbed = target.embedTokensForDrafter(tok)
+                let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
+                let (newH, logits) = drafter(
+                    inputsEmbeds: inputsEmbeds,
+                    sharedKV: sharedKV,
+                    positionOffset: .scalar(driveOffset)
+                )
+                // Greedy sample per row: logits [B, 1, vocab] → [B]
+                let sampled = logits.squeezed(axis: 1).argMax(axis: -1)  // [B]
+                asyncEval(sampled)
+                let sampledInts = sampled.asArray(Int32.self).map { Int($0) }
+                for (bi, s) in sampledInts.enumerated() {
+                    draftTokensRow[bi].append(s)
+                }
+                // Reshape [B] → [B, 1] for next step.
+                tok = sampled.reshaped([B, 1])
+                h = newH
+            }
+            let draftTokensPerRow = draftTokensRow
+
+            // --- Verify ---
+            // Build [B, bs] = concat([bonus], draftTokens) per row.
+            var verifyFlat: [Int32] = []
+            verifyFlat.reserveCapacity(B * bs)
+            for bi in 0 ..< B {
+                verifyFlat.append(Int32(bonus[bi]))
+                for t in draftTokensPerRow[bi] {
+                    verifyFlat.append(Int32(t))
+                }
+            }
+            let verifyInput = MLXArray(verifyFlat, [B, bs])
+            let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
+            let mainTokens = verifyOut.logits.argMax(axis: -1)  // [B, bs]
+            eval(mainTokens)
+            let mainFlat = mainTokens.asArray(Int32.self)
+            var mainPerRow: [[Int]] = []
+            mainPerRow.reserveCapacity(B)
+            for bi in 0 ..< B {
+                let start = bi * bs
+                mainPerRow.append(mainFlat[start ..< start + bs].map { Int($0) })
+            }
+
+            // --- Walk (per-row, with remaining-budget truncation) ---
+            let budgets = emitted.map { maxTokens - $0 }
+            let (accepted, newTokensPerRow) = SpeculativeWalk.batched(
+                draft: draftTokensPerRow,
+                main: mainPerRow,
+                budgets: budgets
+            )
+            let maxAcceptedInt = accepted.max() ?? 0
+
+            // --- Emit one BatchedGeneration per token-position within this round ---
+            let maxNew = newTokensPerRow.map(\.count).max() ?? 0
+            for pos in 0 ..< maxNew {
+                var slots: [BatchedGeneration.Slot] = []
+                slots.reserveCapacity(B)
+                for bi in 0 ..< B {
+                    if finished[bi] {
+                        slots.append(.init(row: bi, token: nil, finishReason: nil))
+                        continue
+                    }
+                    let row = newTokensPerRow[bi]
+                    if pos < row.count {
+                        let t = row[pos]
+                        emitted[bi] += 1
+                        var finishReason: BatchedGeneration.FinishReason? = nil
+                        if let eosTokenIds, eosTokenIds.contains(t) {
+                            finished[bi] = true
+                            finishReason = .eos
+                        } else if emitted[bi] >= maxTokens {
+                            finished[bi] = true
+                            finishReason = .length
+                        }
+                        slots.append(.init(row: bi, token: t, finishReason: finishReason))
+                    } else {
+                        slots.append(.init(row: bi, token: nil, finishReason: nil))
+                    }
+                }
+                continuation.yield(BatchedGeneration(slots: slots))
+            }
+
+            if finished.allSatisfy({ $0 }) {
+                continuation.finish()
+                return
+            }
+
+            // --- Rewind target cache ---
+            // Build per-row accepted MLXArray for the rollback call.
+            let acceptedArr = MLXArray(accepted.map { Int32($0) })
+            if maxAcceptedInt < k {
+                target.rollbackSpeculativeCache(
+                    targetCache,
+                    accepted: .perRow(acceptedArr),
+                    blockSize: bs
+                )
+            }
+
+            // --- Update state ---
+            // Per-row hidden: gather verifyOut.lastHidden[bi, accepted[bi], :]
+            // into a [B, 1, hidden] tensor.
+            // Build by slicing one row at a time and stacking — avoids
+            // relying on advanced multi-MLXArray indexing support.
+            var rowSlices: [MLXArray] = []
+            rowSlices.reserveCapacity(B)
+            for bi in 0 ..< B {
+                let a = accepted[bi]
+                // verifyOut.lastHidden shape: [B, bs, hidden]
+                // Slice → [1, 1, hidden]
+                let slice = verifyOut.lastHidden[
+                    bi ..< bi + 1, a ..< a + 1, 0...]
+                rowSlices.append(slice)
+            }
+            hidden = concatenated(rowSlices, axis: 0)  // [B, 1, hidden]
+
+            // Update per-row bonus: last emitted token (or carry forward if
+            // the row finished without emitting).
+            for bi in 0 ..< B {
+                if let last = newTokensPerRow[bi].last {
+                    bonus[bi] = last
+                }
+            }
+
+            // Slice shared-KV tail: uses the min rejected across rows so
+            // the drafter still sees all rows' K/V at the same length.
+            let minRejected = accepted.map { k - $0 }.min() ?? 0
+            sharedKV = Gemma4SharedKV.sliceTail(
+                from: verifyOut.capturedSharedKV, rejected: minRejected)
+
+            if (emitted.max() ?? 0) % 256 == 0 {
+                MLX.Memory.clearCache()
+            }
+
+            // TODO: Continuous batching — when finished rows accumulate,
+            // call `BatchedCache.filterBatched(batchIndices:)` on every
+            // cache in `targetCache` to shrink B, and compact the bonus/
+            // hidden/sharedKV state accordingly. Deferred to a follow-up.
+        }
+
+        continuation.finish()
+    }
+}
