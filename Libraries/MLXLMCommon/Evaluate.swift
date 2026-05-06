@@ -491,7 +491,11 @@ public struct PenaltyProcessor: LogitProcessor {
 }
 
 /// Common properties shared by token-generating iterators.
-protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
+///
+/// Public so that packages outside `MLXLMCommon` (such as `MLXSpeculative`
+/// for Gemma 4 MTP) can implement their own iterators and plug them into
+/// the shared `generate(iterator:...)` entry point.
+public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
     var tokenCount: Int { get }
     var promptPrefillTime: TimeInterval { get }
@@ -529,8 +533,8 @@ public struct TokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
-    var tokenCount = 0
-    let maxTokens: Int?
+    public var tokenCount = 0
+    public let maxTokens: Int?
 
     // Cache quantization parameters
     let kvBits: Int?
@@ -538,7 +542,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let quantizedKVStart: Int
 
     // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
+    public var promptPrefillTime: TimeInterval = 0.0
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -746,8 +750,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
-    var tokenCount = 0
-    let maxTokens: Int?
+    public var tokenCount = 0
+    public let maxTokens: Int?
     let numDraftTokens: Int
 
     // Buffer of accepted tokens from the current speculation round
@@ -755,7 +759,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     private var pendingIndex = 0
 
     // Internal metrics
-    var promptPrefillTime: TimeInterval = 0.0
+    public var promptPrefillTime: TimeInterval = 0.0
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -1485,6 +1489,40 @@ public func generateTask(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) -> (AsyncStream<Generation>, Task<Void, Never>) {
+    generateLoopTask(
+        promptTokenCount: promptTokenCount,
+        modelConfiguration: modelConfiguration,
+        tokenizer: tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        handler: TextToolTokenLoopHandler(
+            tokenizer: tokenizer,
+            format: modelConfiguration.toolCallFormat ?? .json
+        )
+    )
+}
+
+/// Low-level token generation accepting any `TokenIteratorProtocol`
+/// conformer (including `MLXSpeculative.Gemma4MTPTokenIterator`).
+///
+/// Mirrors `generateTask(...)` but takes the protocol type so packages
+/// outside `MLXLMCommon` can plug in their own iterators. The existing
+/// `TokenIterator`-typed overload is preserved for back-compat.
+///
+/// - Parameters:
+///   - promptTokenCount: number of tokens in the prompt
+///   - modelConfiguration: model configuration (for EOS/extra EOS tokens and tool-call format)
+///   - tokenizer: tokenizer (for EOS id, unknown token id, and detokenization)
+///   - iterator: any conformer of ``TokenIteratorProtocol``
+///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+/// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
+public func generateTask(
+    promptTokenCount: Int,
+    modelConfiguration: ModelConfiguration,
+    tokenizer: Tokenizer,
+    iterator: consuming any TokenIteratorProtocol,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
