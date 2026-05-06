@@ -39,11 +39,87 @@ public struct SpeculativeSampleResult: Sendable {
     }
 }
 
-/// Apply temperature to logits. Returns softmax probabilities along the
-/// last axis.
-private func softmaxWithTemperature(_ logits: MLXArray, temperature: Float) -> MLXArray {
-    let scaled = temperature > 0 ? logits / temperature : logits
-    return softmax(scaled.asType(.float32), axis: -1)
+/// Apply temperature to logits, optionally masking to topP / topK / minP
+/// nucleus, then softmax along the last axis. The mask is applied in
+/// log-space before softmax so masked positions land at 0 in `probs`.
+///
+/// IMPORTANT: The SAME filter parameters must be used for both drafter
+/// and target in `speculativeSampleRound`. Applying topP/topK to only
+/// one side would make the accept ratio `p(c)/q(c)` ill-defined (e.g.
+/// if `c` is in p's nucleus but not q's, `q(c) = 0`).
+private func softmaxWithFilters(
+    _ logits: MLXArray,
+    temperature: Float,
+    topP: Float,
+    topK: Int,
+    minP: Float
+) -> MLXArray {
+    var scaled = (temperature > 0 ? logits / temperature : logits).asType(.float32)
+    // Order matches mlx_lm's TopPSampler: topP → minP → topK.
+    if topP > 0 && topP < 1 {
+        scaled = applyTopP(scaled, p: topP)
+    }
+    if minP > 0 {
+        scaled = applyMinP(scaled, minP: minP)
+    }
+    if topK > 0 {
+        scaled = applyTopK(scaled, k: topK)
+    }
+    return softmax(scaled, axis: -1)
+}
+
+/// Public helper: sample one token from `logits` along the last axis
+/// with temperature + optional topP / topK / minP filters. Returns the
+/// sampled token index. Used by the MTP token iterator for the initial
+/// bonus and for drafter draft steps so that the same filter masks are
+/// applied everywhere along the generation path.
+public func sampleLogitsWithFilters(
+    _ logits: MLXArray,
+    temperature: Float,
+    topP: Float,
+    topK: Int,
+    minP: Float,
+    rngKey: MLXArray
+) -> MLXArray {
+    let probs = softmaxWithFilters(
+        logits, temperature: temperature,
+        topP: topP, topK: topK, minP: minP)
+    return sampleFromDistribution(probs, key: rngKey)
+}
+
+/// Mask all but top-K logits to -inf along the last axis.
+private func applyTopK(_ logits: MLXArray, k: Int) -> MLXArray {
+    let vocab = logits.shape.last ?? 0
+    if k <= 0 || k >= vocab { return logits }
+    let sortedIdx = argSort(-logits, axis: -1)
+    let topIdx = sortedIdx[.ellipsis, 0 ..< k]
+    let topVals = takeAlong(logits, topIdx, axis: -1)
+    let threshold = topVals.min(axes: [-1], keepDims: true)
+    let negInf = MLXArray(-Float.infinity)
+    return MLX.where(logits .>= threshold, logits, negInf)
+}
+
+/// Top-P (nucleus): mask tokens outside the smallest set whose
+/// cumulative softmax mass is at least `p`.
+private func applyTopP(_ logits: MLXArray, p: Float) -> MLXArray {
+    let sortedIdxAsc = argSort(logits, axis: -1)
+    let sortedLogits = takeAlong(logits, sortedIdxAsc, axis: -1)
+    let sortedProbs = softmax(sortedLogits, axis: -1)
+    let cumProbs = sortedProbs.cumsum(axis: -1)
+    let keepMask = cumProbs .> MLXArray(1.0 - p)
+    let negInf = MLXArray(-Float.infinity)
+    let maskedSorted = MLX.where(keepMask, sortedLogits, negInf)
+    let inverseIdx = argSort(sortedIdxAsc, axis: -1)
+    return takeAlong(maskedSorted, inverseIdx, axis: -1)
+}
+
+/// Min-P: mask tokens whose probability is below `minP * max_prob`.
+/// Computed in log-space: `logp >= max_logp + log(minP)`.
+private func applyMinP(_ logits: MLXArray, minP: Float) -> MLXArray {
+    let maxLogit = logits.max(axis: -1, keepDims: true)
+    let threshold = maxLogit + MLXArray(log(minP))
+    let negInf = MLXArray(-Float.infinity)
+    return MLX.where(logits .>= threshold, logits, negInf)
 }
 
 /// Sample one token from a distribution `[vocab]` (or `[..., vocab]`)
@@ -67,6 +143,9 @@ private func sampleFromDistribution(_ probs: MLXArray, key: MLXArray) -> MLXArra
 ///   - verifyLogits: [bs=K+1, vocab] — target logits at each verify
 ///     position, *pre-temperature* (raw target output).
 ///   - temperature: sampling temperature (> 0).
+///   - topP: nucleus mass (1.0 = disabled). Applied identically to p and q.
+///   - topK: top-K filter (0 = disabled). Applied identically to p and q.
+///   - minP: min-P filter (0 = disabled). Applied identically to p and q.
 ///   - rngKey: MLX random key for the uniform draws.
 /// - Returns: `(accepted, emitted)` — number of drafter tokens accepted
 ///   and the list of emitted tokens for this round.
@@ -75,6 +154,9 @@ public func speculativeSampleRound(
     draftTokens: [Int],
     verifyLogits: MLXArray,
     temperature: Float,
+    topP: Float = 1.0,
+    topK: Int = 0,
+    minP: Float = 0.0,
     rngKey: MLXArray
 ) -> SpeculativeSampleResult {
     precondition(temperature > 0, "stochastic path requires temperature > 0")
@@ -84,9 +166,13 @@ public func speculativeSampleRound(
     precondition(draftLogits.dim(0) == K,
         "draftLogits must have K positions")
 
-    // Apply temperature + softmax, once.
-    let q = softmaxWithTemperature(draftLogits, temperature: temperature)  // [K, vocab]
-    let p = softmaxWithTemperature(verifyLogits, temperature: temperature)  // [K+1, vocab]
+    // Apply temperature + identical filters on both p and q, once.
+    let q = softmaxWithFilters(
+        draftLogits, temperature: temperature,
+        topP: topP, topK: topK, minP: minP)  // [K, vocab]
+    let p = softmaxWithFilters(
+        verifyLogits, temperature: temperature,
+        topP: topP, topK: topK, minP: minP)  // [K+1, vocab]
 
     // Split the rng key into 2K subkeys (K for accept r_i, K for resample
     // + final sample).

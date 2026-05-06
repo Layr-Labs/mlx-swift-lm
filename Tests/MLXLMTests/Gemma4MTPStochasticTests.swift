@@ -152,6 +152,90 @@ struct Gemma4MTPStochasticTests {
             """)
     }
 
+    /// topK=1 at temperature > 0 should collapse to greedy — the filter
+    /// masks out everything except the argmax, so the rejection sampler
+    /// has no choice but to accept that token every time.
+    @Test func topKOneCollapsesToGreedy() async throws {
+        MLXRandom.seed(42)
+        let target = try tinyTarget()
+        let drafter = try tinyDrafter()
+        eval(target, drafter)
+
+        let promptTokens = MLXArray([Int32](repeating: 7, count: 8))
+        let input = LMInput(text: .init(tokens: promptTokens))
+
+        var greedyIter = try Gemma4MTPTokenIterator(
+            input: input, target: target, drafter: drafter,
+            parameters: GenerateParameters(maxTokens: 8, temperature: 0),
+            blockSize: 3)
+        var greedyTokens: [Int] = []
+        while let t = greedyIter.next() { greedyTokens.append(t) }
+
+        // topK=1 at temperature=1.0 — the filter collapses both p and q
+        // to point masses at their respective argmax. Since verify uses
+        // fp32 argmax on the SAME target logits baseline uses, emitted
+        // tokens must match greedy output exactly.
+        var params = GenerateParameters(maxTokens: 8, temperature: 1.0)
+        params.topK = 1
+        var topKIter = try Gemma4MTPTokenIterator(
+            input: input, target: target, drafter: drafter,
+            parameters: params,
+            blockSize: 3,
+            rngSeed: 999)
+        var topKTokens: [Int] = []
+        while let t = topKIter.next() { topKTokens.append(t) }
+
+        #expect(
+            greedyTokens == topKTokens,
+            """
+            topK=1 should produce the same output as greedy
+              greedy=\(greedyTokens)
+              topK=1=\(topKTokens)
+            """)
+    }
+
+    /// topP with very small mass should narrow the output distribution
+    /// toward the argmax token — repeated samples under topP=0.01 should
+    /// be much less varied than topP=1.0 at the same temperature.
+    @Test func lowTopPNarrowsOutput() async throws {
+        MLXRandom.seed(42)
+        let target = try tinyTarget()
+        let drafter = try tinyDrafter()
+        eval(target, drafter)
+
+        let promptTokens = MLXArray([Int32](repeating: 7, count: 8))
+        let input = LMInput(text: .init(tokens: promptTokens))
+
+        func sampleAt(topP: Float, seed: UInt64) throws -> [Int] {
+            var params = GenerateParameters(maxTokens: 8, temperature: 1.0)
+            params.topP = topP
+            var iter = try Gemma4MTPTokenIterator(
+                input: input, target: target, drafter: drafter,
+                parameters: params,
+                blockSize: 3,
+                rngSeed: seed)
+            var toks: [Int] = []
+            while let t = iter.next() { toks.append(t) }
+            return toks
+        }
+
+        var narrow = Set<[Int]>()
+        var wide = Set<[Int]>()
+        for seed: UInt64 in 1 ... 8 {
+            narrow.insert(try sampleAt(topP: 0.01, seed: seed))
+            wide.insert(try sampleAt(topP: 1.0, seed: seed))
+        }
+        // Narrow topP should produce fewer distinct sequences than wide.
+        #expect(
+            narrow.count <= wide.count,
+            """
+            topP=0.01 should produce at most as many distinct sequences
+            as topP=1.0 across the same 8 seeds
+              narrow (topP=0.01): \(narrow.count) distinct
+              wide   (topP=1.0): \(wide.count) distinct
+            """)
+    }
+
     /// Different seeds at temperature > 0 should produce different output
     /// (sanity: the sampler is actually stochastic).
     @Test func differentSeedsProduceDifferentOutput() async throws {
