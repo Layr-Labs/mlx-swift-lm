@@ -14,7 +14,7 @@ import MLXNN
 public struct Gemma4TextConfiguration: Codable, Sendable {
     var modelType: String = "gemma4_text"
     var hiddenSize: Int = 1536
-    var numHiddenLayers: Int = 35
+    public internal(set) var numHiddenLayers: Int = 35
     var intermediateSize: Int = 6144
     var numAttentionHeads: Int = 8
     var headDim: Int = 256
@@ -163,6 +163,24 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     }
 }
 
+extension Gemma4TextConfiguration {
+
+    /// Predicate for whether a layer uses shared K/V (consuming it from an
+    /// earlier layer rather than projecting its own).
+    ///
+    /// A layer is shared when either:
+    /// - `forceSharedKV` is true (drafter / assistant models where every layer
+    ///   borrows K/V from the target), or
+    /// - the config declares `numKvSharedLayers > 0` AND this layer's index
+    ///   falls within the trailing shared block.
+    public func layerUsesSharedKV(layerIdx: Int, forceSharedKV: Bool = false) -> Bool {
+        if forceSharedKV { return true }
+        guard numKvSharedLayers > 0 else { return false }
+        let firstShared = numHiddenLayers - numKvSharedLayers
+        return layerIdx >= firstShared
+    }
+}
+
 // MARK: - Helper Modules
 
 private class RMSNormNoScale: Module {
@@ -258,13 +276,13 @@ private class Gemma4Attention: Module {
 
     @ModuleInfo var rope: RoPELayer
 
-    init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
+    init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
         self.layerIdx = layerIdx
         self.layerType = config.layerTypes[layerIdx]
         self.isSliding = layerType == "sliding_attention"
-        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
-        self.usesSharedKV = layerIdx >= firstKvSharedLayerIdx && firstKvSharedLayerIdx > 0
+        self.usesSharedKV = config.layerUsesSharedKV(
+            layerIdx: layerIdx, forceSharedKV: forceSharedKV)
 
         // Full attention uses globalHeadDim, sliding uses headDim
         self.effectiveHeadDim =
@@ -474,8 +492,7 @@ private class Gemma4MLP: Module {
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
-        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
-        let isKvSharedLayer = layerIdx >= firstKvSharedLayerIdx && firstKvSharedLayerIdx > 0
+        let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
         let useDoubleWide = config.useDoubleWideMlp && isKvSharedLayer
         let intermediateSize = config.intermediateSize * (useDoubleWide ? 2 : 1)
 
@@ -523,14 +540,15 @@ private class Gemma4DecoderLayer: Module {
 
     let isMoE: Bool
 
-    init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
+    init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
         self.layerIdx = layerIdx
         self.layerType = config.layerTypes[layerIdx]
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
         self.isMoE = config.enableMoeBlock
 
-        self._selfAttn.wrappedValue = Gemma4Attention(config, layerIdx: layerIdx)
+        self._selfAttn.wrappedValue = Gemma4Attention(
+            config, layerIdx: layerIdx, forceSharedKV: forceSharedKV)
         self._mlp.wrappedValue = Gemma4MLP(config, layerIdx: layerIdx)
 
         self._inputLayernorm.wrappedValue = RMSNorm(
@@ -652,7 +670,7 @@ private class Gemma4TextModelInner: Module {
     let previousKvs: [Int]
     let firstKvSharedLayerIdx: Int
 
-    init(_ config: Gemma4TextConfiguration) {
+    init(_ config: Gemma4TextConfiguration, forceSharedKV: Bool = false) {
         self.config = config
         self.embedScale = Float(config.hiddenSize).squareRoot()
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
@@ -660,7 +678,7 @@ private class Gemma4TextModelInner: Module {
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
         self._layers.wrappedValue = (0 ..< config.numHiddenLayers).map {
-            Gemma4DecoderLayer(config, layerIdx: $0)
+            Gemma4DecoderLayer(config, layerIdx: $0, forceSharedKV: forceSharedKV)
         }
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
