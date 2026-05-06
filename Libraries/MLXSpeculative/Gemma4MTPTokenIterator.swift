@@ -163,7 +163,9 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
             ? bonusCol
             : concatenated([bonusCol] + draftPerStep, axis: 1)
         let verifyOut = target.forwardForMTP(verifyInput, cache: cache)
-        let mainTokens = verifyOut.logits.argMax(axis: -1)
+        // fp32 argmax at verify to avoid bf16 near-uniform-tail argmax
+        // flips that would otherwise diverge from baseline.
+        let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
         let draftConcat: MLXArray =
             draftPerStep.isEmpty
             ? MLXArray.zeros([1, 0], dtype: .int32)

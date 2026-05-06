@@ -117,7 +117,10 @@ public func runGemma4MTPRounds(
                 : concatenated([bonusCol] + draftPerStep, axis: 1)
             let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
             // Greedy sample all bs positions: [1, bs, vocab] → [1, bs] int32.
-            let mainTokens = verifyOut.logits.argMax(axis: -1)
+            // Cast to fp32 before argmax to eliminate bf16 near-uniform-tail
+            // argmax flips that can otherwise diverge MTP from baseline at
+            // post-EOS repetition tails.
+            let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
             // Materialise drafts + main tokens in a single sync.
             let draftConcat: MLXArray =
                 draftPerStep.isEmpty
@@ -311,7 +314,8 @@ public func runGemma4MTPRoundsBatched(
                 ? bonusCol
                 : concatenated([bonusCol] + draftPerStep, axis: 1)
             let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
-            let mainTokens = verifyOut.logits.argMax(axis: -1)  // [B, bs]
+            // fp32 argmax at verify: see comment in B=1 path above.
+            let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)  // [B, bs]
             // Materialise drafts + main tokens in a single sync.
             let draftConcat: MLXArray =
                 draftPerStep.isEmpty

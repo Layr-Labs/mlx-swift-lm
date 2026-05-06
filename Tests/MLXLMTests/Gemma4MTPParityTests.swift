@@ -104,7 +104,7 @@ struct Gemma4MTPParityTests {
         // Prefill.
         let prompt = MLXArray(promptTokens)[.newAxis, .ellipsis]
         var logits = target(prompt, cache: cache)  // [1, L, vocab]
-        var tok = logits[0..., -1, 0...].argMax(axis: -1)  // [1]
+        var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)  // [1]
         eval(tok)
 
         var out: [Int] = [Int(tok.item(Int32.self))]
@@ -112,7 +112,7 @@ struct Gemma4MTPParityTests {
             // Feed last token back; cache advances.
             let input = tok[.newAxis, .ellipsis]  // [1, 1]
             logits = target(input, cache: cache)
-            tok = logits[0..., -1, 0...].argMax(axis: -1)
+            tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
             eval(tok)
             out.append(Int(tok.item(Int32.self)))
         }
@@ -133,7 +133,7 @@ struct Gemma4MTPParityTests {
         let cache = target.newCache(parameters: nil)
         let prefillOut = target.forwardForMTP(prompt, cache: cache)
         let lastLogits = prefillOut.logits[0..., -1, 0...]
-        let firstBonus = Int(lastLogits.argMax(axis: -1).item(Int32.self))
+        let firstBonus = Int(lastLogits.asType(.float32).argMax(axis: -1).item(Int32.self))
         let firstHidden = prefillOut.lastHidden[
             0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         let firstSharedKV = prefillOut.capturedSharedKV
@@ -358,13 +358,13 @@ struct Gemma4E4BMTPParityTests {
         let cache = target.newCache(parameters: nil)
         let prompt = MLXArray(promptTokens)[.newAxis, .ellipsis]
         var logits = target(prompt, cache: cache)
-        var tok = logits[0..., -1, 0...].argMax(axis: -1)
+        var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
         eval(tok)
         var out: [Int] = [Int(tok.item(Int32.self))]
         for _ in 1 ..< maxTokens {
             let input = tok[.newAxis, .ellipsis]
             logits = target(input, cache: cache)
-            tok = logits[0..., -1, 0...].argMax(axis: -1)
+            tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
             eval(tok)
             out.append(Int(tok.item(Int32.self)))
         }
@@ -379,7 +379,7 @@ struct Gemma4E4BMTPParityTests {
         let cache = target.newCache(parameters: nil)
         let prefillOut = target.forwardForMTP(prompt, cache: cache)
         let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
-                                 .argMax(axis: -1).item(Int32.self))
+                                 .asType(.float32).argMax(axis: -1).item(Int32.self))
         let firstHidden = prefillOut.lastHidden[
             0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         let stream = try runGemma4MTPRounds(
@@ -424,7 +424,7 @@ struct Gemma4E4BMTPParityTests {
         }
         let out = target.forwardForMTP(tokens, cache: cache)
         let lastLogits = out.logits[0..., -1, 0...]
-        let bonusArr = lastLogits.argMax(axis: -1).asArray(Int32.self)
+        let bonusArr = lastLogits.asType(.float32).argMax(axis: -1).asArray(Int32.self)
         let bonus = bonusArr.map { Int($0) }
         let lastHidden = out.lastHidden[0..., -1 ..< out.lastHidden.dim(1), 0...]
         return (bonus, lastHidden, out.capturedSharedKV, cache)
@@ -747,13 +747,13 @@ struct Gemma4MoEMTPParityTests {
         let cache = target.newCache(parameters: nil)
         let prompt = MLXArray(promptTokens)[.newAxis, .ellipsis]
         var logits = target(prompt, cache: cache)
-        var tok = logits[0..., -1, 0...].argMax(axis: -1)
+        var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
         eval(tok)
         var out: [Int] = [Int(tok.item(Int32.self))]
         for _ in 1 ..< maxTokens {
             let input = tok[.newAxis, .ellipsis]
             logits = target(input, cache: cache)
-            tok = logits[0..., -1, 0...].argMax(axis: -1)
+            tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
             eval(tok)
             out.append(Int(tok.item(Int32.self)))
         }
@@ -768,7 +768,7 @@ struct Gemma4MoEMTPParityTests {
         let cache = target.newCache(parameters: nil)
         let prefillOut = target.forwardForMTP(prompt, cache: cache)
         let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
-                                 .argMax(axis: -1).item(Int32.self))
+                                 .asType(.float32).argMax(axis: -1).item(Int32.self))
         let firstHidden = prefillOut.lastHidden[
             0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         let stream = try runGemma4MTPRounds(

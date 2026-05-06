@@ -89,7 +89,7 @@ struct Gemma4MTPRoundLoopTests {
         let out = target.forwardForMTP(tokens, cache: cache)
         // Greedy bonus from the last position.
         let lastLogits = out.logits[0..., -1, 0...]
-        let bonus = Int(lastLogits.argMax(axis: -1).item(Int32.self))
+        let bonus = Int(lastLogits.asType(.float32).argMax(axis: -1).item(Int32.self))
         // Last-position hidden (the drafter's next-step input).
         let lastHidden = out.lastHidden[0..., -1 ..< out.lastHidden.dim(1), 0...]
         return (bonus, lastHidden, out.capturedSharedKV, cache)
@@ -251,7 +251,7 @@ struct Gemma4MTPRoundLoopBatchedTests {
         let out = target.forwardForMTP(tokens, cache: cache)
         // Per-row greedy bonus from the last position.
         let lastLogits = out.logits[0..., -1, 0...]  // [B, vocab]
-        let bonusArr = lastLogits.argMax(axis: -1).asArray(Int32.self)
+        let bonusArr = lastLogits.asType(.float32).argMax(axis: -1).asArray(Int32.self)
         let bonus = bonusArr.map { Int($0) }
         let lastHidden = out.lastHidden[0..., -1 ..< out.lastHidden.dim(1), 0...]
         return (bonus, lastHidden, out.capturedSharedKV, cache)
