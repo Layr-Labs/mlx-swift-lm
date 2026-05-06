@@ -329,3 +329,201 @@ struct Gemma4MTPRoundLoopBatchedTests {
         #expect(totalTokens <= 2 * 3)  // B=2, blockSize=3
     }
 }
+
+@Suite("generateGemma4MTP")
+struct GenerateGemma4MTPTests {
+
+    /// Build a minimal Gemma4 target + drafter + TestTokenizer-based context.
+    /// Note: the tests use random weights, so output text is gibberish — we
+    /// only verify structure (stream starts/ends, string chunks emitted).
+    private func makeContext() throws -> (ModelContext, Gemma4AssistantDraftModel) {
+        let targetJSON = """
+        {
+            "model_type": "gemma4_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 10,
+            "intermediate_size": 128,
+            "num_attention_heads": 2,
+            "head_dim": 32,
+            "global_head_dim": 32,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 5,
+            "sliding_window": 64,
+            "sliding_window_pattern": 5,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": true,
+            "vocab_size": 64,
+            "vocab_size_per_layer_input": 64,
+            "rms_norm_eps": 1e-6,
+            "hidden_size_per_layer_input": 0
+        }
+        """
+        let targetCfg = try JSONDecoder.json5().decode(
+            Gemma4TextConfiguration.self, from: Data(targetJSON.utf8))
+        let target = Gemma4TextModel(targetCfg)
+
+        let drafterJSON = """
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": 64,
+            "use_ordered_embeddings": false,
+            "num_centroids": 8,
+            "centroid_intermediate_top_k": 2,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 32,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 4,
+                "sliding_window": 64,
+                "final_logit_softcapping": null,
+                "tie_word_embeddings": true,
+                "vocab_size": 64,
+                "vocab_size_per_layer_input": 64,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["sliding_attention", "sliding_attention",
+                                "sliding_attention", "full_attention"]
+            }
+        }
+        """
+        let drafterCfg = try JSONDecoder.json5().decode(
+            Gemma4AssistantConfiguration.self, from: Data(drafterJSON.utf8))
+        let drafter = Gemma4AssistantDraftModel(config: drafterCfg)
+        eval(target, drafter)
+
+        let processor = TestInputProcessor()
+        let modelConfig = ModelConfiguration(
+            id: "gemma4-test",
+            defaultPrompt: "",
+            extraEOSTokens: [],
+            toolCallFormat: nil
+        )
+        let context = ModelContext(
+            configuration: modelConfig,
+            model: target,
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        return (context, drafter)
+    }
+
+    @Test func generateEmitsChunksAndFinishesCleanly() async throws {
+        let (context, drafter) = try makeContext()
+        // Minimal LMInput.
+        let tokens = MLXArray([Int32(1), 2, 3, 4])[.newAxis, .ellipsis]
+        let input = LMInput(text: .init(tokens: tokens))
+        var params = GenerateParameters()
+        params.maxTokens = 6
+
+        let stream = try generateGemma4MTP(
+            input: input,
+            parameters: params,
+            target: context,
+            drafter: drafter,
+            blockSize: 3
+        )
+
+        var chunks: [String] = []
+        var hasInfo = false
+        for try await gen in stream {
+            switch gen {
+            case .chunk(let s): chunks.append(s)
+            case .info: hasInfo = true
+            default: break
+            }
+        }
+        #expect(chunks.count >= 1)
+        #expect(chunks.count <= 6)
+        #expect(hasInfo)
+    }
+
+    @Test func generateRejectsNonGemma4Target() async throws {
+        // Build a Gemma3TextModel context — it should throw unsupportedTarget.
+        let processor = TestInputProcessor()
+        let modelConfig = ModelConfiguration(
+            id: "gemma3-not-supported", defaultPrompt: "",
+            extraEOSTokens: [], toolCallFormat: nil)
+        let gemma3Config = Gemma3TextConfiguration(
+            modelType: "text",
+            hiddenSize: 64, hiddenLayers: 8, intermediateSize: 64,
+            attentionHeads: 4, headDim: 64,
+            rmsNormEps: 0.00001, vocabularySize: 100, kvHeads: 4,
+            ropeTheta: 1_000_000, ropeLocalBaseFreq: 10_000,
+            ropeTraditional: false, queryPreAttnScalar: 256,
+            slidingWindow: 512, slidingWindowPattern: 6,
+            maxPositionEmbeddings: 32768
+        )
+        let target = Gemma3TextModel(gemma3Config)
+        let context = ModelContext(
+            configuration: modelConfig, model: target,
+            processor: processor, tokenizer: processor.tokenizer)
+
+        let drafterJSON = """
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": 64,
+            "use_ordered_embeddings": false,
+            "num_centroids": 8,
+            "centroid_intermediate_top_k": 2,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 32,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 4,
+                "sliding_window": 64,
+                "final_logit_softcapping": null,
+                "tie_word_embeddings": true,
+                "vocab_size": 64,
+                "vocab_size_per_layer_input": 64,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["sliding_attention", "sliding_attention",
+                                "sliding_attention", "full_attention"]
+            }
+        }
+        """
+        let drafterCfg = try JSONDecoder.json5().decode(
+            Gemma4AssistantConfiguration.self, from: Data(drafterJSON.utf8))
+        let drafter = Gemma4AssistantDraftModel(config: drafterCfg)
+        eval(target, drafter)
+
+        let tokens = MLXArray([Int32(1), 2, 3])[.newAxis, .ellipsis]
+        let input = LMInput(text: .init(tokens: tokens))
+        var params = GenerateParameters()
+        params.maxTokens = 4
+
+        #expect(throws: Gemma4MTPError.self) {
+            _ = try generateGemma4MTP(
+                input: input, parameters: params, target: context,
+                drafter: drafter, blockSize: 3
+            )
+        }
+    }
+
+    @Test func generateRejectsInvalidBlockSize() async throws {
+        let (context, drafter) = try makeContext()
+        let tokens = MLXArray([Int32(1), 2, 3])[.newAxis, .ellipsis]
+        let input = LMInput(text: .init(tokens: tokens))
+        var params = GenerateParameters()
+        params.maxTokens = 4
+
+        #expect(throws: Gemma4MTPError.self) {
+            _ = try generateGemma4MTP(
+                input: input, parameters: params, target: context,
+                drafter: drafter, blockSize: 1
+            )
+        }
+    }
+}
