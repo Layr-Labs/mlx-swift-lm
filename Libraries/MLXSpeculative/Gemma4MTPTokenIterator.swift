@@ -46,6 +46,9 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     private var cache: [KVCache]
     private let blockSize: Int
     private let temperature: Float
+    private let topP: Float
+    private let topK: Int
+    private let minP: Float
     private var rngKey: MLXArray
 
     // MTP state — mutated each round.
@@ -74,14 +77,13 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     ///     call (idempotent if already bound).
     ///   - cache: optional pre-allocated cache. If nil, allocated via
     ///     `target.newCache(parameters:)`.
-    ///   - parameters: generation parameters. `maxTokens` and `temperature`
-    ///     are honored. At `temperature == 0` the iterator uses the greedy
-    ///     walker (exact match with baseline). At `temperature > 0` it
-    ///     uses rejection-based speculative sampling — emitted tokens are
-    ///     drawn from the target's distribution, and match the distribution
-    ///     that pure target sampling would produce at the same temperature.
-    ///     `topP`/`topK`/`minP` are not yet supported on the MTP path
-    ///     (greedy-only for those; raise temperature=0 if needed).
+    ///   - parameters: generation parameters. `maxTokens`, `temperature`,
+    ///     `topP`, `topK`, `minP` are honored. At `temperature == 0` the
+    ///     iterator uses the greedy walker (exact match with baseline).
+    ///     At `temperature > 0` it uses rejection-based speculative
+    ///     sampling with the same filter masks applied to both drafter
+    ///     and target distributions. Emitted tokens match the distribution
+    ///     that pure target sampling with the same filters would produce.
     ///   - blockSize: speculative block size (2–16). Default 4.
     ///   - rngSeed: seed for rejection sampling (only used when
     ///     `temperature > 0`). Default 0 which seeds from the current MLX
@@ -107,6 +109,9 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         self.blockSize = blockSize
         self.maxTokens = parameters.maxTokens
         self.temperature = parameters.temperature
+        self.topP = parameters.topP
+        self.topK = parameters.topK
+        self.minP = parameters.minP
         self.rngKey = rngSeed == 0
             ? MLXRandom.key(UInt64(Date().timeIntervalSince1970 * 1e6))
             : MLXRandom.key(rngSeed)
@@ -126,14 +131,15 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
             firstBonus = Int(firstBonusArr.item(Int32.self))
         } else {
             // Sample the first bonus from the target's temperature-scaled
-            // softmax. Split the rng key so the round loop gets fresh keys
-            // each call.
+            // softmax with the same filters the rest of the round loop
+            // will use. Split the rng key so the round loop gets fresh
+            // keys each call.
             let keys = MLXRandom.split(key: self.rngKey, into: 2)
-            let scaled = lastLogits.asType(.float32) / parameters.temperature
-            let probs = softmax(scaled, axis: -1)
-            let u = MLXRandom.uniform(low: Float(0), high: Float(1), key: keys[0])
-            let cdf = probs.cumsum(axis: -1)
-            let idx = (cdf .< u).sum(axis: -1).asType(.int32)
+            let idx = sampleLogitsWithFilters(
+                lastLogits,
+                temperature: parameters.temperature,
+                topP: parameters.topP, topK: parameters.topK, minP: parameters.minP,
+                rngKey: keys[0])
             eval(idx)
             firstBonus = Int(idx.item(Int32.self))
             self.rngKey = keys[1]
@@ -195,12 +201,11 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
                 draftLogitsPerStep.append(stepLogits)
                 let keys = MLXRandom.split(key: rngKey, into: 2)
                 rngKey = keys[0]
-                let probs = softmax(
-                    stepLogits.asType(.float32) / temperature, axis: -1)
-                let u = MLXRandom.uniform(
-                    low: Float(0), high: Float(1), key: keys[1])
-                let cdf = probs.cumsum(axis: -1)
-                sampled = (cdf .< u).sum(axis: -1).asType(.int32)
+                sampled = sampleLogitsWithFilters(
+                    stepLogits,
+                    temperature: temperature,
+                    topP: topP, topK: topK, minP: minP,
+                    rngKey: keys[1])
             } else {
                 sampled = stepLogits.argMax(axis: -1)
             }
@@ -244,6 +249,7 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
                 draftTokens: draftTokens,
                 verifyLogits: verifyLogits,
                 temperature: temperature,
+                topP: topP, topK: topK, minP: minP,
                 rngKey: keys[1])
             accepted = result.accepted
             newTokens = result.emitted
