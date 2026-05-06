@@ -47,3 +47,46 @@ struct SpeculativeWalkSingleTests {
         #expect(emitted.count == accepted + 1)
     }
 }
+
+@Suite("SpeculativeWalk.batched")
+struct SpeculativeWalkBatchedTests {
+
+    @Test func perRowEquivalenceToSingle() {
+        // B=2, k=3. Row 0 fully accepts; row 1 mismatches at position 1.
+        let draft: [[Int]] = [
+            [1, 2, 3],
+            [4, 99, 6],
+        ]
+        let main: [[Int]] = [
+            [1, 2, 3, 42],
+            [4, 5, 6, 7],
+        ]
+        let budgets = [Int.max, Int.max]
+
+        let (batchedAccepted, batchedNew) =
+            SpeculativeWalk.batched(draft: draft, main: main, budgets: budgets)
+
+        // Expected per-row via single(...)
+        var expectedAccepted: [Int] = []
+        var expectedNew: [[Int]] = []
+        for i in 0 ..< draft.count {
+            let (a, n) = SpeculativeWalk.single(draft: draft[i], main: main[i])
+            expectedAccepted.append(a)
+            expectedNew.append(n)
+        }
+        #expect(batchedAccepted == expectedAccepted)
+        #expect(batchedNew == expectedNew)
+    }
+
+    @Test func budgetTruncates() {
+        // Row accepts 3 and would emit 4 tokens, but budget = 2 truncates.
+        let draft: [[Int]] = [[1, 2, 3]]
+        let main: [[Int]] = [[1, 2, 3, 42]]
+        let (accepted, emitted) =
+            SpeculativeWalk.batched(draft: draft, main: main, budgets: [2])
+        // Emission is capped to 2 tokens; accepted is also capped so
+        // the invariant emitted.count == accepted + 1 still holds.
+        #expect(emitted[0].count == 2)
+        #expect(accepted[0] == 1)
+    }
+}

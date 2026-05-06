@@ -35,4 +35,37 @@ public enum SpeculativeWalk {
         // Emit main[0...accepted] inclusive — that's accepted + 1 tokens.
         return (accepted, Array(main[0 ... accepted]))
     }
+
+    /// Multi-row greedy accept-prefix walker with per-row emit budgets.
+    ///
+    /// - Parameters:
+    ///   - draft: per-row draft tokens, length `[B][k]`.
+    ///   - main: per-row verify tokens, length `[B][k+1]`.
+    ///   - budgets: per-row max emit count. A row emits at most
+    ///     `budgets[i]` tokens; the accept count is capped accordingly so
+    ///     the `emitted.count == accepted + 1` invariant holds per row.
+    /// - Returns: `(acceptedPerRow, emittedPerRow)`.
+    public static func batched(
+        draft: [[Int]], main: [[Int]], budgets: [Int]
+    ) -> ([Int], [[Int]]) {
+        precondition(
+            draft.count == main.count && draft.count == budgets.count,
+            "batched: all inputs must have the same outer length B"
+        )
+        var acceptedOut: [Int] = []
+        var emittedOut: [[Int]] = []
+        acceptedOut.reserveCapacity(draft.count)
+        emittedOut.reserveCapacity(draft.count)
+        for i in 0 ..< draft.count {
+            var (a, e) = single(draft: draft[i], main: main[i])
+            let budget = Swift.max(0, budgets[i])
+            if e.count > budget {
+                e = Array(e.prefix(budget))
+                a = Swift.max(0, e.count - 1)
+            }
+            acceptedOut.append(a)
+            emittedOut.append(e)
+        }
+        return (acceptedOut, emittedOut)
+    }
 }
