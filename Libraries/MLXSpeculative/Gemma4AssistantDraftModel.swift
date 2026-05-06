@@ -97,6 +97,103 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         self.boundTargetID = nil
     }
 
+    // MARK: - Forward pass
+
+    /// Drafter forward pass.
+    ///
+    /// - Parameters:
+    ///   - inputsEmbeds: `[B, 1, 2 * backboneHiddenSize]` — the drafter-step
+    ///     input, which the round-loop constructs as
+    ///     `concat([target_embed(last_token), last_hidden], axis: -1)`.
+    ///   - sharedKV: K/V snapshot from the target's last non-shared
+    ///     full-attention and sliding-attention layers. Every drafter layer
+    ///     reads from the appropriate slot by its `layerType`.
+    ///   - positionOffset: absolute position of the bonus token; held
+    ///     constant across all drafter steps within a block.
+    /// - Returns: `(lastHidden: [B, 1, backboneHiddenSize], logits: [B, 1, vocabSize])`.
+    ///
+    /// Softcap is **not** applied (drafter configs have
+    /// `final_logit_softcapping: null`).
+    public func callAsFunction(
+        inputsEmbeds: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset
+    ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let textCfg = config.textConfig
+
+        // Project the [target_embed, last_hidden] concat to drafter-hidden.
+        var h = preProjection(inputsEmbeds)
+
+        // Build per-layer-type masks (bidirectional; SWA may short-circuit to .none).
+        let queryLen = h.dim(1)
+        let queryOffset: Int
+        switch positionOffset {
+        case .scalar(let v): queryOffset = v
+        case .batch(let arr): queryOffset = Int(arr[0].item(Int32.self))
+        }
+
+        let fullKVLen = sharedKV.fullAttention.0.dim(2)
+        let slidingKVLen = sharedKV.slidingAttention.0.dim(2)
+        let dtype = h.dtype
+
+        let fullMask = DrafterMasks.bidirectionalFull(
+            queryLen: queryLen, kvLen: fullKVLen, dtype: dtype)
+        let slidingMask = DrafterMasks.bidirectionalSWA(
+            queryLen: queryLen, queryOffset: queryOffset,
+            kvLen: slidingKVLen, window: textCfg.slidingWindow, dtype: dtype)
+
+        // Run each drafter layer with the appropriate shared-KV + mask.
+        for (i, layer) in model.layers.enumerated() {
+            let layerType = textCfg.layerTypes[i]
+            let kv: (MLXArray, MLXArray)
+            let mask: MLXFast.ScaledDotProductAttentionMaskMode
+            switch layerType {
+            case "full_attention":
+                kv = sharedKV.fullAttention
+                mask = fullMask
+            case "sliding_attention":
+                kv = sharedKV.slidingAttention
+                mask = slidingMask
+            default:
+                preconditionFailure(
+                    "Gemma4AssistantDraftModel: unexpected layerType '\(layerType)' at "
+                    + "layer \(i). Compat validation should have rejected this."
+                )
+            }
+            let (out, _, _) = layer(
+                h,
+                mask: mask,
+                cache: nil,
+                perLayerInput: nil,
+                sharedKV: kv,
+                positionOffset: positionOffset
+            )
+            h = out
+        }
+
+        h = model.norm(h)
+        let lastHidden = postProjection(h)
+        let logits = applyLMHead(h)
+        return (lastHidden, logits)
+    }
+
+    /// Dispatch the LM head: masked-centroid if `useOrderedEmbeddings`,
+    /// tied otherwise (unless an explicit `lm_head` is present).
+    /// No softcap.
+    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        if let maskedEmbedder {
+            return maskedEmbedder(
+                hiddenStates: hidden,
+                lmHeadWeight: model.embedTokens.weight
+            )
+        }
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        // Tied: project hidden through the (transposed) token embedding.
+        return model.embedTokens.asLinear(hidden)
+    }
+
     // MARK: - Compatibility validation
 
     /// Fail-fast on every drafter/target mismatch with the field name in
