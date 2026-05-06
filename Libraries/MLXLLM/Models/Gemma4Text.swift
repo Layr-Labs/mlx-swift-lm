@@ -293,6 +293,27 @@ public final class Gemma4SharedKVCapture: @unchecked Sendable {
     }
 }
 
+/// Result of `Gemma4TextModel.forwardForMTP`. Carries both the LM head
+/// output and the pre-head trunk hidden, plus the shared-KV snapshot the
+/// drafter needs for its next round.
+public struct Gemma4MTPForward: @unchecked Sendable {
+    /// `[B, L, vocab]` — softcap applied.
+    public let logits: MLXArray
+    /// `[B, L, hidden_size]` — trunk output after `model.norm`, before the
+    /// LM head.
+    public let lastHidden: MLXArray
+    /// Per-layer-type K/V from the last non-shared layers of the target.
+    public let capturedSharedKV: Gemma4SharedKV
+
+    public init(
+        logits: MLXArray, lastHidden: MLXArray, capturedSharedKV: Gemma4SharedKV
+    ) {
+        self.logits = logits
+        self.lastHidden = lastHidden
+        self.capturedSharedKV = capturedSharedKV
+    }
+}
+
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let batchCache = cache as? BatchPositionedKVCache {
@@ -938,6 +959,38 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
         return out
+    }
+
+    /// Forward pass tailored for MTP speculative decoding.
+    ///
+    /// Returns both the LM head output (logits) AND the pre-head trunk
+    /// hidden AND a snapshot of the shared-KV tensors that the drafter
+    /// will consume in its next round.
+    ///
+    /// The capture hook is always engaged on this path; both slots of the
+    /// returned `capturedSharedKV` are expected to be populated. For the
+    /// Gemma 4 target architecture this holds because `numHiddenLayers >
+    /// numKvSharedLayers` and the non-shared prefix always contains at
+    /// least one layer of each type. If a caller constructs a model with
+    /// an atypical config where one layer type is absent from the
+    /// non-shared prefix, `Gemma4SharedKVCapture.snapshot()` will fatal.
+    ///
+    /// - Parameters:
+    ///   - tokens: `[B, L]` int token array.
+    ///   - cache: pre-constructed KV caches for each non-shared layer.
+    /// - Returns: `Gemma4MTPForward` with logits, pre-head hidden, and
+    ///   captured shared-KV.
+    public func forwardForMTP(
+        _ tokens: MLXArray, cache: [KVCache]
+    ) -> Gemma4MTPForward {
+        let capture = Gemma4SharedKVCapture()
+        let hidden = model(tokens, cache: cache, capture: capture)
+        let logits = applyLMHead(hidden)
+        return Gemma4MTPForward(
+            logits: logits,
+            lastHidden: hidden,
+            capturedSharedKV: capture.snapshot()
+        )
     }
 
     /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
