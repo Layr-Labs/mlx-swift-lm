@@ -227,6 +227,72 @@ public enum Gemma4 {
     }
 }
 
+/// Immutable snapshot of per-layer-type K/V captured from a target
+/// `Gemma4TextModel` during `forwardForMTP`. Consumed by the Gemma 4 MTP
+/// drafter; every drafter layer reads from one of these two slots rather
+/// than projecting its own K/V.
+public struct Gemma4SharedKV: @unchecked Sendable {
+    /// K/V from the target's last non-shared full-attention layer.
+    /// Shape: `[B, nGlobalKVHeads, T, globalHeadDim]`.
+    public let fullAttention: (MLXArray, MLXArray)
+    /// K/V from the target's last non-shared sliding-attention layer.
+    /// Shape: `[B, nKVHeads, T, headDim]`.
+    public let slidingAttention: (MLXArray, MLXArray)
+
+    public init(
+        fullAttention: (MLXArray, MLXArray),
+        slidingAttention: (MLXArray, MLXArray)
+    ) {
+        self.fullAttention = fullAttention
+        self.slidingAttention = slidingAttention
+    }
+
+    /// Trim the tail of both K/V tensors by `rejected` time positions. Used
+    /// by the MTP round-loop to match the post-rollback target cache length.
+    /// If `rejected >= T`, clamps to a 1-slot tail so the drafter always has
+    /// at least one K/V position to attend to.
+    public static func sliceTail(
+        from shared: Gemma4SharedKV, rejected: Int
+    ) -> Gemma4SharedKV {
+        func slice(_ kv: (MLXArray, MLXArray)) -> (MLXArray, MLXArray) {
+            let T = kv.0.dim(2)
+            let valid = max(1, T - max(0, rejected))
+            if valid >= T { return kv }
+            let k = kv.0[.ellipsis, ..<valid, 0...]
+            let v = kv.1[.ellipsis, ..<valid, 0...]
+            return (k, v)
+        }
+        return Gemma4SharedKV(
+            fullAttention: slice(shared.fullAttention),
+            slidingAttention: slice(shared.slidingAttention)
+        )
+    }
+}
+
+/// Mutable sink for the shared-KV capture hook in
+/// `Gemma4TextModelInner.callAsFunction`. A reference type so the trunk can
+/// write into it without a return-value contortion; cleared by the caller
+/// between forwards.
+public final class Gemma4SharedKVCapture: @unchecked Sendable {
+    public var fullAttention: (MLXArray, MLXArray)? = nil
+    public var slidingAttention: (MLXArray, MLXArray)? = nil
+
+    public init() {}
+
+    /// Snapshot into an immutable `Gemma4SharedKV`. Throws via
+    /// `fatalError` if either slot is missing — the capture hook is
+    /// expected to populate both.
+    public func snapshot() -> Gemma4SharedKV {
+        guard let full = fullAttention else {
+            fatalError("Gemma4SharedKVCapture: fullAttention was not populated")
+        }
+        guard let sliding = slidingAttention else {
+            fatalError("Gemma4SharedKVCapture: slidingAttention was not populated")
+        }
+        return Gemma4SharedKV(fullAttention: full, slidingAttention: sliding)
+    }
+}
+
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let batchCache = cache as? BatchPositionedKVCache {
