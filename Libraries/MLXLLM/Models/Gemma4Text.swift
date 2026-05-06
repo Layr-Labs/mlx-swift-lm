@@ -831,11 +831,18 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        let hidden = model(inputs, cache: cache)
+        return applyLMHead(hidden)
+    }
+
+    /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
+    /// configured final-logit softcap. Pure function of the post-norm hidden.
+    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        var out: MLXArray
         if let lmHead {
-            out = lmHead(out)
+            out = lmHead(hidden)
         } else {
-            out = model.embedTokens.asLinear(out)
+            out = model.embedTokens.asLinear(hidden)
         }
         out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
         return out
