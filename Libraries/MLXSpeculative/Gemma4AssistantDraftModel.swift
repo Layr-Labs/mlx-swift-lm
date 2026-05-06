@@ -194,6 +194,64 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         return model.embedTokens.asLinear(hidden)
     }
 
+    // MARK: - Weight sanitization
+
+    /// Sanitize a raw drafter checkpoint dictionary into the form the
+    /// drafter's modules expect.
+    ///
+    /// Rules:
+    /// - Cast `masked_embedding.token_ordering` to int32 (HF ships it as int64).
+    /// - Drop `lm_head.weight` when the drafter config has
+    ///   `tieWordEmbeddings == true` (the LM head is tied to `embed_tokens`;
+    ///   a present `lm_head.weight` in the checkpoint is redundant).
+    /// - Throw on unexpected `k_proj` / `v_proj` / `k_norm` / `v_norm`
+    ///   weights: every drafter layer is kv-shared by construction, so
+    ///   those modules aren't instantiated. A stray weight indicates a
+    ///   checkpoint/config mismatch and should surface loudly rather than
+    ///   be silently dropped.
+    ///
+    /// - Throws: `Gemma4MTPError.incompatibleDrafter(field:...)` with a
+    ///   descriptive field name when an unexpected K/V weight is present.
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        var out: [String: MLXArray] = [:]
+        out.reserveCapacity(weights.count)
+
+        let forbiddenSubstrings = [
+            ".self_attn.k_proj",
+            ".self_attn.v_proj",
+            ".self_attn.k_norm",
+            ".self_attn.v_norm",
+        ]
+
+        for (key, value) in weights {
+            // Fail loud on forbidden K/V weights.
+            for substring in forbiddenSubstrings {
+                if key.contains(substring) {
+                    throw Gemma4MTPError.incompatibleDrafter(
+                        field: key,
+                        drafter: "(unexpected — drafter layers are kv-shared)",
+                        target: "(should not be present)"
+                    )
+                }
+            }
+
+            // Drop lm_head.weight when tied.
+            if key == "lm_head.weight" && config.textConfig.tieWordEmbeddings {
+                continue
+            }
+
+            // Cast masked_embedding.token_ordering to int32.
+            if key == "masked_embedding.token_ordering" {
+                out[key] = value.asType(.int32)
+                continue
+            }
+
+            out[key] = value
+        }
+
+        return out
+    }
+
     // MARK: - Compatibility validation
 
     /// Fail-fast on every drafter/target mismatch with the field name in
