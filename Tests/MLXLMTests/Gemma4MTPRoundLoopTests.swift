@@ -148,3 +148,184 @@ struct Gemma4MTPRoundLoopTests {
         #expect(count <= 5)
     }
 }
+
+@Suite("Gemma4MTPRoundLoop B>1")
+struct Gemma4MTPRoundLoopBatchedTests {
+
+    /// Build a target that can handle batched input. Uses `BatchKVCache`
+    /// for all non-shared attention layers. Shape is identical to the B=1
+    /// tests but we pre-populate the cache via a batched prefill.
+    private func smallTarget() throws -> Gemma4TextModel {
+        let json = """
+        {
+            "model_type": "gemma4_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 10,
+            "intermediate_size": 128,
+            "num_attention_heads": 2,
+            "head_dim": 32,
+            "global_head_dim": 32,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 5,
+            "sliding_window": 64,
+            "sliding_window_pattern": 5,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": true,
+            "vocab_size": 64,
+            "vocab_size_per_layer_input": 64,
+            "rms_norm_eps": 1e-6,
+            "hidden_size_per_layer_input": 0
+        }
+        """
+        let data = Data(json.utf8)
+        let config = try JSONDecoder.json5().decode(
+            Gemma4TextConfiguration.self, from: data)
+        return Gemma4TextModel(config)
+    }
+
+    private func smallDrafter() throws -> Gemma4AssistantDraftModel {
+        let json = """
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": 64,
+            "use_ordered_embeddings": false,
+            "num_centroids": 8,
+            "centroid_intermediate_top_k": 2,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 32,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 4,
+                "sliding_window": 64,
+                "final_logit_softcapping": null,
+                "tie_word_embeddings": true,
+                "vocab_size": 64,
+                "vocab_size_per_layer_input": 64,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["sliding_attention", "sliding_attention",
+                                "sliding_attention", "full_attention"]
+            }
+        }
+        """
+        let data = Data(json.utf8)
+        let cfg = try JSONDecoder.json5().decode(
+            Gemma4AssistantConfiguration.self, from: data)
+        return Gemma4AssistantDraftModel(config: cfg)
+    }
+
+    /// Batched prefill: B rows with identical length for simplicity. Returns
+    /// firstBonus (per row), firstHidden [B, 1, hidden], firstSharedKV.
+    private func batchedPrefill(
+        target: Gemma4TextModel, promptIds: [[Int32]]
+    ) -> (firstBonus: [Int], firstHidden: MLXArray,
+          firstSharedKV: Gemma4SharedKV, cache: [KVCache]) {
+        let B = promptIds.count
+        let L = promptIds[0].count
+        precondition(promptIds.allSatisfy { $0.count == L },
+                     "this test helper assumes uniform prompt lengths")
+        let tokens = MLXArray(promptIds.flatMap { $0 }, [B, L])  // [B, L]
+
+        // Use BatchKVCache for every non-shared layer so the B>1 path works.
+        let firstKvShared = target.configuration.numHiddenLayers
+            - target.configuration.numKvSharedLayers
+        let leftPadding = Array(repeating: 0, count: B)
+        var cache: [KVCache] = []
+        for i in 0 ..< firstKvShared {
+            let lt = target.configuration.layerTypes[i]
+            if lt == "full_attention" {
+                cache.append(BatchKVCache(leftPadding: leftPadding))
+            } else {
+                cache.append(BatchRotatingKVCache(
+                    maxSize: target.configuration.slidingWindow,
+                    leftPadding: leftPadding))
+            }
+        }
+
+        let out = target.forwardForMTP(tokens, cache: cache)
+        // Per-row greedy bonus from the last position.
+        let lastLogits = out.logits[0..., -1, 0...]  // [B, vocab]
+        let bonusArr = lastLogits.argMax(axis: -1).asArray(Int32.self)
+        let bonus = bonusArr.map { Int($0) }
+        let lastHidden = out.lastHidden[0..., -1 ..< out.lastHidden.dim(1), 0...]
+        return (bonus, lastHidden, out.capturedSharedKV, cache)
+    }
+
+    @Test func batchedMtpEmitsForAllRows() async throws {
+        let target = try smallTarget()
+        let drafter = try smallDrafter()
+        eval(target, drafter)
+
+        let prompts: [[Int32]] = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+        ]
+        let p = batchedPrefill(target: target, promptIds: prompts)
+
+        var emittedPerRow: [[Int]] = [[], []]
+        let stream = try runGemma4MTPRoundsBatched(
+            target: target,
+            drafter: drafter,
+            targetCache: p.cache,
+            firstBonus: p.firstBonus,
+            firstHidden: p.firstHidden,
+            firstSharedKV: p.firstSharedKV,
+            maxTokens: 8,
+            blockSize: 3,
+            eosTokenIds: nil
+        )
+        for try await step in stream {
+            for slot in step.slots {
+                if let tok = slot.token { emittedPerRow[slot.row].append(tok) }
+            }
+        }
+        #expect(emittedPerRow[0].count >= 1)
+        #expect(emittedPerRow[0].count <= 8)
+        #expect(emittedPerRow[1].count >= 1)
+        #expect(emittedPerRow[1].count <= 8)
+    }
+
+    @Test func batchedMtpRespectsEOS() async throws {
+        // Pick an EOS that's definitely in the vocab (anything <= 63).
+        // We can't force the model to emit a specific EOS on random weights,
+        // but we CAN choose a set large enough that at least one sampled
+        // token falls in it. Use the entire vocab as EOS -> every row
+        // finishes after its first sample.
+        let target = try smallTarget()
+        let drafter = try smallDrafter()
+        eval(target, drafter)
+
+        let prompts: [[Int32]] = [[1, 2, 3], [4, 5, 6]]
+        let p = batchedPrefill(target: target, promptIds: prompts)
+        let allVocabEOS: Set<Int> = Set(0 ..< 64)
+
+        var totalTokens = 0
+        let stream = try runGemma4MTPRoundsBatched(
+            target: target,
+            drafter: drafter,
+            targetCache: p.cache,
+            firstBonus: p.firstBonus,
+            firstHidden: p.firstHidden,
+            firstSharedKV: p.firstSharedKV,
+            maxTokens: 16,
+            blockSize: 3,
+            eosTokenIds: allVocabEOS
+        )
+        for try await step in stream {
+            for slot in step.slots where slot.token != nil {
+                totalTokens += 1
+            }
+        }
+        // With every token in EOS, each row should finish almost immediately
+        // (the first bonus is always emitted before EOS can fire, plus any
+        // tokens emitted in the first round before the EOS check).
+        // Strict bound: each row emits <= blockSize tokens.
+        #expect(totalTokens <= 2 * 3)  // B=2, blockSize=3
+    }
+}
