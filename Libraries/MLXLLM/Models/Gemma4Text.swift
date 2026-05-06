@@ -193,12 +193,24 @@ private class ScaledLinear: Module {
     }
 }
 
-private enum Gemma4PositionOffset {
-    case scalar(Int)
-    case batch(MLXArray)
+/// Public namespace for Gemma 4 types that need cross-module visibility
+/// (e.g. the MTP drafter in `MLXSpeculative`).
+public enum Gemma4 {
+
+    /// Position offset for RoPE, either a single scalar (standard decode)
+    /// or a per-row `MLXArray` (continuous-batching / drafter paths).
+    ///
+    /// `@unchecked Sendable` because `MLXArray` is not `Sendable`; callers must
+    /// treat these values as immutable snapshots (they are only ever read, never
+    /// mutated in place).
+    public enum PositionOffset: @unchecked Sendable {
+        case scalar(Int)
+        case batch(MLXArray)
+    }
 }
 
-private func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4PositionOffset {
+@inline(__always)
+internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let batchCache = cache as? BatchPositionedKVCache {
         // Snapshot the per-sequence offsets before cache.update(...) advances them.
         .batch(batchCache.batchOffset + 0)
@@ -207,10 +219,11 @@ private func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4Position
     }
 }
 
-private func gemma4ApplyRotaryPosition<R: RoPELayer>(
+@inline(__always)
+internal func gemma4ApplyRotaryPosition<R: RoPELayer>(
     _ rope: R,
     to x: MLXArray,
-    offset: Gemma4PositionOffset
+    offset: Gemma4.PositionOffset
 ) -> MLXArray {
     switch offset {
     case .scalar(let value):
@@ -306,8 +319,8 @@ private class Gemma4Attention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
-        positionOffset: Gemma4PositionOffset? = nil
-    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4PositionOffset) {
+        positionOffset: Gemma4.PositionOffset? = nil
+    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
@@ -560,8 +573,8 @@ private class Gemma4DecoderLayer: Module {
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
-        positionOffset: Gemma4PositionOffset? = nil
-    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4PositionOffset) {
+        positionOffset: Gemma4.PositionOffset? = nil
+    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let residual = x
 
         let h = inputLayernorm(x)
@@ -752,7 +765,7 @@ private class Gemma4TextModelInner: Module {
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
-        var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4PositionOffset?)](
+        var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
 
         for (idx, layer) in layers.enumerated() {
