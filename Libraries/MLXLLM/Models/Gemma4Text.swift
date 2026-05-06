@@ -267,6 +267,44 @@ public struct Gemma4SharedKV: @unchecked Sendable {
             slidingAttention: slice(shared.slidingAttention)
         )
     }
+
+    /// Zero per-row tail positions of the shared K/V. For each row `b`,
+    /// slots `[keepLengths[b], T)` in both K and V tensors (for both
+    /// layer types) are set to 0.
+    ///
+    /// Used by the B>1 MTP round loop to match the per-row target cache
+    /// zeroing performed by `rollbackSpeculativeCache(.perRow:)`. Rows
+    /// that accepted less than max have their tail K/V zeroed so the
+    /// drafter doesn't attend to post-rollback "stale" positions.
+    ///
+    /// This differs from `sliceTail` which uniformly trims the T axis.
+    /// `zeroTailPerRow` preserves the T axis length (so all rows share
+    /// the same tensor shape) but zeros the invalid slots — the
+    /// SDPA/attention computation sees zeros, which contribute nothing
+    /// to the softmax when multiplied by queries.
+    ///
+    /// - Parameter keepLengths: int array of shape `[B]`. For row `b`,
+    ///   slots `[0, keepLengths[b])` are preserved; slots
+    ///   `[keepLengths[b], T)` are zeroed.
+    public static func zeroTailPerRow(
+        from shared: Gemma4SharedKV, keepLengths: MLXArray
+    ) -> Gemma4SharedKV {
+        func zero(_ kv: (MLXArray, MLXArray)) -> (MLXArray, MLXArray) {
+            let T = kv.0.dim(2)
+            let positions = MLXArray(Int32(0) ..< Int32(T))
+                .reshaped([1, 1, T, 1])                        // [1, 1, T, 1]
+            let keep = keepLengths.asType(.int32)
+                .reshaped([-1, 1, 1, 1])                       // [B, 1, 1, 1]
+            let keepMask = positions .< keep                   // [B, 1, T, 1]
+            let maskK = keepMask.asType(kv.0.dtype)
+            let maskV = keepMask.asType(kv.1.dtype)
+            return (kv.0 * maskK, kv.1 * maskV)
+        }
+        return Gemma4SharedKV(
+            fullAttention: zero(shared.fullAttention),
+            slidingAttention: zero(shared.slidingAttention)
+        )
+    }
 }
 
 /// Mutable sink for the shared-KV capture hook in

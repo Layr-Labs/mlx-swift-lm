@@ -391,11 +391,22 @@ public func runGemma4MTPRoundsBatched(
                 }
             }
 
-            // Slice shared-KV tail: uses the min rejected across rows so
-            // the drafter still sees all rows' K/V at the same length.
-            let minRejected = accepted.map { k - $0 }.min() ?? 0
-            sharedKV = Gemma4SharedKV.sliceTail(
-                from: verifyOut.capturedSharedKV, rejected: minRejected)
+            // Per-row zero-tail shared-KV to match the target cache's per-row
+            // rewind. For row i, keep the first `prev_plus_accepted+1` positions
+            // relative to the captured K/V's T axis. The captured K/V has length
+            // `prev + bs` (where prev is the prefill + prior rounds' kept length
+            // and bs = k + 1 is this round's speculative block). Row i's valid
+            // KV length after rewind is `prev + accepted[i] + 1`. So relative
+            // to the captured K/V's length (prev + bs), the row's keep length is:
+            //   prev + accepted[i] + 1
+            // which equals capturedLen - (bs - accepted[i] - 1) = capturedLen - rejected[i].
+            let capturedT = verifyOut.capturedSharedKV.fullAttention.0.dim(2)
+            let rejectedPerRow = accepted.map { Int32(k - $0) }
+            let keepLengths = MLXArray(
+                rejectedPerRow.map { Int32(capturedT) - $0 }
+            )
+            sharedKV = Gemma4SharedKV.zeroTailPerRow(
+                from: verifyOut.capturedSharedKV, keepLengths: keepLengths)
 
             if (emitted.max() ?? 0) % 256 == 0 {
                 MLX.Memory.clearCache()

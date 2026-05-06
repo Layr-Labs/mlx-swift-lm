@@ -4,6 +4,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXRandom
 import MLXSpeculative
 import Testing
 
@@ -256,5 +257,372 @@ struct Gemma4MTPParityTests {
               mtp=\(mtp)
             """
         )
+    }
+}
+
+/// E4B-shaped parity, plus batched (B>1) coverage.
+@Suite("Gemma4 MTP parity — E4B shapes")
+struct Gemma4E4BMTPParityTests {
+
+    private struct SeededRNG: RandomNumberGenerator {
+        var state: UInt64
+        init(seed: UInt64) { self.state = seed == 0 ? 0xDEADBEEF : seed }
+        mutating func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    // MARK: - Config fixtures
+
+    /// E4B-shaped target: scaled down for test speed but preserves the
+    /// architectural shape (20 layers, 12 kv-shared, 8-head attention,
+    /// global_head_dim != head_dim). 1024 vocab keeps logit computation
+    /// cheap without changing the algorithm under test.
+    private func e4bStyleTargetConfig() throws -> Gemma4TextConfiguration {
+        let json = """
+        {
+            "model_type": "gemma4_text",
+            "hidden_size": 512,
+            "num_hidden_layers": 20,
+            "intermediate_size": 1024,
+            "num_attention_heads": 4,
+            "head_dim": 64,
+            "global_head_dim": 128,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 12,
+            "sliding_window": 128,
+            "sliding_window_pattern": 5,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": true,
+            "vocab_size": 1024,
+            "vocab_size_per_layer_input": 1024,
+            "rms_norm_eps": 1e-6,
+            "hidden_size_per_layer_input": 0
+        }
+        """
+        let data = Data(json.utf8)
+        return try JSONDecoder.json5().decode(Gemma4TextConfiguration.self, from: data)
+    }
+
+    /// E4B-shaped drafter. backbone_hidden_size MUST equal target
+    /// hidden_size (512) for pre/post projection shapes to work.
+    /// Drafter's own hidden is smaller (128) — the tiny 4-layer trunk.
+    private func e4bStyleDrafterConfig(
+        useOrderedEmbeddings: Bool = false
+    ) throws -> Gemma4AssistantConfiguration {
+        let json = """
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": 512,
+            "use_ordered_embeddings": \(useOrderedEmbeddings),
+            "num_centroids": 32,
+            "centroid_intermediate_top_k": 4,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 2,
+                "head_dim": 64,
+                "global_head_dim": 128,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 4,
+                "sliding_window": 64,
+                "final_logit_softcapping": null,
+                "tie_word_embeddings": true,
+                "vocab_size": 1024,
+                "vocab_size_per_layer_input": 1024,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["sliding_attention", "sliding_attention",
+                                "sliding_attention", "full_attention"]
+            }
+        }
+        """
+        let data = Data(json.utf8)
+        return try JSONDecoder.json5().decode(Gemma4AssistantConfiguration.self, from: data)
+    }
+
+    // MARK: - Baselines & MTP runners (B=1)
+
+    /// Target-only greedy (same logic as Task 23 but inline so this suite is
+    /// self-contained).
+    private func runBaselineGreedy(
+        target: Gemma4TextModel, promptTokens: [Int32], maxTokens: Int
+    ) -> [Int] {
+        let cache = target.newCache(parameters: nil)
+        let prompt = MLXArray(promptTokens)[.newAxis, .ellipsis]
+        var logits = target(prompt, cache: cache)
+        var tok = logits[0..., -1, 0...].argMax(axis: -1)
+        eval(tok)
+        var out: [Int] = [Int(tok.item(Int32.self))]
+        for _ in 1 ..< maxTokens {
+            let input = tok[.newAxis, .ellipsis]
+            logits = target(input, cache: cache)
+            tok = logits[0..., -1, 0...].argMax(axis: -1)
+            eval(tok)
+            out.append(Int(tok.item(Int32.self)))
+        }
+        return out
+    }
+
+    private func runMTPGreedy(
+        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel,
+        promptTokens: [Int32], maxTokens: Int, blockSize: Int
+    ) async throws -> [Int] {
+        let prompt = MLXArray(promptTokens)[.newAxis, .ellipsis]
+        let cache = target.newCache(parameters: nil)
+        let prefillOut = target.forwardForMTP(prompt, cache: cache)
+        let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
+                                 .argMax(axis: -1).item(Int32.self))
+        let firstHidden = prefillOut.lastHidden[
+            0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
+        let stream = try runGemma4MTPRounds(
+            target: target, drafter: drafter,
+            targetCache: cache,
+            firstBonus: firstBonus, firstHidden: firstHidden,
+            firstSharedKV: prefillOut.capturedSharedKV,
+            maxTokens: maxTokens, blockSize: blockSize)
+        var out: [Int] = []
+        for await gen in stream {
+            if case .chunk(let s) = gen, let tok = Int(s) { out.append(tok) }
+        }
+        return out
+    }
+
+    // MARK: - Batched runner (B>1)
+
+    /// Batched prefill helper. Assumes uniform prompt length across rows.
+    /// The target's non-shared layers get BatchKVCache / BatchRotatingKVCache
+    /// so the B>1 round loop has caches that support .filterBatched / per-row
+    /// tail-zero.
+    private func batchedPrefill(
+        target: Gemma4TextModel, promptIds: [[Int32]]
+    ) -> (firstBonus: [Int], firstHidden: MLXArray,
+          firstSharedKV: Gemma4SharedKV, cache: [KVCache]) {
+        let B = promptIds.count
+        let L = promptIds[0].count
+        let tokens = MLXArray(promptIds.flatMap { $0 }, [B, L])
+        let firstKvShared = target.configuration.numHiddenLayers
+                          - target.configuration.numKvSharedLayers
+        let leftPadding = Array(repeating: 0, count: B)
+        var cache: [KVCache] = []
+        for i in 0 ..< firstKvShared {
+            let lt = target.configuration.layerTypes[i]
+            if lt == "full_attention" {
+                cache.append(BatchKVCache(leftPadding: leftPadding))
+            } else {
+                cache.append(BatchRotatingKVCache(
+                    maxSize: target.configuration.slidingWindow,
+                    leftPadding: leftPadding))
+            }
+        }
+        let out = target.forwardForMTP(tokens, cache: cache)
+        let lastLogits = out.logits[0..., -1, 0...]
+        let bonusArr = lastLogits.argMax(axis: -1).asArray(Int32.self)
+        let bonus = bonusArr.map { Int($0) }
+        let lastHidden = out.lastHidden[0..., -1 ..< out.lastHidden.dim(1), 0...]
+        return (bonus, lastHidden, out.capturedSharedKV, cache)
+    }
+
+    /// Collect per-row MTP output tokens from the batched round loop.
+    /// Returns [[Int]] where result[i] is row i's emitted token sequence.
+    private func runBatchedMTP(
+        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel,
+        promptIds: [[Int32]], maxTokens: Int, blockSize: Int
+    ) async throws -> [[Int]] {
+        let B = promptIds.count
+        let p = batchedPrefill(target: target, promptIds: promptIds)
+        let stream = try runGemma4MTPRoundsBatched(
+            target: target, drafter: drafter,
+            targetCache: p.cache,
+            firstBonus: p.firstBonus, firstHidden: p.firstHidden,
+            firstSharedKV: p.firstSharedKV,
+            maxTokens: maxTokens, blockSize: blockSize,
+            eosTokenIds: nil
+        )
+        var perRow: [[Int]] = Array(repeating: [], count: B)
+        for await step in stream {
+            for slot in step.slots {
+                if let tok = slot.token { perRow[slot.row].append(tok) }
+            }
+        }
+        return perRow
+    }
+
+    // MARK: - Tests
+
+    @Test(arguments: [
+        (blockSize: 2, promptLen: 8, maxTokens: 48),
+        (blockSize: 3, promptLen: 8, maxTokens: 48),
+        (blockSize: 4, promptLen: 8, maxTokens: 48),
+        (blockSize: 2, promptLen: 32, maxTokens: 64),
+        (blockSize: 3, promptLen: 32, maxTokens: 64),
+        (blockSize: 4, promptLen: 32, maxTokens: 64),
+    ])
+    func dense_drafter_parity_E4B(
+        config: (blockSize: Int, promptLen: Int, maxTokens: Int)
+    ) async throws {
+        // Seed MLX's global random state so model weight init is
+        // reproducible across runs.
+        MLXRandom.seed(
+            UInt64(config.blockSize) * 1000 + UInt64(config.promptLen) * 100 + UInt64(config.maxTokens))
+        let target = Gemma4TextModel(try e4bStyleTargetConfig())
+        let drafter = Gemma4AssistantDraftModel(config: try e4bStyleDrafterConfig())
+        eval(target, drafter)
+
+        // Deterministic seed keyed on the test config so failures reproduce.
+        var rng = SeededRNG(
+            seed: UInt64(config.blockSize) * 1000 + UInt64(config.promptLen) * 100 + UInt64(config.maxTokens))
+        let promptTokens: [Int32] = (0 ..< config.promptLen).map { _ in
+            Int32.random(in: 0 ..< 1024, using: &rng)
+        }
+
+        let baseline = runBaselineGreedy(
+            target: target, promptTokens: promptTokens, maxTokens: config.maxTokens)
+        let mtp = try await runMTPGreedy(
+            target: target, drafter: drafter,
+            promptTokens: promptTokens, maxTokens: config.maxTokens,
+            blockSize: config.blockSize)
+        #expect(
+            baseline == mtp,
+            """
+            E4B dense parity divergence
+              blockSize=\(config.blockSize)
+              promptLen=\(config.promptLen)
+              maxTokens=\(config.maxTokens)
+              prompt=\(promptTokens)
+              baseline=\(baseline)
+              mtp=\(mtp)
+            """
+        )
+    }
+
+    @Test(arguments: [
+        (blockSize: 2, promptLen: 8, maxTokens: 32),
+        (blockSize: 3, promptLen: 8, maxTokens: 32),
+        (blockSize: 4, promptLen: 8, maxTokens: 32),
+    ])
+    func centroid_drafter_parity_E4B(
+        config: (blockSize: Int, promptLen: Int, maxTokens: Int)
+    ) async throws {
+        // Seed MLX's global random state so model weight init is
+        // reproducible across runs.
+        MLXRandom.seed(
+            UInt64(config.blockSize) * 1000 + UInt64(config.promptLen) * 100 + UInt64(config.maxTokens))
+        let target = Gemma4TextModel(try e4bStyleTargetConfig())
+        let drafter = Gemma4AssistantDraftModel(
+            config: try e4bStyleDrafterConfig(useOrderedEmbeddings: true))
+        eval(target, drafter)
+
+        // Deterministic seed keyed on the test config so failures reproduce.
+        var rng = SeededRNG(
+            seed: UInt64(config.blockSize) * 1000 + UInt64(config.promptLen) * 100 + UInt64(config.maxTokens))
+        let promptTokens: [Int32] = (0 ..< config.promptLen).map { _ in
+            Int32.random(in: 0 ..< 1024, using: &rng)
+        }
+
+        let baseline = runBaselineGreedy(
+            target: target, promptTokens: promptTokens, maxTokens: config.maxTokens)
+        let mtp = try await runMTPGreedy(
+            target: target, drafter: drafter,
+            promptTokens: promptTokens, maxTokens: config.maxTokens,
+            blockSize: config.blockSize)
+        #expect(
+            baseline == mtp,
+            """
+            E4B centroid parity divergence
+              blockSize=\(config.blockSize)
+              promptLen=\(config.promptLen)
+              maxTokens=\(config.maxTokens)
+              prompt=\(promptTokens)
+              baseline=\(baseline)
+              mtp=\(mtp)
+            """
+        )
+    }
+
+    /// Batched parity: per-row MTP must equal that row's standalone baseline.
+    @Test(arguments: [
+        (blockSize: 2, B: 2, maxTokens: 32),
+        (blockSize: 3, B: 2, maxTokens: 32),
+        (blockSize: 4, B: 2, maxTokens: 32),
+        (blockSize: 3, B: 4, maxTokens: 24),
+    ])
+    func batched_parity_E4B(
+        config: (blockSize: Int, B: Int, maxTokens: Int)
+    ) async throws {
+        // Seed MLX's global random state so model weight init is
+        // reproducible across runs.
+        MLXRandom.seed(
+            UInt64(config.blockSize) * 1000 + UInt64(config.B) * 100 + UInt64(config.maxTokens))
+        // Construct B prompts of uniform length 8.
+        // Deterministic seed keyed on the test config so failures reproduce.
+        var rng = SeededRNG(
+            seed: UInt64(config.blockSize) * 1000 + UInt64(config.B) * 100 + UInt64(config.maxTokens))
+        let promptLen = 8
+        let promptIds: [[Int32]] = (0 ..< config.B).map { _ in
+            (0 ..< promptLen).map { _ in
+                Int32.random(in: 0 ..< 1024, using: &rng)
+            }
+        }
+
+        // Per-row baseline via the B=1 path — each row gets its own fresh
+        // target/drafter and cache.
+        var baselines: [[Int]] = []
+        for row in promptIds {
+            let target = Gemma4TextModel(try e4bStyleTargetConfig())
+            eval(target)
+            baselines.append(runBaselineGreedy(
+                target: target, promptTokens: row, maxTokens: config.maxTokens))
+        }
+
+        // Batched MTP run. NOTE: the target/drafter weights must be the
+        // same as the per-row baselines. To make this deterministic we
+        // seed every constructor with random init — but Swift MLX's
+        // random init uses a global RandomState. The simplest way to
+        // make baseline == mtp (weight-exactly) is to build ONE target,
+        // save its parameters, replay into each baseline-per-row target.
+        // That's brittle. Better: use a shared target/drafter for both
+        // baselines and the batched run.
+        //
+        // Rebuild: first construct shared target + drafter, run per-row
+        // baseline using the SAME target (re-using its weights, fresh
+        // cache per row), then run batched with the same target.
+
+        let target = Gemma4TextModel(try e4bStyleTargetConfig())
+        let drafter = Gemma4AssistantDraftModel(config: try e4bStyleDrafterConfig())
+        eval(target, drafter)
+
+        var sharedBaselines: [[Int]] = []
+        for row in promptIds {
+            sharedBaselines.append(runBaselineGreedy(
+                target: target, promptTokens: row, maxTokens: config.maxTokens))
+        }
+        let batched = try await runBatchedMTP(
+            target: target, drafter: drafter,
+            promptIds: promptIds,
+            maxTokens: config.maxTokens,
+            blockSize: config.blockSize)
+
+        #expect(sharedBaselines.count == batched.count)
+        for i in 0 ..< sharedBaselines.count {
+            #expect(
+                sharedBaselines[i] == batched[i],
+                """
+                E4B batched parity divergence at row \(i)
+                  blockSize=\(config.blockSize)
+                  B=\(config.B)
+                  maxTokens=\(config.maxTokens)
+                  baseline[\(i)]=\(sharedBaselines[i])
+                  batched[\(i)]=\(batched[i])
+                """
+            )
+        }
     }
 }
