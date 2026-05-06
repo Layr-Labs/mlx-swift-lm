@@ -64,9 +64,6 @@ public struct PrefixCacheConfig: Sendable {
 /// Divides token sequences into fixed-size blocks and reuses KV state across
 /// requests that share a common prompt prefix.
 ///
-/// When ``SSDCacheManager`` is configured, blocks evicted from GPU memory are
-/// spilled to SSD and transparently reloaded on the next hit.
-///
 /// ### Usage
 /// ```swift
 /// let prefixCache = PrefixCache(config: .init(), modelName: modelName)
@@ -84,7 +81,6 @@ public struct PrefixCacheConfig: Sendable {
 /// ```
 public final class PrefixCache: @unchecked Sendable {
     public let config: PrefixCacheConfig
-    public let ssdCache: SSDCacheManager?
     private let modelName: String
 
     // Blocks that are completely free (no data).
@@ -98,15 +94,9 @@ public final class PrefixCache: @unchecked Sendable {
     public private(set) var hits = 0
     public private(set) var misses = 0
     public private(set) var tokensSaved = 0
-    public private(set) var ssdHits = 0
 
-    public init(
-        config: PrefixCacheConfig = .init(),
-        ssdCache: SSDCacheManager? = nil,
-        modelName: String = ""
-    ) {
+    public init(config: PrefixCacheConfig = .init(), modelName: String = "") {
         self.config = config
-        self.ssdCache = ssdCache
         self.modelName = modelName
         self.freeBlocks = (0 ..< config.maxBlocks).map { CacheBlock(blockId: $0) }
     }
@@ -139,17 +129,9 @@ public final class PrefixCache: @unchecked Sendable {
             let chunk = Array(tokens[start ..< start + bs])
             let hash = computeBlockHash(parentHash: parentHash, tokenIds: chunk, modelName: modelName)
 
-            if let blockId = hashIndex[hash], let block = allocatedBlocks[blockId] {
-                let layerCaches: [KVCacheSimple]
-                if let data = block.cacheData {
-                    layerCaches = data
-                } else if let loaded = ssdCache?.loadBlock(hash: hash) {
-                    block.cacheData = loaded
-                    layerCaches = loaded
-                    ssdHits += 1
-                } else {
-                    break
-                }
+            if let blockId = hashIndex[hash], let block = allocatedBlocks[blockId],
+               let layerCaches = block.cacheData
+            {
                 block.refCount += 1
                 block.touch()
                 matchedPerBlock.append(layerCaches)
@@ -229,7 +211,6 @@ public final class PrefixCache: @unchecked Sendable {
             hashIndex[hash] = block.blockId
             allocatedBlocks[block.blockId] = block
 
-            ssdCache?.saveBlock(hash: hash, layerCaches: sliced, tokenCount: bs)
         }
     }
 
@@ -252,7 +233,6 @@ public final class PrefixCache: @unchecked Sendable {
             "hits": hits,
             "misses": misses,
             "tokens_saved": tokensSaved,
-            "ssd_hits": ssdHits,
             "cached_blocks": hashIndex.count,
             "free_blocks": freeBlocks.count,
         ]

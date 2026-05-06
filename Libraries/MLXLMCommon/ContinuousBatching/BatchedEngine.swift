@@ -39,9 +39,8 @@ public final class BatchedEngine: @unchecked Sendable {
         context: ModelContext,
         config: ContinuousBatchingConfig = ContinuousBatchingConfig()
     ) {
-        let ssdCache = config.ssdCacheConfig.map { SSDCacheManager(config: $0) }
         let prefixCache = config.prefixCacheConfig.map {
-            PrefixCache(config: $0, ssdCache: ssdCache, modelName: context.configuration.name)
+            PrefixCache(config: $0, modelName: context.configuration.name)
         }
         let scheduler = Scheduler(
             model: context.model,
@@ -85,79 +84,41 @@ public final class BatchedEngine: @unchecked Sendable {
     // MARK: - Non-streaming Generation
 
     /// Generate a complete response (non-streaming).
-    public func generate(
-        prompt: String,
-        maxTokens: Int = 256,
-        temperature: Float = 0.7,
-        topP: Float = 0.9,
-        topK: Int = 0,
-        minP: Float = 0.0
-    ) async throws -> String {
-        let result = try await core.generate(
-            prompt: prompt,
-            maxTokens: maxTokens,
-            temperature: temperature,
-            topP: topP,
-            topK: topK,
-            minP: minP
-        )
-        return result.outputText
+    public func generate(prompt: String, samplingParams: SamplingParams = SamplingParams()) async throws -> String {
+        try await generateWithResult(prompt: prompt, samplingParams: samplingParams).outputText
     }
 
     /// Generate with structured result (includes token counts).
-    public func generateWithResult(
-        prompt: String,
-        maxTokens: Int = 256,
-        temperature: Float = 0.7,
-        topP: Float = 0.9,
-        topK: Int = 0,
-        minP: Float = 0.0
-    ) async throws -> RequestOutput {
-        try await core.generate(
-            prompt: prompt,
-            maxTokens: maxTokens,
-            temperature: temperature,
-            topP: topP,
-            topK: topK,
-            minP: minP
-        )
+    public func generateWithResult(prompt: String, samplingParams: SamplingParams = SamplingParams()) async throws -> RequestOutput {
+        try await core.generate(prompt: prompt, samplingParams: samplingParams)
     }
 
     // MARK: - Streaming Generation
 
-    /// Stream generation token by token.
-    public func streamGenerate(
-        prompt: String,
-        maxTokens: Int = 256,
-        temperature: Float = 0.7,
-        topP: Float = 0.9
-    ) -> AsyncStream<String> {
+    /// Stream outputs (RequestOutput per step) with full SamplingParams control.
+    public func streamOutputs(prompt: String, samplingParams: SamplingParams = SamplingParams()) -> AsyncStream<RequestOutput> {
         let rid = UUID().uuidString
-        let request = Request(
-            requestId: rid,
-            prompt: prompt,
-            samplingParams: SamplingParams(
-                maxTokens: maxTokens,
-                temperature: temperature,
-                topP: topP
-            )
-        )
-
+        let request = Request(requestId: rid, prompt: prompt, samplingParams: samplingParams)
         return AsyncStream { continuation in
             Task {
                 let _ = await core.addRequest(request)
-
                 for await output in core.streamOutputs(requestId: rid) {
-                    if !output.newText.isEmpty {
-                        continuation.yield(output.newText)
-                    }
-
-                    if output.finished {
-                        continuation.finish()
-                        return
-                    }
+                    continuation.yield(output)
+                    if output.finished || output.error != nil { break }
                 }
+                continuation.finish()
+            }
+        }
+    }
 
+    /// Stream generation token by token (returns text chunks).
+    public func streamGenerate(prompt: String, samplingParams: SamplingParams = SamplingParams()) -> AsyncStream<String> {
+        AsyncStream { continuation in
+            Task {
+                for await output in streamOutputs(prompt: prompt, samplingParams: samplingParams) {
+                    if !output.newText.isEmpty { continuation.yield(output.newText) }
+                    if output.finished || output.error != nil { break }
+                }
                 continuation.finish()
             }
         }
@@ -178,52 +139,14 @@ public final class BatchedEngine: @unchecked Sendable {
     }
 
     /// Chat completion (non-streaming). Applies chat template.
-    public func chat(
-        messages: [[String: String]],
-        maxTokens: Int = 256,
-        temperature: Float = 0.7,
-        topP: Float = 0.9
-    ) async throws -> String {
-        let prompt: String
-        do {
-            let tokenIds = try tokenizer.applyChatTemplate(messages: messages)
-            prompt = tokenizer.decode(tokenIds: tokenIds)
-        } catch {
-            // Fallback: simple formatting
-            prompt = messages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
-                .joined(separator: "\n") + "\nassistant:"
-        }
-
-        return try await generate(
-            prompt: prompt,
-            maxTokens: maxTokens,
-            temperature: temperature,
-            topP: topP
-        )
+    public func chat(messages: [[String: String]], samplingParams: SamplingParams = SamplingParams()) async throws -> String {
+        let prompt = buildPrompt(messages: messages)
+        return try await generate(prompt: prompt, samplingParams: samplingParams)
     }
 
     /// Stream chat completion.
-    public func streamChat(
-        messages: [[String: String]],
-        maxTokens: Int = 256,
-        temperature: Float = 0.7,
-        topP: Float = 0.9
-    ) -> AsyncStream<String> {
-        let prompt: String
-        do {
-            let tokenIds = try tokenizer.applyChatTemplate(messages: messages)
-            prompt = tokenizer.decode(tokenIds: tokenIds)
-        } catch {
-            prompt = messages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
-                .joined(separator: "\n") + "\nassistant:"
-        }
-
-        return streamGenerate(
-            prompt: prompt,
-            maxTokens: maxTokens,
-            temperature: temperature,
-            topP: topP
-        )
+    public func streamChat(messages: [[String: String]], samplingParams: SamplingParams = SamplingParams()) -> AsyncStream<String> {
+        streamGenerate(prompt: buildPrompt(messages: messages), samplingParams: samplingParams)
     }
 
     // MARK: - Status

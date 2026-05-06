@@ -29,22 +29,16 @@ public struct ContinuousBatchingConfig: Sendable {
     /// Optional in-memory prefix cache configuration.
     /// Set to non-nil to enable block-level KV reuse across requests.
     public var prefixCacheConfig: PrefixCacheConfig?
-    /// Optional SSD cache configuration.
-    /// Requires `prefixCacheConfig` to also be set.
-    public var ssdCacheConfig: SSDCacheConfig?
-
     public init(
         schedulerConfig: SchedulerConfig = SchedulerConfig(),
         stepInterval: TimeInterval = 0.001,
         yieldInterval: Int = 5,
-        prefixCacheConfig: PrefixCacheConfig? = nil,
-        ssdCacheConfig: SSDCacheConfig? = nil
+        prefixCacheConfig: PrefixCacheConfig? = nil
     ) {
         self.schedulerConfig = schedulerConfig
         self.stepInterval = stepInterval
         self.yieldInterval = yieldInterval
         self.prefixCacheConfig = prefixCacheConfig
-        self.ssdCacheConfig = ssdCacheConfig
     }
 }
 
@@ -238,22 +232,12 @@ public final class EngineCore: @unchecked Sendable {
     /// the original `DispatchSemaphore.wait()` design.
     public func generate(
         prompt: String,
-        maxTokens: Int = 256,
-        temperature: Float = 0.7,
-        topP: Float = 0.9,
-        topK: Int = 0,
-        minP: Float = 0.0
+        samplingParams: SamplingParams
     ) async throws -> RequestOutput {
         let request = Request(
             requestId: UUID().uuidString,
             prompt: prompt,
-            samplingParams: SamplingParams(
-                maxTokens: maxTokens,
-                temperature: temperature,
-                topP: topP,
-                topK: topK,
-                minP: minP
-            )
+            samplingParams: samplingParams
         )
 
         let rid = await addRequest(request)
