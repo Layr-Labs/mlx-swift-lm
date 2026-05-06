@@ -322,4 +322,83 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             )
         }
     }
+
+    // MARK: - Loading
+
+    /// Load a Gemma 4 MTP drafter from a local directory containing
+    /// `config.json` and one or more `*.safetensors` files.
+    ///
+    /// - Parameter directory: local directory containing the drafter
+    ///   checkpoint (e.g. pre-downloaded via `huggingface-cli`).
+    /// - Returns: a ready-to-use drafter with weights loaded and evaluated.
+    /// - Throws: file I/O errors, JSON decoding errors, or
+    ///   `Gemma4MTPError.incompatibleDrafter` from `sanitize`.
+    public static func load(from directory: URL) async throws -> Gemma4AssistantDraftModel {
+        // Decode the drafter config.
+        let configURL = directory.appending(component: "config.json")
+        let configData = try Data(contentsOf: configURL)
+        let config = try JSONDecoder.json5().decode(
+            Gemma4AssistantConfiguration.self, from: configData)
+
+        // Construct the drafter (random init).
+        let drafter = Gemma4AssistantDraftModel(config: config)
+
+        // Collect all safetensors files in the directory.
+        var weights = [String: MLXArray]()
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: nil)
+        else {
+            throw NSError(
+                domain: "Gemma4AssistantDraftModel", code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Could not enumerate drafter directory: \(directory.path)"])
+        }
+        let urls = enumerator.allObjects.compactMap { $0 as? URL }
+        for url in urls where url.pathExtension == "safetensors" {
+            let (shardWeights, _) = try loadArraysAndMetadata(url: url)
+            for (k, v) in shardWeights {
+                weights[k] = v
+            }
+        }
+
+        // Run drafter sanitize (throws on unexpected K/V weights).
+        let sanitized = try drafter.sanitize(weights: weights)
+
+        // Apply weights.
+        let params = ModuleParameters.unflattened(sanitized)
+        try drafter.update(parameters: params, verify: [.all])
+        eval(drafter)
+
+        return drafter
+    }
+
+    /// Load a Gemma 4 MTP drafter from a remote model ID via a `Downloader`.
+    ///
+    /// Downloads `config.json` and `*.safetensors` files (tokenizer files are
+    /// skipped — drafters reuse the target's tokenizer at generation time).
+    ///
+    /// - Parameters:
+    ///   - downloader: any `Downloader` (e.g. `HubClient`).
+    ///   - id: the model identifier (e.g. `"mlx-community/gemma-4-E4B-it-assistant-bf16"`).
+    ///   - revision: the revision to download (defaults to the downloader's
+    ///     default, typically `"main"`).
+    ///   - useLatest: whether to bypass the downloader's cache.
+    ///   - progressHandler: optional progress callback.
+    /// - Returns: a ready-to-use drafter.
+    public static func load(
+        from downloader: any Downloader,
+        id: String,
+        revision: String? = nil,
+        useLatest: Bool = false,
+        progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
+    ) async throws -> Gemma4AssistantDraftModel {
+        let directory = try await downloader.download(
+            id: id,
+            revision: revision,
+            matching: ["*.safetensors", "config.json"],
+            useLatest: useLatest,
+            progressHandler: progressHandler
+        )
+        return try await load(from: directory)
+    }
 }
