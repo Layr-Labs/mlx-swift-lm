@@ -12,43 +12,43 @@ import MLXNN
 // MARK: - Configuration
 
 public struct Gemma4TextConfiguration: Codable, Sendable {
-    var modelType: String = "gemma4_text"
-    var hiddenSize: Int = 1536
+    public internal(set) var modelType: String = "gemma4_text"
+    public internal(set) var hiddenSize: Int = 1536
     public internal(set) var numHiddenLayers: Int = 35
-    var intermediateSize: Int = 6144
-    var numAttentionHeads: Int = 8
-    var headDim: Int = 256
-    var globalHeadDim: Int = 512
-    var globalPartialRotaryFactor: Float = 0.25
-    var rmsNormEps: Float = 1e-6
-    var vocabSize: Int = 262144
-    var vocabSizePerLayerInput: Int = 262144
-    var numKeyValueHeads: Int = 1
-    var numGlobalKeyValueHeads: Int?
-    var numKvSharedLayers: Int = 20
-    var hiddenSizePerLayerInput: Int = 256
-    var slidingWindow: Int = 512
-    var slidingWindowPattern: Int = 5
-    var maxPositionEmbeddings: Int = 131072
-    var attentionKeqV: Bool = false
-    var finalLogitSoftcapping: Float = 30.0
-    var useDoubleWideMlp: Bool = true
-    var layerTypes: [String] = []
-    var tieWordEmbeddings: Bool = true
+    public internal(set) var intermediateSize: Int = 6144
+    public internal(set) var numAttentionHeads: Int = 8
+    public internal(set) var headDim: Int = 256
+    public internal(set) var globalHeadDim: Int = 512
+    public internal(set) var globalPartialRotaryFactor: Float = 0.25
+    public internal(set) var rmsNormEps: Float = 1e-6
+    public internal(set) var vocabSize: Int = 262144
+    public internal(set) var vocabSizePerLayerInput: Int = 262144
+    public internal(set) var numKeyValueHeads: Int = 1
+    public internal(set) var numGlobalKeyValueHeads: Int?
+    public var numKvSharedLayers: Int = 20
+    public internal(set) var hiddenSizePerLayerInput: Int = 256
+    public internal(set) var slidingWindow: Int = 512
+    public internal(set) var slidingWindowPattern: Int = 5
+    public internal(set) var maxPositionEmbeddings: Int = 131072
+    public internal(set) var attentionKeqV: Bool = false
+    public internal(set) var finalLogitSoftcapping: Float = 30.0
+    public internal(set) var useDoubleWideMlp: Bool = true
+    public internal(set) var layerTypes: [String] = []
+    public internal(set) var tieWordEmbeddings: Bool = true
 
     // MoE (only set on the 26B-A4B variant; 2B/4B/31B are dense)
-    var enableMoeBlock: Bool = false
-    var numExperts: Int?
-    var topKExperts: Int?
-    var moeIntermediateSize: Int?
+    public internal(set) var enableMoeBlock: Bool = false
+    public internal(set) var numExperts: Int?
+    public internal(set) var topKExperts: Int?
+    public internal(set) var moeIntermediateSize: Int?
 
     // RoPE parameters (nested dict with full_attention/sliding_attention sub-configs)
-    var ropeParameters: [String: [String: StringOrNumber]]?
+    public internal(set) var ropeParameters: [String: [String: StringOrNumber]]?
 
     // Derived properties
-    var slidingRopeTheta: Float = 10000.0
-    var fullRopeTheta: Float = 1_000_000.0
-    var fullPartialRotaryFactor: Float = 1.0
+    public internal(set) var slidingRopeTheta: Float = 10000.0
+    public internal(set) var fullRopeTheta: Float = 1_000_000.0
+    public internal(set) var fullPartialRotaryFactor: Float = 1.0
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
