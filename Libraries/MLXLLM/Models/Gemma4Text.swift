@@ -337,8 +337,9 @@ public final class Gemma4SharedKVCapture: @unchecked Sendable {
 public struct Gemma4MTPForward: @unchecked Sendable {
     /// `[B, L, vocab]` — softcap applied.
     public let logits: MLXArray
-    /// `[B, L, hidden_size]` — trunk output after `model.norm`, before the
-    /// LM head.
+    /// `[B, L, hidden_size]` — last decoder-layer output BEFORE the final
+    /// `model.norm`. This matches HF's `hidden_states` capture point and is
+    /// what the MTP drafter's `pre_projection` was trained against.
     public let lastHidden: MLXArray
     /// Per-layer-type K/V from the last non-shared layers of the target.
     public let capturedSharedKV: Gemma4SharedKV
@@ -888,6 +889,29 @@ public class Gemma4TextModelInner: Module {
         cache: [KVCache]? = nil,
         capture: Gemma4SharedKVCapture? = nil
     ) -> MLXArray {
+        forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: false).postNorm
+    }
+
+    /// Variant that ALSO returns the pre-norm last-layer hidden state.
+    /// The MTP drafter's `pre_projection` was trained against the pre-norm
+    /// hidden (HF captures `hidden_states` at the decoder-layer boundary,
+    /// BEFORE `model.norm`); the LM head consumes the post-norm hidden.
+    /// The non-MTP path goes through `callAsFunction`.
+    public func callCapturingPreNorm(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        capture: Gemma4SharedKVCapture? = nil
+    ) -> (postNorm: MLXArray, preNorm: MLXArray) {
+        let r = forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: true)
+        return (r.postNorm, r.preNorm!)
+    }
+
+    private func forwardTrunk(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        capture: Gemma4SharedKVCapture?,
+        capturePreNorm: Bool
+    ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
         let inputEmbeddings = embedTokens(inputs)
         var h = inputEmbeddings * embedScale
 
@@ -980,7 +1004,8 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
-        return norm(h)
+        let postNorm = norm(h)
+        return (postNorm, capturePreNorm ? h : nil)
     }
 }
 
@@ -1051,11 +1076,12 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ tokens: MLXArray, cache: [KVCache]
     ) -> Gemma4MTPForward {
         let capture = Gemma4SharedKVCapture()
-        let hidden = model(tokens, cache: cache, capture: capture)
-        let logits = applyLMHead(hidden)
+        let (postNorm, preNorm) = model.callCapturingPreNorm(
+            tokens, cache: cache, capture: capture)
+        let logits = applyLMHead(postNorm)
         return Gemma4MTPForward(
             logits: logits,
-            lastHidden: hidden,
+            lastHidden: preNorm,
             capturedSharedKV: capture.snapshot()
         )
     }
