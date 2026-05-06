@@ -12,6 +12,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXRandom
 
 /// Single-batch (B=1) greedy MTP token iterator. Conforms to
 /// ``TokenIteratorProtocol`` so callers can use the existing
@@ -44,6 +45,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     private let drafter: Gemma4AssistantDraftModel
     private var cache: [KVCache]
     private let blockSize: Int
+    private let temperature: Float
+    private var rngKey: MLXArray
 
     // MTP state — mutated each round.
     private var bonus: Int
@@ -71,9 +74,18 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     ///     call (idempotent if already bound).
     ///   - cache: optional pre-allocated cache. If nil, allocated via
     ///     `target.newCache(parameters:)`.
-    ///   - parameters: generation parameters. Only `maxTokens` is read;
-    ///     temperature must be 0 (greedy only).
+    ///   - parameters: generation parameters. `maxTokens` and `temperature`
+    ///     are honored. At `temperature == 0` the iterator uses the greedy
+    ///     walker (exact match with baseline). At `temperature > 0` it
+    ///     uses rejection-based speculative sampling — emitted tokens are
+    ///     drawn from the target's distribution, and match the distribution
+    ///     that pure target sampling would produce at the same temperature.
+    ///     `topP`/`topK`/`minP` are not yet supported on the MTP path
+    ///     (greedy-only for those; raise temperature=0 if needed).
     ///   - blockSize: speculative block size (2–16). Default 4.
+    ///   - rngSeed: seed for rejection sampling (only used when
+    ///     `temperature > 0`). Default 0 which seeds from the current MLX
+    ///     random state.
     /// - Throws: `Gemma4MTPError.invalidBlockSize` / bind errors.
     public init(
         input: LMInput,
@@ -81,7 +93,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         drafter: Gemma4AssistantDraftModel,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        blockSize: Int = 4
+        blockSize: Int = 4,
+        rngSeed: UInt64 = 0
     ) throws {
         guard blockSize >= 2 && blockSize <= 16 else {
             throw Gemma4MTPError.invalidBlockSize(blockSize)
@@ -93,6 +106,10 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         self.cache = cache ?? target.newCache(parameters: parameters)
         self.blockSize = blockSize
         self.maxTokens = parameters.maxTokens
+        self.temperature = parameters.temperature
+        self.rngKey = rngSeed == 0
+            ? MLXRandom.key(UInt64(Date().timeIntervalSince1970 * 1e6))
+            : MLXRandom.key(rngSeed)
 
         // Prefill.
         let prefillStart = Date()
@@ -102,9 +119,26 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         }
         let prefillOut = target.forwardForMTP(promptTokens, cache: self.cache)
         let lastLogits = prefillOut.logits[0..., -1, 0...]
-        let firstBonusArr = lastLogits.argMax(axis: -1)
-        eval(firstBonusArr)
-        self.bonus = Int(firstBonusArr.item(Int32.self))
+        let firstBonus: Int
+        if parameters.temperature == 0 {
+            let firstBonusArr = lastLogits.asType(.float32).argMax(axis: -1)
+            eval(firstBonusArr)
+            firstBonus = Int(firstBonusArr.item(Int32.self))
+        } else {
+            // Sample the first bonus from the target's temperature-scaled
+            // softmax. Split the rng key so the round loop gets fresh keys
+            // each call.
+            let keys = MLXRandom.split(key: self.rngKey, into: 2)
+            let scaled = lastLogits.asType(.float32) / parameters.temperature
+            let probs = softmax(scaled, axis: -1)
+            let u = MLXRandom.uniform(low: Float(0), high: Float(1), key: keys[0])
+            let cdf = probs.cumsum(axis: -1)
+            let idx = (cdf .< u).sum(axis: -1).asType(.int32)
+            eval(idx)
+            firstBonus = Int(idx.item(Int32.self))
+            self.rngKey = keys[1]
+        }
+        self.bonus = firstBonus
         self.hidden = prefillOut.lastHidden[
             0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         self.sharedKV = prefillOut.capturedSharedKV
@@ -137,11 +171,17 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         let k = bs - 1
 
         // Draft k tokens, GPU-resident.
+        // At temperature > 0 we also need to retain per-step drafter
+        // logits so the walker can compute q(c_i) for rejection sampling.
         let driveOffset = cache[0].offset
         var tok = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
         var h = hidden
         var draftPerStep: [MLXArray] = []
+        var draftLogitsPerStep: [MLXArray] = []  // only populated when temperature > 0
         draftPerStep.reserveCapacity(k)
+        if temperature > 0 {
+            draftLogitsPerStep.reserveCapacity(k)
+        }
         for _ in 0 ..< k {
             let tokEmbed = target.embedTokensForDrafter(tok)
             let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
@@ -149,7 +189,21 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
                 inputsEmbeds: inputsEmbeds,
                 sharedKV: sharedKV,
                 positionOffset: .scalar(driveOffset))
-            let sampled = logits.squeezed(axis: 1).argMax(axis: -1)
+            let stepLogits = logits.squeezed(axis: 1)  // [1, vocab]
+            let sampled: MLXArray
+            if temperature > 0 {
+                draftLogitsPerStep.append(stepLogits)
+                let keys = MLXRandom.split(key: rngKey, into: 2)
+                rngKey = keys[0]
+                let probs = softmax(
+                    stepLogits.asType(.float32) / temperature, axis: -1)
+                let u = MLXRandom.uniform(
+                    low: Float(0), high: Float(1), key: keys[1])
+                let cdf = probs.cumsum(axis: -1)
+                sampled = (cdf .< u).sum(axis: -1).asType(.int32)
+            } else {
+                sampled = stepLogits.argMax(axis: -1)
+            }
             let sampled2d = sampled[.newAxis, .ellipsis]
             draftPerStep.append(sampled2d)
             tok = sampled2d
@@ -175,12 +229,32 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         let draftTokens = draftConcat.squeezed(axis: 0).asArray(Int32.self)
                                      .map { Int($0) }
 
-        // Walk.
-        var accepted = 0
-        while accepted < k && draftTokens[accepted] == mainInts[accepted] {
-            accepted += 1
+        // Walk: greedy or rejection-based depending on temperature.
+        let accepted: Int
+        let newTokens: [Int]
+        if temperature > 0 && k > 0 {
+            // Gather verify logits at positions 0..k (bs=k+1 positions).
+            let verifyLogits = verifyOut.logits.squeezed(axis: 0)  // [bs, vocab]
+            // Stack drafter logits into [k, vocab].
+            let draftLogits = concatenated(draftLogitsPerStep, axis: 0)
+            let keys = MLXRandom.split(key: rngKey, into: 2)
+            rngKey = keys[0]
+            let result = speculativeSampleRound(
+                draftLogits: draftLogits,
+                draftTokens: draftTokens,
+                verifyLogits: verifyLogits,
+                temperature: temperature,
+                rngKey: keys[1])
+            accepted = result.accepted
+            newTokens = result.emitted
+        } else {
+            var a = 0
+            while a < k && draftTokens[a] == mainInts[a] {
+                a += 1
+            }
+            accepted = a
+            newTokens = Array(mainInts[0 ..< a + 1])
         }
-        let newTokens = Array(mainInts[0 ..< accepted + 1])
 
         // Rewind.
         if accepted < k {
