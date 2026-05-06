@@ -636,3 +636,203 @@ struct Gemma4E4BMTPParityTests {
         }
     }
 }
+
+/// 26B-A4B-shaped parity. Exercises the MoE (`enable_moe_block: true`)
+/// path in the TARGET. Drafter is always dense (4 layers, no MoE) — only
+/// the target uses MoE routing. Validates that the shared-KV capture
+/// hook, `forwardForMTP`, and round loop all handle MoE decoder layers
+/// correctly.
+///
+/// Shape is scaled down from the real 26B-A4B config (which has
+/// hidden=2304, 32 layers, 24 kv-shared, 128 experts top-2) to keep tests
+/// fast. Key architectural invariants preserved: `enable_moe_block=true`,
+/// `num_experts > top_k_experts`, `moe_intermediate_size != intermediate_size`.
+@Suite("Gemma4 MTP parity — 26B-A4B MoE target")
+struct Gemma4MoEMTPParityTests {
+
+    private struct SeededRNG: RandomNumberGenerator {
+        var state: UInt64
+        init(seed: UInt64) { self.state = seed == 0 ? 0xDEADBEEF : seed }
+        mutating func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    /// 26B-A4B-shaped target with MoE enabled. 12 layers (6 kv-shared), 8
+    /// experts top-2 — matches the real 26B-A4B's architectural pattern
+    /// at a testable scale.
+    private func moeTargetConfig() throws -> Gemma4TextConfiguration {
+        let json = """
+        {
+            "model_type": "gemma4_text",
+            "hidden_size": 256,
+            "num_hidden_layers": 12,
+            "intermediate_size": 512,
+            "num_attention_heads": 4,
+            "head_dim": 64,
+            "global_head_dim": 128,
+            "num_key_value_heads": 1,
+            "num_kv_shared_layers": 6,
+            "sliding_window": 128,
+            "sliding_window_pattern": 5,
+            "final_logit_softcapping": 30.0,
+            "tie_word_embeddings": true,
+            "vocab_size": 1024,
+            "vocab_size_per_layer_input": 1024,
+            "rms_norm_eps": 1e-6,
+            "hidden_size_per_layer_input": 0,
+            "enable_moe_block": true,
+            "num_experts": 8,
+            "top_k_experts": 2,
+            "moe_intermediate_size": 256
+        }
+        """
+        let data = Data(json.utf8)
+        return try JSONDecoder.json5().decode(Gemma4TextConfiguration.self, from: data)
+    }
+
+    /// Drafter matching the 26B-A4B-shape target (backbone_hidden_size=256).
+    /// Drafter itself is dense (no MoE); the real 26B-A4B drafter uses a
+    /// tied LM head and no centroid routing.
+    ///
+    /// Attention head dims MUST match the target (head_dim=64,
+    /// global_head_dim=128) because the drafter reads target K/V directly —
+    /// `scaled_dot_product_attention` requires matching last-axis size
+    /// between query and keys.
+    private func moeDrafterConfig() throws -> Gemma4AssistantConfiguration {
+        let json = """
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": 256,
+            "use_ordered_embeddings": false,
+            "num_centroids": 32,
+            "centroid_intermediate_top_k": 4,
+            "tie_word_embeddings": true,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 2,
+                "head_dim": 64,
+                "global_head_dim": 128,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 4,
+                "sliding_window": 64,
+                "final_logit_softcapping": null,
+                "tie_word_embeddings": true,
+                "vocab_size": 1024,
+                "vocab_size_per_layer_input": 1024,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["sliding_attention", "sliding_attention",
+                                "sliding_attention", "full_attention"]
+            }
+        }
+        """
+        let data = Data(json.utf8)
+        return try JSONDecoder.json5().decode(Gemma4AssistantConfiguration.self, from: data)
+    }
+
+    // MARK: - Baseline + MTP runners
+
+    private func runBaselineGreedy(
+        target: Gemma4TextModel, promptTokens: [Int32], maxTokens: Int
+    ) -> [Int] {
+        let cache = target.newCache(parameters: nil)
+        let prompt = MLXArray(promptTokens)[.newAxis, .ellipsis]
+        var logits = target(prompt, cache: cache)
+        var tok = logits[0..., -1, 0...].argMax(axis: -1)
+        eval(tok)
+        var out: [Int] = [Int(tok.item(Int32.self))]
+        for _ in 1 ..< maxTokens {
+            let input = tok[.newAxis, .ellipsis]
+            logits = target(input, cache: cache)
+            tok = logits[0..., -1, 0...].argMax(axis: -1)
+            eval(tok)
+            out.append(Int(tok.item(Int32.self)))
+        }
+        return out
+    }
+
+    private func runMTPGreedy(
+        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel,
+        promptTokens: [Int32], maxTokens: Int, blockSize: Int
+    ) async throws -> [Int] {
+        let prompt = MLXArray(promptTokens)[.newAxis, .ellipsis]
+        let cache = target.newCache(parameters: nil)
+        let prefillOut = target.forwardForMTP(prompt, cache: cache)
+        let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
+                                 .argMax(axis: -1).item(Int32.self))
+        let firstHidden = prefillOut.lastHidden[
+            0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
+        let stream = try runGemma4MTPRounds(
+            target: target, drafter: drafter,
+            targetCache: cache,
+            firstBonus: firstBonus, firstHidden: firstHidden,
+            firstSharedKV: prefillOut.capturedSharedKV,
+            maxTokens: maxTokens, blockSize: blockSize)
+        var out: [Int] = []
+        for await gen in stream {
+            if case .chunk(let s) = gen, let tok = Int(s) { out.append(tok) }
+        }
+        return out
+    }
+
+    // MARK: - Tests
+
+    /// MoE-target parity: MTP output must equal baseline across block sizes.
+    /// `maxTokens` kept modest to avoid the degenerate-logit tail (bf16
+    /// near-uniform argmax flips, same class as Python oracle divergence).
+    @Test(arguments: [
+        (blockSize: 2, promptLen: 8, maxTokens: 20),
+        (blockSize: 3, promptLen: 8, maxTokens: 20),
+        (blockSize: 4, promptLen: 8, maxTokens: 20),
+        (blockSize: 3, promptLen: 16, maxTokens: 16),
+    ])
+    func moe_target_parity(
+        config: (blockSize: Int, promptLen: Int, maxTokens: Int)
+    ) async throws {
+        MLXRandom.seed(
+            UInt64(config.blockSize) * 1000
+                + UInt64(config.promptLen) * 100
+                + UInt64(config.maxTokens))
+
+        let target = Gemma4TextModel(try moeTargetConfig())
+        let drafter = Gemma4AssistantDraftModel(config: try moeDrafterConfig())
+        eval(target, drafter)
+
+        var rng = SeededRNG(
+            seed: UInt64(config.blockSize) * 1000
+                + UInt64(config.promptLen) * 100
+                + UInt64(config.maxTokens))
+        let promptTokens: [Int32] = (0 ..< config.promptLen).map { _ in
+            Int32.random(in: 0 ..< 1024, using: &rng)
+        }
+
+        let baseline = runBaselineGreedy(
+            target: target, promptTokens: promptTokens, maxTokens: config.maxTokens)
+        let mtp = try await runMTPGreedy(
+            target: target, drafter: drafter,
+            promptTokens: promptTokens, maxTokens: config.maxTokens,
+            blockSize: config.blockSize)
+
+        #expect(
+            baseline == mtp,
+            """
+            MoE-target parity divergence
+              blockSize=\(config.blockSize)
+              promptLen=\(config.promptLen)
+              maxTokens=\(config.maxTokens)
+              prompt=\(promptTokens)
+              baseline=\(baseline)
+              mtp=\(mtp)
+            """
+        )
+    }
+}
