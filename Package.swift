@@ -34,6 +34,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXSpeculative",
+            targets: ["MLXSpeculative"]),
     ],
     dependencies: [
         .package(path: "../mlx-swift"),
@@ -98,6 +101,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXSpeculative",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Libraries/BenchmarkHelpers"
@@ -114,6 +118,19 @@ let package = Package(
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
         ),
+        .target(
+            name: "MLXSpeculative",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXSpeculative",
+            exclude: [
+                "README.md"
+            ]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -124,6 +141,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXSpeculative",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
