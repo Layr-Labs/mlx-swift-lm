@@ -131,27 +131,22 @@ public func measureMTPThroughput(
         blockSize: blockSize
     )
     var generated = 0
-    var lastRoundSize = 1
-    var accepts: [Int] = []
     for await gen in stream {
         if case .chunk = gen {
             generated += 1
-            lastRoundSize += 1
-            if lastRoundSize >= blockSize {
-                accepts.append(lastRoundSize - 1)
-                lastRoundSize = 0
-            }
         }
-    }
-    if lastRoundSize > 0 {
-        accepts.append(lastRoundSize - 1)
     }
     let genElapsed = Date().timeIntervalSince(genStart)
 
+    // NOTE: per-round accept histogram is not currently reconstructible
+    // from the token stream alone (rounds aren't delimited in the
+    // AsyncStream<Generation> surface). Callers that need this should
+    // drive `runGemma4MTPRounds` directly and track it from the round
+    // loop. Left nil here to avoid misleading numbers.
     return Gemma4MTPBenchmarkResult(
         generatedTokens: generated,
         prefillSeconds: prefillElapsed,
         generationSeconds: genElapsed,
-        acceptLengths: accepts
+        acceptLengths: nil
     )
 }
