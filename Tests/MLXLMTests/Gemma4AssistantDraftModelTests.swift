@@ -288,3 +288,130 @@ struct Gemma4AssistantDraftModelForwardTests {
         #expect(absMax.isFinite)
     }
 }
+
+@Suite("Gemma4AssistantDraftModel sanitize")
+struct Gemma4AssistantDraftModelSanitizeTests {
+
+    private func drafterConfig(
+        tieWordEmbeddings: Bool = true
+    ) throws -> Gemma4AssistantConfiguration {
+        let json = """
+        {
+            "model_type": "gemma4_assistant",
+            "backbone_hidden_size": 64,
+            "use_ordered_embeddings": true,
+            "num_centroids": 8,
+            "centroid_intermediate_top_k": 2,
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 32,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 4,
+                "sliding_window": 64,
+                "tie_word_embeddings": \(tieWordEmbeddings),
+                "vocab_size": 64,
+                "vocab_size_per_layer_input": 64,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "layer_types": ["sliding_attention", "sliding_attention",
+                                "sliding_attention", "full_attention"]
+            }
+        }
+        """
+        let data = Data(json.utf8)
+        return try JSONDecoder.json5().decode(
+            Gemma4AssistantConfiguration.self, from: data)
+    }
+
+    @Test func castsTokenOrderingToInt32() throws {
+        let cfg = try drafterConfig()
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        let int64Ordering = MLXArray([Int64(0), 1, 2, 3, 4, 5, 6, 7,
+                                      8, 9, 10, 11, 12, 13, 14, 15,
+                                      16, 17, 18, 19, 20, 21, 22, 23,
+                                      24, 25, 26, 27, 28, 29, 30, 31,
+                                      32, 33, 34, 35, 36, 37, 38, 39,
+                                      40, 41, 42, 43, 44, 45, 46, 47,
+                                      48, 49, 50, 51, 52, 53, 54, 55,
+                                      56, 57, 58, 59, 60, 61, 62, 63])
+        var weights: [String: MLXArray] = [
+            "masked_embedding.token_ordering": int64Ordering,
+        ]
+        weights = try drafter.sanitize(weights: weights)
+        let cast = weights["masked_embedding.token_ordering"]
+        #expect(cast != nil)
+        #expect(cast!.dtype == .int32)
+    }
+
+    @Test func dropsLmHeadWhenTied() throws {
+        let cfg = try drafterConfig(tieWordEmbeddings: true)
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        let lmHead = MLXArray.zeros([64, 64], dtype: .float32)
+        let preProj = MLXArray.zeros([64, 128], dtype: .float32)
+        var weights: [String: MLXArray] = [
+            "lm_head.weight": lmHead,
+            "pre_projection.weight": preProj,
+        ]
+        weights = try drafter.sanitize(weights: weights)
+        #expect(weights["lm_head.weight"] == nil)         // dropped
+        #expect(weights["pre_projection.weight"] != nil)  // kept
+    }
+
+    @Test func keepsLmHeadWhenUntied() throws {
+        let cfg = try drafterConfig(tieWordEmbeddings: false)
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        let lmHead = MLXArray.zeros([64, 64], dtype: .float32)
+        var weights: [String: MLXArray] = [
+            "lm_head.weight": lmHead,
+        ]
+        weights = try drafter.sanitize(weights: weights)
+        #expect(weights["lm_head.weight"] != nil)
+    }
+
+    @Test func failsLoudOnUnexpectedKProj() throws {
+        let cfg = try drafterConfig()
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        let kProj = MLXArray.zeros([64, 64], dtype: .float32)
+        let weights: [String: MLXArray] = [
+            "model.layers.0.self_attn.k_proj.weight": kProj,
+        ]
+        #expect(throws: (any Error).self) {
+            _ = try drafter.sanitize(weights: weights)
+        }
+    }
+
+    @Test func failsLoudOnUnexpectedVProj() throws {
+        let cfg = try drafterConfig()
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        let vProj = MLXArray.zeros([64, 64], dtype: .float32)
+        let weights: [String: MLXArray] = [
+            "model.layers.2.self_attn.v_proj.weight": vProj,
+        ]
+        #expect(throws: (any Error).self) {
+            _ = try drafter.sanitize(weights: weights)
+        }
+    }
+
+    @Test func preservesOtherWeights() throws {
+        let cfg = try drafterConfig()
+        let drafter = Gemma4AssistantDraftModel(config: cfg)
+        let qProj = MLXArray.zeros([64, 64], dtype: .float32)
+        let preProj = MLXArray.zeros([64, 128], dtype: .float32)
+        let postProj = MLXArray.zeros([64, 64], dtype: .float32)
+        let embed = MLXArray.zeros([64, 64], dtype: .float32)
+        let weights: [String: MLXArray] = [
+            "model.layers.0.self_attn.q_proj.weight": qProj,
+            "pre_projection.weight": preProj,
+            "post_projection.weight": postProj,
+            "model.embed_tokens.weight": embed,
+        ]
+        let out = try drafter.sanitize(weights: weights)
+        #expect(out.count == 4)  // all four kept
+    }
+}
