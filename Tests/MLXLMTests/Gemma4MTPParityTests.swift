@@ -555,9 +555,9 @@ struct Gemma4E4BMTPParityTests {
     /// regime B=2 batched vs B=1 non-batched argmax can flip due to bf16
     /// precision differences in batched scaled-dot-product attention. This
     /// is the same class of divergence the Python mlx-vlm MTP reference
-    /// exhibits at temp=0 (see `docs/superpowers/notes/2026-05-06-python-mtp-
-    /// greedy-divergence.md`) and is not a correctness bug in the drafter
-    /// itself — both sequences are valid greedy continuations.
+    /// exhibits at temp=0 (8/20 of our chat-templated prompts diverge)
+    /// and is not a correctness bug in the drafter itself — both sequences
+    /// are valid greedy continuations.
     @Test(arguments: [
         (blockSize: 2, B: 2, maxTokens: 20),
         (blockSize: 3, B: 2, maxTokens: 24),
