@@ -80,31 +80,3 @@ let session = ChatSession(model)
 print(try await session.respond(to: "What are two things to see in San Francisco?"))
 print(try await session.respond(to: "How about a great place to eat?"))
 ```
-
-## Gemma 4 MTP Benchmarks
-
-Gemma 4 Multi-Token Prediction speculative decoding performance depends on
-hardware, output length, batch size, model family, and draft block size. The
-following run uses longer generations than short smoke benchmarks:
-
-- Hardware: Apple M5 Max, 128 GB unified memory
-- Batch size: 1
-- Decoding: greedy, `temperature = 0`
-- Prompts: 3 local prompt fixtures
-- Output budget: `max_tokens = 512`
-- Warmup: `64` generated tokens
-- Throughput: generated-token throughput, excluding prompt prefill
-
-| Model | Draft block size | Baseline tok/s | MTP tok/s | Speedup |
-| --- | ---: | ---: | ---: | ---: |
-| Gemma 4 E2B BF16 | 3 | 89.5 | 114.3 | 1.28x |
-| Gemma 4 E2B BF16 | 4 | 89.5 | 132.3 | 1.48x |
-| Gemma 4 E2B BF16 | 5 | 89.9 | 144.2 | 1.60x |
-| Gemma 4 E4B BF16 | 3 | 46.9 | 43.5 | 0.93x |
-| Gemma 4 E4B BF16 | 4 | 46.9 | 44.3 | 0.94x |
-| Gemma 4 26B-A4B 4-bit | 3 | 109.6 | 122.4 | 1.12x |
-| Gemma 4 26B-A4B 4-bit | 4 | 109.6 | 118.6 | 1.08x |
-
-These numbers are single-machine measurements and can move with system load.
-In this run, longer outputs amortize the MTP overhead for E2B and 26B-A4B. E4B
-BF16 remains slightly below baseline for B=1 on this hardware.
