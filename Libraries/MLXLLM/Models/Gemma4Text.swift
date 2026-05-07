@@ -12,43 +12,43 @@ import MLXNN
 // MARK: - Configuration
 
 public struct Gemma4TextConfiguration: Codable, Sendable {
-    var modelType: String = "gemma4_text"
-    var hiddenSize: Int = 1536
-    var numHiddenLayers: Int = 35
-    var intermediateSize: Int = 6144
-    var numAttentionHeads: Int = 8
-    var headDim: Int = 256
-    var globalHeadDim: Int = 512
-    var globalPartialRotaryFactor: Float = 0.25
-    var rmsNormEps: Float = 1e-6
-    var vocabSize: Int = 262144
-    var vocabSizePerLayerInput: Int = 262144
-    var numKeyValueHeads: Int = 1
-    var numGlobalKeyValueHeads: Int?
-    var numKvSharedLayers: Int = 20
-    var hiddenSizePerLayerInput: Int = 256
-    var slidingWindow: Int = 512
-    var slidingWindowPattern: Int = 5
-    var maxPositionEmbeddings: Int = 131072
-    var attentionKeqV: Bool = false
-    var finalLogitSoftcapping: Float = 30.0
-    var useDoubleWideMlp: Bool = true
-    var layerTypes: [String] = []
-    var tieWordEmbeddings: Bool = true
+    public internal(set) var modelType: String = "gemma4_text"
+    public internal(set) var hiddenSize: Int = 1536
+    public internal(set) var numHiddenLayers: Int = 35
+    public internal(set) var intermediateSize: Int = 6144
+    public internal(set) var numAttentionHeads: Int = 8
+    public internal(set) var headDim: Int = 256
+    public internal(set) var globalHeadDim: Int = 512
+    public internal(set) var globalPartialRotaryFactor: Float = 0.25
+    public internal(set) var rmsNormEps: Float = 1e-6
+    public internal(set) var vocabSize: Int = 262144
+    public internal(set) var vocabSizePerLayerInput: Int = 262144
+    public internal(set) var numKeyValueHeads: Int = 1
+    public internal(set) var numGlobalKeyValueHeads: Int?
+    public var numKvSharedLayers: Int = 20
+    public internal(set) var hiddenSizePerLayerInput: Int = 256
+    public internal(set) var slidingWindow: Int = 512
+    public internal(set) var slidingWindowPattern: Int = 5
+    public internal(set) var maxPositionEmbeddings: Int = 131072
+    public internal(set) var attentionKeqV: Bool = false
+    public internal(set) var finalLogitSoftcapping: Float = 30.0
+    public internal(set) var useDoubleWideMlp: Bool = true
+    public internal(set) var layerTypes: [String] = []
+    public internal(set) var tieWordEmbeddings: Bool = true
 
     // MoE (only set on the 26B-A4B variant; 2B/4B/31B are dense)
-    var enableMoeBlock: Bool = false
-    var numExperts: Int?
-    var topKExperts: Int?
-    var moeIntermediateSize: Int?
+    public internal(set) var enableMoeBlock: Bool = false
+    public internal(set) var numExperts: Int?
+    public internal(set) var topKExperts: Int?
+    public internal(set) var moeIntermediateSize: Int?
 
     // RoPE parameters (nested dict with full_attention/sliding_attention sub-configs)
-    var ropeParameters: [String: [String: StringOrNumber]]?
+    public internal(set) var ropeParameters: [String: [String: StringOrNumber]]?
 
     // Derived properties
-    var slidingRopeTheta: Float = 10000.0
-    var fullRopeTheta: Float = 1_000_000.0
-    var fullPartialRotaryFactor: Float = 1.0
+    public internal(set) var slidingRopeTheta: Float = 10000.0
+    public internal(set) var fullRopeTheta: Float = 1_000_000.0
+    public internal(set) var fullPartialRotaryFactor: Float = 1.0
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -163,6 +163,34 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     }
 }
 
+extension Gemma4TextConfiguration {
+
+    /// Whether a layer uses shared K/V (consuming from an earlier layer rather than projecting).
+    ///
+    /// True when either `forceSharedKV` is set (drafter models where every layer
+    /// borrows K/V from the target), or `numKvSharedLayers > 0` and the layer index
+    /// falls within the trailing shared block.
+    public func layerUsesSharedKV(layerIdx: Int, forceSharedKV: Bool = false) -> Bool {
+        if forceSharedKV { return true }
+        guard numKvSharedLayers > 0 else { return false }
+        let firstShared = numHiddenLayers - numKvSharedLayers
+        return layerIdx >= firstShared
+    }
+}
+
+// MARK: - Position offset
+
+/// Public namespace for Gemma 4 types that need cross-module visibility.
+public enum Gemma4 {
+
+    /// Position offset for RoPE: a single scalar (standard decode) or per-row
+    /// MLXArray (continuous-batching / drafter paths).
+    public enum PositionOffset: @unchecked Sendable {
+        case scalar(Int)
+        case batch(MLXArray)
+    }
+}
+
 // MARK: - Helper Modules
 
 private class RMSNormNoScale: Module {
@@ -193,24 +221,20 @@ private class ScaledLinear: Module {
     }
 }
 
-private enum Gemma4PositionOffset {
-    case scalar(Int)
-    case batch(MLXArray)
-}
-
-private func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4PositionOffset {
+@inline(__always)
+func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let batchCache = cache as? BatchPositionedKVCache {
-        // Snapshot the per-sequence offsets before cache.update(...) advances them.
         .batch(batchCache.batchOffset + 0)
     } else {
         .scalar(cache?.offset ?? 0)
     }
 }
 
-private func gemma4ApplyRotaryPosition<R: RoPELayer>(
+@inline(__always)
+func gemma4ApplyRotaryPosition<R: RoPELayer>(
     _ rope: R,
     to x: MLXArray,
-    offset: Gemma4PositionOffset
+    offset: Gemma4.PositionOffset
 ) -> MLXArray {
     switch offset {
     case .scalar(let value):
@@ -245,13 +269,13 @@ private class Gemma4Attention: Module {
 
     @ModuleInfo var rope: RoPELayer
 
-    init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
+    init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
         self.layerIdx = layerIdx
         self.layerType = config.layerTypes[layerIdx]
         self.isSliding = layerType == "sliding_attention"
-        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
-        self.usesSharedKV = layerIdx >= firstKvSharedLayerIdx && firstKvSharedLayerIdx > 0
+        self.usesSharedKV = config.layerUsesSharedKV(
+            layerIdx: layerIdx, forceSharedKV: forceSharedKV)
 
         // Full attention uses globalHeadDim, sliding uses headDim
         self.effectiveHeadDim =
@@ -306,8 +330,8 @@ private class Gemma4Attention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
-        positionOffset: Gemma4PositionOffset? = nil
-    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4PositionOffset) {
+        positionOffset: Gemma4.PositionOffset? = nil
+    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
@@ -331,10 +355,7 @@ private class Gemma4Attention: Module {
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
 
-            // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B):
-            // values reuses the raw key projection (pre-norm), then goes
-            // through its own `vNorm` and transpose to land in the same
-            // `[B, n_kv_heads, L, D]` layout as keys.
+            // K-eq-V: values reuses the raw key projection (pre-norm).
             var v: MLXArray
             if let vProj {
                 v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
@@ -382,9 +403,6 @@ private class Gemma4Attention: Module {
 
 // MARK: - MoE (26B-A4B)
 
-/// Expert router. Norms `x` with a learnable scale, projects to expert
-/// scores, and returns top-K (indices, weights) where weights are
-/// softmax-normalized and scaled by a per-expert scalar.
 private class Gemma4Router: Module {
     @ModuleInfo(key: "proj") var proj: Linear
     @ModuleInfo(key: "scale") var scale: MLXArray
@@ -426,7 +444,6 @@ private class Gemma4Router: Module {
     }
 }
 
-/// Sparse MoE feed-forward block. Wraps `SwitchGLU` with GeGLU activation.
 private class Gemma4Experts: Module {
     @ModuleInfo(key: "switch_glu") var switchGLU: SwitchGLU
 
@@ -461,8 +478,7 @@ private class Gemma4MLP: Module {
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
-        let firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
-        let isKvSharedLayer = layerIdx >= firstKvSharedLayerIdx && firstKvSharedLayerIdx > 0
+        let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
         let useDoubleWide = config.useDoubleWideMlp && isKvSharedLayer
         let intermediateSize = config.intermediateSize * (useDoubleWide ? 2 : 1)
 
@@ -480,22 +496,24 @@ private class Gemma4MLP: Module {
 
 // MARK: - Decoder Layer
 
-private class Gemma4DecoderLayer: Module {
+/// Gemma 4 decoder layer. Public so the Gemma 4 MTP drafter can build its
+/// own 4-layer kv-shared trunk via `Gemma4TextModelInner(forceSharedKV: true)`.
+public class Gemma4DecoderLayer: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
     let layerType: String
     let hiddenSizePerLayerInput: Int
 
-    @ModuleInfo(key: "self_attn") var selfAttn: Gemma4Attention
-    @ModuleInfo var mlp: Gemma4MLP
+    @ModuleInfo(key: "self_attn") fileprivate var selfAttn: Gemma4Attention
+    @ModuleInfo fileprivate var mlp: Gemma4MLP
     @ModuleInfo(key: "input_layernorm") var inputLayernorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayernorm: RMSNorm
     @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayernorm: RMSNorm
     @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayernorm: RMSNorm
 
     // MoE-only modules (26B-A4B); nil on dense variants.
-    @ModuleInfo(key: "router") var router: Gemma4Router?
-    @ModuleInfo(key: "experts") var experts: Gemma4Experts?
+    @ModuleInfo(key: "router") fileprivate var router: Gemma4Router?
+    @ModuleInfo(key: "experts") fileprivate var experts: Gemma4Experts?
     @ModuleInfo(key: "post_feedforward_layernorm_1") var postFeedforwardLayernorm1: RMSNorm?
     @ModuleInfo(key: "pre_feedforward_layernorm_2") var preFeedforwardLayernorm2: RMSNorm?
     @ModuleInfo(key: "post_feedforward_layernorm_2") var postFeedforwardLayernorm2: RMSNorm?
@@ -510,14 +528,15 @@ private class Gemma4DecoderLayer: Module {
 
     let isMoE: Bool
 
-    init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
+    public init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
         self.layerIdx = layerIdx
         self.layerType = config.layerTypes[layerIdx]
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
         self.isMoE = config.enableMoeBlock
 
-        self._selfAttn.wrappedValue = Gemma4Attention(config, layerIdx: layerIdx)
+        self._selfAttn.wrappedValue = Gemma4Attention(
+            config, layerIdx: layerIdx, forceSharedKV: forceSharedKV)
         self._mlp.wrappedValue = Gemma4MLP(config, layerIdx: layerIdx)
 
         self._inputLayernorm.wrappedValue = RMSNorm(
@@ -554,14 +573,14 @@ private class Gemma4DecoderLayer: Module {
         super.init()
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
-        positionOffset: Gemma4PositionOffset? = nil
-    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4PositionOffset) {
+        positionOffset: Gemma4.PositionOffset? = nil
+    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let residual = x
 
         let h = inputLayernorm(x)
@@ -579,7 +598,6 @@ private class Gemma4DecoderLayer: Module {
             let preFeedforwardLayernorm2,
             let postFeedforwardLayernorm2
         {
-            // Dense + sparse branches in parallel, summed into one residual.
             var h1 = preFeedforwardLayernorm(out)
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
@@ -621,25 +639,32 @@ private class Gemma4DecoderLayer: Module {
 
 // MARK: - Text Model
 
-private class Gemma4TextModelInner: Module {
+/// Inner Gemma 4 trunk. Public so the MTP drafter can build a 4-layer
+/// kv-shared trunk by passing `forceSharedKV: true`.
+public class Gemma4TextModelInner: Module {
     let config: Gemma4TextConfiguration
     let embedScale: Float
     let hiddenSizePerLayerInput: Int
 
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-    @ModuleInfo(key: "layers") var layers: [Gemma4DecoderLayer]
-    @ModuleInfo var norm: RMSNorm
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
+    @ModuleInfo(key: "layers") public var layers: [Gemma4DecoderLayer]
+    @ModuleInfo public var norm: RMSNorm
 
     // Per-layer embeddings (PLE)
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") var perLayerModelProjection: ScaledLinear?
+    @ModuleInfo(key: "per_layer_model_projection") fileprivate var perLayerModelProjection: ScaledLinear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
     let previousKvs: [Int]
     let firstKvSharedLayerIdx: Int
 
-    init(_ config: Gemma4TextConfiguration) {
+    /// Index of the last non-shared full-attention layer; -1 if none.
+    /// Used by the shared-KV capture hook for the MTP drafter.
+    let lastFullAttentionNonSharedIdx: Int
+    let lastSlidingAttentionNonSharedIdx: Int
+
+    public init(_ config: Gemma4TextConfiguration, forceSharedKV: Bool = false) {
         self.config = config
         self.embedScale = Float(config.hiddenSize).squareRoot()
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
@@ -647,7 +672,7 @@ private class Gemma4TextModelInner: Module {
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
         self._layers.wrappedValue = (0 ..< config.numHiddenLayers).map {
-            Gemma4DecoderLayer(config, layerIdx: $0)
+            Gemma4DecoderLayer(config, layerIdx: $0, forceSharedKV: forceSharedKV)
         }
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
@@ -668,12 +693,10 @@ private class Gemma4TextModelInner: Module {
         self.firstKvSharedLayerIdx = config.numHiddenLayers - config.numKvSharedLayers
         var kvMap = Array(0 ..< config.numHiddenLayers)
         if config.numKvSharedLayers > 0 {
-            // Find the last non-shared layer of each type
             var lastByType = [String: Int]()
             for i in 0 ..< firstKvSharedLayerIdx {
                 lastByType[config.layerTypes[i]] = i
             }
-            // Shared layers reference the last non-shared layer of the same type
             for j in firstKvSharedLayerIdx ..< config.numHiddenLayers {
                 if let prev = lastByType[config.layerTypes[j]] {
                     kvMap[j] = prev
@@ -682,13 +705,46 @@ private class Gemma4TextModelInner: Module {
         }
         self.previousKvs = kvMap
 
+        // Capture indices for MTP drafter
+        let firstShared = self.firstKvSharedLayerIdx
+        var lastFull = -1
+        var lastSliding = -1
+        for i in 0 ..< firstShared {
+            if config.layerTypes[i] == "full_attention" { lastFull = i }
+            if config.layerTypes[i] == "sliding_attention" { lastSliding = i }
+        }
+        self.lastFullAttentionNonSharedIdx = lastFull
+        self.lastSlidingAttentionNonSharedIdx = lastSliding
+
         super.init()
     }
 
-    func callAsFunction(
+    public func callAsFunction(
         _ inputs: MLXArray,
-        cache: [KVCache]? = nil
+        cache: [KVCache]? = nil,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> MLXArray {
+        forwardTrunk(inputs, cache: cache, captureHook: captureHook, capturePreNorm: false).postNorm
+    }
+
+    /// Variant that also returns the pre-norm last-layer hidden state.
+    /// The MTP drafter's `pre_projection` was trained against the pre-norm hidden.
+    public func callCapturingPreNorm(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
+    ) -> (postNorm: MLXArray, preNorm: MLXArray) {
+        let r = forwardTrunk(
+            inputs, cache: cache, captureHook: captureHook, capturePreNorm: true)
+        return (r.postNorm, r.preNorm!)
+    }
+
+    private func forwardTrunk(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)?,
+        capturePreNorm: Bool
+    ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
         let inputEmbeddings = embedTokens(inputs)
         var h = inputEmbeddings * embedScale
 
@@ -699,23 +755,19 @@ private class Gemma4TextModelInner: Module {
             let modelProj = perLayerModelProjection,
             let projNorm = perLayerProjectionNorm
         {
-            // Token-based PLE
             let tokenPLE =
                 embedPerLayer(inputs)
                 * Float(config.hiddenSizePerLayerInput).squareRoot()
 
-            // [B, L, numLayers * hiddenSizePerLayerInput] -> [B, L, numLayers, hiddenSizePerLayerInput]
             let reshapedTokenPLE = tokenPLE.reshaped(
                 tokenPLE.dim(0), tokenPLE.dim(1),
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
 
-            // Model projection PLE
             let modelPLE = modelProj(h).reshaped(
                 h.dim(0), h.dim(1),
                 config.numHiddenLayers, config.hiddenSizePerLayerInput)
             let normedModelPLE = projNorm(modelPLE)
 
-            // Combine: (model_proj + token_embed) * 2^{-0.5}
             let perLayerInputScale = pow(Float(2.0), -0.5)
             let combined = (normedModelPLE + reshapedTokenPLE) * perLayerInputScale
 
@@ -752,7 +804,7 @@ private class Gemma4TextModelInner: Module {
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
-        var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4PositionOffset?)](
+        var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
 
         for (idx, layer) in layers.enumerated() {
@@ -771,9 +823,12 @@ private class Gemma4TextModelInner: Module {
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
+
+            captureHook?(idx, kvPair)
         }
 
-        return norm(h)
+        let postNorm = norm(h)
+        return (postNorm, capturePreNorm ? h : nil)
     }
 }
 
@@ -784,7 +839,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     fileprivate let config: Gemma4TextConfiguration
-    fileprivate let model: Gemma4TextModelInner
+    let model: Gemma4TextModelInner
+
+    /// Read-only accessor for the underlying text configuration.
+    /// Needed by `Gemma4AssistantDraftModel` for bind-time compatibility checks.
+    public var configuration: Gemma4TextConfiguration { config }
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -800,14 +859,26 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        let hidden = model(inputs, cache: cache)
+        return applyLMHead(hidden)
+    }
+
+    /// Apply the LM head plus final-logit softcap.
+    func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        var out: MLXArray
         if let lmHead {
-            out = lmHead(out)
+            out = lmHead(hidden)
         } else {
-            out = model.embedTokens.asLinear(out)
+            out = model.embedTokens.asLinear(hidden)
         }
         out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
         return out
+    }
+
+    /// Compute the scaled input embedding for `tokens`. Used by the MTP drafter
+    /// as the "target embedding" when building its input.
+    public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -823,10 +894,18 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 continue
             }
 
-            // 26B-A4B checkpoints ship the experts as a fused
-            // `gate_up_proj` (concatenated along axis -2) plus a separate
-            // `down_proj`. SwitchGLU expects three separate
-            // `switch_glu.{gate,up,down}_proj.weight` tensors.
+            // Skip k_proj/v_proj/k_norm/v_norm for shared-KV layers.
+            if let layerIdx = extractLayerIdx(from: k),
+                config.layerUsesSharedKV(layerIdx: layerIdx),
+                k.contains(".self_attn.k_proj.")
+                    || k.contains(".self_attn.v_proj.")
+                    || k.contains(".self_attn.k_norm.")
+                    || k.contains(".self_attn.v_norm.")
+            {
+                continue
+            }
+
+            // 26B-A4B: split fused gate_up_proj into separate gate/up
             if k.hasSuffix(".experts.gate_up_proj") {
                 let base = String(k.dropLast(".gate_up_proj".count))
                 let parts = MLX.split(v, parts: 2, axis: -2)
@@ -858,6 +937,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
         return caches
+    }
+
+    private func extractLayerIdx(from key: String) -> Int? {
+        guard let layersRange = key.range(of: "layers.") else { return nil }
+        let after = key[layersRange.upperBound...]
+        let end = after.firstIndex(of: ".") ?? after.endIndex
+        return Int(after[..<end])
     }
 }
 
