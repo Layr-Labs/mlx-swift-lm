@@ -233,13 +233,20 @@ public func runGemma4MTPRoundsBatched(
     firstSharedKV: Gemma4SharedKV,
     maxTokens: Int,
     blockSize: Int,
-    eosTokenIds: Set<Int>?
+    eosTokenIds: Set<Int>?,
+    maxTokensPerRow: [Int]? = nil
 ) throws -> AsyncStream<BatchedGeneration> {
     guard blockSize >= 2 && blockSize <= 16 else {
         throw Gemma4MTPError.invalidBlockSize(blockSize)
     }
     try drafter.bind(target: target)
     let originalB = firstBonus.count
+    // Per-row budget: if `maxTokensPerRow` is provided it overrides the
+    // global cap for each row; otherwise every row uses `maxTokens`.
+    let perRowBudget: [Int] = maxTokensPerRow ?? Array(
+        repeating: maxTokens, count: originalB)
+    precondition(perRowBudget.count == originalB,
+        "maxTokensPerRow.count must equal firstBonus.count")
 
     return AsyncStream<BatchedGeneration> { continuation in
         // First yield: prefill bonus per original row.
@@ -254,6 +261,10 @@ public func runGemma4MTPRoundsBatched(
             if let eosTokenIds, eosTokenIds.contains(b) {
                 finished[i] = true
                 firstSlots.append(.init(row: i, token: b, finishReason: .eos))
+            } else if emitted[i] >= perRowBudget[i] {
+                // Row's budget is 1 — the bonus is the only emitted token.
+                finished[i] = true
+                firstSlots.append(.init(row: i, token: b, finishReason: .length))
             } else {
                 firstSlots.append(.init(row: i, token: b, finishReason: nil))
             }
@@ -306,7 +317,7 @@ public func runGemma4MTPRoundsBatched(
             // Determine this round's block size. Use the min `remaining`
             // across ACTIVE rows only (finished rows are already excluded
             // from activeIndices).
-            let activeRemaining = activeIndices.map { maxTokens - emitted[$0] }
+            let activeRemaining = activeIndices.map { perRowBudget[$0] - emitted[$0] }
             guard let minRemaining = activeRemaining.min(), minRemaining > 0 else {
                 break
             }
@@ -373,7 +384,7 @@ public func runGemma4MTPRoundsBatched(
             }
 
             // --- Walk (per-row, with remaining-budget truncation) ---
-            let budgets = activeIndices.map { maxTokens - emitted[$0] }
+            let budgets = activeIndices.map { perRowBudget[$0] - emitted[$0] }
             let (accepted, newTokensPerRow) = SpeculativeWalk.batched(
                 draft: draftTokensPerRow,
                 main: mainPerRow,
@@ -409,7 +420,7 @@ public func runGemma4MTPRoundsBatched(
                             finished[origRow] = true
                             finishedThisRound[bi] = true
                             finishReason = .eos
-                        } else if emitted[origRow] >= maxTokens {
+                        } else if emitted[origRow] >= perRowBudget[origRow] {
                             finished[origRow] = true
                             finishedThisRound[bi] = true
                             finishReason = .length

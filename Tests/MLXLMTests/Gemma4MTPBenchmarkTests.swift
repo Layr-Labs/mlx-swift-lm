@@ -257,8 +257,35 @@ struct Gemma4MTPBenchmarkTests {
             let bbStr = String(format: "%10.1f", batchBase.tokensPerSecond)
             let bmStr = String(format: "%10.1f", batchMtp.tokensPerSecond)
             let bsStr = String(format: "%.2fx", batchSpeedup)
-            let label = pair.label.padding(toLength: 18, withPad: " ", startingAt: 0)
-            print("\(label) 4(B=4) \(bbStr) \(bmStr)   \(bsStr)   -- (aggregate)")
+            let labelB4 = pair.label.padding(toLength: 18, withPad: " ", startingAt: 0)
+            print("\(labelB4) 4(B=4) \(bbStr) \(bmStr)   \(bsStr)   -- (aggregate, uniform budget)")
+
+            // Staggered budgets (B=4, rows finish at different times) —
+            // exercises the continuous-batching compaction path. Compare:
+            //   (A) uniform budget = maxTokens → no compaction possible
+            //   (B) staggered     = [maxTokens/8, maxTokens/4, maxTokens/2, maxTokens]
+            //       → 3 of 4 rows finish early; remaining row runs at B=3,
+            //         then B=2, then B=1 as others drop out.
+            // Same total token count (approximately) on both sides, so
+            // aggregate tok/s directly compares "pad to max" vs compact.
+            let staggered = [maxTokens / 8, maxTokens / 4, maxTokens / 2, maxTokens]
+            _ = try await measureBatchedMTPThroughputStaggered(
+                target: target, drafter: drafter,
+                promptTokens: B4, maxTokensPerRow: staggered.map { Swift.max($0, 1) },
+                blockSize: blockForBatch)
+            MLX.Memory.clearCache()
+            let stagMtp = try await measureBatchedMTPThroughputStaggered(
+                target: target, drafter: drafter,
+                promptTokens: B4, maxTokensPerRow: staggered,
+                blockSize: blockForBatch)
+            MLX.Memory.clearCache()
+            let stagTotal = stagMtp.totalGenerated
+            let stagStr = String(format: "%10.1f", stagMtp.tokensPerSecond)
+            let budgetStr = staggered.map(String.init).joined(separator: "/")
+            print(
+                "\(labelB4) staggered   budgets=\(budgetStr) → \(stagTotal) tok in "
+                    + String(format: "%.2fs", stagMtp.generationSeconds)
+                    + " = \(stagStr) tok/s (continuous-batching active)")
         }
     }
 
