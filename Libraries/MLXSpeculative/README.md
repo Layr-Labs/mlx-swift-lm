@@ -127,8 +127,9 @@ algorithm:
    occasionally flips vs a serial single-position forward at the same
    position — both continuations are mathematically valid greedy
    choices, but not bitwise identical. The Python mlx-vlm reference
-   exhibits the same behavior; see
-   `docs/superpowers/notes/2026-05-06-python-mtp-greedy-divergence.md`.
+   exhibits the same behavior at 8/20 of our chat-templated prompts,
+   so the parity gate is "Swift MTP == Swift baseline" rather than
+   "Swift MTP == Python MTP".
 
 2. **Batched attention.** Small-target batched (B>1) runs can diverge
    from B=1 baselines on the same prompt for the same reason — bf16
