@@ -312,30 +312,34 @@ struct Gemma4MTPBenchmarkTests {
                 MLX.Memory.clearCache()
 
                 // Non-compacted run: all rows run to budgetMax (pad).
-                // Measure wall time, then normalize to budgetTotal tokens
-                // (what the compacted run produced) so the comparison is
-                // work-for-work equivalent.
+                // Reports per-token time, so the win is compact_per_tok /
+                // pad_per_tok invariant (>1 means compact is faster per
+                // emitted token, regardless of total token count).
                 let padRun = try await measureBatchedMTPThroughput(
                     target: target, drafter: drafter,
                     promptTokens: prompts,
                     maxTokens: budgetMax,
                     blockSize: blockForBatch)
                 MLX.Memory.clearCache()
-                // padRun emits B*budgetMax tokens. To compare against
-                // compactRun's budgetTotal tokens, scale:
-                let padWallForCompactTokens =
-                    padRun.generationSeconds * Double(budgetTotal)
-                    / Double(padRun.totalGenerated)
 
-                let win = padWallForCompactTokens / compactRun.generationSeconds
+                let compactPerTok =
+                    compactRun.generationSeconds
+                    / Double(max(compactRun.totalGenerated, 1))
+                let padPerTok =
+                    padRun.generationSeconds
+                    / Double(max(padRun.totalGenerated, 1))
+                let win = padPerTok / compactPerTok
+                _ = budgetTotal  // kept for clarity above
                 let budgetStr = budgets.map(String.init).joined(separator: ",")
-                let compStr = String(format: "%.2fs", compactRun.generationSeconds)
-                let padStr = String(format: "%.2fs", padWallForCompactTokens)
+                let compStr = String(
+                    format: "%.1f tok/s", 1.0 / compactPerTok)
+                let padStr = String(
+                    format: "%.1f tok/s", 1.0 / padPerTok)
                 let winStr = String(format: "%.2fx", win)
                 print(
                     "\(labelB4)   \(B)   "
                         + "\(budgetStr.padding(toLength: 18, withPad: " ", startingAt: 0))"
-                        + " \(compStr)    \(padStr)   \(winStr)")
+                        + " compact=\(compStr)  pad=\(padStr)  win=\(winStr)")
             }
         }
     }
