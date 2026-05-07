@@ -260,32 +260,83 @@ struct Gemma4MTPBenchmarkTests {
             let labelB4 = pair.label.padding(toLength: 18, withPad: " ", startingAt: 0)
             print("\(labelB4) 4(B=4) \(bbStr) \(bmStr)   \(bsStr)   -- (aggregate, uniform budget)")
 
-            // Staggered budgets (B=4, rows finish at different times) —
-            // exercises the continuous-batching compaction path. Compare:
-            //   (A) uniform budget = maxTokens → no compaction possible
-            //   (B) staggered     = [maxTokens/8, maxTokens/4, maxTokens/2, maxTokens]
-            //       → 3 of 4 rows finish early; remaining row runs at B=3,
-            //         then B=2, then B=1 as others drop out.
-            // Same total token count (approximately) on both sides, so
-            // aggregate tok/s directly compares "pad to max" vs compact.
-            let staggered = [maxTokens / 8, maxTokens / 4, maxTokens / 2, maxTokens]
-            _ = try await measureBatchedMTPThroughputStaggered(
-                target: target, drafter: drafter,
-                promptTokens: B4, maxTokensPerRow: staggered.map { Swift.max($0, 1) },
-                blockSize: blockForBatch)
-            MLX.Memory.clearCache()
-            let stagMtp = try await measureBatchedMTPThroughputStaggered(
-                target: target, drafter: drafter,
-                promptTokens: B4, maxTokensPerRow: staggered,
-                blockSize: blockForBatch)
-            MLX.Memory.clearCache()
-            let stagTotal = stagMtp.totalGenerated
-            let stagStr = String(format: "%10.1f", stagMtp.tokensPerSecond)
-            let budgetStr = staggered.map(String.init).joined(separator: "/")
-            print(
-                "\(labelB4) staggered   budgets=\(budgetStr) → \(stagTotal) tok in "
-                    + String(format: "%.2fs", stagMtp.generationSeconds)
-                    + " = \(stagStr) tok/s (continuous-batching active)")
+            // Continuous-batching benchmark: staggered budgets at B ∈
+            // {4, 8, 16}. Each row gets a different maxTokens cap, so
+            // rows finish at different times and compaction can fire.
+            //
+            // For each B: run WITH compaction (maxTokensPerRow set) vs
+            // WITHOUT compaction (uniform maxTokens = max of budgets,
+            // pad all rows). Compare wall time for the SAME total
+            // emitted tokens.
+            //
+            // B=16 only runs when MTP_BENCH_LARGE_B=1 is set (requires
+            // >64 GB to be safe on 26B-A4B).
+            let batchSizes: [Int] = {
+                if ProcessInfo.processInfo.environment["MTP_BENCH_LARGE_B"] != nil {
+                    return [4, 8, 16]
+                }
+                return [4]
+            }()
+            print("\(labelB4)   --- continuous-batching comparison ---")
+            print("\(labelB4)   B   budgets            compact_s   pad_s    win")
+            for B in batchSizes {
+                // Build staggered budgets — half the rows at max, a
+                // quarter at max/2, a quarter at max/4 + max/8.
+                var budgets: [Int] = []
+                for i in 0 ..< B {
+                    switch i % 4 {
+                    case 0: budgets.append(Swift.max(maxTokens / 8, 1))
+                    case 1: budgets.append(Swift.max(maxTokens / 4, 1))
+                    case 2: budgets.append(maxTokens / 2)
+                    default: budgets.append(maxTokens)
+                    }
+                }
+                let budgetMax = budgets.max() ?? maxTokens
+                let budgetTotal = budgets.reduce(0, +)
+
+                let prompts = Array(repeating: promptsData[0], count: B)
+
+                // Warmup (small budget) to clear kernel-compile noise.
+                _ = try await measureBatchedMTPThroughputStaggered(
+                    target: target, drafter: drafter,
+                    promptTokens: prompts,
+                    maxTokensPerRow: Array(repeating: 4, count: B),
+                    blockSize: blockForBatch)
+                MLX.Memory.clearCache()
+
+                // Compacted run (true continuous batching).
+                let compactRun = try await measureBatchedMTPThroughputStaggered(
+                    target: target, drafter: drafter,
+                    promptTokens: prompts, maxTokensPerRow: budgets,
+                    blockSize: blockForBatch)
+                MLX.Memory.clearCache()
+
+                // Non-compacted run: all rows run to budgetMax (pad).
+                // Measure wall time, then normalize to budgetTotal tokens
+                // (what the compacted run produced) so the comparison is
+                // work-for-work equivalent.
+                let padRun = try await measureBatchedMTPThroughput(
+                    target: target, drafter: drafter,
+                    promptTokens: prompts,
+                    maxTokens: budgetMax,
+                    blockSize: blockForBatch)
+                MLX.Memory.clearCache()
+                // padRun emits B*budgetMax tokens. To compare against
+                // compactRun's budgetTotal tokens, scale:
+                let padWallForCompactTokens =
+                    padRun.generationSeconds * Double(budgetTotal)
+                    / Double(padRun.totalGenerated)
+
+                let win = padWallForCompactTokens / compactRun.generationSeconds
+                let budgetStr = budgets.map(String.init).joined(separator: ",")
+                let compStr = String(format: "%.2fs", compactRun.generationSeconds)
+                let padStr = String(format: "%.2fs", padWallForCompactTokens)
+                let winStr = String(format: "%.2fx", win)
+                print(
+                    "\(labelB4)   \(B)   "
+                        + "\(budgetStr.padding(toLength: 18, withPad: " ", startingAt: 0))"
+                        + " \(compStr)    \(padStr)   \(winStr)")
+            }
         }
     }
 
