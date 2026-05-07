@@ -328,6 +328,61 @@ struct Gemma4MTPRoundLoopBatchedTests {
         // Strict bound: each row emits <= blockSize tokens.
         #expect(totalTokens <= 2 * 3)  // B=2, blockSize=3
     }
+
+    /// Continuous-batching compaction: when some rows finish early (EOS),
+    /// the remaining rows should keep emitting and the emission sequence
+    /// should still use the ORIGINAL row indices. Verifies that cache
+    /// filtering + state compaction don't corrupt the per-row output.
+    @Test func continuousBatchingCompactsFinishedRows() async throws {
+        let target = try smallTarget()
+        let drafter = try smallDrafter()
+        eval(target, drafter)
+
+        let prompts: [[Int32]] = [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]
+        let p = batchedPrefill(target: target, promptIds: prompts)
+
+        // Craft an EOS set that contains the first bonus for rows 0 and 2
+        // but not rows 1 and 3 — rows 0/2 finish on their first emission,
+        // rows 1/3 must continue for the full maxTokens budget.
+        //
+        // We don't know the bonuses a priori, but we can find out: firstBonus
+        // is returned from batchedPrefill. Pick the EOS set accordingly.
+        let eos: Set<Int> = [p.firstBonus[0], p.firstBonus[2]]
+
+        var emittedPerRow: [[Int]] = [[], [], [], []]
+        let stream = try runGemma4MTPRoundsBatched(
+            target: target, drafter: drafter,
+            targetCache: p.cache,
+            firstBonus: p.firstBonus, firstHidden: p.firstHidden,
+            firstSharedKV: p.firstSharedKV,
+            maxTokens: 8, blockSize: 3,
+            eosTokenIds: eos
+        )
+        for try await step in stream {
+            for slot in step.slots {
+                if let tok = slot.token {
+                    emittedPerRow[slot.row].append(tok)
+                }
+            }
+        }
+        // Rows 0 and 2: bonus is in EOS so they finish after their very
+        // first emission. They should have exactly 1 emitted token.
+        #expect(emittedPerRow[0].count == 1,
+                "row 0 should finish on bonus (EOS), got \(emittedPerRow[0].count)")
+        #expect(emittedPerRow[2].count == 1,
+                "row 2 should finish on bonus (EOS), got \(emittedPerRow[2].count)")
+        // Rows 1 and 3: bonus is NOT in EOS (unless by coincidence the
+        // random-weight bonuses happen to collide — rare at vocab=64 but
+        // possible); check that they continue past 1.
+        if p.firstBonus[1] != p.firstBonus[0] && p.firstBonus[1] != p.firstBonus[2] {
+            #expect(emittedPerRow[1].count > 1,
+                    "row 1's bonus is not EOS; should continue past 1")
+        }
+        if p.firstBonus[3] != p.firstBonus[0] && p.firstBonus[3] != p.firstBonus[2] {
+            #expect(emittedPerRow[3].count > 1,
+                    "row 3's bonus is not EOS; should continue past 1")
+        }
+    }
 }
 
 @Suite("generateGemma4MTP")

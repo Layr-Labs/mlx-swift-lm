@@ -217,11 +217,13 @@ public struct BatchedGeneration: Sendable {
 /// `BatchedGeneration.Slot.token` becomes nil. The round-loop terminates
 /// when every row is finished.
 ///
-/// - Note: Continuous batching (removing finished rows via
-///   `BatchedCache.filterBatched` to shrink the active batch) is a
-///   follow-up optimization and not implemented here. All B rows run
-///   every round regardless of finishedness. This is a correctness-first
-///   v1; throughput optimization is Task 26's remit.
+/// - Note: Continuous batching is implemented: when a row finishes (EOS
+///   or maxTokens), `BatchedCache.filterBatched` shrinks every target
+///   cache and `MLX.take(axis=0)` compacts `hidden` + `sharedKV` + the
+///   per-row `bonus`/`activeIndices` arrays so the next round only pays
+///   compute for still-active rows. Emitted `BatchedGeneration.Slot.row`
+///   uses the ORIGINAL pre-compaction batch index so consumers can
+///   demux regardless of active-batch size.
 public func runGemma4MTPRoundsBatched(
     target: Gemma4TextModel,
     drafter: Gemma4AssistantDraftModel,
@@ -237,14 +239,17 @@ public func runGemma4MTPRoundsBatched(
         throw Gemma4MTPError.invalidBlockSize(blockSize)
     }
     try drafter.bind(target: target)
-    let B = firstBonus.count
+    let originalB = firstBonus.count
 
     return AsyncStream<BatchedGeneration> { continuation in
-        // First yield: prefill bonus per row.
+        // First yield: prefill bonus per original row.
         var firstSlots: [BatchedGeneration.Slot] = []
-        firstSlots.reserveCapacity(B)
-        var emitted = Array(repeating: 1, count: B)
-        var finished = Array(repeating: false, count: B)
+        firstSlots.reserveCapacity(originalB)
+        // Per-original-row bookkeeping. `emitted`/`finished` stay
+        // indexed by original row for lifetime tracking; we compact the
+        // active batch separately.
+        var emitted = Array(repeating: 1, count: originalB)
+        var finished = Array(repeating: false, count: originalB)
         for (i, b) in firstBonus.enumerated() {
             if let eosTokenIds, eosTokenIds.contains(b) {
                 finished[i] = true
@@ -259,17 +264,49 @@ public func runGemma4MTPRoundsBatched(
             return
         }
 
-        // Mutable state.
-        var bonus: [Int] = firstBonus
-        var hidden = firstHidden
-        var sharedKV = firstSharedKV
+        // Active-batch state. `activeIndices[i]` is the original row index
+        // of active batch slot `i`. Shrinks as rows finish.
+        var activeIndices: [Int] = (0 ..< originalB).filter { !finished[$0] }
+        var bonus: [Int] = activeIndices.map { firstBonus[$0] }
+        var hidden: MLXArray = {
+            // firstHidden is [originalB, 1, H]. If any row already finished
+            // (EOS at prefill), compact to [activeB, 1, H] via takeAlong.
+            if activeIndices.count == originalB {
+                return firstHidden
+            }
+            let idx = MLXArray(activeIndices.map { Int32($0) }, [activeIndices.count])
+            return MLX.take(firstHidden, idx, axis: 0)
+        }()
+        var sharedKV: Gemma4SharedKV = {
+            if activeIndices.count == originalB {
+                return firstSharedKV
+            }
+            let idx = MLXArray(activeIndices.map { Int32($0) }, [activeIndices.count])
+            return Gemma4SharedKV(
+                fullAttention: (
+                    MLX.take(firstSharedKV.fullAttention.0, idx, axis: 0),
+                    MLX.take(firstSharedKV.fullAttention.1, idx, axis: 0)),
+                slidingAttention: (
+                    MLX.take(firstSharedKV.slidingAttention.0, idx, axis: 0),
+                    MLX.take(firstSharedKV.slidingAttention.1, idx, axis: 0)))
+        }()
+        // If we already lost some rows during prefill, compact the caches
+        // to match.
+        if activeIndices.count < originalB {
+            let idx = MLXArray(activeIndices.map { Int32($0) }, [activeIndices.count])
+            for cache in targetCache {
+                if let bc = cache as? BatchedCache {
+                    bc.filterBatched(batchIndices: idx)
+                }
+            }
+        }
 
         while !finished.allSatisfy({ $0 }) {
+            let B = activeIndices.count
             // Determine this round's block size. Use the min `remaining`
-            // across active (non-finished) rows.
-            let activeRemaining = emitted.enumerated()
-                .filter { !finished[$0.offset] }
-                .map { maxTokens - $0.element }
+            // across ACTIVE rows only (finished rows are already excluded
+            // from activeIndices).
+            let activeRemaining = activeIndices.map { maxTokens - emitted[$0] }
             guard let minRemaining = activeRemaining.min(), minRemaining > 0 else {
                 break
             }
@@ -336,7 +373,7 @@ public func runGemma4MTPRoundsBatched(
             }
 
             // --- Walk (per-row, with remaining-budget truncation) ---
-            let budgets = emitted.map { maxTokens - $0 }
+            let budgets = activeIndices.map { maxTokens - emitted[$0] }
             let (accepted, newTokensPerRow) = SpeculativeWalk.batched(
                 draft: draftTokensPerRow,
                 main: mainPerRow,
@@ -345,30 +382,41 @@ public func runGemma4MTPRoundsBatched(
             let maxAcceptedInt = accepted.max() ?? 0
 
             // --- Emit one BatchedGeneration per token-position within this round ---
+            // Slots use the ORIGINAL row index from activeIndices so consumers
+            // can continue to demux emissions even as the active batch shrinks.
+            //
+            // Track which active slots newly finished this round so we can
+            // compact the cache + state afterward.
+            var finishedThisRound = Array(repeating: false, count: B)
             let maxNew = newTokensPerRow.map(\.count).max() ?? 0
             for pos in 0 ..< maxNew {
                 var slots: [BatchedGeneration.Slot] = []
                 slots.reserveCapacity(B)
                 for bi in 0 ..< B {
-                    if finished[bi] {
-                        slots.append(.init(row: bi, token: nil, finishReason: nil))
+                    let origRow = activeIndices[bi]
+                    if finishedThisRound[bi] {
+                        // Already finished earlier this round; no more
+                        // emissions for this slot.
+                        slots.append(.init(row: origRow, token: nil, finishReason: nil))
                         continue
                     }
                     let row = newTokensPerRow[bi]
                     if pos < row.count {
                         let t = row[pos]
-                        emitted[bi] += 1
+                        emitted[origRow] += 1
                         var finishReason: BatchedGeneration.FinishReason? = nil
                         if let eosTokenIds, eosTokenIds.contains(t) {
-                            finished[bi] = true
+                            finished[origRow] = true
+                            finishedThisRound[bi] = true
                             finishReason = .eos
-                        } else if emitted[bi] >= maxTokens {
-                            finished[bi] = true
+                        } else if emitted[origRow] >= maxTokens {
+                            finished[origRow] = true
+                            finishedThisRound[bi] = true
                             finishReason = .length
                         }
-                        slots.append(.init(row: bi, token: t, finishReason: finishReason))
+                        slots.append(.init(row: origRow, token: t, finishReason: finishReason))
                     } else {
-                        slots.append(.init(row: bi, token: nil, finishReason: nil))
+                        slots.append(.init(row: origRow, token: nil, finishReason: nil))
                     }
                 }
                 continuation.yield(BatchedGeneration(slots: slots))
@@ -405,9 +453,7 @@ public func runGemma4MTPRoundsBatched(
 
             // --- Update state ---
             // Per-row hidden: gather verifyOut.lastHidden[bi, accepted[bi], :]
-            // into a [B, 1, hidden] tensor via takeAlong on axis=1. The
-            // old B-way slice + concat forced B intermediate small ops;
-            // takeAlong runs in one kernel.
+            // into a [B, 1, hidden] tensor via takeAlong on axis=1.
             let hiddenDim = verifyOut.lastHidden.dim(2)
             let acceptedIdx = MLX.broadcast(
                 MLXArray(accepted.map { Int32($0) }, [B, 1, 1]),
@@ -424,17 +470,11 @@ public func runGemma4MTPRoundsBatched(
             }
 
             // Shared-KV update to match the target cache's rewind.
-            // Fast path (uniform accept): all rows reject the same count
-            // → use `sliceTail` which simply crops the T axis, avoiding
-            // the per-row mask + multiply that `zeroTailPerRow` performs.
             if uniformAccepted {
                 let rejected = k - accepted[0]
                 sharedKV = Gemma4SharedKV.sliceTail(
                     from: verifyOut.capturedSharedKV, rejected: rejected)
             } else {
-                // Per-row: for row i, keep the first `prev + accepted[i] + 1`
-                // positions relative to the captured K/V's T axis
-                // (prev + bs). That equals capturedLen - rejected[i].
                 let capturedT = verifyOut.capturedSharedKV.fullAttention.0.dim(2)
                 let rejectedPerRow = accepted.map { Int32(k - $0) }
                 let keepLengths = MLXArray(
@@ -444,14 +484,44 @@ public func runGemma4MTPRoundsBatched(
                     from: verifyOut.capturedSharedKV, keepLengths: keepLengths)
             }
 
+            // --- Continuous batching: compact if any slot just finished ---
+            //
+            // When a subset of active slots hit EOS or maxTokens this round,
+            // filter the target cache + per-row state so the next round only
+            // pays compute for still-active rows. Rows that never finish are
+            // a no-op here.
+            if finishedThisRound.contains(true) {
+                let keepLocal: [Int] = finishedThisRound.enumerated()
+                    .compactMap { $0.element ? nil : $0.offset }
+                if keepLocal.isEmpty {
+                    // Shouldn't happen: finished.allSatisfy would have tripped
+                    // above. Guard anyway.
+                    break
+                }
+                // Compact the active-batch bookkeeping.
+                activeIndices = keepLocal.map { activeIndices[$0] }
+                bonus = keepLocal.map { bonus[$0] }
+                // Compact GPU-side state tensors + the shared KV + every cache.
+                let keepIdx = MLXArray(
+                    keepLocal.map { Int32($0) }, [keepLocal.count])
+                hidden = MLX.take(hidden, keepIdx, axis: 0)
+                sharedKV = Gemma4SharedKV(
+                    fullAttention: (
+                        MLX.take(sharedKV.fullAttention.0, keepIdx, axis: 0),
+                        MLX.take(sharedKV.fullAttention.1, keepIdx, axis: 0)),
+                    slidingAttention: (
+                        MLX.take(sharedKV.slidingAttention.0, keepIdx, axis: 0),
+                        MLX.take(sharedKV.slidingAttention.1, keepIdx, axis: 0)))
+                for cache in targetCache {
+                    if let bc = cache as? BatchedCache {
+                        bc.filterBatched(batchIndices: keepIdx)
+                    }
+                }
+            }
+
             if (emitted.max() ?? 0) % 256 == 0 {
                 MLX.Memory.clearCache()
             }
-
-            // TODO: Continuous batching — when finished rows accumulate,
-            // call `BatchedCache.filterBatched(batchIndices:)` on every
-            // cache in `targetCache` to shrink B, and compact the bonus/
-            // hidden/sharedKV state accordingly. Deferred to a follow-up.
         }
 
         continuation.finish()
