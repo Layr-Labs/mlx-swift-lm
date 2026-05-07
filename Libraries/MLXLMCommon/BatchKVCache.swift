@@ -555,6 +555,14 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             self.values = values
             _idx = stepCount
         } else {
+            // Honor a prior trim before appending new K/V. Otherwise the
+            // stored tensors keep stale tail positions while `_idx` and masks
+            // describe the shorter logical cache.
+            if let storedK = self.keys, storedK.dim(2) > _idx {
+                self.keys = storedK[.ellipsis, ..<_idx, 0...]
+                self.values = self.values![.ellipsis, ..<_idx, 0...]
+            }
+
             if stepCount > 1 {
                 // Multi-token prefill must keep enough temporary context for
                 // every query in this call. Match RotatingKVCache's concat
@@ -851,4 +859,26 @@ public func dynamicRoll(
     let reshapedShifts = shifts.reshaped(shiftShape)
     let idx = (arange - reshapedShifts) % Int32(n)
     return takeAlong(x, idx, axis: axis)
+}
+
+// MARK: - Speculative-decoding primitives
+
+extension BatchKVCache {
+
+    /// Zero per-row tail positions. For each row `b`, slots
+    /// `[keepLengths[b], _idx)` in both keys and values are set to 0.
+    ///
+    /// This is used by batched speculative decoding when rows accept different
+    /// numbers of tokens within the same verify block.
+    public func zeroTailPerRow(keepLengths: MLXArray) {
+        guard let storedK = keys, let storedV = values else { return }
+        let T = storedK.dim(2)
+        let positions = MLXArray(Int32(0) ..< Int32(T))
+            .reshaped([1, 1, T, 1])
+        let keep = keepLengths.asType(.int32)
+            .reshaped([-1, 1, 1, 1])
+        let mask = (positions .< keep).asType(storedK.dtype)
+        keys = storedK * mask
+        values = storedV * mask
+    }
 }
