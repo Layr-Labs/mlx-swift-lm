@@ -165,70 +165,24 @@ public func measureMTPThroughput(
         let remaining = maxTokens - emitted
         let bs = min(blockSize, remaining + 1)
         if bs <= 1 { break }
-        let k = bs - 1
+        let round = runGemma4MTPGreedyRound(
+            target: target,
+            drafter: drafter,
+            cache: cache,
+            bonus: bonus,
+            hidden: hidden,
+            sharedKV: sharedKV,
+            blockSize: bs)
+        accepts.append(round.accepted)
 
-        // Draft k tokens autoregressively, keeping drafts on GPU.
-        let driveOffset = cache[0].offset
-        var tok = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
-        var h = hidden
-        var draftPerStep: [MLXArray] = []
-        draftPerStep.reserveCapacity(k)
-        for _ in 0 ..< k {
-            let tokEmbed = target.embedTokensForDrafter(tok)
-            let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
-            let (newH, logits) = drafter(
-                inputsEmbeds: inputsEmbeds,
-                sharedKV: sharedKV,
-                positionOffset: .scalar(driveOffset))
-            let sampled = logits.squeezed(axis: 1).argMax(axis: -1)
-            let sampled2d = sampled[.newAxis, .ellipsis]
-            draftPerStep.append(sampled2d)
-            tok = sampled2d
-            h = newH
-        }
-
-        // Verify.
-        let bonusCol = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
-        let verifyInput: MLXArray =
-            draftPerStep.isEmpty
-            ? bonusCol
-            : concatenated([bonusCol] + draftPerStep, axis: 1)
-        let verifyOut = target.forwardForMTP(verifyInput, cache: cache)
-        // fp32 argmax at verify — see round-loop comment.
-        let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
-        let draftConcat: MLXArray =
-            draftPerStep.isEmpty
-            ? MLXArray.zeros([1, 0], dtype: .int32)
-            : concatenated(draftPerStep, axis: 1)
-        eval(mainTokens, draftConcat)
-        let mainInts = mainTokens.squeezed(axis: 0).asArray(Int.self)
-        let draftTokens = draftConcat.squeezed(axis: 0).asArray(Int32.self)
-                                     .map { Int($0) }
-
-        // Walk: count matches up to first mismatch.
-        var accepted = 0
-        while accepted < k && draftTokens[accepted] == mainInts[accepted] {
-            accepted += 1
-        }
-        accepts.append(accepted)
-
-        let emittedThisRound = min(accepted + 1, remaining)
+        let emittedThisRound = min(round.tokens.count, remaining)
         emitted += emittedThisRound
         if emittedThisRound == 0 { break }
 
-        // Rewind cache if any drafts were rejected.
-        if accepted < k {
-            target.rollbackSpeculativeCache(
-                cache, accepted: .scalar(accepted), blockSize: bs)
-        }
-
         // Update state for next round.
-        hidden = verifyOut.lastHidden[
-            0..., accepted ..< accepted + 1, 0...]
-        bonus = mainInts[accepted]
-        let rejected = k - accepted
-        sharedKV = Gemma4SharedKV.sliceTail(
-            from: verifyOut.capturedSharedKV, rejected: rejected)
+        hidden = round.hidden
+        bonus = round.bonus
+        sharedKV = round.sharedKV
     }
     let genElapsed = Date().timeIntervalSince(genStart)
 

@@ -18,7 +18,7 @@ import MLXRandom
 import MLXSpeculative
 import Testing
 
-@Suite("Gemma4 MTP stochastic sampling")
+@Suite("Gemma4 MTP stochastic sampling", .serialized)
 struct Gemma4MTPStochasticTests {
 
     private func tinyTarget() throws -> Gemma4TextModel {

@@ -34,12 +34,15 @@ import MLXSpeculative
 
 let drafter = try Gemma4AssistantDraftModel.load(
     from: assistantModelDirectory)
+var parameters = GenerateParameters(maxTokens: 512, temperature: 0.8)
+parameters.topP = 0.9
+parameters.topK = 50
 let stream = try generateGemma4MTP(
     input: lmInput,
-    parameters: .init(maxTokens: 512),
+    parameters: parameters,
     target: targetModelContext,     // ModelContext from MLXLLM
     drafter: drafter,
-    blockSize: 4
+    rngSeed: 123
 )
 for try await generation in stream {
     switch generation {
@@ -92,13 +95,52 @@ print("Accept histogram: \(mtp.acceptLengths ?? [])")
 ## Measured throughput (M3, 36 GB)
 
 Single-batch greedy, 3 chat-templated prompts, 64 max_tokens, 16-token
-warmup. Block size swept per model; best configuration shown.
+warmup. Block size swept per model; speedups are shown as observed
+ranges because laptop load can move short local benchmark runs by a few
+percentage points.
 
-| Model           | Best K | Baseline tok/s | MTP tok/s | Speedup |
-|-----------------|--------|----------------|-----------|---------|
-| E2B-bf16        | 5      | 21.4           | 24.1      | 1.13×   |
-| E4B-bf16        | 5      | 11.5           | 12.5      | 1.08×   |
-| 26B-A4B-4bit    | 3      | 28.7           | 35.9      | 1.25×   |
+| Model           | Best K | Baseline tok/s | MTP tok/s | Speedup range |
+|-----------------|--------|----------------|-----------|---------------|
+| E2B-bf16        | 5      | 22.0-22.2      | 24.3-25.0 | 1.10-1.14×    |
+| E2B-4bit        | 3      | 49.7           | 62.3      | 1.25×         |
+| E4B-bf16        | 5      | 11.8-12.0      | 12.6-12.9 | 1.06-1.09×    |
+| 26B-A4B-4bit    | 3      | 29.1-29.4      | 36.9-37.2 | 1.26-1.28×    |
+
+M5 Max 128 GB validation used the same prompt fixture and E2B 4-bit
+target + 160 MB bf16 assistant pair:
+
+| Model    | Max tokens | Best K | Baseline tok/s | MTP tok/s | Speedup |
+|----------|------------|--------|----------------|-----------|---------|
+| E2B-4bit | 12         | 3      | 94.7-95.0      | 136.0-137.8 | 1.43-1.46× |
+| E2B-4bit | 64         | 3      | 88.8           | 107.0     | 1.20×   |
+
+Block-size tuning is model- and quantization-dependent. E2B / E4B bf16
+should sweep K in the 4-5 range, E2B 4-bit should start at K=3, and
+26B-A4B should start at K=3: larger K increases accepted tokens per
+round but was slower on M3 because drafter overhead and the larger verify
+block outweighed the extra accepts. On an upstream-style short run
+(`E2B-4bit`, `max_tokens=12`, K=4, B=1, 160 MB bf16 assistant), this
+implementation measured `1.43-1.47x` on the same M3; K=5 dropped to
+`1.22x` at `max_tokens=12` and `0.97x` at `max_tokens=64`. Sweeping K
+showed K=3 was faster than K=4 for E2B-4bit on both M3 (`1.52x` vs
+`1.44x` at 12 tokens) and M5 Max (`1.46x` vs `1.44x` at 12 tokens,
+`1.20x` vs `1.15x` at 64 tokens).
+
+Batched B=4 needs a separate sweep; the single-batch K does not always
+transfer. In the current benchmark, E2B-bf16 does best at K=3
+(`1.13x`), E4B-bf16 does best at K=2 (`1.06x`), while E2B-4bit and
+26B-A4B-4bit regress in batched mode. On M5 Max, E2B-4bit B=4 was
+`0.74x` at its best tested K=2 and `0.64x` at K=3. On M3, 26B-A4B-4bit
+still regressed even at its best tested K=2 (`0.75x`). Treat batched
+E2B-4bit and batched 26B-A4B MTP as disabled-by-default until the
+drafter/verify balance improves.
+`Gemma4MTPAutomaticPolicy.automatic(for:)` encodes these defaults: E2B
+4-bit uses K=3 and stays on the B=1 path, E2B / E4B bf16 use K=5 for
+B=1, E2B / E4B bf16 use the batched round loop for B>1, and 26B-A4B plus
+unknown MoE models stay on the B=1 path. The single-request
+`generateGemma4MTP` and `Gemma4MTPTokenIterator` APIs use the same policy
+when `blockSize` is omitted; passing `blockSize:` remains an explicit
+override.
 
 Per-round accept rates improve with target size, as expected — the
 drafter's predictions align more closely with a larger target's greedy
@@ -110,7 +152,16 @@ output:
 | E4B-bf16        | 0.53/2 (27%)    | 0.61/3 (20%)    |
 | 26B-A4B-4bit    | 1.25/2 (62%)    | 1.42/3 (47%)    |
 
-Reproduce with the `realModelThroughputBenchmark` test — requires
+Continuous-batching compaction was also measured with staggered
+per-row budgets. The default M3 benchmark runs B=4; larger B is opt-in
+because it needs more memory headroom. The path passed the current
+unit/parity tests but was not faster per emitted token than padded
+generation; the best observed case was near parity on the 26B-A4B 4-bit
+target (`0.97x`). The compaction path is kept as infrastructure for
+serving workloads and future optimization rather than claimed as a
+throughput win today.
+
+Reproduce with the `realModelThroughputBenchmark` test. It requires
 `MTP_BENCH_DATA_DIR` and `MTP_BENCH_PROMPTS` env vars pointing to
 local model directories and a pre-tokenized prompt fixture JSON.
 
@@ -137,8 +188,9 @@ algorithm:
    batch shapes at near-uniform logits.
 
 Parity is enforced as a hard gate internally (Swift MTP tokens == Swift
-baseline tokens) across four test suites covering E2B / E4B / MoE /
-batched shapes. 143/143 tests pass deterministically.
+baseline tokens) across the E2B, E4B, 26B-A4B MoE, iterator, stochastic,
+and batched round-loop suites. The throughput numbers above were taken
+on the M3 36 GB development machine used for those parity runs.
 
 ## Architecture notes
 
@@ -152,14 +204,18 @@ batched shapes. 143/143 tests pass deterministically.
   drafter gets what it was trained against.
 - **Per-row cache rewind**: B>1 rewind uses
   `BatchKVCache.zeroTailPerRow(keepLengths:)` plus
-  `Gemma4SharedKV.zeroTailPerRow(from:keepLengths:)` so rows that
-  accepted different numbers of drafter tokens all get their own
-  correct cache state.
+  `Gemma4SharedKV.zeroTailPerRow(from:keepLengths:)` to clear rejected
+  tails when rows accept different numbers of drafter tokens. This path
+  is covered by parity tests, but remains the main place to harden if
+  B>1 serving becomes a priority: fully right-aligned per-row masking
+  for all target cache types and shared-KV masks would remove the
+  remaining dependence on zeroed tail slots.
 - **MaskedEmbedder** (centroid-routed sparse LM head): used by E2B / E4B
   drafters (`use_ordered_embeddings=true`). Scores 2048 token clusters,
   materialises the top-K clusters' tokens (default 32 of 2048) and
   scatters logits back into the full vocab with sentinel values
-  elsewhere.
+  elsewhere. The sentinel is scalar-filled because the GPU-only broadcast
+  variant regressed E2B B=1 throughput on M3.
 
 ## Model / drafter pairing
 
@@ -177,7 +233,13 @@ real drafters are published this way; the pairing checks in
 
 ## Known limitations
 
-- Greedy (`temperature=0`) only. Stochastic sampling is not implemented.
+- B=1 supports greedy and stochastic sampling. Stochastic sampling uses
+  rejection-based speculative sampling and honors `temperature`,
+  `topP`, `topK`, and `minP`.
+- B>1 currently supports greedy sampling only. Stochastic batched MTP is
+  a follow-up.
+- B>1 currently exposes the raw `runGemma4MTPRoundsBatched` round loop,
+  not a tokenizer-decoding `generateGemma4MTPBatched` convenience API.
 - Text-only. Multimodal prefill (images / audio) runs through the target
   unchanged; MTP kicks in on the text-decode tail.
 - Drafter weights must match the target's input embedding + attention

@@ -58,11 +58,6 @@ public final class MaskedEmbedder: Module, @unchecked Sendable {
     ///     drafter's `embed_tokens.weight`.
     /// - Returns: `[B, L, vocabSize]` with non-selected positions set to
     ///   `min(selected) - 1`.
-    ///
-    /// Note: the `min(selected).item(Float.self)` call forces a CPU sync.
-    /// This is acceptable for v1 (one sync per drafter forward). If the
-    /// benchmark shows this as >5% of drafter forward time we'll rewrite
-    /// to a GPU-only `min - 1`.
     public func callAsFunction(
         hiddenStates: MLXArray, lmHeadWeight: MLXArray
     ) -> MLXArray {
@@ -101,15 +96,16 @@ public final class MaskedEmbedder: Module, @unchecked Sendable {
             selectedEmb.swappedAxes(-1, -2)
         ).squeezed(axis: -2)  // [B, L, topK * vsc]
 
-        // Sentinel: min(selected) - 1 (CPU sync — see doc comment).
+        // Scalar fill is faster than an explicit on-device broadcast on
+        // M3 for this shape; the only CPU sync in the sparse head is this
+        // scalar sentinel extraction.
         let sentinelValue = selectedLogits.min().item(Float.self) - 1.0
 
         // Full-vocab output tensor filled with the sentinel.
         let out = MLX.full(
             [B, L, vocabSize],
             values: MLXArray(sentinelValue),
-            dtype: hiddenStates.dtype
-        )
+            dtype: hiddenStates.dtype)
 
         // Scatter selected logits into their canonical positions.
         let scatterIdx = selectedCanonical.reshaped([

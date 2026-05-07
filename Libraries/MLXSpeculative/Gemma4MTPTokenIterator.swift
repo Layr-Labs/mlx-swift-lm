@@ -35,8 +35,8 @@ import MLXRandom
 /// for await gen in stream { ... }
 /// ```
 ///
-/// Greedy (`temperature=0`) only. Stochastic sampling would require
-/// rejection-based speculative sampling which is deferred to a follow-up.
+/// Supports greedy (`temperature=0`) and B=1 stochastic sampling via
+/// rejection-based speculative sampling.
 public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
 
     // Kept alive by the iterator so the GPU ops finish cleanly; not
@@ -84,7 +84,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     ///     sampling with the same filter masks applied to both drafter
     ///     and target distributions. Emitted tokens match the distribution
     ///     that pure target sampling with the same filters would produce.
-    ///   - blockSize: speculative block size (2–16). Default 4.
+    ///   - blockSize: speculative block size (2–16). Pass `nil` to use the
+    ///     model-aware default from `Gemma4MTPAutomaticPolicy`.
     ///   - rngSeed: seed for rejection sampling (only used when
     ///     `temperature > 0`). Default 0 which seeds from the current MLX
     ///     random state.
@@ -95,18 +96,21 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         drafter: Gemma4AssistantDraftModel,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        blockSize: Int = 4,
+        blockSize: Int? = nil,
         rngSeed: UInt64 = 0
     ) throws {
-        guard blockSize >= 2 && blockSize <= 16 else {
-            throw Gemma4MTPError.invalidBlockSize(blockSize)
+        let resolvedBlockSize = blockSize
+            ?? Gemma4MTPAutomaticPolicy.automatic(for: target)
+                .strategy(forBatchSize: 1).blockSize
+        guard resolvedBlockSize >= 2 && resolvedBlockSize <= 16 else {
+            throw Gemma4MTPError.invalidBlockSize(resolvedBlockSize)
         }
         try drafter.bind(target: target)
 
         self.target = target
         self.drafter = drafter
         self.cache = cache ?? target.newCache(parameters: parameters)
-        self.blockSize = blockSize
+        self.blockSize = resolvedBlockSize
         self.maxTokens = parameters.maxTokens
         self.temperature = parameters.temperature
         self.topP = parameters.topP
@@ -176,10 +180,36 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         if bs <= 1 { return nil }
         let k = bs - 1
 
+        if temperature == 0 {
+            let round = runGemma4MTPGreedyRound(
+                target: target,
+                drafter: drafter,
+                cache: cache,
+                bonus: bonus,
+                hidden: hidden,
+                sharedKV: sharedKV,
+                blockSize: bs)
+            hidden = round.hidden
+            bonus = round.bonus
+            sharedKV = round.sharedKV
+            pendingTokens.append(contentsOf: round.tokens)
+            if pendingTokens.isEmpty { return nil }
+            let t = pendingTokens[pendingIndex]
+            pendingIndex += 1
+            tokenCount += 1
+            return t
+        }
+
         // Draft k tokens, GPU-resident.
         // At temperature > 0 we also need to retain per-step drafter
         // logits so the walker can compute q(c_i) for rejection sampling.
         let driveOffset = cache[0].offset
+        let positionOffset = Gemma4.PositionOffset.scalar(driveOffset)
+        let masks = drafter.makeMasks(
+            queryLen: 1,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            dtype: hidden.dtype)
         var tok = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
         var h = hidden
         var draftPerStep: [MLXArray] = []
@@ -194,7 +224,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
             let (newH, logits) = drafter(
                 inputsEmbeds: inputsEmbeds,
                 sharedKV: sharedKV,
-                positionOffset: .scalar(driveOffset))
+                positionOffset: positionOffset,
+                masks: masks)
             let stepLogits = logits.squeezed(axis: 1)  // [1, vocab]
             let sampled: MLXArray
             if temperature > 0 {

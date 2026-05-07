@@ -25,8 +25,14 @@ public struct Gemma4Configuration: Codable, Sendable {
         case vocabSize = "vocab_size"
     }
 
+    enum QuantizationCodingKeys: String, CodingKey {
+        case quantization
+        case quantizationConfig = "quantization_config"
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let quantizationContainer = try decoder.container(keyedBy: QuantizationCodingKeys.self)
         self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"
         self.vocabSize = try container.decodeIfPresent(Int.self, forKey: .vocabSize) ?? 262144
 
@@ -39,6 +45,16 @@ public struct Gemma4Configuration: Codable, Sendable {
             self.textConfig.vocabSize = self.vocabSize
         } else {
             self.textConfig = try Gemma4TextConfiguration(from: decoder)
+        }
+
+        let quantization =
+            try quantizationContainer.decodeIfPresent(
+                Gemma4WeightQuantizationMetadata.self, forKey: .quantization)
+            ?? quantizationContainer.decodeIfPresent(
+                Gemma4WeightQuantizationMetadata.self, forKey: .quantizationConfig)
+        if let quantization {
+            self.textConfig.quantizationBits = quantization.bits
+            self.textConfig.quantizationGroupSize = quantization.groupSize
         }
     }
 }

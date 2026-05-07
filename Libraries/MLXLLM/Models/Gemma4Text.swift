@@ -11,6 +11,16 @@ import MLXNN
 
 // MARK: - Configuration
 
+struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
+    var bits: Int?
+    var groupSize: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case bits
+        case groupSize = "group_size"
+    }
+}
+
 public struct Gemma4TextConfiguration: Codable, Sendable {
     public internal(set) var modelType: String = "gemma4_text"
     public internal(set) var hiddenSize: Int = 1536
@@ -35,6 +45,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     public internal(set) var useDoubleWideMlp: Bool = true
     public internal(set) var layerTypes: [String] = []
     public internal(set) var tieWordEmbeddings: Bool = true
+    public internal(set) var quantizationBits: Int?
+    public internal(set) var quantizationGroupSize: Int?
 
     // MoE (only set on the 26B-A4B variant; 2B/4B/31B are dense)
     public internal(set) var enableMoeBlock: Bool = false
@@ -81,8 +93,14 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         case moeIntermediateSize = "moe_intermediate_size"
     }
 
+    enum QuantizationCodingKeys: String, CodingKey {
+        case quantization
+        case quantizationConfig = "quantization_config"
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let quantizationContainer = try decoder.container(keyedBy: QuantizationCodingKeys.self)
 
         self.modelType =
             try container.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4_text"
@@ -137,6 +155,13 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         }
         self.tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? true
+        let quantization =
+            try quantizationContainer.decodeIfPresent(
+                Gemma4WeightQuantizationMetadata.self, forKey: .quantization)
+            ?? quantizationContainer.decodeIfPresent(
+                Gemma4WeightQuantizationMetadata.self, forKey: .quantizationConfig)
+        self.quantizationBits = quantization?.bits
+        self.quantizationGroupSize = quantization?.groupSize
         self.ropeParameters =
             try container.decodeIfPresent(
                 [String: [String: StringOrNumber]].self, forKey: .ropeParameters)

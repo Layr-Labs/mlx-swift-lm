@@ -28,6 +28,11 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+internal struct Gemma4DrafterMasks {
+    let full: MLXFast.ScaledDotProductAttentionMaskMode
+    let sliding: MLXFast.ScaledDotProductAttentionMaskMode
+}
+
 public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     public let config: Gemma4AssistantConfiguration
 
@@ -119,13 +124,40 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         sharedKV: Gemma4SharedKV,
         positionOffset: Gemma4.PositionOffset
     ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let h = preProjection(inputsEmbeds)
+        let masks = makeMasks(
+            queryLen: h.dim(1),
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            dtype: h.dtype)
+        return forwardProjected(
+            h,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+    }
+
+    internal func callAsFunction(
+        inputsEmbeds: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let h = preProjection(inputsEmbeds)
+        return forwardProjected(
+            h,
+            sharedKV: sharedKV,
+            positionOffset: positionOffset,
+            masks: masks)
+    }
+
+    internal func makeMasks(
+        queryLen: Int,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        dtype: DType
+    ) -> Gemma4DrafterMasks {
         let textCfg = config.textConfig
-
-        // Project the [target_embed, last_hidden] concat to drafter-hidden.
-        var h = preProjection(inputsEmbeds)
-
-        // Build per-layer-type masks (bidirectional; SWA may short-circuit to .none).
-        let queryLen = h.dim(1)
         let queryOffset: Int
         switch positionOffset {
         case .scalar(let v): queryOffset = v
@@ -134,14 +166,23 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
 
         let fullKVLen = sharedKV.fullAttention.0.dim(2)
         let slidingKVLen = sharedKV.slidingAttention.0.dim(2)
-        let dtype = h.dtype
 
         let fullMask = DrafterMasks.bidirectionalFull(
             queryLen: queryLen, kvLen: fullKVLen, dtype: dtype)
         let slidingMask = DrafterMasks.bidirectionalSWA(
             queryLen: queryLen, queryOffset: queryOffset,
             kvLen: slidingKVLen, window: textCfg.slidingWindow, dtype: dtype)
+        return Gemma4DrafterMasks(full: fullMask, sliding: slidingMask)
+    }
 
+    private func forwardProjected(
+        _ projected: MLXArray,
+        sharedKV: Gemma4SharedKV,
+        positionOffset: Gemma4.PositionOffset,
+        masks: Gemma4DrafterMasks
+    ) -> (lastHidden: MLXArray, logits: MLXArray) {
+        let textCfg = config.textConfig
+        var h = projected
         // Run each drafter layer with the appropriate shared-KV + mask.
         for (i, layer) in model.layers.enumerated() {
             let layerType = textCfg.layerTypes[i]
@@ -150,10 +191,10 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             switch layerType {
             case "full_attention":
                 kv = sharedKV.fullAttention
-                mask = fullMask
+                mask = masks.full
             case "sliding_attention":
                 kv = sharedKV.slidingAttention
-                mask = slidingMask
+                mask = masks.sliding
             default:
                 preconditionFailure(
                     "Gemma4AssistantDraftModel: unexpected layerType '\(layerType)' at "

@@ -33,7 +33,8 @@ import MLXLMCommon
 ///     `Gemma4Model` VLM wrapper whose text portion is `Gemma4TextModel`).
 ///     Throws `unsupportedTarget` otherwise.
 ///   - drafter: the loaded Gemma 4 MTP drafter.
-///   - blockSize: speculative block size (2–16). Default 4.
+///   - blockSize: speculative block size (2–16). Pass `nil` to use the
+///     model-aware default from `Gemma4MTPAutomaticPolicy`.
 ///   - rngSeed: seed for stochastic sampling (only consulted when
 ///     `parameters.temperature > 0`). Default 0 → seeds from the system
 ///     clock.
@@ -46,7 +47,7 @@ public func generateGemma4MTP(
     parameters: GenerateParameters,
     target: ModelContext,
     drafter: Gemma4AssistantDraftModel,
-    blockSize: Int = 4,
+    blockSize: Int? = nil,
     rngSeed: UInt64 = 0
 ) throws -> AsyncStream<Generation> {
     let gemma4: Gemma4TextModel

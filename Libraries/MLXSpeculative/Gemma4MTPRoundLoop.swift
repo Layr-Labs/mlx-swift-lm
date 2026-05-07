@@ -81,63 +81,18 @@ public func runGemma4MTPRounds(
             let remaining = maxTokens - emitted
             let bs = min(blockSize, remaining + 1)
             if bs <= 1 { break }
-            let k = bs - 1
-
-            // --- Draft (k autoregressive steps) ---
-            //
-            // Keep sampled drafts on GPU; concat with bonus for the verify
-            // input in a single eval — avoids K separate CPU syncs per round.
-            let driveOffset = targetCache[0].offset
-            var tok = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]  // [1, 1]
-            var h = hidden
-            var draftPerStep: [MLXArray] = []  // each [1, 1]
-            draftPerStep.reserveCapacity(k)
-            for _ in 0 ..< k {
-                let tokEmbed = target.embedTokensForDrafter(tok)
-                let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
-                let (newH, logits) = drafter(
-                    inputsEmbeds: inputsEmbeds,
-                    sharedKV: sharedKV,
-                    positionOffset: .scalar(driveOffset)
-                )
-                // Greedy sample: logits [1, 1, vocab] → [1, 1] int32.
-                let sampled = logits.squeezed(axis: 1).argMax(axis: -1)  // [1]
-                let sampled2d = sampled[.newAxis, .ellipsis]  // [1, 1]
-                draftPerStep.append(sampled2d)
-                tok = sampled2d
-                h = newH
-            }
-
-            // --- Verify ---
-            // Concat drafts [1, k] + bonus [1, 1] → [1, bs].
-            let bonusCol = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]  // [1, 1]
-            let verifyInput: MLXArray =
-                draftPerStep.isEmpty
-                ? bonusCol
-                : concatenated([bonusCol] + draftPerStep, axis: 1)
-            let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
-            // Greedy sample all bs positions: [1, bs, vocab] → [1, bs] int32.
-            // Cast to fp32 before argmax to eliminate bf16 near-uniform-tail
-            // argmax flips that can otherwise diverge MTP from baseline at
-            // post-EOS repetition tails.
-            let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
-            // Materialise drafts + main tokens in a single sync.
-            let draftConcat: MLXArray =
-                draftPerStep.isEmpty
-                ? MLXArray.zeros([1, 0], dtype: .int32)
-                : concatenated(draftPerStep, axis: 1)  // [1, k]
-            eval(mainTokens, draftConcat)
-            let mainInts = mainTokens.squeezed(axis: 0).asArray(Int.self)  // [bs]
-            let draftTokens = draftConcat.squeezed(axis: 0).asArray(Int32.self)
-                                         .map { Int($0) }  // [k]
-
-            // --- Walk ---
-            let (accepted, newTokens) = SpeculativeWalk.single(
-                draft: draftTokens, main: mainInts)
+            let round = runGemma4MTPGreedyRound(
+                target: target,
+                drafter: drafter,
+                cache: targetCache,
+                bonus: bonus,
+                hidden: hidden,
+                sharedKV: sharedKV,
+                blockSize: bs)
 
             // --- Emit ---
             var stopEarly = false
-            for t in newTokens {
+            for t in round.tokens {
                 continuation.yield(.chunk("\(t)"))
                 emitted += 1
                 if emitted >= maxTokens {
@@ -150,19 +105,10 @@ public func runGemma4MTPRounds(
                 return
             }
 
-            // --- Rewind ---
-            if accepted < k {
-                target.rollbackSpeculativeCache(
-                    targetCache, accepted: .scalar(accepted), blockSize: bs)
-            }
-
             // --- Update state ---
-            hidden = verifyOut.lastHidden[
-                0..., accepted ..< accepted + 1, 0...]
-            bonus = newTokens.last!  // always non-empty (accepted + 1 >= 1)
-            let rejected = k - accepted
-            sharedKV = Gemma4SharedKV.sliceTail(
-                from: verifyOut.capturedSharedKV, rejected: rejected)
+            hidden = round.hidden
+            bonus = round.bonus
+            sharedKV = round.sharedKV
 
             if emitted % 256 == 0 {
                 MLX.Memory.clearCache()
@@ -332,6 +278,12 @@ public func runGemma4MTPRoundsBatched(
             // tensor is collected; at the end we stack them [B, k] and
             // prepend the bonus to form the verify input in one eval.
             let driveOffset = targetCache[0].offset
+            let positionOffset = Gemma4.PositionOffset.scalar(driveOffset)
+            let masks = drafter.makeMasks(
+                queryLen: 1,
+                sharedKV: sharedKV,
+                positionOffset: positionOffset,
+                dtype: hidden.dtype)
             // Seed token: per-row bonus as [B, 1] int32.
             var tok = MLXArray(bonus.map { Int32($0) }, [B, 1])
             var h = hidden
@@ -343,7 +295,8 @@ public func runGemma4MTPRoundsBatched(
                 let (newH, logits) = drafter(
                     inputsEmbeds: inputsEmbeds,
                     sharedKV: sharedKV,
-                    positionOffset: .scalar(driveOffset)
+                    positionOffset: positionOffset,
+                    masks: masks
                 )
                 // Greedy sample per row: logits [B, 1, vocab] → [B, 1]
                 let sampled = logits.squeezed(axis: 1).argMax(axis: -1)  // [B]

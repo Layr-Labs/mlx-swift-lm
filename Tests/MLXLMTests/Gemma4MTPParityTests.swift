@@ -17,7 +17,7 @@ import Testing
 /// change the emitted token sequence. A divergence is an implementation
 /// bug in the target forward, the drafter forward, the round loop, or
 /// the cache rollback.
-@Suite("Gemma4 MTP parity vs baseline (Swift-internal)")
+@Suite("Gemma4 MTP parity vs baseline (Swift-internal)", .serialized)
 struct Gemma4MTPParityTests {
 
     // MARK: - Config fixtures
@@ -261,7 +261,7 @@ struct Gemma4MTPParityTests {
 }
 
 /// E4B-shaped parity, plus batched (B>1) coverage.
-@Suite("Gemma4 MTP parity — E4B shapes")
+@Suite("Gemma4 MTP parity — E4B shapes", .serialized)
 struct Gemma4E4BMTPParityTests {
 
     private struct SeededRNG: RandomNumberGenerator {
@@ -647,7 +647,7 @@ struct Gemma4E4BMTPParityTests {
 /// hidden=2304, 32 layers, 24 kv-shared, 128 experts top-2) to keep tests
 /// fast. Key architectural invariants preserved: `enable_moe_block=true`,
 /// `num_experts > top_k_experts`, `moe_intermediate_size != intermediate_size`.
-@Suite("Gemma4 MTP parity — 26B-A4B MoE target")
+@Suite("Gemma4 MTP parity — 26B-A4B MoE target", .serialized)
 struct Gemma4MoEMTPParityTests {
 
     private struct SeededRNG: RandomNumberGenerator {

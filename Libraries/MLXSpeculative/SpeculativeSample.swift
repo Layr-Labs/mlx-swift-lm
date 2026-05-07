@@ -22,6 +22,7 @@
 
 import Foundation
 import MLX
+import MLXNN
 import MLXRandom
 
 /// Result of one round of rejection-based speculative sampling.
@@ -39,9 +40,11 @@ public struct SpeculativeSampleResult: Sendable {
     }
 }
 
-/// Apply temperature to logits, optionally masking to topP / topK / minP
-/// nucleus, then softmax along the last axis. The mask is applied in
-/// log-space before softmax so masked positions land at 0 in `probs`.
+/// Convert logits into the same sampling distribution used by
+/// `GenerateParameters.sampler()`: compute log-probabilities, apply
+/// topP/minP/topK filters, then apply temperature for the final categorical
+/// distribution. The mask is applied in log-space before softmax so masked
+/// positions land at 0 in `probs`.
 ///
 /// IMPORTANT: The SAME filter parameters must be used for both drafter
 /// and target in `speculativeSampleRound`. Applying topP/topK to only
@@ -54,18 +57,19 @@ private func softmaxWithFilters(
     topK: Int,
     minP: Float
 ) -> MLXArray {
-    var scaled = (temperature > 0 ? logits / temperature : logits).asType(.float32)
+    precondition(temperature > 0, "temperature must be > 0 for stochastic sampling")
+    var logprobs = logSoftmax(logits.asType(.float32), axis: -1)
     // Order matches mlx_lm's TopPSampler: topP → minP → topK.
     if topP > 0 && topP < 1 {
-        scaled = applyTopP(scaled, p: topP)
+        logprobs = applyTopP(logprobs, p: topP)
     }
     if minP > 0 {
-        scaled = applyMinP(scaled, minP: minP)
+        logprobs = applyMinP(logprobs, minP: minP)
     }
     if topK > 0 {
-        scaled = applyTopK(scaled, k: topK)
+        logprobs = applyTopK(logprobs, k: topK)
     }
-    return softmax(scaled, axis: -1)
+    return softmax(logprobs / temperature, axis: -1)
 }
 
 /// Public helper: sample one token from `logits` along the last axis
@@ -87,39 +91,39 @@ public func sampleLogitsWithFilters(
     return sampleFromDistribution(probs, key: rngKey)
 }
 
-/// Mask all but top-K logits to -inf along the last axis.
-private func applyTopK(_ logits: MLXArray, k: Int) -> MLXArray {
-    let vocab = logits.shape.last ?? 0
-    if k <= 0 || k >= vocab { return logits }
-    let sortedIdx = argSort(-logits, axis: -1)
+/// Mask all but top-K log-probabilities to -inf along the last axis.
+private func applyTopK(_ logprobs: MLXArray, k: Int) -> MLXArray {
+    let vocab = logprobs.shape.last ?? 0
+    if k <= 0 || k >= vocab { return logprobs }
+    let sortedIdx = argSort(-logprobs, axis: -1)
     let topIdx = sortedIdx[.ellipsis, 0 ..< k]
-    let topVals = takeAlong(logits, topIdx, axis: -1)
+    let topVals = takeAlong(logprobs, topIdx, axis: -1)
     let threshold = topVals.min(axes: [-1], keepDims: true)
     let negInf = MLXArray(-Float.infinity)
-    return MLX.where(logits .>= threshold, logits, negInf)
+    return MLX.where(logprobs .>= threshold, logprobs, negInf)
 }
 
 /// Top-P (nucleus): mask tokens outside the smallest set whose
 /// cumulative softmax mass is at least `p`.
-private func applyTopP(_ logits: MLXArray, p: Float) -> MLXArray {
-    let sortedIdxAsc = argSort(logits, axis: -1)
-    let sortedLogits = takeAlong(logits, sortedIdxAsc, axis: -1)
-    let sortedProbs = softmax(sortedLogits, axis: -1)
+private func applyTopP(_ logprobs: MLXArray, p: Float) -> MLXArray {
+    let sortedIdxAsc = argSort(logprobs, axis: -1)
+    let sortedLogprobs = takeAlong(logprobs, sortedIdxAsc, axis: -1)
+    let sortedProbs = exp(sortedLogprobs)
     let cumProbs = sortedProbs.cumsum(axis: -1)
     let keepMask = cumProbs .> MLXArray(1.0 - p)
     let negInf = MLXArray(-Float.infinity)
-    let maskedSorted = MLX.where(keepMask, sortedLogits, negInf)
+    let maskedSorted = MLX.where(keepMask, sortedLogprobs, negInf)
     let inverseIdx = argSort(sortedIdxAsc, axis: -1)
     return takeAlong(maskedSorted, inverseIdx, axis: -1)
 }
 
 /// Min-P: mask tokens whose probability is below `minP * max_prob`.
 /// Computed in log-space: `logp >= max_logp + log(minP)`.
-private func applyMinP(_ logits: MLXArray, minP: Float) -> MLXArray {
-    let maxLogit = logits.max(axis: -1, keepDims: true)
-    let threshold = maxLogit + MLXArray(log(minP))
+private func applyMinP(_ logprobs: MLXArray, minP: Float) -> MLXArray {
+    let maxLogprob = logprobs.max(axis: -1, keepDims: true)
+    let threshold = maxLogprob + MLXArray(log(minP))
     let negInf = MLXArray(-Float.infinity)
-    return MLX.where(logits .>= threshold, logits, negInf)
+    return MLX.where(logprobs .>= threshold, logprobs, negInf)
 }
 
 /// Sample one token from a distribution `[vocab]` (or `[..., vocab]`)

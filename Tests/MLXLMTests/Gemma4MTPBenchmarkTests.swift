@@ -14,7 +14,7 @@ import MLXRandom
 import MLXSpeculative
 import Testing
 
-@Suite("Gemma4MTPBenchmark")
+@Suite("Gemma4MTPBenchmark", .serialized)
 struct Gemma4MTPBenchmarkTests {
 
     /// Tiny target for smoke tests — matches the E2B-shaped config used
@@ -136,6 +136,9 @@ struct Gemma4MTPBenchmarkTests {
             let drafterDir: String
         }
         let allPairs: [Pair] = [
+            Pair(label: "E2B-4bit",
+                 targetDir: "gemma-4-e2b-it-4bit",
+                 drafterDir: "gemma-4-E2B-it-assistant-bf16"),
             Pair(label: "E2B-bf16",
                  targetDir: "gemma-4-e2b-it-bf16",
                  drafterDir: "gemma-4-E2B-it-assistant-bf16"),
@@ -146,11 +149,35 @@ struct Gemma4MTPBenchmarkTests {
                  targetDir: "gemma-4-26b-a4b-it-4bit",
                  drafterDir: "gemma-4-26B-A4B-it-assistant-bf16"),
         ]
+        let env = ProcessInfo.processInfo.environment
+        let requestedPair = env["MTP_BENCH_PAIR"]?.lowercased()
         let pairs = allPairs.filter {
-            FileManager.default.fileExists(atPath: "\(dataDir)/\($0.targetDir)")
+            let matchesRequest =
+                requestedPair == nil
+                || $0.label.lowercased() == requestedPair
+                || $0.targetDir.lowercased() == requestedPair
+                || $0.drafterDir.lowercased() == requestedPair
+            return matchesRequest
+                && FileManager.default.fileExists(atPath: "\(dataDir)/\($0.targetDir)")
                 && FileManager.default.fileExists(atPath: "\(dataDir)/\($0.drafterDir)")
         }
-        #expect(!pairs.isEmpty, "No model pairs found in \(dataDir)")
+        #expect(!pairs.isEmpty, "No requested model pairs found in \(dataDir)")
+
+        func envInt(_ name: String, default defaultValue: Int) -> Int {
+            guard let value = env[name], let parsed = Int(value), parsed > 0 else {
+                return defaultValue
+            }
+            return parsed
+        }
+
+        func envIntList(_ name: String, default defaultValue: [Int]) -> [Int] {
+            guard let value = env[name] else { return defaultValue }
+            let parsed = value
+                .split(separator: ",")
+                .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                .filter { $0 > 1 }
+            return parsed.isEmpty ? defaultValue : parsed
+        }
 
         // Load real chat-templated prompt tokens from a JSON fixture
         // (produced via Python's transformers tokenizer — path pointed to
@@ -167,9 +194,12 @@ struct Gemma4MTPBenchmarkTests {
             // Degenerate fallback. Use MTP_BENCH_PROMPTS for real numbers.
             promptsData = [(0 ..< 16).map { Int32($0 * 211 + 7) }]
         }
-        let maxTokens = 64
-        let warmupTokens = 16
-        let blockSizes = [2, 3, 4, 5]
+        let maxTokens = envInt("MTP_BENCH_MAX_TOKENS", default: 64)
+        let warmupTokens = envInt(
+            "MTP_BENCH_WARMUP_TOKENS",
+            default: Swift.min(16, maxTokens))
+        let blockSizes = envIntList("MTP_BENCH_BLOCK_SIZES", default: [2, 3, 4, 5])
+        let b1Only = env["MTP_BENCH_B1_ONLY"] == "1"
 
         print("\n\n=== Gemma 4 MTP real-model benchmark ===")
         print("prompts=\(promptsData.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
@@ -183,6 +213,12 @@ struct Gemma4MTPBenchmarkTests {
             let (target, _) = try loadRealTargetAsTextModel(from: targetURL)
             let drafter = try await Gemma4AssistantDraftModel.load(from: drafterURL)
             eval(target, drafter)
+            let policy = Gemma4MTPAutomaticPolicy.automatic(for: target)
+            print(
+                "\(pair.label) automatic policy: "
+                    + "family=\(policy.family), "
+                    + "B=1 \(policy.strategy(forBatchSize: 1)), "
+                    + "B=4 \(policy.strategy(forBatchSize: 4))")
 
             // Warmup on first prompt with largest block size to exercise
             // the full drafter path.
@@ -232,33 +268,44 @@ struct Gemma4MTPBenchmarkTests {
                 print("\(label) \(K)  \(baseStr) \(mtpStr)   \(spdStr)   \(accStr)/\(K-1)")
             }
 
-            // Batched (B=4) — the apples-to-apples config vs Python's
-            // headline numbers which use batch=4.
+            if b1Only {
+                continue
+            }
+
+            // Batched (B=4) — sweep block sizes because the B=1 optimum
+            // is not guaranteed to carry over to batched decode.
             let B4 = Array(repeating: promptsData[0], count: 4)
-            let blockForBatch = 4
             _ = measureBatchedBaselineThroughput(
                 target: target, promptTokens: B4, maxTokens: warmupTokens)
             _ = try await measureBatchedMTPThroughput(
                 target: target, drafter: drafter,
                 promptTokens: B4, maxTokens: warmupTokens,
-                blockSize: blockForBatch)
+                blockSize: blockSizes.max()!)
             MLX.Memory.clearCache()
 
             let batchBase = measureBatchedBaselineThroughput(
                 target: target, promptTokens: B4, maxTokens: maxTokens)
             MLX.Memory.clearCache()
-            let batchMtp = try await measureBatchedMTPThroughput(
-                target: target, drafter: drafter,
-                promptTokens: B4, maxTokens: maxTokens,
-                blockSize: blockForBatch)
-            MLX.Memory.clearCache()
-            let batchSpeedup = batchMtp.tokensPerSecond
-                             / max(batchBase.tokensPerSecond, 1e-9)
-            let bbStr = String(format: "%10.1f", batchBase.tokensPerSecond)
-            let bmStr = String(format: "%10.1f", batchMtp.tokensPerSecond)
-            let bsStr = String(format: "%.2fx", batchSpeedup)
             let labelB4 = pair.label.padding(toLength: 18, withPad: " ", startingAt: 0)
-            print("\(labelB4) 4(B=4) \(bbStr) \(bmStr)   \(bsStr)   -- (aggregate, uniform budget)")
+            let automaticB4 = policy.strategy(forBatchSize: B4.count)
+            for K in blockSizes {
+                let batchMtp = try await measureBatchedMTPThroughput(
+                    target: target, drafter: drafter,
+                    promptTokens: B4, maxTokens: maxTokens,
+                    blockSize: K)
+                MLX.Memory.clearCache()
+                let batchSpeedup = batchMtp.tokensPerSecond
+                                 / max(batchBase.tokensPerSecond, 1e-9)
+                let bbStr = String(format: "%10.1f", batchBase.tokensPerSecond)
+                let bmStr = String(format: "%10.1f", batchMtp.tokensPerSecond)
+                let bsStr = String(format: "%.2fx", batchSpeedup)
+                let automaticMarker =
+                    automaticB4 == .batched(blockSize: K) ? " auto" : ""
+                print(
+                    "\(labelB4) \(K)(B=4) \(bbStr) \(bmStr)   "
+                        + "\(bsStr)\(automaticMarker)   "
+                        + "-- (aggregate, uniform budget)")
+            }
 
             // Continuous-batching benchmark: staggered budgets at B ∈
             // {4, 8, 16}. Each row gets a different maxTokens cap, so
@@ -271,6 +318,7 @@ struct Gemma4MTPBenchmarkTests {
             //
             // B=16 only runs when MTP_BENCH_LARGE_B=1 is set (requires
             // >64 GB to be safe on 26B-A4B).
+            let blockForBatch = 4
             let batchSizes: [Int] = {
                 if ProcessInfo.processInfo.environment["MTP_BENCH_LARGE_B"] != nil {
                     return [4, 8, 16]

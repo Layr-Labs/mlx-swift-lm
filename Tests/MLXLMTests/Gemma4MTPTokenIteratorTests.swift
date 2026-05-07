@@ -14,7 +14,7 @@ import MLXRandom
 import MLXSpeculative
 import Testing
 
-@Suite("Gemma4MTPTokenIterator")
+@Suite("Gemma4MTPTokenIterator", .serialized)
 struct Gemma4MTPTokenIteratorTests {
 
     private func tinyTarget() throws -> Gemma4TextModel {
