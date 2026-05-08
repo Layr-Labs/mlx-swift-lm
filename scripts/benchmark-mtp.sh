@@ -103,18 +103,19 @@ SERVER_BIN=".build/release/mlx-server"
 start_server() {
     local model_path="$1"; shift
     "$SERVER_BIN" --model "$model_path" --port "$BENCH_PORT" \
-        --no-prefix-cache "$@" &
+        --no-prefix-cache "$@" >/dev/null 2>&1 &
     SERVER_PID=$!
     local tries=0
     until curl -sf "http://localhost:${BENCH_PORT}/health" >/dev/null 2>&1; do
         tries=$((tries + 1))
-        if [[ $tries -ge 60 ]]; then
-            echo "ERROR: server did not start within 60 s" >&2
+        if [[ $tries -ge 300 ]]; then
+            echo "ERROR: server did not start within 300 s" >&2
             kill "$SERVER_PID" 2>/dev/null || true
             exit 1
         fi
         sleep 1
     done
+    echo "  server ready (${tries}s)"
 }
 
 stop_server() {
@@ -138,6 +139,7 @@ run_bench() {
     local result
     result=$(KMP_DUPLICATE_LIB_OK=TRUE llama-benchy \
         --base-url "http://localhost:${BENCH_PORT}" \
+        --tokenizer "$model_path" \
         --pp $PP_SIZES \
         --tg $TG_SIZES \
         --runs "$RUNS" \
