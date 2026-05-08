@@ -89,4 +89,25 @@ struct Gemma4RollbackTests {
         let row1All = state[0][1, 0, 0..<6, 0]
         #expect(row1All.sum().item(Float.self) == 6.0)  // untouched
     }
+
+    @Test func scalarTrimsSaturatedRotatingCacheAfterVerifyBlock() throws {
+        let config = try smallConfig()
+        let model = Gemma4TextModel(config)
+        let rotating = RotatingKVCache(maxSize: 3)
+
+        let initial = MLXArray([Float(1), 2, 3]).reshaped(1, 1, 3, 1)
+        _ = rotating.update(keys: initial, values: initial)
+        #expect(!rotating.isTrimmable)
+
+        let verifyBlock = MLXArray([Float(4), 5]).reshaped(1, 1, 2, 1)
+        _ = rotating.update(keys: verifyBlock, values: verifyBlock)
+        #expect(rotating.isTrimmable)
+        #expect(rotating.offset == 5)
+
+        model.rollbackSpeculativeCache(
+            [rotating], accepted: .scalar(0), blockSize: 2
+        )
+        #expect(rotating.offset == 4)
+        #expect(rotating.state[0].dim(2) == 3)
+    }
 }

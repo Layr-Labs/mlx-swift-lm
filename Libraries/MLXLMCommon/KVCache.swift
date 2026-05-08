@@ -654,15 +654,31 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override var isTrimmable: Bool {
-        return offset < maxCacheSize
+        guard offset >= maxCacheSize else { return true }
+        guard let keys else { return false }
+        return idx == keys.dim(2) && keys.dim(2) > maxCacheSize
     }
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
-        offset -= trimmed
-        idx -= trimmed
-        return trimmed
+        let requested = min(offset, n)
+        guard requested > 0 else { return 0 }
+
+        if let keys, let values, idx == keys.dim(2), keys.dim(2) > maxCacheSize {
+            let trimmed = min(requested, keys.dim(2) - maxCacheSize)
+            let keepLength = keys.dim(2) - trimmed
+            self.keys = keys[.ellipsis, ..<keepLength, 0...]
+            self.values = values[.ellipsis, ..<keepLength, 0...]
+            offset -= trimmed
+            idx = keepLength
+            return trimmed
+        }
+
+        guard offset < maxCacheSize else { return 0 }
+
+        offset -= requested
+        idx = max(0, idx - requested)
+        return requested
     }
 
     /// Optimized mask creation for rotating cache with offset capping

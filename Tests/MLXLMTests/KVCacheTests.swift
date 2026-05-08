@@ -31,6 +31,10 @@ private func assertArraysClose(_ lhs: [MLXArray], _ rhs: [MLXArray], label: Stri
     }
 }
 
+private func singleHeadKV(_ values: [Float]) -> MLXArray {
+    MLXArray(values).reshaped(1, 1, values.count, 1)
+}
+
 // MARK: - Original parameterized test (updated with value assertions)
 
 @Test(
@@ -193,6 +197,25 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     let (loaded, _) = try loadPromptCache(url: url)
     #expect(loaded.count == 1)
     assertArraysClose(loaded[0].state, cache.state)
+}
+
+@Test func testRotatingCacheTrimsTemporaryVerifySuffix() throws {
+    let cache = RotatingKVCache(maxSize: 3)
+    let initial = singleHeadKV([1, 2, 3])
+    _ = cache.update(keys: initial, values: initial)
+    #expect(cache.offset == 3)
+    #expect(!cache.isTrimmable)
+
+    let verifyBlock = singleHeadKV([4, 5])
+    _ = cache.update(keys: verifyBlock, values: verifyBlock)
+    #expect(cache.offset == 5)
+    #expect(cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 4)
+
+    #expect(cache.trim(1) == 1)
+    #expect(cache.offset == 4)
+    #expect(!cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 3)
 }
 
 // MARK: - ArraysCache fully populated round-trip
