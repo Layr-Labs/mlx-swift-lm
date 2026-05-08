@@ -131,7 +131,14 @@ let package = Package(
             exclude: [
                 "README.md"
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"),
+                .process("Resources/audio_only.mov"),
+                .process("Resources/Gemma4MTPPrompts.json"),
+                .process("Resources/gemma4-26B-A4B-assistant-config.json"),
+                .process("Resources/gemma4-E4B-assistant-config.json"),
+                .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
