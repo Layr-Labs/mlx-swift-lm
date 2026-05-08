@@ -37,6 +37,9 @@ let package = Package(
         .library(
             name: "MLXSpeculative",
             targets: ["MLXSpeculative"]),
+        .executable(
+            name: "mlx-bench",
+            targets: ["mlx-bench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
@@ -186,6 +189,18 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/mlx-server"
+        ),
+        .executableTarget(
+            name: "mlx-bench",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                "MLXSpeculative",
+                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Sources/mlx-bench"
         ),
     ]
 )

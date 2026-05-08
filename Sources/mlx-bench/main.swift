@@ -1,0 +1,493 @@
+// Copyright © 2026 Apple Inc.
+
+import Darwin
+import Foundation
+import MLX
+import MLXHuggingFace
+import MLXLLM
+import MLXLMCommon
+import MLXSpeculative
+import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
+
+enum BenchMode: String {
+    case mtp
+    case dflash
+
+    var envPrefix: String {
+        switch self {
+        case .mtp: "MTP_BENCH"
+        case .dflash: "DFLASH_BENCH"
+        }
+    }
+}
+
+struct CLIError: Error, CustomStringConvertible {
+    let description: String
+
+    init(_ description: String) {
+        self.description = description
+    }
+}
+
+struct BenchArguments {
+    var mode: BenchMode?
+    var targetPath: String?
+    var drafterPath: String?
+    var promptsJSONPath: String?
+    var promptTokens: String?
+    var prompt: String?
+    var maxTokens: Int?
+    var warmupTokens: Int?
+    var blockSizes: [Int]?
+    var useChatTemplate = true
+
+    static func parse() throws -> BenchArguments {
+        var args = BenchArguments()
+        let argv = CommandLine.arguments
+        var i = 1
+
+        while i < argv.count {
+            let arg = argv[i]
+            switch arg {
+            case "mtp", "dflash":
+                args.mode = BenchMode(rawValue: arg)
+            case "--mode":
+                args.mode = BenchMode(rawValue: try value(after: arg, argv: argv, index: &i))
+            case "--target", "-t":
+                args.targetPath = try value(after: arg, argv: argv, index: &i)
+            case "--drafter", "-d":
+                args.drafterPath = try value(after: arg, argv: argv, index: &i)
+            case "--prompts-json":
+                args.promptsJSONPath = try value(after: arg, argv: argv, index: &i)
+            case "--prompt-tokens":
+                args.promptTokens = try value(after: arg, argv: argv, index: &i)
+            case "--prompt":
+                args.prompt = try value(after: arg, argv: argv, index: &i)
+            case "--max-tokens":
+                let value = try value(after: arg, argv: argv, index: &i)
+                guard let parsed = Int(value), parsed > 0 else {
+                    throw CLIError("--max-tokens requires a positive integer")
+                }
+                args.maxTokens = parsed
+            case "--warmup-tokens":
+                let value = try value(after: arg, argv: argv, index: &i)
+                guard let parsed = Int(value), parsed > 0 else {
+                    throw CLIError("--warmup-tokens requires a positive integer")
+                }
+                args.warmupTokens = parsed
+            case "--block-sizes":
+                args.blockSizes = try parsePositiveIntList(
+                    try value(after: arg, argv: argv, index: &i),
+                    minimum: 2,
+                    optionName: "--block-sizes")
+            case "--no-chat-template":
+                args.useChatTemplate = false
+            case "--help", "-h":
+                printUsage()
+                exit(0)
+            default:
+                if !arg.hasPrefix("-"), args.mode == nil {
+                    args.mode = BenchMode(rawValue: arg)
+                } else {
+                    throw CLIError("Unknown argument: \(arg)")
+                }
+            }
+            i += 1
+        }
+
+        return args
+    }
+
+    static func value(after option: String, argv: [String], index: inout Int) throws -> String {
+        index += 1
+        guard index < argv.count else {
+            throw CLIError("\(option) requires a value")
+        }
+        return argv[index]
+    }
+
+    static func printUsage() {
+        print("""
+        mlx-bench - local MLX speculative decoding throughput benchmark
+
+        USAGE:
+          mlx-bench mtp    --target <target-dir> --drafter <assistant-dir> [options]
+          mlx-bench dflash --target <target-dir> --drafter <dflash-dir> [options]
+
+        OPTIONS:
+          --target, -t <path>       Target model directory
+          --drafter, -d <path>      Assistant or DFlash drafter directory
+          --prompts-json <path>     JSON file containing [[Int]] token IDs
+          --prompt-tokens <ids>     Comma-separated token IDs for one prompt
+          --prompt <text>           Prompt text to tokenize with target tokenizer
+          --max-tokens <int>        Generated tokens per prompt
+          --warmup-tokens <int>     Generated tokens for warmup
+          --block-sizes <list>      Comma-separated speculative block sizes
+          --no-chat-template        Encode --prompt as plain text
+          --help, -h                Show this help
+
+        ENVIRONMENT:
+          TARGET_DIR, DRAFTER_DIR
+          MTP_BENCH_TARGET_DIR, MTP_BENCH_DRAFTER_DIR
+          DFLASH_BENCH_TARGET_DIR, DFLASH_BENCH_DRAFTER_DIR
+          PROMPTS_JSON, PROMPT_TOKENS, PROMPT
+          MAX_TOKENS, WARMUP_TOKENS, BLOCK_SIZES
+        """)
+    }
+}
+
+@main
+struct MLXBench {
+    static func main() async {
+        do {
+            let args = try BenchArguments.parse()
+            guard let mode = args.mode else {
+                BenchArguments.printUsage()
+                exit(1)
+            }
+
+            switch mode {
+            case .mtp:
+                try await runMTPBenchmark(args: args, mode: mode)
+            case .dflash:
+                try await runDFlashBenchmark(args: args, mode: mode)
+            }
+        } catch {
+            eprint("error: \(error)")
+            exit(1)
+        }
+    }
+
+    private static func runMTPBenchmark(args: BenchArguments, mode: BenchMode) async throws {
+        let targetURL = try requiredURL(
+            explicit: args.targetPath,
+            envNames: ["TARGET_DIR", "\(mode.envPrefix)_TARGET_DIR"],
+            description: "target model directory")
+        let drafterURL = try requiredURL(
+            explicit: args.drafterPath,
+            envNames: ["DRAFTER_DIR", "\(mode.envPrefix)_DRAFTER_DIR"],
+            description: "MTP assistant drafter directory")
+
+        print("loading target: \(targetURL.path)")
+        let context = try await LLMModelFactory.shared.load(
+            from: targetURL,
+            using: #huggingFaceTokenizerLoader())
+        let target = try gemma4TextModel(from: context.model)
+
+        print("loading MTP drafter: \(drafterURL.path)")
+        let drafter = try await Gemma4AssistantDraftModel.load(from: drafterURL)
+        eval(context.model, drafter)
+
+        let prompts = try benchmarkPrompts(args: args, mode: mode, tokenizer: context.tokenizer)
+        let maxTokens = args.maxTokens
+            ?? envInt(names: ["MAX_TOKENS", "\(mode.envPrefix)_MAX_TOKENS"], default: 128)
+        let warmupTokens = min(
+            args.warmupTokens
+                ?? envInt(
+                    names: ["WARMUP_TOKENS", "\(mode.envPrefix)_WARMUP_TOKENS"],
+                    default: min(16, maxTokens)),
+            maxTokens)
+        let blockSizes = args.blockSizes
+            ?? envIntList(
+                names: ["BLOCK_SIZES", "\(mode.envPrefix)_BLOCK_SIZES"],
+                default: [2, 3, 4, 5],
+                minimum: 2)
+
+        print("")
+        print("=== Gemma 4 MTP benchmark ===")
+        print("target=\(targetURL.lastPathComponent)")
+        print("drafter=\(drafterURL.lastPathComponent)")
+        print("prompts=\(prompts.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
+        print("K  base tok/s  mtp tok/s  speedup  accept_avg")
+
+        let warmupPrompt = MLXArray(prompts[0])
+        _ = measureBaselineThroughput(
+            target: target,
+            promptTokens: warmupPrompt,
+            maxTokens: warmupTokens)
+        _ = try measureMTPThroughput(
+            target: target,
+            drafter: drafter,
+            promptTokens: warmupPrompt,
+            maxTokens: warmupTokens,
+            blockSize: blockSizes.max() ?? 2)
+        MLX.Memory.clearCache()
+
+        var baselineRates = [Double]()
+        for prompt in prompts {
+            let result = measureBaselineThroughput(
+                target: target,
+                promptTokens: MLXArray(prompt),
+                maxTokens: maxTokens)
+            baselineRates.append(result.tokensPerSecond)
+            MLX.Memory.clearCache()
+        }
+        let baselineAverage = average(baselineRates)
+
+        for blockSize in blockSizes {
+            var mtpRates = [Double]()
+            var accepts = [Int]()
+            for prompt in prompts {
+                let result = try measureMTPThroughput(
+                    target: target,
+                    drafter: drafter,
+                    promptTokens: MLXArray(prompt),
+                    maxTokens: maxTokens,
+                    blockSize: blockSize)
+                mtpRates.append(result.tokensPerSecond)
+                accepts.append(contentsOf: result.acceptLengths ?? [])
+                MLX.Memory.clearCache()
+            }
+
+            let mtpAverage = average(mtpRates)
+            let speedup = mtpAverage / max(baselineAverage, 1e-9)
+            let acceptAverage = average(accepts.map(Double.init))
+            print(
+                "\(blockSize)  "
+                    + "\(String(format: "%10.1f", baselineAverage)) "
+                    + "\(String(format: "%9.1f", mtpAverage))   "
+                    + "\(String(format: "%.2fx", speedup))   "
+                    + "\(String(format: "%.2f", acceptAverage))/\(blockSize - 1)"
+            )
+        }
+    }
+
+    private static func runDFlashBenchmark(args: BenchArguments, mode: BenchMode) async throws {
+        let targetURL = try requiredURL(
+            explicit: args.targetPath,
+            envNames: ["TARGET_DIR", "\(mode.envPrefix)_TARGET_DIR", "MLX_SWIFT_LM_DFLASH_TARGET_DIR"],
+            description: "target model directory")
+        let drafterURL = try requiredURL(
+            explicit: args.drafterPath,
+            envNames: ["DRAFTER_DIR", "\(mode.envPrefix)_DRAFTER_DIR", "MLX_SWIFT_LM_DFLASH_DRAFTER_DIR"],
+            description: "DFlash drafter directory")
+
+        print("loading target: \(targetURL.path)")
+        let context = try await LLMModelFactory.shared.load(
+            from: targetURL,
+            using: #huggingFaceTokenizerLoader())
+        guard let target = context.model as? any DFlashTargetModel else {
+            throw CLIError("Target model does not conform to DFlashTargetModel: \(type(of: context.model))")
+        }
+
+        print("loading DFlash drafter: \(drafterURL.path)")
+        let drafter = try await DFlashDraftModel.load(
+            from: drafterURL,
+            bindTo: target)
+        eval(context.model, drafter)
+
+        let prompts = try benchmarkPrompts(args: args, mode: mode, tokenizer: context.tokenizer)
+        let maxTokens = args.maxTokens
+            ?? envInt(names: ["MAX_TOKENS", "\(mode.envPrefix)_MAX_TOKENS"], default: 128)
+        let warmupTokens = min(
+            args.warmupTokens
+                ?? envInt(
+                    names: ["WARMUP_TOKENS", "\(mode.envPrefix)_WARMUP_TOKENS"],
+                    default: min(16, maxTokens)),
+            maxTokens)
+        let blockSizes = args.blockSizes
+            ?? envIntList(
+                names: ["BLOCK_SIZES", "\(mode.envPrefix)_BLOCK_SIZES"],
+                default: [drafter.config.blockSize],
+                minimum: 2)
+
+        print("")
+        print("=== DFlash benchmark ===")
+        print("target=\(targetURL.lastPathComponent)")
+        print("drafter=\(drafterURL.lastPathComponent)")
+        print("prompts=\(prompts.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
+        print("K  base tok/s  dflash tok/s  speedup  generated")
+
+        let warmupPrompt = MLXArray(prompts[0])
+        _ = measureDFlashBaselineThroughput(
+            target: target,
+            promptTokens: warmupPrompt,
+            maxTokens: warmupTokens)
+        _ = try measureDFlashThroughput(
+            target: target,
+            drafter: drafter,
+            promptTokens: warmupPrompt,
+            maxTokens: warmupTokens,
+            blockSize: blockSizes.max())
+        MLX.Memory.clearCache()
+
+        var baselineRates = [Double]()
+        for prompt in prompts {
+            let result = measureDFlashBaselineThroughput(
+                target: target,
+                promptTokens: MLXArray(prompt),
+                maxTokens: maxTokens)
+            baselineRates.append(result.tokensPerSecond)
+            MLX.Memory.clearCache()
+        }
+        let baselineAverage = average(baselineRates)
+
+        for blockSize in blockSizes {
+            var dflashRates = [Double]()
+            var generated = [String]()
+            for prompt in prompts {
+                let result = try measureDFlashThroughput(
+                    target: target,
+                    drafter: drafter,
+                    promptTokens: MLXArray(prompt),
+                    maxTokens: maxTokens,
+                    blockSize: blockSize)
+                dflashRates.append(result.tokensPerSecond)
+                generated.append(String(result.generatedTokens))
+                MLX.Memory.clearCache()
+            }
+
+            let dflashAverage = average(dflashRates)
+            let speedup = dflashAverage / max(baselineAverage, 1e-9)
+            print(
+                "\(blockSize)  "
+                    + "\(String(format: "%10.1f", baselineAverage)) "
+                    + "\(String(format: "%12.1f", dflashAverage))   "
+                    + "\(String(format: "%.2fx", speedup))   "
+                    + generated.joined(separator: ",")
+            )
+        }
+    }
+}
+
+private func gemma4TextModel(from model: any LanguageModel) throws -> Gemma4TextModel {
+    if let textModel = model as? Gemma4TextModel {
+        return textModel
+    }
+    if let wrapper = model as? Gemma4Model {
+        return wrapper.textModel
+    }
+    throw CLIError("MTP benchmark requires Gemma4Model or Gemma4TextModel; got \(type(of: model))")
+}
+
+private func benchmarkPrompts(
+    args: BenchArguments,
+    mode: BenchMode,
+    tokenizer: any MLXLMCommon.Tokenizer
+) throws -> [[Int32]] {
+    if let path = args.promptsJSONPath
+        ?? envString(names: ["PROMPTS_JSON", "\(mode.envPrefix)_PROMPTS", "\(mode.envPrefix)_PROMPTS_JSON"])
+    {
+        let url = URL(fileURLWithPath: expandPath(path))
+        let data = try Data(contentsOf: url)
+        let decoded = try JSONDecoder().decode([[Int]].self, from: data)
+        return try decoded.map { try int32Tokens($0) }.filter { !$0.isEmpty }
+    }
+
+    if let tokenList = args.promptTokens
+        ?? envString(names: ["PROMPT_TOKENS", "\(mode.envPrefix)_PROMPT_TOKENS"])
+    {
+        return [try parseTokenList(tokenList)]
+    }
+
+    let prompt = args.prompt
+        ?? envString(names: ["PROMPT", "\(mode.envPrefix)_PROMPT"])
+        ?? "Write a concise explanation of speculative decoding and why accept rate matters."
+
+    if args.useChatTemplate && envString(names: ["BENCH_CHAT_TEMPLATE"]) != "0" {
+        do {
+            let messages: [[String: any Sendable]] = [
+                ["role": "user", "content": prompt]
+            ]
+            let tokenIDs = try tokenizer.applyChatTemplate(
+                messages: messages,
+                tools: nil as [[String: any Sendable]]?,
+                additionalContext: nil as [String: any Sendable]?)
+            return [try int32Tokens(tokenIDs)]
+        } catch {
+            eprint("warning: chat template failed, falling back to plain encode: \(error)")
+        }
+    }
+
+    return [try int32Tokens(tokenizer.encode(text: prompt, addSpecialTokens: true))]
+}
+
+private func requiredURL(
+    explicit: String?,
+    envNames: [String],
+    description: String
+) throws -> URL {
+    guard let path = explicit ?? envString(names: envNames) else {
+        throw CLIError("Missing \(description). Pass an argument or set one of: \(envNames.joined(separator: ", "))")
+    }
+    let url = URL(fileURLWithPath: expandPath(path))
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        throw CLIError("\(description) not found: \(url.path)")
+    }
+    return url
+}
+
+private func expandPath(_ path: String) -> String {
+    (path as NSString).expandingTildeInPath
+}
+
+private func envString(names: [String]) -> String? {
+    let env = ProcessInfo.processInfo.environment
+    for name in names {
+        if let value = env[name], !value.isEmpty {
+            return value
+        }
+    }
+    return nil
+}
+
+private func envInt(names: [String], default defaultValue: Int) -> Int {
+    guard let value = envString(names: names), let parsed = Int(value), parsed > 0 else {
+        return defaultValue
+    }
+    return parsed
+}
+
+private func envIntList(names: [String], default defaultValue: [Int], minimum: Int) -> [Int] {
+    guard let value = envString(names: names),
+        let parsed = try? parsePositiveIntList(value, minimum: minimum, optionName: names[0]),
+        !parsed.isEmpty
+    else {
+        return defaultValue
+    }
+    return parsed
+}
+
+private func parsePositiveIntList(_ value: String, minimum: Int, optionName: String) throws -> [Int] {
+    let parsed = value
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .compactMap(Int.init)
+        .filter { $0 >= minimum }
+    guard !parsed.isEmpty else {
+        throw CLIError("\(optionName) requires comma-separated integers >= \(minimum)")
+    }
+    return parsed
+}
+
+private func parseTokenList(_ value: String) throws -> [Int32] {
+    let parsed = value
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .compactMap(Int.init)
+    return try int32Tokens(parsed)
+}
+
+private func int32Tokens(_ values: [Int]) throws -> [Int32] {
+    var output = [Int32]()
+    output.reserveCapacity(values.count)
+    for value in values {
+        guard value >= Int(Int32.min), value <= Int(Int32.max) else {
+            throw CLIError("Token ID is outside Int32 range: \(value)")
+        }
+        output.append(Int32(value))
+    }
+    guard !output.isEmpty else {
+        throw CLIError("Prompt tokens must not be empty")
+    }
+    return output
+}
+
+private func average(_ values: [Double]) -> Double {
+    guard !values.isEmpty else { return 0 }
+    return values.reduce(0, +) / Double(values.count)
+}
+
+private func eprint(_ message: String) {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+}
