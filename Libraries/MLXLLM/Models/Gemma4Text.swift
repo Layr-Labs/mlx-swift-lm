@@ -612,13 +612,13 @@ private class Gemma4Router: Module {
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
-        self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
+        self._scale.wrappedValue = MLXArray.ones([config.hiddenSize]) * rootSize
         self._perExpertScale.wrappedValue = MLXArray.ones([numExperts])
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let normed = MLXFast.rmsNorm(x, weight: scale, eps: eps)
         let expertScores = proj(normed)
 
         let kth = expertScores.dim(-1) - topK
@@ -1303,6 +1303,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
             // `gate_up_proj` (concatenated along axis -2) plus a separate
             // `down_proj`. SwitchGLU expects three separate
             // `switch_glu.{gate,up,down}_proj.weight` tensors.
+            if k.hasSuffix(".router.scale") {
+                sanitized[k] = v * pow(Float(config.hiddenSize), -0.5)
+                continue
+            }
+
             if k.hasSuffix(".experts.gate_up_proj") {
                 let base = String(k.dropLast(".gate_up_proj".count))
                 let parts = MLX.split(v, parts: 2, axis: -2)
