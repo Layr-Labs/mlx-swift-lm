@@ -6,6 +6,7 @@ import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+import MLXNN
 import MLXSpeculative
 import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
@@ -42,6 +43,7 @@ struct BenchArguments {
     var useChatTemplate = true
     var phaseTimings = false
     var verifySubphaseTimings = false
+    var disableVerifyQMM = false
 
     static func parse() throws -> BenchArguments {
         var args = BenchArguments()
@@ -88,6 +90,8 @@ struct BenchArguments {
                 args.phaseTimings = true
             case "--verify-subphases":
                 args.verifySubphaseTimings = true
+            case "--no-verify-qmm":
+                args.disableVerifyQMM = true
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -133,6 +137,7 @@ struct BenchArguments {
           --no-chat-template        Encode --prompt as plain text
           --phase-timings           Print DFlash diagnostic phase timings
           --verify-subphases        Split DFlash target verify into diagnostic subphases
+          --no-verify-qmm           Disable DFlash target M=16 quantized-matmul fast path
           --help, -h                Show this help
 
         ENVIRONMENT:
@@ -143,6 +148,7 @@ struct BenchArguments {
           MAX_TOKENS, WARMUP_TOKENS, BLOCK_SIZES
           DFLASH_BENCH_PHASES=1
           DFLASH_BENCH_VERIFY_SUBPHASES=1
+          DFLASH_BENCH_VERIFY_QMM=0
         """)
     }
 }
@@ -280,6 +286,13 @@ struct MLXBench {
         guard let target = context.model as? any DFlashTargetModel else {
             throw CLIError("Target model does not conform to DFlashTargetModel: \(type(of: context.model))")
         }
+        let enableVerifyQMM =
+            !args.disableVerifyQMM
+            && envBool(names: ["DFLASH_BENCH_VERIFY_QMM", "\(mode.envPrefix)_VERIFY_QMM"], default: true)
+        let verifyQMMCount =
+            enableVerifyQMM
+            ? DFlashVerifyLinear.install(on: context.model, enableQMM: true)
+            : 0
 
         print("loading DFlash drafter: \(drafterURL.path)")
         let drafter = try await DFlashDraftModel.load(
@@ -315,6 +328,7 @@ struct MLXBench {
         print("target=\(targetURL.lastPathComponent)")
         print("drafter=\(drafterURL.lastPathComponent)")
         print("prompts=\(prompts.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
+        print("verify_qmm=\(enableVerifyQMM ? "enabled" : "disabled") linears=\(verifyQMMCount)")
         if collectPhaseTimings || collectVerifySubphaseTimings {
             print("phase_timing=enabled (diagnostic wall-clock phases)")
         }
