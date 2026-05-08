@@ -2,6 +2,8 @@
 
 import Foundation
 import Hummingbird
+import MLX
+import MLXLLM
 import MLXLMCommon
 
 // MARK: - JSON helpers
@@ -44,10 +46,49 @@ private func samplingParams(from req: CompletionRequest, defaultMaxTokens: Int) 
     )
 }
 
+// MARK: - Gemma 4 MTP generation helper
+
+/// Run Gemma 4 MTP generation for a plain-text prompt, returning (outputText, promptTokens, completionTokens, finishReason).
+private func generateWithGemma4MTP(
+    prompt: String,
+    params: SamplingParams,
+    g4: Gemma4ServerContext
+) async throws -> (String, Int, Int, String) {
+    let tokenIds = g4.target.tokenizer.encode(text: prompt, addSpecialTokens: true)
+    let input = LMInput(text: .init(tokens: MLXArray(tokenIds)))
+    let genParams = GenerateParameters(
+        maxTokens: params.maxTokens,
+        temperature: params.temperature,
+        topP: params.topP,
+        topK: params.topK,
+        minP: params.minP
+    )
+    var outputText = ""
+    var promptToks = tokenIds.count
+    var completionToks = 0
+    var finishReason = "stop"
+    for await gen in try generateGemma4MTP(
+        input: input, parameters: genParams, target: g4.target, drafter: g4.drafter
+    ) {
+        switch gen {
+        case .chunk(let text):
+            outputText += text
+        case .info(let info):
+            promptToks = info.promptTokenCount
+            completionToks = info.generationTokenCount
+            finishReason = info.stopReason == .stop ? "stop" : "length"
+        case .toolCall:
+            break
+        }
+    }
+    return (outputText, promptToks, completionToks, finishReason)
+}
+
 // MARK: - Router builder
 
 func buildRouter(
     engine: BatchedEngine,
+    gemma4Context: Gemma4ServerContext? = nil,
     modelName: String,
     defaultMaxTokens: Int
 ) -> Router<BasicRequestContext> {
@@ -77,6 +118,19 @@ func buildRouter(
 
         if req.stream == true {
             return sseTextResponse(engine: engine, modelName: modelName, prompt: req.prompt, params: params)
+        } else if let g4 = gemma4Context {
+            let (text, pp, tg, finish) = try await generateWithGemma4MTP(
+                prompt: req.prompt, params: params, g4: g4)
+            let resp = CompletionResponse(
+                id: "cmpl-\(UUID().uuidString)",
+                object: "text_completion",
+                created: Int(Date().timeIntervalSince1970),
+                model: modelName,
+                choices: [CompletionChoice(index: 0, text: text, finish_reason: finish)],
+                usage: Usage(prompt_tokens: pp, completion_tokens: tg, total_tokens: pp + tg)
+            )
+            let body = try jsonBody(resp)
+            return Response(status: .ok, headers: [.contentType: "application/json"], body: body)
         } else {
             let output = try await engine.generateWithResult(prompt: req.prompt, samplingParams: params)
             let resp = CompletionResponse(
@@ -108,6 +162,23 @@ func buildRouter(
 
         if req.stream == true {
             return sseChatResponse(engine: engine, modelName: modelName, prompt: prompt, params: params)
+        } else if let g4 = gemma4Context {
+            let (text, pp, tg, finish) = try await generateWithGemma4MTP(
+                prompt: prompt, params: params, g4: g4)
+            let resp = ChatCompletionResponse(
+                id: "chatcmpl-\(UUID().uuidString)",
+                object: "chat.completion",
+                created: Int(Date().timeIntervalSince1970),
+                model: modelName,
+                choices: [ChatChoice(
+                    index: 0,
+                    message: ChatMessage(role: "assistant", content: text),
+                    finish_reason: finish
+                )],
+                usage: Usage(prompt_tokens: pp, completion_tokens: tg, total_tokens: pp + tg)
+            )
+            let body = try jsonBody(resp)
+            return Response(status: .ok, headers: [.contentType: "application/json"], body: body)
         } else {
             let out = try await engine.generateWithResult(prompt: prompt, samplingParams: params)
             let resp = ChatCompletionResponse(

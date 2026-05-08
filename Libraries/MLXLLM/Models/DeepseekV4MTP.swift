@@ -15,7 +15,7 @@ import MLXNN
 /// Set to `true` before calling `MLXLLM.load(...)` when MTP should be active.
 /// Mirrors omlx `is_mtp_active()` / `set_mtp_active()` from
 /// patches/mlx_lm_mtp/__init__.py.
-nonisolated(unsafe) var _deepseekV4MTPEnabled: Bool = false
+public nonisolated(unsafe) var _deepseekV4MTPEnabled: Bool = false
 
 // MARK: - DeepseekV4MTPBlock
 

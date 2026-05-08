@@ -15,7 +15,7 @@ import MLXNN
 /// Set to `true` before calling `MLXLLM.load(...)` when MTP should be active.
 /// Mirrors omlx `is_mtp_active()` / `set_mtp_active()` from
 /// patches/mlx_lm_mtp/__init__.py.
-nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
+public nonisolated(unsafe) var _qwen35MTPEnabled: Bool = false
 
 // MARK: - MTPDecoderLayer
 
