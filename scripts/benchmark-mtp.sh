@@ -140,7 +140,7 @@ run_bench() {
 
     local result bench_exit
     result=$(KMP_DUPLICATE_LIB_OK=TRUE llama-benchy \
-        --base-url "http://localhost:${BENCH_PORT}" \
+        --base-url "http://localhost:${BENCH_PORT}/v1" \
         --tokenizer "$model_path" \
         --pp $PP_SIZES \
         --tg $TG_SIZES \
