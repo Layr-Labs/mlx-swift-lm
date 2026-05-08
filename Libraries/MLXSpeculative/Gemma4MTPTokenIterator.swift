@@ -130,7 +130,7 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         let lastLogits = prefillOut.logits[0..., -1, 0...]
         let firstBonus: Int
         if parameters.temperature == 0 {
-            let firstBonusArr = lastLogits.asType(.float32).argMax(axis: -1)
+            let firstBonusArr = lastLogits.argMax(axis: -1)
             eval(firstBonusArr)
             firstBonus = Int(firstBonusArr.item(Int32.self))
         } else {
@@ -253,9 +253,7 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
             ? bonusCol
             : concatenated([bonusCol] + draftPerStep, axis: 1)
         let verifyOut = target.forwardForMTP(verifyInput, cache: cache)
-        // fp32 argmax at verify to avoid bf16 near-uniform-tail argmax
-        // flips that would otherwise diverge from baseline.
-        let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
+        let mainTokens = verifyOut.logits.argMax(axis: -1)
         let draftConcat: MLXArray =
             draftPerStep.isEmpty
             ? MLXArray.zeros([1, 0], dtype: .int32)

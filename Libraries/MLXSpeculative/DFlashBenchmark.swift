@@ -66,7 +66,7 @@ public func measureDFlashBaselineThroughput(
 
     let prefillStart = Date()
     var logits = target.callAsFunction(prompt, cache: cache)
-    var token = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    var token = logits[0..., -1, 0...].argMax(axis: -1)
     eval(token)
     let prefillElapsed = Date().timeIntervalSince(prefillStart)
 
@@ -74,7 +74,7 @@ public func measureDFlashBaselineThroughput(
     var generated = 1
     for _ in 1 ..< maxTokens {
         logits = target.callAsFunction(token[.newAxis, .ellipsis], cache: cache)
-        token = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+        token = logits[0..., -1, 0...].argMax(axis: -1)
         eval(token)
         generated += 1
     }
@@ -135,7 +135,7 @@ public func measureDFlashThroughput(
         cache: targetCache,
         targetLayerIds: drafter.config.targetLayerIds
     )
-    let firstBonusArray = prefillOut.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    let firstBonusArray = prefillOut.logits[0..., -1, 0...].argMax(axis: -1)
     eval(firstBonusArray, prefillOut.targetHidden)
     let prefillElapsed = Date().timeIntervalSince(prefillStart)
 

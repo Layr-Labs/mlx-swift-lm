@@ -98,7 +98,7 @@ public func measureBaselineThroughput(
 
     let prefillStart = Date()
     var logits = target(prompt, cache: cache)
-    var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    var tok = logits[0..., -1, 0...].argMax(axis: -1)
     eval(tok)
     let prefillElapsed = Date().timeIntervalSince(prefillStart)
 
@@ -107,7 +107,7 @@ public func measureBaselineThroughput(
     for _ in 1 ..< maxTokens {
         let input = tok[.newAxis, .ellipsis]
         logits = target(input, cache: cache)
-        tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+        tok = logits[0..., -1, 0...].argMax(axis: -1)
         eval(tok)
         generated += 1
     }
@@ -147,7 +147,7 @@ public func measureMTPThroughput(
 
     let prefillStart = Date()
     let prefillOut = target.forwardForMTP(prompt, cache: cache)
-    let firstBonusArr = prefillOut.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    let firstBonusArr = prefillOut.logits[0..., -1, 0...].argMax(axis: -1)
     eval(firstBonusArr)
     var bonus = Int(firstBonusArr.item(Int32.self))
     var hidden = prefillOut.lastHidden[
@@ -232,7 +232,7 @@ public func measureBatchedBaselineThroughput(
 
     let prefillStart = Date()
     var logits = target(prompt, cache: cache)
-    var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)  // [B]
+    var tok = logits[0..., -1, 0...].argMax(axis: -1)  // [B]
     eval(tok)
     let prefillElapsed = Date().timeIntervalSince(prefillStart)
 
@@ -241,7 +241,7 @@ public func measureBatchedBaselineThroughput(
     for _ in 1 ..< maxTokens {
         let input = tok.reshaped([B, 1])
         logits = target(input, cache: cache)
-        tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+        tok = logits[0..., -1, 0...].argMax(axis: -1)
         eval(tok)
         total += B
     }
@@ -296,7 +296,7 @@ public func measureBatchedMTPThroughputStaggered(
 
     let prefillStart = Date()
     let prefillOut = target.forwardForMTP(prompt, cache: cache)
-    let firstBonusArr = prefillOut.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    let firstBonusArr = prefillOut.logits[0..., -1, 0...].argMax(axis: -1)
     eval(firstBonusArr)
     let bonusPerRow = firstBonusArr.asArray(Int32.self).map { Int($0) }
     let firstHidden = prefillOut.lastHidden[
@@ -366,7 +366,7 @@ public func measureBatchedMTPThroughput(
 
     let prefillStart = Date()
     let prefillOut = target.forwardForMTP(prompt, cache: cache)
-    let firstBonusArr = prefillOut.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    let firstBonusArr = prefillOut.logits[0..., -1, 0...].argMax(axis: -1)
     eval(firstBonusArr)
     let bonusPerRow = firstBonusArr.asArray(Int32.self).map { Int($0) }
     let firstHidden = prefillOut.lastHidden[

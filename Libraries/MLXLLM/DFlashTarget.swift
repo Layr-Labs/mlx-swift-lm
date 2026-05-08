@@ -11,16 +11,14 @@ import MLXLMCommon
 public struct DFlashTargetForward: @unchecked Sendable {
     public let logits: MLXArray
     public let hiddenStates: [MLXArray]
-
-    public var targetHidden: MLXArray {
-        hiddenStates.count == 1
-            ? hiddenStates[0]
-            : concatenated(hiddenStates, axis: -1)
-    }
+    public let targetHidden: MLXArray
 
     public init(logits: MLXArray, hiddenStates: [MLXArray]) {
         self.logits = logits
         self.hiddenStates = hiddenStates
+        self.targetHidden = hiddenStates.count == 1
+            ? hiddenStates[0]
+            : concatenated(hiddenStates, axis: -1)
     }
 }
 

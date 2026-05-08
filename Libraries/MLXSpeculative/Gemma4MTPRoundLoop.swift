@@ -315,8 +315,7 @@ public func runGemma4MTPRoundsBatched(
                 ? bonusCol
                 : concatenated([bonusCol] + draftPerStep, axis: 1)
             let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
-            // fp32 argmax at verify: see comment in B=1 path above.
-            let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)  // [B, bs]
+            let mainTokens = verifyOut.logits.argMax(axis: -1)  // [B, bs]
             // Materialise drafts + main tokens in a single sync.
             let draftConcat: MLXArray =
                 draftPerStep.isEmpty

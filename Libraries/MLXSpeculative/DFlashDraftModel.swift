@@ -296,7 +296,7 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
             cache: cache,
             logitsStart: 1
         )
-        return logits.asType(.float32).argMax(axis: -1)
+        return logits.argMax(axis: -1)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

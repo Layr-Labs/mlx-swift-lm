@@ -58,7 +58,7 @@ internal func runDFlashGreedyRound(
         cache: targetCache,
         targetLayerIds: drafter.config.targetLayerIds
     )
-    let targetTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
+    let targetTokens = verifyOut.logits.argMax(axis: -1)
     eval(targetTokens, verifyOut.targetHidden)
 
     let targetTokenIds = targetTokens.squeezed(axis: 0).asArray(Int32.self).map { Int($0) }

@@ -61,7 +61,7 @@ internal func runGemma4MTPGreedyRound(
         ? bonusCol
         : concatenated([bonusCol] + draftPerStep, axis: 1)
     let verifyOut = target.forwardForMTP(verifyInput, cache: cache)
-    let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
+    let mainTokens = verifyOut.logits.argMax(axis: -1)
     let draftConcat: MLXArray =
         draftPerStep.isEmpty
         ? MLXArray.zeros([1, 0], dtype: .int32)
