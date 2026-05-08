@@ -19,6 +19,7 @@ BENCH_PORT=18765
 PP_SIZES="512 2048"
 TG_SIZES="128"
 RUNS=3
+CREATE_ISSUE=true
 TIMESTAMP=$(date +"%Y-%m-%d-%H%M%S")
 OUTDIR="benchmarks"
 OUTFILE="${OUTDIR}/mtp-${TIMESTAMP}.md"
@@ -26,9 +27,10 @@ OUTFILE="${OUTDIR}/mtp-${TIMESTAMP}.md"
 # ── parse CLI overrides ───────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --pp)    shift; PP_SIZES="$*"; break ;;
-        --tg)    shift; TG_SIZES="$1"; shift ;;
-        --runs)  shift; RUNS="$1";     shift ;;
+        --pp)        shift; PP_SIZES="$*"; break ;;
+        --tg)        shift; TG_SIZES="$1"; shift ;;
+        --runs)      shift; RUNS="$1";     shift ;;
+        --no-issue)  CREATE_ISSUE=false;   shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -183,12 +185,17 @@ run_bench "Qwen3.6-35B  [MTP]"      "$QWEN_35B" --mtp
 echo ""
 echo "=== Results saved to: $OUTFILE ==="
 
-echo ""
-echo "=== Creating GitHub issue ==="
-gh issue create \
-    --title "MTP benchmark ${TIMESTAMP} (${COMMIT})" \
-    --label "benchmark" \
-    --body-file "$OUTFILE"
+if [[ "$CREATE_ISSUE" == true ]]; then
+    echo ""
+    echo "=== Creating GitHub issue ==="
+    gh issue create \
+        --title "MTP benchmark ${TIMESTAMP} (${COMMIT})" \
+        --label "benchmark" \
+        --body-file "$OUTFILE"
+else
+    echo ""
+    echo "=== Skipping GitHub issue (--no-issue) ==="
+fi
 
 echo ""
 echo "=== Done ==="
