@@ -275,6 +275,12 @@ public struct Gemma4MTPAutomaticPolicy: Sendable, Equatable {
         batchedBlockSize != nil
     }
 
+    /// Whether the public automatic generation entry point should use MTP
+    /// for this family when the caller does not force a block size.
+    public var enablesAutomaticMTP: Bool {
+        family != .e4b
+    }
+
     public func strategy(forBatchSize batchSize: Int) -> Gemma4MTPBatchStrategy {
         precondition(batchSize >= 1, "batchSize must be at least 1")
         if batchSize == 1 {
@@ -291,6 +297,10 @@ public struct Gemma4MTPAutomaticPolicy: Sendable, Equatable {
         maxTokens: Int?
     ) -> Gemma4MTPSingleStreamAction {
         precondition(generatedTokens >= 0, "generatedTokens must be non-negative")
+
+        if !enablesAutomaticMTP {
+            return .targetOnly
+        }
 
         if family == .e2b && singleStreamBlockSize == 3 && batchedBlockSize == nil {
             if let maxTokens, maxTokens <= 16 {
@@ -2289,6 +2299,11 @@ public func generateGemma4MTP(
         params.maxTokens = 1024
     }
     let promptTokenCount = input.text.tokens.size
+
+    let policy = Gemma4MTPAutomaticPolicy.automatic(for: gemma4)
+    if blockSize == nil && !policy.enablesAutomaticMTP {
+        return try generate(input: input, parameters: params, context: target)
+    }
 
     // Build the iterator outside the stream closure so init errors can
     // throw synchronously. Prefill runs inside init.

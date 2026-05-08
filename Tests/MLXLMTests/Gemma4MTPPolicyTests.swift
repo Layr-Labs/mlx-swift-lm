@@ -73,16 +73,17 @@ struct Gemma4MTPPolicyTests {
             generatedTokens: 0, maxTokens: nil) == .targetOnly)
     }
 
-    @Test func e4bStaysSingleStreamUntilCorrectPathBeatsBaseline() throws {
+    @Test func e4bDisablesAutomaticMTPUntilCorrectPathBeatsBaseline() throws {
         let policy = Gemma4MTPAutomaticPolicy.automatic(
             for: try config(hiddenSize: 2560, layers: 42))
 
         #expect(policy.family == .e4b)
+        #expect(!policy.enablesAutomaticMTP)
         #expect(!policy.supportsBatchedMTP)
         #expect(policy.strategy(forBatchSize: 1) == .singleStream(blockSize: 3))
         #expect(policy.strategy(forBatchSize: 4) == .singleStream(blockSize: 3))
         #expect(policy.singleStreamAction(
-            generatedTokens: 64, maxTokens: nil) == .mtp(blockSize: 3))
+            generatedTokens: 64, maxTokens: nil) == .targetOnly)
     }
 
     @Test func moeA4BFallsBackToSingleStreamForBatchedRequests() throws {
