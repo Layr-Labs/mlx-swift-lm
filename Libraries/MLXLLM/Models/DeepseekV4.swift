@@ -310,7 +310,7 @@ final class DeepseekV4RoPE {
                 Float(dims) * log(Float(origMaxPos) / (numRot * 2 * .pi)) / (2 * log(base))
             }
 
-            var low = max(Int(floor(correctionDim(betaFast))), 0)
+            let low = max(Int(floor(correctionDim(betaFast))), 0)
             var high = min(Int(ceil(correctionDim(betaSlow))), dims - 1)
             if low == high { high += 1 }
 
@@ -397,6 +397,176 @@ class HCParams: Module {
     }
 }
 
+// MARK: - HC Sinkhorn Collapse Metal Kernel
+
+/// Fused Sinkhorn-normalisation + HC-collapse Metal kernel.
+///
+/// Mirrors `_make_hc_sinkhorn_collapse_kernel` from
+/// omlx/patches/deepseek_v4/hyper_connection.py.
+///
+/// Layout: one threadgroup per token (B×S rows), 256 threads per group.
+///   - SIMD-group 0 (lanes 0–3 active): compute pre / post / comb (Phase 1).
+///   - All 256 threads: collapse [HC, D] → [D] with pre weights (Phase 2).
+///
+/// Template parameters (all constexpr):
+///   T        input dtype, U output dtype (both x.dtype)
+///   HC       hc_mult (4 for DeepSeek-V4)
+///   ITERS    hc_sinkhorn_iters
+///   D        hidden_size
+///   EPS_INT  eps expressed as integer × 1e-9 (avoids float template args)
+private let _hcSinkhornCollapseKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "hc_sinkhorn_collapse",
+    inputNames: ["x_in", "mixes", "scale", "base"],
+    outputNames: ["collapsed", "post", "comb"],
+    source: """
+        uint tid  = thread_position_in_threadgroup.x;
+        uint row  = threadgroup_position_in_grid.x;
+        uint lane = tid % 32;
+        uint sg   = tid / 32;
+
+        constexpr int   MIX      = (2 + HC) * HC;
+        constexpr int   BASE_OFF = 2 * HC;
+        constexpr float EPS      = EPS_INT * 1e-9f;
+
+        const device float* mix      = (const device float*)mixes + row * MIX;
+              device float* post_out = (device float*)post     + row * HC;
+              device float* comb_out = (device float*)comb     + row * HC * HC;
+
+        threadgroup float pre_shared[HC];
+
+        // ── Phase 1: branchless Sinkhorn on SIMD-group 0 ──────────────────────
+        // Lanes >= HC multiply by active=0 so they never corrupt sums —
+        // no divergent branches inside the Sinkhorn loop.
+        if (sg == 0) {
+            const float pre_scale  = scale[0];
+            const float post_scale = scale[1];
+            const float comb_scale = scale[2];
+
+            const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+            const uint  llane  = metal::min(lane, (uint)(HC - 1));
+
+            float pre_z  = mix[llane]      * pre_scale  + base[llane];
+            float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+            float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
+            float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+            if (lane < (uint)HC) {
+                pre_shared[lane] = pre_v;
+                post_out[lane]   = post_v;
+            }
+
+            // comb row: float4 load (HC=4), softmax, Sinkhorn normalisation
+            float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC) * comb_scale
+                      + *(const device float4*)(base + BASE_OFF + llane * HC)) * active;
+
+            float row_max = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
+            float4 e = metal::fast::exp(v - row_max) * active;
+            float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS)) + EPS * active;
+
+            // Initial column normalisation via simd_sum (free SIMD shuffle)
+            float4 col_inv = 1.0f / (float4(
+                simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
+            r *= col_inv;
+
+            // Sinkhorn iterations: row-norm then col-norm, zero branches
+            for (int iter = 1; iter < ITERS; ++iter) {
+                r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
+                col_inv = 1.0f / (float4(
+                    simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
+                r *= col_inv;
+            }
+
+            if (lane < (uint)HC) {
+                *(device float4*)(comb_out + lane * HC) = r;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 2: vectorised weighted collapse [HC, D] → [D] ──────────────
+        const float p0 = pre_shared[0];
+        const float p1 = pre_shared[1];
+        const float p2 = pre_shared[2];
+        const float p3 = pre_shared[3];
+
+        const device T* x_row   = (const device T*)x_in + row * (HC * D);
+              device U* out_row = (device U*)collapsed   + row * D;
+
+        using T4 = vec<T, 4>;
+        using U4 = vec<U, 4>;
+        const device T4* x_row0 = (const device T4*)(x_row + 0 * D);
+        const device T4* x_row1 = (const device T4*)(x_row + 1 * D);
+        const device T4* x_row2 = (const device T4*)(x_row + 2 * D);
+        const device T4* x_row3 = (const device T4*)(x_row + 3 * D);
+              device U4* out4   = (device U4*)out_row;
+
+        constexpr uint D4 = (uint)D / 4;
+        for (uint d4 = tid; d4 < D4; d4 += 256) {
+            float4 x0 = float4(x_row0[d4]);
+            float4 x1 = float4(x_row1[d4]);
+            float4 x2 = float4(x_row2[d4]);
+            float4 x3 = float4(x_row3[d4]);
+            out4[d4] = U4(fma(float4(p0), x0,
+                         fma(float4(p1), x1,
+                         fma(float4(p2), x2, float4(p3) * x3))));
+        }
+
+        // Scalar tail for D not divisible by 4
+        #if (D % 4) != 0
+        for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
+            float val = p0 * (float)x_row[0*D + d] + p1 * (float)x_row[1*D + d]
+                      + p2 * (float)x_row[2*D + d] + p3 * (float)x_row[3*D + d];
+            out_row[d] = (U)val;
+        }
+        #endif
+    """,
+    ensureRowContiguous: true
+)
+
+/// Dispatch the fused Sinkhorn-collapse kernel.
+/// - Parameters:
+///   - x:     4D hidden `[B, S, hc, D]` (model dtype)
+///   - mixes: pre-computed projections `[B*S, (2+hc)*hc]` (float32)
+///   - scale: `[3]` float32 — pre / post / comb scale factors
+///   - base:  `[(2+hc)*hc]` float32 — biases
+/// - Returns: `(collapsed [B, S, D], post [B, S, HC], comb [B, S, HC, HC])`
+private func hcKernel(
+    x: MLXArray,
+    mixes: MLXArray,
+    scale: MLXArray,
+    base: MLXArray,
+    hcMult: Int,
+    sinkhornIters: Int,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray) {
+    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
+    let BL = B * S
+    let epsInt = max(1, Int((eps / 1e-9).rounded()))
+    let dtype = x.dtype
+
+    let outputs = _hcSinkhornCollapseKernel(
+        [x, mixes, scale, base],
+        template: [
+            ("T", dtype),
+            ("U", dtype),
+            ("HC", hcMult),
+            ("ITERS", sinkhornIters),
+            ("D", D),
+            ("EPS_INT", epsInt),
+        ],
+        grid: (BL * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[BL, D], [BL, hc], [BL, hc, hc]],
+        outputDTypes: [dtype, .float32, .float32]
+    )
+
+    return (
+        outputs[0].reshaped([B, S, D]),
+        outputs[1].reshaped([B, S, hc]),
+        outputs[2].reshaped([B, S, hc, hc])
+    )
+}
+
 // MARK: - HyperConnection helpers
 
 /// Compute the three gating matrices (pre, post, comb) from the 4D hidden state.
@@ -444,6 +614,9 @@ private func hcSplitSinkhorn(
 
 /// HC pre-sublayer: collapse [B, S, hc, D] → [B, S, D].
 /// Returns (collapsed, post, comb) for use in hcPost.
+///
+/// Uses the fused Metal kernel on GPU (eliminates 38+ extra dispatches per call).
+/// Falls back to pure-ops on CPU.
 func hcPre(
     x: MLXArray,
     hcFn: MLXArray,
@@ -458,12 +631,22 @@ func hcPre(
 
     let xFlat = x.reshaped([B, S, hc * D]).asType(.float32)
     let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
-    let mixes = matmul(xFlat, hcFn.T) * normScale
+    let mixes = matmul(xFlat, hcFn.T) * normScale  // [B, S, (2+hc)*hc]
 
+    // Fused Metal kernel: Sinkhorn + collapse in one dispatch
+    if Device.defaultDevice().deviceType == .gpu {
+        return hcKernel(
+            x: x,
+            mixes: mixes.reshaped([B * S, mixes.dim(2)]),
+            scale: hcScale.asType(.float32),
+            base: hcBase.asType(.float32),
+            hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
+    }
+
+    // Pure-ops fallback (CPU / non-Metal)
     let (pre, post, comb) = hcSplitSinkhorn(
         mixes, hcScale: hcScale, hcBase: hcBase,
         hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
-
     let y = (pre.expandedDimensions(axis: -1).asType(dtype) * x).sum(axis: -2)
     return (y, post, comb)
 }
@@ -623,8 +806,9 @@ final class Compressor: Module {
 
     private func overlapCompressKV(_ kv: MLXArray, _ gate: MLXArray) -> MLXArray {
         // kv: [B, nWindows, ratio, out_dim=headDim*2]
-        let B = kv.dim(0), L = kv.dim(1), R = kv.dim(2), D = kv.dim(3)
-        var g = gate + ape.asType(gate.dtype)
+        let B = kv.dim(0), L = kv.dim(1), R = kv.dim(2)
+        let D = kv.dim(3)
+        let g = gate + ape.asType(gate.dtype)
 
         // Split along last dim: first half = prev-window tokens, second half = current
         let kvParts = split(kv, indices: [D / 2], axis: -1)     // [B,L,R,D/2], [B,L,R,D/2]
@@ -1200,8 +1384,8 @@ final class SparseCompressedAttention: Module {
         pooledMask: MLXArray?,
         sinks: MLXArray?
     ) -> MLXArray {
-        let B = q.dim(0), H = q.dim(1), L = q.dim(2), D = q.dim(3)
-        let P = pooled.dim(1), k = topk.dim(2)
+        let B = q.dim(0), L = q.dim(2), D = q.dim(3)
+        let k = topk.dim(2)
 
         // Gather top-k pooled vectors: [B, L, k, D]
         let flatTopk = topk.reshaped([B, L * k])            // [B, L*k]
@@ -1213,7 +1397,6 @@ final class SparseCompressedAttention: Module {
         let qScaled = q * scale
 
         // Local scores: [B, H, L, localLen]
-        let localLen = localKV.dim(2)
         let localScores: MLXArray
         switch localMask {
         case .none, .causal:
@@ -1380,9 +1563,8 @@ public class DeepseekV4ModelInner: Module {
         let B = inputIds.dim(0), S = inputIds.dim(1)
         let hc = config.hcMult
 
-        var h = embedTokens(inputIds)
-        h = h.expandedDimensions(axis: 2)
-        h = repeated(h, count: hc, axis: 2)  // [B, S, hc, D]
+        let emb = embedTokens(inputIds)
+        var h = repeated(emb.expandedDimensions(axis: 2), count: hc, axis: 2)  // [B, S, hc, D]
 
         // Compute attention mask from first rotating cache
         let firstRotatingCache: (any KVCache)? = {
