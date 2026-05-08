@@ -152,6 +152,9 @@ let package = Package(
                 .process("Resources/audio_only.mov"),
                 .process("Resources/gemma4-E4B-assistant-config.json"),
                 .process("Resources/gemma4-26B-A4B-assistant-config.json"),
+                .process("Resources/dflash-gpt-oss-120b-config.json"),
+                .process("Resources/dflash-qwen35-27b-config.json"),
+                .process("Resources/dflash-gemma4-gated-schema-config.json"),
             ]
         ),
         .macro(

@@ -1,0 +1,229 @@
+// Copyright © 2026 Apple Inc.
+
+import Foundation
+import MLXSpeculative
+import Testing
+
+@Suite("DFlashConfiguration decoding")
+struct DFlashConfigurationTests {
+    private func loadFixture(named name: String) throws -> Data {
+        let url = Bundle.module.url(forResource: name, withExtension: "json")
+        #expect(url != nil, "fixture \(name).json not found in test bundle")
+        return try Data(contentsOf: url!)
+    }
+
+    private func validJSON(
+        layerTypes: String = #""full_attention", "full_attention""#,
+        slidingWindow: String = "",
+        blockSize: Int = 4,
+        numTargetLayers: Int = 3,
+        targetLayerIds: String = "0, 1",
+        maskTokenId: Int = 4
+    ) -> String {
+        """
+        {
+            "architectures": ["DFlashDraftModel"],
+            "model_type": "qwen3",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 32,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000,
+            "max_position_embeddings": 128,
+            "block_size": \(blockSize),
+            "num_target_layers": \(numTargetLayers),
+            "layer_types": [\(layerTypes)],
+            \(slidingWindow)
+            "tie_word_embeddings": true,
+            "dflash_config": {
+                "target_layer_ids": [\(targetLayerIds)],
+                "mask_token_id": \(maskTokenId)
+            }
+        }
+        """
+    }
+
+    @Test func decodesSupportedConfig() throws {
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self, from: Data(validJSON().utf8))
+        #expect(config.architectures == ["DFlashDraftModel"])
+        #expect(config.modelType == "qwen3")
+        #expect(config.hiddenSize == 16)
+        #expect(config.layerTypes == [.fullAttention, .fullAttention])
+        #expect(config.numTargetLayers == 3)
+        #expect(config.targetLayerIds == [0, 1])
+        #expect(config.maskTokenId == 4)
+        #expect(config.targetHiddenSize == 32)
+        #expect(config.ignoredConfigKeys.isEmpty)
+    }
+
+    @Test func decodesSlidingAttentionWhenWindowPresent() throws {
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: Data(validJSON(
+                layerTypes: #""sliding_attention", "full_attention""#,
+                slidingWindow: #""sliding_window": 64,"#
+            ).utf8))
+        #expect(config.layerTypes == [.slidingAttention, .fullAttention])
+        #expect(config.slidingWindow == 64)
+    }
+
+    @Test func rejectsSlidingAttentionWithoutWindow() throws {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self,
+                from: Data(validJSON(layerTypes: #""sliding_attention", "full_attention""#).utf8))
+        }
+    }
+
+    @Test func rejectsInvalidLayerTypeCount() throws {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self,
+                from: Data(validJSON(layerTypes: #""full_attention""#).utf8))
+        }
+    }
+
+    @Test func rejectsEmptyTargetLayerIds() throws {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self,
+                from: Data(validJSON(targetLayerIds: "").utf8))
+        }
+    }
+
+    @Test func rejectsDuplicateTargetLayerIds() throws {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self,
+                from: Data(validJSON(targetLayerIds: "0, 0").utf8))
+        }
+    }
+
+    @Test func rejectsOutOfRangeTargetLayerIds() throws {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self,
+                from: Data(validJSON(numTargetLayers: 3, targetLayerIds: "0, 3").utf8))
+        }
+    }
+
+    @Test func rejectsBlockSizeBelowTwo() throws {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self,
+                from: Data(validJSON(blockSize: 1).utf8))
+        }
+    }
+
+    @Test func rejectsMaskTokenOutsideVocabulary() throws {
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self,
+                from: Data(validJSON(maskTokenId: 32).utf8))
+        }
+    }
+
+    @Test func recordsUnknownTopLevelAndDFlashConfigKeys() throws {
+        let json = """
+        {
+            "architectures": ["DFlashDraftModel"],
+            "model_type": "qwen3",
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "intermediate_size": 32,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 32,
+            "rms_norm_eps": 1e-6,
+            "block_size": 4,
+            "num_target_layers": 3,
+            "layer_types": ["full_attention", "full_attention"],
+            "unknown_top_level": true,
+            "dflash_config": {
+                "target_layer_ids": [0, 1],
+                "mask_token_id": 4,
+                "unknown_nested": "kept for diagnostics"
+            }
+        }
+        """
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self, from: Data(json.utf8))
+        #expect(config.ignoredConfigKeys == ["unknown_top_level"])
+        #expect(config.dflashConfig.ignoredConfigKeys == ["unknown_nested"])
+    }
+
+    @Test func decodesUpstreamGPTOSS120BFixture() throws {
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: try loadFixture(named: "dflash-gpt-oss-120b-config"))
+        #expect(config.blockSize == 10)
+        #expect(config.hiddenLayers == 8)
+        #expect(config.numTargetLayers == 36)
+        #expect(config.targetLayerIds == [1, 9, 17, 25, 33])
+        #expect(config.maskTokenId == 200000)
+        #expect(config.vocabularySize == 201088)
+        #expect(config.ignoredConfigKeys.contains("auto_map"))
+        #expect(config.ignoredConfigKeys.contains("dtype"))
+        #expect(config.ignoredConfigKeys.contains("use_cache"))
+    }
+
+    @Test func decodesUpstreamQwen35Fixture() throws {
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: try loadFixture(named: "dflash-qwen35-27b-config"))
+        #expect(config.blockSize == 16)
+        #expect(config.hiddenLayers == 5)
+        #expect(config.numTargetLayers == 64)
+        #expect(config.targetLayerIds == [1, 16, 31, 46, 61])
+        #expect(config.maskTokenId == 248070)
+        #expect(config.ropeTheta == 10_000_000)
+        #expect(config.ignoredConfigKeys.contains("max_window_layers"))
+    }
+
+    @Test func decodesGemma4GatedSchemaFixture() throws {
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: try loadFixture(named: "dflash-gemma4-gated-schema-config"))
+        #expect(config.blockSize == 16)
+        #expect(config.numTargetLayers == 35)
+        #expect(config.targetLayerIds == [1, 9, 17, 25, 33])
+        #expect(config.vocabularySize == 262144)
+        #expect(config.ignoredConfigKeys.contains("fixture_note"))
+    }
+
+    @Test func loadConfigurationFromDirectory() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let configURL = directory.appendingPathComponent("config.json")
+        try loadFixture(named: "dflash-qwen35-27b-config").write(to: configURL)
+
+        let config = try DFlashDraftModel.loadConfiguration(from: directory)
+
+        #expect(config.targetLayerIds == [1, 16, 31, 46, 61])
+    }
+
+    @Test func loadRejectsDirectoryWithoutSafetensors() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let configURL = directory.appendingPathComponent("config.json")
+        try loadFixture(named: "dflash-qwen35-27b-config").write(to: configURL)
+
+        await #expect(throws: DFlashError.noSafetensorsFound(directory.path)) {
+            _ = try await DFlashDraftModel.load(from: directory)
+        }
+    }
+}

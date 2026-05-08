@@ -356,6 +356,16 @@ public final class Gemma4SharedKVCapture: @unchecked Sendable {
     }
 }
 
+private final class Gemma4DFlashHiddenCapture {
+    let layerIds: Set<Int>
+    var hiddenStates = [Int: MLXArray]()
+
+    init(layerIds: [Int]) {
+        self.layerIds = Set(layerIds)
+        self.hiddenStates.reserveCapacity(layerIds.count)
+    }
+}
+
 /// Result of `Gemma4TextModel.forwardForMTP`. Carries both the LM head
 /// output and the pre-head trunk hidden, plus the shared-KV snapshot the
 /// drafter needs for its next round.
@@ -931,11 +941,33 @@ public class Gemma4TextModelInner: Module {
         return (r.postNorm, r.preNorm!)
     }
 
+    public func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+
+        let hiddenCapture = Gemma4DFlashHiddenCapture(layerIds: targetLayerIds)
+        let r = forwardTrunk(
+            inputs,
+            cache: cache,
+            capture: nil,
+            capturePreNorm: false,
+            dFlashHiddenCapture: hiddenCapture
+        )
+
+        let hiddenStates = targetLayerIds.map { hiddenCapture.hiddenStates[$0]! }
+        return (r.postNorm, hiddenStates)
+    }
+
     private func forwardTrunk(
         _ inputs: MLXArray,
         cache: [KVCache]?,
         capture: Gemma4SharedKVCapture?,
-        capturePreNorm: Bool
+        capturePreNorm: Bool,
+        dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
         let inputEmbeddings = embedTokens(inputs)
         var h = inputEmbeddings * embedScale
@@ -1027,6 +1059,10 @@ public class Gemma4TextModelInner: Module {
                     capture.slidingAttention = kvPair
                 }
             }
+
+            if dFlashHiddenCapture?.layerIds.contains(idx) == true {
+                dFlashHiddenCapture?.hiddenStates[idx] = h
+            }
         }
 
         let postNorm = norm(h)
@@ -1036,7 +1072,7 @@ public class Gemma4TextModelInner: Module {
 
 // MARK: - Public Model
 
-public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -1065,15 +1101,44 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return applyLMHead(hidden)
     }
 
-    /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
-    /// configured final-logit softcap. Pure function of the post-norm hidden.
-    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
-        var out: MLXArray
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { config.hiddenSize }
+    public var dFlashLayerCount: Int { config.numHiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: applyLMHead(forward.postNorm),
+            hiddenStates: forward.hiddenStates
+        )
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        embedTokensForDrafter(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        applyRawLMHead(hidden)
+    }
+
+    /// Apply the raw LM head (tied embedding or explicit `lm_head`).
+    private func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
-            out = lmHead(hidden)
+            return lmHead(hidden)
         } else {
-            out = model.embedTokens.asLinear(hidden)
+            return model.embedTokens.asLinear(hidden)
         }
+    }
+
+    /// Apply the LM head plus the configured final-logit softcap. Pure
+    /// function of the post-norm hidden.
+    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        var out = applyRawLMHead(hidden)
         out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
         return out
     }

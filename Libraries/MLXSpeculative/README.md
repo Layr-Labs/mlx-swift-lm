@@ -2,9 +2,14 @@
 
 Speculative-decoding drafters and round-loops for `mlx-swift-lm`.
 
-v1 ships one drafter family: Google's Gemma 4 Multi-Token Prediction
-(MTP) "assistant" drafters, published at
+v1 ships Google's Gemma 4 Multi-Token Prediction (MTP) "assistant"
+drafters, published at
 `mlx-community/gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`.
+
+This branch also includes an experimental DFlash path for upstream-style
+`z-lab/*-DFlash` drafters. The API is intentionally narrow while it is
+being hardened: single-request greedy decoding, explicit drafter loading,
+and target models that conform to `DFlashTargetModel`.
 
 ## What is MTP
 
@@ -51,6 +56,85 @@ for try await generation in stream {
     }
 }
 ```
+
+### DFlash generation (experimental)
+
+DFlash drafters condition on selected target hidden states from multiple
+layers and draft a masked block in one forward pass. The target verifies
+the block, accepts the matching prefix, and rewinds rejected target-cache
+state. The Swift port keeps the integration hidden behind an explicit API
+until checkpoint compatibility is proven on real model pairs.
+
+Supported target conformers in this branch:
+
+- `Qwen3Model`
+- `Qwen3MoEModel`
+- `Qwen3NextModel`
+- `Qwen35TextModel` / `Qwen35Model` / `Qwen35MoEModel`
+- `Gemma4TextModel` / `Gemma4Model`
+- `GPTOSSModel`
+
+```swift
+import MLXLLM
+import MLXSpeculative
+
+let target = modelContext                 // ModelContext from MLXLLM
+let targetModel = target.model as! any DFlashTargetModel
+
+let drafter = try await DFlashDraftModel.load(
+    from: drafterDirectory,
+    bindTo: targetModel
+)
+
+let stream = try generateDFlash(
+    input: lmInput,
+    parameters: GenerateParameters(maxTokens: 512, temperature: 0),
+    target: target,
+    drafter: drafter
+)
+
+for await generation in stream {
+    switch generation {
+    case .chunk(let text): print(text, terminator: "")
+    case .info(let info): print("\n[tokens: \(info.tokensPerSecond) tok/s]")
+    case .toolCall: break
+    }
+}
+```
+
+`DFlashDraftModel.load(from:downloader:id:bindTo:)` is available for Hub
+downloads. It fetches only `config.json` and `*.safetensors`; tokenizers
+and prompt formatting still come from the target `ModelContext`.
+
+Target integration is split into two surfaces. `DFlashTargetModel` is the
+minimal hidden-state capture and LM-head API that new target models need.
+`DFlashTargetCacheRollbackProvider` is optional and exists for hybrid or
+model-specific cache rollback without putting those cache details in the
+generic DFlash generation loop.
+
+Current DFlash limitations:
+
+- Greedy only: `GenerateParameters.temperature` must be `0`.
+- B=1 only.
+- Checkpoint weights must use the upstream DFlash MLX naming shape
+  (`fc`, `hidden_norm`, `layers`, `norm`) and must match the target
+  hidden size, vocab size, and selected layer ids.
+- Hybrid Qwen targets with `MambaCache` use snapshot plus accepted-prefix
+  replay for rejected-token rollback. This is correct but not yet the
+  optimized gated-delta rollback path used by upstream Python.
+
+Real checkpoint smoke coverage is opt-in. Set:
+
+```sh
+MLX_SWIFT_LM_DFLASH_TARGET_DIR=/path/to/target
+MLX_SWIFT_LM_DFLASH_DRAFTER_DIR=/path/to/z-lab-dflash-drafter
+MLX_SWIFT_LM_DFLASH_PROMPT_TOKENS=1,2,3   # optional
+swift test --filter DFlashRealCheckpointSmokeTests
+```
+
+The test loads the target with `LLMModelFactory`, loads and binds the
+DFlash drafter, then runs a two-token greedy `generateDFlashTokens`
+smoke pass.
 
 ### Batched (B>1) generation
 

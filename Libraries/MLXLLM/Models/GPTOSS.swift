@@ -411,6 +411,56 @@ public class GPTOSSModelInner: Module {
 
         return x
     }
+
+    public func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+
+        var x = embedTokens(inputs)
+        let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
+
+        let seqLen = x.dim(1)
+        var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
+        var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
+        let captureIds = Set(targetLayerIds)
+        var captured = [Int: MLXArray]()
+        captured.reserveCapacity(targetLayerIds.count)
+
+        for (i, layer) in layers.enumerated() {
+            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
+            if layerTypes[i] == "full_attention" {
+                if fullMask == nil {
+                    fullMask = makeAttentionMask(
+                        n: seqLen,
+                        cache: cache[fullAttentionIndex],
+                        windowSize: nil
+                    )
+                }
+                maskMode = fullMask!
+            } else {
+                if slidingMask == nil {
+                    slidingMask = makeAttentionMask(
+                        n: seqLen,
+                        cache: cache[slidingAttentionIndex],
+                        windowSize: windowSize
+                    )
+                }
+                maskMode = slidingMask!
+            }
+
+            x = layer(x, mask: maskMode, cache: cache[i])
+            if captureIds.contains(i) {
+                captured[i] = x
+            }
+        }
+
+        let hiddenStates = targetLayerIds.map { captured[$0]! }
+        return (norm(x), hiddenStates)
+    }
 }
 
 private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXArray {
@@ -439,7 +489,7 @@ private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXA
     return out.asType(.bfloat16)
 }
 
-public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
+public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
     public let modelType: String
     public let vocabularySize: Int
     public let kvHeads: [Int]
@@ -459,6 +509,31 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let hidden = model(inputs, cache: cache)
         return lmHead(hidden)
+    }
+
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { configuration.hiddenSize }
+    public var dFlashLayerCount: Int { configuration.hiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: lmHead(forward.postNorm),
+            hiddenStates: forward.hiddenStates
+        )
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        lmHead(hidden)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

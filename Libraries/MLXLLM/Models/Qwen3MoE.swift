@@ -218,9 +218,34 @@ public class Qwen3MoEModelInner: Module {
 
         return norm(h)
     }
+
+    func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+
+        var h = embedTokens(inputs)
+        let mask = createAttentionMask(h: h, cache: cache?.first)
+        let captureIds = Set(targetLayerIds)
+        var captured = [Int: MLXArray]()
+        captured.reserveCapacity(targetLayerIds.count)
+
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, mask: mask, cache: cache?[i])
+            if captureIds.contains(i) {
+                captured[i] = h
+            }
+        }
+
+        let hiddenStates = targetLayerIds.map { captured[$0]! }
+        return (norm(h), hiddenStates)
+    }
 }
 
-public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -241,7 +266,36 @@ public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        applyLMHead(model(inputs, cache: cache))
+    }
+
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { configuration.hiddenSize }
+    public var dFlashLayerCount: Int { configuration.hiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: applyLMHead(forward.postNorm),
+            hiddenStates: forward.hiddenStates
+        )
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        applyLMHead(hidden)
+    }
+
+    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        var out = hidden
         if let lmHead {
             out = lmHead(out)
         } else {
