@@ -40,6 +40,7 @@ struct BenchArguments {
     var warmupTokens: Int?
     var blockSizes: [Int]?
     var useChatTemplate = true
+    var phaseTimings = false
 
     static func parse() throws -> BenchArguments {
         var args = BenchArguments()
@@ -82,6 +83,8 @@ struct BenchArguments {
                     optionName: "--block-sizes")
             case "--no-chat-template":
                 args.useChatTemplate = false
+            case "--phase-timings":
+                args.phaseTimings = true
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -124,6 +127,7 @@ struct BenchArguments {
           --warmup-tokens <int>     Generated tokens for warmup
           --block-sizes <list>      Comma-separated speculative block sizes
           --no-chat-template        Encode --prompt as plain text
+          --phase-timings           Print DFlash diagnostic phase timings
           --help, -h                Show this help
 
         ENVIRONMENT:
@@ -132,6 +136,7 @@ struct BenchArguments {
           DFLASH_BENCH_TARGET_DIR, DFLASH_BENCH_DRAFTER_DIR
           PROMPTS_JSON, PROMPT_TOKENS, PROMPT
           MAX_TOKENS, WARMUP_TOKENS, BLOCK_SIZES
+          DFLASH_BENCH_PHASES=1
         """)
     }
 }
@@ -290,13 +295,18 @@ struct MLXBench {
                 names: ["BLOCK_SIZES", "\(mode.envPrefix)_BLOCK_SIZES"],
                 default: [drafter.config.blockSize],
                 minimum: 2)
+        let collectPhaseTimings = args.phaseTimings
+            || envBool(names: ["DFLASH_BENCH_PHASES", "\(mode.envPrefix)_PHASES"], default: false)
 
         print("")
         print("=== DFlash benchmark ===")
         print("target=\(targetURL.lastPathComponent)")
         print("drafter=\(drafterURL.lastPathComponent)")
         print("prompts=\(prompts.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
-        print("K  base tok/s  dflash tok/s  speedup  accept_avg  generated")
+        if collectPhaseTimings {
+            print("phase_timing=enabled (diagnostic wall-clock phases)")
+        }
+        print("K  base tok/s  dflash tok/s  speedup  accept_avg  emit_avg  generated")
 
         let warmupPrompt = MLXArray(prompts[0])
         _ = measureDFlashBaselineThroughput(
@@ -324,32 +334,44 @@ struct MLXBench {
 
         for blockSize in blockSizes {
             var dflashRates = [Double]()
+            var dflashSeconds = 0.0
             var generated = [String]()
             var accepts = [Int]()
+            var phaseTotals = DFlashPhaseTotals()
             for prompt in prompts {
                 let result = try measureDFlashThroughput(
                     target: target,
                     drafter: drafter,
                     promptTokens: MLXArray(prompt),
                     maxTokens: maxTokens,
-                    blockSize: blockSize)
+                    blockSize: blockSize,
+                    collectPhaseTimings: collectPhaseTimings)
                 dflashRates.append(result.tokensPerSecond)
+                dflashSeconds += result.generationSeconds
                 generated.append(String(result.generatedTokens))
                 accepts.append(contentsOf: result.acceptLengths ?? [])
+                if let phases = result.phaseTimings {
+                    phaseTotals.add(phases)
+                }
                 MLX.Memory.clearCache()
             }
 
             let dflashAverage = average(dflashRates)
             let speedup = dflashAverage / max(baselineAverage, 1e-9)
             let acceptAverage = average(accepts.map(Double.init))
+            let emitAverage = acceptAverage + 1
             print(
                 "\(blockSize)  "
                     + "\(String(format: "%10.1f", baselineAverage)) "
                     + "\(String(format: "%12.1f", dflashAverage))   "
                     + "\(String(format: "%.2fx", speedup))   "
                     + "\(String(format: "%.2f", acceptAverage))/\(blockSize - 1)   "
+                    + "\(String(format: "%.2f", emitAverage))/\(blockSize)   "
                     + generated.joined(separator: ",")
             )
+            if collectPhaseTimings, phaseTotals.rounds > 0 {
+                print("   " + phaseTotals.summary(generationSeconds: dflashSeconds))
+            }
         }
     }
 }
@@ -464,6 +486,20 @@ private func parsePositiveIntList(_ value: String, minimum: Int, optionName: Str
     return parsed
 }
 
+private func envBool(names: [String], default defaultValue: Bool) -> Bool {
+    guard let value = envString(names: names)?.lowercased() else {
+        return defaultValue
+    }
+    switch value {
+    case "1", "true", "yes", "on":
+        return true
+    case "0", "false", "no", "off":
+        return false
+    default:
+        return defaultValue
+    }
+}
+
 private func parseTokenList(_ value: String) throws -> [Int32] {
     let parsed = value
         .split(separator: ",")
@@ -490,6 +526,51 @@ private func int32Tokens(_ values: [Int]) throws -> [Int32] {
 private func average(_ values: [Double]) -> Double {
     guard !values.isEmpty else { return 0 }
     return values.reduce(0, +) / Double(values.count)
+}
+
+private struct DFlashPhaseTotals {
+    var rounds = 0
+    var cacheSnapshotSeconds = 0.0
+    var draftLaunchSeconds = 0.0
+    var draftCacheTrimSeconds = 0.0
+    var verifyAndWaitSeconds = 0.0
+    var acceptWalkSeconds = 0.0
+    var cacheRollbackSeconds = 0.0
+    var roundSeconds = 0.0
+
+    mutating func add(_ phases: DFlashBenchmarkPhaseTimings) {
+        rounds += phases.rounds
+        cacheSnapshotSeconds += phases.cacheSnapshotSeconds
+        draftLaunchSeconds += phases.draftLaunchSeconds
+        draftCacheTrimSeconds += phases.draftCacheTrimSeconds
+        verifyAndWaitSeconds += phases.verifyAndWaitSeconds
+        acceptWalkSeconds += phases.acceptWalkSeconds
+        cacheRollbackSeconds += phases.cacheRollbackSeconds
+        roundSeconds += phases.roundSeconds
+    }
+
+    func summary(generationSeconds: Double) -> String {
+        "phase ms/round: "
+            + "snapshot=\(msPerRound(cacheSnapshotSeconds)) "
+            + "draft_launch=\(msPerRound(draftLaunchSeconds)) "
+            + "draft_trim=\(msPerRound(draftCacheTrimSeconds)) "
+            + "verify_wait=\(msPerRound(verifyAndWaitSeconds)) "
+            + "accept=\(msPerRound(acceptWalkSeconds)) "
+            + "rollback=\(msPerRound(cacheRollbackSeconds)) "
+            + "round=\(msPerRound(roundSeconds)); "
+            + "%gen verify_wait=\(percent(verifyAndWaitSeconds, of: generationSeconds)) "
+            + "accept=\(percent(acceptWalkSeconds, of: generationSeconds)) "
+            + "rollback=\(percent(cacheRollbackSeconds, of: generationSeconds))"
+    }
+
+    private func msPerRound(_ seconds: Double) -> String {
+        String(format: "%.2f", seconds * 1000 / Double(max(rounds, 1)))
+    }
+
+    private func percent(_ seconds: Double, of totalSeconds: Double) -> String {
+        guard totalSeconds > 0 else { return "0.0%" }
+        return String(format: "%.1f%%", seconds * 100 / totalSeconds)
+    }
 }
 
 private func eprint(_ message: String) {

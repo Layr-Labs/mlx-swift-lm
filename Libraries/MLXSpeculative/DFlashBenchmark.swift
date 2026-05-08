@@ -17,6 +17,10 @@ public struct DFlashBenchmarkResult: Sendable {
     /// Per-round count of accepted drafter tokens. `nil` for the no-drafter
     /// baseline; populated with one entry per DFlash round otherwise.
     public let acceptLengths: [Int]?
+    /// Optional diagnostic phase timing for DFlash rounds. This is only
+    /// populated when `measureDFlashThroughput(..., collectPhaseTimings: true)`
+    /// is used.
+    public let phaseTimings: DFlashBenchmarkPhaseTimings?
 
     /// Generated tokens / generationSeconds.
     public var tokensPerSecond: Double {
@@ -28,12 +32,65 @@ public struct DFlashBenchmarkResult: Sendable {
         generatedTokens: Int,
         prefillSeconds: Double,
         generationSeconds: Double,
-        acceptLengths: [Int]? = nil
+        acceptLengths: [Int]? = nil,
+        phaseTimings: DFlashBenchmarkPhaseTimings? = nil
     ) {
         self.generatedTokens = generatedTokens
         self.prefillSeconds = prefillSeconds
         self.generationSeconds = generationSeconds
         self.acceptLengths = acceptLengths
+        self.phaseTimings = phaseTimings
+    }
+}
+
+/// Aggregate wall-clock phase timings for DFlash greedy rounds.
+///
+/// These timings are diagnostic. `draftLaunchSeconds` measures graph
+/// construction/launch, not full drafter execution, because the current
+/// DFlash loop intentionally overlaps drafter evaluation with target verify
+/// work. `verifyAndWaitSeconds` includes the explicit wait on target outputs
+/// and pending draft tokens.
+public struct DFlashBenchmarkPhaseTimings: Sendable {
+    public let rounds: Int
+    public let cacheSnapshotSeconds: Double
+    public let draftLaunchSeconds: Double
+    public let draftCacheTrimSeconds: Double
+    public let verifyAndWaitSeconds: Double
+    public let acceptWalkSeconds: Double
+    public let cacheRollbackSeconds: Double
+    public let roundSeconds: Double
+
+    public var accountedSeconds: Double {
+        cacheSnapshotSeconds
+            + draftLaunchSeconds
+            + draftCacheTrimSeconds
+            + verifyAndWaitSeconds
+            + acceptWalkSeconds
+            + cacheRollbackSeconds
+    }
+}
+
+internal final class DFlashPhaseAccumulator {
+    var rounds = 0
+    var cacheSnapshotSeconds = 0.0
+    var draftLaunchSeconds = 0.0
+    var draftCacheTrimSeconds = 0.0
+    var verifyAndWaitSeconds = 0.0
+    var acceptWalkSeconds = 0.0
+    var cacheRollbackSeconds = 0.0
+    var roundSeconds = 0.0
+
+    func snapshot() -> DFlashBenchmarkPhaseTimings {
+        DFlashBenchmarkPhaseTimings(
+            rounds: rounds,
+            cacheSnapshotSeconds: cacheSnapshotSeconds,
+            draftLaunchSeconds: draftLaunchSeconds,
+            draftCacheTrimSeconds: draftCacheTrimSeconds,
+            verifyAndWaitSeconds: verifyAndWaitSeconds,
+            acceptWalkSeconds: acceptWalkSeconds,
+            cacheRollbackSeconds: cacheRollbackSeconds,
+            roundSeconds: roundSeconds
+        )
     }
 }
 
@@ -97,7 +154,8 @@ public func measureDFlashThroughput(
     promptTokens: MLXArray,
     maxTokens: Int,
     blockSize: Int? = nil,
-    parameters: GenerateParameters = GenerateParameters(temperature: 0)
+    parameters: GenerateParameters = GenerateParameters(temperature: 0),
+    collectPhaseTimings: Bool = false
 ) throws -> DFlashBenchmarkResult {
     guard maxTokens > 0 else {
         return DFlashBenchmarkResult(
@@ -145,6 +203,7 @@ public func measureDFlashThroughput(
     let generationStart = Date()
     var generated = 1
     var accepts: [Int] = []
+    let phases = collectPhaseTimings ? DFlashPhaseAccumulator() : nil
 
     while generated < maxTokens {
         let remaining = maxTokens - generated
@@ -161,7 +220,8 @@ public func measureDFlashThroughput(
             promptTokenCount: prompt.dim(1),
             generatedTokenCount: generated,
             blockSize: roundBlockSize,
-            maxEmitCount: remaining
+            maxEmitCount: remaining,
+            phaseAccumulator: phases
         )
         accepts.append(round.accepted)
 
@@ -178,6 +238,7 @@ public func measureDFlashThroughput(
         generatedTokens: generated,
         prefillSeconds: prefillElapsed,
         generationSeconds: generationElapsed,
-        acceptLengths: accepts
+        acceptLengths: accepts,
+        phaseTimings: phases?.snapshot()
     )
 }

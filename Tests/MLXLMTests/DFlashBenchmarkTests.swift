@@ -28,8 +28,10 @@ struct DFlashBenchmarkTests {
                 drafter: drafter,
                 promptTokens: prompt,
                 maxTokens: 4,
-                blockSize: 3
+                blockSize: 3,
+                collectPhaseTimings: true
             )
+            let phases = try #require(dflash.phaseTimings)
 
             #expect(baseline.generatedTokens == 4)
             #expect(dflash.generatedTokens == 4)
@@ -37,6 +39,9 @@ struct DFlashBenchmarkTests {
             #expect(baseline.generationSeconds.isFinite && baseline.generationSeconds >= 0)
             #expect(dflash.prefillSeconds.isFinite && dflash.prefillSeconds >= 0)
             #expect(dflash.generationSeconds.isFinite && dflash.generationSeconds >= 0)
+            #expect(phases.rounds > 0)
+            #expect(phases.roundSeconds.isFinite && phases.roundSeconds >= 0)
+            #expect(phases.verifyAndWaitSeconds.isFinite && phases.verifyAndWaitSeconds >= 0)
         }
     }
 
