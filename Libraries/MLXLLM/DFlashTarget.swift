@@ -26,10 +26,39 @@ public struct DFlashTargetForward: @unchecked Sendable {
 public struct DFlashGreedyTargetForward: @unchecked Sendable {
     public let tokens: MLXArray
     public let targetHidden: MLXArray
+    public let verifyTimings: DFlashTargetVerifyTimings?
 
-    public init(tokens: MLXArray, targetHidden: MLXArray) {
+    public init(
+        tokens: MLXArray,
+        targetHidden: MLXArray,
+        verifyTimings: DFlashTargetVerifyTimings? = nil
+    ) {
         self.tokens = tokens
         self.targetHidden = targetHidden
+        self.verifyTimings = verifyTimings
+    }
+}
+
+/// Diagnostic target-side timing split for DFlash greedy verification.
+///
+/// These timings intentionally force additional eval barriers and should only
+/// be used for profiling, not for normal throughput measurements.
+public struct DFlashTargetVerifyTimings: Sendable {
+    public let trunkSeconds: Double
+    public let hiddenConcatSeconds: Double
+    public let lmHeadSeconds: Double
+    public let softcapArgmaxSeconds: Double
+
+    public init(
+        trunkSeconds: Double,
+        hiddenConcatSeconds: Double,
+        lmHeadSeconds: Double,
+        softcapArgmaxSeconds: Double
+    ) {
+        self.trunkSeconds = trunkSeconds
+        self.hiddenConcatSeconds = hiddenConcatSeconds
+        self.lmHeadSeconds = lmHeadSeconds
+        self.softcapArgmaxSeconds = softcapArgmaxSeconds
     }
 }
 
@@ -111,6 +140,18 @@ public protocol DFlashTargetCacheRollbackProvider: DFlashTargetModel {
         targetLayerIds: [Int],
         verifiedTargetHidden: MLXArray
     ) throws -> MLXArray
+}
+
+/// Optional target hook that can expose a diagnostic timing split for greedy
+/// verification. Implementations may insert eval barriers to make the split
+/// meaningful, so callers should request this only in profiling modes.
+public protocol DFlashTargetDiagnosticForwardProvider: DFlashTargetModel {
+    func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        collectVerifyTimings: Bool
+    ) throws -> DFlashGreedyTargetForward
 }
 
 extension DFlashTargetModel {

@@ -85,7 +85,7 @@ struct DFlashConfigurationTests {
             ).utf8))
 
         #expect(full.recommendedBlockSize == 16)
-        #expect(sliding.recommendedBlockSize == 4)
+        #expect(sliding.recommendedBlockSize == 6)
     }
 
     @Test func rejectsSlidingAttentionWithoutWindow() throws {

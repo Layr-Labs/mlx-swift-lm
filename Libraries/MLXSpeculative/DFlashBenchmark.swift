@@ -19,7 +19,7 @@ public struct DFlashBenchmarkResult: Sendable {
     public let acceptLengths: [Int]?
     /// Optional diagnostic phase timing for DFlash rounds. This is only
     /// populated when `measureDFlashThroughput(..., collectPhaseTimings: true)`
-    /// is used.
+    /// or `collectVerifySubphaseTimings: true` is used.
     public let phaseTimings: DFlashBenchmarkPhaseTimings?
 
     /// Generated tokens / generationSeconds.
@@ -56,6 +56,12 @@ public struct DFlashBenchmarkPhaseTimings: Sendable {
     public let draftLaunchSeconds: Double
     public let draftCacheTrimSeconds: Double
     public let verifyAndWaitSeconds: Double
+    /// Nested inside `verifyAndWaitSeconds` when target diagnostic timings
+    /// are requested and the target supports `DFlashTargetDiagnosticForwardProvider`.
+    public let targetTrunkSeconds: Double
+    public let targetHiddenConcatSeconds: Double
+    public let targetLMHeadSeconds: Double
+    public let targetSoftcapArgmaxSeconds: Double
     public let acceptWalkSeconds: Double
     public let cacheRollbackSeconds: Double
     public let roundSeconds: Double
@@ -71,14 +77,23 @@ public struct DFlashBenchmarkPhaseTimings: Sendable {
 }
 
 internal final class DFlashPhaseAccumulator {
+    let collectTargetSubphaseTimings: Bool
     var rounds = 0
     var cacheSnapshotSeconds = 0.0
     var draftLaunchSeconds = 0.0
     var draftCacheTrimSeconds = 0.0
     var verifyAndWaitSeconds = 0.0
+    var targetTrunkSeconds = 0.0
+    var targetHiddenConcatSeconds = 0.0
+    var targetLMHeadSeconds = 0.0
+    var targetSoftcapArgmaxSeconds = 0.0
     var acceptWalkSeconds = 0.0
     var cacheRollbackSeconds = 0.0
     var roundSeconds = 0.0
+
+    init(collectTargetSubphaseTimings: Bool = false) {
+        self.collectTargetSubphaseTimings = collectTargetSubphaseTimings
+    }
 
     func snapshot() -> DFlashBenchmarkPhaseTimings {
         DFlashBenchmarkPhaseTimings(
@@ -87,6 +102,10 @@ internal final class DFlashPhaseAccumulator {
             draftLaunchSeconds: draftLaunchSeconds,
             draftCacheTrimSeconds: draftCacheTrimSeconds,
             verifyAndWaitSeconds: verifyAndWaitSeconds,
+            targetTrunkSeconds: targetTrunkSeconds,
+            targetHiddenConcatSeconds: targetHiddenConcatSeconds,
+            targetLMHeadSeconds: targetLMHeadSeconds,
+            targetSoftcapArgmaxSeconds: targetSoftcapArgmaxSeconds,
             acceptWalkSeconds: acceptWalkSeconds,
             cacheRollbackSeconds: cacheRollbackSeconds,
             roundSeconds: roundSeconds
@@ -155,7 +174,8 @@ public func measureDFlashThroughput(
     maxTokens: Int,
     blockSize: Int? = nil,
     parameters: GenerateParameters = GenerateParameters(temperature: 0),
-    collectPhaseTimings: Bool = false
+    collectPhaseTimings: Bool = false,
+    collectVerifySubphaseTimings: Bool = false
 ) throws -> DFlashBenchmarkResult {
     guard maxTokens > 0 else {
         return DFlashBenchmarkResult(
@@ -203,7 +223,9 @@ public func measureDFlashThroughput(
     let generationStart = Date()
     var generated = 1
     var accepts: [Int] = []
-    let phases = collectPhaseTimings ? DFlashPhaseAccumulator() : nil
+    let phases = collectPhaseTimings || collectVerifySubphaseTimings
+        ? DFlashPhaseAccumulator(collectTargetSubphaseTimings: collectVerifySubphaseTimings)
+        : nil
 
     while generated < maxTokens {
         let remaining = maxTokens - generated

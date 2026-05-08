@@ -1072,7 +1072,9 @@ public class Gemma4TextModelInner: Module {
 
 // MARK: - Public Model
 
-public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
+public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
+    DFlashTargetDiagnosticForwardProvider
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -1123,15 +1125,66 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
         cache: [KVCache]?,
         targetLayerIds: [Int]
     ) throws -> DFlashGreedyTargetForward {
+        try forwardGreedyTokensForDFlash(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds,
+            collectVerifyTimings: false
+        )
+    }
+
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        collectVerifyTimings: Bool
+    ) throws -> DFlashGreedyTargetForward {
+        guard collectVerifyTimings else {
+            let forward = try model.callCapturingDFlashHiddenStates(
+                inputs, cache: cache, targetLayerIds: targetLayerIds)
+            let targetHidden = forward.hiddenStates.count == 1
+                ? forward.hiddenStates[0]
+                : concatenated(forward.hiddenStates, axis: -1)
+
+            return DFlashGreedyTargetForward(
+                tokens: applyLMHead(forward.postNorm).argMax(axis: -1),
+                targetHidden: targetHidden
+            )
+        }
+
+        let trunkStart = Date()
         let forward = try model.callCapturingDFlashHiddenStates(
             inputs, cache: cache, targetLayerIds: targetLayerIds)
+        eval([forward.postNorm] + forward.hiddenStates)
+        let trunkSeconds = Date().timeIntervalSince(trunkStart)
+
+        let hiddenConcatStart = Date()
         let targetHidden = forward.hiddenStates.count == 1
             ? forward.hiddenStates[0]
             : concatenated(forward.hiddenStates, axis: -1)
+        eval(targetHidden)
+        let hiddenConcatSeconds = Date().timeIntervalSince(hiddenConcatStart)
+
+        let lmHeadStart = Date()
+        let rawLogits = applyRawLMHead(forward.postNorm)
+        eval(rawLogits)
+        let lmHeadSeconds = Date().timeIntervalSince(lmHeadStart)
+
+        let softcapArgmaxStart = Date()
+        let logits = tanh(rawLogits / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
+        let tokens = logits.argMax(axis: -1)
+        eval(tokens)
+        let softcapArgmaxSeconds = Date().timeIntervalSince(softcapArgmaxStart)
 
         return DFlashGreedyTargetForward(
-            tokens: applyLMHead(forward.postNorm).argMax(axis: -1),
-            targetHidden: targetHidden
+            tokens: tokens,
+            targetHidden: targetHidden,
+            verifyTimings: DFlashTargetVerifyTimings(
+                trunkSeconds: trunkSeconds,
+                hiddenConcatSeconds: hiddenConcatSeconds,
+                lmHeadSeconds: lmHeadSeconds,
+                softcapArgmaxSeconds: softcapArgmaxSeconds
+            )
         )
     }
 

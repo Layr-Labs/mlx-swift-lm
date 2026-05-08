@@ -66,7 +66,7 @@ public struct DFlashConfiguration: Codable, Sendable, Equatable {
     public var maskTokenId: Int { dflashConfig.maskTokenId }
     public var targetHiddenSize: Int { targetLayerIds.count * hiddenSize }
     public var recommendedBlockSize: Int {
-        layerTypes.contains(.slidingAttention) ? Swift.min(blockSize, 4) : blockSize
+        layerTypes.contains(.slidingAttention) ? Swift.min(blockSize, 6) : blockSize
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {

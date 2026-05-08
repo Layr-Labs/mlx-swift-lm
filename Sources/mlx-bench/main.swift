@@ -41,6 +41,7 @@ struct BenchArguments {
     var blockSizes: [Int]?
     var useChatTemplate = true
     var phaseTimings = false
+    var verifySubphaseTimings = false
 
     static func parse() throws -> BenchArguments {
         var args = BenchArguments()
@@ -85,6 +86,8 @@ struct BenchArguments {
                 args.useChatTemplate = false
             case "--phase-timings":
                 args.phaseTimings = true
+            case "--verify-subphases":
+                args.verifySubphaseTimings = true
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -129,6 +132,7 @@ struct BenchArguments {
                                   (DFlash default sweeps 4,5,6,8 plus checkpoint size)
           --no-chat-template        Encode --prompt as plain text
           --phase-timings           Print DFlash diagnostic phase timings
+          --verify-subphases        Split DFlash target verify into diagnostic subphases
           --help, -h                Show this help
 
         ENVIRONMENT:
@@ -138,6 +142,7 @@ struct BenchArguments {
           PROMPTS_JSON, PROMPT_TOKENS, PROMPT
           MAX_TOKENS, WARMUP_TOKENS, BLOCK_SIZES
           DFLASH_BENCH_PHASES=1
+          DFLASH_BENCH_VERIFY_SUBPHASES=1
         """)
     }
 }
@@ -294,18 +299,27 @@ struct MLXBench {
         let blockSizes = args.blockSizes
             ?? envIntList(
                 names: ["BLOCK_SIZES", "\(mode.envPrefix)_BLOCK_SIZES"],
-                default: defaultDFlashBlockSizes(configured: drafter.config.blockSize),
+                default: defaultDFlashBlockSizes(
+                    configured: drafter.config.blockSize,
+                    recommended: drafter.config.recommendedBlockSize),
                 minimum: 2)
         let collectPhaseTimings = args.phaseTimings
             || envBool(names: ["DFLASH_BENCH_PHASES", "\(mode.envPrefix)_PHASES"], default: false)
+        let collectVerifySubphaseTimings = args.verifySubphaseTimings
+            || envBool(
+                names: ["DFLASH_BENCH_VERIFY_SUBPHASES", "\(mode.envPrefix)_VERIFY_SUBPHASES"],
+                default: false)
 
         print("")
         print("=== DFlash benchmark ===")
         print("target=\(targetURL.lastPathComponent)")
         print("drafter=\(drafterURL.lastPathComponent)")
         print("prompts=\(prompts.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
-        if collectPhaseTimings {
+        if collectPhaseTimings || collectVerifySubphaseTimings {
             print("phase_timing=enabled (diagnostic wall-clock phases)")
+        }
+        if collectVerifySubphaseTimings {
+            print("verify_subphases=enabled (adds target eval barriers)")
         }
         print("K  base tok/s  dflash tok/s  speedup  accept_avg  emit_avg  generated")
 
@@ -346,7 +360,8 @@ struct MLXBench {
                     promptTokens: MLXArray(prompt),
                     maxTokens: maxTokens,
                     blockSize: blockSize,
-                    collectPhaseTimings: collectPhaseTimings)
+                    collectPhaseTimings: collectPhaseTimings,
+                    collectVerifySubphaseTimings: collectVerifySubphaseTimings)
                 dflashRates.append(result.tokensPerSecond)
                 dflashSeconds += result.generationSeconds
                 generated.append(String(result.generatedTokens))
@@ -370,16 +385,20 @@ struct MLXBench {
                     + "\(String(format: "%.2f", emitAverage))/\(blockSize)   "
                     + generated.joined(separator: ",")
             )
-            if collectPhaseTimings, phaseTotals.rounds > 0 {
+            if collectPhaseTimings || collectVerifySubphaseTimings, phaseTotals.rounds > 0 {
                 print("   " + phaseTotals.summary(generationSeconds: dflashSeconds))
             }
         }
     }
 
-    private static func defaultDFlashBlockSizes(configured: Int) -> [Int] {
+    private static func defaultDFlashBlockSizes(configured: Int, recommended: Int) -> [Int] {
         var seen = Set<Int>()
         var values = [Int]()
-        for candidate in [4, 5, 6, 8, configured] {
+        let candidates =
+            recommended == configured
+            ? [4, 5, 6, 8, configured]
+            : [recommended, 4, 5, 6, 8, configured]
+        for candidate in candidates {
             guard candidate >= 2, candidate <= configured, !seen.contains(candidate) else {
                 continue
             }
@@ -551,6 +570,10 @@ private struct DFlashPhaseTotals {
     var draftLaunchSeconds = 0.0
     var draftCacheTrimSeconds = 0.0
     var verifyAndWaitSeconds = 0.0
+    var targetTrunkSeconds = 0.0
+    var targetHiddenConcatSeconds = 0.0
+    var targetLMHeadSeconds = 0.0
+    var targetSoftcapArgmaxSeconds = 0.0
     var acceptWalkSeconds = 0.0
     var cacheRollbackSeconds = 0.0
     var roundSeconds = 0.0
@@ -561,6 +584,10 @@ private struct DFlashPhaseTotals {
         draftLaunchSeconds += phases.draftLaunchSeconds
         draftCacheTrimSeconds += phases.draftCacheTrimSeconds
         verifyAndWaitSeconds += phases.verifyAndWaitSeconds
+        targetTrunkSeconds += phases.targetTrunkSeconds
+        targetHiddenConcatSeconds += phases.targetHiddenConcatSeconds
+        targetLMHeadSeconds += phases.targetLMHeadSeconds
+        targetSoftcapArgmaxSeconds += phases.targetSoftcapArgmaxSeconds
         acceptWalkSeconds += phases.acceptWalkSeconds
         cacheRollbackSeconds += phases.cacheRollbackSeconds
         roundSeconds += phases.roundSeconds
@@ -578,6 +605,18 @@ private struct DFlashPhaseTotals {
             + "%gen verify_wait=\(percent(verifyAndWaitSeconds, of: generationSeconds)) "
             + "accept=\(percent(acceptWalkSeconds, of: generationSeconds)) "
             + "rollback=\(percent(cacheRollbackSeconds, of: generationSeconds))"
+            + verifySubphaseSummary()
+    }
+
+    private func verifySubphaseSummary() -> String {
+        let total = targetTrunkSeconds + targetHiddenConcatSeconds + targetLMHeadSeconds
+            + targetSoftcapArgmaxSeconds
+        guard total > 0 else { return "" }
+        return "; target_verify ms/round: "
+            + "trunk=\(msPerRound(targetTrunkSeconds)) "
+            + "hidden_concat=\(msPerRound(targetHiddenConcatSeconds)) "
+            + "lm_head=\(msPerRound(targetLMHeadSeconds)) "
+            + "softcap_argmax=\(msPerRound(targetSoftcapArgmaxSeconds))"
     }
 
     private func msPerRound(_ seconds: Double) -> String {

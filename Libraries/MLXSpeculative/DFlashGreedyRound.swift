@@ -70,11 +70,29 @@ internal func runDFlashGreedyRound(
     let verifyStart = dflashTimingStart(phaseAccumulator)
     let bonusColumn = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
     let verifyInput = concatenated([bonusColumn, draftTokens], axis: 1)
-    let verifyOut = try target.forwardGreedyTokensForDFlash(
-        verifyInput,
-        cache: targetCache,
-        targetLayerIds: drafter.config.targetLayerIds
-    )
+    let verifyOut: DFlashGreedyTargetForward
+    if phaseAccumulator?.collectTargetSubphaseTimings == true,
+        let diagnosticTarget = target as? any DFlashTargetDiagnosticForwardProvider
+    {
+        verifyOut = try diagnosticTarget.forwardGreedyTokensForDFlash(
+            verifyInput,
+            cache: targetCache,
+            targetLayerIds: drafter.config.targetLayerIds,
+            collectVerifyTimings: true
+        )
+    } else {
+        verifyOut = try target.forwardGreedyTokensForDFlash(
+            verifyInput,
+            cache: targetCache,
+            targetLayerIds: drafter.config.targetLayerIds
+        )
+    }
+    if let timings = verifyOut.verifyTimings, let phaseAccumulator {
+        phaseAccumulator.targetTrunkSeconds += timings.trunkSeconds
+        phaseAccumulator.targetHiddenConcatSeconds += timings.hiddenConcatSeconds
+        phaseAccumulator.targetLMHeadSeconds += timings.lmHeadSeconds
+        phaseAccumulator.targetSoftcapArgmaxSeconds += timings.softcapArgmaxSeconds
+    }
     let targetTokens = verifyOut.tokens
     let draftTokenIds = draftTokens.squeezed(axis: 0)
     let targetTokenIds = targetTokens.squeezed(axis: 0)

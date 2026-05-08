@@ -61,7 +61,9 @@ public struct Gemma4Configuration: Codable, Sendable {
 
 // MARK: - Model
 
-public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
+public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider,
+    DFlashTargetDiagnosticForwardProvider
+{
     public var vocabularySize: Int { languageModel.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
@@ -137,6 +139,20 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider, DFlashTarg
     ) throws -> DFlashGreedyTargetForward {
         try languageModel.forwardGreedyTokensForDFlash(
             inputs, cache: cache, targetLayerIds: targetLayerIds)
+    }
+
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        collectVerifyTimings: Bool
+    ) throws -> DFlashGreedyTargetForward {
+        try languageModel.forwardGreedyTokensForDFlash(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds,
+            collectVerifyTimings: collectVerifyTimings
+        )
     }
 
     public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
