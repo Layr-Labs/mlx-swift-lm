@@ -102,6 +102,10 @@ for await generation in stream {
 }
 ```
 
+When `blockSize` is omitted, DFlash uses the checkpoint block size for
+full-attention drafters and a smaller Apple-GPU-oriented default for
+sliding-window drafters. Passing `blockSize:` remains an explicit override.
+
 `DFlashDraftModel.load(from:downloader:id:bindTo:)` is available for Hub
 downloads. It fetches only `config.json` and `*.safetensors`; tokenizers
 and prompt formatting still come from the target `ModelContext`.

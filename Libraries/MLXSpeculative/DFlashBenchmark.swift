@@ -169,7 +169,7 @@ public func measureDFlashThroughput(
     generationParameters.maxTokens = maxTokens
     generationParameters.temperature = 0
 
-    let resolvedBlockSize = blockSize ?? drafter.config.blockSize
+    let resolvedBlockSize = blockSize ?? drafter.config.recommendedBlockSize
     guard resolvedBlockSize >= 2 else {
         throw DFlashError.invalidBlockSize(resolvedBlockSize)
     }

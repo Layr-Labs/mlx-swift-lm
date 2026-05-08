@@ -76,26 +76,29 @@ internal func runDFlashGreedyRound(
         targetLayerIds: drafter.config.targetLayerIds
     )
     let targetTokens = verifyOut.tokens
-    eval(targetTokens, verifyOut.targetHidden, draftTokens)
+    let draftTokenIds = draftTokens.squeezed(axis: 0)
+    let targetTokenIds = targetTokens.squeezed(axis: 0)
+    let proposedCount = Swift.max(0, blockSize - 1)
+    let acceptedArray: MLXArray?
+    if proposedCount == 0 {
+        acceptedArray = nil
+    } else {
+        let targetPrefix = targetTokenIds[0 ..< proposedCount]
+        let matches = (draftTokenIds .== targetPrefix).asType(.int32)
+        let prefixMatches = matches.cumprod(axis: 0)
+        acceptedArray = prefixMatches.sum()
+    }
+    if let acceptedArray {
+        eval(targetTokens, verifyOut.targetHidden, draftTokens, acceptedArray)
+    } else {
+        eval(targetTokens, verifyOut.targetHidden, draftTokens)
+    }
     dflashRecord(verifyStart, into: phaseAccumulator) {
         $0.verifyAndWaitSeconds += $1
     }
 
     let acceptStart = dflashTimingStart(phaseAccumulator)
-    let draftTokenIds = draftTokens.squeezed(axis: 0)
-    let targetTokenIds = targetTokens.squeezed(axis: 0)
-    let proposedCount = Swift.max(0, blockSize - 1)
-    let walkedAccepted: Int
-    if proposedCount == 0 {
-        walkedAccepted = 0
-    } else {
-        let targetPrefix = targetTokenIds[0 ..< proposedCount]
-        let matches = (draftTokenIds .== targetPrefix).asType(.int32)
-        let prefixMatches = matches.cumprod(axis: 0)
-        let acceptedArray = prefixMatches.sum()
-        eval(acceptedArray)
-        walkedAccepted = Int(acceptedArray.item(Int32.self))
-    }
+    let walkedAccepted = acceptedArray.map { Int($0.item(Int32.self)) } ?? 0
     let walkedTokenCount = walkedAccepted + 1
     let emittedCount = Swift.min(maxEmitCount, walkedTokenCount)
     let emitted = targetTokenIds[0 ..< emittedCount]

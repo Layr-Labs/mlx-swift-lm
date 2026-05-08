@@ -72,6 +72,22 @@ struct DFlashConfigurationTests {
         #expect(config.slidingWindow == 64)
     }
 
+    @Test func recommendsSmallerBlockForSlidingDrafts() throws {
+        let full = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: Data(validJSON(blockSize: 16).utf8))
+        let sliding = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: Data(validJSON(
+                layerTypes: #""sliding_attention", "full_attention""#,
+                slidingWindow: #""sliding_window": 64,"#,
+                blockSize: 16
+            ).utf8))
+
+        #expect(full.recommendedBlockSize == 16)
+        #expect(sliding.recommendedBlockSize == 4)
+    }
+
     @Test func rejectsSlidingAttentionWithoutWindow() throws {
         #expect(throws: DecodingError.self) {
             _ = try JSONDecoder.json5().decode(

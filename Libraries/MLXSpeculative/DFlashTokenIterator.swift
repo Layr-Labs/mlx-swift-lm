@@ -37,7 +37,7 @@ public struct DFlashTokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters,
         blockSize: Int? = nil
     ) throws {
-        let resolvedBlockSize = blockSize ?? drafter.config.blockSize
+        let resolvedBlockSize = blockSize ?? drafter.config.recommendedBlockSize
         guard resolvedBlockSize >= 2 else {
             throw DFlashError.invalidBlockSize(resolvedBlockSize)
         }
