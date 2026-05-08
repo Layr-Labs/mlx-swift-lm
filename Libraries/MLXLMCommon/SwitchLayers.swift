@@ -4,6 +4,12 @@ import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
+private let switchGLUSortMinSize: Int = {
+    let raw = ProcessInfo.processInfo.environment["MLX_SWITCH_GLU_SORT_MIN_SIZE"]
+    guard let raw, let value = Int(raw) else { return 32 }
+    return max(0, value)
+}()
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -62,7 +68,7 @@ public class SwitchGLU: Module {
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
-        let doSort = indices.size >= 32
+        let doSort = indices.size >= switchGLUSortMinSize
 
         var idx = indices
         var inverseOrder = MLXArray()

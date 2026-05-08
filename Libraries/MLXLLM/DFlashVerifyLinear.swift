@@ -70,6 +70,36 @@ public final class DFlashVerifyQuantizedLinear: QuantizedLinear {
         return inputDimensions % (32 * Self.pipeKParts) == 0
     }
 
+    public static func pathTag(_ path: String) -> String {
+        if path.hasSuffix(".mlp.gate_proj") { return "mlp_gate" }
+        if path.hasSuffix(".mlp.up_proj") { return "mlp_up" }
+        if path.hasSuffix(".mlp.down_proj") { return "mlp_down" }
+        if path.hasSuffix(".self_attn.q_proj") { return "attn_q" }
+        if path.hasSuffix(".self_attn.k_proj") { return "attn_k" }
+        if path.hasSuffix(".self_attn.v_proj") { return "attn_v" }
+        if path.hasSuffix(".self_attn.o_proj") { return "attn_o" }
+        if path.hasSuffix(".router.proj") { return "router" }
+        return "other"
+    }
+
+    public static func includeAllows(path: String, include: String) -> Bool {
+        let rawTags = include
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        guard !rawTags.isEmpty else { return true }
+        if rawTags.contains("all") { return true }
+
+        var tags = Set(rawTags)
+        if tags.contains("mlp") {
+            tags.formUnion(["mlp_gate", "mlp_up", "mlp_down"])
+        }
+        if tags.contains("attn") {
+            tags.formUnion(["attn_q", "attn_k", "attn_v", "attn_o"])
+        }
+        return tags.contains(pathTag(path))
+    }
+
     private func fallback(_ x: MLXArray) -> MLXArray {
         quantizedMM(
             x,
@@ -237,6 +267,7 @@ public enum DFlashVerifyLinear {
     public static func install(
         on model: Module,
         enableQMM: Bool = true,
+        include: String = "all",
         maxOutputDimensions: Int = 100_000
     ) -> Int {
         let updates =
@@ -245,6 +276,9 @@ public enum DFlashVerifyLinear {
             .flattened()
             .compactMap { path, module -> (String, Module)? in
             guard let linear = module as? QuantizedLinear else { return nil }
+            guard DFlashVerifyQuantizedLinear.includeAllows(path: path, include: include) else {
+                return nil
+            }
             guard DFlashVerifyQuantizedLinear.isEligible(
                 linear, maxOutputDimensions: maxOutputDimensions)
             else {

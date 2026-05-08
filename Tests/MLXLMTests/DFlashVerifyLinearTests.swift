@@ -50,6 +50,24 @@ struct DFlashVerifyLinearTests {
         #expect(secondPass == 0)
         #expect(model.good is DFlashVerifyQuantizedLinear)
     }
+
+    @Test func includeFilterMatchesProjectionFamilies() {
+        #expect(
+            DFlashVerifyQuantizedLinear.includeAllows(
+                path: "model.layers.0.self_attn.q_proj", include: "attn"))
+        #expect(
+            DFlashVerifyQuantizedLinear.includeAllows(
+                path: "model.layers.0.self_attn.o_proj", include: "attn_o"))
+        #expect(
+            DFlashVerifyQuantizedLinear.includeAllows(
+                path: "model.layers.0.mlp.down_proj", include: "mlp"))
+        #expect(
+            DFlashVerifyQuantizedLinear.includeAllows(
+                path: "model.layers.0.router.proj", include: "router"))
+        #expect(
+            !DFlashVerifyQuantizedLinear.includeAllows(
+                path: "model.layers.0.router.proj", include: "attn,mlp"))
+    }
 }
 
 private final class LinearPair: Module {

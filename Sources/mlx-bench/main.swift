@@ -44,6 +44,7 @@ struct BenchArguments {
     var phaseTimings = false
     var verifySubphaseTimings = false
     var enableVerifyQMM = false
+    var verifyQMMInclude: String?
     var tokenHashes = false
 
     static func parse() throws -> BenchArguments {
@@ -93,6 +94,8 @@ struct BenchArguments {
                 args.verifySubphaseTimings = true
             case "--verify-qmm":
                 args.enableVerifyQMM = true
+            case "--verify-qmm-include":
+                args.verifyQMMInclude = try value(after: arg, argv: argv, index: &i)
             case "--no-verify-qmm":
                 args.enableVerifyQMM = false
             case "--token-hashes":
@@ -143,6 +146,8 @@ struct BenchArguments {
           --phase-timings           Print DFlash diagnostic phase timings
           --verify-subphases        Split DFlash target verify into diagnostic subphases
           --verify-qmm              Enable experimental DFlash target M=16 qmm fast path
+          --verify-qmm-include <s>  Comma-separated qmm subset:
+                                  all, attn, attn_q/k/v/o, mlp, router
           --no-verify-qmm           Disable DFlash target M=16 qmm fast path
           --token-hashes            Print per-prompt generated-token hash diagnostics
           --help, -h                Show this help
@@ -156,6 +161,8 @@ struct BenchArguments {
           DFLASH_BENCH_PHASES=1
           DFLASH_BENCH_VERIFY_SUBPHASES=1
           DFLASH_BENCH_VERIFY_QMM=1
+          DFLASH_BENCH_VERIFY_QMM_INCLUDE=attn,mlp,router
+          MLX_SWITCH_GLU_SORT_MIN_SIZE=32
         """)
     }
 }
@@ -298,9 +305,18 @@ struct MLXBench {
         let enableVerifyQMM =
             args.enableVerifyQMM
             || envBool(names: ["DFLASH_BENCH_VERIFY_QMM", "\(mode.envPrefix)_VERIFY_QMM"], default: false)
+        let verifyQMMInclude =
+            args.verifyQMMInclude
+            ?? envString(
+                names: [
+                    "DFLASH_BENCH_VERIFY_QMM_INCLUDE",
+                    "\(mode.envPrefix)_VERIFY_QMM_INCLUDE",
+                ])
+            ?? "all"
         let verifyQMMCount =
             enableVerifyQMM
-            ? DFlashVerifyLinear.install(on: context.model, enableQMM: true)
+            ? DFlashVerifyLinear.install(
+                on: context.model, enableQMM: true, include: verifyQMMInclude)
             : 0
 
         print("loading DFlash drafter: \(drafterURL.path)")
@@ -337,7 +353,10 @@ struct MLXBench {
         print("target=\(targetURL.lastPathComponent)")
         print("drafter=\(drafterURL.lastPathComponent)")
         print("prompts=\(prompts.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
-        print("verify_qmm=\(enableVerifyQMM ? "enabled" : "disabled") linears=\(verifyQMMCount)")
+        print(
+            "verify_qmm=\(enableVerifyQMM ? "enabled" : "disabled")"
+                + " include=\(verifyQMMInclude) linears=\(verifyQMMCount)"
+        )
         if collectPhaseTimings || collectVerifySubphaseTimings {
             print("phase_timing=enabled (diagnostic wall-clock phases)")
         }
