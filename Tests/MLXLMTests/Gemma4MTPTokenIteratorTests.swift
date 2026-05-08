@@ -103,39 +103,31 @@ struct Gemma4MTPTokenIteratorTests {
 
     @Test func iteratorMatchesAsyncStreamPath() async throws {
         MLXRandom.seed(42)
-        let target1 = try tinyTarget()
-        let drafter1 = try tinyDrafter()
-        eval(target1, drafter1)
-
-        // Same seed → same weights, but we need to replay exactly:
-        // build a second pair from the same seeded init so iterator
-        // and stream see identical weights.
-        MLXRandom.seed(42)
-        let target2 = try tinyTarget()
-        let drafter2 = try tinyDrafter()
-        eval(target2, drafter2)
+        let target = try tinyTarget()
+        let drafter = try tinyDrafter()
+        eval(target, drafter)
 
         let promptTokens = MLXArray([Int32](repeating: 7, count: 8))
 
         // Iterator path.
         let input = LMInput(text: .init(tokens: promptTokens))
         var iter = try Gemma4MTPTokenIterator(
-            input: input, target: target1, drafter: drafter1,
+            input: input, target: target, drafter: drafter,
             parameters: GenerateParameters(maxTokens: 12, temperature: 0),
             blockSize: 3)
         var iteratorTokens: [Int] = []
         while let t = iter.next() { iteratorTokens.append(t) }
 
         // AsyncStream path.
-        let cache = target2.newCache(parameters: nil)
-        let prefillOut = target2.forwardForMTP(
+        let cache = target.newCache(parameters: nil)
+        let prefillOut = target.forwardForMTP(
             promptTokens[.newAxis, .ellipsis], cache: cache)
         let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
                                  .asType(.float32).argMax(axis: -1).item(Int32.self))
         let firstHidden = prefillOut.lastHidden[
             0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         let stream = try runGemma4MTPRounds(
-            target: target2, drafter: drafter2,
+            target: target, drafter: drafter,
             targetCache: cache,
             firstBonus: firstBonus, firstHidden: firstHidden,
             firstSharedKV: prefillOut.capturedSharedKV,
