@@ -43,7 +43,7 @@ final class DeepseekV4MTPBlock: Module {
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
         self.config = config
-        self.block = DeepseekV4Block(config: config)
+        self.block = DeepseekV4Block(config: config, layerIdx: layerIdx)
 
         let dim = config.hiddenSize
         self.e_proj = Linear(dim, dim, bias: false)
@@ -88,7 +88,7 @@ final class DeepseekV4MTPBlock: Module {
         let x = e_proj(e).expandedDimensions(axis: 2) + h_proj(hNorm)  // [B, S, hc, D]
 
         // 4. Run full transformer block (returns 4D hidden).
-        return block(x, mask: mask, cache: cache)
+        return block(x, mask: mask, cache: cache, inputIds: inputIds)
     }
 }
 
@@ -137,8 +137,10 @@ extension DeepseekV4Model: MTPCapable {
         // Build attention mask from the collapsed [B, S, hc*D] representation.
         let B = h.dim(0), S = h.dim(1), hc = h.dim(2), D = h.dim(3)
         let maskInput = h.reshaped([B, S, hc * D])
-        let firstCache: KVCache? = cache.isEmpty ? nil : cache[0]
-        let mask = createAttentionMask(h: maskInput, cache: firstCache)
+        let firstCache: (any KVCache)? = cache.isEmpty ? nil : cache[0]
+        let mask = createAttentionMask(
+            h: maskInput, cache: firstCache,
+            windowSize: args.slidingWindow, returnArray: true)
 
         var lastBlock: DeepseekV4MTPBlock?
         for (i, mtpBlock) in mtpBlocks.enumerated() {
