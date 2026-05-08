@@ -31,6 +31,25 @@ struct DFlashVerifyLinearTests {
         #expect(model.bad is QuantizedLinear)
         #expect(!(model.bad is DFlashVerifyQuantizedLinear))
     }
+
+    @Test func installReturnsZeroWhenNoLinearsAreEligible() {
+        let model = NoEligibleLinears()
+        let replaced = DFlashVerifyLinear.install(on: model)
+
+        #expect(replaced == 0)
+        #expect(model.smallQuantized is QuantizedLinear)
+        #expect(!(model.smallQuantized is DFlashVerifyQuantizedLinear))
+    }
+
+    @Test func installDoesNotReplaceAlreadyWrappedLinears() {
+        let model = LinearPair()
+        let firstPass = DFlashVerifyLinear.install(on: model)
+        let secondPass = DFlashVerifyLinear.install(on: model)
+
+        #expect(firstPass == 1)
+        #expect(secondPass == 0)
+        #expect(model.good is DFlashVerifyQuantizedLinear)
+    }
 }
 
 private final class LinearPair: Module {
@@ -40,6 +59,17 @@ private final class LinearPair: Module {
     override init() {
         self._good.wrappedValue = QuantizedLinear(Linear(256, 64), groupSize: 64, bits: 4)
         self._bad.wrappedValue = QuantizedLinear(Linear(128, 64), groupSize: 64, bits: 4)
+        super.init()
+    }
+}
+
+private final class NoEligibleLinears: Module {
+    @ModuleInfo var floatLinear: Linear
+    @ModuleInfo var smallQuantized: Linear
+
+    override init() {
+        self._floatLinear.wrappedValue = Linear(256, 64)
+        self._smallQuantized.wrappedValue = QuantizedLinear(Linear(128, 64), groupSize: 64, bits: 4)
         super.init()
     }
 }

@@ -239,19 +239,22 @@ public enum DFlashVerifyLinear {
         enableQMM: Bool = true,
         maxOutputDimensions: Int = 100_000
     ) -> Int {
-        var count = 0
-        let updates = model.leafModules().compactMapValues { module -> Module? in
+        let updates =
+            model
+            .leafModules()
+            .flattened()
+            .compactMap { path, module -> (String, Module)? in
             guard let linear = module as? QuantizedLinear else { return nil }
             guard DFlashVerifyQuantizedLinear.isEligible(
                 linear, maxOutputDimensions: maxOutputDimensions)
             else {
                 return nil
             }
-            count += 1
-            return DFlashVerifyQuantizedLinear(linear, enableQMM: enableQMM)
+            return (path, DFlashVerifyQuantizedLinear(linear, enableQMM: enableQMM))
         }
-        guard count > 0 else { return 0 }
-        model.update(modules: updates)
-        return count
+
+        guard !updates.isEmpty else { return 0 }
+        model.update(modules: ModuleChildren.unflattened(updates))
+        return updates.count
     }
 }

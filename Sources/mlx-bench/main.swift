@@ -229,13 +229,15 @@ struct MLXBench {
             target: target,
             promptTokens: warmupPrompt,
             maxTokens: warmupTokens)
-        _ = try measureMTPThroughput(
-            target: target,
-            drafter: drafter,
-            promptTokens: warmupPrompt,
-            maxTokens: warmupTokens,
-            blockSize: blockSizes.max() ?? 2)
-        MLX.Memory.clearCache()
+        for blockSize in orderedUnique(blockSizes) {
+            _ = try measureMTPThroughput(
+                target: target,
+                drafter: drafter,
+                promptTokens: warmupPrompt,
+                maxTokens: warmupTokens,
+                blockSize: blockSize)
+            MLX.Memory.clearCache()
+        }
 
         var baselineRates = [Double]()
         for prompt in prompts {
@@ -349,13 +351,15 @@ struct MLXBench {
             target: target,
             promptTokens: warmupPrompt,
             maxTokens: warmupTokens)
-        _ = try measureDFlashThroughput(
-            target: target,
-            drafter: drafter,
-            promptTokens: warmupPrompt,
-            maxTokens: warmupTokens,
-            blockSize: blockSizes.max())
-        MLX.Memory.clearCache()
+        for blockSize in orderedUnique(blockSizes) {
+            _ = try measureDFlashThroughput(
+                target: target,
+                drafter: drafter,
+                promptTokens: warmupPrompt,
+                maxTokens: warmupTokens,
+                blockSize: blockSize)
+            MLX.Memory.clearCache()
+        }
 
         var baselineRates = [Double]()
         for prompt in prompts {
@@ -546,6 +550,16 @@ private func parsePositiveIntList(_ value: String, minimum: Int, optionName: Str
         throw CLIError("\(optionName) requires comma-separated integers >= \(minimum)")
     }
     return parsed
+}
+
+private func orderedUnique(_ values: [Int]) -> [Int] {
+    var seen = Set<Int>()
+    var result = [Int]()
+    result.reserveCapacity(values.count)
+    for value in values where seen.insert(value).inserted {
+        result.append(value)
+    }
+    return result
 }
 
 private func envBool(names: [String], default defaultValue: Bool) -> Bool {
