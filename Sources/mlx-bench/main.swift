@@ -43,7 +43,8 @@ struct BenchArguments {
     var useChatTemplate = true
     var phaseTimings = false
     var verifySubphaseTimings = false
-    var disableVerifyQMM = false
+    var enableVerifyQMM = false
+    var tokenHashes = false
 
     static func parse() throws -> BenchArguments {
         var args = BenchArguments()
@@ -90,8 +91,12 @@ struct BenchArguments {
                 args.phaseTimings = true
             case "--verify-subphases":
                 args.verifySubphaseTimings = true
+            case "--verify-qmm":
+                args.enableVerifyQMM = true
             case "--no-verify-qmm":
-                args.disableVerifyQMM = true
+                args.enableVerifyQMM = false
+            case "--token-hashes":
+                args.tokenHashes = true
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -137,7 +142,9 @@ struct BenchArguments {
           --no-chat-template        Encode --prompt as plain text
           --phase-timings           Print DFlash diagnostic phase timings
           --verify-subphases        Split DFlash target verify into diagnostic subphases
-          --no-verify-qmm           Disable DFlash target M=16 quantized-matmul fast path
+          --verify-qmm              Enable experimental DFlash target M=16 qmm fast path
+          --no-verify-qmm           Disable DFlash target M=16 qmm fast path
+          --token-hashes            Print per-prompt generated-token hash diagnostics
           --help, -h                Show this help
 
         ENVIRONMENT:
@@ -148,7 +155,7 @@ struct BenchArguments {
           MAX_TOKENS, WARMUP_TOKENS, BLOCK_SIZES
           DFLASH_BENCH_PHASES=1
           DFLASH_BENCH_VERIFY_SUBPHASES=1
-          DFLASH_BENCH_VERIFY_QMM=0
+          DFLASH_BENCH_VERIFY_QMM=1
         """)
     }
 }
@@ -287,8 +294,8 @@ struct MLXBench {
             throw CLIError("Target model does not conform to DFlashTargetModel: \(type(of: context.model))")
         }
         let enableVerifyQMM =
-            !args.disableVerifyQMM
-            && envBool(names: ["DFLASH_BENCH_VERIFY_QMM", "\(mode.envPrefix)_VERIFY_QMM"], default: true)
+            args.enableVerifyQMM
+            || envBool(names: ["DFLASH_BENCH_VERIFY_QMM", "\(mode.envPrefix)_VERIFY_QMM"], default: false)
         let verifyQMMCount =
             enableVerifyQMM
             ? DFlashVerifyLinear.install(on: context.model, enableQMM: true)
@@ -365,6 +372,7 @@ struct MLXBench {
             var dflashRates = [Double]()
             var dflashSeconds = 0.0
             var generated = [String]()
+            var tokenHashes = [String]()
             var accepts = [Int]()
             var phaseTotals = DFlashPhaseTotals()
             for prompt in prompts {
@@ -379,6 +387,7 @@ struct MLXBench {
                 dflashRates.append(result.tokensPerSecond)
                 dflashSeconds += result.generationSeconds
                 generated.append(String(result.generatedTokens))
+                tokenHashes.append(tokenHash(result.generatedTokenIds))
                 accepts.append(contentsOf: result.acceptLengths ?? [])
                 if let phases = result.phaseTimings {
                     phaseTotals.add(phases)
@@ -401,6 +410,9 @@ struct MLXBench {
             )
             if collectPhaseTimings || collectVerifySubphaseTimings, phaseTotals.rounds > 0 {
                 print("   " + phaseTotals.summary(generationSeconds: dflashSeconds))
+            }
+            if args.tokenHashes {
+                print("   token_hashes=" + tokenHashes.joined(separator: ","))
             }
         }
     }
@@ -576,6 +588,19 @@ private func int32Tokens(_ values: [Int]) throws -> [Int32] {
 private func average(_ values: [Double]) -> Double {
     guard !values.isEmpty else { return 0 }
     return values.reduce(0, +) / Double(values.count)
+}
+
+private func tokenHash(_ tokens: [Int]) -> String {
+    var hash: UInt64 = 0xcbf29ce484222325
+    for token in tokens {
+        var value = UInt64(bitPattern: Int64(token))
+        for _ in 0 ..< 8 {
+            hash ^= value & 0xff
+            hash &*= 0x100000001b3
+            value >>= 8
+        }
+    }
+    return String(hash, radix: 16)
 }
 
 private struct DFlashPhaseTotals {

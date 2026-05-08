@@ -19,7 +19,7 @@ struct DFlashVerifyLinearTests {
         let actual = verify(x)
         eval(expected, actual)
 
-        #expect(allClose(actual, expected, rtol: 5e-2, atol: 5e-2).item(Bool.self))
+        #expect(allClose(actual, expected, rtol: 1e-2, atol: 1e-2).item(Bool.self))
     }
 
     @Test func installReplacesOnlyEligibleQuantizedLinears() {

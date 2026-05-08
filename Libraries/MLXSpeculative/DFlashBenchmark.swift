@@ -21,6 +21,9 @@ public struct DFlashBenchmarkResult: Sendable {
     /// populated when `measureDFlashThroughput(..., collectPhaseTimings: true)`
     /// or `collectVerifySubphaseTimings: true` is used.
     public let phaseTimings: DFlashBenchmarkPhaseTimings?
+    /// Generated token ids, excluding the prompt. This is populated by the
+    /// benchmark helpers so CLI diagnostics can compare exact outputs.
+    public let generatedTokenIds: [Int]
 
     /// Generated tokens / generationSeconds.
     public var tokensPerSecond: Double {
@@ -33,13 +36,15 @@ public struct DFlashBenchmarkResult: Sendable {
         prefillSeconds: Double,
         generationSeconds: Double,
         acceptLengths: [Int]? = nil,
-        phaseTimings: DFlashBenchmarkPhaseTimings? = nil
+        phaseTimings: DFlashBenchmarkPhaseTimings? = nil,
+        generatedTokenIds: [Int] = []
     ) {
         self.generatedTokens = generatedTokens
         self.prefillSeconds = prefillSeconds
         self.generationSeconds = generationSeconds
         self.acceptLengths = acceptLengths
         self.phaseTimings = phaseTimings
+        self.generatedTokenIds = generatedTokenIds
     }
 }
 
@@ -144,6 +149,7 @@ public func measureDFlashBaselineThroughput(
     var logits = target.callAsFunction(prompt, cache: cache)
     var token = logits[0..., -1, 0...].argMax(axis: -1)
     eval(token)
+    var generatedIds = [Int(token.item(Int32.self))]
     let prefillElapsed = Date().timeIntervalSince(prefillStart)
 
     let generationStart = Date()
@@ -152,6 +158,7 @@ public func measureDFlashBaselineThroughput(
         logits = target.callAsFunction(token[.newAxis, .ellipsis], cache: cache)
         token = logits[0..., -1, 0...].argMax(axis: -1)
         eval(token)
+        generatedIds.append(Int(token.item(Int32.self)))
         generated += 1
     }
     let generationElapsed = Date().timeIntervalSince(generationStart)
@@ -159,7 +166,8 @@ public func measureDFlashBaselineThroughput(
     return DFlashBenchmarkResult(
         generatedTokens: generated,
         prefillSeconds: prefillElapsed,
-        generationSeconds: generationElapsed
+        generationSeconds: generationElapsed,
+        generatedTokenIds: generatedIds
     )
 }
 
@@ -219,6 +227,7 @@ public func measureDFlashThroughput(
 
     var bonus = Int(firstBonusArray.item(Int32.self))
     var targetHidden = prefillOut.targetHidden
+    var generatedIds = [bonus]
 
     let generationStart = Date()
     var generated = 1
@@ -249,6 +258,7 @@ public func measureDFlashThroughput(
 
         let emitted = round.tokens.count
         generated += emitted
+        generatedIds.append(contentsOf: round.tokens)
         if emitted == 0 { break }
 
         bonus = round.bonus
@@ -261,6 +271,7 @@ public func measureDFlashThroughput(
         prefillSeconds: prefillElapsed,
         generationSeconds: generationElapsed,
         acceptLengths: accepts,
-        phaseTimings: phases?.snapshot()
+        phaseTimings: phases?.snapshot(),
+        generatedTokenIds: generatedIds
     )
 }
