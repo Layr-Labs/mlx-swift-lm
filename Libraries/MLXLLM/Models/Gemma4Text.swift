@@ -366,6 +366,36 @@ private final class Gemma4DFlashHiddenCapture {
     }
 }
 
+private final class Gemma4DFlashTrunkTimings {
+    var embeddingSeconds = 0.0
+    var pleSeconds = 0.0
+    var maskSeconds = 0.0
+    var attentionSeconds = 0.0
+    var denseMLPSeconds = 0.0
+    var routerSeconds = 0.0
+    var expertsSeconds = 0.0
+    var pleGateSeconds = 0.0
+    var finalNormSeconds = 0.0
+}
+
+private enum Gemma4DFlashTimingContext {
+    nonisolated(unsafe) static var current: Gemma4DFlashTrunkTimings?
+}
+
+@inline(__always)
+private func gemma4TimingStart() -> Date? {
+    Gemma4DFlashTimingContext.current == nil ? nil : Date()
+}
+
+@inline(__always)
+private func gemma4Record(
+    _ start: Date?,
+    _ update: (Gemma4DFlashTrunkTimings, Double) -> Void
+) {
+    guard let start, let timings = Gemma4DFlashTimingContext.current else { return }
+    update(timings, Date().timeIntervalSince(start))
+}
+
 /// Result of `Gemma4TextModel.forwardForMTP`. Carries both the LM head
 /// output and the pre-head trunk hidden, plus the shared-KV snapshot the
 /// drafter needs for its next round.
@@ -621,9 +651,8 @@ private class Gemma4Router: Module {
         let normed = MLXFast.rmsNorm(x, weight: scale, eps: eps)
         let expertScores = proj(normed)
 
-        let kth = expertScores.dim(-1) - topK
-        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-        topKIndices = topKIndices[.ellipsis, kth...]
+        var topKIndices = MLX.argPartition(expertScores, kth: -topK, axis: -1)
+        topKIndices = topKIndices[.ellipsis, (-topK)...]
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
@@ -654,9 +683,17 @@ private class Gemma4Experts: Module {
     func callAsFunction(
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray
     ) -> MLXArray {
-        let w = MLX.expandedDimensions(topKWeights, axis: -1)
-        let y = switchGLU(x, topKIndices)
-        return (w * y).sum(axis: -2)
+        let batch = x.dim(0)
+        let length = x.dim(1)
+        let hidden = x.dim(2)
+        let topK = topKIndices.dim(-1)
+
+        let y = switchGLU(
+            x.reshaped(batch * length, hidden),
+            topKIndices.reshaped(batch * length, topK)
+        )
+        let w = topKWeights.reshaped(batch * length, topK, 1).asType(y.dtype)
+        return (w * y).sum(axis: -2).reshaped(batch, length, hidden)
     }
 }
 
@@ -776,11 +813,18 @@ public class Gemma4DecoderLayer: Module {
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let residual = x
 
+        let attentionStart = gemma4TimingStart()
         let h = inputLayernorm(x)
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset)
         let postAttn = postAttentionLayernorm(attnOut)
         var out = residual + postAttn
+        if attentionStart != nil {
+            eval(out, kvPair.0, kvPair.1)
+        }
+        gemma4Record(attentionStart) {
+            $0.attentionSeconds += $1
+        }
 
         let residual2 = out
 
@@ -792,19 +836,48 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
+            let denseStart = gemma4TimingStart()
             var h1 = preFeedforwardLayernorm(out)
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
+            if denseStart != nil {
+                eval(h1)
+            }
+            gemma4Record(denseStart) {
+                $0.denseMLPSeconds += $1
+            }
 
+            let routerStart = gemma4TimingStart()
             let (topKIndices, topKWeights) = router(out)
+            if routerStart != nil {
+                eval(topKIndices, topKWeights)
+            }
+            gemma4Record(routerStart) {
+                $0.routerSeconds += $1
+            }
+
+            let expertsStart = gemma4TimingStart()
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(h2, topKIndices: topKIndices, topKWeights: topKWeights)
             h2 = postFeedforwardLayernorm2(h2)
+            if expertsStart != nil {
+                eval(h2)
+            }
+            gemma4Record(expertsStart) {
+                $0.expertsSeconds += $1
+            }
 
             out = h1 + h2
         } else {
+            let denseStart = gemma4TimingStart()
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
+            if denseStart != nil {
+                eval(out)
+            }
+            gemma4Record(denseStart) {
+                $0.denseMLPSeconds += $1
+            }
         }
 
         out = postFeedforwardLayernorm(out)
@@ -816,6 +889,7 @@ public class Gemma4DecoderLayer: Module {
             let norm = postPerLayerInputNorm,
             let perLayerInput
         {
+            let pleGateStart = gemma4TimingStart()
             let residual3 = out
             var g = gate(out)
             g = geluApproximate(g)
@@ -823,6 +897,12 @@ public class Gemma4DecoderLayer: Module {
             g = proj(g)
             g = norm(g)
             out = residual3 + g
+            if pleGateStart != nil {
+                eval(out)
+            }
+            gemma4Record(pleGateStart) {
+                $0.pleGateSeconds += $1
+            }
         }
 
         out = out * layerScalar
@@ -969,11 +1049,19 @@ public class Gemma4TextModelInner: Module {
         capturePreNorm: Bool,
         dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        let embeddingStart = gemma4TimingStart()
         let inputEmbeddings = embedTokens(inputs)
         var h = inputEmbeddings * embedScale
+        if embeddingStart != nil {
+            eval(h)
+        }
+        gemma4Record(embeddingStart) {
+            $0.embeddingSeconds += $1
+        }
 
         // Compute per-layer inputs (PLE)
-        var perLayerInputs: [MLXArray?]
+        let pleStart = gemma4TimingStart()
+        let perLayerInputs: [MLXArray?]
         if hiddenSizePerLayerInput > 0,
             let embedPerLayer = embedTokensPerLayer,
             let modelProj = perLayerModelProjection,
@@ -1005,6 +1093,15 @@ public class Gemma4TextModelInner: Module {
         } else {
             perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
         }
+        if pleStart != nil {
+            let pleArrays = perLayerInputs.compactMap { $0 }
+            if !pleArrays.isEmpty {
+                eval(pleArrays)
+            }
+        }
+        gemma4Record(pleStart) {
+            $0.pleSeconds += $1
+        }
 
         // Extend cache array for shared layers (which get nil caches)
         var fullCache: [KVCache?]
@@ -1018,6 +1115,7 @@ public class Gemma4TextModelInner: Module {
         }
 
         // Build masks: one per attention type
+        let maskStart = gemma4TimingStart()
         var maskByType = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
         for (i, layer) in layers.enumerated() {
             let lt = layer.layerType
@@ -1029,6 +1127,20 @@ public class Gemma4TextModelInner: Module {
                     maskByType[lt] = createAttentionMask(h: h, cache: fullCache[i])
                 }
             }
+        }
+        if maskStart != nil {
+            var maskArrays = [MLXArray]()
+            for mask in maskByType.values {
+                if case .array(let array) = mask {
+                    maskArrays.append(array)
+                }
+            }
+            if !maskArrays.isEmpty {
+                eval(maskArrays)
+            }
+        }
+        gemma4Record(maskStart) {
+            $0.maskSeconds += $1
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
@@ -1065,7 +1177,14 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
+        let finalNormStart = gemma4TimingStart()
         let postNorm = norm(h)
+        if finalNormStart != nil {
+            eval(postNorm)
+        }
+        gemma4Record(finalNormStart) {
+            $0.finalNormSeconds += $1
+        }
         return (postNorm, capturePreNorm ? h : nil)
     }
 }
@@ -1153,6 +1272,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
         }
 
         let trunkStart = Date()
+        let trunkTimings = Gemma4DFlashTrunkTimings()
+        Gemma4DFlashTimingContext.current = trunkTimings
+        defer {
+            Gemma4DFlashTimingContext.current = nil
+        }
         let forward = try model.callCapturingDFlashHiddenStates(
             inputs, cache: cache, targetLayerIds: targetLayerIds)
         eval([forward.postNorm] + forward.hiddenStates)
@@ -1183,7 +1307,16 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
                 trunkSeconds: trunkSeconds,
                 hiddenConcatSeconds: hiddenConcatSeconds,
                 lmHeadSeconds: lmHeadSeconds,
-                softcapArgmaxSeconds: softcapArgmaxSeconds
+                softcapArgmaxSeconds: softcapArgmaxSeconds,
+                trunkEmbeddingSeconds: trunkTimings.embeddingSeconds,
+                trunkPLESeconds: trunkTimings.pleSeconds,
+                trunkMaskSeconds: trunkTimings.maskSeconds,
+                trunkAttentionSeconds: trunkTimings.attentionSeconds,
+                trunkDenseMLPSeconds: trunkTimings.denseMLPSeconds,
+                trunkRouterSeconds: trunkTimings.routerSeconds,
+                trunkExpertsSeconds: trunkTimings.expertsSeconds,
+                trunkPLEGateSeconds: trunkTimings.pleGateSeconds,
+                trunkFinalNormSeconds: trunkTimings.finalNormSeconds
             )
         )
     }

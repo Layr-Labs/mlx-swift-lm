@@ -204,7 +204,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     let initial = singleHeadKV([1, 2, 3])
     _ = cache.update(keys: initial, values: initial)
     #expect(cache.offset == 3)
-    #expect(!cache.isTrimmable)
+    #expect(cache.isTrimmable)
 
     let verifyBlock = singleHeadKV([4, 5])
     _ = cache.update(keys: verifyBlock, values: verifyBlock)
@@ -214,8 +214,51 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
 
     #expect(cache.trim(1) == 1)
     #expect(cache.offset == 4)
-    #expect(!cache.isTrimmable)
+    #expect(cache.isTrimmable)
     #expect(cache.state[0].dim(2) == 3)
+}
+
+@Test func testRotatingCacheTrimsExactSaturationTail() throws {
+    let cache = RotatingKVCache(maxSize: 6)
+    let initial = singleHeadKV([1, 2, 3, 4])
+    _ = cache.update(keys: initial, values: initial)
+    #expect(cache.offset == 4)
+    #expect(cache.isTrimmable)
+
+    let verifyBlock = singleHeadKV([5, 6])
+    _ = cache.update(keys: verifyBlock, values: verifyBlock)
+    #expect(cache.offset == 6)
+    #expect(cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 6)
+
+    #expect(cache.trim(1) == 1)
+    #expect(cache.offset == 5)
+    #expect(cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 5)
+}
+
+@Test func testFullRotatingCacheUsesSymbolicCausalMaskForMultiTokenWindow() throws {
+    let cache = RotatingKVCache(maxSize: 3)
+    let initial = singleHeadKV([1, 2, 3])
+    _ = cache.update(keys: initial, values: initial)
+
+    let mask = cache.makeMask(n: 2, windowSize: 3, returnArray: false)
+    let isCausal: Bool
+    if case .causal = mask {
+        isCausal = true
+    } else {
+        isCausal = false
+    }
+    #expect(isCausal, "Expected symbolic causal mask for full rotating multi-token window")
+
+    let forcedMask = cache.makeMask(n: 2, windowSize: 3, returnArray: true)
+    let isArray: Bool
+    if case .array = forcedMask {
+        isArray = true
+    } else {
+        isArray = false
+    }
+    #expect(isArray, "Expected explicit array mask when returnArray is true")
 }
 
 // MARK: - ArraysCache fully populated round-trip

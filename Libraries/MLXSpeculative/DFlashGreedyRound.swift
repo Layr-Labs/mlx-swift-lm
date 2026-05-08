@@ -92,6 +92,15 @@ internal func runDFlashGreedyRound(
         phaseAccumulator.targetHiddenConcatSeconds += timings.hiddenConcatSeconds
         phaseAccumulator.targetLMHeadSeconds += timings.lmHeadSeconds
         phaseAccumulator.targetSoftcapArgmaxSeconds += timings.softcapArgmaxSeconds
+        phaseAccumulator.targetTrunkEmbeddingSeconds += timings.trunkEmbeddingSeconds
+        phaseAccumulator.targetTrunkPLESeconds += timings.trunkPLESeconds
+        phaseAccumulator.targetTrunkMaskSeconds += timings.trunkMaskSeconds
+        phaseAccumulator.targetTrunkAttentionSeconds += timings.trunkAttentionSeconds
+        phaseAccumulator.targetTrunkDenseMLPSeconds += timings.trunkDenseMLPSeconds
+        phaseAccumulator.targetTrunkRouterSeconds += timings.trunkRouterSeconds
+        phaseAccumulator.targetTrunkExpertsSeconds += timings.trunkExpertsSeconds
+        phaseAccumulator.targetTrunkPLEGateSeconds += timings.trunkPLEGateSeconds
+        phaseAccumulator.targetTrunkFinalNormSeconds += timings.trunkFinalNormSeconds
     }
     let targetTokens = verifyOut.tokens
     let draftTokenIds = draftTokens.squeezed(axis: 0)

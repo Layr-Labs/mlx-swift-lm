@@ -48,17 +48,44 @@ public struct DFlashTargetVerifyTimings: Sendable {
     public let hiddenConcatSeconds: Double
     public let lmHeadSeconds: Double
     public let softcapArgmaxSeconds: Double
+    public let trunkEmbeddingSeconds: Double
+    public let trunkPLESeconds: Double
+    public let trunkMaskSeconds: Double
+    public let trunkAttentionSeconds: Double
+    public let trunkDenseMLPSeconds: Double
+    public let trunkRouterSeconds: Double
+    public let trunkExpertsSeconds: Double
+    public let trunkPLEGateSeconds: Double
+    public let trunkFinalNormSeconds: Double
 
     public init(
         trunkSeconds: Double,
         hiddenConcatSeconds: Double,
         lmHeadSeconds: Double,
-        softcapArgmaxSeconds: Double
+        softcapArgmaxSeconds: Double,
+        trunkEmbeddingSeconds: Double = 0,
+        trunkPLESeconds: Double = 0,
+        trunkMaskSeconds: Double = 0,
+        trunkAttentionSeconds: Double = 0,
+        trunkDenseMLPSeconds: Double = 0,
+        trunkRouterSeconds: Double = 0,
+        trunkExpertsSeconds: Double = 0,
+        trunkPLEGateSeconds: Double = 0,
+        trunkFinalNormSeconds: Double = 0
     ) {
         self.trunkSeconds = trunkSeconds
         self.hiddenConcatSeconds = hiddenConcatSeconds
         self.lmHeadSeconds = lmHeadSeconds
         self.softcapArgmaxSeconds = softcapArgmaxSeconds
+        self.trunkEmbeddingSeconds = trunkEmbeddingSeconds
+        self.trunkPLESeconds = trunkPLESeconds
+        self.trunkMaskSeconds = trunkMaskSeconds
+        self.trunkAttentionSeconds = trunkAttentionSeconds
+        self.trunkDenseMLPSeconds = trunkDenseMLPSeconds
+        self.trunkRouterSeconds = trunkRouterSeconds
+        self.trunkExpertsSeconds = trunkExpertsSeconds
+        self.trunkPLEGateSeconds = trunkPLEGateSeconds
+        self.trunkFinalNormSeconds = trunkFinalNormSeconds
     }
 }
 

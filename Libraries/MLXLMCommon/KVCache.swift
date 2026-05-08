@@ -656,7 +656,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     public override var isTrimmable: Bool {
         guard offset >= maxCacheSize else { return true }
         guard let keys else { return false }
-        return idx == keys.dim(2) && keys.dim(2) > maxCacheSize
+        return idx == keys.dim(2)
     }
 
     @discardableResult
@@ -664,8 +664,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let requested = min(offset, n)
         guard requested > 0 else { return 0 }
 
-        if let keys, let values, idx == keys.dim(2), keys.dim(2) > maxCacheSize {
-            let trimmed = min(requested, keys.dim(2) - maxCacheSize)
+        if let keys, let values, idx == keys.dim(2) {
+            let minLength = min(keep, keys.dim(2))
+            let trimmed = min(requested, keys.dim(2) - minLength)
+            guard trimmed > 0 else { return 0 }
             let keepLength = keys.dim(2) - trimmed
             self.keys = keys[.ellipsis, ..<keepLength, 0...]
             self.values = values[.ellipsis, ..<keepLength, 0...]
@@ -689,6 +691,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             // Multi-token case
             let actualWindowSize = windowSize ?? maxCacheSize
             let cappedOffset = min(maxCacheSize - 1, offset)
+
+            // Once the rotating cache is full, multi-token updates are returned
+            // in temporal order with only `window - 1` past tokens plus the new
+            // block. The symbolic causal mask is then equivalent to the explicit
+            // sliding-window array mask, and avoids materializing/applying it.
+            if !returnArray, offset >= actualWindowSize {
+                return .causal
+            }
 
             // Decide if we need an array mask
             if cappedOffset + n > actualWindowSize || returnArray {

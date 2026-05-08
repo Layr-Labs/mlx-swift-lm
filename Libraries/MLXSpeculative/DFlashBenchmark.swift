@@ -67,6 +67,15 @@ public struct DFlashBenchmarkPhaseTimings: Sendable {
     public let targetHiddenConcatSeconds: Double
     public let targetLMHeadSeconds: Double
     public let targetSoftcapArgmaxSeconds: Double
+    public let targetTrunkEmbeddingSeconds: Double
+    public let targetTrunkPLESeconds: Double
+    public let targetTrunkMaskSeconds: Double
+    public let targetTrunkAttentionSeconds: Double
+    public let targetTrunkDenseMLPSeconds: Double
+    public let targetTrunkRouterSeconds: Double
+    public let targetTrunkExpertsSeconds: Double
+    public let targetTrunkPLEGateSeconds: Double
+    public let targetTrunkFinalNormSeconds: Double
     public let acceptWalkSeconds: Double
     public let cacheRollbackSeconds: Double
     public let roundSeconds: Double
@@ -92,6 +101,15 @@ internal final class DFlashPhaseAccumulator {
     var targetHiddenConcatSeconds = 0.0
     var targetLMHeadSeconds = 0.0
     var targetSoftcapArgmaxSeconds = 0.0
+    var targetTrunkEmbeddingSeconds = 0.0
+    var targetTrunkPLESeconds = 0.0
+    var targetTrunkMaskSeconds = 0.0
+    var targetTrunkAttentionSeconds = 0.0
+    var targetTrunkDenseMLPSeconds = 0.0
+    var targetTrunkRouterSeconds = 0.0
+    var targetTrunkExpertsSeconds = 0.0
+    var targetTrunkPLEGateSeconds = 0.0
+    var targetTrunkFinalNormSeconds = 0.0
     var acceptWalkSeconds = 0.0
     var cacheRollbackSeconds = 0.0
     var roundSeconds = 0.0
@@ -111,6 +129,15 @@ internal final class DFlashPhaseAccumulator {
             targetHiddenConcatSeconds: targetHiddenConcatSeconds,
             targetLMHeadSeconds: targetLMHeadSeconds,
             targetSoftcapArgmaxSeconds: targetSoftcapArgmaxSeconds,
+            targetTrunkEmbeddingSeconds: targetTrunkEmbeddingSeconds,
+            targetTrunkPLESeconds: targetTrunkPLESeconds,
+            targetTrunkMaskSeconds: targetTrunkMaskSeconds,
+            targetTrunkAttentionSeconds: targetTrunkAttentionSeconds,
+            targetTrunkDenseMLPSeconds: targetTrunkDenseMLPSeconds,
+            targetTrunkRouterSeconds: targetTrunkRouterSeconds,
+            targetTrunkExpertsSeconds: targetTrunkExpertsSeconds,
+            targetTrunkPLEGateSeconds: targetTrunkPLEGateSeconds,
+            targetTrunkFinalNormSeconds: targetTrunkFinalNormSeconds,
             acceptWalkSeconds: acceptWalkSeconds,
             cacheRollbackSeconds: cacheRollbackSeconds,
             roundSeconds: roundSeconds

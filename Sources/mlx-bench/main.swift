@@ -362,15 +362,20 @@ struct MLXBench {
         }
 
         var baselineRates = [Double]()
+        var baselineHashes = [String]()
         for prompt in prompts {
             let result = measureDFlashBaselineThroughput(
                 target: target,
                 promptTokens: MLXArray(prompt),
                 maxTokens: maxTokens)
             baselineRates.append(result.tokensPerSecond)
+            baselineHashes.append(tokenHash(result.generatedTokenIds))
             MLX.Memory.clearCache()
         }
         let baselineAverage = average(baselineRates)
+        if args.tokenHashes {
+            print("   baseline_token_hashes=" + baselineHashes.joined(separator: ","))
+        }
 
         for blockSize in blockSizes {
             var dflashRates = [Double]()
@@ -627,6 +632,15 @@ private struct DFlashPhaseTotals {
     var targetHiddenConcatSeconds = 0.0
     var targetLMHeadSeconds = 0.0
     var targetSoftcapArgmaxSeconds = 0.0
+    var targetTrunkEmbeddingSeconds = 0.0
+    var targetTrunkPLESeconds = 0.0
+    var targetTrunkMaskSeconds = 0.0
+    var targetTrunkAttentionSeconds = 0.0
+    var targetTrunkDenseMLPSeconds = 0.0
+    var targetTrunkRouterSeconds = 0.0
+    var targetTrunkExpertsSeconds = 0.0
+    var targetTrunkPLEGateSeconds = 0.0
+    var targetTrunkFinalNormSeconds = 0.0
     var acceptWalkSeconds = 0.0
     var cacheRollbackSeconds = 0.0
     var roundSeconds = 0.0
@@ -641,6 +655,15 @@ private struct DFlashPhaseTotals {
         targetHiddenConcatSeconds += phases.targetHiddenConcatSeconds
         targetLMHeadSeconds += phases.targetLMHeadSeconds
         targetSoftcapArgmaxSeconds += phases.targetSoftcapArgmaxSeconds
+        targetTrunkEmbeddingSeconds += phases.targetTrunkEmbeddingSeconds
+        targetTrunkPLESeconds += phases.targetTrunkPLESeconds
+        targetTrunkMaskSeconds += phases.targetTrunkMaskSeconds
+        targetTrunkAttentionSeconds += phases.targetTrunkAttentionSeconds
+        targetTrunkDenseMLPSeconds += phases.targetTrunkDenseMLPSeconds
+        targetTrunkRouterSeconds += phases.targetTrunkRouterSeconds
+        targetTrunkExpertsSeconds += phases.targetTrunkExpertsSeconds
+        targetTrunkPLEGateSeconds += phases.targetTrunkPLEGateSeconds
+        targetTrunkFinalNormSeconds += phases.targetTrunkFinalNormSeconds
         acceptWalkSeconds += phases.acceptWalkSeconds
         cacheRollbackSeconds += phases.cacheRollbackSeconds
         roundSeconds += phases.roundSeconds
@@ -670,6 +693,25 @@ private struct DFlashPhaseTotals {
             + "hidden_concat=\(msPerRound(targetHiddenConcatSeconds)) "
             + "lm_head=\(msPerRound(targetLMHeadSeconds)) "
             + "softcap_argmax=\(msPerRound(targetSoftcapArgmaxSeconds))"
+            + trunkBreakdownSummary()
+    }
+
+    private func trunkBreakdownSummary() -> String {
+        let total = targetTrunkEmbeddingSeconds + targetTrunkPLESeconds + targetTrunkMaskSeconds
+            + targetTrunkAttentionSeconds + targetTrunkDenseMLPSeconds
+            + targetTrunkRouterSeconds + targetTrunkExpertsSeconds + targetTrunkPLEGateSeconds
+            + targetTrunkFinalNormSeconds
+        guard total > 0 else { return "" }
+        return "; trunk_breakdown ms/round: "
+            + "embed=\(msPerRound(targetTrunkEmbeddingSeconds)) "
+            + "ple=\(msPerRound(targetTrunkPLESeconds)) "
+            + "mask=\(msPerRound(targetTrunkMaskSeconds)) "
+            + "attn=\(msPerRound(targetTrunkAttentionSeconds)) "
+            + "dense_mlp=\(msPerRound(targetTrunkDenseMLPSeconds)) "
+            + "router=\(msPerRound(targetTrunkRouterSeconds)) "
+            + "experts=\(msPerRound(targetTrunkExpertsSeconds)) "
+            + "ple_gate=\(msPerRound(targetTrunkPLEGateSeconds)) "
+            + "final_norm=\(msPerRound(targetTrunkFinalNormSeconds))"
     }
 
     private func msPerRound(_ seconds: Double) -> String {
