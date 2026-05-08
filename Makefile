@@ -1,4 +1,16 @@
-.PHONY: test test-cb build-server serve
+.PHONY: test test-cb build-server serve loc
+
+# Count lines of code in the Libraries folder.
+loc:
+	tokei Libraries/
+
+# Show lines added/removed in Libraries/ and Tests/ since this branch diverged from main.
+loc-pr:
+	@base=$$(git merge-base main HEAD); \
+	for dir in Libraries Tests; do \
+		git diff --numstat $$base HEAD -- $$dir/ \
+		| awk -v d=$$dir 'BEGIN{a=0;r=0} {a+=$$1; r+=$$2} END{printf "+%d / -%d lines in %s/\n", a, r, d}'; \
+	done
 
 # Run the full test suite (requires Metal; use xcodebuild so shaders compile).
 test:
