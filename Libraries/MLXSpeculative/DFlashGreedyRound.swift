@@ -82,15 +82,27 @@ internal func runDFlashGreedyRound(
     }
 
     let acceptStart = dflashTimingStart(phaseAccumulator)
-    let draftTokenIds = draftTokens.squeezed(axis: 0).asArray(Int32.self).map { Int($0) }
-    let targetTokenIds = targetTokens.squeezed(axis: 0).asArray(Int32.self).map { Int($0) }
-    let (walkedAccepted, walkedTokens) = SpeculativeWalk.single(
-        draft: draftTokenIds,
-        main: targetTokenIds
-    )
-    let emitted = Array(walkedTokens.prefix(maxEmitCount))
-    let accepted = emitted.count < walkedTokens.count
-        ? Swift.max(0, emitted.count - 1)
+    let draftTokenIds = draftTokens.squeezed(axis: 0)
+    let targetTokenIds = targetTokens.squeezed(axis: 0)
+    let proposedCount = Swift.max(0, blockSize - 1)
+    let walkedAccepted: Int
+    if proposedCount == 0 {
+        walkedAccepted = 0
+    } else {
+        let targetPrefix = targetTokenIds[0 ..< proposedCount]
+        let matches = (draftTokenIds .== targetPrefix).asType(.int32)
+        let prefixMatches = matches.cumprod(axis: 0)
+        let acceptedArray = prefixMatches.sum()
+        eval(acceptedArray)
+        walkedAccepted = Int(acceptedArray.item(Int32.self))
+    }
+    let walkedTokenCount = walkedAccepted + 1
+    let emittedCount = Swift.min(maxEmitCount, walkedTokenCount)
+    let emitted = targetTokenIds[0 ..< emittedCount]
+        .asArray(Int32.self)
+        .map { Int($0) }
+    let accepted = emittedCount < walkedTokenCount
+        ? Swift.max(0, emittedCount - 1)
         : walkedAccepted
     dflashRecord(acceptStart, into: phaseAccumulator) {
         $0.acceptWalkSeconds += $1

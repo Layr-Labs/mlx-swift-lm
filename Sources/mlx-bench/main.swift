@@ -126,6 +126,7 @@ struct BenchArguments {
           --max-tokens <int>        Generated tokens per prompt
           --warmup-tokens <int>     Generated tokens for warmup
           --block-sizes <list>      Comma-separated speculative block sizes
+                                  (DFlash default sweeps 4,5,6,8 plus checkpoint size)
           --no-chat-template        Encode --prompt as plain text
           --phase-timings           Print DFlash diagnostic phase timings
           --help, -h                Show this help
@@ -293,7 +294,7 @@ struct MLXBench {
         let blockSizes = args.blockSizes
             ?? envIntList(
                 names: ["BLOCK_SIZES", "\(mode.envPrefix)_BLOCK_SIZES"],
-                default: [drafter.config.blockSize],
+                default: defaultDFlashBlockSizes(configured: drafter.config.blockSize),
                 minimum: 2)
         let collectPhaseTimings = args.phaseTimings
             || envBool(names: ["DFLASH_BENCH_PHASES", "\(mode.envPrefix)_PHASES"], default: false)
@@ -373,6 +374,22 @@ struct MLXBench {
                 print("   " + phaseTotals.summary(generationSeconds: dflashSeconds))
             }
         }
+    }
+
+    private static func defaultDFlashBlockSizes(configured: Int) -> [Int] {
+        var seen = Set<Int>()
+        var values = [Int]()
+        for candidate in [4, 5, 6, 8, configured] {
+            guard candidate >= 2, candidate <= configured, !seen.contains(candidate) else {
+                continue
+            }
+            seen.insert(candidate)
+            values.append(candidate)
+        }
+        if values.isEmpty, configured >= 2 {
+            values.append(configured)
+        }
+        return values
     }
 }
 
