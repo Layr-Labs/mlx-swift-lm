@@ -1118,6 +1118,23 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
         )
     }
 
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashGreedyTargetForward {
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        let targetHidden = forward.hiddenStates.count == 1
+            ? forward.hiddenStates[0]
+            : concatenated(forward.hiddenStates, axis: -1)
+
+        return DFlashGreedyTargetForward(
+            tokens: applyLMHead(forward.postNorm).argMax(axis: -1),
+            targetHidden: targetHidden
+        )
+    }
+
     public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
         embedTokensForDrafter(tokens)
     }

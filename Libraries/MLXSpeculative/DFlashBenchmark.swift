@@ -130,12 +130,12 @@ public func measureDFlashThroughput(
     }
 
     let prefillStart = Date()
-    let prefillOut = try target.forwardForDFlash(
+    let prefillOut = try target.forwardGreedyTokensForDFlash(
         prompt,
         cache: targetCache,
         targetLayerIds: drafter.config.targetLayerIds
     )
-    let firstBonusArray = prefillOut.logits[0..., -1, 0...].argMax(axis: -1)
+    let firstBonusArray = prefillOut.tokens[0..., -1]
     eval(firstBonusArray, prefillOut.targetHidden)
     let prefillElapsed = Date().timeIntervalSince(prefillStart)
 

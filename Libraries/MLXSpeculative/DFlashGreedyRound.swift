@@ -38,7 +38,7 @@ internal func runDFlashGreedyRound(
         blockSize: blockSize
     )
 
-    eval(draftTokens)
+    asyncEval(draftTokens)
     let committedDraftOffset = Swift.max(0, promptTokenCount + generatedTokenCount - 1)
     if let draftOffset = draftCache.first?.offset {
         let extraDraftContext = draftOffset - committedDraftOffset
@@ -49,18 +49,18 @@ internal func runDFlashGreedyRound(
             }
         }
     }
-    let draftTokenIds = draftTokens.squeezed(axis: 0).asArray(Int32.self).map { Int($0) }
 
     let bonusColumn = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
     let verifyInput = concatenated([bonusColumn, draftTokens], axis: 1)
-    let verifyOut = try target.forwardForDFlash(
+    let verifyOut = try target.forwardGreedyTokensForDFlash(
         verifyInput,
         cache: targetCache,
         targetLayerIds: drafter.config.targetLayerIds
     )
-    let targetTokens = verifyOut.logits.argMax(axis: -1)
-    eval(targetTokens, verifyOut.targetHidden)
+    let targetTokens = verifyOut.tokens
+    eval(targetTokens, verifyOut.targetHidden, draftTokens)
 
+    let draftTokenIds = draftTokens.squeezed(axis: 0).asArray(Int32.self).map { Int($0) }
     let targetTokenIds = targetTokens.squeezed(axis: 0).asArray(Int32.self).map { Int($0) }
     let (walkedAccepted, walkedTokens) = SpeculativeWalk.single(
         draft: draftTokenIds,

@@ -22,6 +22,17 @@ public struct DFlashTargetForward: @unchecked Sendable {
     }
 }
 
+/// Greedy target-model output used by DFlash when only top-1 tokens are needed.
+public struct DFlashGreedyTargetForward: @unchecked Sendable {
+    public let tokens: MLXArray
+    public let targetHidden: MLXArray
+
+    public init(tokens: MLXArray, targetHidden: MLXArray) {
+        self.tokens = tokens
+        self.targetHidden = targetHidden
+    }
+}
+
 public enum DFlashTargetError: LocalizedError, Sendable, Equatable {
     case emptyTargetLayerIds
     case duplicateTargetLayerIds([Int])
@@ -71,6 +82,12 @@ public protocol DFlashTargetModel: LLMModel {
         targetLayerIds: [Int]
     ) throws -> DFlashTargetForward
 
+    func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashGreedyTargetForward
+
     func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray
     /// Raw target LM-head projection for drafter hidden states. The DFlash
     /// drafter applies any config-level final-logit transform itself.
@@ -97,6 +114,22 @@ public protocol DFlashTargetCacheRollbackProvider: DFlashTargetModel {
 }
 
 extension DFlashTargetModel {
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashGreedyTargetForward {
+        let forward = try forwardForDFlash(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds
+        )
+        return DFlashGreedyTargetForward(
+            tokens: forward.logits.argMax(axis: -1),
+            targetHidden: forward.targetHidden
+        )
+    }
+
     public func makeDefaultDFlashCacheRollbackState(
         cache: [KVCache]
     ) -> (any DFlashTargetRollbackState)? {

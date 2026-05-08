@@ -130,6 +130,15 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider, DFlashTarg
             inputs, cache: cache, targetLayerIds: targetLayerIds)
     }
 
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashGreedyTargetForward {
+        try languageModel.forwardGreedyTokensForDFlash(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+    }
+
     public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
         languageModel.embedTokensForDFlash(tokens)
     }
