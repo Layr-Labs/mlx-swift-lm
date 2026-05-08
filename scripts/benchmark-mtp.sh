@@ -138,7 +138,7 @@ run_bench() {
     echo "━━━ ${label} ━━━"
     start_server "$model_path" "$@"
 
-    local result
+    local result bench_exit
     result=$(KMP_DUPLICATE_LIB_OK=TRUE llama-benchy \
         --base-url "http://localhost:${BENCH_PORT}" \
         --tokenizer "$model_path" \
@@ -148,10 +148,16 @@ run_bench() {
         --no-cache \
         --no-warmup \
         --latency-mode generation \
-        --format md)
+        --format md 2>&1) && bench_exit=0 || bench_exit=$?
 
     echo "$result"
-    printf "### %s\n\n%s\n\n" "$label" "$result" >> "$OUTFILE"
+    if [[ $bench_exit -ne 0 ]]; then
+        echo "WARNING: llama-benchy exited $bench_exit for '${label}'" >&2
+        printf "### %s\n\n⚠️ llama-benchy failed (exit %s):\n\`\`\`\n%s\n\`\`\`\n\n" \
+            "$label" "$bench_exit" "$result" >> "$OUTFILE"
+    else
+        printf "### %s\n\n%s\n\n" "$label" "$result" >> "$OUTFILE"
+    fi
 
     stop_server
 }
