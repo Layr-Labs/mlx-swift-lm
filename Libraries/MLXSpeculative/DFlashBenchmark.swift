@@ -14,6 +14,9 @@ public struct DFlashBenchmarkResult: Sendable {
     public let prefillSeconds: Double
     /// Seconds from prefill end to the last emitted token.
     public let generationSeconds: Double
+    /// Per-round count of accepted drafter tokens. `nil` for the no-drafter
+    /// baseline; populated with one entry per DFlash round otherwise.
+    public let acceptLengths: [Int]?
 
     /// Generated tokens / generationSeconds.
     public var tokensPerSecond: Double {
@@ -24,11 +27,13 @@ public struct DFlashBenchmarkResult: Sendable {
     public init(
         generatedTokens: Int,
         prefillSeconds: Double,
-        generationSeconds: Double
+        generationSeconds: Double,
+        acceptLengths: [Int]? = nil
     ) {
         self.generatedTokens = generatedTokens
         self.prefillSeconds = prefillSeconds
         self.generationSeconds = generationSeconds
+        self.acceptLengths = acceptLengths
     }
 }
 
@@ -106,24 +111,73 @@ public func measureDFlashThroughput(
     generationParameters.maxTokens = maxTokens
     generationParameters.temperature = 0
 
-    var iterator = try DFlashTokenIterator(
-        input: LMInput(text: .init(tokens: promptTokens)),
-        target: target,
-        drafter: drafter,
-        parameters: generationParameters,
-        blockSize: blockSize
+    let resolvedBlockSize = blockSize ?? drafter.config.blockSize
+    guard resolvedBlockSize >= 2 else {
+        throw DFlashError.invalidBlockSize(resolvedBlockSize)
+    }
+
+    try drafter.bind(target: target)
+
+    var prompt = promptTokens
+    if prompt.ndim == 1 {
+        prompt = prompt[.newAxis, .ellipsis]
+    }
+
+    var targetCache = target.newCache(parameters: generationParameters)
+    let draftCache = try drafter.makeCache()
+    guard canTrimPromptCache(draftCache) else {
+        throw DFlashError.untrimmableCache
+    }
+
+    let prefillStart = Date()
+    let prefillOut = try target.forwardForDFlash(
+        prompt,
+        cache: targetCache,
+        targetLayerIds: drafter.config.targetLayerIds
     )
+    let firstBonusArray = prefillOut.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    eval(firstBonusArray, prefillOut.targetHidden)
+    let prefillElapsed = Date().timeIntervalSince(prefillStart)
+
+    var bonus = Int(firstBonusArray.item(Int32.self))
+    var targetHidden = prefillOut.targetHidden
 
     let generationStart = Date()
-    var generated = 0
-    while iterator.next() != nil {
-        generated += 1
+    var generated = 1
+    var accepts: [Int] = []
+
+    while generated < maxTokens {
+        let remaining = maxTokens - generated
+        let roundBlockSize = Swift.min(resolvedBlockSize, remaining + 1)
+        if roundBlockSize < 2 { break }
+
+        let round = try runDFlashGreedyRound(
+            target: target,
+            drafter: drafter,
+            targetCache: &targetCache,
+            draftCache: draftCache,
+            bonus: bonus,
+            targetHidden: targetHidden,
+            promptTokenCount: prompt.dim(1),
+            generatedTokenCount: generated,
+            blockSize: roundBlockSize,
+            maxEmitCount: remaining
+        )
+        accepts.append(round.accepted)
+
+        let emitted = round.tokens.count
+        generated += emitted
+        if emitted == 0 { break }
+
+        bonus = round.bonus
+        targetHidden = round.targetHidden
     }
     let generationElapsed = Date().timeIntervalSince(generationStart)
 
     return DFlashBenchmarkResult(
         generatedTokens: generated,
-        prefillSeconds: iterator.promptPrefillTime,
-        generationSeconds: generationElapsed
+        prefillSeconds: prefillElapsed,
+        generationSeconds: generationElapsed,
+        acceptLengths: accepts
     )
 }

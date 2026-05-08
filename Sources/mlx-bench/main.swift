@@ -296,7 +296,7 @@ struct MLXBench {
         print("target=\(targetURL.lastPathComponent)")
         print("drafter=\(drafterURL.lastPathComponent)")
         print("prompts=\(prompts.count), max_tokens=\(maxTokens), warmup=\(warmupTokens)")
-        print("K  base tok/s  dflash tok/s  speedup  generated")
+        print("K  base tok/s  dflash tok/s  speedup  accept_avg  generated")
 
         let warmupPrompt = MLXArray(prompts[0])
         _ = measureDFlashBaselineThroughput(
@@ -325,6 +325,7 @@ struct MLXBench {
         for blockSize in blockSizes {
             var dflashRates = [Double]()
             var generated = [String]()
+            var accepts = [Int]()
             for prompt in prompts {
                 let result = try measureDFlashThroughput(
                     target: target,
@@ -334,16 +335,19 @@ struct MLXBench {
                     blockSize: blockSize)
                 dflashRates.append(result.tokensPerSecond)
                 generated.append(String(result.generatedTokens))
+                accepts.append(contentsOf: result.acceptLengths ?? [])
                 MLX.Memory.clearCache()
             }
 
             let dflashAverage = average(dflashRates)
             let speedup = dflashAverage / max(baselineAverage, 1e-9)
+            let acceptAverage = average(accepts.map(Double.init))
             print(
                 "\(blockSize)  "
                     + "\(String(format: "%10.1f", baselineAverage)) "
                     + "\(String(format: "%12.1f", dflashAverage))   "
                     + "\(String(format: "%.2fx", speedup))   "
+                    + "\(String(format: "%.2f", acceptAverage))/\(blockSize - 1)   "
                     + generated.joined(separator: ",")
             )
         }
