@@ -4,7 +4,17 @@
 
 The KV (Key-Value) cache stores attention key and value tensors from previous tokens, enabling efficient autoregressive generation. Different cache types trade off between memory usage, context length, and performance.
 
-## Quick Reference
+| Class | Storage | Eviction | Use case |
+|---|---|---|---|
+| `StandardKVCache` | raw fp16 / bf16 | `.unbounded` or `.window(size:keep:)` | Default. Legacy `KVCacheSimple` (unbounded) and `RotatingKVCache` (windowed) collapsed into this single class. |
+| `AffineQuantizedKVCache` | 4 / 6 / 8-bit affine group-quant | unbounded only | Memory-efficient. Self-transitions from raw → quantized at `startOffset` so prefill stays fast. Windowed-eviction requests fall back to raw `StandardKVCache(maxSize:)` per legacy `maybeQuantizeKVCache` swap behaviour. |
+| `TurboQuantizedKVCache` | TurboQuant MSE codec, asymmetric K/V bits | unbounded **or** `.window(size:)` via `makeKVCache` (direct construction); `unbounded` only via `makeAttentionCache` (model-factory path, until [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) is fixed) | Best memory ratio. `keyBits`=0 enables raw-key mode. Sliding-window via `rotatingMaxSize` / `rotatingIdx` machinery — verified working on Mistral 3 / Ministral 3 / Gemma 3. Gemma 4 produces incoherent output under windowed turbo (KV-shared + mixed sliding/full-attention layers); the model-factory path falls through to `StandardKVCache(maxSize:)` until that's investigated. `.keep` (attention-sink prefix) is not surfaced through the codec — windowed turbo treats the buffer as a flat rotating window. |
+| `ArraysCache` | generic indexed `[MLXArray?]` slots | n/a | Building block for non-K/V caches. |
+| `SSMStateCache` | conv state + recurrent state (subclass of `ArraysCache`) | n/a (SSM state is cumulative) | Mamba / GatedDeltaNet / hybrid linear-attention layers. Replaces legacy `MambaCache`. |
+| `BatchedKVCache` | raw fp16 / bf16 across N streams | unbounded | Speculative decoding + multi-request servers. |
+| `BatchedMambaCache` / `BatchedHybridCache` | batched SSM / hybrid | n/a | Batched analogues of `SSMStateCache` for hybrid models. |
+| `PagedKVCache` | page-table-allocated raw K/V | unbounded | Paged attention; experimental. |
+| `CacheList` | heterogeneous sub-caches | composite | Hybrid models (e.g. Qwen 3.5 GDN+Attention) that need multiple cache shapes per layer set. |
 
 | Type | Use Case | Memory | Max Context |
 |------|----------|--------|-------------|
@@ -41,11 +51,137 @@ Fixed-size cache with sliding window attention:
 // Enable via GenerateParameters
 let params = GenerateParameters(maxKVSize: 4096)
 
-// Or create directly
-let cache = RotatingKVCache(
-    maxSize: 4096,  // Window size
-    keep: 4,        // Tokens to always keep at start
-    step: 256       // Allocation step size
+### Runtime dispatch tag (`KVStorageKind`)
+
+What the cache currently holds. Self-transitioning caches
+(`AffineQuantizedKVCache`, `TurboQuantizedKVCache`) report their
+*post-transition* state, so attention dispatch doesn't need `as?`
+downcasts on concrete types.
+
+```swift
+public enum KVStorageKind: Sendable, Equatable {
+    case raw
+    case affineQuantized(bits: Int, groupSize: Int)
+    case turboCompressed(keyBits: Int, valueBits: Int)
+    case ssm
+    case composite
+}
+
+cache.storageKind  // available on every KVCache
+```
+
+### User-facing string format (`KVCache.CompressionAlgorithm`)
+
+The `GenerateParameters.compressionAlgorithm` parameter takes a
+`KVCache.CompressionAlgorithm` (typealias for the top-level
+`KVCacheCompressionAlgorithm`). It also has a string parser used by the
+bench harness's `--kv` flag.
+
+```swift
+public enum KVCacheCompressionAlgorithm: Sendable, Equatable, CustomStringConvertible {
+    case none
+    case affine(bits: Int, groupSize: Int = 64)
+    case turbo(
+        keyBits: Int,
+        valueBits: Int,
+        skipBoundaryLayerCompression: Bool = true,
+        boundaryLayersToSkip: Int = 2
+    )
+}
+
+// Programmatic
+let algo: KVCache.CompressionAlgorithm = .turbo(keyBits: 4, valueBits: 2)
+
+// Or from a string (CLI / scheme):
+let algo = KVCache.CompressionAlgorithm("turbo4v2")        // .turbo(4, 2)
+let algo = KVCache.CompressionAlgorithm("turbo4")          // .turbo(4, 4)
+let algo = KVCache.CompressionAlgorithm("turbo0v4")        // raw-key mode
+let algo = KVCache.CompressionAlgorithm("affine4")         // .affine(4, 64)
+let algo = KVCache.CompressionAlgorithm("affine4g32")      // .affine(4, 32)
+let algo = KVCache.CompressionAlgorithm("affine8g32")      // .affine(8, 32)
+let algo = KVCache.CompressionAlgorithm("none")            // .none
+```
+
+`description` round-trips: `algo.description == "turbo4v2"` etc.
+
+## Factories
+
+These are the call sites that ~14 model `newCache(parameters:)` factories
+use. Don't hand-instantiate cache classes from outside the model
+factories unless you're writing a custom cache strategy.
+
+### `makeAttentionCache(parameters:maxSize:keep:)`
+
+The 90% case for `newCache(parameters:)` — picks the right class based on
+the parameters' `compressionAlgorithm`.
+
+```swift
+public func makeAttentionCache(
+    parameters: GenerateParameters?,
+    maxSize: Int? = nil,
+    keep: Int = 0
+) -> KVCache
+```
+
+Decision tree:
+- `.affine(bits:groupSize:)` → `AffineQuantizedKVCache`. Window eviction is
+  ignored (matches the legacy `maybeQuantizeKVCache` swap behaviour).
+- `.turbo(...)` → caller's responsibility. Turbo construction needs
+  per-model `headDim` for kernel JIT pre-warm + boundary-skip logic, so
+  models that opt into turbo construct `TurboQuantizedKVCache` directly.
+- `.none` / `nil` → `StandardKVCache(maxSize: maxSize, keep: keep)` if
+  `maxSize` is set; else unbounded `StandardKVCache()`.
+
+### `makeKVCache(scheme:eviction:)`
+
+Single-cache factory composing the storage + eviction axes orthogonally.
+
+```swift
+public func makeKVCache(
+    scheme: KVCache.CompressionAlgorithm = .none,
+    eviction: KVEviction = .unbounded
+) -> any KVCache
+```
+
+`.turbo(...)` + `.window(size:)` is supported — the codec's
+`rotatingMaxSize` / `rotatingIdx` machinery wraps writes at `maxSize`
+once the raw → compressed transition completes, and the SDPA path
+honours windowed semantics for the mask. The `.keep` (attention-sink
+prefix) parameter on `.window(...)` is not currently surfaced through
+the TurboQuant codec; windowed turbo treats the buffer as a flat
+rotating window. Use `.affine(bits:)` instead if you need the
+attention-sink prefix.
+
+### `turboBoundarySkipSet(attentionLayerIndices:algorithm:)`
+
+For models that opt into `TurboQuant`, returns the set of attention-layer
+indices that should stay uncompressed (first N / last N — most
+PPL-sensitive).
+
+```swift
+public func turboBoundarySkipSet(
+    attentionLayerIndices: [Int],
+    algorithm: KVCache.CompressionAlgorithm?
+) -> Set<Int>
+```
+
+Returns an empty set when the algorithm is `nil` / not turbo /
+`skipBoundaryLayerCompression == false` / fewer than
+`4 * boundaryLayersToSkip` attention layers (the floor exists so small
+models like Qwen 3.5 0.8B don't end up with half their layers skipped).
+Hybrid models like NemotronH thread Mamba / MLP / MoE layers around the
+attention ones, so the caller computes `attentionLayerIndices` from its
+own layer-type discovery.
+
+Example pattern from `Qwen35TextModel.newCache`:
+
+```swift
+let layerIndices = (0..<args.hiddenLayers).filter {
+    !linearLayerSet.contains($0)
+}
+let skipSet = turboBoundarySkipSet(
+    attentionLayerIndices: layerIndices,
+    algorithm: parameters?.compressionAlgorithm
 )
 
 // Behavior:
@@ -241,7 +377,24 @@ if let qCache = cache as? QuantizedKVCacheProtocol {
 
 ### MambaCache
 
-For Mamba/SSM architecture models:
+- **`.turbo(...)` + `.window(size:keep:)` ignores `keep`.** The codec's
+  rotating buffer treats the window as flat — the attention-sink prefix
+  parameter is not currently surfaced. Use `.affine(bits:)` on a
+  separate `StandardKVCache` if you need the sink prefix.
+- **`AffineQuantizedKVCache` ignores windowed eviction** even when passed
+  through `makeAttentionCache(maxSize:)` — matches legacy
+  `maybeQuantizeKVCache` behaviour. If you need both, manage context
+  length manually.
+- **TurboQuantizedKVCache values are not directly trimmable** —
+  `isTrimmable` is `false`. The decode-side compressed store doesn't
+  preserve a clean tail.
+- **KV-sharing donors must not be quantized** — `isDonor` flagged caches
+  return raw fp16 / bf16 K / V to shared layers. Self-transitioning
+  caches respect `isDonor` and stay raw. If you set `isDonor` on a
+  pre-constructed quantized cache, behaviour is undefined.
+- **Self-transition timing** — `AffineQuantizedKVCache` stays raw until
+  `startOffset` (default `0` for spec-006 callers), then transitions in
+  place. Inspect `cache.storageKind` to see the *current* state.
 
 ```swift
 let cache = MambaCache(leftPadding: nil)
