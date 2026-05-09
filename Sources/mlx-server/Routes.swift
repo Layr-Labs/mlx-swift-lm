@@ -2,6 +2,8 @@
 
 import Foundation
 import Hummingbird
+import MLX
+import MLXLLM
 import MLXLMCommon
 
 // MARK: - JSON helpers
@@ -44,10 +46,49 @@ private func samplingParams(from req: CompletionRequest, defaultMaxTokens: Int) 
     )
 }
 
+// MARK: - Gemma 4 MTP generation helper
+
+/// Run Gemma 4 MTP generation for a plain-text prompt, returning (outputText, promptTokens, completionTokens, finishReason).
+private func generateWithGemma4MTP(
+    prompt: String,
+    params: SamplingParams,
+    g4: Gemma4ServerContext
+) async throws -> (String, Int, Int, String) {
+    let tokenIds = g4.target.tokenizer.encode(text: prompt, addSpecialTokens: true)
+    let input = LMInput(text: .init(tokens: MLXArray(tokenIds)))
+    let genParams = GenerateParameters(
+        maxTokens: params.maxTokens,
+        temperature: params.temperature,
+        topP: params.topP,
+        topK: params.topK,
+        minP: params.minP
+    )
+    var outputText = ""
+    var promptToks = tokenIds.count
+    var completionToks = 0
+    var finishReason = "stop"
+    for await gen in try generateGemma4MTP(
+        input: input, parameters: genParams, target: g4.target, drafter: g4.drafter
+    ) {
+        switch gen {
+        case .chunk(let text):
+            outputText += text
+        case .info(let info):
+            promptToks = info.promptTokenCount
+            completionToks = info.generationTokenCount
+            finishReason = info.stopReason == .stop ? "stop" : "length"
+        case .toolCall:
+            break
+        }
+    }
+    return (outputText, promptToks, completionToks, finishReason)
+}
+
 // MARK: - Router builder
 
 func buildRouter(
     engine: BatchedEngine,
+    gemma4Context: Gemma4ServerContext? = nil,
     modelName: String,
     defaultMaxTokens: Int
 ) -> Router<BasicRequestContext> {
@@ -76,7 +117,23 @@ func buildRouter(
         let params = samplingParams(from: req, defaultMaxTokens: defaultMaxTokens)
 
         if req.stream == true {
+            if let g4 = gemma4Context {
+                return sseTextGemma4Response(g4: g4, modelName: modelName, prompt: req.prompt, params: params)
+            }
             return sseTextResponse(engine: engine, modelName: modelName, prompt: req.prompt, params: params)
+        } else if let g4 = gemma4Context {
+            let (text, pp, tg, finish) = try await generateWithGemma4MTP(
+                prompt: req.prompt, params: params, g4: g4)
+            let resp = CompletionResponse(
+                id: "cmpl-\(UUID().uuidString)",
+                object: "text_completion",
+                created: Int(Date().timeIntervalSince1970),
+                model: modelName,
+                choices: [CompletionChoice(index: 0, text: text, finish_reason: finish)],
+                usage: Usage(prompt_tokens: pp, completion_tokens: tg, total_tokens: pp + tg)
+            )
+            let body = try jsonBody(resp)
+            return Response(status: .ok, headers: [.contentType: "application/json"], body: body)
         } else {
             let output = try await engine.generateWithResult(prompt: req.prompt, samplingParams: params)
             let resp = CompletionResponse(
@@ -107,7 +164,27 @@ func buildRouter(
         )
 
         if req.stream == true {
+            if let g4 = gemma4Context {
+                return sseChatGemma4Response(g4: g4, modelName: modelName, prompt: prompt, params: params)
+            }
             return sseChatResponse(engine: engine, modelName: modelName, prompt: prompt, params: params)
+        } else if let g4 = gemma4Context {
+            let (text, pp, tg, finish) = try await generateWithGemma4MTP(
+                prompt: prompt, params: params, g4: g4)
+            let resp = ChatCompletionResponse(
+                id: "chatcmpl-\(UUID().uuidString)",
+                object: "chat.completion",
+                created: Int(Date().timeIntervalSince1970),
+                model: modelName,
+                choices: [ChatChoice(
+                    index: 0,
+                    message: ChatMessage(role: "assistant", content: text),
+                    finish_reason: finish
+                )],
+                usage: Usage(prompt_tokens: pp, completion_tokens: tg, total_tokens: pp + tg)
+            )
+            let body = try jsonBody(resp)
+            return Response(status: .ok, headers: [.contentType: "application/json"], body: body)
         } else {
             let out = try await engine.generateWithResult(prompt: prompt, samplingParams: params)
             let resp = ChatCompletionResponse(
@@ -195,6 +272,113 @@ private func sseChatResponse(
         continuation.finish()
     }
 
+    return Response(
+        status: .ok,
+        headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
+        body: .init(asyncSequence: stream)
+    )
+}
+
+/// SSE streaming for chat/completions via Gemma4 MTP draft model.
+private func sseChatGemma4Response(
+    g4: Gemma4ServerContext,
+    modelName: String,
+    prompt: String,
+    params: SamplingParams
+) -> Response {
+    let (stream, continuation) = AsyncStream<ByteBuffer>.makeStream()
+    Task {
+        let requestId = "chatcmpl-\(UUID().uuidString)"
+        let created = Int(Date().timeIntervalSince1970)
+        let firstChunk = ChatCompletionChunk(
+            id: requestId, object: "chat.completion.chunk", created: created, model: modelName,
+            choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: "assistant", content: ""), finish_reason: nil)]
+        )
+        if let buf = try? sseData(firstChunk) { continuation.yield(buf) }
+
+        let tokenIds = g4.target.tokenizer.encode(text: prompt, addSpecialTokens: true)
+        let input = LMInput(text: .init(tokens: MLXArray(tokenIds)))
+        let genParams = GenerateParameters(
+            maxTokens: params.maxTokens, temperature: params.temperature,
+            topP: params.topP, topK: params.topK, minP: params.minP)
+        var finishReason = "stop"
+        if let genStream = try? generateGemma4MTP(
+            input: input, parameters: genParams, target: g4.target, drafter: g4.drafter) {
+            for await gen in genStream {
+                switch gen {
+                case .chunk(let text):
+                    let chunk = ChatCompletionChunk(
+                        id: requestId, object: "chat.completion.chunk", created: created,
+                        model: modelName,
+                        choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: nil, content: text), finish_reason: nil)]
+                    )
+                    if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                case .info(let info):
+                    finishReason = info.stopReason == .stop ? "stop" : "length"
+                case .toolCall:
+                    break
+                }
+            }
+        }
+        let finalChunk = ChatCompletionChunk(
+            id: requestId, object: "chat.completion.chunk", created: created, model: modelName,
+            choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: nil, content: nil), finish_reason: finishReason)]
+        )
+        if let buf = try? sseData(finalChunk) { continuation.yield(buf) }
+        continuation.yield(ByteBuffer(string: "data: [DONE]\n\n"))
+        continuation.finish()
+    }
+    return Response(
+        status: .ok,
+        headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
+        body: .init(asyncSequence: stream)
+    )
+}
+
+/// SSE streaming for text/completions via Gemma4 MTP draft model.
+private func sseTextGemma4Response(
+    g4: Gemma4ServerContext,
+    modelName: String,
+    prompt: String,
+    params: SamplingParams
+) -> Response {
+    let (stream, continuation) = AsyncStream<ByteBuffer>.makeStream()
+    Task {
+        let completionId = "cmpl-\(UUID().uuidString)"
+        let created = Int(Date().timeIntervalSince1970)
+
+        let tokenIds = g4.target.tokenizer.encode(text: prompt, addSpecialTokens: true)
+        let input = LMInput(text: .init(tokens: MLXArray(tokenIds)))
+        let genParams = GenerateParameters(
+            maxTokens: params.maxTokens, temperature: params.temperature,
+            topP: params.topP, topK: params.topK, minP: params.minP)
+        var finishReason = "stop"
+        if let genStream = try? generateGemma4MTP(
+            input: input, parameters: genParams, target: g4.target, drafter: g4.drafter) {
+            for await gen in genStream {
+                switch gen {
+                case .chunk(let text):
+                    let chunk = CompletionChunk(
+                        id: completionId, object: "text_completion", created: created,
+                        model: modelName,
+                        choices: [CompletionChunkChoice(index: 0, text: text, finish_reason: nil)]
+                    )
+                    if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                case .info(let info):
+                    finishReason = info.stopReason == .stop ? "stop" : "length"
+                case .toolCall:
+                    break
+                }
+            }
+        }
+        let finalChunk = CompletionChunk(
+            id: completionId, object: "text_completion", created: created, model: modelName,
+            choices: [CompletionChunkChoice(index: 0, text: "", finish_reason: finishReason)]
+        )
+        if let buf = try? sseData(finalChunk) { continuation.yield(buf) }
+        continuation.yield(ByteBuffer(string: "data: [DONE]\n\n"))
+        continuation.finish()
+    }
     return Response(
         status: .ok,
         headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],

@@ -15,7 +15,7 @@ import MLXNN
 /// Set to `true` before calling `MLXLLM.load(...)` when MTP should be active.
 /// Mirrors omlx `is_mtp_active()` / `set_mtp_active()` from
 /// patches/mlx_lm_mtp/__init__.py.
-nonisolated(unsafe) var _deepseekV4MTPEnabled: Bool = false
+public nonisolated(unsafe) var _deepseekV4MTPEnabled: Bool = false
 
 // MARK: - DeepseekV4MTPBlock
 
@@ -95,6 +95,7 @@ final class DeepseekV4MTPBlock: Module {
 // MARK: - MTPCapable conformance
 
 extension DeepseekV4Model: MTPCapable {
+    public var hasMTPHead: Bool { mtp != nil }
 
     /// Backbone forward that also returns the raw 4D pre-hcHead hidden state.
     ///

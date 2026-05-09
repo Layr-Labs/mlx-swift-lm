@@ -51,9 +51,6 @@ final class MTPState {
     /// Max 2 items at any time (one draft + one bonus on accept).
     var queue: [MTPQueueItem] = []
 
-    /// Separate KV cache for the MTP head layers (allocated via model.makeMTPCache()).
-    var mtpCache: [any KVCache] = []
-
     /// First input token for the next verify forward. Shape: (1,) uint32.
     /// omlx: state.next_main
     var nextMain: MLXArray?
