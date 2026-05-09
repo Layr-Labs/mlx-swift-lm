@@ -112,6 +112,27 @@ struct Gemma4DFlashForwardTests {
         }
     }
 
+    @Test func greedyTokensMatchSoftcappedLogitsArgmax() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Gemma4TextModel(try tinyGemma4Config())
+            eval(model)
+            let tokens = MLXArray([Int32(1), 2, 3])[.newAxis, .ellipsis]
+
+            let forward = try model.forwardForDFlash(
+                tokens,
+                cache: model.newCache(parameters: nil),
+                targetLayerIds: [0, 3]
+            )
+            let greedy = try model.forwardGreedyTokensForDFlash(
+                tokens,
+                cache: model.newCache(parameters: nil),
+                targetLayerIds: [0, 3]
+            )
+
+            #expect((greedy.tokens .== forward.logits.argMax(axis: -1)).all().item(Bool.self))
+        }
+    }
+
     @Test func capturesSharedKVLayerHiddenStates() throws {
         try Device.withDefaultDevice(.cpu) {
             let model = Gemma4TextModel(

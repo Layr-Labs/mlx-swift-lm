@@ -1059,6 +1059,15 @@ public class Gemma4TextModelInner: Module {
             $0.embeddingSeconds += $1
         }
 
+        if hiddenSizePerLayerInput == 0, config.numKvSharedLayers == 0, capture == nil {
+            return forwardTrunkWithoutPLEOrSharedKV(
+                h,
+                cache: cache,
+                capturePreNorm: capturePreNorm,
+                dFlashHiddenCapture: dFlashHiddenCapture
+            )
+        }
+
         // Compute per-layer inputs (PLE)
         let pleStart = gemma4TimingStart()
         let perLayerInputs: [MLXArray?]
@@ -1171,6 +1180,77 @@ public class Gemma4TextModelInner: Module {
                     capture.slidingAttention = kvPair
                 }
             }
+
+            if dFlashHiddenCapture?.layerIds.contains(idx) == true {
+                dFlashHiddenCapture?.hiddenStates[idx] = h
+            }
+        }
+
+        let finalNormStart = gemma4TimingStart()
+        let postNorm = norm(h)
+        if finalNormStart != nil {
+            eval(postNorm)
+        }
+        gemma4Record(finalNormStart) {
+            $0.finalNormSeconds += $1
+        }
+        return (postNorm, capturePreNorm ? h : nil)
+    }
+
+    private func forwardTrunkWithoutPLEOrSharedKV(
+        _ initialHidden: MLXArray,
+        cache: [KVCache]?,
+        capturePreNorm: Bool,
+        dFlashHiddenCapture: Gemma4DFlashHiddenCapture?
+    ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        var h = initialHidden
+
+        var fullCache: [KVCache?]
+        if let cache {
+            fullCache = cache.map { Optional($0) }
+            while fullCache.count < config.numHiddenLayers {
+                fullCache.append(nil)
+            }
+        } else {
+            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
+        }
+
+        let maskStart = gemma4TimingStart()
+        let firstFullAttention = layers.firstIndex { $0.layerType != "sliding_attention" }
+        let firstSlidingAttention = layers.firstIndex { $0.layerType == "sliding_attention" }
+        let fullMask = firstFullAttention.map {
+            createAttentionMask(h: h, cache: fullCache[$0])
+        }
+        let slidingMask = firstSlidingAttention.map {
+            createAttentionMask(h: h, cache: fullCache[$0], windowSize: config.slidingWindow)
+        }
+        if maskStart != nil {
+            var maskArrays = [MLXArray]()
+            if case .array(let array)? = fullMask {
+                maskArrays.append(array)
+            }
+            if case .array(let array)? = slidingMask {
+                maskArrays.append(array)
+            }
+            if !maskArrays.isEmpty {
+                eval(maskArrays)
+            }
+        }
+        gemma4Record(maskStart) {
+            $0.maskSeconds += $1
+        }
+
+        for (idx, layer) in layers.enumerated() {
+            let mask = layer.layerType == "sliding_attention" ? slidingMask : fullMask
+            let (out, _, _) = layer(
+                h,
+                mask: mask,
+                cache: fullCache[idx],
+                perLayerInput: nil,
+                sharedKV: nil,
+                positionOffset: nil
+            )
+            h = out
 
             if dFlashHiddenCapture?.layerIds.contains(idx) == true {
                 dFlashHiddenCapture?.hiddenStates[idx] = h
