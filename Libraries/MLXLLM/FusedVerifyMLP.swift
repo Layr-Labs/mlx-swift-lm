@@ -123,9 +123,9 @@ private let _gateUpSource = """
     uint simd_gid = simdgroup_index_in_threadgroup;
     uint simd_lid = thread_index_in_simdgroup;
 
-    int M = int(M_size);
-    int K = int(K_size);
-    int N = int(N_size);
+    int M = int(M_size[0]);
+    int K = int(K_size[0]);
+    int N = int(N_size[0]);
     constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
     int out_row       = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
     int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;
@@ -253,7 +253,7 @@ func gateUpSwiGLUFused(
             x2,
             gateProj.weight, gateProj.scales, gateProj.biases!,
             upProj.weight, upProj.scales, upProj.biases!,
-            MLXArray(Int32(M)), MLXArray(Int32(K)), MLXArray(Int32(N)),
+            MLXArray([Int32(M)]), MLXArray([Int32(K)]), MLXArray([Int32(N)]),
         ],
         template: [("T", x.dtype), ("GS", gateProj.groupSize)],
         grid: (32, gridY, 1),
@@ -277,8 +277,8 @@ private let _smallMQmmSource = """
     uint sg_id = tid / 32;
     uint tg_n  = threadgroup_position_in_grid.y;
 
-    int K = int(K_size);
-    int N = int(N_size);
+    int K = int(K_size[0]);
+    int N = int(N_size[0]);
     int K_by_8  = K / 8;
     int K_by_gs = K / GS;
     int n0 = int(tg_n) * BN;
@@ -363,7 +363,7 @@ func smallMQuantizedLinear(x: MLXArray, layer: QuantizedLinear) -> MLXArray {
         [
             x2,
             layer.weight, layer.scales, layer.biases!,
-            MLXArray(Int32(M)), MLXArray(Int32(K)), MLXArray(Int32(N)),
+            MLXArray([Int32(M)]), MLXArray([Int32(K)]), MLXArray([Int32(N)]),
         ],
         template: [("T", x.dtype), ("GS", layer.groupSize)],
         grid: (64, N / 32, 1),
