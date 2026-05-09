@@ -781,8 +781,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35TextModel: MTPCapable {
     public var hasMTPHead: Bool { mtp != nil }
 
-    /// Run a backbone forward that also returns pre-norm hidden states.
+    /// Run a backbone forward that also returns post-norm hidden states.
+    ///
+    /// Returns `(logits, postNormHidden)` where `postNormHidden` is the backbone output
+    /// AFTER `model.norm` — matching MTPLX's default `"post_norm"` hidden variant.
+    /// The MTP head's `pre_fc_norm_hidden` weights were trained on post-norm inputs.
+    ///
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
+    /// MTPLX: _MTPLXTextModel.__call__ hidden_variant="post_norm" (default)
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
@@ -795,7 +801,9 @@ extension Qwen35TextModel: MTPCapable {
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
-        return (logits, hidden)
+        // Return post-norm hidden (normed), not pre-norm (hidden).
+        // pre_fc_norm_hidden in the MTP module was trained on already-normalized inputs.
+        return (logits, normed)
     }
 
     /// Run the MTP head forward.

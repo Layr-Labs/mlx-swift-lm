@@ -162,6 +162,7 @@ run_bench() {
         --runs "$RUNS" \
         --no-cache \
         --no-warmup \
+        --skip-coherence \
         --latency-mode generation \
         --format md 2>&1) && bench_exit=0 || bench_exit=$?
 

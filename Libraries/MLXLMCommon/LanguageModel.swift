@@ -227,19 +227,24 @@ public protocol MTPCapable: LanguageModel {
     /// in which case `mtpForward` must not be called.
     var hasMTPHead: Bool { get }
 
-    /// Run the MTP head. `hidden` is pre-norm hidden from the backbone at position t.
+    /// Run the MTP head. `hidden` is post-norm hidden from the backbone at position t
+    /// (i.e., after `model.norm` — the "post_norm" variant). The MTP head's
+    /// `pre_fc_norm_hidden` weights were trained on post-norm inputs.
     /// `nextTokenIds` shape: [1, S] (usually S=1). Returns logits [1, S, vocab].
     /// omlx: TextModel.mtp_forward
+    /// MTPLX: hidden_variant="post_norm" (default for all generation commands)
     func mtpForward(hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]) -> MLXArray
 
     /// Allocate fresh KV caches for the MTP head layers.
+    /// Called once per draft proposal — never reused across cycles.
     /// omlx: TextModel.make_mtp_cache
     func makeMTPCache() -> [any KVCache]
 
-    /// Forward pass that also returns pre-norm hidden states.
+    /// Forward pass that also returns post-norm hidden states.
     /// - Parameter nConfirmed: Confirmed prefix length for the 2-token verify input (0 = standard).
-    /// - Returns: `(logits [B, S, vocab], preNormHidden [B, S, hiddenSize])`
+    /// - Returns: `(logits [B, S, vocab], postNormHidden [B, S, hiddenSize])`
     /// omlx: TextModel.__call__ with return_hidden=True + n_confirmed
+    /// MTPLX: hidden_variant="post_norm" — hidden is backbone output after model.norm
     func callWithHidden(input: LMInput.Text, cache: [any KVCache], nConfirmed: Int) -> (MLXArray, MLXArray)
 }
 

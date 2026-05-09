@@ -264,8 +264,10 @@ public final class GenerationBatch: @unchecked Sendable {
         // nextTokens = main_tok: sampled from prompt[-1]'s logits in init's step().
         let mainTok = nextTokens  // shape (1,) — asyncEval'd in step(); will force on use
 
-        // 1. Backbone forward at main_tok → (logits [1,1,vocab], preNormHidden [1,1,H]).
+        // 1. Backbone forward at main_tok → (logits [1,1,vocab], postNormHidden [1,1,H]).
         // omlx: _post_init_mtp — "1-token backbone forward at main_tok with hidden state"
+        // MTPLX defaults to "post_norm" variant: hidden is the backbone's post-norm output
+        // (after model.norm). The MTP head's pre_fc_norm_hidden was trained on post-norm inputs.
         let mainInput = mainTok.reshaped(1, 1)
         let backboneCache = promptCache.map { $0 as any KVCache }
         let (logits, hidden) = model.callWithHidden(
@@ -274,20 +276,22 @@ public final class GenerationBatch: @unchecked Sendable {
             nConfirmed: 0
         )
 
-        // 2. Sample next_main_tok from logits[:, -1, :].
-        let nextMainLogits = logits[0..., -1, 0...]  // [1, vocab]
+        // 2. Sample next_main_tok from logits[:, -1, :]. Upcast to float32 to avoid
+        // BF16 underflow on low-probability tokens (MTPLX: "fp32 p/q ratio" note).
+        let nextMainLogits = logits[0..., -1, 0...].asType(.float32)  // [1, vocab]
         let nextMainLp = nextMainLogits - logSumExp(nextMainLogits, axis: -1, keepDims: true)
         let nextMainTok = sampler(nextMainLp)  // (1,)
 
         // 3. Run MTP head: (hidden_at_main [1,1,H], next_main_tok [1,1]) → draft [1,1,vocab].
+        // Use a fresh MTP cache for each draft proposal — never accumulate across cycles.
+        // MTPLX: rt.draft_mtp(..., mtp_cache=rt.make_mtp_cache()) creates fresh cache each time.
         // omlx: _post_init_mtp — "MTP head sees (hidden_at_main, next_main_tok)"
-        let mtpCache = model.makeMTPCache()
         let T = hidden.dim(1)
         let hiddenAtMain = hidden[0..., (T - 1) ..< T, 0...]  // [1, 1, H]
         let nextIds = nextMainTok.reshaped(1, 1)               // [1, 1]
         let mtpLogits = model.mtpForward(
-            hidden: hiddenAtMain, nextTokenIds: nextIds, cache: mtpCache)
-        let draftLogits2d = mtpLogits[0..., -1, 0...]  // [1, vocab]
+            hidden: hiddenAtMain, nextTokenIds: nextIds, cache: model.makeMTPCache())
+        let draftLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
         let draftLp2d = draftLogits2d - logSumExp(draftLogits2d, axis: -1, keepDims: true)
         let draftTok = sampler(draftLp2d)  // (1,)
 
@@ -300,7 +304,7 @@ public final class GenerationBatch: @unchecked Sendable {
         let draftId = Int(draftTok.asArray(UInt32.self)[0])
 
         let state = MTPState()
-        state.mtpCache = mtpCache
+        // mtpCache is NOT stored: each stepMTP allocates a fresh cache (see stepMTP).
         state.nextMain = nextMainTok
         state.draftTok = draftTok
         state.draftLp = draftLp2d[0]  // [vocab]
@@ -448,9 +452,11 @@ private extension GenerationBatch {
         let bonusLogits  = logits[0..., 1, 0...]  // [1, vocab]
 
         // Batched logprob: one logsumexp over (2, vocab) vs two over (1, vocab).
+        // Upcast to float32 before log-softmax: BF16 underflows at low probabilities,
+        // causing -inf logprobs that break the acceptance ratio (MTPLX "fp32 p/q ratio" note).
         // omlx: _run_verify_cycle — "combined_logits = mx.concatenate([verify_logits, bonus_logits])"
         let tSample = CFAbsoluteTimeGetCurrent()
-        let combinedLogits = concatenated([verifyLogits, bonusLogits], axis: 0)  // [2, vocab]
+        let combinedLogits = concatenated([verifyLogits, bonusLogits], axis: 0).asType(.float32)  // [2, vocab]
         let combinedLp = combinedLogits - logSumExp(combinedLogits, axis: -1, keepDims: true)
         let verifyLp2d = combinedLp[0 ..< 1, 0...]  // [1, vocab]
         let bonusLp2d  = combinedLp[1 ..< 2, 0...]  // [1, vocab]
@@ -554,9 +560,13 @@ private extension GenerationBatch {
         let sampler = samplers[0] ?? fallbackSampler
 
         let nextIds = nextMainTok.reshaped(1, 1)  // [1, 1]
+        // Always allocate a fresh MTP cache: each draft proposal is independent.
+        // MTPLX: rt.draft_mtp(..., mtp_cache=rt.make_mtp_cache()) — fresh cache every cycle.
+        // Reusing an accumulated cache would cause the MTP layer to attend to all previous
+        // draft proposals (garbage context). This was the cache-reuse bug.
         let mtpLogits = model.mtpForward(
-            hidden: hiddenAtPosition, nextTokenIds: nextIds, cache: state.mtpCache)
-        let mtpLogits2d = mtpLogits[0..., -1, 0...]  // [1, vocab]
+            hidden: hiddenAtPosition, nextTokenIds: nextIds, cache: model.makeMTPCache())
+        let mtpLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
         let newLp2d = mtpLogits2d - logSumExp(mtpLogits2d, axis: -1, keepDims: true)
         let newTok = sampler(newLp2d)  // (1,)
 
