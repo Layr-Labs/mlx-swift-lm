@@ -110,7 +110,7 @@ public final class GenerationBatch: @unchecked Sendable {
             _ = step()
             // Attempt MTP post-init for eligible single-sequence batches.
             // omlx: batch_generator.py patched_init → _post_init_mtp
-            if batchSize == 1, let mtpModel = model as? (any MTPCapable) {
+            if batchSize == 1, let mtpModel = model as? (any MTPCapable), mtpModel.hasMTPHead {
                 postInitMTP(model: mtpModel)
             }
         }

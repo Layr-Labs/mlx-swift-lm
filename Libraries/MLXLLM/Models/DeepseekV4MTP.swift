@@ -95,6 +95,7 @@ final class DeepseekV4MTPBlock: Module {
 // MARK: - MTPCapable conformance
 
 extension DeepseekV4Model: MTPCapable {
+    public var hasMTPHead: Bool { mtp != nil }
 
     /// Backbone forward that also returns the raw 4D pre-hcHead hidden state.
     ///

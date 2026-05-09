@@ -222,6 +222,11 @@ extension LanguageModel {
 ///   patches/mlx_lm_mtp/qwen35_model.py (_patch_text_model / _patch_outer_model)
 ///   patches/mlx_lm_mtp/batch_generator.py (_is_mtp_eligible)
 public protocol MTPCapable: LanguageModel {
+    /// True when the MTP head is attached and operational.
+    /// Returns false when the model was loaded without MTP (e.g. no --mtp flag),
+    /// in which case `mtpForward` must not be called.
+    var hasMTPHead: Bool { get }
+
     /// Run the MTP head. `hidden` is pre-norm hidden from the backbone at position t.
     /// `nextTokenIds` shape: [1, S] (usually S=1). Returns logits [1, S, vocab].
     /// omlx: TextModel.mtp_forward
