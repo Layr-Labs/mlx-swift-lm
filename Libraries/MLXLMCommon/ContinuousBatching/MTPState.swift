@@ -69,6 +69,13 @@ final class MTPState {
     /// omlx: state.draft_id
     var draftId: Int = -1
 
+    /// KV caches for the MTP transformer layer(s). Created once at init and
+    /// accumulated across cycles — the MTP head is auto-regressive and was
+    /// trained with a growing KV context, matching the backbone's behaviour.
+    /// PR #990: `mtp_cache = model.make_mtp_cache()` (created once, reused).
+    /// omlx uses fresh-per-cycle; we now match PR #990 for correctness.
+    var mtpCache: [any KVCache]?
+
     /// Stats to be logged on sequence finish.
     var stats: MTPStats = MTPStats()
 }

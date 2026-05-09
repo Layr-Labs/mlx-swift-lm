@@ -282,17 +282,19 @@ public final class GenerationBatch: @unchecked Sendable {
         let nextMainTok = sampler(nextMainLp)  // (1,)
 
         // 3. Run MTP head: (hidden_at_main [1,1,H], next_main_tok [1,1]) → draft [1,1,vocab].
-        // Use a fresh MTP cache for each draft proposal — never accumulate across cycles.
-        // MTPLX: rt.draft_mtp(..., mtp_cache=rt.make_mtp_cache()) creates fresh cache each time.
         // omlx: _post_init_mtp — "MTP head sees (hidden_at_main, next_main_tok)"
+        // Allocate the persistent MTP cache here so it's shared with all subsequent
+        // stepMTP calls. The MTP head is auto-regressive (trained with growing KV context).
+        // PR #990: `mtp_cache = model.make_mtp_cache()` — created once, reused every cycle.
+        let mtpCache = model.makeMTPCache()
         let T = hidden.dim(1)
         let hiddenAtMain = hidden[0..., (T - 1) ..< T, 0...]  // [1, 1, H]
         let nextIds = nextMainTok.reshaped(1, 1)               // [1, 1]
         let mtpLogits = model.mtpForward(
-            hidden: hiddenAtMain, nextTokenIds: nextIds, cache: model.makeMTPCache())
+            hidden: hiddenAtMain, nextTokenIds: nextIds, cache: mtpCache)
         let draftLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
         let draftLp2d = draftLogits2d - logSumExp(draftLogits2d, axis: -1, keepDims: true)
-        let draftTok = sampler(draftLp2d)  // (1,)
+        let draftTok = argMax(draftLp2d, axis: -1)  // (1,) — greedy draft (see stepMTP)
 
         // 4. Single eval for all sampled tokens. Cache draft_id as Int to avoid a
         //    GPU→CPU sync in the first verify cycle's accept/reject check.
@@ -303,7 +305,7 @@ public final class GenerationBatch: @unchecked Sendable {
         let draftId = Int(draftTok.asArray(UInt32.self)[0])
 
         let state = MTPState()
-        // mtpCache is NOT stored: each stepMTP allocates a fresh cache (see stepMTP).
+        state.mtpCache = mtpCache
         state.nextMain = nextMainTok
         state.draftTok = draftTok
         state.draftLp = draftLp2d[0]  // [vocab]
@@ -556,18 +558,25 @@ private extension GenerationBatch {
         nextMainTok: MLXArray
     ) -> (MLXArray, MLXArray) {
         let t0 = CFAbsoluteTimeGetCurrent()
-        let sampler = samplers[0] ?? fallbackSampler
 
         let nextIds = nextMainTok.reshaped(1, 1)  // [1, 1]
-        // Always allocate a fresh MTP cache: each draft proposal is independent.
-        // MTPLX: rt.draft_mtp(..., mtp_cache=rt.make_mtp_cache()) — fresh cache every cycle.
-        // Reusing an accumulated cache would cause the MTP layer to attend to all previous
-        // draft proposals (garbage context). This was the cache-reuse bug.
+        // Use the persistent MTP cache from MTPState. The MTP head is auto-regressive
+        // (one full-attention transformer layer) and was trained with a growing KV context
+        // accumulated across the generation. PR #990 creates the cache once at init.
+        let mtpCache = state.mtpCache ?? model.makeMTPCache()
         let mtpLogits = model.mtpForward(
-            hidden: hiddenAtPosition, nextTokenIds: nextIds, cache: model.makeMTPCache())
+            hidden: hiddenAtPosition, nextTokenIds: nextIds, cache: mtpCache)
         let mtpLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
         let newLp2d = mtpLogits2d - logSumExp(mtpLogits2d, axis: -1, keepDims: true)
-        let newTok = sampler(newLp2d)  // (1,)
+
+        // Always use argmax for the MTP draft token regardless of the sampler.
+        // Speculative decoding is valid for any draft distribution q — including greedy
+        // (q = one-hot at argmax). The acceptance ratio P_target(draft)/P_draft(draft)
+        // remains the correct rejection criterion, and on reject the residual sample
+        // restores the exact target distribution. Using argmax avoids MLXRandom.categorical
+        // (~18ms per 150K-vocab sample), saving the dominant per-cycle overhead at
+        // stochastic temperatures. draft_lp (newLp2d[0]) is still the correct q distribution.
+        let newTok = argMax(newLp2d, axis: -1)  // (1,) — greedy draft
 
         // Force eval + cache int: avoids re-sync on next cycle's accept check.
         // omlx: _step_mtp — "draft_id_int = int(new_tok.tolist()[0])"
@@ -644,7 +653,8 @@ private extension GenerationBatch {
             // omlx: _emit_response finish path — "delattr(gen_batch, '_omlx_mtp_state')"
             if let s = _omlxMtpState {
                 let st = s.stats
-                print("[MTP] cycles=\(st.cycles) accepts=\(st.accepts) rejects=\(st.rejects) acceptRate=\(String(format:"%.2f",st.acceptRate)) emits=init:\(st.initEmits)+draft:\(st.draftEmits)+bonus:\(st.bonusEmits)+verify:\(st.verifyEmits)=\(st.totalEmits)")
+                let n = Double(max(1, st.cycles))
+                print("[MTP] cycles=\(st.cycles) accepts=\(st.accepts) rejects=\(st.rejects) acceptRate=\(String(format:"%.2f",st.acceptRate)) emits=init:\(st.initEmits)+draft:\(st.draftEmits)+bonus:\(st.bonusEmits)+verify:\(st.verifyEmits)=\(st.totalEmits) backbone=\(String(format:"%.1f",st.backboneMs/n))ms/cycle mtp=\(String(format:"%.1f",st.mtpHeadMs/n))ms/cycle sample=\(String(format:"%.1f",st.sampleMs/n))ms/cycle cacheOps=\(String(format:"%.1f",st.cacheOpsMs/n))ms/cycle")
             }
             _omlxMtpState = nil
             filter(keep: [])
