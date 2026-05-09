@@ -19,8 +19,9 @@ import MLXNN
 // MARK: - Eligibility
 
 /// Returns true when the fused gate+up+SwiGLU kernel can run.
-/// Requires: 4-bit affine QuantizedLinear, M ∈ [1,6], K and N divisible by 32,
+/// Requires: 4-bit affine QuantizedLinear, M ∈ [2,6], K and N divisible by 32,
 /// single batch dimension, dtype bfloat16 or float16.
+/// M=1 (single-token AR) is excluded — stock qmv_fast_impl is faster there.
 func gateUpSwiGLUFusedEligible(x: MLXArray, gateProj: Linear, upProj: Linear) -> Bool {
     guard let gate = gateProj as? QuantizedLinear,
           let up   = upProj   as? QuantizedLinear else { return false }
@@ -31,7 +32,7 @@ func gateUpSwiGLUFusedEligible(x: MLXArray, gateProj: Linear, upProj: Linear) ->
     guard x.dtype == .bfloat16 || x.dtype == .float16 else { return false }
     guard x.shape.count >= 2 else { return false }
     let M = x.shape[x.shape.count - 2]
-    guard M >= 1, M <= 6 else { return false }
+    guard M >= 2, M <= 6 else { return false }
     let K = x.shape[x.shape.count - 1]
     let N = gate.weight.shape[0]
     guard K % 32 == 0, N % 32 == 0 else { return false }
@@ -40,7 +41,8 @@ func gateUpSwiGLUFusedEligible(x: MLXArray, gateProj: Linear, upProj: Linear) ->
 }
 
 /// Returns true when the small-M simdgroup-MMA kernel can run.
-/// Requires: 4-bit affine QuantizedLinear, M ∈ [1,8], K and N divisible by 32.
+/// Requires: 4-bit affine QuantizedLinear, M ∈ [2,8], K and N divisible by 32.
+/// M=1 is excluded — stock qmv_fast_impl is faster for single-token decode.
 func smallMQuantizedLinearEligible(x: MLXArray, layer: Linear) -> Bool {
     guard let ql = layer as? QuantizedLinear else { return false }
     guard ql.bits == 4 else { return false }
@@ -49,7 +51,7 @@ func smallMQuantizedLinearEligible(x: MLXArray, layer: Linear) -> Bool {
     guard x.dtype == .bfloat16 || x.dtype == .float16 else { return false }
     guard x.shape.count >= 2 else { return false }
     let M = x.shape[x.shape.count - 2]
-    guard M >= 1, M <= 8 else { return false }
+    guard M >= 2, M <= 8 else { return false }
     let K = x.shape[x.shape.count - 1]
     let N = ql.weight.shape[0]
     guard K % 32 == 0, N % 32 == 0 else { return false }
