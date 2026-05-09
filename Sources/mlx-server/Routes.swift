@@ -117,6 +117,9 @@ func buildRouter(
         let params = samplingParams(from: req, defaultMaxTokens: defaultMaxTokens)
 
         if req.stream == true {
+            if let g4 = gemma4Context {
+                return sseTextGemma4Response(g4: g4, modelName: modelName, prompt: req.prompt, params: params)
+            }
             return sseTextResponse(engine: engine, modelName: modelName, prompt: req.prompt, params: params)
         } else if let g4 = gemma4Context {
             let (text, pp, tg, finish) = try await generateWithGemma4MTP(
@@ -161,6 +164,9 @@ func buildRouter(
         )
 
         if req.stream == true {
+            if let g4 = gemma4Context {
+                return sseChatGemma4Response(g4: g4, modelName: modelName, prompt: prompt, params: params)
+            }
             return sseChatResponse(engine: engine, modelName: modelName, prompt: prompt, params: params)
         } else if let g4 = gemma4Context {
             let (text, pp, tg, finish) = try await generateWithGemma4MTP(
@@ -266,6 +272,113 @@ private func sseChatResponse(
         continuation.finish()
     }
 
+    return Response(
+        status: .ok,
+        headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
+        body: .init(asyncSequence: stream)
+    )
+}
+
+/// SSE streaming for chat/completions via Gemma4 MTP draft model.
+private func sseChatGemma4Response(
+    g4: Gemma4ServerContext,
+    modelName: String,
+    prompt: String,
+    params: SamplingParams
+) -> Response {
+    let (stream, continuation) = AsyncStream<ByteBuffer>.makeStream()
+    Task {
+        let requestId = "chatcmpl-\(UUID().uuidString)"
+        let created = Int(Date().timeIntervalSince1970)
+        let firstChunk = ChatCompletionChunk(
+            id: requestId, object: "chat.completion.chunk", created: created, model: modelName,
+            choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: "assistant", content: ""), finish_reason: nil)]
+        )
+        if let buf = try? sseData(firstChunk) { continuation.yield(buf) }
+
+        let tokenIds = g4.target.tokenizer.encode(text: prompt, addSpecialTokens: true)
+        let input = LMInput(text: .init(tokens: MLXArray(tokenIds)))
+        let genParams = GenerateParameters(
+            maxTokens: params.maxTokens, temperature: params.temperature,
+            topP: params.topP, topK: params.topK, minP: params.minP)
+        var finishReason = "stop"
+        if let genStream = try? generateGemma4MTP(
+            input: input, parameters: genParams, target: g4.target, drafter: g4.drafter) {
+            for await gen in genStream {
+                switch gen {
+                case .chunk(let text):
+                    let chunk = ChatCompletionChunk(
+                        id: requestId, object: "chat.completion.chunk", created: created,
+                        model: modelName,
+                        choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: nil, content: text), finish_reason: nil)]
+                    )
+                    if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                case .info(let info):
+                    finishReason = info.stopReason == .stop ? "stop" : "length"
+                case .toolCall:
+                    break
+                }
+            }
+        }
+        let finalChunk = ChatCompletionChunk(
+            id: requestId, object: "chat.completion.chunk", created: created, model: modelName,
+            choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: nil, content: nil), finish_reason: finishReason)]
+        )
+        if let buf = try? sseData(finalChunk) { continuation.yield(buf) }
+        continuation.yield(ByteBuffer(string: "data: [DONE]\n\n"))
+        continuation.finish()
+    }
+    return Response(
+        status: .ok,
+        headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
+        body: .init(asyncSequence: stream)
+    )
+}
+
+/// SSE streaming for text/completions via Gemma4 MTP draft model.
+private func sseTextGemma4Response(
+    g4: Gemma4ServerContext,
+    modelName: String,
+    prompt: String,
+    params: SamplingParams
+) -> Response {
+    let (stream, continuation) = AsyncStream<ByteBuffer>.makeStream()
+    Task {
+        let completionId = "cmpl-\(UUID().uuidString)"
+        let created = Int(Date().timeIntervalSince1970)
+
+        let tokenIds = g4.target.tokenizer.encode(text: prompt, addSpecialTokens: true)
+        let input = LMInput(text: .init(tokens: MLXArray(tokenIds)))
+        let genParams = GenerateParameters(
+            maxTokens: params.maxTokens, temperature: params.temperature,
+            topP: params.topP, topK: params.topK, minP: params.minP)
+        var finishReason = "stop"
+        if let genStream = try? generateGemma4MTP(
+            input: input, parameters: genParams, target: g4.target, drafter: g4.drafter) {
+            for await gen in genStream {
+                switch gen {
+                case .chunk(let text):
+                    let chunk = CompletionChunk(
+                        id: completionId, object: "text_completion", created: created,
+                        model: modelName,
+                        choices: [CompletionChunkChoice(index: 0, text: text, finish_reason: nil)]
+                    )
+                    if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                case .info(let info):
+                    finishReason = info.stopReason == .stop ? "stop" : "length"
+                case .toolCall:
+                    break
+                }
+            }
+        }
+        let finalChunk = CompletionChunk(
+            id: completionId, object: "text_completion", created: created, model: modelName,
+            choices: [CompletionChunkChoice(index: 0, text: "", finish_reason: finishReason)]
+        )
+        if let buf = try? sseData(finalChunk) { continuation.yield(buf) }
+        continuation.yield(ByteBuffer(string: "data: [DONE]\n\n"))
+        continuation.finish()
+    }
     return Response(
         status: .ok,
         headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
