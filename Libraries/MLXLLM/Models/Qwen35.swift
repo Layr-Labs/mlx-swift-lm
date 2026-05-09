@@ -781,14 +781,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35TextModel: MTPCapable {
     public var hasMTPHead: Bool { mtp != nil }
 
-    /// Run a backbone forward that also returns post-norm hidden states.
+    /// Run a backbone forward that also returns pre-norm hidden states.
     ///
-    /// Returns `(logits, postNormHidden)` where `postNormHidden` is the backbone output
-    /// AFTER `model.norm` — matching MTPLX's default `"post_norm"` hidden variant.
-    /// The MTP head's `pre_fc_norm_hidden` weights were trained on post-norm inputs.
+    /// Returns `(logits, preNormHidden)` where `preNormHidden` is the raw backbone output
+    /// BEFORE `model.norm`. The MTP head applies its own `pre_fc_norm_hidden` normalization,
+    /// so it expects un-normalized input. Passing post-norm would double-normalize.
     ///
+    /// PR #990: `return out, hidden  # pre-norm hidden for MTP head`
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
-    /// MTPLX: _MTPLXTextModel.__call__ hidden_variant="post_norm" (default)
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
@@ -801,9 +801,9 @@ extension Qwen35TextModel: MTPCapable {
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
-        // Return post-norm hidden (normed), not pre-norm (hidden).
-        // pre_fc_norm_hidden in the MTP module was trained on already-normalized inputs.
-        return (logits, normed)
+        // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
+        // is the normalization step — it expects the raw backbone output as input.
+        return (logits, hidden)
     }
 
     /// Run the MTP head forward.

@@ -264,10 +264,9 @@ public final class GenerationBatch: @unchecked Sendable {
         // nextTokens = main_tok: sampled from prompt[-1]'s logits in init's step().
         let mainTok = nextTokens  // shape (1,) — asyncEval'd in step(); will force on use
 
-        // 1. Backbone forward at main_tok → (logits [1,1,vocab], postNormHidden [1,1,H]).
+        // 1. Backbone forward at main_tok → (logits [1,1,vocab], preNormHidden [1,1,H]).
         // omlx: _post_init_mtp — "1-token backbone forward at main_tok with hidden state"
-        // MTPLX defaults to "post_norm" variant: hidden is the backbone's post-norm output
-        // (after model.norm). The MTP head's pre_fc_norm_hidden was trained on post-norm inputs.
+        // Returns pre-norm hidden: the MTP head's pre_fc_norm_hidden applies its own norm.
         let mainInput = mainTok.reshaped(1, 1)
         let backboneCache = promptCache.map { $0 as any KVCache }
         let (logits, hidden) = model.callWithHidden(
