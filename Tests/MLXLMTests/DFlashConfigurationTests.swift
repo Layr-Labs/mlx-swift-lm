@@ -72,7 +72,7 @@ struct DFlashConfigurationTests {
         #expect(config.slidingWindow == 64)
     }
 
-    @Test func recommendsSmallerBlockForSlidingDrafts() throws {
+    @Test func recommendsCheckpointBlockForSlidingDrafts() throws {
         let full = try JSONDecoder.json5().decode(
             DFlashConfiguration.self,
             from: Data(validJSON(blockSize: 16).utf8))
@@ -85,7 +85,7 @@ struct DFlashConfigurationTests {
             ).utf8))
 
         #expect(full.recommendedBlockSize == 16)
-        #expect(sliding.recommendedBlockSize == 6)
+        #expect(sliding.recommendedBlockSize == 16)
     }
 
     @Test func rejectsSlidingAttentionWithoutWindow() throws {
