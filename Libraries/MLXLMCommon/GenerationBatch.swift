@@ -643,6 +643,10 @@ private extension GenerationBatch {
             )
             // Drop MTP state before filter([]) so patched_filter doesn't double-clear.
             // omlx: _emit_response finish path — "delattr(gen_batch, '_omlx_mtp_state')"
+            if let s = _omlxMtpState {
+                let st = s.stats
+                print("[MTP] cycles=\(st.cycles) accepts=\(st.accepts) rejects=\(st.rejects) acceptRate=\(String(format:"%.2f",st.acceptRate)) emits=init:\(st.initEmits)+draft:\(st.draftEmits)+bonus:\(st.bonusEmits)+verify:\(st.verifyEmits)=\(st.totalEmits)")
+            }
             _omlxMtpState = nil
             filter(keep: [])
             return [response]

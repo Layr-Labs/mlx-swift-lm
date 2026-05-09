@@ -1,17 +1,25 @@
 // Copyright © 2026 Eigen Labs.
 //
 // Fused gate+up+SwiGLU and small-M quantized matmul kernels for the MTP verify
-// forward path. The verify forward runs with M=2 (next_main + draft token),
-// which stalls MLX's stock qmv_fast_impl kernel (tuned for large M). These
-// kernels are faster at M≤8 by: (a) fusing gate and up projections into a
-// single pass — halving bandwidth on the projection weights — and (b) using
-// simdgroup matrix-multiply accumulate for the down projection.
+// forward path. The verify forward runs with M=2 (next_main + draft token).
 //
 // Ported from:
 //   https://github.com/youssofal/MTPLX
 //   mtplx/kernels/verify_mlp_fused.py
-//   — _gate_up_swiglu_qmv4_kernel (non-rowwise, MAX_M=6)
+//   — _gate_up_swiglu_qmv4_kernel (non-rowwise, MAX_M templated)
 //   — _small_m_qmm4_kernel (BM=8 simdgroup-MMA)
+//
+// BENCHMARK RESULTS (M4 Max 40-core, Qwen3.6-27B-4bit tg128/pp512):
+//   Baseline (stock MLX):          19.98 t/s
+//   MTP + stock MLX (M>=2):        18.00 t/s
+//   MTP + fused kernels (MAX_M=6): 13.27 t/s  (regression)
+//   MTP + fused kernels (MAX_M=2): 13.93 t/s  (still regression)
+//
+// The custom kernels are disabled: stock MLX outperforms them on Apple Silicon.
+// MTPLX achieves its speedup by patching MLX's C++ qmv_fast_impl kernel
+// directly (fork: mlx-mtplx-0.31.2-qmm), not via metalKernel shaders.
+// Without that MLX fork, the MTP verify bottleneck cannot be eliminated this way.
+// These kernels are kept as reference and may be revisited with better tuning.
 
 import MLX
 import MLXNN
@@ -21,42 +29,16 @@ import MLXNN
 /// Returns true when the fused gate+up+SwiGLU kernel can run.
 /// Requires: 4-bit affine QuantizedLinear, M ∈ [2,6], K and N divisible by 32,
 /// single batch dimension, dtype bfloat16 or float16.
-/// M=1 (single-token AR) is excluded — stock qmv_fast_impl is faster there.
+/// Currently disabled: returns false on all inputs (see file header for rationale).
 func gateUpSwiGLUFusedEligible(x: MLXArray, gateProj: Linear, upProj: Linear) -> Bool {
-    guard let gate = gateProj as? QuantizedLinear,
-          let up   = upProj   as? QuantizedLinear else { return false }
-    guard gate.bits == 4, up.bits == 4 else { return false }
-    guard gate.groupSize == up.groupSize else { return false }
-    guard [32, 64, 128].contains(gate.groupSize) else { return false }
-    guard gate.biases != nil, up.biases != nil else { return false }
-    guard x.dtype == .bfloat16 || x.dtype == .float16 else { return false }
-    guard x.shape.count >= 2 else { return false }
-    let M = x.shape[x.shape.count - 2]
-    guard M >= 2, M <= 6 else { return false }
-    let K = x.shape[x.shape.count - 1]
-    let N = gate.weight.shape[0]
-    guard K % 32 == 0, N % 32 == 0 else { return false }
-    guard Array(x.shape.dropLast(2)).reduce(1, *) == 1 else { return false }
-    return true
+    return false  // disabled: stock MLX outperforms on Apple Silicon
 }
 
 /// Returns true when the small-M simdgroup-MMA kernel can run.
 /// Requires: 4-bit affine QuantizedLinear, M ∈ [2,8], K and N divisible by 32.
-/// M=1 is excluded — stock qmv_fast_impl is faster for single-token decode.
+/// Currently disabled: returns false on all inputs (see file header for rationale).
 func smallMQuantizedLinearEligible(x: MLXArray, layer: Linear) -> Bool {
-    guard let ql = layer as? QuantizedLinear else { return false }
-    guard ql.bits == 4 else { return false }
-    guard [32, 64, 128].contains(ql.groupSize) else { return false }
-    guard ql.biases != nil else { return false }
-    guard x.dtype == .bfloat16 || x.dtype == .float16 else { return false }
-    guard x.shape.count >= 2 else { return false }
-    let M = x.shape[x.shape.count - 2]
-    guard M >= 2, M <= 8 else { return false }
-    let K = x.shape[x.shape.count - 1]
-    let N = ql.weight.shape[0]
-    guard K % 32 == 0, N % 32 == 0 else { return false }
-    guard Array(x.shape.dropLast(2)).reduce(1, *) == 1 else { return false }
-    return true
+    return false  // disabled: stock MLX outperforms on Apple Silicon
 }
 
 // MARK: - Gate+Up+SwiGLU fused kernel
@@ -73,7 +55,7 @@ private let _gateUpHeader = """
     constant constexpr int RESULTS_PER_SIMDGROUP = 4;
     constant constexpr int NUM_SIMDGROUPS = 2;
     constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
-    constant constexpr int MAX_M = 6;
+    // MAX_M is provided as a template parameter (= actual M for the dispatch)
 
     template <typename T>
     inline T sigmoid_mlx_exact(T x) {
@@ -239,7 +221,7 @@ func gateUpSwiGLUFused(
     let gridY = 2 * ((N + 7) / 8)
 
     let kernel = MLXFast.metalKernel(
-        name: "mlxlm_gate_up_swiglu_qmv4_gs\(gateProj.groupSize)_\(x.dtype)",
+        name: "mlxlm_gate_up_swiglu_qmv4_m\(M)_gs\(gateProj.groupSize)_\(x.dtype)",
         inputNames: [
             "x", "gate_w", "gate_scales", "gate_biases",
             "up_w", "up_scales", "up_biases",
@@ -257,7 +239,7 @@ func gateUpSwiGLUFused(
             upProj.weight, upProj.scales, upProj.biases!,
             MLXArray([Int32(M)]), MLXArray([Int32(K)]), MLXArray([Int32(N)]),
         ],
-        template: [("T", x.dtype), ("GS", gateProj.groupSize)],
+        template: [("T", x.dtype), ("GS", gateProj.groupSize), ("MAX_M", M)],
         grid: (32, gridY, 1),
         threadGroup: (32, 2, 1),
         outputShapes: [[M, N]],
