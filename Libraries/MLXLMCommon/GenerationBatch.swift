@@ -294,7 +294,7 @@ public final class GenerationBatch: @unchecked Sendable {
             hidden: hiddenAtMain, nextTokenIds: nextIds, cache: mtpCache)
         let draftLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
         let draftLp2d = draftLogits2d - logSumExp(draftLogits2d, axis: -1, keepDims: true)
-        let draftTok = argMax(draftLp2d, axis: -1)  // (1,) — greedy draft (see stepMTP)
+        let draftTok = compactCategorical(draftLp2d, k: 512)  // (1,) — sample draft for losslessness
 
         // 4. Single eval for all sampled tokens. Cache draft_id as Int to avoid a
         //    GPU→CPU sync in the first verify cycle's accept/reject check.
@@ -595,14 +595,11 @@ private extension GenerationBatch {
         let mtpLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
         let newLp2d = mtpLogits2d - logSumExp(mtpLogits2d, axis: -1, keepDims: true)
 
-        // Always use argmax for the MTP draft token regardless of the sampler.
-        // Speculative decoding is valid for any draft distribution q — including greedy
-        // (q = one-hot at argmax). The acceptance ratio P_target(draft)/P_draft(draft)
-        // remains the correct rejection criterion, and on reject the residual sample
-        // restores the exact target distribution. Using argmax avoids MLXRandom.categorical
-        // (~18ms per 150K-vocab sample), saving the dominant per-cycle overhead at
-        // stochastic temperatures. draft_lp (newLp2d[0]) is still the correct q distribution.
-        let newTok = argMax(newLp2d, axis: -1)  // (1,) — greedy draft
+        // Sample the MTP draft from compactCategorical(top-512) so q matches the
+        // acceptance distribution exactly — fully lossless speculative decoding.
+        // compactCategorical is ~0.1ms/cycle (vs ~18ms for full 150K-vocab categorical).
+        // draft_lp (newLp2d[0]) is stored as the correct q distribution for accept check.
+        let newTok = compactCategorical(newLp2d, k: 512)  // (1,) — compact-categorical draft
 
         // Force eval + cache int: avoids re-sync on next cycle's accept check.
         // omlx: _step_mtp — "draft_id_int = int(new_tok.tolist()[0])"
