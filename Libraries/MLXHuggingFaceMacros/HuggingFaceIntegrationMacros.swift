@@ -121,6 +121,18 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                             throw MLXLMCommon.TokenizerError.missingChatTemplate
                         }
                     }
+
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]],
+                        chatTemplate: String
+                    ) throws -> [Int] {
+                        do {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, chatTemplate: chatTemplate)
+                        } catch Tokenizers.TokenizerError.missingChatTemplate {
+                            throw MLXLMCommon.TokenizerError.missingChatTemplate
+                        }
+                    }
                 }
 
                 return TokenizerBridge(huggingFaceTokenizer)
