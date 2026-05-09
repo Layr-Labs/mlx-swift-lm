@@ -779,6 +779,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 // MARK: - Qwen35TextModel + MTPCapable
 
 extension Qwen35TextModel: MTPCapable {
+    public var hasMTPHead: Bool { mtp != nil }
+
     /// Run a backbone forward that also returns pre-norm hidden states.
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
     public func callWithHidden(
@@ -886,6 +888,8 @@ extension Qwen35Model: LoRAModel {
 /// Forwards all MTP calls to the inner `languageModel` (a Qwen35TextModel).
 /// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
 extension Qwen35Model: MTPCapable {
+    public var hasMTPHead: Bool { languageModel.hasMTPHead }
+
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {

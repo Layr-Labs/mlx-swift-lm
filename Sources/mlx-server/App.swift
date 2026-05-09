@@ -131,6 +131,17 @@ struct Gemma4ServerContext: @unchecked Sendable {
 
 // MARK: - Model loading
 
+/// Returns true if the model directory contains any weight keys with "mtp" in their name.
+/// Checks the safetensors index file (fast), falling back to false on any error.
+func checkModelHasMTPWeights(at url: URL) -> Bool {
+    let indexURL = url.appendingPathComponent("model.safetensors.index.json")
+    guard let data = try? Data(contentsOf: indexURL),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let weightMap = json["weight_map"] as? [String: String]
+    else { return false }
+    return weightMap.keys.contains { $0.contains("mtp") }
+}
+
 struct ServerSetup: @unchecked Sendable {
     let engine: BatchedEngine
     let modelName: String
@@ -154,6 +165,15 @@ func loadEngine(args: ServerArgs) async throws -> ServerSetup {
     // Enable internal MTP heads before loading (Qwen3.5/3.6, DeepSeek-V4).
     let hasExternalDrafter = !args.draftModel.isEmpty
     if args.mtp && !hasExternalDrafter {
+        // Pre-check: ensure the checkpoint actually contains mtp.* weights before
+        // enabling the flag (which causes the model init to allocate the MTP module).
+        // Without weights the MLXNN parameter update crashes with keyNotFound.
+        let hasMTPWeights = checkModelHasMTPWeights(at: url)
+        if !hasMTPWeights {
+            throw CLIError(
+                "--mtp was requested but the model at \(url.path) contains no MTP weights. "
+                + "Re-convert the checkpoint with a converter that preserves MTP weights.")
+        }
         _qwen35MTPEnabled = true
         _deepseekV4MTPEnabled = true
     }

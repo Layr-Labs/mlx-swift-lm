@@ -105,18 +105,28 @@ SERVER_BIN=".build/release/mlx-server"
 start_server() {
     local model_path="$1"; shift
     "$SERVER_BIN" --model "$model_path" --port "$BENCH_PORT" \
-        --no-prefix-cache "$@" >/dev/null 2>&1 &
+        --no-prefix-cache "$@" >/tmp/mlx-server-$$.log 2>&1 &
     SERVER_PID=$!
     local tries=0
     until curl -sf "http://localhost:${BENCH_PORT}/health" >/dev/null 2>&1; do
+        # Bail early if the server process has already exited.
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            echo "ERROR: server process exited before becoming ready" >&2
+            cat /tmp/mlx-server-$$.log >&2 || true
+            rm -f /tmp/mlx-server-$$.log
+            SERVER_PID=""
+            return 1
+        fi
         tries=$((tries + 1))
         if [[ $tries -ge 300 ]]; then
             echo "ERROR: server did not start within 300 s" >&2
             kill "$SERVER_PID" 2>/dev/null || true
-            exit 1
+            SERVER_PID=""
+            return 1
         fi
         sleep 1
     done
+    rm -f /tmp/mlx-server-$$.log
     echo "  server ready (${tries}s)"
 }
 
@@ -136,7 +146,12 @@ run_bench() {
 
     echo ""
     echo "━━━ ${label} ━━━"
-    start_server "$model_path" "$@"
+    if ! start_server "$model_path" "$@"; then
+        echo "  SKIPPED: server failed to start for '${label}'" >&2
+        printf "### %s\n\n⚠️ Server failed to start (no MTP weights or other startup error).\n\n" \
+            "$label" >> "$OUTFILE"
+        return 0
+    fi
 
     local result bench_exit
     result=$(KMP_DUPLICATE_LIB_OK=TRUE llama-benchy \
