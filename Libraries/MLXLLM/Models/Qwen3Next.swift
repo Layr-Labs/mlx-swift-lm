@@ -131,15 +131,6 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if gateUpSwiGLUFusedEligible(x: x, gateProj: gateProj, upProj: upProj),
-           let gate = gateProj as? QuantizedLinear,
-           let up   = upProj   as? QuantizedLinear,
-           smallMQuantizedLinearEligible(x: x, layer: downProj),
-           let down = downProj as? QuantizedLinear
-        {
-            let act = gateUpSwiGLUFused(x: x, gateProj: gate, upProj: up)
-            return smallMQuantizedLinear(x: act, layer: down)
-        }
         return downProj(silu(gateProj(x)) * upProj(x))
     }
 }
