@@ -124,10 +124,12 @@ per-round matmul launches. Set `MLX_DFLASH_DRAFTER_FUSE_MLP_GATE_UP=0` if
 memory pressure or benchmark results favor the separate projections on a
 specific checkpoint.
 
-Gemma4 target expert gate/up fusion is on by default. Set
-`MLX_SWITCH_GLU_GEMMA4_FUSE_GATE_UP=0` to force separate expert gate/up
-projections for comparison on checkpoints or hosts where that schedule
-benchmarks faster.
+Gemma4 target expert gate/up fusion is on by default for the general routed
+path. The DFlash weighted expert path defaults to separate expert gate/up
+projections because that schedules faster on the 26B A4B DFlash benchmark.
+Set `MLX_SWITCH_GLU_GEMMA4_WEIGHTED_FUSE_GATE_UP=1` to force the fused
+weighted path, or set `MLX_SWITCH_GLU_GEMMA4_FUSE_GATE_UP=0` to force separate
+projections everywhere for comparison.
 
 The optimized Gemma4 verify fusion paths are capped at the K=16 shape by
 default. For block-size experiments above 16, set

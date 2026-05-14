@@ -48,6 +48,26 @@ private let switchGLUGemma4FuseGateUp: Bool = {
     return true
 }()
 
+private let switchGLUGemma4WeightedFuseGateUp: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_SWITCH_GLU_GEMMA4_WEIGHTED_FUSE_GATE_UP"] {
+        switch raw.lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+    if let raw = ProcessInfo.processInfo.environment["MLX_SWITCH_GLU_GEMMA4_FUSE_GATE_UP"] {
+        switch raw.lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+    return false
+}()
+
 private let switchGLUGemma4WeightedTimings: Bool = {
     switch ProcessInfo.processInfo.environment["MLX_SWITCH_GLU_GEMMA4_WEIGHTED_TIMINGS"]?
         .lowercased()
@@ -328,7 +348,7 @@ public class SwitchGLU: Module {
         let xUp: MLXArray
         let xGate: MLXArray
         let gateUpStart = switchGLUGemma4WeightedTimings ? Date() : nil
-        if switchGLUGemma4FuseGateUp, let fused = fusedGateUp() {
+        if switchGLUGemma4WeightedFuseGateUp, let fused = fusedGateUp() {
             let gateUp = fused(expanded, idx, sortedIndices: true)
             let parts = MLX.split(gateUp, parts: 2, axis: -1)
             xGate = parts[0].contiguous()
