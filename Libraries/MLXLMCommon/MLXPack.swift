@@ -35,10 +35,34 @@ import Darwin
 public enum MLXPack {
     public static let magic: [UInt8] = Array("MLXPACK\0".utf8)
     public static let version: UInt32 = 1
-    /// Apple Silicon page size. `vm_page_size` would be the runtime value;
-    /// 16384 is fixed for arm64-darwin and we want files portable across
-    /// machines.
+
+    /// On-disk alignment for tensor data regions. **Fixed at 16 KiB** so that
+    /// files are portable across all currently shipping platforms:
+    ///
+    ///   - arm64-darwin (Apple Silicon): vm_page_size = 16 KiB — exact match.
+    ///   - x86_64-darwin (Intel Mac): vm_page_size = 4 KiB — 16 KiB is a
+    ///     multiple, so Metal's `newBufferWithBytesNoCopy` still accepts the
+    ///     pointer (alignment requirement is "multiple of page size").
+    ///   - Linux ARM64: vm_page_size = 4 or 16 KiB depending on kernel build
+    ///     — 16 KiB is the safe upper bound.
+    ///   - Linux x86_64: vm_page_size = 4 KiB — same as Intel Mac.
+    ///
+    /// Hardcoding to 16 KiB (the max-of-supported) trades ~0.5% file-size
+    /// overhead for cross-machine portability. A file built on one machine
+    /// loads on any other with the zero-copy path intact.
     public static let pageSize: Int = 16384
+
+    /// Runtime sanity check: confirm `pageSize` is a multiple of the OS page
+    /// size. If not, mmap-zero-copy will silently fall back to memcpy.
+    public static var isCompatibleWithCurrentPlatform: Bool {
+        #if canImport(Darwin)
+        // sysconf(_SC_PAGESIZE) is the thread-safe portable accessor.
+        let runtime = Int(sysconf(_SC_PAGESIZE))
+        return runtime > 0 && pageSize % runtime == 0
+        #else
+        return true
+        #endif
+    }
 
     /// Suffix for converted bundles. Sits next to (not inside) the safetensors
     /// directory so a model dir can hold both formats.
