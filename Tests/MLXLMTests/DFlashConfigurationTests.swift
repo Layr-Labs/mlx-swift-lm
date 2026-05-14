@@ -88,7 +88,7 @@ struct DFlashConfigurationTests {
         #expect(sliding.recommendedBlockSize == 16)
     }
 
-    @Test func recommendsTunedBlockForGemma426BA4BDFlash() throws {
+    @Test func recommendsCheckpointBlockForGemma426BA4BDFlash() throws {
         let json = """
         {
             "architectures": ["DFlashDraftModel"],
@@ -122,7 +122,7 @@ struct DFlashConfigurationTests {
         """
         let config = try JSONDecoder.json5().decode(DFlashConfiguration.self, from: Data(json.utf8))
         #expect(config.blockSize == 16)
-        #expect(config.recommendedBlockSize == 14)
+        #expect(config.recommendedBlockSize == 16)
     }
 
     @Test func rejectsSlidingAttentionWithoutWindow() throws {

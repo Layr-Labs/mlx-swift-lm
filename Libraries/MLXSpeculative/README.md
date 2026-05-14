@@ -104,9 +104,8 @@ for await generation in stream {
 
 When `blockSize` is omitted, DFlash uses the configuration's recommended
 block size. This is usually the checkpoint block size, clamped only by a
-shorter sliding-window constraint; narrowly measured Apple Silicon profiles
-can tune lower when that is both faster and stricter on parity. Passing
-`blockSize:` remains an explicit override.
+shorter sliding-window constraint. Passing `blockSize:` remains an explicit
+override.
 
 For benchmark parity with the upstream z-lab MLX backend, set
 `MLX_GEMMA4_DFLASH_OFFICIAL_FAST=1`. This uses one vector target verify

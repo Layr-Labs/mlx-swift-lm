@@ -150,16 +150,19 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                "ContinuousBatchingTestPlan.md",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
                 .process("Resources/audio_only.mov"),
+                .process("Resources/Gemma4MTPPrompts.json"),
                 .process("Resources/gemma4-E4B-assistant-config.json"),
                 .process("Resources/gemma4-26B-A4B-assistant-config.json"),
                 .process("Resources/dflash-gpt-oss-120b-config.json"),
                 .process("Resources/dflash-qwen35-27b-config.json"),
                 .process("Resources/dflash-gemma4-gated-schema-config.json"),
+                .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
             ]
         ),
         .macro(

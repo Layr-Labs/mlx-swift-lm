@@ -66,43 +66,10 @@ public struct DFlashConfiguration: Codable, Sendable, Equatable {
     public var maskTokenId: Int { dflashConfig.maskTokenId }
     public var targetHiddenSize: Int { targetLayerIds.count * hiddenSize }
     public var recommendedBlockSize: Int {
-        if let tuned = tunedRecommendedBlockSize {
-            return tuned
-        }
         guard layerTypes.contains(.slidingAttention), let slidingWindow else {
             return blockSize
         }
         return Swift.min(blockSize, Swift.max(2, slidingWindow))
-    }
-
-    private var tunedRecommendedBlockSize: Int? {
-        // z-lab/gemma-4-26B-A4B-it-DFlash ships block_size=16, but the exact
-        // MLX Swift Gemma4 DFlash path currently has broader strict parity and
-        // better 1024-token throughput at K=14 on the measured M5 Ultra stack.
-        // Keep this intentionally narrow so Qwen/GPT-OSS/other DFlash configs
-        // continue to follow their checkpoint block size.
-        guard blockSize == 16,
-            hiddenSize == 2816,
-            hiddenLayers == 5,
-            intermediateSize == 5632,
-            attentionHeads == 32,
-            kvHeads == 8,
-            headDim == 128,
-            vocabularySize == 262144,
-            numTargetLayers == 30,
-            targetLayerIds == [1, 6, 11, 17, 22, 27],
-            maskTokenId == 4,
-            layerTypes == [
-                .slidingAttention,
-                .slidingAttention,
-                .slidingAttention,
-                .slidingAttention,
-                .fullAttention,
-            ]
-        else {
-            return nil
-        }
-        return 14
     }
 
     enum CodingKeys: String, CodingKey, CaseIterable {
