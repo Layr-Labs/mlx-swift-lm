@@ -30,8 +30,10 @@ struct BenchLoad {
             at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         let shards = weightFiles.filter { $0.pathExtension == "safetensors" }
         let totalBytes = shards.reduce(Int64(0)) { acc, url in
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            return acc + Int64(size)
+            // attributesOfItem follows symlinks (resourceValues does not).
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            return acc + size
         }
         let totalGiB = Double(totalBytes) / (1024 * 1024 * 1024)
         print("Model directory: \(directory.lastPathComponent)")

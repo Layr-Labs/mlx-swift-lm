@@ -16,6 +16,18 @@ public func loadWeights(
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
 ) throws {
+    let bench = ProcessInfo.processInfo.environment["BENCH_VERBOSE"] != nil
+    var t = CFAbsoluteTimeGetCurrent()
+    func mark(_ label: String) {
+        if bench {
+            let now = CFAbsoluteTimeGetCurrent()
+            FileHandle.standardError.write(
+                Data("    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
+                    .utf8))
+            t = now
+        }
+    }
+
     // load the weights and collect metadata from the first safetensor file
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
@@ -32,9 +44,11 @@ public func loadWeights(
             }
         }
     }
+    mark("read shards")
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
+    mark("sanitize")
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
@@ -50,10 +64,13 @@ public func loadWeights(
             }
         }
     }
+    mark("quantize wire")
 
     // apply the loaded weights
     let parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
+    mark("update params")
 
     eval(model)
+    mark("eval")
 }
