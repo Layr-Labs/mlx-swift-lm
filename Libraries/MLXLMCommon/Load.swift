@@ -4,6 +4,30 @@ import Foundation
 import MLX
 import MLXNN
 
+#if canImport(Darwin)
+import Darwin
+
+/// Tell the kernel to start prefetching every shard into the unified buffer
+/// cache. Non-blocking; the actual reads happen in the SSD controller's own
+/// queue. Safe to call even when files are already cached (it's just a hint).
+private func prefetchShards(_ urls: [URL]) {
+    DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
+        let path = urls[idx].path
+        let fd = open(path, O_RDONLY)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+
+        var sb = stat()
+        guard fstat(fd, &sb) == 0 else { return }
+
+        var ra = radvisory(ra_offset: 0, ra_count: Int32(min(Int(sb.st_size), Int(Int32.max))))
+        _ = fcntl(fd, F_RDADVISE, &ra)
+    }
+}
+#else
+private func prefetchShards(_ urls: [URL]) { }
+#endif
+
 /// Lock-protected scratch space used by the parallel shard reader. Wrapped in
 /// a final class so Swift 6 strict concurrency can see we mean to share it
 /// across the concurrent closures.
@@ -62,6 +86,15 @@ public func loadWeights(
         shardURLs.append(url)
     }
     shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
+
+    // Hand the kernel a head start on every shard. F_RDADVISE is Darwin's
+    // async-prefetch primitive — it issues a non-blocking advisory read into
+    // the unified buffer cache, letting the SSD start streaming pages before
+    // we ask for them. Net cost is one open/fcntl/close per shard. By the
+    // time the DispatchQueue.concurrentPerform tasks below try to read, the
+    // pages may already be resident.
+    prefetchShards(shardURLs)
+    mark("rdadvise")
 
     // Load shards in parallel. Each task forces eval() on its arrays so MLX
     // actually performs the disk read inside the task rather than deferring all
