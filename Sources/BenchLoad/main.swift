@@ -40,6 +40,70 @@ func runChecksum(directory: URL) async {
     }
 }
 
+/// Time loading an .mlxpack via the mmap+zero-copy path.
+func runMLXPackBench(file: URL, runs: Int, warmup: Int) {
+    let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?
+        .int64Value ?? 0
+    let gb = Double(size) / 1024 / 1024 / 1024
+    print("MLXPack: \(file.lastPathComponent)")
+    print("  Size: \(String(format: "%.2f", gb)) GiB")
+    print("  Warmup: \(warmup)   Runs: \(runs)")
+    print("")
+
+    do {
+        if warmup > 0 {
+            for i in 1...warmup {
+                let start = CFAbsoluteTimeGetCurrent()
+                _ = try MLXPackLoader.load(url: file)
+                let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+                print("  [warmup \(i)] \(String(format: "%.1f", elapsed)) ms")
+                Memory.clearCache()
+            }
+        }
+        var times: [Double] = []
+        for i in 1...runs {
+            let start = CFAbsoluteTimeGetCurrent()
+            _ = try MLXPackLoader.load(url: file)
+            let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+            times.append(elapsed)
+            print("  [run \(i)] \(String(format: "%.1f", elapsed)) ms")
+            Memory.clearCache()
+        }
+        print("")
+        let stats = BenchmarkStats(times: times)
+        stats.printSummary(label: "Load \(file.lastPathComponent)")
+        print("RAW_MS:\(times.map { String(format: "%.1f", $0) }.joined(separator: ","))")
+    } catch {
+        print("error: \(error)")
+        exit(70)
+    }
+}
+
+/// Compute a digest of the .mlxpack's tensors using the same algorithm as
+/// --checksum so we can compare with the safetensors loader.
+func runMLXPackChecksum(file: URL) {
+    do {
+        let (weights, _) = try MLXPackLoader.load(url: file)
+        let sorted = weights.sorted { $0.key < $1.key }
+        var combinedHash: UInt64 = 0xcbf29ce484222325
+        var totalElements: Int64 = 0
+        for (key, array) in sorted {
+            let s = sum(array.asType(.float32)).item(Float.self)
+            let shape = array.shape.map { String($0) }.joined(separator: "x")
+            let line = "\(key)|\(shape)|\(array.dtype)|\(s)"
+            for b in line.utf8 {
+                combinedHash = (combinedHash ^ UInt64(b)) &* 0x100000001b3
+            }
+            totalElements += Int64(array.size)
+        }
+        print("digest=\(String(format: "%016x", combinedHash))")
+        print("tensors=\(sorted.count) elements=\(totalElements)")
+    } catch {
+        print("error: \(error)")
+        exit(70)
+    }
+}
+
 @main
 struct BenchLoad {
     static func main() async {
@@ -59,6 +123,56 @@ struct BenchLoad {
                 exit(64)
             }
             await runChecksum(directory: URL(fileURLWithPath: args[2]))
+            return
+        }
+
+        // --convert mode: read all safetensors shards in <dir> and write a
+        // single page-aligned .mlxpack file.
+        if args[1] == "--convert" {
+            guard args.count >= 4 else {
+                print("usage: BenchLoad --convert <model-directory> <output.mlxpack>")
+                exit(64)
+            }
+            let src = URL(fileURLWithPath: args[2])
+            let dst = URL(fileURLWithPath: args[3])
+            let t0 = CFAbsoluteTimeGetCurrent()
+            do {
+                try convertSafetensorsDirectoryToMLXPack(directory: src, outputFile: dst)
+                let secs = CFAbsoluteTimeGetCurrent() - t0
+                let size = (try? FileManager.default.attributesOfItem(atPath: dst.path)[.size] as? NSNumber)?
+                    .int64Value ?? 0
+                let gb = Double(size) / 1024 / 1024 / 1024
+                print(String(
+                    format: "converted in %.2f s → %@ (%.2f GiB)",
+                    secs, dst.path, gb))
+            } catch {
+                print("convert error: \(error)")
+                exit(70)
+            }
+            return
+        }
+
+        // --load-mlxpack mode: time loading from a converted .mlxpack file.
+        if args[1] == "--load-mlxpack" {
+            guard args.count >= 3 else {
+                print("usage: BenchLoad --load-mlxpack <file.mlxpack> [runs=5] [warmup=1]")
+                exit(64)
+            }
+            let pack = URL(fileURLWithPath: args[2])
+            let runs = args.count > 3 ? Int(args[3]) ?? 5 : 5
+            let warmup = args.count > 4 ? Int(args[4]) ?? 1 : 1
+            runMLXPackBench(file: pack, runs: runs, warmup: warmup)
+            return
+        }
+
+        // --checksum-mlxpack: load .mlxpack and compute the same digest as
+        // --checksum so we can verify bit-identical loading.
+        if args[1] == "--checksum-mlxpack" {
+            guard args.count >= 3 else {
+                print("usage: BenchLoad --checksum-mlxpack <file.mlxpack>")
+                exit(64)
+            }
+            runMLXPackChecksum(file: URL(fileURLWithPath: args[2]))
             return
         }
 

@@ -1,0 +1,16 @@
+--- a/Source/Cmlx/mlx/mlx/io/load.cpp
++++ b/Source/Cmlx/mlx/mlx/io/load.cpp
+@@ -335,12 +335,12 @@
+ namespace io {
+ 
+ ThreadPool& thread_pool() {
+-  static ThreadPool pool_{4};
++  static ThreadPool pool_{8};  // was 4 — match perf-core count on Apple Silicon
+   return pool_;
+ }
+ 
+ ThreadPool& ParallelFileReader::thread_pool() {
+-  static ThreadPool thread_pool{4};
++  static ThreadPool thread_pool{8};  // was 4 — saturate memcpy bandwidth on M3/M4
+   return thread_pool;
+ }
