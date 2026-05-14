@@ -62,7 +62,7 @@ public struct Gemma4Configuration: Codable, Sendable {
 // MARK: - Model
 
 public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider,
-    DFlashTargetDiagnosticForwardProvider
+    DFlashTargetDiagnosticForwardProvider, DFlashTargetCacheRollbackProvider
 {
     public var vocabularySize: Int { languageModel.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
@@ -161,6 +161,30 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider,
 
     public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
         languageModel.logitsForDFlashHidden(hidden)
+    }
+
+    public func makeDFlashCacheRollbackState(cache: [KVCache]) -> (any DFlashTargetRollbackState)? {
+        languageModel.makeDFlashCacheRollbackState(cache: cache)
+    }
+
+    public func rollbackDFlashCache(
+        _ cache: inout [KVCache],
+        state: (any DFlashTargetRollbackState)?,
+        verifyInput: MLXArray,
+        acceptedTokenCount: Int,
+        rejectedTokenCount: Int,
+        targetLayerIds: [Int],
+        verifiedTargetHidden: MLXArray
+    ) throws -> MLXArray {
+        try languageModel.rollbackDFlashCache(
+            &cache,
+            state: state,
+            verifyInput: verifyInput,
+            acceptedTokenCount: acceptedTokenCount,
+            rejectedTokenCount: rejectedTokenCount,
+            targetLayerIds: targetLayerIds,
+            verifiedTargetHidden: verifiedTargetHidden
+        )
     }
 }
 

@@ -402,6 +402,15 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if leftPadding.max().item(Int32.self) == 0 {
+            if n == 1 {
+                return .none
+            }
+            return .array(createCausalMask(
+                n: n,
+                offset: _idx,
+                windowSize: windowSize))
+        }
         let mask = createCausalMask(
             n: n,
             offset: _idx,
@@ -750,6 +759,15 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         let actualWindowSize = windowSize ?? maxCacheSize
         let maskOffset = min(maxCacheSize - 1, _idx)
+        if leftPadding.max().item(Int32.self) == 0 {
+            if n == 1 {
+                return .none
+            }
+            return .array(createCausalMask(
+                n: n,
+                offset: maskOffset,
+                windowSize: actualWindowSize))
+        }
         let mask = createCausalMask(
             n: n,
             offset: maskOffset,
@@ -889,6 +907,25 @@ extension BatchKVCache {
         let keep = keepLengths.asType(.int32)
             .reshaped([-1, 1, 1, 1])                         // [B, 1, 1, 1]
         let keepMask = positions .< keep                     // [B, 1, T, 1] bool
+        let maskFloat = keepMask.asType(storedK.dtype)
+        keys = storedK * maskFloat
+        values = storedV * maskFloat
+    }
+}
+
+extension BatchRotatingKVCache {
+    /// Zero per-row tail positions in the rotating batched cache.
+    ///
+    /// This mirrors `BatchKVCache.zeroTailPerRow` and is used when batched
+    /// speculative rows accept different numbers of tokens in the same block.
+    public func zeroTailPerRow(keepLengths: MLXArray) {
+        guard let storedK = keys, let storedV = values else { return }
+        let T = storedK.dim(2)
+        let positions = MLXArray(Int32(0) ..< Int32(T))
+            .reshaped([1, 1, T, 1])
+        let keep = keepLengths.asType(.int32)
+            .reshaped([-1, 1, 1, 1])
+        let keepMask = positions .< keep
         let maskFloat = keepMask.asType(storedK.dtype)
         keys = storedK * maskFloat
         values = storedV * maskFloat

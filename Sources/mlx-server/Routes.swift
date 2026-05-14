@@ -19,10 +19,14 @@ private func jsonBody<T: Encodable>(_ value: T) throws -> ResponseBody {
 
 // MARK: - Sampling params
 
-private func samplingParams(from req: ChatCompletionRequest, defaultMaxTokens: Int) -> SamplingParams {
+private func samplingParams(
+    from req: ChatCompletionRequest,
+    defaultMaxTokens: Int,
+    defaultTemperature: Float
+) -> SamplingParams {
     SamplingParams(
         maxTokens: req.max_tokens ?? defaultMaxTokens,
-        temperature: req.temperature ?? 0.7,
+        temperature: req.temperature ?? defaultTemperature,
         topP: req.top_p ?? 0.9,
         topK: req.top_k ?? 0,
         minP: req.min_p ?? 0.0,
@@ -34,10 +38,14 @@ private func samplingParams(from req: ChatCompletionRequest, defaultMaxTokens: I
     )
 }
 
-private func samplingParams(from req: CompletionRequest, defaultMaxTokens: Int) -> SamplingParams {
+private func samplingParams(
+    from req: CompletionRequest,
+    defaultMaxTokens: Int,
+    defaultTemperature: Float
+) -> SamplingParams {
     SamplingParams(
         maxTokens: req.max_tokens ?? defaultMaxTokens,
-        temperature: req.temperature ?? 0.7,
+        temperature: req.temperature ?? defaultTemperature,
         topP: req.top_p ?? 0.9,
         stop: req.stop?.strings ?? [],
         seed: req.seed.map { UInt64(bitPattern: Int64($0)) }
@@ -47,7 +55,7 @@ private func samplingParams(from req: CompletionRequest, defaultMaxTokens: Int) 
 // MARK: - Router builder
 
 func buildRouter(
-    engine: BatchedEngine,
+    engine: any ServerGenerationEngine,
     modelName: String,
     defaultMaxTokens: Int
 ) -> Router<BasicRequestContext> {
@@ -73,7 +81,10 @@ func buildRouter(
     // Text completions
     router.post("/v1/completions") { request, context in
         let req = try await request.decode(as: CompletionRequest.self, context: context)
-        let params = samplingParams(from: req, defaultMaxTokens: defaultMaxTokens)
+        let params = samplingParams(
+            from: req,
+            defaultMaxTokens: defaultMaxTokens,
+            defaultTemperature: engine.defaultTemperature)
 
         if req.stream == true {
             return sseTextResponse(engine: engine, modelName: modelName, prompt: req.prompt, params: params)
@@ -101,7 +112,10 @@ func buildRouter(
     // Chat completions
     router.post("/v1/chat/completions") { request, context in
         let req = try await request.decode(as: ChatCompletionRequest.self, context: context)
-        let params = samplingParams(from: req, defaultMaxTokens: defaultMaxTokens)
+        let params = samplingParams(
+            from: req,
+            defaultMaxTokens: defaultMaxTokens,
+            defaultTemperature: engine.defaultTemperature)
         let prompt = engine.buildPrompt(
             messages: req.messages.map { ["role": $0.role, "content": $0.content] }
         )
@@ -142,7 +156,7 @@ private func sseData<T: Encodable>(_ value: T) throws -> ByteBuffer {
 }
 
 private func sseChatResponse(
-    engine: BatchedEngine,
+    engine: any ServerGenerationEngine,
     modelName: String,
     prompt: String,
     params: SamplingParams
@@ -203,7 +217,7 @@ private func sseChatResponse(
 }
 
 private func sseTextResponse(
-    engine: BatchedEngine,
+    engine: any ServerGenerationEngine,
     modelName: String,
     prompt: String,
     params: SamplingParams

@@ -184,6 +184,7 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXHuggingFace",
+                "MLXSpeculative",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Transformers", package: "swift-transformers"),
                 .product(name: "MLX", package: "mlx-swift"),

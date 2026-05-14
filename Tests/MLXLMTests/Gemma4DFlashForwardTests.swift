@@ -8,9 +8,45 @@ import Testing
 
 @Suite("Gemma4TextModel forwardForDFlash")
 struct Gemma4DFlashForwardTests {
+    @Test func autoVectorVerifySuffixUsesConservativeEnvelope() {
+        #expect(
+            (1 ... 3).map {
+                gemma4DFlashAutoVectorSuffixLength(
+                    sequenceLength: $0,
+                    baseSafeVectorTokens: 1,
+                    k16SafeVectorTokens: 1)
+            } == Array(repeating: 1, count: 3))
+
+        #expect(
+            (4 ... 15).map {
+                gemma4DFlashAutoVectorSuffixLength(
+                    sequenceLength: $0,
+                    baseSafeVectorTokens: 1,
+                    k16SafeVectorTokens: 1,
+                    perSequenceSafeVectorTokens: [:])
+            } == Array(repeating: 1, count: 12))
+
+        #expect(
+            (9 ... 15).map {
+                gemma4DFlashAutoVectorSuffixLength(
+                    sequenceLength: $0,
+                    baseSafeVectorTokens: 9,
+                    k16SafeVectorTokens: 13,
+                    perSequenceSafeVectorTokens: [:])
+            } == Array(repeating: 9, count: 7))
+
+        #expect(
+            gemma4DFlashAutoVectorSuffixLength(
+                sequenceLength: 16,
+                baseSafeVectorTokens: 1,
+                k16SafeVectorTokens: 1,
+                perSequenceSafeVectorTokens: [:]) == 1)
+    }
+
     private func tinyGemma4Config(
         hiddenLayers: Int = 4,
-        sharedLayers: Int = 0
+        sharedLayers: Int = 0,
+        slidingWindow: Int = 16
     ) throws -> Gemma4TextConfiguration {
         let json = """
         {
@@ -26,7 +62,7 @@ struct Gemma4DFlashForwardTests {
             "num_global_key_value_heads": 1,
             "num_kv_shared_layers": \(sharedLayers),
             "hidden_size_per_layer_input": 0,
-            "sliding_window": 16,
+            "sliding_window": \(slidingWindow),
             "sliding_window_pattern": 2,
             "vocab_size": 32,
             "vocab_size_per_layer_input": 32,
@@ -148,6 +184,126 @@ struct Gemma4DFlashForwardTests {
 
             #expect(forward.logits.shape == [1, 3, 32])
             #expect(forward.targetHidden.shape == [1, 3, 32])
+        }
+    }
+
+    @Test func cachedBlockForwardMatchesSequentialDecode() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Gemma4TextModel(
+                try tinyGemma4Config(hiddenLayers: 6, sharedLayers: 2))
+            eval(model)
+            let prompt = MLXArray([Int32(1), 2, 3, 4])[.newAxis, .ellipsis]
+            let block = MLXArray([Int32(5), 6, 7, 8])[.newAxis, .ellipsis]
+
+            let blockCache = model.newCache(parameters: nil)
+            _ = model(prompt, cache: blockCache)
+            let blockLogits = model(block, cache: blockCache)
+
+            let sequentialCache = model.newCache(parameters: nil)
+            _ = model(prompt, cache: sequentialCache)
+            let sequentialLogits = concatenated(
+                (0 ..< block.dim(1)).map { i in
+                    model(block[0..., i ..< (i + 1)], cache: sequentialCache)
+                },
+                axis: 1)
+
+            eval(blockLogits, sequentialLogits)
+            #expect(
+                allClose(blockLogits, sequentialLogits, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+        }
+    }
+
+    @Test func cachedBlockForwardMatchesSequentialDecodeAfterSlidingWindowSaturation() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Gemma4TextModel(
+                try tinyGemma4Config(hiddenLayers: 6, sharedLayers: 2, slidingWindow: 4))
+            eval(model)
+            let prompt = MLXArray([Int32(1), 2, 3, 4, 5, 6, 7])[.newAxis, .ellipsis]
+            let block = MLXArray([Int32(8), 9, 10, 11])[.newAxis, .ellipsis]
+
+            let blockCache = model.newCache(parameters: nil)
+            _ = model(prompt, cache: blockCache)
+            let blockLogits = model(block, cache: blockCache)
+
+            let sequentialCache = model.newCache(parameters: nil)
+            _ = model(prompt, cache: sequentialCache)
+            let sequentialLogits = concatenated(
+                (0 ..< block.dim(1)).map { i in
+                    model(block[0..., i ..< (i + 1)], cache: sequentialCache)
+                },
+                axis: 1)
+
+            eval(blockLogits, sequentialLogits)
+            #expect(
+                allClose(blockLogits, sequentialLogits, rtol: 1e-4, atol: 1e-4).item(Bool.self))
+        }
+    }
+
+    @Test func dFlashBlockForwardMatchesSequentialAfterSlidingWindowSaturation() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = Gemma4TextModel(
+                try tinyGemma4Config(hiddenLayers: 6, sharedLayers: 2, slidingWindow: 4))
+            eval(model)
+            let prompt = MLXArray([Int32(1), 2, 3, 4, 5, 6, 7])[.newAxis, .ellipsis]
+            let block = MLXArray([Int32(8), 9, 10, 11])[.newAxis, .ellipsis]
+            let targetLayerIds = [1, 3]
+
+            let blockCache = model.newCache(parameters: nil)
+            _ = model(prompt, cache: blockCache)
+            let blockForward = try model.forwardForDFlash(
+                block, cache: blockCache, targetLayerIds: targetLayerIds)
+
+            let sequentialCache = model.newCache(parameters: nil)
+            _ = model(prompt, cache: sequentialCache)
+            let sequentialForwards = try (0 ..< block.dim(1)).map { i in
+                try model.forwardForDFlash(
+                    block[0..., i ..< (i + 1)],
+                    cache: sequentialCache,
+                    targetLayerIds: targetLayerIds)
+            }
+            let sequentialLogits = concatenated(sequentialForwards.map(\.logits), axis: 1)
+            let sequentialHidden = concatenated(sequentialForwards.map(\.targetHidden), axis: 1)
+
+            eval(blockForward.logits, sequentialLogits, blockForward.targetHidden, sequentialHidden)
+            #expect(
+                allClose(blockForward.logits, sequentialLogits, rtol: 1e-4, atol: 1e-4)
+                    .item(Bool.self))
+            #expect(
+                allClose(blockForward.targetHidden, sequentialHidden, rtol: 1e-4, atol: 1e-4)
+                    .item(Bool.self))
+        }
+    }
+
+    @Test func autoVerifyPathReportsSubphaseTimings() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["MLX_GEMMA4_DFLASH_SEQUENTIAL_VERIFY"] == nil,
+            environment["MLX_GEMMA4_DFLASH_AUTO_VERIFY"] == nil,
+            environment["MLX_GEMMA4_DFLASH_BATCHED_VECTOR_VERIFY"] == nil
+        else {
+            return
+        }
+
+        try Device.withDefaultDevice(.cpu) {
+            let model = Gemma4TextModel(
+                try tinyGemma4Config(hiddenLayers: 6, sharedLayers: 2, slidingWindow: 4))
+            eval(model)
+            let prompt = MLXArray([Int32(1), 2, 3, 4, 5])[.newAxis, .ellipsis]
+            let block = MLXArray([Int32(6), 7, 8, 9])[.newAxis, .ellipsis]
+            let cache = model.newCache(parameters: nil)
+            _ = model(prompt, cache: cache)
+
+            let out = try model.forwardGreedyTokensForDFlash(
+                block,
+                cache: cache,
+                targetLayerIds: [1, 3],
+                collectVerifyTimings: true)
+
+            let timings = try #require(out.verifyTimings)
+            #expect(out.tokens.shape == [1, 4])
+            #expect(out.targetHidden.shape == [1, 4, 32])
+            #expect(timings.trunkSeconds.isFinite && timings.trunkSeconds >= 0)
+            #expect(timings.lmHeadSeconds.isFinite && timings.lmHeadSeconds >= 0)
+            #expect(timings.softcapArgmaxSeconds.isFinite && timings.softcapArgmaxSeconds >= 0)
         }
     }
 

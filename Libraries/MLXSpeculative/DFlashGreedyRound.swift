@@ -5,6 +5,15 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 
+private let dFlashCPUAcceptWalk: Bool = {
+    switch ProcessInfo.processInfo.environment["MLX_DFLASH_CPU_ACCEPT_WALK"]?.lowercased() {
+    case "0", "false", "no", "off":
+        return false
+    default:
+        return true
+    }
+}()
+
 internal struct DFlashGreedyRoundResult {
     let accepted: Int
     let tokens: [Int]
@@ -70,23 +79,24 @@ internal func runDFlashGreedyRound(
     let verifyStart = dflashTimingStart(phaseAccumulator)
     let bonusColumn = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]
     let verifyInput = concatenated([bonusColumn, draftTokens], axis: 1)
-    let verifyOut: DFlashGreedyTargetForward
-    if phaseAccumulator?.collectTargetSubphaseTimings == true,
-        let diagnosticTarget = target as? any DFlashTargetDiagnosticForwardProvider
-    {
-        verifyOut = try diagnosticTarget.forwardGreedyTokensForDFlash(
-            verifyInput,
-            cache: targetCache,
-            targetLayerIds: drafter.config.targetLayerIds,
-            collectVerifyTimings: true
-        )
-    } else {
-        verifyOut = try target.forwardGreedyTokensForDFlash(
-            verifyInput,
-            cache: targetCache,
-            targetLayerIds: drafter.config.targetLayerIds
-        )
-    }
+    let verifyOut: DFlashGreedyTargetForward =
+        try DFlashTargetRuntimeOptions.withSmallRowVerifyFusionsEnabled {
+            if phaseAccumulator?.collectTargetSubphaseTimings == true,
+                let diagnosticTarget = target as? any DFlashTargetDiagnosticForwardProvider
+            {
+                return try diagnosticTarget.forwardGreedyTokensForDFlash(
+                    verifyInput,
+                    cache: targetCache,
+                    targetLayerIds: drafter.config.targetLayerIds,
+                    collectVerifyTimings: true
+                )
+            }
+            return try target.forwardGreedyTokensForDFlash(
+                verifyInput,
+                cache: targetCache,
+                targetLayerIds: drafter.config.targetLayerIds
+            )
+        }
     if let timings = verifyOut.verifyTimings, let phaseAccumulator {
         phaseAccumulator.targetTrunkSeconds += timings.trunkSeconds
         phaseAccumulator.targetHiddenConcatSeconds += timings.hiddenConcatSeconds
@@ -103,42 +113,77 @@ internal func runDFlashGreedyRound(
         phaseAccumulator.targetTrunkFinalNormSeconds += timings.trunkFinalNormSeconds
     }
     let targetTokens = verifyOut.tokens
+    let verifiedTokenCount = targetTokens.dim(1)
     let draftTokenIds = draftTokens.squeezed(axis: 0)
     let targetTokenIds = targetTokens.squeezed(axis: 0)
     let proposedCount = Swift.max(0, blockSize - 1)
-    let acceptedArray: MLXArray?
-    if proposedCount == 0 {
-        acceptedArray = nil
-    } else {
-        let targetPrefix = targetTokenIds[0 ..< proposedCount]
-        let matches = (draftTokenIds .== targetPrefix).asType(.int32)
-        let prefixMatches = matches.cumprod(axis: 0)
-        acceptedArray = prefixMatches.sum()
-    }
-    if let acceptedArray {
-        eval(targetTokens, verifyOut.targetHidden, draftTokens, acceptedArray)
-    } else {
-        eval(targetTokens, verifyOut.targetHidden, draftTokens)
-    }
-    dflashRecord(verifyStart, into: phaseAccumulator) {
-        $0.verifyAndWaitSeconds += $1
-    }
+    let comparableCount = Swift.min(proposedCount, verifiedTokenCount)
+    let acceptStart: Date?
+    let walkedAccepted: Int
+    let emitted: [Int]
+    let accepted: Int
+    if dFlashCPUAcceptWalk {
+        let targetReadCount = Swift.min(
+            verifiedTokenCount,
+            Swift.max(comparableCount, Swift.min(maxEmitCount, comparableCount + 1)))
+        let targetIds = targetReadCount > 0
+            ? targetTokenIds[0 ..< targetReadCount].asArray(Int32.self)
+            : []
+        let draftIds = comparableCount > 0
+            ? draftTokenIds[0 ..< comparableCount].asArray(Int32.self)
+            : []
+        dflashRecord(verifyStart, into: phaseAccumulator) {
+            $0.verifyAndWaitSeconds += $1
+        }
 
-    let acceptStart = dflashTimingStart(phaseAccumulator)
-    let walkedAccepted = acceptedArray.map { Int($0.item(Int32.self)) } ?? 0
-    let walkedTokenCount = walkedAccepted + 1
-    let emittedCount = Swift.min(maxEmitCount, walkedTokenCount)
-    let emitted = targetTokenIds[0 ..< emittedCount]
-        .asArray(Int32.self)
-        .map { Int($0) }
-    let accepted = emittedCount < walkedTokenCount
-        ? Swift.max(0, emittedCount - 1)
-        : walkedAccepted
+        acceptStart = dflashTimingStart(phaseAccumulator)
+        var prefix = 0
+        while prefix < comparableCount, draftIds[prefix] == targetIds[prefix] {
+            prefix += 1
+        }
+        walkedAccepted = prefix
+        let walkedTokenCount = walkedAccepted + 1
+        let emittedCount = Swift.min(maxEmitCount, walkedTokenCount, verifiedTokenCount)
+        emitted = targetIds.prefix(emittedCount).map { Int($0) }
+        accepted = emittedCount < walkedTokenCount
+            ? Swift.max(0, emittedCount - 1)
+            : walkedAccepted
+    } else {
+        let acceptedArray: MLXArray?
+        if comparableCount == 0 {
+            acceptedArray = nil
+        } else {
+            let targetPrefix = targetTokenIds[0 ..< comparableCount]
+            let draftPrefix = draftTokenIds[0 ..< comparableCount]
+            let matches = (draftPrefix .== targetPrefix).asType(.int32)
+            let prefixMatches = matches.cumprod(axis: 0)
+            acceptedArray = prefixMatches.sum()
+        }
+        if let acceptedArray {
+            eval(targetTokens, draftTokens, acceptedArray)
+        } else {
+            eval(targetTokens, draftTokens)
+        }
+        dflashRecord(verifyStart, into: phaseAccumulator) {
+            $0.verifyAndWaitSeconds += $1
+        }
+
+        acceptStart = dflashTimingStart(phaseAccumulator)
+        walkedAccepted = acceptedArray.map { Int($0.item(Int32.self)) } ?? 0
+        let walkedTokenCount = walkedAccepted + 1
+        let emittedCount = Swift.min(maxEmitCount, walkedTokenCount, verifiedTokenCount)
+        emitted = targetTokenIds[0 ..< emittedCount]
+            .asArray(Int32.self)
+            .map { Int($0) }
+        accepted = emittedCount < walkedTokenCount
+            ? Swift.max(0, emittedCount - 1)
+            : walkedAccepted
+    }
     dflashRecord(acceptStart, into: phaseAccumulator) {
         $0.acceptWalkSeconds += $1
     }
 
-    let trim = blockSize - accepted - 1
+    let trim = Swift.max(0, verifiedTokenCount - accepted - 1)
     let nextTargetHidden: MLXArray
     let rollbackStart = dflashTimingStart(phaseAccumulator)
     if let rollbackProvider {

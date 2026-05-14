@@ -42,6 +42,220 @@ struct DFlashBenchmarkTests {
             #expect(phases.rounds > 0)
             #expect(phases.roundSeconds.isFinite && phases.roundSeconds >= 0)
             #expect(phases.verifyAndWaitSeconds.isFinite && phases.verifyAndWaitSeconds >= 0)
+
+            let stopAfterTwo: DFlashStopPredicate = { generated in
+                generated.count >= 2 ? 2 : nil
+            }
+            let stoppedBaseline = measureDFlashBaselineThroughput(
+                target: target,
+                promptTokens: prompt,
+                maxTokens: 4,
+                stopAfterGeneratedTokenCount: stopAfterTwo
+            )
+            let stoppedDFlash = try measureDFlashThroughput(
+                target: target,
+                drafter: drafter,
+                promptTokens: prompt,
+                maxTokens: 4,
+                blockSize: 3,
+                stopAfterGeneratedTokenCount: stopAfterTwo
+            )
+            #expect(stoppedBaseline.generatedTokens == 2)
+            #expect(stoppedBaseline.generatedTokenIds.count == 2)
+            #expect(stoppedDFlash.generatedTokens == 2)
+            #expect(stoppedDFlash.generatedTokenIds.count == 2)
+        }
+    }
+
+    @Test func batchedBenchmarkHelpersRunAndProduceFiniteTimings() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let target = Qwen3Model(try tinyQwen3Config())
+            let drafter = DFlashDraftModel(config: try dflashConfig())
+            try drafter.bind(target: target)
+            eval(target, drafter)
+
+            let prompts: [[Int32]] = [
+                [1, 2, 3],
+                [1, 2, 3],
+            ]
+            let baseline = try measureBatchedDFlashBaselineThroughput(
+                target: target,
+                promptTokens: prompts,
+                maxTokens: 4
+            )
+            let dflash = try measureBatchedDFlashThroughput(
+                target: target,
+                drafter: drafter,
+                promptTokens: prompts,
+                maxTokens: 4,
+                blockSize: 3
+            )
+
+            #expect(baseline.batchSize == 2)
+            #expect(dflash.batchSize == 2)
+            #expect(baseline.generatedTokensPerRow == [4, 4])
+            #expect(dflash.generatedTokensPerRow == [4, 4])
+            #expect(baseline.totalGeneratedTokens == 8)
+            #expect(dflash.totalGeneratedTokens == 8)
+            #expect(baseline.generatedTokenIds.count == 2)
+            #expect(dflash.generatedTokenIds.count == 2)
+            #expect(baseline.generatedTokenIds.allSatisfy { $0.count == 4 })
+            #expect(dflash.generatedTokenIds.allSatisfy { $0.count == 4 })
+            #expect(dflash.generatedTokenIds == baseline.generatedTokenIds)
+            #expect(baseline.prefillSeconds.isFinite && baseline.prefillSeconds >= 0)
+            #expect(baseline.generationSeconds.isFinite && baseline.generationSeconds >= 0)
+            #expect(dflash.prefillSeconds.isFinite && dflash.prefillSeconds >= 0)
+            #expect(dflash.generationSeconds.isFinite && dflash.generationSeconds >= 0)
+        }
+    }
+
+    @Test func batchedBenchmarkKeepsDFlashForHeterogeneousPrompts() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let target = Qwen3Model(try tinyQwen3Config())
+            let drafter = DFlashDraftModel(config: try dflashConfig())
+            try drafter.bind(target: target)
+            eval(target, drafter)
+
+            let prompts: [[Int32]] = [
+                [1, 2, 3],
+                [2, 4, 6, 8],
+                [3, 5],
+            ]
+            let baseline = try measureBatchedDFlashBaselineThroughput(
+                target: target,
+                promptTokens: prompts,
+                maxTokens: 5
+            )
+            let dflash = try measureBatchedDFlashThroughput(
+                target: target,
+                drafter: drafter,
+                promptTokens: prompts,
+                maxTokens: 5,
+                blockSize: 3
+            )
+
+            #expect(dflash.batchSize == prompts.count)
+            #expect(dflash.generatedTokensPerRow == [5, 5, 5])
+            #expect(dflash.acceptLengths != nil)
+            #expect(dflash.generatedTokenIds == baseline.generatedTokenIds)
+        }
+    }
+
+    @Test func batchedEffectiveBlockSizeUsesSingleRowCap() {
+        #expect(dFlashBatchedEffectiveBlockSize(requestedBlockSize: 16, activeBatchSize: 1) == 4)
+        #expect(
+            dFlashBatchedEffectiveBlockSize(
+                requestedBlockSize: 16,
+                activeBatchSize: 1,
+                totalLiveRequestCount: 4) == 4)
+        #expect(dFlashBatchedEffectiveBlockSize(requestedBlockSize: 6, activeBatchSize: 1) == 4)
+        #expect(dFlashBatchedEffectiveBlockSize(requestedBlockSize: 16, activeBatchSize: 2) == 4)
+        #expect(dFlashBatchedEffectiveBlockSize(requestedBlockSize: 16, activeBatchSize: 4) == 4)
+    }
+
+    @Test func batchedTokenGeneratorSupportsStaggeredConcurrentRequests() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let target = Qwen3Model(try tinyQwen3Config())
+            let drafter = DFlashDraftModel(config: try dflashConfig())
+            try drafter.bind(target: target)
+            eval(target, drafter)
+
+            let prompts: [[Int32]] = [
+                [1, 2, 3],
+                [1, 2, 3],
+                [2, 4, 6, 8],
+            ]
+            let maxTokens = 5
+            let generator = try DFlashBatchedTokenGenerator(
+                target: target,
+                drafter: drafter,
+                blockSize: 3,
+                parameters: GenerateParameters(maxTokens: maxTokens, temperature: 0)
+            )
+
+            try generator.insert(
+                prompts: Array(prompts.prefix(2)),
+                uids: [10, 11],
+                maxTokens: [maxTokens, maxTokens])
+
+            var generatedByUID: [Int: [Int]] = [:]
+            for response in try generator.next() {
+                generatedByUID[response.uid, default: []].append(response.token)
+            }
+
+            try generator.insert(
+                prompts: [prompts[2]],
+                uids: [12],
+                maxTokens: [maxTokens])
+
+            var finishReasons: [Int: String] = [:]
+            while !generator.isEmpty {
+                for response in try generator.next() {
+                    generatedByUID[response.uid, default: []].append(response.token)
+                    if let finishReason = response.finishReason {
+                        finishReasons[response.uid] = finishReason
+                    }
+                }
+            }
+
+            for (uid, prompt) in zip([10, 11, 12], prompts) {
+                let expected = measureDFlashBaselineThroughput(
+                    target: target,
+                    promptTokens: MLXArray(prompt),
+                    maxTokens: maxTokens
+                )
+                #expect(generatedByUID[uid] == expected.generatedTokenIds)
+                #expect(finishReasons[uid] == "length")
+            }
+        }
+    }
+
+    @Test func dFlashBatchedEngineRunsConcurrentRequestsOnOneGenerator() async throws {
+        try await Device.withDefaultDevice(.cpu) {
+            let target = Qwen3Model(try tinyQwen3Config())
+            let drafter = DFlashDraftModel(config: try dflashConfig())
+            try drafter.bind(target: target)
+            eval(target, drafter)
+
+            let tokenizer = DeterministicDFlashTokenizer()
+            let context = ModelContext(
+                configuration: ModelConfiguration(id: "test"),
+                model: target,
+                processor: StandInUserInputProcessor(),
+                tokenizer: tokenizer)
+            let engine = try DFlashBatchedEngine(
+                context: context,
+                drafter: drafter,
+                blockSize: 3)
+            await engine.start()
+            defer {
+                Task { await engine.stop() }
+            }
+
+            async let first = engine.generateWithResult(
+                prompt: "alpha",
+                samplingParams: SamplingParams(maxTokens: 5, temperature: 0))
+            async let second = engine.generateWithResult(
+                prompt: "alpha",
+                samplingParams: SamplingParams(maxTokens: 5, temperature: 0))
+            async let third = engine.generateWithResult(
+                prompt: "beta",
+                samplingParams: SamplingParams(maxTokens: 5, temperature: 0))
+
+            let outputs = try await [first, second, third]
+            let expectedAlpha = measureDFlashBaselineThroughput(
+                target: target,
+                promptTokens: MLXArray(tokenizer.promptTokens["alpha"]!),
+                maxTokens: 5)
+            let expectedBeta = measureDFlashBaselineThroughput(
+                target: target,
+                promptTokens: MLXArray(tokenizer.promptTokens["beta"]!),
+                maxTokens: 5)
+
+            #expect(outputs[0].outputTokenIds == expectedAlpha.generatedTokenIds)
+            #expect(outputs[1].outputTokenIds == expectedAlpha.generatedTokenIds)
+            #expect(outputs[2].outputTokenIds == expectedBeta.generatedTokenIds)
+            #expect(outputs.allSatisfy { $0.finishReason == "length" })
         }
     }
 
@@ -259,5 +473,40 @@ struct DFlashBenchmarkTests {
 private struct DFlashBenchmarkTokenizerLoader: TokenizerLoader {
     func load(from directory: URL) async throws -> any Tokenizer {
         TestTokenizer(vocabularySize: 300_000)
+    }
+}
+
+private struct DeterministicDFlashTokenizer: Tokenizer {
+    let promptTokens: [String: [Int32]] = [
+        "alpha": [1, 2, 3],
+        "beta": [2, 4, 6, 8],
+    ]
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        (promptTokens[text] ?? [1]).map(Int.init)
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map(String.init).joined(separator: " ")
+    }
+
+    func convertTokenToId(_ token: String) -> Int? {
+        Int(token)
+    }
+
+    func convertIdToToken(_ id: Int) -> String? {
+        String(id)
+    }
+
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        encode(text: messages.last?["content"] as? String ?? "", addSpecialTokens: true)
     }
 }

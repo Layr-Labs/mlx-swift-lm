@@ -6,10 +6,40 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
+private let dflashDrafterFuseQKV: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_DFLASH_DRAFTER_FUSE_QKV"] {
+        switch raw.lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+    return true
+}()
+
+private let dflashDrafterFuseMLPGateUp: Bool = {
+    switch ProcessInfo.processInfo.environment["MLX_DFLASH_DRAFTER_FUSE_MLP_GATE_UP"]?.lowercased() {
+    case "0", "false", "no", "off":
+        return false
+    default:
+        return true
+    }
+}()
+
+private let dflashCompiledSiluGateUp: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, up in
+    silu(gate) * up
+}
+
 private final class DFlashMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
+
+    private var fusedGateUpProj: Linear?
+    private var fusedGateUpUnavailable = false
 
     init(hiddenSize: Int, intermediateSize: Int) {
         _gate.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
@@ -19,8 +49,53 @@ private final class DFlashMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        if dflashDrafterFuseMLPGateUp, let fused = fusedGateUp() {
+            let parts = fused(x).split(parts: 2, axis: -1)
+            return down(dflashCompiledSiluGateUp(parts[0], parts[1]))
+        }
+
+        return down(dflashCompiledSiluGateUp(gate(x), up(x)))
     }
+
+    private func fusedGateUp() -> Linear? {
+        if let fusedGateUpProj {
+            return fusedGateUpProj
+        }
+        guard !fusedGateUpUnavailable,
+            !(gate is QuantizedLinear),
+            !(up is QuantizedLinear),
+            gate.bias == nil,
+            up.bias == nil,
+            gate.weight.shape == up.weight.shape
+        else {
+            fusedGateUpUnavailable = true
+            return nil
+        }
+
+        let fused = Linear(
+            weight: concatenated([gate.weight, up.weight], axis: 0),
+            bias: nil
+        )
+        fusedGateUpProj = fused
+        return fused
+    }
+}
+
+private func dFlashDrafterLeftPadding(_ cache: KVCache) -> MLXArray? {
+    if let cache = cache as? BatchKVCache {
+        return cache.leftPadding
+    }
+    if let cache = cache as? BatchRotatingKVCache {
+        return cache.leftPadding
+    }
+    return nil
+}
+
+private func dFlashDrafterLeftPaddingMask(length: Int, leftPadding: MLXArray) -> MLXArray {
+    let positions = MLXArray(Int32(0) ..< Int32(length))[
+        .newAxis, .newAxis, .newAxis, 0...]
+    let padding = leftPadding.asType(.int32)[0..., .newAxis, .newAxis, .newAxis]
+    return padding .<= positions
 }
 
 private final class DFlashAttention: Module {
@@ -34,6 +109,11 @@ private final class DFlashAttention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+
+    private var fusedProposalQKVProj: Linear?
+    private var fusedContextKVProj: Linear?
+    private var fusedProposalQKVUnavailable = false
+    private var fusedContextKVUnavailable = false
 
     init(_ config: DFlashConfiguration, layerIdx: Int) {
         self.config = config
@@ -79,13 +159,36 @@ private final class DFlashAttention: Module {
             }
         }
 
+        let batchBaseOffset = (cache as? BatchPositionedKVCache)?.batchOffset
         let baseOffset = cache.offset
 
-        var queries = qProj(x)
-        var contextKeys = kProj(context)
-        var contextValues = vProj(context)
-        var proposalKeys = kProj(x)
-        var proposalValues = vProj(x)
+        let qDim = config.attentionHeads * config.headDim
+        let kvDim = config.kvHeads * config.headDim
+
+        var queries: MLXArray
+        var proposalKeys: MLXArray
+        var proposalValues: MLXArray
+        if dflashDrafterFuseQKV, let fusedProposalQKV = fusedProposalQKV() {
+            let parts = fusedProposalQKV(x).split(indices: [qDim, qDim + kvDim], axis: -1)
+            queries = parts[0]
+            proposalKeys = parts[1]
+            proposalValues = parts[2]
+        } else {
+            queries = qProj(x)
+            proposalKeys = kProj(x)
+            proposalValues = vProj(x)
+        }
+
+        var contextKeys: MLXArray
+        var contextValues: MLXArray
+        if dflashDrafterFuseQKV, let fusedContextKV = fusedContextKV() {
+            let parts = fusedContextKV(context).split(indices: [kvDim], axis: -1)
+            contextKeys = parts[0]
+            contextValues = parts[1]
+        } else {
+            contextKeys = kProj(context)
+            contextValues = vProj(context)
+        }
 
         queries =
             qNorm(queries.reshaped(B, L, config.attentionHeads, -1))
@@ -103,9 +206,16 @@ private final class DFlashAttention: Module {
             proposalValues.reshaped(B, L, config.kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
-        queries = rope(queries, offset: baseOffset + contextLength)
-        contextKeys = rope(contextKeys, offset: baseOffset)
-        proposalKeys = rope(proposalKeys, offset: baseOffset + contextLength)
+        if let batchBaseOffset {
+            let proposalOffset = batchBaseOffset + Int32(contextLength)
+            queries = rope(queries, offset: proposalOffset)
+            contextKeys = rope(contextKeys, offset: batchBaseOffset)
+            proposalKeys = rope(proposalKeys, offset: proposalOffset)
+        } else {
+            queries = rope(queries, offset: baseOffset + contextLength)
+            contextKeys = rope(contextKeys, offset: baseOffset)
+            proposalKeys = rope(proposalKeys, offset: baseOffset + contextLength)
+        }
 
         let (cachedKeys, cachedValues) = cache.update(
             keys: contextKeys, values: contextValues)
@@ -113,13 +223,26 @@ private final class DFlashAttention: Module {
         let keys = concatenated([cachedKeys, proposalKeys], axis: 2)
         let values = concatenated([cachedValues, proposalValues], axis: 2)
 
+        let leftPadding = dFlashDrafterLeftPadding(cache)
+        let hasLeftPadding = leftPadding.map {
+            $0.max().item(Int32.self) > 0
+        } ?? false
+
         let mask: MLXFast.ScaledDotProductAttentionMaskMode
         if layerType == .slidingAttention {
             let slidingWindow = config.slidingWindow!
             mask =
-                cachedLength + L <= slidingWindow
+                cachedLength + L <= slidingWindow && !hasLeftPadding
                 ? .causal
-                : .array(createCausalMask(n: L, offset: cachedLength, windowSize: slidingWindow))
+                : .array(createCausalMask(
+                    n: L,
+                    offset: cachedLength,
+                    windowSize: slidingWindow,
+                    leftPadding: leftPadding))
+        } else if let leftPadding, hasLeftPadding {
+            mask = .array(dFlashDrafterLeftPaddingMask(
+                length: cachedLength + L,
+                leftPadding: leftPadding))
         } else {
             mask = .none
         }
@@ -133,6 +256,55 @@ private final class DFlashAttention: Module {
         )
 
         return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
+
+    private func fusedProposalQKV() -> Linear? {
+        if let fusedProposalQKVProj {
+            return fusedProposalQKVProj
+        }
+        guard !fusedProposalQKVUnavailable,
+            !(qProj is QuantizedLinear),
+            !(kProj is QuantizedLinear),
+            !(vProj is QuantizedLinear),
+            qProj.bias == nil,
+            kProj.bias == nil,
+            vProj.bias == nil,
+            qProj.weight.shape.dropFirst() == kProj.weight.shape.dropFirst(),
+            qProj.weight.shape.dropFirst() == vProj.weight.shape.dropFirst()
+        else {
+            fusedProposalQKVUnavailable = true
+            return nil
+        }
+
+        let fused = Linear(
+            weight: concatenated([qProj.weight, kProj.weight, vProj.weight], axis: 0),
+            bias: nil
+        )
+        fusedProposalQKVProj = fused
+        return fused
+    }
+
+    private func fusedContextKV() -> Linear? {
+        if let fusedContextKVProj {
+            return fusedContextKVProj
+        }
+        guard !fusedContextKVUnavailable,
+            !(kProj is QuantizedLinear),
+            !(vProj is QuantizedLinear),
+            kProj.bias == nil,
+            vProj.bias == nil,
+            kProj.weight.shape.dropFirst() == vProj.weight.shape.dropFirst()
+        else {
+            fusedContextKVUnavailable = true
+            return nil
+        }
+
+        let fused = Linear(
+            weight: concatenated([kProj.weight, vProj.weight], axis: 0),
+            bias: nil
+        )
+        fusedContextKVProj = fused
+        return fused
     }
 }
 
@@ -239,6 +411,25 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         return caches
     }
 
+    public func makeBatchedCache(leftPadding: [Int]) throws -> [KVCache] {
+        var caches = [KVCache]()
+        caches.reserveCapacity(config.layerTypes.count)
+        for layerType in config.layerTypes {
+            switch layerType {
+            case .fullAttention:
+                caches.append(BatchKVCache(leftPadding: leftPadding))
+            case .slidingAttention:
+                guard let slidingWindow = config.slidingWindow else {
+                    throw DFlashError.missingSlidingWindow
+                }
+                caches.append(BatchRotatingKVCache(
+                    maxSize: slidingWindow - 1,
+                    leftPadding: leftPadding))
+            }
+        }
+        return caches
+    }
+
     public func callAsFunction(
         _ inputs: MLXArray,
         targetHidden: MLXArray,
@@ -290,6 +481,30 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         }
         let maskValues = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
         let block = MLXArray([Int32(bonus)] + maskValues)[.newAxis, .ellipsis]
+        let logits = try self(
+            block,
+            targetHidden: targetHidden,
+            cache: cache,
+            logitsStart: 1
+        )
+        return logits.argMax(axis: -1)
+    }
+
+    public func draftBlock(
+        bonus: [Int],
+        targetHidden: MLXArray,
+        cache: [KVCache],
+        blockSize: Int
+    ) throws -> MLXArray {
+        guard blockSize >= 2 else {
+            throw DFlashError.invalidBlockSize(blockSize)
+        }
+        let batchSize = bonus.count
+        let maskValues = Array(repeating: Int32(config.maskTokenId), count: blockSize - 1)
+        let rows = bonus.flatMap { rowBonus in
+            [Int32(rowBonus)] + maskValues
+        }
+        let block = MLXArray(rows, [batchSize, blockSize])
         let logits = try self(
             block,
             targetHidden: targetHidden,

@@ -18,6 +18,7 @@ public enum DFlashError: LocalizedError, Sendable, Equatable {
     case unreadableDirectory(String)
     case noSafetensorsFound(String)
     case duplicateWeightKey(String)
+    case invalidBatchArguments(String)
 
     public var errorDescription: String? {
         switch self {
@@ -52,6 +53,8 @@ public enum DFlashError: LocalizedError, Sendable, Equatable {
             return "DFlash draft directory contains no .safetensors weights: \(directory)."
         case .duplicateWeightKey(let key):
             return "DFlash draft weights contain duplicate tensor key: \(key)."
+        case .invalidBatchArguments(let message):
+            return "Invalid DFlash batch arguments: \(message)."
         }
     }
 }

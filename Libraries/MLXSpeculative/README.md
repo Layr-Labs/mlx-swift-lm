@@ -102,8 +102,45 @@ for await generation in stream {
 }
 ```
 
-When `blockSize` is omitted, DFlash uses the checkpoint block size. Passing
+When `blockSize` is omitted, DFlash uses the configuration's recommended
+block size. This is usually the checkpoint block size, clamped only by a
+shorter sliding-window constraint; narrowly measured Apple Silicon profiles
+can tune lower when that is both faster and stricter on parity. Passing
 `blockSize:` remains an explicit override.
+
+For benchmark parity with the upstream z-lab MLX backend, set
+`MLX_GEMMA4_DFLASH_OFFICIAL_FAST=1`. This uses one vector target verify
+per block and accepts the matching target-token prefix, matching the
+throughput contract used by the Python MLX benchmark. It does not promise
+an exact generated-token hash match against sequential baseline decoding.
+Leave it unset when running strict parity diagnostics.
+
+Single-request DFlash uses a CPU accept walk by default, matching the
+upstream MLX implementation's small-list token comparison and avoiding extra
+GPU work for the 15-token prefix check. Set `MLX_DFLASH_CPU_ACCEPT_WALK=0`
+to force the older MLX `cumprod`/`sum` accept path for comparison.
+
+The DFlash drafter fuses its MLP gate/up projection by default to reduce
+per-round matmul launches. Set `MLX_DFLASH_DRAFTER_FUSE_MLP_GATE_UP=0` if
+memory pressure or benchmark results favor the separate projections on a
+specific checkpoint.
+
+Gemma4 target expert gate/up fusion is on by default. Set
+`MLX_SWITCH_GLU_GEMMA4_FUSE_GATE_UP=0` to force separate expert gate/up
+projections for comparison on checkpoints or hosts where that schedule
+benchmarks faster.
+
+The optimized Gemma4 verify fusion paths are capped at the K=16 shape by
+default. For block-size experiments above 16, set
+`MLX_GEMMA4_DFLASH_VERIFY_FUSION_MAX_ROWS=24` and
+`MLX_SWITCH_GLU_GEMMA4_WEIGHTED_MAX_ROWS=24` to let the fused attention/MLP
+and weighted expert paths run on larger verify blocks.
+
+Router-only verify QMM can be enabled with
+`--verify-qmm --verify-qmm-include router` for a speed-oriented benchmark
+mode. It changes floating-point routing decisions enough to alter token
+hashes and EOS behavior, so it remains opt-in rather than the default
+quality path.
 
 `DFlashDraftModel.load(from:downloader:id:bindTo:)` is available for Hub
 downloads. It fetches only `config.json` and `*.safetensors`; tokenizers

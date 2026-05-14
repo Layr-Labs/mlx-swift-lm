@@ -4,6 +4,58 @@ import Foundation
 import MLX
 import MLXLMCommon
 
+/// Per-thread target-side DFlash options used while constructing verify graphs.
+///
+/// The batched DFlash path intentionally disables some single-row Gemma4
+/// verify fusions because a live request can be processed as a single-row
+/// subgroup even while it still shares cache state with other requests.
+public enum DFlashTargetRuntimeOptions {
+    private static let disabledSmallRowVerifyFusionsKey =
+        "mlxswiftlm.dflash.disableSmallRowVerifyFusions"
+    private static let enabledSmallRowVerifyFusionsKey =
+        "mlxswiftlm.dflash.enableSmallRowVerifyFusions"
+
+    public static var smallRowVerifyFusionsDisabled: Bool {
+        Thread.current.threadDictionary[disabledSmallRowVerifyFusionsKey] as? Bool ?? false
+    }
+
+    public static var smallRowVerifyFusionsEnabled: Bool {
+        Thread.current.threadDictionary[enabledSmallRowVerifyFusionsKey] as? Bool ?? false
+    }
+
+    public static func withSmallRowVerifyFusionsEnabled<T>(
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary[enabledSmallRowVerifyFusionsKey]
+        dictionary[enabledSmallRowVerifyFusionsKey] = true
+        defer {
+            if let previous {
+                dictionary[enabledSmallRowVerifyFusionsKey] = previous
+            } else {
+                dictionary.removeObject(forKey: enabledSmallRowVerifyFusionsKey)
+            }
+        }
+        return try body()
+    }
+
+    public static func withSmallRowVerifyFusionsDisabled<T>(
+        _ body: () throws -> T
+    ) rethrows -> T {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary[disabledSmallRowVerifyFusionsKey]
+        dictionary[disabledSmallRowVerifyFusionsKey] = true
+        defer {
+            if let previous {
+                dictionary[disabledSmallRowVerifyFusionsKey] = previous
+            } else {
+                dictionary.removeObject(forKey: disabledSmallRowVerifyFusionsKey)
+            }
+        }
+        return try body()
+    }
+}
+
 /// Target-model output used by DFlash speculative decoding.
 ///
 /// `targetHidden` is the concatenation of the selected post-layer hidden

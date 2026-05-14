@@ -88,6 +88,43 @@ struct DFlashConfigurationTests {
         #expect(sliding.recommendedBlockSize == 16)
     }
 
+    @Test func recommendsTunedBlockForGemma426BA4BDFlash() throws {
+        let json = """
+        {
+            "architectures": ["DFlashDraftModel"],
+            "model_type": "qwen3",
+            "hidden_size": 2816,
+            "num_hidden_layers": 5,
+            "intermediate_size": 5632,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 262144,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000,
+            "max_position_embeddings": 262144,
+            "block_size": 16,
+            "num_target_layers": 30,
+            "layer_types": [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "sliding_window": 2048,
+            "tie_word_embeddings": false,
+            "dflash_config": {
+                "target_layer_ids": [1, 6, 11, 17, 22, 27],
+                "mask_token_id": 4
+            }
+        }
+        """
+        let config = try JSONDecoder.json5().decode(DFlashConfiguration.self, from: Data(json.utf8))
+        #expect(config.blockSize == 16)
+        #expect(config.recommendedBlockSize == 14)
+    }
+
     @Test func rejectsSlidingAttentionWithoutWindow() throws {
         #expect(throws: DecodingError.self) {
             _ = try JSONDecoder.json5().decode(

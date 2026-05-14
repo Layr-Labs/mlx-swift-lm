@@ -543,7 +543,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         if self.keys == nil
             || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
         {
-            let newSize = min(step, maxCacheSize - prev)
+            // `offset` is an absolute sequence position. After a saturated
+            // rotating cache is trimmed for speculative rollback, `offset`
+            // can remain much larger than `maxCacheSize` while the stored
+            // temporal window is shorter than `maxCacheSize`. Grow from the
+            // stored window length, not the absolute offset, or the requested
+            // allocation can go negative.
+            let currentSize = self.keys?.dim(2) ?? 0
+            let newSize = min(step, maxCacheSize - currentSize)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
@@ -557,7 +564,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.keys = newK
                 self.values = newV
             }
-            idx = prev
+            idx = currentSize
         }
 
         // Trim if needed
@@ -692,16 +699,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             let actualWindowSize = windowSize ?? maxCacheSize
             let cappedOffset = min(maxCacheSize - 1, offset)
 
-            // Once the rotating cache is full, multi-token updates are returned
-            // in temporal order with only `window - 1` past tokens plus the new
-            // block. The symbolic causal mask is then equivalent to the explicit
-            // sliding-window array mask, and avoids materializing/applying it.
-            if !returnArray, offset >= actualWindowSize {
-                return .causal
-            }
-
             // Decide if we need an array mask
-            if cappedOffset + n > actualWindowSize || returnArray {
+            if cappedOffset + n > actualWindowSize || returnArray || offset >= actualWindowSize {
                 return .array(
                     createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
             }

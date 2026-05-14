@@ -237,28 +237,44 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     #expect(cache.state[0].dim(2) == 5)
 }
 
-@Test func testFullRotatingCacheUsesSymbolicCausalMaskForMultiTokenWindow() throws {
+@Test func testRotatingCacheCanAppendAfterSaturatedRollbackTrim() throws {
+    let cache = RotatingKVCache(maxSize: 6)
+    let initial = singleHeadKV([1, 2, 3, 4, 5, 6])
+    _ = cache.update(keys: initial, values: initial)
+
+    let verifyBlock = singleHeadKV([7, 8])
+    _ = cache.update(keys: verifyBlock, values: verifyBlock)
+    #expect(cache.offset == 8)
+    #expect(cache.isTrimmable)
+
+    #expect(cache.trim(2) == 2)
+    #expect(cache.offset == 6)
+    #expect(cache.state[0].dim(2) == 5)
+
+    let next = singleHeadKV([9])
+    _ = cache.update(keys: next, values: next)
+    #expect(cache.offset == 7)
+    #expect(cache.state[0].dim(2) == 6)
+}
+
+@Test func testFullRotatingCacheUsesSlidingArrayMaskForMultiTokenWindow() throws {
     let cache = RotatingKVCache(maxSize: 3)
     let initial = singleHeadKV([1, 2, 3])
     _ = cache.update(keys: initial, values: initial)
 
     let mask = cache.makeMask(n: 2, windowSize: 3, returnArray: false)
-    let isCausal: Bool
-    if case .causal = mask {
-        isCausal = true
+    if case .array(let maskArray) = mask {
+        #expect(maskArray.shape == [2, 4])
     } else {
-        isCausal = false
+        Issue.record("Expected explicit sliding-window mask for full rotating multi-token window")
     }
-    #expect(isCausal, "Expected symbolic causal mask for full rotating multi-token window")
 
     let forcedMask = cache.makeMask(n: 2, windowSize: 3, returnArray: true)
-    let isArray: Bool
-    if case .array = forcedMask {
-        isArray = true
+    if case .array(let maskArray) = forcedMask {
+        #expect(maskArray.shape == [2, 4])
     } else {
-        isArray = false
+        Issue.record("Expected explicit array mask when returnArray is true")
     }
-    #expect(isArray, "Expected explicit array mask when returnArray is true")
 }
 
 // MARK: - ArraysCache fully populated round-trip

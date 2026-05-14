@@ -12,6 +12,7 @@ import Hummingbird
 import MLXLLM
 import MLXHuggingFace
 import MLXLMCommon
+import MLXSpeculative
 import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
 // MARK: - CLI args
@@ -23,6 +24,8 @@ struct ServerArgs: Sendable {
     var maxTokens: Int = 4096
     var prefixCache: Bool = true
     var maxKVCacheTokens: Int = 0
+    var drafter: String?
+    var dflashBlockSize: Int?
 
     static func parse() throws -> ServerArgs {
         var args = ServerArgs()
@@ -58,6 +61,16 @@ struct ServerArgs: Sendable {
                     throw CLIError("--max-kv-tokens requires an integer")
                 }
                 args.maxKVCacheTokens = t
+            case "--drafter", "-d":
+                i += 1
+                guard i < argv.count else { throw CLIError("--drafter requires a value") }
+                args.drafter = argv[i]
+            case "--dflash-block-size":
+                i += 1
+                guard i < argv.count, let t = Int(argv[i]), t >= 2 else {
+                    throw CLIError("--dflash-block-size requires an integer >= 2")
+                }
+                args.dflashBlockSize = t
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -90,6 +103,9 @@ struct ServerArgs: Sendable {
           --max-tokens <int>    Default max tokens per request (default: 4096)
           --no-prefix-cache     Disable KV prefix caching
           --max-kv-tokens <int> Max total KV-cache tokens across running requests (0=unlimited)
+          --drafter, -d <path>  DFlash drafter directory. Enables greedy DFlash serving.
+          --dflash-block-size <int>
+                                Override DFlash block size (default: drafter config)
           --help, -h            Show this help
 
         DOWNLOAD MODELS:
@@ -110,7 +126,7 @@ struct CLIError: Error, CustomStringConvertible {
 
 // MARK: - Model loading
 
-func loadEngine(args: ServerArgs) async throws -> (BatchedEngine, String) {
+func loadEngine(args: ServerArgs) async throws -> (any ServerGenerationEngine, String) {
     let tokenizerLoader = #huggingFaceTokenizerLoader()
 
     // Expand ~ and resolve to an absolute URL.
@@ -129,6 +145,42 @@ func loadEngine(args: ServerArgs) async throws -> (BatchedEngine, String) {
     let modelName = url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent
     print("Model loaded: \(modelName)")
 
+    if let drafterPath = args.drafter {
+        let expandedDrafter = (drafterPath as NSString).expandingTildeInPath
+        let drafterURL = URL(fileURLWithPath: expandedDrafter)
+        guard FileManager.default.fileExists(atPath: drafterURL.path) else {
+            throw CLIError("DFlash drafter directory not found: \(drafterURL.path)")
+        }
+        guard let target = context.model as? any DFlashTargetModel else {
+            throw CLIError("Model does not support DFlash target hooks: \(type(of: context.model))")
+        }
+        let verifyQMMEnabled =
+            serverEnvBoolOverride("MLX_DFLASH_VERIFY_QMM") ?? false
+        if verifyQMMEnabled {
+            let include = ProcessInfo.processInfo.environment["MLX_DFLASH_VERIFY_QMM_INCLUDE"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let verifyQMMInclude = if let include, !include.isEmpty {
+                include
+            } else {
+                "router"
+            }
+            let replaced = DFlashVerifyLinear.install(
+                on: context.model,
+                enableQMM: true,
+                include: verifyQMMInclude)
+            print("DFlash verify QMM enabled: include=\(verifyQMMInclude) linears=\(replaced)")
+        }
+        print("Loading DFlash drafter from: \(drafterURL.path)")
+        let drafter = try await DFlashDraftModel.load(from: drafterURL, bindTo: target)
+        let engine = try DFlashBatchedEngine(
+            context: context,
+            drafter: drafter,
+            blockSize: args.dflashBlockSize)
+        await engine.start()
+        print("DFlash serving enabled (greedy requests only)")
+        return (engine, modelName)
+    }
+
     let cbConfig = ContinuousBatchingConfig(
         schedulerConfig: SchedulerConfig(maxKVCacheTokens: args.maxKVCacheTokens),
         prefixCacheConfig: args.prefixCache ? PrefixCacheConfig() : nil
@@ -136,6 +188,17 @@ func loadEngine(args: ServerArgs) async throws -> (BatchedEngine, String) {
     let engine = BatchedEngine(context: context, config: cbConfig)
     await engine.start()
     return (engine, modelName)
+}
+
+private func serverEnvBoolOverride(_ key: String) -> Bool? {
+    switch ProcessInfo.processInfo.environment[key]?.lowercased() {
+    case "1", "true", "yes", "on":
+        return true
+    case "0", "false", "no", "off":
+        return false
+    default:
+        return nil
+    }
 }
 
 // MARK: - Entry point
