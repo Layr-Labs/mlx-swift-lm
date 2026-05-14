@@ -10,26 +10,6 @@ private let switchGLUSortMinSize: Int = {
     return max(0, value)
 }()
 
-private let switchGLUGemma4FusedDown: Bool = {
-    switch ProcessInfo.processInfo.environment["MLX_SWITCH_GLU_GEMMA4_FUSED_DOWN"]?.lowercased() {
-    case "1", "true", "yes", "on":
-        true
-    default:
-        false
-    }
-}()
-
-private let switchGLUDebugGemma4FusedDown: Bool = {
-    switch ProcessInfo.processInfo.environment["MLX_SWITCH_GLU_DEBUG_GEMMA4_FUSED_DOWN"]?
-        .lowercased()
-    {
-    case "1", "true", "yes", "on":
-        true
-    default:
-        false
-    }
-}()
-
 private let switchGLUFuseGateUp: Bool = {
     switch ProcessInfo.processInfo.environment["MLX_SWITCH_GLU_FUSE_GATE_UP"]?.lowercased() {
     case "1", "true", "yes", "on":
@@ -101,7 +81,6 @@ private let switchGLUGemma4RouteSortKernel: Bool = {
     return true
 }()
 
-nonisolated(unsafe) private var switchGLUDebugGemma4FusedDownManualReports = 0
 nonisolated(unsafe) private var switchGLUDebugFuseGateUpReports = 0
 nonisolated(unsafe) private var switchGLUGemma4WeightedTimingCalls = 0
 nonisolated(unsafe) private var switchGLUGemma4WeightedTimingSort = 0.0
@@ -299,153 +278,6 @@ public class SwitchGLU: Module {
         return fused
     }
 
-    public func gemma4FusedDown(
-        _ x: MLXArray, indices: MLXArray, weights: MLXArray
-    ) -> MLXArray? {
-        guard switchGLUGemma4FusedDown else { return nil }
-        guard x.dim(-1) == 2816, indices.dim(-1) == 8, hiddenDims == 704,
-            inputDims == 2816, numExperts == 128
-        else { return nil }
-        guard let down = downProj as? QuantizedSwitchLinear,
-            down.bits == 4,
-            down.groupSize == 64,
-            down.mode == .affine,
-            let downBiases = down.biases
-        else { return nil }
-
-        let rows = x.size / inputDims
-        guard rows > 0, rows <= 16, rows * 8 == indices.size else { return nil }
-
-        let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
-        let xUp: MLXArray
-        let xGate: MLXArray
-        if switchGLUGemma4FuseGateUp, let fused = fusedGateUp() {
-            let gateUp = fused(expanded, indices, sortedIndices: false)
-            let parts = MLX.split(gateUp, parts: 2, axis: -1)
-            xGate = parts[0].contiguous()
-            xUp = parts[1].contiguous()
-        } else {
-            xUp = upProj(expanded, indices, sortedIndices: false)
-            xGate = gateProj(expanded, indices, sortedIndices: false)
-        }
-        let hidden = switchGLUCompiledGELUGateUp(xGate, xUp)
-            .reshaped(rows, 8, hiddenDims)
-            .contiguous()
-        if switchGLUDebugGemma4FusedDown {
-            print(
-                "gemma4 fused down shapes x=\(x.shape) expanded=\(expanded.shape) "
-                    + "indices=\(indices.shape) xUp=\(xUp.shape) xGate=\(xGate.shape) "
-                    + "hidden=\(hidden.shape) weight=\(down.weight.shape) "
-                    + "scales=\(down.scales.shape) biases=\(downBiases.shape)"
-            )
-            let hiddenNaNs = MLX.isNaN(hidden.asType(.float32)).asType(.int32).sum()
-            let hiddenNonFinite = (.!MLX.isFinite(hidden.asType(.float32))).asType(.int32).sum()
-            let scaleNaNs = MLX.isNaN(down.scales.asType(.float32)).asType(.int32).sum()
-            let biasNaNs = MLX.isNaN(downBiases.asType(.float32)).asType(.int32).sum()
-            let routedZeroCount = (weights.asType(.float32).reshaped(rows, 8) .== MLXArray(0))
-                .asType(.int32).sum()
-            let maxExpert = indices.max()
-            let maxHidden = MLX.abs(MLX.nanToNum(hidden.asType(.float32))).max()
-            let maxRouteWeight = MLX.abs(weights.asType(.float32).reshaped(rows, 8)).max()
-            let maxScale = MLX.abs(down.scales.asType(.float32)).max()
-            let maxBias = MLX.abs(downBiases.asType(.float32)).max()
-            eval(
-                hiddenNaNs, hiddenNonFinite, scaleNaNs, biasNaNs, routedZeroCount, maxExpert,
-                maxHidden, maxRouteWeight, maxScale, maxBias)
-            print(
-                "gemma4 fused down inputs hidden_nan=\(hiddenNaNs.item(Int32.self)) "
-                    + "hidden_nonfinite=\(hiddenNonFinite.item(Int32.self)) "
-                    + "scale_nan=\(scaleNaNs.item(Int32.self)) "
-                    + "bias_nan=\(biasNaNs.item(Int32.self)) "
-                    + "route_zero=\(routedZeroCount.item(Int32.self)) "
-                    + "max_expert=\(maxExpert.item(UInt32.self)) "
-                    + "max_hidden=\(maxHidden.item(Float.self)) "
-                    + "max_route_weight=\(maxRouteWeight.item(Float.self)) "
-                    + "max_scale=\(maxScale.item(Float.self)) "
-                    + "max_bias=\(maxBias.item(Float.self))"
-            )
-        }
-        let routedWeights = weights.asType(hidden.dtype).reshaped(rows, 8).contiguous()
-        let fused = Self.gemma4FusedDownKernel(
-            hidden: hidden,
-            indices: indices.reshaped(rows, 8).contiguous(),
-            weights: routedWeights,
-            downWeight: down.weight.contiguous(),
-            downScales: down.scales.contiguous(),
-            downBiases: downBiases.contiguous(),
-            rows: rows,
-            hiddenDims: hiddenDims,
-            outputDims: inputDims,
-            dtype: hidden.dtype
-        )
-        if switchGLUDebugGemma4FusedDown {
-            let fallback = downProj(
-                switchGLUCompiledGELUGateUp(xGate, xUp).contiguous(),
-                indices,
-                sortedIndices: false)
-            let expected =
-                (MLX.squeezed(fallback, axis: -2).reshaped(rows, 8, inputDims)
-                    * MLX.expandedDimensions(routedWeights, axis: -1))
-                .sum(axis: -2)
-            let fusedF32 = fused.asType(.float32)
-            let expectedF32 = expected.asType(.float32)
-            let fusedNaNs = MLX.isNaN(fusedF32).asType(.int32).sum()
-            let expectedNaNs = MLX.isNaN(expectedF32).asType(.int32).sum()
-            let diff = MLX.abs(MLX.nanToNum(fusedF32) - MLX.nanToNum(expectedF32))
-            let maxDiff = diff.max()
-            let argMaxDiff = diff.flattened().argMax()
-            eval(fusedNaNs, expectedNaNs, maxDiff, argMaxDiff)
-            let maxDiffValue = maxDiff.item(Float.self)
-            print(
-                "gemma4 fused down nan_counts fused=\(fusedNaNs.item(Int32.self)) "
-                    + "expected=\(expectedNaNs.item(Int32.self)) "
-                    + "max_diff_nan_to_num=\(maxDiffValue)"
-            )
-            if switchGLUDebugGemma4FusedDownManualReports < 3, maxDiffValue > 1 {
-                switchGLUDebugGemma4FusedDownManualReports += 1
-                let flatIndex = Int(argMaxDiff.item(Int32.self))
-                let sampleRow = flatIndex / inputDims
-                let sampleOutput = flatIndex % inputDims
-                var manual = MLXArray(Float(0))
-                var routeSummary = [String]()
-                for route in 0 ..< 8 {
-                    let expert = Int(indices[sampleRow, route].item(UInt32.self))
-                    let wq = down.weight[expert, sampleOutput, 0...].reshaped(1, -1)
-                    let scales = down.scales[expert, sampleOutput, 0...].reshaped(1, -1)
-                    let biases = downBiases[expert, sampleOutput, 0...].reshaped(1, -1)
-                    let dequantized = MLX.dequantized(
-                        wq,
-                        scales: scales,
-                        biases: biases,
-                        groupSize: 64,
-                        bits: 4,
-                        mode: .affine,
-                        dtype: .float32
-                    ).reshaped(hiddenDims)
-                    let routeWeight = weights[sampleRow, route].asType(.float32)
-                    let dot = (hidden[sampleRow, route, 0...].asType(.float32) * dequantized).sum()
-                    let weighted = dot * routeWeight
-                    manual = manual + weighted
-                    eval(dot, routeWeight, weighted)
-                    routeSummary.append(
-                        "\(route):e\(expert):w=\(routeWeight.item(Float.self)):dot=\(dot.item(Float.self)):term=\(weighted.item(Float.self))"
-                    )
-                }
-                let fusedSample = fusedF32[sampleRow, sampleOutput]
-                let expectedSample = expectedF32[sampleRow, sampleOutput]
-                eval(manual, fusedSample, expectedSample)
-                print(
-                    "gemma4 fused down sample row=\(sampleRow) out=\(sampleOutput) "
-                        + "fused=\(fusedSample.item(Float.self)) "
-                        + "expected=\(expectedSample.item(Float.self)) "
-                        + "manual=\(manual.item(Float.self)) "
-                        + "routes=[\(routeSummary.joined(separator: ";"))]"
-                )
-            }
-        }
-        return fused
-    }
-
     public func gemma4Weighted(
         _ x: MLXArray, indices: MLXArray, weights: MLXArray
     ) -> MLXArray? {
@@ -552,60 +384,6 @@ public class SwitchGLU: Module {
         return reduced
     }
 
-    private static func gemma4FusedDownKernel(
-        hidden: MLXArray,
-        indices: MLXArray,
-        weights: MLXArray,
-        downWeight: MLXArray,
-        downScales: MLXArray,
-        downBiases: MLXArray,
-        rows: Int,
-        hiddenDims: Int,
-        outputDims: Int,
-        dtype: DType
-    ) -> MLXArray {
-        let kernel = Gemma4RoutedDownKernelManager.shared.kernel
-        return kernel(
-            [
-                hidden, indices, weights, downWeight, downScales, downBiases,
-                rows, 8, hiddenDims, outputDims,
-            ],
-            template: [("T", dtype)],
-            grid: (rows * 256, outputDims / 8, 1),
-            threadGroup: (256, 1, 1),
-            outputShapes: [[rows, outputDims]],
-            outputDTypes: [dtype]
-        )[0]
-    }
-
-    static func gemma4FusedDownKernelForTesting(
-        hidden: MLXArray,
-        indices: MLXArray,
-        weights: MLXArray,
-        downWeight: MLXArray,
-        downScales: MLXArray,
-        downBiases: MLXArray,
-        rows: Int,
-        topK: Int,
-        hiddenDims: Int,
-        outputDims: Int,
-        dtype: DType
-    ) -> MLXArray {
-        precondition(topK == 8, "Gemma4 fused-down test kernel currently supports topK=8")
-        return gemma4FusedDownKernel(
-            hidden: hidden,
-            indices: indices,
-            weights: weights,
-            downWeight: downWeight,
-            downScales: downScales,
-            downBiases: downBiases,
-            rows: rows,
-            hiddenDims: hiddenDims,
-            outputDims: outputDims,
-            dtype: dtype
-        )
-    }
-
     private static func gemma4UnsortWeightedSumKernel(
         sorted: MLXArray,
         inverseOrder: MLXArray,
@@ -705,72 +483,6 @@ private final class Gemma4RouteSortKernelManager: Sendable {
                 sorted_indices[sorted_pos] = expert;
                 inverse_order[route] = sorted_pos;
                 order[sorted_pos] = route;
-                """
-        )
-    }
-}
-
-private final class Gemma4RoutedDownKernelManager: Sendable {
-    static let shared = Gemma4RoutedDownKernelManager()
-
-    let kernel: MLXFast.MLXFastKernel
-
-    private init() {
-        kernel = MLXFast.metalKernel(
-            name: "gemma4_routed_weighted_down_4bit_gs64",
-            inputNames: [
-                "hidden", "indices", "route_weights", "down_w", "down_scales", "down_biases",
-                "rows", "top_k", "hidden_dims", "output_dims",
-            ],
-            outputNames: ["out"],
-            source: """
-                using namespace metal;
-                constexpr int GROUP_SIZE = 64;
-                constexpr int BITS = 4;
-                constexpr int VALUES_PER_PACK = 8;
-                constexpr int OUTPUTS_PER_THREADGROUP = 8;
-
-                uint row = threadgroup_position_in_grid.x;
-                uint n_block = threadgroup_position_in_grid.y;
-                uint tid = thread_position_in_threadgroup.x;
-                uint lane = tid & 31u;
-                uint simd_id = tid >> 5;
-                uint n = n_block * OUTPUTS_PER_THREADGROUP + simd_id;
-
-                if (row >= uint(rows) || n >= uint(output_dims)) {
-                    return;
-                }
-
-                int k_packs = hidden_dims / VALUES_PER_PACK;
-                int k_groups = hidden_dims / GROUP_SIZE;
-                float acc = 0.0f;
-
-                for (int route = 0; route < top_k; ++route) {
-                    int route_offset = int(row) * top_k + route;
-                    int expert = int(indices[route_offset]);
-                    float route_weight = float(route_weights[route_offset]);
-
-                    int hidden_base = route_offset * hidden_dims;
-                    int weight_base = (expert * output_dims + int(n)) * k_packs;
-                    int scale_base = (expert * output_dims + int(n)) * k_groups;
-
-                    float partial = 0.0f;
-                    for (int k = int(lane); k < hidden_dims; k += 32) {
-                        uint32_t packed = down_w[weight_base + (k / VALUES_PER_PACK)];
-                        uint32_t q = (packed >> ((k & 7) * BITS)) & 0xFu;
-                        float scale = float(down_scales[scale_base + (k / GROUP_SIZE)]);
-                        float bias = float(down_biases[scale_base + (k / GROUP_SIZE)]);
-                        float x_value = float(hidden[hidden_base + k]);
-                        partial += x_value * (float(q) * scale + bias);
-                    }
-
-                    float route_dot = float(T(simd_sum(partial)));
-                    acc += route_weight * route_dot;
-                }
-
-                if (lane == 0) {
-                    out[int(row) * output_dims + int(n)] = T(acc);
-                }
                 """
         )
     }

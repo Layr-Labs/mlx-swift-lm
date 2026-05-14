@@ -1317,14 +1317,6 @@ private class Gemma4Experts: Module {
         let hidden = x.dim(2)
         let topK = topKIndices.dim(-1)
 
-        if let fused = switchGLU.gemma4FusedDown(
-            x.reshaped(batch * length, hidden),
-            indices: topKIndices.reshaped(batch * length, topK),
-            weights: topKWeights.reshaped(batch * length, topK)
-        ) {
-            return fused.reshaped(batch, length, hidden)
-        }
-
         if gemma4ExpertWeightSumKernel,
             let weighted = switchGLU.gemma4Weighted(
                 x.reshaped(batch * length, hidden),

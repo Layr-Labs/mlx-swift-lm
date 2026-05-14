@@ -68,6 +68,7 @@ public final class EngineCore: @unchecked Sendable {
         label: "com.eigen.engine",
         qos: .userInitiated
     )
+    private let engineQueueKey = DispatchSpecificKey<Void>()
 
     // Output collectors for streaming (vLLM pattern).
     // Mutations happen ONLY on engineQueue; reads from external contexts
@@ -96,6 +97,7 @@ public final class EngineCore: @unchecked Sendable {
     ) {
         self.scheduler = scheduler
         self.config = config
+        engineQueue.setSpecific(key: engineQueueKey, value: ())
     }
 
     // MARK: - Lifecycle
@@ -113,6 +115,10 @@ public final class EngineCore: @unchecked Sendable {
         _running = false
         _task?.cancel()
         _task = nil
+        if DispatchQueue.getSpecific(key: engineQueueKey) == nil {
+            engineQueue.sync {}
+        }
+        Stream().synchronize()
     }
 
     public var isRunning: Bool { _running }
@@ -164,7 +170,7 @@ public final class EngineCore: @unchecked Sendable {
         ))
 
         engineQueue.async { [weak self] in
-            self?.scheduler.abortRequest(requestId)
+            _ = self?.scheduler.abortRequest(requestId)
         }
         return true
     }
@@ -178,7 +184,7 @@ public final class EngineCore: @unchecked Sendable {
 
         for rid in rids {
             engineQueue.async { [weak self] in
-                self?.scheduler.abortRequest(rid)
+                _ = self?.scheduler.abortRequest(rid)
             }
             _lock.lock()
             let collector = outputCollectors[rid]
@@ -260,7 +266,7 @@ public final class EngineCore: @unchecked Sendable {
             }
             throw EngineError.missingOutput
         } onCancel: { [weak self] in
-            self?.abortRequest(rid)
+            _ = self?.abortRequest(rid)
         }
     }
 

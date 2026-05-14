@@ -105,7 +105,7 @@ final class CBSchedulerTests: XCTestCase {
 
         _ = s.step()  // both admitted and running
 
-        s.abortRequest("r1")
+        _ = s.abortRequest("r1")
 
         // Drain remaining steps; r1 must not appear in any output.
         var seenR1 = false

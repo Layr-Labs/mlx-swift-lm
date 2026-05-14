@@ -115,7 +115,7 @@ final class CBEngineCoreRequestTests: XCTestCase {
         let req = makeIntRequest()
         await engine.addRequest(req)
 
-        engine.abortRequest(req.requestId)
+        _ = engine.abortRequest(req.requestId)
 
         // Wait for the deferred engineQueue dispatch to process.
         try await Task.sleep(nanoseconds: 80_000_000)
@@ -243,7 +243,7 @@ final class CBEngineCoreGenerationTests: XCTestCase {
         }
 
         try await Task.sleep(nanoseconds: 20_000_000)
-        engine.abortRequest(rid)
+        _ = engine.abortRequest(rid)
 
         let output = await streamTask.value
         XCTAssertNotNil(output?.error)
@@ -271,7 +271,7 @@ final class CBEngineCoreGenerationTests: XCTestCase {
         }
 
         try await Task.sleep(nanoseconds: 20_000_000)
-        engine.abortRequest(req.requestId)
+        _ = engine.abortRequest(req.requestId)
 
         do {
             _ = try await generateTask.value
@@ -384,7 +384,7 @@ final class CBEngineCoreThreadSafetyTests: XCTestCase {
         engine.start()
 
         await withTaskGroup(of: Void.self) { group in
-            for i in 0 ..< 20 {
+            for _ in 0 ..< 20 {
                 group.addTask {
                     await engine.addRequest(makeIntRequest(tokens: [3], maxTokens: 5))
                 }

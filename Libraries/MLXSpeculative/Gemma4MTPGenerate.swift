@@ -70,7 +70,7 @@ public func generateGemma4MTP(
 
     // Build the iterator outside the stream closure so init errors can
     // throw synchronously. Prefill runs inside init.
-    var iter = try Gemma4MTPTokenIterator(
+    let iter = try Gemma4MTPTokenIterator(
         input: input,
         target: gemma4,
         drafter: drafter,
