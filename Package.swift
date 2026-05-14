@@ -36,11 +36,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        // Use local fork worktree with loader patches (Layr-Labs/mlx-swift on
-        // branch opt/load-perf). `name:` forces the dependency to be visible
-        // as `mlx-swift` to target deps even though the path is named
-        // differently.
-        .package(name: "mlx-swift", path: "/Users/gaj/Documents/Builds/MLX-Swift/mlx-swift-fork-opt"),
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
     ],
     targets: [
