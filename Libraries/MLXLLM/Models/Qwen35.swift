@@ -49,6 +49,11 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     var moeIntermediateSize: Int = 0
     var normTopkProb: Bool = true
 
+    // MTP — number of Multi-Token Prediction head layers.
+    // Port of omlx commit 696d90a: patches/mlx_lm_mtp/qwen35_model.py
+    // `_patch_text_model_args` attaches this from config.json at runtime.
+    var mtpNumHiddenLayers: Int = 0
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case hiddenSize = "hidden_size"
@@ -77,6 +82,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case sharedExpertIntermediateSize = "shared_expert_intermediate_size"
         case moeIntermediateSize = "moe_intermediate_size"
         case normTopkProb = "norm_topk_prob"
+        case mtpNumHiddenLayers = "mtp_num_hidden_layers"
     }
 
     public init(from decoder: Decoder) throws {
@@ -129,6 +135,8 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         self.moeIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
+        self.mtpNumHiddenLayers =
+            try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
 
         let ropeContainer = try decoder.container(keyedBy: RopeParametersCodingKey.self)
         let ropeParameters = try ropeContainer.decodeIfPresent(
@@ -225,11 +233,78 @@ final class Qwen35GatedDeltaNet: Module {
         super.init()
     }
 
+    // MARK: - _processChunk (MTP helper)
+
+    /// Process one time-chunk of the linear-attention layer.
+    ///
+    /// Extracted from `callAsFunction` so the MTP verify cycle can run the prefix
+    /// (n_confirmed tokens) and draft suffix separately, snapshotting the SSM/conv
+    /// state in between for rollback on draft rejection.
+    ///
+    /// Port of omlx commit 696d90a:
+    ///   patches/mlx_lm_mtp/qwen35_model.py `GatedDeltaNet._process_chunk`
+    ///
+    /// - Parameters:
+    ///   - qkv: Already-masked QKV for this chunk [B, S_chunk, conv_dim]
+    ///   - a, b: Input projections for this chunk [B, S_chunk, ...]
+    ///   - convState: Initial conv state [B, conv_kernel_size-1, conv_dim]
+    ///   - ssmState: Initial SSM state (nil on first token)
+    ///   - mask: SSM mask for `gatedDeltaUpdate` (optional)
+    /// - Returns: `(out, newConvState, newSsmState)`
+    private func processChunk(
+        qkv: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        convState: MLXArray,
+        ssmState: MLXArray?,
+        mask: MLXArray?
+    ) -> (out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray) {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let nKeep = convKernelSize - 1
+        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
+
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let (out, newSsmState) = gatedDeltaUpdate(
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            aLog: aLog,
+            dtBias: dtBias,
+            state: ssmState,
+            mask: mask
+        )
+        return (out, newConvState, newSsmState)
+    }
+
+    // MARK: - callAsFunction
+
     func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
-        cache: MambaCache? = nil
+        cache: MambaCache? = nil,
+        nConfirmed: Int = 0
     ) -> MLXArray {
+        // Port of omlx commit 696d90a:
+        //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
@@ -245,52 +320,66 @@ final class Qwen35GatedDeltaNet: Module {
             convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
         }
 
+        // Apply mask to full qkv before any chunking.
         if let mask {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
         }
 
-        let convInput = concatenated([convState, qkv], axis: 1)
-        if let cache {
-            cache[0] = convInput[0..., (-(convKernelSize - 1))...]
+        let ssmState = cache?[1]
+        let out: MLXArray
+        let finalConvState: MLXArray
+        let finalSsmState: MLXArray
+
+        if nConfirmed > 0 && nConfirmed < S {
+            // Split at nConfirmed boundary for the MTP 2-token verify forward.
+            // Run confirmed prefix first, snapshot rollback state, then run draft.
+            // omlx: GatedDeltaNet.__call__ nConfirmed > 0 branch
+            let maskC = mask.map { $0[0..., 0..<nConfirmed] }
+            let maskD = mask.map { $0[0..., nConfirmed...] }
+
+            let (outC, convC, ssmC) = processChunk(
+                qkv: qkv[0..., 0..<nConfirmed, 0...],
+                a: a[0..., 0..<nConfirmed, 0...],
+                b: b[0..., 0..<nConfirmed, 0...],
+                convState: convState,
+                ssmState: ssmState,
+                mask: maskC
+            )
+            // Snapshot (conv_state, ssm_state) after confirmed prefix for rollback.
+            // omlx: cache.rollback_state = (conv_c, ssm_c)
+            cache?.rollbackState = (convC, ssmC)
+
+            let (outD, convF, ssmF) = processChunk(
+                qkv: qkv[0..., nConfirmed..., 0...],
+                a: a[0..., nConfirmed..., 0...],
+                b: b[0..., nConfirmed..., 0...],
+                convState: convC,
+                ssmState: ssmC,
+                mask: maskD
+            )
+            out = concatenated([outC, outD], axis: 1)
+            finalConvState = convF
+            finalSsmState = ssmF
+        } else {
+            // Standard single-chunk path (nConfirmed == 0 or S == 1).
+            let (o, c, s) = processChunk(
+                qkv: qkv, a: a, b: b,
+                convState: convState,
+                ssmState: ssmState,
+                mask: mask
+            )
+            out = o
+            finalConvState = c
+            finalSsmState = s
         }
 
-        let convOut = silu(conv1d(convInput))
-
-        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
-        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
-
-        var state = cache?[1]
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
-
-        var out: MLXArray
-
-        (out, state) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: state,
-            mask: mask
-        )
-
         if let cache {
-            cache[1] = state
+            cache[0] = finalConvState
+            cache[1] = finalSsmState
         }
 
-        out = norm(out, gate: z)
-        return outProj(out.reshaped(B, S, -1))
+        let normedOut = norm(out, gate: z)
+        return outProj(normedOut.reshaped(B, S, -1))
     }
 }
 
@@ -478,11 +567,17 @@ final class Qwen35DecoderLayer: Module {
         _ x: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
-        cache: KVCache?
+        cache: KVCache?,
+        nConfirmed: Int = 0
     ) -> MLXArray {
+        // Port of omlx commit 696d90a:
+        //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
+        // Passes nConfirmed through to the linear-attention sublayer.
         let r: MLXArray
         if isLinear {
-            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+            r = linearAttn!(
+                inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed)
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -523,7 +618,20 @@ public class Qwen35TextModelInner: Module {
         super.init()
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
+    /// Returns the pre-norm hidden state from the final layer.
+    ///
+    /// The caller (`Qwen35TextModel`) applies `norm` and the LM head on top.
+    /// This split lets `callWithHidden` return both pre-norm hidden (for the MTP head)
+    /// and the normalised logits in one forward pass.
+    ///
+    /// Port of omlx commit 696d90a:
+    ///   patches/mlx_lm_mtp/qwen35_model.py `_patch_qwen3_5_text_model`
+    ///   (returns hidden_states before self.model.norm so TextModel can apply it)
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        nConfirmed: Int = 0
+    ) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
 
         var cacheArray = cache
@@ -540,10 +648,12 @@ public class Qwen35TextModelInner: Module {
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
-                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+                hiddenStates, attentionMask: attnMask, ssmMask: mask,
+                cache: cacheArray?[i], nConfirmed: nConfirmed)
         }
 
-        return norm(hiddenStates)
+        // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
+        return hiddenStates
     }
 
     func callCapturingDFlashHiddenStates(
@@ -592,6 +702,11 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    /// MTP head. Non-nil only when `_qwen35MTPEnabled == true` at init time
+    /// AND `args.mtpNumHiddenLayers > 0`.
+    /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
+    @ModuleInfo(key: "mtp") var mtp: Qwen35MTPModule?
+
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
@@ -601,10 +716,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+
+        // Attach MTP head only when enabled and config declares MTP layers.
+        // omlx: `if n_mtp > 0 and is_mtp_active(): self.mtp = q35.MTPModule(args)`
+        if args.mtpNumHiddenLayers > 0 && _qwen35MTPEnabled {
+            _mtp.wrappedValue = Qwen35MTPModule(args)
+        }
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        applyLMHead(model(inputs, cache: cache))
+        // Inner model returns pre-norm hidden for MTP; normal generation applies
+        // final norm and the raw LM head here.
+        applyLMHead(model.norm(model(inputs, cache: cache)))
     }
 
     public var dFlashVocabularySize: Int { vocabularySize }
@@ -652,24 +775,51 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        let hasMTPWeights = weights.keys.contains { $0.contains("mtp.") }
+        // Port of omlx commit 696d90a:
+        //   patches/mlx_lm_mtp/qwen35_model.py TextModel.sanitize
+        //
+        // Key differences from stock mlx-lm:
+        //  1. Gate norm shift on unsanitized conv1d shape ONLY (not on MTP key presence).
+        //     Stock code uses `hasMTPWeights || hasUnsanitizedConv1d`, which double-shifts
+        //     already-converted MLX checkpoints that have mtp.* keys.
+        //  2. Keep mtp.* keys when the MTP head is attached; strip them otherwise.
+        //  3. Extend norm-shift key set with MTP-specific norm names.
+
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
+        let shouldShiftNormWeights = hasUnsanitizedConv1d  // NOT hasMTPWeights
 
-        var weights = weights.filter { !$0.key.contains("mtp.") }
+        var weights = weights
+
+        // Keep mtp.* keys if the head is attached; strip them otherwise.
+        // omlx: `if not hasattr(self, "mtp"): weights = {k:v if "mtp." not in k}`
+        if mtp == nil {
+            weights = weights.filter { !$0.key.contains("mtp.") }
+        } else if !weights.keys.contains(where: { $0.contains("mtp.") }) {
+            // MTP enabled but no mtp.* keys in checkpoint → needs re-conversion.
+            // omlx: raises ValueError with "weights are missing the mtp.* tensors"
+            print(
+                "[WARNING] Qwen35TextModel.sanitize: MTP head is enabled but no mtp.* "
+                + "weights found. Load will likely fail or produce garbage. "
+                + "Re-convert the checkpoint with a converter that preserves MTP weights.")
+        }
 
         if configuration.tieWordEmbeddings {
             weights["lm_head.weight"] = nil
         }
 
+        // Extended norm key set includes MTP-specific names.
+        // omlx: norm_keys tuple with ".pre_fc_norm_hidden.weight" etc.
         let normKeys = [
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         ]
 
         for k in Array(weights.keys) {
@@ -687,6 +837,54 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
         }
 
         return weights
+    }
+}
+
+// MARK: - Qwen35TextModel + MTPCapable
+
+extension Qwen35TextModel: MTPCapable {
+    /// Run a backbone forward that also returns pre-norm hidden states.
+    /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
+    public func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        let cacheOpt: [KVCache?] = cache.map { Optional($0) }
+        let hidden = model(input.tokens, cache: cacheOpt, nConfirmed: nConfirmed)
+        let normed = model.norm(hidden)
+        let logits: MLXArray
+        if let lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = model.embedTokens.asLinear(normed)
+        }
+        return (logits, hidden)
+    }
+
+    /// Run the MTP head forward.
+    /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.mtp_forward
+    public func mtpForward(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        guard let mtp else {
+            fatalError("mtpForward called but MTP head is not attached. "
+                + "Set _qwen35MTPEnabled = true before loading the model.")
+        }
+        let mtpOut = mtp(
+            hidden: hidden,
+            nextTokenIds: nextTokenIds,
+            embedTokens: model.embedTokens,
+            cache: cache)
+        if configuration.tieWordEmbeddings {
+            return model.embedTokens.asLinear(mtpOut)
+        }
+        return lmHead!(mtpOut)
+    }
+
+    /// Allocate a fresh KV cache for the MTP head layers.
+    /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.make_mtp_cache
+    public func makeMTPCache() -> [any KVCache] {
+        guard let mtp else { return [] }
+        return mtp.layers.map { _ in KVCacheSimple() as any KVCache }
     }
 }
 
@@ -764,5 +962,28 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, DFlashTarg
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+// MARK: - Qwen35Model + MTPCapable
+
+/// VLM-outer-wrapper pass-through for MTPCapable.
+/// Forwards all MTP calls to the inner `languageModel` (a Qwen35TextModel).
+/// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
+extension Qwen35Model: MTPCapable {
+    public func callWithHidden(
+        input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
+    ) -> (MLXArray, MLXArray) {
+        languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func mtpForward(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        languageModel.mtpForward(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    public func makeMTPCache() -> [any KVCache] {
+        languageModel.makeMTPCache()
     }
 }

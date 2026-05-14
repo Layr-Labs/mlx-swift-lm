@@ -209,6 +209,35 @@ extension LanguageModel {
     }
 }
 
+/// Protocol for models that support Multi-Token Prediction (MTP) speculative decoding.
+///
+/// MTP embeds a lightweight draft head inside the model. After each backbone forward,
+/// the head proposes token t+2 from the pre-norm hidden state at t+1. A subsequent
+/// 2-token verify forward confirms or rejects the draft in one pass.
+///
+/// Eligibility: single-sequence batches only (`batchSize == 1`).
+/// Throughput (greedy, accept rate p): ~1.74× at p≈1.0, ~1.30× at p≈0.5.
+///
+/// Port of omlx commit 696d90a:
+///   patches/mlx_lm_mtp/qwen35_model.py (_patch_text_model / _patch_outer_model)
+///   patches/mlx_lm_mtp/batch_generator.py (_is_mtp_eligible)
+public protocol MTPCapable: LanguageModel {
+    /// Run the MTP head. `hidden` is pre-norm hidden from the backbone at position t.
+    /// `nextTokenIds` shape: [1, S] (usually S=1). Returns logits [1, S, vocab].
+    /// omlx: TextModel.mtp_forward
+    func mtpForward(hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]) -> MLXArray
+
+    /// Allocate fresh KV caches for the MTP head layers.
+    /// omlx: TextModel.make_mtp_cache
+    func makeMTPCache() -> [any KVCache]
+
+    /// Forward pass that also returns pre-norm hidden states.
+    /// - Parameter nConfirmed: Confirmed prefix length for the 2-token verify input (0 = standard).
+    /// - Returns: `(logits [B, S, vocab], preNormHidden [B, S, hiddenSize])`
+    /// omlx: TextModel.__call__ with return_hidden=True + n_confirmed
+    func callWithHidden(input: LMInput.Text, cache: [any KVCache], nConfirmed: Int) -> (MLXArray, MLXArray)
+}
+
 /// Optional protocol that can be implemented by ``LanguageModel`` and will
 /// provide an automatic implementation of ``LanguageModel/newCache(parameters:)``
 public protocol KVCacheDimensionProvider {

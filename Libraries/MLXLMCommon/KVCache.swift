@@ -1099,6 +1099,13 @@ public class ArraysCache: BaseKVCache {
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
 
+    /// Snapshot of `(conv_state, ssm_state)` after the confirmed prefix in a 2-token
+    /// verify forward. Written by `Qwen35GatedDeltaNet` when `nConfirmed > 0` so that
+    /// a rejected draft can restore the SSM state exactly.
+    /// Cleared on accept; restored on reject.
+    /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
+    public var rollbackState: (MLXArray, MLXArray)? = nil
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }
