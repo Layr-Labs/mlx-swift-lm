@@ -28,23 +28,51 @@ public func loadWeights(
         }
     }
 
-    // load the weights and collect metadata from the first safetensor file
-    var weights = [String: MLXArray]()
-    var metadata = [String: String]()
+    // Gather the shard URLs first so we can fan them out concurrently.
+    var shardURLs: [URL] = []
     let enumerator = FileManager.default.enumerator(
         at: modelDirectory, includingPropertiesForKeys: nil)!
-    for case let url as URL in enumerator {
-        if url.pathExtension == "safetensors" {
-            let (w, m) = try loadArraysAndMetadata(url: url)
-            for (key, value) in w {
-                weights[key] = value
+    for case let url as URL in enumerator where url.pathExtension == "safetensors" {
+        shardURLs.append(url)
+    }
+    shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
+
+    // Load shards in parallel. Each task forces eval() on its arrays so MLX
+    // actually performs the disk read inside the task rather than deferring all
+    // of it to a single later eval(model) call. This lets concurrent shards
+    // overlap their I/O.
+    typealias ShardResult = (weights: [String: MLXArray], metadata: [String: String])
+    let resultsLock = NSLock()
+    var shardResults: [ShardResult?] = Array(repeating: nil, count: shardURLs.count)
+    var shardError: Error?
+
+    DispatchQueue.concurrentPerform(iterations: shardURLs.count) { idx in
+        do {
+            let (w, m) = try loadArraysAndMetadata(url: shardURLs[idx])
+            // Force materialization of this shard now so the disk read happens
+            // concurrently with other shards' reads, instead of all being
+            // deferred to a single later eval(model) call.
+            if !w.isEmpty {
+                eval(Array(w.values))
             }
-            if metadata.isEmpty {
-                metadata = m
-            }
+            resultsLock.lock()
+            shardResults[idx] = (w, m)
+            resultsLock.unlock()
+        } catch {
+            resultsLock.lock()
+            if shardError == nil { shardError = error }
+            resultsLock.unlock()
         }
     }
-    mark("read shards")
+    if let shardError { throw shardError }
+
+    var weights = [String: MLXArray]()
+    var metadata = [String: String]()
+    for case let (w, m)? in shardResults {
+        for (key, value) in w { weights[key] = value }
+        if metadata.isEmpty { metadata = m }
+    }
+    mark("read shards (parallel)")
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)

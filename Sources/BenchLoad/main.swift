@@ -46,12 +46,14 @@ struct BenchLoad {
 
         do {
             // Warmup runs (page cache warming, JIT-ish overhead, etc.)
-            for i in 1...max(warmup, 0) {
-                let start = CFAbsoluteTimeGetCurrent()
-                _ = try await loadModelContainer(from: directory, using: tokenizerLoader)
-                let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
-                print("  [warmup \(i)] \(String(format: "%.1f", elapsed)) ms")
-                Memory.clearCache()
+            if warmup > 0 {
+                for i in 1...warmup {
+                    let start = CFAbsoluteTimeGetCurrent()
+                    _ = try await loadModelContainer(from: directory, using: tokenizerLoader)
+                    let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
+                    print("  [warmup \(i)] \(String(format: "%.1f", elapsed)) ms")
+                    Memory.clearCache()
+                }
             }
 
             // Timed runs
