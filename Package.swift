@@ -146,6 +146,17 @@ let package = Package(
             ],
             path: "Libraries/MLXHuggingFace"
         ),
+        .executableTarget(
+            name: "BenchLoad",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "BenchmarkHelpers",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Sources/BenchLoad"
+        ),
     ]
 )
 
