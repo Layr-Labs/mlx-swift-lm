@@ -4,6 +4,32 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Lock-protected scratch space used by the parallel shard reader. Wrapped in
+/// a final class so Swift 6 strict concurrency can see we mean to share it
+/// across the concurrent closures.
+private final class ParallelShardState: @unchecked Sendable {
+    typealias ShardResult = (weights: [String: MLXArray], metadata: [String: String])
+    let lock = NSLock()
+    var results: [ShardResult?]
+    var firstError: Error?
+
+    init(shardCount: Int) {
+        self.results = Array(repeating: nil, count: shardCount)
+    }
+
+    func store(index: Int, result: ShardResult) {
+        lock.lock()
+        defer { lock.unlock() }
+        results[index] = result
+    }
+
+    func recordError(_ error: Error) {
+        lock.lock()
+        defer { lock.unlock() }
+        if firstError == nil { firstError = error }
+    }
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -42,35 +68,30 @@ public func loadWeights(
     // of it to a single later eval(model) call. This lets concurrent shards
     // overlap their I/O.
     typealias ShardResult = (weights: [String: MLXArray], metadata: [String: String])
-    let resultsLock = NSLock()
-    var shardResults: [ShardResult?] = Array(repeating: nil, count: shardURLs.count)
-    var shardError: Error?
+    let shared = ParallelShardState(shardCount: shardURLs.count)
+    let urls = shardURLs  // immutable Sendable snapshot for the closure
 
-    DispatchQueue.concurrentPerform(iterations: shardURLs.count) { idx in
+    DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
         do {
-            let (w, m) = try loadArraysAndMetadata(url: shardURLs[idx])
-            // Force materialization of this shard now so the disk read happens
-            // concurrently with other shards' reads, instead of all being
-            // deferred to a single later eval(model) call.
+            let (w, m) = try loadArraysAndMetadata(url: urls[idx])
             if !w.isEmpty {
                 eval(Array(w.values))
             }
-            resultsLock.lock()
-            shardResults[idx] = (w, m)
-            resultsLock.unlock()
+            shared.store(index: idx, result: (w, m))
         } catch {
-            resultsLock.lock()
-            if shardError == nil { shardError = error }
-            resultsLock.unlock()
+            shared.recordError(error)
         }
     }
-    if let shardError { throw shardError }
+    if let err = shared.firstError { throw err }
 
     var weights = [String: MLXArray]()
     var metadata = [String: String]()
-    for case let (w, m)? in shardResults {
+    for (i, slot) in shared.results.enumerated() {
+        guard let (w, m) = slot else { continue }
         for (key, value) in w { weights[key] = value }
-        if metadata.isEmpty { metadata = m }
+        // Match the original "first iterated shard's metadata" semantics by
+        // taking shard 0's, falling back to next non-empty for safety.
+        if i == 0 || metadata.isEmpty { metadata = m }
     }
     mark("read shards (parallel)")
 
