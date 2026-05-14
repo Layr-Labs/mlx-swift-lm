@@ -89,7 +89,8 @@ final class CBSchedulerTests: XCTestCase {
         s.addRequest(makeIntRequest(tokens: [1], maxTokens: 10))
         s.addRequest(makeIntRequest(tokens: [6], maxTokens: 10))
 
-        _ = s.step()   // admits both, runs first decode step
+        _ = s.step()   // admits both into pending prefill
+        _ = s.step()   // promotes the prefilled batch into decode state
 
         XCTAssertEqual(s.getNumRunning(), 2)
     }
