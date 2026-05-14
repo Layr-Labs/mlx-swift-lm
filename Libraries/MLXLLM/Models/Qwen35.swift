@@ -655,9 +655,45 @@ public class Qwen35TextModelInner: Module {
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
     }
+
+    func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+
+        var hiddenStates = embedTokens(inputs)
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+
+        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let captureIds = Set(targetLayerIds)
+        var captured = [Int: MLXArray]()
+        captured.reserveCapacity(targetLayerIds.count)
+
+        for (i, layer) in layers.enumerated() {
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask =
+                layer.isLinear
+                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            hiddenStates = layer(
+                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            if captureIds.contains(i) {
+                captured[i] = hiddenStates
+            }
+        }
+
+        let hiddenStatesOut = targetLayerIds.map { captured[$0]! }
+        return (norm(hiddenStates), hiddenStatesOut)
+    }
 }
 
-public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -689,10 +725,38 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        // Inner model now returns pre-norm hidden; apply norm + lm_head here.
-        // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
-        let hidden = model(inputs, cache: cache)
-        var out = model.norm(hidden)
+        // Inner model returns pre-norm hidden for MTP; normal generation applies
+        // final norm and the raw LM head here.
+        applyLMHead(model.norm(model(inputs, cache: cache)))
+    }
+
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { configuration.hiddenSize }
+    public var dFlashLayerCount: Int { configuration.hiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: applyLMHead(forward.postNorm),
+            hiddenStates: forward.hiddenStates
+        )
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        applyLMHead(hidden)
+    }
+
+    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        var out = hidden
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -842,7 +906,7 @@ extension Qwen35TextModel: LoRAModel {
 
 // MARK: - Top-level Model
 
-public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -857,6 +921,27 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    public var dFlashVocabularySize: Int { languageModel.dFlashVocabularySize }
+    public var dFlashHiddenSize: Int { languageModel.dFlashHiddenSize }
+    public var dFlashLayerCount: Int { languageModel.dFlashLayerCount }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        try languageModel.forwardForDFlash(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        languageModel.embedTokensForDFlash(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        languageModel.logitsForDFlashHidden(hidden)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

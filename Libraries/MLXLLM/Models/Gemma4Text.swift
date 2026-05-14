@@ -9,6 +9,248 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+private func gemma4EnvironmentFlag(_ key: String) -> Bool {
+    switch ProcessInfo.processInfo.environment[key]?.lowercased() {
+    case "1", "true", "yes", "on":
+        true
+    default:
+        false
+    }
+}
+
+private func gemma4EnvironmentFlagOverride(_ key: String) -> Bool? {
+    switch ProcessInfo.processInfo.environment[key]?.lowercased() {
+    case "1", "true", "yes", "on":
+        true
+    case "0", "false", "no", "off":
+        false
+    default:
+        nil
+    }
+}
+
+private let gemma4DFlashSequentialVerifyOverride =
+    gemma4EnvironmentFlagOverride("MLX_GEMMA4_DFLASH_SEQUENTIAL_VERIFY")
+
+private let gemma4DFlashOfficialFast =
+    gemma4EnvironmentFlag("MLX_GEMMA4_DFLASH_OFFICIAL_FAST")
+
+private let gemma4DFlashAutoVerify: Bool = {
+    if gemma4DFlashOfficialFast {
+        return false
+    }
+    if gemma4DFlashSequentialVerifyOverride != nil {
+        return false
+    }
+    if gemma4EnvironmentFlag("MLX_GEMMA4_DFLASH_BATCHED_VECTOR_VERIFY") {
+        return false
+    }
+    return gemma4EnvironmentFlagOverride("MLX_GEMMA4_DFLASH_AUTO_VERIFY") ?? true
+}()
+
+private let gemma4DFlashBaseSafeVectorTokensOverride: Int? = {
+    guard let raw = ProcessInfo.processInfo.environment["MLX_GEMMA4_DFLASH_SAFE_VECTOR_TOKENS"],
+        let value = Int(raw), value > 0
+    else {
+        return nil
+    }
+    return value
+}()
+
+private let gemma4DFlashBaseSafeVectorTokens = gemma4DFlashBaseSafeVectorTokensOverride ?? 1
+
+private let gemma4DFlashPerSequenceSafeVectorTokens: [Int: Int] = [:]
+
+private let gemma4DFlashK16SafeVectorTokens: Int = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "MLX_GEMMA4_DFLASH_K16_SAFE_VECTOR_TOKENS"],
+        let value = Int(raw), value > 0
+    else {
+        return 1
+    }
+    return value
+}()
+
+package func gemma4DFlashAutoVectorSuffixLength(
+    sequenceLength: Int,
+    baseSafeVectorTokens: Int = gemma4DFlashBaseSafeVectorTokens,
+    k16SafeVectorTokens: Int = gemma4DFlashK16SafeVectorTokens,
+    perSequenceSafeVectorTokens: [Int: Int] = gemma4DFlashPerSequenceSafeVectorTokens
+) -> Int {
+    guard sequenceLength > 0 else { return 0 }
+    if sequenceLength <= baseSafeVectorTokens {
+        return sequenceLength
+    }
+    if sequenceLength == 16 {
+        return Swift.min(k16SafeVectorTokens, sequenceLength - 1)
+    }
+    if let safeVectorTokens = perSequenceSafeVectorTokens[sequenceLength] {
+        return Swift.min(Swift.max(1, safeVectorTokens), sequenceLength - 1)
+    }
+    return Swift.min(baseSafeVectorTokens, sequenceLength - 1)
+}
+
+private let gemma4DFlashSequentialVerify: Bool = {
+    if gemma4DFlashOfficialFast {
+        return false
+    }
+    if let override = gemma4DFlashSequentialVerifyOverride {
+        return override
+    }
+    if gemma4DFlashAutoVerify {
+        return true
+    }
+    if gemma4EnvironmentFlag("MLX_GEMMA4_DFLASH_BATCHED_VECTOR_VERIFY") {
+        return false
+    }
+    return true
+}()
+
+private let gemma4DFlashBatchedVectorVerify =
+    gemma4EnvironmentFlag("MLX_GEMMA4_DFLASH_BATCHED_VECTOR_VERIFY")
+
+private let gemma4DFlashArrayVerifyMask: Bool = {
+    gemma4EnvironmentFlagOverride("MLX_GEMMA4_DFLASH_ARRAY_VERIFY_MASK") ?? true
+}()
+
+private let gemma4DFlashMixedVerify: Bool = {
+    gemma4EnvironmentFlagOverride("MLX_GEMMA4_DFLASH_MIXED_VERIFY") ?? false
+}()
+
+private let gemma4DFlashEarlyStopSequentialVerify: Bool = {
+    gemma4EnvironmentFlagOverride("MLX_GEMMA4_DFLASH_EARLY_STOP_VERIFY") ?? true
+}()
+
+private let gemma4DFlashReplayRollback: Bool = {
+    if gemma4DFlashOfficialFast {
+        return false
+    }
+    return gemma4EnvironmentFlagOverride("MLX_GEMMA4_DFLASH_REPLAY_ROLLBACK")
+        ?? gemma4DFlashSequentialVectorAttention
+}()
+
+private let gemma4MLPFuseGateUp: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_GEMMA4_MLP_FUSE_GATE_UP"] {
+        switch raw.lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+    return true
+}()
+
+private let gemma4ExpertWeightSumKernel: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_GEMMA4_EXPERT_WEIGHT_SUM_KERNEL"] {
+        switch raw.lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+    return true
+}()
+
+private let gemma4RouterTopKKernel: Bool = {
+    switch ProcessInfo.processInfo.environment["MLX_GEMMA4_ROUTER_TOPK_KERNEL"]?.lowercased() {
+    case "1", "true", "yes", "on":
+        return true
+    default:
+        return false
+    }
+}()
+
+private let gemma4RouterWeightsKernel: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_GEMMA4_ROUTER_WEIGHTS_KERNEL"] {
+        switch raw.lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+    return false
+}()
+
+private let gemma4RouterCompiledWeights: Bool = {
+    switch ProcessInfo.processInfo.environment["MLX_GEMMA4_ROUTER_COMPILED_WEIGHTS"]?
+        .lowercased()
+    {
+    case "1", "true", "yes", "on":
+        return true
+    default:
+        return false
+    }
+}()
+
+private let gemma4AttentionFuseQK: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_GEMMA4_ATTENTION_FUSE_QK"] {
+        switch raw.lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+    return true
+}()
+
+private let gemma4DFlashSequentialVectorAttention =
+    gemma4EnvironmentFlag("MLX_GEMMA4_DFLASH_SEQUENTIAL_VECTOR_ATTENTION")
+
+private let gemma4DFlashSmallRowFusions: Bool = {
+    switch ProcessInfo.processInfo.environment["MLX_GEMMA4_DFLASH_SMALL_ROW_FUSIONS"]?
+        .lowercased()
+    {
+    case "0", "false", "no", "off":
+        return false
+    case "1", "true", "yes", "on":
+        return true
+    default:
+        return false
+    }
+}()
+
+private let gemma4DFlashVerifyFusionMaxRows: Int = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "MLX_GEMMA4_DFLASH_VERIFY_FUSION_MAX_ROWS"],
+        let value = Int(raw),
+        value > 0
+    else {
+        return 16
+    }
+    return value
+}()
+
+private let gemma4DFlashExpertSmallRowWeightSumKernel =
+    gemma4EnvironmentFlag("MLX_GEMMA4_DFLASH_EXPERT_SMALL_ROW_SUM_KERNEL")
+
+private func gemma4UseDFlashSmallRowFusions(batch: Int, tokenRows: Int) -> Bool {
+    (gemma4DFlashSmallRowFusions || DFlashTargetRuntimeOptions.smallRowVerifyFusionsEnabled)
+        && !DFlashTargetRuntimeOptions.smallRowVerifyFusionsDisabled
+        && batch == 1
+        && tokenRows <= gemma4DFlashVerifyFusionMaxRows
+}
+
+private func gemma4UseDFlashVerifyFusions(batch: Int, tokenRows: Int) -> Bool {
+    tokenRows == 16 || gemma4UseDFlashSmallRowFusions(batch: batch, tokenRows: tokenRows)
+}
+
+private let gemma4CompiledGELUGateUp: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, up in
+    geluApproximate(gate) * up
+}
+
+private let gemma4CompiledRouterWeights: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { scores, indices, perExpertScale in
+        MLX.softmax(scores, axis: -1, precise: true) * perExpertScale[indices]
+    }
+
 // MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
@@ -236,13 +478,94 @@ private class ScaledLinear: Module {
     }
 }
 
+private final class Gemma4DFlashHiddenCapture {
+    private let positionsByLayer: [Int?]
+    private var hiddenStates: [MLXArray?]
+
+    init(layerIds: [Int], layerCount: Int) {
+        var positions = Array<Int?>(repeating: nil, count: layerCount)
+        for (position, layerId) in layerIds.enumerated() {
+            positions[layerId] = position
+        }
+        self.positionsByLayer = positions
+        self.hiddenStates = Array<MLXArray?>(repeating: nil, count: layerIds.count)
+    }
+
+    @inline(__always)
+    func capture(_ hidden: MLXArray, layer: Int) {
+        if let position = positionsByLayer[layer] {
+            hiddenStates[position] = hidden
+        }
+    }
+
+    func orderedHiddenStates() -> [MLXArray] {
+        hiddenStates.map { $0! }
+    }
+}
+
+private final class Gemma4DFlashTrunkTimings {
+    var embeddingSeconds = 0.0
+    var pleSeconds = 0.0
+    var maskSeconds = 0.0
+    var attentionSeconds = 0.0
+    var denseMLPSeconds = 0.0
+    var routerSeconds = 0.0
+    var expertsSeconds = 0.0
+    var pleGateSeconds = 0.0
+    var finalNormSeconds = 0.0
+}
+
+public struct Gemma4DFlashLayerComponentForward: @unchecked Sendable {
+    public let attentionStates: [MLXArray]
+    public let layerOutputs: [MLXArray]
+
+    public init(attentionStates: [MLXArray], layerOutputs: [MLXArray]) {
+        self.attentionStates = attentionStates
+        self.layerOutputs = layerOutputs
+    }
+}
+
+private final class Gemma4DFlashLayerComponentCapture {
+    let layerIds: Set<Int>
+    var attentionStates = [Int: MLXArray]()
+    var layerOutputs = [Int: MLXArray]()
+
+    init(layerIds: [Int]) {
+        self.layerIds = Set(layerIds)
+        self.attentionStates.reserveCapacity(layerIds.count)
+        self.layerOutputs.reserveCapacity(layerIds.count)
+    }
+}
+
+private enum Gemma4DFlashTimingContext {
+    nonisolated(unsafe) static var current: Gemma4DFlashTrunkTimings?
+}
+
+private enum Gemma4DFlashLayerComponentContext {
+    nonisolated(unsafe) static var current: Gemma4DFlashLayerComponentCapture?
+}
+
+@inline(__always)
+private func gemma4TimingStart() -> Date? {
+    Gemma4DFlashTimingContext.current == nil ? nil : Date()
+}
+
+@inline(__always)
+private func gemma4Record(
+    _ start: Date?,
+    _ update: (Gemma4DFlashTrunkTimings, Double) -> Void
+) {
+    guard let start, let timings = Gemma4DFlashTimingContext.current else { return }
+    update(timings, Date().timeIntervalSince(start))
+}
+
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let batchCache = cache as? BatchPositionedKVCache {
         // Snapshot the per-sequence offsets before cache.update(...) advances them.
-        .batch(batchCache.batchOffset + 0)
+        return .batch(batchCache.batchOffset + 0)
     } else {
-        .scalar(cache?.offset ?? 0)
+        return .scalar(cache?.offset ?? 0)
     }
 }
 
@@ -258,71 +581,6 @@ internal func gemma4ApplyRotaryPosition<R: RoPELayer>(
     case .batch(let values):
         rope(x, offset: values)
     }
-}
-
-private func gemma4AttentionFallback(
-    queries: MLXArray,
-    keys: MLXArray,
-    values: MLXArray,
-    scale: Float,
-    mask: MLXFast.ScaledDotProductAttentionMaskMode
-) -> MLXArray {
-    let (B, nQHeads, L, D) = (
-        queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)
-    )
-    let nKVHeads = keys.dim(1)
-    let repeats = nQHeads / nKVHeads
-
-    var q = queries * scale
-    var k = keys
-    var v = values
-    if repeats > 1 {
-        q = q.reshaped([B, nKVHeads, repeats, L, D])
-        k = expandedDimensions(k, axis: 2)
-        v = expandedDimensions(v, axis: 2)
-    }
-
-    var scores = matmul(q, k.swappedAxes(-1, -2))
-
-    func applyMask(_ maskArray: MLXArray) {
-        var mask = maskArray
-        if scores.ndim == 5 && mask.ndim == 4 && mask.dim(0) == scores.dim(0) {
-            mask = expandedDimensions(mask, axis: 2)
-        }
-        if mask.dtype == .bool {
-            scores = MLX.where(
-                mask, scores, MLXArray(-Float.infinity, dtype: scores.dtype))
-        } else {
-            scores = scores + mask
-        }
-    }
-
-    switch mask {
-    case .none:
-        break
-    case .causal:
-        let qL = scores.dim(-2)
-        let kL = scores.dim(-1)
-        let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
-        let kIndices = MLXArray(0 ..< kL)
-        let causalMask = greaterEqual(
-            expandedDimensions(qIndices, axis: -1),
-            expandedDimensions(kIndices, axis: -2))
-        applyMask(causalMask)
-    case .array(let maskArray):
-        applyMask(maskArray)
-    case .arrays(let maskArrays):
-        if let maskArray = maskArrays.first {
-            applyMask(maskArray)
-        }
-    }
-
-    scores = softmax(scores.asType(.float32), axis: -1, precise: true).asType(scores.dtype)
-    var output = matmul(scores, v)
-    if repeats > 1 {
-        output = output.reshaped([B, nQHeads, L, values.dim(3)])
-    }
-    return output
 }
 
 // MARK: - Attention
@@ -349,6 +607,11 @@ private class Gemma4Attention: Module {
     @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale?
 
     @ModuleInfo var rope: RoPELayer
+
+    private var fusedQKProj: DFlashVerifyQuantizedLinear?
+    private var fusedQKVProj: DFlashVerifyQuantizedLinear?
+    private var fusedQKUnavailable = false
+    private var fusedQKVUnavailable = false
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false) {
         self.config = config
@@ -415,7 +678,42 @@ private class Gemma4Attention: Module {
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+        let qRaw: MLXArray
+        let fusedKRaw: MLXArray?
+        let fusedVRaw: MLXArray?
+        let tokenRows = x.shape.dropLast().reduce(1, *)
+        if sharedKV == nil,
+            gemma4AttentionFuseQK,
+            tokenRows > 0,
+            gemma4UseDFlashVerifyFusions(batch: B, tokenRows: tokenRows),
+            let fusedQKV = fusedQKV()
+        {
+            let qkv = fusedQKV(x)
+            let qDim = nHeads * effectiveHeadDim
+            let kvDim = nKvHeads * effectiveHeadDim
+            let parts = qkv.split(indices: [qDim, qDim + kvDim], axis: -1)
+            qRaw = parts[0]
+            fusedKRaw = parts[1]
+            fusedVRaw = parts[2]
+        } else if sharedKV == nil,
+            gemma4AttentionFuseQK,
+            tokenRows > 0,
+            gemma4UseDFlashVerifyFusions(batch: B, tokenRows: tokenRows),
+            let fusedQK = fusedQK()
+        {
+            let qk = fusedQK(x)
+            let qDim = nHeads * effectiveHeadDim
+            let parts = qk.split(indices: [qDim], axis: -1)
+            qRaw = parts[0]
+            fusedKRaw = parts[1]
+            fusedVRaw = nil
+        } else {
+            qRaw = qProj(x)
+            fusedKRaw = nil
+            fusedVRaw = nil
+        }
+
+        var queries = qRaw.reshaped(B, L, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
 
         let keys: MLXArray
@@ -431,7 +729,8 @@ private class Gemma4Attention: Module {
                 preconditionFailure("Gemma4 shared-KV layers require sharedKV input")
             }
 
-            let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            let kProjected = fusedKRaw ?? kProj(x)
+            let kRaw = kProjected.reshaped(B, L, nKvHeads, effectiveHeadDim)
             var k = kNorm(kRaw)
             k = k.transposed(0, 2, 1, 3)
             k = gemma4ApplyRotaryPosition(rope, to: k, offset: activePositionOffset)
@@ -441,7 +740,9 @@ private class Gemma4Attention: Module {
             // through its own `vNorm` and transpose to land in the same
             // `[B, n_kv_heads, L, D]` layout as keys.
             var v: MLXArray
-            if let vProj {
+            if let fusedVRaw {
+                v = fusedVRaw.reshaped(B, L, nKvHeads, effectiveHeadDim)
+            } else if let vProj {
                 v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
             } else {
                 v = kRaw
@@ -471,37 +772,159 @@ private class Gemma4Attention: Module {
             }
         }
 
-        let hasCachedPrefix: Bool
-        switch activePositionOffset {
-        case .scalar(let offset):
-            hasCachedPrefix = offset > 0
-        case .batch:
-            hasCachedPrefix = true
-        }
-
-        let attention: MLXArray
-        if L > 1 && hasCachedPrefix {
-            attention = gemma4AttentionFallback(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: adjustedMask ?? .none)
-        } else {
-            attention = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: adjustedMask ?? .none
-            )
-        }
-
-        let output = attention
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let hadCacheContext =
+            switch activePositionOffset {
+            case .scalar(let offset): offset > 0
+            case .batch: false
+            }
+        let attentionOutput =
+            if gemma4DFlashSequentialVectorAttention,
+                B == 1,
+                L > 1,
+                sharedKV == nil,
+                hadCacheContext
+            {
+                sequentialVectorAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    tokenCount: L
+                )
+            } else {
+                MLXFast.scaledDotProductAttention(
+                    queries: queries,
+                    keys: keys,
+                    values: values,
+                    scale: scale,
+                    mask: adjustedMask ?? .none
+                )
+            }
+        let output = attentionOutput
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return (oProj(output), (keys, values), activePositionOffset)
+    }
+
+    private func sequentialVectorAttention(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        tokenCount: Int
+    ) -> MLXArray {
+        let fullKeyCount = keys.dim(2)
+        var rows = [MLXArray]()
+        rows.reserveCapacity(tokenCount)
+        for i in 0 ..< tokenCount {
+            let end = fullKeyCount - (tokenCount - i - 1)
+            let start = isSliding ? Swift.max(0, end - config.slidingWindow) : 0
+            let query = queries[0..., 0..., i ..< i + 1, 0...]
+            let key = keys[0..., 0..., start ..< end, 0...]
+            let value = values[0..., 0..., start ..< end, 0...]
+            rows.append(
+                MLXFast.scaledDotProductAttention(
+                    queries: query,
+                    keys: key,
+                    values: value,
+                    scale: scale,
+                    mask: .none
+                )
+            )
+        }
+        return concatenated(rows, axis: 2)
+    }
+
+    private func fusedQK() -> DFlashVerifyQuantizedLinear? {
+        if let fusedQKProj {
+            return fusedQKProj
+        }
+        guard !fusedQKUnavailable,
+            let q = qProj as? QuantizedLinear,
+            let k = kProj as? QuantizedLinear,
+            q.bias == nil,
+            k.bias == nil,
+            q.bits == k.bits,
+            q.groupSize == k.groupSize,
+            q.mode == k.mode,
+            q.weight.shape.dropFirst() == k.weight.shape.dropFirst(),
+            q.scales.shape.dropFirst() == k.scales.shape.dropFirst(),
+            q.biases?.shape.dropFirst() == k.biases?.shape.dropFirst(),
+            let qBiases = q.biases,
+            let kBiases = k.biases
+        else {
+            fusedQKUnavailable = true
+            return nil
+        }
+
+        let linear = QuantizedLinear(
+            weight: concatenated([q.weight, k.weight], axis: 0),
+            bias: nil,
+            scales: concatenated([q.scales, k.scales], axis: 0),
+            biases: concatenated([qBiases, kBiases], axis: 0),
+            groupSize: q.groupSize,
+            bits: q.bits,
+            mode: q.mode
+        )
+
+        guard DFlashVerifyQuantizedLinear.isEligible(linear) else {
+            fusedQKUnavailable = true
+            return nil
+        }
+
+        let fused = DFlashVerifyQuantizedLinear(linear, enableQMM: true)
+        fusedQKProj = fused
+        return fused
+    }
+
+    private func fusedQKV() -> DFlashVerifyQuantizedLinear? {
+        if let fusedQKVProj {
+            return fusedQKVProj
+        }
+        guard !fusedQKVUnavailable,
+            let q = qProj as? QuantizedLinear,
+            let k = kProj as? QuantizedLinear,
+            let v = vProj as? QuantizedLinear,
+            q.bias == nil,
+            k.bias == nil,
+            v.bias == nil,
+            q.bits == k.bits,
+            q.bits == v.bits,
+            q.groupSize == k.groupSize,
+            q.groupSize == v.groupSize,
+            q.mode == k.mode,
+            q.mode == v.mode,
+            q.weight.shape.dropFirst() == k.weight.shape.dropFirst(),
+            q.weight.shape.dropFirst() == v.weight.shape.dropFirst(),
+            q.scales.shape.dropFirst() == k.scales.shape.dropFirst(),
+            q.scales.shape.dropFirst() == v.scales.shape.dropFirst(),
+            q.biases?.shape.dropFirst() == k.biases?.shape.dropFirst(),
+            q.biases?.shape.dropFirst() == v.biases?.shape.dropFirst(),
+            let qBiases = q.biases,
+            let kBiases = k.biases,
+            let vBiases = v.biases
+        else {
+            fusedQKVUnavailable = true
+            return nil
+        }
+
+        let linear = QuantizedLinear(
+            weight: concatenated([q.weight, k.weight, v.weight], axis: 0),
+            bias: nil,
+            scales: concatenated([q.scales, k.scales, v.scales], axis: 0),
+            biases: concatenated([qBiases, kBiases, vBiases], axis: 0),
+            groupSize: q.groupSize,
+            bits: q.bits,
+            mode: q.mode
+        )
+
+        guard DFlashVerifyQuantizedLinear.isEligible(linear) else {
+            fusedQKVUnavailable = true
+            return nil
+        }
+
+        let fused = DFlashVerifyQuantizedLinear(linear, enableQMM: true)
+        fusedQKVProj = fused
+        return fused
     }
 }
 
@@ -530,24 +953,184 @@ private class Gemma4Router: Module {
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
-        self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
+        self._scale.wrappedValue = MLXArray.ones([config.hiddenSize]) * rootSize
         self._perExpertScale.wrappedValue = MLXArray.ones([numExperts])
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
-        let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let normed = MLXFast.rmsNorm(x, weight: scale, eps: eps)
         let expertScores = proj(normed)
+        let expertScoreRows = expertScores.size / expertScores.dim(-1)
 
-        let kth = expertScores.dim(-1) - topK
-        var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
-        topKIndices = topKIndices[.ellipsis, kth...]
+        if gemma4RouterTopKKernel,
+            topK == 8,
+            expertScores.dim(-1) == 128,
+            expertScoreRows == 16
+        {
+            return Gemma4RouterTopKKernelManager.apply(
+                scores: expertScores.contiguous(),
+                perExpertScale: perExpertScale.asType(expertScores.dtype).contiguous()
+            )
+        }
+
+        var topKIndices = MLX.argPartition(expertScores, kth: -topK, axis: -1)
+        topKIndices = topKIndices[.ellipsis, (-topK)...]
 
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
-        topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
-        topKWeights = topKWeights * perExpertScale[topKIndices]
+        if gemma4RouterWeightsKernel,
+            topK == 8,
+            expertScores.dim(-1) == 128,
+            topKWeights.size / 8 == 16
+        {
+            topKWeights = Gemma4RouterWeightsKernelManager.apply(
+                scores: topKWeights.contiguous(),
+                indices: topKIndices.contiguous(),
+                perExpertScale: perExpertScale.asType(topKWeights.dtype).contiguous()
+            )
+            return (topKIndices, topKWeights)
+        }
+
+        if gemma4RouterCompiledWeights {
+            topKWeights = gemma4CompiledRouterWeights(topKWeights, topKIndices, perExpertScale)
+        } else {
+            topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
+            topKWeights = topKWeights * perExpertScale[topKIndices]
+        }
 
         return (topKIndices, topKWeights)
+    }
+}
+
+private final class Gemma4RouterTopKKernelManager: Sendable {
+    static let shared = Gemma4RouterTopKKernelManager()
+
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "gemma4_router_top8_softmax_scale",
+            inputNames: ["scores", "per_expert_scale"],
+            outputNames: ["indices", "weights"],
+            source: """
+                using namespace metal;
+                constexpr uint NUM_EXPERTS = 128;
+                constexpr uint TOP_K = 8;
+
+                uint row = thread_position_in_grid.x;
+                uint base = row * NUM_EXPERTS;
+
+                float values[TOP_K];
+                uint idx[TOP_K];
+                for (uint k = 0; k < TOP_K; ++k) {
+                    values[k] = -3.402823466e38f;
+                    idx[k] = 0;
+                }
+
+                for (uint expert = 0; expert < NUM_EXPERTS; ++expert) {
+                    float v = float(scores[base + expert]);
+                    for (uint k = 0; k < TOP_K; ++k) {
+                        if (v > values[k] || (v == values[k] && expert < idx[k])) {
+                            for (uint j = TOP_K - 1; j > k; --j) {
+                                values[j] = values[j - 1];
+                                idx[j] = idx[j - 1];
+                            }
+                            values[k] = v;
+                            idx[k] = expert;
+                            break;
+                        }
+                    }
+                }
+
+                float max_value = values[0];
+                float denom = 0.0f;
+                float exp_values[TOP_K];
+                for (uint k = 0; k < TOP_K; ++k) {
+                    exp_values[k] = fast::exp(values[k] - max_value);
+                    denom += exp_values[k];
+                }
+
+                uint out_base = row * TOP_K;
+                for (uint k = 0; k < TOP_K; ++k) {
+                    uint src = TOP_K - 1 - k;
+                    uint expert = idx[src];
+                    indices[out_base + k] = expert;
+                    weights[out_base + k] = T((exp_values[src] / denom) * float(per_expert_scale[expert]));
+                }
+                """
+        )
+    }
+
+    static func apply(scores: MLXArray, perExpertScale: MLXArray) -> (
+        topKIndices: MLXArray, topKWeights: MLXArray
+    ) {
+        let outputShape = Array(scores.shape.dropLast()) + [8]
+        let outputs = shared.kernel(
+            [scores, perExpertScale],
+            template: [("T", scores.dtype)],
+            grid: (scores.size / 128, 1, 1),
+            threadGroup: (1, 1, 1),
+            outputShapes: [outputShape, outputShape],
+            outputDTypes: [.uint32, scores.dtype]
+        )
+        return (outputs[0], outputs[1])
+    }
+}
+
+private final class Gemma4RouterWeightsKernelManager: Sendable {
+    static let shared = Gemma4RouterWeightsKernelManager()
+
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "gemma4_router_top8_weights",
+            inputNames: ["scores", "indices", "per_expert_scale"],
+            outputNames: ["weights"],
+            source: """
+                constexpr uint TOP_K = 8;
+
+                uint row = thread_position_in_grid.x;
+                uint base = row * TOP_K;
+
+                float values[TOP_K];
+                float max_value = -3.402823466e38f;
+                for (uint k = 0; k < TOP_K; ++k) {
+                    float value = float(scores[base + k]);
+                    values[k] = value;
+                    max_value = max(max_value, value);
+                }
+
+                float exp_values[TOP_K];
+                float denom = 0.0f;
+                for (uint k = 0; k < TOP_K; ++k) {
+                    float exp_value = exp(values[k] - max_value);
+                    exp_values[k] = exp_value;
+                    denom += exp_value;
+                }
+
+                for (uint k = 0; k < TOP_K; ++k) {
+                    uint expert = uint(indices[base + k]);
+                    weights[base + k] =
+                        T((exp_values[k] / denom) * float(per_expert_scale[expert]));
+                }
+                """
+        )
+    }
+
+    static func apply(
+        scores: MLXArray,
+        indices: MLXArray,
+        perExpertScale: MLXArray
+    ) -> MLXArray {
+        shared.kernel(
+            [scores, indices, perExpertScale],
+            template: [("T", scores.dtype)],
+            grid: (scores.size / 8, 1, 1),
+            threadGroup: (1, 1, 1),
+            outputShapes: [scores.shape],
+            outputDTypes: [scores.dtype]
+        )[0]
     }
 }
 
@@ -572,9 +1155,162 @@ private class Gemma4Experts: Module {
     func callAsFunction(
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray
     ) -> MLXArray {
-        let w = MLX.expandedDimensions(topKWeights, axis: -1)
-        let y = switchGLU(x, topKIndices)
-        return (w * y).sum(axis: -2)
+        let batch = x.dim(0)
+        let length = x.dim(1)
+        let hidden = x.dim(2)
+        let topK = topKIndices.dim(-1)
+
+        if gemma4ExpertWeightSumKernel,
+            let weighted = switchGLU.gemma4Weighted(
+                x.reshaped(batch * length, hidden),
+                indices: topKIndices.reshaped(batch * length, topK),
+                weights: topKWeights.reshaped(batch * length, topK)
+            )
+        {
+            return weighted.reshaped(batch, length, hidden)
+        }
+
+        let y = switchGLU.gemma4Routed(
+            x.reshaped(batch * length, hidden),
+            indices: topKIndices.reshaped(batch * length, topK)
+        )
+        if gemma4ExpertWeightSumKernel,
+            gemma4DFlashExpertSmallRowWeightSumKernel,
+            batch * length > 0,
+            batch * length < 16,
+            topK == 8,
+            hidden == 2816,
+            y.shape == [batch * length, topK, hidden]
+        {
+            return Gemma4ExpertWeightSumSmallRowsKernelManager.apply(
+                y: y.contiguous(),
+                weights: topKWeights.reshaped(batch * length, topK).asType(y.dtype).contiguous(),
+                rows: batch * length,
+                topK: topK,
+                hidden: hidden
+            )
+            .reshaped(batch, length, hidden)
+        }
+
+        if gemma4ExpertWeightSumKernel,
+            batch * length == 16,
+            topK == 8,
+            hidden == 2816,
+            y.shape == [batch * length, topK, hidden]
+        {
+            return Gemma4ExpertWeightSumKernelManager.apply(
+                y: y.contiguous(),
+                weights: topKWeights.reshaped(batch * length, topK).asType(y.dtype).contiguous(),
+                rows: batch * length,
+                topK: topK,
+                hidden: hidden
+            )
+            .reshaped(batch, length, hidden)
+        }
+        let w = topKWeights.reshaped(batch * length, topK, 1).asType(y.dtype)
+        return (w * y).sum(axis: -2).reshaped(batch, length, hidden)
+    }
+}
+
+private final class Gemma4ExpertWeightSumSmallRowsKernelManager: Sendable {
+    static let shared = Gemma4ExpertWeightSumSmallRowsKernelManager()
+
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "gemma4_expert_weighted_sum_top8_small_rows",
+            inputNames: ["y", "weights", "rows", "top_k", "hidden_dims"],
+            outputNames: ["out"],
+            source: """
+                uint gid = thread_position_in_grid.x;
+                uint total = uint(rows) * uint(hidden_dims);
+                if (gid >= total) {
+                    return;
+                }
+
+                uint h = gid % uint(hidden_dims);
+                uint row = gid / uint(hidden_dims);
+                uint route_base = row * uint(top_k);
+                uint y_base = route_base * uint(hidden_dims) + h;
+
+                float acc = 0.0f;
+                for (uint route = 0; route < uint(top_k); ++route) {
+                    acc += float(weights[route_base + route])
+                        * float(y[y_base + route * uint(hidden_dims)]);
+                }
+
+                out[gid] = T(acc);
+                """
+        )
+    }
+
+    static func apply(
+        y: MLXArray,
+        weights: MLXArray,
+        rows: Int,
+        topK: Int,
+        hidden: Int
+    ) -> MLXArray {
+        shared.kernel(
+            [y, weights, rows, topK, hidden],
+            template: [("T", y.dtype)],
+            grid: (rows * hidden, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[rows, hidden]],
+            outputDTypes: [y.dtype]
+        )[0]
+    }
+}
+
+private final class Gemma4ExpertWeightSumKernelManager: Sendable {
+    static let shared = Gemma4ExpertWeightSumKernelManager()
+
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "gemma4_expert_weighted_sum_top8",
+            inputNames: ["y", "weights", "rows", "top_k", "hidden_dims"],
+            outputNames: ["out"],
+            source: """
+                uint gid = thread_position_in_grid.x;
+                uint total = uint(rows) * uint(hidden_dims);
+                if (gid >= total) {
+                    return;
+                }
+
+                uint h = gid % uint(hidden_dims);
+                uint row = gid / uint(hidden_dims);
+                uint route_base = row * uint(top_k);
+                uint y_base = route_base * uint(hidden_dims) + h;
+
+                float acc = 0.0f;
+                for (uint route = 0; route < uint(top_k); ++route) {
+                    acc += float(weights[route_base + route])
+                        * float(y[y_base + route * uint(hidden_dims)]);
+                }
+
+                out[gid] = T(acc);
+                """
+        )
+    }
+
+    static func apply(
+        y: MLXArray,
+        weights: MLXArray,
+        rows: Int,
+        topK: Int,
+        hidden: Int
+    ) -> MLXArray {
+        shared.kernel(
+            [y, weights, rows, topK, hidden],
+            template: [("T", y.dtype)],
+            grid: (rows * hidden, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[rows, hidden]],
+            outputDTypes: [y.dtype]
+        )[0]
     }
 }
 
@@ -584,6 +1320,9 @@ private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    private var fusedGateUpProj: DFlashVerifyQuantizedLinear?
+    private var fusedGateUpUnavailable = false
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
@@ -598,7 +1337,64 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        let batch = x.dim(0)
+        let tokenRows = x.shape.dropLast().reduce(1, *)
+        if gemma4MLPFuseGateUp,
+            tokenRows > 0,
+            gemma4UseDFlashVerifyFusions(batch: batch, tokenRows: tokenRows),
+            let fused = fusedGateUp()
+        {
+            let gateUp = fused(x)
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
+            return downProj(gemma4CompiledGELUGateUp(parts[0], parts[1]))
+        }
+
+        return downProj(gemma4CompiledGELUGateUp(gateProj(x), upProj(x)))
+    }
+
+    private func fusedGateUp() -> DFlashVerifyQuantizedLinear? {
+        if let fusedGateUpProj {
+            return fusedGateUpProj
+        }
+        guard !fusedGateUpUnavailable,
+            let gate = gateProj as? QuantizedLinear,
+            let up = upProj as? QuantizedLinear,
+            gate.bias == nil,
+            up.bias == nil,
+            gate.bits == up.bits,
+            gate.groupSize == up.groupSize,
+            gate.mode == up.mode,
+            gate.weight.shape == up.weight.shape,
+            gate.scales.shape == up.scales.shape,
+            gate.biases?.shape == up.biases?.shape,
+            let gateBiases = gate.biases,
+            let upBiases = up.biases
+        else {
+            fusedGateUpUnavailable = true
+            return nil
+        }
+
+        let weight = concatenated([gate.weight, up.weight], axis: 0)
+        let scales = concatenated([gate.scales, up.scales], axis: 0)
+        let biases = concatenated([gateBiases, upBiases], axis: 0)
+        let linear = QuantizedLinear(
+            weight: weight,
+            bias: nil,
+            scales: scales,
+            biases: biases,
+            groupSize: gate.groupSize,
+            bits: gate.bits,
+            mode: gate.mode
+        )
+
+        guard DFlashVerifyQuantizedLinear.isEligible(linear) else {
+            fusedGateUpUnavailable = true
+            return nil
+        }
+
+        let fused = DFlashVerifyQuantizedLinear(linear, enableQMM: true)
+        fusedGateUpProj = fused
+        return fused
     }
 }
 
@@ -607,8 +1403,7 @@ private class Gemma4MLP: Module {
 /// Gemma 4 decoder layer. Combines `Gemma4Attention` with an MLP (or MoE)
 /// block, the per-layer-input (PLE) path, and residual / layer-scalar
 /// plumbing. Consumed by `Gemma4TextModelInner` and by the Gemma 4 MTP
-/// drafter's trunk in `Gemma4MTP`; not intended as a user-facing
-/// composable layer.
+/// drafter trunk; not intended as a user-facing composable layer.
 public class Gemma4DecoderLayer: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -694,11 +1489,23 @@ public class Gemma4DecoderLayer: Module {
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let residual = x
 
+        let attentionStart = gemma4TimingStart()
         let h = inputLayernorm(x)
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset)
         let postAttn = postAttentionLayernorm(attnOut)
         var out = residual + postAttn
+        if let componentCapture = Gemma4DFlashLayerComponentContext.current,
+            componentCapture.layerIds.contains(layerIdx)
+        {
+            componentCapture.attentionStates[layerIdx] = out
+        }
+        if attentionStart != nil {
+            eval(out, kvPair.0, kvPair.1)
+        }
+        gemma4Record(attentionStart) {
+            $0.attentionSeconds += $1
+        }
 
         let residual2 = out
 
@@ -710,19 +1517,48 @@ public class Gemma4DecoderLayer: Module {
             let postFeedforwardLayernorm2
         {
             // Dense + sparse branches in parallel, summed into one residual.
+            let denseStart = gemma4TimingStart()
             var h1 = preFeedforwardLayernorm(out)
             h1 = mlp(h1)
             h1 = postFeedforwardLayernorm1(h1)
+            if denseStart != nil {
+                eval(h1)
+            }
+            gemma4Record(denseStart) {
+                $0.denseMLPSeconds += $1
+            }
 
+            let routerStart = gemma4TimingStart()
             let (topKIndices, topKWeights) = router(out)
+            if routerStart != nil {
+                eval(topKIndices, topKWeights)
+            }
+            gemma4Record(routerStart) {
+                $0.routerSeconds += $1
+            }
+
+            let expertsStart = gemma4TimingStart()
             var h2 = preFeedforwardLayernorm2(out)
             h2 = experts(h2, topKIndices: topKIndices, topKWeights: topKWeights)
             h2 = postFeedforwardLayernorm2(h2)
+            if expertsStart != nil {
+                eval(h2)
+            }
+            gemma4Record(expertsStart) {
+                $0.expertsSeconds += $1
+            }
 
             out = h1 + h2
         } else {
+            let denseStart = gemma4TimingStart()
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
+            if denseStart != nil {
+                eval(out)
+            }
+            gemma4Record(denseStart) {
+                $0.denseMLPSeconds += $1
+            }
         }
 
         out = postFeedforwardLayernorm(out)
@@ -734,6 +1570,7 @@ public class Gemma4DecoderLayer: Module {
             let norm = postPerLayerInputNorm,
             let perLayerInput
         {
+            let pleGateStart = gemma4TimingStart()
             let residual3 = out
             var g = gate(out)
             g = geluApproximate(g)
@@ -741,21 +1578,32 @@ public class Gemma4DecoderLayer: Module {
             g = proj(g)
             g = norm(g)
             out = residual3 + g
+            if pleGateStart != nil {
+                eval(out)
+            }
+            gemma4Record(pleGateStart) {
+                $0.pleGateSeconds += $1
+            }
         }
 
         out = out * layerScalar
+        if let componentCapture = Gemma4DFlashLayerComponentContext.current,
+            componentCapture.layerIds.contains(layerIdx)
+        {
+            componentCapture.layerOutputs[layerIdx] = out
+        }
 
         return (out, kvPair, attnPositionOffset)
     }
+
 }
 
 // MARK: - Text Model
 
 /// Inner Gemma 4 trunk: embeddings + per-layer-input (PLE) + 35 decoder
-/// layers + final norm. Public so the Gemma 4 MTP drafter in
-/// `Gemma4MTP` can build its own 4-layer kv-shared trunk; not
-/// intended as a user-facing model — use `Gemma4TextModel` for
-/// standalone inference.
+/// layers + final norm. Public so the Gemma 4 MTP drafter can build its
+/// own 4-layer kv-shared trunk; not intended as a user-facing model —
+/// use `Gemma4TextModel` for standalone inference.
 public class Gemma4TextModelInner: Module {
     let config: Gemma4TextConfiguration
     let embedScale: Float
@@ -843,8 +1691,17 @@ public class Gemma4TextModelInner: Module {
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> MLXArray {
         forwardTrunk(
-            inputs, cache: cache, captureHook: captureHook, capturePreNorm: false
+            inputs, cache: cache, capture: nil, captureHook: captureHook,
+            capturePreNorm: false
         ).postNorm
+    }
+
+    public func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        capture: Gemma4SharedKVCapture?
+    ) -> MLXArray {
+        forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: false).postNorm
     }
 
     /// Variant that ALSO returns the pre-norm last-layer hidden state.
@@ -858,21 +1715,238 @@ public class Gemma4TextModelInner: Module {
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> (postNorm: MLXArray, preNorm: MLXArray) {
         let r = forwardTrunk(
-            inputs, cache: cache, captureHook: captureHook, capturePreNorm: true)
+            inputs, cache: cache, capture: nil, captureHook: captureHook,
+            capturePreNorm: true)
         return (r.postNorm, r.preNorm!)
+    }
+
+    public func callCapturingPreNorm(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        capture: Gemma4SharedKVCapture?
+    ) -> (postNorm: MLXArray, preNorm: MLXArray) {
+        let r = forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: true)
+        return (r.postNorm, r.preNorm!)
+    }
+
+    public func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+
+        let hiddenCapture = Gemma4DFlashHiddenCapture(
+            layerIds: targetLayerIds,
+            layerCount: layers.count)
+        let useArrayMask =
+            gemma4DFlashArrayVerifyMask
+            && inputs.ndim >= 2
+            && inputs.dim(1) > 1
+            && (cache?.first?.offset ?? 0) > 0
+        let r = forwardTrunk(
+            inputs,
+            cache: cache,
+            capture: nil,
+            capturePreNorm: false,
+            dFlashHiddenCapture: hiddenCapture,
+            forceArrayMask: useArrayMask
+        )
+
+        return (r.postNorm, hiddenCapture.orderedHiddenStates())
+    }
+
+    public func callCapturingDFlashLayerComponents(
+        _ inputs: MLXArray,
+        cache: [KVCache]? = nil,
+        layerIds: [Int]
+    ) throws -> Gemma4DFlashLayerComponentForward {
+        try DFlashTargetValidation.validateTargetLayerIds(layerIds, layerCount: layers.count)
+
+        let componentCapture = Gemma4DFlashLayerComponentCapture(layerIds: layerIds)
+        let previous = Gemma4DFlashLayerComponentContext.current
+        Gemma4DFlashLayerComponentContext.current = componentCapture
+        defer {
+            Gemma4DFlashLayerComponentContext.current = previous
+        }
+
+        let useArrayMask =
+            gemma4DFlashArrayVerifyMask
+            && inputs.ndim >= 2
+            && inputs.dim(1) > 1
+            && (cache?.first?.offset ?? 0) > 0
+        _ = forwardTrunk(
+            inputs,
+            cache: cache,
+            capture: nil,
+            capturePreNorm: false,
+            forceArrayMask: useArrayMask
+        )
+
+        return Gemma4DFlashLayerComponentForward(
+            attentionStates: layerIds.map { componentCapture.attentionStates[$0]! },
+            layerOutputs: layerIds.map { componentCapture.layerOutputs[$0]! }
+        )
+    }
+
+    public func callCapturingDFlashHiddenStatesWithVectorPrefix(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        sequentialStartLayer: Int
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+        precondition(
+            hiddenSizePerLayerInput == 0 && config.numKvSharedLayers == 0,
+            "mixed DFlash verify currently supports Gemma text trunks without PLE or shared KV")
+        precondition(sequentialStartLayer > 0 && sequentialStartLayer < layers.count)
+
+        let targetLayerSet = Set(targetLayerIds)
+        let embeddingStart = gemma4TimingStart()
+        let inputEmbeddings = embedTokens(inputs)
+        var h = inputEmbeddings * embedScale
+        if embeddingStart != nil {
+            eval(h)
+        }
+        gemma4Record(embeddingStart) {
+            $0.embeddingSeconds += $1
+        }
+
+        var fullCache: [KVCache?]
+        if let cache {
+            fullCache = cache.map { Optional($0) }
+            while fullCache.count < config.numHiddenLayers {
+                fullCache.append(nil)
+            }
+        } else {
+            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
+        }
+
+        let maskStart = gemma4TimingStart()
+        let prefixLayers = layers.prefix(sequentialStartLayer)
+        let firstFullAttention = prefixLayers.firstIndex { $0.layerType != "sliding_attention" }
+        let firstSlidingAttention = prefixLayers.firstIndex { $0.layerType == "sliding_attention" }
+        let fullMask = firstFullAttention.map {
+            createAttentionMask(h: h, cache: fullCache[$0], returnArray: true)
+        }
+        let slidingMask = firstSlidingAttention.map {
+            createAttentionMask(
+                h: h, cache: fullCache[$0], windowSize: config.slidingWindow,
+                returnArray: true)
+        }
+        if maskStart != nil {
+            var maskArrays = [MLXArray]()
+            if case .array(let array)? = fullMask {
+                maskArrays.append(array)
+            }
+            if case .array(let array)? = slidingMask {
+                maskArrays.append(array)
+            }
+            if !maskArrays.isEmpty {
+                eval(maskArrays)
+            }
+        }
+        gemma4Record(maskStart) {
+            $0.maskSeconds += $1
+        }
+
+        var captured = [Int: MLXArray]()
+        captured.reserveCapacity(targetLayerIds.count)
+
+        for idx in 0 ..< sequentialStartLayer {
+            let mask = layers[idx].layerType == "sliding_attention" ? slidingMask : fullMask
+            let (out, _, _) = layers[idx](
+                h,
+                mask: mask,
+                cache: fullCache[idx],
+                perLayerInput: nil,
+                sharedKV: nil,
+                positionOffset: nil
+            )
+            h = out
+            if targetLayerSet.contains(idx) {
+                captured[idx] = h
+            }
+        }
+
+        var postNormRows = [MLXArray]()
+        postNormRows.reserveCapacity(inputs.dim(1))
+        var sequentialHiddenRows = [Int: [MLXArray]]()
+        for layerId in targetLayerIds where layerId >= sequentialStartLayer {
+            sequentialHiddenRows[layerId] = []
+            sequentialHiddenRows[layerId]?.reserveCapacity(inputs.dim(1))
+        }
+
+        for tokenIndex in 0 ..< inputs.dim(1) {
+            var tokenHidden = h[0..., tokenIndex ..< tokenIndex + 1, 0...]
+            for idx in sequentialStartLayer ..< layers.count {
+                let layer = layers[idx]
+                let mask = layer.layerType == "sliding_attention"
+                    ? createAttentionMask(
+                        h: tokenHidden,
+                        cache: fullCache[idx],
+                        windowSize: config.slidingWindow)
+                    : createAttentionMask(h: tokenHidden, cache: fullCache[idx])
+                let (out, _, _) = layer(
+                    tokenHidden,
+                    mask: mask,
+                    cache: fullCache[idx],
+                    perLayerInput: nil,
+                    sharedKV: nil,
+                    positionOffset: nil
+                )
+                tokenHidden = out
+                if targetLayerSet.contains(idx) {
+                    sequentialHiddenRows[idx]?.append(tokenHidden)
+                }
+            }
+            postNormRows.append(norm(tokenHidden))
+        }
+
+        let postNorm = concatenated(postNormRows, axis: 1)
+        let hiddenStates = targetLayerIds.map { layerId in
+            if let blockHidden = captured[layerId] {
+                return blockHidden
+            }
+            return concatenated(sequentialHiddenRows[layerId] ?? [], axis: 1)
+        }
+        return (postNorm, hiddenStates)
     }
 
     private func forwardTrunk(
         _ inputs: MLXArray,
         cache: [KVCache]?,
-        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)?,
-        capturePreNorm: Bool
+        capture: Gemma4SharedKVCapture?,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil,
+        capturePreNorm: Bool,
+        dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil,
+        forceArrayMask: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        let embeddingStart = gemma4TimingStart()
         let inputEmbeddings = embedTokens(inputs)
         var h = inputEmbeddings * embedScale
+        if embeddingStart != nil {
+            eval(h)
+        }
+        gemma4Record(embeddingStart) {
+            $0.embeddingSeconds += $1
+        }
+
+        if hiddenSizePerLayerInput == 0, config.numKvSharedLayers == 0, capture == nil {
+            return forwardTrunkWithoutPLEOrSharedKV(
+                h,
+                cache: cache,
+                capturePreNorm: capturePreNorm,
+                dFlashHiddenCapture: dFlashHiddenCapture,
+                forceArrayMask: forceArrayMask
+            )
+        }
 
         // Compute per-layer inputs (PLE)
-        var perLayerInputs: [MLXArray?]
+        let pleStart = gemma4TimingStart()
+        let perLayerInputs: [MLXArray?]
         if hiddenSizePerLayerInput > 0,
             let embedPerLayer = embedTokensPerLayer,
             let modelProj = perLayerModelProjection,
@@ -904,6 +1978,15 @@ public class Gemma4TextModelInner: Module {
         } else {
             perLayerInputs = Array(repeating: nil, count: config.numHiddenLayers)
         }
+        if pleStart != nil {
+            let pleArrays = perLayerInputs.compactMap { $0 }
+            if !pleArrays.isEmpty {
+                eval(pleArrays)
+            }
+        }
+        gemma4Record(pleStart) {
+            $0.pleSeconds += $1
+        }
 
         // Extend cache array for shared layers (which get nil caches)
         var fullCache: [KVCache?]
@@ -916,18 +1999,35 @@ public class Gemma4TextModelInner: Module {
             fullCache = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
-        // Build masks: one per attention type.
+        // Build masks: one per attention type
+        let maskStart = gemma4TimingStart()
         var maskByType = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
         for (i, layer) in layers.enumerated() {
             let lt = layer.layerType
             if maskByType[lt] == nil {
                 if lt == "sliding_attention" {
                     maskByType[lt] = createAttentionMask(
-                        h: h, cache: fullCache[i], windowSize: config.slidingWindow)
+                        h: h, cache: fullCache[i], windowSize: config.slidingWindow,
+                        returnArray: forceArrayMask)
                 } else {
-                    maskByType[lt] = createAttentionMask(h: h, cache: fullCache[i])
+                    maskByType[lt] = createAttentionMask(
+                        h: h, cache: fullCache[i], returnArray: forceArrayMask)
                 }
             }
+        }
+        if maskStart != nil {
+            var maskArrays = [MLXArray]()
+            for mask in maskByType.values {
+                if case .array(let array) = mask {
+                    maskArrays.append(array)
+                }
+            }
+            if !maskArrays.isEmpty {
+                eval(maskArrays)
+            }
+        }
+        gemma4Record(maskStart) {
+            $0.maskSeconds += $1
         }
 
         // Forward through layers, tracking intermediate KV pairs for sharing
@@ -950,17 +2050,109 @@ public class Gemma4TextModelInner: Module {
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
+
+            if let capture = capture {
+                if idx == lastFullAttentionNonSharedIdx {
+                    capture.fullAttention = kvPair
+                } else if idx == lastSlidingAttentionNonSharedIdx {
+                    capture.slidingAttention = kvPair
+                }
+            }
             captureHook?(idx, kvPair)
+
+            dFlashHiddenCapture?.capture(h, layer: idx)
         }
 
+        let finalNormStart = gemma4TimingStart()
         let postNorm = norm(h)
+        if finalNormStart != nil {
+            eval(postNorm)
+        }
+        gemma4Record(finalNormStart) {
+            $0.finalNormSeconds += $1
+        }
         return (postNorm, capturePreNorm ? h : nil)
     }
+
+    private func forwardTrunkWithoutPLEOrSharedKV(
+        _ initialHidden: MLXArray,
+        cache: [KVCache]?,
+        capturePreNorm: Bool,
+        dFlashHiddenCapture: Gemma4DFlashHiddenCapture?,
+        forceArrayMask: Bool = false
+    ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
+        var h = initialHidden
+
+        var fullCache: [KVCache?]
+        if let cache {
+            fullCache = cache.map { Optional($0) }
+            while fullCache.count < config.numHiddenLayers {
+                fullCache.append(nil)
+            }
+        } else {
+            fullCache = Array(repeating: nil, count: config.numHiddenLayers)
+        }
+
+        let maskStart = gemma4TimingStart()
+        let firstFullAttention = layers.firstIndex { $0.layerType != "sliding_attention" }
+        let firstSlidingAttention = layers.firstIndex { $0.layerType == "sliding_attention" }
+        let fullMask = firstFullAttention.map {
+            createAttentionMask(h: h, cache: fullCache[$0], returnArray: forceArrayMask)
+        }
+        let slidingMask = firstSlidingAttention.map {
+            createAttentionMask(
+                h: h, cache: fullCache[$0], windowSize: config.slidingWindow,
+                returnArray: forceArrayMask)
+        }
+        if maskStart != nil {
+            var maskArrays = [MLXArray]()
+            if case .array(let array)? = fullMask {
+                maskArrays.append(array)
+            }
+            if case .array(let array)? = slidingMask {
+                maskArrays.append(array)
+            }
+            if !maskArrays.isEmpty {
+                eval(maskArrays)
+            }
+        }
+        gemma4Record(maskStart) {
+            $0.maskSeconds += $1
+        }
+
+        for (idx, layer) in layers.enumerated() {
+            let mask = layer.layerType == "sliding_attention" ? slidingMask : fullMask
+            let (out, _, _) = layer(
+                h,
+                mask: mask,
+                cache: fullCache[idx],
+                perLayerInput: nil,
+                sharedKV: nil,
+                positionOffset: nil
+            )
+            h = out
+
+            dFlashHiddenCapture?.capture(h, layer: idx)
+        }
+
+        let finalNormStart = gemma4TimingStart()
+        let postNorm = norm(h)
+        if finalNormStart != nil {
+            eval(postNorm)
+        }
+        gemma4Record(finalNormStart) {
+            $0.finalNormSeconds += $1
+        }
+        return (postNorm, capturePreNorm ? h : nil)
+    }
+
 }
 
 // MARK: - Public Model
 
-public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
+    DFlashTargetDiagnosticForwardProvider, DFlashTargetCacheRollbackProvider
+{
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -989,17 +2181,554 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return applyLMHead(hidden)
     }
 
-    /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
-    /// configured final-logit softcap. Pure function of the post-norm hidden.
-    func applyLMHead(_ hidden: MLXArray) -> MLXArray {
-        var out: MLXArray
-        if let lmHead {
-            out = lmHead(hidden)
-        } else {
-            out = model.embedTokens.asLinear(hidden)
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { config.hiddenSize }
+    public var dFlashLayerCount: Int { config.numHiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: applyLMHead(forward.postNorm),
+            hiddenStates: forward.hiddenStates
+        )
+    }
+
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashGreedyTargetForward {
+        try forwardGreedyTokensForDFlash(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds,
+            collectVerifyTimings: false
+        )
+    }
+
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        collectVerifyTimings: Bool
+    ) throws -> DFlashGreedyTargetForward {
+        if let fast = try autoDFlashGreedyTokensIfAvailable(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds,
+            collectVerifyTimings: collectVerifyTimings)
+        {
+            return fast
         }
-        out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
-        return out
+
+        if shouldUseSequentialDFlashVerify(inputs, cache: cache) {
+            if let mixed = try mixedDFlashGreedyTokensIfAvailable(
+                inputs,
+                cache: cache,
+                targetLayerIds: targetLayerIds,
+                collectVerifyTimings: collectVerifyTimings)
+            {
+                return mixed
+            }
+            return try sequentialDFlashGreedyTokens(
+                inputs,
+                cache: cache,
+                targetLayerIds: targetLayerIds
+            )
+        }
+
+        guard collectVerifyTimings else {
+            let forward = try model.callCapturingDFlashHiddenStates(
+                inputs, cache: cache, targetLayerIds: targetLayerIds)
+            let targetHidden = forward.hiddenStates.count == 1
+                ? forward.hiddenStates[0]
+                : concatenated(forward.hiddenStates, axis: -1)
+
+            return DFlashGreedyTargetForward(
+                tokens: greedyTokensFromPostNorm(forward.postNorm),
+                targetHidden: targetHidden
+            )
+        }
+
+        let trunkStart = Date()
+        let trunkTimings = Gemma4DFlashTrunkTimings()
+        Gemma4DFlashTimingContext.current = trunkTimings
+        defer {
+            Gemma4DFlashTimingContext.current = nil
+        }
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        eval([forward.postNorm] + forward.hiddenStates)
+        let trunkSeconds = Date().timeIntervalSince(trunkStart)
+
+        let hiddenConcatStart = Date()
+        let targetHidden = forward.hiddenStates.count == 1
+            ? forward.hiddenStates[0]
+            : concatenated(forward.hiddenStates, axis: -1)
+        eval(targetHidden)
+        let hiddenConcatSeconds = Date().timeIntervalSince(hiddenConcatStart)
+
+        let lmHeadStart = Date()
+        let rawLogits = applyRawLMHead(forward.postNorm)
+        eval(rawLogits)
+        let lmHeadSeconds = Date().timeIntervalSince(lmHeadStart)
+
+        let softcapArgmaxStart = Date()
+        let tokens = finalLogitTransform(rawLogits).argMax(axis: -1)
+        eval(tokens)
+        let softcapArgmaxSeconds = Date().timeIntervalSince(softcapArgmaxStart)
+
+        return DFlashGreedyTargetForward(
+            tokens: tokens,
+            targetHidden: targetHidden,
+            verifyTimings: DFlashTargetVerifyTimings(
+                trunkSeconds: trunkSeconds,
+                hiddenConcatSeconds: hiddenConcatSeconds,
+                lmHeadSeconds: lmHeadSeconds,
+                softcapArgmaxSeconds: softcapArgmaxSeconds,
+                trunkEmbeddingSeconds: trunkTimings.embeddingSeconds,
+                trunkPLESeconds: trunkTimings.pleSeconds,
+                trunkMaskSeconds: trunkTimings.maskSeconds,
+                trunkAttentionSeconds: trunkTimings.attentionSeconds,
+                trunkDenseMLPSeconds: trunkTimings.denseMLPSeconds,
+                trunkRouterSeconds: trunkTimings.routerSeconds,
+                trunkExpertsSeconds: trunkTimings.expertsSeconds,
+                trunkPLEGateSeconds: trunkTimings.pleGateSeconds,
+                trunkFinalNormSeconds: trunkTimings.finalNormSeconds
+            )
+        )
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        embedTokensForDrafter(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        applyRawLMHead(hidden)
+    }
+
+    public func dFlashLayerComponents(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        layerIds: [Int]
+    ) throws -> Gemma4DFlashLayerComponentForward {
+        try model.callCapturingDFlashLayerComponents(inputs, cache: cache, layerIds: layerIds)
+    }
+
+    public func makeDFlashCacheRollbackState(cache: [KVCache]) -> (any DFlashTargetRollbackState)? {
+        if gemma4DFlashSequentialVerify {
+            if gemma4DFlashReplayRollback {
+                return DFlashCopiedTargetRollbackState(cache: cache.map { $0.copy() })
+            }
+            if canTrimPromptCache(cache) {
+                return nil
+            }
+            return DFlashCopiedTargetRollbackState(cache: cache.map { $0.copy() })
+        }
+        return makeDefaultDFlashCacheRollbackState(cache: cache)
+    }
+
+    public func rollbackDFlashCache(
+        _ cache: inout [KVCache],
+        state: (any DFlashTargetRollbackState)?,
+        verifyInput: MLXArray,
+        acceptedTokenCount: Int,
+        rejectedTokenCount: Int,
+        targetLayerIds: [Int],
+        verifiedTargetHidden: MLXArray
+    ) throws -> MLXArray {
+        let acceptedHidden = verifiedTargetHidden[0..., 0 ..< acceptedTokenCount + 1, 0...]
+        guard rejectedTokenCount > 0 else {
+            if gemma4DFlashReplayRollback,
+                let copiedState = state as? DFlashCopiedTargetRollbackState
+            {
+                cache = copiedState.cache
+                let acceptedPrefix = verifyInput[0..., 0 ..< acceptedTokenCount + 1]
+                let replayHidden = try sequentialDFlashHiddenReplay(
+                    acceptedPrefix,
+                    cache: cache,
+                    targetLayerIds: targetLayerIds
+                )
+                eval(replayHidden)
+                return replayHidden
+            }
+            return acceptedHidden
+        }
+
+        if !gemma4DFlashReplayRollback, canTrimPromptCache(cache) {
+            let trimmed = trimPromptCache(cache, numTokens: rejectedTokenCount)
+            if trimmed == rejectedTokenCount {
+                return acceptedHidden
+            }
+        }
+
+        guard let copiedState = state as? DFlashCopiedTargetRollbackState else {
+            throw DFlashTargetError.untrimmableCache
+        }
+
+        cache = copiedState.cache
+        let acceptedPrefix = verifyInput[0..., 0 ..< acceptedTokenCount + 1]
+        if gemma4DFlashSequentialVerify {
+            let replayHidden = try sequentialDFlashHiddenReplay(
+                acceptedPrefix,
+                cache: cache,
+                targetLayerIds: targetLayerIds
+            )
+            eval(replayHidden)
+            return replayHidden
+        }
+
+        let replay = try forwardForDFlash(
+            acceptedPrefix,
+            cache: cache,
+            targetLayerIds: targetLayerIds
+        )
+        eval(replay.targetHidden)
+        return replay.targetHidden
+    }
+
+    private func sequentialDFlashHiddenReplay(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> MLXArray {
+        var hiddenRows = [MLXArray]()
+        hiddenRows.reserveCapacity(inputs.dim(1))
+        for index in 0 ..< inputs.dim(1) {
+            let input = inputs[0..., index ..< index + 1]
+            let forward = try model.callCapturingDFlashHiddenStates(
+                input,
+                cache: cache,
+                targetLayerIds: targetLayerIds
+            )
+            hiddenRows.append(dFlashTargetHidden(forward.hiddenStates))
+        }
+        return hiddenRows.count == 1 ? hiddenRows[0] : concatenated(hiddenRows, axis: 1)
+    }
+
+    private func shouldUseSequentialDFlashVerify(_ inputs: MLXArray, cache: [KVCache]?) -> Bool {
+        guard inputs.ndim >= 2, inputs.dim(1) > 1 else {
+            return false
+        }
+        if inputs.dim(0) > 1 {
+            if gemma4DFlashBatchedVectorVerify {
+                return false
+            }
+            return gemma4DFlashSequentialVerify && (cache?.first?.offset ?? 0) > 0
+        }
+        guard gemma4DFlashSequentialVerify else {
+            return false
+        }
+        return (cache?.first?.offset ?? 0) > 0
+    }
+
+    private func sequentialDFlashGreedyTokens(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashGreedyTargetForward {
+        let inputIds =
+            gemma4DFlashEarlyStopSequentialVerify && inputs.dim(0) == 1
+            ? inputs.squeezed(axis: 0).asArray(Int32.self)
+            : []
+        var tokenRows = [MLXArray]()
+        var hiddenRows = [MLXArray]()
+        tokenRows.reserveCapacity(inputs.dim(1))
+        hiddenRows.reserveCapacity(inputs.dim(1))
+
+        for index in 0 ..< inputs.dim(1) {
+            let input = inputs[0..., index ..< index + 1]
+            let forward = try model.callCapturingDFlashHiddenStates(
+                input, cache: cache, targetLayerIds: targetLayerIds)
+            tokenRows.append(greedyTokensFromPostNorm(forward.postNorm))
+            hiddenRows.append(
+                forward.hiddenStates.count == 1
+                    ? forward.hiddenStates[0]
+                    : concatenated(forward.hiddenStates, axis: -1))
+
+            if gemma4DFlashEarlyStopSequentialVerify,
+                inputs.dim(0) == 1,
+                index + 1 < inputs.dim(1)
+            {
+                eval(tokenRows[tokenRows.count - 1])
+                let targetToken = tokenRows[tokenRows.count - 1].item(Int32.self)
+                if targetToken != inputIds[index + 1] {
+                    break
+                }
+            }
+        }
+
+        return DFlashGreedyTargetForward(
+            tokens: concatenated(tokenRows, axis: 1),
+            targetHidden: concatenated(hiddenRows, axis: 1)
+        )
+    }
+
+    private func autoDFlashGreedyTokensIfAvailable(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        collectVerifyTimings: Bool = false
+    ) throws -> DFlashGreedyTargetForward? {
+        guard gemma4DFlashAutoVerify,
+            inputs.ndim >= 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > 1,
+            (cache?.first?.offset ?? 0) > 0
+        else {
+            return nil
+        }
+
+        let sequenceLength = inputs.dim(1)
+        let vectorSuffixLength = dFlashAutoVectorSuffixLength(sequenceLength: sequenceLength)
+        if vectorSuffixLength <= 1, !collectVerifyTimings {
+            return try sequentialDFlashGreedyTokens(
+                inputs,
+                cache: cache,
+                targetLayerIds: targetLayerIds)
+        }
+        let prefixLength = sequenceLength - vectorSuffixLength
+
+        var tokenChunks = [MLXArray]()
+        var hiddenChunks = [MLXArray]()
+        tokenChunks.reserveCapacity(prefixLength + 1)
+        hiddenChunks.reserveCapacity(prefixLength + 1)
+
+        var trunkSeconds = 0.0
+        var hiddenConcatSeconds = 0.0
+        var lmHeadSeconds = 0.0
+        var softcapArgmaxSeconds = 0.0
+        let trunkTimings = collectVerifyTimings ? Gemma4DFlashTrunkTimings() : nil
+        if let trunkTimings {
+            Gemma4DFlashTimingContext.current = trunkTimings
+        }
+        defer {
+            if trunkTimings != nil {
+                Gemma4DFlashTimingContext.current = nil
+            }
+        }
+
+        func appendChunk(_ input: MLXArray) throws {
+            let trunkStart = collectVerifyTimings ? Date() : nil
+            let forward = try model.callCapturingDFlashHiddenStates(
+                input,
+                cache: cache,
+                targetLayerIds: targetLayerIds)
+            if collectVerifyTimings {
+                eval([forward.postNorm] + forward.hiddenStates)
+                trunkSeconds += Date().timeIntervalSince(trunkStart!)
+            }
+
+            let hiddenConcatStart = collectVerifyTimings ? Date() : nil
+            let targetHidden = dFlashTargetHidden(forward.hiddenStates)
+            if collectVerifyTimings {
+                eval(targetHidden)
+                hiddenConcatSeconds += Date().timeIntervalSince(hiddenConcatStart!)
+            }
+            hiddenChunks.append(targetHidden)
+
+            let lmHeadStart = collectVerifyTimings ? Date() : nil
+            let rawLogits = applyRawLMHead(forward.postNorm)
+            if collectVerifyTimings {
+                eval(rawLogits)
+                lmHeadSeconds += Date().timeIntervalSince(lmHeadStart!)
+            }
+
+            let softcapArgmaxStart = collectVerifyTimings ? Date() : nil
+            let tokens = finalLogitTransform(rawLogits).argMax(axis: -1)
+            if collectVerifyTimings {
+                eval(tokens)
+                softcapArgmaxSeconds += Date().timeIntervalSince(softcapArgmaxStart!)
+            }
+            tokenChunks.append(tokens)
+        }
+
+        if prefixLength == 0 {
+            try appendChunk(inputs)
+        } else {
+            for index in 0 ..< prefixLength {
+                let input = inputs[0..., index ..< index + 1]
+                try appendChunk(input)
+            }
+
+            let suffix = inputs[0..., prefixLength...]
+            try appendChunk(suffix)
+        }
+
+        let targetHidden: MLXArray
+        if hiddenChunks.count == 1 {
+            targetHidden = hiddenChunks[0]
+        } else {
+            let hiddenConcatStart = collectVerifyTimings ? Date() : nil
+            targetHidden = concatenated(hiddenChunks, axis: 1)
+            if collectVerifyTimings {
+                eval(targetHidden)
+                hiddenConcatSeconds += Date().timeIntervalSince(hiddenConcatStart!)
+            }
+        }
+
+        let tokens =
+            tokenChunks.count == 1
+            ? tokenChunks[0]
+            : concatenated(tokenChunks, axis: 1)
+        if collectVerifyTimings {
+            eval(tokens)
+        }
+
+        if let trunkTimings {
+            return DFlashGreedyTargetForward(
+                tokens: tokens,
+                targetHidden: targetHidden,
+                verifyTimings: DFlashTargetVerifyTimings(
+                    trunkSeconds: trunkSeconds,
+                    hiddenConcatSeconds: hiddenConcatSeconds,
+                    lmHeadSeconds: lmHeadSeconds,
+                    softcapArgmaxSeconds: softcapArgmaxSeconds,
+                    trunkEmbeddingSeconds: trunkTimings.embeddingSeconds,
+                    trunkPLESeconds: trunkTimings.pleSeconds,
+                    trunkMaskSeconds: trunkTimings.maskSeconds,
+                    trunkAttentionSeconds: trunkTimings.attentionSeconds,
+                    trunkDenseMLPSeconds: trunkTimings.denseMLPSeconds,
+                    trunkRouterSeconds: trunkTimings.routerSeconds,
+                    trunkExpertsSeconds: trunkTimings.expertsSeconds,
+                    trunkPLEGateSeconds: trunkTimings.pleGateSeconds,
+                    trunkFinalNormSeconds: trunkTimings.finalNormSeconds)
+            )
+        }
+
+        return DFlashGreedyTargetForward(tokens: tokens, targetHidden: targetHidden)
+    }
+
+    private func dFlashTargetHidden(_ hiddenStates: [MLXArray]) -> MLXArray {
+        hiddenStates.count == 1
+            ? hiddenStates[0]
+            : concatenated(hiddenStates, axis: -1)
+    }
+
+    private func dFlashAutoVectorSuffixLength(sequenceLength: Int) -> Int {
+        return gemma4DFlashAutoVectorSuffixLength(sequenceLength: sequenceLength)
+    }
+
+    private func mixedDFlashGreedyTokensIfAvailable(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        collectVerifyTimings: Bool = false
+    ) throws -> DFlashGreedyTargetForward? {
+        guard gemma4DFlashMixedVerify,
+            inputs.ndim >= 2,
+            inputs.dim(0) == 1,
+            inputs.dim(1) > 1,
+            (cache?.first?.offset ?? 0) > 0,
+            config.hiddenSizePerLayerInput == 0,
+            config.numKvSharedLayers == 0,
+            let sequentialStartLayer = dFlashMixedVerifyStartLayer()
+        else {
+            return nil
+        }
+
+        guard collectVerifyTimings else {
+            let forward = try model.callCapturingDFlashHiddenStatesWithVectorPrefix(
+                inputs,
+                cache: cache,
+                targetLayerIds: targetLayerIds,
+                sequentialStartLayer: sequentialStartLayer)
+            let targetHidden = forward.hiddenStates.count == 1
+                ? forward.hiddenStates[0]
+                : concatenated(forward.hiddenStates, axis: -1)
+            return DFlashGreedyTargetForward(
+                tokens: greedyTokensFromPostNorm(forward.postNorm),
+                targetHidden: targetHidden
+            )
+        }
+
+        let trunkStart = Date()
+        let trunkTimings = Gemma4DFlashTrunkTimings()
+        Gemma4DFlashTimingContext.current = trunkTimings
+        defer {
+            Gemma4DFlashTimingContext.current = nil
+        }
+        let forward = try model.callCapturingDFlashHiddenStatesWithVectorPrefix(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds,
+            sequentialStartLayer: sequentialStartLayer)
+        eval([forward.postNorm] + forward.hiddenStates)
+        let trunkSeconds = Date().timeIntervalSince(trunkStart)
+
+        let hiddenConcatStart = Date()
+        let targetHidden = forward.hiddenStates.count == 1
+            ? forward.hiddenStates[0]
+            : concatenated(forward.hiddenStates, axis: -1)
+        eval(targetHidden)
+        let hiddenConcatSeconds = Date().timeIntervalSince(hiddenConcatStart)
+
+        let lmHeadStart = Date()
+        let rawLogits = applyRawLMHead(forward.postNorm)
+        eval(rawLogits)
+        let lmHeadSeconds = Date().timeIntervalSince(lmHeadStart)
+
+        let softcapArgmaxStart = Date()
+        let tokens = finalLogitTransform(rawLogits).argMax(axis: -1)
+        eval(tokens)
+        let softcapArgmaxSeconds = Date().timeIntervalSince(softcapArgmaxStart)
+
+        return DFlashGreedyTargetForward(
+            tokens: tokens,
+            targetHidden: targetHidden,
+            verifyTimings: DFlashTargetVerifyTimings(
+                trunkSeconds: trunkSeconds,
+                hiddenConcatSeconds: hiddenConcatSeconds,
+                lmHeadSeconds: lmHeadSeconds,
+                softcapArgmaxSeconds: softcapArgmaxSeconds,
+                trunkEmbeddingSeconds: trunkTimings.embeddingSeconds,
+                trunkPLESeconds: trunkTimings.pleSeconds,
+                trunkMaskSeconds: trunkTimings.maskSeconds,
+                trunkAttentionSeconds: trunkTimings.attentionSeconds,
+                trunkDenseMLPSeconds: trunkTimings.denseMLPSeconds,
+                trunkRouterSeconds: trunkTimings.routerSeconds,
+                trunkExpertsSeconds: trunkTimings.expertsSeconds,
+                trunkPLEGateSeconds: trunkTimings.pleGateSeconds,
+                trunkFinalNormSeconds: trunkTimings.finalNormSeconds)
+        )
+    }
+
+    private func dFlashMixedVerifyStartLayer() -> Int? {
+        let fullAttentionLayers = config.layerTypes.enumerated()
+            .filter { $0.element != "sliding_attention" }
+            .map(\.offset)
+        guard fullAttentionLayers.count >= 2 else {
+            return nil
+        }
+        return fullAttentionLayers[1]
+    }
+
+    /// Apply the raw LM head (tied embedding or explicit `lm_head`).
+    private func applyRawLMHead(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        } else {
+            return model.embedTokens.asLinear(hidden)
+        }
+    }
+
+    private func greedyTokensFromPostNorm(_ hidden: MLXArray) -> MLXArray {
+        applyLMHead(hidden).argMax(axis: -1)
+    }
+
+    /// Apply the LM head plus the configured final-logit softcap. Pure
+    /// function of the post-norm hidden.
+    func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        finalLogitTransform(applyRawLMHead(hidden))
+    }
+
+    private func finalLogitTransform(_ rawLogits: MLXArray) -> MLXArray {
+        tanh(rawLogits / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
     }
 
     /// Compute the scaled input embedding for `tokens`, matching what the
@@ -1061,6 +2790,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // `gate_up_proj` (concatenated along axis -2) plus a separate
             // `down_proj`. SwitchGLU expects three separate
             // `switch_glu.{gate,up,down}_proj.weight` tensors.
+            if k.hasSuffix(".router.scale") {
+                sanitized[k] = v * pow(Float(config.hiddenSize), -0.5)
+                continue
+            }
+
             if k.hasSuffix(".experts.gate_up_proj") {
                 let base = String(k.dropLast(".gate_up_proj".count))
                 let parts = MLX.split(v, parts: 2, axis: -2)

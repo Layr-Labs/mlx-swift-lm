@@ -27,6 +27,9 @@ struct ServerArgs: Sendable {
     var mtp: Bool = false
     /// Path to an external Gemma 4 assistant/drafter model directory.
     var draftModel: String = ""
+    /// Path to a D-Flash drafter model directory.
+    var dflashDraftModel: String = ""
+    var dflashBlockSize: Int?
 
     static func parse() throws -> ServerArgs {
         var args = ServerArgs()
@@ -68,6 +71,18 @@ struct ServerArgs: Sendable {
                 i += 1
                 guard i < argv.count else { throw CLIError("--draft-model requires a value") }
                 args.draftModel = argv[i]
+            case "--dflash-draft-model":
+                i += 1
+                guard i < argv.count else {
+                    throw CLIError("--dflash-draft-model requires a value")
+                }
+                args.dflashDraftModel = argv[i]
+            case "--dflash-block-size":
+                i += 1
+                guard i < argv.count, let t = Int(argv[i]), t >= 2 else {
+                    throw CLIError("--dflash-block-size requires an integer >= 2")
+                }
+                args.dflashBlockSize = t
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -102,6 +117,10 @@ struct ServerArgs: Sendable {
           --max-kv-tokens <int> Max total KV-cache tokens across running requests (0=unlimited)
           --mtp                 Enable internal MTP speculative decoding (Qwen3.5/3.6, DeepSeek-V4)
           --draft-model <path>  Path to an external Gemma 4 assistant/drafter model directory
+          --dflash-draft-model <path>
+                                Path to a D-Flash drafter model directory
+          --dflash-block-size <int>
+                                Override D-Flash block size (default: drafter config)
           --help, -h            Show this help
 
         DOWNLOAD MODELS:
@@ -143,9 +162,10 @@ func checkModelHasMTPWeights(at url: URL) -> Bool {
 }
 
 struct ServerSetup: @unchecked Sendable {
-    let engine: BatchedEngine
+    let engine: any ServerGenerationEngine
     let modelName: String
     let gemma4Context: Gemma4ServerContext?
+    let modeLabel: String
 }
 
 func loadEngine(args: ServerArgs) async throws -> ServerSetup {
@@ -163,8 +183,13 @@ func loadEngine(args: ServerArgs) async throws -> ServerSetup {
     }
 
     // Enable internal MTP heads before loading (Qwen3.5/3.6, DeepSeek-V4).
-    let hasExternalDrafter = !args.draftModel.isEmpty
-    if args.mtp && !hasExternalDrafter {
+    let hasGemma4MTPDrafter = !args.draftModel.isEmpty
+    let hasDFlashDrafter = !args.dflashDraftModel.isEmpty
+    if hasGemma4MTPDrafter && hasDFlashDrafter {
+        throw CLIError("--draft-model and --dflash-draft-model are mutually exclusive.")
+    }
+
+    if args.mtp && !hasGemma4MTPDrafter && !hasDFlashDrafter {
         // Pre-check: ensure the checkpoint actually contains mtp.* weights before
         // enabling the flag (which causes the model init to allocate the MTP module).
         // Without weights the MLXNN parameter update crashes with keyNotFound.
@@ -183,16 +208,40 @@ func loadEngine(args: ServerArgs) async throws -> ServerSetup {
     let modelName = url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent
     print("Model loaded: \(modelName)")
 
+    if hasDFlashDrafter {
+        let draftExpanded = (args.dflashDraftModel as NSString).expandingTildeInPath
+        let draftURL = URL(fileURLWithPath: draftExpanded)
+        guard FileManager.default.fileExists(atPath: draftURL.path) else {
+            throw CLIError("D-Flash drafter directory not found: \(draftURL.path)")
+        }
+        guard let target = context.model as? any DFlashTargetModel else {
+            throw CLIError("Model does not support D-Flash target hooks: \(type(of: context.model))")
+        }
+        print("Loading D-Flash drafter from: \(draftURL.path)")
+        let drafter = try await DFlashDraftModel.load(from: draftURL, bindTo: target)
+        let engine = try DFlashBatchedEngine(
+            context: context,
+            drafter: drafter,
+            blockSize: args.dflashBlockSize)
+        await engine.start()
+        print("D-Flash serving enabled for greedy requests")
+        return ServerSetup(
+            engine: engine,
+            modelName: modelName,
+            gemma4Context: nil,
+            modeLabel: "D-Flash")
+    }
+
     let cbConfig = ContinuousBatchingConfig(
         schedulerConfig: SchedulerConfig(maxKVCacheTokens: args.maxKVCacheTokens),
         prefixCacheConfig: args.prefixCache ? PrefixCacheConfig() : nil,
-        mtpEnabled: args.mtp && !hasExternalDrafter
+        mtpEnabled: args.mtp && !hasGemma4MTPDrafter
     )
     let engine = BatchedEngine(context: context, config: cbConfig)
     await engine.start()
 
     var gemma4Context: Gemma4ServerContext? = nil
-    if hasExternalDrafter {
+    if hasGemma4MTPDrafter {
         let draftExpanded = (args.draftModel as NSString).expandingTildeInPath
         let draftURL = URL(fileURLWithPath: draftExpanded)
         guard FileManager.default.fileExists(atPath: draftURL.path) else {
@@ -204,7 +253,20 @@ func loadEngine(args: ServerArgs) async throws -> ServerSetup {
         gemma4Context = Gemma4ServerContext(target: context, drafter: drafter)
     }
 
-    return ServerSetup(engine: engine, modelName: modelName, gemma4Context: gemma4Context)
+    let modeLabel: String
+    if gemma4Context != nil {
+        modeLabel = "Gemma4 MTP"
+    } else if args.mtp {
+        modeLabel = "internal MTP"
+    } else {
+        modeLabel = "standard"
+    }
+
+    return ServerSetup(
+        engine: engine,
+        modelName: modelName,
+        gemma4Context: gemma4Context,
+        modeLabel: modeLabel)
 }
 
 // MARK: - Entry point
@@ -227,15 +289,7 @@ struct MLXServer {
             configuration: .init(address: .hostname(args.host, port: args.port))
         )
 
-        let modeLabel: String
-        if setup.gemma4Context != nil {
-            modeLabel = "Gemma4 MTP"
-        } else if args.mtp {
-            modeLabel = "internal MTP"
-        } else {
-            modeLabel = "standard"
-        }
-        print("Server listening at http://\(args.host):\(args.port) [\(modeLabel)]")
+        print("Server listening at http://\(args.host):\(args.port) [\(setup.modeLabel)]")
         print("  POST /v1/chat/completions")
         print("  POST /v1/completions")
         print("  GET  /v1/models")

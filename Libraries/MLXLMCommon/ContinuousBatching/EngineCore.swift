@@ -264,6 +264,25 @@ public final class EngineCore: @unchecked Sendable {
         }
     }
 
+    /// Generate a complete response using the legacy convenience parameters.
+    public func generate(
+        prompt: String,
+        maxTokens: Int,
+        temperature: Float = 0.7,
+        topP: Float = 0.9,
+        topK: Int = 0,
+        minP: Float = 0.0
+    ) async throws -> RequestOutput {
+        try await generate(
+            prompt: prompt,
+            samplingParams: SamplingParams(
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                topK: topK,
+                minP: minP))
+    }
+
     // MARK: - Engine Loop
 
     /// Main engine loop — runs scheduler steps on the engine queue.

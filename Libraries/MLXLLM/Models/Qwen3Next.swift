@@ -462,9 +462,43 @@ public class Qwen3NextModelInner: Module {
 
         return norm(hiddenStates)
     }
+
+    func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+
+        var hiddenStates = embedTokens(inputs)
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+
+        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let captureIds = Set(targetLayerIds)
+        var captured = [Int: MLXArray]()
+        captured.reserveCapacity(targetLayerIds.count)
+
+        for (i, layer) in layers.enumerated() {
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask = layer.isLinear ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            hiddenStates = layer(
+                hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            if captureIds.contains(i) {
+                captured[i] = hiddenStates
+            }
+        }
+
+        let hiddenStatesOut = targetLayerIds.map { captured[$0]! }
+        return (norm(hiddenStates), hiddenStatesOut)
+    }
 }
 
-public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider, DFlashTargetModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -485,7 +519,36 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        applyLMHead(model(inputs, cache: cache))
+    }
+
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { configuration.hiddenSize }
+    public var dFlashLayerCount: Int { configuration.hiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let forward = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: applyLMHead(forward.postNorm),
+            hiddenStates: forward.hiddenStates
+        )
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        applyLMHead(hidden)
+    }
+
+    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+        var out = hidden
         if let lmHead {
             out = lmHead(out)
         } else {

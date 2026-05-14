@@ -61,7 +61,9 @@ public struct Gemma4Configuration: Codable, Sendable {
 
 // MARK: - Model
 
-public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider,
+    DFlashTargetDiagnosticForwardProvider, DFlashTargetCacheRollbackProvider
+{
     public var vocabularySize: Int { languageModel.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
 
@@ -115,6 +117,74 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         languageModel.newCache(parameters: parameters)
+    }
+
+    public var dFlashVocabularySize: Int { languageModel.dFlashVocabularySize }
+    public var dFlashHiddenSize: Int { languageModel.dFlashHiddenSize }
+    public var dFlashLayerCount: Int { languageModel.dFlashLayerCount }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        try languageModel.forwardForDFlash(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+    }
+
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int]
+    ) throws -> DFlashGreedyTargetForward {
+        try languageModel.forwardGreedyTokensForDFlash(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+    }
+
+    public func forwardGreedyTokensForDFlash(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        targetLayerIds: [Int],
+        collectVerifyTimings: Bool
+    ) throws -> DFlashGreedyTargetForward {
+        try languageModel.forwardGreedyTokensForDFlash(
+            inputs,
+            cache: cache,
+            targetLayerIds: targetLayerIds,
+            collectVerifyTimings: collectVerifyTimings
+        )
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        languageModel.embedTokensForDFlash(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        languageModel.logitsForDFlashHidden(hidden)
+    }
+
+    public func makeDFlashCacheRollbackState(cache: [KVCache]) -> (any DFlashTargetRollbackState)? {
+        languageModel.makeDFlashCacheRollbackState(cache: cache)
+    }
+
+    public func rollbackDFlashCache(
+        _ cache: inout [KVCache],
+        state: (any DFlashTargetRollbackState)?,
+        verifyInput: MLXArray,
+        acceptedTokenCount: Int,
+        rejectedTokenCount: Int,
+        targetLayerIds: [Int],
+        verifiedTargetHidden: MLXArray
+    ) throws -> MLXArray {
+        try languageModel.rollbackDFlashCache(
+            &cache,
+            state: state,
+            verifyInput: verifyInput,
+            acceptedTokenCount: acceptedTokenCount,
+            rejectedTokenCount: rejectedTokenCount,
+            targetLayerIds: targetLayerIds,
+            verifiedTargetHidden: verifiedTargetHidden
+        )
     }
 }
 

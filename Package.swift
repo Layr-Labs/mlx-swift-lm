@@ -34,6 +34,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .executable(
+            name: "mlx-bench",
+            targets: ["mlx-bench"]),
     ],
     dependencies: [
         .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
@@ -129,7 +132,8 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                "ContinuousBatchingTestPlan.md",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
@@ -137,6 +141,9 @@ let package = Package(
                 .process("Resources/Gemma4MTPPrompts.json"),
                 .process("Resources/gemma4-26B-A4B-assistant-config.json"),
                 .process("Resources/gemma4-E4B-assistant-config.json"),
+                .process("Resources/dflash-gemma4-gated-schema-config.json"),
+                .process("Resources/dflash-gpt-oss-120b-config.json"),
+                .process("Resources/dflash-qwen35-27b-config.json"),
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
             ]
         ),
@@ -167,6 +174,19 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/mlx-server"
+        ),
+        .executableTarget(
+            name: "mlx-bench",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                .product(name: "Transformers", package: "swift-transformers"),
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "Sources/mlx-bench"
         ),
     ]
 )

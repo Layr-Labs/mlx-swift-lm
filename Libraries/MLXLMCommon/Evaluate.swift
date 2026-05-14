@@ -493,7 +493,7 @@ public struct PenaltyProcessor: LogitProcessor {
 /// Common properties shared by token-generating iterators.
 ///
 /// Public so model-specific iterators outside `MLXLMCommon` can plug into
-/// the shared generation loop.
+/// the shared `generate(iterator:...)` entry point.
 public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
     var tokenCount: Int { get }
@@ -1503,11 +1503,20 @@ public func generateTask(
     )
 }
 
-/// Low-level token generation accepting any ``TokenIteratorProtocol``
+/// Low-level token generation accepting any `TokenIteratorProtocol`
 /// conformer.
 ///
-/// This mirrors the `TokenIterator` overload while allowing model-specific
-/// iterators to share the standard `AsyncStream<Generation>` output path.
+/// Mirrors `generateTask(...)` but takes the protocol type so packages
+/// outside `MLXLMCommon` can plug in their own iterators. The existing
+/// `TokenIterator`-typed overload is preserved for back-compat.
+///
+/// - Parameters:
+///   - promptTokenCount: number of tokens in the prompt
+///   - modelConfiguration: model configuration (for EOS/extra EOS tokens and tool-call format)
+///   - tokenizer: tokenizer (for EOS id, unknown token id, and detokenization)
+///   - iterator: any conformer of ``TokenIteratorProtocol``
+///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination.
+/// - Returns: An `AsyncStream` that emits `Generation` values and a `Task`
 public func generateTask(
     promptTokenCount: Int,
     modelConfiguration: ModelConfiguration,

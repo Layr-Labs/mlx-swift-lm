@@ -543,7 +543,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         if self.keys == nil
             || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
         {
-            let newSize = min(step, maxCacheSize - prev)
+            // `offset` is an absolute sequence position. After a saturated
+            // rotating cache is trimmed for speculative rollback, `offset`
+            // can remain much larger than `maxCacheSize` while the stored
+            // temporal window is shorter than `maxCacheSize`. Grow from the
+            // stored window length, not the absolute offset, or the requested
+            // allocation can go negative.
+            let currentSize = self.keys?.dim(2) ?? 0
+            let newSize = min(step, maxCacheSize - currentSize)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
@@ -557,7 +564,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
                 self.keys = newK
                 self.values = newV
             }
-            idx = prev
+            idx = currentSize
         }
 
         // Trim if needed
@@ -654,15 +661,33 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override var isTrimmable: Bool {
-        return offset < maxCacheSize
+        guard offset >= maxCacheSize else { return true }
+        guard let keys else { return false }
+        return idx == keys.dim(2)
     }
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
-        offset -= trimmed
-        idx -= trimmed
-        return trimmed
+        let requested = min(offset, n)
+        guard requested > 0 else { return 0 }
+
+        if let keys, let values, idx == keys.dim(2) {
+            let minLength = min(keep, keys.dim(2))
+            let trimmed = min(requested, keys.dim(2) - minLength)
+            guard trimmed > 0 else { return 0 }
+            let keepLength = keys.dim(2) - trimmed
+            self.keys = keys[.ellipsis, ..<keepLength, 0...]
+            self.values = values[.ellipsis, ..<keepLength, 0...]
+            offset -= trimmed
+            idx = keepLength
+            return trimmed
+        }
+
+        guard offset < maxCacheSize else { return 0 }
+
+        offset -= requested
+        idx = max(0, idx - requested)
+        return requested
     }
 
     /// Optimized mask creation for rotating cache with offset capping
@@ -675,7 +700,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             let cappedOffset = min(maxCacheSize - 1, offset)
 
             // Decide if we need an array mask
-            if cappedOffset + n > actualWindowSize || returnArray {
+            if cappedOffset + n > actualWindowSize || returnArray || offset >= actualWindowSize {
                 return .array(
                     createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
             }

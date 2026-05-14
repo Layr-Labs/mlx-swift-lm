@@ -98,6 +98,25 @@ public final class BatchedEngine: @unchecked Sendable {
         try await generateWithResult(prompt: prompt, samplingParams: samplingParams).outputText
     }
 
+    /// Generate a complete response using the legacy convenience parameters.
+    public func generate(
+        prompt: String,
+        maxTokens: Int,
+        temperature: Float = 0.7,
+        topP: Float = 0.9,
+        topK: Int = 0,
+        minP: Float = 0.0
+    ) async throws -> String {
+        try await generate(
+            prompt: prompt,
+            samplingParams: SamplingParams(
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                topK: topK,
+                minP: minP))
+    }
+
     /// Generate with structured result (includes token counts).
     public func generateWithResult(prompt: String, samplingParams: SamplingParams = SamplingParams()) async throws -> RequestOutput {
         try await core.generate(prompt: prompt, samplingParams: samplingParams)
@@ -134,6 +153,25 @@ public final class BatchedEngine: @unchecked Sendable {
         }
     }
 
+    /// Stream generation using the legacy convenience parameters.
+    public func streamGenerate(
+        prompt: String,
+        maxTokens: Int,
+        temperature: Float = 0.7,
+        topP: Float = 0.9,
+        topK: Int = 0,
+        minP: Float = 0.0
+    ) -> AsyncStream<String> {
+        streamGenerate(
+            prompt: prompt,
+            samplingParams: SamplingParams(
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                topK: topK,
+                minP: minP))
+    }
+
     // MARK: - Chat Completion
 
     /// Apply chat template to messages and return the prompt string.
@@ -160,6 +198,25 @@ public final class BatchedEngine: @unchecked Sendable {
     public func chat(messages: [[String: String]], samplingParams: SamplingParams = SamplingParams()) async throws -> String {
         let prompt = buildPrompt(messages: messages)
         return try await generate(prompt: prompt, samplingParams: samplingParams)
+    }
+
+    /// Chat completion using the legacy convenience parameters.
+    public func chat(
+        messages: [[String: String]],
+        maxTokens: Int,
+        temperature: Float = 0.7,
+        topP: Float = 0.9,
+        topK: Int = 0,
+        minP: Float = 0.0
+    ) async throws -> String {
+        try await chat(
+            messages: messages,
+            samplingParams: SamplingParams(
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                topK: topK,
+                minP: minP))
     }
 
     /// Stream chat completion.

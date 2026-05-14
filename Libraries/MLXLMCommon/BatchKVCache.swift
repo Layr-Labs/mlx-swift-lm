@@ -402,6 +402,15 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if leftPadding.max().item(Int32.self) == 0 {
+            if n == 1 {
+                return .none
+            }
+            return .array(createCausalMask(
+                n: n,
+                offset: _idx,
+                windowSize: windowSize))
+        }
         let mask = createCausalMask(
             n: n,
             offset: _idx,
@@ -555,14 +564,16 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             self.values = values
             _idx = stepCount
         } else {
-            // Honor a prior trim before appending new K/V. Otherwise the
-            // stored tensors keep stale tail positions while `_idx` and masks
-            // describe the shorter logical cache.
+            // Honour any prior `trim(_:)` that decremented `_idx` below the
+            // stored tensor length. Without this slice, a post-trim update
+            // would concatenate onto the old tail and mask K (derived from
+            // `_idx`) would no longer match the actual QK length. This is
+            // the batched analogue of `RotatingKVCache.updateInPlace`'s
+            // offset-aware write.
             if let storedK = self.keys, storedK.dim(2) > _idx {
                 self.keys = storedK[.ellipsis, ..<_idx, 0...]
                 self.values = self.values![.ellipsis, ..<_idx, 0...]
             }
-
             if stepCount > 1 {
                 // Multi-token prefill must keep enough temporary context for
                 // every query in this call. Match RotatingKVCache's concat
@@ -748,6 +759,15 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         let actualWindowSize = windowSize ?? maxCacheSize
         let maskOffset = min(maxCacheSize - 1, _idx)
+        if leftPadding.max().item(Int32.self) == 0 {
+            if n == 1 {
+                return .none
+            }
+            return .array(createCausalMask(
+                n: n,
+                offset: maskOffset,
+                windowSize: actualWindowSize))
+        }
         let mask = createCausalMask(
             n: n,
             offset: maskOffset,
@@ -867,9 +887,37 @@ extension BatchKVCache {
 
     /// Zero per-row tail positions. For each row `b`, slots
     /// `[keepLengths[b], _idx)` in both keys and values are set to 0.
+    /// Rows where `keepLengths[b] >= _idx` are left unchanged.
     ///
-    /// This is used by batched speculative decoding when rows accept different
-    /// numbers of tokens within the same verify block.
+    /// Used by the Gemma 4 MTP round-loop to clear rejected-tail mismatches
+    /// when rows accepted different numbers of tokens within the same
+    /// speculative block.
+    ///
+    /// No-op if the cache is empty (no `update` has been called yet).
+    ///
+    /// - Parameter keepLengths: int array of shape `[B]`. Values should
+    ///   satisfy `0 <= keepLengths[b] <= _idx` for all `b`; out-of-range
+    ///   values just fall back to "no zeroing" (keep >= T) or "zero all"
+    ///   (keep <= 0).
+    public func zeroTailPerRow(keepLengths: MLXArray) {
+        guard let storedK = keys, let storedV = values else { return }
+        let T = storedK.dim(2)
+        let positions = MLXArray(Int32(0) ..< Int32(T))
+            .reshaped([1, 1, T, 1])                          // [1, 1, T, 1]
+        let keep = keepLengths.asType(.int32)
+            .reshaped([-1, 1, 1, 1])                         // [B, 1, 1, 1]
+        let keepMask = positions .< keep                     // [B, 1, T, 1] bool
+        let maskFloat = keepMask.asType(storedK.dtype)
+        keys = storedK * maskFloat
+        values = storedV * maskFloat
+    }
+}
+
+extension BatchRotatingKVCache {
+    /// Zero per-row tail positions in the rotating batched cache.
+    ///
+    /// This mirrors `BatchKVCache.zeroTailPerRow` and is used when batched
+    /// speculative rows accept different numbers of tokens in the same block.
     public func zeroTailPerRow(keepLengths: MLXArray) {
         guard let storedK = keys, let storedV = values else { return }
         let T = storedK.dim(2)
@@ -877,8 +925,9 @@ extension BatchKVCache {
             .reshaped([1, 1, T, 1])
         let keep = keepLengths.asType(.int32)
             .reshaped([-1, 1, 1, 1])
-        let mask = (positions .< keep).asType(storedK.dtype)
-        keys = storedK * mask
-        values = storedV * mask
+        let keepMask = positions .< keep
+        let maskFloat = keepMask.asType(storedK.dtype)
+        keys = storedK * maskFloat
+        values = storedV * maskFloat
     }
 }
