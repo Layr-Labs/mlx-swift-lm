@@ -453,6 +453,33 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("hello, world!"))
     }
 
+    @Test("Test Gemma 4 Tool Call Parser")
+    func testGemma4ToolCallParser() throws {
+        let parser = GemmaFunctionParser()
+        let content = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["city"] == .string("Paris"))
+    }
+
+    @Test("Test Gemma 4 Tool Call Parser - Nested JSON")
+    func testGemma4ToolCallParserNestedJSON() throws {
+        let parser = GemmaFunctionParser()
+        let content =
+            "<|tool_call>call:search{query:<|\"|>swift, mlx<|\"|>,filters:{\"limit\":2,\"fresh\":true}}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("swift, mlx"))
+        #expect(toolCall.function.arguments["filters"] == .object([
+            "limit": .int(2),
+            "fresh": .bool(true),
+        ]))
+    }
+
     @Test("Test Gemma Format via ToolCallProcessor")
     func testGemmaFormatProcessor() throws {
         let processor = ToolCallProcessor(format: .gemma)

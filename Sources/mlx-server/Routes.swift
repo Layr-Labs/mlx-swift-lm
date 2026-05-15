@@ -84,6 +84,106 @@ private func generateWithGemma4MTP(
     return (outputText, promptToks, completionToks, finishReason)
 }
 
+private func assistantChatChoice(
+    index: Int,
+    text: String,
+    finishReason: String?,
+    tools: [[String: any Sendable]]?
+) -> ChatChoice {
+    let parser = GemmaFunctionParser()
+    guard looksLikeGemmaToolCall(text),
+          let toolCall = parser.parse(content: text, tools: tools)
+    else {
+        return ChatChoice(
+            index: index,
+            message: ChatMessage(role: "assistant", content: text),
+            finish_reason: finishReason ?? "stop"
+        )
+    }
+
+    return ChatChoice(
+        index: index,
+        message: ChatMessage(
+            role: "assistant",
+            content: .null,
+            tool_calls: [openAIToolCall(toolCall)]
+        ),
+        finish_reason: "tool_calls"
+    )
+}
+
+private func looksLikeGemmaToolCall(_ text: String) -> Bool {
+    text.contains("<|tool_call>") || text.contains("<start_function_call>")
+}
+
+private func openAIToolCall(_ toolCall: ToolCall) -> JSONValue {
+    .object([
+        "id": .string("call_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"),
+        "type": .string("function"),
+        "function": .object([
+            "name": .string(toolCall.function.name),
+            "arguments": .string(jsonString(toolCall.function.arguments)),
+        ]),
+    ])
+}
+
+private func openAIChunkToolCall(_ toolCall: ToolCall, index: Int) -> JSONValue {
+    .object([
+        "index": .int(index),
+        "id": .string("call_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"),
+        "type": .string("function"),
+        "function": .object([
+            "name": .string(toolCall.function.name),
+            "arguments": .string(jsonString(toolCall.function.arguments)),
+        ]),
+    ])
+}
+
+private func assistantStreamDelta(
+    text: String,
+    tools: [[String: any Sendable]]?
+) -> (delta: ChunkDelta, finishReason: String) {
+    let parser = GemmaFunctionParser()
+    guard looksLikeGemmaToolCall(text),
+          let toolCall = parser.parse(content: text, tools: tools)
+    else {
+        return (ChunkDelta(content: text), "stop")
+    }
+    return (
+        ChunkDelta(tool_calls: [openAIChunkToolCall(toolCall, index: 0)]),
+        "tool_calls"
+    )
+}
+
+private func jsonString(_ arguments: [String: MLXLMCommon.JSONValue]) -> String {
+    let value = JSONValue.object(arguments.mapValues(serverJSONValue))
+    guard let data = try? jsonEncoder.encode(value),
+          let string = String(data: data, encoding: .utf8)
+    else {
+        return "{}"
+    }
+    return string
+}
+
+private func serverJSONValue(_ value: MLXLMCommon.JSONValue) -> JSONValue {
+    switch value {
+    case .null:
+        .null
+    case .bool(let value):
+        .bool(value)
+    case .int(let value):
+        .int(value)
+    case .double(let value):
+        .double(value)
+    case .string(let value):
+        .string(value)
+    case .array(let value):
+        .array(value.map(serverJSONValue))
+    case .object(let value):
+        .object(value.mapValues(serverJSONValue))
+    }
+}
+
 // MARK: - Router builder
 
 func buildRouter(
@@ -160,14 +260,28 @@ func buildRouter(
         let req = try await request.decode(as: ChatCompletionRequest.self, context: context)
         let params = samplingParams(from: req, defaultMaxTokens: defaultMaxTokens)
         let prompt = engine.buildPrompt(
-            messages: req.messages.map { ["role": $0.role, "content": $0.content] }
+            messages: req.messages.map(\.promptMessage),
+            tools: req.promptTools,
+            additionalContext: ["enable_thinking": false]
         )
 
         if req.stream == true {
             if let g4 = gemma4Context {
-                return sseChatGemma4Response(g4: g4, modelName: modelName, prompt: prompt, params: params)
+                return sseChatGemma4Response(
+                    g4: g4,
+                    modelName: modelName,
+                    prompt: prompt,
+                    params: params,
+                    tools: req.promptTools
+                )
             }
-            return sseChatResponse(engine: engine, modelName: modelName, prompt: prompt, params: params)
+            return sseChatResponse(
+                engine: engine,
+                modelName: modelName,
+                prompt: prompt,
+                params: params,
+                tools: req.promptTools
+            )
         } else if let g4 = gemma4Context {
             let (text, pp, tg, finish) = try await generateWithGemma4MTP(
                 prompt: prompt, params: params, g4: g4)
@@ -176,10 +290,11 @@ func buildRouter(
                 object: "chat.completion",
                 created: Int(Date().timeIntervalSince1970),
                 model: modelName,
-                choices: [ChatChoice(
+                choices: [assistantChatChoice(
                     index: 0,
-                    message: ChatMessage(role: "assistant", content: text),
-                    finish_reason: finish
+                    text: text,
+                    finishReason: finish,
+                    tools: req.promptTools,
                 )],
                 usage: Usage(prompt_tokens: pp, completion_tokens: tg, total_tokens: pp + tg)
             )
@@ -192,10 +307,11 @@ func buildRouter(
                 object: "chat.completion",
                 created: Int(Date().timeIntervalSince1970),
                 model: modelName,
-                choices: [ChatChoice(
+                choices: [assistantChatChoice(
                     index: 0,
-                    message: ChatMessage(role: "assistant", content: out.outputText),
-                    finish_reason: out.finishReason
+                    text: out.outputText,
+                    finishReason: out.finishReason,
+                    tools: req.promptTools,
                 )],
                 usage: Usage(
                     prompt_tokens: out.promptTokens,
@@ -222,7 +338,8 @@ private func sseChatResponse(
     engine: BatchedEngine,
     modelName: String,
     prompt: String,
-    params: SamplingParams
+    params: SamplingParams,
+    tools: [[String: any Sendable]]?
 ) -> Response {
     let (stream, continuation) = AsyncStream<ByteBuffer>.makeStream()
 
@@ -241,30 +358,52 @@ private func sseChatResponse(
         )
         if let buf = try? sseData(firstChunk) { continuation.yield(buf) }
 
+        var bufferedOutput = ""
+        let bufferForToolParsing = tools?.isEmpty == false
+
         for await output in engine.streamOutputs(prompt: prompt, samplingParams: params) {
             if !output.newText.isEmpty {
+                if bufferForToolParsing {
+                    bufferedOutput += output.newText
+                } else {
+                    let chunk = ChatCompletionChunk(
+                        id: requestId, object: "chat.completion.chunk", created: created,
+                        model: modelName,
+                        choices: [ChunkChoice(
+                            index: 0,
+                            delta: ChunkDelta(role: nil, content: output.newText),
+                            finish_reason: nil
+                        )]
+                    )
+                    if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                }
+            }
+            if output.finished || output.error != nil {
+                var finishReason = output.finishReason ?? "stop"
+                if bufferForToolParsing, !bufferedOutput.isEmpty {
+                    let parsed = assistantStreamDelta(text: bufferedOutput, tools: tools)
+                    finishReason = parsed.finishReason == "tool_calls" ? "tool_calls" : finishReason
+                    let chunk = ChatCompletionChunk(
+                        id: requestId, object: "chat.completion.chunk", created: created,
+                        model: modelName,
+                        choices: [ChunkChoice(
+                            index: 0,
+                            delta: parsed.delta,
+                            finish_reason: nil
+                        )]
+                    )
+                    if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                }
                 let chunk = ChatCompletionChunk(
                     id: requestId, object: "chat.completion.chunk", created: created,
                     model: modelName,
                     choices: [ChunkChoice(
                         index: 0,
-                        delta: ChunkDelta(role: nil, content: output.newText),
-                        finish_reason: nil
+                        delta: ChunkDelta(role: nil, content: nil),
+                        finish_reason: finishReason
                     )]
                 )
                 if let buf = try? sseData(chunk) { continuation.yield(buf) }
-            }
-            if output.finished || output.error != nil {
-                let finalChunk = ChatCompletionChunk(
-                    id: requestId, object: "chat.completion.chunk", created: created,
-                    model: modelName,
-                    choices: [ChunkChoice(
-                        index: 0,
-                        delta: ChunkDelta(role: nil, content: nil),
-                        finish_reason: output.finishReason ?? "stop"
-                    )]
-                )
-                if let buf = try? sseData(finalChunk) { continuation.yield(buf) }
                 break
             }
         }
@@ -284,7 +423,8 @@ private func sseChatGemma4Response(
     g4: Gemma4ServerContext,
     modelName: String,
     prompt: String,
-    params: SamplingParams
+    params: SamplingParams,
+    tools: [[String: any Sendable]]?
 ) -> Response {
     let (stream, continuation) = AsyncStream<ByteBuffer>.makeStream()
     Task {
@@ -302,23 +442,39 @@ private func sseChatGemma4Response(
             maxTokens: params.maxTokens, temperature: params.temperature,
             topP: params.topP, topK: params.topK, minP: params.minP)
         var finishReason = "stop"
+        var bufferedOutput = ""
+        let bufferForToolParsing = tools?.isEmpty == false
         if let genStream = try? generateGemma4MTP(
             input: input, parameters: genParams, target: g4.target, drafter: g4.drafter) {
             for await gen in genStream {
                 switch gen {
                 case .chunk(let text):
-                    let chunk = ChatCompletionChunk(
-                        id: requestId, object: "chat.completion.chunk", created: created,
-                        model: modelName,
-                        choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: nil, content: text), finish_reason: nil)]
-                    )
-                    if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                    if bufferForToolParsing {
+                        bufferedOutput += text
+                    } else {
+                        let chunk = ChatCompletionChunk(
+                            id: requestId, object: "chat.completion.chunk", created: created,
+                            model: modelName,
+                            choices: [ChunkChoice(index: 0, delta: ChunkDelta(role: nil, content: text), finish_reason: nil)]
+                        )
+                        if let buf = try? sseData(chunk) { continuation.yield(buf) }
+                    }
                 case .info(let info):
                     finishReason = info.stopReason == .stop ? "stop" : "length"
                 case .toolCall:
                     break
                 }
             }
+        }
+        if bufferForToolParsing, !bufferedOutput.isEmpty {
+            let parsed = assistantStreamDelta(text: bufferedOutput, tools: tools)
+            finishReason = parsed.finishReason == "tool_calls" ? "tool_calls" : finishReason
+            let chunk = ChatCompletionChunk(
+                id: requestId, object: "chat.completion.chunk", created: created,
+                model: modelName,
+                choices: [ChunkChoice(index: 0, delta: parsed.delta, finish_reason: nil)]
+            )
+            if let buf = try? sseData(chunk) { continuation.yield(buf) }
         }
         let finalChunk = ChatCompletionChunk(
             id: requestId, object: "chat.completion.chunk", created: created, model: modelName,
