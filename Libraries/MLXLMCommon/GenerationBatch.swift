@@ -219,12 +219,12 @@ public final class GenerationBatch: @unchecked Sendable {
     /// detection / response dispatch.
     private func step() -> [Int] {
         let currentTokens = nextTokens
-        let inputs = currentTokens[0..., .newAxis]
+        let inputs = currentTokens.reshaped(uids.count, 1)
 
         let logits = model.callAsFunction(inputs, cache: promptCache.map { $0 as any KVCache })
 
         // [B, 1, vocab] -> [B, vocab]
-        let stepLogits = logits[.ellipsis, -1, 0...]
+        let stepLogits = logits[0..., -1, 0...]
 
         let sampledTokens: MLXArray
         if samplers.contains(where: { $0 != nil }) {
