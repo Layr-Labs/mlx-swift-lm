@@ -1381,27 +1381,31 @@ private final class Gemma4VisionTransformerBlock: Module {
     @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayerNorm:
         Gemma4RMSNormZeroShift
 
-    init(config: Gemma4VisionConfiguration) {
-        self._selfAttention.wrappedValue = Gemma4VisionAttention(config: config)
-        self._mlp.wrappedValue = Gemma4VisionMLP(config: config)
-        self._inputLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._postAttentionLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._preFeedforwardLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._postFeedforwardLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        super.init()
+    let expectedCount = scaledImageFeaturesFlattened.shape[0]
+    let actualTrueCount = imageMaskExpandedFlattened
+        .asType(.int32).sum().item(Int.self)
+    guard actualTrueCount == expectedCount else {
+        if actualTrueCount == 0 {
+            return finalEmbedding
+        }
+        fatalError(
+            """
+            gemma4MaskedScatter: Size mismatch between image features and positions.
+            Image features: \(expectedCount)
+            Image positions: \(actualTrueCount)
+            """)
+    }
+    guard expectedCount > 0 else {
+        return finalEmbedding
     }
 
-    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray?) -> MLXArray {
-        let normed = inputLayerNorm(x)
-        let attentionOutput = selfAttention(normed, positions: positions, mask: mask)
-        let h = x + postAttentionLayerNorm(attentionOutput)
-        let ff = mlp(preFeedforwardLayerNorm(h))
-        return h + postFeedforwardLayerNorm(ff)
-    }
+    // argWhere stays on GPU; one .item() for the count replaces a full
+    // .asArray(Bool.self) readback of the entire mask.
+    let rawIndices = argWhere(
+        imageMaskExpandedFlattened.asType(.bool), count: expectedCount)
+    let imagePositions = rawIndices.asType(DType.uint32)
+    finalEmbeddingFlattened[imagePositions] = scaledImageFeaturesFlattened
+    return finalEmbeddingFlattened.reshaped(finalEmbeddingShape)
 }
 
 private final class Gemma4VisionPatchEmbedder: Module {
@@ -1725,20 +1729,33 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         let convertedCache = cache.map { $0 }
+        let result: LMOutput
         if let imagePixels = input.image?.pixels {
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens, pixelValues: imagePixels)
-            let result = languageModel(
+            result = languageModel(
                 nil,
                 cache: convertedCache,
                 inputsEmbeds: inputsEmbeds,
                 perLayerInputs: perLayerInputs
             )
-            return .logits(result)
         } else {
-            let result = languageModel(input.text.tokens, cache: convertedCache)
-            return .logits(result)
+            result = languageModel(input.text.tokens, cache: convertedCache)
         }
+
+        // Issue #169: Gemma 4 VLM's prefill leaves K/V writes pending in the
+        // command buffer. Without an eval barrier here, the iterator's first
+        // decode forward reads the cache before the prefill writes commit,
+        // producing garbage logits — manifests as "ThisThis" duplicate at
+        // temp=0 and a `<pad>` flood at temp>0. Hard sync barrier on cache +
+        // logits before returning.
+        var cacheArrays: [MLXArray] = []
+        for c in convertedCache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [result.logits])
+
+        return .logits(result)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
