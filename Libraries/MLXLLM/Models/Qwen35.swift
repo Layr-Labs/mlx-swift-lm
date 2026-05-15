@@ -578,9 +578,30 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let turboScheme = parameters?.kvScheme
+        let isTurbo = turboScheme?.hasPrefix("turbo") ?? false
+        var parsed: (bits: Int, keyBits: Int?, valueBits: Int?, useCompressedAttention: Bool) = (4, nil, nil, false)
+        if isTurbo, let scheme = turboScheme {
+            parsed = parseTurboScheme(scheme)
+        }
+
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
+            }
+            if isTurbo {
+                // TurboQuantKVCache: α default = dequant-FP16 + standard SDPA;
+                // β opt-in (`useCompressedAttention=true` from `-compact` suffix)
+                // = compressed-domain Metal kernels. headDim only triggers
+                // codec prewarm in β; lazy α defers it.
+                return TurboQuantKVCache(
+                    bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
+                    maxSize: parameters?.maxKVSize,
+                    useCompressedAttention: parsed.useCompressedAttention,
+                    headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
+            }
+            if let maxKVSize = parameters?.maxKVSize {
+                return RotatingKVCache(maxSize: maxKVSize, keep: 0)
             }
             return KVCacheSimple()
         }
@@ -672,6 +693,24 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return languageModel.sanitize(weights: sanitized)
+    }
+
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+    {
+        guard let plq = perLayerQuantization else { return nil }
+        // Keep both prefixed AND stripped keys. The quantize() loop uses Swift
+        // module paths which include 'language_model.' from @ModuleInfo(key:),
+        // so both forms must be present for per-layer lookup to match.
+        let prefix = "language_model."
+        var merged: [String: BaseConfiguration.QuantizationOption] = plq.perLayerQuantization
+        for (key, value) in plq.perLayerQuantization {
+            if key.hasPrefix(prefix) {
+                merged[String(key.dropFirst(prefix.count))] = value
+            }
+        }
+        return languageModel.sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization(
+            quantization: plq.quantization, perLayerQuantization: merged))
     }
 }
 

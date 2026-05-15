@@ -194,9 +194,45 @@ public protocol LanguageModel: BaseLanguageModel {
     /// create a new array of ``KVCache``: automatic implementation if self
     /// implements ``KVCacheDimensionProvider``
     func newCache(parameters: GenerateParameters?) -> [KVCache]
+
+    /// Optionally preprocess the weights and modify / remove values as needed.
+    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
+
+    /// Optionally preprocess the weights with access to safetensor metadata.
+    ///
+    /// The default implementation forwards to ``sanitize(weights:)``.
+    /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
+    /// and skip or customize sanitization accordingly.
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+
+    /// Optionally remap ``BaseConfiguration/PerLayerQuantization`` keys so they
+    /// match the Swift module paths for this model.
+    ///
+    /// VLM configs use Python-style paths like `language_model.model.layers.0...`,
+    /// but when the inner text model is loaded stand-alone, the Swift paths drop
+    /// the `language_model.` prefix. Override this to strip that prefix (or
+    /// perform any other remapping) so mixed-precision quantization overrides
+    /// resolve correctly.
+    func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+
+    /// Whether this model's attention path supports TurboQuant-compressed KV.
+    ///
+    /// The α default (`useCompressedAttention = false`) routes through standard
+    /// `MLXFast.scaledDotProductAttention(... sinks:)`, so attention-sink models
+    /// (GPT-OSS) work without opting out. Override to `false` only if a model's
+    /// attention path is genuinely incompatible with `TurboQuantKVCache`'s
+    /// `update`/`updateAndDequant` semantics. Defaults to `true`.
+    var supportsTurboQuantization: Bool { get }
 }
 
 extension LanguageModel {
+    /// Library-wide fallback. Concrete models override to declare an
+    /// audited per-architecture optimum.
+    public var defaultPrefillStepSize: Int { 1024 }
+
+    public var supportsTurboQuantization: Bool { true }
+
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
     {
