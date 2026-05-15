@@ -1,8 +1,14 @@
 // Port of mlx_lm.generate.GenerationBatch.
 // https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py
+//
+// MTP (Multi-Token Prediction) dispatch is added at the bottom of this file
+// as a private extension. It intercepts init/next/filter/extend when the
+// model is MTPCapable and batchSize == 1.
+// Port of omlx commit 696d90a: patches/mlx_lm_mtp/batch_generator.py
 
 import Foundation
 import MLX
+import MLXRandom
 import MLXNN
 
 /// Picks one token per row from a `[B, vocab]` logits tensor.
@@ -64,6 +70,11 @@ public final class GenerationBatch: @unchecked Sendable {
     private var numTokens: [Int]
     private var matcherStates: [SequenceStateMachineState]
 
+    /// MTP state. Non-nil when the batch is running the MTP draft+verify cycle.
+    /// Set by `postInitMTP` immediately after `init`; cleared on finish or fallback.
+    /// Port of omlx commit 696d90a: batch_generator.py _omlx_mtp_state
+    internal var _omlxMtpState: MTPState?
+
     public init(
         model: any LanguageModel,
         uids: [Int],
@@ -97,6 +108,11 @@ public final class GenerationBatch: @unchecked Sendable {
         // token extraction path.
         if !uids.isEmpty {
             _ = step()
+            // Attempt MTP post-init for eligible single-sequence batches.
+            // omlx: batch_generator.py patched_init → _post_init_mtp
+            if batchSize == 1, let mtpModel = model as? (any MTPCapable), mtpModel.hasMTPHead {
+                postInitMTP(model: mtpModel)
+            }
         }
     }
 
@@ -105,6 +121,21 @@ public final class GenerationBatch: @unchecked Sendable {
     /// non-nil `finishReason`.
     public func next() -> [GenerationBatchResponse] {
         if uids.isEmpty { return [] }
+
+        // MTP dispatch: for eligible single-sequence batches, emit from queue or
+        // run the 2-token verify cycle.
+        // omlx: batch_generator.py patched_next → _mtp_next
+        if batchSize == 1,
+           let state = _omlxMtpState,
+           let mtpModel = model as? (any MTPCapable)
+        {
+            do {
+                return try mtpNext(state: state, model: mtpModel)
+            } catch {
+                // Fall back to standard step; drop state to prevent half-built cycles.
+                _omlxMtpState = nil
+            }
+        }
 
         let stepTokens = step()
 
@@ -184,6 +215,9 @@ public final class GenerationBatch: @unchecked Sendable {
         if !keep.isEmpty {
             nextTokens = take(nextTokens, keepArr, axis: 0)
         }
+        // MTP: drop state when batch is emptied externally (e.g. scheduler abort).
+        // omlx: batch_generator.py patched_filter
+        if keep.isEmpty { _omlxMtpState = nil }
     }
 
     /// In-place: append `other`'s rows to this batch. Per-layer caches are
@@ -204,10 +238,87 @@ public final class GenerationBatch: @unchecked Sendable {
         matcherStates.append(contentsOf: other.matcherStates)
         numTokens.append(contentsOf: other.numTokens)
         nextTokens = concatenated([nextTokens, other.nextTokens], axis: 0)
+        // MTP: transfer state from donor batch when BatchGenerator merges a fresh
+        // single-sequence batch into self via extend(). The MTP post-init fires on
+        // the donor (whose __init__ ran with uids=[1]); without this transfer the
+        // state would be lost when the donor is released.
+        // omlx: batch_generator.py patched_extend
+        if let donorState = other._omlxMtpState, _omlxMtpState == nil {
+            _omlxMtpState = donorState
+            other._omlxMtpState = nil
+        }
     }
 
     public var isEmpty: Bool { uids.isEmpty }
     public var batchSize: Int { uids.count }
+
+    // MARK: - MTP post-init
+
+    /// Called from `init` immediately after the standard `step()` for eligible
+    /// single-sequence batches. Sets up `_omlxMtpState` and seeds the emit queue
+    /// with two confirmed tokens so the first two `next()` calls bypass `step()`.
+    /// omlx: batch_generator.py patched_init → _post_init_mtp
+    internal func postInitMTP(model: any MTPCapable) {
+        let sampler = samplers[0] ?? fallbackSampler
+
+        // nextTokens = main_tok: sampled from prompt[-1]'s logits in init's step().
+        let mainTok = nextTokens  // shape (1,) — asyncEval'd in step(); will force on use
+
+        // 1. Backbone forward at main_tok → (logits [1,1,vocab], preNormHidden [1,1,H]).
+        // omlx: _post_init_mtp — "1-token backbone forward at main_tok with hidden state"
+        // Returns pre-norm hidden: the MTP head's pre_fc_norm_hidden applies its own norm.
+        let mainInput = mainTok.reshaped(1, 1)
+        let backboneCache = promptCache.map { $0 as any KVCache }
+        let (logits, hidden) = model.callWithHidden(
+            input: LMInput.Text(tokens: mainInput),
+            cache: backboneCache,
+            nConfirmed: 0
+        )
+
+        // 2. Sample next_main_tok from logits[:, -1, :]. Upcast to float32 to avoid
+        // BF16 underflow on low-probability tokens (MTPLX: "fp32 p/q ratio" note).
+        let nextMainLogits = logits[0..., -1, 0...].asType(.float32)  // [1, vocab]
+        let nextMainLp = nextMainLogits - logSumExp(nextMainLogits, axis: -1, keepDims: true)
+        let nextMainTok = sampler(nextMainLp)  // (1,)
+
+        // 3. Run MTP head: (hidden_at_main [1,1,H], next_main_tok [1,1]) → draft [1,1,vocab].
+        // omlx: _post_init_mtp — "MTP head sees (hidden_at_main, next_main_tok)"
+        // Allocate the persistent MTP cache here so it's shared with all subsequent
+        // stepMTP calls. The MTP head is auto-regressive (trained with growing KV context).
+        // PR #990: `mtp_cache = model.make_mtp_cache()` — created once, reused every cycle.
+        let mtpCache = model.makeMTPCache()
+        let T = hidden.dim(1)
+        let hiddenAtMain = hidden[0..., (T - 1) ..< T, 0...]  // [1, 1, H]
+        let nextIds = nextMainTok.reshaped(1, 1)               // [1, 1]
+        let mtpLogits = model.mtpForward(
+            hidden: hiddenAtMain, nextTokenIds: nextIds, cache: mtpCache)
+        let draftLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
+        let draftLp2d = draftLogits2d - logSumExp(draftLogits2d, axis: -1, keepDims: true)
+        let draftTok = compactCategorical(draftLp2d, k: 512)  // (1,) — sample draft for losslessness
+
+        // 4. Single eval for all sampled tokens. Cache draft_id as Int to avoid a
+        //    GPU→CPU sync in the first verify cycle's accept/reject check.
+        // omlx: _post_init_mtp — "mx.eval(main_tok, next_main_tok, draft_tok)"
+        eval(mainTok, nextMainTok, draftTok)
+        let mainId = Int(mainTok.asArray(UInt32.self)[0])
+        let nextMainId = Int(nextMainTok.asArray(UInt32.self)[0])
+        let draftId = Int(draftTok.asArray(UInt32.self)[0])
+
+        let state = MTPState()
+        state.mtpCache = mtpCache
+        state.nextMain = nextMainTok
+        state.draftTok = draftTok
+        state.draftLp = draftLp2d[0]  // [vocab]
+        state.draftId = draftId
+        // Queue the two confirmed tokens. The first two next() calls emit from
+        // this queue without any model forward — "two confirmed tokens" from PR 990.
+        state.queue.append(MTPQueueItem(tokenId: mainId, source: "init"))
+        state.queue.append(MTPQueueItem(tokenId: nextMainId, source: "init"))
+
+        _omlxMtpState = state
+    }
+
+    // MARK: - Standard decode step (unchanged)
 
     /// One forward pass + per-row sample, double-buffered like upstream
     /// `mlx_lm.generate.GenerationBatch._step`.
@@ -259,5 +370,422 @@ public final class GenerationBatch: @unchecked Sendable {
         }
 
         return stepTokens
+    }
+}
+
+// MARK: - MTP fallback error
+
+/// Signals a clean fallback to the standard step() inside the MTP dispatch path.
+/// omlx: batch_generator.py _MtpStepFallback
+private enum MTPFallback: Error {
+    case missingVerifyInputs
+    case verifyProducedNoTokens
+    case cacheRollbackFailed
+}
+
+// MARK: - MTP dispatch (private extension)
+//
+// Port of omlx commit 696d90a:
+//   patches/mlx_lm_mtp/batch_generator.py
+//   _mtp_next, _run_verify_cycle, _step_mtp, _residual_sample, _emit_response,
+//   _restore_or_trim_caches, _clear_rollback, _bump_emit_stat
+//
+// This extension intercepts next() for eligible single-sequence batches.
+// The queue emitted by postInitMTP (two confirmed tokens) is drained first;
+// subsequent calls run the 2-token verify cycle.
+
+private extension GenerationBatch {
+
+    // MARK: next() dispatch
+
+    /// Emit one token from the queue; run a verify cycle if the queue is empty.
+    /// omlx: batch_generator.py _mtp_next
+    func mtpNext(state: MTPState, model: any MTPCapable) throws -> [GenerationBatchResponse] {
+        if !state.queue.isEmpty {
+            let item = state.queue.removeFirst()
+            bumpEmitStat(&state.stats, source: item.source)
+            return emitMTPToken(item, state: state)
+        }
+
+        try runVerifyCycle(state: state, model: model)
+        guard !state.queue.isEmpty else {
+            // Verify cycle must always produce at least the rejected-verify token.
+            // omlx: _mtp_next — "verify cycle produced no emit tokens"
+            throw MTPFallback.verifyProducedNoTokens
+        }
+
+        let item = state.queue.removeFirst()
+        bumpEmitStat(&state.stats, source: item.source)
+        return emitMTPToken(item, state: state)
+    }
+
+    // MARK: Verify cycle
+
+    /// 2-token backbone forward [next_main, draft] with nConfirmed=1.
+    /// Populates state.queue with 1 (reject) or 2 (accept) tokens for the
+    /// upcoming emit calls. Updates state.nextMain / draftTok / draftLp for
+    /// the following cycle.
+    /// omlx: batch_generator.py _run_verify_cycle
+    func runVerifyCycle(state: MTPState, model: any MTPCapable) throws {
+        guard let nextMain = state.nextMain, let draftTok = state.draftTok else {
+            throw MTPFallback.missingVerifyInputs
+        }
+
+        let sampler = samplers[0] ?? fallbackSampler
+        let isGreedy = samplers[0] == nil
+
+        // Concatenate [next_main (1,), draft_tok (1,)] → (2,) → [1, 2] input.
+        let inputs = concatenated([nextMain, draftTok], axis: 0).reshaped(1, 2)
+        let backboneCache = promptCache.map { $0 as any KVCache }
+
+        // --- backbone forward (2-token, nConfirmed=1) ---
+        // nConfirmed=1: GatedDeltaNet runs two sequential M=1 processChunk calls, saving
+        // a mid-point rollbackState snapshot for the reject path. Benchmarks show this costs
+        // only ~2ms more than nConfirmed=0 (single M=2 processChunk) since the DeltaNet
+        // layers are not the bottleneck — the 28 attention layers dominate KV cache bandwidth.
+        // omlx: _run_verify_cycle — "logits, hidden = gen_batch.model(..., n_confirmed=1)"
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let (logits, hidden) = model.callWithHidden(
+            input: LMInput.Text(tokens: inputs),
+            cache: backboneCache,
+            nConfirmed: 1
+        )
+        state.stats.backboneMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+
+        // verify position = [:, 0, :]; bonus position = [:, 1, :]
+        let verifyLogits = logits[0..., 0, 0...]  // [1, vocab]
+        let bonusLogits  = logits[0..., 1, 0...]  // [1, vocab]
+
+        // Batched logprob: one logsumexp over (2, vocab) vs two over (1, vocab).
+        // Upcast to float32 before log-softmax: BF16 underflows at low probabilities,
+        // causing -inf logprobs that break the acceptance ratio (MTPLX "fp32 p/q ratio" note).
+        // omlx: _run_verify_cycle — "combined_logits = mx.concatenate([verify_logits, bonus_logits])"
+        let tSample = CFAbsoluteTimeGetCurrent()
+        let combinedLogits = concatenated([verifyLogits, bonusLogits], axis: 0).asType(.float32)  // [2, vocab]
+        let combinedLp = combinedLogits - logSumExp(combinedLogits, axis: -1, keepDims: true)
+        let verifyLp2d = combinedLp[0 ..< 1, 0...]  // [1, vocab]
+        let bonusLp2d  = combinedLp[1 ..< 2, 0...]  // [1, vocab]
+
+        let draftId = state.draftId
+
+        // Accept check WITHOUT full categorical sampling.
+        // Greedy: argmax(verifyLp2d) == draft token (fast, O(vocab) max reduction).
+        // Stochastic: log P_target(draft) / log P_draft(draft) ratio check (single index read).
+        // Deferring sampling saves one categorical (~18ms at vocab=151K) per cycle:
+        // on accept we sample bonusTok; on reject we sample from residual distribution.
+        // Both paths perform exactly ONE categorical vs the previous unconditional TWO.
+        let accept: Bool
+        if isGreedy {
+            let verifyArgmax = argMax(verifyLp2d, axis: -1)
+            eval(verifyArgmax)
+            accept = Int(verifyArgmax.asArray(UInt32.self)[0]) == draftId
+        } else {
+            let logTargetAtDraft = Double(verifyLp2d[0, draftId].asArray(Float.self)[0])
+            let logDraftAtDraft  = Double(state.draftLp![draftId].asArray(Float.self)[0])
+            let logAccept = logTargetAtDraft - logDraftAtDraft
+            accept = logAccept >= 0 || Double.random(in: 0 ..< 1) < exp(logAccept)
+        }
+        state.stats.sampleMs += (CFAbsoluteTimeGetCurrent() - tSample) * 1000
+
+        // Hidden at each verify-forward position.
+        let hiddenAtConfirmed = hidden[0..., 0 ..< 1, 0...]  // [1, 1, H]
+        let hiddenAtDraft     = hidden[0..., 1 ..< 2, 0...]  // [1, 1, H]
+
+        state.stats.cycles += 1
+
+        if accept {
+            state.stats.accepts += 1
+
+            // Accept path: clear rollback snapshots, sample bonus, run MTP head at draft position.
+            // ONE categorical (bonusTok) — verify token not needed on accept path.
+            // omlx: _run_verify_cycle accept branch
+            let tCache = CFAbsoluteTimeGetCurrent()
+            clearRollback()
+            state.stats.cacheOpsMs += (CFAbsoluteTimeGetCurrent() - tCache) * 1000
+
+            // Use compact sampling (argPartition top-K) to avoid categorical(151K) ≈ 18ms.
+            // Greedy: argmax is already O(N) optimal. Stochastic: pre-filter to top-512
+            // and sample from that compact distribution — semantically identical to full
+            // vocab when topP nucleus fits within 512 tokens (true for topP≤0.9 on 151K vocab).
+            let bonusTok = isGreedy
+                ? argMax(bonusLp2d, axis: -1)
+                : compactSample(bonusLp2d, sampler: sampler)
+            eval(bonusTok)
+            let bonusId = Int(bonusTok.asArray(UInt32.self)[0])
+
+            let (newDraft, newDraftLp) = stepMTP(
+                state: state, model: model,
+                hiddenAtPosition: hiddenAtDraft,
+                nextMainTok: bonusTok
+            )
+            // Queue: accepted draft uses MTP head's original draft distribution;
+            // bonus uses the verify forward's bonus distribution.
+            // omlx: _run_verify_cycle — "state.queue.append((draft_id, state.draft_lp, 'draft'))"
+            state.queue.append(MTPQueueItem(tokenId: draftId, source: "draft"))
+            state.queue.append(MTPQueueItem(tokenId: bonusId, source: "bonus"))
+            state.nextMain = bonusTok
+            state.draftTok = newDraft
+            state.draftLp  = newDraftLp
+            return
+        }
+
+        // Reject path: restore / trim caches, sample corrected token, run MTP at confirmed.
+        // ONE categorical (residualSample) or zero (greedy fallback) — bonus not needed.
+        // omlx: _run_verify_cycle reject branch
+        state.stats.rejects += 1
+        let tCache = CFAbsoluteTimeGetCurrent()
+        guard restoreOrTrimCaches() else {
+            throw MTPFallback.cacheRollbackFailed
+        }
+        state.stats.cacheOpsMs += (CFAbsoluteTimeGetCurrent() - tCache) * 1000
+
+        let emitId: Int
+        if isGreedy {
+            // Greedy: emit argmax of verify distribution (already computed in accept check).
+            let verifyArgmax = argMax(verifyLp2d, axis: -1)
+            eval(verifyArgmax)
+            emitId = Int(verifyArgmax.asArray(UInt32.self)[0])
+        } else {
+            // Stochastic: residual sample from max(P_target - P_draft, 0) / Z.
+            // Fall back to argmax if residual mass is negligible (z ≤ 1e-8).
+            let (rid, _) = residualSample(
+                verifyLp2d: verifyLp2d, draftLp1d: state.draftLp!)
+            if let rid {
+                emitId = rid
+            } else {
+                let verifyArgmax = argMax(verifyLp2d, axis: -1)
+                eval(verifyArgmax)
+                emitId = Int(verifyArgmax.asArray(UInt32.self)[0])
+            }
+        }
+
+        let emitTok = MLXArray([UInt32(emitId)])  // (1,) uint32
+        let (newDraft, newDraftLp) = stepMTP(
+            state: state, model: model,
+            hiddenAtPosition: hiddenAtConfirmed,
+            nextMainTok: emitTok
+        )
+        state.queue.append(MTPQueueItem(tokenId: emitId, source: "verify"))
+        state.nextMain = emitTok
+        state.draftTok = newDraft
+        state.draftLp  = newDraftLp
+    }
+
+    // MARK: MTP head forward
+
+    /// One MTP-head forward + sample. Returns (draft_tok [1], draft_lp [vocab]).
+    /// Side effect: stores the host-side int in `state.draftId` to avoid a
+    /// GPU→CPU sync on the next verify cycle's accept/reject check.
+    /// omlx: batch_generator.py _step_mtp
+    func stepMTP(
+        state: MTPState,
+        model: any MTPCapable,
+        hiddenAtPosition: MLXArray,
+        nextMainTok: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        let nextIds = nextMainTok.reshaped(1, 1)  // [1, 1]
+        // Use the persistent MTP cache from MTPState. The MTP head is auto-regressive
+        // (one full-attention transformer layer) and was trained with a growing KV context
+        // accumulated across the generation. PR #990 creates the cache once at init.
+        let mtpCache = state.mtpCache ?? model.makeMTPCache()
+        let mtpLogits = model.mtpForward(
+            hidden: hiddenAtPosition, nextTokenIds: nextIds, cache: mtpCache)
+        let mtpLogits2d = mtpLogits[0..., -1, 0...].asType(.float32)  // [1, vocab]
+        let newLp2d = mtpLogits2d - logSumExp(mtpLogits2d, axis: -1, keepDims: true)
+
+        // Sample the MTP draft from compactCategorical(top-512) so q matches the
+        // acceptance distribution exactly — fully lossless speculative decoding.
+        // compactCategorical is ~0.1ms/cycle (vs ~18ms for full 150K-vocab categorical).
+        // draft_lp (newLp2d[0]) is stored as the correct q distribution for accept check.
+        let newTok = compactCategorical(newLp2d, k: 512)  // (1,) — compact-categorical draft
+
+        // Force eval + cache int: avoids re-sync on next cycle's accept check.
+        // omlx: _step_mtp — "draft_id_int = int(new_tok.tolist()[0])"
+        eval(newTok)
+        state.draftId = Int(newTok.asArray(UInt32.self)[0])
+        state.stats.mtpHeadMs += (CFAbsoluteTimeGetCurrent() - t0) * 1000
+
+        return (newTok, newLp2d[0])  // ([1], [vocab])
+    }
+
+    // MARK: Compact sampling helpers
+
+    /// Sample from log-probability distribution lp [1, vocab] using a compact top-K subset.
+    ///
+    /// Uses `argPartition` (O(N)) to select the K highest-logprob tokens, then calls the
+    /// sampler closure on the compact [1, K] distribution, and maps the local index back
+    /// to the full vocabulary. This reduces the categorical kernel from vocab=151K to K,
+    /// eliminating the dominant ~18ms sampling bottleneck per MTP verify cycle.
+    ///
+    /// Correctness: the sampler's topP filter is applied to the K pre-filtered tokens.
+    /// This is equivalent to the full-vocab filter when K >= topP nucleus size (typically
+    /// 50–200 tokens for topP=0.9 on a 151K vocab), which K=512 satisfies conservatively.
+    private func compactSample(_ lp: MLXArray, sampler: RowSampler, k: Int = 512) -> MLXArray {
+        let vocab = lp.dim(-1)
+        if vocab <= k { return sampler(lp) }
+
+        // argPartition(-lp, kth: k-1): indices at positions [0, k-1] are the K largest
+        // elements of lp (= K smallest of -lp), in arbitrary order. O(N) vs O(N log N) sort.
+        let partIdx = argPartition(-lp, kth: k - 1, axis: -1)  // [1, vocab]
+        let topKIdx = partIdx[0..., 0 ..< k]                   // [1, K]
+        let topKLp  = takeAlong(lp, topKIdx, axis: -1)         // [1, K] compact log-probs
+
+        // Sample from the compact distribution using the sampler (temp + topP + categorical).
+        let localTok = sampler(topKLp)  // (1,) in [0, K-1]
+
+        // Map local index back to the full vocabulary.
+        return takeAlong(topKIdx, localTok.reshaped(1, 1), axis: -1).reshaped(-1)  // (1,)
+    }
+
+    /// Direct compact categorical over lp [1, vocab] without a sampler closure.
+    /// Used for residual sampling where temperature has already been folded into the distribution.
+    private func compactCategorical(_ lp: MLXArray, k: Int = 512) -> MLXArray {
+        let vocab = lp.dim(-1)
+        if vocab <= k { return MLXRandom.categorical(lp, axis: -1) }
+
+        let partIdx   = argPartition(-lp, kth: k - 1, axis: -1)  // [1, vocab]
+        let topKIdx   = partIdx[0..., 0 ..< k]                   // [1, K]
+        let topKLp    = takeAlong(lp, topKIdx, axis: -1)         // [1, K]
+        let localTok  = MLXRandom.categorical(topKLp, axis: -1)  // (1,)
+        return takeAlong(topKIdx, localTok.reshaped(1, 1), axis: -1).reshaped(-1)  // (1,)
+    }
+
+    // MARK: Residual sampling
+
+    /// Sample from max(P_target - P_draft, 0) / Z  (Leviathan et al. 2023).
+    /// Returns (tokenId or nil, verify_lp_1d). Caller falls back to verify_id when nil.
+    /// omlx: batch_generator.py _residual_sample
+    func residualSample(
+        verifyLp2d: MLXArray,
+        draftLp1d: MLXArray
+    ) -> (Int?, MLXArray) {
+        let pTarget  = exp(verifyLp2d[0])   // [vocab]
+        let pDraft   = exp(draftLp1d)        // [vocab]
+        let residual = maximum(pTarget - pDraft, MLXArray(Float(0)))
+        let zArr     = residual.sum()
+        eval(zArr)
+        let z = Double(zArr.asArray(Float.self)[0])
+        if z <= 1e-8 {
+            return (nil, verifyLp2d[0])
+        }
+        // Sample from the normalised residual distribution.
+        // omlx: _residual_sample — "mx.random.categorical(mx.log(residual / z + 1e-10)...)"
+        let logResidNorm = log(residual / Float(z) + Float(1e-10)).reshaped(1, -1)  // [1, vocab]
+        // Compact categorical: argPartition top-512 → categorical(512) instead of categorical(151K).
+        // The residual mass is concentrated on tokens where P_target > P_draft (i.e. high-prob
+        // tokens), so top-512 safely contains the entire residual nucleus.
+        let sample = compactCategorical(logResidNorm, k: 512)  // (1,)
+        eval(sample)
+        return (Int(sample.asArray(Int32.self)[0]), verifyLp2d[0])
+    }
+
+    // MARK: Response builder
+
+    /// Build a single-element response, applying the standard per-token epilogue
+    /// (token append, maxTokens / matcher checks). Calls filter([]) and clears
+    /// MTP state on the final token.
+    /// omlx: batch_generator.py _emit_response
+    func emitMTPToken(_ item: MTPQueueItem, state: MTPState) -> [GenerationBatchResponse] {
+        let tokenId = item.tokenId
+
+        tokens[0].append(tokenId)
+        numTokens[0] += 1
+
+        var finishReason: String? = nil
+        if numTokens[0] >= maxTokens[0] {
+            finishReason = "length"
+        }
+
+        let machine = stateMachines[0]
+        let (nextMatchState, matchedSequence, currentState) =
+            machine.match(matcherStates[0], tokenId)
+        matcherStates[0] = nextMatchState
+        if matchedSequence != nil, currentState == nil {
+            finishReason = "stop"
+        }
+
+        if let finishReason {
+            let extracted: [any KVCache] = promptCache.map { $0.extractBatched(0) }
+            let response = GenerationBatchResponse(
+                uid: uids[0],
+                token: tokenId,
+                finishReason: finishReason,
+                matchedSequence: matchedSequence,
+                currentState: currentState,
+                allTokens: tokens[0],
+                promptCache: extracted
+            )
+            // Drop MTP state before filter([]) so patched_filter doesn't double-clear.
+            // omlx: _emit_response finish path — "delattr(gen_batch, '_omlx_mtp_state')"
+            if let s = _omlxMtpState {
+                let st = s.stats
+                let n = Double(max(1, st.cycles))
+                print("[MTP] cycles=\(st.cycles) accepts=\(st.accepts) rejects=\(st.rejects) acceptRate=\(String(format:"%.2f",st.acceptRate)) emits=init:\(st.initEmits)+draft:\(st.draftEmits)+bonus:\(st.bonusEmits)+verify:\(st.verifyEmits)=\(st.totalEmits) backbone=\(String(format:"%.1f",st.backboneMs/n))ms/cycle mtp=\(String(format:"%.1f",st.mtpHeadMs/n))ms/cycle sample=\(String(format:"%.1f",st.sampleMs/n))ms/cycle cacheOps=\(String(format:"%.1f",st.cacheOpsMs/n))ms/cycle")
+            }
+            _omlxMtpState = nil
+            filter(keep: [])
+            return [response]
+        }
+
+        return [GenerationBatchResponse(
+            uid: uids[0],
+            token: tokenId,
+            finishReason: nil,
+            matchedSequence: matchedSequence,
+            currentState: currentState,
+            allTokens: nil,
+            promptCache: nil
+        )]
+    }
+
+    // MARK: Cache rollback helpers
+
+    /// Roll back one token from each layer cache after a draft rejection.
+    /// SSM/linear-attention layers restore their `rollbackState` snapshot;
+    /// full-attention layers trim by 1. Returns false if any layer supports neither.
+    /// omlx: batch_generator.py _restore_or_trim_caches
+    @discardableResult
+    func restoreOrTrimCaches() -> Bool {
+        for cache in promptCache {
+            if let ac = cache as? ArraysCache, let snap = ac.rollbackState {
+                let (convSnap, ssmSnap) = snap
+                ac[0] = convSnap
+                ac[1] = ssmSnap
+                ac.rollbackState = nil
+                continue
+            }
+            if cache.isTrimmable {
+                cache.trim(1)
+                continue
+            }
+            return false
+        }
+        return true
+    }
+
+    /// Drop rollback snapshots after a draft is accepted.
+    /// omlx: batch_generator.py _clear_rollback
+    func clearRollback() {
+        for cache in promptCache {
+            if let ac = cache as? ArraysCache {
+                ac.rollbackState = nil
+            }
+        }
+    }
+
+    // MARK: Stat helpers
+
+    /// Increment the emit-source stat counter.
+    /// omlx: batch_generator.py _bump_emit_stat
+    func bumpEmitStat(_ stats: inout MTPStats, source: String) {
+        switch source {
+        case "init":   stats.initEmits += 1
+        case "draft":  stats.draftEmits += 1
+        case "bonus":  stats.bonusEmits += 1
+        case "verify": stats.verifyEmits += 1
+        default:       break
+        }
     }
 }

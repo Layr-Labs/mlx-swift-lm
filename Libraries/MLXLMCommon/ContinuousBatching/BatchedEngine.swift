@@ -33,6 +33,9 @@ public final class BatchedEngine: @unchecked Sendable {
 
     private let tokenizer: any Tokenizer
     public let modelName: String
+    /// Chat template loaded from `chat_template.jinja` in the model directory,
+    /// used as fallback when the tokenizer config lacks a `chat_template` field.
+    private let externalChatTemplate: String?
 
     /// Create a batched engine from a loaded model context.
     public convenience init(
@@ -49,11 +52,16 @@ public final class BatchedEngine: @unchecked Sendable {
             eosTokenIds: context.configuration.eosTokenIds,
             prefixCache: prefixCache
         )
+        // Load chat_template.jinja if the tokenizer lacks an embedded chat template.
+        let externalTemplate: String? = (try? context.configuration.modelDirectory).flatMap {
+            try? String(contentsOf: $0.appendingPathComponent("chat_template.jinja"), encoding: .utf8)
+        }
         self.init(
             scheduler: scheduler,
             tokenizer: context.tokenizer,
             modelName: context.configuration.name,
-            config: config
+            config: config,
+            externalChatTemplate: externalTemplate
         )
     }
 
@@ -62,11 +70,13 @@ public final class BatchedEngine: @unchecked Sendable {
         scheduler: Scheduler,
         tokenizer: any Tokenizer,
         modelName: String = "",
-        config: ContinuousBatchingConfig = ContinuousBatchingConfig()
+        config: ContinuousBatchingConfig = ContinuousBatchingConfig(),
+        externalChatTemplate: String? = nil
     ) {
         self.core = EngineCore(scheduler: scheduler, config: config)
         self.tokenizer = tokenizer
         self.modelName = modelName
+        self.externalChatTemplate = externalChatTemplate
     }
 
     // MARK: - Lifecycle
@@ -127,12 +137,20 @@ public final class BatchedEngine: @unchecked Sendable {
     // MARK: - Chat Completion
 
     /// Apply chat template to messages and return the prompt string.
-    /// Falls back to a simple "role: content" format if the template is unavailable.
+    /// If the tokenizer config lacks a chat_template, falls back to `chat_template.jinja`
+    /// loaded from the model directory.
     public func buildPrompt(messages: [[String: String]]) -> String {
         do {
             let tokenIds = try tokenizer.applyChatTemplate(messages: messages)
             return tokenizer.decode(tokenIds: tokenIds)
         } catch {
+            if let template = externalChatTemplate {
+                do {
+                    let tokenIds = try tokenizer.applyChatTemplate(
+                        messages: messages, chatTemplate: template)
+                    return tokenizer.decode(tokenIds: tokenIds)
+                } catch {}
+            }
             return messages.map { "\($0["role"] ?? "user"): \($0["content"] ?? "")" }
                 .joined(separator: "\n") + "\nassistant:"
         }

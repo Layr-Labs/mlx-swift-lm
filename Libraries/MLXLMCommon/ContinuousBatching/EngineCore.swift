@@ -29,16 +29,23 @@ public struct ContinuousBatchingConfig: Sendable {
     /// Optional in-memory prefix cache configuration.
     /// Set to non-nil to enable block-level KV reuse across requests.
     public var prefixCacheConfig: PrefixCacheConfig?
+    /// Enable Multi-Token Prediction (MTP) speculative decoding for compatible models.
+    /// When true, the model loader should attach the MTP head (e.g. set `_qwen35MTPEnabled`
+    /// before calling `MLXLLM.load`). Only affects single-sequence batches.
+    /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/qwen35_model.py is_mtp_active()
+    public var mtpEnabled: Bool
     public init(
         schedulerConfig: SchedulerConfig = SchedulerConfig(),
         stepInterval: TimeInterval = 0.001,
         yieldInterval: Int = 5,
-        prefixCacheConfig: PrefixCacheConfig? = nil
+        prefixCacheConfig: PrefixCacheConfig? = nil,
+        mtpEnabled: Bool = false
     ) {
         self.schedulerConfig = schedulerConfig
         self.stepInterval = stepInterval
         self.yieldInterval = yieldInterval
         self.prefixCacheConfig = prefixCacheConfig
+        self.mtpEnabled = mtpEnabled
     }
 }
 
