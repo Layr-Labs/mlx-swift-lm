@@ -89,7 +89,7 @@ public struct SchedulerOutput: Sendable {
         self.numScheduledTokens = numScheduledTokens
         self.finishedRequestIds = finishedRequestIds
         self.outputs = outputs
-        self.hasWork = false
+        self.hasWork = hasWork
     }
 }
 

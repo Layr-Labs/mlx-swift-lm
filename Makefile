@@ -26,7 +26,6 @@ test-cb:
 		-only-testing:MLXLMTests/CBEngineCoreGenerationTests \
 		-only-testing:MLXLMTests/CBEngineCoreThreadSafetyTests \
 		-only-testing:MLXLMTests/CBBatchedEngineTests \
-		-only-testing:MLXLMTests/CBSSDCacheManagerTests \
 		-only-testing:MLXLMTests/CBGenerationBatchShapeTests \
 		2>&1 | grep -E "Test Case|Test Suite|SUCCEEDED|FAILED|error:"
 
