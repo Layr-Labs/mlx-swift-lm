@@ -554,7 +554,8 @@ private final class Gemma4TextExperts: Module {
             hiddenDims: moeIntermediateSize,
             numExperts: numExperts,
             activation: geluApproximate,
-            bias: false
+            bias: false,
+            fuseGateUp: true
         )
         super.init()
     }
@@ -1003,14 +1004,22 @@ private final class Gemma4TextBackbone: Module {
             fullMask = mask
             slidingMask = mask
         } else {
+            let fullCache = firstFullCacheIdx < localCache.count ? localCache[firstFullCacheIdx] : nil
+            let slidingCache = firstSlidingCacheIdx < localCache.count
+                ? localCache[firstSlidingCacheIdx] : nil
+            let useExplicitPrefixMask = h0.dim(1) > 1
+
+            // Cached multi-token chunks need offset-aware masks. Keep the first
+            // uncached chunk on the fast symbolic path.
             fullMask = createAttentionMask(
                 h: h0,
-                cache: firstFullCacheIdx < localCache.count ? localCache[firstFullCacheIdx] : nil)
+                cache: fullCache,
+                returnArray: useExplicitPrefixMask && (fullCache?.offset ?? 0) > 0)
             slidingMask = createAttentionMask(
                 h: h0,
-                cache: firstSlidingCacheIdx < localCache.count
-                    ? localCache[firstSlidingCacheIdx] : nil,
-                windowSize: config.slidingWindow
+                cache: slidingCache,
+                windowSize: config.slidingWindow,
+                returnArray: useExplicitPrefixMask && (slidingCache?.offset ?? 0) > 0
             )
         }
 
@@ -1095,17 +1104,20 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         }
     }
 
-    func callAsFunction(
+    func prefillBackbone(
         _ inputs: MLXArray? = nil,
         cache: [KVCache]? = nil,
         inputsEmbeds: MLXArray? = nil,
         perLayerInputs: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
-    ) -> LMOutput {
-        let output = model(
+    ) -> MLXArray {
+        model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs
         )
+    }
+
+    private func projectToLogits(_ output: MLXArray) -> MLXArray {
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(output)
@@ -1114,9 +1126,22 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         }
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)
-            return LMOutput(logits: tanh(logits / scale) * scale)
+            return tanh(logits / scale) * scale
         }
-        return LMOutput(logits: logits)
+        return logits
+    }
+
+    func callAsFunction(
+        _ inputs: MLXArray? = nil,
+        cache: [KVCache]? = nil,
+        inputsEmbeds: MLXArray? = nil,
+        perLayerInputs: MLXArray? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
+    ) -> LMOutput {
+        LMOutput(logits: projectToLogits(
+            prefillBackbone(
+                inputs, cache: cache, inputsEmbeds: inputsEmbeds,
+                perLayerInputs: perLayerInputs, mask: mask)))
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1167,6 +1192,8 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             sanitized[newKey] = value
         }
 
+        fuseSwitchGLUGateUp(weights: &sanitized)
+
         if config.tieWordEmbeddings {
             sanitized = sanitized.filter { key, _ in
                 !key.hasPrefix("language_model.lm_head.")
@@ -1178,6 +1205,28 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         }
 
         return sanitized
+    }
+
+    private func fuseSwitchGLUGateUp(weights: inout [String: MLXArray]) {
+        let suffixes = ["weight", "scales", "biases"]
+        for suffix in suffixes {
+            let gateSuffix = ".experts.switch_glu.gate_proj.\(suffix)"
+            let keys = Array(weights.keys).filter { $0.hasSuffix(gateSuffix) }
+            for gateKey in keys {
+                let upKey = gateKey.replacingOccurrences(
+                    of: ".experts.switch_glu.gate_proj.\(suffix)",
+                    with: ".experts.switch_glu.up_proj.\(suffix)"
+                )
+                let fusedKey = gateKey.replacingOccurrences(
+                    of: ".experts.switch_glu.gate_proj.\(suffix)",
+                    with: ".experts.switch_glu.gate_up_proj.\(suffix)"
+                )
+                guard let gate = weights[gateKey], let up = weights[upKey] else { continue }
+                weights[fusedKey] = concatenated([gate, up], axis: gate.ndim - 2)
+                weights[gateKey] = nil
+                weights[upKey] = nil
+            }
+        }
     }
 }
 
@@ -1736,7 +1785,36 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             )
             return .logits(result)
         } else {
-            let result = languageModel(input.text.tokens, cache: convertedCache)
+            let tokens = input.text.tokens.ndim == 1 ? input.text.tokens[.newAxis] : input.text.tokens
+            let tokenCount = tokens.dim(-1)
+
+            if tokenCount > 1 {
+                // TokenIterator samples only from the final prompt position.
+                // Fill KV cache through the backbone for prefix tokens and only
+                // project the final prompt token through the vocabulary head.
+                let prefixTokenCount = tokenCount - 1
+                let prefillStepSize = max(windowSize ?? 512, 1)
+                let chunkingMinPrefixTokens = max(config.textConfiguration.slidingWindow, 4096)
+
+                if prefixTokenCount > chunkingMinPrefixTokens {
+                    var start = 0
+                    while start < prefixTokenCount {
+                        let end = min(start + prefillStepSize, prefixTokenCount)
+                        _ = languageModel.prefillBackbone(
+                            tokens[.ellipsis, start ..< end], cache: convertedCache)
+                        eval(convertedCache)
+                        start = end
+                    }
+                } else {
+                    _ = languageModel.prefillBackbone(
+                        tokens[.ellipsis, ..<prefixTokenCount], cache: convertedCache)
+                }
+
+                let result = languageModel(tokens[.ellipsis, prefixTokenCount...], cache: convertedCache)
+                return .logits(result)
+            }
+
+            let result = languageModel(tokens, cache: convertedCache)
             return .logits(result)
         }
     }

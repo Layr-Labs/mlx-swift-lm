@@ -28,8 +28,9 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 // MARK: - SwitchGLU
 
 public class SwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
+    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
+    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear?
     @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
 
     let inputDims: Int
@@ -42,17 +43,23 @@ public class SwitchGLU: Module {
         hiddenDims: Int,
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
-        bias: Bool = false
+        bias: Bool = false,
+        fuseGateUp: Bool = false
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation
 
-        self._gateProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        self._upProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        if fuseGateUp {
+            self._gateUpProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims * 2, numExperts: numExperts, bias: bias)
+        } else {
+            self._gateProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+            self._upProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        }
         self._downProj.wrappedValue = SwitchLinear(
             inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
 
@@ -71,8 +78,55 @@ public class SwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        let xUp = upProj(x, idx, sortedIndices: doSort)
-        let xGate = gateProj(x, idx, sortedIndices: doSort)
+        let xGate: MLXArray
+        let xUp: MLXArray
+        if let gateUpProj {
+            if let quantized = gateUpProj as? QuantizedSwitchLinear {
+                xGate = MLX.gatherQuantizedMM(
+                    x,
+                    quantized.weight[.ellipsis, ..<hiddenDims, 0...],
+                    scales: quantized.scales[.ellipsis, ..<hiddenDims, 0...],
+                    biases: quantized.biases?[.ellipsis, ..<hiddenDims, 0...],
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: quantized.groupSize,
+                    bits: quantized.bits,
+                    mode: quantized.mode,
+                    sortedIndices: doSort
+                )
+                xUp = MLX.gatherQuantizedMM(
+                    x,
+                    quantized.weight[.ellipsis, hiddenDims..., 0...],
+                    scales: quantized.scales[.ellipsis, hiddenDims..., 0...],
+                    biases: quantized.biases?[.ellipsis, hiddenDims..., 0...],
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: quantized.groupSize,
+                    bits: quantized.bits,
+                    mode: quantized.mode,
+                    sortedIndices: doSort
+                )
+            } else {
+                xGate = MLX.gatherMM(
+                    x,
+                    gateUpProj.weight[.ellipsis, ..<hiddenDims, 0...].swappedAxes(-1, -2),
+                    rhsIndices: idx,
+                    sortedIndices: doSort
+                )
+                xUp = MLX.gatherMM(
+                    x,
+                    gateUpProj.weight[.ellipsis, hiddenDims..., 0...].swappedAxes(-1, -2),
+                    rhsIndices: idx,
+                    sortedIndices: doSort
+                )
+            }
+        } else {
+            guard let gateProj, let upProj else {
+                fatalError("SwitchGLU requires either gate_up_proj or gate_proj/up_proj")
+            }
+            xUp = upProj(x, idx, sortedIndices: doSort)
+            xGate = gateProj(x, idx, sortedIndices: doSort)
+        }
         x = downProj(
             activation(xGate) * xUp,
             idx,
