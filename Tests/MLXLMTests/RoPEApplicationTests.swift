@@ -12,7 +12,9 @@ struct RoPEApplicationTests {
     /// Gemma3nAttention applies rope, updates the cache and applies rope again.
     /// Ensure that it is correctly implemented.  We can observe prefill vs single token
     /// generaton and they should produce the same answers if implemented correctly.
-    @Test func gemma3nAttentionTest() {
+    @Test func gemma3nAttentionTest() async throws {
+        await MLXTestLock.shared.acquire()
+
         let config = Gemma3nTextConfiguration()
         let attention = Gemma3nAttention(config, layerIdx: 3)
 
@@ -52,5 +54,7 @@ struct RoPEApplicationTests {
         print(outputSeq)
         print(abs(outputSeq - outputBatch))
         #expect(match.item(Bool.self))
+
+        await MLXTestLock.shared.release()
     }
 }

@@ -70,6 +70,27 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertGreaterThan(result2.count, targetLength, result2)
     }
 
+    func testChatSessionSpeculativeDecodingMultiTurn() async throws {
+        let main = model()
+        let draft = ModelContainer(context: model())
+        let session = ChatSession(
+            main,
+            speculativeDecoding: SpeculativeDecodingConfig(
+                draftModel: draft, numDraftTokens: 2),
+            generateParameters: GenerateParameters(maxTokens: 8, temperature: 0.0)
+        )
+
+        let result1 = try await session.respond(to: "hello")
+        XCTAssertGreaterThan(result1.count, targetLength, result1)
+
+        let result2 = try await session.respond(to: "hello again")
+        XCTAssertGreaterThan(result2.count, targetLength, result2)
+
+        await session.withCache { cache in
+            XCTAssertNotNil(cache)
+        }
+    }
+
     func testChatSessionAsyncInterrupt() async throws {
         // interrupt the streamResponse and continue with another request
         let model = model()

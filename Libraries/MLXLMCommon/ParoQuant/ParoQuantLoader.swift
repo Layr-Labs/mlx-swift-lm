@@ -338,18 +338,15 @@ private struct ParoQuantInputProcessor: UserInputProcessor {
 /// quantization. Rotation parameters (theta, pairs, channel_scales) are kept
 /// in the model and applied to activations at runtime via Metal kernel.
 ///
-/// - Parameters:
-///   - directory: Local path to the model checkpoint directory.
-///   - typeRegistry: Registry used to create the underlying model architecture.
-///   - tokenizerLoader: Loader for tokenizer.
-///   - toolCallFormat: Optional tool-call format for the model configuration.
-/// - Returns: A ``ModelContainer`` ready for inference.
-public func loadParoQuantModel<T: LanguageModel>(
+private func loadParoQuantModelContext(
     from directory: URL,
-    typeRegistry: ModelTypeRegistry<T>,
+    createModel: @escaping (Data, String) async throws -> any LanguageModel,
     tokenizerLoader: any TokenizerLoader,
-    toolCallFormat: ToolCallFormat? = nil
-) async throws -> ModelContainer {
+    toolCallFormat: ToolCallFormat? = nil,
+    messageGenerator: @escaping (any LanguageModel, any Tokenizer) -> any MessageGenerator = { _, _ in
+        DefaultMessageGenerator()
+    }
+) async throws -> ModelContext {
     // 1. Parse config.json (flatten VLM text_config if present)
     let configURL = directory.appendingPathComponent("config.json")
     var configData = try Data(contentsOf: configURL)
@@ -367,7 +364,7 @@ public func loadParoQuantModel<T: LanguageModel>(
         configJSON["model_type"] = "qwen3_5"
         configData = try JSONSerialization.data(withJSONObject: configJSON)
     }
-    let baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: configData)
+    let baseConfig = try JSONDecoder.json5().decode(BaseConfiguration.self, from: configData)
 
     // 2. Read ParoQuant params
     guard let paroConfig = readParoQuantConfig(configData) else {
@@ -378,15 +375,13 @@ public func loadParoQuantModel<T: LanguageModel>(
     )
 
     // 3. Create model via standard typeRegistry
-    let model =
-        try await typeRegistry
-        .createModel(configuration: configData, modelType: baseConfig.modelType)
+    let model = try await createModel(configData, baseConfig.modelType)
 
     // 4. EOS token override from generation_config.json
     var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
     let genConfigURL = directory.appendingPathComponent("generation_config.json")
     if let genData = try? Data(contentsOf: genConfigURL),
-        let genConfig = try? JSONDecoder().decode(GenerationConfigFile.self, from: genData),
+        let genConfig = try? JSONDecoder.json5().decode(GenerationConfigFile.self, from: genData),
         let genEos = genConfig.eosTokenIds?.values
     {
         eosTokenIds = Set(genEos)
@@ -473,20 +468,60 @@ public func loadParoQuantModel<T: LanguageModel>(
     // 13. Load tokenizer
     let tokenizer = try await tokenizerLoader.load(from: directory)
 
-    // 14. Create processor with messageGenerator
-    // Use DefaultMessageGenerator — LLMModel.messageGenerator(tokenizer:) is in MLXLLM
-    // and this loader lives in MLXLMCommon. Callers who need custom message generation
-    // can swap the processor after loading.
-    let messageGenerator: MessageGenerator = DefaultMessageGenerator()
+    // 14. Create processor with caller-provided message generator.
     let processor = ParoQuantInputProcessor(
         tokenizer: tokenizer, configuration: config,
-        messageGenerator: messageGenerator
+        messageGenerator: messageGenerator(model, tokenizer)
     )
 
-    // 15. Assemble ModelContext → ModelContainer
-    let context = ModelContext(
+    // 15. Assemble ModelContext
+    return ModelContext(
         configuration: config, model: model,
         processor: processor, tokenizer: tokenizer
+    )
+}
+
+/// Load a ParoQuant checkpoint into a model context.
+///
+/// - Parameters:
+///   - directory: Local path to the model checkpoint directory.
+///   - typeRegistry: Registry used to create the underlying model architecture.
+///   - tokenizerLoader: Loader for tokenizer.
+///   - toolCallFormat: Optional tool-call format for the model configuration.
+/// - Returns: A ``ModelContext`` ready for inference.
+public func loadParoQuantModelContext(
+    from directory: URL,
+    typeRegistry: ModelTypeRegistry<LanguageModel>,
+    tokenizerLoader: any TokenizerLoader,
+    toolCallFormat: ToolCallFormat? = nil,
+    messageGenerator: @escaping (any LanguageModel, any Tokenizer) -> any MessageGenerator = { _, _ in
+        DefaultMessageGenerator()
+    }
+) async throws -> ModelContext {
+    try await loadParoQuantModelContext(
+        from: directory,
+        createModel: { configuration, modelType in
+            try await typeRegistry.createModel(configuration: configuration, modelType: modelType)
+        },
+        tokenizerLoader: tokenizerLoader,
+        toolCallFormat: toolCallFormat,
+        messageGenerator: messageGenerator
+    )
+}
+
+public func loadParoQuantModel<T: LanguageModel>(
+    from directory: URL,
+    typeRegistry: ModelTypeRegistry<T>,
+    tokenizerLoader: any TokenizerLoader,
+    toolCallFormat: ToolCallFormat? = nil
+) async throws -> ModelContainer {
+    let context = try await loadParoQuantModelContext(
+        from: directory,
+        createModel: { configuration, modelType in
+            try await typeRegistry.createModel(configuration: configuration, modelType: modelType)
+        },
+        tokenizerLoader: tokenizerLoader,
+        toolCallFormat: toolCallFormat
     )
     return ModelContainer(context: context)
 }

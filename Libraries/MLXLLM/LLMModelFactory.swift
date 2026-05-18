@@ -73,6 +73,7 @@ public enum LLMTypeRegistry {
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
         "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
+        "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "jamba": create(JambaConfiguration.self, JambaModel.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
@@ -376,6 +377,9 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         defaultPrompt: ""
     )
 
+    @available(*, deprecated, renamed: "jamba_3b_4bit")
+    static public let jamba_3b = jamba_3b_4bit
+
     private static func all() -> [ModelConfiguration] {
         [
             codeLlama13b4bit,
@@ -506,11 +510,29 @@ public final class LLMModelFactory: GenericModelFactory {
     /// registry of model id to configuration, e.g. `mlx-community/Llama-3.2-3B-Instruct-4bit`
     public let modelRegistry: AbstractModelRegistry
 
+    static func shouldUseParoQuantLoader(configuration: ResolvedModelConfiguration) -> Bool {
+        isParoQuantModel(directory: configuration.modelDirectory)
+    }
+
     public func _load(
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> ModelContext {
         let modelDirectory = configuration.modelDirectory
+
+        if Self.shouldUseParoQuantLoader(configuration: configuration) {
+            return try await loadParoQuantModelContext(
+                from: modelDirectory,
+                typeRegistry: typeRegistry,
+                tokenizerLoader: tokenizerLoader,
+                toolCallFormat: configuration.toolCallFormat
+            ) { model, tokenizer in
+                if let model = model as? LLMModel {
+                    return model.messageGenerator(tokenizer: tokenizer)
+                }
+                return DefaultMessageGenerator()
+            }
+        }
 
         // Load config.json once and decode for both base config and model-specific config
         let configurationURL = modelDirectory.appending(component: "config.json")

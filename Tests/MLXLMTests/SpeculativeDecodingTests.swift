@@ -52,33 +52,40 @@ struct SpeculativeDecodingTests {
         numDraftTokens: Int,
         withLogitProcessor: Bool
     ) async throws {
-        let input = UserInput(prompt: "Input text")
-        let modelInput = try await processor.prepare(input: input)
-        let parameters = GenerateParameters(
-            maxTokens: 32,
-            temperature: 0.0,  // Use greedy decoding for deterministic output
-            repetitionPenalty: withLogitProcessor ? 1.5 : nil,
-            presencePenalty: withLogitProcessor ? 0.5 : nil,
-            frequencyPenalty: withLogitProcessor ? 0.2 : nil,
-        )
+        await MLXTestLock.shared.acquire()
+        do {
+            let input = UserInput(prompt: "Input text")
+            let modelInput = try await processor.prepare(input: input)
+            let parameters = GenerateParameters(
+                maxTokens: 32,
+                temperature: 0.0,  // Use greedy decoding for deterministic output
+                repetitionPenalty: withLogitProcessor ? 1.5 : nil,
+                presencePenalty: withLogitProcessor ? 0.5 : nil,
+                frequencyPenalty: withLogitProcessor ? 0.2 : nil,
+            )
 
-        var normalTokens: [Int] = []
-        for await generation in try generateTokens(
-            input: modelInput, parameters: parameters, context: mainContext
-        ) {
-            if let token = generation.token { normalTokens.append(token) }
+            var normalTokens: [Int] = []
+            for await generation in try generateTokens(
+                input: modelInput, parameters: parameters, context: mainContext
+            ) {
+                if let token = generation.token { normalTokens.append(token) }
+            }
+
+            var speculativeTokens: [Int] = []
+            for await generation in try generateTokens(
+                input: modelInput, parameters: parameters, context: mainContext,
+                draftModel: draftContext.model, numDraftTokens: numDraftTokens
+            ) {
+                if let token = generation.token { speculativeTokens.append(token) }
+            }
+
+            #expect(!normalTokens.isEmpty)
+            #expect(!speculativeTokens.isEmpty)
+            #expect(normalTokens == speculativeTokens)
+            await MLXTestLock.shared.release()
+        } catch {
+            await MLXTestLock.shared.release()
+            throw error
         }
-
-        var speculativeTokens: [Int] = []
-        for await generation in try generateTokens(
-            input: modelInput, parameters: parameters, context: mainContext,
-            draftModel: draftContext.model, numDraftTokens: numDraftTokens
-        ) {
-            if let token = generation.token { speculativeTokens.append(token) }
-        }
-
-        #expect(!normalTokens.isEmpty)
-        #expect(!speculativeTokens.isEmpty)
-        #expect(normalTokens == speculativeTokens)
     }
 }
