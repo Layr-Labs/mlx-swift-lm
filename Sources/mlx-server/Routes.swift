@@ -235,7 +235,12 @@ func buildRouter(
             let body = try jsonBody(resp)
             return Response(status: .ok, headers: [.contentType: "application/json"], body: body)
         } else {
-            let output = try await engine.generateWithResult(prompt: req.prompt, samplingParams: params)
+            let output = try await engine.generateWithResult(
+                prompt: req.prompt,
+                maxTokens: params.maxTokens,
+                temperature: params.temperature,
+                topP: params.topP
+            )
             let resp = CompletionResponse(
                 id: "cmpl-\(UUID().uuidString)",
                 object: "text_completion",
@@ -301,7 +306,22 @@ func buildRouter(
             let body = try jsonBody(resp)
             return Response(status: .ok, headers: [.contentType: "application/json"], body: body)
         } else {
-            let out = try await engine.generateWithResult(prompt: prompt, samplingParams: params)
+            let internalReq = MLXLMCommon.Request(
+                requestId: UUID().uuidString,
+                prompt: prompt,
+                samplingParams: params
+            )
+            let _ = await engine.core.addRequest(internalReq)
+            var finalOutput: RequestOutput?
+            for await output in engine.core.streamOutputs(requestId: internalReq.requestId) {
+                if output.finished || output.error != nil {
+                    finalOutput = output
+                    break
+                }
+            }
+            guard let out = finalOutput, out.error == nil else {
+                throw HTTPError(.internalServerError, message: finalOutput?.error ?? "generation failed")
+            }
             let resp = ChatCompletionResponse(
                 id: "chatcmpl-\(UUID().uuidString)",
                 object: "chat.completion",
@@ -341,6 +361,7 @@ private func sseChatResponse(
     params: SamplingParams,
     tools: [[String: any Sendable]]?
 ) -> Response {
+    // Use makeStream() for Swift 6 compatibility.
     let (stream, continuation) = AsyncStream<ByteBuffer>.makeStream()
 
     Task {
@@ -361,7 +382,12 @@ private func sseChatResponse(
         var bufferedOutput = ""
         let bufferForToolParsing = tools?.isEmpty == false
 
-        for await output in engine.streamOutputs(prompt: prompt, samplingParams: params) {
+        let internalReq = MLXLMCommon.Request(
+            requestId: UUID().uuidString, prompt: prompt, samplingParams: params
+        )
+        let _ = await engine.core.addRequest(internalReq)
+
+        for await output in engine.core.streamOutputs(requestId: internalReq.requestId) {
             if !output.newText.isEmpty {
                 if bufferForToolParsing {
                     bufferedOutput += output.newText
@@ -554,7 +580,12 @@ private func sseTextResponse(
         let completionId = "cmpl-\(UUID().uuidString)"
         let created = Int(Date().timeIntervalSince1970)
 
-        for await output in engine.streamOutputs(prompt: prompt, samplingParams: params) {
+        let internalReq = MLXLMCommon.Request(
+            requestId: UUID().uuidString, prompt: prompt, samplingParams: params
+        )
+        let _ = await engine.core.addRequest(internalReq)
+
+        for await output in engine.core.streamOutputs(requestId: internalReq.requestId) {
             let chunk = CompletionChunk(
                 id: completionId, object: "text_completion", created: created, model: modelName,
                 choices: [CompletionChunkChoice(

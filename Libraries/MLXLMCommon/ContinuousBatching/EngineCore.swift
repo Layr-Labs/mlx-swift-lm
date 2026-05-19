@@ -34,18 +34,24 @@ public struct ContinuousBatchingConfig: Sendable {
     /// before calling `MLXLLM.load`). Only affects single-sequence batches.
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/qwen35_model.py is_mtp_active()
     public var mtpEnabled: Bool
+    /// Optional SSD cache configuration.
+    /// Requires `prefixCacheConfig` to also be set.
+    public var ssdCacheConfig: SSDCacheConfig?
+
     public init(
         schedulerConfig: SchedulerConfig = SchedulerConfig(),
         stepInterval: TimeInterval = 0.001,
         yieldInterval: Int = 5,
         prefixCacheConfig: PrefixCacheConfig? = nil,
-        mtpEnabled: Bool = false
+        mtpEnabled: Bool = false,
+        ssdCacheConfig: SSDCacheConfig? = nil
     ) {
         self.schedulerConfig = schedulerConfig
         self.stepInterval = stepInterval
         self.yieldInterval = yieldInterval
         self.prefixCacheConfig = prefixCacheConfig
         self.mtpEnabled = mtpEnabled
+        self.ssdCacheConfig = ssdCacheConfig
     }
 }
 
@@ -239,12 +245,22 @@ public final class EngineCore: @unchecked Sendable {
     /// the original `DispatchSemaphore.wait()` design.
     public func generate(
         prompt: String,
-        samplingParams: SamplingParams
+        maxTokens: Int = 256,
+        temperature: Float = 0.7,
+        topP: Float = 0.9,
+        topK: Int = 0,
+        minP: Float = 0.0
     ) async throws -> RequestOutput {
         let request = Request(
             requestId: UUID().uuidString,
             prompt: prompt,
-            samplingParams: samplingParams
+            samplingParams: SamplingParams(
+                maxTokens: maxTokens,
+                temperature: temperature,
+                topP: topP,
+                topK: topK,
+                minP: minP
+            )
         )
 
         let rid = await addRequest(request)
