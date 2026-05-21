@@ -347,10 +347,19 @@ public class LlamaModelTP: Module, LLMModel, KVCacheDimensionProvider {
 
 // MARK: - LoRA
 
+// LoRAModel conformance is required by LLMModel but TP+LoRA isn't actually
+// supported. The MLXLLM LoRA training code walks `loraLayers` looking for
+// `Linear` sub-modules to wrap with adapters; our sharded variants
+// (`AllToShardedLinear` etc.) are NOT `Linear` subclasses, so adapter
+// insertion either no-ops silently or hits surprising shape errors at
+// train time. Returning `[]` makes the limitation explicit: LoRA over a
+// TP model produces zero adapters, which is more honest than handing back
+// transformer layers that LoRA can't actually adapt.
+//
+// If you need LoRA, use `LlamaModel` (single-rank) and accept the memory
+// cost. Sharded LoRA is its own research problem (Q-LoRA over TP, etc.).
 extension LlamaModelTP: LoRAModel {
-    public var loraLayers: [Module] {
-        model.layers
-    }
+    public var loraLayers: [Module] { [] }
 }
 
 // MARK: - Quantized TP variant
@@ -695,8 +704,10 @@ public class LlamaModelTPQ: Module, LLMModel, KVCacheDimensionProvider {
     }
 }
 
+// LoRA is not supported on the quantized TP path either — see the
+// docstring on `LlamaModelTP`'s extension above for the rationale.
 extension LlamaModelTPQ: LoRAModel {
-    public var loraLayers: [Module] { model.layers }
+    public var loraLayers: [Module] { [] }
 }
 
 // MARK: - Shared helpers + factory

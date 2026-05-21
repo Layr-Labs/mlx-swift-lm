@@ -106,21 +106,17 @@ public class LlamaTPTests: XCTestCase {
             "TP(size=1) output diverged from LlamaModel by max=\(diffValue)")
     }
 
-    /// Shape validation: TP refuses to initialize if heads don't divide evenly.
-    func testLlamaTPRejectsNonDivisibleHeads() {
-        // Force a 2-rank "fake" by directly testing the validation logic via
-        // the helper — we can't easily construct a size-2 group in-process
-        // without a real distributed backend.
-        var config = smallConfig()
-        config = LlamaConfiguration(
+    /// Divisibility-check happy path: an odd-head config trivially passes the
+    /// `heads % group.size == 0` gate on a singleton group (7 % 1 == 0). This
+    /// documents that the check uses % (not strict equality), so size-1 will
+    /// accept any positive head count. Real `world >= 2` rejection paths are
+    /// exercised end-to-end by the 2-Mac smoke test in d-inference, not here.
+    func testLlamaTPAcceptsAnyHeadCountOnSingletonGroup() {
+        let config = LlamaConfiguration(
             hiddenSize: 64, hiddenLayers: 2, intermediateSize: 256,
-            attentionHeads: 7,  // not divisible by 2
+            attentionHeads: 7,
             rmsNormEps: 1e-5, vocabularySize: 128, kvHeads: 4
         )
-
-        // With size=1 group, divisibility check is trivially satisfied (7 % 1 = 0),
-        // so this test only documents that we CAN construct on size=1. Real
-        // size-2 rejection is exercised by the 2-Mac smoke test in d-inference.
         XCTAssertNoThrow(try LlamaModelTP(config, group: singletonGroup()))
     }
 
