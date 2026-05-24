@@ -29,6 +29,12 @@ let package = Package(
             name: "MLXHuggingFace",
             targets: ["MLXHuggingFace"]),
         .library(
+            name: "MLXLMServer",
+            targets: ["MLXLMServer"]),
+        .executable(
+            name: "mlx-server",
+            targets: ["mlx-server"]),
+        .library(
             name: "BenchmarkHelpers",
             targets: ["BenchmarkHelpers"]),
         .library(
@@ -38,7 +44,8 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.2"),
     ],
     targets: [
@@ -94,6 +101,26 @@ let package = Package(
             ]
         ),
         .target(
+            name: "MLXLMServer",
+            dependencies: [
+                "MLXLLM",
+                "MLXVLM",
+                "MLXLMCommon",
+                "MLXEmbedders",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Hummingbird", package: "hummingbird"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Libraries/MLXLMServer"
+        ),
+        .executableTarget(
+            name: "mlx-server",
+            dependencies: ["MLXLMServer"],
+            path: "Executables/mlx-server"
+        ),
+        .target(
             name: "BenchmarkHelpers",
             dependencies: [
                 "MLXLMCommon",
@@ -140,6 +167,15 @@ let package = Package(
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
             ]
         ),
+        .testTarget(
+            name: "MLXLMServerTests",
+            dependencies: [
+                "MLXLMServer",
+                "MLXLMCommon",
+                .product(name: "HummingbirdTesting", package: "hummingbird"),
+            ],
+            path: "Tests/MLXLMServerTests"
+        ),
         .macro(
             name: "MLXHuggingFaceMacros",
             dependencies: [
@@ -166,18 +202,6 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/BenchLoad"
-        ),
-        .executableTarget(
-            name: "mlx-server",
-            dependencies: [
-                "MLXLMCommon",
-                "MLXLLM",
-                "MLXHuggingFace",
-                .product(name: "Hummingbird", package: "hummingbird"),
-                .product(name: "Transformers", package: "swift-transformers"),
-                .product(name: "MLX", package: "mlx-swift"),
-            ],
-            path: "Sources/mlx-server"
         ),
     ]
 )

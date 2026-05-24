@@ -5,10 +5,18 @@ import Foundation
 /// Parser for Gemma format: call:name{key:value,k:<escape>str<escape>}
 /// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tool_parsers/function_gemma.py
 public struct GemmaFunctionParser: ToolCallParser, Sendable {
-    public let startTag: String? = "<start_function_call>"
-    public let endTag: String? = "<end_function_call>"
+    public let startTag: String? = "<|tool_call>"
+    public let endTag: String? = "<tool_call|>"
+    public let alternateStartTags: [String] = ["<start_function_call>"]
+    public let alternateEndTags: [String] = ["<end_function_call>"]
 
-    private let quoteMarkers = ["<escape>", "<|\"|>"]
+    private let quoteMarkers = ["<|\"|>", "<escape>"]
+    private let wrapperTags = [
+        "<|tool_call>",
+        "<tool_call|>",
+        "<start_function_call>",
+        "<end_function_call>",
+    ]
 
     public init() {}
 
@@ -16,7 +24,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         // Strip tags if present. Gemma 4 emits the newer `<|tool_call>` form,
         // while older Gemma-family templates use `<start_function_call>`.
         var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        for tag in ["<start_function_call>", "<end_function_call>", "<|tool_call>", "<tool_call|>"] {
+        for tag in wrapperTags {
             text = text.replacingOccurrences(of: tag, with: "")
         }
 

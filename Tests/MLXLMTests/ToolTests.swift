@@ -431,7 +431,7 @@ struct ToolTests {
     func testGemmaParser() throws {
         let parser = GemmaFunctionParser()
         let content =
-            "<start_function_call>call:get_weather{location:Paris,unit:celsius}<end_function_call>"
+            "<|tool_call>call:get_weather{location:Paris,unit:celsius}<tool_call|>"
 
         let toolCall = try #require(parser.parse(content: content, tools: nil))
 
@@ -443,9 +443,8 @@ struct ToolTests {
     @Test("Test Gemma Function Parser - Escaped Strings")
     func testGemmaParserEscapedStrings() throws {
         let parser = GemmaFunctionParser()
-        // Note: Gemma uses <escape> for both start and end markers (not </escape>)
         let content =
-            "<start_function_call>call:search{query:<escape>hello, world!<escape>}<end_function_call>"
+            "<|tool_call>call:search{query:<|\"|>hello, world!<|\"|>}<tool_call|>"
 
         let toolCall = try #require(parser.parse(content: content, tools: nil))
 
@@ -483,7 +482,7 @@ struct ToolTests {
     @Test("Test Gemma Format via ToolCallProcessor")
     func testGemmaFormatProcessor() throws {
         let processor = ToolCallProcessor(format: .gemma)
-        let content = "<start_function_call>call:calculator{expression:2+2}<end_function_call>"
+        let content = "<|tool_call>call:calculator{expression:2+2}<tool_call|>"
 
         _ = processor.processChunk(content)
 
@@ -491,6 +490,32 @@ struct ToolTests {
         let toolCall = try #require(processor.toolCalls.first)
         #expect(toolCall.function.name == "calculator")
         #expect(toolCall.function.arguments["expression"] == .string("2+2"))
+    }
+
+    @Test("Test Gemma Function Parser - Legacy Tags")
+    func testGemmaParserLegacyTags() throws {
+        let parser = GemmaFunctionParser()
+        let content =
+            "<start_function_call>call:get_weather{location:<escape>San Francisco<escape>}<end_function_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("San Francisco"))
+    }
+
+    @Test("Test Gemma Legacy Tags via ToolCallProcessor")
+    func testGemmaLegacyFormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .gemma)
+        let content =
+            "<start_function_call>call:get_weather{location:<escape>San Francisco<escape>}<end_function_call>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("San Francisco"))
     }
 
     // MARK: - Kimi K2 Format Tests
@@ -658,6 +683,8 @@ struct ToolTests {
         // Gemma models
         #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
         #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma)
 
         // Nemotron models (prefix matching)
         #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
@@ -710,6 +737,7 @@ struct ToolTests {
         // Unknown models should return nil (use default JSON format)
         #expect(ToolCallFormat.infer(from: "qwen2") == nil)
         #expect(ToolCallFormat.infer(from: "mistral") == nil)
+        #expect(ToolCallFormat.infer(from: "gpt_oss") == .harmony)
     }
 
     // MARK: - Mistral Format Tests
@@ -833,5 +861,92 @@ struct ToolTests {
         let second = processor.toolCalls[1]
         #expect(second.function.name == "get_time")
         #expect(second.function.arguments["timezone"] == .string("UTC"))
+    }
+
+    // MARK: - Harmony Format Tests
+
+    @Test("Test Harmony Tool Call Parser")
+    func testHarmonyParser() throws {
+        let parser = HarmonyToolCallParser()
+        let content =
+            "<|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"location\":\"Paris\",\"unit\":\"celsius\"}<|call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Harmony Tool Call Parser - Commentary Channel Variant")
+    func testHarmonyParserCommentaryChannelVariant() throws {
+        let parser = HarmonyToolCallParser()
+        let content =
+            "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\":\"Tokyo, Japan\",\"unit\":\"celsius\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo, Japan"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Harmony Format via ToolCallProcessor")
+    func testHarmonyFormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .harmony)
+        let chunks = [
+            "<|channel|>analysis<|message|>Need current data.<|end|>",
+            "<|start|>assistant to=functions.get_weather",
+            "<|channel|>commentary json<|message|>",
+            "{\"location\":\"Tokyo\"}",
+            "<|call|>",
+        ]
+
+        var content = ""
+        for chunk in chunks {
+            if let emitted = processor.processChunk(chunk) {
+                content += emitted
+            }
+        }
+
+        #expect(content == "<|channel|>analysis<|message|>Need current data.<|end|>")
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("Test Harmony Format Processor EOS")
+    func testHarmonyFormatProcessorEOS() throws {
+        let processor = ToolCallProcessor(format: .harmony)
+        _ = processor.processChunk(
+            "<|start|>assistant to=functions.search<|channel|>commentary json<|message|>{\"query\":\"mlx swift\"}"
+        )
+
+        #expect(processor.toolCalls.isEmpty)
+        processor.processEOS()
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("mlx swift"))
+    }
+
+    @Test("Test Harmony Format Processor EOS - Commentary Channel Variant")
+    func testHarmonyFormatProcessorEOSCommentaryChannelVariant() throws {
+        let processor = ToolCallProcessor(format: .harmony)
+        _ = processor.processChunk("<|channel|>analysis<|message|>Need weather.<|end|>")
+        _ = processor.processChunk(
+            "<|start|>assistant<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"location\":\"Tokyo, Japan\",\"unit\":\"celsius\"}"
+        )
+
+        #expect(processor.toolCalls.isEmpty)
+        processor.processEOS()
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo, Japan"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
     }
 }
