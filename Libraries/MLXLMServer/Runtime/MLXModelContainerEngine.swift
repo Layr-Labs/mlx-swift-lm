@@ -6,6 +6,9 @@ import MLXHuggingFace
 import MLXLMCommon
 import Tokenizers
 
+/// Single-request server engine backed by ``ModelContainer``'s serial actor.
+/// Concurrent ``streamChatCompletion(request:)`` calls serialise; for
+/// concurrent production traffic use ``MLXBatchedEngineServerEngine``.
 public struct MLXModelContainerEngine: MLXServerEngine {
     private let modelID: String
     private let model: ModelContainer
@@ -122,5 +125,14 @@ public enum MLXServerModelLoader {
         configuration: ModelConfiguration
     ) async throws -> ModelContainer {
         try await #huggingFaceLoadModelContainer(configuration: configuration)
+    }
+
+    /// Load a model and return the raw ``ModelContext`` (bypasses the
+    /// serial-access container so ``MLXBatchedEngineServerEngine`` can drive
+    /// ``BatchedEngine`` directly).
+    public static func loadContext(
+        configuration: ModelConfiguration
+    ) async throws -> sending ModelContext {
+        try await #huggingFaceLoadModel(configuration: configuration)
     }
 }

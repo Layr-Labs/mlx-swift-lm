@@ -17,15 +17,44 @@ public enum MLXServer {
             )
         }
 
-        let model = try await MLXServerModelLoader.load(
-            configuration: primaryModelConfiguration
-        )
-        let engine = MLXModelContainerEngine(
-            modelID: configuration.model,
-            model: model,
-            modelType: configuration.modelType,
-            defaultToolCallParser: configuration.toolCallParser
-        )
+        let engine: any MLXServerEngine
+        let batchedEngine: MLXBatchedEngineServerEngine?
+        switch configuration.engineKind {
+        case .batched:
+            let context = try await MLXServerModelLoader.loadContext(
+                configuration: primaryModelConfiguration
+            )
+            let batched = try MLXBatchedEngineServerEngine(
+                modelID: configuration.model,
+                modelContext: context,
+                modelType: configuration.modelType,
+                configuration: configuration.batchedEngineConfiguration,
+                defaultToolCallParser: configuration.toolCallParser
+            )
+            await batched.start()
+            engine = batched
+            batchedEngine = batched
+        case .singleRequest:
+            let model = try await MLXServerModelLoader.load(
+                configuration: primaryModelConfiguration
+            )
+            engine = MLXModelContainerEngine(
+                modelID: configuration.model,
+                model: model,
+                modelType: configuration.modelType,
+                defaultToolCallParser: configuration.toolCallParser
+            )
+            batchedEngine = nil
+        }
+
+        // Stop the engine on any exit path. Fire-and-forget is safe because
+        // EngineCore.stop is synchronous + idempotent today.
+        defer {
+            if let batchedEngine {
+                Task.detached(priority: .high) { await batchedEngine.stop() }
+            }
+        }
+
         let embeddingEngine: MLXEmbedderContainerEngine?
         if let embeddingModelID = configuration.embeddingModel {
             let embeddingModel = try await MLXServerEmbedderLoader.load(
@@ -48,6 +77,7 @@ public enum MLXServer {
             host: configuration.host,
             port: configuration.port
         )
+
         try await app.runService()
     }
 
