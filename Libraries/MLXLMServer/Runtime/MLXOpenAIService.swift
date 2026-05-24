@@ -91,6 +91,9 @@ public struct MLXOpenAIService: Sendable {
             let task = Task {
                 var usage: OpenAIUsage?
                 var finishReason = "stop"
+                var reasoningParser = StreamingReasoningParser(
+                    format: request.reasoningParser ?? defaultReasoningParser ?? .none
+                )
                 do {
                     continuation.yield(
                         try ServerSentEventEncoder.encode(
@@ -118,28 +121,32 @@ public struct MLXOpenAIService: Sendable {
                     for try await event in stream {
                         switch event {
                         case .content(let text):
-                            continuation.yield(
-                                try ServerSentEventEncoder.encode(
-                                    OpenAIChatCompletionChunk(
-                                        id: id,
-                                        model: request.model,
-                                        choices: [
-                                            .init(
-                                                index: 0,
-                                                delta: .init(
-                                                    role: nil,
-                                                    content: text,
-                                                    reasoningContent: nil,
-                                                    toolCalls: nil
-                                                ),
-                                                finishReason: nil
-                                            )
-                                        ],
-                                        usage: nil,
-                                        created: created
+                            for parsed in reasoningParser.parse(text) {
+                                let content = parsed.content.isEmpty ? nil : parsed.content
+                                guard content != nil || parsed.reasoningContent != nil else { continue }
+                                continuation.yield(
+                                    try ServerSentEventEncoder.encode(
+                                        OpenAIChatCompletionChunk(
+                                            id: id,
+                                            model: request.model,
+                                            choices: [
+                                                .init(
+                                                    index: 0,
+                                                    delta: .init(
+                                                        role: nil,
+                                                        content: content,
+                                                        reasoningContent: parsed.reasoningContent,
+                                                        toolCalls: nil
+                                                    ),
+                                                    finishReason: nil
+                                                )
+                                            ],
+                                            usage: nil,
+                                            created: created
+                                        )
                                     )
                                 )
-                            )
+                            }
                         case .toolCall(let toolCall):
                             finishReason = "tool_calls"
                             let openAIToolCall = try OpenAIToolCall(
@@ -178,6 +185,33 @@ public struct MLXOpenAIService: Sendable {
                                 finishReason = info.stopReason
                             }
                         }
+                    }
+
+                    for parsed in reasoningParser.finish() {
+                        let content = parsed.content.isEmpty ? nil : parsed.content
+                        guard content != nil || parsed.reasoningContent != nil else { continue }
+                        continuation.yield(
+                            try ServerSentEventEncoder.encode(
+                                OpenAIChatCompletionChunk(
+                                    id: id,
+                                    model: request.model,
+                                    choices: [
+                                        .init(
+                                            index: 0,
+                                            delta: .init(
+                                                role: nil,
+                                                content: content,
+                                                reasoningContent: parsed.reasoningContent,
+                                                toolCalls: nil
+                                            ),
+                                            finishReason: nil
+                                        )
+                                    ],
+                                    usage: nil,
+                                    created: created
+                                )
+                            )
+                        )
                     }
 
                     continuation.yield(

@@ -105,6 +105,154 @@ struct OpenAIServiceTests {
         #expect(frames.contains { $0.contains("\"finish_reason\":\"tool_calls\"") })
     }
 
+    @Test("streaming tool calls preserve reasoning emitted before the tool call")
+    func streamingToolCallsPreservePriorReasoning() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("<|channel|>analysis<|message|>call weather<|end|>"),
+            .toolCall(
+                ToolCall(
+                    function: .init(
+                        name: "get_weather",
+                        arguments: ["location": .string("San Francisco")]
+                    )
+                )
+            ),
+            .info(.init(promptTokens: 5, completionTokens: 3)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(reasoningParser: .harmony, stream: true)
+        )
+        var frames: [String] = []
+        for try await frame in stream {
+            frames.append(frame)
+        }
+        let reasoningIndex = try #require(frames.firstIndex { $0.contains("\"reasoning_content\":\"call weather\"") })
+        let toolIndex = try #require(frames.firstIndex { $0.contains("\"tool_calls\"") })
+
+        #expect(reasoningIndex < toolIndex)
+        #expect(frames.contains { $0.contains("\"finish_reason\":\"tool_calls\"") })
+    }
+
+    @Test("streaming chat completion separates harmony reasoning from visible content")
+    func streamingChatCompletionSeparatesHarmonyReasoning() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("<|channel|>analysis<|message|>use "),
+            .content("tool first<|end|><|channel|>final<|message|>done"),
+            .content("<|return|>"),
+            .info(.init(promptTokens: 4, completionTokens: 3)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(reasoningParser: .harmony, stream: true)
+        )
+        var frames: [String] = []
+        for try await frame in stream {
+            frames.append(frame)
+        }
+        let joined = frames.joined()
+
+        #expect(joined.contains("\"reasoning_content\""))
+        #expect(joined.contains("\"reasoning_content\":\"use \""))
+        #expect(joined.contains("tool first"))
+        #expect(joined.contains("\"content\":\"done\""))
+        #expect(!joined.contains("<|channel|>"))
+        #expect(!joined.contains("<|message|>"))
+        #expect(!joined.contains("<|end|>"))
+        #expect(!joined.contains("<|return|>"))
+    }
+
+    @Test("streaming chat completion separates split harmony markers")
+    func streamingChatCompletionSeparatesSplitHarmonyMarkers() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("<|chan"),
+            .content("nel|>analysis<|mes"),
+            .content("sage|>use tool<|en"),
+            .content("d|><|sta"),
+            .content("rt|>assistant<|chan"),
+            .content("nel|>final<|mes"),
+            .content("sage|>done<|ret"),
+            .content("urn|>"),
+            .info(.init(promptTokens: 5, completionTokens: 7)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(reasoningParser: .harmony, stream: true)
+        )
+        var frames: [String] = []
+        for try await frame in stream {
+            frames.append(frame)
+        }
+        let joined = frames.joined()
+
+        #expect(joined.contains("\"reasoning_content\":\"use tool\""))
+        #expect(joined.contains("\"content\":\"done\""))
+        #expect(!joined.contains("<|chan"))
+        #expect(!joined.contains("<|mes"))
+        #expect(!joined.contains("<|en"))
+        #expect(!joined.contains("<|ret"))
+        #expect(!joined.contains("<|sta"))
+        #expect(!joined.contains("nel|>"))
+        #expect(!joined.contains("sage|>"))
+        #expect(!joined.contains("urn|>"))
+    }
+
+    @Test("streaming chat completion separates split think tags from visible content")
+    func streamingChatCompletionSeparatesSplitThinkTags() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("<thi"),
+            .content("nk>plan"),
+            .content(" first</thi"),
+            .content("nk>visible"),
+            .info(.init(promptTokens: 4, completionTokens: 4)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(reasoningParser: .qwen3, stream: true)
+        )
+        var frames: [String] = []
+        for try await frame in stream {
+            frames.append(frame)
+        }
+        let joined = frames.joined()
+
+        #expect(joined.contains("\"reasoning_content\":\"plan\""))
+        #expect(joined.contains("\"reasoning_content\":\" first\""))
+        #expect(joined.contains("\"content\":\"visible\""))
+        #expect(!joined.contains("<think>"))
+        #expect(!joined.contains("</think>"))
+        #expect(!joined.contains("<thi"))
+        #expect(!joined.contains("nk>"))
+    }
+
+    @Test("streaming chat completion separates split orphan think closing tag")
+    func streamingChatCompletionSeparatesSplitOrphanThinkClosingTag() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("need tool</thi"),
+            .content("nk>visible"),
+            .info(.init(promptTokens: 4, completionTokens: 2)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(reasoningParser: .qwen3, stream: true)
+        )
+        var frames: [String] = []
+        for try await frame in stream {
+            frames.append(frame)
+        }
+        let joined = frames.joined()
+
+        #expect(joined.contains("\"reasoning_content\":\"need tool\""))
+        #expect(joined.contains("\"content\":\"visible\""))
+        #expect(!joined.contains("</thi"))
+        #expect(!joined.contains("nk>"))
+    }
+
     @Test("JSON object response format injects instructions and returns normalized JSON")
     func jsonObjectResponseFormatInjectsInstructionsAndNormalizesJSON() async throws {
         let engine = ScriptedServerEngine(events: [
@@ -253,6 +401,7 @@ struct OpenAIServiceTests {
         #expect(created.status == .completed)
         #expect(created.outputText == "response text")
         #expect(created.output.first?.content?.first?.text == "response text")
+        #expect(created.output.first?.content?.first?.annotations == [])
         #expect(created.usage?.inputTokens == 4)
         #expect(created.usage?.outputTokens == 2)
 
