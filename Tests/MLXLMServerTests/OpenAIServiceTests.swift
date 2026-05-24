@@ -229,6 +229,30 @@ struct OpenAIServiceTests {
         #expect(!joined.contains("nk>"))
     }
 
+    @Test("streaming chat completion flushes ordinary text while waiting for think tags")
+    func streamingChatCompletionFlushesOrdinaryTextWhileWaitingForThinkTags() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("visible "),
+            .content("text"),
+            .info(.init(promptTokens: 4, completionTokens: 2)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(reasoningParser: .qwen3, stream: true)
+        )
+        var frames: [String] = []
+        for try await frame in stream {
+            frames.append(frame)
+        }
+        let joined = frames.joined()
+
+        #expect(joined.contains("\"content\":\"visible \""))
+        #expect(joined.contains("\"content\":\"text\""))
+        #expect(!joined.contains("\"content\":\"visible text\""))
+        #expect(!joined.contains("\"reasoning_content\""))
+    }
+
     @Test("streaming chat completion separates split orphan think closing tag")
     func streamingChatCompletionSeparatesSplitOrphanThinkClosingTag() async throws {
         let engine = ScriptedServerEngine(events: [

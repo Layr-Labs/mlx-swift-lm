@@ -40,6 +40,10 @@ struct StreamingThinkReasoningParser: Sendable {
                     appendContent(buffer, to: &output)
                     buffer.removeAll(keepingCapacity: true)
                     state = .content
+                } else if !buffer.contains("<") {
+                    appendContent(buffer, to: &output)
+                    buffer.removeAll(keepingCapacity: true)
+                    shouldContinue = false
                 } else {
                     shouldContinue = false
                 }
