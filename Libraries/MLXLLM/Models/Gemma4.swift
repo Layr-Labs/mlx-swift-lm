@@ -25,8 +25,14 @@ public struct Gemma4Configuration: Codable, Sendable {
         case vocabSize = "vocab_size"
     }
 
+    enum QuantizationCodingKeys: String, CodingKey {
+        case quantization
+        case quantizationConfig = "quantization_config"
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let quantizationContainer = try decoder.container(keyedBy: QuantizationCodingKeys.self)
         self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"
         self.vocabSize = try container.decodeIfPresent(Int.self, forKey: .vocabSize) ?? 262144
 
@@ -40,6 +46,16 @@ public struct Gemma4Configuration: Codable, Sendable {
         } else {
             self.textConfig = try Gemma4TextConfiguration(from: decoder)
         }
+
+        let quantization =
+            try quantizationContainer.decodeIfPresent(
+                Gemma4WeightQuantizationMetadata.self, forKey: .quantization)
+            ?? quantizationContainer.decodeIfPresent(
+                Gemma4WeightQuantizationMetadata.self, forKey: .quantizationConfig)
+        if let quantization {
+            self.textConfig.quantizationBits = quantization.bits
+            self.textConfig.quantizationGroupSize = quantization.groupSize
+        }
     }
 }
 
@@ -50,6 +66,10 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
     public var kvHeads: [Int] { languageModel.kvHeads }
 
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Gemma4TextModel
+
+    /// Public accessor for the inner text model (needed by MTP speculative
+    /// decoding which calls `Gemma4TextModel.forwardForMTP` directly).
+    public var textModel: Gemma4TextModel { languageModel }
 
     public init(_ config: Gemma4Configuration) {
         self._languageModel.wrappedValue = Gemma4TextModel(config.textConfig)

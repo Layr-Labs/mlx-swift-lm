@@ -81,7 +81,8 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
             //
             { (huggingFaceTokenizer: Tokenizers.Tokenizer) -> MLXLMCommon.Tokenizer in
                 struct TokenizerBridge: MLXLMCommon.Tokenizer {
-                    private let upstream: any Tokenizers.Tokenizer
+                    // nonisolated(unsafe): the upstream tokenizer is immutable after init.
+                    nonisolated(unsafe) private let upstream: any Tokenizers.Tokenizer
 
                     init(_ upstream: any Tokenizers.Tokenizer) {
                         self.upstream = upstream
@@ -116,6 +117,38 @@ public struct TokenizerAdaptorMacro: ExpressionMacro {
                         do {
                             return try upstream.applyChatTemplate(
                                 messages: messages, tools: tools, additionalContext: additionalContext)
+                        } catch Tokenizers.TokenizerError.missingChatTemplate {
+                            throw MLXLMCommon.TokenizerError.missingChatTemplate
+                        }
+                    }
+
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]],
+                        chatTemplate: String
+                    ) throws -> [Int] {
+                        do {
+                            return try upstream.applyChatTemplate(
+                                messages: messages, chatTemplate: chatTemplate)
+                        } catch Tokenizers.TokenizerError.missingChatTemplate {
+                            throw MLXLMCommon.TokenizerError.missingChatTemplate
+                        }
+                    }
+
+                    func applyChatTemplate(
+                        messages: [[String: any Sendable]],
+                        chatTemplate: String,
+                        tools: [[String: any Sendable]]?,
+                        additionalContext: [String: any Sendable]?
+                    ) throws -> [Int] {
+                        do {
+                            return try upstream.applyChatTemplate(
+                                messages: messages,
+                                chatTemplate: .literal(chatTemplate),
+                                addGenerationPrompt: true,
+                                truncation: false,
+                                maxLength: nil,
+                                tools: tools,
+                                additionalContext: additionalContext)
                         } catch Tokenizers.TokenizerError.missingChatTemplate {
                             throw MLXLMCommon.TokenizerError.missingChatTemplate
                         }

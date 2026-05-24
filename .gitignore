@@ -89,6 +89,12 @@ fastlane/test_output
 
 iOSInjectionProject/
 
+# Reference implementations — never commit
+omlx/
+mlx-swift-lm/
+vllm-swift/
+refs/
+
 # OS
 .DS_Store
 

@@ -42,11 +42,11 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
-        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
-        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.2"),
     ],
     targets: [
         .target(
@@ -81,6 +81,7 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
             ],
             path: "Libraries/MLXLMCommon",
             exclude: [
@@ -157,7 +158,14 @@ let package = Package(
             exclude: [
                 "README.md"
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"),
+                .process("Resources/audio_only.mov"),
+                .process("Resources/Gemma4MTPPrompts.json"),
+                .process("Resources/gemma4-26B-A4B-assistant-config.json"),
+                .process("Resources/gemma4-E4B-assistant-config.json"),
+                .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
+            ]
         ),
         .testTarget(
             name: "MLXLMServerTests",
@@ -183,6 +191,17 @@ let package = Package(
                 "MLXLMCommon",
             ],
             path: "Libraries/MLXHuggingFace"
+        ),
+        .executableTarget(
+            name: "BenchLoad",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "BenchmarkHelpers",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Sources/BenchLoad"
         ),
     ]
 )
