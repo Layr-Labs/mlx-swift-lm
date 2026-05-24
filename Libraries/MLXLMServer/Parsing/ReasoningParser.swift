@@ -97,7 +97,7 @@ public struct ReasoningParser: Sendable {
             let contentStart = messageStart.upperBound
             let contentEnd = firstRange(ofAny: endMarkers, in: text, range: contentStart..<text.endIndex)
             let messageEnd = contentEnd?.lowerBound ?? text.endIndex
-            let content = String(text[contentStart..<messageEnd])
+            let content = String(text[contentStart..<messageEnd]).removingHarmonyRoleMarkers
 
             switch channel {
             case "analysis":
@@ -120,26 +120,5 @@ public struct ReasoningParser: Sendable {
             content: final.joined(separator: "\n").trimmedForReasoning,
             reasoningContent: reasoningText.isEmpty ? nil : reasoningText
         )
-    }
-
-    private func firstRange(
-        ofAny markers: [String],
-        in text: String,
-        range: Range<String.Index>
-    ) -> Range<String.Index>? {
-        var first: Range<String.Index>?
-        for marker in markers {
-            guard let candidate = text.range(of: marker, range: range) else { continue }
-            if first == nil || candidate.lowerBound < first!.lowerBound {
-                first = candidate
-            }
-        }
-        return first
-    }
-}
-
-extension String {
-    fileprivate var trimmedForReasoning: String {
-        trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

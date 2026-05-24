@@ -230,7 +230,7 @@ struct ServerSurfaceTests {
     func reasoningParserExtractsHarmonyChannels() {
         let parser = ReasoningParser(format: .harmony)
         let parsed = parser.parse(
-            "<|channel|>analysis<|message|>use tool first<|end|><|channel|>final<|message|>done<|end|>"
+            "<|channel|>analysis<|message|>use tool first<|end|><|channel|>final<|message|><|start|>assistantdone<|end|>"
         )
 
         #expect(parsed.reasoningContent == "use tool first")
@@ -250,9 +250,15 @@ struct ServerSurfaceTests {
 
     @Test("server runner treats existing model argument as local directory")
     func serverRunnerSupportsLocalModelDirectory() {
-        let config = MLXServer.modelConfiguration(for: FileManager.default.currentDirectoryPath)
+        let currentDirectory = FileManager.default.currentDirectoryPath
+        let config = MLXServer.modelConfiguration(for: currentDirectory)
 
-        #expect(config.name.hasSuffix("/mlx-swift-lm"))
+        guard case .directory(let url) = config.id else {
+            Issue.record("Expected local directory model configuration")
+            return
+        }
+
+        #expect(url.standardizedFileURL.path == URL(fileURLWithPath: currentDirectory).standardizedFileURL.path)
     }
 
     @Test("SSE encoder formats OpenAI data frames and done sentinel")

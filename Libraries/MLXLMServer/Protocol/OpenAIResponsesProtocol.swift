@@ -133,10 +133,12 @@ public enum OpenAIResponseStatus: String, Codable, Sendable, Equatable {
 public struct OpenAIResponseOutputContent: Codable, Sendable, Equatable {
     public var type: String
     public var text: String
+    public var annotations: [JSONValue]?
 
-    public init(type: String = "output_text", text: String) {
+    public init(type: String = "output_text", text: String, annotations: [JSONValue]? = nil) {
         self.type = type
         self.text = text
+        self.annotations = annotations
     }
 }
 
@@ -169,7 +171,7 @@ public struct OpenAIResponseOutputItem: Codable, Sendable, Equatable {
             type: "message",
             status: .completed,
             role: .assistant,
-            content: [.init(text: text)],
+            content: [.init(text: text, annotations: [])],
             summary: nil,
             callID: nil,
             name: nil,
