@@ -144,7 +144,8 @@ public struct MLXOpenAIService: Sendable {
                             finishReason = "tool_calls"
                             let openAIToolCall = try OpenAIToolCall(
                                 toolCall: toolCall,
-                                id: idProvider("call")
+                                id: idProvider("call"),
+                                index: 0
                             )
                             continuation.yield(
                                 try ServerSentEventEncoder.encode(
@@ -223,7 +224,7 @@ public struct MLXOpenAIService: Sendable {
             if request.store != false {
                 await responseStore.save(response)
             }
-            await metrics.recordUsage(response.usage)
+            await metrics.recordUsage(output.usage)
             return response
         } catch {
             await metrics.recordError()
@@ -368,7 +369,7 @@ public struct MLXOpenAIService: Sendable {
             model: request.model,
             output: outputItems,
             outputText: parsed.content,
-            usage: output.usage,
+            usage: output.usage.map(OpenAIResponseUsage.init(chatUsage:)),
             metadata: request.metadata
         )
     }

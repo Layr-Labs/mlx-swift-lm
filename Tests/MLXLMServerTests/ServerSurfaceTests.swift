@@ -124,6 +124,78 @@ struct ServerSurfaceTests {
         ]))
     }
 
+    @Test("OpenAI responses request decodes AI SDK input text and flat function tools")
+    func openAIResponsesRequestDecodesAISDKToolShape() throws {
+        let json = """
+            {
+              "model": "local-model",
+              "input": [
+                {
+                  "role": "user",
+                  "content": [
+                    {"type": "input_text", "text": "weather in Tokyo?"}
+                  ]
+                }
+              ],
+              "tools": [
+                {
+                  "type": "function",
+                  "name": "get_weather",
+                  "description": "Get weather",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "location": {"type": "string"},
+                      "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                    },
+                    "required": ["location", "unit"]
+                  }
+                },
+                {
+                  "type": "function",
+                  "name": "get_time",
+                  "description": "Get local time",
+                  "input_schema": {
+                    "type": "object",
+                    "properties": {
+                      "location": {"type": "string"}
+                    },
+                    "required": ["location"]
+                  }
+                }
+              ],
+              "tool_choice": "required",
+              "max_output_tokens": 128
+            }
+            """
+
+        let request = try JSONDecoder().decode(OpenAIResponseRequest.self, from: Data(json.utf8))
+        let chatRequest = request.chatCompletionRequest
+
+        #expect(chatRequest.messages.first?.textContent == "weather in Tokyo?")
+        #expect(chatRequest.tools?.map(\.function.name) == ["get_weather", "get_time"])
+        #expect(chatRequest.tools?.first?.function.parameters == .object([
+            "type": .string("object"),
+            "properties": .object([
+                "location": .object(["type": .string("string")]),
+                "unit": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("celsius"), .string("fahrenheit")]),
+                ]),
+            ]),
+            "required": .array([.string("location"), .string("unit")]),
+        ]))
+        #expect(chatRequest.tools?[1].function.parameters == .object([
+            "type": .string("object"),
+            "properties": .object([
+                "location": .object(["type": .string("string")])
+            ]),
+            "required": .array([.string("location")]),
+        ]))
+        #expect(chatRequest.toolChoice == .mode(.required))
+        #expect(chatRequest.maxTokens == 128)
+    }
+
     @Test("server tool parser resolver supports named and auto formats")
     func serverToolParserResolverSupportsNamedAndAutoFormats() throws {
         #expect(try ServerToolParser.resolve(requested: "mistral", modelType: nil) == .mistral)
@@ -204,5 +276,37 @@ struct ServerSurfaceTests {
         #expect(frame.contains("\"object\":\"chat.completion.chunk\""))
         #expect(frame.contains("\"content\":\"hello\""))
         #expect(ServerSentEventEncoder.done == "data: [DONE]\n\n")
+    }
+
+    @Test("SSE encoder includes index on streamed tool call deltas")
+    func sseEncoderIncludesToolCallIndex() throws {
+        let frame = try ServerSentEventEncoder.encode(
+            OpenAIChatCompletionChunk(
+                id: "chatcmpl-test",
+                model: "local-model",
+                choices: [
+                    .init(
+                        index: 0,
+                        delta: .init(
+                            role: nil,
+                            content: nil,
+                            reasoningContent: nil,
+                            toolCalls: [
+                                .init(
+                                    id: "call-test",
+                                    function: .init(name: "get_weather", arguments: "{}"),
+                                    index: 0
+                                )
+                            ]
+                        ),
+                        finishReason: nil
+                    )
+                ],
+                usage: nil
+            )
+        )
+
+        #expect(frame.contains("\"tool_calls\""))
+        #expect(frame.contains("\"index\":0"))
     }
 }

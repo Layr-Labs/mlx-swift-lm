@@ -253,6 +253,8 @@ struct OpenAIServiceTests {
         #expect(created.status == .completed)
         #expect(created.outputText == "response text")
         #expect(created.output.first?.content?.first?.text == "response text")
+        #expect(created.usage?.inputTokens == 4)
+        #expect(created.usage?.outputTokens == 2)
 
         let retrieved = try await service.retrieveResponse(id: created.id)
         #expect(retrieved.id == created.id)

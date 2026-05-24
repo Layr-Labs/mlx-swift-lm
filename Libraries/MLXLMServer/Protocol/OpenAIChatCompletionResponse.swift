@@ -71,12 +71,13 @@ public struct OpenAIErrorResponse: Codable, Sendable, Equatable {
 }
 
 extension OpenAIToolCall {
-    init(toolCall: ToolCall, id: String) throws {
+    init(toolCall: ToolCall, id: String, index: Int? = nil) throws {
         let data = try JSONEncoder.openAIServer.encode(toolCall.function.arguments)
         let arguments = String(decoding: data, as: UTF8.self)
         self.init(
             id: id,
-            function: .init(name: toolCall.function.name, arguments: arguments)
+            function: .init(name: toolCall.function.name, arguments: arguments),
+            index: index
         )
     }
 }

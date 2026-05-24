@@ -24,6 +24,7 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
 
     private enum PartType: String, Codable {
         case text
+        case inputText = "input_text"
         case imageURL = "image_url"
     }
 
@@ -31,7 +32,7 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let type = try container.decode(String.self, forKey: .type)
         switch type {
-        case PartType.text.rawValue:
+        case PartType.text.rawValue, PartType.inputText.rawValue:
             self = .text(try container.decode(String.self, forKey: .text))
         case PartType.imageURL.rawValue:
             let image = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageURL)
@@ -167,9 +168,43 @@ public struct OpenAITool: Codable, Sendable, Equatable {
     public var type: String
     public var function: OpenAIFunctionDefinition
 
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case function
+        case name
+        case description
+        case parameters
+        case inputSchema = "input_schema"
+    }
+
     public init(type: String = "function", function: OpenAIFunctionDefinition) {
         self.type = type
         self.function = function
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.type = (try? container.decode(String.self, forKey: .type)) ?? "function"
+
+        if let function = try? container.decode(OpenAIFunctionDefinition.self, forKey: .function) {
+            self.function = function
+            return
+        }
+
+        let parameters =
+            try container.decodeIfPresent(JSONValue.self, forKey: .parameters)
+            ?? container.decodeIfPresent(JSONValue.self, forKey: .inputSchema)
+        self.function = OpenAIFunctionDefinition(
+            name: try container.decode(String.self, forKey: .name),
+            description: try container.decodeIfPresent(String.self, forKey: .description),
+            parameters: parameters
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type)
+        try container.encode(function, forKey: .function)
     }
 
     public func toolSpec() -> ToolSpec {
@@ -224,11 +259,13 @@ public struct OpenAIToolCall: Codable, Sendable, Equatable {
     public var id: String
     public var type: String
     public var function: Function
+    public var index: Int?
 
-    public init(id: String, type: String = "function", function: Function) {
+    public init(id: String, type: String = "function", function: Function, index: Int? = nil) {
         self.id = id
         self.type = type
         self.function = function
+        self.index = index
     }
 }
 
@@ -258,6 +295,14 @@ public enum OpenAIToolChoice: Codable, Sendable, Equatable {
         }
 
         let object = try decoder.container(keyedBy: CodingKeys.self)
+        if let mode = try? object.decode(Mode.self, forKey: .type) {
+            self = .mode(mode)
+            return
+        }
+        if let name = try? object.decode(String.self, forKey: .name) {
+            self = .function(name: name)
+            return
+        }
         let function = try object.nestedContainer(keyedBy: CodingKeys.self, forKey: .function)
         self = .function(name: try function.decode(String.self, forKey: .name))
     }

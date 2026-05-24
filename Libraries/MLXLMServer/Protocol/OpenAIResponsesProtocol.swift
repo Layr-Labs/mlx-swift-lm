@@ -206,6 +206,32 @@ public struct OpenAIResponseOutputItem: Codable, Sendable, Equatable {
     }
 }
 
+public struct OpenAIResponseUsage: Codable, Sendable, Equatable {
+    public var inputTokens: Int
+    public var outputTokens: Int
+    public var totalTokens: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case totalTokens = "total_tokens"
+    }
+
+    public init(inputTokens: Int, outputTokens: Int) {
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.totalTokens = inputTokens + outputTokens
+    }
+
+    public init(chatUsage: OpenAIUsage) {
+        self.init(inputTokens: chatUsage.promptTokens, outputTokens: chatUsage.completionTokens)
+    }
+
+    public var chatUsage: OpenAIUsage {
+        OpenAIUsage(promptTokens: inputTokens, completionTokens: outputTokens)
+    }
+}
+
 public struct OpenAIResponse: Codable, Sendable, Equatable {
     public var id: String
     public var object: String
@@ -214,7 +240,7 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
     public var model: String
     public var output: [OpenAIResponseOutputItem]
     public var outputText: String
-    public var usage: OpenAIUsage?
+    public var usage: OpenAIResponseUsage?
     public var metadata: [String: JSONValue]?
 
     private enum CodingKeys: String, CodingKey {
@@ -235,7 +261,7 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
         model: String,
         output: [OpenAIResponseOutputItem],
         outputText: String,
-        usage: OpenAIUsage?,
+        usage: OpenAIResponseUsage?,
         metadata: [String: JSONValue]? = nil,
         createdAt: Int = Int(Date().timeIntervalSince1970)
     ) {
