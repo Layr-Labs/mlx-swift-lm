@@ -169,6 +169,17 @@ public final class EngineCore: @unchecked Sendable {
         return true
     }
 
+    /// Update the scheduler's runtime concurrency cap on the engine queue.
+    ///
+    /// Hops onto `engineQueue` so the mutation is serialised with the step
+    /// loop (mirrors `addRequest` / `abortRequest`). The new value takes
+    /// effect on the next `admitWaiting()` call.
+    public func setMaxNumSeqs(_ value: Int) {
+        engineQueue.async { [weak self] in
+            self?.scheduler.setMaxNumSeqs(value)
+        }
+    }
+
     /// Abort all active requests.
     @discardableResult
     public func abortAllRequests() -> Int {

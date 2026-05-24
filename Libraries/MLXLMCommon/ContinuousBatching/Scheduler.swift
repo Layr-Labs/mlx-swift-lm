@@ -105,6 +105,13 @@ private struct PendingPrefill {
 
 public final class Scheduler: @unchecked Sendable {
     public let config: SchedulerConfig
+    /// Runtime-adjustable cap on concurrently running sequences. Initialised
+    /// from `config.maxNumSeqs` and mutated via `setMaxNumSeqs(_:)`. The
+    /// admission path consults this rather than `config.maxNumSeqs` so the
+    /// engine can be reshaped at runtime (e.g. by an adaptive concurrency
+    /// policy in the embedder). Must be mutated from the engine queue or
+    /// before `EngineCore.start()`; see `setMaxNumSeqs` below.
+    private var runtimeMaxNumSeqs: Int
     public let model: any LanguageModel
     private let tokenizer: any Tokenizer
     private let eosTokenIds: Set<Int>
@@ -146,8 +153,21 @@ public final class Scheduler: @unchecked Sendable {
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
+        self.runtimeMaxNumSeqs = config.maxNumSeqs
         self.eosTokenIds = eosTokenIds
         self.prefixCache = prefixCache
+    }
+
+    /// Update the runtime concurrency cap. `value < 1` is clamped to 1 to
+    /// prevent permanent admission deadlock (a cap of 0 would block every
+    /// future request forever via the runtime setter).
+    ///
+    /// Thread-safety: like the rest of `Scheduler`'s mutating API, this must
+    /// be invoked from the engine queue (i.e. via
+    /// `EngineCore.setMaxNumSeqs(_:)`) or before `EngineCore.start()`. The
+    /// new value is observed by the next `admitWaiting()` call.
+    public func setMaxNumSeqs(_ value: Int) {
+        runtimeMaxNumSeqs = max(1, value)
     }
 
     public func addRequest(_ request: Request) {
@@ -374,7 +394,7 @@ public final class Scheduler: @unchecked Sendable {
     @discardableResult
     private func admitWaiting() -> [Request] {
         guard !waiting.isEmpty else { return [] }
-        let availableSlots = max(0, config.maxNumSeqs - activeRids.count)
+        let availableSlots = max(0, runtimeMaxNumSeqs - activeRids.count)
         guard availableSlots > 0 else { return [] }
 
         struct AdmittedEntry {
@@ -766,6 +786,7 @@ extension Scheduler {
             "total_prompt_tokens": totalPromptTokens,
             "total_completion_tokens": totalCompletionTokens,
             "current_kv_tokens": currentKVTokens,
+            "max_num_seqs": runtimeMaxNumSeqs,
         ]
     }
 }

@@ -91,6 +91,12 @@ public final class BatchedEngine: @unchecked Sendable {
         core.stop()
     }
 
+    /// Adjust the engine's runtime concurrency cap. Forwarded to
+    /// `EngineCore.setMaxNumSeqs(_:)` which serialises on the engine queue.
+    public func setMaxNumSeqs(_ value: Int) {
+        core.setMaxNumSeqs(value)
+    }
+
     // MARK: - Non-streaming Generation
 
     /// Generate a complete response (non-streaming).
