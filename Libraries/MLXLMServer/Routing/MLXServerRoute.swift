@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
 public enum HTTPMethod: String, Codable, Sendable, Hashable {
     case get = "GET"

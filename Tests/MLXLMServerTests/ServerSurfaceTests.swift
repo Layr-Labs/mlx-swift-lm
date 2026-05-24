@@ -1,3 +1,5 @@
+// Copyright © 2026 Eigen Labs Inc.
+
 import Foundation
 import MLXLMCommon
 @testable import MLXLMServer
@@ -129,6 +131,8 @@ struct ServerSurfaceTests {
         #expect(try ServerToolParser.resolve(requested: "gemma4", modelType: nil) == .gemma)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma)
         #expect(try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: "gpt_oss", modelType: nil) == .harmony)
+        #expect(try ServerToolParser.resolve(requested: nil, modelType: "gpt_oss") == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "lfm2") == .lfm2)
     }
 
@@ -141,6 +145,15 @@ struct ServerSurfaceTests {
         #expect(parsed.content == "The answer is 42.")
     }
 
+    @Test("reasoning parser handles Qwen output when opening think tag is suppressed")
+    func reasoningParserExtractsOrphanClosingThinkBlock() {
+        let parser = ReasoningParser(format: .qwen3)
+        let parsed = parser.parse("Need a tool call.\n</think>\n\n")
+
+        #expect(parsed.reasoningContent == "Need a tool call.")
+        #expect(parsed.content == "")
+    }
+
     @Test("reasoning parser extracts harmony analysis and final channels")
     func reasoningParserExtractsHarmonyChannels() {
         let parser = ReasoningParser(format: .harmony)
@@ -150,6 +163,24 @@ struct ServerSurfaceTests {
 
         #expect(parsed.reasoningContent == "use tool first")
         #expect(parsed.content == "done")
+    }
+
+    @Test("reasoning parser treats harmony return marker as final terminator")
+    func reasoningParserExtractsHarmonyReturnMarker() {
+        let parser = ReasoningParser(format: .harmony)
+        let parsed = parser.parse(
+            "<|channel|>analysis<|message|>briefly reason<|end|><|channel|>final<|message|>done<|return|>"
+        )
+
+        #expect(parsed.reasoningContent == "briefly reason")
+        #expect(parsed.content == "done")
+    }
+
+    @Test("server runner treats existing model argument as local directory")
+    func serverRunnerSupportsLocalModelDirectory() {
+        let config = MLXServer.modelConfiguration(for: FileManager.default.currentDirectoryPath)
+
+        #expect(config.name.hasSuffix("/mlx-swift-lm"))
     }
 
     @Test("SSE encoder formats OpenAI data frames and done sentinel")

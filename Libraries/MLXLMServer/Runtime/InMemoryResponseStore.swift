@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
 public actor InMemoryResponseStore {
     private var responses: [String: OpenAIResponse] = [:]

@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
 import MLXLMCommon
@@ -44,6 +44,8 @@ public enum ServerToolParser {
             return .mistral
         case "llama3", "llama3_json", "llama_3":
             return .llama3
+        case "harmony", "gpt_oss", "openai_harmony":
+            return .harmony
         case .some(let name):
             throw ServerToolParserError.unsupported(name)
         case .none:

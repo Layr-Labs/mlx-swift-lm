@@ -1,23 +1,24 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
+import Foundation
 import Hummingbird
 import MLXLMCommon
 
 public enum MLXServer {
     public static func run(configuration: MLXServerConfiguration) async throws {
-        var modelConfiguration = ModelConfiguration(
-            id: configuration.model,
+        var primaryModelConfiguration = modelConfiguration(
+            for: configuration.model,
             revision: configuration.revision
         )
         if let parser = configuration.toolCallParser {
-            modelConfiguration.toolCallFormat = try ServerToolParser.resolve(
+            primaryModelConfiguration.toolCallFormat = try ServerToolParser.resolve(
                 requested: parser,
                 modelType: configuration.modelType
             )
         }
 
         let model = try await MLXServerModelLoader.load(
-            configuration: modelConfiguration
+            configuration: primaryModelConfiguration
         )
         let engine = MLXModelContainerEngine(
             modelID: configuration.model,
@@ -28,7 +29,7 @@ public enum MLXServer {
         let embeddingEngine: MLXEmbedderContainerEngine?
         if let embeddingModelID = configuration.embeddingModel {
             let embeddingModel = try await MLXServerEmbedderLoader.load(
-                configuration: .init(id: embeddingModelID)
+                configuration: modelConfiguration(for: embeddingModelID)
             )
             embeddingEngine = MLXEmbedderContainerEngine(
                 modelID: embeddingModelID,
@@ -48,5 +49,28 @@ public enum MLXServer {
             port: configuration.port
         )
         try await app.runService()
+    }
+
+    static func modelConfiguration(for idOrPath: String, revision: String = "main") -> ModelConfiguration {
+        let expandedPath: String
+        if idOrPath == "~" {
+            expandedPath = FileManager.default.homeDirectoryForCurrentUser.path
+        } else if idOrPath.hasPrefix("~/") {
+            expandedPath = FileManager.default.homeDirectoryForCurrentUser
+                .appending(path: String(idOrPath.dropFirst(2)))
+                .path
+        } else {
+            expandedPath = idOrPath
+        }
+
+        let url = URL(fileURLWithPath: expandedPath)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: expandedPath, isDirectory: &isDirectory),
+            isDirectory.boolValue
+        {
+            return .init(directory: url)
+        }
+
+        return .init(id: idOrPath, revision: revision)
     }
 }

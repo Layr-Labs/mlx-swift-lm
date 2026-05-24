@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
 
@@ -66,6 +66,11 @@ public struct ReasoningParser: Sendable {
             remaining.removeSubrange(start.lowerBound..<end.upperBound)
         }
 
+        if reasoning.isEmpty, let end = remaining.range(of: "</think>") {
+            reasoning.append(String(remaining[..<end.lowerBound]))
+            remaining.removeSubrange(remaining.startIndex..<end.upperBound)
+        }
+
         let reasoningText = reasoning.joined(separator: "\n").trimmedForReasoning
         return .init(
             content: remaining.trimmedForReasoning,
@@ -76,7 +81,7 @@ public struct ReasoningParser: Sendable {
     private func parseHarmony(_ text: String) -> ParsedReasoning {
         let channelMarker = "<|channel|>"
         let messageMarker = "<|message|>"
-        let endMarker = "<|end|>"
+        let endMarkers = ["<|end|>", "<|return|>", "<|call|>"]
         var final: [String] = []
         var analysis: [String] = []
         var cursor = text.startIndex
@@ -90,7 +95,7 @@ public struct ReasoningParser: Sendable {
 
             let channel = String(text[channelNameStart..<messageStart.lowerBound])
             let contentStart = messageStart.upperBound
-            let contentEnd = text.range(of: endMarker, range: contentStart..<text.endIndex)
+            let contentEnd = firstRange(ofAny: endMarkers, in: text, range: contentStart..<text.endIndex)
             let messageEnd = contentEnd?.lowerBound ?? text.endIndex
             let content = String(text[contentStart..<messageEnd])
 
@@ -115,6 +120,21 @@ public struct ReasoningParser: Sendable {
             content: final.joined(separator: "\n").trimmedForReasoning,
             reasoningContent: reasoningText.isEmpty ? nil : reasoningText
         )
+    }
+
+    private func firstRange(
+        ofAny markers: [String],
+        in text: String,
+        range: Range<String.Index>
+    ) -> Range<String.Index>? {
+        var first: Range<String.Index>?
+        for marker in markers {
+            guard let candidate = text.range(of: marker, range: range) else { continue }
+            if first == nil || candidate.lowerBound < first!.lowerBound {
+                first = candidate
+            }
+        }
+        return first
     }
 }
 

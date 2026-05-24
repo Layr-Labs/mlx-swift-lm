@@ -120,6 +120,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|python_tag|>{ "name": "func", "parameters": {...} }`
     case llama3
 
+    /// OpenAI Harmony format used by GPT-OSS models.
+    /// Example: `<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{"k":"v"}<|call|>`
+    case harmony
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -145,6 +149,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return MistralToolCallParser()
         case .llama3:
             return Llama3ToolCallParser()
+        case .harmony:
+            return HarmonyToolCallParser()
         }
     }
 
@@ -210,6 +216,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Qwen3-Next family (qwen3_next, etc.)
         if type.hasPrefix("qwen3_next") {
             return .xmlFunction
+        }
+
+        // GPT-OSS / OpenAI Harmony family.
+        if type == "gpt_oss" {
+            return .harmony
         }
 
         // Mistral3 family (mistral3, mistral3_text, etc.)

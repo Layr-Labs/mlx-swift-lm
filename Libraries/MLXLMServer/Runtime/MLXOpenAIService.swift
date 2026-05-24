@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
 import MLXLMCommon
@@ -352,6 +352,9 @@ public struct MLXOpenAIService: Sendable {
         let parsed = ReasoningParser(format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
             .parse(output.content)
         var outputItems: [OpenAIResponseOutputItem] = []
+        if let reasoningContent = parsed.reasoningContent, !reasoningContent.isEmpty {
+            outputItems.append(.reasoning(id: idProvider("rs"), text: reasoningContent))
+        }
         if !parsed.content.isEmpty {
             outputItems.append(.message(id: idProvider("msg"), text: parsed.content))
         }

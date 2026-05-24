@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
 import MLXLMCommon
@@ -146,6 +146,7 @@ public struct OpenAIResponseOutputItem: Codable, Sendable, Equatable {
     public var status: OpenAIResponseStatus?
     public var role: OpenAIRole?
     public var content: [OpenAIResponseOutputContent]?
+    public var summary: [OpenAIResponseOutputContent]?
     public var callID: String?
     public var name: String?
     public var arguments: String?
@@ -156,6 +157,7 @@ public struct OpenAIResponseOutputItem: Codable, Sendable, Equatable {
         case status
         case role
         case content
+        case summary
         case callID = "call_id"
         case name
         case arguments
@@ -168,6 +170,21 @@ public struct OpenAIResponseOutputItem: Codable, Sendable, Equatable {
             status: .completed,
             role: .assistant,
             content: [.init(text: text)],
+            summary: nil,
+            callID: nil,
+            name: nil,
+            arguments: nil
+        )
+    }
+
+    public static func reasoning(id: String, text: String) -> Self {
+        .init(
+            id: id,
+            type: "reasoning",
+            status: .completed,
+            role: nil,
+            content: [.init(type: "reasoning_text", text: text)],
+            summary: [.init(type: "summary_text", text: text)],
             callID: nil,
             name: nil,
             arguments: nil
@@ -181,6 +198,7 @@ public struct OpenAIResponseOutputItem: Codable, Sendable, Equatable {
             status: .completed,
             role: nil,
             content: nil,
+            summary: nil,
             callID: toolCall.id,
             name: toolCall.function.name,
             arguments: toolCall.function.arguments

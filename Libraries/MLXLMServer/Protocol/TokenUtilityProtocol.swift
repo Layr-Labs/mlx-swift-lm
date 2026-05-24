@@ -1,4 +1,4 @@
-// Copyright © 2026 Apple Inc.
+// Copyright © 2026 Eigen Labs Inc.
 
 public struct TokenizeRequest: Codable, Sendable, Equatable {
     public var model: String?

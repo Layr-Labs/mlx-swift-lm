@@ -1,3 +1,5 @@
+// Copyright © 2026 Eigen Labs Inc.
+
 import Foundation
 import Hummingbird
 import HummingbirdTesting
@@ -261,6 +263,33 @@ struct OpenAIServiceTests {
 
         let snapshot = await service.metricsSnapshot()
         #expect(snapshot.responsesTotal == 1)
+    }
+
+    @Test("responses API emits parsed reasoning output item")
+    func responsesAPIEmitsParsedReasoningOutputItem() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("<think>check constraints</think>final text"),
+            .info(.init(promptTokens: 4, completionTokens: 2)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let response = try await service.createResponse(
+            request: .init(
+                model: "local-model",
+                input: .text("Say hi"),
+                reasoning: .init(parser: .qwen3),
+                store: false
+            )
+        )
+
+        #expect(response.outputText == "final text")
+        #expect(response.output.first?.type == "reasoning")
+        #expect(response.output.first?.summary?.first?.type == "summary_text")
+        #expect(response.output.first?.summary?.first?.text == "check constraints")
+        #expect(response.output.first?.content?.first?.type == "reasoning_text")
+        #expect(response.output.first?.content?.first?.text == "check constraints")
+        #expect(response.output.dropFirst().first?.type == "message")
+        #expect(response.output.dropFirst().first?.content?.first?.text == "final text")
     }
 
     @Test("token utility requests delegate through the engine")
