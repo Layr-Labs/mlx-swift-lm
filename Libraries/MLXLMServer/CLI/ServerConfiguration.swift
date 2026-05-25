@@ -2,6 +2,14 @@
 
 import Foundation
 
+/// Which ``MLXServerEngine`` implementation the runner constructs.
+public enum MLXServerEngineKind: String, Sendable, Equatable, CaseIterable {
+    /// ``MLXBatchedEngineServerEngine`` (continuous batching). Default.
+    case batched
+    /// ``MLXModelContainerEngine`` (single-request serialised access).
+    case singleRequest = "single_request"
+}
+
 public struct MLXServerConfiguration: Sendable, Equatable {
     public var model: String
     public var revision: String
@@ -11,6 +19,10 @@ public struct MLXServerConfiguration: Sendable, Equatable {
     public var toolCallParser: String?
     public var reasoningParser: ReasoningParserFormat?
     public var embeddingModel: String?
+    /// Which engine to construct. Default: ``MLXServerEngineKind/batched``.
+    public var engineKind: MLXServerEngineKind
+    /// Batching knobs; ignored when ``engineKind`` is ``MLXServerEngineKind/singleRequest``.
+    public var batchedEngineConfiguration: BatchedEngineServerConfiguration
 
     public init(
         model: String,
@@ -20,7 +32,9 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         modelType: String? = nil,
         toolCallParser: String? = nil,
         reasoningParser: ReasoningParserFormat? = nil,
-        embeddingModel: String? = nil
+        embeddingModel: String? = nil,
+        engineKind: MLXServerEngineKind = .batched,
+        batchedEngineConfiguration: BatchedEngineServerConfiguration = .init()
     ) {
         self.model = model
         self.revision = revision
@@ -30,6 +44,8 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
         self.embeddingModel = embeddingModel
+        self.engineKind = engineKind
+        self.batchedEngineConfiguration = batchedEngineConfiguration
     }
 }
 
@@ -43,6 +59,7 @@ public enum MLXServerCLIError: Error, LocalizedError, Equatable {
     case missingValue(String)
     case invalidPort(String)
     case unknownOption(String)
+    case invalidEngineKind(String)
 
     public var errorDescription: String? {
         switch self {
@@ -52,6 +69,8 @@ public enum MLXServerCLIError: Error, LocalizedError, Equatable {
             return "Invalid port '\(value)'"
         case .unknownOption(let option):
             return "Unknown option '\(option)'"
+        case .invalidEngineKind(let value):
+            return "Invalid engine kind '\(value)'"
         }
     }
 }
@@ -71,6 +90,10 @@ public enum MLXServerCLI {
         var reasoningParser: ReasoningParserFormat?
         if let raw = environment["MLX_SERVER_REASONING_PARSER"] {
             reasoningParser = try decodeReasoningParser(raw)
+        }
+        var engineKind: MLXServerEngineKind = .batched
+        if let raw = environment["MLX_SERVER_ENGINE_KIND"] {
+            engineKind = try decodeEngineKind(raw)
         }
 
         var index = 1
@@ -103,6 +126,10 @@ public enum MLXServerCLI {
                 )
             case "--embedding-model":
                 embeddingModel = try value(after: option, arguments: arguments, index: &index)
+            case "--engine-kind":
+                engineKind = try decodeEngineKind(
+                    try value(after: option, arguments: arguments, index: &index)
+                )
             default:
                 if option.hasPrefix("-") {
                     throw MLXServerCLIError.unknownOption(option)
@@ -121,7 +148,8 @@ public enum MLXServerCLI {
                 modelType: modelType,
                 toolCallParser: toolCallParser,
                 reasoningParser: reasoningParser,
-                embeddingModel: embeddingModel
+                embeddingModel: embeddingModel,
+                engineKind: engineKind
             )
         )
     }
@@ -138,13 +166,14 @@ public enum MLXServerCLI {
               --tool-call-parser <parser>  auto, json, lfm2, xml_function, glm4, gemma, gemma4, kimi_k2, minimax_m2, mistral, llama3_json, harmony
               --reasoning-parser <parser>  none, deepseek_r1, qwen3, harmony
               --embedding-model <id>       Optional embedding model id for /v1/embeddings
+              --engine-kind <kind>         batched (default) or single_request
               --list-routes                Print the server route manifest
           -h, --help                       Print this help
 
         Environment:
           MLX_SERVER_MODEL, MLX_SERVER_REVISION, MLX_SERVER_HOST, MLX_SERVER_PORT,
           MLX_SERVER_MODEL_TYPE, MLX_SERVER_TOOL_CALL_PARSER, MLX_SERVER_REASONING_PARSER,
-          MLX_SERVER_EMBEDDING_MODEL
+          MLX_SERVER_EMBEDDING_MODEL, MLX_SERVER_ENGINE_KIND
         """
 
     private static func value(
@@ -163,5 +192,13 @@ public enum MLXServerCLI {
     private static func decodeReasoningParser(_ raw: String) throws -> ReasoningParserFormat {
         let data = try JSONEncoder().encode(raw)
         return try JSONDecoder().decode(ReasoningParserFormat.self, from: data)
+    }
+
+    private static func decodeEngineKind(_ raw: String) throws -> MLXServerEngineKind {
+        let normalized = raw.lowercased().replacingOccurrences(of: "-", with: "_")
+        guard let kind = MLXServerEngineKind(rawValue: normalized) else {
+            throw MLXServerCLIError.invalidEngineKind(raw)
+        }
+        return kind
     }
 }

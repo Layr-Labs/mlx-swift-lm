@@ -45,7 +45,7 @@ final class CacheBlock {
 
 // MARK: - PrefixCacheConfig
 
-public struct PrefixCacheConfig: Sendable {
+public struct PrefixCacheConfig: Sendable, Equatable {
     /// Tokens per block. Must be consistent across all stored blocks.
     public var blockSize: Int
     /// Maximum number of in-GPU-memory blocks.
