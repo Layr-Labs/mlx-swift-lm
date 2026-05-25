@@ -253,6 +253,30 @@ struct OpenAIServiceTests {
         #expect(!joined.contains("nk>"))
     }
 
+    @Test("streaming chat completion preserves orphan think reasoning across chunk boundary")
+    func streamingChatCompletionPreservesOrphanThinkReasoningAcrossChunkBoundary() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .content("need tool"),
+            .content("</think>visible"),
+            .info(.init(promptTokens: 4, completionTokens: 2)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(reasoningParser: .qwen3, stream: true)
+        )
+        var frames: [String] = []
+        for try await frame in stream {
+            frames.append(frame)
+        }
+        let joined = frames.joined()
+
+        #expect(joined.contains("\"reasoning_content\":\"need tool\""))
+        #expect(joined.contains("\"content\":\"visible\""))
+        #expect(!joined.contains("\"content\":\"need tool\""))
+        #expect(!joined.contains("</think>"))
+    }
+
     @Test("JSON object response format injects instructions and returns normalized JSON")
     func jsonObjectResponseFormatInjectsInstructionsAndNormalizesJSON() async throws {
         let engine = ScriptedServerEngine(events: [
