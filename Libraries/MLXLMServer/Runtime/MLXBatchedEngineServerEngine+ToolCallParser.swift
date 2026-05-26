@@ -32,18 +32,18 @@ extension MLXBatchedEngineServerEngine {
 /// Sendable wrapper around the non-Sendable ``ToolCallProcessor`` for
 /// capture in the streaming-completion Task closure. Only touched from
 /// that single Task.
-final class BatchedToolStreamHandler: @unchecked Sendable {
+public final class BatchedToolStreamHandler: @unchecked Sendable {
     private let processor: ToolCallProcessor
 
-    init(format: ToolCallFormat, tools: [[String: any Sendable]]?) {
+    public init(format: ToolCallFormat, tools: [[String: any Sendable]]?) {
         self.processor = ToolCallProcessor(format: format, tools: tools)
     }
 
-    func processChunk(_ chunk: String) -> String? {
+    public func processChunk(_ chunk: String) -> String? {
         processor.processChunk(chunk)
     }
 
-    func finish() -> [ToolCall] {
+    public func finish() -> [ToolCall] {
         processor.processEOS()
         return processor.toolCalls
     }
