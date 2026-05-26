@@ -66,7 +66,11 @@ func consumeSafePrefix(
 }
 
 func potentialMarkerPrefixSuffixLength(in text: String, marker: String) -> Int {
-    let maxLength = min(text.count, max(marker.count - 1, 0))
+    // Use marker.count (not marker.count - 1) so that a COMPLETE marker
+    // at the end of the buffer is also held back. This is critical for
+    // drainContent in the Gemma4 streaming parser where trailing markers
+    // (<turn|>, <eos>) must not leak through non-final chunks.
+    let maxLength = min(text.count, marker.count)
     guard maxLength > 0 else { return 0 }
 
     for length in stride(from: maxLength, through: 1, by: -1) {

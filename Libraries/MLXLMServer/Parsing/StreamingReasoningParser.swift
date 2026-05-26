@@ -5,6 +5,7 @@ public struct StreamingReasoningParser: Sendable {
 
     private var thinkParser = StreamingThinkReasoningParser()
     private var harmonyParser = StreamingHarmonyReasoningParser()
+    private var gemma4Parser = StreamingGemma4ReasoningParser()
 
     public init(format: ReasoningParserFormat) {
         self.format = format
@@ -19,6 +20,8 @@ public struct StreamingReasoningParser: Sendable {
             return thinkParser.parse(chunk)
         case .harmony:
             return harmonyParser.parse(chunk)
+        case .gemma4:
+            return gemma4Parser.parse(chunk)
         }
     }
 
@@ -30,6 +33,8 @@ public struct StreamingReasoningParser: Sendable {
             return thinkParser.finish()
         case .harmony:
             return harmonyParser.finish()
+        case .gemma4:
+            return gemma4Parser.finish()
         }
     }
 }
