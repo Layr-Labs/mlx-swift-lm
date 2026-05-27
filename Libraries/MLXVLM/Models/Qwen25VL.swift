@@ -321,7 +321,7 @@ private enum Vision {
                 keys: k,
                 values: v,
                 scale: scale,
-                mask: .none
+                mask: .array(attentionMask)
             )
             .transposed(0, 2, 1, 3)
             .reshaped(sequenceLength, -1)
@@ -583,9 +583,19 @@ private enum Vision {
             }
             let cuSeqlensArray = MLXArray(cuSeqlens)
 
-            let fullAttentionMask = attentionMask(sequenceLength: seqLen, cuSeqlens: cuSeqlensArray)
-            let windowAttentionMask = attentionMask(
+            let fullAttentionMaskBool = attentionMask(
+                sequenceLength: seqLen, cuSeqlens: cuSeqlensArray)
+            let windowAttentionMaskBool = attentionMask(
                 sequenceLength: seqLen, cuSeqlens: cuWindowSeqlens)
+            let maskDtype = hiddenStates.dtype
+            let fullAttentionMask = MLX.where(
+                fullAttentionMaskBool[.newAxis, 0..., 0..., 0...],
+                MLXArray(0, dtype: maskDtype),
+                MLXArray(-10000, dtype: maskDtype))
+            let windowAttentionMask = MLX.where(
+                windowAttentionMaskBool[.newAxis, 0..., 0..., 0...],
+                MLXArray(0, dtype: maskDtype),
+                MLXArray(-10000, dtype: maskDtype))
 
             // Reshape and reindex hidden states
             hiddenStates = hiddenStates.reshaped(seqLen / spatialMergeUnit, spatialMergeUnit, -1)
