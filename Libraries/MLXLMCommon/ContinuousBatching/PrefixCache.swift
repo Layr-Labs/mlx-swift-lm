@@ -43,6 +43,34 @@ final class CacheBlock {
     func touch() { lastAccess = .init() }
 }
 
+// MARK: - PrefixCachePersistence
+
+/// Optional encrypted/cold-storage backend for the in-GPU prefix cache.
+///
+/// The `PrefixCache` keeps hot blocks in GPU/unified memory and evicts
+/// the LRU block when it needs room. With a persistence backend wired
+/// in, an evicted block is handed to `saveBlock` (so it survives the
+/// eviction, and process restart) and a fetch miss for a known block
+/// hash is retried against `loadBlock` (so an evicted/persisted block
+/// can be reloaded instead of re-prefilled).
+///
+/// Both calls are SYNCHRONOUS — they run inside the engine's step loop.
+/// Implementations must therefore do any key unwrap up front and keep
+/// `saveBlock`/`loadBlock` non-async (e.g. hold an already-unwrapped
+/// symmetric key and do synchronous crypto + file I/O). `saveBlock` is
+/// best-effort: it must not throw and should fail silently (a lost
+/// block just means a future cold prefill).
+///
+/// Block keying is the content-addressed `computeBlockHash` chain, so a
+/// backend's on-disk layout is stable across runs and models.
+public protocol PrefixCachePersistence: AnyObject, Sendable {
+    /// Persist a block's per-layer KV under its content hash. Best-effort.
+    func saveBlock(blockHash: Data, layerCaches: [KVCacheSimple])
+    /// Load a previously-persisted block's per-layer KV, or nil if absent
+    /// (or if the backend rejects it, e.g. a model-binding mismatch).
+    func loadBlock(blockHash: Data) -> [KVCacheSimple]?
+}
+
 // MARK: - PrefixCacheConfig
 
 public struct PrefixCacheConfig: Sendable, Equatable {
@@ -82,6 +110,9 @@ public struct PrefixCacheConfig: Sendable, Equatable {
 public final class PrefixCache: @unchecked Sendable {
     public let config: PrefixCacheConfig
     private let modelName: String
+    /// Optional encrypted/cold-storage backend (see `PrefixCachePersistence`).
+    /// nil = in-GPU only (default; evicted blocks are dropped).
+    private let persistence: PrefixCachePersistence?
 
     // Blocks that are completely free (no data).
     private var freeBlocks: [CacheBlock]
@@ -95,9 +126,14 @@ public final class PrefixCache: @unchecked Sendable {
     public private(set) var misses = 0
     public private(set) var tokensSaved = 0
 
-    public init(config: PrefixCacheConfig = .init(), modelName: String = "") {
+    public init(
+        config: PrefixCacheConfig = .init(),
+        modelName: String = "",
+        persistence: PrefixCachePersistence? = nil
+    ) {
         self.config = config
         self.modelName = modelName
+        self.persistence = persistence
         self.freeBlocks = (0 ..< config.maxBlocks).map { CacheBlock(blockId: $0) }
     }
 
@@ -136,6 +172,22 @@ public final class PrefixCache: @unchecked Sendable {
                 block.touch()
                 matchedPerBlock.append(layerCaches)
                 matchedIds.append(blockId)
+                parentHash = hash
+            } else if let p = persistence, let layerCaches = p.loadBlock(blockHash: hash) {
+                // Cold hit: the block was evicted (or persisted in a prior
+                // run). Reload it into a GPU block so subsequent fetches hit
+                // in-memory; if there's no room, use it for this request only.
+                if let block = allocateBlock() {
+                    block.blockHash = hash
+                    block.tokenCount = bs
+                    block.cacheData = layerCaches
+                    block.refCount = 1
+                    block.touch()
+                    hashIndex[hash] = block.blockId
+                    allocatedBlocks[block.blockId] = block
+                    matchedIds.append(block.blockId)
+                }
+                matchedPerBlock.append(layerCaches)
                 parentHash = hash
             } else {
                 break
@@ -249,6 +301,13 @@ public final class PrefixCache: @unchecked Sendable {
             .filter({ $0.isEvictable })
             .min(by: { $0.lastAccess < $1.lastAccess })
         else { return nil }
+
+        // Persist to cold storage before dropping the in-GPU data, so an
+        // evicted block can be reloaded (and survives restart) instead of
+        // being re-prefilled. Best-effort; nil backend = drop as before.
+        if let p = persistence, let hash = victim.blockHash, let data = victim.cacheData {
+            p.saveBlock(blockHash: hash, layerCaches: data)
+        }
 
         if let hash = victim.blockHash { hashIndex.removeValue(forKey: hash) }
         allocatedBlocks.removeValue(forKey: victim.blockId)
