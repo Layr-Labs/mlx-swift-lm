@@ -55,6 +55,16 @@ final class CBBlockHashTests: XCTestCase {
 
 // MARK: - §6  PrefixCache
 
+/// Test persistence backend: returns a caller-supplied block for every
+/// loadBlock (simulating blocks previously evicted to SSD), so cold-hit
+/// paths can be exercised without real encryption.
+private final class StubColdPersistence: PrefixCachePersistence, @unchecked Sendable {
+    private let make: @Sendable () -> [KVCacheSimple]
+    init(_ make: @escaping @Sendable () -> [KVCacheSimple]) { self.make = make }
+    func saveBlock(blockHash: Data, layerCaches: [KVCacheSimple]) {}
+    func loadBlock(blockHash: Data) -> [KVCacheSimple]? { make() }
+}
+
 final class CBPrefixCacheTests: XCTestCase {
 
     private let blockSize = 4
@@ -194,5 +204,44 @@ final class CBPrefixCacheTests: XCTestCase {
         let (caches2, _) = pc.fetchPrefix(requestId: "req2", tokens: sharedPrefix + [6])
         XCTAssertNotNil(caches2, "second request with identical prefix should hit")
         XCTAssertEqual(pc.hits, 1)
+    }
+
+    // MARK: - Cold hit with saturated block pool (regression)
+
+    func testColdHitWithSaturatedPoolDoesNotOverlapRemaining() {
+        // Regression: on a cold (persistence) hit where the block pool is
+        // saturated (allocateBlock()==nil), the loaded block is still merged
+        // into the returned cache, but cachedTokens was previously derived
+        // from matchedIds (GPU-resident blocks only), undercounting it. The
+        // returned remainingTokens then OVERLAPPED KV already present in the
+        // merged cache, so the scheduler re-prefilled those positions on top
+        // of the seeded cache — duplicating them at wrong offsets and
+        // corrupting generation. cachedTokens must equal the merged width.
+        let bs = blockSize
+        // Every cold lookup returns a fresh full block. maxBlocks=1: the
+        // first cold block in a fetch borrows the only slot (pinned,
+        // refCount=1), so every later cold block in the same fetch hits
+        // allocateBlock()==nil — exactly the saturated path.
+        let stub = StubColdPersistence { [bs] in
+            let c = KVCacheSimple()
+            let t = MLXArray(Array(repeating: Float(9), count: bs)).reshaped([1, 1, bs, 1])
+            c.state = [t, t * 2]
+            return [c]
+        }
+        let pc = PrefixCache(config: makeConfig(maxBlocks: 1), persistence: stub)
+
+        // 13 tokens, bs=4 → numFull=3, 13%4≠0 → maxMatch=3 cold hits. Only the
+        // first gets a GPU slot; the other two are served for this request.
+        let tokens = Array(0 ..< 13)
+        let (caches, remaining) = pc.fetchPrefix(requestId: "r", tokens: tokens)
+
+        XCTAssertNotNil(caches)
+        let mergedSeq = caches![0].state[0].dim(2)
+        XCTAssertEqual(mergedSeq, 3 * bs, "all 3 cold blocks are merged into the served cache")
+        // The fix: remainingTokens starts exactly where the merged cache ends
+        // — no overlap. (Before the fix remaining would include re-prefilled
+        // tokens [bs ..< 3*bs] already present in the merged cache.)
+        XCTAssertEqual(remaining.count, tokens.count - mergedSeq)
+        XCTAssertEqual(remaining, [12])
     }
 }

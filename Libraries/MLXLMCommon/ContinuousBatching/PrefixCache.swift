@@ -210,7 +210,18 @@ public final class PrefixCache: @unchecked Sendable {
             return merged
         }
 
-        let cachedTokens = matchedIds.count * bs
+        // Count tokens from the blocks actually merged into `merged`, NOT
+        // from matchedIds. On a cold (persistence) hit where the block pool
+        // is saturated and allocateBlock() returns nil, the loaded block is
+        // appended to matchedPerBlock (and served) but NOT to matchedIds
+        // (which tracks only GPU-resident blocks for ref-count bookkeeping).
+        // Using matchedIds.count here would undercount cachedTokens, so the
+        // returned remainingTokens would overlap KV already present in
+        // `merged` — the scheduler would then re-prefill those positions on
+        // top of the seeded cache, duplicating them at wrong offsets and
+        // corrupting generation. matchedPerBlock.count*bs is exactly the
+        // width of `merged`.
+        let cachedTokens = matchedPerBlock.count * bs
         hits += 1
         tokensSaved += cachedTokens
         return (merged, Array(tokens[cachedTokens...]))
