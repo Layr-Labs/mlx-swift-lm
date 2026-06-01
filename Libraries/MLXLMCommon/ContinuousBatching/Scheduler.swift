@@ -139,6 +139,27 @@ public final class Scheduler: @unchecked Sendable {
 
     public var prefixCache: PrefixCache?
 
+    /// Checkpoint KV-cache capture hook (hybrid sliding-window models).
+    /// When set, cold single-row prefill is boundary-aligned (see
+    /// `CheckpointPrefillPlanner`) and this closure is invoked at each
+    /// checkpoint boundary with the prompt-prefix tokens, the boundary
+    /// length, and the per-layer single-row caches extracted at that point.
+    /// Default nil ⇒ no capture and `advancePendingPrefill` is byte-identical
+    /// to the pre-hook behavior. The closure must be cheap/non-blocking
+    /// (the provider boxes the caches and stores via a detached Task).
+    ///
+    /// Note: prefill covers only the first `promptLength - 1` tokens (the
+    /// final token is the decode seed, forwarded later inside `generate()`).
+    /// So a boundary equal to the full prompt length never fires — reachable
+    /// boundaries are those `<= promptLength - 1`. This is correct for a
+    /// prefix checkpoint (the cache genuinely covers `checkpointLength`
+    /// tokens at fire time); callers just shouldn't expect a capture at
+    /// exactly `promptLength`.
+    public var onCheckpointCapture: (@Sendable (_ prefixTokens: [Int], _ checkpointLength: Int, _ caches: [any KVCache]) -> Void)?
+    /// Checkpoint boundaries for capture, derived from the model's sliding
+    /// window. Empty ⇒ capture disabled even if the hook is set.
+    public var checkpointBoundaries: [Int] = []
+
     public private(set) var numRequestsProcessed: Int = 0
     public private(set) var totalPromptTokens: Int = 0
     public private(set) var totalCompletionTokens: Int = 0
@@ -156,6 +177,15 @@ public final class Scheduler: @unchecked Sendable {
         self.runtimeMaxNumSeqs = config.maxNumSeqs
         self.eosTokenIds = eosTokenIds
         self.prefixCache = prefixCache
+    }
+
+    /// True when checkpoint capture should run for the current pending
+    /// prefill: hook installed, boundaries present, and a single cold row
+    /// (B==1 — extract is row-isolated for any B, but B==1 sidesteps the
+    /// untested left-padded cross-row restore, per the design).
+    private func checkpointCaptureActive(_ pp: PendingPrefill) -> Bool {
+        onCheckpointCapture != nil && !checkpointBoundaries.isEmpty
+            && pp.ppBatch.tokens.count == 1
     }
 
     /// Update the runtime concurrency cap. `value < 1` is clamped to 1 to
@@ -300,13 +330,46 @@ public final class Scheduler: @unchecked Sendable {
         // Budget: how many prefill tokens we're allowed this step.
         let prefillBudget = max(1, config.maxNumBatchedTokens - decodeBatchSize)
         // Chunk size: never exceed the per-step budget or the remaining work.
-        let chunkSize = min(config.prefillStepSize, prefillBudget, maxRemaining)
+        var chunkSize = min(config.prefillStepSize, prefillBudget, maxRemaining)
+
+        // Checkpoint capture (hybrid models, B==1, hook installed): cap the
+        // chunk so the prefilled count lands exactly on a checkpoint boundary,
+        // then snapshot the per-layer caches there. Pure planner decides the
+        // chunk; default path below is untouched when inactive.
+        var captureAt: Int? = nil
+        let captureActive = checkpointCaptureActive(pp)
+        if captureActive {
+            // The cache covers (full prompt length - remaining) tokens so far.
+            // For B==1 the single row's prompt length is its seed + its
+            // already-consumed remaining.
+            let prefilled = (pp.ppBatch.tokens.first?.count ?? 0)
+            let step = CheckpointPrefillPlanner.plan(
+                prefilled: prefilled,
+                defaultChunk: chunkSize,
+                remaining: pp.remaining.first?.count ?? 0,
+                boundaries: checkpointBoundaries
+            )
+            chunkSize = step.chunk
+            captureAt = step.captureAt
+        }
+
         let chunks = pp.remaining.map { Array($0.prefix(chunkSize)) }
 
         pp.ppBatch.prompt(chunks)
 
         pp.remaining = zip(pp.remaining, chunks).map { rem, chunk in
             Array(rem.dropFirst(chunk.count))
+        }
+
+        // Fire the capture hook AFTER the chunk is prefilled (so the cache
+        // covers exactly `captureAt` tokens) but BEFORE generate()'s in-init
+        // decode step would slide a rotating window.
+        if captureActive, let boundary = captureAt, let hook = onCheckpointCapture {
+            let prefixTokens = Array((pp.ppBatch.tokens.first ?? []).prefix(boundary))
+            if prefixTokens.count == boundary {
+                let caches = pp.ppBatch.promptCache.map { $0.extractBatched(0) }
+                hook(prefixTokens, boundary, caches)
+            }
         }
 
         if pp.remaining.allSatisfy({ $0.isEmpty }) {
