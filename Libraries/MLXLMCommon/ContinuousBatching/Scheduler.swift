@@ -93,6 +93,22 @@ public struct SchedulerOutput: Sendable {
     }
 }
 
+// One admitted request plus the routing info computed at admission.
+private struct AdmittedEntry {
+    let request: Request
+    let promptTokens: [Int]
+    let tokensToPrefill: [Int]
+    let existingCache: [KVCache]?
+    /// Per-layer single-stream caches restored from a checkpoint hit (mixed
+    /// simple + rotating). Non-nil routes the entry through the dedicated
+    /// B==1 restore path, NOT the KVCacheSimple-only warm path.
+    /// `tokensToPrefill` is then the suffix after the restored prefix.
+    let restoredCaches: [any KVCache]?
+    let uid: Int
+    let sampler: RowSampler?
+    let machine: SequenceStateMachine
+}
+
 // Holds a batch of cold sequences being prefilled incrementally across steps.
 private struct PendingPrefill {
     // Accumulates KV state across prompt() calls.
@@ -460,16 +476,6 @@ public final class Scheduler: @unchecked Sendable {
         let availableSlots = max(0, runtimeMaxNumSeqs - activeRids.count)
         guard availableSlots > 0 else { return [] }
 
-        struct AdmittedEntry {
-            let request: Request
-            let promptTokens: [Int]
-            let tokensToPrefill: [Int]
-            let existingCache: [KVCache]?
-            let uid: Int
-            let sampler: RowSampler?
-            let machine: SequenceStateMachine
-        }
-
         var admitted: [AdmittedEntry] = []
         var newScheduled: [Request] = []
         let admitCold = pendingPrefill == nil
@@ -495,7 +501,21 @@ public final class Scheduler: @unchecked Sendable {
 
             var tokensToPrefill = promptTokens
             var existingCache: [KVCache]? = nil
-            if let pc = prefixCache {
+            var restoredCaches: [any KVCache]? = nil
+
+            // Checkpoint restore (hybrid models) takes precedence: the
+            // provider attached a per-layer mixed cache covering the first
+            // `tokenCount` prompt tokens. Only valid for a real prefix
+            // (1 <= tokenCount < promptTokens.count) so there is a suffix to
+            // decode from; otherwise ignore and fall through to cold.
+            if let rc = request.restoredCheckpoint,
+               rc.tokenCount >= 1, rc.tokenCount < promptTokens.count,
+               rc.caches.count == model.newCache(parameters: nil).count
+            {
+                restoredCaches = rc.caches
+                tokensToPrefill = Array(promptTokens[rc.tokenCount...])
+                request.cachedTokens = rc.tokenCount
+            } else if let pc = prefixCache {
                 let (cached, remaining) = pc.fetchPrefix(
                     requestId: request.requestId, tokens: promptTokens)
                 if let cached {
@@ -505,7 +525,9 @@ public final class Scheduler: @unchecked Sendable {
                 }
             }
 
-            let isCold = existingCache == nil
+            // A restored-checkpoint request is "warm" (not cold) for batch
+            // gating, but goes through its own admit path below.
+            let isCold = existingCache == nil && restoredCaches == nil
             if isCold && !admitCold {
                 // A cold batch is already in flight; push back and wait for it to finish.
                 waiting.insert(request, at: 0)
@@ -565,6 +587,7 @@ public final class Scheduler: @unchecked Sendable {
                 promptTokens: promptTokens,
                 tokensToPrefill: tokensToPrefill,
                 existingCache: existingCache,
+                restoredCaches: restoredCaches,
                 uid: uid,
                 sampler: sampler,
                 machine: makeStateMachine(for: request)
@@ -573,8 +596,19 @@ public final class Scheduler: @unchecked Sendable {
 
         guard !admitted.isEmpty else { return newScheduled }
 
-        let cold = admitted.filter { $0.existingCache == nil }
-        let warm = admitted.filter { $0.existingCache != nil }
+        // Checkpoint-restored entries run their own B==1 mixed-cache path;
+        // they are neither "cold" nor the KVCacheSimple-only "warm" path.
+        let restored = admitted.filter { $0.restoredCaches != nil }
+        let cold = admitted.filter { $0.existingCache == nil && $0.restoredCaches == nil }
+        let warm = admitted.filter { $0.existingCache != nil && $0.restoredCaches == nil }
+
+        // Restore: one GenerationBatch per restored request (B==1 each), via
+        // a PromptProcessingBatch seeded with the restored batched caches.
+        // A failed rebuild re-queues the request (admitColdFallback) — drop
+        // it from newScheduled so step() doesn't report it as scheduled.
+        for entry in restored where !admitRestoredCheckpoint(entry) {
+            newScheduled.removeAll { $0.requestId == entry.request.requestId }
+        }
 
         // Warm: run doExternalPrefill immediately and merge into genBatch.
         if !warm.isEmpty {
@@ -641,6 +675,91 @@ public final class Scheduler: @unchecked Sendable {
         }
 
         return newScheduled
+    }
+
+    /// Admit a checkpoint-restored request (hybrid sliding-window models).
+    /// Builds a B==1 batched cache from the restored per-layer single-stream
+    /// caches (the inverse of `extractBatched`: `merge([c])` for full layers,
+    /// `fromSingleRow` for sliding layers), seeds a `PromptProcessingBatch`
+    /// that already holds the restored prefix, and prefills + decodes ONLY
+    /// the suffix. This reuses the exact prefill→decode machinery a cold
+    /// request uses (so the resulting GenerationBatch is shape-identical),
+    /// but seeded from the restored cache instead of an empty one. Does NOT
+    /// touch `doExternalPrefill` or `BatchKVCache.merge`'s KVCacheSimple-only
+    /// warm path — it is a separate, additive branch.
+    /// Returns true if the restore succeeded, false if it fell back to cold
+    /// (caller then drops the entry from newScheduled).
+    @discardableResult
+    private func admitRestoredCheckpoint(_ entry: AdmittedEntry) -> Bool {
+        guard let restored = entry.restoredCaches else { return true }
+        // Inverse of extract, per layer. Check ChunkedKVCache (a
+        // KVCacheSimple subclass) BEFORE KVCacheSimple, mirroring the
+        // serializer's type order. An unsupported layer type aborts the
+        // whole restore and re-queues as a cold full-prompt prefill rather
+        // than risk seeding wrong KV.
+        var batched: [any BatchedCache] = []
+        batched.reserveCapacity(restored.count)
+        for layer in restored {
+            if let rot = layer as? RotatingKVCache {
+                batched.append(BatchRotatingKVCache.fromSingleRow(rot))
+            } else if layer is ChunkedKVCache {
+                admitColdFallback(entry)
+                return false
+            } else if let simple = layer as? KVCacheSimple {
+                batched.append(BatchKVCache.merge([simple]))
+            } else {
+                // Unknown / recurrent layer type — restore is unsound.
+                admitColdFallback(entry)
+                return false
+            }
+        }
+
+        // The suffix to process: everything after the restored prefix. The
+        // last token is the decode seed; the rest is prefilled on top of the
+        // restored cache. `generate(lastTokensOf:)` runs prompt(dropLast) then
+        // seeds with last — exactly the cold transition, but warm-seeded.
+        // suffix is non-empty (guard: 1 <= tokenCount < promptLen).
+        let suffix = entry.tokensToPrefill
+        let ppBatch = PromptProcessingBatch(
+            model: model,
+            uids: [entry.uid],
+            promptCache: batched,
+            tokens: [Array(entry.promptTokens.prefix(entry.promptTokens.count - suffix.count))],
+            maxTokens: [entry.request.maxTokens],
+            prefillStepSize: config.prefillStepSize,
+            samplers: [entry.sampler],
+            fallbackSampler: greedySampler,
+            stateMachines: [entry.machine]
+        )
+        let gen = ppBatch.generate(lastTokensOf: [suffix])
+        mergeIntoGenBatch(gen)
+        return true
+    }
+
+    /// Fallback when a restored cache can't be rebuilt (an unsupported layer
+    /// type slipped past the provider's capability gate). Fully unwinds the
+    /// admission state this entry already took (mirroring `preemptOne`),
+    /// clears `restoredCheckpoint`, and re-queues at the front so the next
+    /// admit cycle processes it as a normal COLD full-prompt prefill. We do
+    /// NOT start a parallel prefill here — that could clobber a cold batch
+    /// being set up in the same `admitWaiting` cycle. Correctness over reuse.
+    private func admitColdFallback(_ entry: AdmittedEntry) {
+        let rid = entry.request.requestId
+        // Undo the admission bookkeeping done earlier in admitWaiting.
+        activeRids.removeAll { $0 == rid }
+        activeSamplers.removeValue(forKey: rid)
+        activeDetokenizers.removeValue(forKey: rid)
+        activeStreamStates.removeValue(forKey: rid)
+        tokenHistories.removeValue(forKey: rid)
+        if let uid = ridToUid[rid] { uidToRid.removeValue(forKey: uid) }
+        ridToUid.removeValue(forKey: rid)
+        totalPromptTokens -= entry.request.numPromptTokens
+
+        // Reset so the retry is a clean cold prefill of the full prompt.
+        entry.request.restoredCheckpoint = nil
+        entry.request.cachedTokens = 0
+        entry.request.status = RequestStatus.waiting
+        waiting.insert(entry.request, at: 0)
     }
 
     private func makeStateMachine(for request: Request) -> SequenceStateMachine {

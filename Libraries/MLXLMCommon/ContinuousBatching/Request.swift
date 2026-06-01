@@ -116,6 +116,15 @@ public final class Request: @unchecked Sendable {
     public var cachedTokens: Int
     public var remainingTokens: [Int]?
 
+    /// Externally-restored checkpoint cache (hybrid sliding-window models):
+    /// the per-layer single-stream caches covering the first `tokenCount`
+    /// prompt tokens, plus that count. Set by the provider after a
+    /// `PrefixCacheManager` hit BEFORE the request is enqueued. When non-nil
+    /// the scheduler routes the request through the dedicated checkpoint
+    /// restore-admit path (B==1) instead of cold prefill. nil for every
+    /// request that didn't hit the checkpoint cache (the default).
+    public var restoredCheckpoint: (caches: [any KVCache], tokenCount: Int)?
+
     // Finish reason
     public var finishReason: String?
 
@@ -146,6 +155,7 @@ public final class Request: @unchecked Sendable {
         self.promptCache = nil
         self.cachedTokens = 0
         self.remainingTokens = nil
+        self.restoredCheckpoint = nil
         self.finishReason = nil
         self.cacheCorruptionRetries = 0
         self.detokenizer = nil
