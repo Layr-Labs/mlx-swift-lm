@@ -28,6 +28,65 @@ public protocol BatchedCache: KVCache {
     func advanceBatched(_ n: Int)
 }
 
+/// Batched wrapper for composite per-layer caches. Some hybrid models keep
+/// multiple cache objects per logical layer, so batching has to preserve that
+/// nested topology instead of treating the composite as full attention.
+public final class BatchedCacheList: CacheList, BatchedCache {
+
+    private let batchedCaches: [any BatchedCache]
+
+    internal init(caches: [any BatchedCache]) {
+        self.batchedCaches = caches
+        super.init(caches: caches.map { $0 as any KVCache })
+    }
+
+    public func filterBatched(batchIndices: MLXArray) {
+        for cache in batchedCaches {
+            cache.filterBatched(batchIndices: batchIndices)
+        }
+    }
+
+    public func extendBatched(_ other: any BatchedCache) {
+        guard let other = other as? BatchedCacheList else {
+            preconditionFailure("BatchedCacheList.extendBatched requires another BatchedCacheList")
+        }
+        precondition(
+            batchedCaches.count == other.batchedCaches.count,
+            "Cannot extend BatchedCacheList with different child count"
+        )
+
+        for (a, b) in zip(batchedCaches, other.batchedCaches) {
+            a.extendBatched(b)
+        }
+    }
+
+    public func prepareBatched(leftPadding: [Int]?, lengths: [Int]?, rightPadding: [Int]?) {
+        for cache in batchedCaches {
+            cache.prepareBatched(
+                leftPadding: leftPadding,
+                lengths: lengths,
+                rightPadding: rightPadding
+            )
+        }
+    }
+
+    public func finalizeBatched() {
+        for cache in batchedCaches {
+            cache.finalizeBatched()
+        }
+    }
+
+    public func extractBatched(_ idx: Int) -> any KVCache {
+        CacheList(caches: batchedCaches.map { $0.extractBatched(idx) })
+    }
+
+    public func advanceBatched(_ n: Int) {
+        for cache in batchedCaches {
+            cache.advanceBatched(n)
+        }
+    }
+}
+
 /// Continuous-batching KV cache.
 ///
 /// Storage is right-justified along axis=2: for each row `b`, real keys
@@ -521,6 +580,16 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         set { _idx = newValue }
     }
 
+    private func trimLeftPadding(by trimSize: Int) {
+        guard trimSize > 0 else { return }
+
+        // Trimming stored window context should not turn admission padding negative.
+        leftPadding = MLX.maximum(
+            leftPadding - Int32(trimSize),
+            MLXArray.zeros(leftPadding.shape, dtype: leftPadding.dtype)
+        )
+    }
+
     public func filterBatched(batchIndices: MLXArray) {
         filter(batchIndices: batchIndices)
     }
@@ -572,7 +641,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
                 if trimSize > 0 {
                     self.keys = self.keys![.ellipsis, trimSize..., 0...]
                     self.values = self.values![.ellipsis, trimSize..., 0...]
-                    leftPadding = leftPadding - Int32(trimSize)
+                    trimLeftPadding(by: trimSize)
                     _idx -= trimSize
                 }
             }
@@ -588,7 +657,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             let trimSize = _idx - maxCacheSize
             self.keys = self.keys![.ellipsis, trimSize..., 0...]
             self.values = self.values![.ellipsis, trimSize..., 0...]
-            leftPadding = leftPadding - Int32(trimSize)
+            trimLeftPadding(by: trimSize)
             _idx = maxCacheSize
         }
 
