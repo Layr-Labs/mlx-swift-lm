@@ -176,5 +176,16 @@ final class CBCheckpointRestoreTests: XCTestCase {
         let r2 = makeIntRequest(tokens: prompt, maxTokens: maxTokens)
         r2.restoredCheckpoint = (caches: [KVCacheSimple()], tokenCount: 4)  // 1 layer, model has 2
         XCTAssertEqual(runOutputs(s2, r2), coldOut, "wrong layer count must fall back to cold")
+
+        // Right COUNT but wrong per-position TYPE ORDER (model is
+        // [KVCacheSimple, RotatingKVCache]; supply the reverse) → the
+        // per-layer type check must reject and fall back, NOT silently
+        // rebuild the wrong attention class.
+        let s3 = makeRestoreScheduler(window: window)
+        let r3 = makeIntRequest(tokens: prompt, maxTokens: maxTokens)
+        r3.restoredCheckpoint = (
+            caches: [RotatingKVCache(maxSize: window, keep: 0), KVCacheSimple()],
+            tokenCount: 4)
+        XCTAssertEqual(runOutputs(s3, r3), coldOut, "wrong per-position type order must fall back to cold")
     }
 }

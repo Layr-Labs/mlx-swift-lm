@@ -692,23 +692,36 @@ public final class Scheduler: @unchecked Sendable {
     @discardableResult
     private func admitRestoredCheckpoint(_ entry: AdmittedEntry) -> Bool {
         guard let restored = entry.restoredCaches else { return true }
-        // Inverse of extract, per layer. Check ChunkedKVCache (a
-        // KVCacheSimple subclass) BEFORE KVCacheSimple, mirroring the
-        // serializer's type order. An unsupported layer type aborts the
-        // whole restore and re-queues as a cold full-prompt prefill rather
-        // than risk seeding wrong KV.
+        // Defense in depth: the admission guard checked the layer COUNT, but
+        // each layer's attention semantics are defined by its concrete cache
+        // CLASS (sliding RotatingKVCache vs full KVCacheSimple). A
+        // same-count-but-wrong-per-position-type checkpoint (a provider/
+        // serializer bug) would otherwise rebuild the wrong batched class and
+        // silently run wrong attention. Verify each restored layer's class
+        // matches the model's own layer class at that position; any mismatch
+        // aborts the restore and falls back to a clean cold prefill.
+        let expected = model.newCache(parameters: nil)
+        guard expected.count == restored.count else {
+            admitColdFallback(entry)
+            return false
+        }
+        // Inverse of extract, per layer, requiring the restored class to
+        // match the model's class at that position. RotatingKVCache is NOT a
+        // KVCacheSimple subclass; ChunkedKVCache IS, and is unsupported, so
+        // it's rejected on either side.
         var batched: [any BatchedCache] = []
         batched.reserveCapacity(restored.count)
-        for layer in restored {
-            if let rot = layer as? RotatingKVCache {
-                batched.append(BatchRotatingKVCache.fromSingleRow(rot))
-            } else if layer is ChunkedKVCache {
-                admitColdFallback(entry)
+        for (layer, exp) in zip(restored, expected) {
+            if layer is ChunkedKVCache || exp is ChunkedKVCache {
+                admitColdFallback(entry)  // unsupported subclass
                 return false
-            } else if let simple = layer as? KVCacheSimple {
+            } else if let rot = layer as? RotatingKVCache, exp is RotatingKVCache {
+                batched.append(BatchRotatingKVCache.fromSingleRow(rot))
+            } else if let simple = layer as? KVCacheSimple, exp is KVCacheSimple {
                 batched.append(BatchKVCache.merge([simple]))
             } else {
-                // Unknown / recurrent layer type — restore is unsound.
+                // Type mismatch (e.g. Rotating where the model wants Simple),
+                // recurrent, or unknown — restore is unsound; cold-prefill.
                 admitColdFallback(entry)
                 return false
             }
