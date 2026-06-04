@@ -25,6 +25,33 @@ func deserializeJSON(_ data: Data) -> (any Sendable)? {
     return asSendable(object)
 }
 
+/// Normalize an OpenAI tool-call `arguments` payload for chat-template rendering.
+///
+/// The OpenAI wire format delivers `function.arguments` as a JSON-encoded
+/// *string* (e.g. `#"{"command":"ls -la"}"#`). Gemma's `chat_template.jinja`
+/// opens its own `{ … }` block around the call and, on the `is string` branch,
+/// dumps that string verbatim — producing a malformed double brace
+/// `call:run_terminal{{"command":"ls -la"}}`. The model then imitates that
+/// shape on the next turn and the output parser shreds it (splitting the inner
+/// object at its first `:`), corrupting `function.arguments`.
+///
+/// Decoding the string into a `[String: any Sendable]` object makes the
+/// template take the `is mapping` branch and emit valid `command:<|"|>ls -la<|"|>`
+/// pairs instead. Returns the decoded object when `raw` is a JSON object;
+/// otherwise returns `raw` unchanged so non-JSON arguments (and JSON
+/// non-objects) keep their original shape. This only normalizes the
+/// *template-input* shape — the OpenAI request/response contract still carries
+/// `arguments` as a `String`.
+public func decodeToolCallArguments(_ raw: String) -> any Sendable {
+    guard let data = raw.data(using: .utf8),
+        let decoded = deserializeJSON(data),
+        let object = decoded as? [String: any Sendable]
+    else {
+        return raw
+    }
+    return object
+}
+
 // MARK: - Basic Deserialization
 
 /// Deserialize a string value to JSON or return as string.
