@@ -150,6 +150,49 @@ final class CBEngineCoreRequestTests: XCTestCase {
         XCTAssertEqual(engine.abortAllRequests(), 0)
     }
 
+    func testEngineCoreAddRequestAfterStopDoesNotEnqueueAndTerminatesStream() async throws {
+        // After stop(), addRequest must NOT hand the request to the scheduler
+        // (the step loop is gone → it would never run and the stream would hang).
+        // It must instead terminate the request's stream cleanly so a direct
+        // EngineCore/BatchedEngine caller doesn't block forever.
+        let engine = makeTestEngine()
+        engine.start()
+        engine.stop()
+
+        let rid = await engine.addRequest(makeIntRequest(id: "after-stop"))
+
+        // The stream must yield a terminal output (not hang).
+        var received: RequestOutput? = nil
+        for await output in engine.streamOutputs(requestId: rid) {
+            received = output
+            break
+        }
+        XCTAssertEqual(received?.finished, true, "a post-stop add must terminate the stream")
+        XCTAssertNotNil(received?.error, "post-stop add must surface an error, not silently hang")
+
+        // The scheduler must hold no waiting/running entry for it.
+        let stats = engine.getStats()
+        XCTAssertEqual(stats["num_waiting"] as? Int, 0,
+                       "post-stop add must not enqueue into the (stopped) scheduler")
+        XCTAssertEqual(stats["num_running"] as? Int, 0)
+    }
+
+    func testEngineCoreAddBeforeStartStillWorks() async throws {
+        // Guard against over-broad rejection: an engine that has NOT been started
+        // yet (also `_running == false`, but NOT stopped) must still accept the
+        // request and run it once started (the add-before-start pattern).
+        let engine = makeTestEngine(eosTokenIds: [5])
+        let rid = await engine.addRequest(makeIntRequest(tokens: [3], maxTokens: 10))
+        engine.start()  // start AFTER the add
+
+        var finished = false
+        for await output in engine.streamOutputs(requestId: rid) {
+            if output.finished { finished = true; break }
+        }
+        XCTAssertTrue(finished, "add-before-start must still generate once started")
+        engine.stop()
+    }
+
     func testEngineCoreEngineKeepsRunningAfterAbortAll() async throws {
         let engine = makeTestEngine()
         engine.start()

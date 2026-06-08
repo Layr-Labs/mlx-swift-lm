@@ -743,6 +743,41 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         return cache
     }
 
+    /// Inverse of `extract`: build a B=1 batched cache from a single-stream
+    /// `RotatingKVCache` (e.g. one restored from an SSD checkpoint snapshot),
+    /// ready to decode as batch row 0. The single-stream cache must carry
+    /// both `state` ([keys, values]) and `metaState` ([keep, maxSize, step,
+    /// offset, idx]) — exactly what `extract` emits and `KVCacheSerializer`
+    /// round-trips. `keep != 0` is unsupported (the batched cache has no
+    /// keep region) and a recurrent/ unsupported window returns an empty B=1
+    /// cache (caller should not have routed it here).
+    ///
+    /// Left padding is 0 (single row), so the stored arrays are already in
+    /// the batched layout `[1, H, S, D]`. `batchOffset` is the source's
+    /// absolute offset and `_idx` its physical length — both read from the
+    /// source so a subsequent decode step continues from the right position
+    /// and the sliding mask aligns. This is the restore-side mirror of
+    /// `extract`; the pair is covered by an extract→fromSingleRow→resume
+    /// equivalence test.
+    public static func fromSingleRow(_ src: RotatingKVCache) -> BatchRotatingKVCache {
+        let meta = src.metaState  // [keep, maxSize, step, offset, idx]
+        let maxSize = (meta.count > 1 ? Int(meta[1]) : nil) ?? src.maxSize ?? 0
+        let absoluteOffset = (meta.count > 3 ? Int(meta[3]) : nil) ?? src.offset
+        let s = src.state
+        guard maxSize > 0, s.count >= 2 else {
+            return BatchRotatingKVCache(maxSize: max(1, maxSize), leftPadding: [0])
+        }
+        let k = s[0]  // [1, H, S, D] — single row already
+        let v = s[1]
+        let idx = k.dim(2)
+        let result = BatchRotatingKVCache(maxSize: maxSize, leftPadding: [0])
+        // state setter (>=4 arrays) sets keys/values/batchOffset/leftPadding
+        // and _idx = keys.dim(2); batchOffset is the absolute position.
+        result.state = [k, v, MLXArray([Int32(absoluteOffset)]), MLXArray([Int32(0)])]
+        _ = idx  // _idx is derived from k.dim(2) by the setter; documented intent
+        return result
+    }
+
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {

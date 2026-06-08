@@ -79,6 +79,11 @@ public final class EngineCore: @unchecked Sendable {
 
     // Engine state
     private var _running = false
+    // Set true by stop(); never reset. Distinct from `!_running`, which is also
+    // true for a freshly-constructed engine that hasn't started yet (the
+    // add-before-start pattern some callers/tests rely on). `addRequest` rejects
+    // enqueues only when the engine was actually STOPPED, not merely not-started.
+    private var _stopped = false
     private var _task: Task<Void, Never>?
     private var _startTime: Date?
     public private(set) var stepsExecuted: Int = 0
@@ -111,6 +116,7 @@ public final class EngineCore: @unchecked Sendable {
     /// Stop the engine loop.
     public func stop() {
         _running = false
+        _stopped = true
         _task?.cancel()
         _task = nil
     }
@@ -133,6 +139,27 @@ public final class EngineCore: @unchecked Sendable {
             engineQueue.async { [weak self] in
                 guard let self else { continuation.resume(); return }
                 _lock.lock()
+                // Reject enqueues after stop(): the step loop is gone, so a
+                // request added now would never run and its stream would hang.
+                // Gate on `_stopped` (set only by stop()), NOT `!_running` — a
+                // never-started engine also has `_running == false` but legitimately
+                // accepts add-before-start (the request waits for start()/abort).
+                // Register a collector and put a terminal output so any
+                // `streamOutputs(rid)` consumer unblocks cleanly, but do NOT call
+                // `scheduler.addRequest` (nothing will step it).
+                guard !_stopped else {
+                    let collector = RequestOutputCollector(aggregate: true)
+                    outputCollectors[rid] = collector
+                    _lock.unlock()
+                    collector.put(RequestOutput(
+                        requestId: rid,
+                        finished: true,
+                        finishReason: "abort",
+                        error: "Engine stopped"
+                    ))
+                    continuation.resume()
+                    return
+                }
                 outputCollectors[rid] = RequestOutputCollector(aggregate: true)
                 streamStates[rid] = RequestStreamState(
                     streamInterval: config.schedulerConfig.streamInterval
