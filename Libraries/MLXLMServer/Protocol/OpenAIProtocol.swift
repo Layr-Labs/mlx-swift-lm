@@ -13,12 +13,14 @@ public enum OpenAIRole: String, Codable, Sendable {
 public enum OpenAIContentPart: Codable, Sendable, Equatable {
     case text(String)
     case imageURL(String)
+    case videoURL(String)
     case unsupported(type: String)
 
     private enum CodingKeys: String, CodingKey {
         case type
         case text
         case imageURL = "image_url"
+        case videoURL = "video_url"
         case url
     }
 
@@ -26,6 +28,7 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
         case text
         case inputText = "input_text"
         case imageURL = "image_url"
+        case videoURL = "video_url"
     }
 
     public init(from decoder: Decoder) throws {
@@ -37,6 +40,9 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
         case PartType.imageURL.rawValue:
             let image = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageURL)
             self = .imageURL(try image.decode(String.self, forKey: .url))
+        case PartType.videoURL.rawValue:
+            let video = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .videoURL)
+            self = .videoURL(try video.decode(String.self, forKey: .url))
         default:
             self = .unsupported(type: type)
         }
@@ -52,6 +58,10 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
             try container.encode(PartType.imageURL.rawValue, forKey: .type)
             var image = container.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageURL)
             try image.encode(url, forKey: .url)
+        case .videoURL(let url):
+            try container.encode(PartType.videoURL.rawValue, forKey: .type)
+            var video = container.nestedContainer(keyedBy: CodingKeys.self, forKey: .videoURL)
+            try video.encode(url, forKey: .url)
         case .unsupported(let type):
             try container.encode(type, forKey: .type)
         }
