@@ -141,8 +141,19 @@ public struct UserInput {
     public struct Processing: Sendable {
         public var resize: CGSize?
 
-        public init(resize: CGSize? = nil) {
+        /// Optional per-call overrides for the image resize budget. When set,
+        /// they replace the model's configured `min_pixels` / `max_pixels` for
+        /// this request; when `nil` the model configuration is used. This lets
+        /// a caller request the resolution a model was tuned for without
+        /// hard-coding pixel counts in the processor. (audio override from the
+        /// upstream hunk is dropped -- our fork doesn't carry audio support.)
+        public var minPixels: Int?
+        public var maxPixels: Int?
+
+        public init(resize: CGSize? = nil, minPixels: Int? = nil, maxPixels: Int? = nil) {
             self.resize = resize
+            self.minPixels = minPixels
+            self.maxPixels = maxPixels
         }
     }
 
