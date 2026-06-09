@@ -34,6 +34,16 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     public func streamChatCompletion(
         request: OpenAIChatCompletionRequest
     ) async throws -> AsyncThrowingStream<MLXServerGenerationEvent, Error> {
+        // This engine builds its prompt by flattening each message to text via
+        // `chatMessage()`, which discards `image_url`/`video_url` parts. Rather
+        // than accept media and silently ignore it, fail loud — real media
+        // serving lives in the downstream VLM path, not this text-only engine.
+        // Checked before any model state is mutated so a rejected request is a
+        // no-op.
+        if request.messages.contains(where: { $0.content.hasMedia }) {
+            throw MLXModelContainerEngineError.mediaUnsupported
+        }
+
         try await configureToolParser(for: request)
 
         let userInput = UserInput(
@@ -41,7 +51,8 @@ public struct MLXModelContainerEngine: MLXServerEngine {
             tools: request.tools?.map { $0.toolSpec() }
         )
         let input = try await model.prepare(input: userInput)
-        let stream = try await model.generate(input: input, parameters: request.generationParameters)
+        let stream = try await model.generate(
+            input: input, parameters: request.generationParameters)
 
         return AsyncThrowingStream { continuation in
             let task = Task {

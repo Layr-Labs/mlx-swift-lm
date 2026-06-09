@@ -109,6 +109,22 @@ public enum OpenAIMessageContent: Codable, Sendable, Equatable {
             return ""
         }
     }
+
+    /// True if any content part carries image or video media (which the
+    /// text-only ``MLXModelContainerEngine`` cannot serve). ``text`` flattens
+    /// content to its text parts only, so media would otherwise be silently
+    /// dropped; engines use this to reject such requests instead.
+    public var hasMedia: Bool {
+        if case .parts(let parts) = self {
+            return parts.contains { part in
+                switch part {
+                case .imageURL, .videoURL: return true
+                case .text, .unsupported: return false
+                }
+            }
+        }
+        return false
+    }
 }
 
 public struct OpenAIChatMessage: Codable, Sendable, Equatable {
