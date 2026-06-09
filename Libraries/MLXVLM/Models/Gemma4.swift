@@ -1,4 +1,5 @@
 import CoreImage
+import CoreMedia
 import Foundation
 import MLX
 import MLXLMCommon
@@ -473,7 +474,9 @@ public struct Gemma4Configuration: Codable, Sendable {
         quantization = try c.decodeIfPresent(
             BaseConfiguration.Quantization.self, forKey: CodingKeys.quantization)
         imageTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.imageTokenId) ?? 258_880
-        videoTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.videoTokenId)
+        // Default to the Gemma 4 video token id so the model stays in sync with the processor
+        // (which always emits video placeholders) even when config.json omits the key.
+        videoTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.videoTokenId) ?? 258_884
         audioTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.audioTokenId)
         boiTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.boiTokenId) ?? 255_999
         eoiTokenId = try c.decodeIfPresent(Int.self, forKey: CodingKeys.eoiTokenId)
@@ -2037,12 +2040,21 @@ public struct Gemma4Processor: UserInputProcessor {
         // per sampled frame.
         var processedVideo: LMInput.ProcessedVideo?
         var videoFrameGroups: [[Int]] = []
+        var videoTimestampGroups: [[CMTime]] = []
         if !input.videos.isEmpty {
             var allFlat: [MLXArray] = []
             var allFrames: [THW] = []
             for video in input.videos {
+                // Sample a fixed ~32 frames spread uniformly across the WHOLE clip, matching the
+                // Python Gemma4VideoProcessor (num_frames=32, np.linspace(0, T-1, 32)) rather than
+                // a 1-fps-proportional cap. Returning `32 / durationSeconds` as the target fps makes
+                // `round(fps * duration) ≈ 32` so linspace spreads the frames across the entire
+                // asset; `maxFrames: 32` is the hard cap and the internal `max(_, 1)` keeps very
+                // short clips at >= 1 frame.
                 let processed = try await MediaProcessing.asProcessedSequence(
-                    video, samplesPerSecond: 1
+                    video,
+                    targetFPS: { duration in 32.0 / max(duration.seconds, 1.0) },
+                    maxFrames: 32
                 ) { videoFrame in
                     let extent = videoFrame.frame.extent
                     let target = config.aspectRatioTargetSize(
@@ -2053,6 +2065,10 @@ public struct Gemma4Processor: UserInputProcessor {
                     let resized = MediaProcessing.resampleBicubic(srgb, to: target)
                     return VideoFrame(frame: resized, timeStamp: videoFrame.timeStamp)
                 }
+                guard !processed.frames.isEmpty else {
+                    throw Gemma4Error.imageTokenCountMismatch(
+                        expectedVisionTokens: 0, actualPromptTokens: 0)
+                }
                 var groupCounts: [Int] = []
                 for frame in processed.frames {
                     let h = frame.dim(frame.ndim - 2)
@@ -2062,6 +2078,7 @@ public struct Gemma4Processor: UserInputProcessor {
                     groupCounts.append(config.softTokenCount(width: w, height: h))
                 }
                 videoFrameGroups.append(groupCounts)
+                videoTimestampGroups.append(processed.timestamps)
             }
             let flat = allFlat.count == 1 ? allFlat[0] : concatenated(allFlat, axis: 0)
             processedVideo = LMInput.ProcessedVideo(pixels: flat, frames: allFrames)
@@ -2072,6 +2089,9 @@ public struct Gemma4Processor: UserInputProcessor {
             var expanded: [Int] = []
             var imageIndex = 0
             var videoIndex = 0
+            // Token ids for the literal " " separator used by Python's `" ".join(frames)`.
+            // Encoded without special tokens so no BOS leaks into the middle of the prompt.
+            let spaceTokens = tokenizer.encode(text: " ", addSpecialTokens: false)
             func appendBlock(_ tokenId: Int, _ count: Int) {
                 expanded.append(config.boiTokenId)
                 expanded.append(contentsOf: Array(repeating: tokenId, count: count))
@@ -2086,7 +2106,29 @@ public struct Gemma4Processor: UserInputProcessor {
                     imageIndex += 1
                 } else if token == config.videoTokenId, processedVideo != nil {
                     let group = videoIndex < videoFrameGroups.count ? videoFrameGroups[videoIndex] : []
-                    for count in group { appendBlock(config.videoTokenId, count) }
+                    let timestamps =
+                        videoIndex < videoTimestampGroups.count
+                        ? videoTimestampGroups[videoIndex] : []
+                    // Match Python's per-frame expansion: `"<mm:ss> {boi}{video*n}{eoi}"` per frame,
+                    // joined by a single space. The boi/eoi block + soft-token count are unchanged
+                    // (so the count-mismatch guard and bidirectional masking are unaffected); we only
+                    // prepend the per-frame "MM:SS " timestamp text and a space token between frames.
+                    for (frameIdx, count) in group.enumerated() {
+                        if frameIdx > 0 {
+                            expanded.append(contentsOf: spaceTokens)
+                        }
+                        let seconds =
+                            frameIdx < timestamps.count
+                            ? CMTimeGetSeconds(timestamps[frameIdx]) : 0
+                        let totalSeconds = seconds.isFinite ? Int(seconds) : 0
+                        let mm = totalSeconds / 60
+                        let ss = totalSeconds % 60
+                        let timestampText = String(format: "%02d:%02d ", mm, ss)
+                        expanded.append(
+                            contentsOf: tokenizer.encode(
+                                text: timestampText, addSpecialTokens: false))
+                        appendBlock(config.videoTokenId, count)
+                    }
                     videoIndex += 1
                 } else {
                     expanded.append(token)
