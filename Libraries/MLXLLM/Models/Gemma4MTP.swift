@@ -1814,6 +1814,64 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
     }
 }
 
+// MARK: - Engine runtime bridge
+
+/// Engine-facing `BatchedMTPSession` wrapping a `Gemma4MTPBatchState`.
+public final class Gemma4MTPSessionBox: BatchedMTPSession, @unchecked Sendable {
+    private let state: Gemma4MTPBatchState
+    public init(state: Gemma4MTPBatchState) { self.state = state }
+    public var activeCount: Int { state.activeCount }
+    public func step(caches: [any KVCache], maxNewPerRow: [Int]) -> [[Int]] {
+        state.step(targetCache: caches, maxNewPerRow: maxNewPerRow)
+    }
+    public func compactCarry(keepLocal: [Int]) { state.compactCarry(keepLocal: keepLocal) }
+}
+
+/// Concrete `BatchedMTPRuntime` for Gemma 4: binds a drafter to a target and
+/// seeds `Gemma4MTPBatchState` sessions for the continuous-batching engine.
+public final class Gemma4MTPEngineRuntime: BatchedMTPRuntime, @unchecked Sendable {
+    public let target: Gemma4TextModel
+    public let drafter: Gemma4AssistantDraftModel
+    public let maxBatch: Int
+    public let blockSize: Int
+
+    /// - Parameters:
+    ///   - maxBatch: speculate only at active batch ≤ this (default 2; B≥3
+    ///     falls back to plain decode — ~break-even on the MoE target).
+    ///   - blockSize: verify width (default from the model's automatic policy).
+    public init(
+        target: Gemma4TextModel,
+        drafter: Gemma4AssistantDraftModel,
+        maxBatch: Int = 2,
+        blockSize: Int? = nil
+    ) throws {
+        try drafter.bind(target: target)
+        self.target = target
+        self.drafter = drafter
+        self.maxBatch = Swift.max(1, maxBatch)
+        let policy = Gemma4MTPAutomaticPolicy.automatic(for: target)
+        self.blockSize = blockSize ?? policy.singleStreamBlockSize
+    }
+
+    public func beginSession(
+        seedTokens: MLXArray, caches: [any KVCache]
+    ) -> BatchedMTPSession? {
+        let B = seedTokens.dim(0)
+        // Advance the cache over the seed tokens (one forward) and capture the
+        // per-row MTP carry: bonus (next greedy token), pre-norm hidden, and
+        // the shared-KV snapshot.
+        let out = target.forwardForMTP(seedTokens.reshaped(B, 1), cache: caches)
+        let bonusArr = out.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+        eval(bonusArr)
+        let bonus = bonusArr.asArray(Int32.self).map { Int($0) }
+        let hidden = out.lastHidden[0..., -1 ..< out.lastHidden.dim(1), 0...]
+        let state = Gemma4MTPBatchState(
+            target: target, drafter: drafter, blockSize: blockSize,
+            firstBonus: bonus, firstHidden: hidden, firstSharedKV: out.capturedSharedKV)
+        return Gemma4MTPSessionBox(state: state)
+    }
+}
+
 // MARK: - B > 1 round loop
 
 /// Run the Gemma 4 MTP round loop for a batch of requests (B > 1).
