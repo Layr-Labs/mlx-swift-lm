@@ -592,13 +592,20 @@ public final class Scheduler: @unchecked Sendable {
                 || params.frequencyPenalty != 0.0
             let history = TokenHistoryHolder(tokens: promptTokens)
             tokenHistories[request.requestId] = history
+            // Greedy (temperature 0, no penalty) uses a nil sampler so the
+            // GenerationBatch takes its argMax fast path. `makeRowSampler(0)`
+            // is exactly argMax, so this is behavior-preserving — and it's the
+            // condition the drafter-MTP path keys on (it speculates greedily,
+            // so it only engages when every row is nil-sampler greedy). With a
+            // non-nil baseSampler here, MTP would never become eligible.
+            let isGreedy = params.temperature == 0 && !needsPenalty
             let sampler: RowSampler? = needsPenalty
                 ? makeRepetitionSampler(
                     base: baseSampler, history: history,
                     repetitionPenalty: params.repetitionPenalty,
                     presencePenalty: params.presencePenalty,
                     frequencyPenalty: params.frequencyPenalty)
-                : baseSampler
+                : (isGreedy ? nil : baseSampler)
 
             activeSamplers[request.requestId] = sampler
             activeDetokenizers[request.requestId] = NaiveStreamingDetokenizer(tokenizer: tokenizer)
