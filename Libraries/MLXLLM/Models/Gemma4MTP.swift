@@ -1636,6 +1636,13 @@ public func runGemma4MTPRoundsBatched(
     precondition(perRowBudget.count == originalB,
         "maxTokensPerRow.count must equal firstBonus.count")
 
+    // Per-phase wall-time profile, printed at stream finish when
+    // GEMMA4_MTP_PROFILE=1. Wall times include GPU waits: the phase whose
+    // sync (eval) lands absorbs all GPU work queued before it.
+    let profile = ProcessInfo.processInfo.environment["GEMMA4_MTP_PROFILE"] == "1"
+    var draftMs = 0.0, verifyMs = 0.0, walkMs = 0.0, updateMs = 0.0
+    var rounds = 0, emitTotal = 0, tInTotal = 0, draftStepsTotal = 0
+
     return AsyncStream<BatchedGeneration> { continuation in
         // First yield: prefill bonus per original row.
         var firstSlots: [BatchedGeneration.Slot] = []
@@ -1705,6 +1712,17 @@ public func runGemma4MTPRoundsBatched(
             }
         }
 
+        func printProfile() {
+            guard profile, rounds > 0 else { return }
+            let n = Double(rounds)
+            print(String(
+                format: "[MTP-B prof] rounds=%d emit/round=%.2f tIn=%.2f draftSteps=%.2f "
+                    + "| draft=%.1fms verify=%.1fms walk=%.1fms update=%.1fms per round",
+                rounds, Double(emitTotal) / n, Double(tInTotal) / n,
+                Double(draftStepsTotal) / n,
+                draftMs / n, verifyMs / n, walkMs / n, updateMs / n))
+        }
+
         while !finished.allSatisfy({ $0 }) {
             let B = activeIndices.count
             // Determine this round's block size. Use the min `remaining`
@@ -1719,19 +1737,21 @@ public func runGemma4MTPRoundsBatched(
 
             // --- Round geometry ---
             // Row input = [p_b pending tokens][k_b fresh drafts], uniform
-            // total length tIn. tIn = maxPend + bs - 1 gives the row with
-            // pending == 1 the full bs - 1 fresh-draft depth. The 2*bs cap
-            // bounds adversarial pending growth; the inductive invariant
-            // p' <= 1 + maxRejected <= tIn keeps every pending <= tIn, so
-            // every row always consumes all its pendings each round.
+            // total length tIn. tIn is FIXED at bs: pendings displace
+            // fresh drafts (k_b = bs - p_b) instead of growing the input.
+            // On the MoE target the verify forward's cost grows steeply
+            // with B*T (expert-union dispersion), so a bounded T wins over
+            // deeper drafting — profiled: an adaptive tIn = maxPend+bs-1
+            // policy drifted to tIn~7 at B=4 and halved throughput.
+            // Inductive bound: p' <= 1 + maxRejected <= tIn, so with
+            // tIn = max(bs, maxPend) pendings never exceed bs while bs is
+            // stable, and still fit when bs shrinks near a budget boundary.
             let pendCounts = pendings.map(\.count)
             let maxPend = pendCounts.max() ?? 1
-            // Never cap below maxPend: when bs shrinks near a budget
-            // boundary, rows with deep pendings must still fit (they then
-            // draft 0 fresh tokens and drain pendings over later rounds).
-            let tIn = max(min(maxPend + bs - 1, 2 * bs), maxPend)
+            let tIn = max(bs, maxPend)
             let freshCounts = pendCounts.map { tIn - $0 }  // k_b
             let draftSteps = freshCounts.max() ?? 0
+            let tDraft0 = profile ? CFAbsoluteTimeGetCurrent() : 0
 
             // --- Draft (lockstep autoregressive steps) ---
             //
@@ -1802,11 +1822,27 @@ public func runGemma4MTPRoundsBatched(
                 verifyInput = pendTensor
             }
 
+            // When profiling, force the drafter chain + input assembly so
+            // draft GPU time is attributed to the draft phase, not verify.
+            var tVerify0 = 0.0
+            if profile {
+                eval(verifyInput)
+                let now = CFAbsoluteTimeGetCurrent()
+                draftMs += (now - tDraft0) * 1000
+                tVerify0 = now
+            }
+
             let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
             // fp32 argmax at verify: see comment in B=1 path above.
             let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)  // [B, tIn]
             // Materialise drafts + main tokens in a single sync.
             eval(mainTokens, draftConcat)
+            var tWalk0 = 0.0
+            if profile {
+                let now = CFAbsoluteTimeGetCurrent()
+                verifyMs += (now - tVerify0) * 1000
+                tWalk0 = now
+            }
             let mainFlat = mainTokens.asArray(Int32.self)
             let draftFlat = draftConcat.asArray(Int32.self)
 
@@ -1878,10 +1914,21 @@ public func runGemma4MTPRoundsBatched(
                 continuation.yield(BatchedGeneration(slots: slots))
             }
 
+            if profile {
+                let now = CFAbsoluteTimeGetCurrent()
+                walkMs += (now - tWalk0) * 1000
+                rounds += 1
+                emitTotal += newTokensPerRow.reduce(0) { $0 + $1.count }
+                tInTotal += tIn
+                draftStepsTotal += draftSteps
+            }
+
             if finished.allSatisfy({ $0 }) {
+                printProfile()
                 continuation.finish()
                 return
             }
+            let tUpdate0 = profile ? CFAbsoluteTimeGetCurrent() : 0
 
             // --- Rewind target cache (uniform, exact) ---
             // Confirmed input tokens of row b: c_b = p_b + a_b. Trim ALL
@@ -1928,6 +1975,7 @@ public func runGemma4MTPRoundsBatched(
             // cache length. Uniform tail slice — exact, no per-row zeroing.
             sharedKV = Gemma4SharedKV.sliceTail(
                 from: verifyOut.capturedSharedKV, rejected: maxRejected)
+            if profile { updateMs += (CFAbsoluteTimeGetCurrent() - tUpdate0) * 1000 }
 
             // --- Continuous batching: compact if any slot just finished ---
             //
@@ -1969,6 +2017,7 @@ public func runGemma4MTPRoundsBatched(
             }
         }
 
+        printProfile()
         continuation.finish()
     }
 }
