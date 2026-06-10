@@ -9,6 +9,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 import MLXRandom
 import MLXLLM
 import Testing
@@ -147,6 +148,12 @@ struct Gemma4MTPBenchmarkTests {
             Pair(label: "26B-A4B-4bit",
                  targetDir: "gemma-4-26b-a4b-it-4bit",
                  drafterDir: "gemma-4-26B-A4B-it-assistant-bf16"),
+            Pair(label: "26B-A4B-q4draft",
+                 targetDir: "gemma-4-26b-a4b-it-4bit",
+                 drafterDir: "gemma-4-26B-A4B-it-qat-assistant-4bit"),
+            Pair(label: "26B-QAT4-q4draft",
+                 targetDir: "gemma-4-26B-A4B-it-qat-4bit",
+                 drafterDir: "gemma-4-26B-A4B-it-qat-assistant-4bit"),
         ]
         let env = ProcessInfo.processInfo.environment
         let requestedPair = env["MTP_BENCH_PAIR"]?.lowercased()
@@ -391,6 +398,212 @@ struct Gemma4MTPBenchmarkTests {
         }
     }
 
+    /// Batch-scaling sweep + a "is multi-token verify free?" micro-bench.
+    /// Gated on MTP_BENCH_SWEEP=1. Maps where MTP crosses from win to loss
+    /// as batch grows, and measures whether a T-position forward amortizes
+    /// (dense-like) or costs ~T separate steps (MoE expert dispersion).
+    @Test func batchScalingSweep() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MTP_BENCH_SWEEP"] == "1", let dataDir = env["MTP_BENCH_DATA_DIR"],
+              let promptsPath = env["MTP_BENCH_PROMPTS"]
+        else { print("Skipping: set MTP_BENCH_SWEEP=1, MTP_BENCH_DATA_DIR, MTP_BENCH_PROMPTS"); return }
+
+        let targetDir = env["MTP_BENCH_SWEEP_TARGET"] ?? "gemma-4-26b-a4b-it-4bit"
+        let drafterDir = env["MTP_BENCH_SWEEP_DRAFTER"] ?? "gemma-4-26B-A4B-it-qat-assistant-4bit"
+        let K = Int(env["MTP_BENCH_SWEEP_K"] ?? "3") ?? 3
+        let maxTokens = Int(env["MTP_BENCH_SWEEP_MAXTOK"] ?? "128") ?? 128
+        let batchSizes = (env["MTP_BENCH_SWEEP_B"] ?? "1,2,4,8")
+            .split(separator: ",").compactMap { Int($0) }
+
+        let pdata = try JSONDecoder()
+            .decode([[Int]].self, from: Data(contentsOf: URL(fileURLWithPath: promptsPath)))
+            .map { $0.map { Int32($0) } }
+
+        let (target, _) = try loadRealTargetAsTextModel(
+            from: URL(fileURLWithPath: "\(dataDir)/\(targetDir)"))
+        let drafter = try await Gemma4AssistantDraftModel.load(
+            from: URL(fileURLWithPath: "\(dataDir)/\(drafterDir)"))
+        eval(target, drafter)
+
+        print("\n=== Batch-scaling sweep (K=\(K), max_tokens=\(maxTokens), diverse prompts) ===")
+        print("B  base_agg  base/seq   mtp_agg   speedup   mtp/seq")
+        for B in batchSizes {
+            let batch = (0 ..< B).map { pdata[$0 % pdata.count] }
+            _ = measureBatchedBaselineThroughput(target: target, promptTokens: batch, maxTokens: 8)
+            _ = try await measureBatchedMTPThroughput(
+                target: target, drafter: drafter, promptTokens: batch, maxTokens: 8, blockSize: K)
+            MLX.Memory.clearCache()
+            let base = measureBatchedBaselineThroughput(
+                target: target, promptTokens: batch, maxTokens: maxTokens)
+            MLX.Memory.clearCache()
+            let mtp = try await measureBatchedMTPThroughput(
+                target: target, drafter: drafter, promptTokens: batch,
+                maxTokens: maxTokens, blockSize: K)
+            MLX.Memory.clearCache()
+            let spd = mtp.tokensPerSecond / max(base.tokensPerSecond, 1e-9)
+            print(String(format: "%d  %8.1f  %8.1f  %8.1f   %.2fx   %8.1f",
+                B, base.tokensPerSecond, base.tokensPerSecond / Double(B),
+                mtp.tokensPerSecond, spd, mtp.tokensPerSecond / Double(B)))
+        }
+
+        // Decisive MoE test: time a single forward of [B, T]. If ms/T drops
+        // sharply with T, a T-token verify amortizes (dense-like → MTP free).
+        // If ms/T stays ~flat (≈ the T=1 cost), the multi-token verify is NOT
+        // free — MoE expert dispersion defeats speculation.
+        print("\n=== Single-forward cost vs #positions T (is multi-token verify free?) ===")
+        print("B  T  forward_ms  ms/position")
+        for B in [1, 4] {
+            for T in [1, 2, 4, 8] {
+                let rows = (0 ..< B).map { r -> [Int32] in
+                    let p = pdata[r % pdata.count]
+                    return (0 ..< T).map { p[$0 % p.count] }
+                }
+                let input = MLXArray(rows.flatMap { $0 }, [B, T])
+                _ = target(input, cache: target.newCache(parameters: nil))  // warmup
+                eval(target(input, cache: target.newCache(parameters: nil)))
+                let N = 10
+                let t0 = Date()
+                for _ in 0 ..< N {
+                    let out = target(input, cache: target.newCache(parameters: nil))
+                    eval(out)
+                }
+                let ms = Date().timeIntervalSince(t0) / Double(N) * 1000
+                print(String(format: "%d  %d  %9.2f  %9.2f", B, T, ms, ms / Double(T)))
+                MLX.Memory.clearCache()
+            }
+        }
+    }
+
+    /// Real-model batched parity. Token-level comparison of the batched
+    /// greedy baseline vs the batched MTP round loop on the actual 26B
+    /// model. This is the "no garbage outputs" gate for B>=2: greedy MTP
+    /// must reproduce the baseline's tokens row-for-row (modulo rare bf16
+    /// argmax ties). Dumps both token streams to JSON for offline decode.
+    /// Gated on MTP_BENCH_PARITY=1.
+    @Test func batchedParityRealModel() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MTP_BENCH_PARITY"] == "1", let dataDir = env["MTP_BENCH_DATA_DIR"],
+              let promptsPath = env["MTP_BENCH_PROMPTS"]
+        else { print("Skipping: set MTP_BENCH_PARITY=1, MTP_BENCH_DATA_DIR, MTP_BENCH_PROMPTS"); return }
+
+        let targetDir = env["MTP_BENCH_SWEEP_TARGET"] ?? "gemma-4-26B-A4B-it-qat-4bit"
+        let drafterDir = env["MTP_BENCH_SWEEP_DRAFTER"] ?? "gemma-4-26B-A4B-it-qat-assistant-4bit"
+        let K = Int(env["MTP_BENCH_SWEEP_K"] ?? "4") ?? 4
+        let maxTokens = Int(env["MTP_BENCH_SWEEP_MAXTOK"] ?? "160") ?? 160
+        let batchSizes = (env["MTP_BENCH_SWEEP_B"] ?? "1,2,4")
+            .split(separator: ",").compactMap { Int($0) }
+
+        let pdata = try JSONDecoder()
+            .decode([[Int]].self, from: Data(contentsOf: URL(fileURLWithPath: promptsPath)))
+            .map { $0.map { Int32($0) } }
+
+        let (target, _) = try loadRealTargetAsTextModel(
+            from: URL(fileURLWithPath: "\(dataDir)/\(targetDir)"))
+        let drafter = try await Gemma4AssistantDraftModel.load(
+            from: URL(fileURLWithPath: "\(dataDir)/\(drafterDir)"))
+        eval(target, drafter)
+
+        var dump: [String: [[Int]]] = [:]
+        print("\n=== Batched parity vs baseline (K=\(K), max_tokens=\(maxTokens)) ===")
+        for B in batchSizes {
+            let batch = (0 ..< B).map { pdata[$0 % pdata.count] }
+            let baseline = runBatchedBaselineGreedyTokens(
+                target: target, promptTokens: batch, maxTokens: maxTokens)
+            MLX.Memory.clearCache()
+            let mtp = try await runBatchedMTPTokens(
+                target: target, drafter: drafter, promptTokens: batch,
+                maxTokens: maxTokens, blockSize: K)
+            MLX.Memory.clearCache()
+
+            for bi in 0 ..< B {
+                let n = Swift.min(baseline[bi].count, mtp[bi].count)
+                var firstDiv = -1
+                for i in 0 ..< n where baseline[bi][i] != mtp[bi][i] {
+                    firstDiv = i
+                    break
+                }
+                let matched = firstDiv == -1 ? n : firstDiv
+                print("B=\(B) row=\(bi): matched \(matched)/\(n) tokens"
+                      + (firstDiv >= 0 ? "  FIRST-DIVERGENCE@\(firstDiv)" : "  EXACT"))
+            }
+            dump["B\(B)_baseline"] = baseline
+            dump["B\(B)_mtp"] = mtp
+        }
+        let outPath = env["MTP_BENCH_PARITY_OUT"] ?? "/tmp/mtp-bench/parity_out.json"
+        let data = try JSONEncoder().encode(dump)
+        try data.write(to: URL(fileURLWithPath: outPath))
+        print("wrote \(outPath)")
+    }
+
+    /// Pipelining fairness check. The naive baseline syncs the GPU once per
+    /// token (`eval(tok)`); MTP syncs once per round (~K tokens), so MTP's
+    /// speedup vs the naive baseline is partly a sync-overhead artifact. The
+    /// fair comparison is MTP vs an async-pipelined baseline. Gated on
+    /// MTP_BENCH_PIPELINE=1.
+    @Test func pipelinedBaselineCheck() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MTP_BENCH_PIPELINE"] == "1", let dataDir = env["MTP_BENCH_DATA_DIR"],
+              let promptsPath = env["MTP_BENCH_PROMPTS"]
+        else { print("Skipping: set MTP_BENCH_PIPELINE=1, MTP_BENCH_DATA_DIR, MTP_BENCH_PROMPTS"); return }
+        let targetDir = env["MTP_BENCH_SWEEP_TARGET"] ?? "gemma-4-26b-a4b-it-4bit"
+        let drafterDir = env["MTP_BENCH_SWEEP_DRAFTER"] ?? "gemma-4-26B-A4B-it-qat-assistant-4bit"
+        let K = Int(env["MTP_BENCH_SWEEP_K"] ?? "4") ?? 4
+        let maxTokens = Int(env["MTP_BENCH_SWEEP_MAXTOK"] ?? "256") ?? 256
+        let pdata = try JSONDecoder()
+            .decode([[Int]].self, from: Data(contentsOf: URL(fileURLWithPath: promptsPath)))
+            .map { $0.map { Int32($0) } }
+        let prompt = MLXArray(pdata[0])
+
+        let (target, _) = try loadRealTargetAsTextModel(
+            from: URL(fileURLWithPath: "\(dataDir)/\(targetDir)"))
+        let drafter = try await Gemma4AssistantDraftModel.load(
+            from: URL(fileURLWithPath: "\(dataDir)/\(drafterDir)"))
+        eval(target, drafter)
+
+        // Pipelined baseline: feed the token MLXArray forward and asyncEval
+        // each step so CPU prep overlaps GPU compute (mirrors mlx generate /
+        // Python's generation_stream). One blocking eval at the end.
+        func pipelined(_ maxTok: Int) -> Double {
+            let cache = target.newCache(parameters: nil)
+            var logits = target(prompt[.newAxis, .ellipsis], cache: cache)
+            var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+            asyncEval(tok)
+            let start = Date()
+            var n = 1
+            for _ in 1 ..< maxTok {
+                logits = target(tok[.newAxis, .ellipsis], cache: cache)
+                tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+                asyncEval(tok)
+                n += 1
+            }
+            eval(tok)
+            return Double(n) / Date().timeIntervalSince(start)
+        }
+
+        _ = measureBaselineThroughput(target: target, promptTokens: prompt, maxTokens: 16)
+        _ = pipelined(16)
+        _ = try measureMTPThroughput(
+            target: target, drafter: drafter, promptTokens: prompt, maxTokens: 16, blockSize: K)
+        MLX.Memory.clearCache()
+
+        let naive = measureBaselineThroughput(
+            target: target, promptTokens: prompt, maxTokens: maxTokens).tokensPerSecond
+        MLX.Memory.clearCache()
+        let pipe = pipelined(maxTokens)
+        MLX.Memory.clearCache()
+        let mtp = try measureMTPThroughput(
+            target: target, drafter: drafter, promptTokens: prompt,
+            maxTokens: maxTokens, blockSize: K).tokensPerSecond
+        MLX.Memory.clearCache()
+
+        print("\n=== Pipelining fairness check (B=1, K=\(K), max_tokens=\(maxTokens)) ===")
+        print(String(format: "naive baseline (eval/token):    %.1f tok/s", naive))
+        print(String(format: "pipelined baseline (asyncEval):  %.1f tok/s", pipe))
+        print(String(format: "MTP:                             %.1f tok/s", mtp))
+        print(String(format: "MTP vs naive baseline:      %.2fx", mtp / max(naive, 1e-9)))
+        print(String(format: "MTP vs PIPELINED baseline:  %.2fx  <-- the fair number", mtp / max(pipe, 1e-9)))
+    }
+
     /// Load a HF Gemma 4 target (VLM-format checkpoint) into a bare
     /// `Gemma4TextModel`. The VLM wrapper is instantiated briefly so its
     /// sanitize() can strip vision/audio weights + remap key names; we
@@ -405,12 +618,30 @@ struct Gemma4MTPBenchmarkTests {
         let baseConfig = try? decoder.decode(BaseConfiguration.self, from: configData)
 
         let wrapper = Gemma4Model(fullConfig)
-        try loadWeights(
-            modelDirectory: modelDir,
-            model: wrapper,
-            quantization: nil,
-            perLayerQuantization: baseConfig?.perLayerQuantization
-        )
+
+        // Load shards manually. `resolvingSymlinksInPath` is required so a
+        // symlinked staging dir (e.g. pointing into the HF cache snapshot)
+        // is followed — FileManager shard discovery does not follow a
+        // top-level directory symlink, which otherwise yields zero shards
+        // and a misleading `keyNotFound(embed_tokens.weight)` at update.
+        var weights = [String: MLXArray]()
+        let scanDir = modelDir.resolvingSymlinksInPath()
+        let shardURLs = (try? FileManager.default.contentsOfDirectory(
+            at: scanDir, includingPropertiesForKeys: nil)) ?? []
+        for url in shardURLs where url.pathExtension == "safetensors" {
+            let (w, _) = try loadArraysAndMetadata(url: url)
+            for (k, v) in w { weights[k] = v }
+        }
+        let sanitized = wrapper.sanitize(weights: weights)
+        if let plq = baseConfig?.perLayerQuantization {
+            quantize(model: wrapper) { path, _ in
+                sanitized["\(path).scales"] != nil
+                    ? plq.quantization(layer: path)?.asTuple : nil
+            }
+        }
+        try wrapper.update(
+            parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
+        eval(wrapper)
         return (wrapper.textModel, fullConfig)
     }
 }

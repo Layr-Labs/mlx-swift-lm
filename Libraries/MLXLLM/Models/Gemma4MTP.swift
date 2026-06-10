@@ -1284,22 +1284,24 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         let configData = try Data(contentsOf: configURL)
         let config = try JSONDecoder.json5().decode(
             Gemma4AssistantConfiguration.self, from: configData)
+        // Optional quantization block: 4-bit QAT (and other quantized)
+        // drafters ship a `quantization` section in config.json. nil for
+        // plain bf16 drafters, in which case no quantization is applied.
+        let baseConfig = try? JSONDecoder.json5().decode(
+            BaseConfiguration.self, from: configData)
 
         // Construct the drafter (random init).
         let drafter = Gemma4AssistantDraftModel(config: config)
 
-        // Collect all safetensors files in the directory.
+        // Collect all safetensors files in the directory. `resolvingSymlinksInPath`
+        // ensures a symlinked directory (e.g. pointing into the HF cache) is
+        // followed — `contentsOfDirectory` over the resolved path lists the
+        // shards, and `loadArraysAndMetadata` follows the per-file blob symlinks.
         var weights = [String: MLXArray]()
-        guard let enumerator = FileManager.default.enumerator(
-            at: directory, includingPropertiesForKeys: nil)
-        else {
-            throw NSError(
-                domain: "Gemma4AssistantDraftModel", code: 1,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "Could not enumerate drafter directory: \(directory.path)"])
-        }
-        let urls = enumerator.allObjects.compactMap { $0 as? URL }
-        for url in urls where url.pathExtension == "safetensors" {
+        let scanDir = directory.resolvingSymlinksInPath()
+        let shardURLs = (try? FileManager.default.contentsOfDirectory(
+            at: scanDir, includingPropertiesForKeys: nil)) ?? []
+        for url in shardURLs where url.pathExtension == "safetensors" {
             let (shardWeights, _) = try loadArraysAndMetadata(url: url)
             for (k, v) in shardWeights {
                 weights[k] = v
@@ -1308,6 +1310,16 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
 
         // Run drafter sanitize (throws on unexpected K/V weights).
         let sanitized = try drafter.sanitize(weights: weights)
+
+        // Quantize matching modules before applying weights when the checkpoint
+        // is quantized (4-bit QAT drafter). A module is quantized iff its
+        // `.scales` tensor is present. Mirrors `loadWeights` in MLXLMCommon.
+        if let plq = baseConfig?.perLayerQuantization {
+            quantize(model: drafter) { path, _ in
+                sanitized["\(path).scales"] != nil
+                    ? plq.quantization(layer: path)?.asTuple : nil
+            }
+        }
 
         // Apply weights.
         let params = ModuleParameters.unflattened(sanitized)

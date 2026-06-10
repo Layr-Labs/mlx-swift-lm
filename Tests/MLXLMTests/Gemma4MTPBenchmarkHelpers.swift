@@ -328,6 +328,100 @@ public func measureBatchedMTPThroughputStaggered(
         prefillSeconds: prefillElapsed, generationSeconds: genElapsed)
 }
 
+/// Build the per-layer batched cache array for a Gemma 4 target —
+/// `BatchKVCache` for full-attention layers, `BatchRotatingKVCache` for
+/// sliding layers. Shared across the batched measurement/parity helpers.
+func makeBatchedCache(target: Gemma4TextModel, batchSize: Int) -> [KVCache] {
+    let firstKvShared = target.configuration.numHiddenLayers
+                      - target.configuration.numKvSharedLayers
+    let leftPadding = Array(repeating: 0, count: batchSize)
+    var cache: [KVCache] = []
+    for i in 0 ..< firstKvShared {
+        if target.configuration.layerTypes[i] == "full_attention" {
+            cache.append(BatchKVCache(leftPadding: leftPadding))
+        } else {
+            cache.append(BatchRotatingKVCache(
+                maxSize: target.configuration.slidingWindow,
+                leftPadding: leftPadding))
+        }
+    }
+    return cache
+}
+
+/// Batched greedy baseline that COLLECTS per-row tokens (for parity
+/// checks) instead of just timing. Lockstep: every row emits exactly
+/// `maxTokens` tokens; no EOS early-exit so streams stay comparable.
+public func runBatchedBaselineGreedyTokens(
+    target: Gemma4TextModel,
+    promptTokens: [[Int32]],
+    maxTokens: Int
+) -> [[Int]] {
+    let B = promptTokens.count
+    let maxLen = promptTokens.map(\.count).max() ?? 0
+    let padded = promptTokens.map { row -> [Int32] in
+        row + Array(repeating: Int32(0), count: maxLen - row.count)
+    }
+    let prompt = MLXArray(padded.flatMap { $0 }, [B, maxLen])
+    let cache = makeBatchedCache(target: target, batchSize: B)
+
+    var logits = target(prompt, cache: cache)
+    var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)  // [B]
+    eval(tok)
+
+    var out: [[Int]] = Array(repeating: [], count: B)
+    for (bi, t) in tok.asArray(Int32.self).enumerated() { out[bi].append(Int(t)) }
+    for _ in 1 ..< maxTokens {
+        logits = target(tok.reshaped([B, 1]), cache: cache)
+        tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+        eval(tok)
+        for (bi, t) in tok.asArray(Int32.self).enumerated() { out[bi].append(Int(t)) }
+    }
+    return out
+}
+
+/// Batched MTP run that COLLECTS per-row tokens (for parity checks).
+/// Mirrors `measureBatchedMTPThroughput` but demuxes the emitted slots
+/// into per-row streams.
+public func runBatchedMTPTokens(
+    target: Gemma4TextModel,
+    drafter: Gemma4AssistantDraftModel,
+    promptTokens: [[Int32]],
+    maxTokens: Int,
+    blockSize: Int
+) async throws -> [[Int]] {
+    try drafter.bind(target: target)
+    let B = promptTokens.count
+    let maxLen = promptTokens.map(\.count).max() ?? 0
+    let padded = promptTokens.map { row -> [Int32] in
+        row + Array(repeating: Int32(0), count: maxLen - row.count)
+    }
+    let prompt = MLXArray(padded.flatMap { $0 }, [B, maxLen])
+    let cache = makeBatchedCache(target: target, batchSize: B)
+
+    let prefillOut = target.forwardForMTP(prompt, cache: cache)
+    let firstBonusArr = prefillOut.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+    eval(firstBonusArr)
+    let bonusPerRow = firstBonusArr.asArray(Int32.self).map { Int($0) }
+    let firstHidden = prefillOut.lastHidden[
+        0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
+
+    let stream = try runGemma4MTPRoundsBatched(
+        target: target, drafter: drafter,
+        targetCache: cache,
+        firstBonus: bonusPerRow, firstHidden: firstHidden,
+        firstSharedKV: prefillOut.capturedSharedKV,
+        maxTokens: maxTokens, blockSize: blockSize,
+        eosTokenIds: nil
+    )
+    var out: [[Int]] = Array(repeating: [], count: B)
+    for await step in stream {
+        for slot in step.slots {
+            if let t = slot.token { out[slot.row].append(t) }
+        }
+    }
+    return out
+}
+
 /// Run MTP over B padded prompts via `runGemma4MTPRoundsBatched`. Returns
 /// aggregate timing — sum of emitted tokens / wall seconds.
 public func measureBatchedMTPThroughput(
