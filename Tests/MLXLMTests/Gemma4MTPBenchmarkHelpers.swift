@@ -392,6 +392,67 @@ public func runBatchedMTPTokens(
     return out
 }
 
+/// Drive the ENGINE decode path (`GenerationBatch` + `Gemma4MTPEngineRuntime`)
+/// exactly as the continuous-batching scheduler does, on left-padded prompts.
+/// Returns aggregate timing + per-row tokens (for parity vs plain decode).
+/// This is the end-to-end "wired-in" path, distinct from the standalone
+/// `runGemma4MTPRoundsBatched` used by `measureBatchedMTPThroughput`.
+public func measureEngineMTPThroughput(
+    target: Gemma4TextModel,
+    drafter: Gemma4AssistantDraftModel,
+    promptTokens: [[Int32]],
+    maxTokens: Int,
+    blockSize: Int,
+    maxBatch: Int
+) throws -> (result: Gemma4MTPBatchedBenchmarkResult, perRow: [[Int]]) {
+    let B = promptTokens.count
+    let runtime = try Gemma4MTPEngineRuntime(
+        target: target, drafter: drafter, maxBatch: maxBatch, blockSize: blockSize)
+    let (prompt, leftPadding) = leftPadBatch(promptTokens)
+    // GenerationBatch wants [any BatchedCache]; the concrete batched caches
+    // conform, so retype the same objects (forwardForMTP takes them as KVCache).
+    let cache: [any BatchedCache] = makeBatchedCache(target: target, leftPadding: leftPadding)
+        .compactMap { $0 as? any BatchedCache }
+    let L = prompt.dim(1)
+
+    // Prefill prompt[:-1] into the batched caches; seed with the last column
+    // (GenerationBatch.init's step() feeds it). Mirrors the engine's
+    // prefill→generate handoff.
+    let prefillStart = Date()
+    if L > 1 {
+        _ = target.forwardForMTP(
+            prompt[0..., 0 ..< (L - 1)], cache: cache.map { $0 as any KVCache })
+    }
+    let seed = prompt[0..., (L - 1) ..< L].reshaped([B])  // [B]
+    eval(seed)
+    let prefillElapsed = Date().timeIntervalSince(prefillStart)
+
+    let gen = GenerationBatch(
+        model: target, uids: Array(0 ..< B), seedTokens: seed,
+        promptCache: cache, tokens: promptTokens.map { $0.map(Int.init) },
+        maxTokens: Array(repeating: maxTokens, count: B),
+        mtpRuntime: runtime)
+
+    let genStart = Date()
+    var out: [[Int]] = Array(repeating: [], count: B)
+    var total = 0
+    var guardSteps = 0
+    while !gen.isEmpty && guardSteps < maxTokens * 4 + 16 {
+        guardSteps += 1
+        for r in gen.next() {
+            out[r.uid].append(r.token)
+            total += 1
+        }
+    }
+    let genElapsed = Date().timeIntervalSince(genStart)
+
+    return (
+        Gemma4MTPBatchedBenchmarkResult(
+            batchSize: B, totalGenerated: total,
+            prefillSeconds: prefillElapsed, generationSeconds: genElapsed),
+        out)
+}
+
 /// Run MTP over B padded prompts via `runGemma4MTPRoundsBatched`. Returns
 /// aggregate timing — sum of emitted tokens / wall seconds.
 public func measureBatchedMTPThroughput(

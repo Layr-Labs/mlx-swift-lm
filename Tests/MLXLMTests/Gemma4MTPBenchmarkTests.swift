@@ -535,6 +535,73 @@ struct Gemma4MTPBenchmarkTests {
         print("wrote \(outPath)")
     }
 
+    /// Real-model ENGINE-path verification: drives the actual continuous-
+    /// batching `GenerationBatch` + `Gemma4MTPEngineRuntime` on the 26B model
+    /// (the wired-in path the server uses), at B=1/2/4. Reports engine-MTP
+    /// tok/s vs plain batched-decode tok/s, and verifies token parity vs plain
+    /// greedy (no garbage). Gated on MTP_BENCH_ENGINE=1.
+    @Test func engineMtpRealModel() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["MTP_BENCH_ENGINE"] == "1", let dataDir = env["MTP_BENCH_DATA_DIR"],
+              let promptsPath = env["MTP_BENCH_PROMPTS"]
+        else { print("Skipping: set MTP_BENCH_ENGINE=1, MTP_BENCH_DATA_DIR, MTP_BENCH_PROMPTS"); return }
+
+        let targetDir = env["MTP_BENCH_SWEEP_TARGET"] ?? "gemma-4-26B-A4B-it-qat-4bit"
+        let drafterDir = env["MTP_BENCH_SWEEP_DRAFTER"] ?? "gemma-4-26B-A4B-it-qat-assistant-4bit"
+        let K = Int(env["MTP_BENCH_SWEEP_K"] ?? "3") ?? 3
+        let maxTokens = Int(env["MTP_BENCH_SWEEP_MAXTOK"] ?? "160") ?? 160
+        let batchSizes = (env["MTP_BENCH_SWEEP_B"] ?? "1,2,4")
+            .split(separator: ",").compactMap { Int($0) }
+        // One representative prompt replicated across rows (uniform length —
+        // isolates engine economics from ragged-prefill padding).
+        let pdata = try JSONDecoder()
+            .decode([[Int]].self, from: Data(contentsOf: URL(fileURLWithPath: promptsPath)))
+            .map { $0.map { Int32($0) } }
+        let basePrompt = pdata[(Int(env["MTP_BENCH_PROMPT_IDX"] ?? "0") ?? 0) % pdata.count]
+
+        let (target, _) = try loadRealTargetAsTextModel(
+            from: URL(fileURLWithPath: "\(dataDir)/\(targetDir)"))
+        let drafter = try await Gemma4AssistantDraftModel.load(
+            from: URL(fileURLWithPath: "\(dataDir)/\(drafterDir)"))
+        eval(target, drafter)
+
+        print("\n=== Engine-path MTP on real model (K=\(K), max_tokens=\(maxTokens)) ===")
+        print("B  base tok/s  engine-mtp tok/s  speedup  token-parity(worst row)")
+        for B in batchSizes {
+            let batch = Array(repeating: basePrompt, count: B)
+            // Warmup.
+            _ = measureBatchedBaselineThroughput(target: target, promptTokens: batch, maxTokens: 8)
+            _ = try measureEngineMTPThroughput(
+                target: target, drafter: drafter, promptTokens: batch,
+                maxTokens: 8, blockSize: K, maxBatch: Swift.max(B, 2))
+            MLX.Memory.clearCache()
+
+            let base = measureBatchedBaselineThroughput(
+                target: target, promptTokens: batch, maxTokens: maxTokens)
+            let baseTokens = runBatchedBaselineGreedyTokens(
+                target: target, promptTokens: batch, maxTokens: maxTokens)
+            MLX.Memory.clearCache()
+            let (eng, engTokens) = try measureEngineMTPThroughput(
+                target: target, drafter: drafter, promptTokens: batch,
+                maxTokens: maxTokens, blockSize: K, maxBatch: Swift.max(B, 2))
+            MLX.Memory.clearCache()
+
+            // Token parity: worst row's matched-prefix length (bf16 argmax ties
+            // can diverge late — same tolerance as the batched parity suite).
+            var worstMatched = maxTokens
+            for i in 0 ..< B {
+                let n = Swift.min(baseTokens[i].count, engTokens[i].count)
+                var matched = n
+                for j in 0 ..< n where baseTokens[i][j] != engTokens[i][j] { matched = j; break }
+                worstMatched = Swift.min(worstMatched, matched)
+            }
+            let speedup = eng.tokensPerSecond / Swift.max(base.tokensPerSecond, 1e-9)
+            print(String(
+                format: "%d  %9.1f  %15.1f  %.2fx  %d/%d exact",
+                B, base.tokensPerSecond, eng.tokensPerSecond, speedup, worstMatched, maxTokens))
+        }
+    }
+
     /// Pipelining fairness check. The naive baseline syncs the GPU once per
     /// token (`eval(tok)`); MTP syncs once per round (~K tokens), so MTP's
     /// speedup vs the naive baseline is partly a sync-overhead artifact. The
