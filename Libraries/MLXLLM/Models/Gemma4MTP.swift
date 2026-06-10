@@ -1578,6 +1578,242 @@ public struct BatchedGeneration: Sendable {
     }
 }
 
+// MARK: - Reusable batched MTP round state
+
+/// One round of batched Gemma 4 MTP, factored out of `runGemma4MTPRoundsBatched`
+/// so both the standalone stream API and the continuous-batching engine can
+/// drive it. Holds the per-round *carry* state (per-row pending tokens, the
+/// target hidden seed, and the shared-KV snapshot) for the currently active
+/// rows. The caller owns the target KV cache, the per-row budgets/stop logic,
+/// emission, and (on a row finishing) compaction.
+///
+/// Confirmed-prefix invariant: after every `step`, the target cache holds
+/// exactly each row's confirmed prefix and `pendings[b]` carries the
+/// confirmed-but-trimmed tail (≥ 1 token, last = the row's newest bonus).
+/// See `runGemma4MTPRoundsBatched` for the full rationale.
+public final class Gemma4MTPBatchState: @unchecked Sendable {
+    public let target: Gemma4TextModel
+    public let drafter: Gemma4AssistantDraftModel
+    public let blockSize: Int
+
+    /// Per active-row confirmed-but-not-cached tokens (last = newest bonus).
+    public private(set) var pendings: [[Int]]
+    /// Target hidden seed for the drafter chain, `[B, 1, H]`.
+    public private(set) var hidden: MLXArray
+    /// Shared-KV snapshot the drafter attends to.
+    public private(set) var sharedKV: Gemma4SharedKV
+
+    /// Number of currently active rows.
+    public var activeCount: Int { pendings.count }
+
+    // Optional per-phase profiling (enabled by the standalone API).
+    public var profile = false
+    public private(set) var rounds = 0
+    private var draftMs = 0.0, verifyMs = 0.0, walkMs = 0.0, updateMs = 0.0
+    private var emitTotal = 0, tInTotal = 0, draftStepsTotal = 0
+
+    /// - Parameters carry the active-row seed produced by a prefill
+    ///   `forwardForMTP`: `firstBonus[b]` is the token sampled at row b's last
+    ///   prompt position, `firstHidden` is `[B,1,H]`, `firstSharedKV` the
+    ///   captured snapshot. The caller must have already compacted these to the
+    ///   active set (rows that finished at prefill removed).
+    public init(
+        target: Gemma4TextModel,
+        drafter: Gemma4AssistantDraftModel,
+        blockSize: Int,
+        firstBonus: [Int],
+        firstHidden: MLXArray,
+        firstSharedKV: Gemma4SharedKV
+    ) {
+        self.target = target
+        self.drafter = drafter
+        self.blockSize = blockSize
+        self.pendings = firstBonus.map { [$0] }
+        self.hidden = firstHidden
+        self.sharedKV = firstSharedKV
+    }
+
+    /// Run exactly one MTP round over the active rows.
+    ///
+    /// - Parameter targetCache: the target's per-layer batched KV caches
+    ///   (owned by the caller); trimmed in place by the round's rollback.
+    /// - Parameter maxNewPerRow: per active-row cap on tokens emitted this
+    ///   round (the row's remaining budget). Every entry must be ≥ 1.
+    /// - Returns: per active-row emitted tokens, each `1...maxNewPerRow[b]`
+    ///   (accepted drafts + one correction/bonus). Index aligns with the
+    ///   current active set; `pendings`/`hidden`/`sharedKV` are advanced.
+    public func step(targetCache: [KVCache], maxNewPerRow: [Int]) -> [[Int]] {
+        let B = pendings.count
+        precondition(maxNewPerRow.count == B, "maxNewPerRow must match active rows")
+        let minRemaining = maxNewPerRow.min() ?? 0
+        let bs = Swift.min(blockSize, minRemaining + 1)
+        precondition(bs >= 2, "Gemma4MTPBatchState.step requires bs >= 2; guard in caller")
+
+        // --- Round geometry (fixed verify width = bs) ---
+        let pendCounts = pendings.map(\.count)
+        let maxPend = pendCounts.max() ?? 1
+        let tIn = Swift.max(bs, maxPend)
+        let freshCounts = pendCounts.map { tIn - $0 }
+        let draftSteps = freshCounts.max() ?? 0
+        let tDraft0 = profile ? CFAbsoluteTimeGetCurrent() : 0
+
+        // --- Draft (lockstep) ---
+        let physicalLen = targetCache[0].offset
+        let positionOffset: Gemma4.PositionOffset
+        if let positioned = targetCache[0] as? BatchPositionedKVCache {
+            let pendOffsets = MLXArray(pendCounts.map { Int32($0 - 1) })
+            positionOffset = .batch(positioned.batchOffset + pendOffsets)
+        } else {
+            positionOffset = .scalar(physicalLen + maxPend - 1)
+        }
+        let masks = drafter.makeMasks(
+            queryLen: 1, sharedKV: sharedKV,
+            positionOffset: .scalar(physicalLen + maxPend - 1), dtype: hidden.dtype)
+        var tok = MLXArray(pendings.map { Int32($0.last!) }, [B, 1])
+        var h = hidden
+        var draftPerStep: [MLXArray] = []
+        draftPerStep.reserveCapacity(draftSteps)
+        for _ in 0 ..< draftSteps {
+            let tokEmbed = target.embedTokensForDrafter(tok)
+            let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
+            let (newH, logits) = drafter(
+                inputsEmbeds: inputsEmbeds, sharedKV: sharedKV,
+                positionOffset: positionOffset, masks: masks)
+            let sampled2d = logits.squeezed(axis: 1).argMax(axis: -1).reshaped([B, 1])
+            draftPerStep.append(sampled2d)
+            tok = sampled2d
+            h = newH
+        }
+
+        // --- Verify input assembly (GPU-side) ---
+        let pendPadded: [Int32] = pendings.flatMap { row -> [Int32] in
+            row.map { Int32($0) } + Array(repeating: Int32(0), count: tIn - row.count)
+        }
+        let pendTensor = MLXArray(pendPadded, [B, tIn])
+        let verifyInput: MLXArray
+        let draftConcat: MLXArray
+        if draftSteps > 0 {
+            draftConcat = concatenated(draftPerStep, axis: 1)
+            let pendCountCol = MLXArray(pendCounts.map { Int32($0) }, [B, 1])
+            let positions = MLXArray(Array(0 ..< Int32(tIn)), [1, tIn])
+            let draftIdx = clip(positions - pendCountCol, min: 0, max: Int32(draftSteps - 1))
+            let shiftedDrafts = takeAlong(draftConcat, draftIdx, axis: -1)
+            verifyInput = MLX.where(positions .< pendCountCol, pendTensor, shiftedDrafts)
+        } else {
+            draftConcat = MLXArray.zeros([B, 0], dtype: .int32)
+            verifyInput = pendTensor
+        }
+
+        var tVerify0 = 0.0
+        if profile {
+            eval(verifyInput)
+            let now = CFAbsoluteTimeGetCurrent()
+            draftMs += (now - tDraft0) * 1000
+            tVerify0 = now
+        }
+
+        let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
+        let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)
+        eval(mainTokens, draftConcat)
+        var tWalk0 = 0.0
+        if profile {
+            let now = CFAbsoluteTimeGetCurrent()
+            verifyMs += (now - tVerify0) * 1000
+            tWalk0 = now
+        }
+        let mainFlat = mainTokens.asArray(Int32.self)
+        let draftFlat = draftConcat.asArray(Int32.self)
+
+        // --- Walk (per row, capped by maxNewPerRow) ---
+        var accepted: [Int] = []
+        var newTokensPerRow: [[Int]] = []
+        accepted.reserveCapacity(B)
+        newTokensPerRow.reserveCapacity(B)
+        for bi in 0 ..< B {
+            let p = pendCounts[bi]
+            let kRow = freshCounts[bi]
+            let mStart = bi * tIn + (p - 1)
+            let mainRow = mainFlat[mStart ..< mStart + kRow + 1].map { Int($0) }
+            let dStart = bi * draftSteps
+            let draftRow = draftSteps > 0
+                ? draftFlat[dStart ..< dStart + kRow].map { Int($0) }
+                : []
+            var (a, e) = Gemma4SpeculativeWalk.single(draft: draftRow, main: mainRow)
+            let budget = Swift.max(0, maxNewPerRow[bi])
+            if e.count > budget {
+                e = Array(e.prefix(budget))
+                a = Swift.max(0, e.count - 1)
+            }
+            accepted.append(a)
+            newTokensPerRow.append(e)
+        }
+
+        if profile {
+            let now = CFAbsoluteTimeGetCurrent()
+            walkMs += (now - tWalk0) * 1000
+            rounds += 1
+            emitTotal += newTokensPerRow.reduce(0) { $0 + $1.count }
+            tInTotal += tIn
+            draftStepsTotal += draftSteps
+        }
+        let tUpdate0 = profile ? CFAbsoluteTimeGetCurrent() : 0
+
+        // --- Rewind (uniform, exact) ---
+        let confirmedCounts = (0 ..< B).map { pendCounts[$0] + accepted[$0] }
+        let maxRejected = (0 ..< B).map { tIn - confirmedCounts[$0] }.max() ?? 0
+        if maxRejected > 0 {
+            for cache in targetCache { _ = cache.trim(maxRejected) }
+        }
+
+        // --- Advance carry ---
+        let hiddenDim = verifyOut.lastHidden.dim(2)
+        let seedIdx = MLX.broadcast(
+            MLXArray(confirmedCounts.map { Int32($0 - 1) }, [B, 1, 1]),
+            to: [B, 1, hiddenDim])
+        hidden = MLX.takeAlong(verifyOut.lastHidden, seedIdx, axis: 1)
+
+        let cachedNow = tIn - maxRejected
+        for bi in 0 ..< B {
+            guard let bonus = newTokensPerRow[bi].last else { continue }
+            let confirmedInput = pendings[bi] + Array(newTokensPerRow[bi].prefix(accepted[bi]))
+            pendings[bi] = Array(confirmedInput[cachedNow...]) + [bonus]
+        }
+        sharedKV = Gemma4SharedKV.sliceTail(
+            from: verifyOut.capturedSharedKV, rejected: maxRejected)
+        if profile { updateMs += (CFAbsoluteTimeGetCurrent() - tUpdate0) * 1000 }
+
+        return newTokensPerRow
+    }
+
+    /// Shrink the carry to keep only the active-row indices in `keepLocal`
+    /// (after some rows finished). The caller must separately filter the
+    /// target cache by the same indices.
+    public func compactCarry(keepLocal: [Int]) {
+        pendings = keepLocal.map { pendings[$0] }
+        let keepIdx = MLXArray(keepLocal.map { Int32($0) }, [keepLocal.count])
+        hidden = MLX.take(hidden, keepIdx, axis: 0)
+        sharedKV = Gemma4SharedKV(
+            fullAttention: (
+                MLX.take(sharedKV.fullAttention.0, keepIdx, axis: 0),
+                MLX.take(sharedKV.fullAttention.1, keepIdx, axis: 0)),
+            slidingAttention: (
+                MLX.take(sharedKV.slidingAttention.0, keepIdx, axis: 0),
+                MLX.take(sharedKV.slidingAttention.1, keepIdx, axis: 0)))
+    }
+
+    /// Emit the accumulated per-phase profile (no-op unless `profile`).
+    public func printProfile() {
+        guard profile, rounds > 0 else { return }
+        let n = Double(rounds)
+        print(String(
+            format: "[MTP-B prof] rounds=%d emit/round=%.2f tIn=%.2f draftSteps=%.2f "
+                + "| draft=%.1fms verify=%.1fms walk=%.1fms update=%.1fms per round",
+            rounds, Double(emitTotal) / n, Double(tInTotal) / n,
+            Double(draftStepsTotal) / n,
+            draftMs / n, verifyMs / n, walkMs / n, updateMs / n))
+    }
+}
+
 // MARK: - B > 1 round loop
 
 /// Run the Gemma 4 MTP round loop for a batch of requests (B > 1).
@@ -1637,11 +1873,8 @@ public func runGemma4MTPRoundsBatched(
         "maxTokensPerRow.count must equal firstBonus.count")
 
     // Per-phase wall-time profile, printed at stream finish when
-    // GEMMA4_MTP_PROFILE=1. Wall times include GPU waits: the phase whose
-    // sync (eval) lands absorbs all GPU work queued before it.
+    // GEMMA4_MTP_PROFILE=1. Accumulated inside Gemma4MTPBatchState.
     let profile = ProcessInfo.processInfo.environment["GEMMA4_MTP_PROFILE"] == "1"
-    var draftMs = 0.0, verifyMs = 0.0, walkMs = 0.0, updateMs = 0.0
-    var rounds = 0, emitTotal = 0, tInTotal = 0, draftStepsTotal = 0
 
     return AsyncStream<BatchedGeneration> { continuation in
         // First yield: prefill bonus per original row.
@@ -1671,214 +1904,48 @@ public func runGemma4MTPRoundsBatched(
         }
 
         // Active-batch state. `activeIndices[i]` is the original row index
-        // of active batch slot `i`. Shrinks as rows finish.
+        // of active batch slot `i`. Shrinks as rows finish. The MTP carry
+        // (pendings/hidden/sharedKV) lives in the reusable round state.
         var activeIndices: [Int] = (0 ..< originalB).filter { !finished[$0] }
-        // Per-row confirmed-but-not-yet-cached tokens. Always >= 1 entry;
-        // the last entry is the row's most recent confirmed token (the
-        // "bonus"). Tokens before it were confirmed in an earlier round
-        // but trimmed out of the cache by the shared rollback and will be
-        // re-inserted by the next verify forward.
-        var pendings: [[Int]] = activeIndices.map { [firstBonus[$0]] }
-        var hidden: MLXArray = {
-            // firstHidden is [originalB, 1, H]. If any row already finished
-            // (EOS at prefill), compact to [activeB, 1, H] via takeAlong.
-            if activeIndices.count == originalB {
-                return firstHidden
-            }
-            let idx = MLXArray(activeIndices.map { Int32($0) }, [activeIndices.count])
-            return MLX.take(firstHidden, idx, axis: 0)
-        }()
-        var sharedKV: Gemma4SharedKV = {
-            if activeIndices.count == originalB {
-                return firstSharedKV
-            }
-            let idx = MLXArray(activeIndices.map { Int32($0) }, [activeIndices.count])
-            return Gemma4SharedKV(
+        let activeIdxArr = MLXArray(activeIndices.map { Int32($0) }, [activeIndices.count])
+        let allActive = activeIndices.count == originalB
+        let seedHidden = allActive ? firstHidden : MLX.take(firstHidden, activeIdxArr, axis: 0)
+        let seedSharedKV: Gemma4SharedKV = allActive
+            ? firstSharedKV
+            : Gemma4SharedKV(
                 fullAttention: (
-                    MLX.take(firstSharedKV.fullAttention.0, idx, axis: 0),
-                    MLX.take(firstSharedKV.fullAttention.1, idx, axis: 0)),
+                    MLX.take(firstSharedKV.fullAttention.0, activeIdxArr, axis: 0),
+                    MLX.take(firstSharedKV.fullAttention.1, activeIdxArr, axis: 0)),
                 slidingAttention: (
-                    MLX.take(firstSharedKV.slidingAttention.0, idx, axis: 0),
-                    MLX.take(firstSharedKV.slidingAttention.1, idx, axis: 0)))
-        }()
-        // If we already lost some rows during prefill, compact the caches
-        // to match.
-        if activeIndices.count < originalB {
-            let idx = MLXArray(activeIndices.map { Int32($0) }, [activeIndices.count])
+                    MLX.take(firstSharedKV.slidingAttention.0, activeIdxArr, axis: 0),
+                    MLX.take(firstSharedKV.slidingAttention.1, activeIdxArr, axis: 0)))
+        // If we already lost some rows during prefill, compact the caches.
+        if !allActive {
             for cache in targetCache {
-                if let bc = cache as? BatchedCache {
-                    bc.filterBatched(batchIndices: idx)
-                }
+                if let bc = cache as? BatchedCache { bc.filterBatched(batchIndices: activeIdxArr) }
             }
         }
-
-        func printProfile() {
-            guard profile, rounds > 0 else { return }
-            let n = Double(rounds)
-            print(String(
-                format: "[MTP-B prof] rounds=%d emit/round=%.2f tIn=%.2f draftSteps=%.2f "
-                    + "| draft=%.1fms verify=%.1fms walk=%.1fms update=%.1fms per round",
-                rounds, Double(emitTotal) / n, Double(tInTotal) / n,
-                Double(draftStepsTotal) / n,
-                draftMs / n, verifyMs / n, walkMs / n, updateMs / n))
-        }
+        let state = Gemma4MTPBatchState(
+            target: target, drafter: drafter, blockSize: blockSize,
+            firstBonus: activeIndices.map { firstBonus[$0] },
+            firstHidden: seedHidden, firstSharedKV: seedSharedKV)
+        state.profile = profile
 
         while !finished.allSatisfy({ $0 }) {
             let B = activeIndices.count
-            // Determine this round's block size. Use the min `remaining`
-            // across ACTIVE rows only (finished rows are already excluded
-            // from activeIndices).
-            let activeRemaining = activeIndices.map { perRowBudget[$0] - emitted[$0] }
-            guard let minRemaining = activeRemaining.min(), minRemaining > 0 else {
-                break
-            }
-            let bs = min(blockSize, minRemaining + 1)
-            if bs <= 1 { break }
+            // Per active-row remaining budget; drives this round's block size.
+            let maxNewPerRow = activeIndices.map { perRowBudget[$0] - emitted[$0] }
+            guard let minRemaining = maxNewPerRow.min(), minRemaining > 0 else { break }
+            if min(blockSize, minRemaining + 1) <= 1 { break }
 
-            // --- Round geometry ---
-            // Row input = [p_b pending tokens][k_b fresh drafts], uniform
-            // total length tIn. tIn is FIXED at bs: pendings displace
-            // fresh drafts (k_b = bs - p_b) instead of growing the input.
-            // On the MoE target the verify forward's cost grows steeply
-            // with B*T (expert-union dispersion), so a bounded T wins over
-            // deeper drafting — profiled: an adaptive tIn = maxPend+bs-1
-            // policy drifted to tIn~7 at B=4 and halved throughput.
-            // Inductive bound: p' <= 1 + maxRejected <= tIn, so with
-            // tIn = max(bs, maxPend) pendings never exceed bs while bs is
-            // stable, and still fit when bs shrinks near a budget boundary.
-            let pendCounts = pendings.map(\.count)
-            let maxPend = pendCounts.max() ?? 1
-            let tIn = max(bs, maxPend)
-            let freshCounts = pendCounts.map { tIn - $0 }  // k_b
-            let draftSteps = freshCounts.max() ?? 0
-            let tDraft0 = profile ? CFAbsoluteTimeGetCurrent() : 0
+            // One MTP round over the active rows (draft → verify → walk →
+            // exact rollback → carry advance) via the reusable state.
+            let newTokensPerRow = state.step(
+                targetCache: targetCache, maxNewPerRow: maxNewPerRow)
 
-            // --- Draft (lockstep autoregressive steps) ---
-            //
-            // The drafter chain seeds from `hidden` (target hidden at the
-            // predecessor of each row's last pending) and consumes the last
-            // pending token first, then its own samples. Rows that need
-            // fewer than `draftSteps` fresh drafts ignore the surplus.
-            // Draft tokens stay GPU-resident; one sync at the walk below.
-            let physicalLen = targetCache[0].offset
-            // Per-row RoPE offset for the drafter: position of the row's
-            // last pending token (= cached count + pending - 1). Held
-            // constant within the block, matching the B=1 path.
-            let positionOffset: Gemma4.PositionOffset
-            if let positioned = targetCache[0] as? BatchPositionedKVCache {
-                let pendOffsets = MLXArray(pendCounts.map { Int32($0 - 1) })
-                positionOffset = .batch(positioned.batchOffset + pendOffsets)
-            } else {
-                positionOffset = .scalar(physicalLen + maxPend - 1)
-            }
-            // Mask query offset is scalar (window-boundary granularity);
-            // use the most recent edge across rows.
-            let masks = drafter.makeMasks(
-                queryLen: 1,
-                sharedKV: sharedKV,
-                positionOffset: .scalar(physicalLen + maxPend - 1),
-                dtype: hidden.dtype)
-            var tok = MLXArray(pendings.map { Int32($0.last!) }, [B, 1])
-            var h = hidden
-            var draftPerStep: [MLXArray] = []  // each is shape [B, 1]
-            draftPerStep.reserveCapacity(draftSteps)
-            for _ in 0 ..< draftSteps {
-                let tokEmbed = target.embedTokensForDrafter(tok)
-                let inputsEmbeds = concatenated([tokEmbed, h], axis: -1)
-                let (newH, logits) = drafter(
-                    inputsEmbeds: inputsEmbeds,
-                    sharedKV: sharedKV,
-                    positionOffset: positionOffset,
-                    masks: masks
-                )
-                // Greedy sample per row: logits [B, 1, vocab] -> [B, 1]
-                let sampled = logits.squeezed(axis: 1).argMax(axis: -1)  // [B]
-                let sampled2d = sampled.reshaped([B, 1])  // [B, 1]
-                draftPerStep.append(sampled2d)
-                tok = sampled2d
-                h = newH
-            }
-
-            // --- Verify input assembly (GPU-side, no sync) ---
-            // input[b, j] = pendings[b][j]            for j <  p_b
-            //             = drafts[b][j - p_b]        for j >= p_b
-            let pendPadded: [Int32] = pendings.flatMap { row -> [Int32] in
-                row.map { Int32($0) } + Array(repeating: Int32(0), count: tIn - row.count)
-            }
-            let pendTensor = MLXArray(pendPadded, [B, tIn])
-            let verifyInput: MLXArray
-            let draftConcat: MLXArray  // [B, draftSteps]
-            if draftSteps > 0 {
-                draftConcat = concatenated(draftPerStep, axis: 1)
-                let pendCountCol = MLXArray(pendCounts.map { Int32($0) }, [B, 1])
-                let positions = MLXArray(Array(0 ..< Int32(tIn)), [1, tIn])
-                let draftIdx = clip(
-                    positions - pendCountCol, min: 0, max: Int32(draftSteps - 1))
-                let shiftedDrafts = takeAlong(draftConcat, draftIdx, axis: -1)
-                verifyInput = MLX.where(
-                    positions .< pendCountCol, pendTensor, shiftedDrafts)
-            } else {
-                draftConcat = MLXArray.zeros([B, 0], dtype: .int32)
-                verifyInput = pendTensor
-            }
-
-            // When profiling, force the drafter chain + input assembly so
-            // draft GPU time is attributed to the draft phase, not verify.
-            var tVerify0 = 0.0
-            if profile {
-                eval(verifyInput)
-                let now = CFAbsoluteTimeGetCurrent()
-                draftMs += (now - tDraft0) * 1000
-                tVerify0 = now
-            }
-
-            let verifyOut = target.forwardForMTP(verifyInput, cache: targetCache)
-            // fp32 argmax at verify: see comment in B=1 path above.
-            let mainTokens = verifyOut.logits.asType(.float32).argMax(axis: -1)  // [B, tIn]
-            // Materialise drafts + main tokens in a single sync.
-            eval(mainTokens, draftConcat)
-            var tWalk0 = 0.0
-            if profile {
-                let now = CFAbsoluteTimeGetCurrent()
-                verifyMs += (now - tVerify0) * 1000
-                tWalk0 = now
-            }
-            let mainFlat = mainTokens.asArray(Int32.self)
-            let draftFlat = draftConcat.asArray(Int32.self)
-
-            // --- Walk (per-row, offset by the row's pending count) ---
-            // Fresh draft j of row b sits at input index p_b + j; the
-            // verify token for it is main[p_b - 1 + j]. The emitted tokens
-            // are main[p_b - 1 ... p_b - 1 + a_b] (accepted + correction).
-            var accepted: [Int] = []
-            var newTokensPerRow: [[Int]] = []
-            accepted.reserveCapacity(B)
-            newTokensPerRow.reserveCapacity(B)
-            for bi in 0 ..< B {
-                let p = pendCounts[bi]
-                let kRow = freshCounts[bi]
-                let mStart = bi * tIn + (p - 1)
-                let mainRow = mainFlat[mStart ..< mStart + kRow + 1].map { Int($0) }
-                let dStart = bi * draftSteps
-                let draftRow = draftSteps > 0
-                    ? draftFlat[dStart ..< dStart + kRow].map { Int($0) }
-                    : []
-                var (a, e) = Gemma4SpeculativeWalk.single(draft: draftRow, main: mainRow)
-                let budget = Swift.max(0, perRowBudget[activeIndices[bi]] - emitted[activeIndices[bi]])
-                if e.count > budget {
-                    e = Array(e.prefix(budget))
-                    a = Swift.max(0, e.count - 1)
-                }
-                accepted.append(a)
-                newTokensPerRow.append(e)
-            }
-
-            // --- Emit one BatchedGeneration per token-position within this round ---
-            // Slots use the ORIGINAL row index from activeIndices so consumers
-            // can continue to demux emissions even as the active batch shrinks.
-            //
-            // Track which active slots newly finished this round so we can
-            // compact the cache + state afterward.
+            // --- Emit one BatchedGeneration per token-position this round ---
+            // Slots use the ORIGINAL row index so consumers can demux even as
+            // the active batch shrinks.
             var finishedThisRound = Array(repeating: false, count: B)
             let maxNew = newTokensPerRow.map(\.count).max() ?? 0
             for pos in 0 ..< maxNew {
@@ -1887,8 +1954,6 @@ public func runGemma4MTPRoundsBatched(
                 for bi in 0 ..< B {
                     let origRow = activeIndices[bi]
                     if finishedThisRound[bi] {
-                        // Already finished earlier this round; no more
-                        // emissions for this slot.
                         slots.append(.init(row: origRow, token: nil, finishReason: nil))
                         continue
                     }
@@ -1914,110 +1979,25 @@ public func runGemma4MTPRoundsBatched(
                 continuation.yield(BatchedGeneration(slots: slots))
             }
 
-            if profile {
-                let now = CFAbsoluteTimeGetCurrent()
-                walkMs += (now - tWalk0) * 1000
-                rounds += 1
-                emitTotal += newTokensPerRow.reduce(0) { $0 + $1.count }
-                tInTotal += tIn
-                draftStepsTotal += draftSteps
-            }
+            if finished.allSatisfy({ $0 }) { break }
 
-            if finished.allSatisfy({ $0 }) {
-                printProfile()
-                continuation.finish()
-                return
-            }
-            let tUpdate0 = profile ? CFAbsoluteTimeGetCurrent() : 0
-
-            // --- Rewind target cache (uniform, exact) ---
-            // Confirmed input tokens of row b: c_b = p_b + a_b. Trim ALL
-            // rows by the batch-max rejection so the cache is a confirmed
-            // prefix for every row (c_b >= tIn - maxRejected holds for all
-            // rows by construction). Over-trimmed confirmed tokens go back
-            // to the row's pending queue below. Plain `trim` on every
-            // batched cache — no isTrimmable gate (the trim is always
-            // within the block this round just appended, which both
-            // batched cache types can rewind even past a full sliding
-            // window) and no per-row tensor rewrites.
-            let confirmedCounts = (0 ..< B).map { pendCounts[$0] + accepted[$0] }
-            let maxRejected = (0 ..< B).map { tIn - confirmedCounts[$0] }.max() ?? 0
-            if maxRejected > 0 {
-                for cache in targetCache {
-                    _ = cache.trim(maxRejected)
-                }
-            }
-
-            // --- Update state ---
-            // Chain seed for the next round: target hidden at the LAST
-            // confirmed input position (the predecessor of the row's new
-            // bonus). Gather verifyOut.lastHidden[bi, c_b - 1, :].
-            let hiddenDim = verifyOut.lastHidden.dim(2)
-            let seedIdx = MLX.broadcast(
-                MLXArray(confirmedCounts.map { Int32($0 - 1) }, [B, 1, 1]),
-                to: [B, 1, hiddenDim])
-            hidden = MLX.takeAlong(
-                verifyOut.lastHidden, seedIdx, axis: 1)  // [B, 1, hidden]
-
-            // New pendings: confirmed input tokens beyond the post-trim
-            // cache length, plus the new bonus/correction token. Rows that
-            // finished this round keep a placeholder; they are filtered
-            // out by the compaction below before the next round.
-            let cachedNow = tIn - maxRejected
-            for bi in 0 ..< B {
-                guard let bonus = newTokensPerRow[bi].last else { continue }
-                let confirmedInput =
-                    pendings[bi] + Array(newTokensPerRow[bi].prefix(accepted[bi]))
-                pendings[bi] = Array(confirmedInput[cachedNow...]) + [bonus]
-            }
-
-            // Shared-KV snapshot for the drafter, matching the post-trim
-            // cache length. Uniform tail slice — exact, no per-row zeroing.
-            sharedKV = Gemma4SharedKV.sliceTail(
-                from: verifyOut.capturedSharedKV, rejected: maxRejected)
-            if profile { updateMs += (CFAbsoluteTimeGetCurrent() - tUpdate0) * 1000 }
-
-            // --- Continuous batching: compact if any slot just finished ---
-            //
-            // When a subset of active slots hit EOS or maxTokens this round,
-            // filter the target cache + per-row state so the next round only
-            // pays compute for still-active rows. Rows that never finish are
-            // a no-op here.
+            // --- Continuous batching: compact carry + cache for finished rows ---
             if finishedThisRound.contains(true) {
                 let keepLocal: [Int] = finishedThisRound.enumerated()
                     .compactMap { $0.element ? nil : $0.offset }
-                if keepLocal.isEmpty {
-                    // Shouldn't happen: finished.allSatisfy would have tripped
-                    // above. Guard anyway.
-                    break
-                }
-                // Compact the active-batch bookkeeping.
+                if keepLocal.isEmpty { break }
                 activeIndices = keepLocal.map { activeIndices[$0] }
-                pendings = keepLocal.map { pendings[$0] }
-                // Compact GPU-side state tensors + the shared KV + every cache.
-                let keepIdx = MLXArray(
-                    keepLocal.map { Int32($0) }, [keepLocal.count])
-                hidden = MLX.take(hidden, keepIdx, axis: 0)
-                sharedKV = Gemma4SharedKV(
-                    fullAttention: (
-                        MLX.take(sharedKV.fullAttention.0, keepIdx, axis: 0),
-                        MLX.take(sharedKV.fullAttention.1, keepIdx, axis: 0)),
-                    slidingAttention: (
-                        MLX.take(sharedKV.slidingAttention.0, keepIdx, axis: 0),
-                        MLX.take(sharedKV.slidingAttention.1, keepIdx, axis: 0)))
+                state.compactCarry(keepLocal: keepLocal)
+                let keepIdx = MLXArray(keepLocal.map { Int32($0) }, [keepLocal.count])
                 for cache in targetCache {
-                    if let bc = cache as? BatchedCache {
-                        bc.filterBatched(batchIndices: keepIdx)
-                    }
+                    if let bc = cache as? BatchedCache { bc.filterBatched(batchIndices: keepIdx) }
                 }
             }
 
-            if (emitted.max() ?? 0) % 256 == 0 {
-                MLX.Memory.clearCache()
-            }
+            if (emitted.max() ?? 0) % 256 == 0 { MLX.Memory.clearCache() }
         }
 
-        printProfile()
+        state.printProfile()
         continuation.finish()
     }
 }
