@@ -762,6 +762,78 @@ struct Gemma4E4BMTPParityTests {
             )
         }
     }
+
+    /// Build a prefilled engine GenerationBatch with the MTP runtime attached,
+    /// ready to drive via next() (prompt[:-1] prefilled, seed = prompt[-1]).
+    private func makeEngineBatch(
+        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel,
+        promptIds: [[Int32]], maxTokens: Int, blockSize: Int, maxBatch: Int
+    ) throws -> GenerationBatch {
+        let B = promptIds.count
+        let runtime = try Gemma4MTPEngineRuntime(
+            target: target, drafter: drafter, maxBatch: maxBatch, blockSize: blockSize)
+        let prefixes = promptIds.map { Array($0.dropLast()) }
+        let pl = prefixes[0].count
+        let cache = makeBatchedCache(target: target, B: B)
+        if pl > 0 {
+            _ = target.forwardForMTP(
+                MLXArray(prefixes.flatMap { $0 }, [B, pl]), cache: cache.map { $0 as any KVCache })
+        }
+        let seed = MLXArray(promptIds.map { UInt32($0.last ?? 0) })
+        return GenerationBatch(
+            model: target, uids: Array(0 ..< B), seedTokens: seed,
+            promptCache: cache, tokens: promptIds.map { $0.map(Int.init) },
+            maxTokens: Array(repeating: maxTokens, count: B), mtpRuntime: runtime)
+    }
+
+    /// Regression for the scheduler-abort invariant: filter() must keep the MTP
+    /// session carry aligned (compact survivors) and clear it when the batch
+    /// empties — otherwise the next round traps `maxNewPerRow.count == B`, or an
+    /// emptied-but-non-nil session wedges admission. Mirrors a mid-session row
+    /// abort (consumer disconnect) and a last-row abort.
+    @Test func engine_mtp_midsession_eviction() throws {
+        MLXRandom.seed(77)
+        var rng = SeededRNG(seed: 77)
+        let B = 2, promptLen = 8, maxTokens = 24
+        let promptIds: [[Int32]] = (0 ..< B).map { _ in
+            (0 ..< promptLen).map { _ in Int32.random(in: 0 ..< 1024, using: &rng) }
+        }
+        let target = Gemma4TextModel(try e4bStyleTargetConfig())
+        let drafter = Gemma4AssistantDraftModel(config: try e4bStyleDrafterConfig())
+        eval(target, drafter)
+
+        // Phase 1: enter a B=2 session, abort one row mid-session, run the
+        // survivor to completion — must not crash and must clear on empty.
+        let gen = try makeEngineBatch(
+            target: target, drafter: drafter, promptIds: promptIds,
+            maxTokens: maxTokens, blockSize: 3, maxBatch: 2)
+        _ = gen.next()  // ENTER: session active over both rows
+        #expect(gen.hasActiveMTPSession)
+        #expect(gen.batchSize == 2)
+        // Abort the row with uid == 1 (scheduler doAbortRequest path).
+        let keep = (0 ..< gen.uids.count).filter { gen.uids[$0] != 1 }
+        gen.filter(keep: keep)
+        #expect(gen.batchSize == 1)
+        #expect(gen.hasActiveMTPSession)  // survivor still speculating
+        var steps = 0
+        while !gen.isEmpty && steps < maxTokens * 4 + 16 {
+            _ = gen.next()
+            steps += 1
+        }
+        #expect(gen.isEmpty)
+        #expect(!gen.hasActiveMTPSession)  // cleared when the batch emptied
+
+        // Phase 2: aborting the LAST active row clears the session immediately
+        // (else admission would deadlock on a non-nil session over an empty batch).
+        let gen2 = try makeEngineBatch(
+            target: target, drafter: drafter, promptIds: [promptIds[0]],
+            maxTokens: maxTokens, blockSize: 3, maxBatch: 2)
+        _ = gen2.next()
+        #expect(gen2.hasActiveMTPSession)
+        gen2.filter(keep: [])
+        #expect(gen2.isEmpty)
+        #expect(!gen2.hasActiveMTPSession)
+    }
 }
 
 /// 26B-A4B-shaped parity. Exercises the MoE (`enable_moe_block: true`)

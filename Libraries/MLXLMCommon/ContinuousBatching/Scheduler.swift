@@ -342,6 +342,13 @@ public final class Scheduler: @unchecked Sendable {
         let maxRemaining = pp.remaining.map { $0.count }.max() ?? 0
 
         if maxRemaining == 0 {
+            // Hold the completed prefill while the live genBatch is mid-MTP
+            // session: `extend()` would grow `uids`/caches without growing the
+            // session's per-row carry, tripping the round precondition. Merge
+            // once the session ends (the batch empties → mtpSession cleared in
+            // GenerationBatch.filter). pendingPrefill is unmutated here, so a
+            // bare return safely retains it for a later step.
+            if genBatch?.hasActiveMTPSession == true { return }
             // All sequences prefilled — transition to decode.
             let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
             mergeIntoGenBatch(gen)
@@ -395,6 +402,13 @@ public final class Scheduler: @unchecked Sendable {
         }
 
         if pp.remaining.allSatisfy({ $0.isEmpty }) {
+            // Hold (don't merge) while a live MTP session owns the genBatch;
+            // the merge will fire from the maxRemaining==0 branch on a later
+            // step once the session ends. Store the now-complete prefill back.
+            if genBatch?.hasActiveMTPSession == true {
+                pendingPrefill = pp
+                return
+            }
             let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
             mergeIntoGenBatch(gen)
             pendingPrefill = nil

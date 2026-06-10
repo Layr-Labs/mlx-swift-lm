@@ -234,6 +234,22 @@ public final class GenerationBatch: @unchecked Sendable {
             }
         }
 
+        // Drafter-MTP: keep the session carry aligned with the surviving rows.
+        // `filter` is the single eviction choke point (round emission, scheduler
+        // abort, external shrink all route through here), so maintaining the
+        // session invariant here — rather than only in the round emitter —
+        // keeps `mtpSession.activeCount == uids.count` and clears the session
+        // when the batch empties (preventing a stale non-nil session that would
+        // wedge admission). `keep` indexes the pre-filter rows, matching the
+        // session's current row order. Done before the metadata remap below.
+        if let session = mtpSession {
+            if keep.isEmpty {
+                mtpSession = nil
+            } else if keep.count < session.activeCount {
+                session.compactCarry(keepLocal: keep)
+            }
+        }
+
         uids = keep.map { uids[$0] }
         tokens = keep.map { tokens[$0] }
         samplers = keep.map { samplers[$0] }
@@ -489,11 +505,9 @@ public final class GenerationBatch: @unchecked Sendable {
         }
 
         if keep.count < n {
-            // Compact the session carry to survivors, then filter cache +
-            // metadata by the same local indices.
-            mtpSession?.compactCarry(keepLocal: keep)
+            // `filter` is the single choke point that compacts the session
+            // carry (and clears it when the batch empties) — see filter(keep:).
             filter(keep: keep)
-            if uids.isEmpty { mtpSession = nil }
         }
 
         return responses
