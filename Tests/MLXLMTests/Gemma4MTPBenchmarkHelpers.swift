@@ -206,29 +206,8 @@ public func measureBatchedBaselineThroughput(
 ) -> Gemma4MTPBatchedBenchmarkResult {
     let B = promptTokens.count
     precondition(B >= 1, "Batch size must be >= 1")
-    let maxLen = promptTokens.map(\.count).max() ?? 0
-    // Right-pad with 0s (token id 0). For a throughput bench this is fine;
-    // we're measuring compute, not semantic output. Real applications
-    // would left-pad and track leftPadding per row.
-    let padded = promptTokens.map { row -> [Int32] in
-        row + Array(repeating: Int32(0), count: maxLen - row.count)
-    }
-    let flat = padded.flatMap { $0 }
-    let prompt = MLXArray(flat, [B, maxLen])
-
-    let firstKvShared = target.configuration.numHiddenLayers
-                      - target.configuration.numKvSharedLayers
-    let leftPadding = Array(repeating: 0, count: B)
-    var cache: [KVCache] = []
-    for i in 0 ..< firstKvShared {
-        if target.configuration.layerTypes[i] == "full_attention" {
-            cache.append(BatchKVCache(leftPadding: leftPadding))
-        } else {
-            cache.append(BatchRotatingKVCache(
-                maxSize: target.configuration.slidingWindow,
-                leftPadding: leftPadding))
-        }
-    }
+    let (prompt, leftPadding) = leftPadBatch(promptTokens)
+    let cache = makeBatchedCache(target: target, leftPadding: leftPadding)
 
     let prefillStart = Date()
     var logits = target(prompt, cache: cache)
@@ -273,26 +252,8 @@ public func measureBatchedMTPThroughputStaggered(
     let B = promptTokens.count
     precondition(maxTokensPerRow.count == B,
         "maxTokensPerRow must match the number of prompts")
-    let maxLen = promptTokens.map(\.count).max() ?? 0
-    let padded = promptTokens.map { row -> [Int32] in
-        row + Array(repeating: Int32(0), count: maxLen - row.count)
-    }
-    let flat = padded.flatMap { $0 }
-    let prompt = MLXArray(flat, [B, maxLen])
-
-    let firstKvShared = target.configuration.numHiddenLayers
-                      - target.configuration.numKvSharedLayers
-    let leftPadding = Array(repeating: 0, count: B)
-    var cache: [KVCache] = []
-    for i in 0 ..< firstKvShared {
-        if target.configuration.layerTypes[i] == "full_attention" {
-            cache.append(BatchKVCache(leftPadding: leftPadding))
-        } else {
-            cache.append(BatchRotatingKVCache(
-                maxSize: target.configuration.slidingWindow,
-                leftPadding: leftPadding))
-        }
-    }
+    let (prompt, leftPadding) = leftPadBatch(promptTokens)
+    let cache = makeBatchedCache(target: target, leftPadding: leftPadding)
 
     let prefillStart = Date()
     let prefillOut = target.forwardForMTP(prompt, cache: cache)
@@ -328,13 +289,30 @@ public func measureBatchedMTPThroughputStaggered(
         prefillSeconds: prefillElapsed, generationSeconds: genElapsed)
 }
 
+/// LEFT-pad ragged prompts so every row's real tokens are right-aligned
+/// (last token at the right edge). Returns the `[B, maxLen]` token tensor
+/// plus per-row `leftPadding`. Right-padding is WRONG for this path: it
+/// puts the row's last real token mid-tensor, so `logits[:, -1, :]` reads
+/// a padding position and the MTP bonus/hidden/sharedKV seed becomes
+/// garbage for short rows — which silently collapses draft acceptance to
+/// zero at B>1 with diverse-length prompts. Left-padding + a leftPadding
+/// mask is exactly what `BatchKVCache` is documented to expect.
+func leftPadBatch(_ promptTokens: [[Int32]]) -> (prompt: MLXArray, leftPadding: [Int]) {
+    let B = promptTokens.count
+    let maxLen = promptTokens.map(\.count).max() ?? 0
+    let padded = promptTokens.map { row -> [Int32] in
+        Array(repeating: Int32(0), count: maxLen - row.count) + row
+    }
+    let leftPadding = promptTokens.map { maxLen - $0.count }
+    return (MLXArray(padded.flatMap { $0 }, [B, maxLen]), leftPadding)
+}
+
 /// Build the per-layer batched cache array for a Gemma 4 target —
 /// `BatchKVCache` for full-attention layers, `BatchRotatingKVCache` for
 /// sliding layers. Shared across the batched measurement/parity helpers.
-func makeBatchedCache(target: Gemma4TextModel, batchSize: Int) -> [KVCache] {
+func makeBatchedCache(target: Gemma4TextModel, leftPadding: [Int]) -> [KVCache] {
     let firstKvShared = target.configuration.numHiddenLayers
                       - target.configuration.numKvSharedLayers
-    let leftPadding = Array(repeating: 0, count: batchSize)
     var cache: [KVCache] = []
     for i in 0 ..< firstKvShared {
         if target.configuration.layerTypes[i] == "full_attention" {
@@ -357,12 +335,8 @@ public func runBatchedBaselineGreedyTokens(
     maxTokens: Int
 ) -> [[Int]] {
     let B = promptTokens.count
-    let maxLen = promptTokens.map(\.count).max() ?? 0
-    let padded = promptTokens.map { row -> [Int32] in
-        row + Array(repeating: Int32(0), count: maxLen - row.count)
-    }
-    let prompt = MLXArray(padded.flatMap { $0 }, [B, maxLen])
-    let cache = makeBatchedCache(target: target, batchSize: B)
+    let (prompt, leftPadding) = leftPadBatch(promptTokens)
+    let cache = makeBatchedCache(target: target, leftPadding: leftPadding)
 
     var logits = target(prompt, cache: cache)
     var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)  // [B]
@@ -391,12 +365,8 @@ public func runBatchedMTPTokens(
 ) async throws -> [[Int]] {
     try drafter.bind(target: target)
     let B = promptTokens.count
-    let maxLen = promptTokens.map(\.count).max() ?? 0
-    let padded = promptTokens.map { row -> [Int32] in
-        row + Array(repeating: Int32(0), count: maxLen - row.count)
-    }
-    let prompt = MLXArray(padded.flatMap { $0 }, [B, maxLen])
-    let cache = makeBatchedCache(target: target, batchSize: B)
+    let (prompt, leftPadding) = leftPadBatch(promptTokens)
+    let cache = makeBatchedCache(target: target, leftPadding: leftPadding)
 
     let prefillOut = target.forwardForMTP(prompt, cache: cache)
     let firstBonusArr = prefillOut.logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
@@ -437,26 +407,8 @@ public func measureBatchedMTPThroughput(
     try drafter.bind(target: target)
 
     let B = promptTokens.count
-    let maxLen = promptTokens.map(\.count).max() ?? 0
-    let padded = promptTokens.map { row -> [Int32] in
-        row + Array(repeating: Int32(0), count: maxLen - row.count)
-    }
-    let flat = padded.flatMap { $0 }
-    let prompt = MLXArray(flat, [B, maxLen])
-
-    let firstKvShared = target.configuration.numHiddenLayers
-                      - target.configuration.numKvSharedLayers
-    let leftPadding = Array(repeating: 0, count: B)
-    var cache: [KVCache] = []
-    for i in 0 ..< firstKvShared {
-        if target.configuration.layerTypes[i] == "full_attention" {
-            cache.append(BatchKVCache(leftPadding: leftPadding))
-        } else {
-            cache.append(BatchRotatingKVCache(
-                maxSize: target.configuration.slidingWindow,
-                leftPadding: leftPadding))
-        }
-    }
+    let (prompt, leftPadding) = leftPadBatch(promptTokens)
+    let cache = makeBatchedCache(target: target, leftPadding: leftPadding)
 
     let prefillStart = Date()
     let prefillOut = target.forwardForMTP(prompt, cache: cache)
