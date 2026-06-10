@@ -2,6 +2,7 @@ import CoreImage
 import CoreMedia
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
@@ -917,6 +918,10 @@ private final class Gemma4TextBackbone: Module {
     let layerIdxToCacheIdx: [Int]
     let firstFullCacheIdx: Int
     let firstSlidingCacheIdx: Int
+    /// Last non-shared full/sliding-attention layer indices — the layers whose
+    /// own K/V the MTP drafter reads (mirrors MLXLLM's capture indices).
+    let lastFullNonSharedIdx: Int
+    let lastSlidingNonSharedIdx: Int
     let embedScale: Float
     let embedTokensPerLayerScale: Float
     private let _perLayerInputScale: MLXArray
@@ -952,6 +957,8 @@ private final class Gemma4TextBackbone: Module {
         layerIdxToCacheIdx = cacheMap
         firstFullCacheIdx = concreteLayers.firstIndex(of: "full_attention") ?? 0
         firstSlidingCacheIdx = concreteLayers.firstIndex(of: "sliding_attention") ?? 0
+        lastFullNonSharedIdx = sharedFullIdx
+        lastSlidingNonSharedIdx = sharedSlidingIdx
 
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
@@ -1023,6 +1030,46 @@ private final class Gemma4TextBackbone: Module {
         perLayerInputs: MLXArray? = nil,
         imageTokenMask: MLXArray? = nil
     ) -> MLXArray {
+        forwardTrunk(
+            inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache,
+            perLayerInputs: perLayerInputs, imageTokenMask: imageTokenMask,
+            captureMTP: false
+        ).postNorm
+    }
+
+    /// MTP forward over the shared trunk: returns the post-norm hidden (for the
+    /// LM head), the pre-norm last hidden (the drafter's `pre_projection` input,
+    /// matching HF's `hidden_states` capture point), and the last non-shared
+    /// full/sliding-attention K/V snapshots the drafter attends to next round.
+    func callForMTP(
+        _ inputs: MLXArray? = nil,
+        inputsEmbeds: MLXArray? = nil,
+        cache: [KVCache?]? = nil,
+        perLayerInputs: MLXArray? = nil,
+        imageTokenMask: MLXArray? = nil
+    ) -> (
+        postNorm: MLXArray, preNorm: MLXArray,
+        full: (MLXArray, MLXArray), sliding: (MLXArray, MLXArray)
+    ) {
+        let r = forwardTrunk(
+            inputs, inputsEmbeds: inputsEmbeds, mask: nil, cache: cache,
+            perLayerInputs: perLayerInputs, imageTokenMask: imageTokenMask,
+            captureMTP: true)
+        return (r.postNorm, r.preNorm!, r.full!, r.sliding!)
+    }
+
+    private func forwardTrunk(
+        _ inputs: MLXArray? = nil,
+        inputsEmbeds: MLXArray? = nil,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        cache: [KVCache?]? = nil,
+        perLayerInputs: MLXArray? = nil,
+        imageTokenMask: MLXArray? = nil,
+        captureMTP: Bool = false
+    ) -> (
+        postNorm: MLXArray, preNorm: MLXArray?,
+        full: (MLXArray, MLXArray)?, sliding: (MLXArray, MLXArray)?
+    ) {
         let h0: MLXArray
         if let inputsEmbeds {
             h0 = inputsEmbeds
@@ -1059,7 +1106,6 @@ private final class Gemma4TextBackbone: Module {
             let fullCache = firstFullCacheIdx < localCache.count ? localCache[firstFullCacheIdx] : nil
             let slidingCache = firstSlidingCacheIdx < localCache.count
                 ? localCache[firstSlidingCacheIdx] : nil
-            let useExplicitPrefixMask = h0.dim(1) > 1
 
             // Gemma 4 applies blockwise bidirectional attention within image-token spans
             // during prefill. The overlay needs a materialized boolean mask, so force
@@ -1069,20 +1115,18 @@ private final class Gemma4TextBackbone: Module {
                 && config.useBidirectionalAttention == "vision"
                 && h0.dim(1) > 1
 
-            // Cached multi-token chunks need offset-aware masks. Keep the first
-            // uncached chunk on the fast symbolic path.
+            // Otherwise let `createAttentionMask` choose (symbolic `.causal`, or
+            // a windowed array on overflow) — identical to the text-only MLXLLM
+            // tower. Forcing an offset-indexed array mask for every cached
+            // multi-token chunk silently miscounts after a speculative
+            // rollback shrinks the cache (the MTP verify pattern), which the
+            // symbolic causal path handles correctly. Only the vision overlay
+            // genuinely needs a materialized mask.
             var builtFullMask = createAttentionMask(
-                h: h0,
-                cache: fullCache,
-                returnArray: useBidirectionalVision
-                    || (useExplicitPrefixMask && (fullCache?.offset ?? 0) > 0))
+                h: h0, cache: fullCache, returnArray: useBidirectionalVision)
             var builtSlidingMask = createAttentionMask(
-                h: h0,
-                cache: slidingCache,
-                windowSize: config.slidingWindow,
-                returnArray: useBidirectionalVision
-                    || (useExplicitPrefixMask && (slidingCache?.offset ?? 0) > 0)
-            )
+                h: h0, cache: slidingCache, windowSize: config.slidingWindow,
+                returnArray: useBidirectionalVision)
             if useBidirectionalVision, let imageTokenMask {
                 builtFullMask = gemma4OverlayBidirectionalVision(
                     builtFullMask, isVision: imageTokenMask)
@@ -1129,7 +1173,22 @@ private final class Gemma4TextBackbone: Module {
             h = output
             intermediates[idx] = (kvState, attentionOffset)
         }
-        return norm(h)
+        if captureMTP {
+            func regular(_ state: Gemma4SharedKVState?) -> (MLXArray, MLXArray) {
+                guard case let .regular(keys, values)? = state else {
+                    fatalError(
+                        "MTP capture requires non-quantized KV caches (got "
+                            + "\(String(describing: state)))")
+                }
+                return (keys, values)
+            }
+            return (
+                norm(h), h,
+                regular(intermediates[lastFullNonSharedIdx].kv),
+                regular(intermediates[lastSlidingNonSharedIdx].kv)
+            )
+        }
+        return (norm(h), nil, nil, nil)
     }
 }
 
@@ -1214,6 +1273,26 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             prefillBackbone(
                 inputs, cache: cache, inputsEmbeds: inputsEmbeds,
                 perLayerInputs: perLayerInputs, mask: mask, imageTokenMask: imageTokenMask)))
+    }
+
+    /// MTP forward producing logits, the pre-norm last hidden, and the last
+    /// non-shared full/sliding K/V snapshots. Handles both text-token decode
+    /// (`inputs`) and the multimodal prefill (`inputsEmbeds` + `perLayerInputs`
+    /// + `imageTokenMask`).
+    func forwardForMTP(
+        _ inputs: MLXArray? = nil,
+        cache: [KVCache],
+        inputsEmbeds: MLXArray? = nil,
+        perLayerInputs: MLXArray? = nil,
+        imageTokenMask: MLXArray? = nil
+    ) -> (
+        logits: MLXArray, lastHidden: MLXArray,
+        full: (MLXArray, MLXArray), sliding: (MLXArray, MLXArray)
+    ) {
+        let r = model.callForMTP(
+            inputs, inputsEmbeds: inputsEmbeds, cache: cache.map { $0 as KVCache? },
+            perLayerInputs: perLayerInputs, imageTokenMask: imageTokenMask)
+        return (projectToLogits(r.postNorm), r.preNorm, r.full, r.sliding)
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1939,6 +2018,97 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         }
 
         return sanitized
+    }
+}
+
+// MARK: - MTP speculative decoding
+
+/// Conformance that lets the Gemma 4 MTP drafter (trained against the MLXLLM
+/// text tower) drive speculative decoding through this VLM tower. The VLM
+/// implements the *same* Gemma 4 text architecture and loads the *same* text
+/// weights, and its non-shared full/sliding K/V are stored post-k_norm,
+/// post-RoPE in `[B, H, S, D]` — identical to what the drafter expects. The
+/// parity spike validates the two towers are numerically equivalent.
+extension Gemma4: Gemma4MTPTarget {
+
+    /// Bridge the VLM text config to the MLXLLM text config the drafter
+    /// validator and automatic policy consume. Both decode from the same HF
+    /// JSON schema (snake_case keys) and the MLXLLM decoder defaults any
+    /// absent field, so a JSON round-trip transfers every field the MTP path
+    /// reads (hidden_size, vocab_size, layer_types, num_kv_shared_layers,
+    /// attention_k_eq_v, num_global_key_value_heads, enable_moe_block).
+    public var mtpConfiguration: MLXLLM.Gemma4TextConfiguration {
+        do {
+            let data = try JSONEncoder().encode(config.textConfiguration)
+            return try JSONDecoder().decode(
+                MLXLLM.Gemma4TextConfiguration.self, from: data)
+        } catch {
+            fatalError("Gemma4 VLM→MLXLLM MTP config bridge failed: \(error)")
+        }
+    }
+
+    public func mtpNewCache(parameters: GenerateParameters?) -> [any KVCache] {
+        newCache(parameters: parameters)
+    }
+
+    /// `embed(tokens) * sqrt(hidden)` — matches the trunk's input scaling and
+    /// the MLXLLM tower's `embedTokensForDrafter`.
+    public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
+        let e = languageModel.model.embedTokens(tokens)
+        let scale = MLXArray(
+            pow(Float(config.textConfiguration.hiddenSize), 0.5), dtype: .float32)
+        return (e * scale).asType(e.dtype)
+    }
+
+    public func forwardForMTP(_ tokens: MLXArray, cache: [KVCache]) -> Gemma4MTPForward {
+        let r = languageModel.forwardForMTP(tokens, cache: cache)
+        return Gemma4MTPForward(
+            logits: r.logits, lastHidden: r.lastHidden,
+            capturedSharedKV: Gemma4SharedKV(
+                fullAttention: r.full, slidingAttention: r.sliding))
+    }
+
+    /// Single-stream rollback: uniform suffix trim of the confirmed prefix.
+    /// The VLM decode path is B=1 (no batched caches), so the per-row zeroing
+    /// branch of the MLXLLM implementation never applies here.
+    public func rollbackSpeculativeCache(
+        _ caches: [KVCache], accepted: Gemma4AcceptCount, blockSize: Int
+    ) {
+        let maxAccepted = accepted.maxAccepted()
+        let trim = Swift.max(0, blockSize - maxAccepted - 1)
+        guard trim > 0 else { return }
+        for cache in caches where cache.isTrimmable {
+            _ = cache.trim(trim)
+        }
+    }
+
+    /// Multimodal MTP prefill: merge vision/video features into the prompt
+    /// embeddings, then run the MTP forward to seed the drafter (logits +
+    /// pre-norm hidden + shared-KV). The subsequent decode rounds are
+    /// text-only and reuse `forwardForMTP`.
+    public func forwardForMTPMultimodal(
+        _ input: LMInput, cache: [KVCache]
+    ) throws -> Gemma4MTPForward {
+        let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
+            inputIds: input.text.tokens,
+            imagePixels: input.image?.pixels,
+            imageFrames: input.image?.frames,
+            videoPixels: input.video?.pixels,
+            videoFrames: input.video?.frames)
+        let tokens =
+            input.text.tokens.ndim == 1
+            ? input.text.tokens[.newAxis] : input.text.tokens
+        var visualTokenMask = tokens .== config.imageTokenId
+        if let videoTokenId = config.videoTokenId {
+            visualTokenMask = logicalOr(visualTokenMask, tokens .== videoTokenId)
+        }
+        let r = languageModel.forwardForMTP(
+            nil, cache: cache, inputsEmbeds: inputsEmbeds,
+            perLayerInputs: perLayerInputs, imageTokenMask: visualTokenMask)
+        return Gemma4MTPForward(
+            logits: r.logits, lastHidden: r.lastHidden,
+            capturedSharedKV: Gemma4SharedKV(
+                fullAttention: r.full, slidingAttention: r.sliding))
     }
 }
 

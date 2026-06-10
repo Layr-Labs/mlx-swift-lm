@@ -205,7 +205,7 @@ public enum Gemma4AcceptCount: @unchecked Sendable {
     case perRow(MLXArray)
 
     /// Max accepted across all rows (== the scalar value in the scalar case).
-    func maxAccepted() -> Int {
+    public func maxAccepted() -> Int {
         switch self {
         case .scalar(let n): return n
         case .perRow(let arr): return Int(arr.max().item(Int32.self))
@@ -317,6 +317,12 @@ public struct Gemma4MTPAutomaticPolicy: Sendable, Equatable {
 
     public static func automatic(for target: Gemma4TextModel) -> Self {
         automatic(for: target.configuration)
+    }
+
+    /// Resolve the automatic policy for any Gemma 4 MTP target tower
+    /// (text-only or VLM), using its resolved text configuration.
+    public static func automatic(forTarget target: any Gemma4MTPTarget) -> Self {
+        automatic(for: target.mtpConfiguration)
     }
 
     public static func automatic(for config: Gemma4TextConfiguration) -> Self {
@@ -986,7 +992,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     /// target's scaled embedding lookup + runs compatibility validation.
     /// Idempotent on the same target; throws `.rebindForbidden` if called
     /// with a different target.
-    public func bind(target: Gemma4TextModel) throws {
+    public func bind(target: any Gemma4MTPTarget) throws {
         let newID = ObjectIdentifier(target)
         if let existing = boundTargetID {
             if existing == newID { return }  // idempotent same-target
@@ -1201,9 +1207,9 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
 
     /// Fail-fast on every drafter/target mismatch with the field name in
     /// the error. Called once at bind time.
-    private func validateCompatibility(with target: Gemma4TextModel) throws {
+    private func validateCompatibility(with target: any Gemma4MTPTarget) throws {
         let drafterT = config.textConfig
-        let targetCfg = target.configuration
+        let targetCfg = target.mtpConfiguration
 
         // 1. Backbone hidden size must match target hidden size (pre/post
         //    projection shapes depend on this).
@@ -1376,7 +1382,7 @@ internal struct Gemma4MTPGreedyRoundResult {
 /// per-round size (`bonus + drafts`), not necessarily the user's maximum
 /// configured block size.
 internal func runGemma4MTPGreedyRound(
-    target: Gemma4TextModel,
+    target: any Gemma4MTPTarget,
     drafter: Gemma4AssistantDraftModel,
     cache: [KVCache],
     bonus: Int,
@@ -1478,7 +1484,7 @@ internal func runGemma4MTPGreedyRound(
 /// integration layer (see `generateGemma4MTP` in Task 22) wraps this with
 /// `tokenizer.decode(tokenIds:)`.
 public func runGemma4MTPRounds(
-    target: Gemma4TextModel,
+    target: any Gemma4MTPTarget,
     drafter: Gemma4AssistantDraftModel,
     targetCache: [KVCache],
     firstBonus: Int,
@@ -2089,7 +2095,7 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
 
     // Kept alive by the iterator so the GPU ops finish cleanly; not
     // inspected from the outside.
-    private let target: Gemma4TextModel
+    private let target: any Gemma4MTPTarget
     private let drafter: Gemma4AssistantDraftModel
     private var cache: [KVCache]
     private let configuredBlockSize: Int
@@ -2142,14 +2148,14 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     /// - Throws: `Gemma4MTPError.invalidBlockSize` / bind errors.
     public init(
         input: LMInput,
-        target: Gemma4TextModel,
+        target: any Gemma4MTPTarget,
         drafter: Gemma4AssistantDraftModel,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         blockSize: Int? = nil,
         rngSeed: UInt64 = 0
     ) throws {
-        let policy = Gemma4MTPAutomaticPolicy.automatic(for: target)
+        let policy = Gemma4MTPAutomaticPolicy.automatic(forTarget: target)
         let resolvedBlockSize = blockSize
             ?? policy.strategy(forBatchSize: 1).blockSize
         guard resolvedBlockSize >= 2 && resolvedBlockSize <= 16 else {
@@ -2159,7 +2165,7 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
 
         self.target = target
         self.drafter = drafter
-        self.cache = cache ?? target.newCache(parameters: parameters)
+        self.cache = cache ?? target.mtpNewCache(parameters: parameters)
         self.configuredBlockSize = resolvedBlockSize
         self.automaticPolicy = blockSize == nil ? policy : nil
         self.maxTokens = parameters.maxTokens
@@ -2207,6 +2213,76 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
 
         // First emitted token is the prefill bonus.
         self.pendingTokens.append(self.bonus)
+    }
+
+    /// Initialize from a caller-supplied prefill instead of running a
+    /// text-token prefill. Used by the multimodal VLM path: the caller merges
+    /// image/video features into the prompt embeddings, runs one
+    /// `forwardForMTP`-style multimodal pass to advance `cache` and capture the
+    /// seed `Gemma4MTPForward`, then hands it here. The subsequent decode
+    /// rounds are text-only and identical to the text path. The first emitted
+    /// token is the bonus sampled from the prefill's last position.
+    ///
+    /// - Parameters:
+    ///   - prefill: seed produced by the caller's multimodal forward (logits,
+    ///     pre-norm last hidden, shared-KV snapshot).
+    ///   - cache: the caches the caller already advanced over the prompt.
+    public init(
+        prefill: Gemma4MTPForward,
+        cache: [KVCache],
+        target: any Gemma4MTPTarget,
+        drafter: Gemma4AssistantDraftModel,
+        parameters: GenerateParameters,
+        blockSize: Int? = nil,
+        rngSeed: UInt64 = 0
+    ) throws {
+        let policy = Gemma4MTPAutomaticPolicy.automatic(forTarget: target)
+        let resolvedBlockSize = blockSize
+            ?? policy.strategy(forBatchSize: 1).blockSize
+        guard resolvedBlockSize >= 2 && resolvedBlockSize <= 16 else {
+            throw Gemma4MTPError.invalidBlockSize(resolvedBlockSize)
+        }
+        try drafter.bind(target: target)
+
+        self.target = target
+        self.drafter = drafter
+        self.cache = cache
+        self.configuredBlockSize = resolvedBlockSize
+        self.automaticPolicy = blockSize == nil ? policy : nil
+        self.maxTokens = parameters.maxTokens
+        self.temperature = parameters.temperature
+        self.topP = parameters.topP
+        self.topK = parameters.topK
+        self.minP = parameters.minP
+        self.rngKey = rngSeed == 0
+            ? MLXRandom.key(UInt64(Date().timeIntervalSince1970 * 1e6))
+            : MLXRandom.key(rngSeed)
+
+        let lastLogits = prefill.logits[0..., -1, 0...]
+        let firstBonus: Int
+        if parameters.temperature == 0 {
+            let arr = lastLogits.asType(.float32).argMax(axis: -1)
+            eval(arr)
+            firstBonus = Int(arr.item(Int32.self))
+        } else {
+            let keys = MLXRandom.split(key: self.rngKey, into: 2)
+            let idx = gemma4SampleLogitsWithFilters(
+                lastLogits,
+                temperature: parameters.temperature,
+                topP: parameters.topP, topK: parameters.topK, minP: parameters.minP,
+                rngKey: keys[0])
+            eval(idx)
+            firstBonus = Int(idx.item(Int32.self))
+            self.rngKey = keys[1]
+        }
+        self.bonus = firstBonus
+        self.hidden = prefill.lastHidden[
+            0..., -1 ..< prefill.lastHidden.dim(1), 0...]
+        self.sharedKV = prefill.capturedSharedKV
+        self.promptPrefillTime = 0
+
+        // First emitted token is the prefill bonus.
+        self.pendingTokens.append(firstBonus)
     }
 
     private mutating func nextTargetOnlyToken() -> Int? {
@@ -2483,9 +2559,19 @@ public func generateGemma4MTP(
             let generateStart = Date()
             var tokenCount = 0
             var stopReason: GenerateStopReason = .length
+            // Streaming detokenizer: buffers a token whose decoded segment ends
+            // mid-codepoint (U+FFFD) and emits only complete text. Byte-level
+            // BPE splits many characters (CJK, emoji, accented Latin) across
+            // multiple tokens, so the previous per-token `decode([tok])` emitted
+            // replacement characters / split glyphs for any non-ASCII output.
+            // Matches the continuous-batching engine's detokenization.
+            var detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
             while let tok = boxed.next() {
                 tokenCount += 1
-                continuation.yield(.chunk(tokenizer.decode(tokenIds: [tok])))
+                detokenizer.append(token: tok)
+                if let chunk = detokenizer.next(), !chunk.isEmpty {
+                    continuation.yield(.chunk(chunk))
+                }
                 if eosIds.contains(tok) {
                     stopReason = .stop
                     break
