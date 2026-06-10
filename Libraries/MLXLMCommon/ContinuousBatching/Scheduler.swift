@@ -132,6 +132,12 @@ public final class Scheduler: @unchecked Sendable {
     private let tokenizer: any Tokenizer
     private let eosTokenIds: Set<Int>
 
+    /// Optional drafter-based MTP runtime (Gemma 4). Set by the provider after
+    /// loading a compatible drafter + flag; passed into every `GenerationBatch`
+    /// the scheduler builds. Mutate before `EngineCore.start()` (same contract
+    /// as `runtimeMaxNumSeqs`).
+    public var mtpRuntime: (any BatchedMTPRuntime)?
+
     private var waiting: [Request] = []
     private var requests: [String: Request] = [:]
     public private(set) var finishedReqIds: Set<String> = []
@@ -337,7 +343,7 @@ public final class Scheduler: @unchecked Sendable {
 
         if maxRemaining == 0 {
             // All sequences prefilled — transition to decode.
-            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] })
+            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
             return
@@ -389,7 +395,7 @@ public final class Scheduler: @unchecked Sendable {
         }
 
         if pp.remaining.allSatisfy({ $0.isEmpty }) {
-            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] })
+            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
         } else {
@@ -473,6 +479,12 @@ public final class Scheduler: @unchecked Sendable {
     @discardableResult
     private func admitWaiting() -> [Request] {
         guard !waiting.isEmpty else { return [] }
+        // Defer admission while a drafter-MTP session is live: it carries
+        // ragged per-row pending tokens that the shared-index batched cache
+        // cannot absorb via `extend` mid-stream. The batch runs to completion
+        // (rows evict as they finish); waiting requests are admitted into a
+        // fresh batch once it empties. (Mid-session growth is a follow-up.)
+        if genBatch?.hasActiveMTPSession == true { return [] }
         let availableSlots = max(0, runtimeMaxNumSeqs - activeRids.count)
         guard availableSlots > 0 else { return [] }
 
@@ -647,7 +659,8 @@ public final class Scheduler: @unchecked Sendable {
                 maxTokens: warmMaxTokens,
                 samplers: warmSamplers,
                 fallbackSampler: greedySampler,
-                stateMachines: warmMachines
+                stateMachines: warmMachines,
+                mtpRuntime: mtpRuntime
             )
             mergeIntoGenBatch(warmGen)
         }
@@ -744,7 +757,7 @@ public final class Scheduler: @unchecked Sendable {
             fallbackSampler: greedySampler,
             stateMachines: [entry.machine]
         )
-        let gen = ppBatch.generate(lastTokensOf: [suffix])
+        let gen = ppBatch.generate(lastTokensOf: [suffix], mtpRuntime: mtpRuntime)
         mergeIntoGenBatch(gen)
         return true
     }

@@ -51,8 +51,14 @@ public protocol BatchedMTPRuntime: AnyObject, Sendable {
 
     /// Seed a session by advancing `caches` over `seedTokens` (`[B]` — each
     /// row's most recent sampled token, not yet in the cache) and capturing
-    /// the per-row MTP carry. Returns nil when MTP cannot run for this
-    /// model/state (e.g. the model isn't MTP-capable or the drafter is
-    /// unbound), in which case the caller stays on plain decode.
-    func beginSession(seedTokens: MLXArray, caches: [any KVCache]) -> BatchedMTPSession?
+    /// the per-row MTP carry. The seed forward also samples each row's next
+    /// token (the "bonus"), returned alongside the session so the caller can
+    /// emit `[seedToken, bonus]` per row before the first round (the bonus is
+    /// the round-1 draft seed and is not re-emitted by the round).
+    /// Returns nil when MTP cannot run for this model/state (e.g. the model
+    /// isn't MTP-capable or the drafter is unbound) — caller stays on plain
+    /// decode.
+    func beginSession(
+        seedTokens: MLXArray, caches: [any KVCache]
+    ) -> (session: BatchedMTPSession, bonus: [Int])?
 }

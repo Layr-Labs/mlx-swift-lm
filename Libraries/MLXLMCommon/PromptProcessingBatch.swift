@@ -144,7 +144,10 @@ public final class PromptProcessingBatch: @unchecked Sendable {
     ///
     /// Ownership of the cache and per-row state transfers to the returned
     /// `GenerationBatch`.
-    public func generate(lastTokensOf inputTokens: [[Int]]) -> GenerationBatch {
+    public func generate(
+        lastTokensOf inputTokens: [[Int]],
+        mtpRuntime: (any BatchedMTPRuntime)? = nil
+    ) -> GenerationBatch {
         precondition(
             inputTokens.count == uids.count,
             "PromptProcessingBatch.generate: token list length \(inputTokens.count) "
@@ -167,7 +170,8 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             maxTokens: maxTokens,
             samplers: samplers,
             fallbackSampler: fallbackSampler,
-            stateMachines: stateMachines
+            stateMachines: stateMachines,
+            mtpRuntime: mtpRuntime
         )
 
         uids = []

@@ -1855,7 +1855,7 @@ public final class Gemma4MTPEngineRuntime: BatchedMTPRuntime, @unchecked Sendabl
 
     public func beginSession(
         seedTokens: MLXArray, caches: [any KVCache]
-    ) -> BatchedMTPSession? {
+    ) -> (session: BatchedMTPSession, bonus: [Int])? {
         let B = seedTokens.dim(0)
         // Advance the cache over the seed tokens (one forward) and capture the
         // per-row MTP carry: bonus (next greedy token), pre-norm hidden, and
@@ -1868,7 +1868,7 @@ public final class Gemma4MTPEngineRuntime: BatchedMTPRuntime, @unchecked Sendabl
         let state = Gemma4MTPBatchState(
             target: target, drafter: drafter, blockSize: blockSize,
             firstBonus: bonus, firstHidden: hidden, firstSharedKV: out.capturedSharedKV)
-        return Gemma4MTPSessionBox(state: state)
+        return (Gemma4MTPSessionBox(state: state), bonus)
     }
 }
 

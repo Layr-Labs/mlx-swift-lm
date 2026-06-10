@@ -75,6 +75,22 @@ public final class GenerationBatch: @unchecked Sendable {
     /// Port of omlx commit 696d90a: batch_generator.py _omlx_mtp_state
     internal var _omlxMtpState: MTPState?
 
+    /// Optional drafter-based MTP runtime (Gemma 4). When set and the batch is
+    /// eligible (size ≤ `maxBatch`, all rows greedy), `next()` speculates one
+    /// MTP round per call instead of a single decode step. Injected by the
+    /// `Scheduler`; nil = plain decode (the default).
+    internal let mtpRuntime: (any BatchedMTPRuntime)?
+    /// Live drafter-MTP session over the current rows. Non-nil once entered;
+    /// persists across `next()` calls; compacted as rows finish; cleared when
+    /// the batch empties. While non-nil the `Scheduler` must not `extend()`
+    /// this batch (the session carries ragged per-row pending tokens that the
+    /// shared-index cache can't absorb mid-stream — see BatchedMTP.swift).
+    private var mtpSession: (any BatchedMTPSession)?
+
+    /// True while a drafter-MTP session is active. The scheduler gates
+    /// admission on this (no mid-session `extend`).
+    public var hasActiveMTPSession: Bool { mtpSession != nil }
+
     public init(
         model: any LanguageModel,
         uids: [Int],
@@ -84,8 +100,10 @@ public final class GenerationBatch: @unchecked Sendable {
         maxTokens: [Int],
         samplers: [RowSampler?]? = nil,
         fallbackSampler: @escaping RowSampler = greedySampler,
-        stateMachines: [SequenceStateMachine]? = nil
+        stateMachines: [SequenceStateMachine]? = nil,
+        mtpRuntime: (any BatchedMTPRuntime)? = nil
     ) {
+        self.mtpRuntime = mtpRuntime
         precondition(uids.count == tokens.count, "uids/tokens count mismatch")
         precondition(uids.count == maxTokens.count, "uids/max_tokens count mismatch")
         self.model = model
@@ -135,6 +153,17 @@ public final class GenerationBatch: @unchecked Sendable {
                 // Fall back to standard step; drop state to prevent half-built cycles.
                 _omlxMtpState = nil
             }
+        }
+
+        // Drafter-based MTP (Gemma 4): one speculative round per call when a
+        // runtime is attached and the batch is eligible (size ≤ maxBatch, all
+        // greedy). A session, once entered, persists until the batch empties.
+        if let runtime = mtpRuntime, mtpEligible(runtime) {
+            if let responses = gemma4MtpNext(runtime: runtime) {
+                return responses
+            }
+            // beginSession returned nil (model not MTP-capable): fall through
+            // to plain decode and never retry MTP for this batch.
         }
 
         let stepTokens = step()
@@ -370,6 +399,104 @@ public final class GenerationBatch: @unchecked Sendable {
         }
 
         return stepTokens
+    }
+
+    // MARK: - Drafter-based MTP (Gemma 4) decode
+
+    /// Whether the batch may speculate this call: size within the runtime's
+    /// cap and every row greedy (the batched round loop is greedy in v1).
+    private func mtpEligible(_ runtime: any BatchedMTPRuntime) -> Bool {
+        guard !uids.isEmpty else { return false }
+        guard uids.count <= runtime.maxBatch else { return false }
+        guard !samplers.contains(where: { $0 != nil }) else { return false }
+        return true
+    }
+
+    /// Run one drafter-MTP round (or enter a session) and emit its tokens.
+    /// Returns per-row responses (possibly several per uid — the scheduler
+    /// appends them in order), or nil if a session couldn't be started (the
+    /// caller then falls back to plain decode for this batch).
+    private func gemma4MtpNext(runtime: any BatchedMTPRuntime) -> [GenerationBatchResponse]? {
+        let caches = promptCache.map { $0 as any KVCache }
+        var blocks: [[Int]]
+
+        if mtpSession == nil {
+            // ENTER: feed the buffered token (seed) via one forward, capturing
+            // the per-row carry + bonus. Emit [seed, bonus]: seed is the
+            // model's confirmed next token; bonus is the round-1 draft seed and
+            // is not re-emitted by the round, so it must be emitted here.
+            eval(nextTokens)
+            let seed = nextTokens.asArray(UInt32.self).map { Int($0) }
+            guard let (session, bonus) = runtime.beginSession(
+                seedTokens: nextTokens, caches: caches)
+            else { return nil }
+            mtpSession = session
+            blocks = (0 ..< uids.count).map { [seed[$0], bonus[$0]] }
+        } else {
+            // STEADY: one round, capped per row by the remaining budget.
+            let maxNewPerRow = (0 ..< uids.count).map {
+                Swift.max(1, maxTokens[$0] - numTokens[$0])
+            }
+            blocks = mtpSession!.step(caches: caches, maxNewPerRow: maxNewPerRow)
+        }
+
+        return emitMTPBlocks(blocks)
+    }
+
+    /// Apply the standard per-token epilogue to each row's emitted block,
+    /// truncating a row at its first finish, then evict finished rows
+    /// (filter + session compaction). Mirrors the standard `next()` epilogue.
+    private func emitMTPBlocks(_ blocks: [[Int]]) -> [GenerationBatchResponse] {
+        let n = uids.count
+        var responses: [GenerationBatchResponse] = []
+        var keep: [Int] = []
+        keep.reserveCapacity(n)
+
+        for i in 0 ..< n {
+            var finishedRow = false
+            for t in blocks[i] {
+                if finishedRow { break }
+                numTokens[i] += 1
+                tokens[i].append(t)
+
+                var finishReason: String? = nil
+                if numTokens[i] >= maxTokens[i] { finishReason = "length" }
+                let machine = stateMachines[i]
+                let (nextState, matchedSequence, currentState) =
+                    machine.match(matcherStates[i], t)
+                matcherStates[i] = nextState
+                if matchedSequence != nil, currentState == nil { finishReason = "stop" }
+
+                if let finishReason {
+                    finishedRow = true
+                    // Prefix-cache storage is skipped for MTP rows (promptCache
+                    // nil): the live cache is the confirmed prefix and excludes
+                    // the row's pending tail, so the extracted cache wouldn't
+                    // match the full emitted sequence. Storing the complete
+                    // prefix is a follow-up (feed pendings before extract).
+                    responses.append(GenerationBatchResponse(
+                        uid: uids[i], token: t, finishReason: finishReason,
+                        matchedSequence: matchedSequence, currentState: currentState,
+                        allTokens: tokens[i], promptCache: nil))
+                } else {
+                    responses.append(GenerationBatchResponse(
+                        uid: uids[i], token: t, finishReason: nil,
+                        matchedSequence: matchedSequence, currentState: currentState,
+                        allTokens: nil, promptCache: nil))
+                }
+            }
+            if !finishedRow { keep.append(i) }
+        }
+
+        if keep.count < n {
+            // Compact the session carry to survivors, then filter cache +
+            // metadata by the same local indices.
+            mtpSession?.compactCarry(keepLocal: keep)
+            filter(keep: keep)
+            if uids.isEmpty { mtpSession = nil }
+        }
+
+        return responses
     }
 }
 
