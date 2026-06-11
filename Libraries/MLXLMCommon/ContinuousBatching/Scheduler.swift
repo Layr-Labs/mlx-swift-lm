@@ -132,6 +132,12 @@ public final class Scheduler: @unchecked Sendable {
     private let tokenizer: any Tokenizer
     private let eosTokenIds: Set<Int>
 
+    /// Optional drafter-based MTP runtime (Gemma 4). Set by the provider after
+    /// loading a compatible drafter + flag; passed into every `GenerationBatch`
+    /// the scheduler builds. Mutate before `EngineCore.start()` (same contract
+    /// as `runtimeMaxNumSeqs`).
+    public var mtpRuntime: (any BatchedMTPRuntime)?
+
     private var waiting: [Request] = []
     private var requests: [String: Request] = [:]
     public private(set) var finishedReqIds: Set<String> = []
@@ -336,8 +342,15 @@ public final class Scheduler: @unchecked Sendable {
         let maxRemaining = pp.remaining.map { $0.count }.max() ?? 0
 
         if maxRemaining == 0 {
+            // Hold the completed prefill while the live genBatch is mid-MTP
+            // session: `extend()` would grow `uids`/caches without growing the
+            // session's per-row carry, tripping the round precondition. Merge
+            // once the session ends (the batch empties → mtpSession cleared in
+            // GenerationBatch.filter). pendingPrefill is unmutated here, so a
+            // bare return safely retains it for a later step.
+            if genBatch?.hasActiveMTPSession == true { return }
             // All sequences prefilled — transition to decode.
-            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] })
+            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
             return
@@ -389,7 +402,14 @@ public final class Scheduler: @unchecked Sendable {
         }
 
         if pp.remaining.allSatisfy({ $0.isEmpty }) {
-            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] })
+            // Hold (don't merge) while a live MTP session owns the genBatch;
+            // the merge will fire from the maxRemaining==0 branch on a later
+            // step once the session ends. Store the now-complete prefill back.
+            if genBatch?.hasActiveMTPSession == true {
+                pendingPrefill = pp
+                return
+            }
+            let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
         } else {
@@ -473,6 +493,12 @@ public final class Scheduler: @unchecked Sendable {
     @discardableResult
     private func admitWaiting() -> [Request] {
         guard !waiting.isEmpty else { return [] }
+        // Defer admission while a drafter-MTP session is live: it carries
+        // ragged per-row pending tokens that the shared-index batched cache
+        // cannot absorb via `extend` mid-stream. The batch runs to completion
+        // (rows evict as they finish); waiting requests are admitted into a
+        // fresh batch once it empties. (Mid-session growth is a follow-up.)
+        if genBatch?.hasActiveMTPSession == true { return [] }
         let availableSlots = max(0, runtimeMaxNumSeqs - activeRids.count)
         guard availableSlots > 0 else { return [] }
 
@@ -566,13 +592,20 @@ public final class Scheduler: @unchecked Sendable {
                 || params.frequencyPenalty != 0.0
             let history = TokenHistoryHolder(tokens: promptTokens)
             tokenHistories[request.requestId] = history
+            // Greedy (temperature 0, no penalty) uses a nil sampler so the
+            // GenerationBatch takes its argMax fast path. `makeRowSampler(0)`
+            // is exactly argMax, so this is behavior-preserving — and it's the
+            // condition the drafter-MTP path keys on (it speculates greedily,
+            // so it only engages when every row is nil-sampler greedy). With a
+            // non-nil baseSampler here, MTP would never become eligible.
+            let isGreedy = params.temperature == 0 && !needsPenalty
             let sampler: RowSampler? = needsPenalty
                 ? makeRepetitionSampler(
                     base: baseSampler, history: history,
                     repetitionPenalty: params.repetitionPenalty,
                     presencePenalty: params.presencePenalty,
                     frequencyPenalty: params.frequencyPenalty)
-                : baseSampler
+                : (isGreedy ? nil : baseSampler)
 
             activeSamplers[request.requestId] = sampler
             activeDetokenizers[request.requestId] = NaiveStreamingDetokenizer(tokenizer: tokenizer)
@@ -647,7 +680,8 @@ public final class Scheduler: @unchecked Sendable {
                 maxTokens: warmMaxTokens,
                 samplers: warmSamplers,
                 fallbackSampler: greedySampler,
-                stateMachines: warmMachines
+                stateMachines: warmMachines,
+                mtpRuntime: mtpRuntime
             )
             mergeIntoGenBatch(warmGen)
         }
@@ -744,7 +778,7 @@ public final class Scheduler: @unchecked Sendable {
             fallbackSampler: greedySampler,
             stateMachines: [entry.machine]
         )
-        let gen = ppBatch.generate(lastTokensOf: [suffix])
+        let gen = ppBatch.generate(lastTokensOf: [suffix], mtpRuntime: mtpRuntime)
         mergeIntoGenBatch(gen)
         return true
     }

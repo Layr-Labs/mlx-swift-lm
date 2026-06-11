@@ -454,6 +454,81 @@ struct Gemma4E4BMTPParityTests {
         return perRow
     }
 
+    // MARK: - Engine-path runners (GenerationBatch + BatchedMTPRuntime)
+
+    /// Build the per-layer batched cache for a Gemma 4 target (uniform rows).
+    private func makeBatchedCache(target: Gemma4TextModel, B: Int) -> [any BatchedCache] {
+        let firstKvShared = target.configuration.numHiddenLayers
+                          - target.configuration.numKvSharedLayers
+        let leftPadding = Array(repeating: 0, count: B)
+        var cache: [any BatchedCache] = []
+        for i in 0 ..< firstKvShared {
+            if target.configuration.layerTypes[i] == "full_attention" {
+                cache.append(BatchKVCache(leftPadding: leftPadding))
+            } else {
+                cache.append(BatchRotatingKVCache(
+                    maxSize: target.configuration.slidingWindow, leftPadding: leftPadding))
+            }
+        }
+        return cache
+    }
+
+    /// Plain batched greedy decode (no speculation), per-row token streams.
+    /// The "no garbage" oracle: MTP must reproduce this exactly.
+    private func runPlainBatchedGreedy(
+        target: Gemma4TextModel, promptIds: [[Int32]], maxTokens: Int
+    ) -> [[Int]] {
+        let B = promptIds.count
+        let L = promptIds[0].count
+        let cache = makeBatchedCache(target: target, B: B).map { $0 as any KVCache }
+        var logits = target(MLXArray(promptIds.flatMap { $0 }, [B, L]), cache: cache)
+        var tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)  // [B]
+        eval(tok)
+        var out: [[Int]] = Array(repeating: [], count: B)
+        for (b, t) in tok.asArray(Int32.self).enumerated() { out[b].append(Int(t)) }
+        for _ in 1 ..< maxTokens {
+            logits = target(tok.reshaped([B, 1]), cache: cache)
+            tok = logits[0..., -1, 0...].asType(.float32).argMax(axis: -1)
+            eval(tok)
+            for (b, t) in tok.asArray(Int32.self).enumerated() { out[b].append(Int(t)) }
+        }
+        return out
+    }
+
+    /// Drive the engine's `GenerationBatch` with a `Gemma4MTPEngineRuntime`
+    /// attached, exactly as the continuous-batching scheduler would. Prefills
+    /// prompt[:-1] into batched caches, seeds with prompt[-1] (the init step
+    /// feeds it), then drains `next()` collecting per-row tokens.
+    private func runEngineMTP(
+        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel,
+        promptIds: [[Int32]], maxTokens: Int, blockSize: Int, maxBatch: Int
+    ) throws -> [[Int]] {
+        let B = promptIds.count
+        let runtime = try Gemma4MTPEngineRuntime(
+            target: target, drafter: drafter, maxBatch: maxBatch, blockSize: blockSize)
+        // Prefill prompt[:-1] so the GenerationBatch init step() feeds prompt[-1].
+        let prefixes = promptIds.map { Array($0.dropLast()) }
+        let pl = prefixes[0].count
+        let cache = makeBatchedCache(target: target, B: B)
+        if pl > 0 {
+            _ = target.forwardForMTP(
+                MLXArray(prefixes.flatMap { $0 }, [B, pl]), cache: cache.map { $0 as any KVCache })
+        }
+        let seed = MLXArray(promptIds.map { UInt32($0.last ?? 0) })
+        let gen = GenerationBatch(
+            model: target, uids: Array(0 ..< B), seedTokens: seed,
+            promptCache: cache, tokens: promptIds.map { $0.map(Int.init) },
+            maxTokens: Array(repeating: maxTokens, count: B),
+            mtpRuntime: runtime)
+        var out: [[Int]] = Array(repeating: [], count: B)
+        var guardSteps = 0
+        while !gen.isEmpty && guardSteps < maxTokens * 4 + 8 {
+            guardSteps += 1
+            for r in gen.next() { out[r.uid].append(r.token) }
+        }
+        return out
+    }
+
     // MARK: - Tests
 
     @Test(arguments: [
@@ -633,6 +708,131 @@ struct Gemma4E4BMTPParityTests {
                 """
             )
         }
+    }
+
+    /// Engine-path parity: driving `GenerationBatch` with a
+    /// `Gemma4MTPEngineRuntime` attached must produce the SAME tokens as plain
+    /// batched greedy decode (the "no garbage" guarantee for the wired-in
+    /// engine). Covers B=1 and B=2 (≤ maxBatch, so MTP engages) and a
+    /// staggered-budget case where one row finishes first (eviction +
+    /// session compaction mid-stream).
+    @Test(arguments: [
+        (blockSize: 2, B: 1, maxTokens: 24),
+        (blockSize: 3, B: 1, maxTokens: 24),
+        (blockSize: 3, B: 2, maxTokens: 20),
+        (blockSize: 4, B: 2, maxTokens: 20),
+    ])
+    func engine_mtp_parity_E4B(
+        config: (blockSize: Int, B: Int, maxTokens: Int)
+    ) throws {
+        MLXRandom.seed(
+            UInt64(config.blockSize) * 991 + UInt64(config.B) * 131 + UInt64(config.maxTokens))
+        var rng = SeededRNG(
+            seed: UInt64(config.blockSize) * 991 + UInt64(config.B) * 131 + UInt64(config.maxTokens))
+        let promptLen = 8
+        let promptIds: [[Int32]] = (0 ..< config.B).map { _ in
+            (0 ..< promptLen).map { _ in Int32.random(in: 0 ..< 1024, using: &rng) }
+        }
+
+        let target = Gemma4TextModel(try e4bStyleTargetConfig())
+        let drafter = Gemma4AssistantDraftModel(config: try e4bStyleDrafterConfig())
+        eval(target, drafter)
+
+        let plain = runPlainBatchedGreedy(
+            target: target, promptIds: promptIds, maxTokens: config.maxTokens)
+        let engine = try runEngineMTP(
+            target: target, drafter: drafter, promptIds: promptIds,
+            maxTokens: config.maxTokens, blockSize: config.blockSize, maxBatch: 2)
+
+        #expect(engine.count == plain.count)
+        for i in 0 ..< plain.count {
+            // Compare on the common prefix (both should reach maxTokens; the
+            // engine caps emission at the per-row budget exactly like plain).
+            let n = Swift.min(plain[i].count, engine[i].count)
+            #expect(plain[i].count == engine[i].count,
+                "row \(i): engine emitted \(engine[i].count) vs plain \(plain[i].count) (B=\(config.B), K=\(config.blockSize))")
+            #expect(
+                Array(engine[i].prefix(n)) == Array(plain[i].prefix(n)),
+                """
+                Engine-MTP vs plain-decode divergence at row \(i)
+                  blockSize=\(config.blockSize) B=\(config.B) maxTokens=\(config.maxTokens)
+                  plain[\(i)] =\(plain[i])
+                  engine[\(i)]=\(engine[i])
+                """
+            )
+        }
+    }
+
+    /// Build a prefilled engine GenerationBatch with the MTP runtime attached,
+    /// ready to drive via next() (prompt[:-1] prefilled, seed = prompt[-1]).
+    private func makeEngineBatch(
+        target: Gemma4TextModel, drafter: Gemma4AssistantDraftModel,
+        promptIds: [[Int32]], maxTokens: Int, blockSize: Int, maxBatch: Int
+    ) throws -> GenerationBatch {
+        let B = promptIds.count
+        let runtime = try Gemma4MTPEngineRuntime(
+            target: target, drafter: drafter, maxBatch: maxBatch, blockSize: blockSize)
+        let prefixes = promptIds.map { Array($0.dropLast()) }
+        let pl = prefixes[0].count
+        let cache = makeBatchedCache(target: target, B: B)
+        if pl > 0 {
+            _ = target.forwardForMTP(
+                MLXArray(prefixes.flatMap { $0 }, [B, pl]), cache: cache.map { $0 as any KVCache })
+        }
+        let seed = MLXArray(promptIds.map { UInt32($0.last ?? 0) })
+        return GenerationBatch(
+            model: target, uids: Array(0 ..< B), seedTokens: seed,
+            promptCache: cache, tokens: promptIds.map { $0.map(Int.init) },
+            maxTokens: Array(repeating: maxTokens, count: B), mtpRuntime: runtime)
+    }
+
+    /// Regression for the scheduler-abort invariant: filter() must keep the MTP
+    /// session carry aligned (compact survivors) and clear it when the batch
+    /// empties — otherwise the next round traps `maxNewPerRow.count == B`, or an
+    /// emptied-but-non-nil session wedges admission. Mirrors a mid-session row
+    /// abort (consumer disconnect) and a last-row abort.
+    @Test func engine_mtp_midsession_eviction() throws {
+        MLXRandom.seed(77)
+        var rng = SeededRNG(seed: 77)
+        let B = 2, promptLen = 8, maxTokens = 24
+        let promptIds: [[Int32]] = (0 ..< B).map { _ in
+            (0 ..< promptLen).map { _ in Int32.random(in: 0 ..< 1024, using: &rng) }
+        }
+        let target = Gemma4TextModel(try e4bStyleTargetConfig())
+        let drafter = Gemma4AssistantDraftModel(config: try e4bStyleDrafterConfig())
+        eval(target, drafter)
+
+        // Phase 1: enter a B=2 session, abort one row mid-session, run the
+        // survivor to completion — must not crash and must clear on empty.
+        let gen = try makeEngineBatch(
+            target: target, drafter: drafter, promptIds: promptIds,
+            maxTokens: maxTokens, blockSize: 3, maxBatch: 2)
+        _ = gen.next()  // ENTER: session active over both rows
+        #expect(gen.hasActiveMTPSession)
+        #expect(gen.batchSize == 2)
+        // Abort the row with uid == 1 (scheduler doAbortRequest path).
+        let keep = (0 ..< gen.uids.count).filter { gen.uids[$0] != 1 }
+        gen.filter(keep: keep)
+        #expect(gen.batchSize == 1)
+        #expect(gen.hasActiveMTPSession)  // survivor still speculating
+        var steps = 0
+        while !gen.isEmpty && steps < maxTokens * 4 + 16 {
+            _ = gen.next()
+            steps += 1
+        }
+        #expect(gen.isEmpty)
+        #expect(!gen.hasActiveMTPSession)  // cleared when the batch emptied
+
+        // Phase 2: aborting the LAST active row clears the session immediately
+        // (else admission would deadlock on a non-nil session over an empty batch).
+        let gen2 = try makeEngineBatch(
+            target: target, drafter: drafter, promptIds: [promptIds[0]],
+            maxTokens: maxTokens, blockSize: 3, maxBatch: 2)
+        _ = gen2.next()
+        #expect(gen2.hasActiveMTPSession)
+        gen2.filter(keep: [])
+        #expect(gen2.isEmpty)
+        #expect(!gen2.hasActiveMTPSession)
     }
 }
 
