@@ -1,0 +1,45 @@
+name: PagedKVCache Tests
+
+# Fork-runnable Swift test job (the main Build and Test workflow is gated to
+# ml-explore/mlx-swift-lm). Runs the PagedKVCache + BlockAllocator tests on a
+# Blacksmith macOS runner so MLX has a Metal device.
+on:
+  pull_request:
+    paths:
+      - "Libraries/MLXLMCommon/PagedKVCache.swift"
+      - "Libraries/MLXLMCommon/BlockAllocator.swift"
+      - "Tests/MLXLMTests/PagedKVCacheTests.swift"
+      - ".github/workflows/paged-kv-cache-test.yml"
+  workflow_dispatch:
+
+jobs:
+  paged-kv-cache:
+    name: PagedKVCache Swift tests
+    runs-on: blacksmith-12vcpu-macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tests
+        run: swift build --build-tests
+
+      - name: Extract and colocate mlx.metallib
+        run: |
+          python3 -m venv /tmp/mlxvenv
+          /tmp/mlxvenv/bin/pip install 'mlx==0.31.1'
+          pyver="$(/tmp/mlxvenv/bin/python -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+          metallib="/tmp/mlxvenv/lib/python${pyver}/site-packages/mlx/lib/mlx.metallib"
+          test -f "$metallib" || { echo "::error::mlx.metallib not found at $metallib"; exit 1; }
+          # MLX's C++ loader looks for mlx.metallib next to the running binary.
+          # Under `swift test` that is the xctest runner inside the bundle, so
+          # place a copy there as well as in .build/debug.
+          cp "$metallib" .build/debug/mlx.metallib
+          for bundle in .build/debug/*PackageTests.xctest; do
+            macos="$bundle/Contents/MacOS"
+            if [ -d "$macos" ]; then
+              cp "$metallib" "$macos/mlx.metallib"
+              echo "placed metallib in $macos"
+            fi
+          done
+
+      - name: Run PagedKVCache tests
+        run: swift test --filter PagedKVCache
