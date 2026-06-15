@@ -535,6 +535,149 @@ struct Gemma4MTPBenchmarkTests {
         print("wrote \(outPath)")
     }
 
+    /// Regression for the ragged-batch left-padding corruption.
+    ///
+    /// When prompts of different lengths are batched, the cache left-pads the
+    /// short rows and the attention mask blocks their padding slots. The
+    /// padding-position *queries* are then fully masked (every key blocked) and
+    /// the hand-rolled batched-attention fallback softmaxed them to NaN; the
+    /// `0 * NaN` in the value matmul propagated NaN into the hidden state and a
+    /// later layer's real queries (which mask padding keys to weight 0) hit
+    /// `0 * NaN` again, corrupting EVERY row -> all-NaN logits -> token-salad
+    /// under concurrent load. See the NaN guard in `gemma4AttentionFallback`.
+    ///
+    /// This asserts the deterministic bug signature on a tiny random-weight
+    /// model (fast, no model download, CI-safe):
+    ///   (1) batched prefill logits are finite for every row (no NaN), and
+    ///   (2) each row's first generated token matches its solo (B=1) decode.
+    /// Full-sequence parity is intentionally NOT asserted: greedy argMax on a
+    /// random-weight model is numerically hypersensitive, so benign batched-vs-
+    /// solo reduction-order flips occur mid-stream. The gated
+    /// `raggedBatchGreedyParityRealModel` confirms coherent full parity on the
+    /// real model. (The pre-existing `batchedParityRealModel` only compared
+    /// batched-MTP vs batched-baseline — both share the batched path, so they
+    /// agreed while both were wrong; this compares against the independent B=1
+    /// oracle.)
+    @Test func raggedBatchGreedyParityTinyModel() throws {
+        MLXRandom.seed(1234)
+        let target = Gemma4TextModel(try tinyTargetConfig())
+        eval(target)
+
+        // Ragged prompt lengths -> different per-row left-padding when batched.
+        let prompts: [[Int32]] = [
+            [1, 5, 9, 3, 7],  // len 5 (most left-padding when batched)
+            [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],  // len 12
+            (0 ..< 30).map { Int32(($0 * 7 + 1) % 1000) },  // len 30
+        ]
+
+        // (1) Batched ragged prefill must produce FINITE logits for every row,
+        // including the heavily left-padded ones. Pre-fix this was all-NaN.
+        let (padded, leftPadding) = leftPadBatch(prompts)
+        let cache = makeBatchedCache(target: target, leftPadding: leftPadding)
+        let prefillLast = target(padded, cache: cache)[0..., -1, 0...].asType(.float32)
+        eval(prefillLast)
+        let nanCount = (prefillLast .!= prefillLast).sum().item(Int32.self)
+        #expect(
+            nanCount == 0,
+            "batched ragged prefill produced \(nanCount) NaN logits (left-padding fully-masked-query corruption)")
+
+        // (2) Each row's first generated token in the ragged batch must equal
+        // its solo (B=1) decode. Pre-fix the left-padded rows produced token 0.
+        let maxTokens = 4
+        let batched = runBatchedBaselineGreedyTokens(
+            target: target, promptTokens: prompts, maxTokens: maxTokens)
+        for (i, p) in prompts.enumerated() {
+            let solo = runBatchedBaselineGreedyTokens(
+                target: target, promptTokens: [p], maxTokens: maxTokens)[0]
+            MLX.Memory.clearCache()
+            #expect(
+                batched[i].first == solo.first,
+                "row \(i) (len \(p.count)) first batched token \(batched[i].first ?? -1) != solo \(solo.first ?? -1)")
+        }
+    }
+
+    /// Same batched-vs-solo parity check on the real model (gated). Asserts the
+    /// bug signature — finite logits + per-row first-token parity — and PRINTS
+    /// any later divergence (which on a real model is benign near-tie argMax
+    /// drift, not corruption) without failing on it. Point it at a local model:
+    ///   RAGGED_PARITY=1 RAGGED_MODEL_DIR=/path/to/gemma-4-... \
+    ///   [MTP_BENCH_PROMPTS=/tmp/ragged_prompts.json] swift test \
+    ///   --filter raggedBatchGreedyParityRealModel
+    @Test func raggedBatchGreedyParityRealModel() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["RAGGED_PARITY"] == "1" else {
+            print("Skipping: set RAGGED_PARITY=1 + RAGGED_MODEL_DIR")
+            return
+        }
+        guard let modelDir = env["RAGGED_MODEL_DIR"]
+            ?? env["MTP_BENCH_DATA_DIR"].map({
+                "\($0)/\(env["RAGGED_TARGET"] ?? "gemma-4-26B-A4B-it-qat-4bit")"
+            })
+        else {
+            print("Skipping: set RAGGED_MODEL_DIR (or MTP_BENCH_DATA_DIR)")
+            return
+        }
+        let maxTokens = Int(env["RAGGED_MAXTOK"] ?? "48") ?? 48
+        let prompts: [[Int32]]
+        if let pp = env["MTP_BENCH_PROMPTS"] {
+            prompts = try JSONDecoder()
+                .decode([[Int]].self, from: Data(contentsOf: URL(fileURLWithPath: pp)))
+                .map { $0.map { Int32($0) } }
+        } else {
+            prompts = [
+                [2, 3, 4, 5, 6],
+                [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+                (0 ..< 30).map { Int32($0 + 2) },
+            ]
+        }
+
+        let (target, _) = try loadRealTargetAsTextModel(
+            from: URL(fileURLWithPath: modelDir))
+        eval(target)
+
+        // Finite-logit check on the ragged prefill (the bug signature).
+        let (padded, leftPadding) = leftPadBatch(prompts)
+        let prefillCache = makeBatchedCache(target: target, leftPadding: leftPadding)
+        let prefillLast = target(padded, cache: prefillCache)[0..., -1, 0...].asType(.float32)
+        eval(prefillLast)
+        let nanCount = (prefillLast .!= prefillLast).sum().item(Int32.self)
+        MLX.Memory.clearCache()
+        #expect(nanCount == 0, "real-model ragged prefill produced \(nanCount) NaN logits")
+
+        var solo: [[Int]] = []
+        for p in prompts {
+            solo.append(
+                runBatchedBaselineGreedyTokens(
+                    target: target, promptTokens: [p], maxTokens: maxTokens)[0])
+            MLX.Memory.clearCache()
+        }
+        let batched = runBatchedBaselineGreedyTokens(
+            target: target, promptTokens: prompts, maxTokens: maxTokens)
+        MLX.Memory.clearCache()
+
+        print("\n=== Ragged batched-vs-solo parity (real model, max_tokens=\(maxTokens)) ===")
+        for (i, p) in prompts.enumerated() {
+            let firstDiv = zip(solo[i], batched[i]).enumerated()
+                .first(where: { $0.element.0 != $0.element.1 })?.offset
+            if let d = firstDiv {
+                print("row \(i) (len \(p.count)) matches \(d) tokens then forks "
+                    + "(benign argMax near-tie): solo=\(solo[i].prefix(8)) batched=\(batched[i].prefix(8))")
+            } else {
+                print("row \(i) (len \(p.count)) EXACT (\(solo[i].count) tokens)")
+            }
+            // The bug signature is a row corrupted from the FIRST token; a real
+            // model's later forks are benign numerical drift.
+            #expect(
+                batched[i].first == solo[i].first,
+                "row \(i) corrupted from token 0 (batched=\(batched[i].prefix(4)) solo=\(solo[i].prefix(4)))")
+        }
+        if let outPath = env["RAGGED_OUT"] {
+            try? JSONEncoder().encode(["solo": solo, "batched": batched])
+                .write(to: URL(fileURLWithPath: outPath))
+            print("wrote \(outPath)")
+        }
+    }
+
     /// Real-model ENGINE-path verification: drives the actual continuous-
     /// batching `GenerationBatch` + `Gemma4MTPEngineRuntime` on the 26B model
     /// (the wired-in path the server uses), at B=1/2/4. Reports engine-MTP

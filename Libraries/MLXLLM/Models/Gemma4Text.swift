@@ -317,7 +317,17 @@ private func gemma4AttentionFallback(
         }
     }
 
-    scores = softmax(scores.asType(.float32), axis: -1, precise: true).asType(scores.dtype)
+    var probs = softmax(scores.asType(.float32), axis: -1, precise: true)
+    // A fully-masked query row (every key masked -> all -inf) softmaxes to NaN.
+    // For left-padded batches these are the padding query positions, whose
+    // outputs are discarded — but `0 * NaN = NaN` in the value matmul below
+    // would propagate NaN into the hidden state, and a later layer's real
+    // queries (which mask padding keys to weight 0) then hit `0 * NaN` again
+    // and corrupt EVERY row of the batch. Map NaN -> 0 so a fully-masked query
+    // contributes nothing. This matches `MLXFast.scaledDotProductAttention`,
+    // which this manual fallback replaces for the batched (ragged) path.
+    probs = MLX.where(probs .!= probs, MLXArray(Float(0)), probs)
+    scores = probs.asType(scores.dtype)
     var output = matmul(scores, v)
     if repeats > 1 {
         output = output.reshaped([B, nQHeads, L, values.dim(3)])
