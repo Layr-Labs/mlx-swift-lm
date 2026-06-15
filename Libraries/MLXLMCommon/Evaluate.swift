@@ -154,7 +154,11 @@ public struct GenerateParameters: Sendable {
 
     public func processor() -> LogitProcessor? {
         let repetitionContext: RepetitionContext?
-        if let repetitionPenalty, repetitionPenalty != 0, repetitionContextSize > 0 {
+        // 1 is the identity (logits are ×/÷ by it), so skip it like "unset" —
+        // clients commonly send repetition_penalty: 1 by default.
+        if let repetitionPenalty, repetitionPenalty != 0, repetitionPenalty != 1,
+            repetitionContextSize > 0
+        {
             repetitionContext = RepetitionContext(
                 repetitionPenalty: repetitionPenalty,
                 repetitionContextSize: repetitionContextSize
@@ -332,21 +336,26 @@ struct TokenRing {
         return count < capacity ? buffer[..<count] : buffer
     }
 
-    /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
+    /// Bulk-load from a prompt, keeping the last `capacity` tokens.
+    ///
+    /// Flatten to 1-D first: the VLM path passes a 2-D `[1, seq]` token array, so
+    /// `prompt.dim(0)` would read the batch size (1), not `seq` — mis-sizing the
+    /// buffer and crashing a later `append` with an MLX broadcast error on any
+    /// image request carrying a penalty. 1-D prompts are unaffected (no-op reshape).
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let n = prompt.dim(0)
-        let promptTokens = prompt.asType(.int32)
+        let promptTokens = prompt.reshaped(-1).asType(.int32)
+        let n = promptTokens.dim(0)
         if n <= capacity {
             if n < capacity {
                 let padding = MLXArray.zeros([capacity - n], type: Int32.self)
-                buffer = concatenated([promptTokens.reshaped(-1), padding])
+                buffer = concatenated([promptTokens, padding])
             } else {
-                buffer = promptTokens.reshaped(-1)
+                buffer = promptTokens
             }
             count = n
             writeIndex = n % capacity
         } else {
-            buffer = promptTokens[(-capacity)...].reshaped(-1)
+            buffer = promptTokens[(n - capacity)...]
             count = capacity
             writeIndex = 0
         }
