@@ -95,6 +95,16 @@ public final class EngineCore: @unchecked Sendable {
     private var _idleSteps = 0
     private static let deferredClearDelay = 8
 
+    // Diagnostic: when DARKBLOOM_MLX_RESOURCE_DEBUG is set, log the live Metal
+    // resource (buffer) COUNT vs the cache/active BYTES every N busy steps. This
+    // distinguishes a cached-buffer count climb (cache bytes track count -> a
+    // count-aware cache trim fixes it) from a live-buffer climb (count climbs
+    // while cache stays small -> needs admission control). Off by default; no
+    // overhead when unset.
+    private static let resourceDebug: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_MLX_RESOURCE_DEBUG"] != nil
+    private static let resourceDebugEverySteps = 50
+
     public init(
         scheduler: Scheduler,
         config: ContinuousBatchingConfig = ContinuousBatchingConfig()
@@ -321,6 +331,22 @@ public final class EngineCore: @unchecked Sendable {
                         }
                         let output = scheduler.step()
                         stepsExecuted += 1
+
+                        // Diagnostic (env-gated): observe resource COUNT vs BYTES
+                        // on the real batched-decode path to classify the
+                        // [metal::malloc] Resource limit crash as cached vs live.
+                        if Self.resourceDebug, stepsExecuted % Self.resourceDebugEverySteps == 0 {
+                            let res = Memory.numResources
+                            let lim = Memory.resourceLimit
+                            let pct = lim > 0 ? Double(res) / Double(lim) * 100 : 0
+                            let batch = output.outputs.count
+                            print(String(
+                                format: "[rsrc] step=%d batch=%d resources=%d/%d (%.1f%%) cache=%.0fMB active=%.0fMB",
+                                stepsExecuted, batch, res, lim, pct,
+                                Double(Memory.cacheMemory) / 1_048_576,
+                                Double(Memory.activeMemory) / 1_048_576))
+                            fflush(stdout)
+                        }
 
                         // Distribute outputs to collectors inside the queue block.
                         if !output.outputs.isEmpty {
