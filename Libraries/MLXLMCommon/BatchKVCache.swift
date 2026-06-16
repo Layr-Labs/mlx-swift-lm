@@ -397,11 +397,20 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     }
 
     /// Causal mask that also blocks each row's own left-padded slots.
-    /// Always materialized to an array because per-row left-padding can't
-    /// be expressed via the symbolic `.causal` mode.
+    ///
+    /// For single-token decode steps with no left padding we return `.none` so
+    /// the fast attention kernel can take its unmasked path. MLX issue #3384:
+    /// on 4-bit quantized Gemma 4, passing an explicit boolean mask (even an
+    /// all-`true` one) routes `scaled_dot_product_attention` through a divergent
+    /// evaluation branch whose numerical drift flips top-1 logprobs and traps
+    /// continuous-batched generation in repetition loops. The unmasked path is
+    /// safe here because every stored key position is a real token.
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n == 1, leftPadding.max().item(Int32.self) == 0 {
+            return .none
+        }
         let mask = createCausalMask(
             n: n,
             offset: _idx,
@@ -782,6 +791,17 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         let actualWindowSize = windowSize ?? maxCacheSize
+        // See BatchKVCache.makeMask comment for the Gemma 4 / MLX #3384
+        // workaround. For a single decode token with no left padding the
+        // unmasked fast path is safe — but ONLY when every retained key already
+        // fits inside the requested window. When `windowSize < maxCacheSize` the
+        // buffer can hold keys older than the active window; returning `.none`
+        // there would let the query attend past it, so keep the windowed mask.
+        // For Gemma (and any caller where window == cache size) `_idx` is capped
+        // at `maxCacheSize == actualWindowSize`, so this is always taken.
+        if n == 1, _idx <= actualWindowSize, leftPadding.max().item(Int32.self) == 0 {
+            return .none
+        }
         let maskOffset = min(maxCacheSize - 1, _idx)
         let mask = createCausalMask(
             n: n,
