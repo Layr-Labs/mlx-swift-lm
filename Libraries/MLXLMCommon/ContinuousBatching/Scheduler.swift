@@ -44,6 +44,22 @@ func makeRepetitionSampler(
     }
 }
 
+/// Configuration for per-layer KV-cache quantization in the continuous-batching
+/// scheduler. When set on ``SchedulerConfig/kvQuantization``, full-attention
+/// layers use ``QuantizedBatchKVCache`` instead of ``BatchKVCache``; rotating
+/// / sliding-window layers keep ``BatchRotatingKVCache``.
+public struct KVQuantizationConfig: Sendable {
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: QuantizationMode
+
+    public init(groupSize: Int = 128, bits: Int = 8, mode: QuantizationMode = .affine) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+    }
+}
+
 public struct SchedulerConfig: Sendable {
     public var maxNumSeqs: Int
     public var maxNumBatchedTokens: Int
@@ -55,19 +71,25 @@ public struct SchedulerConfig: Sendable {
     /// When a new admission would exceed this, the running request with the
     /// largest KV footprint is preempted and re-queued. 0 = unlimited.
     public var maxKVCacheTokens: Int
+    /// Optional KV-cache quantization configuration. When non-nil, full-attention
+    /// layers are backed by ``QuantizedBatchKVCache``; sliding-window layers
+    /// remain ``BatchRotatingKVCache``.
+    public var kvQuantization: KVQuantizationConfig?
 
     public init(
         maxNumSeqs: Int = 64,
         maxNumBatchedTokens: Int = 8192,
         prefillStepSize: Int = 512,
         streamInterval: Int = 1,
-        maxKVCacheTokens: Int = 0
+        maxKVCacheTokens: Int = 0,
+        kvQuantization: KVQuantizationConfig? = nil
     ) {
         self.maxNumSeqs = maxNumSeqs
         self.maxNumBatchedTokens = maxNumBatchedTokens
         self.prefillStepSize = prefillStepSize
         self.streamInterval = streamInterval
         self.maxKVCacheTokens = maxKVCacheTokens
+        self.kvQuantization = kvQuantization
     }
 }
 
@@ -840,23 +862,91 @@ public final class Scheduler: @unchecked Sendable {
     }
 
     private lazy var cacheFactories: [(Int) -> any BatchedCache] = {
-        model.newCache(parameters: nil).map { layer -> (Int) -> any BatchedCache in
-            if layer is MambaCache {
-                return { MambaCache(leftPadding: Array(repeating: 0, count: $0)) }
-            }
-            if let arrays = layer as? ArraysCache {
-                let size = arrays.slotCount
-                return { ArraysCache(size: size, leftPadding: Array(repeating: 0, count: $0)) }
-            }
-            if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
-                return { BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0)) }
-            }
-            return { BatchKVCache(leftPadding: Array(repeating: 0, count: $0)) }
+        let quantConfig = config.kvQuantization
+        return model.newCache(parameters: nil).map { layer -> (Int) -> any BatchedCache in
+            Self.makeCacheFactory(for: layer, quantConfig: quantConfig)
         }
     }()
 
     private func makeBatchedCache(batchSize B: Int) -> [any BatchedCache] {
         cacheFactories.map { $0(B) }
+    }
+
+    /// Internal decision of which batched cache type to build for a layer.
+    /// Kept in one place so the production factory and the test-facing
+    /// type-name helper cannot drift.
+    private enum CacheFactoryKind: Sendable {
+        case mamba
+        case arrays(size: Int)
+        case rotating(maxSize: Int)
+        case quantized(config: KVQuantizationConfig)
+        case fp16
+
+        var typeName: String {
+            switch self {
+            case .mamba: return String(describing: MambaCache.self)
+            case .arrays: return String(describing: ArraysCache.self)
+            case .rotating: return String(describing: BatchRotatingKVCache.self)
+            case .quantized: return String(describing: QuantizedBatchKVCache.self)
+            case .fp16: return String(describing: BatchKVCache.self)
+            }
+        }
+    }
+
+    private static func cacheFactoryKind(
+        for layer: any KVCache,
+        quantConfig: KVQuantizationConfig?
+    ) -> CacheFactoryKind {
+        if layer is MambaCache {
+            return .mamba
+        }
+        if let arrays = layer as? ArraysCache {
+            return .arrays(size: arrays.slotCount)
+        }
+        if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
+            return .rotating(maxSize: maxSize)
+        }
+        if let quantConfig {
+            return .quantized(config: quantConfig)
+        }
+        return .fp16
+    }
+
+    /// Build a single cache factory for a layer, optionally using quantized
+    /// storage for full-attention layers. Exposed publicly so provider tests
+    /// can verify per-layer factory selection without constructing a live model.
+    public static func makeCacheFactory(
+        for layer: any KVCache,
+        quantConfig: KVQuantizationConfig?
+    ) -> (Int) -> any BatchedCache {
+        switch cacheFactoryKind(for: layer, quantConfig: quantConfig) {
+        case .mamba:
+            return { MambaCache(leftPadding: Array(repeating: 0, count: $0)) }
+        case .arrays(let size):
+            return { ArraysCache(size: size, leftPadding: Array(repeating: 0, count: $0)) }
+        case .rotating(let maxSize):
+            return { BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0)) }
+        case .quantized(let config):
+            return {
+                QuantizedBatchKVCache(
+                    leftPadding: Array(repeating: 0, count: $0),
+                    groupSize: config.groupSize,
+                    bits: config.bits,
+                    mode: config.mode
+                )
+            }
+        case .fp16:
+            return { BatchKVCache(leftPadding: Array(repeating: 0, count: $0)) }
+        }
+    }
+
+    /// Test-facing type-name helper. Avoids instantiating caches (which would
+    /// require a Metal device) while still pinning the exact per-layer selection.
+    public static func cacheFactoryTypeName(
+        for layer: any KVCache,
+        quantConfig: KVQuantizationConfig?
+    ) -> String {
+        cacheFactoryKind(for: layer, quantConfig: quantConfig).typeName
     }
 
     private func doExternalPrefill(
