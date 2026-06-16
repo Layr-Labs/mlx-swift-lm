@@ -28,6 +28,13 @@ public protocol BatchedCache: KVCache {
     func advanceBatched(_ n: Int)
 }
 
+private func canUseUnmaskedSingleTokenDecode(n: Int, leftPadding: MLXArray) -> Bool {
+    // For unpadded one-token decode the materialized batch mask is all-true.
+    // Returning .none keeps continuous batching on the same fast-attention path
+    // as regular KVCache; explicit array masks can diverge on 4-bit Gemma 4.
+    n == 1 && leftPadding.max().item(Int32.self) <= 0
+}
+
 /// Continuous-batching KV cache.
 ///
 /// Storage is right-justified along axis=2: for each row `b`, real keys
@@ -402,6 +409,10 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if canUseUnmaskedSingleTokenDecode(n: n, leftPadding: leftPadding) {
+            return .none
+        }
+
         let mask = createCausalMask(
             n: n,
             offset: _idx,
@@ -781,6 +792,10 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if canUseUnmaskedSingleTokenDecode(n: n, leftPadding: leftPadding) {
+            return .none
+        }
+
         let actualWindowSize = windowSize ?? maxCacheSize
         let maskOffset = min(maxCacheSize - 1, _idx)
         let mask = createCausalMask(
