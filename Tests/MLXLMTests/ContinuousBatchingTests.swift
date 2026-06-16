@@ -47,6 +47,34 @@ final class ContinuousBatchingTests: XCTestCase {
         XCTAssertEqual(extracted.state[0].asArray(Float.self), [3, 4, 9])
     }
 
+    func testBatchedKVCachesSkipMaskForUnpaddedSingleTokenDecode() {
+        let keys = MLXArray.zeros([2, 1, 3, 1], dtype: .float32)
+        let values = MLXArray.zeros([2, 1, 3, 1], dtype: .float32)
+
+        let cache = BatchKVCache(leftPadding: [0, 0])
+        _ = cache.update(keys: keys, values: values)
+        assertMaskNone(cache.makeMask(n: 1, windowSize: nil, returnArray: false))
+
+        let rotating = BatchRotatingKVCache(maxSize: 4, leftPadding: [0, 0])
+        _ = rotating.update(keys: keys, values: values)
+        assertMaskNone(rotating.makeMask(n: 1, windowSize: nil, returnArray: false))
+    }
+
+    func testBatchedKVCachesKeepMaskForPaddedSingleTokenDecode() {
+        let keys = MLXArray.zeros([2, 1, 3, 1], dtype: .float32)
+        let values = MLXArray.zeros([2, 1, 3, 1], dtype: .float32)
+
+        let cache = BatchKVCache(leftPadding: [0, 2])
+        _ = cache.update(keys: keys, values: values)
+        let cacheMask = assertMaskArray(cache.makeMask(n: 1, windowSize: nil, returnArray: false))
+        XCTAssertEqual(cacheMask?.shape, [2, 1, 1, 4])
+
+        let rotating = BatchRotatingKVCache(maxSize: 4, leftPadding: [0, 2])
+        _ = rotating.update(keys: keys, values: values)
+        let rotatingMask = assertMaskArray(rotating.makeMask(n: 1, windowSize: nil, returnArray: false))
+        XCTAssertEqual(rotatingMask?.shape, [2, 1, 1, 4])
+    }
+
     func testArraysCachePreservesBatchMetadataThroughFilterAndExtend() {
         let first = ArraysCache(size: 1, leftPadding: [0, 2])
         first[0] = MLXArray([1, 2] as [Float]).reshaped([2, 1])
@@ -255,6 +283,33 @@ private func assertCache(
     XCTAssertEqual(state.count, 2, file: file, line: line)
     XCTAssertEqual(state[0].asArray(Float.self), expectedKeys, file: file, line: line)
     XCTAssertEqual(state[1].asArray(Float.self), expectedValues, file: file, line: line)
+}
+
+private func assertMaskNone(
+    _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    switch mask {
+    case .none:
+        break
+    default:
+        XCTFail("expected .none mask", file: file, line: line)
+    }
+}
+
+private func assertMaskArray(
+    _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) -> MLXArray? {
+    switch mask {
+    case .array(let array):
+        return array
+    default:
+        XCTFail("expected .array mask", file: file, line: line)
+        return nil
+    }
 }
 
 private final class IncrementingLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
