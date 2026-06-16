@@ -408,7 +408,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        if n == 1, leftPadding.max().item(Int32.self) == 0 {
+        if n == 1, leftPadding.max().item(Int32.self) <= 0 {
             return .none
         }
         let mask = createCausalMask(
@@ -799,7 +799,24 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         // there would let the query attend past it, so keep the windowed mask.
         // For Gemma (and any caller where window == cache size) `_idx` is capped
         // at `maxCacheSize == actualWindowSize`, so this is always taken.
-        if n == 1, _idx <= actualWindowSize, leftPadding.max().item(Int32.self) == 0 {
+        // `<= 0`, not `== 0`: a rotating cache that has generated past its window
+        // trims slots and subtracts from `leftPadding`, so unpadded rows go
+        // NEGATIVE once past `maxCacheSize`. Accepting only `== 0` would send
+        // every long (> window) Gemma 4 decode back through the explicit-mask path
+        // (the mlx#3384 slow/divergent path) on every sliding layer.
+        //
+        // Boundary: makeMask runs BEFORE `update`, which appends `n` keys and then
+        // trims to `maxCacheSize` (NOT to the window). So the post-update retained
+        // length is `min(_idx + n, maxCacheSize)`; `.none` is correct only if THAT
+        // fits the window. For Gemma (window == maxCacheSize) this is always true,
+        // so the fast path is unchanged; it only tightens `windowSize <
+        // maxCacheSize`, where the old `_idx <= actualWindowSize` let the query
+        // attend one token past the window. (Plain `_idx + n <= actualWindowSize`
+        // would wrongly drop Gemma's fast path at the full-cache boundary, where
+        // the trim keeps everything in-window.)
+        if n == 1, min(_idx + n, maxCacheSize) <= actualWindowSize,
+            leftPadding.max().item(Int32.self) <= 0
+        {
             return .none
         }
         let maskOffset = min(maxCacheSize - 1, _idx)

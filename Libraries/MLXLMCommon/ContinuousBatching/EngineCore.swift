@@ -16,6 +16,7 @@
 
 import Foundation
 import MLX
+import os
 
 // MARK: - EngineConfig
 
@@ -95,15 +96,53 @@ public final class EngineCore: @unchecked Sendable {
     private var _idleSteps = 0
     private static let deferredClearDelay = 8
 
-    // Diagnostic: when DARKBLOOM_MLX_RESOURCE_DEBUG is set, log the live Metal
-    // resource (buffer) COUNT vs the cache/active BYTES every N busy steps. This
-    // distinguishes a cached-buffer count climb (cache bytes track count -> a
-    // count-aware cache trim fixes it) from a live-buffer climb (count climbs
-    // while cache stays small -> needs admission control). Off by default; no
-    // overhead when unset.
-    private static let resourceDebug: Bool =
-        ProcessInfo.processInfo.environment["DARKBLOOM_MLX_RESOURCE_DEBUG"] != nil
+    // Diagnostic: log the live Metal resource (buffer) COUNT vs the cache/active
+    // BYTES on the batched-decode path. This distinguishes a cached-buffer count
+    // climb (cache bytes track count -> a count-aware cache trim fixes it) from a
+    // live-buffer climb (count climbs while cache stays small -> needs admission
+    // control) — the latter is the `[metal::malloc] Resource limit (499000)` crash.
+    //
+    // DEFAULT ON: `darkbloom report` collects logs via
+    // `log show --predicate 'subsystem == "dev.darkbloom.provider"'`, so the
+    // `[rsrc]` line is emitted via os_log under that subsystem (not just stdout)
+    // and is therefore captured in every uploaded report — giving us the
+    // resource-count trajectory before a crash without asking the operator to set
+    // any env var. Opt out with DARKBLOOM_MLX_RESOURCE_DEBUG=0 (or false/no/off).
+    private static let resourceDebug: Bool = {
+        switch ProcessInfo.processInfo.environment["DARKBLOOM_MLX_RESOURCE_DEBUG"]?
+            .lowercased()
+        {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }()
+    // Console cadence (stdout). Frequent, so the console line is TTY-gated (see
+    // `stdoutIsTTY`) to keep it out of the unbounded daemon log.
     private static let resourceDebugEverySteps = 50
+    // stdout is a real terminal only for interactive/foreground runs. Under
+    // launchd the provider's stdout/stderr are redirected to
+    // ~/.darkbloom/provider.log (which is NOT rotated), so printing the `[rsrc]`
+    // line every ~50 steps on an always-on daemon would grow that log without
+    // bound — and the operator can't disable it if the opt-out env var isn't
+    // forwarded into the service. Gate the console print on a TTY: interactive
+    // debugging still sees it, the daemon never does. The os_log emit below is
+    // always on regardless and is what `darkbloom report` actually reads.
+    private static let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
+    // Report cadence (os_log). Coarser so a 24h report stays well under the 10 MB
+    // upload cap (~every 1000 busy steps ≈ tens of seconds), but we ALSO emit
+    // whenever pressure is high (>=70% of the limit) to always capture the
+    // dangerous ramp toward 499000.
+    private static let resourceLogEverySteps = 1000
+    private static let resourcePressurePct = 70.0
+    // Fine cadence at which the high-pressure check is evaluated. Must divide both
+    // coarse cadences above so their sampling is unchanged; finer than the coarse
+    // sample so a fast ramp from >=70% to the limit is caught between coarse
+    // samples (the window this telemetry exists to diagnose).
+    private static let resourcePressureEverySteps = 10
+    /// os_log channel for the `[rsrc]` line, under the subsystem that
+    /// `darkbloom report` captures.
+    private static let resourceLogger = Logger(
+        subsystem: "dev.darkbloom.provider", category: "rsrc")
 
     public init(
         scheduler: Scheduler,
@@ -332,20 +371,40 @@ public final class EngineCore: @unchecked Sendable {
                         let output = scheduler.step()
                         stepsExecuted += 1
 
-                        // Diagnostic (env-gated): observe resource COUNT vs BYTES
+                        // Diagnostic (default-on): observe resource COUNT vs BYTES
                         // on the real batched-decode path to classify the
                         // [metal::malloc] Resource limit crash as cached vs live.
-                        if Self.resourceDebug, stepsExecuted % Self.resourceDebugEverySteps == 0 {
+                        // Sample on the fine pressure cadence (which divides the
+                        // coarse one) so the high-pressure check is NOT gated by the
+                        // coarse window: resources can cross 70% and hit the limit
+                        // between coarse samples, and that ramp is exactly what this
+                        // telemetry must capture.
+                        if Self.resourceDebug, stepsExecuted % Self.resourcePressureEverySteps == 0 {
                             let res = Memory.numResources
                             let lim = Memory.resourceLimit
                             let pct = lim > 0 ? Double(res) / Double(lim) * 100 : 0
-                            let batch = output.outputs.count
-                            print(String(
-                                format: "[rsrc] step=%d batch=%d resources=%d/%d (%.1f%%) cache=%.0fMB active=%.0fMB",
-                                stepsExecuted, batch, res, lim, pct,
-                                Double(Memory.cacheMemory) / 1_048_576,
-                                Double(Memory.activeMemory) / 1_048_576))
-                            fflush(stdout)
+                            let highPressure = pct >= Self.resourcePressurePct
+                            let coarseSample = stepsExecuted % Self.resourceDebugEverySteps == 0
+                            // Emit the line on the coarse cadence, or on every fine
+                            // sample while under pressure (dense ramp, still bounded).
+                            if coarseSample || highPressure {
+                                let batch = output.outputs.count
+                                let line = String(
+                                    format: "[rsrc] step=%d batch=%d resources=%d/%d (%.1f%%) cache=%.0fMB active=%.0fMB",
+                                    stepsExecuted, batch, res, lim, pct,
+                                    Double(Memory.cacheMemory) / 1_048_576,
+                                    Double(Memory.activeMemory) / 1_048_576)
+                                if Self.stdoutIsTTY {
+                                    print(line)
+                                    fflush(stdout)
+                                }
+                                // os_log (captured by `darkbloom report`) on the coarse
+                                // report cadence, plus every fine sample while pressure
+                                // is high so the climb toward 499000 is never missed.
+                                if stepsExecuted % Self.resourceLogEverySteps == 0 || highPressure {
+                                    Self.resourceLogger.log("\(line, privacy: .public)")
+                                }
+                            }
                         }
 
                         // Distribute outputs to collectors inside the queue block.
