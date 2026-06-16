@@ -96,21 +96,38 @@ public class LlamaPipelineShard: Module {
 
     /// Run this rank's owned transformer blocks on a hidden state.
     /// `cache` (if provided) must be sized to this rank's layer count.
-    public func runOwnedLayers(_ hidden: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+    ///
+    /// `evalEvery` forces an `eval()` every N layers so a single Metal command
+    /// buffer never spans all owned layers — without it, ~40 layers of a 70B
+    /// run as one buffer and trip macOS's ~5s GPU watchdog
+    /// (kIOGPUCommandBufferCallbackErrorTimeout). 0 disables the periodic eval.
+    public func runOwnedLayers(_ hidden: MLXArray, cache: [KVCache]? = nil, evalEvery: Int = 8) -> MLXArray {
         var h = hidden
         let mask = createAttentionMask(h: h, cache: cache?.first)
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
+            if evalEvery > 0 && (i + 1) % evalEvery == 0 {
+                eval(h)
+            }
         }
         return h
     }
 
     /// TAIL only: final norm + lm_head -> vocabulary logits.
-    public func projectToLogits(_ hidden: MLXArray) -> MLXArray {
+    ///
+    /// `lastPositionOnly` projects just the final sequence position (all that's
+    /// needed to sample the next token), avoiding an [seq × vocab] matmul over
+    /// every position — a large, watchdog-tripping op for long prompts.
+    public func projectToLogits(_ hidden: MLXArray, lastPositionOnly: Bool = true) -> MLXArray {
         guard let norm else {
             fatalError("projectToLogits() called on non-tail shard (rank does not own norm/lm_head)")
         }
-        let normed = norm(hidden)
+        // hidden is [1, seq, dim]; slice to the last position before the big
+        // vocabulary projection when only the next token is needed.
+        let h = lastPositionOnly && hidden.ndim == 3
+            ? hidden[0..., (hidden.dim(1) - 1)..., 0...]
+            : hidden
+        let normed = norm(h)
         if let lmHead {
             return lmHead(normed)
         }
