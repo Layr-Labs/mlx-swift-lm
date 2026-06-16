@@ -44,19 +44,37 @@ func makeRepetitionSampler(
     }
 }
 
+/// Which quantized batched-cache implementation to use for full-attention
+/// layers when KV quantization is enabled.
+public enum KVQuantCacheKind: Sendable, Equatable {
+    /// Use ``QuantizedBatchKVCache`` and the native quantized attention kernel.
+    case kernel
+    /// Use ``DequantBatchKVCache``: stores quantized, but returns dequantized
+    /// fp16 so the model's regular attention path (including sinks) is used.
+    case dequant
+}
+
 /// Configuration for per-layer KV-cache quantization in the continuous-batching
 /// scheduler. When set on ``SchedulerConfig/kvQuantization``, full-attention
-/// layers use ``QuantizedBatchKVCache`` instead of ``BatchKVCache``; rotating
-/// / sliding-window layers keep ``BatchRotatingKVCache``.
+/// layers use ``QuantizedBatchKVCache`` (or ``DequantBatchKVCache`` when
+/// ``cacheKind`` is ``KVQuantCacheKind/dequant``); rotating / sliding-window
+/// layers keep ``BatchRotatingKVCache``.
 public struct KVQuantizationConfig: Sendable {
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
+    public let cacheKind: KVQuantCacheKind
 
-    public init(groupSize: Int = 128, bits: Int = 8, mode: QuantizationMode = .affine) {
+    public init(
+        groupSize: Int = 128,
+        bits: Int = 8,
+        mode: QuantizationMode = .affine,
+        cacheKind: KVQuantCacheKind = .kernel
+    ) {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
+        self.cacheKind = cacheKind
     }
 }
 
@@ -887,7 +905,11 @@ public final class Scheduler: @unchecked Sendable {
             case .mamba: return String(describing: MambaCache.self)
             case .arrays: return String(describing: ArraysCache.self)
             case .rotating: return String(describing: BatchRotatingKVCache.self)
-            case .quantized: return String(describing: QuantizedBatchKVCache.self)
+            case .quantized(let config):
+                switch config.cacheKind {
+                case .kernel: return String(describing: QuantizedBatchKVCache.self)
+                case .dequant: return String(describing: DequantBatchKVCache.self)
+                }
             case .fp16: return String(describing: BatchKVCache.self)
             }
         }
@@ -928,12 +950,22 @@ public final class Scheduler: @unchecked Sendable {
             return { BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0)) }
         case .quantized(let config):
             return {
-                QuantizedBatchKVCache(
-                    leftPadding: Array(repeating: 0, count: $0),
-                    groupSize: config.groupSize,
-                    bits: config.bits,
-                    mode: config.mode
-                )
+                switch config.cacheKind {
+                case .kernel:
+                    QuantizedBatchKVCache(
+                        leftPadding: Array(repeating: 0, count: $0),
+                        groupSize: config.groupSize,
+                        bits: config.bits,
+                        mode: config.mode
+                    )
+                case .dequant:
+                    DequantBatchKVCache(
+                        leftPadding: Array(repeating: 0, count: $0),
+                        groupSize: config.groupSize,
+                        bits: config.bits,
+                        mode: config.mode
+                    )
+                }
             }
         case .fp16:
             return { BatchKVCache(leftPadding: Array(repeating: 0, count: $0)) }

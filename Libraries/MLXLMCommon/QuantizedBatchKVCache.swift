@@ -10,11 +10,32 @@ import MLX
 /// returned either dequantized (``update(keys:values:)``) or as quantized
 /// tuples (``updateQuantized(keys:values:)``) for the native quantized
 /// attention kernel.
-public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
-    BatchedCache, QuantizedKVCacheProtocol
+public final class QuantizedBatchKVCache: QuantizedBatchKVCacheBase,
+    QuantizedKVCacheProtocol
+{
+}
+
+/// Quantized-storage, continuously-batchable KV cache that does **not**
+/// conform to ``QuantizedKVCacheProtocol``.
+///
+/// Use this for models whose quantized attention kernel is not sink-safe
+/// (e.g. GPT-OSS). The cache still stores K/V in quantized form for the
+/// capacity win, but ``update(keys:values:)`` returns dequantized fp16 so the
+/// model falls back to the regular sink-aware attention path.
+public final class DequantBatchKVCache: QuantizedBatchKVCacheBase {
+}
+
+/// Base implementation for quantized batched KV caches.
+///
+/// Holds all the storage, batched-cache logic, and the dequantizing
+/// ``update(keys:values:)`` path. The two final subclasses differ only in
+/// whether they also conform to ``QuantizedKVCacheProtocol`` (the native
+/// quantized-kernel path) or stay off that path (the dequant-only path).
+public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
+    BatchedCache
 {
 
-    // MARK: - QuantizedKVCacheProtocol
+    // MARK: - Quantization parameters
 
     public let groupSize: Int
     public let bits: Int
@@ -55,7 +76,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
 
     // MARK: - Init
 
-    public init(
+    public required init(
         leftPadding: [Int],
         groupSize: Int = 64,
         bits: Int = 8,
@@ -69,7 +90,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
         super.init()
     }
 
-    private init(
+    fileprivate init(
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
@@ -134,7 +155,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
 
         precondition(
             kHeadDim % groupSize == 0 && vHeadDim % groupSize == 0,
-            "QuantizedBatchKVCache requires groupSize to divide head_dim"
+            "QuantizedBatchKVCacheBase requires groupSize to divide head_dim"
         )
 
         var currentKeys = self.keys
@@ -166,7 +187,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
         }
 
         guard var ck = currentKeys, var cv = currentValues else {
-            fatalError("QuantizedBatchKVCache storage not initialized")
+            fatalError("QuantizedBatchKVCacheBase storage not initialized")
         }
 
         let qk = quantized(keys, groupSize: groupSize, bits: bits)
@@ -217,7 +238,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
         if let additionalLeftPadding {
             precondition(
                 keys == nil,
-                "prepareBatched() with leftPadding can only be called on an empty QuantizedBatchKVCache"
+                "prepareBatched() with leftPadding can only be called on an empty QuantizedBatchKVCacheBase"
             )
             let additional = MLXArray(additionalLeftPadding.map { Int32($0) })
             leftPadding = leftPadding + additional
@@ -265,9 +286,9 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
     }
 
     public func extendBatched(_ other: any BatchedCache) {
-        guard let other = other as? QuantizedBatchKVCache else {
+        guard let other = other as? QuantizedBatchKVCacheBase else {
             preconditionFailure(
-                "QuantizedBatchKVCache.extendBatched requires another QuantizedBatchKVCache"
+                "QuantizedBatchKVCacheBase.extendBatched requires another QuantizedBatchKVCacheBase"
             )
         }
         extend(other)
@@ -304,10 +325,10 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
     /// In-place concatenation of another batched cache's rows onto this one.
     /// Both caches are padded to the same right-justified time-axis size, then
     /// concatenated along the batch axis.
-    public func extend(_ other: QuantizedBatchKVCache) {
+    public func extend(_ other: QuantizedBatchKVCacheBase) {
         precondition(
             groupSize == other.groupSize && bits == other.bits && mode == other.mode,
-            "QuantizedBatchKVCache.extend requires matching quantization params"
+            "QuantizedBatchKVCacheBase.extend requires matching quantization params"
         )
 
         if keys == nil && other.keys == nil {
@@ -444,7 +465,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
                 _idx = newValue[0].dim(-2)
             default:
                 fatalError(
-                    "QuantizedBatchKVCache.state setter expects 2, 6, or 8 arrays"
+                    "QuantizedBatchKVCacheBase.state setter expects 2, 6, or 8 arrays"
                 )
             }
         }
@@ -470,7 +491,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
             // bits, and mode are not serialized here. Acceptable for v1 because
             // prefix-cache/checkpoint is disabled when quantization is on.
             guard newValue.count == 5 else {
-                fatalError("QuantizedBatchKVCache.metaState expects 5 values")
+                fatalError("QuantizedBatchKVCacheBase.metaState expects 5 values")
             }
             if let off = Int(newValue[1]) {
                 _idx = off
@@ -479,7 +500,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
     }
 
     public override func copy() -> any KVCache {
-        let new = QuantizedBatchKVCache(
+        let new = Self(
             leftPadding: Array(repeating: 0, count: leftPadding.dim(0)),
             groupSize: groupSize,
             bits: bits,
@@ -533,7 +554,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
         case (.none, .none):
             break
         default:
-            fatalError("QuantizedBatchKVCache bias mismatch during assignment")
+            fatalError("QuantizedBatchKVCacheBase bias mismatch during assignment")
         }
     }
 
@@ -558,7 +579,7 @@ public final class QuantizedBatchKVCache: BaseKVCache, BatchPositionedKVCache,
         case (.none, .none):
             return nil
         default:
-            fatalError("QuantizedBatchKVCache optional mismatch")
+            fatalError("QuantizedBatchKVCacheBase optional mismatch")
         }
     }
 }
