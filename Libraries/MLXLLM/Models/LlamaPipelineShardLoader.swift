@@ -60,6 +60,22 @@ public enum LlamaPipelineShardLoader {
         return (shard, config.hiddenLayers)
     }
 
+    /// TEST HELPER: load the FULL (monolithic) Llama model from `directory`,
+    /// returning it plus the layer count. Used by the shard smoke test to get a
+    /// reference forward pass without touching internal config fields from
+    /// outside the module.
+    public static func loadFullModel(_ directory: URL) throws -> (model: LlamaModel, totalLayers: Int) {
+        let configURL = directory.appending(component: "config.json")
+        let data = try Data(contentsOf: configURL)
+        let config = try JSONDecoder.json5().decode(LlamaConfiguration.self, from: data)
+        let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
+        let model = LlamaModel(config)
+        try loadWeights(
+            modelDirectory: directory, model: model,
+            perLayerQuantization: base.perLayerQuantization)
+        return (model, config.hiddenLayers)
+    }
+
     /// Build and weight-load a shard for `range` from a HF-format model dir.
     ///
     /// - Parameters:
