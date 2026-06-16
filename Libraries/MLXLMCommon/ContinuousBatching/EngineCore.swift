@@ -116,8 +116,18 @@ public final class EngineCore: @unchecked Sendable {
         default: return true
         }
     }()
-    // Console cadence (stdout). Frequent — stdout is unbounded.
+    // Console cadence (stdout). Frequent, so the console line is TTY-gated (see
+    // `stdoutIsTTY`) to keep it out of the unbounded daemon log.
     private static let resourceDebugEverySteps = 50
+    // stdout is a real terminal only for interactive/foreground runs. Under
+    // launchd the provider's stdout/stderr are redirected to
+    // ~/.darkbloom/provider.log (which is NOT rotated), so printing the `[rsrc]`
+    // line every ~50 steps on an always-on daemon would grow that log without
+    // bound — and the operator can't disable it if the opt-out env var isn't
+    // forwarded into the service. Gate the console print on a TTY: interactive
+    // debugging still sees it, the daemon never does. The os_log emit below is
+    // always on regardless and is what `darkbloom report` actually reads.
+    private static let stdoutIsTTY = isatty(STDOUT_FILENO) != 0
     // Report cadence (os_log). Coarser so a 24h report stays well under the 10 MB
     // upload cap (~every 1000 busy steps ≈ tens of seconds), but we ALSO emit
     // whenever pressure is high (>=70% of the limit) to always capture the
@@ -369,8 +379,10 @@ public final class EngineCore: @unchecked Sendable {
                                 stepsExecuted, batch, res, lim, pct,
                                 Double(Memory.cacheMemory) / 1_048_576,
                                 Double(Memory.activeMemory) / 1_048_576)
-                            print(line)
-                            fflush(stdout)
+                            if Self.stdoutIsTTY {
+                                print(line)
+                                fflush(stdout)
+                            }
                             // Captured by `darkbloom report` (os_log). Coarse cadence
                             // to bound report size, but always when pressure is high
                             // so the climb toward 499000 is never missed.
