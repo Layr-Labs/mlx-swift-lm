@@ -804,7 +804,19 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         // NEGATIVE once past `maxCacheSize`. Accepting only `== 0` would send
         // every long (> window) Gemma 4 decode back through the explicit-mask path
         // (the mlx#3384 slow/divergent path) on every sliding layer.
-        if n == 1, _idx <= actualWindowSize, leftPadding.max().item(Int32.self) <= 0 {
+        //
+        // Boundary: makeMask runs BEFORE `update`, which appends `n` keys and then
+        // trims to `maxCacheSize` (NOT to the window). So the post-update retained
+        // length is `min(_idx + n, maxCacheSize)`; `.none` is correct only if THAT
+        // fits the window. For Gemma (window == maxCacheSize) this is always true,
+        // so the fast path is unchanged; it only tightens `windowSize <
+        // maxCacheSize`, where the old `_idx <= actualWindowSize` let the query
+        // attend one token past the window. (Plain `_idx + n <= actualWindowSize`
+        // would wrongly drop Gemma's fast path at the full-cache boundary, where
+        // the trim keeps everything in-window.)
+        if n == 1, min(_idx + n, maxCacheSize) <= actualWindowSize,
+            leftPadding.max().item(Int32.self) <= 0
+        {
             return .none
         }
         let maskOffset = min(maxCacheSize - 1, _idx)
