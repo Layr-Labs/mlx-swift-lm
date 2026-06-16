@@ -790,14 +790,18 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        let actualWindowSize = windowSize ?? maxCacheSize
         // See BatchKVCache.makeMask comment for the Gemma 4 / MLX #3384
-        // workaround. For a single decode token with no left padding, the
-        // rotating buffer already contains exactly the window-sized history,
-        // so causal attention over all stored keys is correct.
-        if n == 1, leftPadding.max().item(Int32.self) == 0 {
+        // workaround. For a single decode token with no left padding the
+        // unmasked fast path is safe — but ONLY when every retained key already
+        // fits inside the requested window. When `windowSize < maxCacheSize` the
+        // buffer can hold keys older than the active window; returning `.none`
+        // there would let the query attend past it, so keep the windowed mask.
+        // For Gemma (and any caller where window == cache size) `_idx` is capped
+        // at `maxCacheSize == actualWindowSize`, so this is always taken.
+        if n == 1, _idx <= actualWindowSize, leftPadding.max().item(Int32.self) == 0 {
             return .none
         }
-        let actualWindowSize = windowSize ?? maxCacheSize
         let maskOffset = min(maxCacheSize - 1, _idx)
         let mask = createCausalMask(
             n: n,
