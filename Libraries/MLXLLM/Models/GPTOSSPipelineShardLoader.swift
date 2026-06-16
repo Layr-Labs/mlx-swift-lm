@@ -85,20 +85,20 @@ public enum GPTOSSPipelineShardLoader {
             throw GPTOSSPipelineShardLoaderError.missingOwnedWeights(role: roleName(range))
         }
 
-        // Quantize modules that arrived with packed weights (`.scales` present).
-        // GPT-OSS Q8's per-layer quant config is keyed by the GLOBAL module path
-        // (e.g. "model.layers.0.self_attn.o_proj"), but the shard's modules are
-        // at LOCAL paths ("layers.0.self_attn.o_proj" where local 0 == global
-        // range.start). Translate local→global before the per-layer lookup, and
-        // fall back to the config's default (the top-level group_size/bits, used
-        // by the MoE experts) when a module has no explicit entry.
-        if let perLayerQuantization {
-            quantize(model: shard) { localPath, _ in
-                guard owned["\(localPath).scales"] != nil else { return nil }
-                let globalPath = Self.localToGlobalPath(localPath, range: range)
-                let q = perLayerQuantization.quantization(layer: globalPath)
-                return q?.asTuple
-            }
+        // Quantize each module that arrived with packed weights, INFERRING its
+        // bits + group_size directly from the loaded tensor shapes rather than
+        // trusting a path-keyed config (GPT-OSS mixes 8-bit affine attn/lm_head
+        // with mxfp4 experts, and the config is keyed by global paths the shard
+        // doesn't use). Ground truth from the data:
+        //   scales.lastDim = inFeatures / group_size
+        //   weight.lastDim (packed) = inFeatures * bits / 32
+        // so bits = 32 * weightLast / inFeatures, group_size = inFeatures / scalesLast.
+        _ = perLayerQuantization  // shapes are authoritative; config not needed
+        quantize(model: shard) { localPath, _ in
+            guard let scales = owned["\(localPath).scales"],
+                  let weight = owned["\(localPath).weight"] else { return nil }
+            let hasBias = owned["\(localPath).biases"] != nil
+            return Self.inferQuant(weightShape: weight.shape, scalesShape: scales.shape, hasBias: hasBias)
         }
 
         let parameters = ModuleParameters.unflattened(owned)
@@ -133,6 +133,39 @@ public enum GPTOSSPipelineShardLoader {
 
     private static func roleName(_ r: LlamaShardRange) -> String {
         r.isHead ? "head" : r.isTail ? "tail" : "middle"
+    }
+
+    /// Infer (groupSize, bits, mode) for a quantized module from its loaded
+    /// tensor shapes — ground truth, independent of any path-keyed config.
+    ///
+    /// For affine quant the last dim of `weight` is `inFeatures * bits / 32`
+    /// (uint32-packed) and `scales` last dim is `inFeatures / groupSize`. We
+    /// recover `inFeatures` from the scales/weight ratio, then bits and
+    /// groupSize. No `.biases` ⇒ MXFP4 (fixed bits=4, groupSize=32), which is
+    /// how the GPT-OSS MoE experts are stored.
+    static func inferQuant(weightShape: [Int], scalesShape: [Int], hasBias: Bool)
+        -> (groupSize: Int, bits: Int, mode: QuantizationMode)?
+    {
+        guard let wLast = weightShape.last, let sLast = scalesShape.last,
+              wLast > 0, sLast > 0 else { return nil }
+        if !hasBias {
+            // MXFP4: fixed format.
+            return (32, 4, .mxfp4)
+        }
+        // Affine: weightLast(packed) = inFeatures*bits/32, scalesLast = inFeatures/gs.
+        // bits/gs = 32 * scalesLast / weightLast  → and bits ∈ {2,4,8}.
+        // inFeatures = bits/32 * weightLast ... solve via candidate bit widths.
+        for bits in [8, 4, 2] {
+            // inFeatures must be integer from packing: wLast = inFeatures*bits/32
+            let inFeatures = wLast * 32 / bits
+            guard inFeatures * bits / 32 == wLast else { continue }
+            guard inFeatures % sLast == 0 else { continue }
+            let gs = inFeatures / sLast
+            if gs == 32 || gs == 64 || gs == 128 {
+                return (gs, bits, .affine)
+            }
+        }
+        return nil
     }
 
     /// Translate a shard-local module path to the model-global path used as the
