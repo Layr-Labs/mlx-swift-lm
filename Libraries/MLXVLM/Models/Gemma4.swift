@@ -240,6 +240,90 @@ private func gemma4AdjustAttentionMask(
         return mask
     }
 }
+
+/// Manual batched attention used on the decode path when an explicit array mask
+/// is present. MLX issue #3384: `MLXFast.scaledDotProductAttention` takes a
+/// numerically divergent kernel branch when handed an explicit mask array on
+/// 4-bit-quantized Gemma 4 — flipping top-1 logits and trapping continuous-
+/// batched generation in repetition loops (the symptom users hit). This
+/// explicit matmul + precise float32 softmax path is immune to that divergence
+/// and matches the fused kernel's math. The NaN guard maps fully-masked
+/// (left-padding) query rows to zero so `0 * NaN` can't corrupt other rows.
+private func gemma4MaskedAttentionFallback(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> MLXArray {
+    let (B, nQHeads, L, D) = (
+        queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3)
+    )
+    let nKVHeads = keys.dim(1)
+    let repeats = nQHeads / nKVHeads
+
+    var q = queries * scale
+    var k = keys
+    var v = values
+    if repeats > 1 {
+        q = q.reshaped([B, nKVHeads, repeats, L, D])
+        k = expandedDimensions(k, axis: 2)
+        v = expandedDimensions(v, axis: 2)
+    }
+
+    var scores = matmul(q, k.swappedAxes(-1, -2))
+
+    func applyMask(_ maskArray: MLXArray) {
+        var m = maskArray
+        if scores.ndim == 5 && m.ndim == 4 && m.dim(0) == scores.dim(0) {
+            m = expandedDimensions(m, axis: 2)
+        }
+        if m.dtype == .bool {
+            scores = MLX.where(m, scores, MLXArray(-Float.infinity, dtype: scores.dtype))
+        } else {
+            scores = scores + m
+        }
+    }
+
+    switch mask {
+    case .none:
+        break
+    case .causal:
+        let qL = scores.dim(-2)
+        let kL = scores.dim(-1)
+        let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
+        let kIndices = MLXArray(0 ..< kL)
+        let causalMask = greaterEqual(
+            expandedDimensions(qIndices, axis: -1),
+            expandedDimensions(kIndices, axis: -2))
+        applyMask(causalMask)
+    case .array(let maskArray):
+        applyMask(maskArray)
+    case .arrays(let maskArrays):
+        if let maskArray = maskArrays.first { applyMask(maskArray) }
+    }
+
+    var probs = softmax(scores.asType(.float32), axis: -1, precise: true)
+    probs = MLX.where(probs .!= probs, MLXArray(Float(0)), probs)
+    scores = probs.asType(scores.dtype)
+    var output = matmul(scores, v)
+    if repeats > 1 {
+        output = output.reshaped([B, nQHeads, L, values.dim(3)])
+    }
+    return output
+}
+
+/// Whether a mask mode carries an explicit materialized array (the kernel path
+/// that triggers MLX #3384 on quantized Gemma 4).
+private func gemma4MaskIsExplicitArray(
+    _ mask: MLXFast.ScaledDotProductAttentionMaskMode
+) -> Bool {
+    switch mask {
+    case .array, .arrays: return true
+    case .none, .causal: return false
+    }
+}
+
 // MARK: - Configuration
 
 public struct Gemma4TextConfiguration: Codable, Sendable {
@@ -713,7 +797,8 @@ private final class Gemma4TextAttention: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
         cache: KVCache? = nil,
         sharedKV: Gemma4SharedKVState? = nil,
-        offset: Int? = nil
+        offset: Int? = nil,
+        perRowOffset: MLXArray? = nil
     ) -> (MLXArray, Gemma4SharedKVState?, Int) {
         let (batch, length, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -722,6 +807,19 @@ private final class Gemma4TextAttention: Module {
 
         let currentOffset: Int
         let kvState: Gemma4SharedKVState?
+
+        // Per-row RoPE: in a continuous batch, rows have different lengths, so a
+        // single scalar `cache.offset` (the max across rows) would give shorter
+        // rows the wrong positions and corrupt their output. When the cache is a
+        // BatchPositionedKVCache the caller threads its per-row `batchOffset`
+        // (captured pre-update) and we apply RoPE per row; otherwise (B=1 /
+        // vision / non-batched) we fall back to the scalar offset unchanged.
+        func applyRoPE(_ t: MLXArray, scalar: Int) -> MLXArray {
+            if let perRowOffset, let arrayRope = rope as? ArrayOffsetLayer {
+                return arrayRope.callAsFunction(t, offset: perRowOffset)
+            }
+            return rope(t, offset: scalar)
+        }
 
         if let sharedKV {
             currentOffset = offset ?? 0
@@ -737,7 +835,7 @@ private final class Gemma4TextAttention: Module {
                 }
             keys = kNorm(keys).transposed(0, 2, 1, 3)
             values = vNorm(values).transposed(0, 2, 1, 3)
-            keys = rope(keys, offset: currentOffset)
+            keys = applyRoPE(keys, scalar: currentOffset)
             if let quantizedCache = cache as? QuantizedKVCacheProtocol {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
                     keys: keys, values: values)
@@ -757,35 +855,52 @@ private final class Gemma4TextAttention: Module {
         }
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = rope(queries, offset: currentOffset)
+        queries = applyRoPE(queries, scalar: currentOffset)
 
         guard let kvState else {
             fatalError("Gemma4 attention expected a KV state")
         }
         let localMask = gemma4AdjustAttentionMask(mask, keyLength: kvState.sequenceLength)
 
-        let output: MLXArray =
-            switch kvState {
-            case .regular(let keys, let values):
-                MLXFast.scaledDotProductAttention(
+        // Decode steps that carry an explicit array mask (left-padded batches)
+        // would otherwise hit the MLX #3384 fused-kernel divergence on 4-bit
+        // Gemma 4. Route just those through the immune manual fallback; prefill
+        // (length > 1) and unmasked decode (.none/.causal) keep the fast fused
+        // kernel.
+        let useManualMaskedAttention = length == 1 && gemma4MaskIsExplicitArray(localMask)
+
+        let output: MLXArray
+        switch kvState {
+        case .regular(let keys, let values):
+            if useManualMaskedAttention {
+                output = gemma4MaskedAttentionFallback(
                     queries: queries,
                     keys: keys,
                     values: values,
                     scale: scale,
                     mask: localMask
                 )
-            case .quantized(let keys, let values, let groupSize, let bits, let mode):
-                quantizedScaledDotProductAttention(
+            } else {
+                output = MLXFast.scaledDotProductAttention(
                     queries: queries,
-                    quantizedKeys: keys,
-                    quantizedValues: values,
+                    keys: keys,
+                    values: values,
                     scale: scale,
-                    mask: localMask,
-                    groupSize: groupSize,
-                    bits: bits,
-                    mode: mode
+                    mask: localMask
                 )
             }
+        case .quantized(let keys, let values, let groupSize, let bits, let mode):
+            output = quantizedScaledDotProductAttention(
+                queries: queries,
+                quantizedKeys: keys,
+                quantizedValues: values,
+                scale: scale,
+                mask: localMask,
+                groupSize: groupSize,
+                bits: bits,
+                mode: mode
+            )
+        }
 
         return (
             oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)),
@@ -861,12 +976,14 @@ private final class Gemma4TextDecoderLayer: Module {
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         sharedKV: Gemma4SharedKVState? = nil,
-        offset: Int? = nil
+        offset: Int? = nil,
+        perRowOffset: MLXArray? = nil
     ) -> (MLXArray, Gemma4SharedKVState?, Int) {
         var residual = x
         var h = inputLayerNorm(x)
         let (attentionOutput, kvState, attentionOffset) = selfAttention(
-            h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset)
+            h, mask: mask, cache: cache, sharedKV: sharedKV, offset: offset,
+            perRowOffset: perRowOffset)
         h = attentionOutput
         h = postAttentionLayerNorm(h)
         h = residual + h
@@ -1137,6 +1254,17 @@ private final class Gemma4TextBackbone: Module {
             slidingMask = builtSlidingMask
         }
 
+        // Per-row RoPE offsets for continuous batching. Every non-shared layer
+        // cache holds the same pre-step offset, so capture it once here — before
+        // any layer's `cache.update` advances it — and thread it into every
+        // layer (including KV-shared layers, whose queries sit at the same
+        // positions). nil for non-batched caches (B=1 / vision), which keeps the
+        // existing scalar-offset path. Fixes mixed-length batch corruption where
+        // the scalar `cache.offset` (max across rows) mis-positions shorter rows.
+        let perRowOffset: MLXArray? = localCache.lazy
+            .compactMap { ($0 as? BatchPositionedKVCache)?.batchOffset }
+            .first
+
         var h = h0
         var intermediates = [(kv: Gemma4SharedKVState?, offset: Int?)](
             repeating: (nil, nil), count: config.hiddenLayers)
@@ -1168,7 +1296,8 @@ private final class Gemma4TextBackbone: Module {
                 sharedKV: hasExplicitCache && idx >= firstKVSharedLayerIdx
                     ? intermediates[sourceIdx].kv : nil,
                 offset: hasExplicitCache && idx >= firstKVSharedLayerIdx
-                    ? intermediates[sourceIdx].offset : nil
+                    ? intermediates[sourceIdx].offset : nil,
+                perRowOffset: perRowOffset
             )
             h = output
             intermediates[idx] = (kvState, attentionOffset)
