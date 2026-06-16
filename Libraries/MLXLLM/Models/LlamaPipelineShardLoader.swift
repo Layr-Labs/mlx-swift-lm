@@ -101,12 +101,15 @@ public enum LlamaPipelineShardLoader {
         guard !shardURLs.isEmpty else { throw LlamaPipelineShardLoaderError.noSafetensors(directory) }
         shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
 
-        // 2+3. Read each file, keep+remap only this rank's keys.
+        // 2+3. Read each file, keep+remap only this rank's keys. A tied-
+        //      embedding tail also keeps embed_tokens (for output projection).
+        let tiedTailNeedsEmbed = config.tieWordEmbeddings && range.isTail
         var owned = [String: MLXArray]()
         for url in shardURLs {
             let (weights, _) = try loadArraysAndMetadata(url: url)
             for (key, value) in weights {
-                guard let localKey = remap(key, range: range) else { continue }
+                guard let localKey = remap(key, range: range, tiedTailNeedsEmbed: tiedTailNeedsEmbed)
+                else { continue }
                 owned[localKey] = value
             }
         }
@@ -136,10 +139,10 @@ public enum LlamaPipelineShardLoader {
     }
 
     /// Map a global checkpoint key to this shard's local key, or nil to drop it.
-    static func remap(_ key: String, range: LlamaShardRange) -> String? {
-        // embed_tokens — head only.
+    static func remap(_ key: String, range: LlamaShardRange, tiedTailNeedsEmbed: Bool) -> String? {
+        // embed_tokens — head always; a tied tail also keeps it for projection.
         if key.hasPrefix("model.embed_tokens.") {
-            return range.isHead ? String(key.dropFirst("model.".count)) : nil
+            return (range.isHead || tiedTailNeedsEmbed) ? String(key.dropFirst("model.".count)) : nil
         }
         // final norm — tail only. (Must check before the generic layer prefix.)
         if key.hasPrefix("model.norm.") {

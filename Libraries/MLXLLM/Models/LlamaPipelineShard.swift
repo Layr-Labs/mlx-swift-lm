@@ -49,18 +49,29 @@ public class LlamaPipelineShard: Module {
 
     // Owned submodules. Optionals are nil unless this rank owns that role,
     // so they neither allocate nor expect weights.
+    /// Embedding matrix. Present on the head (to embed tokens) AND on a tied-
+    /// embedding tail (to project logits via `asLinear`, mirroring the
+    /// monolithic LlamaModel). The loader replicates `embed_tokens` weights to
+    /// the tail when the model is tied.
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding?
     let layers: [LlamaTransformerBlock]
     @ModuleInfo(key: "norm") var norm: RMSNorm?
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
+    /// Whether this model ties input/output embeddings (no separate lm_head).
+    public let tieWordEmbeddings: Bool
 
     public init(_ args: LlamaConfiguration, range: LlamaShardRange) {
         precondition(args.vocabularySize > 0)
         precondition(range.start >= 0 && range.end <= args.hiddenLayers && range.start < range.end)
         self.args = args
         self.range = range
+        self.tieWordEmbeddings = args.tieWordEmbeddings
 
-        if range.isHead {
+        // embed_tokens lives on the head (always) and on a tied tail (for the
+        // output projection). A single-node head==tail keeps just one copy.
+        let needsEmbed = range.isHead || (range.isTail && args.tieWordEmbeddings)
+        if needsEmbed {
             self._embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
         }
@@ -103,13 +114,12 @@ public class LlamaPipelineShard: Module {
         if let lmHead {
             return lmHead(normed)
         }
-        // Tied embeddings: project through the (head's) embedding matrix. In a
-        // pipeline split the tail does NOT own embed_tokens, so tied-embedding
-        // models must be configured with an explicit lm_head for the tail, or
-        // the embedding weight replicated to the tail. Llama-3.3-70B ships an
-        // untied lm_head, so this path is not exercised for the target model.
-        fatalError("tied-embedding tail projection requires embed_tokens on the tail; "
-            + "use a model with an explicit lm_head (Llama-3.3-70B has one)")
+        // Tied embeddings: project through the embedding matrix (replicated to
+        // the tail by the loader), exactly as the monolithic LlamaModel does.
+        if let embedTokens {
+            return embedTokens.asLinear(normed)
+        }
+        fatalError("tied-embedding tail is missing its embed_tokens copy (loader bug)")
     }
 
     // MARK: - KV cache sizing
