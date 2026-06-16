@@ -134,6 +134,11 @@ public final class EngineCore: @unchecked Sendable {
     // dangerous ramp toward 499000.
     private static let resourceLogEverySteps = 1000
     private static let resourcePressurePct = 70.0
+    // Fine cadence at which the high-pressure check is evaluated. Must divide both
+    // coarse cadences above so their sampling is unchanged; finer than the coarse
+    // sample so a fast ramp from >=70% to the limit is caught between coarse
+    // samples (the window this telemetry exists to diagnose).
+    private static let resourcePressureEverySteps = 10
     /// os_log channel for the `[rsrc]` line, under the subsystem that
     /// `darkbloom report` captures.
     private static let resourceLogger = Logger(
@@ -369,27 +374,36 @@ public final class EngineCore: @unchecked Sendable {
                         // Diagnostic (default-on): observe resource COUNT vs BYTES
                         // on the real batched-decode path to classify the
                         // [metal::malloc] Resource limit crash as cached vs live.
-                        if Self.resourceDebug, stepsExecuted % Self.resourceDebugEverySteps == 0 {
+                        // Sample on the fine pressure cadence (which divides the
+                        // coarse one) so the high-pressure check is NOT gated by the
+                        // coarse window: resources can cross 70% and hit the limit
+                        // between coarse samples, and that ramp is exactly what this
+                        // telemetry must capture.
+                        if Self.resourceDebug, stepsExecuted % Self.resourcePressureEverySteps == 0 {
                             let res = Memory.numResources
                             let lim = Memory.resourceLimit
                             let pct = lim > 0 ? Double(res) / Double(lim) * 100 : 0
-                            let batch = output.outputs.count
-                            let line = String(
-                                format: "[rsrc] step=%d batch=%d resources=%d/%d (%.1f%%) cache=%.0fMB active=%.0fMB",
-                                stepsExecuted, batch, res, lim, pct,
-                                Double(Memory.cacheMemory) / 1_048_576,
-                                Double(Memory.activeMemory) / 1_048_576)
-                            if Self.stdoutIsTTY {
-                                print(line)
-                                fflush(stdout)
-                            }
-                            // Captured by `darkbloom report` (os_log). Coarse cadence
-                            // to bound report size, but always when pressure is high
-                            // so the climb toward 499000 is never missed.
-                            if stepsExecuted % Self.resourceLogEverySteps == 0
-                                || pct >= Self.resourcePressurePct
-                            {
-                                Self.resourceLogger.log("\(line, privacy: .public)")
+                            let highPressure = pct >= Self.resourcePressurePct
+                            let coarseSample = stepsExecuted % Self.resourceDebugEverySteps == 0
+                            // Emit the line on the coarse cadence, or on every fine
+                            // sample while under pressure (dense ramp, still bounded).
+                            if coarseSample || highPressure {
+                                let batch = output.outputs.count
+                                let line = String(
+                                    format: "[rsrc] step=%d batch=%d resources=%d/%d (%.1f%%) cache=%.0fMB active=%.0fMB",
+                                    stepsExecuted, batch, res, lim, pct,
+                                    Double(Memory.cacheMemory) / 1_048_576,
+                                    Double(Memory.activeMemory) / 1_048_576)
+                                if Self.stdoutIsTTY {
+                                    print(line)
+                                    fflush(stdout)
+                                }
+                                // os_log (captured by `darkbloom report`) on the coarse
+                                // report cadence, plus every fine sample while pressure
+                                // is high so the climb toward 499000 is never missed.
+                                if stepsExecuted % Self.resourceLogEverySteps == 0 || highPressure {
+                                    Self.resourceLogger.log("\(line, privacy: .public)")
+                                }
                             }
                         }
 
