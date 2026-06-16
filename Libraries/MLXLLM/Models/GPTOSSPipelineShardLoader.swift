@@ -85,12 +85,19 @@ public enum GPTOSSPipelineShardLoader {
             throw GPTOSSPipelineShardLoaderError.missingOwnedWeights(role: roleName(range))
         }
 
-        // Quantize modules with packed weights (`.scales` present), per-layer
-        // config with default fallback — same as the Llama loader.
+        // Quantize modules that arrived with packed weights (`.scales` present).
+        // GPT-OSS Q8's per-layer quant config is keyed by the GLOBAL module path
+        // (e.g. "model.layers.0.self_attn.o_proj"), but the shard's modules are
+        // at LOCAL paths ("layers.0.self_attn.o_proj" where local 0 == global
+        // range.start). Translate local→global before the per-layer lookup, and
+        // fall back to the config's default (the top-level group_size/bits, used
+        // by the MoE experts) when a module has no explicit entry.
         if let perLayerQuantization {
-            quantize(model: shard) { path, _ in
-                guard owned["\(path).scales"] != nil else { return nil }
-                return perLayerQuantization.quantization(layer: path)?.asTuple
+            quantize(model: shard) { localPath, _ in
+                guard owned["\(localPath).scales"] != nil else { return nil }
+                let globalPath = Self.localToGlobalPath(localPath, range: range)
+                let q = perLayerQuantization.quantization(layer: globalPath)
+                return q?.asTuple
             }
         }
 
@@ -126,5 +133,23 @@ public enum GPTOSSPipelineShardLoader {
 
     private static func roleName(_ r: LlamaShardRange) -> String {
         r.isHead ? "head" : r.isTail ? "tail" : "middle"
+    }
+
+    /// Translate a shard-local module path to the model-global path used as the
+    /// key in the per-layer quantization config.
+    ///   "layers.{local}.…"  ->  "model.layers.{local+start}.…"
+    ///   "lm_head"            ->  "lm_head"  (unchanged)
+    ///   "embed_tokens"/"norm" -> "model.embed_tokens" / "model.norm"
+    static func localToGlobalPath(_ localPath: String, range: LlamaShardRange) -> String {
+        if localPath.hasPrefix("layers.") {
+            let rest = localPath.dropFirst("layers.".count)
+            guard let dot = rest.firstIndex(of: "."),
+                  let local = Int(rest[rest.startIndex..<dot]) else {
+                return "model." + localPath
+            }
+            return "model.layers.\(local + range.start)\(rest[dot...])"
+        }
+        if localPath == "lm_head" || localPath.hasPrefix("lm_head.") { return localPath }
+        return "model." + localPath   // embed_tokens, norm
     }
 }
