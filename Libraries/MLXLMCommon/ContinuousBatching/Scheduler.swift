@@ -106,9 +106,11 @@ public enum KVQuantCacheKind: Sendable, Equatable {
 
 /// Configuration for per-layer KV-cache quantization in the continuous-batching
 /// scheduler. When set on ``SchedulerConfig/kvQuantization``, full-attention
-/// layers use ``QuantizedBatchKVCache`` (or ``DequantBatchKVCache`` when
-/// ``cacheKind`` is ``KVQuantCacheKind/dequant``); rotating / sliding-window
-/// layers keep ``BatchRotatingKVCache``.
+/// layers use ``QuantizedBatchKVCache`` and sliding-window layers use
+/// ``QuantizedBatchRotatingKVCache`` (or the ``DequantBatchKVCache`` /
+/// ``DequantBatchRotatingKVCache`` variants when ``cacheKind`` is
+/// ``KVQuantCacheKind/dequant``). Both attention layer types are quantized, so
+/// the capacity win covers the whole cache, not just the full-attention layers.
 public struct KVQuantizationConfig: Sendable {
     public let groupSize: Int
     public let bits: Int
@@ -140,8 +142,9 @@ public struct SchedulerConfig: Sendable {
     /// largest KV footprint is preempted and re-queued. 0 = unlimited.
     public var maxKVCacheTokens: Int
     /// Optional KV-cache quantization configuration. When non-nil, full-attention
-    /// layers are backed by ``QuantizedBatchKVCache``; sliding-window layers
-    /// remain ``BatchRotatingKVCache``.
+    /// layers are backed by ``QuantizedBatchKVCache`` and sliding-window layers by
+    /// ``QuantizedBatchRotatingKVCache`` (or their dequant variants), so the whole
+    /// KV cache is quantized.
     public var kvQuantization: KVQuantizationConfig?
 
     public init(
@@ -1027,7 +1030,9 @@ public final class Scheduler: @unchecked Sendable {
     private enum CacheFactoryKind: Sendable {
         case mamba
         case arrays(size: Int)
-        case rotating(maxSize: Int)
+        /// Sliding-window layer. When `quant` is set, the layer is backed by a
+        /// quantized rotating cache; otherwise the fp16 ``BatchRotatingKVCache``.
+        case rotating(maxSize: Int, quant: KVQuantizationConfig?)
         case quantized(config: KVQuantizationConfig)
         case fp16
 
@@ -1035,7 +1040,12 @@ public final class Scheduler: @unchecked Sendable {
             switch self {
             case .mamba: return String(describing: MambaCache.self)
             case .arrays: return String(describing: ArraysCache.self)
-            case .rotating: return String(describing: BatchRotatingKVCache.self)
+            case .rotating(_, let quant):
+                guard let quant else { return String(describing: BatchRotatingKVCache.self) }
+                switch quant.cacheKind {
+                case .kernel: return String(describing: QuantizedBatchRotatingKVCache.self)
+                case .dequant: return String(describing: DequantBatchRotatingKVCache.self)
+                }
             case .quantized(let config):
                 switch config.cacheKind {
                 case .kernel: return String(describing: QuantizedBatchKVCache.self)
@@ -1057,7 +1067,9 @@ public final class Scheduler: @unchecked Sendable {
             return .arrays(size: arrays.slotCount)
         }
         if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
-            return .rotating(maxSize: maxSize)
+            // Sliding-window layers are now quantizable too (quant groups run
+            // along head-dim, so the window front-trim is group-safe).
+            return .rotating(maxSize: maxSize, quant: quantConfig)
         }
         // Composite caches (e.g. CacheList = MambaCache + KVCacheSimple in
         // BaichuanM1 / FalconH1) must not be replaced wholesale by a quantized
@@ -1095,8 +1107,32 @@ public final class Scheduler: @unchecked Sendable {
             return { MambaCache(leftPadding: Array(repeating: 0, count: $0)) }
         case .arrays(let size):
             return { ArraysCache(size: size, leftPadding: Array(repeating: 0, count: $0)) }
-        case .rotating(let maxSize):
-            return { BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0)) }
+        case .rotating(let maxSize, let quant):
+            guard let quant else {
+                return {
+                    BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0))
+                }
+            }
+            return {
+                switch quant.cacheKind {
+                case .kernel:
+                    QuantizedBatchRotatingKVCache(
+                        maxSize: maxSize,
+                        leftPadding: Array(repeating: 0, count: $0),
+                        groupSize: quant.groupSize,
+                        bits: quant.bits,
+                        mode: quant.mode
+                    )
+                case .dequant:
+                    DequantBatchRotatingKVCache(
+                        maxSize: maxSize,
+                        leftPadding: Array(repeating: 0, count: $0),
+                        groupSize: quant.groupSize,
+                        bits: quant.bits,
+                        mode: quant.mode
+                    )
+                }
+            }
         case .quantized(let config):
             return {
                 switch config.cacheKind {

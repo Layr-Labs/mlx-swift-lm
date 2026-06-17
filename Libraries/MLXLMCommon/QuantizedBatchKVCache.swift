@@ -42,6 +42,47 @@ public final class DequantBatchKVCache: QuantizedBatchKVCacheBase {
     }
 }
 
+/// Quantized, continuously-batchable **sliding-window** KV cache — the rotating
+/// counterpart of ``QuantizedBatchKVCache``. Backs full quantization of the
+/// sliding-window layers (the majority on Gemma-4 / GPT-OSS) that otherwise stay
+/// fp16, using the native quantized attention kernel. Window front-trim is
+/// handled by ``QuantizedBatchKVCacheBase`` (it is group-safe because quant
+/// groups run along head-dim, not time).
+public final class QuantizedBatchRotatingKVCache: QuantizedBatchKVCacheBase,
+    QuantizedKVCacheProtocol
+{
+    /// Build a windowed quantized cache. `maxSize` is the sliding-window length.
+    public convenience init(
+        maxSize: Int,
+        leftPadding: [Int],
+        groupSize: Int = 64,
+        bits: Int = 8,
+        mode: QuantizationMode = .affine
+    ) {
+        self.init(
+            leftPadding: leftPadding, groupSize: groupSize, bits: bits, mode: mode,
+            windowSize: maxSize)
+    }
+}
+
+/// Sink-safe (dequant-on-read) sliding-window quantized cache — the rotating
+/// counterpart of ``DequantBatchKVCache``, for sink models (e.g. GPT-OSS) whose
+/// quantized kernel path can't be used. Stores quantized for the capacity win,
+/// returns fp16 so the regular sink-aware attention path runs.
+public final class DequantBatchRotatingKVCache: QuantizedBatchKVCacheBase {
+    public convenience init(
+        maxSize: Int,
+        leftPadding: [Int],
+        groupSize: Int = 64,
+        bits: Int = 8,
+        mode: QuantizationMode = .affine
+    ) {
+        self.init(
+            leftPadding: leftPadding, groupSize: groupSize, bits: bits, mode: mode,
+            windowSize: maxSize)
+    }
+}
+
 /// Base implementation for quantized batched KV caches.
 ///
 /// Holds all the storage, batched-cache logic, and the dequantizing
@@ -57,6 +98,16 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
+
+    /// Sliding-window size, in tokens. `nil` ⇒ a full-attention cache that grows
+    /// unbounded (the original behavior). When set, this cache mirrors
+    /// ``BatchRotatingKVCache``: after each update the oldest tokens are trimmed
+    /// off the **front** of the time axis so at most `windowSize` tokens are
+    /// retained. Front-trimming is safe for the quantized representation because
+    /// quantization groups run along the HEAD-DIM axis (`groupSize` divides
+    /// `head_dim`), never the time axis — so dropping whole leading tokens can
+    /// never split a quant group. Subclasses set this for sliding-window layers.
+    public let windowSize: Int?
 
     // MARK: - BatchedCache / BatchPositionedKVCache
 
@@ -88,8 +139,15 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         set { _idx = newValue }
     }
 
-    public override var maxSize: Int? { nil }
-    public override var isTrimmable: Bool { true }
+    /// A windowed cache caps its time axis at `windowSize`; an unbounded cache
+    /// reports `nil` (matching ``BatchKVCache``/``BatchRotatingKVCache``).
+    public override var maxSize: Int? { windowSize }
+    /// A windowed cache is only trimmable until it fills its window (mirrors
+    /// ``BatchRotatingKVCache.isTrimmable``); an unbounded cache always is.
+    public override var isTrimmable: Bool {
+        guard let windowSize else { return true }
+        return _idx < windowSize
+    }
 
     // MARK: - Init
 
@@ -97,11 +155,13 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         leftPadding: [Int],
         groupSize: Int = 64,
         bits: Int = 8,
-        mode: QuantizationMode = .affine
+        mode: QuantizationMode = .affine,
+        windowSize: Int? = nil
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
+        self.windowSize = windowSize
         self.leftPadding = MLXArray(leftPadding.map { Int32($0) })
         self.batchOffset = MLXArray(leftPadding.map { Int32(-$0) })
         super.init()
@@ -111,6 +171,7 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         groupSize: Int,
         bits: Int,
         mode: QuantizationMode,
+        windowSize: Int?,
         keys: (MLXArray, MLXArray, MLXArray?)?,
         values: (MLXArray, MLXArray, MLXArray?)?,
         offset: MLXArray,
@@ -121,6 +182,7 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         self.groupSize = groupSize
         self.bits = bits
         self.mode = mode
+        self.windowSize = windowSize
         self.keys = keys
         self.values = values
         self.batchOffset = offset
@@ -178,9 +240,32 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         var currentKeys = self.keys
         var currentValues = self.values
 
+        // Sliding-window front-trim BEFORE a multi-token prefill append, mirroring
+        // ``BatchRotatingKVCache.update``: drop the oldest tokens so the retained
+        // context plus this prefill block fits the window, but never trim the
+        // block being appended. (Single-token decode trims AFTER the append,
+        // below.) Front-trim is a plain time-axis slice of the quantized tuples —
+        // group-safe because groups run along head-dim, not time.
+        if let windowSize, stepCount > 1, var ck = currentKeys, var cv = currentValues {
+            let trimSize = prev - windowSize + 1
+            if trimSize > 0 {
+                ck = trimmedFront(ck, by: trimSize)
+                cv = trimmedFront(cv, by: trimSize)
+                currentKeys = ck
+                currentValues = cv
+                self.keys = ck
+                self.values = cv
+                leftPadding = leftPadding - Int32(trimSize)
+                _idx -= trimSize
+            }
+        }
+        // `prev` is captured before any trim; refresh it so the append range and
+        // the grow check below use the post-trim write position.
+        let writeStart = _idx
+
         let needGrow: Bool = {
             guard let storedKeys = currentKeys else { return true }
-            return (prev + stepCount) > storedKeys.0.dim(-2)
+            return (writeStart + stepCount) > storedKeys.0.dim(-2)
         }()
 
         if needGrow {
@@ -188,9 +273,9 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
             let newShape = [B, nKVHeads, nSteps * Self.allocationStep]
 
             if var existingKeys = currentKeys, var existingValues = currentValues {
-                if prev % Self.allocationStep != 0 {
-                    existingKeys = trimmedTo(existingKeys, limit: prev)
-                    existingValues = trimmedTo(existingValues, limit: prev)
+                if writeStart % Self.allocationStep != 0 {
+                    existingKeys = trimmedTo(existingKeys, limit: writeStart)
+                    existingValues = trimmedTo(existingValues, limit: writeStart)
                 }
                 currentKeys = expandQuant(existingKeys, newShape: newShape)
                 currentValues = expandQuant(existingValues, newShape: newShape)
@@ -215,8 +300,19 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         _idx += stepCount
         batchOffset = batchOffset + Int32(stepCount)
 
-        assign(into: &ck, from: newKeys, range: prev..<_idx)
-        assign(into: &cv, from: newValues, range: prev..<_idx)
+        assign(into: &ck, from: newKeys, range: writeStart..<_idx)
+        assign(into: &cv, from: newValues, range: writeStart..<_idx)
+
+        // Single-token decode front-trim AFTER the append, mirroring
+        // ``BatchRotatingKVCache.update``: once the window is full, drop the one
+        // oldest token so the retained length stays at `windowSize`.
+        if let windowSize, stepCount == 1, _idx > windowSize {
+            let trimSize = _idx - windowSize
+            ck = trimmedFront(ck, by: trimSize)
+            cv = trimmedFront(cv, by: trimSize)
+            leftPadding = leftPadding - Int32(trimSize)
+            _idx = windowSize
+        }
 
         self.keys = ck
         self.values = cv
@@ -245,33 +341,50 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
     // MARK: - Mask
 
     public override func makeMask(
-        n: Int, windowSize: Int?, returnArray _: Bool
+        n: Int, windowSize callerWindowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        // Single-query decode fast path: one query attends to every stored key,
-        // so the causal mask is all-`true` — a no-op. Skip building and applying
-        // it on the kernel path. This is only valid when nothing would actually
-        // be masked:
-        //   * `windowSize == nil` — a sliding window would mask keys older than
-        //     the window. This cache stores all tokens (it grows; it does not
-        //     evict), so a windowed layer still needs the materialized mask.
-        //   * `leftPadding.max() <= 0` — left padding would mask the leading
-        //     padded slots of right-justified rows.
-        // Under both conditions the omitted mask is bit-identical to the
-        // materialized all-`true` mask (in `quantizedScaledDotProductAttention`,
-        // `.none` skips the masking step while an all-`true` array mask leaves
-        // every score untouched), so decode numerics are preserved exactly while
-        // saving the per-step `createCausalMask` build and `where` application.
-        // The `n == 1` / `windowSize == nil` checks short-circuit before the
-        // `leftPadding` device sync, so prefill (n > 1) never pays for it.
-        // For n > 1 (prefill / chunked) the mask is materialized exactly as
-        // before. Mirrors `BatchKVCache.makeMask`'s fast path.
-        if n == 1, windowSize == nil, leftPadding.max().item(Int32.self) <= 0 {
+        if let cacheWindow = self.windowSize {
+            // Windowed cache: mirror ``BatchRotatingKVCache.makeMask`` exactly,
+            // including the single-token `.none` fast path. The fast path matters
+            // for more than perf: the DequantBatchRotatingKVCache subclass runs
+            // the REGULAR `MLXFast.scaledDotProductAttention`, so always handing
+            // it an explicit array mask would route sliding-window decode back
+            // through the mlx#3384 explicit-mask path (the divergence PR #43 fixed
+            // for full-attention layers). The boundary check mirrors the
+            // reference: makeMask runs BEFORE update (which appends `n` then trims
+            // to the window), so `.none` is valid only if the post-update retained
+            // length `min(_idx + n, cacheWindow)` fits the window.
+            let actualWindow = callerWindowSize ?? cacheWindow
+            if n == 1, min(_idx + n, cacheWindow) <= actualWindow,
+                leftPadding.max().item(Int32.self) <= 0
+            {
+                return .none
+            }
+            let maskOffset = min(cacheWindow - 1, _idx)
+            let mask = createCausalMask(
+                n: n,
+                offset: maskOffset,
+                windowSize: actualWindow,
+                leftPadding: leftPadding
+            )
+            return .array(mask)
+        }
+        // Non-windowed (full-attention) single-query decode fast path: one query
+        // attends to every stored key, so the causal mask is all-`true` — a no-op.
+        // Skip building/applying it when nothing would actually be masked
+        // (`callerWindowSize == nil` and `leftPadding.max() <= 0`). `.none` is
+        // bit-identical to an all-`true` mask in both the kernel path (skips the
+        // masking step) and the dequant path's regular SDPA (avoids the mlx#3384
+        // explicit-mask divergence). For n > 1 (prefill/chunked) the mask is
+        // materialized as before; the `n == 1` check short-circuits before the
+        // `leftPadding` device sync.
+        if n == 1, callerWindowSize == nil, leftPadding.max().item(Int32.self) <= 0 {
             return .none
         }
         let mask = createCausalMask(
             n: n,
             offset: _idx,
-            windowSize: windowSize,
+            windowSize: callerWindowSize,
             leftPadding: leftPadding
         )
         return .array(mask)
@@ -344,9 +457,13 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
     }
 
     public func extractBatched(_ idx: Int) -> any KVCache {
-        let cache = KVCacheSimple()
+        // A windowed cache restores into a single-stream RotatingKVCache so the
+        // window semantics survive the round-trip; an unbounded cache restores
+        // into a KVCacheSimple. Both carry the dequantized fp16 view (the
+        // serializer round-trips fp16; quant params are re-applied on reload via
+        // the scheduler's cache factory).
         guard let storedK = keys, let storedV = values else {
-            return cache
+            return windowSize != nil ? RotatingKVCache(maxSize: windowSize!, keep: 0) : KVCacheSimple()
         }
 
         let leftPad = max(0, Int(leftPadding[idx].item(Int32.self)))
@@ -363,6 +480,24 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
             groupSize: groupSize, bits: bits, mode: mode)
 
         eval(kDQ, vDQ)
+
+        if let windowSize {
+            // Mirror ``BatchRotatingKVCache.extract``: build a single-stream
+            // rotating cache with the absolute offset so resume aligns the
+            // sliding mask correctly.
+            let rotating = RotatingKVCache(maxSize: windowSize, keep: 0)
+            let absoluteOffset = Int(batchOffset[idx].item(Int32.self))
+            rotating.state = [kDQ, vDQ]
+            // metaState = [keep, maxSize, step, offset, idx] — same shape and
+            // step (allocationStep=256) BatchRotatingKVCache.extract emits.
+            rotating.metaState = [
+                "0", "\(windowSize)", "\(Self.allocationStep)", "\(absoluteOffset)",
+                "\(kDQ.dim(2))",
+            ]
+            return rotating
+        }
+
+        let cache = KVCacheSimple()
         cache.state = [kDQ, vDQ]
         return cache
     }
@@ -376,8 +511,9 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
     /// concatenated along the batch axis.
     public func extend(_ other: QuantizedBatchKVCacheBase) {
         precondition(
-            groupSize == other.groupSize && bits == other.bits && mode == other.mode,
-            "QuantizedBatchKVCacheBase.extend requires matching quantization params"
+            groupSize == other.groupSize && bits == other.bits && mode == other.mode
+                && windowSize == other.windowSize,
+            "QuantizedBatchKVCacheBase.extend requires matching quantization params and window"
         )
 
         if keys == nil && other.keys == nil {
@@ -553,7 +689,8 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
             leftPadding: Array(repeating: 0, count: leftPadding.dim(0)),
             groupSize: groupSize,
             bits: bits,
-            mode: mode
+            mode: mode,
+            windowSize: windowSize
         )
         let s = state
         if !s.isEmpty {
@@ -588,6 +725,16 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         limit: Int
     ) -> (MLXArray, MLXArray, MLXArray?) {
         return treeMap({ $0[.ellipsis, ..<limit, 0...] }, tuple)
+    }
+
+    /// Drop the leading `count` tokens off the time axis (the sliding-window
+    /// front-trim). Group-safe: quant groups run along head-dim, so removing
+    /// whole leading tokens never splits a group.
+    private func trimmedFront(
+        _ tuple: (MLXArray, MLXArray, MLXArray?),
+        by count: Int
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        return treeMap({ $0[.ellipsis, count..., 0...] }, tuple)
     }
 
     private func assign(
