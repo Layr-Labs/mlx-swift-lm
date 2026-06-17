@@ -1033,7 +1033,23 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelAttentionMask: pixelAttentionMask
         )
 
-        let result = languageModel(nil, cache: cache, inputsEmbeds: inputEmbeddings)
+        // windowSize-chunked prefill (upstream 0ec0f33), adapted to our fork's
+        // pattern: we don't carry upstream's withPreparedCache/sequenceLengths
+        // batched-cache wrapper, so drive the chunked loop directly like the
+        // other VLM prepare() paths and our Gemma4 prepare().
+        let prefillStepSize = windowSize ?? 512
+        let totalPositions = inputEmbeddings.dim(1)
+        var processed = 0
+        while totalPositions - processed > 1 {
+            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+            let range = processed ..< (processed + chunkLength)
+            _ = languageModel(nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., range, 0...])
+            asyncEval(cache)
+            processed += chunkLength
+        }
+        eval(cache)
+        let result = languageModel(
+            nil, cache: cache, inputsEmbeds: inputEmbeddings[0..., processed..., 0...])
 
         return .logits(result)
     }
