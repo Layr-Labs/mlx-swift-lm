@@ -928,6 +928,14 @@ public final class Scheduler: @unchecked Sendable {
         if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
             return .rotating(maxSize: maxSize)
         }
+        // Composite caches (e.g. CacheList = MambaCache + KVCacheSimple in
+        // BaichuanM1 / FalconH1) must not be replaced wholesale by a quantized
+        // KV cache: those models downcast the per-layer cache back to CacheList
+        // in their forward pass. Only plain full-attention layers are eligible
+        // for KV-quant; leave everything else on the existing fp16 path.
+        if layer is CacheList {
+            return .fp16
+        }
         if let quantConfig {
             return .quantized(config: quantConfig)
         }

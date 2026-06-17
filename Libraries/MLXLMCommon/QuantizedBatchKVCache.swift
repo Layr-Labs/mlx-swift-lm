@@ -23,6 +23,23 @@ public final class QuantizedBatchKVCache: QuantizedBatchKVCacheBase,
 /// capacity win, but ``update(keys:values:)`` returns dequantized fp16 so the
 /// model falls back to the regular sink-aware attention path.
 public final class DequantBatchKVCache: QuantizedBatchKVCacheBase {
+    /// Because this path returns dequantized fp16 K/V and attends through the
+    /// regular `MLXFast.scaledDotProductAttention`, it must mirror the fast-path
+    /// in ``BatchKVCache/makeMask(n:windowSize:returnArray:)``: for single-token
+    /// decode with no left padding, return `.none` so SDPA takes its unmasked
+    /// kernel path. Passing an explicit (all-`true`) mask here routes SDPA
+    /// through the divergent MLX #3384 branch whose numerical drift flips top-1
+    /// logprobs on quantized Gemma 4 and traps continuous-batched decode in
+    /// repetition loops. The base class (kernel path) keeps its always-masked
+    /// behavior, which is what the Gemma 4 g128 kernel scheme was validated on.
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray returnArrayFlag: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n == 1, leftPadding.max().item(Int32.self) <= 0 {
+            return .none
+        }
+        return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArrayFlag)
+    }
 }
 
 /// Base implementation for quantized batched KV caches.
