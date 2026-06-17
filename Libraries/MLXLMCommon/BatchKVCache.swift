@@ -611,9 +611,10 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
         }
 
         // DAR-325: collapse the per-step `batchOffset`/`leftPadding` lazy chains
-        // on decode (rebuilt at :594/:600). gemma-4 consumes each from only one
-        // representative cache (shared RoPE offset + one sliding mask), so the
-        // others leak ~2 tiny scalar buffers/step until `numResources` hits the
+        // on decode (rebuilt at :603/:609). Models consume these from only one
+        // representative cache per step (gemma-4: a shared RoPE offset + one
+        // sliding mask; gpt-oss: one shared sliding mask), so every other cache's
+        // chain accretes a tiny scalar buffer/step until `numResources` hits the
         // iogpu ceiling and aborts (COUNT leak, flat bytes). keys/values don't
         // leak (attention consumes them each step). `asyncEval` detaches the
         // chains, no GPU sync. Prefill untouched.

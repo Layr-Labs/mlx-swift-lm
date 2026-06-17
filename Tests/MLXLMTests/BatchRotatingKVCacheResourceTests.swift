@@ -98,9 +98,10 @@ struct BatchRotatingKVCacheResourceTests {
     }
 
     /// A genuine leak grows ~linearly (tens per step → tens of thousands total);
-    /// the fix and the control stay flat. The threshold (< 0.5/step) sits two
-    /// orders of magnitude under the pre-fix slope (~48/step sliding, ~24/step
-    /// full) and well above any clearCache-suppressed cross-suite noise.
+    /// the fix and the control stay flat. The 0.5/step threshold sits well below
+    /// the pre-fix slope — synthetic ~48/step (sliding x25), ~7/step (full x8);
+    /// live ~53/step (gemma-4-26B), ~11/step (gpt-oss) — and above any
+    /// clearCache-suppressed cross-suite noise.
     private let maxSlope = 0.5
 
     // MARK: - Subject: BatchRotatingKVCache (gemma sliding layers)
