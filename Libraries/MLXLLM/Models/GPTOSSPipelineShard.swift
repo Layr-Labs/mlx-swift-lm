@@ -120,4 +120,16 @@ public class GPTOSSPipelineShard: Module {
     }
 
     public var ownedLayerCount: Int { layers.count }
+
+    /// Batched KV caches for this rank's owned layers (continuous-batching path).
+    /// GPT-OSS interleaves full- and sliding-attention layers, so each owned
+    /// layer gets the matching batched cache type (sliding ⇒ BatchRotatingKVCache
+    /// capped at the window). `leftPadding` has one entry per batch row.
+    public func makeBatchedCaches(leftPadding: [Int]) -> [any KVCache] {
+        ownedLayerTypes.map { type in
+            type == "sliding_attention"
+                ? BatchRotatingKVCache(maxSize: windowSize, leftPadding: leftPadding)
+                : BatchKVCache(leftPadding: leftPadding)
+        }
+    }
 }

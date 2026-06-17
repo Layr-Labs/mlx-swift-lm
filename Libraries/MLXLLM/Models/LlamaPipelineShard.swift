@@ -143,4 +143,11 @@ public class LlamaPipelineShard: Module {
 
     /// Number of KV caches this rank needs (one per owned layer).
     public var ownedLayerCount: Int { layers.count }
+
+    /// Batched KV caches for this rank's owned layers (continuous-batching path).
+    /// Llama is full-attention throughout ⇒ one `BatchKVCache` per owned layer.
+    /// `leftPadding` has one entry per batch row.
+    public func makeBatchedCaches(leftPadding: [Int]) -> [any KVCache] {
+        (0 ..< layers.count).map { _ in BatchKVCache(leftPadding: leftPadding) }
+    }
 }
