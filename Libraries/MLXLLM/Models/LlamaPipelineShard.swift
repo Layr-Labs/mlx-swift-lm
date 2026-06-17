@@ -103,7 +103,11 @@ public class LlamaPipelineShard: Module {
     /// (kIOGPUCommandBufferCallbackErrorTimeout). 0 disables the periodic eval.
     public func runOwnedLayers(_ hidden: MLXArray, cache: [KVCache]? = nil, evalEvery: Int = 8) -> MLXArray {
         var h = hidden
-        let mask = createAttentionMask(h: h, cache: cache?.first)
+        // Derive the mask from the cache via makeMask so a batched cache
+        // (BatchKVCache) supplies its per-row left-padding-aware mask for ragged
+        // batches. For KVCacheSimple this returns .causal/.none — identical to
+        // the previous plain-causal behavior, so the B=1 path is unchanged.
+        let mask = makeAttentionMask(n: h.dim(1), cache: cache?.first)
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
             if evalEvery > 0 && (i + 1) % evalEvery == 0 {
