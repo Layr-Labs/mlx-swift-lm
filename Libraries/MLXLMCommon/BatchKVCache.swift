@@ -180,6 +180,15 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         self.keys?[.ellipsis, prev ..< _idx, 0...] = keys
         self.values?[.ellipsis, prev ..< _idx, 0...] = values
 
+        // DAR-325: collapse the per-step `batchOffset` lazy chain on decode.
+        // gemma-4 shares one RoPE `perRowOffset` from the first cache
+        // (Gemma4.swift:1264), so other caches never consume their own
+        // `batchOffset` and leak a tiny scalar buffer/step (COUNT leak, flat
+        // bytes). `asyncEval` detaches it, no GPU sync. Prefill untouched.
+        if stepCount == 1 {
+            asyncEval(batchOffset)
+        }
+
         return (
             self.keys![.ellipsis, ..<_idx, 0...],
             self.values![.ellipsis, ..<_idx, 0...]
@@ -599,6 +608,17 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             self.values = self.values![.ellipsis, trimSize..., 0...]
             leftPadding = leftPadding - Int32(trimSize)
             _idx = maxCacheSize
+        }
+
+        // DAR-325: collapse the per-step `batchOffset`/`leftPadding` lazy chains
+        // on decode (rebuilt at :594/:600). gemma-4 consumes each from only one
+        // representative cache (shared RoPE offset + one sliding mask), so the
+        // others leak ~2 tiny scalar buffers/step until `numResources` hits the
+        // iogpu ceiling and aborts (COUNT leak, flat bytes). keys/values don't
+        // leak (attention consumes them each step). `asyncEval` detaches the
+        // chains, no GPU sync. Prefill untouched.
+        if stepCount == 1 {
+            asyncEval(batchOffset, leftPadding)
         }
 
         return (self.keys!, self.values!)
