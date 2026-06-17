@@ -1764,7 +1764,8 @@ public func quantizedScaledDotProductAttention(
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
     groupSize: Int = 64,
     bits: Int = 8,
-    mode: QuantizationMode = .affine
+    mode: QuantizationMode = .affine,
+    sinks: MLXArray? = nil
 ) -> MLXArray {
 
     let (B, nQHeads, L, D) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
@@ -1791,19 +1792,28 @@ public func quantizedScaledDotProductAttention(
         )
     }
 
-    // Compute attention scores using quantized matmul
-    var scores = quantizedMM(
+    // Compute attention scores using quantized matmul. In the GQA case this is
+    // 5D [B, nKVHeads, nRepeats, L, kL]; otherwise 4D [B, nQHeads, L, kL].
+    let rawScores = quantizedMM(
         scaledQueries, qKeys.0, scales: qKeys.1, biases: qKeys.2,
         transpose: true, groupSize: groupSize, bits: bits,
         mode: mode
     )
+    let kL = rawScores.dim(-1)
+
+    // Collapse to the canonical 4D [B, nQHeads, L, kL] layout for masking, sink,
+    // and softmax. This is required for correctness with GQA *and* batching:
+    // standard attention masks are [B, 1, L, kL] / [B, nQHeads, L, kL] / [L, kL]
+    // and cannot broadcast against the 5D GQA score tensor when B > 1 (the 5D
+    // path only "worked" at B == 1 because the leading 1s happened to broadcast).
+    var scores = nRepeats > 1 ? rawScores.reshaped([B, nQHeads, L, kL]) : rawScores
 
     // Apply mask
     switch mask {
     case .causal:
-        let (qL, kL) = (scores.dim(-2), scores.dim(-1))
-        let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
-        let kIndices = MLXArray(0 ..< kL)
+        let (qL, kLen) = (scores.dim(-2), scores.dim(-1))
+        let qIndices = MLXArray(0 ..< qL) + MLXArray(kLen - qL)
+        let kIndices = MLXArray(0 ..< kLen)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
         // Local patch: keep -Float.greatestFiniteMagnitude here until the upstream fix lands.
@@ -1830,7 +1840,45 @@ public func quantizedScaledDotProductAttention(
         break
     }
 
-    let attentionWeights = softmax(scores, axis: -1)
+    let attentionWeights4D: MLXArray
+    if let sinks {
+        // Attention sink: a learned per-(query)head logit that acts as one extra
+        // "virtual" key in the softmax — it has no value vector, so it only
+        // absorbs softmax mass, making the real-token weights sum to < 1.
+        // (Equivalent to concatenating `sinks` as an extra score column and
+        // dropping it after softmax, but done without concat/slice so the
+        // weights stay contiguous for `quantizedMM`.) A no-sink cache is the
+        // `sink -> -inf` limit, i.e. `sinks == nil` below, NOT a zero sink.
+        //
+        // In the canonical 4D layout `sinks` ([nQHeads]) maps directly onto the
+        // head axis.
+        let sinkLogits = sinks.reshaped([1, nQHeads, 1, 1])
+        // Numerically-stable softmax with the sink folded into the denominator.
+        let rowMax = scores.max(axis: -1, keepDims: true)
+        let m = maximum(rowMax, sinkLogits)
+        let expScores = exp(scores - m)
+        let sinkExp = exp(sinkLogits - m)
+        let denom = expScores.sum(axis: -1, keepDims: true) + sinkExp
+        attentionWeights4D = expScores / denom
+    } else {
+        // Stable no-sink softmax. Unlike the generic softmax, this keeps fully
+        // masked query rows finite by assigning zero probability to every real
+        // key (there is no sink to absorb probability mass). Model code ignores
+        // padded query rows, but keeping them finite avoids NaN propagation.
+        let rowMax = scores.max(axis: -1, keepDims: true)
+        let validRow = rowMax .> MLXArray(-Float.greatestFiniteMagnitude / 2)
+        let expScores = MLX.where(validRow, exp(scores - rowMax), MLXArray(Float(0)))
+        let denom = expScores.sum(axis: -1, keepDims: true)
+        attentionWeights4D = MLX.where(
+            denom .> MLXArray(Float(0)), expScores / denom, MLXArray(Float(0)))
+    }
+
+    // Restore the GQA-expanded layout [B, nKVHeads, nRepeats, L, kL] for the value
+    // matmul (qValues were expanded along axis -3 above).
+    let attentionWeights =
+        nRepeats > 1
+        ? attentionWeights4D.reshaped([B, nKVHeads, nRepeats, L, kL])
+        : attentionWeights4D
 
     // Compute output using quantized matmul
     var output = quantizedMM(
