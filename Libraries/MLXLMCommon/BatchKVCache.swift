@@ -180,16 +180,11 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         self.keys?[.ellipsis, prev ..< _idx, 0...] = keys
         self.values?[.ellipsis, prev ..< _idx, 0...] = values
 
-        // DAR-325: detach the per-step `batchOffset` lazy chain on the decode
-        // path. gemma-4 shares a single RoPE `perRowOffset` (Gemma4.swift:1264)
-        // across all layers, so a full-attention cache that is not the
-        // representative one never has its `batchOffset` consumed and accretes a
-        // tiny scalar buffer per step (a COUNT leak with flat bytes). `asyncEval`
-        // collapses it without a hard GPU sync. (Models that consume each
-        // cache's own batchOffset via the generic `applyRotaryPosition` — e.g.
-        // gpt-oss — already collapse it; this is then a cheap no-op.) Unlike the
-        // sliding `BatchRotatingKVCache`, this cache never mutates `leftPadding`
-        // per step, so only `batchOffset` needs collapsing. Prefill untouched.
+        // DAR-325: collapse the per-step `batchOffset` lazy chain on decode.
+        // gemma-4 shares one RoPE `perRowOffset` from the first cache
+        // (Gemma4.swift:1264), so other caches never consume their own
+        // `batchOffset` and leak a tiny scalar buffer/step (COUNT leak, flat
+        // bytes). `asyncEval` detaches it, no GPU sync. Prefill untouched.
         if stepCount == 1 {
             asyncEval(batchOffset)
         }
@@ -615,29 +610,13 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             _idx = maxCacheSize
         }
 
-        // DAR-325: on the single-token DECODE path, detach the per-step lazy
-        // metadata graphs so the prior step's pinned scalar buffer becomes
-        // reclaimable. Every decode step rebuilds `batchOffset` (`+ stepCount`,
-        // :594) and `leftPadding` (`- trimSize`, :600) into a growing lazy add
-        // chain, and each `+/- Int32(...)` pins a tiny Metal scalar buffer. The
-        // generation loop never collapses these chains, because gemma-4's decode
-        // forward consumes each metadata array from only ONE representative
-        // cache: RoPE applies a single shared `perRowOffset` captured from the
-        // first cache (Gemma4.swift:1264-1266, :1300) and the sliding mask is
-        // built once (Gemma4.swift:1244, :1283, whose makeMask does
-        // `leftPadding.max().item()`). So every other sliding cache accretes ~2
-        // live buffers per step (batchOffset + leftPadding) — bytes stay flat
-        // (the scalars are tiny) while the COUNT climbs ~2·(N−1)/step until
-        // `numResources` hits the iogpu ceiling and the process aborts with
-        // `[metal::malloc] Resource limit exceeded`.
-        //
-        // `asyncEval` materializes the two TINY ([B] int32) arrays and detaches
-        // their graphs without a hard GPU sync (mirroring the decode loop's own
-        // `asyncEval(sampledTokens)`). keys/values are deliberately NOT touched:
-        // attention consumes the returned (k, v) every step, so their
-        // slice-of-`concatenated(...)` graph already collapses — the earlier
-        // `contiguous()`+`eval` of keys/values was unnecessary work. The bounded
-        // prefill path (`stepCount > 1`) is intentionally left untouched.
+        // DAR-325: collapse the per-step `batchOffset`/`leftPadding` lazy chains
+        // on decode (rebuilt at :594/:600). gemma-4 consumes each from only one
+        // representative cache (shared RoPE offset + one sliding mask), so the
+        // others leak ~2 tiny scalar buffers/step until `numResources` hits the
+        // iogpu ceiling and aborts (COUNT leak, flat bytes). keys/values don't
+        // leak (attention consumes them each step). `asyncEval` detaches the
+        // chains, no GPU sync. Prefill untouched.
         if stepCount == 1 {
             asyncEval(batchOffset, leftPadding)
         }

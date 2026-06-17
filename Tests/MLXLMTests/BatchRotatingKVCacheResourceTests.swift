@@ -1,62 +1,24 @@
 // Copyright © 2026 Apple Inc.
 //
 // Regression test for DAR-325: a Metal live-resource COUNT leak on the
-// single-token decode path of the continuous-batching KV caches
-// (`BatchKVCache.swift`).
+// single-token decode path of the continuous-batching KV caches.
 //
-// ── TRUE ROOT CAUSE (established empirically; see the DAR-325 investigation) ──
+// Root cause: each decode step rebuilds the metadata MLXArrays `batchOffset`
+// (+=1, both caches) and `leftPadding` (-=trim, BatchRotatingKVCache) into lazy
+// add-chains that are never collapsed; each pins a tiny scalar buffer. gemma-4
+// consumes each from only ONE representative cache (shared RoPE perRowOffset
+// from the first cache, Gemma4.swift:1264-1266/:1300; sliding mask built once,
+// :1244/:1283, makeMask -> leftPadding.max().item()), so every other cache
+// leaks ~1-2 buffers/step — flat bytes, climbing COUNT, ~53/step in prod (25
+// sliding + 5 full), until numResources hits the iogpu ceiling and aborts.
+// keys/values do NOT leak (attention consumes the returned (k,v) each step).
+// Fix: `asyncEval(batchOffset[, leftPadding])` on the decode path.
 //
-// Each decode step the caches mutate two *metadata* MLXArrays into fresh lazy
-// graphs that are never collapsed by the generation loop:
-//   • `batchOffset += 1`   (both BatchKVCache and BatchRotatingKVCache)
-//   • `leftPadding -= trim` (BatchRotatingKVCache only, once the window is full)
-// Each `+ Int32(...)` / `- Int32(...)` allocates a tiny scalar buffer that the
-// growing lazy add-chain pins live. The chain only collapses when something
-// *consumes* the array (forcing eval).
-//
-// The keys/values are NOT a leak: every layer's attention consumes the returned
-// `(k, v)` each step, which collapses their slice-of-`concatenated(...)` graph.
-// (The earlier "heavy" fix that `contiguous()`-copied + `eval`'d keys/values was
-// therefore unnecessary work.)
-//
-// The metadata leaks because Gemma 4's decode forward consumes each metadata
-// array from only ONE representative cache:
-//   • RoPE applies a single shared `perRowOffset` captured from the FIRST cache
-//     (Gemma4.swift:1264-1266, threaded into every layer at :1300) — so only
-//     cache[0].batchOffset is consumed; every other cache's batchOffset chain
-//     accretes one scalar/step.
-//   • The sliding mask is built ONCE from `localCache[firstSlidingCacheIdx]`
-//     (Gemma4.swift:1244, reused for every sliding layer at :1283) and its
-//     `makeMask` calls `leftPadding.max().item()` — so only that one sliding
-//     cache's leftPadding chain collapses; the others accrete one scalar/step.
-//
-// Net live-resource growth in production gemma-4 (25 sliding + ~6 full caches):
-//   ≈ 2·(25−1)  [sliding: batchOffset + leftPadding]
-//   +  (6−1)    [full:    batchOffset only]
-//   ≈ 53 / step, with FLAT bytes (scalars are tiny), until `numResources` hits
-//   the iogpu ceiling (~499000) and the process aborts with
-//   `[metal::malloc] Resource limit exceeded`.
-//
-// ── THE FIX (minimal, proven) ──
-// On the single-token decode path only, `asyncEval` the leaking metadata so its
-// lazy chain detaches and the prior step's scalar buffer becomes reclaimable:
-//   • BatchRotatingKVCache.update(): `asyncEval(batchOffset, leftPadding)`
-//   • BatchKVCache.update():          `asyncEval(batchOffset)`
-// `asyncEval` (no hard GPU sync) suffices; keys/values are left untouched; the
-// bounded prefill path (`stepCount > 1`) is untouched.
-//
-// ── FAITHFULNESS RULES (violating any hides the leak) ──
-//   1. Reproduce the MULTI-cache shape: a single cache cannot expose the
-//      production mechanism (one cache would have its own metadata consumed).
-//   2. Consume `(k, v)` from EVERY cache each step (mirrors per-layer attention)
-//      but consume `batchOffset`/`leftPadding` from only ONE representative
-//      cache (mirrors the shared RoPE offset + shared sliding mask). Eval a
-//      tiny PROBE derived from those — never the cache state directly.
-//   3. Measure `numResources` AFTER `clearCache()` so only LIVE (graph-pinned,
-//      non-reclaimable) buffers count; take the min over a few samples to reject
-//      transient cross-suite allocations.
-//   4. Raise `cacheLimit`/`memoryLimit` so the byte-driven trim can't mask the
-//      COUNT; restore on exit.
+// Faithfulness (violating any hides the leak): (1) MULTI-cache — one cache
+// can't expose it; (2) consume (k,v) from every cache but metadata from only
+// one representative (eval a probe, never the cache); (3) measure numResources
+// AFTER clearCache(), min over samples; (4) raise cache/memoryLimit so the byte
+// trim can't mask the COUNT.
 
 import Foundation
 import MLX
