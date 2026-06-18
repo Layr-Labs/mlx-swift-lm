@@ -221,6 +221,17 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         self.keys = ck
         self.values = cv
 
+        // DAR-325: collapse the per-step `batchOffset` lazy chain on decode,
+        // mirroring `BatchKVCache.update`. gemma-4 shares one RoPE
+        // `perRowOffset` from the first cache (Gemma4.swift:1264), so other
+        // caches never consume their own `batchOffset` and leak a tiny scalar
+        // buffer/step (COUNT leak, flat bytes) until the iogpu `numResources`
+        // ceiling aborts. `asyncEval` detaches it, no GPU sync. Prefill
+        // untouched.
+        if stepCount == 1 {
+            asyncEval(batchOffset)
+        }
+
         return (trimmedTo(ck, limit: _idx), trimmedTo(cv, limit: _idx))
     }
 
