@@ -95,6 +95,14 @@ public final class EngineCore: @unchecked Sendable {
     // completeMemory() callbacks that cause kernel panics on M4 hardware.
     private var _idleSteps = 0
     private static let deferredClearDelay = 8
+    // Set by the abort paths, consumed by the step loop (both on engineQueue):
+    // requests a pool reclaim once the aborted rows have been filtered out.
+    private var reclaimAfterStep = false
+    // Coalesce post-abort reclaims so a burst of cancellations can't force a full
+    // GPU sync (Stream().synchronize) on every step. The flag persists across
+    // throttled steps, so no reclaim is dropped — only delayed by a few steps.
+    private var lastReclaimStep = 0
+    private static let reclaimMinStepGap = 4
 
     // Diagnostic: log the live Metal resource (buffer) COUNT vs the cache/active
     // BYTES on the batched-decode path. This distinguishes a cached-buffer count
@@ -170,6 +178,26 @@ public final class EngineCore: @unchecked Sendable {
         _task = nil
     }
 
+    /// Stop the loop and wait for it to fully exit, so the caller can safely
+    /// release the engine and reclaim its MLX buffers. Unlike `stop()`, this awaits
+    /// the loop task: once it returns, the loop has finished its in-flight step and
+    /// will enqueue no more, and it no longer retains `self`. A final queue drain
+    /// then flushes any abort/cleanup blocks the loop left behind. This is what
+    /// makes a subsequent `Memory.clearCache()` both safe (no step's MLX work runs
+    /// concurrently — the IOKit completeMemory race seen on M4) and effective (the
+    /// engine chain, and thus the batch KV, can actually be released).
+    public func stopAndWait() async {
+        _running = false
+        _stopped = true
+        let task = _task
+        _task = nil
+        task?.cancel()
+        await task?.value
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            engineQueue.async { continuation.resume() }
+        }
+    }
+
     public var isRunning: Bool { _running }
 
     // MARK: - Request Management
@@ -240,7 +268,9 @@ public final class EngineCore: @unchecked Sendable {
         ))
 
         engineQueue.async { [weak self] in
-            _ = self?.scheduler.abortRequest(requestId)
+            guard let self else { return }
+            _ = scheduler.abortRequest(requestId)
+            reclaimAfterStep = true
         }
         return true
     }
@@ -265,7 +295,9 @@ public final class EngineCore: @unchecked Sendable {
 
         for rid in rids {
             engineQueue.async { [weak self] in
-                _ = self?.scheduler.abortRequest(rid)
+                guard let self else { return }
+                _ = scheduler.abortRequest(rid)
+                reclaimAfterStep = true
             }
             _lock.lock()
             let collector = outputCollectors[rid]
@@ -415,6 +447,19 @@ public final class EngineCore: @unchecked Sendable {
                                 _lock.unlock()
                                 collector?.put(reqOutput)
                             }
+                        }
+
+                        if reclaimAfterStep,
+                            stepsExecuted - lastReclaimStep >= Self.reclaimMinStepGap {
+                            reclaimAfterStep = false
+                            lastReclaimStep = stepsExecuted
+                            // scheduler.step() filtered the aborted rows at its start,
+                            // so their KV is now in the reclaimable pool. Return it to
+                            // the OS here rather than waiting for the idle clear, which
+                            // never fires under sustained load. The step gate above
+                            // coalesces bursts so cancel churn can't sync every step.
+                            Stream().synchronize()
+                            Memory.clearCache()
                         }
 
                         continuation.resume()
