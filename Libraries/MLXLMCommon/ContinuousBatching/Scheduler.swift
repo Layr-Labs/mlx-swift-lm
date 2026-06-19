@@ -585,25 +585,36 @@ public final class Scheduler: @unchecked Sendable {
             var existingCache: [KVCache]? = nil
             var restoredCaches: [any KVCache]? = nil
 
-            // Checkpoint restore (hybrid models) takes precedence: the
-            // provider attached a per-layer mixed cache covering the first
-            // `tokenCount` prompt tokens. Only valid for a real prefix
-            // (1 <= tokenCount < promptTokens.count) so there is a suffix to
-            // decode from; otherwise ignore and fall through to cold.
-            if let rc = request.restoredCheckpoint,
-               rc.tokenCount >= 1, rc.tokenCount < promptTokens.count,
-               rc.caches.count == model.newCache(parameters: nil).count
-            {
-                restoredCaches = rc.caches
-                tokensToPrefill = Array(promptTokens[rc.tokenCount...])
-                request.cachedTokens = rc.tokenCount
-            } else if let pc = prefixCache {
-                let (cached, remaining) = pc.fetchPrefix(
-                    requestId: request.requestId, tokens: promptTokens)
-                if let cached {
-                    tokensToPrefill = remaining
-                    existingCache = cached.map { $0 as KVCache }
-                    request.cachedTokens = promptTokens.count - remaining.count
+            // KV quantization builds quantized batched caches for the cold path.
+            // Warm prefix hits and checkpoint restores rebuild full-attention rows
+            // as fp16 `BatchKVCache` (`doExternalPrefill`/`BatchKVCache.merge`),
+            // which cannot be merged into a live quantized batch — `extendBatched`
+            // requires matching concrete cache classes. Until warm/restore can
+            // rebuild quantized rows with the same factory, force every request onto
+            // the cold path when quantization is active so fp16 and quantized rows
+            // never mix. (The provider also disables the prefix cache when KV quant
+            // is on; this is engine-level defense in depth for any caller.)
+            if config.kvQuantization == nil {
+                // Checkpoint restore (hybrid models) takes precedence: the
+                // provider attached a per-layer mixed cache covering the first
+                // `tokenCount` prompt tokens. Only valid for a real prefix
+                // (1 <= tokenCount < promptTokens.count) so there is a suffix to
+                // decode from; otherwise ignore and fall through to cold.
+                if let rc = request.restoredCheckpoint,
+                   rc.tokenCount >= 1, rc.tokenCount < promptTokens.count,
+                   rc.caches.count == model.newCache(parameters: nil).count
+                {
+                    restoredCaches = rc.caches
+                    tokensToPrefill = Array(promptTokens[rc.tokenCount...])
+                    request.cachedTokens = rc.tokenCount
+                } else if let pc = prefixCache {
+                    let (cached, remaining) = pc.fetchPrefix(
+                        requestId: request.requestId, tokens: promptTokens)
+                    if let cached {
+                        tokensToPrefill = remaining
+                        existingCache = cached.map { $0 as KVCache }
+                        request.cachedTokens = promptTokens.count - remaining.count
+                    }
                 }
             }
 
@@ -937,7 +948,17 @@ public final class Scheduler: @unchecked Sendable {
             return .fp16
         }
         if let quantConfig {
-            return .quantized(config: quantConfig)
+            // Only plain full-attention `KVCacheSimple` layers are eligible for KV
+            // quantization. `ChunkedKVCache` (a `KVCacheSimple` subclass with
+            // bespoke chunked semantics) and any non-`KVCacheSimple` custom cache
+            // (e.g. `DeepseekV4LayerCache`, which the model downcasts back to its
+            // concrete type in its attention path) must stay fp16: quantizing them
+            // would trip a downcast or silently drop their semantics. RotatingKVCache
+            // is already handled above and is not a `KVCacheSimple` subclass.
+            if layer is KVCacheSimple, !(layer is ChunkedKVCache) {
+                return .quantized(config: quantConfig)
+            }
+            return .fp16
         }
         return .fp16
     }
