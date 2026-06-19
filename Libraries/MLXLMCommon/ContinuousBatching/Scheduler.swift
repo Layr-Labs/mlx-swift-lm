@@ -234,6 +234,17 @@ public final class Scheduler: @unchecked Sendable {
         return true
     }
 
+    /// Remove the decode-batch row for `uid`, if present. No-op when the row has
+    /// already left the batch (e.g. it finished on the normal path), so it is safe
+    /// to call from the abort, cleanup, and preemption paths in any order.
+    private func dropRowFromBatch(uid: Int) {
+        guard let batch = genBatch else { return }
+        let keep = (0..<batch.uids.count).filter { batch.uids[$0] != uid }
+        if keep.count != batch.uids.count {
+            batch.filter(keep: keep)
+        }
+    }
+
     public func removeFinishedRequest(_ requestId: String) {
         requests.removeValue(forKey: requestId)
         activeSamplers.removeValue(forKey: requestId)
@@ -242,9 +253,18 @@ public final class Scheduler: @unchecked Sendable {
         tokenHistories.removeValue(forKey: requestId)
         activeRids.removeAll { $0 == requestId }
         if let uid = ridToUid[requestId] {
+            // Drop the row from the live batch too. Otherwise a removeFinishedRequest
+            // that wins the race against the deferred doAbortRequest leaves an
+            // orphaned, still-decoding row in genBatch whose outputs map to no request.
+            dropRowFromBatch(uid: uid)
             uidToRid.removeValue(forKey: uid)
         }
         ridToUid.removeValue(forKey: requestId)
+        // Mirror doAbortRequest's prefix-cache release so the abort-vs-cleanup race
+        // can't permanently pin borrowed prefix blocks (refCount never reaches 0 →
+        // never evictable). Idempotent: a no-op once the request's blocks have
+        // already been released on the normal path.
+        prefixCache?.releaseRequest(requestId)
     }
 
     public func hasRequests() -> Bool {
@@ -313,11 +333,8 @@ public final class Scheduler: @unchecked Sendable {
         }
 
         if let uid = ridToUid[requestId] {
-            if let batch = genBatch {
-                let keep = (0..<batch.uids.count).filter { batch.uids[$0] != uid }
-                batch.filter(keep: keep)
-                activeRids.removeAll { $0 == requestId }
-            }
+            dropRowFromBatch(uid: uid)
+            activeRids.removeAll { $0 == requestId }
             removeFinishedRequest(requestId)
         }
 
@@ -452,9 +469,8 @@ public final class Scheduler: @unchecked Sendable {
         guard let rid = victim, let request = requests[rid] else { return nil }
 
         // Remove from genBatch.
-        if let uid = ridToUid[rid], let batch = genBatch {
-            let keep = (0..<batch.uids.count).filter { batch.uids[$0] != uid }
-            batch.filter(keep: keep)
+        if let uid = ridToUid[rid] {
+            dropRowFromBatch(uid: uid)
         }
 
         // Tear down per-request scheduler state.
