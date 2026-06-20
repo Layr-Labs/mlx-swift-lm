@@ -502,6 +502,41 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         return cache
     }
 
+    /// Rotating-restore inverse of `extractBatched`: build a B==1 quantized
+    /// rotating cache (matching `kind`) from a restored fp16 single-stream
+    /// `RotatingKVCache`, re-quantizing its window and preserving the absolute
+    /// RoPE offset — so a restored sliding-window row is the SAME concrete class
+    /// as quantized cold rows and `extendBatched` accepts it. The rotating analog
+    /// of the scheduler's full-attention restore path.
+    public static func quantizedRotatingFromSingleRow(
+        _ src: RotatingKVCache,
+        kind: KVQuantCacheKind,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode
+    ) -> QuantizedBatchKVCacheBase {
+        let meta = src.metaState  // [keep, maxSize, step, offset, idx]
+        let maxSize = (meta.count > 1 ? Int(meta[1]) : nil) ?? src.maxSize ?? 1
+        let absoluteOffset = (meta.count > 3 ? Int(meta[3]) : nil) ?? src.offset
+        let cache: QuantizedBatchKVCacheBase =
+            kind == .kernel
+            ? QuantizedBatchRotatingKVCache(
+                maxSize: max(1, maxSize), leftPadding: [0],
+                groupSize: groupSize, bits: bits, mode: mode)
+            : DequantBatchRotatingKVCache(
+                maxSize: max(1, maxSize), leftPadding: [0],
+                groupSize: groupSize, bits: bits, mode: mode)
+        let s = src.state
+        guard maxSize > 0, s.count >= 2 else { return cache }
+        // `update` quantizes the restored fp16 window and stores it (B==1; the
+        // window is <= maxSize so no front-trim fires), leaving batchOffset at
+        // the appended count — override it to the absolute RoPE position the
+        // restored row carried (mirrors `BatchRotatingKVCache.fromSingleRow`).
+        _ = cache.update(keys: s[0], values: s[1])
+        cache.batchOffset = MLXArray([Int32(absoluteOffset)])
+        return cache
+    }
+
     public func advanceBatched(_: Int) {}
 
     // MARK: - Extend (in-place admission)

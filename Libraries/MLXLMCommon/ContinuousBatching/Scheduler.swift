@@ -886,7 +886,7 @@ public final class Scheduler: @unchecked Sendable {
                 admitColdFallback(entry)  // unsupported subclass
                 return false
             } else if let rot = layer as? RotatingKVCache, exp is RotatingKVCache {
-                batched.append(BatchRotatingKVCache.fromSingleRow(rot))
+                batched.append(restoredSlidingCache(layerIndex: idx, restored: rot))
             } else if let simple = layer as? KVCacheSimple, exp is KVCacheSimple {
                 // Build a batched cache matching the cold path's
                 // per-layer type so a restored row stays concrete-class-
@@ -949,6 +949,26 @@ public final class Scheduler: @unchecked Sendable {
         // axis (B==1, T = restored prefix length), exactly as cold prefill does.
         _ = quant.update(keys: st[0], values: st[1])
         return quant
+    }
+
+    /// Rotating analog of `restoredFullAttentionCache` for sliding-window layers.
+    /// Under KV-quant the cold factory yields a quantized rotating cache
+    /// (`QuantizedBatchRotatingKVCache` / `DequantBatchRotatingKVCache`), so the
+    /// restored fp16 window must be re-quantized into the SAME class (preserving
+    /// the absolute offset) or `extendBatched` rejects the row when it merges
+    /// with quantized cold rows. KV-quant off → fp16
+    /// `BatchRotatingKVCache.fromSingleRow`.
+    private func restoredSlidingCache(
+        layerIndex: Int, restored: RotatingKVCache
+    ) -> any BatchedCache {
+        let coldCache = cacheFactories[layerIndex](1)
+        guard let quant = coldCache as? QuantizedBatchKVCacheBase else {
+            return BatchRotatingKVCache.fromSingleRow(restored)
+        }
+        let kind: KVQuantCacheKind = (quant is QuantizedKVCacheProtocol) ? .kernel : .dequant
+        return QuantizedBatchKVCacheBase.quantizedRotatingFromSingleRow(
+            restored, kind: kind,
+            groupSize: quant.groupSize, bits: quant.bits, mode: quant.mode)
     }
 
     /// Fallback when a restored cache can't be rebuilt (an unsupported layer
