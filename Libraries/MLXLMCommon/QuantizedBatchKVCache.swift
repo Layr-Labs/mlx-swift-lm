@@ -247,6 +247,27 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray _: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        // Single-query decode fast path: one query attends to every stored key,
+        // so the causal mask is all-`true` — a no-op. Skip building and applying
+        // it on the kernel path. This is only valid when nothing would actually
+        // be masked:
+        //   * `windowSize == nil` — a sliding window would mask keys older than
+        //     the window. This cache stores all tokens (it grows; it does not
+        //     evict), so a windowed layer still needs the materialized mask.
+        //   * `leftPadding.max() <= 0` — left padding would mask the leading
+        //     padded slots of right-justified rows.
+        // Under both conditions the omitted mask is bit-identical to the
+        // materialized all-`true` mask (in `quantizedScaledDotProductAttention`,
+        // `.none` skips the masking step while an all-`true` array mask leaves
+        // every score untouched), so decode numerics are preserved exactly while
+        // saving the per-step `createCausalMask` build and `where` application.
+        // The `n == 1` / `windowSize == nil` checks short-circuit before the
+        // `leftPadding` device sync, so prefill (n > 1) never pays for it.
+        // For n > 1 (prefill / chunked) the mask is materialized exactly as
+        // before. Mirrors `BatchKVCache.makeMask`'s fast path.
+        if n == 1, windowSize == nil, leftPadding.max().item(Int32.self) <= 0 {
+            return .none
+        }
         let mask = createCausalMask(
             n: n,
             offset: _idx,
