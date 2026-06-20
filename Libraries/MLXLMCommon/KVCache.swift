@@ -1756,6 +1756,60 @@ public typealias StandardKVCache = KVCacheSimple
 
 // MARK: - Quantized Attention Operations
 
+// Compiled, shape-agnostic softmax cores for `quantizedScaledDotProductAttention`.
+//
+// The softmax over the score tensor is the largest cluster of small elementwise
+// kernels in the quantized-attention path (max, sub, exp, where, sum, div) —
+// each a separate GPU dispatch. Wrapping it in `compile(shapeless:)` fuses those
+// launches into a single graph and cuts the per-step launch overhead that
+// dominates decode latency.
+//
+// `shapeless: true` is what makes this safe on the decode path. During
+// single-query decode the query length is 1 but the cached-KV (`kL`) axis grows
+// by one every token, so the score tensor's *shape* changes every step. A
+// shapeless graph is NOT recompiled when only shapes change — only a change in
+// rank (ndim) or dtype forces a recompile. The score tensor is always rank-4
+// (`[B, nQHeads, L, kL]`, collapsed below before softmax) and keeps a stable
+// dtype during a run, so the graph compiles once and is reused for every step;
+// there is no per-shape recompilation churn.
+//
+// The cores use only `axis: -1` reductions and broadcasts, so they are
+// independent of batch size, head count, query length and `kL`, and they carry
+// no quantization parameters (groupSize/bits/mode live in the surrounding
+// `quantizedMM` calls, which stay outside the compiled core). The matmuls
+// themselves are intentionally left out: each is a single large kernel whose
+// launch overhead is marginal, and folding the GQA reshape (which depends on the
+// batch axis) into a shapeless graph would bake in a stale batch constant.
+//
+// Numerics are identical to the previous inline version — the same ops in the
+// same order, just fused into one graph.
+
+/// Stable no-sink softmax. Keeps fully-masked query rows finite by assigning
+/// zero probability to every key (there is no sink to absorb the mass).
+private let compiledQuantizedAttentionSoftmax: @Sendable (MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { scores in
+    let rowMax = scores.max(axis: -1, keepDims: true)
+    let validRow = rowMax .> MLXArray(-Float.greatestFiniteMagnitude / 2)
+    let expScores = MLX.where(validRow, exp(scores - rowMax), MLXArray(Float(0)))
+    let denom = expScores.sum(axis: -1, keepDims: true)
+    return MLX.where(denom .> MLXArray(Float(0)), expScores / denom, MLXArray(Float(0)))
+}
+
+/// Sink-aware stable softmax with the sink folded into the denominator.
+/// `sinkLogits` is pre-reshaped to `[1, nQHeads, 1, 1]` by the caller so the
+/// compiled core stays a pure elementwise/broadcast graph (the reshape uses
+/// `nQHeads`, a per-config constant we deliberately keep out of the core).
+private let compiledQuantizedAttentionSoftmaxWithSink: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { scores, sinkLogits in
+        let rowMax = scores.max(axis: -1, keepDims: true)
+        let m = maximum(rowMax, sinkLogits)
+        let expScores = exp(scores - m)
+        let sinkExp = exp(sinkLogits - m)
+        let denom = expScores.sum(axis: -1, keepDims: true) + sinkExp
+        return expScores / denom
+    }
+
 public func quantizedScaledDotProductAttention(
     queries: MLXArray,
     quantizedKeys: (MLXArray, MLXArray, MLXArray?),
@@ -1851,26 +1905,18 @@ public func quantizedScaledDotProductAttention(
         // `sink -> -inf` limit, i.e. `sinks == nil` below, NOT a zero sink.
         //
         // In the canonical 4D layout `sinks` ([nQHeads]) maps directly onto the
-        // head axis.
+        // head axis. The reshape stays outside the compiled core so the core
+        // never bakes in a head-count constant. The fused, numerically-stable
+        // softmax then folds the sink into the denominator.
         let sinkLogits = sinks.reshaped([1, nQHeads, 1, 1])
-        // Numerically-stable softmax with the sink folded into the denominator.
-        let rowMax = scores.max(axis: -1, keepDims: true)
-        let m = maximum(rowMax, sinkLogits)
-        let expScores = exp(scores - m)
-        let sinkExp = exp(sinkLogits - m)
-        let denom = expScores.sum(axis: -1, keepDims: true) + sinkExp
-        attentionWeights4D = expScores / denom
+        attentionWeights4D = compiledQuantizedAttentionSoftmaxWithSink(scores, sinkLogits)
     } else {
-        // Stable no-sink softmax. Unlike the generic softmax, this keeps fully
-        // masked query rows finite by assigning zero probability to every real
-        // key (there is no sink to absorb probability mass). Model code ignores
-        // padded query rows, but keeping them finite avoids NaN propagation.
-        let rowMax = scores.max(axis: -1, keepDims: true)
-        let validRow = rowMax .> MLXArray(-Float.greatestFiniteMagnitude / 2)
-        let expScores = MLX.where(validRow, exp(scores - rowMax), MLXArray(Float(0)))
-        let denom = expScores.sum(axis: -1, keepDims: true)
-        attentionWeights4D = MLX.where(
-            denom .> MLXArray(Float(0)), expScores / denom, MLXArray(Float(0)))
+        // Fused, stable no-sink softmax. Unlike the generic softmax, this keeps
+        // fully masked query rows finite by assigning zero probability to every
+        // real key (there is no sink to absorb probability mass). Model code
+        // ignores padded query rows, but keeping them finite avoids NaN
+        // propagation.
+        attentionWeights4D = compiledQuantizedAttentionSoftmax(scores)
     }
 
     // Restore the GQA-expanded layout [B, nKVHeads, nRepeats, L, kL] for the value
