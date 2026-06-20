@@ -8,7 +8,29 @@ import MLX
 
 final class TokenHistoryHolder: @unchecked Sendable {
     var tokens: [Int]
-    init(tokens: [Int]) { self.tokens = tokens }
+    /// Per-token occurrence counts, maintained incrementally as tokens are
+    /// appended (see ``append(_:)``). The original repetition sampler rebuilt
+    /// this dictionary from the entire history on every decode step — O(n) per
+    /// token, i.e. O(n²) over a generation. Maintaining it here makes each
+    /// sampler call O(unique tokens) instead. Counts include every appended id;
+    /// the sampler filters to the in-range `[0, vocab)` ids (matching the old
+    /// `t >= 0 && t < vocab` guard) when it builds the device arrays.
+    private(set) var counts: [Int: Int]
+
+    init(tokens: [Int]) {
+        self.tokens = tokens
+        var counts: [Int: Int] = [:]
+        for t in tokens { counts[t, default: 0] += 1 }
+        self.counts = counts
+    }
+
+    /// Append a generated token, keeping `tokens` and `counts` in sync in
+    /// O(1) amortized. Must be called instead of `tokens.append(_:)` so the
+    /// incremental counts stay correct.
+    func append(_ token: Int) {
+        tokens.append(token)
+        counts[token, default: 0] += 1
+    }
 }
 
 func makeRepetitionSampler(
@@ -19,28 +41,90 @@ func makeRepetitionSampler(
     frequencyPenalty: Float
 ) -> RowSampler {
     return { @Sendable logits in
-        let tokens = history.tokens
-        guard !tokens.isEmpty else { return base(logits) }
+        // Incremental counts: no rescan of the full history. Empty history
+        // (no counts) → pass through to the base sampler, as before.
+        guard !history.counts.isEmpty else { return base(logits) }
         let vocab = logits.dim(-1)
 
-        var counts: [Int: Int] = [:]
-        for t in tokens where t >= 0 && t < vocab {
-            counts[t, default: 0] += 1
+        // Build parallel host arrays of the unique in-range penalized token ids
+        // and their counts. This is the only host-side work and is O(unique
+        // tokens) — not O(history length) and not O(vocab). Filtering to
+        // `0 ..< vocab` preserves the original guard exactly.
+        var idList: [Int32] = []
+        var countList: [Float] = []
+        idList.reserveCapacity(history.counts.count)
+        countList.reserveCapacity(history.counts.count)
+        for (tokenId, count) in history.counts where tokenId >= 0 && tokenId < vocab {
+            idList.append(Int32(tokenId))
+            countList.append(Float(count))
         }
-        guard !counts.isEmpty else { return base(logits) }
+        // No in-range counts → pass through (matches the old `counts.isEmpty` guard).
+        guard !idList.isEmpty else { return base(logits) }
 
-        eval(logits)
-        var flat = logits.reshaped(-1).asArray(Float.self)
-        for (tokenId, count) in counts {
-            var v = flat[tokenId]
-            if repetitionPenalty != 1.0 {
-                v = v > 0 ? v / repetitionPenalty : v * repetitionPenalty
-            }
-            v -= presencePenalty
-            v -= frequencyPenalty * Float(count)
-            flat[tokenId] = v
+        // Apply the penalties entirely on-device via gather → transform →
+        // scatter. No `eval`, no `asArray`, no full-vocab GPU↔host round trip.
+        //
+        // Upcast to float32 first so the math is bit-for-bit the original CPU
+        // formula, which read the logits as `Float` before penalizing. The
+        // scatter produces a new array (functional op), so the caller's
+        // `logits` is never mutated.
+        //
+        // Numerics, in order (identical to the original):
+        //   if repetitionPenalty != 1: v = v > 0 ? v / rp : v * rp
+        //   v -= presencePenalty
+        //   v -= frequencyPenalty * count
+        let idsArr = MLXArray(idList)
+        let countsArr = MLXArray(countList)
+        let flat = logits.reshaped(-1).asType(.float32)        // [vocab]
+        let gathered = take(flat, idsArr, axis: 0)             // [K]
+
+        var penalized = gathered
+        if repetitionPenalty != 1.0 {
+            penalized = which(
+                gathered .> 0,
+                gathered / repetitionPenalty,
+                gathered * repetitionPenalty
+            )
         }
-        return base(MLXArray(flat).reshaped(logits.shape))
+        penalized = penalized - presencePenalty
+        penalized = penalized - frequencyPenalty * countsArr
+
+        flat[idsArr] = penalized                                // scatter back
+        return base(flat.reshaped(logits.shape))
+    }
+}
+
+/// Which quantized batched-cache implementation to use for full-attention
+/// layers when KV quantization is enabled.
+public enum KVQuantCacheKind: Sendable, Equatable {
+    /// Use ``QuantizedBatchKVCache`` and the native quantized attention kernel.
+    case kernel
+    /// Use ``DequantBatchKVCache``: stores quantized, but returns dequantized
+    /// fp16 so the model's regular attention path (including sinks) is used.
+    case dequant
+}
+
+/// Configuration for per-layer KV-cache quantization in the continuous-batching
+/// scheduler. When set on ``SchedulerConfig/kvQuantization``, full-attention
+/// layers use ``QuantizedBatchKVCache`` (or ``DequantBatchKVCache`` when
+/// ``cacheKind`` is ``KVQuantCacheKind/dequant``); rotating / sliding-window
+/// layers keep ``BatchRotatingKVCache``.
+public struct KVQuantizationConfig: Sendable {
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: QuantizationMode
+    public let cacheKind: KVQuantCacheKind
+
+    public init(
+        groupSize: Int = 128,
+        bits: Int = 8,
+        mode: QuantizationMode = .affine,
+        cacheKind: KVQuantCacheKind = .kernel
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.cacheKind = cacheKind
     }
 }
 
@@ -55,19 +139,25 @@ public struct SchedulerConfig: Sendable {
     /// When a new admission would exceed this, the running request with the
     /// largest KV footprint is preempted and re-queued. 0 = unlimited.
     public var maxKVCacheTokens: Int
+    /// Optional KV-cache quantization configuration. When non-nil, full-attention
+    /// layers are backed by ``QuantizedBatchKVCache``; sliding-window layers
+    /// remain ``BatchRotatingKVCache``.
+    public var kvQuantization: KVQuantizationConfig?
 
     public init(
         maxNumSeqs: Int = 64,
         maxNumBatchedTokens: Int = 8192,
         prefillStepSize: Int = 512,
         streamInterval: Int = 1,
-        maxKVCacheTokens: Int = 0
+        maxKVCacheTokens: Int = 0,
+        kvQuantization: KVQuantizationConfig? = nil
     ) {
         self.maxNumSeqs = maxNumSeqs
         self.maxNumBatchedTokens = maxNumBatchedTokens
         self.prefillStepSize = prefillStepSize
         self.streamInterval = streamInterval
         self.maxKVCacheTokens = maxKVCacheTokens
+        self.kvQuantization = kvQuantization
     }
 }
 
@@ -117,6 +207,11 @@ private struct PendingPrefill {
     var remaining: [[Int]]
     // Last token of each sequence; used as the seed for GenerationBatch.
     var seeds: [Int]
+    // Whether the resulting decode batch can skip the per-step logSumExp
+    // normalization (no row uses top-p or a penalty sampler). Computed at
+    // admission and applied to the GenerationBatch once prefill completes,
+    // since `PromptProcessingBatch.generate` builds the batch internally.
+    var skipLogprobNorm: Bool
 }
 
 public final class Scheduler: @unchecked Sendable {
@@ -368,6 +463,7 @@ public final class Scheduler: @unchecked Sendable {
             if genBatch?.hasActiveMTPSession == true { return }
             // All sequences prefilled — transition to decode.
             let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
+            gen.skipLogprobNormalization = pp.skipLogprobNorm
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
             return
@@ -427,6 +523,7 @@ public final class Scheduler: @unchecked Sendable {
                 return
             }
             let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
+            gen.skipLogprobNormalization = pp.skipLogprobNorm
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
         } else {
@@ -435,6 +532,10 @@ public final class Scheduler: @unchecked Sendable {
     }
 
     private func mergeIntoGenBatch(_ gen: GenerationBatch) {
+        // Only extract (dequant + copy) a finished row's prompt cache when a
+        // prefix cache can consume it. This skips a per-finish fp16 copy of the
+        // KV history on runs without prefix caching.
+        gen.capturePromptCacheOnFinish = prefixCache != nil
         if let existing = genBatch, !existing.isEmpty {
             existing.extend(gen)
         } else {
@@ -545,11 +646,21 @@ public final class Scheduler: @unchecked Sendable {
             var existingCache: [KVCache]? = nil
             var restoredCaches: [any KVCache]? = nil
 
-            // Checkpoint restore (hybrid models) takes precedence: the
-            // provider attached a per-layer mixed cache covering the first
-            // `tokenCount` prompt tokens. Only valid for a real prefix
-            // (1 <= tokenCount < promptTokens.count) so there is a suffix to
-            // decode from; otherwise ignore and fall through to cold.
+            // Checkpoint restore (hybrid models) takes precedence: the provider
+            // attached a per-layer mixed cache covering the first `tokenCount`
+            // prompt tokens. Only valid for a real prefix (1 <= tokenCount <
+            // promptTokens.count) so there is a suffix to decode from; otherwise
+            // ignore and fall through to cold.
+            //
+            // Checkpoint restore composes with KV-quant.
+            // `admitRestoredCheckpoint` rebuilds full-attention rows as QUANTIZED
+            // batched caches via the cold cache factory
+            // (`restoredFullAttentionCache`), so a restored row stays concrete-
+            // class-compatible with quantized cold rows under `extendBatched`.
+            // The engine-tier warm prefix path (`prefixCache` →
+            // `doExternalPrefill` + `BatchKVCache.merge`) still rebuilds fp16
+            // only, so it stays cold-only under quantization until it too
+            // rebuilds quantized rows.
             if let rc = request.restoredCheckpoint,
                rc.tokenCount >= 1, rc.tokenCount < promptTokens.count,
                rc.caches.count == model.newCache(parameters: nil).count
@@ -557,7 +668,7 @@ public final class Scheduler: @unchecked Sendable {
                 restoredCaches = rc.caches
                 tokensToPrefill = Array(promptTokens[rc.tokenCount...])
                 request.cachedTokens = rc.tokenCount
-            } else if let pc = prefixCache {
+            } else if config.kvQuantization == nil, let pc = prefixCache {
                 let (cached, remaining) = pc.fetchPrefix(
                     requestId: request.requestId, tokens: promptTokens)
                 if let cached {
@@ -699,6 +810,8 @@ public final class Scheduler: @unchecked Sendable {
                 stateMachines: warmMachines,
                 mtpRuntime: mtpRuntime
             )
+            warmGen.skipLogprobNormalization = Self.batchCanSkipLogprobNorm(
+                warm.map { $0.request.samplingParams })
             mergeIntoGenBatch(warmGen)
         }
 
@@ -721,7 +834,11 @@ public final class Scheduler: @unchecked Sendable {
                 return toks.count > 1 ? Array(toks.dropLast()) : []
             }
             let seeds = cold.map { $0.tokensToPrefill.last ?? 0 }
-            pendingPrefill = PendingPrefill(ppBatch: ppBatch, remaining: remaining, seeds: seeds)
+            let skipLogprobNorm = Self.batchCanSkipLogprobNorm(
+                cold.map { $0.request.samplingParams })
+            pendingPrefill = PendingPrefill(
+                ppBatch: ppBatch, remaining: remaining, seeds: seeds,
+                skipLogprobNorm: skipLogprobNorm)
         }
 
         return newScheduled
@@ -761,14 +878,22 @@ public final class Scheduler: @unchecked Sendable {
         // it's rejected on either side.
         var batched: [any BatchedCache] = []
         batched.reserveCapacity(restored.count)
-        for (layer, exp) in zip(restored, expected) {
+        for (idx, (layer, exp)) in zip(restored, expected).enumerated() {
             if layer is ChunkedKVCache || exp is ChunkedKVCache {
                 admitColdFallback(entry)  // unsupported subclass
                 return false
             } else if let rot = layer as? RotatingKVCache, exp is RotatingKVCache {
                 batched.append(BatchRotatingKVCache.fromSingleRow(rot))
             } else if let simple = layer as? KVCacheSimple, exp is KVCacheSimple {
-                batched.append(BatchKVCache.merge([simple]))
+                // Build a batched cache matching the cold path's
+                // per-layer type so a restored row stays concrete-class-
+                // compatible with quantized cold rows under `extendBatched`.
+                // Under KV-quant the cold factory yields a
+                // QuantizedBatchKVCacheBase for eligible full-attention layers;
+                // re-quantize the restored fp16 prefix into it via `update()`
+                // (the same path cold prefill uses). KV-quant off → fp16
+                // `BatchKVCache.merge`.
+                batched.append(restoredFullAttentionCache(layerIndex: idx, restored: simple))
             } else {
                 // Type mismatch (e.g. Rotating where the model wants Simple),
                 // recurrent, or unknown — restore is unsound; cold-prefill.
@@ -795,8 +920,32 @@ public final class Scheduler: @unchecked Sendable {
             stateMachines: [entry.machine]
         )
         let gen = ppBatch.generate(lastTokensOf: [suffix], mtpRuntime: mtpRuntime)
+        gen.skipLogprobNormalization = Self.batchCanSkipLogprobNorm([entry.request.samplingParams])
         mergeIntoGenBatch(gen)
         return true
+    }
+
+    /// Build the batched cache for a restored full-attention layer, matching
+    /// the cold path's per-layer cache type. Under KV-quant the cold factory
+    /// (`cacheFactories`) produces a `QuantizedBatchKVCacheBase`; ingest the
+    /// restored fp16 K/V via `update()` so the prefix is re-quantized into the
+    /// exact layout cold rows use — keeping each genBatch layer a single
+    /// concrete class (an `extendBatched` precondition). When the layer is not
+    /// quantized (KV-quant off, or ineligible) fall back to fp16
+    /// `BatchKVCache.merge`.
+    private func restoredFullAttentionCache(
+        layerIndex: Int, restored: KVCacheSimple
+    ) -> any BatchedCache {
+        let coldCache = cacheFactories[layerIndex](1)
+        guard let quant = coldCache as? QuantizedBatchKVCacheBase else {
+            return BatchKVCache.merge([restored])
+        }
+        let st = restored.state
+        guard st.count == 2 else { return BatchKVCache.merge([restored]) }
+        // `update` quantizes the incoming fp16 K/V and appends along the time
+        // axis (B==1, T = restored prefix length), exactly as cold prefill does.
+        _ = quant.update(keys: st[0], values: st[1])
+        return quant
     }
 
     /// Fallback when a restored cache can't be rebuilt (an unsupported layer
@@ -839,24 +988,146 @@ public final class Scheduler: @unchecked Sendable {
         return SequenceStateMachine(states: ["normal": seqs])
     }
 
+    /// Whether a decode batch made up of rows with these sampling params can
+    /// skip the per-step `logSumExp` normalization in `GenerationBatch.step()`.
+    ///
+    /// Safe to skip only when NO row needs normalized logprobs:
+    /// - a penalty sampler (repetition/presence/frequency) applies a transform
+    ///   that is not invariant to the constant `logSumExp` shift, and
+    /// - an active top-p (nucleus) filter compares a cumulative probability mass
+    ///   against `1 - topP`, which is also not shift-invariant.
+    /// Temperature scaling, top-k, min-p, categorical and argMax are all
+    /// shift-invariant, so a pure-temperature / greedy batch can skip it.
+    /// Mirrors the exact predicates in `makeRowSampler` / `makeRepetitionSampler`.
+    private static func batchCanSkipLogprobNorm(_ params: [SamplingParams]) -> Bool {
+        !params.contains { p in
+            let needsPenalty =
+                p.repetitionPenalty != 1.0
+                || p.presencePenalty != 0.0
+                || p.frequencyPenalty != 0.0
+            let topPActive = p.temperature != 0 && p.topP > 0 && p.topP < 1
+            return needsPenalty || topPActive
+        }
+    }
+
     private lazy var cacheFactories: [(Int) -> any BatchedCache] = {
-        model.newCache(parameters: nil).map { layer -> (Int) -> any BatchedCache in
-            if layer is MambaCache {
-                return { MambaCache(leftPadding: Array(repeating: 0, count: $0)) }
-            }
-            if let arrays = layer as? ArraysCache {
-                let size = arrays.slotCount
-                return { ArraysCache(size: size, leftPadding: Array(repeating: 0, count: $0)) }
-            }
-            if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
-                return { BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0)) }
-            }
-            return { BatchKVCache(leftPadding: Array(repeating: 0, count: $0)) }
+        let quantConfig = config.kvQuantization
+        return model.newCache(parameters: nil).map { layer -> (Int) -> any BatchedCache in
+            Self.makeCacheFactory(for: layer, quantConfig: quantConfig)
         }
     }()
 
     private func makeBatchedCache(batchSize B: Int) -> [any BatchedCache] {
         cacheFactories.map { $0(B) }
+    }
+
+    /// Internal decision of which batched cache type to build for a layer.
+    /// Kept in one place so the production factory and the test-facing
+    /// type-name helper cannot drift.
+    private enum CacheFactoryKind: Sendable {
+        case mamba
+        case arrays(size: Int)
+        case rotating(maxSize: Int)
+        case quantized(config: KVQuantizationConfig)
+        case fp16
+
+        var typeName: String {
+            switch self {
+            case .mamba: return String(describing: MambaCache.self)
+            case .arrays: return String(describing: ArraysCache.self)
+            case .rotating: return String(describing: BatchRotatingKVCache.self)
+            case .quantized(let config):
+                switch config.cacheKind {
+                case .kernel: return String(describing: QuantizedBatchKVCache.self)
+                case .dequant: return String(describing: DequantBatchKVCache.self)
+                }
+            case .fp16: return String(describing: BatchKVCache.self)
+            }
+        }
+    }
+
+    private static func cacheFactoryKind(
+        for layer: any KVCache,
+        quantConfig: KVQuantizationConfig?
+    ) -> CacheFactoryKind {
+        if layer is MambaCache {
+            return .mamba
+        }
+        if let arrays = layer as? ArraysCache {
+            return .arrays(size: arrays.slotCount)
+        }
+        if let rotating = layer as? RotatingKVCache, let maxSize = rotating.maxSize {
+            return .rotating(maxSize: maxSize)
+        }
+        // Composite caches (e.g. CacheList = MambaCache + KVCacheSimple in
+        // BaichuanM1 / FalconH1) must not be replaced wholesale by a quantized
+        // KV cache: those models downcast the per-layer cache back to CacheList
+        // in their forward pass. Only plain full-attention layers are eligible
+        // for KV-quant; leave everything else on the existing fp16 path.
+        if layer is CacheList {
+            return .fp16
+        }
+        if let quantConfig {
+            // Only plain full-attention `KVCacheSimple` layers are eligible for KV
+            // quantization. `ChunkedKVCache` (a `KVCacheSimple` subclass with
+            // bespoke chunked semantics) and any non-`KVCacheSimple` custom cache
+            // (e.g. `DeepseekV4LayerCache`, which the model downcasts back to its
+            // concrete type in its attention path) must stay fp16: quantizing them
+            // would trip a downcast or silently drop their semantics. RotatingKVCache
+            // is already handled above and is not a `KVCacheSimple` subclass.
+            if layer is KVCacheSimple, !(layer is ChunkedKVCache) {
+                return .quantized(config: quantConfig)
+            }
+            return .fp16
+        }
+        return .fp16
+    }
+
+    /// Build a single cache factory for a layer, optionally using quantized
+    /// storage for full-attention layers. Exposed publicly so provider tests
+    /// can verify per-layer factory selection without constructing a live model.
+    public static func makeCacheFactory(
+        for layer: any KVCache,
+        quantConfig: KVQuantizationConfig?
+    ) -> (Int) -> any BatchedCache {
+        switch cacheFactoryKind(for: layer, quantConfig: quantConfig) {
+        case .mamba:
+            return { MambaCache(leftPadding: Array(repeating: 0, count: $0)) }
+        case .arrays(let size):
+            return { ArraysCache(size: size, leftPadding: Array(repeating: 0, count: $0)) }
+        case .rotating(let maxSize):
+            return { BatchRotatingKVCache(maxSize: maxSize, leftPadding: Array(repeating: 0, count: $0)) }
+        case .quantized(let config):
+            return {
+                switch config.cacheKind {
+                case .kernel:
+                    QuantizedBatchKVCache(
+                        leftPadding: Array(repeating: 0, count: $0),
+                        groupSize: config.groupSize,
+                        bits: config.bits,
+                        mode: config.mode
+                    )
+                case .dequant:
+                    DequantBatchKVCache(
+                        leftPadding: Array(repeating: 0, count: $0),
+                        groupSize: config.groupSize,
+                        bits: config.bits,
+                        mode: config.mode
+                    )
+                }
+            }
+        case .fp16:
+            return { BatchKVCache(leftPadding: Array(repeating: 0, count: $0)) }
+        }
+    }
+
+    /// Test-facing type-name helper. Avoids instantiating caches (which would
+    /// require a Metal device) while still pinning the exact per-layer selection.
+    public static func cacheFactoryTypeName(
+        for layer: any KVCache,
+        quantConfig: KVQuantizationConfig?
+    ) -> String {
+        cacheFactoryKind(for: layer, quantConfig: quantConfig).typeName
     }
 
     private func doExternalPrefill(
@@ -916,14 +1187,14 @@ extension Scheduler {
             let newText: String
             if !isFinished {
                 request.appendOutputToken(tokenId)
-                tokenHistories[rid]?.tokens.append(tokenId)
+                tokenHistories[rid]?.append(tokenId)
                 var detok = activeDetokenizers[rid]!
                 detok.append(token: tokenId)
                 newText = detok.next() ?? ""
                 activeDetokenizers[rid] = detok
             } else if resp.finishReason == "length" {
                 request.appendOutputToken(tokenId)
-                tokenHistories[rid]?.tokens.append(tokenId)
+                tokenHistories[rid]?.append(tokenId)
                 newText = ""
             } else {
                 newText = ""

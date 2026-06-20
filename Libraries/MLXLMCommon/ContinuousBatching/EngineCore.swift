@@ -110,18 +110,20 @@ public final class EngineCore: @unchecked Sendable {
     // live-buffer climb (count climbs while cache stays small -> needs admission
     // control) — the latter is the `[metal::malloc] Resource limit (499000)` crash.
     //
-    // DEFAULT ON: `darkbloom report` collects logs via
-    // `log show --predicate 'subsystem == "dev.darkbloom.provider"'`, so the
-    // `[rsrc]` line is emitted via os_log under that subsystem (not just stdout)
-    // and is therefore captured in every uploaded report — giving us the
-    // resource-count trajectory before a crash without asking the operator to set
-    // any env var. Opt out with DARKBLOOM_MLX_RESOURCE_DEBUG=0 (or false/no/off).
+    // DEFAULT OFF (opt-in): the `Memory.*` resource/byte reads in the step loop
+    // (see `engineLoop`) sit on the per-step decode hot path, so they are gated
+    // behind this flag and not evaluated at all unless an operator opts in.
+    // Enable with DARKBLOOM_MLX_RESOURCE_DEBUG=1 (or true/yes/on) to collect the
+    // `[rsrc]` trajectory; `darkbloom report` then captures the os_log line via
+    // `log show --predicate 'subsystem == "dev.darkbloom.provider"'`. The
+    // capability is unchanged — it simply costs nothing when disabled, which is
+    // the default.
     private static let resourceDebug: Bool = {
         switch ProcessInfo.processInfo.environment["DARKBLOOM_MLX_RESOURCE_DEBUG"]?
             .lowercased()
         {
-        case "0", "false", "no", "off": return false
-        default: return true
+        case "1", "true", "yes", "on": return true
+        default: return false
         }
     }()
     // Console cadence (stdout). Frequent, so the console line is TTY-gated (see

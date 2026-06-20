@@ -1756,6 +1756,60 @@ public typealias StandardKVCache = KVCacheSimple
 
 // MARK: - Quantized Attention Operations
 
+// Compiled, shape-agnostic softmax cores for `quantizedScaledDotProductAttention`.
+//
+// The softmax over the score tensor is the largest cluster of small elementwise
+// kernels in the quantized-attention path (max, sub, exp, where, sum, div) —
+// each a separate GPU dispatch. Wrapping it in `compile(shapeless:)` fuses those
+// launches into a single graph and cuts the per-step launch overhead that
+// dominates decode latency.
+//
+// `shapeless: true` is what makes this safe on the decode path. During
+// single-query decode the query length is 1 but the cached-KV (`kL`) axis grows
+// by one every token, so the score tensor's *shape* changes every step. A
+// shapeless graph is NOT recompiled when only shapes change — only a change in
+// rank (ndim) or dtype forces a recompile. The score tensor is always rank-4
+// (`[B, nQHeads, L, kL]`, collapsed below before softmax) and keeps a stable
+// dtype during a run, so the graph compiles once and is reused for every step;
+// there is no per-shape recompilation churn.
+//
+// The cores use only `axis: -1` reductions and broadcasts, so they are
+// independent of batch size, head count, query length and `kL`, and they carry
+// no quantization parameters (groupSize/bits/mode live in the surrounding
+// `quantizedMM` calls, which stay outside the compiled core). The matmuls
+// themselves are intentionally left out: each is a single large kernel whose
+// launch overhead is marginal, and folding the GQA reshape (which depends on the
+// batch axis) into a shapeless graph would bake in a stale batch constant.
+//
+// Numerics are identical to the previous inline version — the same ops in the
+// same order, just fused into one graph.
+
+/// Stable no-sink softmax. Keeps fully-masked query rows finite by assigning
+/// zero probability to every key (there is no sink to absorb the mass).
+private let compiledQuantizedAttentionSoftmax: @Sendable (MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { scores in
+    let rowMax = scores.max(axis: -1, keepDims: true)
+    let validRow = rowMax .> MLXArray(-Float.greatestFiniteMagnitude / 2)
+    let expScores = MLX.where(validRow, exp(scores - rowMax), MLXArray(Float(0)))
+    let denom = expScores.sum(axis: -1, keepDims: true)
+    return MLX.where(denom .> MLXArray(Float(0)), expScores / denom, MLXArray(Float(0)))
+}
+
+/// Sink-aware stable softmax with the sink folded into the denominator.
+/// `sinkLogits` is pre-reshaped to `[1, nQHeads, 1, 1]` by the caller so the
+/// compiled core stays a pure elementwise/broadcast graph (the reshape uses
+/// `nQHeads`, a per-config constant we deliberately keep out of the core).
+private let compiledQuantizedAttentionSoftmaxWithSink: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { scores, sinkLogits in
+        let rowMax = scores.max(axis: -1, keepDims: true)
+        let m = maximum(rowMax, sinkLogits)
+        let expScores = exp(scores - m)
+        let sinkExp = exp(sinkLogits - m)
+        let denom = expScores.sum(axis: -1, keepDims: true) + sinkExp
+        return expScores / denom
+    }
+
 public func quantizedScaledDotProductAttention(
     queries: MLXArray,
     quantizedKeys: (MLXArray, MLXArray, MLXArray?),
@@ -1764,7 +1818,8 @@ public func quantizedScaledDotProductAttention(
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
     groupSize: Int = 64,
     bits: Int = 8,
-    mode: QuantizationMode = .affine
+    mode: QuantizationMode = .affine,
+    sinks: MLXArray? = nil
 ) -> MLXArray {
 
     let (B, nQHeads, L, D) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
@@ -1791,26 +1846,36 @@ public func quantizedScaledDotProductAttention(
         )
     }
 
-    // Compute attention scores using quantized matmul
-    var scores = quantizedMM(
+    // Compute attention scores using quantized matmul. In the GQA case this is
+    // 5D [B, nKVHeads, nRepeats, L, kL]; otherwise 4D [B, nQHeads, L, kL].
+    let rawScores = quantizedMM(
         scaledQueries, qKeys.0, scales: qKeys.1, biases: qKeys.2,
         transpose: true, groupSize: groupSize, bits: bits,
         mode: mode
     )
+    let kL = rawScores.dim(-1)
+
+    // Collapse to the canonical 4D [B, nQHeads, L, kL] layout for masking, sink,
+    // and softmax. This is required for correctness with GQA *and* batching:
+    // standard attention masks are [B, 1, L, kL] / [B, nQHeads, L, kL] / [L, kL]
+    // and cannot broadcast against the 5D GQA score tensor when B > 1 (the 5D
+    // path only "worked" at B == 1 because the leading 1s happened to broadcast).
+    var scores = nRepeats > 1 ? rawScores.reshaped([B, nQHeads, L, kL]) : rawScores
 
     // Apply mask
     switch mask {
     case .causal:
-        let (qL, kL) = (scores.dim(-2), scores.dim(-1))
-        let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
-        let kIndices = MLXArray(0 ..< kL)
+        let (qL, kLen) = (scores.dim(-2), scores.dim(-1))
+        let qIndices = MLXArray(0 ..< qL) + MLXArray(kLen - qL)
+        let kIndices = MLXArray(0 ..< kLen)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
+        // Local patch: keep -Float.greatestFiniteMagnitude here until the upstream fix lands.
+        scores = MLX.where(causalMask, scores, MLXArray(-Float.greatestFiniteMagnitude))
 
     case .array(let maskArray):
         if maskArray.dtype == .bool {
-            scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+            scores = MLX.where(maskArray, scores, MLXArray(-Float.greatestFiniteMagnitude))
         } else {
             scores = scores + maskArray
         }
@@ -1819,7 +1884,7 @@ public func quantizedScaledDotProductAttention(
         // Handle multiple mask arrays - just use the first one for simplicity
         if let maskArray = maskArrays.first {
             if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+                scores = MLX.where(maskArray, scores, MLXArray(-Float.greatestFiniteMagnitude))
             } else {
                 scores = scores + maskArray
             }
@@ -1829,7 +1894,37 @@ public func quantizedScaledDotProductAttention(
         break
     }
 
-    let attentionWeights = softmax(scores, axis: -1)
+    let attentionWeights4D: MLXArray
+    if let sinks {
+        // Attention sink: a learned per-(query)head logit that acts as one extra
+        // "virtual" key in the softmax — it has no value vector, so it only
+        // absorbs softmax mass, making the real-token weights sum to < 1.
+        // (Equivalent to concatenating `sinks` as an extra score column and
+        // dropping it after softmax, but done without concat/slice so the
+        // weights stay contiguous for `quantizedMM`.) A no-sink cache is the
+        // `sink -> -inf` limit, i.e. `sinks == nil` below, NOT a zero sink.
+        //
+        // In the canonical 4D layout `sinks` ([nQHeads]) maps directly onto the
+        // head axis. The reshape stays outside the compiled core so the core
+        // never bakes in a head-count constant. The fused, numerically-stable
+        // softmax then folds the sink into the denominator.
+        let sinkLogits = sinks.reshaped([1, nQHeads, 1, 1])
+        attentionWeights4D = compiledQuantizedAttentionSoftmaxWithSink(scores, sinkLogits)
+    } else {
+        // Fused, stable no-sink softmax. Unlike the generic softmax, this keeps
+        // fully masked query rows finite by assigning zero probability to every
+        // real key (there is no sink to absorb probability mass). Model code
+        // ignores padded query rows, but keeping them finite avoids NaN
+        // propagation.
+        attentionWeights4D = compiledQuantizedAttentionSoftmax(scores)
+    }
+
+    // Restore the GQA-expanded layout [B, nKVHeads, nRepeats, L, kL] for the value
+    // matmul (qValues were expanded along axis -3 above).
+    let attentionWeights =
+        nRepeats > 1
+        ? attentionWeights4D.reshaped([B, nKVHeads, nRepeats, L, kL])
+        : attentionWeights4D
 
     // Compute output using quantized matmul
     var output = quantizedMM(

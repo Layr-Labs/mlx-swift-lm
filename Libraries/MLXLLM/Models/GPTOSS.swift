@@ -224,11 +224,13 @@ class AttentionBlock: Module {
                 return active
             }()
 
-        // Quantized cache path
+        // Quantized cache path (taken when the cache conforms to
+        // QuantizedKVCacheProtocol, i.e. the native quantized-attention kernel).
+        // Attention sinks are threaded through so the kernel folds them into the
+        // softmax denominator and stays correct for sink models — no fatalError.
+        // (Note: GPT-OSS defaults to the dequant cache for decode speed; this
+        // path is used only when the kernel cache is selected.)
         if let qcache = cache as? QuantizedKVCacheProtocol {
-            if sinksActive {
-                fatalError("Quantized attention does not support non-zero sinks.")
-            }
             q = applyRotaryPosition(rope, to: q, cache: cache)
             k = applyRotaryPosition(rope, to: k, cache: cache)
 
@@ -241,7 +243,8 @@ class AttentionBlock: Module {
                 mask: mask,
                 groupSize: qcache.groupSize,
                 bits: qcache.bits,
-                mode: qcache.mode
+                mode: qcache.mode,
+                sinks: sinksActive ? sinks : nil
             )
 
             return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
