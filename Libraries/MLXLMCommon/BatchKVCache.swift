@@ -180,7 +180,7 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
         self.keys?[.ellipsis, prev ..< _idx, 0...] = keys
         self.values?[.ellipsis, prev ..< _idx, 0...] = values
 
-        // DAR-325: collapse the per-step `batchOffset` lazy chain on decode.
+        // Collapse the per-step `batchOffset` lazy chain on decode.
         // gemma-4 shares one RoPE `perRowOffset` from the first cache
         // (Gemma4.swift:1264), so other caches never consume their own
         // `batchOffset` and leak a tiny scalar buffer/step (COUNT leak, flat
@@ -610,7 +610,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
             _idx = maxCacheSize
         }
 
-        // DAR-325: collapse the per-step `batchOffset`/`leftPadding` lazy chains
+        // Collapse the per-step `batchOffset`/`leftPadding` lazy chains
         // on decode (rebuilt at :594/:600). gemma-4 consumes each from only one
         // representative cache (shared RoPE offset + one sliding mask), so the
         // others leak ~2 tiny scalar buffers/step until `numResources` hits the

@@ -78,6 +78,13 @@ public final class GenerationBatch: @unchecked Sendable {
     /// needed it.
     public var skipLogprobNormalization: Bool = false
 
+    /// When false, finished rows skip the `extractBatched` dequant-and-copy of
+    /// their prompt cache (only a prefix cache consumes it). The scheduler sets
+    /// this true only when a prefix cache is active, so runs without prefix
+    /// caching — e.g. KV-quant models whose prefix tier isn't the in-GPU block
+    /// cache — don't pay a per-finish fp16 copy of the KV history.
+    public var capturePromptCacheOnFinish: Bool = false
+
     /// Tokens queued for the next model call. At construction this is the
     /// final prompt token for each row. After priming, and after every
     /// decode step, it holds the sampled token that should be returned on
@@ -205,7 +212,8 @@ public final class GenerationBatch: @unchecked Sendable {
             }
 
             if finishReason != nil {
-                let extracted: [any KVCache] = promptCache.map { $0.extractBatched(i) }
+                let extracted: [any KVCache]? =
+                    capturePromptCacheOnFinish ? promptCache.map { $0.extractBatched(i) } : nil
                 responses.append(
                     GenerationBatchResponse(
                         uid: uids[i],

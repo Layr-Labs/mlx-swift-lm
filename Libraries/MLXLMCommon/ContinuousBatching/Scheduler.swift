@@ -532,6 +532,10 @@ public final class Scheduler: @unchecked Sendable {
     }
 
     private func mergeIntoGenBatch(_ gen: GenerationBatch) {
+        // Only extract (dequant + copy) a finished row's prompt cache when a
+        // prefix cache can consume it. This skips a per-finish fp16 copy of the
+        // KV history on runs without prefix caching.
+        gen.capturePromptCacheOnFinish = prefixCache != nil
         if let existing = genBatch, !existing.isEmpty {
             existing.extend(gen)
         } else {
@@ -648,7 +652,7 @@ public final class Scheduler: @unchecked Sendable {
             // promptTokens.count) so there is a suffix to decode from; otherwise
             // ignore and fall through to cold.
             //
-            // DAR-319 v2: checkpoint restore COMPOSES with KV-quant.
+            // Checkpoint restore composes with KV-quant.
             // `admitRestoredCheckpoint` rebuilds full-attention rows as QUANTIZED
             // batched caches via the cold cache factory
             // (`restoredFullAttentionCache`), so a restored row stays concrete-
@@ -881,7 +885,7 @@ public final class Scheduler: @unchecked Sendable {
             } else if let rot = layer as? RotatingKVCache, exp is RotatingKVCache {
                 batched.append(BatchRotatingKVCache.fromSingleRow(rot))
             } else if let simple = layer as? KVCacheSimple, exp is KVCacheSimple {
-                // DAR-319: build a batched cache MATCHING the cold path's
+                // Build a batched cache matching the cold path's
                 // per-layer type so a restored row stays concrete-class-
                 // compatible with quantized cold rows under `extendBatched`.
                 // Under KV-quant the cold factory yields a

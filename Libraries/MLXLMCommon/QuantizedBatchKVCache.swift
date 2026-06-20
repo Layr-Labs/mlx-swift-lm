@@ -221,7 +221,7 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
         self.keys = ck
         self.values = cv
 
-        // DAR-325: collapse the per-step `batchOffset` lazy chain on decode,
+        // Collapse the per-step `batchOffset` lazy chain on decode,
         // mirroring `BatchKVCache.update`. gemma-4 shares one RoPE
         // `perRowOffset` from the first cache (Gemma4.swift:1264), so other
         // caches never consume their own `batchOffset` and leak a tiny scalar
@@ -536,7 +536,7 @@ public class QuantizedBatchKVCacheBase: BaseKVCache, BatchPositionedKVCache,
             ]
         }
         set {
-            // TODO(DAR-319): metaState currently restores only _idx; groupSize,
+            // TODO: metaState currently restores only _idx; groupSize,
             // bits, and mode are not serialized here. Acceptable for v1 because
             // prefix-cache/checkpoint is disabled when quantization is on.
             guard newValue.count == 5 else {
