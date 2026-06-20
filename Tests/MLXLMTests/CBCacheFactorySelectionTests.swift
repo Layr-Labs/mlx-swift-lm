@@ -40,12 +40,19 @@ final class CBCacheFactorySelectionTests: XCTestCase {
             "DequantBatchKVCache")
     }
 
-    func testSlidingLayersStayFp16WhenQuantOn() {
+    func testSlidingLayersAreQuantizedRotatingWhenQuantOn() {
+        // Sliding-window layers are quantized too (rotating variants) so the
+        // capacity win covers the whole cache, not just full-attention layers.
         XCTAssertEqual(
             Scheduler.cacheFactoryTypeName(
                 for: RotatingKVCache(maxSize: 1024, keep: 0, step: 1024),
                 quantConfig: kernel),
-            "BatchRotatingKVCache")
+            "QuantizedBatchRotatingKVCache")
+        XCTAssertEqual(
+            Scheduler.cacheFactoryTypeName(
+                for: RotatingKVCache(maxSize: 1024, keep: 0, step: 1024),
+                quantConfig: dequant),
+            "DequantBatchRotatingKVCache")
     }
 
     func testChunkedKVCacheIsNotQuantized() {
