@@ -642,36 +642,35 @@ public final class Scheduler: @unchecked Sendable {
             var existingCache: [KVCache]? = nil
             var restoredCaches: [any KVCache]? = nil
 
-            // KV quantization builds quantized batched caches for the cold path.
-            // Warm prefix hits and checkpoint restores rebuild full-attention rows
-            // as fp16 `BatchKVCache` (`doExternalPrefill`/`BatchKVCache.merge`),
-            // which cannot be merged into a live quantized batch — `extendBatched`
-            // requires matching concrete cache classes. Until warm/restore can
-            // rebuild quantized rows with the same factory, force every request onto
-            // the cold path when quantization is active so fp16 and quantized rows
-            // never mix. (The provider also disables the prefix cache when KV quant
-            // is on; this is engine-level defense in depth for any caller.)
-            if config.kvQuantization == nil {
-                // Checkpoint restore (hybrid models) takes precedence: the
-                // provider attached a per-layer mixed cache covering the first
-                // `tokenCount` prompt tokens. Only valid for a real prefix
-                // (1 <= tokenCount < promptTokens.count) so there is a suffix to
-                // decode from; otherwise ignore and fall through to cold.
-                if let rc = request.restoredCheckpoint,
-                   rc.tokenCount >= 1, rc.tokenCount < promptTokens.count,
-                   rc.caches.count == model.newCache(parameters: nil).count
-                {
-                    restoredCaches = rc.caches
-                    tokensToPrefill = Array(promptTokens[rc.tokenCount...])
-                    request.cachedTokens = rc.tokenCount
-                } else if let pc = prefixCache {
-                    let (cached, remaining) = pc.fetchPrefix(
-                        requestId: request.requestId, tokens: promptTokens)
-                    if let cached {
-                        tokensToPrefill = remaining
-                        existingCache = cached.map { $0 as KVCache }
-                        request.cachedTokens = promptTokens.count - remaining.count
-                    }
+            // Checkpoint restore (hybrid models) takes precedence: the provider
+            // attached a per-layer mixed cache covering the first `tokenCount`
+            // prompt tokens. Only valid for a real prefix (1 <= tokenCount <
+            // promptTokens.count) so there is a suffix to decode from; otherwise
+            // ignore and fall through to cold.
+            //
+            // DAR-319 v2: checkpoint restore COMPOSES with KV-quant.
+            // `admitRestoredCheckpoint` rebuilds full-attention rows as QUANTIZED
+            // batched caches via the cold cache factory
+            // (`restoredFullAttentionCache`), so a restored row stays concrete-
+            // class-compatible with quantized cold rows under `extendBatched`.
+            // The engine-tier warm prefix path (`prefixCache` →
+            // `doExternalPrefill` + `BatchKVCache.merge`) still rebuilds fp16
+            // only, so it stays cold-only under quantization until it too
+            // rebuilds quantized rows.
+            if let rc = request.restoredCheckpoint,
+               rc.tokenCount >= 1, rc.tokenCount < promptTokens.count,
+               rc.caches.count == model.newCache(parameters: nil).count
+            {
+                restoredCaches = rc.caches
+                tokensToPrefill = Array(promptTokens[rc.tokenCount...])
+                request.cachedTokens = rc.tokenCount
+            } else if config.kvQuantization == nil, let pc = prefixCache {
+                let (cached, remaining) = pc.fetchPrefix(
+                    requestId: request.requestId, tokens: promptTokens)
+                if let cached {
+                    tokensToPrefill = remaining
+                    existingCache = cached.map { $0 as KVCache }
+                    request.cachedTokens = promptTokens.count - remaining.count
                 }
             }
 
@@ -875,14 +874,22 @@ public final class Scheduler: @unchecked Sendable {
         // it's rejected on either side.
         var batched: [any BatchedCache] = []
         batched.reserveCapacity(restored.count)
-        for (layer, exp) in zip(restored, expected) {
+        for (idx, (layer, exp)) in zip(restored, expected).enumerated() {
             if layer is ChunkedKVCache || exp is ChunkedKVCache {
                 admitColdFallback(entry)  // unsupported subclass
                 return false
             } else if let rot = layer as? RotatingKVCache, exp is RotatingKVCache {
                 batched.append(BatchRotatingKVCache.fromSingleRow(rot))
             } else if let simple = layer as? KVCacheSimple, exp is KVCacheSimple {
-                batched.append(BatchKVCache.merge([simple]))
+                // DAR-319: build a batched cache MATCHING the cold path's
+                // per-layer type so a restored row stays concrete-class-
+                // compatible with quantized cold rows under `extendBatched`.
+                // Under KV-quant the cold factory yields a
+                // QuantizedBatchKVCacheBase for eligible full-attention layers;
+                // re-quantize the restored fp16 prefix into it via `update()`
+                // (the same path cold prefill uses). KV-quant off → fp16
+                // `BatchKVCache.merge`.
+                batched.append(restoredFullAttentionCache(layerIndex: idx, restored: simple))
             } else {
                 // Type mismatch (e.g. Rotating where the model wants Simple),
                 // recurrent, or unknown — restore is unsound; cold-prefill.
@@ -912,6 +919,29 @@ public final class Scheduler: @unchecked Sendable {
         gen.skipLogprobNormalization = Self.batchCanSkipLogprobNorm([entry.request.samplingParams])
         mergeIntoGenBatch(gen)
         return true
+    }
+
+    /// Build the batched cache for a restored full-attention layer, matching
+    /// the cold path's per-layer cache type. Under KV-quant the cold factory
+    /// (`cacheFactories`) produces a `QuantizedBatchKVCacheBase`; ingest the
+    /// restored fp16 K/V via `update()` so the prefix is re-quantized into the
+    /// exact layout cold rows use — keeping each genBatch layer a single
+    /// concrete class (an `extendBatched` precondition). When the layer is not
+    /// quantized (KV-quant off, or ineligible) fall back to fp16
+    /// `BatchKVCache.merge`.
+    private func restoredFullAttentionCache(
+        layerIndex: Int, restored: KVCacheSimple
+    ) -> any BatchedCache {
+        let coldCache = cacheFactories[layerIndex](1)
+        guard let quant = coldCache as? QuantizedBatchKVCacheBase else {
+            return BatchKVCache.merge([restored])
+        }
+        let st = restored.state
+        guard st.count == 2 else { return BatchKVCache.merge([restored]) }
+        // `update` quantizes the incoming fp16 K/V and appends along the time
+        // axis (B==1, T = restored prefix length), exactly as cold prefill does.
+        _ = quant.update(keys: st[0], values: st[1])
+        return quant
     }
 
     /// Fallback when a restored cache can't be rebuilt (an unsupported layer
