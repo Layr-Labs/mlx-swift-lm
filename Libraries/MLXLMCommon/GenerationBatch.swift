@@ -62,6 +62,22 @@ public final class GenerationBatch: @unchecked Sendable {
     public let fallbackSampler: RowSampler
     public private(set) var stateMachines: [SequenceStateMachine]
 
+    /// When true, `step()` skips the per-step `logSumExp` normalization of the
+    /// decode logits and hands the raw logits to the row samplers. This is a
+    /// pure host/GPU-overhead optimization and is **only** safe when no active
+    /// row needs the normalized logprobs: temperature scaling, top-k, min-p,
+    /// categorical and argMax are all invariant to the per-row constant
+    /// `logSumExp` shift, but top-p (nucleus) sampling's cumulative-probability
+    /// threshold is not, and the repetition/presence/frequency penalty sampler
+    /// applies its (non-shift-invariant) transform to the values it receives.
+    ///
+    /// The `Scheduler` sets this from the admitted rows' sampling params (it is
+    /// the only place that knows them); it defaults to `false` so any batch that
+    /// is never told otherwise keeps the exact previous behavior. `extend`
+    /// combines with logical AND so a merged batch normalizes if *either* side
+    /// needed it.
+    public var skipLogprobNormalization: Bool = false
+
     /// Tokens queued for the next model call. At construction this is the
     /// final prompt token for each row. After priming, and after every
     /// decode step, it holds the sampled token that should be returned on
@@ -283,6 +299,9 @@ public final class GenerationBatch: @unchecked Sendable {
         matcherStates.append(contentsOf: other.matcherStates)
         numTokens.append(contentsOf: other.numTokens)
         nextTokens = concatenated([nextTokens, other.nextTokens], axis: 0)
+        // Only keep skipping normalization if BOTH batches were safe to skip;
+        // a single incoming top-p / penalty row forces normalization again.
+        skipLogprobNormalization = skipLogprobNormalization && other.skipLogprobNormalization
         // MTP: transfer state from donor batch when BatchGenerator merges a fresh
         // single-sequence batch into self via extend(). The MTP post-init fires on
         // the donor (whose __init__ ran with uids=[1]); without this transfer the
@@ -384,7 +403,16 @@ public final class GenerationBatch: @unchecked Sendable {
 
         let sampledTokens: MLXArray
         if samplers.contains(where: { $0 != nil }) {
-            let logprobs = stepLogits - logSumExp(stepLogits, axis: -1, keepDims: true)
+            // The `logSumExp` reduction over the full vocabulary is only needed
+            // when a row uses top-p (or a penalty sampler keyed on logprobs).
+            // When no active row needs it (`skipLogprobNormalization`), pass the
+            // raw logits through: every other filter/sampler is invariant to the
+            // per-row constant shift, so results are unchanged. See the property
+            // doc on `skipLogprobNormalization`.
+            let logprobs =
+                skipLogprobNormalization
+                ? stepLogits
+                : stepLogits - logSumExp(stepLogits, axis: -1, keepDims: true)
             var samples: [MLXArray] = []
             samples.reserveCapacity(uids.count)
             for i in 0 ..< uids.count {
@@ -408,7 +436,15 @@ public final class GenerationBatch: @unchecked Sendable {
         asyncEval(sampledTokens)
 
         eval(currentTokens)
-        let stepTokens = currentTokens.asArray(UInt32.self).map { Int($0) }
+        // For the common single-row batch, read the one scalar via `item`
+        // instead of materializing a 1-element Swift array. Multi-row batches
+        // keep the bulk `asArray` extraction unchanged.
+        let stepTokens: [Int]
+        if uids.count == 1 {
+            stepTokens = [currentTokens.item(Int.self)]
+        } else {
+            stepTokens = currentTokens.asArray(UInt32.self).map { Int($0) }
+        }
 
         for (i, t) in stepTokens.enumerated() {
             tokens[i].append(t)

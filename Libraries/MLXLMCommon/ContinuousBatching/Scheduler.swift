@@ -8,7 +8,29 @@ import MLX
 
 final class TokenHistoryHolder: @unchecked Sendable {
     var tokens: [Int]
-    init(tokens: [Int]) { self.tokens = tokens }
+    /// Per-token occurrence counts, maintained incrementally as tokens are
+    /// appended (see ``append(_:)``). The original repetition sampler rebuilt
+    /// this dictionary from the entire history on every decode step — O(n) per
+    /// token, i.e. O(n²) over a generation. Maintaining it here makes each
+    /// sampler call O(unique tokens) instead. Counts include every appended id;
+    /// the sampler filters to the in-range `[0, vocab)` ids (matching the old
+    /// `t >= 0 && t < vocab` guard) when it builds the device arrays.
+    private(set) var counts: [Int: Int]
+
+    init(tokens: [Int]) {
+        self.tokens = tokens
+        var counts: [Int: Int] = [:]
+        for t in tokens { counts[t, default: 0] += 1 }
+        self.counts = counts
+    }
+
+    /// Append a generated token, keeping `tokens` and `counts` in sync in
+    /// O(1) amortized. Must be called instead of `tokens.append(_:)` so the
+    /// incremental counts stay correct.
+    func append(_ token: Int) {
+        tokens.append(token)
+        counts[token, default: 0] += 1
+    }
 }
 
 func makeRepetitionSampler(
@@ -19,28 +41,56 @@ func makeRepetitionSampler(
     frequencyPenalty: Float
 ) -> RowSampler {
     return { @Sendable logits in
-        let tokens = history.tokens
-        guard !tokens.isEmpty else { return base(logits) }
+        // Incremental counts: no rescan of the full history. Empty history
+        // (no counts) → pass through to the base sampler, as before.
+        guard !history.counts.isEmpty else { return base(logits) }
         let vocab = logits.dim(-1)
 
-        var counts: [Int: Int] = [:]
-        for t in tokens where t >= 0 && t < vocab {
-            counts[t, default: 0] += 1
+        // Build parallel host arrays of the unique in-range penalized token ids
+        // and their counts. This is the only host-side work and is O(unique
+        // tokens) — not O(history length) and not O(vocab). Filtering to
+        // `0 ..< vocab` preserves the original guard exactly.
+        var idList: [Int32] = []
+        var countList: [Float] = []
+        idList.reserveCapacity(history.counts.count)
+        countList.reserveCapacity(history.counts.count)
+        for (tokenId, count) in history.counts where tokenId >= 0 && tokenId < vocab {
+            idList.append(Int32(tokenId))
+            countList.append(Float(count))
         }
-        guard !counts.isEmpty else { return base(logits) }
+        // No in-range counts → pass through (matches the old `counts.isEmpty` guard).
+        guard !idList.isEmpty else { return base(logits) }
 
-        eval(logits)
-        var flat = logits.reshaped(-1).asArray(Float.self)
-        for (tokenId, count) in counts {
-            var v = flat[tokenId]
-            if repetitionPenalty != 1.0 {
-                v = v > 0 ? v / repetitionPenalty : v * repetitionPenalty
-            }
-            v -= presencePenalty
-            v -= frequencyPenalty * Float(count)
-            flat[tokenId] = v
+        // Apply the penalties entirely on-device via gather → transform →
+        // scatter. No `eval`, no `asArray`, no full-vocab GPU↔host round trip.
+        //
+        // Upcast to float32 first so the math is bit-for-bit the original CPU
+        // formula, which read the logits as `Float` before penalizing. The
+        // scatter produces a new array (functional op), so the caller's
+        // `logits` is never mutated.
+        //
+        // Numerics, in order (identical to the original):
+        //   if repetitionPenalty != 1: v = v > 0 ? v / rp : v * rp
+        //   v -= presencePenalty
+        //   v -= frequencyPenalty * count
+        let idsArr = MLXArray(idList)
+        let countsArr = MLXArray(countList)
+        let flat = logits.reshaped(-1).asType(.float32)        // [vocab]
+        let gathered = take(flat, idsArr, axis: 0)             // [K]
+
+        var penalized = gathered
+        if repetitionPenalty != 1.0 {
+            penalized = which(
+                gathered .> 0,
+                gathered / repetitionPenalty,
+                gathered * repetitionPenalty
+            )
         }
-        return base(MLXArray(flat).reshaped(logits.shape))
+        penalized = penalized - presencePenalty
+        penalized = penalized - frequencyPenalty * countsArr
+
+        flat[idsArr] = penalized                                // scatter back
+        return base(flat.reshaped(logits.shape))
     }
 }
 
@@ -157,6 +207,11 @@ private struct PendingPrefill {
     var remaining: [[Int]]
     // Last token of each sequence; used as the seed for GenerationBatch.
     var seeds: [Int]
+    // Whether the resulting decode batch can skip the per-step logSumExp
+    // normalization (no row uses top-p or a penalty sampler). Computed at
+    // admission and applied to the GenerationBatch once prefill completes,
+    // since `PromptProcessingBatch.generate` builds the batch internally.
+    var skipLogprobNorm: Bool
 }
 
 public final class Scheduler: @unchecked Sendable {
@@ -408,6 +463,7 @@ public final class Scheduler: @unchecked Sendable {
             if genBatch?.hasActiveMTPSession == true { return }
             // All sequences prefilled — transition to decode.
             let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
+            gen.skipLogprobNormalization = pp.skipLogprobNorm
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
             return
@@ -467,6 +523,7 @@ public final class Scheduler: @unchecked Sendable {
                 return
             }
             let gen = pp.ppBatch.generate(lastTokensOf: pp.seeds.map { [$0] }, mtpRuntime: mtpRuntime)
+            gen.skipLogprobNormalization = pp.skipLogprobNorm
             mergeIntoGenBatch(gen)
             pendingPrefill = nil
         } else {
@@ -750,6 +807,8 @@ public final class Scheduler: @unchecked Sendable {
                 stateMachines: warmMachines,
                 mtpRuntime: mtpRuntime
             )
+            warmGen.skipLogprobNormalization = Self.batchCanSkipLogprobNorm(
+                warm.map { $0.request.samplingParams })
             mergeIntoGenBatch(warmGen)
         }
 
@@ -772,7 +831,11 @@ public final class Scheduler: @unchecked Sendable {
                 return toks.count > 1 ? Array(toks.dropLast()) : []
             }
             let seeds = cold.map { $0.tokensToPrefill.last ?? 0 }
-            pendingPrefill = PendingPrefill(ppBatch: ppBatch, remaining: remaining, seeds: seeds)
+            let skipLogprobNorm = Self.batchCanSkipLogprobNorm(
+                cold.map { $0.request.samplingParams })
+            pendingPrefill = PendingPrefill(
+                ppBatch: ppBatch, remaining: remaining, seeds: seeds,
+                skipLogprobNorm: skipLogprobNorm)
         }
 
         return newScheduled
@@ -846,6 +909,7 @@ public final class Scheduler: @unchecked Sendable {
             stateMachines: [entry.machine]
         )
         let gen = ppBatch.generate(lastTokensOf: [suffix], mtpRuntime: mtpRuntime)
+        gen.skipLogprobNormalization = Self.batchCanSkipLogprobNorm([entry.request.samplingParams])
         mergeIntoGenBatch(gen)
         return true
     }
@@ -888,6 +952,28 @@ public final class Scheduler: @unchecked Sendable {
         }
         guard !seqs.isEmpty else { return SequenceStateMachine() }
         return SequenceStateMachine(states: ["normal": seqs])
+    }
+
+    /// Whether a decode batch made up of rows with these sampling params can
+    /// skip the per-step `logSumExp` normalization in `GenerationBatch.step()`.
+    ///
+    /// Safe to skip only when NO row needs normalized logprobs:
+    /// - a penalty sampler (repetition/presence/frequency) applies a transform
+    ///   that is not invariant to the constant `logSumExp` shift, and
+    /// - an active top-p (nucleus) filter compares a cumulative probability mass
+    ///   against `1 - topP`, which is also not shift-invariant.
+    /// Temperature scaling, top-k, min-p, categorical and argMax are all
+    /// shift-invariant, so a pure-temperature / greedy batch can skip it.
+    /// Mirrors the exact predicates in `makeRowSampler` / `makeRepetitionSampler`.
+    private static func batchCanSkipLogprobNorm(_ params: [SamplingParams]) -> Bool {
+        !params.contains { p in
+            let needsPenalty =
+                p.repetitionPenalty != 1.0
+                || p.presencePenalty != 0.0
+                || p.frequencyPenalty != 0.0
+            let topPActive = p.temperature != 0 && p.topP > 0 && p.topP < 1
+            return needsPenalty || topPActive
+        }
     }
 
     private lazy var cacheFactories: [(Int) -> any BatchedCache] = {
@@ -1067,14 +1153,14 @@ extension Scheduler {
             let newText: String
             if !isFinished {
                 request.appendOutputToken(tokenId)
-                tokenHistories[rid]?.tokens.append(tokenId)
+                tokenHistories[rid]?.append(tokenId)
                 var detok = activeDetokenizers[rid]!
                 detok.append(token: tokenId)
                 newText = detok.next() ?? ""
                 activeDetokenizers[rid] = detok
             } else if resp.finishReason == "length" {
                 request.appendOutputToken(tokenId)
-                tokenHistories[rid]?.tokens.append(tokenId)
+                tokenHistories[rid]?.append(tokenId)
                 newText = ""
             } else {
                 newText = ""
