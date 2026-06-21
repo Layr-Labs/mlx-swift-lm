@@ -8,7 +8,7 @@ Use it when you need explicit control over request admission and per-row
 streaming responses:
 
 ```swift
-let generator = BatchGenerator(
+let generator = try BatchGenerator(
     model: model,
     eosTokens: [[eosToken]],
     defaultMaxTokens: 128,
@@ -30,6 +30,44 @@ context at a time. Each call to `next()` may prefill queued prompts, run one
 decode step for active rows, and return one response per active row. A response
 with a non-`nil` `finishReason` is the final response for that UID.
 
+Use `drain(wiredMemoryTicket:onResponse:)` when you want the generator to hold
+a wired-memory ticket across the whole drain loop:
+
+```swift
+let policy = WiredBudgetPolicy(baseBytes: baseBytes)
+let ticket = policy.ticket(size: estimatedBatchBytes)
+
+try await generator.drain(wiredMemoryTicket: ticket) { response in
+    print(response.uid, response.token, response.finishReason as Any)
+}
+```
+
+The ticket stays active until the generator has no queued or active rows, or
+until the response handler throws or the task is cancelled. In those cases, the
+error propagates, the ticket is released, and the generator keeps any remaining
+state. Responses delivered before the throw or cancellation are not replayed or
+rolled back. Do not call `insert`, `cancel`, `next`, or `close` concurrently
+with `drain`; serialize server-side admission and driving through one owner,
+such as an actor.
+
+For long-running services that keep inserting work, wrap shorter driver windows
+directly in `ticket.withWiredLimit` so one never-ending drain does not block
+other wired-memory admission waiters:
+
+```swift
+while shouldContinueServing {
+    try await waitForMoreWork()
+
+    try await ticket.withWiredLimit {
+        while generator.hasWork {
+            for response in generator.next() {
+                try await send(response)
+            }
+        }
+    }
+}
+```
+
 Call `cancel(uid:)` to remove a queued or active row. The method returns `true`
 when it found the UID and filtered that row out of the generator state.
 
@@ -50,6 +88,9 @@ request.
 ## Cache Model
 
 Continuous batching uses `BatchKVCache` for attention layers and `ArraysCache`
-or `MambaCache` for array-backed state-space layers. `BatchKVCache` keeps rows
-right-aligned so requests with different prompt lengths can share one cache and
-attention mask while still preserving per-row positions for RoPE.
+or `MambaCache` for array-backed state-space layers. Composite `CacheList`
+layers are preserved when every child cache has a supported batched analog.
+Unsupported cache topologies fail during `BatchGenerator` initialization.
+`BatchKVCache` keeps rows right-aligned so requests with different prompt
+lengths can share one cache and attention mask while still preserving per-row
+positions for RoPE.
