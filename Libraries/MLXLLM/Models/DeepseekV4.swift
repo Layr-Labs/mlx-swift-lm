@@ -1,10 +1,7 @@
-// DeepSeek-V4 model port.
-//
-// Faithful port of ml-explore/mlx-lm#1192 (base model by Blaizzy, 0xClandestine,
-// angeloskath, pcuenca, eauchs) and Blaizzy/mlx-lm#15 (MTP).
-// Reference: omlx/patches/deepseek_v4/deepseek_v4_model.py
-//            omlx/patches/deepseek_v4/hyper_connection.py
-//            omlx/patches/deepseek_v4/cache_extras.py (PoolingCache)
+// Copyright © 2025 Apple Inc.
+
+// Port of DeepSeek-V4 inference code
+// Reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro
 
 import Foundation
 import MLX
@@ -14,39 +11,48 @@ import MLXNN
 // MARK: - Configuration
 
 public struct DeepseekV4Configuration: Codable, Sendable {
-    var vocabSize: Int = 129280
-    var hiddenSize: Int = 4096
-    var moeIntermediateSize: Int = 2048
-    var numHiddenLayers: Int = 43
-    var numAttentionHeads: Int = 64
-    var headDim: Int = 512
-    var qLoraRank: Int = 1024
-    var qkRopeHeadDim: Int = 64
-    var rmsNormEps: Float = 1e-6
-    var oGroups: Int = 8
-    var oLoraRank: Int = 1024
-    var slidingWindow: Int = 128
-    var compressRatios: [Int] = []
-    var compressRopeTheta: Float = 160000.0
-    var nRoutedExperts: Int = 256
-    var nSharedExperts: Int = 1
-    var numExpertsPerTok: Int = 6
-    var scoringFunc: String = "sqrtsoftplus"
-    var routedScalingFactor: Float = 1.5
-    var swiguLimit: Float = 10.0
-    var numHashLayers: Int = 3
-    var numNextnPredictLayers: Int = 1
-    var normTopkProb: Bool = true
-    var hcMult: Int = 4
-    var hcSinkhornIters: Int = 20
-    var hcEps: Float = 1e-6
-    var ropeTheta: Float = 10000.0
-    var ropeScaling: [String: StringOrNumber]?
-    var maxPositionEmbeddings: Int = 1_048_576
-    var indexNHeads: Int = 64
-    var indexHeadDim: Int = 128
-    var indexTopk: Int = 512
+    // Core architecture
+    var vocabSize: Int
+    var hiddenSize: Int
+    var moeIntermediateSize: Int
+    var numHiddenLayers: Int
+    var numAttentionHeads: Int
+    var headDim: Int
+    var qLoraRank: Int
+    var qkRopeHeadDim: Int
+    var rmsNormEps: Float
 
+    // Output projection grouping
+    var oGroups: Int
+    var oLoraRank: Int
+
+    // Attention / compression (per layer)
+    var slidingWindow: Int
+    var compressRatios: [Int]
+    var compressRopeTheta: Float
+
+    // MoE
+    var nRoutedExperts: Int
+    var nSharedExperts: Int
+    var numExpertsPerTok: Int
+    var scoringFunc: String
+    var routedScalingFactor: Float
+    var swiguLimit: Float
+    var numHashLayers: Int
+    var numNextnPredictLayers: Int
+    var normTopkProb: Bool
+
+    // Hyper-Connections (mHC)
+    var hcMult: Int
+    var hcSinkhornIters: Int
+    var hcEps: Float
+
+    // RoPE
+    var ropeTheta: Float
+    var ropeScaling: [String: StringOrNumber]?
+    var maxPositionEmbeddings: Int
+
+    // Nope head dim (derived)
     var nopeHeadDim: Int { headDim - qkRopeHeadDim }
 
     enum CodingKeys: String, CodingKey {
@@ -79,311 +85,151 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         case ropeTheta = "rope_theta"
         case ropeScaling = "rope_scaling"
         case maxPositionEmbeddings = "max_position_embeddings"
-        case indexNHeads = "index_n_heads"
-        case indexHeadDim = "index_head_dim"
-        case indexTopk = "index_topk"
-    }
-
-    /// Populate default compress_ratios if empty (mirrors Python __post_init__).
-    mutating func fillDefaultCompressRatios() {
-        guard compressRatios.isEmpty else { return }
-        let n = numHiddenLayers
-        compressRatios =
-            [0]
-            + (0..<max(n - 2, 0)).map { i in i % 2 == 0 ? 128 : 4 }
-            + (n >= 2 ? [0] : [])
-        compressRatios = Array(compressRatios.prefix(numHiddenLayers))
     }
 }
 
-// MARK: - PoolingCache
+// MARK: - Helper Functions
 
-/// Accumulates tokens into windows of size `ratio`, compresses them, and stores pooled KVs.
-/// Mirrors Python PoolingCache from mlx-lm#1192 cache.py.
-final class PoolingCache {
-    let ratio: Int
-    var bufKV: MLXArray?    // [B, remainder, out_dim]
-    var bufGate: MLXArray?  // [B, remainder, out_dim]
-    var pooled: MLXArray?   // [B, n_pooled, head_dim]
+/// sqrtsoftplus activation: sqrt(softplus(x)) = sqrt(log(1 + e^x))
+/// Uses numerically stable form to avoid exp overflow for large positive x.
+private func sqrtSoftplus(_ x: MLXArray) -> MLXArray {
+    let sp = MLX.maximum(x, MLXArray(0)) + MLX.log1p(MLX.exp(-MLX.abs(x)))
+    return MLX.sqrt(sp)
+}
 
-    var pooledCount: Int { pooled?.dim(1) ?? 0 }
+/// Apply per-head RMS normalization (without learnable scale)
+private func headRmsNorm(_ x: MLXArray, eps: Float) -> MLXArray {
+    x * rsqrt(x.square().mean(axis: -1, keepDims: true) + eps)
+}
 
-    init(ratio: Int) {
-        self.ratio = ratio
-    }
+// MARK: - Sinkhorn-based Hyper-Connection helpers
 
-    /// Split `kv`/`gate` into complete windows of `ratio` tokens.
-    /// Returns (readyKV, readyGate, poolBase) where readyKV has shape [B, n_windows*ratio, D].
-    func accumulateWindows(kv: MLXArray, gate: MLXArray, offset: Int)
-        -> (MLXArray, MLXArray, Int)
+/// Cache of compiled Sinkhorn graphs keyed by (hcMult, iters, eps).
+/// The raw graph is ~80 tiny elementwise/reduce ops; at 2 calls/layer × 43 layers that is
+/// thousands of kernel dispatches per decoded token. `MLX.compile` fuses them.
+private final class HCSinkhornCompileCache: @unchecked Sendable {
+    static let shared = HCSinkhornCompileCache()
+    private var cache: [String: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    private let lock = NSLock()
+
+    func fn(hcMult: Int, sinkhornIters: Int, eps: Float)
+        -> @Sendable ([MLXArray]) -> [MLXArray]
     {
-        let B = kv.dim(0), L = kv.dim(1), D1 = kv.dim(2), D2 = gate.dim(2)
+        let key = "\(hcMult)-\(sinkhornIters)-\(eps)"
+        lock.lock()
+        defer { lock.unlock() }
+        if let f = cache[key] { return f }
+        let hc = hcMult
+        let f = compile { (args: [MLXArray]) -> [MLXArray] in
+            let mixes = args[0], hcScale = args[1], hcBase = args[2]
+            let B = mixes.dim(0), S = mixes.dim(1)
 
-        if L > 1 {
-            // Prompt mode
-            let remainder = bufKV?.dim(1) ?? 0
-            let total = L + remainder
-            let usable = (total / ratio) * ratio
-            let newRemainder = total % ratio
+            // Split mixes / base into (pre, post, comb) parts.
+            let preMix = mixes[.ellipsis, ..<hc]
+            let postMix = mixes[.ellipsis, hc ..< 2 * hc]
+            let combMix = mixes[.ellipsis, (2 * hc)...]
+            let preBase = hcBase[..<hc]
+            let postBase = hcBase[hc ..< 2 * hc]
+            let combBase = hcBase[(2 * hc)...]
 
-            let readyKV: MLXArray
-            let readyGate: MLXArray
-            let poolBase: Int
+            // Match the official DeepSeek-V4 hc_split_sinkhorn kernel EXACTLY (kernel.py:372).
+            // pre: sigmoid + eps, NOT normalized.  post: 2*sigmoid, NO eps (range (0,2),
+            // identity at zero logits).
+            let pre = sigmoid(preMix * hcScale[0] + preBase) + eps     // [B, S, hc]
+            let post = 2 * sigmoid(postMix * hcScale[1] + postBase)   // [B, S, hc]
 
-            if usable > 0 {
-                let prevKV = bufKV ?? zeros([B, 0, D1], dtype: kv.dtype)
-                let prevGate = bufGate ?? zeros([B, 0, D2], dtype: gate.dtype)
-                let combinedKV = concatenated([prevKV, kv], axis: 1)
-                let combinedGate = concatenated([prevGate, gate], axis: 1)
-                readyKV = combinedKV[0..., ..<usable, 0...]
-                readyGate = combinedGate[0..., ..<usable, 0...]
-                poolBase = offset - remainder
-            } else {
-                readyKV = zeros([B, 0, D1], dtype: kv.dtype)
-                readyGate = zeros([B, 0, D2], dtype: gate.dtype)
-                poolBase = 0
+            // comb: RAW affine logits → softmax(-1)+eps → column → (iters-1)×(row, column).
+            var comb = (combMix * hcScale[2] + combBase).reshaped(B, S, hc, hc)
+            comb = softmax(comb, axis: -1) + eps
+            comb = comb / (comb.sum(axis: -2, keepDims: true) + eps)
+            for _ in 0 ..< (sinkhornIters - 1) {
+                comb = comb / (comb.sum(axis: -1, keepDims: true) + eps)
+                comb = comb / (comb.sum(axis: -2, keepDims: true) + eps)
             }
-
-            if newRemainder > 0 {
-                bufKV = kv[0..., (L - newRemainder)..., 0...]
-                bufGate = gate[0..., (L - newRemainder)..., 0...]
-            } else {
-                bufKV = nil
-                bufGate = nil
-            }
-
-            return (readyKV, readyGate, poolBase)
-        } else {
-            // Decode mode: accumulate one token at a time
-            let newBufKV: MLXArray
-            let newBufGate: MLXArray
-            if let cur = bufKV, let curG = bufGate {
-                newBufKV = concatenated([cur, kv], axis: 1)
-                newBufGate = concatenated([curG, gate], axis: 1)
-            } else {
-                newBufKV = kv
-                newBufGate = gate
-            }
-
-            if newBufKV.dim(1) == ratio {
-                // Full window ready
-                let readyKV = newBufKV
-                let readyGate = newBufGate
-                let poolBase = offset - ratio + 1
-                bufKV = nil
-                bufGate = nil
-                return (readyKV, readyGate, poolBase)
-            } else {
-                bufKV = newBufKV
-                bufGate = newBufGate
-                return (zeros([B, 0, D1], dtype: kv.dtype), zeros([B, 0, D2], dtype: gate.dtype), 0)
-            }
-        }
-    }
-
-    /// Append newly compressed tokens to the pool and return full pooled array.
-    func updateAndFetch(_ px: MLXArray) -> MLXArray {
-        if px.dim(1) == 0 {
-            return pooled ?? zeros([px.dim(0), 0, px.dim(2)], dtype: px.dtype)
-        }
-        if let p = pooled {
-            pooled = concatenated([p, px], axis: 1)
-        } else {
-            pooled = px
-        }
-        return pooled!
-    }
-
-    /// Build a causal validity mask for pooled positions.
-    /// Returns `[L, P]` bool mask (nil for decode or empty pool).
-    func makeMask(L: Int, offset: Int) -> MLXArray? {
-        guard let p = pooled, L > 1 else { return nil }
-        let P = p.dim(1)
-        let poolIdx = MLXArray(Int32(0)..<Int32(P))           // [P]
-        let queryPos = MLXArray(Int32(offset + 1)..<Int32(offset + L + 1))  // [L]
-        return poolIdx .< (queryPos[0..., .newAxis] / Int32(ratio))  // [L, P]
-    }
-}
-
-// MARK: - DeepseekV4LayerCache
-
-/// KVCache-conformant wrapper for compressed attention layers.
-/// Holds a RotatingKVCache (local window) + 1–2 PoolingCaches.
-///
-/// Implemented as a direct KVCache conformance (not subclassing BaseKVCache) because
-/// BaseKVCache.init() and its `offset`/`maxSize` properties are not open for external override.
-final class DeepseekV4LayerCache: KVCache {
-    let rotating: RotatingKVCache
-    var pooling: [PoolingCache]
-
-    init(rotating: RotatingKVCache, pooling: [PoolingCache]) {
-        self.rotating = rotating
-        self.pooling = pooling
-    }
-
-    // MARK: KVCache / Evaluatable / Updatable
-
-    func innerState() -> [MLXArray] { rotating.innerState() }
-
-    var offset: Int {
-        get { rotating.offset }
-        set { rotating.offset = newValue }
-    }
-
-    var maxSize: Int? { rotating.maxSize }
-
-    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        rotating.update(keys: keys, values: values)
-    }
-
-    var state: [MLXArray] {
-        get { rotating.state }
-        set { rotating.state = newValue }
-    }
-
-    var metaState: [String] {
-        get { rotating.metaState }
-        set { rotating.metaState = newValue }
-    }
-
-    var isTrimmable: Bool { rotating.isTrimmable }
-
-    @discardableResult
-    func trim(_ n: Int) -> Int { rotating.trim(n) }
-
-    func copy() -> any KVCache {
-        DeepseekV4LayerCache(rotating: rotating.copy() as! RotatingKVCache, pooling: pooling)
-    }
-
-    func makeMask(
-        n: Int, windowSize: Int?, returnArray: Bool
-    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-        rotating.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
-    }
-}
-
-// MARK: - DeepseekV4RoPE
-
-/// Custom RoPE that prepends `nope_pairs` infinite-frequency pairs before the real RoPE dims.
-/// Supports `inverse=true` for un-rotating attention outputs.
-/// Mirrors Python DeepseekV4RoPE from mlx-lm#1192.
-final class DeepseekV4RoPE {
-    let dims: Int
-    let freqScale: Int
-    private let baseFreqs: MLXArray  // [dims/2] – base periods
-    private var cache: [String: MLXArray] = [:]
-
-    init(
-        dims: Int,
-        base: Float,
-        scalingConfig: [String: StringOrNumber]?,
-        maxPositionEmbeddings: Int,
-        freqScale: Int = 1
-    ) {
-        self.dims = dims
-        self.freqScale = freqScale
-
-        // inv_freq[i] = base^(2i/dims)
-        let exponents =
-            MLXArray(stride(from: 0, to: dims, by: 2)).asType(.float32) / Float(dims)
-        var invFreq = MLX.pow(base, exponents)  // [dims/2]
-
-        // Yarn / DeepSeek-Yarn scaling
-        let ropeType: String?
-        if let cfg = scalingConfig {
-            if case .string(let s) = cfg["type"] { ropeType = s }
-            else if case .string(let s) = cfg["rope_type"] { ropeType = s }
-            else { ropeType = nil }
-        } else {
-            ropeType = nil
-        }
-
-        if ropeType == "yarn" || ropeType == "deepseek_yarn" {
-            let factor = scalingConfig?["factor"]?.asFloat() ?? 1.0
-            let origMaxPos =
-                (scalingConfig?["original_max_position_embeddings"]?.asInts()?.first)
-                ?? maxPositionEmbeddings
-            let betaFast = scalingConfig?["beta_fast"]?.asFloat() ?? 32.0
-            let betaSlow = scalingConfig?["beta_slow"]?.asFloat() ?? 1.0
-
-            func correctionDim(_ numRot: Float) -> Float {
-                Float(dims) * log(Float(origMaxPos) / (numRot * 2 * .pi)) / (2 * log(base))
-            }
-
-            let low = max(Int(floor(correctionDim(betaFast))), 0)
-            var high = min(Int(ceil(correctionDim(betaSlow))), dims - 1)
-            if low == high { high += 1 }
-
-            let ramp =
-                (MLXArray(stride(from: 0, to: dims / 2, by: 1)).asType(.float32) - Float(low))
-                / Float(high - low)
-            let smooth = 1.0 - MLX.clip(ramp, min: MLXArray(Float(0)), max: MLXArray(Float(1)))
-            invFreq = invFreq / factor * (1.0 - smooth) + invFreq * smooth
-        }
-
-        // baseFreqs = 1 / inv_freq = periods
-        self.baseFreqs = MLXArray(1.0) / invFreq
-    }
-
-    private func freqs(headDim: Int, inverse: Bool) -> MLXArray {
-        let key = "\(headDim)_\(inverse)"
-        if let cached = cache[key] { return cached }
-
-        var f = baseFreqs
-        if freqScale != 1 {
-            f = f / Float(freqScale)
-        }
-        if inverse {
-            f = -f
-        }
-        let nopePairs = (headDim - dims) / 2
-        if nopePairs > 0 {
-            // Infinite frequency → angle = pos / inf = 0 → identity rotation (NOPE)
-            let infArr = MLXArray(Array(repeating: Float.infinity, count: nopePairs))
-            f = concatenated([infArr, f])
+            return [pre, post, comb]
         }
         cache[key] = f
         return f
     }
-
-    func callAsFunction(_ x: MLXArray, offset: Int = 0, inverse: Bool = false) -> MLXArray {
-        let headDim = x.dim(-1)
-        let f = freqs(headDim: headDim, inverse: inverse)
-        let actualOffset = freqScale != 1 ? offset / freqScale : offset
-        return MLXFast.RoPE(
-            x,
-            dimensions: headDim,
-            traditional: true,
-            base: nil,
-            scale: 1.0,
-            offset: actualOffset,
-            freqs: f)
-    }
 }
 
-// MARK: - MultiLinear
-
-/// Grouped linear: o_groups independent projections applied in batch.
-/// Weight shape: [groups, out_features, in_features].
-/// Used for wo_a (output gate projection before wo_b).
-final class DeepseekV4MultiLinear: Module {
-    var weight: MLXArray  // [groups, out_features, in_features]
-
-    init(inFeatures: Int, outFeatures: Int, groups: Int) {
-        self.weight = zeros([groups, outFeatures, inFeatures])
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        // x: [B, groups, L, in_features]
-        // weight.T (axis 1,2): [groups, in_features, out_features]
-        return matmul(x, weight.transposed(0, 2, 1))
-    }
+/// Split mixes into (pre, post, comb) with Sinkhorn normalization (compiled).
+/// mixes: [B, S, mix_hc] where mix_hc = (2+hc)*hc
+/// Returns pre [B,S,hc], post [B,S,hc], comb [B,S,hc,hc]
+private func hcSplitSinkhorn(
+    _ mixes: MLXArray,
+    hcScale: MLXArray,    // [3]
+    hcBase: MLXArray,     // [mix_hc]
+    hcMult: Int,
+    sinkhornIters: Int,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray) {
+    let f = HCSinkhornCompileCache.shared.fn(
+        hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
+    let out = f([mixes, hcScale, hcBase])
+    return (out[0], out[1], out[2])
 }
 
-// MARK: - HCParams
+/// Hyper-Connection pre-step: reduce [B,S,hc,D] → [B,S,D] with Sinkhorn weights.
+/// Returns (reduced_x, post_weights, comb_matrix).
+private func hcPre(
+    x: MLXArray,           // [B, S, hc, D]
+    hcFn: MLXArray,        // [mix_hc, hc*D]
+    hcScale: MLXArray,     // [3]
+    hcBase: MLXArray,      // [mix_hc]
+    hcMult: Int,
+    sinkhornIters: Int,
+    eps: Float
+) -> (MLXArray, MLXArray, MLXArray) {
+    let dtype = x.dtype
+    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
 
-/// Holds the three learnable tensors for one HyperConnection block.
+    // Flatten: [B, S, hc*D]
+    let xFlat = x.reshaped(B, S, hc * D).asType(.float32)
+
+    // RMS-style normalization scale
+    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
+
+    // Linear projection: [B, S, mix_hc]
+    let mixes = matmul(xFlat, hcFn.T) * normScale
+
+    let (pre, post, comb) = hcSplitSinkhorn(
+        mixes, hcScale: hcScale, hcBase: hcBase,
+        hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
+
+    // Weighted sum of hc copies: [B, S, D] — reduce in fp32 (pre is fp32, xFlat is fp32),
+    // matching the official kernel, then cast back.
+    let y = (pre.expandedDimensions(axis: -1) * xFlat.reshaped(B, S, hc, D)).sum(axis: -2).asType(dtype)
+
+    return (y, post, comb)
+}
+
+/// Hyper-Connection post-step: expand sublayer output back to [B,S,hc,D].
+/// y[b,s,j,:] = post[b,s,j]*x[b,s,:] + sum_i(comb[b,s,i,j]*residual[b,s,i,:])
+private func hcPost(
+    x: MLXArray,        // [B, S, D] - sublayer output
+    residual: MLXArray, // [B, S, hc, D] - input to this block
+    post: MLXArray,     // [B, S, hc]
+    comb: MLXArray      // [B, S, hc, hc]
+) -> MLXArray {
+    // term1: post[b,s,j] * x[b,s,:] → broadcast to [B,S,hc,D]
+    let term1 = post.expandedDimensions(axis: -1) * x.expandedDimensions(axis: -2)
+
+    // term2: sum_i(comb[b,s,i,j] * residual[b,s,i,:])
+    // comb.unsqueeze(-1): [B,S,hc_i,hc_j,1]
+    // residual.unsqueeze(-2): [B,S,hc_i,1,D]
+    // product: [B,S,hc_i,hc_j,D] → sum over dim 2 → [B,S,hc_j,D]
+    let combExp = comb.expandedDimensions(axis: -1)         // [B,S,hc,hc,1]
+    let residualExp = residual.expandedDimensions(axis: -2) // [B,S,hc,1,D]
+    let term2 = (combExp * residualExp).sum(axis: 2)        // [B,S,hc,D]
+
+    return (term1 + term2).asType(x.dtype)
+}
+
+// MARK: - HCParams Module
+
+/// Lightweight Module to hold the three Hyper-Connection tensors loaded from checkpoint.
+/// Key names (fn, base, scale) match the `hc_attn.*` / `hc_ffn.*` / `hc_head.*` paths.
 class HCParams: Module {
     var fn: MLXArray
     var base: MLXArray
@@ -393,1377 +239,1073 @@ class HCParams: Module {
         self.fn = fn
         self.base = base
         self.scale = scale
-        super.init()
     }
 }
 
-// MARK: - HC Sinkhorn Collapse Metal Kernel
-
-/// Fused Sinkhorn-normalisation + HC-collapse Metal kernel.
-///
-/// Mirrors `_make_hc_sinkhorn_collapse_kernel` from
-/// omlx/patches/deepseek_v4/hyper_connection.py.
-///
-/// Layout: one threadgroup per token (B×S rows), 256 threads per group.
-///   - SIMD-group 0 (lanes 0–3 active): compute pre / post / comb (Phase 1).
-///   - All 256 threads: collapse [HC, D] → [D] with pre weights (Phase 2).
-///
-/// Template parameters (all constexpr):
-///   T        input dtype, U output dtype (both x.dtype)
-///   HC       hc_mult (4 for DeepSeek-V4)
-///   ITERS    hc_sinkhorn_iters
-///   D        hidden_size
-///   EPS_INT  eps expressed as integer × 1e-9 (avoids float template args)
-private let _hcSinkhornCollapseKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "hc_sinkhorn_collapse",
-    inputNames: ["x_in", "mixes", "scale", "base"],
-    outputNames: ["collapsed", "post", "comb"],
-    source: """
-        uint tid  = thread_position_in_threadgroup.x;
-        uint row  = threadgroup_position_in_grid.x;
-        uint lane = tid % 32;
-        uint sg   = tid / 32;
-
-        constexpr int   MIX      = (2 + HC) * HC;
-        constexpr int   BASE_OFF = 2 * HC;
-        constexpr float EPS      = EPS_INT * 1e-9f;
-
-        const device float* mix      = (const device float*)mixes + row * MIX;
-              device float* post_out = (device float*)post     + row * HC;
-              device float* comb_out = (device float*)comb     + row * HC * HC;
-
-        threadgroup float pre_shared[HC];
-
-        // ── Phase 1: branchless Sinkhorn on SIMD-group 0 ──────────────────────
-        // Lanes >= HC multiply by active=0 so they never corrupt sums —
-        // no divergent branches inside the Sinkhorn loop.
-        if (sg == 0) {
-            const float pre_scale  = scale[0];
-            const float post_scale = scale[1];
-            const float comb_scale = scale[2];
-
-            const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
-            const uint  llane  = metal::min(lane, (uint)(HC - 1));
-
-            float pre_z  = mix[llane]      * pre_scale  + base[llane];
-            float post_z = mix[HC + llane] * post_scale + base[HC + llane];
-            float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
-            float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
-
-            if (lane < (uint)HC) {
-                pre_shared[lane] = pre_v;
-                post_out[lane]   = post_v;
-            }
-
-            // comb row: float4 load (HC=4), softmax, Sinkhorn normalisation
-            float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC) * comb_scale
-                      + *(const device float4*)(base + BASE_OFF + llane * HC)) * active;
-
-            float row_max = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
-            float4 e = metal::fast::exp(v - row_max) * active;
-            float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS)) + EPS * active;
-
-            // Initial column normalisation via simd_sum (free SIMD shuffle)
-            float4 col_inv = 1.0f / (float4(
-                simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
-            r *= col_inv;
-
-            // Sinkhorn iterations: row-norm then col-norm, zero branches
-            for (int iter = 1; iter < ITERS; ++iter) {
-                r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
-                col_inv = 1.0f / (float4(
-                    simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
-                r *= col_inv;
-            }
-
-            if (lane < (uint)HC) {
-                *(device float4*)(comb_out + lane * HC) = r;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 2: vectorised weighted collapse [HC, D] → [D] ──────────────
-        const float p0 = pre_shared[0];
-        const float p1 = pre_shared[1];
-        const float p2 = pre_shared[2];
-        const float p3 = pre_shared[3];
-
-        const device T* x_row   = (const device T*)x_in + row * (HC * D);
-              device U* out_row = (device U*)collapsed   + row * D;
-
-        using T4 = vec<T, 4>;
-        using U4 = vec<U, 4>;
-        const device T4* x_row0 = (const device T4*)(x_row + 0 * D);
-        const device T4* x_row1 = (const device T4*)(x_row + 1 * D);
-        const device T4* x_row2 = (const device T4*)(x_row + 2 * D);
-        const device T4* x_row3 = (const device T4*)(x_row + 3 * D);
-              device U4* out4   = (device U4*)out_row;
-
-        constexpr uint D4 = (uint)D / 4;
-        for (uint d4 = tid; d4 < D4; d4 += 256) {
-            float4 x0 = float4(x_row0[d4]);
-            float4 x1 = float4(x_row1[d4]);
-            float4 x2 = float4(x_row2[d4]);
-            float4 x3 = float4(x_row3[d4]);
-            out4[d4] = U4(fma(float4(p0), x0,
-                         fma(float4(p1), x1,
-                         fma(float4(p2), x2, float4(p3) * x3))));
-        }
-
-        // Scalar tail for D not divisible by 4
-        #if (D % 4) != 0
-        for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
-            float val = p0 * (float)x_row[0*D + d] + p1 * (float)x_row[1*D + d]
-                      + p2 * (float)x_row[2*D + d] + p3 * (float)x_row[3*D + d];
-            out_row[d] = (U)val;
-        }
-        #endif
-    """,
-    ensureRowContiguous: true
-)
-
-/// Dispatch the fused Sinkhorn-collapse kernel.
-/// - Parameters:
-///   - x:     4D hidden `[B, S, hc, D]` (model dtype)
-///   - mixes: pre-computed projections `[B*S, (2+hc)*hc]` (float32)
-///   - scale: `[3]` float32 — pre / post / comb scale factors
-///   - base:  `[(2+hc)*hc]` float32 — biases
-/// - Returns: `(collapsed [B, S, D], post [B, S, HC], comb [B, S, HC, HC])`
-private func hcKernel(
-    x: MLXArray,
-    mixes: MLXArray,
-    scale: MLXArray,
-    base: MLXArray,
-    hcMult: Int,
-    sinkhornIters: Int,
-    eps: Float
-) -> (MLXArray, MLXArray, MLXArray) {
-    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
-    let BL = B * S
-    let epsInt = max(1, Int((eps / 1e-9).rounded()))
-    let dtype = x.dtype
-
-    let outputs = _hcSinkhornCollapseKernel(
-        [x, mixes, scale, base],
-        template: [
-            ("T", dtype),
-            ("U", dtype),
-            ("HC", hcMult),
-            ("ITERS", sinkhornIters),
-            ("D", D),
-            ("EPS_INT", epsInt),
-        ],
-        grid: (BL * 256, 1, 1),
-        threadGroup: (256, 1, 1),
-        outputShapes: [[BL, D], [BL, hc], [BL, hc, hc]],
-        outputDTypes: [dtype, .float32, .float32]
-    )
-
-    return (
-        outputs[0].reshaped([B, S, D]),
-        outputs[1].reshaped([B, S, hc]),
-        outputs[2].reshaped([B, S, hc, hc])
-    )
-}
-
-// MARK: - HyperConnection helpers
-
-/// Compute the three gating matrices (pre, post, comb) from the 4D hidden state.
-/// Corrected from Python hyper_connection.py:
-///   post = 2 * sigmoid(...)  (no eps, factor of 2)
-///   comb = softmax(...) + eps  (not sigmoid)
-private func hcSplitSinkhorn(
-    _ mixes: MLXArray,
-    hcScale: MLXArray,
-    hcBase: MLXArray,
-    hcMult: Int,
-    sinkhornIters: Int,
-    eps: Float
-) -> (MLXArray, MLXArray, MLXArray) {
-    let hc = hcMult
-    let B = mixes.dim(0), S = mixes.dim(1)
-
-    let preMix = mixes[.ellipsis, ..<hc]
-    let postMix = mixes[.ellipsis, hc ..< 2 * hc]
-    let combMix = mixes[.ellipsis, (2 * hc)...]
-
-    let preBase = hcBase[..<hc]
-    let postBase = hcBase[hc ..< 2 * hc]
-    let combBase = hcBase[(2 * hc)...]
-
-    // pre: sigmoid + eps, then row-normalize
-    var pre = sigmoid(preMix * hcScale[0] + preBase) + eps
-    pre = pre / pre.sum(axis: -1, keepDims: true)
-
-    // post: 2 * sigmoid (no eps)
-    let post = 2 * sigmoid(postMix * hcScale[1] + postBase)
-
-    // comb: softmax init + eps, then initial col norm, then Sinkhorn
-    let combScaled = combMix.reshaped([B, S, hc, hc]) * hcScale[2]
-        + combBase.reshaped([hc, hc])
-    var comb = softmax(combScaled, axis: -1) + eps
-    comb = comb / (comb.sum(axis: -2, keepDims: true) + eps)  // initial col norm
-    for _ in 0 ..< max(sinkhornIters - 1, 0) {
-        comb = comb / (comb.sum(axis: -1, keepDims: true) + eps)  // row norm
-        comb = comb / (comb.sum(axis: -2, keepDims: true) + eps)  // col norm
-    }
-
-    return (pre, post, comb)
-}
-
-/// HC pre-sublayer: collapse [B, S, hc, D] → [B, S, D].
-/// Returns (collapsed, post, comb) for use in hcPost.
-///
-/// Uses the fused Metal kernel on GPU (eliminates 38+ extra dispatches per call).
-/// Falls back to pure-ops on CPU.
-func hcPre(
-    x: MLXArray,
-    hcFn: MLXArray,
-    hcScale: MLXArray,
-    hcBase: MLXArray,
-    hcMult: Int,
-    sinkhornIters: Int,
-    eps: Float
-) -> (MLXArray, MLXArray, MLXArray) {
-    let dtype = x.dtype
-    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
-
-    let xFlat = x.reshaped([B, S, hc * D]).asType(.float32)
-    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
-    let mixes = matmul(xFlat, hcFn.T) * normScale  // [B, S, (2+hc)*hc]
-
-    // Fused Metal kernel: Sinkhorn + collapse in one dispatch
-    if Device.defaultDevice().deviceType == .gpu {
-        return hcKernel(
-            x: x,
-            mixes: mixes.reshaped([B * S, mixes.dim(2)]),
-            scale: hcScale.asType(.float32),
-            base: hcBase.asType(.float32),
-            hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
-    }
-
-    // Pure-ops fallback (CPU / non-Metal)
-    let (pre, post, comb) = hcSplitSinkhorn(
-        mixes, hcScale: hcScale, hcBase: hcBase,
-        hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
-    let y = (pre.expandedDimensions(axis: -1).asType(dtype) * x).sum(axis: -2)
-    return (y, post, comb)
-}
-
-/// HC post-sublayer: expand [B, S, D] back to [B, S, hc, D].
-/// term1 = post[..., None] * x[:, :, None, :]
-/// term2 = comb.swapaxes(-1,-2) @ residual  (equiv to expand-multiply-sum trick)
-func hcPost(
-    x: MLXArray,
-    residual: MLXArray,
-    post: MLXArray,
-    comb: MLXArray
-) -> MLXArray {
-    let term1 = post.expandedDimensions(axis: -1) * x.expandedDimensions(axis: -2)
-    // term2: comb.swapaxes(-1,-2) @ residual
-    // comb: [B, S, hc, hc], residual: [B, S, hc, D]
-    // Using expand trick: combExp [B,S,hc,hc,1] * residualExp [B,S,hc,1,D] → sum axis 2
-    let combExp = comb.expandedDimensions(axis: -1)
-    let residualExp = residual.expandedDimensions(axis: -2)
-    let term2 = (combExp * residualExp).sum(axis: 2)
-    return (term1.asType(.float32) + term2.asType(.float32)).asType(x.dtype)
-}
-
-/// HC head: collapse 4D [B, S, hc, D] → [B, S, D] using HyperHead weights.
-func hcHeadReduce(
-    x: MLXArray,
-    hcFn: MLXArray,
-    hcScale: MLXArray,
-    hcBase: MLXArray,
+/// Final HC head: reduce [B,S,hc,D] → [B,S,D] for lm_head.
+/// No Sinkhorn – just sigmoid + eps weighted sum.
+private func hcHead(
+    x: MLXArray,        // [B, S, hc, D]
+    hcFn: MLXArray,     // [hc, hc*D]
+    hcScale: MLXArray,  // [1]
+    hcBase: MLXArray,   // [hc]
     eps: Float
 ) -> MLXArray {
     let dtype = x.dtype
     let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
 
-    let xFlat = x.reshaped([B, S, hc * D]).asType(.float32)
+    let xFlat = x.reshaped(B, S, hc * D).asType(.float32)
     let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
-    let mixes = matmul(xFlat, hcFn.T) * normScale
-    let pre = sigmoid(mixes * hcScale + hcBase) + eps
+    let mixes = matmul(xFlat, hcFn.T) * normScale           // [B, S, hc]
+    let pre = sigmoid(mixes * hcScale + hcBase) + eps        // [B, S, hc]
 
-    return (pre.expandedDimensions(axis: -1).asType(dtype) * x).sum(axis: -2).asType(dtype)
+    // Weighted sum in fp32 (matches official hc_head), then cast back: [B, S, D]
+    let y = (pre.expandedDimensions(axis: -1) * xFlat.reshaped(B, S, hc, D)).sum(axis: -2)
+    return y.asType(dtype)
 }
 
-// MARK: - Helpers
+// MARK: - Inverse RoPE (de-rotation)
 
-private func sqrtSoftplus(_ x: MLXArray) -> MLXArray {
-    let sp = MLX.maximum(x, MLXArray(Float(0))) + MLX.log1p(MLX.exp(-MLX.abs(x)))
-    return MLX.sqrt(sp)
+/// Negate the second element of each traditional (interleaved) RoPE pair.
+/// For x[..., rd] viewed as rd/2 pairs (x0,x1): returns (x0, -x1).
+private func ropeFlipPairSign(_ x: MLXArray) -> MLXArray {
+    let lead = Array(x.shape.dropLast())
+    let rd = x.dim(-1)
+    let signs = MLXArray([Float(1), Float(-1)])               // [2]
+    return (x.reshaped(lead + [rd / 2, 2]) * signs).reshaped(x.shape)
 }
 
-private func headRmsNorm(_ x: MLXArray, eps: Float) -> MLXArray {
-    x * rsqrt(x.square().mean(axis: -1, keepDims: true) + eps)
+/// Apply the INVERSE rotary embedding R(-θ) to the last `rope` dims of `x`, using the
+/// conjugate identity  R(-θ) = C ∘ R(θ) ∘ C  where C flips the sign of the 2nd element of
+/// each interleaved pair. Matches the official `apply_rotary_emb(o, freqs_cis, inverse=True)`
+/// (which conjugates freqs_cis). `x` must have its sequence axis at -2 (e.g. [B, H, L, rd]).
+private func inverseRotary<R: RoPELayer>(_ rope: R, _ x: MLXArray, offset: Int) -> MLXArray {
+    ropeFlipPairSign(rope(ropeFlipPairSign(x), offset: offset))
 }
 
-/// Extend an attention mask to cover pooled KV positions.
-/// If mask is .none (decode mode), returns .none unchanged.
-private func extendMask(
-    _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
-    poolMask: MLXArray?,
-    L: Int,
-    P: Int
-) -> MLXFast.ScaledDotProductAttentionMaskMode {
-    guard case .array(let localArr) = mask, P > 0 else { return mask }
-    let poolCols: MLXArray
-    if let pm = poolMask {
-        poolCols = pm.asType(.bool)  // [L, P]
-    } else {
-        poolCols = MLXArray.ones([L, P], dtype: .bool)
+// MARK: - DSA (DeepSeek Sparse Attention) — window + compressed-KV structure
+
+/// YaRN-interpolated rope wavelengths, replicating YarnRoPE's internal freq
+/// computation (RoPEUtils.swift) so DSA compressed slots can be roped at
+/// block-start positions with stride `ratio` (see DeepseekV4Compressor).
+private func dsv4YarnWavelengths(config: DeepseekV4Configuration) -> MLXArray {
+    let dims = config.qkRopeHeadDim
+    let base = config.compressRopeTheta
+    let s = config.ropeScaling
+    let factor = s?["factor"]?.asFloat() ?? 16.0
+    let origMax = s?["original_max_position_embeddings"]?.asInt() ?? 65536
+    let betaFast = s?["beta_fast"]?.asFloat() ?? 32.0
+    let betaSlow = s?["beta_slow"]?.asFloat() ?? 1.0
+
+    func correctionDim(_ numRotations: Float) -> Float {
+        Float(dims) * log(Float(origMax) / (numRotations * 2 * Float.pi)) / (2 * log(base))
     }
-    return .array(concatenated([localArr, poolCols], axis: -1))
+    let low = max(Int(floor(correctionDim(betaFast))), 0)
+    let high = min(Int(ceil(correctionDim(betaSlow))), dims - 1)
+    var maxV = Float(high)
+    let minV = Float(low)
+    if minV == maxV { maxV += 0.001 }
+    let linear = (MLXArray(0 ..< (dims / 2)).asType(.float32) - minV) / (maxV - minV)
+    let freqMask = 1.0 - clip(linear, min: 0, max: 1)
+
+    let freqExtra = pow(base, MLXArray(stride(from: 0, to: dims, by: 2)).asType(.float32) / Float(dims))
+    let freqInter = factor * freqExtra
+    return (freqInter * freqExtra) / (freqInter * freqMask + freqExtra * (1 - freqMask))
 }
 
-// MARK: - Compressor
-
-/// Compresses windows of `ratio` tokens into a single pooled KV.
-/// Used by CompressedAttention (ratio=128) and SparseCompressedAttention/Indexer (ratio=4).
-final class Compressor: Module {
-    let compressRatio: Int
+/// Learned KV compressor (official model.py:279-377): gated softmax pooling of
+/// `ratio` consecutive tokens (overlapping the previous block when ratio==4)
+/// into one 512-dim slot, RMS-normed and roped at the block-start position.
+class DeepseekV4Compressor: Module {
+    let ratio: Int
     let headDim: Int
-    let overlap: Bool  // true when ratio=4
-    let outDim: Int
+    let ropeDim: Int
+    let overlap: Bool
+    let coff: Int
 
-    var wkv: Linear
-    var wgate: Linear
-    var ape: MLXArray   // [ratio, out_dim] – positional encoding for windows
-    var norm: RMSNorm
-    let rope: DeepseekV4RoPE  // non-Module: computed from hyperparams
+    @ModuleInfo(key: "wkv") var wkv: Linear
+    @ModuleInfo(key: "wgate") var wgate: Linear
+    @ModuleInfo(key: "norm") var norm: RMSNorm
+    var ape: MLXArray  // [ratio, coff*headDim] (bf16 in checkpoint)
 
-    init(config: DeepseekV4Configuration, compressRatio: Int, headDim: Int) {
-        self.compressRatio = compressRatio
-        self.headDim = headDim
-        self.overlap = compressRatio == 4
-        self.outDim = headDim * (overlap ? 2 : 1)
+    // Slot rope: slot k of a run starting at block-aligned position s sits at
+    // absolute position s + k*ratio. theta = (s+k·r)/λ = (s/r + k)/(λ/r), so
+    // rope with freqs λ/r at integer offset s/r yields stride-r positions.
+    private let slotFreqs: MLXArray
 
-        self.wkv = Linear(config.hiddenSize, outDim, bias: false)
-        self.wgate = Linear(config.hiddenSize, outDim, bias: false)
-        self.ape = zeros([compressRatio, outDim])
-        self.norm = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-        self.rope = DeepseekV4RoPE(
-            dims: config.qkRopeHeadDim,
-            base: config.compressRopeTheta,
-            scalingConfig: config.ropeScaling,
-            maxPositionEmbeddings: config.maxPositionEmbeddings,
-            freqScale: compressRatio)
+    init(config: DeepseekV4Configuration, ratio: Int) {
+        self.ratio = ratio
+        self.headDim = config.headDim
+        self.ropeDim = config.qkRopeHeadDim
+        self.overlap = (ratio == 4)
+        self.coff = overlap ? 2 : 1
 
+        self._wkv.wrappedValue = Linear(config.hiddenSize, coff * config.headDim, bias: false)
+        self._wgate.wrappedValue = Linear(config.hiddenSize, coff * config.headDim, bias: false)
+        self._norm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
+        self.ape = zeros([ratio, coff * config.headDim])
+        self.slotFreqs = dsv4YarnWavelengths(config: config) / Float(ratio)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, poolCache: PoolingCache?, offset: Int) -> MLXArray {
-        let B = x.dim(0), D = x.dim(2)
-        let kv = wkv(x)    // [B, S, out_dim]
-        let gate = wgate(x) // [B, S, out_dim]
+    /// Consume `x` ([B, L, hidden], the attention sublayer input) and emit any
+    /// completed compressed slots into the cache's slot buffer.
+    func process(x: MLXArray, cache: DSAKVCache) {
+        let dtype = x.dtype
+        let B = x.dim(0)
+        let d = headDim
 
-        let readyKV: MLXArray
-        let readyGate: MLXArray
-        let poolBase: Int
+        // fp32 projections (official compresses in fp32).
+        var kvP = wkv(x).asType(.float32)      // [B, L, coff*d]
+        var scP = wgate(x).asType(.float32)
+        let L = kvP.dim(1)
 
-        if let pc = poolCache {
-            (readyKV, readyGate, poolBase) = pc.accumulateWindows(kv: kv, gate: gate, offset: offset)
-        } else {
-            let usable = (kv.dim(1) / compressRatio) * compressRatio
-            readyKV = kv[0..., ..<usable, 0...]
-            readyGate = gate[0..., ..<usable, 0...]
-            poolBase = offset
+        if cache.pendKV == nil {
+            cache.pendKV = MLXArray.zeros([B, ratio, coff * d], dtype: .float32)
+            cache.pendScore = MLXArray.zeros([B, ratio, coff * d], dtype: .float32)
+            cache.pendLen = 0
         }
 
-        let newPooled: MLXArray
-        if readyKV.dim(1) == 0 {
-            newPooled = zeros([B, 0, headDim], dtype: x.dtype)
-        } else {
-            let nWindows = readyKV.dim(1) / compressRatio
-            let kvW = readyKV.reshaped([B, nWindows, compressRatio, outDim])
-            let gateW = readyGate.reshaped([B, nWindows, compressRatio, outDim])
-            let compressed: MLXArray
+        // ── Decode fast path: block not yet complete → one in-place pending
+        // write per projection, no concat/alloc churn.
+        if cache.pendLen + L < ratio {
+            cache.pendKV?[0..., cache.pendLen ..< (cache.pendLen + L), 0...] = kvP
+            cache.pendScore?[0..., cache.pendLen ..< (cache.pendLen + L), 0...] = scP
+            cache.pendLen += L
+            return
+        }
+
+        // ── Block-completing path (every `ratio`-th token at decode; any
+        // prefill chunk): assemble pending + new, run the batch pooling.
+        if cache.pendLen > 0 {
+            kvP = concatenated([cache.pendKV![0..., ..<cache.pendLen, 0...], kvP], axis: 1)
+            scP = concatenated([cache.pendScore![0..., ..<cache.pendLen, 0...], scP], axis: 1)
+        }
+
+        let P = kvP.dim(1)
+        let nBlocks = P / ratio
+        if nBlocks > 0 {
+            let cutoff = nBlocks * ratio
+            var blocksKV = kvP[0..., ..<cutoff, 0...].reshaped(B, nBlocks, ratio, coff * d)
+            var blocksSc = scP[0..., ..<cutoff, 0...].reshaped(B, nBlocks, ratio, coff * d)
+                + ape.asType(.float32)  // ape per in-block position
+
+            var poolK: MLXArray
+            var poolS: MLXArray
             if overlap {
-                compressed = overlapCompressKV(kvW, gateW)
+                // rows ratio..<2r: current block second-half channels;
+                // rows 0..<ratio: PREVIOUS block first-half channels
+                // (block 0's previous comes from carried state, else pad 0/-inf).
+                let prevK0 = cache.prevBlockKV
+                    ?? MLXArray.zeros([B, 1, ratio, d]).asType(.float32)
+                let prevS0 = cache.prevBlockScore
+                    ?? MLXArray.full([B, 1, ratio, d], values: MLXArray(-Float.infinity)).asType(.float32)
+                let curFirstHalfK = blocksKV[.ellipsis, ..<d]    // [B, n, r, d]
+                let curFirstHalfS = blocksSc[.ellipsis, ..<d]
+                let prevKs = nBlocks > 1
+                    ? concatenated([prevK0, curFirstHalfK[0..., ..<(nBlocks - 1), 0..., 0...]], axis: 1)
+                    : prevK0
+                let prevSs = nBlocks > 1
+                    ? concatenated([prevS0, curFirstHalfS[0..., ..<(nBlocks - 1), 0..., 0...]], axis: 1)
+                    : prevS0
+                poolK = concatenated([prevKs, blocksKV[.ellipsis, d...]], axis: 2)  // [B,n,2r,d]
+                poolS = concatenated([prevSs, blocksSc[.ellipsis, d...]], axis: 2)
+                // Carry the last complete block's first-half channels forward.
+                cache.prevBlockKV = curFirstHalfK[0..., (nBlocks - 1)..., 0..., 0...]
+                cache.prevBlockScore = curFirstHalfS[0..., (nBlocks - 1)..., 0..., 0...]
             } else {
-                compressed = simpleCompressKV(kvW, gateW)
+                poolK = blocksKV  // [B, n, r, d]
+                poolS = blocksSc
             }
-            let normed = norm(compressed)  // [B, nWindows, headDim]
-            // Apply RoPE: add head dim → [B, 1, nWindows, headDim], rope, squeeze
-            let roped = rope.callAsFunction(normed.expandedDimensions(axis: 1), offset: poolBase)
-            newPooled = roped.squeezed(axis: 1)
+
+            // Gated softmax pooling over the block positions → [B, n, d].
+            var slots = (poolK * softmax(poolS, axis: 2)).sum(axis: 2)
+            slots = norm(slots.asType(dtype))
+
+            // Rope the tail dims at block-start positions (stride ratio).
+            let slotIdx0 = cache.pendStart / ratio
+            let nope = slots[.ellipsis, ..<(d - ropeDim)]
+            let roped = MLXFast.RoPE(
+                slots[.ellipsis, (d - ropeDim)...],
+                dimensions: ropeDim, traditional: true, base: nil,
+                scale: 1.0, offset: slotIdx0, freqs: slotFreqs)
+            slots = concatenated([nope, roped], axis: -1)
+
+            let slotsHeaded = slots.expandedDimensions(axis: 1)  // [B, 1, n, d]
+            cache.appendSlots(slotsHeaded)
+            cache.pendStart += cutoff
+
+            // Remainder becomes the new pending (raw scores, no ape) — written
+            // in-place into the preallocated pending buffers.
+            let rem = P - cutoff
+            if rem > 0 {
+                cache.pendKV?[0..., ..<rem, 0...] = kvP[0..., cutoff..., 0...]
+                cache.pendScore?[0..., ..<rem, 0...] = scP[0..., cutoff..., 0...]
+            }
+            cache.pendLen = rem
+        } else {
+            // L ≥ 1 but pending+L < ratio handled above; here only when a
+            // multi-token chunk still doesn't complete a block (pendLen+L < ratio
+            // was false only if == ratio-boundary edge) — store everything.
+            cache.pendKV?[0..., ..<P, 0...] = kvP
+            cache.pendScore?[0..., ..<P, 0...] = scP
+            cache.pendLen = P
         }
-
-        if let pc = poolCache {
-            return pc.updateAndFetch(newPooled)
-        }
-        return newPooled
-    }
-
-    private func simpleCompressKV(_ kv: MLXArray, _ gate: MLXArray) -> MLXArray {
-        // kv: [B, nWindows, ratio, out_dim=headDim]
-        // weights over ratio dim
-        let weights = softmax(gate.asType(.float32) + ape, axis: -2)
-        return (kv * weights.asType(kv.dtype)).sum(axis: -2)  // [B, nWindows, headDim]
-    }
-
-    private func overlapCompressKV(_ kv: MLXArray, _ gate: MLXArray) -> MLXArray {
-        // kv: [B, nWindows, ratio, out_dim=headDim*2]
-        let B = kv.dim(0), L = kv.dim(1), R = kv.dim(2)
-        let D = kv.dim(3)
-        let g = gate + ape.asType(gate.dtype)
-
-        // Split along last dim: first half = prev-window tokens, second half = current
-        let kvParts = split(kv, indices: [D / 2], axis: -1)     // [B,L,R,D/2], [B,L,R,D/2]
-        var kvA = kvParts[0]
-        let kvB = kvParts[1]
-        let gParts = split(g, indices: [D / 2], axis: -1)
-        var gA = gParts[0]
-        let gB = gParts[1]
-
-        // Shift kvA by 1 window (prev window's first half)
-        let kv0 = zeros([B, 1, R, D / 2], dtype: kv.dtype)
-        kvA = concatenated([kv0, kvA[0..., ..<(L - 1), 0..., 0...]], axis: 1)
-        let g0 = full([B, 1, R, D / 2], values: MLXArray(-Float.infinity), dtype: gate.dtype)
-        gA = concatenated([g0, gA[0..., ..<(L - 1), 0..., 0...]], axis: 1)
-
-        // Combine: [B, L, 2R, D/2]
-        let kvCombined = concatenated([kvA, kvB], axis: 2)
-        let gCombined = concatenated([gA, gB], axis: 2)
-
-        let weights = softmax(gCombined.asType(.float32), axis: -2)
-        return (kvCombined * weights.asType(kv.dtype)).sum(axis: -2)  // [B, L, D/2] = [B, L, headDim]
     }
 }
 
-// MARK: - Indexer
+// MARK: - Attention
 
-/// Builds a sparse top-k index over pooled KV positions for SparseCompressedAttention.
-final class Indexer: Module {
-    let nHeads: Int
+/// Attention with cache update that optionally applies per-head sink bias.
+/// Mirrors `attentionWithCacheUpdateAndSinks` from MiMoV2Flash but uses the public API.
+private func deepseekAttentionWithSinks(
+    queries: MLXArray,
+    keys: MLXArray,
+    values: MLXArray,
+    cache: KVCache?,
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    sinks: MLXArray?
+) -> MLXArray {
+    guard let cache else {
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values,
+            scale: scale, mask: mask, sinks: sinks)
+    }
+    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+        precondition(sinks == nil, "Quantized SDPA does not support attention sinks.")
+        let (qk, qv) = quantizedKVCache.updateQuantized(keys: keys, values: values)
+        return quantizedScaledDotProductAttention(
+            queries: queries,
+            quantizedKeys: qk, quantizedValues: qv,
+            scale: scale, mask: mask,
+            groupSize: quantizedKVCache.groupSize,
+            bits: quantizedKVCache.bits,
+            mode: quantizedKVCache.mode)
+    }
+    let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+    return MLXFast.scaledDotProductAttention(
+        queries: queries, keys: cachedKeys, values: cachedValues,
+        scale: scale, mask: mask, sinks: sinks)
+}
+
+class DeepseekV4Attention: Module {
+    let config: DeepseekV4Configuration
+    let numHeads: Int
     let headDim: Int
-    let indexTopk: Int
+    let nopeHeadDim: Int
+    let ropeHeadDim: Int
+    let oGroups: Int
+    let oLoraRank: Int
+    let nHeadsPerGroup: Int
     let scale: Float
+    let eps: Float
 
-    var wq_b: Linear
-    var weights_proj: Linear
-    var compressor: Compressor
+    let rope: RoPELayer
 
-    init(config: DeepseekV4Configuration, compressRatio: Int) {
-        self.nHeads = config.indexNHeads
-        self.headDim = config.indexHeadDim
-        self.indexTopk = config.indexTopk
-        self.scale = pow(Float(config.indexHeadDim), -0.5)
+    // Q low-rank projections
+    @ModuleInfo(key: "wq_a") var wqA: Linear
+    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
+    @ModuleInfo(key: "wq_b") var wqB: Linear
 
-        self.wq_b = Linear(config.qLoraRank, nHeads * headDim, bias: false)
-        self.weights_proj = Linear(config.hiddenSize, nHeads, bias: false)
-        self.compressor = Compressor(config: config, compressRatio: compressRatio, headDim: headDim)
+    // Unified KV projection (K and V share the same projection)
+    @ModuleInfo(key: "wkv") var wkv: Linear
+    @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
 
-        super.init()
+    // Grouped output projection
+    @ModuleInfo(key: "wo_a") var woA: Linear
+    @ModuleInfo(key: "wo_b") var woB: Linear
+
+    // Attention sink bias (per head, no .weight suffix)
+    // Stored via update(parameters:) using the key "attn_sink"
+    var attn_sink: MLXArray
+    // Cached "is the sink non-zero" check. The naive per-call
+    // `attn_sink.sum().item()` forces a blocking GPU sync EVERY layer EVERY
+    // token (43 syncs/token on DSV4) — evaluate once on first use instead.
+    private var _sinkActive: Bool? = nil
+
+    // DSA: learned KV compressor on compress layers (ratio 4 or 128); nil on
+    // pure sliding-window layers (0, 1). Checkpoint keys: attn.compressor.*
+    @ModuleInfo(key: "compressor") var compressor: DeepseekV4Compressor?
+    let compressRatio: Int
+    let windowSize: Int
+
+    init(config: DeepseekV4Configuration, layerIdx: Int = 0) {
+        self.config = config
+        self.compressRatio = layerIdx < config.compressRatios.count
+            ? config.compressRatios[layerIdx] : 0
+        self.windowSize = config.slidingWindow
+        self.numHeads = config.numAttentionHeads
+        self.headDim = config.headDim
+        self.nopeHeadDim = config.nopeHeadDim
+        self.ropeHeadDim = config.qkRopeHeadDim
+        self.oGroups = config.oGroups
+        self.oLoraRank = config.oLoraRank
+        self.nHeadsPerGroup = config.numAttentionHeads / config.oGroups
+        self.scale = pow(Float(config.headDim), -0.5)
+        self.eps = config.rmsNormEps
+
+        // Q projections
+        self._wqA.wrappedValue = Linear(config.hiddenSize, config.qLoraRank, bias: false)
+        self._qNorm.wrappedValue = RMSNorm(dimensions: config.qLoraRank, eps: config.rmsNormEps)
+        self._wqB.wrappedValue = Linear(config.qLoraRank, config.numAttentionHeads * config.headDim, bias: false)
+
+        // Unified KV: single head, headDim dimensional
+        self._wkv.wrappedValue = Linear(config.hiddenSize, config.headDim, bias: false)
+        self._kvNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
+
+        // Grouped output projection
+        // wo_a: Linear(nHeadsPerGroup * headDim, oGroups * oLoraRank) per group → stored as [oGroups*oLoraRank, nHeadsPerGroup*headDim]
+        self._woA.wrappedValue = Linear(nHeadsPerGroup * config.headDim, config.oGroups * config.oLoraRank, bias: false)
+        self._woB.wrappedValue = Linear(config.oGroups * config.oLoraRank, config.hiddenSize, bias: false)
+
+        // Attention sink: per-head bias [numAttentionHeads], applied to attention logits before softmax.
+        // Shape matches numAttentionHeads (== qkRopeHeadDim in this architecture).
+        self.attn_sink = zeros([config.numAttentionHeads])
+
+        // Per-layer RoPE, matching the official DeepSeek-V4 reference (model.py:475-482):
+        //  - compress layers (compress_ratios[l] != 0): base = compress_rope_theta (160000)
+        //    with YaRN *frequency* interpolation (factor/origMax/beta from rope_scaling).
+        //  - pure sliding-window layers (compress_ratios[l] == 0, i.e. layers 0,1):
+        //    base = rope_theta (10000), YaRN disabled (plain RoPE).
+        // CRITICAL: the official applies NO YaRN magnitude correction anywhere
+        //   (softmax_scale = head_dim**-0.5 flat; freqs_cis = polar(ones, .)). The generic
+        //   YarnRoPE here would otherwise bake an mscale of ~1.277 into q AND k, scaling every
+        //   attention logit by ~1.63x. We neutralize it by forcing _mscale == 1.
+        let isCompressLayer = layerIdx < config.compressRatios.count
+            && config.compressRatios[layerIdx] != 0
+        if isCompressLayer {
+            let s = config.ropeScaling
+            self.rope = YarnRoPE(
+                dimensions: config.qkRopeHeadDim,
+                traditional: true,
+                maxPositionEmbeddings: config.maxPositionEmbeddings,
+                base: config.compressRopeTheta,
+                scalingFactor: s?["factor"]?.asFloat() ?? 16.0,
+                originalMaxPositionEmbeddings: s?["original_max_position_embeddings"]?.asInt() ?? 65536,
+                betaFast: s?["beta_fast"]?.asFloat() ?? 32.0,
+                betaSlow: s?["beta_slow"]?.asFloat() ?? 1.0,
+                mscale: 0,        // mscale==mscaleAllDim → _mscale == 1 (no magnitude scaling)
+                mscaleAllDim: 0
+            )
+        } else {
+            self.rope = RoPE(
+                dimensions: config.qkRopeHeadDim,
+                traditional: true,
+                base: config.ropeTheta,
+                scale: 1.0
+            )
+        }
+
+        // DSA compressor exists only on compress layers (checkpoint has
+        // attn.compressor.* for those layers only).
+        if compressRatio > 0 && dsaEnabled {
+            self._compressor.wrappedValue =
+                DeepseekV4Compressor(config: config, ratio: compressRatio)
+        }
     }
 
-    /// Returns top-k indices [B, L, k] into the pooled KV, or nil if pool is empty.
+    /// Grouped output projection matching the reference Python implementation.
+    /// For QuantizedLinear wo_a: slices weight rows per group, calls quantizedMM.
+    /// For plain Linear wo_a: uses batched matmul after weight reshape.
+    /// Input:  [B, L, n_heads, head_dim]
+    /// Output: [B, L, oGroups * oLoraRank]
+    private func groupedOutputProjection(_ out: MLXArray) -> MLXArray {
+        let B = out.dim(0), L = out.dim(1)
+        let groupFeat = numHeads * headDim / oGroups  // = nHeadsPerGroup * headDim
+
+        // Flatten to [B, L, n_heads * head_dim] for easy group slicing
+        let outFlat = out.reshaped(B, L, numHeads * headDim)
+
+        if let qLinear = woA as? QuantizedLinear {
+            var pieces: [MLXArray] = []
+            for g in 0 ..< oGroups {
+                let gStart = g * groupFeat
+                let gEnd   = (g + 1) * groupFeat
+                let rStart = g * oLoraRank
+                let rEnd   = (g + 1) * oLoraRank
+
+                // Per-group input: [B, L, groupFeat]
+                let groupInput = outFlat[0..., 0..., gStart ..< gEnd]
+                // Slice weight rows for this group
+                let wRows = qLinear.weight[rStart ..< rEnd]
+                let sRows = qLinear.scales[rStart ..< rEnd]
+                let bRows = qLinear.biases.map { $0[rStart ..< rEnd] }
+
+                // quantizedMM: [B, L, groupFeat] @ dequant(wRows)^T → [B, L, oLoraRank]
+                let y = quantizedMM(
+                    groupInput,
+                    wRows,
+                    scales: sRows,
+                    biases: bRows,
+                    transpose: true,
+                    groupSize: qLinear.groupSize,
+                    bits: qLinear.bits,
+                    mode: qLinear.mode
+                )
+                pieces.append(y)
+            }
+            return concatenated(pieces, axis: -1)  // [B, L, oGroups * oLoraRank]
+        } else {
+            // Non-quantized fallback: per-group matmul (same structure as quantized path).
+            // A single batched matmul would broadcast batch dims [B,L] against [oGroups],
+            // which fails when L != oGroups, so we loop instead.
+            var pieces: [MLXArray] = []
+            for g in 0 ..< oGroups {
+                let gStart = g * groupFeat
+                let gEnd   = (g + 1) * groupFeat
+                let rStart = g * oLoraRank
+                let rEnd   = (g + 1) * oLoraRank
+                let groupInput = outFlat[0..., 0..., gStart ..< gEnd]  // [B, L, groupFeat]
+                let wa_g = woA.weight[rStart ..< rEnd]                 // [oLoraRank, groupFeat]
+                pieces.append(matmul(groupInput, wa_g.T))              // [B, L, oLoraRank]
+            }
+            return concatenated(pieces, axis: -1)
+        }
+    }
+
     func callAsFunction(
         _ x: MLXArray,
-        qResidual: MLXArray,
-        rope: DeepseekV4RoPE,
-        poolCache: PoolingCache?,
-        offset: Int
-    ) -> MLXArray? {
-        let B = x.dim(0), L = x.dim(1)
-        let pooled = compressor(x, poolCache: poolCache, offset: offset)
-        guard pooled.dim(1) > 0 else { return nil }
-        let P = pooled.dim(1)
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
+        // Capture the RoPE offset BEFORE the cache update (the attention call advances
+        // cache.offset). Needed to de-rotate the attention output at the query positions.
+        let ropeOffset = cache?.offset ?? 0
 
-        var q = wq_b(qResidual).reshaped([B, L, nHeads, headDim])
-        q = q.transposed(0, 2, 1, 3)  // [B, nHeads, L, headDim]
-        q = rope.callAsFunction(q, offset: offset)
+        // --- Query ---
+        // Low-rank Q: wq_a → q_norm → wq_b
+        var q = wqB(qNorm(wqA(x)))                       // [B, L, n_heads * head_dim]
+        q = q.reshaped(B, L, numHeads, headDim)
+            .transposed(0, 2, 1, 3)                       // [B, n_heads, L, head_dim]
+        // Per-head RMS normalization (no learnable scale)
+        q = headRmsNorm(q, eps: eps)
 
-        // scores: [B, nHeads, L, P]
-        let scores = q.asType(.float32)
-            .matmul(pooled[0..., .newAxis, 0..., 0...].transposed(0, 1, 3, 2).asType(.float32))
-        let posScores = MLX.maximum(scores, MLXArray(Float(0))) * scale
+        // Split Q into nope and rope parts
+        let qNope = q[.ellipsis, ..<nopeHeadDim]          // [B, n_heads, L, nope_head_dim]
+        var qRope = q[.ellipsis, nopeHeadDim...]           // [B, n_heads, L, rope_head_dim]
+        qRope = applyRotaryPosition(rope, to: qRope, cache: cache)
+        let queries = concatenated([qNope, qRope], axis: -1) // [B, n_heads, L, head_dim]
 
-        // Head weights: [B, L, nHeads]
-        let w = weights_proj(x).asType(.float32) * pow(Float(nHeads), -0.5)
-        // Combine heads: [B, L, P]
-        let combined = (posScores * w.transposed(0, 2, 1).expandedDimensions(axis: -1))
-            .sum(axis: 1)
+        // --- KV: k = v (reference: k = v = concat([k_nope, k_pe_roped])) ---
+        let kv = kvNorm(wkv(x))                           // [B, L, head_dim]
+        let kvNope = kv[.ellipsis, ..<nopeHeadDim]
+            .reshaped(B, L, 1, nopeHeadDim)
+            .transposed(0, 2, 1, 3)                       // [B, 1, L, nope_head_dim]
+        var kvRope = kv[.ellipsis, nopeHeadDim...]
+            .reshaped(B, L, 1, ropeHeadDim)
+            .transposed(0, 2, 1, 3)                       // [B, 1, L, rope_head_dim]
+        kvRope = applyRotaryPosition(rope, to: kvRope, cache: cache)
+        let kFull = concatenated([kvNope, kvRope], axis: -1) // [B, 1, L, head_dim]
+        // In reference k = v = kFull: both K and V have rope applied to their rope dims.
+        // attentionWithCacheUpdate handles the KV cache update internally.
 
-        // Apply causal pool mask if in prefill
-        var maskedScores = combined
-        if let pc = poolCache, let pm = pc.makeMask(L: L, offset: offset) {
-            maskedScores = MLX.where(pm[0..., 0...].expandedDimensions(axis: 0), combined,
-                MLXArray(Float(-Float.infinity)))
+        // --- Attention ---
+        // Pass kFull as both keys and values; cache update happens inside.
+        // Apply attn_sink (per-head bias) to attention logits when non-zero.
+        // Cast to queries.dtype (bfloat16) — attn_sink may be loaded as float32 from the
+        // checkpoint, but MLXFast.scaledDotProductAttention requires sinks to promote to
+        // the output dtype (bfloat16); float32 does not satisfy this constraint.
+        if _sinkActive == nil {
+            _sinkActive = attn_sink.sum().item(Float.self) != 0  // one-time sync per layer
+        }
+        let sinksToUse: MLXArray? = (_sinkActive == true)
+            ? attn_sink.asType(queries.dtype)
+            : nil
+        var attnOut: MLXArray
+        if let dsa = cache as? DSAKVCache {
+            // ── DSA path: sliding-window raw KV (ring buffer) + compressed
+            // slots. Matches the official structure (model.py:484-534): queries
+            // see at most the last `windowSize` raw tokens plus all completed
+            // compressed slots (slot j visible iff (j+1)*ratio ≤ pos+1).
+            // Ring rows are in (pos % windowSize) order — SDPA over a key SET is
+            // permutation-invariant (rope is baked into keys), so decode needs
+            // no mask at all; prefill masks use the rows' absolute positions.
+            let offset = dsa.offset
+            let winK = dsa.appendWindow(kFull)        // in-place ring write, view out
+            let nWin = winK.dim(2)
+
+            // Emit compressed slots BEFORE building masks so slots completed by
+            // this chunk are visible to its later queries.
+            if let comp = compressor { comp.process(x: x, cache: dsa) }
+            let nSlots = dsa.slotCount
+
+            let keysAll = dsa.slotsView.map { concatenated([winK, $0], axis: 2) } ?? winK
+            let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
+            if L == 1 {
+                // Decode fast path: all ≤ windowSize ring rows are valid past
+                // tokens and every completed slot is visible — no mask needed.
+                maskMode = .none
+            } else {
+                // Additive masks in fp32 → cast to query dtype. Window rows are
+                // in ring order; use their stored absolute positions.
+                let qPos = (MLXArray(0 ..< L) + offset).reshaped(L, 1).asType(.float32)
+                let kPos = MLXArray(dsa.windowPositions(count: nWin).map { Float($0) })
+                    .reshaped(1, nWin)
+                let diff = qPos - kPos
+                let winVisible = (diff .>= 0) .&& (diff .< Float(windowSize))
+                var maskArr = which(
+                    winVisible, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                if nSlots > 0 {
+                    // Slot j (j from 0) visible iff (j+1)*ratio ≤ qPos+1.
+                    let slotEnd = (MLXArray(0 ..< nSlots) + 1).reshaped(1, nSlots)
+                        .asType(.float32) * Float(compressRatio)
+                    let compVisible = slotEnd .<= (qPos + 1)
+                    let compMask = which(
+                        compVisible, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                    maskArr = concatenated([maskArr, compMask], axis: -1)
+                }
+                maskMode = .array(maskArr.asType(queries.dtype))
+            }
+            attnOut = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keysAll, values: keysAll,
+                scale: scale, mask: maskMode,
+                sinks: sinksToUse)
+
+            dsa.offset += L
+        } else {
+            attnOut = deepseekAttentionWithSinks(
+                queries: queries,
+                keys: kFull,
+                values: kFull,
+                cache: cache,
+                scale: scale,
+                mask: mask,
+                sinks: sinksToUse
+            )                                              // [B, n_heads, L, head_dim]
         }
 
-        let k = min(indexTopk, P)
-        return argPartition(-maskedScores, kth: k - 1, axis: -1)[0..., 0..., ..<k]
+        // --- Inverse-RoPE the output (official: apply_rotary_emb(o, freqs, inverse=True)) ---
+        // In this MLA variant k == v == kv, so the value carries position-rotated content in
+        // its last rope_head_dim dims; the attention output must be de-rotated at the query
+        // positions before the output projection. Done here while the sequence axis is at -2.
+        let oNope = attnOut[.ellipsis, ..<nopeHeadDim]
+        let oRope = attnOut[.ellipsis, nopeHeadDim...]
+        attnOut = concatenated(
+            [oNope, inverseRotary(rope, oRope, offset: ropeOffset)], axis: -1)
+
+        let output = attnOut
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, numHeads, headDim)               // [B, L, n_heads, head_dim]
+
+        // --- Grouped output projection ---
+        let oLora = groupedOutputProjection(output)        // [B, L, oGroups * oLoraRank]
+        return woB(oLora)
     }
 }
 
-// MARK: - MoEGate
+// MARK: - MoE Components
 
+/// Single FFN expert: SwiGLU with optional activation clamping.
+class DeepseekV4Expert: Module, UnaryLayer {
+    let swiguLimit: Float
+
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "up_proj") var upProj: Linear
+    @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    init(hiddenSize: Int, intermediateSize: Int, swiguLimit: Float) {
+        self.swiguLimit = swiguLimit
+        self._gateProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
+        self._upProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
+        self._downProj.wrappedValue = Linear(intermediateSize, hiddenSize, bias: false)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        var gate = gateProj(x)
+        var up = upProj(x)
+        if swiguLimit > 0 {
+            gate = clip(gate, min: -swiguLimit, max: swiguLimit)
+            up = clip(up, min: -swiguLimit, max: swiguLimit)
+        }
+        return downProj(silu(gate) * up)
+    }
+}
+
+/// MoE routing gate with sqrtsoftplus scoring. The first `numHashLayers` layers route by a
+/// fixed token-ID → expert hash table (`tid2eid`); the rest route by top-k of the scores.
+/// Matches the official DeepSeek-V4 Gate (model.py:546-584).
 class DeepseekV4Gate: Module {
     let topK: Int
+    let nRoutedExperts: Int
     let routedScalingFactor: Float
     let normTopkProb: Bool
     let scoringFunc: String
     let isHash: Bool
 
-    var weight: MLXArray
-    var e_score_correction_bias: MLXArray?
-    var tid2eid: MLXArray?  // [vocab_size, topK] int32 – only for hash layers
+    var weight: MLXArray              // [n_routed_experts, hidden_size]
+    var e_score_correction_bias: MLXArray  // [n_routed_experts]
+    // Token-ID → expert hash table [vocab, topk] (hash layers only). Tiny placeholder
+    // on non-hash layers (kept missing, never indexed).
+    var tid2eid: MLXArray
 
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
+    init(config: DeepseekV4Configuration, layerIdx: Int = 999) {
         self.topK = config.numExpertsPerTok
+        self.nRoutedExperts = config.nRoutedExperts
         self.routedScalingFactor = config.routedScalingFactor
         self.normTopkProb = config.normTopkProb
         self.scoringFunc = config.scoringFunc
         self.isHash = layerIdx < config.numHashLayers
         self.weight = zeros([config.nRoutedExperts, config.hiddenSize])
-        if isHash {
-            self.tid2eid = zeros([config.vocabSize, config.numExpertsPerTok], dtype: .int32)
-        } else {
-            self.e_score_correction_bias = zeros([config.nRoutedExperts])
-        }
-        super.init()
+        self.e_score_correction_bias = zeros([config.nRoutedExperts])
+        // Real [vocab, topk] shape on hash layers so a non-streaming load (verify: .all)
+        // doesn't shape-mismatch; tiny placeholder elsewhere (never indexed). Overwritten on load.
+        self.tid2eid = (layerIdx < config.numHashLayers)
+            ? zeros([config.vocabSize, config.numExpertsPerTok]).asType(.int64)
+            : zeros([1])
     }
 
+    /// Hash layers have no `e_score_correction_bias`; non-hash layers have no `tid2eid`.
+    /// Allow either to be absent from the checkpoint without failing the load.
     override func updateMissing(
-        parameter: String, verify: VerifyUpdate, path: [String], modulePath: [String]
+        parameter: String,
+        verify: VerifyUpdate,
+        path: [String],
+        modulePath: [String]
     ) throws {
-        // e_score_correction_bias absent on hash layers; tid2eid absent on normal layers
-        if parameter == "e_score_correction_bias" || parameter == "tid2eid" { return }
+        if parameter == "e_score_correction_bias" || parameter == "tid2eid" {
+            return  // keep zero-initialized default
+        }
         try super.updateMissing(
             parameter: parameter, verify: verify, path: path, modulePath: modulePath)
     }
 
-    func callAsFunction(_ x: MLXArray, inputIds: MLXArray?) -> (MLXArray, MLXArray) {
-        let logits = x.matmul(weight.T).asType(.float32)
-
+    /// - Parameter inputIds: original token IDs `[B, S]` (required for hash layers).
+    func callAsFunction(_ x: MLXArray, inputIds: MLXArray? = nil) -> (MLXArray, MLXArray) {
+        // Scores in fp32 (official computes the gate in float32 for stable routing).
+        let logits = x.asType(.float32).matmul(weight.asType(.float32).T)  // [B, S, n_experts]
         let scores: MLXArray
         switch scoringFunc {
         case "softmax": scores = softmax(logits, axis: -1)
         case "sigmoid": scores = sigmoid(logits)
-        default: scores = sqrtSoftplus(logits)
+        default:        scores = sqrtSoftplus(logits)   // sqrt(softplus(x))
         }
 
         let inds: MLXArray
-        let selectedScores: MLXArray
-
-        if isHash, let ids = inputIds, let t2e = tid2eid {
-            // Hash routing: expert IDs determined by token ID
-            inds = t2e[ids]  // [B, S, topK]
-            selectedScores = takeAlong(scores, inds, axis: -1)
+        if isHash, let ids = inputIds {
+            // Fixed per-token-ID expert selection: tid2eid[input_ids] → [B, S, topk].
+            inds = take(tid2eid, ids, axis: 0).asType(.int32)
         } else {
-            let bias = e_score_correction_bias ?? zeros([weight.dim(0)])
-            let scoresForChoice = scores + bias
+            // Bias-shifted scores for top-k selection (bias not applied to routing weights).
+            let scoresForChoice = scores + e_score_correction_bias
             inds = argPartition(-scoresForChoice, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
-            selectedScores = takeAlong(scores, inds, axis: -1)
         }
 
-        var ws = selectedScores
-        if scoringFunc != "softmax" && normTopkProb {
-            ws = ws / (ws.sum(axis: -1, keepDims: true) + 1e-20)
+        // Routing weights from the original (non-biased) scores at the selected experts.
+        var selectedScores = takeAlong(scores, inds, axis: -1)
+        // Official normalizes whenever score_func != softmax (config has norm_topk_prob=true).
+        if topK > 1 && (normTopkProb || scoringFunc != "softmax") {
+            selectedScores = selectedScores / (selectedScores.sum(axis: -1, keepDims: true) + 1e-20)
         }
-        return (inds, ws * routedScalingFactor)
+        selectedScores = (selectedScores * routedScalingFactor).asType(x.dtype)
+
+        return (inds, selectedScores)
     }
 }
 
-// MARK: - DeepseekV4MLP (for shared experts)
-
-class DeepseekV4MLP: Module, UnaryLayer {
-    var gate_proj: Linear
-    var up_proj: Linear
-    var down_proj: Linear
-    let swiguLimit: Float
-
-    init(hiddenSize: Int, intermediateSize: Int, swiguLimit: Float) {
-        self.gate_proj = Linear(hiddenSize, intermediateSize, bias: false)
-        self.up_proj = Linear(hiddenSize, intermediateSize, bias: false)
-        self.down_proj = Linear(intermediateSize, hiddenSize, bias: false)
-        self.swiguLimit = swiguLimit
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        var g = gate_proj(x)
-        var u = up_proj(x)
-        if swiguLimit > 0 {
-            g = MLX.minimum(g, MLXArray(swiguLimit))
-            u = clip(u, min: MLXArray(-swiguLimit), max: MLXArray(swiguLimit))
-        }
-        return down_proj(silu(g) * u)
-    }
-}
-
-// MARK: - DeepseekV4MoE
-
-class DeepseekV4MoE: Module {
+/// Mixture-of-Experts layer with shared expert.
+class DeepseekV4MoE: Module, UnaryLayer {
     let numExpertsPerTok: Int
-    let swiguLimit: Float
 
-    var gate: DeepseekV4Gate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
-    @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
+    var gate: DeepseekV4Gate
+    @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4Expert
 
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
+    init(config: DeepseekV4Configuration, layerIdx: Int = 999) {
         self.numExpertsPerTok = config.numExpertsPerTok
-        self.swiguLimit = config.swiguLimit
-        self.gate = DeepseekV4Gate(config: config, layerIdx: layerIdx)
-        let limit = config.swiguLimit
+
+        // Routed experts (stacked via SwitchGLU, same as V3)
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            activation: { x in limit > 0 ? silu(clip(x, min: -limit, max: limit)) : silu(x) })
-        self._sharedExperts.wrappedValue = DeepseekV4MLP(
+            activation: { x in
+                // SwiGLU with limit
+                if config.swiguLimit > 0 {
+                    let g = clip(x, min: -config.swiguLimit, max: config.swiguLimit)
+                    return silu(g)
+                }
+                return silu(x)
+            }
+        )
+        self.gate = DeepseekV4Gate(config: config, layerIdx: layerIdx)
+
+        // Shared expert (1 expert, same intermediate size)
+        self._sharedExperts.wrappedValue = DeepseekV4Expert(
             hiddenSize: config.hiddenSize,
-            intermediateSize: config.moeIntermediateSize * config.nSharedExperts,
-            swiguLimit: config.swiguLimit)
-        super.init()
+            intermediateSize: config.moeIntermediateSize,
+            swiguLimit: config.swiguLimit
+        )
     }
 
-    func callAsFunction(_ x: MLXArray, inputIds: MLXArray) -> MLXArray {
+    // UnaryLayer conformance — score-routed path (non-hash layers / callers without token IDs).
+    func callAsFunction(_ x: MLXArray) -> MLXArray { routed(x, inputIds: nil) }
+
+    /// MoE forward. `inputIds` (`[B, S]`) is required for hash-routing layers.
+    func routed(_ x: MLXArray, inputIds: MLXArray?) -> MLXArray {
         let (indices, scores) = gate(x, inputIds: inputIds)
         var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis].asType(y.dtype)).sum(axis: -2)
-        return y + sharedExperts(x)
+        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+
+        // Add shared expert output
+        y = y + sharedExperts(x)
+        return y
     }
 }
 
-// MARK: - Attention output projection helper
+// MARK: - Decoder Block (with mHC Hyper-Connections)
 
-private func applyOutputProjection(
-    _ out: MLXArray,
-    woA: DeepseekV4MultiLinear,
-    woB: Linear,
-    oGroups: Int,
-    oLoraRank: Int,
-    numHeads: Int,
-    headDim: Int
-) -> MLXArray {
-    // out: [B, numHeads, L, headDim]
-    let B = out.dim(0), L = out.dim(2)
-    let nHeadsPerGroup = numHeads / oGroups
-    let groupFeat = nHeadsPerGroup * headDim
-
-    let r = out
-        .reshaped([B, oGroups, nHeadsPerGroup, L, headDim])  // [B, oG, nHpG, L, hD]
-        .transposed(0, 1, 3, 2, 4)                            // [B, oG, L, nHpG, hD]
-        .reshaped([B, oGroups, L, groupFeat])                  // [B, oG, L, groupFeat]
-    let lora = woA(r)                                          // [B, oG, L, oLoraRank]
-    return woB(
-        lora
-            .transposed(0, 2, 1, 3)                           // [B, L, oG, oLoraRank]
-            .reshaped([B, L, oGroups * oLoraRank]))            // [B, L, oG*oLoraRank]
-}
-
-// MARK: - LocalAttention
-
-/// Attention with no KV compression (compress_ratio=0).
-/// Uses ropeTheta=10000.
-final class LocalAttention: Module {
-    let numHeads: Int
-    let headDim: Int
-    let oGroups: Int
-    let oLoraRank: Int
-    let scale: Float
-    let eps: Float
-
-    let rope: DeepseekV4RoPE  // non-Module
-
-    var wq_a: Linear
-    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    var wq_b: Linear
-    var wkv: Linear
-    @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
-    var wo_a: DeepseekV4MultiLinear
-    var wo_b: Linear
-    var attn_sink: MLXArray
-
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
-        self.numHeads = config.numAttentionHeads
-        self.headDim = config.headDim
-        self.oGroups = config.oGroups
-        self.oLoraRank = config.oLoraRank
-        self.scale = pow(Float(config.headDim), -0.5)
-        self.eps = config.rmsNormEps
-
-        self.wq_a = Linear(config.hiddenSize, config.qLoraRank, bias: false)
-        self._qNorm.wrappedValue = RMSNorm(dimensions: config.qLoraRank, eps: config.rmsNormEps)
-        self.wq_b = Linear(config.qLoraRank, config.numAttentionHeads * config.headDim, bias: false)
-        self.wkv = Linear(config.hiddenSize, config.headDim, bias: false)
-        self._kvNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
-        self.wo_a = DeepseekV4MultiLinear(
-            inFeatures: config.numAttentionHeads * config.headDim / config.oGroups,
-            outFeatures: config.oLoraRank,
-            groups: config.oGroups)
-        self.wo_b = Linear(config.oGroups * config.oLoraRank, config.hiddenSize, bias: false)
-        self.attn_sink = zeros([config.numAttentionHeads])
-
-        // Local attention uses base rope_theta (not compress_rope_theta)
-        self.rope = DeepseekV4RoPE(
-            dims: config.qkRopeHeadDim,
-            base: config.ropeTheta,
-            scalingConfig: nil,
-            maxPositionEmbeddings: config.maxPositionEmbeddings)
-
-        super.init()
-    }
-
-    func callAsFunction(
-        _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: (any KVCache)?
-    ) -> MLXArray {
-        let B = x.dim(0), L = x.dim(1)
-        let offset = cache?.offset ?? 0
-
-        var q = wq_b(qNorm(wq_a(x)))
-        q = q.reshaped([B, L, numHeads, headDim])
-        q = headRmsNorm(q, eps: eps)
-        q = q.transposed(0, 2, 1, 3)       // [B, numHeads, L, headDim]
-        q = rope.callAsFunction(q, offset: offset)
-
-        var kv = kvNorm(wkv(x)).reshaped([B, 1, L, headDim])
-        kv = rope.callAsFunction(kv, offset: offset)
-        if let c = cache {
-            let (cached, _) = c.update(keys: kv, values: kv)
-            kv = cached
-        }
-
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-            ? attn_sink.asType(q.dtype) : nil
-        var out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: kv, values: kv,
-            scale: scale, mask: mask, sinks: sinks)  // [B, numHeads, L, headDim]
-
-        out = rope.callAsFunction(out, offset: offset, inverse: true)
-
-        return applyOutputProjection(out, woA: wo_a, woB: wo_b,
-            oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
-    }
-}
-
-// MARK: - CompressedAttention
-
-/// Attention with pooled KV compression (compress_ratio=128).
-/// Uses compressRopeTheta=160000 with Yarn scaling.
-final class CompressedAttention: Module {
-    let numHeads: Int
-    let headDim: Int
-    let oGroups: Int
-    let oLoraRank: Int
-    let scale: Float
-    let eps: Float
-
-    let rope: DeepseekV4RoPE
-    var compressor: Compressor
-
-    var wq_a: Linear
-    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    var wq_b: Linear
-    var wkv: Linear
-    @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
-    var wo_a: DeepseekV4MultiLinear
-    var wo_b: Linear
-    var attn_sink: MLXArray
-
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
-        self.numHeads = config.numAttentionHeads
-        self.headDim = config.headDim
-        self.oGroups = config.oGroups
-        self.oLoraRank = config.oLoraRank
-        self.scale = pow(Float(config.headDim), -0.5)
-        self.eps = config.rmsNormEps
-
-        self.wq_a = Linear(config.hiddenSize, config.qLoraRank, bias: false)
-        self._qNorm.wrappedValue = RMSNorm(dimensions: config.qLoraRank, eps: config.rmsNormEps)
-        self.wq_b = Linear(config.qLoraRank, config.numAttentionHeads * config.headDim, bias: false)
-        self.wkv = Linear(config.hiddenSize, config.headDim, bias: false)
-        self._kvNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
-        self.wo_a = DeepseekV4MultiLinear(
-            inFeatures: config.numAttentionHeads * config.headDim / config.oGroups,
-            outFeatures: config.oLoraRank,
-            groups: config.oGroups)
-        self.wo_b = Linear(config.oGroups * config.oLoraRank, config.hiddenSize, bias: false)
-        self.attn_sink = zeros([config.numAttentionHeads])
-
-        self.rope = DeepseekV4RoPE(
-            dims: config.qkRopeHeadDim,
-            base: config.compressRopeTheta,
-            scalingConfig: config.ropeScaling,
-            maxPositionEmbeddings: config.maxPositionEmbeddings)
-        self.compressor = Compressor(
-            config: config,
-            compressRatio: config.compressRatios[layerIdx],
-            headDim: config.headDim)
-
-        super.init()
-    }
-
-    func callAsFunction(
-        _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: (any KVCache)?
-    ) -> MLXArray {
-        let B = x.dim(0), L = x.dim(1)
-        let layerCache = cache as? DeepseekV4LayerCache
-        let localCache = layerCache?.rotating
-        let poolCache = layerCache?.pooling.first
-        let offset = localCache?.offset ?? 0
-
-        var q = wq_b(qNorm(wq_a(x)))
-        q = q.reshaped([B, L, numHeads, headDim])
-        q = headRmsNorm(q, eps: eps)
-        q = q.transposed(0, 2, 1, 3)
-        q = rope.callAsFunction(q, offset: offset)
-
-        var kv = kvNorm(wkv(x)).reshaped([B, 1, L, headDim])
-        kv = rope.callAsFunction(kv, offset: offset)
-        if let lc = localCache {
-            let (cached, _) = lc.update(keys: kv, values: kv)
-            kv = cached
-        }
-
-        // Pooled KV from Compressor
-        let pooled = compressor(x, poolCache: poolCache, offset: offset)  // [B, P, headDim]
-        var effectiveMask = mask
-        let P = pooled.dim(1)
-        if P > 0 {
-            let poolMask = poolCache?.makeMask(L: L, offset: offset)
-            let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
-            effectiveMask = extendMask(mask, poolMask: poolMask, L: L, P: P)
-
-            let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-                ? attn_sink.asType(q.dtype) : nil
-            var out = MLXFast.scaledDotProductAttention(
-                queries: q, keys: fullKV, values: fullKV,
-                scale: scale, mask: effectiveMask, sinks: sinks)
-            out = rope.callAsFunction(out, offset: offset, inverse: true)
-            return applyOutputProjection(out, woA: wo_a, woB: wo_b,
-                oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
-        }
-
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-            ? attn_sink.asType(q.dtype) : nil
-        var out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: kv, values: kv,
-            scale: scale, mask: mask, sinks: sinks)
-        out = rope.callAsFunction(out, offset: offset, inverse: true)
-        return applyOutputProjection(out, woA: wo_a, woB: wo_b,
-            oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
-    }
-}
-
-// MARK: - SparseCompressedAttention
-
-/// Attention with sparse indexed pooled KV (compress_ratio=4).
-final class SparseCompressedAttention: Module {
-    let numHeads: Int
-    let headDim: Int
-    let oGroups: Int
-    let oLoraRank: Int
-    let scale: Float
-    let eps: Float
-
-    let rope: DeepseekV4RoPE
-    var compressor: Compressor
-    var indexer: Indexer
-
-    var wq_a: Linear
-    @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    var wq_b: Linear
-    var wkv: Linear
-    @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
-    var wo_a: DeepseekV4MultiLinear
-    var wo_b: Linear
-    var attn_sink: MLXArray
-
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
-        self.numHeads = config.numAttentionHeads
-        self.headDim = config.headDim
-        self.oGroups = config.oGroups
-        self.oLoraRank = config.oLoraRank
-        self.scale = pow(Float(config.headDim), -0.5)
-        self.eps = config.rmsNormEps
-
-        self.wq_a = Linear(config.hiddenSize, config.qLoraRank, bias: false)
-        self._qNorm.wrappedValue = RMSNorm(dimensions: config.qLoraRank, eps: config.rmsNormEps)
-        self.wq_b = Linear(config.qLoraRank, config.numAttentionHeads * config.headDim, bias: false)
-        self.wkv = Linear(config.hiddenSize, config.headDim, bias: false)
-        self._kvNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
-        self.wo_a = DeepseekV4MultiLinear(
-            inFeatures: config.numAttentionHeads * config.headDim / config.oGroups,
-            outFeatures: config.oLoraRank,
-            groups: config.oGroups)
-        self.wo_b = Linear(config.oGroups * config.oLoraRank, config.hiddenSize, bias: false)
-        self.attn_sink = zeros([config.numAttentionHeads])
-
-        self.rope = DeepseekV4RoPE(
-            dims: config.qkRopeHeadDim,
-            base: config.compressRopeTheta,
-            scalingConfig: config.ropeScaling,
-            maxPositionEmbeddings: config.maxPositionEmbeddings)
-        let compressRatio = config.compressRatios[layerIdx]
-        self.compressor = Compressor(config: config, compressRatio: compressRatio, headDim: config.headDim)
-        self.indexer = Indexer(config: config, compressRatio: compressRatio)
-
-        super.init()
-    }
-
-    func callAsFunction(
-        _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: (any KVCache)?
-    ) -> MLXArray {
-        let B = x.dim(0), L = x.dim(1)
-        let layerCache = cache as? DeepseekV4LayerCache
-        let localCache = layerCache?.rotating
-        let compCache = layerCache?.pooling.first
-        let idxCache = layerCache?.pooling.count ?? 0 > 1 ? layerCache?.pooling[1] : nil
-        let offset = localCache?.offset ?? 0
-
-        let qResidual = qNorm(wq_a(x))
-        var q = wq_b(qResidual).reshaped([B, L, numHeads, headDim])
-        q = headRmsNorm(q, eps: eps)
-        q = q.transposed(0, 2, 1, 3)
-        q = rope.callAsFunction(q, offset: offset)
-
-        var kv = kvNorm(wkv(x)).reshaped([B, 1, L, headDim])
-        kv = rope.callAsFunction(kv, offset: offset)
-        if let lc = localCache {
-            let (cached, _) = lc.update(keys: kv, values: kv)
-            kv = cached
-        }
-
-        let pooled = compressor(x, poolCache: compCache, offset: offset)
-        let pmask = compCache?.makeMask(L: L, offset: offset)
-        let topk = indexer(x, qResidual: qResidual, rope: rope, poolCache: idxCache, offset: offset)
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-            ? attn_sink.asType(q.dtype) : nil
-        let P = pooled.dim(1)
-        let indexTopk = indexer.indexTopk
-
-        let out: MLXArray
-        if P == 0 {
-            // No pooled KV yet – pure local attention
-            out = MLXFast.scaledDotProductAttention(
-                queries: q, keys: kv, values: kv,
-                scale: scale, mask: mask, sinks: sinks)
-        } else if P <= indexTopk {
-            // Pool fits in topk – full attention with all pooled
-            let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
-            let extMask = extendMask(mask, poolMask: pmask, L: L, P: P)
-            out = MLXFast.scaledDotProductAttention(
-                queries: q, keys: fullKV, values: fullKV,
-                scale: scale, mask: extMask, sinks: sinks)
-        } else if let tk = topk {
-            // Sparse: gather top-k pooled vectors and attend
-            out = sparsePooledAttention(
-                q: q, localKV: kv, pooled: pooled, topk: tk,
-                localMask: mask, pooledMask: pmask, sinks: sinks)
-        } else {
-            // Indexer returned nil (shouldn't happen if P > 0 and indexer returns)
-            out = MLXFast.scaledDotProductAttention(
-                queries: q, keys: kv, values: kv,
-                scale: scale, mask: mask, sinks: sinks)
-        }
-
-        let result = rope.callAsFunction(out, offset: offset, inverse: true)
-        return applyOutputProjection(result, woA: wo_a, woB: wo_b,
-            oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
-    }
-
-    /// Sparse pooled attention: gather top-k pooled KVs, combine with local in log-space.
-    private func sparsePooledAttention(
-        q: MLXArray,
-        localKV: MLXArray,
-        pooled: MLXArray,
-        topk: MLXArray,     // [B, L, k]
-        localMask: MLXFast.ScaledDotProductAttentionMaskMode,
-        pooledMask: MLXArray?,
-        sinks: MLXArray?
-    ) -> MLXArray {
-        let B = q.dim(0), L = q.dim(2), D = q.dim(3)
-        let k = topk.dim(2)
-
-        // Gather top-k pooled vectors: [B, L, k, D]
-        let flatTopk = topk.reshaped([B, L * k])            // [B, L*k]
-        let expandedIdx = flatTopk.expandedDimensions(axis: -1)  // [B, L*k, 1]
-        let tiledIdx = expandedIdx + zeros([B, L * k, D], dtype: .int32)  // [B, L*k, D]
-        let gathered = takeAlong(pooled, tiledIdx, axis: 1)  // [B, L*k, D]
-        let pooledTopk = gathered.reshaped([B, L, k, D])    // [B, L, k, D]
-
-        let qScaled = q * scale
-
-        // Local scores: [B, H, L, localLen]
-        let localScores: MLXArray
-        switch localMask {
-        case .none, .causal:
-            localScores = qScaled.matmul(localKV.transposed(0, 1, 3, 2))
-        case .array(let arr):
-            let raw = qScaled.matmul(localKV.transposed(0, 1, 3, 2))
-            let arrExpanded = arr.expandedDimensions(axis: 0).expandedDimensions(axis: 1)
-            localScores = MLX.where(arrExpanded, raw, MLXArray(Float(-Float.infinity)))
-        @unknown default:
-            localScores = qScaled.matmul(localKV.transposed(0, 1, 3, 2))
-        }
-
-        let maxLocal = localScores.max(axis: -1, keepDims: true)
-        var logNorm = maxLocal + MLX.log(
-            MLX.exp(localScores - maxLocal).sum(axis: -1, keepDims: true) + 1e-20)
-
-        // Pooled scores: [B, H, L, k]
-        let qBL = qScaled.transposed(0, 2, 1, 3)  // [B, L, H, D]
-        var pooledScores = qBL.matmul(pooledTopk.transposed(0, 1, 3, 2))  // [B, L, H, k]
-        pooledScores = pooledScores.transposed(0, 2, 1, 3)  // [B, H, L, k]
-
-        // Apply sparse pool mask
-        if let pm = pooledMask {
-            // topk: [B, L, k], pm: [L, P] or [B, L, P]
-            let pmExpanded = pm.ndim == 2 ? pm.expandedDimensions(axis: 0) : pm
-            let sparsePM = takeAlong(pmExpanded, topk, axis: -1)  // [B, L, k]
-            pooledScores = MLX.where(
-                sparsePM[0..., .newAxis, 0..., 0...],
-                pooledScores,
-                MLXArray(Float(-Float.infinity)))
-        }
-
-        let maxPooled = pooledScores.max(axis: -1, keepDims: true)
-        let logNormPooled = maxPooled + MLX.log(
-            MLX.exp(pooledScores - maxPooled).sum(axis: -1, keepDims: true) + 1e-20)
-        logNorm = logNorm + MLX.log1p(MLX.exp(logNormPooled - logNorm))
-
-        if let s = sinks {
-            logNorm = logNorm + MLX.log1p(MLX.exp(s[.newAxis, 0..., .newAxis, .newAxis] - logNorm))
-        }
-
-        let localWeights = MLX.exp(localScores - logNorm)
-        let pooledWeights = MLX.exp(pooledScores - logNorm)
-
-        let outLocal = localWeights.matmul(localKV)  // [B, H, L, D]
-        let pwBL = pooledWeights.transposed(0, 2, 1, 3)  // [B, L, H, k]
-        let outPooled = pwBL.matmul(pooledTopk).transposed(0, 2, 1, 3)  // [B, H, L, D]
-        return (outLocal + outPooled).asType(q.dtype)
-    }
-}
-
-// MARK: - Attention factory
-
-private func v4AttentionFactory(config: DeepseekV4Configuration, layerIdx: Int) -> Module {
-    let ratio = layerIdx < config.compressRatios.count ? config.compressRatios[layerIdx] : 0
-    if ratio == 0 { return LocalAttention(config: config, layerIdx: layerIdx) }
-    if ratio == 128 { return CompressedAttention(config: config, layerIdx: layerIdx) }
-    return SparseCompressedAttention(config: config, layerIdx: layerIdx)
-}
-
-// MARK: - Decoder Block
-
-class DeepseekV4Block: Module {
+public class DeepseekV4Block: Module {
     let config: DeepseekV4Configuration
 
-    @ModuleInfo(key: "attn") var attn: Module
+    // Key "attn" matches checkpoint path `layers.{l}.attn.*`
+    @ModuleInfo(key: "attn") var selfAttn: DeepseekV4Attention
+    // Plain var: property name "ffn" matches checkpoint path `layers.{l}.ffn.*`
     var ffn: DeepseekV4MoE
+    // Key names match checkpoint: `attn_norm`, `ffn_norm`
     @ModuleInfo(key: "attn_norm") var attnNorm: RMSNorm
     @ModuleInfo(key: "ffn_norm") var ffnNorm: RMSNorm
 
-    var attn_hc: HCParams  // key matches Python attn_hc.fn/base/scale
-    var ffn_hc: HCParams
+    // Hyper-Connection parameter bundles.
+    // Underscore names match checkpoint paths: `hc_attn.fn/base/scale`, `hc_ffn.fn/base/scale`
+    var hc_attn: HCParams
+    var hc_ffn: HCParams
 
-    init(config: DeepseekV4Configuration, layerIdx: Int) {
+    init(config: DeepseekV4Configuration, layerIdx: Int = 0) {
         self.config = config
-        self._attn.wrappedValue = v4AttentionFactory(config: config, layerIdx: layerIdx)
-        self.ffn = DeepseekV4MoE(config: config, layerIdx: layerIdx)
-        self._attnNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._ffnNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
+        self._selfAttn.wrappedValue = DeepseekV4Attention(config: config, layerIdx: layerIdx)
+        self.ffn = DeepseekV4MoE(config: config, layerIdx: layerIdx)
+
+        self._attnNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self._ffnNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+
+        // Initialize HC parameters (will be overwritten by weight loading)
         let hc = config.hcMult
         let mixHc = (2 + hc) * hc
         let hcDim = hc * config.hiddenSize
-        self.attn_hc = HCParams(fn: zeros([mixHc, hcDim]), base: zeros([mixHc]), scale: ones([3]))
-        self.ffn_hc = HCParams(fn: zeros([mixHc, hcDim]), base: zeros([mixHc]), scale: ones([3]))
-
-        super.init()
+        self.hc_attn = HCParams(
+            fn: zeros([mixHc, hcDim]),
+            base: zeros([mixHc]),
+            scale: ones([3]))
+        self.hc_ffn = HCParams(
+            fn: zeros([mixHc, hcDim]),
+            base: zeros([mixHc]),
+            scale: ones([3]))
     }
 
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: (any KVCache)?,
-        inputIds: MLXArray
+        cache: KVCache?,
+        inputIds: MLXArray? = nil
     ) -> MLXArray {
-        // Attention sub-block
-        var residual = x
+        // x: [B, S, hc, D]
+        let residualAttn = x
+
+        // HC pre for attention: [B,S,hc,D] → [B,S,D]
         let (xAttn, postAttn, combAttn) = hcPre(
-            x: residual, hcFn: attn_hc.fn, hcScale: attn_hc.scale, hcBase: attn_hc.base,
-            hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps)
+            x: residualAttn,
+            hcFn: hc_attn.fn,
+            hcScale: hc_attn.scale,
+            hcBase: hc_attn.base,
+            hcMult: config.hcMult,
+            sinkhornIters: config.hcSinkhornIters,
+            eps: config.hcEps
+        )
 
-        let attnOut: MLXArray
-        let normedAttn = attnNorm(xAttn)
-        if let la = attn as? LocalAttention {
-            attnOut = la(normedAttn, mask: mask, cache: cache)
-        } else if let ca = attn as? CompressedAttention {
-            attnOut = ca(normedAttn, mask: mask, cache: cache)
-        } else if let sca = attn as? SparseCompressedAttention {
-            attnOut = sca(normedAttn, mask: mask, cache: cache)
-        } else {
-            fatalError("Unknown attention type in DeepseekV4Block")
-        }
+        // Attention sublayer: [B,S,D] → [B,S,D]
+        let attnOut = selfAttn(attnNorm(xAttn), mask: mask, cache: cache)
 
-        var h = hcPost(x: attnOut, residual: residual, post: postAttn, comb: combAttn)
+        // HC post for attention: [B,S,D] → [B,S,hc,D]
+        let residualFfn = hcPost(x: attnOut, residual: residualAttn, post: postAttn, comb: combAttn)
 
-        // FFN sub-block
-        residual = h
+        // HC pre for FFN: [B,S,hc,D] → [B,S,D]
         let (xFfn, postFfn, combFfn) = hcPre(
-            x: residual, hcFn: ffn_hc.fn, hcScale: ffn_hc.scale, hcBase: ffn_hc.base,
-            hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps)
-        let ffnOut = ffn(ffnNorm(xFfn), inputIds: inputIds)
-        return hcPost(x: ffnOut, residual: residual, post: postFfn, comb: combFfn)
+            x: residualFfn,
+            hcFn: hc_ffn.fn,
+            hcScale: hc_ffn.scale,
+            hcBase: hc_ffn.base,
+            hcMult: config.hcMult,
+            sinkhornIters: config.hcSinkhornIters,
+            eps: config.hcEps
+        )
+
+        // FFN sublayer: [B,S,D] → [B,S,D] (inputIds drives hash routing on layers 0..<numHashLayers)
+        let ffnOut = ffn.routed(ffnNorm(xFfn), inputIds: inputIds)
+
+        // HC post for FFN: [B,S,D] → [B,S,hc,D]
+        return hcPost(x: ffnOut, residual: residualFfn, post: postFfn, comb: combFfn)
     }
 }
 
 // MARK: - Inner Model
 
-public class DeepseekV4ModelInner: Module {
+public class DeepseekV4ModelInner: Module, LayerPartitionable, StreamableMoE {
     var config: DeepseekV4Configuration
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     var layers: [DeepseekV4Block]
     @ModuleInfo(key: "norm") var norm: RMSNorm
+
+    // HC head parameter bundle for final reduction [B,S,hc,D] → [B,S,D]
+    // Underscore name matches checkpoint path `model.hc_head.fn/base/scale`
     var hc_head: HCParams
+
+    public var gpuLayerCount: Int? = nil
+    public var streamExperts: Bool = false
+    // Main forward runs all `num_hidden_layers` real layers. In DeepSeek-V4 `num_hidden_layers`
+    // counts ONLY the main transformer layers (43 here, indices 0..42); MTP layers, when present,
+    // are ADDITIONAL at indices >= num_hidden_layers. The mlx-community checkpoint ships no MTP
+    // weights, so we must NOT subtract num_nextn_predict_layers (that dropped real layer 42).
+    public var totalLayerCount: Int { config.numHiddenLayers }
 
     init(config: DeepseekV4Configuration) {
         self.config = config
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
-        self.layers = (0 ..< config.numHiddenLayers).map {
+        let retainMTP = MTPConfig.retainMTPWeights && config.numNextnPredictLayers > 0
+        // All real layers, plus optional trailing MTP blocks only when explicitly retained.
+        let totalCount = config.numHiddenLayers + (retainMTP ? config.numNextnPredictLayers : 0)
+        self.layers = (0 ..< totalCount).map {
             DeepseekV4Block(config: config, layerIdx: $0)
         }
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
+        // HC head parameters (will be overwritten by weight loading)
         let hc = config.hcMult
         self.hc_head = HCParams(
             fn: zeros([hc, hc * config.hiddenSize]),
             base: zeros([hc]),
             scale: ones([1]))
-        super.init()
     }
 
-    func callAsFunction(_ inputIds: MLXArray, cache: [any KVCache]?) -> MLXArray {
-        let (h, _) = forward(inputIds, cache: cache, returnRawHidden: false)
-        return h
-    }
-
-    /// Forward with optional return of the raw 4D hidden state (for MTP).
-    func forward(
-        _ inputIds: MLXArray,
-        cache: [any KVCache]?,
-        returnRawHidden: Bool
-    ) -> (MLXArray, MLXArray?) {
-        let B = inputIds.dim(0), S = inputIds.dim(1)
+    func callAsFunction(_ x: MLXArray, cache: [KVCache]?) -> MLXArray {
+        // x: [B, S] token IDs
+        let B = x.dim(0), S = x.dim(1)
         let hc = config.hcMult
 
-        let emb = embedTokens(inputIds)
-        var h = repeated(emb.expandedDimensions(axis: 2), count: hc, axis: 2)  // [B, S, hc, D]
+        // Embed tokens: [B, S, D]
+        var h = embedTokens(x)
 
-        // Compute attention mask from first rotating cache
-        let firstRotatingCache: (any KVCache)? = {
-            guard let c = cache?.first else { return nil }
-            return (c as? DeepseekV4LayerCache)?.rotating ?? c
-        }()
-        let hForMask = h.reshaped([B, S, hc * config.hiddenSize])
-        let maskMode = createAttentionMask(
-            h: hForMask,
-            cache: firstRotatingCache,
-            windowSize: config.slidingWindow,
-            returnArray: true)
+        // Expand to hc copies: [B, S, hc, D]
+        // Repeat along new hc dimension
+        h = h.expandedDimensions(axis: 2)                  // [B, S, 1, D]
+        h = repeated(h, count: hc, axis: 2)                // [B, S, hc, D]
 
-        for (i, layer) in layers.enumerated() {
-            h = layer(h, mask: maskMode, cache: cache?[i], inputIds: inputIds)
+        // Create causal attention mask; reshape to 3D so dim(1)==S
+        let hForMask = h.reshaped([B, S, hc * config.hiddenSize])  // [B, S, hc*D]
+        let attentionMask = createAttentionMask(h: hForMask, cache: cache?.first)
+
+        for (i, layer) in layers.prefix(totalLayerCount).enumerated() {
+            h = partitionedLayerCall(
+                index: i, gpuLayerCount: gpuLayerCount, stream: streamExperts
+            ) {
+                // Pass token IDs so hash-routing layers (0..<numHashLayers) can index tid2eid.
+                layer(h, mask: attentionMask, cache: cache?[i], inputIds: x)
+            }
         }
 
-        let rawHidden = returnRawHidden ? h : nil
-        h = hcHeadReduce(
-            x: h, hcFn: hc_head.fn, hcScale: hc_head.scale, hcBase: hc_head.base,
-            eps: config.hcEps)
-        return (norm(h), rawHidden)
+        // HC head: [B, S, hc, D] → [B, S, D]
+        h = hcHead(
+            x: h, hcFn: hc_head.fn, hcScale: hc_head.scale,
+            hcBase: hc_head.base, eps: config.hcEps)
+
+        return norm(h)
     }
 }
 
 // MARK: - Top-level Model
 
 public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
+    /// One KV head per layer (unified KV, single head)
     public var kvHeads: [Int]
 
     var args: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    /// MTP prediction blocks. Non-nil only when `_deepseekV4MTPEnabled == true` at init time.
-    var mtp: [DeepseekV4MTPBlock]?
-
-    init(_ args: DeepseekV4Configuration) {
-        var config = args
-        config.fillDefaultCompressRatios()
-        self.args = config
-        self.kvHeads = Array(repeating: 1, count: config.numHiddenLayers)
-        self.model = DeepseekV4ModelInner(config: config)
-        self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
-
-        if config.numNextnPredictLayers > 0 && _deepseekV4MTPEnabled {
-            let n = config.numHiddenLayers
-            self.mtp = (0 ..< config.numNextnPredictLayers).map {
-                DeepseekV4MTPBlock(config: config, layerIdx: n + $0)
-            }
-        }
-        super.init()
+    public init(_ args: DeepseekV4Configuration) {
+        self.args = args
+        self.kvHeads = Array(repeating: 1, count: args.numHiddenLayers)
+        self.model = DeepseekV4ModelInner(config: args)
+        self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
 
-    public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]? = nil) -> MLXArray {
-        lmHead(model(inputs, cache: cache))
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        let out = model(inputs, cache: cache)
+        return lmHead(out)
     }
 
-    public func makeCache(parameters: GenerateParameters) -> [any KVCache] {
-        args.compressRatios.map { ratio in
-            if ratio == 0 {
-                return RotatingKVCache(maxSize: args.slidingWindow) as any KVCache
-            } else if ratio == 4 {
-                return DeepseekV4LayerCache(
-                    rotating: RotatingKVCache(maxSize: args.slidingWindow),
-                    pooling: [PoolingCache(ratio: ratio), PoolingCache(ratio: ratio)]
-                ) as any KVCache
-            } else {
-                // ratio == 128
-                return DeepseekV4LayerCache(
-                    rotating: RotatingKVCache(maxSize: args.slidingWindow),
-                    pooling: [PoolingCache(ratio: ratio)]
-                ) as any KVCache
+    /// Per-layer caches.
+    /// Default (DSA on): DSAKVCache — sliding window of `sliding_window` raw
+    /// tokens + learned compressed slots, the structure DSV4 was trained with.
+    /// K==V is stored once by construction. `--ctx-size` (maxKVSize) is ignored
+    /// for these layers: the window is architectural and compressed slots grow
+    /// at tokens/ratio (tiny).
+    /// Fallback (MLX_DSA=0): dense caches, SharedKVCache-wrapped for k==v dedup.
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        if dsaEnabled {
+            return (0 ..< kvHeads.count).map { i in
+                let ratio = i < args.compressRatios.count ? args.compressRatios[i] : 0
+                return DSAKVCache(windowSize: args.slidingWindow, ratio: ratio)
             }
         }
+        let base: [KVCache]
+        if let maxKVSize = parameters?.maxKVSize {
+            base = (0 ..< kvHeads.count).map { _ in RotatingKVCache(maxSize: maxKVSize, keep: 4) }
+        } else {
+            base = (0 ..< kvHeads.count).map { _ in KVCacheSimple() }
+        }
+        guard sharedKVEnabled else { return base }
+        return base.map { SharedKVCache(wrapping: $0) }
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var w = weights
-        let hasMTP = mtp != nil
-        let hasMTPWeights = weights.keys.contains { $0.hasPrefix("mtp.") }
+        var newWeights = weights
 
-        if hasMTP && !hasMTPWeights {
-            self.mtp = nil
-        }
-
-        // FP8 dequantization
+        // 1. Dequantize FP8 weights (weight_scale_inv pattern, same as V3)
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
             let bs = 128
             let (m, n) = (weight.dim(0), weight.dim(1))
             let padBottom = (bs - m % bs) % bs
             let padSide = (bs - n % bs) % bs
-            var p = MLX.padded(weight, widths: [.init((0, padBottom)), .init((0, padSide))])
-            p = p.reshaped([(m + padBottom) / bs, bs, (n + padSide) / bs, bs])
-            let scaled = p * scaleInv[0..., .newAxis, 0..., .newAxis]
+            var padded = MLX.padded(weight, widths: [.init((0, padBottom)), .init((0, padSide))])
+            padded = padded.reshaped([(m + padBottom) / bs, bs, (n + padSide) / bs, bs])
+            let scaled = padded * scaleInv[0..., .newAxis, 0..., .newAxis]
             return scaled.reshaped([m + padBottom, n + padSide])[0 ..< m, 0 ..< n]
         }
+
         for (key, value) in weights {
             if key.contains("weight_scale_inv") {
                 let weightKey = key.replacingOccurrences(of: "_scale_inv", with: "")
-                if let wt = weights[weightKey] {
-                    w[weightKey] = dequant(weight: wt, scaleInv: value)
+                if let weight = weights[weightKey] {
+                    newWeights[weightKey] = dequant(weight: weight, scaleInv: value)
                 }
-            } else if w[key] == nil {
-                w[key] = value
+            } else if newWeights[key] == nil {
+                newWeights[key] = value
             }
         }
 
-        // Remap keys: hc_attn_fn → attn_hc.fn, w1 → gate_proj, etc.
-        // Also: ffn.gate.bias → ffn.gate.e_score_correction_bias
-        // Also: model.embed → model.embed_tokens, etc.
-        let topRemap: [String: String] = [
-            "embed.weight": "model.embed_tokens.weight",
-            "norm.weight": "model.norm.weight",
-            "head.weight": "lm_head.weight",
-            "hc_head_fn": "model.hc_head.fn",
-            "hc_head_base": "model.hc_head.base",
-            "hc_head_scale": "model.hc_head.scale",
-        ]
-        let wRemap: [String: String] = ["w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"]
-
-        var remapped: [String: MLXArray] = [:]
-        for (key, value) in w {
-            var nk = key.hasPrefix("layers.") ? "model." + key : key
-            // Remap flat hc keys: .hc_attn_fn → .attn_hc.fn
-            for sub in ["attn", "ffn"] {
-                for param in ["fn", "base", "scale"] {
-                    nk = nk.replacingOccurrences(
-                        of: ".hc_\(sub)_\(param)", with: ".\(sub)_hc.\(param)")
-                }
-            }
-            // Gate bias rename
-            nk = nk.replacingOccurrences(
-                of: ".ffn.gate.bias", with: ".ffn.gate.e_score_correction_bias")
-            // Shared expert weight name remap
-            for (old, new) in wRemap {
-                nk = nk.replacingOccurrences(
-                    of: ".shared_experts.\(old).", with: ".shared_experts.\(new).")
-            }
-            // Top-level remap
-            if let mapped = topRemap[nk] { remapped[mapped] = value }
-            else { remapped[nk] = value }
-        }
-        w = remapped
-
-        // Stack per-expert routed weights → switch_mlp format
-        for l in 0 ..< args.numHiddenLayers {
+        // 2. Stack per-expert weights into SwitchGLU format (for non-pre-stacked checkpoints)
+        // MLX quantized checkpoints already have stacked weights; this is a no-op for them.
+        let mainLayerCount = args.numHiddenLayers
+        for l in 0 ..< mainLayerCount {
             let prefix = "model.layers.\(l)"
-            for (src, dst) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
-                for suffix in ["weight", "scales"] {
-                    let key0 = "\(prefix).ffn.experts.0.\(src).\(suffix)"
-                    if w[key0] != nil {
-                        let stacked = (0 ..< args.nRoutedExperts).compactMap {
-                            w.removeValue(forKey: "\(prefix).ffn.experts.\($0).\(src).\(suffix)")
+            for projName in ["gate_proj", "down_proj", "up_proj"] {
+                for key in ["weight", "scales", "biases"] {
+                    let firstKey = "\(prefix).ffn.experts.0.\(projName).\(key)"
+                    if weights[firstKey] != nil {
+                        let stacked = (0 ..< args.nRoutedExperts).map {
+                            // Prefer dequantized value from newWeights (FP8 dequant), fall back to original
+                            newWeights["\(prefix).ffn.experts.\($0).\(projName).\(key)"]
+                                ?? weights["\(prefix).ffn.experts.\($0).\(projName).\(key)"]!
                         }
-                        if stacked.count == args.nRoutedExperts {
-                            w["\(prefix).ffn.switch_mlp.\(dst).\(suffix)"] = MLX.stacked(stacked)
-                        }
-                    }
-                }
-            }
-        }
-
-        // Stack MTP expert weights
-        if hasMTP && hasMTPWeights {
-            for i in 0 ..< args.numNextnPredictLayers {
-                let prefix = "mtp.\(i).block.ffn.experts"
-                for (src, dst) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
-                    for suffix in ["weight", "scales"] {
-                        let key0 = "\(prefix).0.\(src).\(suffix)"
-                        if w[key0] != nil {
-                            let stacked = (0 ..< args.nRoutedExperts).compactMap {
-                                w.removeValue(forKey: "\(prefix).\($0).\(src).\(suffix)")
-                            }
-                            if stacked.count == args.nRoutedExperts {
-                                w["mtp.\(i).block.ffn.switch_mlp.\(dst).\(suffix)"] = MLX.stacked(stacked)
-                            }
+                        newWeights["\(prefix).ffn.switch_mlp.\(projName).\(key)"] = MLX.stacked(stacked)
+                        for j in 0 ..< args.nRoutedExperts {
+                            newWeights.removeValue(forKey: "\(prefix).ffn.experts.\(j).\(projName).\(key)")
                         }
                     }
                 }
             }
         }
 
-        // Reshape wo_a weights from 2D → 3D [o_groups, o_lora_rank, -1]
-        for l in 0 ..< args.numHiddenLayers {
-            let prefix = "model.layers.\(l).attn.wo_a"
-            for key in ["\(prefix).weight", "\(prefix).scales", "\(prefix).biases"] {
-                if let v = w[key], v.ndim == 2 {
-                    w[key] = v.reshaped([args.oGroups, args.oLoraRank, -1])
+        // 3. Filter out MTP (multi-token prediction) layers and rotary_emb keys
+        // Also drop compressor/indexer sub-module keys (not yet implemented).
+        // MTP layers (if any) live at indices >= num_hidden_layers; real layers are 0..<num_hidden_layers.
+        let numMainLayers = args.numHiddenLayers
+        var finalWeights = [String: MLXArray]()
+        for (key, value) in newWeights {
+            // Drop rotary embedding precomputed frequencies
+            if key.contains("rotary_emb.inv_freq") { continue }
+            // Compressor weights are consumed by DeepseekV4Compressor (DSA path);
+            // drop them only when DSA is disabled. The indexer (top-k slot
+            // selection) remains unimplemented — attending ALL compressed slots
+            // is exact, just unpruned, so dropping indexer weights is lossless.
+            if !dsaEnabled && key.contains(".attn.compressor.") { continue }
+            if key.contains(".attn.indexer.") { continue }
+            // Keep ffn.gate.tid2eid — consumed by hash-routing layers (0..<numHashLayers).
+
+            if key.starts(with: "model.layers.") {
+                let parts = key.split(separator: ".")
+                if parts.count >= 3, let layerIdx = Int(parts[2]) {
+                    if layerIdx >= numMainLayers && !MTPConfig.retainMTPWeights {
+                        continue
+                    }
                 }
             }
+            // 4. Key-name compat: official DeepSeek-V4 checkpoints (mlx-community)
+            // name the per-layer Hyper-Connection bundles `attn_hc` / `ffn_hc`;
+            // our block properties are `hc_attn` / `hc_ffn`. Remap so both naming
+            // conventions load. (`model.hc_head.*` already matches.)
+            var outKey = key
+            if outKey.contains(".attn_hc.") {
+                outKey = outKey.replacingOccurrences(of: ".attn_hc.", with: ".hc_attn.")
+            } else if outKey.contains(".ffn_hc.") {
+                outKey = outKey.replacingOccurrences(of: ".ffn_hc.", with: ".hc_ffn.")
+            }
+            finalWeights[outKey] = value
         }
-
-        return w.filter { key, _ in
-            if key.hasPrefix("mtp.") && !hasMTP { return false }
-            if key.contains("rotary_emb.inv_freq") { return false }
-            return true
-        }
+        return finalWeights
     }
 
-    public var loraLayers: [Module] { model.layers }
+    public var loraLayers: [Module] {
+        model.layers
+    }
+}
+
+// MARK: - MTPLanguageModel Conformance for DeepseekV4Model
+
+/// DeepSeek V4 uses a different MTP scheme: the MTP layers are the last
+/// `numNextnPredictLayers` standard transformer blocks (`model.layers[numMainLayers...]`).
+/// They share the same architecture as the main blocks but operate on the final hidden state.
+/// The main `lm_head` is reused for all MTP depth projections.
+extension DeepseekV4Model: MTPLanguageModel {
+    public func callMTP(_ inputs: MLXArray, cache: [KVCache]?, mtpCaches: [[KVCache]]?) -> [MLXArray] {
+        let mtpLayers = model.layers.suffix(args.numNextnPredictLayers)
+        guard MTPConfig.retainMTPWeights, !mtpLayers.isEmpty else {
+            return [callAsFunction(inputs, cache: cache)]
+        }
+
+        // Run the main model body (excludes MTP layers \u2014 DeepseekV4ModelInner only
+        // instantiates `numMain` blocks, so this is the standard forward pass)
+        let mainHidden = model(inputs, cache: cache)
+        let mainLogits = lmHead(mainHidden)
+        var result = [mainLogits]
+
+        // Chain MTP blocks stored in `model.mtpLayers`
+        var prevHidden = mainHidden
+        let B = prevHidden.dim(0), S = prevHidden.dim(1)
+        let hc = args.hcMult
+        for (i, mtpLayer) in mtpLayers.enumerated() {
+            let mtpCache = mtpCaches?[i]
+            // Expand [B, S, D] -> [B, S, hc, D]
+            var h = prevHidden.expandedDimensions(axis: 2)
+            h = repeated(h, count: hc, axis: 2)
+
+            let hForMask = h.reshaped([B, S, hc * args.hiddenSize])
+            let attentionMask = createAttentionMask(h: hForMask, cache: mtpCache?.first)
+            
+            h = mtpLayer(h, mask: attentionMask, cache: mtpCache?.first)
+            
+            // Reduce back to [B, S, D]
+            prevHidden = hcHead(
+                x: h, hcFn: model.hc_head.fn, hcScale: model.hc_head.scale,
+                hcBase: model.hc_head.base, eps: args.hcEps)
+                
+            let mtpLogits = lmHead(model.norm(prevHidden))
+            result.append(mtpLogits)
+        }
+
+        return result
+    }
+
+    public func makeMTPCaches(parameters: GenerateParameters?) -> [[KVCache]] {
+        return (0 ..< args.numNextnPredictLayers).map { _ in
+            [KVCacheSimple()]
+        }
+    }
 }
