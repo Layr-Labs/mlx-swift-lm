@@ -4,6 +4,23 @@ import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
+/// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
+/// Fusing activation + product into one compiled, shapeless kernel cuts kernel
+/// dispatches and intermediates on the hot decode path. Upstream ef85ed0.
+private let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, up in
+    MLXNN.silu(gate) * up
+}
+
+/// Compiled weighted expert-output combine (`(outputs * weights[..., None]).sum(-2)`).
+/// Shared by MoE routers (e.g. Gemma 4) to fuse the scale + reduce. Upstream ef85ed0.
+public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { outputs, weights in
+    (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
+}
+
 public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
@@ -37,12 +54,46 @@ public class SwitchGLU: Module {
     let hiddenDims: Int
     let numExperts: Int
     let activation: (MLXArray) -> MLXArray
+    /// Optional fused (activation * up) kernel. Set for the default SiLU path so
+    /// the GLU product runs as one compiled op; nil when a custom activation is
+    /// supplied (we then fall back to `activation(gate) * up`). Upstream ef85ed0.
+    let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
 
+    /// Default SiLU GLU path -- uses the compiled fused (silu * up) kernel.
     public init(
         inputDims: Int,
         hiddenDims: Int,
         numExperts: Int,
-        activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
+        bias: Bool = false,
+        fuseGateUp: Bool = false
+    ) {
+        self.inputDims = inputDims
+        self.hiddenDims = hiddenDims
+        self.numExperts = numExperts
+        self.activation = MLXNN.silu
+        self.activationProduct = compiledSiluProduct
+
+        if fuseGateUp {
+            self._gateUpProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims * 2, numExperts: numExperts, bias: bias)
+        } else {
+            self._gateProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+            self._upProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        }
+        self._downProj.wrappedValue = SwitchLinear(
+            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
+
+        super.init()
+    }
+
+    /// Custom-activation GLU path -- runs `activation(gate) * up` uncompiled.
+    public init(
+        inputDims: Int,
+        hiddenDims: Int,
+        numExperts: Int,
+        activation: @escaping (MLXArray) -> MLXArray,
         bias: Bool = false,
         fuseGateUp: Bool = false
     ) {
@@ -50,6 +101,7 @@ public class SwitchGLU: Module {
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation
+        self.activationProduct = nil
 
         if fuseGateUp {
             self._gateUpProj.wrappedValue = SwitchLinear(
@@ -81,45 +133,14 @@ public class SwitchGLU: Module {
         let xGate: MLXArray
         let xUp: MLXArray
         if let gateUpProj {
-            if let quantized = gateUpProj as? QuantizedSwitchLinear {
-                xGate = MLX.gatherQuantizedMM(
-                    x,
-                    quantized.weight[.ellipsis, ..<hiddenDims, 0...],
-                    scales: quantized.scales[.ellipsis, ..<hiddenDims, 0...],
-                    biases: quantized.biases?[.ellipsis, ..<hiddenDims, 0...],
-                    rhsIndices: idx,
-                    transpose: true,
-                    groupSize: quantized.groupSize,
-                    bits: quantized.bits,
-                    mode: quantized.mode,
-                    sortedIndices: doSort
-                )
-                xUp = MLX.gatherQuantizedMM(
-                    x,
-                    quantized.weight[.ellipsis, hiddenDims..., 0...],
-                    scales: quantized.scales[.ellipsis, hiddenDims..., 0...],
-                    biases: quantized.biases?[.ellipsis, hiddenDims..., 0...],
-                    rhsIndices: idx,
-                    transpose: true,
-                    groupSize: quantized.groupSize,
-                    bits: quantized.bits,
-                    mode: quantized.mode,
-                    sortedIndices: doSort
-                )
-            } else {
-                xGate = MLX.gatherMM(
-                    x,
-                    gateUpProj.weight[.ellipsis, ..<hiddenDims, 0...].swappedAxes(-1, -2),
-                    rhsIndices: idx,
-                    sortedIndices: doSort
-                )
-                xUp = MLX.gatherMM(
-                    x,
-                    gateUpProj.weight[.ellipsis, hiddenDims..., 0...].swappedAxes(-1, -2),
-                    rhsIndices: idx,
-                    sortedIndices: doSort
-                )
-            }
+            // One gathered matmul for the combined gate_up projection (via the
+            // polymorphic SwitchLinear call, so the quantized path and bias are
+            // handled uniformly), then split the float result. This avoids
+            // slicing packed quantized weights and halves the number of gather
+            // dispatches vs. two separate projections. Upstream b6aeaa6.
+            let xGateUp = gateUpProj(x, idx, sortedIndices: doSort)
+            xGate = xGateUp[.ellipsis, ..<hiddenDims]
+            xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
             guard let gateProj, let upProj else {
                 fatalError("SwitchGLU requires either gate_up_proj or gate_proj/up_proj")
@@ -127,8 +148,14 @@ public class SwitchGLU: Module {
             xUp = upProj(x, idx, sortedIndices: doSort)
             xGate = gateProj(x, idx, sortedIndices: doSort)
         }
+        let activated =
+            if let activationProduct {
+                activationProduct(xGate, xUp)
+            } else {
+                activation(xGate) * xUp
+            }
         x = downProj(
-            activation(xGate) * xUp,
+            activated,
             idx,
             sortedIndices: doSort)
 
