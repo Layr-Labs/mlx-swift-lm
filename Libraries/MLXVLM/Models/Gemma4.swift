@@ -659,13 +659,18 @@ private final class Gemma4TextRouter: Module {
         x = x * scale.asType(x.dtype)
 
         let expertScores = proj(x)
-        let routerProbabilities = MLX.softmax(expertScores, axis: -1, precise: true)
 
         let topKIndices = MLX.argPartition(-expertScores, kth: topKExperts - 1, axis: -1)[
             .ellipsis, ..<topKExperts,
         ]
-        var topKWeights = MLX.takeAlong(routerProbabilities, topKIndices, axis: -1)
-        topKWeights = topKWeights / MLX.sum(topKWeights, axis: -1, keepDims: true)
+        // Softmax AFTER top-k selection so the combination weights are the
+        // distribution over the CHOSEN experts, not the full 128-expert set
+        // (the old code softmaxed all scores first, then renormalized the
+        // top-k slice). Matches our already-correct LLM Gemma4 router. Upstream
+        // 84ab278 (correctness half; the norm-fusion perf half is omitted to
+        // keep the module tree / checkpoint layout unchanged).
+        var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
+        topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices].asType(topKWeights.dtype)
         return (topKIndices, topKWeights)
     }
@@ -1187,6 +1192,15 @@ private final class Gemma4TextBackbone: Module {
         postNorm: MLXArray, preNorm: MLXArray?,
         full: (MLXArray, MLXArray)?, sliding: (MLXArray, MLXArray)?
     ) {
+        // Tolerate 1D (L,) token inputs / 2D (L, D) embeds by adding the leading
+        // batch dim. The perLayerInputs indexing path needs 4D shapes and would
+        // otherwise crash on continuation prefills that build LMInput directly.
+        // Zero-copy and a no-op for canonical 2D/3D shapes. Upstream 84697ac.
+        let inputs = inputs.map { $0.ndim == 1 ? $0.expandedDimensions(axis: 0) : $0 }
+        let inputsEmbeds = inputsEmbeds.map {
+            $0.ndim == 2 ? $0.expandedDimensions(axis: 0) : $0
+        }
+
         let h0: MLXArray
         if let inputsEmbeds {
             h0 = inputsEmbeds
@@ -1293,9 +1307,16 @@ private final class Gemma4TextBackbone: Module {
                 mask: layerMask,
                 cache: layerCache,
                 perLayerInput: layerInput,
-                sharedKV: hasExplicitCache && idx >= firstKVSharedLayerIdx
+                // Shared-KV layers gate on layer index only, NOT on the presence
+                // of an explicit cache: no-cache forwards (embedding extraction,
+                // retrieval, batched eval) must still reuse the source layer's
+                // K/V or they silently re-project and violate Gemma 4's
+                // cross-layer KV-sharing invariant. Cached generation is
+                // unaffected (hasExplicitCache was always true there). Upstream
+                // d675185. (Our per-row batched offset is preserved below.)
+                sharedKV: idx >= firstKVSharedLayerIdx
                     ? intermediates[sourceIdx].kv : nil,
-                offset: hasExplicitCache && idx >= firstKVSharedLayerIdx
+                offset: idx >= firstKVSharedLayerIdx
                     ? intermediates[sourceIdx].offset : nil,
                 perRowOffset: perRowOffset
             )
