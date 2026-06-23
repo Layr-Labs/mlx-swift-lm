@@ -276,7 +276,15 @@ func gatedDeltaOps(
 
 // MARK: - Public API
 
-func gatedDeltaUpdate(
+/// Shared gated-delta (GDN) recurrence for the Qwen3.5 / Qwen3-Next family.
+///
+/// This is the single source of truth for the recurrence: the LLM models
+/// (`Qwen35`, `Qwen3Next`) and the VLM `Qwen35` model all call it. It computes
+/// `g`/`beta` in fp32 and keeps the recurrent `state` in fp32 across the
+/// T-step recurrence (upstream c566c95 + 93cf322); bf16 state loses precision
+/// and, on the kernel path, forces a recompile vs. the fp32 state. `public`
+/// so `MLXVLM` can reuse it instead of carrying a private (drift-prone) copy.
+public func gatedDeltaUpdate(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
