@@ -1961,10 +1961,15 @@ public func maybeQuantizeKVCache(
     kvGroupSize: Int = 64,
     quantizedKVStart: Int = 0
 ) {
-    guard let kvBits = kvBits,
-        !cache.isEmpty,
-        !(cache[0] is QuantizedKVCache),
-        cache[0].offset > quantizedKVStart
+    guard let kvBits = kvBits, !cache.isEmpty else { return }
+
+    // Find the first quantizable (non-Mamba, non-already-quantized) cache entry.
+    // On hybrid attention+SSM models (Qwen3.5, Qwen3-Next, Nemotron, Falcon-H1)
+    // cache[0] is often a MambaCache, so gating on cache[0] silently no-ops KV
+    // quantization. Scan for the first KVCacheSimple instead. Upstream 88beb40.
+    guard let firstQuantizable = cache.first(where: { $0 is KVCacheSimple }),
+        !(firstQuantizable is QuantizedKVCache),
+        firstQuantizable.offset > quantizedKVStart
     else {
         return
     }
