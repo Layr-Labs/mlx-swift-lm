@@ -136,4 +136,40 @@ final class CBSchedulerTests: XCTestCase {
 
         XCTAssertNotNil(final_, "generation must complete even with repetition penalty")
     }
+
+    // MARK: - Prefill-start admission marker
+
+    /// A newly admitted request must produce a token-less prefill-start
+    /// `RequestOutput` AT the admit step — BEFORE any decode token — so a consumer
+    /// can stamp engine-admission at real prefill start (the provider's
+    /// observed_prefill_tps window). Previously the FIRST output a cold request
+    /// produced was its first decode token, collapsing that window to ~0.
+    func testSchedulerEmitsPrefillStartAdmissionMarker() {
+        let s = makeTestScheduler(eosTokenIds: [])
+        let req = makeIntRequest(id: "r1", tokens: [1, 2, 3, 4], maxTokens: 5)
+        s.addRequest(req)
+
+        // Admit step: emits exactly one token-less marker, no decode token yet.
+        let admit = s.step()
+        let markers = admit.outputs.filter { $0.requestId == "r1" }
+        XCTAssertEqual(markers.count, 1, "exactly one admission marker at admit")
+        let marker = markers[0]
+        XCTAssertTrue(marker.newTokenIds.isEmpty, "marker carries no decoded token")
+        XCTAssertEqual(marker.newText, "", "marker carries no text")
+        XCTAssertFalse(marker.finished, "marker is not terminal")
+        XCTAssertGreaterThan(marker.promptTokens, 0, "marker reports the prompt size")
+
+        // The first DECODE token arrives on a LATER step, never collapsed into the
+        // admit step — proving the admission→first-token window is real (> one step).
+        var sawFirstToken = false
+        for _ in 0 ..< 10 {
+            let out = s.step()
+            if out.outputs.contains(where: { $0.requestId == "r1" && !$0.newTokenIds.isEmpty }) {
+                sawFirstToken = true
+                break
+            }
+            if !s.hasRequests() { break }
+        }
+        XCTAssertTrue(sawFirstToken, "request must decode a first token after admission")
+    }
 }

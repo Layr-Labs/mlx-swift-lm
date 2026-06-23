@@ -416,6 +416,26 @@ public final class Scheduler: @unchecked Sendable {
         for r in newScheduled {
             output.scheduledRequestIds.append(r.requestId)
             output.numScheduledTokens += r.numPromptTokens
+            // Prefill-start / admission marker: a token-less RequestOutput emitted
+            // the instant a request is admitted — BEFORE its first prefill `eval`.
+            // Without it, the FIRST RequestOutput a cold request ever produces is
+            // its first DECODE token (processGenResponses is the only other emitter),
+            // so a consumer measuring the admitted→first-token window collapses it to
+            // ~0 (the provider's observed_prefill_tps EWMA then stays stuck at 0 and
+            // the coordinator falls back to a ~23x-pessimistic prefill estimate).
+            // newTokenIds:[] / newText:"" / finished:false ⇒ a pure marker: not a
+            // decoded token, not a terminal, and never forwarded as content (the
+            // provider bridge yields a chunk only for non-empty newText). It also
+            // lets the provider stamp admittedAt at real prefill start, which fixes
+            // the wedge detector's blindness to prefill-stage stalls and stops the
+            // pending-timeout watchdog from treating a long prefill as a queue
+            // timeout. Warm / prefix-cache hits still emit the marker, but the
+            // provider's cold-only guard skips the resulting (unrepresentative)
+            // sample.
+            output.outputs.append(RequestOutput(
+                requestId: r.requestId,
+                promptTokens: r.numPromptTokens
+            ))
         }
         if !newScheduled.isEmpty || genBatch != nil { output.hasWork = true }
 
