@@ -13,7 +13,11 @@ import MLXNN
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(a.dtype)
+    // Keep g in fp32 (do not downcast to a.dtype). g/beta inheriting bf16 from
+    // the input tensors forces a Metal kernel recompile between turns vs the
+    // fp32 SSM state, which triggers a use-after-free when reusing
+    // QuantizedKVCache. Upstream 93cf322.
+    return decay
 }
 
 // MARK: - Metal Kernel
@@ -75,6 +79,8 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
                 if (thread_index_in_simdgroup == 0) {
                   y[dv_idx] = static_cast<InT>(out);
                 }
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
               }
               // Increment data pointers to next time step
               q_ += Hk * Dk;
@@ -210,7 +216,7 @@ private func gatedDeltaStepOps(
         state = MLX.where(expandedMask, state, oldState)
     }
 
-    return (y, state)
+    return (y.asType(q.dtype), state)
 }
 
 func gatedDeltaOps(
@@ -238,7 +244,7 @@ func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
@@ -281,7 +287,7 @@ func gatedDeltaUpdate(
     state: MLXArray? = nil,
     mask: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
+    let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
     let B = q.dim(0)
