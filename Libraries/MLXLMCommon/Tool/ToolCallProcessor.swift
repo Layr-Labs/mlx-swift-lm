@@ -77,6 +77,17 @@ public class ToolCallProcessor {
         return processTaggedChunk(chunk)
     }
 
+    /// Drain all extracted tool calls in parse (FIFO) order, clearing the queue.
+    ///
+    /// Prefer this over reading/`popLast()`-ing `toolCalls` directly: it emits
+    /// every complete tool call from a multi-call turn exactly once and in
+    /// order. Upstream 1335fb5.
+    public func drainToolCalls() -> [ToolCall] {
+        let drained = toolCalls
+        toolCalls = []
+        return drained
+    }
+
     /// Process end-of-sequence, parsing any buffered content as tool call(s).
     ///
     /// Call this when generation ends (e.g., on EOS token) to handle formats
@@ -85,17 +96,31 @@ public class ToolCallProcessor {
     ///
     /// For formats with end tags that appear in the text stream, the buffer
     /// will already be empty at generation end, making this a no-op.
-    public func processEOS() {
-        guard state == .collectingToolCall || state == .potentialToolCall else { return }
+    ///
+    /// - Parameter returnBufferedText: when `true`, if the residual buffer did
+    ///   not parse into any tool call it is returned as ordinary text instead of
+    ///   being discarded (it was withheld only while probing for a tool call).
+    /// - Returns: residual non-tool text when `returnBufferedText` is `true`,
+    ///   otherwise `nil`.
+    @discardableResult
+    public func processEOS(returnBufferedText: Bool = false) -> String? {
+        guard state == .collectingToolCall || state == .potentialToolCall else { return nil }
         guard !toolCallBuffer.isEmpty else {
             state = .normal
-            return
+            return nil
         }
 
-        toolCalls.append(contentsOf: parser.parseEOS(toolCallBuffer, tools: tools))
+        let parsed = parser.parseEOS(toolCallBuffer, tools: tools)
+        toolCalls.append(contentsOf: parsed)
 
+        let buffered = toolCallBuffer
         toolCallBuffer = ""
         state = .normal
+
+        if returnBufferedText && parsed.isEmpty {
+            return buffered
+        }
+        return nil
     }
 
     // MARK: - Private Methods
@@ -161,12 +186,38 @@ public class ToolCallProcessor {
     }
 
     /// Check whether open/close braces are balanced in the string.
+    ///
+    /// String-aware: braces inside a JSON string value (and escaped quotes) are
+    /// ignored, so streaming content like `{"path": "a}b"` is not treated as a
+    /// complete object the moment the in-string `}` arrives. A naive counter
+    /// would prematurely flush partial JSON and corrupt the tool call. The
+    /// result also requires the scanner to not end mid-string. (Upstream 1335fb5
+    /// inString/isEscaped scanner, re-derived for our multi-tag processor.)
     private func jsonBracesBalanced(_ text: String) -> Bool {
         var depth = 0
+        var inString = false
+        var isEscaped = false
         for ch in text {
-            if ch == "{" { depth += 1 } else if ch == "}" { depth -= 1 }
+            if isEscaped {
+                isEscaped = false
+                continue
+            }
+            if ch == "\\" {
+                if inString { isEscaped = true }
+                continue
+            }
+            if ch == "\"" {
+                inString.toggle()
+                continue
+            }
+            if inString { continue }
+            if ch == "{" {
+                depth += 1
+            } else if ch == "}" {
+                depth -= 1
+            }
         }
-        return depth == 0
+        return depth == 0 && !inString
     }
 
     /// Process chunk for tagged formats.

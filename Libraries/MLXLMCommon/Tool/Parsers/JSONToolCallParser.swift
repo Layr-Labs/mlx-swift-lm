@@ -33,6 +33,24 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
             let function = try? JSONDecoder().decode(ToolCall.Function.self, from: data)
         else { return nil }
 
+        // If tool schemas are provided, only accept calls to declared tools.
+        // Bare JSON objects that merely look like {"name":..,"arguments":..}
+        // should not be misparsed as tool calls. Upstream 1335fb5.
+        if let tools, !tools.isEmpty {
+            var isDeclaredTool = false
+            for tool in tools {
+                let functionSpec = tool["function"] as? [String: any Sendable]
+                if functionSpec?["name"] as? String == function.name {
+                    isDeclaredTool = true
+                    break
+                }
+            }
+
+            guard isDeclaredTool else {
+                return nil
+            }
+        }
+
         return ToolCall(function: function)
     }
 }
