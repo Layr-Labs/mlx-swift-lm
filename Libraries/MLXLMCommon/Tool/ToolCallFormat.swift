@@ -100,16 +100,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
     case glm4
 
-    /// Gemma function call format.
+    /// Gemma function call format. Our `GemmaFunctionParser` accepts BOTH the
+    /// older Gemma (`<start_function_call>`) and the newer Gemma4 (`<|tool_call>`)
+    /// tag styles plus both escape markers, so this single case is a superset of
+    /// upstream's separate `.gemma`/`.gemma4` formats (8c61800). `gemma4`
+    /// model_types resolve here by design — see the infer() prefix below.
     /// Example: `<|tool_call>call:name{key:value,k:<|"|>str<|"|>}<tool_call|>`
     case gemma
-
-    /// Gemma4 function call format (newer `<|tool_call>` wrapper + `<|"|>` escape).
-    /// Example: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>`
-    /// Our `GemmaFunctionParser` already accepts both the Gemma and Gemma4 tag
-    /// styles, so this maps to the same parser; the distinct case exists for
-    /// API parity with upstream and explicit `format: "gemma4"` configs. (8c61800)
-    case gemma4
 
     /// Kimi K2 format with functions prefix.
     /// Example: `functions.name:0<|tool_call_argument_begin|>{"key": "value"}`
@@ -147,8 +144,6 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
-            return GemmaFunctionParser()
-        case .gemma4:
             return GemmaFunctionParser()
         case .kimiK2:
             return KimiK2ToolCallParser()
@@ -207,12 +202,11 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .glm4
         }
 
-        // Gemma4 (check before the generic gemma prefix). Upstream 8c61800.
-        if type.hasPrefix("gemma4") {
-            return .gemma4
-        }
-
-        // Gemma
+        // Gemma family. `gemma4` (and `gemma4_text`, etc.) intentionally resolve
+        // to the unified `.gemma` format -- our GemmaFunctionParser handles the
+        // Gemma4 `<|tool_call>` tags too, so we do not need upstream's separate
+        // `.gemma4` format (8c61800). This is enforced by ToolTests /
+        // ToolCallParserIntegrationTests.
         if type.hasPrefix("gemma") {
             return .gemma
         }
