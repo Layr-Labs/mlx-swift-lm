@@ -198,6 +198,13 @@ public struct RequestOutput: Sendable {
     public var cachedTokens: Int
     /// Error message.
     public var error: String?
+    /// When false, a downstream `RequestOutputCollector` MUST deliver this output
+    /// as its own discrete unit and never coalesce it with an adjacent output
+    /// (`mergeOutputs`). Set on the prefill-start admission marker so admission and
+    /// the first decoded token are not merged into a single output — which would
+    /// collapse the admitted→first-token window the marker exists to measure.
+    /// Defaults to true, so every ordinary streaming output aggregates as before.
+    public var coalesceable: Bool
 
     public init(
         requestId: String,
@@ -210,7 +217,8 @@ public struct RequestOutput: Sendable {
         promptTokens: Int = 0,
         completionTokens: Int = 0,
         cachedTokens: Int = 0,
-        error: String? = nil
+        error: String? = nil,
+        coalesceable: Bool = true
     ) {
         self.requestId = requestId
         self.newTokenIds = newTokenIds
@@ -223,6 +231,7 @@ public struct RequestOutput: Sendable {
         self.completionTokens = completionTokens
         self.cachedTokens = cachedTokens
         self.error = error
+        self.coalesceable = coalesceable
     }
 
     public var usage: (promptTokens: Int, completionTokens: Int, totalTokens: Int) {

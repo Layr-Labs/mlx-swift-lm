@@ -199,6 +199,41 @@ final class CBCheckpointRestoreTests: XCTestCase {
         XCTAssertEqual(warmOut, coldOut, "restore@4 must match cold output")
     }
 
+    // The prefill-start admission marker must carry `cachedTokens` so a restored
+    // checkpoint / prefix-cache hit is not misread as a cold prefill. A restore
+    // sets r.cachedTokens>0; the marker emitted at admit must report it (not the 0
+    // default), and report the FULL prompt so a consumer subtracts the cached
+    // prefix instead of charging the whole prompt as cold prefill.
+    func testAdmissionMarkerCarriesCachedTokensOnRestore() {
+        let window = 8
+        let prompt = Array(0..<12).map { $0 % 16 }   // 12-token prompt
+        let maxTokens = 6
+
+        // Cold run captures a checkpoint at L=8.
+        let coldSched = makeRestoreScheduler(window: window)
+        coldSched.checkpointBoundaries = [4, 8]
+        final class Cap: @unchecked Sendable { var atL: [Int: [any KVCache]] = [:] }
+        let cap = Cap()
+        coldSched.onCheckpointCapture = { _, length, caches in cap.atL[length] = caches }
+        _ = runOutputs(coldSched, makeIntRequest(tokens: prompt, maxTokens: maxTokens))
+        guard let restoredAt8 = cap.atL[8] else { return XCTFail("expected a capture at L=8") }
+
+        // Restore run: admit and inspect the marker emitted at the admit step.
+        let warmSched = makeRestoreScheduler(window: window)
+        let req = makeIntRequest(id: "warm", tokens: prompt, maxTokens: maxTokens)
+        req.restoredCheckpoint = (caches: restoredAt8.map { $0.copy() }, tokenCount: 8)
+        warmSched.addRequest(req)
+
+        let admit = warmSched.step()
+        let markers = admit.outputs.filter { $0.requestId == "warm" && $0.newTokenIds.isEmpty }
+        XCTAssertEqual(markers.count, 1, "exactly one admission marker at the admit step")
+        XCTAssertEqual(req.cachedTokens, 8, "restore reports 8 cached prompt tokens")
+        XCTAssertEqual(markers[0].cachedTokens, 8,
+                       "marker must carry r.cachedTokens (the restored prefix), not the 0 default")
+        XCTAssertEqual(markers[0].promptTokens, prompt.count,
+                       "marker reports the FULL prompt so a consumer excludes only the cached portion")
+    }
+
     // ISOLATION: a request with no restoredCheckpoint behaves exactly as
     // before (cold prefill), even when the scheduler COULD restore.
     func testNoRestoredCheckpointIsCold() {
