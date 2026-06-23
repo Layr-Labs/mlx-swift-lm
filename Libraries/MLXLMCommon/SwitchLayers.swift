@@ -7,7 +7,7 @@ import MLXNN
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
 /// Fusing activation + product into one compiled, shapeless kernel cuts kernel
 /// dispatches and intermediates on the hot decode path. Upstream ef85ed0.
-private let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+public let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
     shapeless: true
 ) { gate, up in
     MLXNN.silu(gate) * up
