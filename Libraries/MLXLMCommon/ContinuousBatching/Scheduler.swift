@@ -429,12 +429,26 @@ public final class Scheduler: @unchecked Sendable {
             // lets the provider stamp admittedAt at real prefill start, which fixes
             // the wedge detector's blindness to prefill-stage stalls and stops the
             // pending-timeout watchdog from treating a long prefill as a queue
-            // timeout. Warm / prefix-cache hits still emit the marker, but the
-            // provider's cold-only guard skips the resulting (unrepresentative)
-            // sample.
+            // timeout.
+            //
+            //   * coalesceable:false — the marker MUST reach the consumer as its own
+            //     discrete output. RequestOutputCollector(aggregate:true) would
+            //     otherwise merge it with the first token output if the consumer
+            //     hasn't drained it before prefill completes (slow/backpressured
+            //     stream, or a short cold prompt), re-collapsing admission and
+            //     first-token into one output and defeating the measurement.
+            //   * cachedTokens:r.cachedTokens — a prefix-cache hit / restored
+            //     checkpoint sets r.cachedTokens>0; carrying it (instead of the 0
+            //     default) keeps the marker consistent with the request's decode
+            //     outputs so a consumer can exclude the cached portion and not
+            //     misclassify a warm request as a cold prefill. Warm / cache-hit
+            //     requests still emit the marker; the provider's cold-only guard
+            //     skips the resulting (unrepresentative) sample.
             output.outputs.append(RequestOutput(
                 requestId: r.requestId,
-                promptTokens: r.numPromptTokens
+                promptTokens: r.numPromptTokens,
+                cachedTokens: r.cachedTokens,
+                coalesceable: false
             ))
         }
         if !newScheduled.isEmpty || genBatch != nil { output.hasWork = true }
