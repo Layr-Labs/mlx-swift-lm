@@ -1,8 +1,9 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import MLXNN
 import XCTest
+
+@testable import MLXLMCommon
 
 final class ContinuousBatchingTests: XCTestCase {
 
@@ -72,7 +73,7 @@ final class ContinuousBatchingTests: XCTestCase {
     }
 
     func testArraysCacheAdvancesLengthsForChunkedPrefill() {
-        let cache = ArraysCache(size: 1)
+        let cache = ArraysCache(size: 1, leftPadding: [0, 3])
         cache.prepare(lengths: [3, 5])
 
         XCTAssertEqual(
@@ -90,6 +91,59 @@ final class ContinuousBatchingTests: XCTestCase {
                 true, false, false,
                 true, true, true,
             ])
+        // leftPadding should remain fixed while lengths tracks chunk progress.
+        XCTAssertEqual(cache.metaState.last, "0,3")
+    }
+
+    func testArraysCacheMasksRightPaddingBeforeLeftPaddingDuringPrefill() {
+        let cache = ArraysCache(size: 1, leftPadding: [0, 3])
+        cache.prepare(lengths: [3, 5])
+
+        XCTAssertEqual(
+            cache.makeMask(N: 5)?.asArray(Bool.self),
+            [
+                true, true, true, false, false,
+                true, true, true, true, true,
+            ])
+
+        let mamba = MambaCache(leftPadding: [0, 3])
+        mamba.prepare(lengths: [3, 5])
+
+        XCTAssertEqual(
+            mamba.makeMask(N: 5)?.asArray(Bool.self),
+            [
+                true, true, true, false, false,
+                true, true, true, true, true,
+            ])
+    }
+
+    func testBatchedCacheListForwardsSSMPrefillMetadata() {
+        let mamba = MambaCache(leftPadding: [0, 3])
+        let attention = BatchKVCache(leftPadding: [0, 0])
+        let composite = BatchedCacheList(caches: [mamba, attention])
+
+        composite.prepareBatched(leftPadding: nil, lengths: [3, 5], rightPadding: [2, 0])
+
+        XCTAssertEqual(
+            mamba.makeMask(N: 5)?.asArray(Bool.self),
+            [
+                true, true, true, false, false,
+                true, true, true, true, true,
+            ])
+
+        composite.advanceBatched(2)
+
+        XCTAssertEqual(
+            mamba.makeMask(N: 3)?.asArray(Bool.self),
+            [
+                true, false, false,
+                true, true, true,
+            ])
+        // leftPadding should remain fixed while lengths tracks chunk progress.
+        XCTAssertEqual(mamba.metaState.last, "0,3")
+
+        composite.finalizeBatched()
+        XCTAssertNil(mamba.makeMask(N: 3))
     }
 
     func testSequenceStateMachineMatchesMultiTokenStopsAndTransitions() {
@@ -145,8 +199,94 @@ final class ContinuousBatchingTests: XCTestCase {
         }
     }
 
-    func testBatchGeneratorAdmitsQueuedRowsAndReportsFinishReasons() {
-        let generator = BatchGenerator(
+    func testBatchGeneratorAcceptsSupportedCacheTopologies() throws {
+        _ = try BatchGenerator(
+            model: CacheTopologyLanguageModel { _ in [KVCacheSimple()] }
+        )
+
+        _ = try BatchGenerator(
+            model: CacheTopologyLanguageModel { _ in [ArraysCache(size: 3)] }
+        )
+
+        _ = try BatchGenerator(
+            model: CacheTopologyLanguageModel { _ in [MambaCache()] }
+        )
+
+        _ = try BatchGenerator(
+            model: CacheTopologyLanguageModel { _ in [RotatingKVCache(maxSize: 8, keep: 0)] }
+        )
+
+        _ = try BatchGenerator(
+            model: CacheTopologyLanguageModel { _ in [CacheList(MambaCache(), KVCacheSimple())] }
+        )
+    }
+
+    func testBatchGeneratorRejectsUnsupportedCacheTopologies() {
+        assertBatchGeneratorRejectsCache(
+            QuantizedKVCache(),
+            expectedType: "QuantizedKVCache",
+            expectedPath: "layer"
+        )
+        assertBatchGeneratorRejectsCache(
+            ChunkedKVCache(),
+            expectedType: "ChunkedKVCache",
+            expectedPath: "layer"
+        )
+        assertBatchGeneratorRejectsCache(
+            RotatingKVCache(maxSize: 8, keep: 4),
+            expectedType: "RotatingKVCache",
+            expectedPath: "layer"
+        )
+        assertBatchGeneratorRejectsCache(
+            CacheList(MambaCache(), QuantizedKVCache()),
+            expectedType: "QuantizedKVCache",
+            expectedPathContains: "children"
+        )
+    }
+
+    func testBatchGeneratorPassesCacheParametersToModel() throws {
+        let model = CacheTopologyLanguageModel { _ in [KVCacheSimple()] }
+
+        _ = try BatchGenerator(
+            model: model,
+            cacheParameters: GenerateParameters(maxKVSize: 17)
+        )
+
+        XCTAssertEqual(model.receivedParameters?.maxKVSize, 17)
+    }
+
+    func testBatchGeneratorRejectsUnsupportedCacheParameters() {
+        XCTAssertThrowsError(
+            try BatchGenerator(
+                model: IncrementingLanguageModel(),
+                cacheParameters: GenerateParameters(maxKVSize: 17)
+            )
+        ) { error in
+            guard
+                case BatchGeneratorError.unsupportedCacheTopology(
+                    _,
+                    let
+                        path,
+                    let
+                        cacheType,
+                    let
+                        reason
+                ) = error
+            else {
+                XCTFail(
+                    "Expected BatchGeneratorError.unsupportedCacheTopology, got \(error)"
+                )
+                return
+            }
+
+            XCTAssertEqual(path, "layer")
+            XCTAssertEqual(cacheType, "RotatingKVCache")
+            XCTAssertTrue(reason.contains("keep tokens"))
+        }
+    }
+
+    func testBatchGeneratorAdmitsQueuedRowsAndReportsFinishReasons() throws {
+        let generator = try BatchGenerator(
             model: IncrementingLanguageModel(),
             eosTokens: [[5]],
             defaultMaxTokens: 4,
@@ -181,8 +321,8 @@ final class ContinuousBatchingTests: XCTestCase {
         XCTAssertFalse(generator.hasWork)
     }
 
-    func testBatchGeneratorCancelRemovesQueuedRequest() {
-        let generator = BatchGenerator(
+    func testBatchGeneratorCancelRemovesQueuedRequest() throws {
+        let generator = try BatchGenerator(
             model: IncrementingLanguageModel(),
             defaultMaxTokens: 3,
             prefillBatchSize: 1,
@@ -206,8 +346,8 @@ final class ContinuousBatchingTests: XCTestCase {
         XCTAssertEqual(seenUIDs, [uids[0]])
     }
 
-    func testBatchGeneratorCancelRemovesActiveRequest() {
-        let generator = BatchGenerator(
+    func testBatchGeneratorCancelRemovesActiveRequest() throws {
+        let generator = try BatchGenerator(
             model: IncrementingLanguageModel(),
             defaultMaxTokens: 4,
             prefillBatchSize: 2,
@@ -232,6 +372,51 @@ final class ContinuousBatchingTests: XCTestCase {
 
         XCTAssertFalse(laterUIDs.contains(uids[0]))
         XCTAssertTrue(laterUIDs.contains(uids[1]))
+    }
+}
+
+private func assertBatchGeneratorRejectsCache(
+    _ cache: any KVCache,
+    expectedType: String,
+    expectedPath: String? = nil,
+    expectedPathContains: String? = nil,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    let model = CacheTopologyLanguageModel { _ in [cache] }
+
+    XCTAssertThrowsError(
+        try BatchGenerator(model: model),
+        file: file,
+        line: line
+    ) { error in
+        guard
+            case BatchGeneratorError.unsupportedCacheTopology(
+                _,
+                let
+                    path,
+                let
+                    cacheType,
+                let
+                    reason
+            ) = error
+        else {
+            XCTFail(
+                "Expected BatchGeneratorError.unsupportedCacheTopology, got \(error)",
+                file: file,
+                line: line
+            )
+            return
+        }
+
+        if let expectedPath {
+            XCTAssertEqual(path, expectedPath, file: file, line: line)
+        }
+        if let expectedPathContains {
+            XCTAssertTrue(path.contains(expectedPathContains), file: file, line: line)
+        }
+        XCTAssertEqual(cacheType, expectedType, file: file, line: line)
+        XCTAssertFalse(reason.isEmpty, file: file, line: line)
     }
 }
 
@@ -294,5 +479,27 @@ private final class IncrementingLanguageModel: Module, LanguageModel, KVCacheDim
         }
 
         return MLXArray(logits).reshaped([batchSize, sequenceLength, vocabularySize])
+    }
+}
+
+private final class CacheTopologyLanguageModel: Module, LanguageModel {
+    private let cacheFactory: (GenerateParameters?) -> [any KVCache]
+    private(set) var receivedParameters: GenerateParameters?
+
+    init(_ cacheFactory: @escaping (GenerateParameters?) -> [any KVCache]) {
+        self.cacheFactory = cacheFactory
+    }
+
+    func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        fatalError("CacheTopologyLanguageModel is only used for cache topology tests")
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        receivedParameters = parameters
+        return cacheFactory(parameters)
     }
 }
