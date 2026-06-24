@@ -89,6 +89,39 @@ public final class EngineCore: @unchecked Sendable {
     private var _startTime: Date?
     public private(set) var stepsExecuted: Int = 0
 
+    // Idle-clear instrumentation (MEASUREMENT ONLY) — the `Stream().synchronize()`
+    // + `Memory.clearCache()` hand-off is the M4 kernel-panic race flagged below
+    // (candidate #1 for the first-token wedge: it runs right after load, and a
+    // lost race vs IOKit's async `completeMemory()` can leave the Metal queue
+    // stuck so the next forced `eval` wedges). These mark when a clear is in
+    // flight so a clear that never exits pins the race as the trigger. Written
+    // only on the engine loop / engineQueue (like `stepsExecuted`); read
+    // lock-free from the heartbeat (benign diagnostic race).
+    public private(set) var idleClearInFlight: Bool = false
+    public private(set) var idleClearsCompleted: Int = 0
+    private var idleClearStartedNanos: UInt64 = 0
+    /// Milliseconds the current idle clear has been running, or 0 if none. A
+    /// value in the seconds range with no matching exit is the clearCache wedge.
+    public var idleClearElapsedMs: Int64 {
+        guard idleClearInFlight, idleClearStartedNanos != 0 else { return 0 }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now > idleClearStartedNanos else { return 0 }
+        return Int64((now &- idleClearStartedNanos) / 1_000_000)
+    }
+
+    /// Run the GPU drain + buffer-cache flush with the idle-clear marker set, so
+    /// a wedge inside `synchronize`/`clearCache` is visible (flag stays true,
+    /// `idleClearElapsedMs` climbs). The two call sites (idle window + post-abort
+    /// reclaim) share this so neither can wedge unobserved.
+    private func synchronizeAndClearCache() {
+        idleClearStartedNanos = DispatchTime.now().uptimeNanoseconds
+        idleClearInFlight = true
+        Stream().synchronize()
+        Memory.clearCache()
+        idleClearInFlight = false
+        idleClearsCompleted += 1
+    }
+
     // Steps spent idle after the last active request completed.
     // After `deferredClearDelay` idle steps we flush the Metal buffer cache
     // to reclaim GPU memory. The delay prevents races with IOKit's async
@@ -460,8 +493,7 @@ public final class EngineCore: @unchecked Sendable {
                             // the OS here rather than waiting for the idle clear, which
                             // never fires under sustained load. The step gate above
                             // coalesces bursts so cancel churn can't sync every step.
-                            Stream().synchronize()
-                            Memory.clearCache()
+                            synchronizeAndClearCache()
                         }
 
                         continuation.resume()
@@ -473,8 +505,7 @@ public final class EngineCore: @unchecked Sendable {
                 // reclaim GPU memory. The delay avoids races with IOKit's
                 // async completeMemory() callbacks (M4 kernel-panic fix).
                 if _idleSteps == Self.deferredClearDelay {
-                    Stream().synchronize()
-                    Memory.clearCache()
+                    synchronizeAndClearCache()
                 }
                 try? await Task.sleep(nanoseconds: UInt64(config.stepInterval * 1_000_000_000))
             }
