@@ -48,6 +48,28 @@ public enum GPTOSSPipelineShardLoader {
         return (shard, config.hiddenLayers)
     }
 
+    /// TEST HELPER: load the FULL (monolithic) GPT-OSS model from `directory`,
+    /// returning it plus the layer count. Mirrors
+    /// `LlamaPipelineShardLoader.loadFullModel` — used by the shard smoke test to
+    /// get a reference forward pass against a (tiny, synthetic) checkpoint.
+    ///
+    /// Reuses `MLXLMCommon.loadWeights`, so the model's own `sanitize` runs (for
+    /// an FP / non-quantized synthetic checkpoint whose expert keys already carry
+    /// `gate_proj.weight`, `sanitize` early-returns and no MoE unpack happens).
+    public static func loadFullModel(_ directory: URL)
+        throws -> (model: GPTOSSModel, totalLayers: Int)
+    {
+        let configURL = directory.appending(component: "config.json")
+        let data = try Data(contentsOf: configURL)
+        let config = try JSONDecoder.json5().decode(GPTOSSConfiguration.self, from: data)
+        let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
+        let model = GPTOSSModel(config)
+        try loadWeights(
+            modelDirectory: directory, model: model,
+            perLayerQuantization: base.perLayerQuantization)
+        return (model, config.hiddenLayers)
+    }
+
     public static func load(
         directory: URL,
         config: GPTOSSConfiguration,
