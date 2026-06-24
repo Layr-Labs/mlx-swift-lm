@@ -45,11 +45,22 @@ public final class BatchedEngine: @unchecked Sendable {
         let prefixCache = config.prefixCacheConfig.map {
             PrefixCache(config: $0, modelName: context.configuration.name)
         }
+        // Resolve extraEOSTokens strings (e.g. "<turn|>" for Gemma 4) into token IDs
+        // and merge them with the IDs loaded from config.json/generation_config.json.
+        // Evaluate.swift does the same in buildStopTokenIds(); the batched path must
+        // mirror it or models whose EOS is configured via extraEOSTokens (not config.json)
+        // will never stop generating — causing repeating output and runaway tool-call turns.
+        var eosTokenIds = context.configuration.eosTokenIds
+        for token in context.configuration.extraEOSTokens {
+            if let id = context.tokenizer.convertTokenToId(token) {
+                eosTokenIds.insert(id)
+            }
+        }
         let scheduler = Scheduler(
             model: context.model,
             tokenizer: context.tokenizer,
             config: config.schedulerConfig,
-            eosTokenIds: context.configuration.eosTokenIds,
+            eosTokenIds: eosTokenIds,
             prefixCache: prefixCache
         )
         // Load chat_template.jinja if the tokenizer lacks an embedded chat template.
