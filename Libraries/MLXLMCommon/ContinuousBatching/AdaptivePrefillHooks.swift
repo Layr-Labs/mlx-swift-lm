@@ -27,6 +27,15 @@ public struct ColdPrefillChunkSample: Sendable, Equatable {
     public let actualChunkSize: Int
     public let batchSize: Int
     public let totalTokens: Int
+    /// KV-cache length (in tokens) BEFORE this chunk was prefilled, i.e. the
+    /// position at which this chunk starts. 0 marks the first chunk of a cold
+    /// prefill; any value > 0 means earlier chunks of the same prompt already
+    /// populated the cache, so the per-chunk cost carries the O(N²) attention
+    /// growth of those earlier positions. Consumers that calibrate chunk size
+    /// on measured ms/token MUST gate on `positionOffset == 0` so the
+    /// position-dependent attention cost can never masquerade as a chunk-size
+    /// effect. For batch > 1 this is the maximum row length before the chunk.
+    public let positionOffset: Int
     public let durationSeconds: Double
     public let decodeBatchSize: Int
     public let cappedByBudget: Bool
@@ -38,6 +47,7 @@ public struct ColdPrefillChunkSample: Sendable, Equatable {
         actualChunkSize: Int,
         batchSize: Int,
         totalTokens: Int,
+        positionOffset: Int = 0,
         durationSeconds: Double,
         decodeBatchSize: Int,
         cappedByBudget: Bool,
@@ -48,6 +58,7 @@ public struct ColdPrefillChunkSample: Sendable, Equatable {
         self.actualChunkSize = actualChunkSize
         self.batchSize = batchSize
         self.totalTokens = totalTokens
+        self.positionOffset = positionOffset
         self.durationSeconds = durationSeconds
         self.decodeBatchSize = decodeBatchSize
         self.cappedByBudget = cappedByBudget
