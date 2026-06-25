@@ -279,6 +279,12 @@ public final class Scheduler: @unchecked Sendable {
     /// Checkpoint boundaries for capture, derived from the model's sliding
     /// window. Empty ⇒ capture disabled even if the hook is set.
     public var checkpointBoundaries: [Int] = []
+    /// Optional embedder-owned cold-prefill chunk sizer. Nil preserves the fixed
+    /// `config.prefillStepSize` behavior exactly.
+    public var adaptivePrefillChunkSizer: (@Sendable (PrefillChunkContext) -> Int)?
+    /// Optional cold-prefill sample sink. Only the cold pending-prefill path calls
+    /// this; prefix-cache warm paths and checkpoint restores bypass it.
+    public var onColdPrefillChunk: (@Sendable (ColdPrefillChunkSample) -> Void)?
 
     public private(set) var numRequestsProcessed: Int = 0
     public private(set) var totalPromptTokens: Int = 0
@@ -474,8 +480,18 @@ public final class Scheduler: @unchecked Sendable {
 
         // Budget: how many prefill tokens we're allowed this step.
         let prefillBudget = max(1, config.maxNumBatchedTokens - decodeBatchSize)
+        let defaultChunkSize = min(config.prefillStepSize, prefillBudget, maxRemaining)
+        let requestedChunkSize = max(1, adaptivePrefillChunkSizer?(PrefillChunkContext(
+            configuredStepSize: config.prefillStepSize,
+            maxNumBatchedTokens: config.maxNumBatchedTokens,
+            decodeBatchSize: decodeBatchSize,
+            maxRemaining: maxRemaining,
+            defaultChunkSize: defaultChunkSize
+        )) ?? config.prefillStepSize)
         // Chunk size: never exceed the per-step budget or the remaining work.
-        var chunkSize = min(config.prefillStepSize, prefillBudget, maxRemaining)
+        var chunkSize = min(requestedChunkSize, prefillBudget, maxRemaining)
+        let cappedByBudget = requestedChunkSize > prefillBudget
+        let cappedByRemaining = min(requestedChunkSize, prefillBudget) > maxRemaining
 
         // Checkpoint capture (hybrid models, B==1, hook installed): cap the
         // chunk so the prefilled count lands exactly on a checkpoint boundary,
@@ -483,6 +499,7 @@ public final class Scheduler: @unchecked Sendable {
         // chunk; default path below is untouched when inactive.
         var captureAt: Int? = nil
         let captureActive = checkpointCaptureActive(pp)
+        var cappedByCheckpoint = false
         if captureActive {
             // The cache covers (full prompt length - remaining) tokens so far.
             // For B==1 the single row's prompt length is its seed + its
@@ -494,16 +511,33 @@ public final class Scheduler: @unchecked Sendable {
                 remaining: pp.remaining.first?.count ?? 0,
                 boundaries: checkpointBoundaries
             )
+            cappedByCheckpoint = step.chunk < chunkSize
             chunkSize = step.chunk
             captureAt = step.captureAt
         }
 
         let chunks = pp.remaining.map { Array($0.prefix(chunkSize)) }
 
+        let started = DispatchTime.now().uptimeNanoseconds
         pp.ppBatch.prompt(chunks)
+        let elapsedNanos = DispatchTime.now().uptimeNanoseconds - started
 
         pp.remaining = zip(pp.remaining, chunks).map { rem, chunk in
             Array(rem.dropFirst(chunk.count))
+        }
+
+        if let onColdPrefillChunk {
+            onColdPrefillChunk(ColdPrefillChunkSample(
+                requestedChunkSize: requestedChunkSize,
+                actualChunkSize: chunkSize,
+                batchSize: chunks.count,
+                totalTokens: chunks.reduce(0) { $0 + $1.count },
+                durationSeconds: Double(elapsedNanos) / 1_000_000_000.0,
+                decodeBatchSize: decodeBatchSize,
+                cappedByBudget: cappedByBudget,
+                cappedByCheckpoint: cappedByCheckpoint,
+                cappedByRemaining: cappedByRemaining
+            ))
         }
 
         // Fire the capture hook AFTER the chunk is prefilled (so the cache
@@ -827,7 +861,9 @@ public final class Scheduler: @unchecked Sendable {
                 promptCache: batchCache,
                 tokens: Array(repeating: [], count: cold.count),
                 maxTokens: cold.map { $0.request.maxTokens },
-                prefillStepSize: config.prefillStepSize,
+                prefillStepSize: adaptivePrefillChunkSizer == nil
+                    ? config.prefillStepSize
+                    : config.maxNumBatchedTokens,
                 samplers: cold.map { $0.sampler },
                 fallbackSampler: greedySampler,
                 stateMachines: cold.map { $0.machine }
