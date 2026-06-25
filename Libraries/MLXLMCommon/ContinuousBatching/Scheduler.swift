@@ -518,6 +518,12 @@ public final class Scheduler: @unchecked Sendable {
 
         let chunks = pp.remaining.map { Array($0.prefix(chunkSize)) }
 
+        // Cache length BEFORE this chunk is prefilled (max row for batch > 1).
+        // `prompt()` appends the chunk to `tokens`, so this must be read first.
+        // 0 ⇒ first chunk of the cold prefill; > 0 ⇒ later chunk carrying the
+        // O(N²) attention cost of the already-prefilled prefix.
+        let positionOffset = pp.ppBatch.tokens.map { $0.count }.max() ?? 0
+
         let started = DispatchTime.now().uptimeNanoseconds
         pp.ppBatch.prompt(chunks)
         let elapsedNanos = DispatchTime.now().uptimeNanoseconds - started
@@ -532,6 +538,7 @@ public final class Scheduler: @unchecked Sendable {
                 actualChunkSize: chunkSize,
                 batchSize: chunks.count,
                 totalTokens: chunks.reduce(0) { $0 + $1.count },
+                positionOffset: positionOffset,
                 durationSeconds: Double(elapsedNanos) / 1_000_000_000.0,
                 decodeBatchSize: decodeBatchSize,
                 cappedByBudget: cappedByBudget,
