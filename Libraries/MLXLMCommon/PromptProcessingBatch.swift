@@ -110,10 +110,12 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             inputs = MLXArray(flat).reshaped([promptTokens.count, maxLength])
         }
 
-        var remaining = inputs
-        while remaining.dim(1) > 0 {
-            let n = min(prefillStepSize, remaining.dim(1))
-            let chunk = remaining[0..., ..<n]
+        let totalLength = inputs.dim(1)
+        var processed = 0
+        while processed < totalLength {
+            let end = min(processed + prefillStepSize, totalLength)
+            let n = end - processed
+            let chunk = inputs[0..., processed ..< end]
             _ = model.callAsFunction(
                 chunk,
                 cache: promptCache.map { $0 as any KVCache }
@@ -124,10 +126,7 @@ public final class PromptProcessingBatch: @unchecked Sendable {
             for cache in promptCache {
                 cache.advanceBatched(n)
             }
-            if n == remaining.dim(1) {
-                break
-            }
-            remaining = remaining[0..., n...]
+            processed = end
         }
 
         if maxPadding > 0 {
