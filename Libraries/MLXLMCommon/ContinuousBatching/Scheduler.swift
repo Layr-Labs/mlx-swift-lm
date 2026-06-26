@@ -1283,29 +1283,42 @@ extension Scheduler {
             let tokenId = resp.token
             let isFinished = resp.finishReason != nil
 
-            let newText: String
+            // Token bookkeeping runs unconditionally: append the token to
+            // the request and feed it to the streaming detokenizer so its
+            // internal state stays consistent. For non-finished tokens, we
+            // defer `detok.next()` until AFTER the streamInterval gate —
+            // calling next() consumes the incremental text, so calling it on
+            // a skipped interval would discard the text for that token.
+            // Deferring lets next() return ALL accumulated text at once when
+            // the interval fires.
             if !isFinished {
                 request.appendOutputToken(tokenId)
                 tokenHistories[rid]?.append(tokenId)
                 var detok = activeDetokenizers[rid]!
                 detok.append(token: tokenId)
-                newText = detok.next() ?? ""
                 activeDetokenizers[rid] = detok
             } else if resp.finishReason == "length" {
                 request.appendOutputToken(tokenId)
                 tokenHistories[rid]?.append(tokenId)
-                newText = ""
-            } else {
-                newText = ""
             }
 
             var output: RequestOutput
 
             if isFinished {
+                // Flush any remaining accumulated text in the streaming
+                // detokenizer. With streamInterval > 1, the last 1-(N-1)
+                // tokens' text may still be buffered (append was called but
+                // next() was deferred). Drain it now so the terminal chunk
+                // carries the tail text the client hasn't seen yet.
+                var trailingText = ""
+                if var detok = activeDetokenizers[rid] {
+                    trailingText = detok.next() ?? ""
+                    activeDetokenizers[rid] = detok
+                }
                 output = RequestOutput(
                     requestId: rid,
                     newTokenIds: [],
-                    newText: newText,
+                    newText: trailingText,
                     outputTokenIds: request.outputTokenIds,
                     outputText: tokenizer.decode(tokenIds: request.outputTokenIds),
                     finished: true,
@@ -1340,6 +1353,14 @@ extension Scheduler {
                     finished: false
                 )
                 if !shouldSend { continue }
+
+                // Now consume the accumulated text — next() returns ALL
+                // decoded text since the last next() call, covering every
+                // token appended since the previous emission (up to
+                // streamInterval tokens' worth).
+                var detok = activeDetokenizers[rid]!
+                let newText = detok.next() ?? ""
+                activeDetokenizers[rid] = detok
 
                 output = RequestOutput(
                     requestId: rid,
