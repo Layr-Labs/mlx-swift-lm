@@ -141,8 +141,19 @@ public struct UserInput {
     public struct Processing: Sendable {
         public var resize: CGSize?
 
-        public init(resize: CGSize? = nil) {
+        /// Optional per-call overrides for the image resize budget. When set,
+        /// they replace the model's configured `min_pixels` / `max_pixels` for
+        /// this request; when `nil` the model configuration is used. This lets
+        /// a caller request the resolution a model was tuned for without
+        /// hard-coding pixel counts in the processor. (audio override from the
+        /// upstream hunk is dropped -- our fork doesn't carry audio support.)
+        public var minPixels: Int?
+        public var maxPixels: Int?
+
+        public init(resize: CGSize? = nil, minPixels: Int? = nil, maxPixels: Int? = nil) {
             self.resize = resize
+            self.minPixels = minPixels
+            self.maxPixels = maxPixels
         }
     }
 
@@ -202,6 +213,9 @@ public struct UserInput {
         self.prompt = .chat([
             .user(prompt, images: images, videos: videos)
         ])
+        // note: prompt.didSet is not triggered in init
+        self.images = images
+        self.videos = videos
         self.tools = tools
         self.additionalContext = additionalContext
     }
@@ -317,12 +331,18 @@ public struct UserInput {
         tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
     ) {
         self.prompt = prompt
+        // note: prompt.didSet is not triggered in init
         switch prompt {
         case .text, .messages:
             self.images = images
             self.videos = videos
-        case .chat:
-            break
+        case .chat(let messages):
+            self.images = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.images)
+            }
+            self.videos = messages.reduce(into: []) { result, message in
+                result.append(contentsOf: message.videos)
+            }
         }
         self.processing = processing
         self.tools = tools

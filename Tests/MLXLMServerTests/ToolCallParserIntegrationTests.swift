@@ -317,6 +317,74 @@ struct ToolCallParserIntegrationTests {
         #expect(tc.function.arguments["location"] == .string("Paris"))
     }
 
+    // MARK: - BatchedToolStreamHandler: Declared-Tool Filter (JSON)
+
+    /// A realistic OpenAI-style nested tool spec: `{"type":"function",
+    /// "function":{"name": ...}}`. The JSON parser's declared-tool filter reads
+    /// `tool["function"]["name"]` (upstream 1335fb5).
+    private func functionTool(named name: String) -> [String: any Sendable] {
+        [
+            "type": "function",
+            "function": [
+                "name": name,
+                "description": "test tool \(name)",
+            ] as [String: any Sendable],
+        ]
+    }
+
+    @Test("Declared JSON tool call is kept when its name matches a declared tool")
+    func batchedHandlerJSONDeclaredToolKept() throws {
+        let handler = BatchedToolStreamHandler(
+            format: .json, tools: [functionTool(named: "get_weather")])
+
+        let result = handler.processChunk(
+            "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}</tool_call>"
+        )
+        #expect(result == nil)
+
+        let toolCalls = handler.finish()
+        #expect(toolCalls.count == 1)
+
+        let tc = try #require(toolCalls.first)
+        #expect(tc.function.name == "get_weather")
+        #expect(tc.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("Undeclared JSON tool call is dropped when its name is not a declared tool")
+    func batchedHandlerJSONUndeclaredToolDropped() throws {
+        // Only `get_weather` is declared; the model emits a call to a tool that
+        // was never offered. Bare JSON that merely looks like a tool call must
+        // not be misparsed into one.
+        let handler = BatchedToolStreamHandler(
+            format: .json, tools: [functionTool(named: "get_weather")])
+
+        _ = handler.processChunk(
+            "<tool_call>{\"name\": \"transfer_funds\", \"arguments\": {\"amount\": 1000}}</tool_call>"
+        )
+
+        let toolCalls = handler.finish()
+        #expect(toolCalls.isEmpty)
+    }
+
+    @Test("Declared JSON tool call is kept when multiple tools are declared")
+    func batchedHandlerJSONDeclaredAmongMultipleKept() throws {
+        let handler = BatchedToolStreamHandler(
+            format: .json,
+            tools: [
+                functionTool(named: "get_weather"),
+                functionTool(named: "get_time"),
+            ])
+
+        _ = handler.processChunk(
+            "<tool_call>{\"name\": \"get_time\", \"arguments\": {\"timezone\": \"CET\"}}</tool_call>"
+        )
+
+        let toolCalls = handler.finish()
+        #expect(toolCalls.count == 1)
+        #expect(toolCalls.first?.function.name == "get_time")
+        #expect(toolCalls.first?.function.arguments["timezone"] == .string("CET"))
+    }
+
     // MARK: - BatchedToolStreamHandler: LFM2 Format
 
     @Test("BatchedToolStreamHandler extracts LFM2 Pythonic tool call")

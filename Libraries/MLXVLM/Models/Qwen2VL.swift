@@ -540,12 +540,16 @@ public struct Qwen2VLProcessor: UserInputProcessor {
         let images = images.map { MediaProcessing.apply($0, processing: processing) }
 
         // image_processing_qwen2_vl._preprocess
-
         let size = images[0].extent.size
+        let factor = config.patchSize * config.mergeSize
+        // Default to the image budget the model card recommends
+        // (1280 * 28 * 28), override-able via `processing`.
+        let maxPixels = processing?.maxPixels ?? min(config.maxPixels, 1280 * factor * factor)
         let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
             height: Int(size.height), width: Int(size.width),
-            factor: config.patchSize * config.mergeSize,
-            minPixels: config.minPixels, maxPixels: config.maxPixels)
+            factor: factor,
+            minPixels: processing?.minPixels ?? config.minPixels,
+            maxPixels: maxPixels)
         let resizedSize = CGSize(width: resizedWidth, height: resizedHeight)
 
         let processedImages = images.map { image in
@@ -714,7 +718,19 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
             inputIds: input.text.tokens, pixelValues: allPixels,
             frames: allFrames.isEmpty ? nil : allFrames)
 
-        let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
+        let prefillStepSize = windowSize ?? 512
+        let totalPositions = inputEmbeddings.dim(1)
+        var processed = 0
+        while totalPositions - processed > 1 {
+            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
+            let range = processed ..< (processed + chunkLength)
+            _ = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings[0..., range, 0...])
+            asyncEval(cache)
+            processed += chunkLength
+        }
+        eval(cache)
+        let result = languageModel(
+            nil, cache: cache, inputEmbedding: inputEmbeddings[0..., processed..., 0...])
 
         return .logits(result)
     }
@@ -909,18 +925,17 @@ public struct Qwen2VLMessageGenerator: MessageGenerator {
     public init() {}
 
     public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        // Image content MUST come BEFORE text in the content array, matching
+        // HuggingFace's apply_chat_template output for Qwen2.5-VL which emits
+        // <|vision_start|><|image_pad|><|vision_end|>{text}. Putting text first
+        // shifts image-token positions and skews MROPE position IDs, producing
+        // a deterministic ~9 px bbox offset vs the Python mlx-vlm reference.
         [
             "role": message.role.rawValue,
-            "content": [
-                ["type": "text", "text": message.content]
-            ]
-                // Messages format for Qwen 2 VL, Qwen 2.5 VL. May need to be adapted for other models.
-                + message.images.map { _ in
-                    ["type": "image"]
-                }
-                + message.videos.map { _ in
-                    ["type": "video"]
-                },
+            "content":
+                message.images.map { _ in ["type": "image"] }
+                + message.videos.map { _ in ["type": "video"] }
+                + [["type": "text", "text": message.content]],
         ]
     }
 }

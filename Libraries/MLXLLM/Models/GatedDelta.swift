@@ -13,7 +13,11 @@ import MLXNN
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(a.dtype)
+    // Keep g in fp32 (do not downcast to a.dtype). g/beta inheriting bf16 from
+    // the input tensors forces a Metal kernel recompile between turns vs the
+    // fp32 SSM state, which triggers a use-after-free when reusing
+    // QuantizedKVCache. Upstream 93cf322.
+    return decay
 }
 
 // MARK: - Metal Kernel
@@ -75,6 +79,8 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
                 if (thread_index_in_simdgroup == 0) {
                   y[dv_idx] = static_cast<InT>(out);
                 }
+              } else {
+                y[dv_idx] = static_cast<InT>(0);
               }
               // Increment data pointers to next time step
               q_ += Hk * Dk;
@@ -86,7 +92,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             }
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<InT>(state[i]);
+              o_state[s_idx] = static_cast<StT>(state[i]);
             }
         """
 
@@ -135,6 +141,7 @@ func gatedDeltaKernel(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
     let inputType = q.dtype
+    let stateType = state.dtype
 
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
@@ -153,6 +160,7 @@ func gatedDeltaKernel(
         inputs,
         template: [
             ("InT", inputType),
+            ("StT", stateType),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -161,7 +169,7 @@ func gatedDeltaKernel(
         grid: (32, Dv, B * Hv),
         threadGroup: (32, 4, 1),
         outputShapes: [[B, T, Hv, Dv], state.shape],
-        outputDTypes: [inputType, inputType]
+        outputDTypes: [inputType, stateType]
     )
 
     return (outputs[0], outputs[1])
@@ -208,7 +216,7 @@ private func gatedDeltaStepOps(
         state = MLX.where(expandedMask, state, oldState)
     }
 
-    return (y, state)
+    return (y.asType(q.dtype), state)
 }
 
 func gatedDeltaOps(
@@ -236,7 +244,7 @@ func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
@@ -268,7 +276,15 @@ func gatedDeltaOps(
 
 // MARK: - Public API
 
-func gatedDeltaUpdate(
+/// Shared gated-delta (GDN) recurrence for the Qwen3.5 / Qwen3-Next family.
+///
+/// This is the single source of truth for the recurrence: the LLM models
+/// (`Qwen35`, `Qwen3Next`) and the VLM `Qwen35` model all call it. It computes
+/// `g`/`beta` in fp32 and keeps the recurrent `state` in fp32 across the
+/// T-step recurrence (upstream c566c95 + 93cf322); bf16 state loses precision
+/// and, on the kernel path, forces a recompile vs. the fp32 state. `public`
+/// so `MLXVLM` can reuse it instead of carrying a private (drift-prone) copy.
+public func gatedDeltaUpdate(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -279,7 +295,7 @@ func gatedDeltaUpdate(
     state: MLXArray? = nil,
     mask: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
-    let beta = sigmoid(b)
+    let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
     let B = q.dim(0)
@@ -287,7 +303,12 @@ func gatedDeltaUpdate(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
 
-    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    // State kept in fp32 to match Python mlx-lm. Using q.dtype (bf16) loses
+    // precision across T-step recurrence, compounding rounding error.
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
 
     if GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
