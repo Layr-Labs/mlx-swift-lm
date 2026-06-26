@@ -54,7 +54,7 @@ public enum Gemma4PipelineShardLoader {
         // handles both the nested and flat shapes.
         let textConfig = try JSONDecoder().decode(Gemma4Configuration.self, from: data).textConfig
         try assertClusterable(textConfig)
-        let range = LlamaShardRange(start: start, end: end, totalLayers: textConfig.numHiddenLayers)
+        let range = PipelineShardRange(start: start, end: end, totalLayers: textConfig.numHiddenLayers)
         let shard = try load(directory: directory, config: textConfig, range: range)
         return (shard, textConfig.numHiddenLayers)
     }
@@ -117,7 +117,7 @@ public enum Gemma4PipelineShardLoader {
     public static func load(
         directory: URL,
         config: Gemma4TextConfiguration,
-        range: LlamaShardRange
+        range: PipelineShardRange
     ) throws -> Gemma4PipelineShard {
         try assertClusterable(config)
         let shard = Gemma4PipelineShard(config, range: range)
@@ -207,7 +207,7 @@ public enum Gemma4PipelineShardLoader {
     /// Map a shard-local module path to the GLOBAL config key.
     ///   "layers.{local}.…"   -> "language_model.model.layers.{local+start}.…"
     ///   "embed_tokens"/"norm" -> "language_model.model.{…}"
-    static func localToGlobalPath(_ localPath: String, range: LlamaShardRange) -> String {
+    static func localToGlobalPath(_ localPath: String, range: PipelineShardRange) -> String {
         let prefix = "language_model.model."
         if localPath.hasPrefix("layers.") {
             let rest = localPath.dropFirst("layers.".count)
@@ -239,7 +239,7 @@ public enum Gemma4PipelineShardLoader {
     /// The text tower mirrors the Llama layout (embed_tokens + layers + norm),
     /// with experts living UNDER `layers.{i}.experts.*` so they reindex with the
     /// same per-layer rule automatically. Gemma 4 ties embeddings (no lm_head).
-    static func remap(_ key: String, range: LlamaShardRange, tied: Bool) -> String? {
+    static func remap(_ key: String, range: PipelineShardRange, tied: Bool) -> String? {
         // Drop non-text towers.
         if key.hasPrefix("vision_tower") || key.hasPrefix("audio_tower")
             || key.hasPrefix("multi_modal_projector") || key.hasPrefix("embed_vision")
@@ -269,7 +269,7 @@ public enum Gemma4PipelineShardLoader {
         return nil
     }
 
-    private static func roleName(_ r: LlamaShardRange) -> String {
+    private static func roleName(_ r: PipelineShardRange) -> String {
         r.isHead ? "head" : r.isTail ? "tail" : "middle"
     }
 }

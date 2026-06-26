@@ -1,7 +1,7 @@
 // Copyright © 2026 Eigen Labs.
 //
 // GPTOSSPipelineShardLoader -- load ONLY this rank's weights into a
-// GPTOSSPipelineShard. Mirrors LlamaPipelineShardLoader.
+// GPTOSSPipelineShard. Per-rank weight loader.
 //
 // Targets the PRE-QUANTIZED Q8 build (gpt-oss-20b-MXFP4-Q8). For that build the
 // model's `sanitize` early-returns (weights already have `gate_proj.weight`), so
@@ -42,7 +42,7 @@ public enum GPTOSSPipelineShardLoader {
         let data = try Data(contentsOf: directory.appending(component: "config.json"))
         let config = try JSONDecoder().decode(GPTOSSConfiguration.self, from: data)
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
-        let range = LlamaShardRange(start: start, end: end, totalLayers: config.hiddenLayers)
+        let range = PipelineShardRange(start: start, end: end, totalLayers: config.hiddenLayers)
         let shard = try load(directory: directory, config: config, range: range,
                              perLayerQuantization: base.perLayerQuantization)
         return (shard, config.hiddenLayers)
@@ -50,7 +50,7 @@ public enum GPTOSSPipelineShardLoader {
 
     /// TEST HELPER: load the FULL (monolithic) GPT-OSS model from `directory`,
     /// returning it plus the layer count. Mirrors
-    /// `LlamaPipelineShardLoader.loadFullModel` — used by the shard smoke test to
+    /// the GPT-OSS loadFullModel helper — used by the shard smoke test to
     /// get a reference forward pass against a (tiny, synthetic) checkpoint.
     ///
     /// Reuses `MLXLMCommon.loadWeights`, so the model's own `sanitize` runs (for
@@ -73,7 +73,7 @@ public enum GPTOSSPipelineShardLoader {
     public static func load(
         directory: URL,
         config: GPTOSSConfiguration,
-        range: LlamaShardRange,
+        range: PipelineShardRange,
         perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
     ) throws -> GPTOSSPipelineShard {
         let shard = GPTOSSPipelineShard(config, range: range)
@@ -133,7 +133,7 @@ public enum GPTOSSPipelineShardLoader {
     /// Same structure as the Llama remap (embed/norm/lm_head + layer reindex);
     /// GPT-OSS's MoE expert keys live UNDER `model.layers.{i}.mlp.*`, so they
     /// reindex with the same rule automatically.
-    static func remap(_ key: String, range: LlamaShardRange) -> String? {
+    static func remap(_ key: String, range: PipelineShardRange) -> String? {
         if key.hasPrefix("model.embed_tokens.") {
             return range.isHead ? String(key.dropFirst("model.".count)) : nil
         }
@@ -153,7 +153,7 @@ public enum GPTOSSPipelineShardLoader {
         return nil
     }
 
-    private static func roleName(_ r: LlamaShardRange) -> String {
+    private static func roleName(_ r: PipelineShardRange) -> String {
         r.isHead ? "head" : r.isTail ? "tail" : "middle"
     }
 
@@ -195,7 +195,7 @@ public enum GPTOSSPipelineShardLoader {
     ///   "layers.{local}.…"  ->  "model.layers.{local+start}.…"
     ///   "lm_head"            ->  "lm_head"  (unchanged)
     ///   "embed_tokens"/"norm" -> "model.embed_tokens" / "model.norm"
-    static func localToGlobalPath(_ localPath: String, range: LlamaShardRange) -> String {
+    static func localToGlobalPath(_ localPath: String, range: PipelineShardRange) -> String {
         if localPath.hasPrefix("layers.") {
             let rest = localPath.dropFirst("layers.".count)
             guard let dot = rest.firstIndex(of: "."),

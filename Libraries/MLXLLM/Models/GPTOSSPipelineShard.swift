@@ -1,7 +1,7 @@
 // Copyright © 2026 Eigen Labs.
 //
 // GPTOSSPipelineShard -- a per-rank SLICE of a GPT-OSS model for pipeline-
-// parallel inference across a cluster (Darkbloom), mirroring LlamaPipelineShard.
+// parallel inference across a cluster (Darkbloom), a per-rank shard (mirrors the GPT-OSS shard structure).
 //
 // GPT-OSS is MoE with sliding-window attention, but its layer-list shape matches
 // Llama's: embed_tokens + layers[GPTOSSTransformerBlock] + norm + a separate
@@ -28,7 +28,7 @@ import MLXNN
 /// pipeline drives, not a full callAsFunction.
 public class GPTOSSPipelineShard: Module {
 
-    public let range: LlamaShardRange   // reuse the shared range type
+    public let range: PipelineShardRange   // reuse the shared range type
     private let config: GPTOSSConfiguration
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding?
@@ -40,7 +40,7 @@ public class GPTOSSPipelineShard: Module {
     private let ownedLayerTypes: [String]
     private let windowSize: Int
 
-    public init(_ config: GPTOSSConfiguration, range: LlamaShardRange) {
+    public init(_ config: GPTOSSConfiguration, range: PipelineShardRange) {
         precondition(config.vocabularySize > 0)
         precondition(range.start >= 0 && range.end <= config.hiddenLayers && range.start < range.end)
         self.config = config

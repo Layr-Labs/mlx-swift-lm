@@ -37,7 +37,7 @@ import MLXNN
 /// callAsFunction.
 public class Gemma4PipelineShard: Module {
 
-    public let range: LlamaShardRange   // reuse the shared range type
+    public let range: PipelineShardRange   // reuse the shared range type
     private let config: Gemma4TextConfiguration
     private let embedScale: Float
     private let logitSoftcap: Float
@@ -52,7 +52,7 @@ public class Gemma4PipelineShard: Module {
     private let ownedLayerTypes: [String]
     private let windowSize: Int
 
-    public init(_ config: Gemma4TextConfiguration, range: LlamaShardRange) {
+    public init(_ config: Gemma4TextConfiguration, range: PipelineShardRange) {
         precondition(config.vocabSize > 0)
         precondition(range.start >= 0 && range.end <= config.numHiddenLayers && range.start < range.end)
         // Pipeline sharding ships ONLY the hidden state across the cut, so the
