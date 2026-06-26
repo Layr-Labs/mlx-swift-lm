@@ -83,6 +83,9 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
+                // Cmlx: low-level mlx_slice_dynamic / mlx_slice_update_dynamic
+                // entry points used by DynamicSlice.swift (compiled-decode infra).
+                .product(name: "Cmlx", package: "mlx-swift"),
             ],
             path: "Libraries/MLXLMCommon",
             exclude: [
