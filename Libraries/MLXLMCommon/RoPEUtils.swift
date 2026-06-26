@@ -110,7 +110,24 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         if rotatedDims > 0 {
             let exponents =
                 MLXArray(stride(from: 0, to: rotatedDims, by: 2)).asType(.float32) / Float(dims)
-            self._freqs = factor * MLX.pow(base, exponents)
+            let realFreqs = factor * MLX.pow(base, exponents)
+            // Pad the pass-through pairs with +inf "frequencies" so a single
+            // MLXFast.RoPE over the FULL `dims` leaves them unrotated
+            // (angle = offset / inf = 0). This reproduces the previous explicit
+            // split/concat/reconstruct partial rotary EXACTLY (verified
+            // bit-identical) in one fused dispatch, mirroring the mlx_lm Python
+            // `ProportionalRoPE` reference. NOTE: this is deliberately NOT a
+            // default RoPE over `rotatedDims` dims — that rotates different pairs
+            // (x[i],x[rotatedDims/2+i]) with /rotatedDims frequencies and is
+            // numerically wrong for Gemma4 (the weights expect /dims, partner at
+            // dims/2).
+            let padCount = (dims - rotatedDims) / 2
+            if padCount > 0 {
+                let pad = MLXArray(Array(repeating: Float.infinity, count: padCount))
+                self._freqs = concatenated([realFreqs, pad], axis: -1)
+            } else {
+                self._freqs = realFreqs
+            }
         } else {
             self._freqs = nil
         }
@@ -122,96 +139,37 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         guard rotatedDims > 0, let _freqs else {
             return x
         }
-
-        let half = dims / 2
-        let rotatedHalf = rotatedDims / 2
-
-        let head: MLXArray
-        let tail: MLXArray?
-        if x.shape[x.ndim - 1] > dims {
-            let parts = split(x, indices: [dims], axis: -1)
-            head = parts[0]
-            tail = parts[1]
-        } else {
-            head = x
-            tail = nil
-        }
-
-        let headParts = split(head, indices: [half], axis: -1)
-        var left = headParts[0]
-        var right = headParts[1]
-
-        let leftParts = split(left, indices: [rotatedHalf], axis: -1)
-        let rightParts = split(right, indices: [rotatedHalf], axis: -1)
-        var rotated = concatenated([leftParts[0], rightParts[0]], axis: -1)
-        rotated = MLXFast.RoPE(
-            rotated,
-            dimensions: rotatedDims,
+        // Single fused partial RoPE over the full head dim. `_freqs` carries +inf
+        // entries for the pass-through pairs (built in init), so MLXFast.RoPE
+        // rotates only the first `rotatedDims` pairs and leaves the rest
+        // unchanged — bit-identical to the previous split/concat/reconstruct path
+        // but in one dispatch. Trailing dims beyond `dims` pass through natively.
+        return MLXFast.RoPE(
+            x,
+            dimensions: dims,
             traditional: traditional,
             base: nil,
             scale: 1.0,
             offset: offset,
             freqs: _freqs
         )
-
-        let rotatedParts = split(rotated, indices: [rotatedHalf], axis: -1)
-        left = concatenated([rotatedParts[0], leftParts[1]], axis: -1)
-        right = concatenated([rotatedParts[1], rightParts[1]], axis: -1)
-        let updatedHead = concatenated([left, right], axis: -1)
-
-        if let tail {
-            return concatenated([updatedHead, tail], axis: -1)
-        } else {
-            return updatedHead
-        }
     }
 
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
         guard rotatedDims > 0, let _freqs else {
             return x
         }
-
-        let half = dims / 2
-        let rotatedHalf = rotatedDims / 2
-
-        let head: MLXArray
-        let tail: MLXArray?
-        if x.shape[x.ndim - 1] > dims {
-            let parts = split(x, indices: [dims], axis: -1)
-            head = parts[0]
-            tail = parts[1]
-        } else {
-            head = x
-            tail = nil
-        }
-
-        let headParts = split(head, indices: [half], axis: -1)
-        var left = headParts[0]
-        var right = headParts[1]
-
-        let leftParts = split(left, indices: [rotatedHalf], axis: -1)
-        let rightParts = split(right, indices: [rotatedHalf], axis: -1)
-        var rotated = concatenated([leftParts[0], rightParts[0]], axis: -1)
-        rotated = MLXFast.RoPE(
-            rotated,
-            dimensions: rotatedDims,
+        // Batched-offset twin of the scalar path above: one fused MLXFast.RoPE
+        // over the full head dim with the inf-padded `_freqs`.
+        return MLXFast.RoPE(
+            x,
+            dimensions: dims,
             traditional: traditional,
             base: nil,
             scale: 1.0,
             offset: offset,
             freqs: _freqs
         )
-
-        let rotatedParts = split(rotated, indices: [rotatedHalf], axis: -1)
-        left = concatenated([rotatedParts[0], leftParts[1]], axis: -1)
-        right = concatenated([rotatedParts[1], rightParts[1]], axis: -1)
-        let updatedHead = concatenated([left, right], axis: -1)
-
-        if let tail {
-            return concatenated([updatedHead, tail], axis: -1)
-        } else {
-            return updatedHead
-        }
     }
 }
 

@@ -9,6 +9,45 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
+//
+// File-private, self-contained compiled fusions. They do NOT depend on the
+// SwitchLayers / HardwareInfo lane so this file builds stand-alone; when that
+// lane lands public `safeGeluApproximate` / `MLXHardwareInfo` these can collapse
+// to the shared symbols (identical math + same env knob) with no behavior change.
+// `compile(shapeless: true)` is gated by `MLX_COMPILED_DECODE` (default on),
+// mirroring `MLXHardwareInfo.isCompiledDecodeSupported`, so M1/M2 + macOS Tahoe
+// (MLX #3329) can opt out without a code change. Matches the ungated
+// `compiledSiluProduct` / `weightedExpertSum` convention already in this tree.
+private let gemma4CompiledDecodeSupported: Bool = {
+    if let raw = ProcessInfo.processInfo.environment["MLX_COMPILED_DECODE"] {
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+    return true
+}()
+
+/// Approximate (tanh) GELU written with `x * x * x` instead of the Power
+/// primitive (`x ** 3`) so it is safe under `compile(shapeless: true)` — the
+/// Power primitive returns zero results on the Tahoe Metal JIT (MLX #3329).
+/// Numerically identical to `MLXNN.geluApproximate` (vMLX `safeGeluApproximate`).
+private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray) -> MLXArray = { (x: MLXArray) -> MLXArray in
+        0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
+/// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
+/// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
+/// math — and the logits handed to the sampler — full precision.
+private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (x: MLXArray, cap: MLXArray) -> MLXArray in
+        tanh(x / cap) * cap
+    }
+    return gemma4CompiledDecodeSupported ? compile(shapeless: true, body) : body
+}()
+
 // MARK: - Configuration
 
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
@@ -573,7 +612,7 @@ private class Gemma4Experts: Module {
             inputDims: config.hiddenSize,
             hiddenDims: moeIntermediate,
             numExperts: numExperts,
-            activation: { geluApproximate($0) },
+            activation: { gemma4SafeGeluApproximate($0) },
             bias: false
         )
         super.init()
@@ -582,9 +621,15 @@ private class Gemma4Experts: Module {
     func callAsFunction(
         _ x: MLXArray, topKIndices: MLXArray, topKWeights: MLXArray
     ) -> MLXArray {
-        let w = MLX.expandedDimensions(topKWeights, axis: -1)
-        let y = switchGLU(x, topKIndices)
-        return (w * y).sum(axis: -2)
+        // Flatten [B, S, H] -> [B*S, H] (and indices/weights to [B*S, K]) so
+        // SwitchGLU runs its optimized 2D gather/sort path, then fuse the
+        // per-expert scale + reduce via the shared compiled `weightedExpertSum`
+        // and reshape back. Numerically identical to the prior
+        // `(expandDims(weights, -1) * switchGLU(x, idx)).sum(-2)`; matches vMLX.
+        let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
+        let K = topKIndices.dim(-1)
+        let y = switchGLU(x.reshaped(B * S, H), topKIndices.reshaped(B * S, K))
+        return weightedExpertSum(y, topKWeights.reshaped(B * S, K)).reshaped(B, S, H)
     }
 }
 
@@ -608,7 +653,7 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
     }
 }
 
@@ -746,7 +791,7 @@ public class Gemma4DecoderLayer: Module {
         {
             let residual3 = out
             var g = gate(out)
-            g = geluApproximate(g)
+            g = gemma4SafeGeluApproximate(g)
             g = g * perLayerInput
             g = proj(g)
             g = norm(g)
@@ -1008,7 +1053,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             out = model.embedTokens.asLinear(hidden)
         }
-        out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
+        // Fused tanh-softcap (vMLX `compiledLogitSoftcap`). Untyped (float32) cap
+        // keeps the softcap math + sampler logits full precision; when the compile
+        // gate is off this is equivalent to `tanh(out / cap) * cap`.
+        out = gemma4CompiledLogitSoftcap(out, MLXArray(config.finalLogitSoftcapping))
         return out
     }
 
