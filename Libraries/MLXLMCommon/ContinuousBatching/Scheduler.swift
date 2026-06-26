@@ -416,6 +416,40 @@ public final class Scheduler: @unchecked Sendable {
         for r in newScheduled {
             output.scheduledRequestIds.append(r.requestId)
             output.numScheduledTokens += r.numPromptTokens
+            // Prefill-start / admission marker: a token-less RequestOutput emitted
+            // the instant a request is admitted — BEFORE its first prefill `eval`.
+            // Without it, the FIRST RequestOutput a cold request ever produces is
+            // its first DECODE token (processGenResponses is the only other emitter),
+            // so a consumer measuring the admitted→first-token window collapses it to
+            // ~0 (the provider's observed_prefill_tps EWMA then stays stuck at 0 and
+            // the coordinator falls back to a ~23x-pessimistic prefill estimate).
+            // newTokenIds:[] / newText:"" / finished:false ⇒ a pure marker: not a
+            // decoded token, not a terminal, and never forwarded as content (the
+            // provider bridge yields a chunk only for non-empty newText). It also
+            // lets the provider stamp admittedAt at real prefill start, which fixes
+            // the wedge detector's blindness to prefill-stage stalls and stops the
+            // pending-timeout watchdog from treating a long prefill as a queue
+            // timeout.
+            //
+            //   * coalesceable:false — the marker MUST reach the consumer as its own
+            //     discrete output. RequestOutputCollector(aggregate:true) would
+            //     otherwise merge it with the first token output if the consumer
+            //     hasn't drained it before prefill completes (slow/backpressured
+            //     stream, or a short cold prompt), re-collapsing admission and
+            //     first-token into one output and defeating the measurement.
+            //   * cachedTokens:r.cachedTokens — a prefix-cache hit / restored
+            //     checkpoint sets r.cachedTokens>0; carrying it (instead of the 0
+            //     default) keeps the marker consistent with the request's decode
+            //     outputs so a consumer can exclude the cached portion and not
+            //     misclassify a warm request as a cold prefill. Warm / cache-hit
+            //     requests still emit the marker; the provider's cold-only guard
+            //     skips the resulting (unrepresentative) sample.
+            output.outputs.append(RequestOutput(
+                requestId: r.requestId,
+                promptTokens: r.numPromptTokens,
+                cachedTokens: r.cachedTokens,
+                coalesceable: false
+            ))
         }
         if !newScheduled.isEmpty || genBatch != nil { output.hasWork = true }
 

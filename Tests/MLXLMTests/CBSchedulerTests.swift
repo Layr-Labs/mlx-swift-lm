@@ -136,4 +136,79 @@ final class CBSchedulerTests: XCTestCase {
 
         XCTAssertNotNil(final_, "generation must complete even with repetition penalty")
     }
+
+    // MARK: - Prefill-start admission marker
+
+    /// A newly admitted request must produce a token-less prefill-start
+    /// `RequestOutput` AT the admit step — BEFORE any decode token — so a consumer
+    /// can stamp engine-admission at real prefill start (the provider's
+    /// observed_prefill_tps window). Previously the FIRST output a cold request
+    /// produced was its first decode token, collapsing that window to ~0.
+    func testSchedulerEmitsPrefillStartAdmissionMarker() {
+        let s = makeTestScheduler(eosTokenIds: [])
+        let req = makeIntRequest(id: "r1", tokens: [1, 2, 3, 4], maxTokens: 5)
+        s.addRequest(req)
+
+        // Admit step: emits exactly one token-less marker, no decode token yet.
+        let admit = s.step()
+        let markers = admit.outputs.filter { $0.requestId == "r1" }
+        XCTAssertEqual(markers.count, 1, "exactly one admission marker at admit")
+        let marker = markers[0]
+        XCTAssertTrue(marker.newTokenIds.isEmpty, "marker carries no decoded token")
+        XCTAssertEqual(marker.newText, "", "marker carries no text")
+        XCTAssertFalse(marker.finished, "marker is not terminal")
+        XCTAssertGreaterThan(marker.promptTokens, 0, "marker reports the prompt size")
+        XCTAssertFalse(marker.coalesceable,
+                       "marker must be non-coalesceable so the collector keeps it discrete")
+        XCTAssertEqual(marker.cachedTokens, 0, "a cold prompt has no cached tokens")
+
+        // The first DECODE token arrives on a LATER step, never collapsed into the
+        // admit step — proving the admission→first-token window is real (> one step).
+        var sawFirstToken = false
+        for _ in 0 ..< 10 {
+            let out = s.step()
+            if out.outputs.contains(where: { $0.requestId == "r1" && !$0.newTokenIds.isEmpty }) {
+                sawFirstToken = true
+                break
+            }
+            if !s.hasRequests() { break }
+        }
+        XCTAssertTrue(sawFirstToken, "request must decode a first token after admission")
+    }
+
+    /// Real downstream path: feed each step's outputs into the SAME
+    /// `RequestOutputCollector(aggregate: true)` that `EngineCore` uses, WITHOUT
+    /// draining between puts (worst-case slow/backpressured consumer). The
+    /// admission marker must STILL be delivered as a discrete, token-less output
+    /// BEFORE the first decode token — otherwise `mergeOutputs` collapses admission
+    /// and first-token and the prefill window is lost. FAILS on the pre-fix
+    /// single-slot collector (the first token merges into the buffered marker).
+    func testAdmissionMarkerSurvivesCollectorBackpressureBeforeFirstToken() {
+        let s = makeTestScheduler(eosTokenIds: [])
+        let req = makeIntRequest(id: "r1", tokens: [1, 2, 3, 4], maxTokens: 5)
+        s.addRequest(req)
+
+        let col = RequestOutputCollector(aggregate: true)
+        var bufferedFirstToken = false
+        for _ in 0 ..< 12 {
+            let out = s.step()
+            for ro in out.outputs where ro.requestId == "r1" {
+                col.put(ro)  // never drained between puts (backpressure)
+                if !ro.newTokenIds.isEmpty { bufferedFirstToken = true }
+            }
+            if bufferedFirstToken { break }
+            if !s.hasRequests() { break }
+        }
+        XCTAssertTrue(bufferedFirstToken, "request must have produced a first token")
+
+        // Drain: the FIRST output must be the token-less admission marker.
+        let first = col.getNowait()
+        XCTAssertNotNil(first)
+        XCTAssertTrue(first!.newTokenIds.isEmpty, "admission marker must arrive first (token-less)")
+        XCTAssertGreaterThan(first!.promptTokens, 0)
+        // A later drained output carries the first token (survived as its own unit).
+        var sawTokenOut = false
+        while let o = col.getNowait() { if !o.newTokenIds.isEmpty { sawTokenOut = true } }
+        XCTAssertTrue(sawTokenOut, "first token must survive as its own output after the marker")
+    }
 }

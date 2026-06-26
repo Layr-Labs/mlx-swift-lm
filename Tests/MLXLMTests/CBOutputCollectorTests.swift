@@ -50,6 +50,42 @@ final class CBOutputCollectorTests: XCTestCase {
         XCTAssertEqual(col.getNowait()?.newTokenIds, [2])
     }
 
+    // MARK: - Non-coalesceable markers (prefill-start admission)
+
+    /// A non-coalesceable admission marker MUST survive as its own discrete output
+    /// even when a token output is put before the consumer drains the buffer.
+    /// FAILS on the pre-fix single-slot collector: `mergeOutputs` coalesces the
+    /// token into the buffered marker, so the first output the consumer sees
+    /// already carries `newTokenIds` and admission/first-token timestamps collapse.
+    func testCollectorPreservesNonCoalesceableMarkerBeforeToken() {
+        let col = RequestOutputCollector(aggregate: true)
+        let marker = RequestOutput(requestId: "r1", promptTokens: 100, coalesceable: false)
+        let token = makeOutput(tokens: [7])
+
+        col.put(marker)   // buffered: no consumer waiting yet
+        col.put(token)    // must NOT merge into the marker
+
+        let first = col.getNowait()
+        XCTAssertEqual(first?.newTokenIds, [], "admission marker must arrive first, token-less")
+        XCTAssertEqual(first?.promptTokens, 100)
+        let second = col.getNowait()
+        XCTAssertEqual(second?.newTokenIds, [7], "first token arrives as a separate output")
+        XCTAssertNil(col.getNowait(), "exactly two discrete outputs")
+    }
+
+    /// Tokens that follow the marker still aggregate AMONG THEMSELVES (the marker
+    /// only blocks coalescing across itself), so streaming throughput is unchanged.
+    func testCollectorAggregatesTokensAfterMarker() {
+        let col = RequestOutputCollector(aggregate: true)
+        col.put(RequestOutput(requestId: "r1", promptTokens: 100, coalesceable: false))
+        col.put(makeOutput(tokens: [1]))
+        col.put(makeOutput(tokens: [2]))
+
+        XCTAssertEqual(col.getNowait()?.newTokenIds, [], "marker first")
+        XCTAssertEqual(col.getNowait()?.newTokenIds, [1, 2], "post-marker tokens still merge")
+        XCTAssertNil(col.getNowait())
+    }
+
     // MARK: - Async get
 
     func testCollectorGetBlocksUntilPut() async {
