@@ -10,6 +10,7 @@
 // Python reference: mlx_vlm/models/gemma4/
 
 import CoreImage
+import CoreMedia
 import Foundation
 import MLX
 import MLXLMCommon
@@ -398,6 +399,24 @@ private func gemma4OverlayBidirectionalVision(
     }
 }
 
+/// Symmetrize a boolean causal / windowed-causal mask (True = attend) so every
+/// token attends bidirectionally — fully for global layers, within its sliding
+/// window for sliding layers. Mirrors Gemma4's `use_bidirectional_attention ==
+/// "all"` (HF sets `is_causal = use_bidirectional_attention != "all"`): ORing the
+/// causal mask with its transpose yields the symmetric version of whatever
+/// lower-triangular pattern `createAttentionMask` produced. Non-array modes (the
+/// single-token decode hot path stays on symbolic `.causal`) pass through.
+private func gemma4SymmetrizeMask(
+    _ mode: MLXFast.ScaledDotProductAttentionMaskMode
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    switch mode {
+    case .array(let maskArray):
+        return .array(logicalOr(maskArray, maskArray.swappedAxes(-1, -2)))
+    default:
+        return mode
+    }
+}
+
 // Vision Attention
 private class VisionAttn: Module {
     let numHeads: Int
@@ -532,16 +551,22 @@ private class VisionPooler: Module {
         rootH = sqrt(Float(cfg.hiddenSize))
         super.init()
     }
-    func callAsFunction(_ h: MLXArray, patchPos: MLXArray, padPos: MLXArray) -> (MLXArray, MLXArray) {
+    /// Pool `h` down to `outputLen` soft tokens. Images use the default (image)
+    /// budget; video frames pass a smaller per-frame budget (e.g. 70 vs 280) so a
+    /// frame resized to the video patch budget pools to its own token count.
+    func callAsFunction(
+        _ h: MLXArray, patchPos: MLXArray, padPos: MLXArray, outputLen: Int? = nil
+    ) -> (MLXArray, MLXArray) {
+        let outLen = outputLen ?? defaultLen
         let L = h.dim(1)
-        if L == defaultLen { return (h * rootH, logicalNot(padPos)) }
-        let k = Int(sqrt(Float(L / defaultLen)))
+        if L == outLen { return (h * rootH, logicalNot(padPos)) }
+        let k = Int(sqrt(Float(L / outLen)))
         let kSq = Float(k * k)
         let clamped = maximum(patchPos, MLXArray(Int32(0)))
         let maxX = clamped[.ellipsis, 0].max(axis: -1, keepDims: true) + 1
         let ki = floor(clamped.asType(.float32) / Float(k)).asType(.int32)
         let linearIdx = ki[.ellipsis, 0] + (maxX / MLXArray(Int32(k))) * ki[.ellipsis, 1]
-        let w = oneHot(linearIdx, numClasses: defaultLen) / kSq
+        let w = oneHot(linearIdx, numClasses: outLen) / kSq
         let out = matmul(w.transposed(0, 2, 1), h)
         let mask = logicalNot(all(w .== Float(0), axis: 1))
         return (out.asType(h.dtype) * rootH, mask)
@@ -561,7 +586,6 @@ private class VisionEncoder: Module {
 
 private class VisionTower: Module {
     let cfg: Gemma4VisionConfig
-    let maxPatches: Int
     @ModuleInfo(key: "patch_embedder") var patchEmb: VisionPatchEmbedder
     @ModuleInfo var encoder: VisionEncoder
     @ModuleInfo var pooler: VisionPooler
@@ -570,7 +594,6 @@ private class VisionTower: Module {
 
     init(_ cfg: Gemma4VisionConfig) {
         self.cfg = cfg
-        maxPatches = cfg.defaultOutputLength * cfg.poolingKernelSize * cfg.poolingKernelSize
         _patchEmb.wrappedValue = VisionPatchEmbedder(cfg)
         self.encoder = VisionEncoder(cfg)
         self.pooler = VisionPooler(cfg)
@@ -578,18 +601,40 @@ private class VisionTower: Module {
         super.init()
     }
 
-    func callAsFunction(_ pixels: MLXArray) -> MLXArray {
+    /// Encode one image / video frame to `outputLength` soft tokens. `outputLength`
+    /// defaults to the image budget (`defaultOutputLength`); video frames pass a
+    /// smaller per-frame budget so the local patch budget (`outputLength * pool^2`)
+    /// and the pooler output both shrink to the trained video-frame representation.
+    func callAsFunction(_ pixels: MLXArray, outputLength: Int? = nil) -> MLXArray {
         let (B, _, H, W) = (pixels.dim(0), pixels.dim(1), pixels.dim(2), pixels.dim(3))
-        let p = cfg.patchSize; let pH = H / p; let pW = W / p
-        // Clamp to maxPatches to prevent Range crash if image is larger than expected
-        let nReal = min(pH * pW, maxPatches); let nPad = maxPatches - nReal
+        let outLen = outputLength ?? cfg.defaultOutputLength
+        let localMaxPatches = max(1, outLen) * cfg.poolingKernelSize * cfg.poolingKernelSize
+        let p = cfg.patchSize
+        var pH = H / p
+        let pW = W / p
+
+        // Truncate oversized grids CONSISTENTLY: drop whole trailing rows so the
+        // patch embedding (built from the same cropped pixels), the position grid,
+        // and the pooler all agree on the patch count. Previously `nReal` was
+        // clamped to `maxPatches` but `posFlat` was still built for every `pH * pW`
+        // patch, so the `reshaped(1, nReal, 2)` below trapped before the clamp could
+        // help — and the pixels stayed untruncated, mismatching the clamped
+        // positions. Cropping rows keeps `pW` (and the per-row x positions) intact.
+        var croppedPixels = pixels
+        if pH * pW > localMaxPatches {
+            pH = max(1, localMaxPatches / max(1, pW))
+            croppedPixels = pixels[0..., 0..., ..<(pH * p), 0...]
+        }
+        let nReal = pH * pW
+        let nPad = localMaxPatches - nReal
 
         // Build position grid [nReal, 2] then expand to [B, nReal, 2]
         var posFlat = [Int32]()
+        posFlat.reserveCapacity(nReal * 2)
         for y in 0 ..< pH { for x in 0 ..< pW { posFlat.append(Int32(x)); posFlat.append(Int32(y)) } }
         var patchPos = MLXArray(posFlat).reshaped(1, nReal, 2)
         patchPos = repeated(patchPos, count: B, axis: 0)
-        var padPos = MLXArray.zeros([B, maxPatches]).asType(.bool)
+        var padPos = MLXArray.zeros([B, localMaxPatches]).asType(.bool)
 
         if nPad > 0 {
             let padFlat = [Int32](repeating: -1, count: nPad * 2)
@@ -598,7 +643,7 @@ private class VisionTower: Module {
             padPos = concatenated([MLXArray.zeros([B, nReal]).asType(.bool), MLXArray.ones([B, nPad]).asType(.bool)], axis: 1)
         }
 
-        var emb = patchEmb(pixels: pixels, patchPos: patchPos[0..., ..<nReal], padPos: padPos[0..., ..<nReal])
+        var emb = patchEmb(pixels: croppedPixels, patchPos: patchPos[0..., ..<nReal], padPos: padPos[0..., ..<nReal])
         if nPad > 0 { emb = concatenated([emb, MLXArray.zeros([B, nPad, cfg.hiddenSize]).asType(emb.dtype)], axis: 1) }
 
         let valid = logicalNot(padPos).asType(.float32)
@@ -609,9 +654,9 @@ private class VisionTower: Module {
         mask = expandedDimensions(mask, axis: 1)
 
         var h = encoder(emb, pos: patchPos, mask: mask)
-        let (pooled, _) = pooler(h, patchPos: patchPos, padPos: padPos)
-        // Return all defaultOutputLength features — the processor inserts exactly
-        // that many image tokens, so maskedScatter needs them all to match.
+        let (pooled, _) = pooler(h, patchPos: patchPos, padPos: padPos, outputLen: outLen)
+        // Return all `outLen` features — the processor inserts exactly that many
+        // image/video soft tokens, so maskedScatter needs them all to match.
         h = pooled
         if cfg.standardize, let sb = stdBias, let ss = stdScale { h = (h - sb) * ss }
         return h
@@ -894,11 +939,21 @@ private class TextModel: Module {
         // so it stays on the symbolic `.causal` mask (no array materialized).
         let useBidirectionalVision =
             imageTokenMask != nil && cfg.useBidirectionalAttention == "vision" && h.dim(1) > 1
-        var gm = createAttentionMask(h: h, cache: gc, returnArray: useBidirectionalVision)
-        var sm = createAttentionMask(h: h, cache: sc, windowSize: cfg.slidingWindow, returnArray: useBidirectionalVision)
+        // `use_bidirectional_attention == "all"` makes the WHOLE prefill non-causal
+        // (HF: `is_causal = use_bidirectional_attention != "all"`), independent of any
+        // vision span. Only relevant during multi-token prefill — single-token decode
+        // (`h.dim(1) == 1`) attends to all past keys either way, so the fast text path
+        // stays on the symbolic causal mask.
+        let useBidirectionalAll = cfg.useBidirectionalAttention == "all" && h.dim(1) > 1
+        let forceArrayMask = useBidirectionalVision || useBidirectionalAll
+        var gm = createAttentionMask(h: h, cache: gc, returnArray: forceArrayMask)
+        var sm = createAttentionMask(h: h, cache: sc, windowSize: cfg.slidingWindow, returnArray: forceArrayMask)
         if useBidirectionalVision, let imageTokenMask {
             gm = gemma4OverlayBidirectionalVision(gm, isVision: imageTokenMask)
             sm = gemma4OverlayBidirectionalVision(sm, isVision: imageTokenMask)
+        } else if useBidirectionalAll {
+            gm = gemma4SymmetrizeMask(gm)
+            sm = gemma4SymmetrizeMask(sm)
         }
 
         var intermediates: [(keys: MLXArray, values: MLXArray, offset: Int, offsetArray: MLXArray?)?] = Array(repeating: nil, count: layers.count)
@@ -1038,7 +1093,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         // placeholder token they scatter into differs (image_token vs video_token).
         if let videoPixels = input.video?.pixels, let videoTokenId = config.videoTokenId {
             let vidFeatures = encodeVisionFeatures(
-                pixels: videoPixels, frames: input.video?.frames, dtype: emb.dtype)
+                pixels: videoPixels, frames: input.video?.frames, dtype: emb.dtype, isVideo: true)
             let vidMask = MLX.equal(input.text.tokens, MLXArray(Int32(videoTokenId)))
             let vidMaskExp = MLX.broadcast(expandedDimensions(vidMask, axis: -1), to: emb.shape)
             emb = try maskedScatter(input: emb, mask: vidMaskExp, source: vidFeatures)
@@ -1054,12 +1109,25 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
     /// Encode one batch of images / video frames through the vision tower and
     /// project into the text embedding space. Each frame is sliced to its real
-    /// (un-padded) dimensions stored in `frames`, then yields
-    /// `defaultOutputLength` soft tokens regardless of input size.
-    private func encodeVisionFeatures(pixels: MLXArray, frames: [THW]?, dtype: DType) -> MLXArray {
+    /// (un-padded) dimensions stored in `frames`. Images yield `defaultOutputLength`
+    /// soft tokens; video frames (`isVideo`) yield a per-frame, data-driven count
+    /// (`(h/patch)*(w/patch)/pool^2`) from their video-budget-resized grid, matching
+    /// the processor's per-frame placeholder expansion (HF/mlx-vlm Gemma4 use a
+    /// smaller per-frame video soft-token budget, ~70, vs 280 for images).
+    private func encodeVisionFeatures(
+        pixels: MLXArray, frames: [THW]?, dtype: DType, isVideo: Bool = false
+    ) -> MLXArray {
         let B = pixels.dim(0)
         var featuresList = [MLXArray]()
         featuresList.reserveCapacity(B)
+        let p = config.visionConfig.patchSize
+        let poolSq = config.visionConfig.poolingKernelSize * config.visionConfig.poolingKernelSize
+        // All frames of one video share the same resized size, so this per-frame
+        // count is uniform within a video and matches the processor's placeholder
+        // expansion (both derive it from the same video-budget-resized grid).
+        func videoOutputLength(h: Int, w: Int) -> Int {
+            max(1, ((h / p) * (w / p)) / max(1, poolSq))
+        }
         for i in 0 ..< B {
             // Extract each frame at its original dimensions (stored in frames)
             // to avoid processing zero-padded regions through the vision tower.
@@ -1067,10 +1135,12 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 let h = frames[i].h
                 let w = frames[i].w
                 let single = pixels[i, 0..., ..<h, ..<w].expandedDimensions(axis: 0)
-                featuresList.append(embedVision(visionTower(single)))
+                let outLen = isVideo ? videoOutputLength(h: h, w: w) : nil
+                featuresList.append(embedVision(visionTower(single, outputLength: outLen)))
             } else {
                 let single = pixels[i].expandedDimensions(axis: 0)
-                featuresList.append(embedVision(visionTower(single)))
+                let outLen = isVideo ? videoOutputLength(h: pixels.dim(2), w: pixels.dim(3)) : nil
+                featuresList.append(embedVision(visionTower(single, outputLength: outLen)))
             }
         }
         return (B == 1 ? featuresList[0] : concatenated(featuresList)).asType(dtype)
@@ -1130,10 +1200,21 @@ extension Gemma4: LoRAModel { public var loraLayers: [Module] { languageModel.mo
 
 // MARK: - Processor
 
+/// Nested `video_processor` sub-config from `preprocessor_config.json`. Gemma4
+/// ships a separate, lower per-frame soft-token budget for video than for images
+/// (`video_processor.max_soft_tokens` ~70 vs the image `max_soft_tokens` 280).
+private struct Gemma4VideoProcessorConfiguration: Codable {
+    let maxSoftTokens: Int?
+    enum CodingKeys: String, CodingKey {
+        case maxSoftTokens = "max_soft_tokens"
+    }
+}
+
 public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     public let processorClass: String
     public let patchSize: Int
     public let maxSoftTokens: Int
+    public let videoMaxSoftTokens: Int
     public let poolingKernelSize: Int
     public let imageSeqLength: Int
     public let audioSeqLength: Int
@@ -1156,16 +1237,65 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         case eoiTokenId = "eoi_token_id"
     }
 
+    // `video_processor` is a nested block, so it is read via its own keyed
+    // container below rather than the main `CodingKeys`. `videoMaxSoftTokens` is
+    // therefore decoded separately and intentionally omitted from `CodingKeys`
+    // (the synthesized Encodable simply skips it; this config is decode-only in
+    // practice). Mirrors the `TopKeys`/`rope_parameters` pattern in
+    // `Gemma4VisionConfig`.
+    enum VideoProcessorTopKeys: String, CodingKey {
+        case videoProcessor = "video_processor"
+    }
+
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         processorClass = try c.decodeIfPresent(String.self, forKey: .processorClass) ?? "Gemma4Processor"
         patchSize = try c.decodeIfPresent(Int.self, forKey: .patchSize) ?? 16
         maxSoftTokens = try c.decodeIfPresent(Int.self, forKey: .maxSoftTokens) ?? 280
+        // Video frames use the nested `video_processor.max_soft_tokens` budget (~70),
+        // not the image `max_soft_tokens` (280). Tolerate the key being absent or a
+        // non-dict so text/image-only configs keep loading.
+        var decodedVideoSoftTokens: Int? = nil
+        if let vc = try? decoder.container(keyedBy: VideoProcessorTopKeys.self),
+            let videoSub = try? vc.decodeIfPresent(
+                Gemma4VideoProcessorConfiguration.self, forKey: .videoProcessor)
+        {
+            decodedVideoSoftTokens = videoSub.maxSoftTokens
+        }
+        videoMaxSoftTokens = decodedVideoSoftTokens ?? 70
         poolingKernelSize = try c.decodeIfPresent(Int.self, forKey: .poolingKernelSize) ?? 3
         imageSeqLength = try c.decodeIfPresent(Int.self, forKey: .imageSeqLength) ?? 280
         audioSeqLength = try c.decodeIfPresent(Int.self, forKey: .audioSeqLength) ?? 750
         boiTokenId = try c.decodeIfPresent(Int.self, forKey: .boiTokenId) ?? 255_999
         eoiTokenId = try c.decodeIfPresent(Int.self, forKey: .eoiTokenId) ?? 258_882
+    }
+}
+
+/// Gemma4-specific chat message generator. Unlike `Qwen2VLMessageGenerator`,
+/// Gemma4's chat template expects SYSTEM messages as a plain string `content`
+/// (the template folds the system text into the first user turn); only the
+/// non-system turns carry typed multimodal content arrays. Reusing Qwen2VL's
+/// generator emits a typed array for the system role too, which renders malformed
+/// Gemma4 prompts. Modality order is images, then videos, then text — matching the
+/// HF Gemma4 chat template / processor. (PR #56's vMLX decode port dropped this;
+/// `UserInputTests.testGemma4Conversion*` still pin the plain-string-system
+/// contract, so they reference this type.)
+public struct Gemma4MessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        if message.role == .system {
+            return [
+                "role": message.role.rawValue,
+                "content": message.content,
+            ]
+        }
+        return [
+            "role": message.role.rawValue,
+            "content": message.images.map { _ in ["type": "image"] }
+                + message.videos.map { _ in ["type": "video"] }
+                + [["type": "text", "text": message.content]],
+        ]
     }
 }
 
@@ -1181,9 +1311,10 @@ public struct Gemma4Processor: UserInputProcessor {
     /// to the sRGB tone curve the vision tower was trained on (PIL/Python
     /// default). Shared by the image and video paths so frames go through the
     /// exact same pipeline.
-    private func resizedSRGB(from ci: CIImage) throws -> CIImage {
+    private func resizedSRGB(from ci: CIImage, maxSoftTokens: Int? = nil) throws -> CIImage {
         let ps = config.patchSize
-        let maxP = config.maxSoftTokens * config.poolingKernelSize * config.poolingKernelSize
+        let budget = maxSoftTokens ?? config.maxSoftTokens
+        let maxP = budget * config.poolingKernelSize * config.poolingKernelSize
         // Reject zero-area, infinite, and NaN extents explicitly. The scale-factor
         // math below divides by `w * h`; a CIImage with a zero extent produces an
         // infinite `f` and a NaN trap inside `Int(floor(.nan))`. A non-finite
@@ -1226,7 +1357,7 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(from: input)
         var tokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools, additionalContext: input.additionalContext)
 
         // ── Images ── each image is resized independently (aspect-ratio
@@ -1241,23 +1372,42 @@ public struct Gemma4Processor: UserInputProcessor {
 
         // ── Videos ── frames are sampled (~32 spread uniformly across the whole
         // clip, matching the Python Gemma4VideoProcessor) and resized with the
-        // exact same per-frame pipeline as images, then stored the same flat way.
-        // Restores the `ProcessedVideo` the provider routes through the processor;
-        // the text tower's bidirectional-vision overlay and `maskedScatter`
-        // consume `input.video`. `videoFrameCounts[i]` is the frame count of the
-        // i-th video, used to expand its `<|video|>` placeholder below.
+        // lower per-frame VIDEO soft-token budget (`video_processor.max_soft_tokens`,
+        // ~70) rather than the image budget (280), then stored the same flat way.
+        // Per-frame timestamps (seconds) are captured for the `mm:ss` prompt prefix
+        // (HF `Gemma4Processor.replace_video_token`); the per-video soft-token count
+        // is data-driven from the resized frame grid so it matches the vision tower's
+        // pooled output exactly.
         var processedVideo: LMInput.ProcessedVideo?
-        var videoFrameCounts: [Int] = []
+        var videoTimestamps: [[Double]] = []
+        var videoSoftTokenCounts: [Int] = []
         if !input.videos.isEmpty {
             var frames: [MLXArray] = []
+            let poolSq = config.poolingKernelSize * config.poolingKernelSize
             for video in input.videos {
                 let sequence = try await MediaProcessing.asProcessedSequence(
                     video, targetFPS: { duration in 32.0 / max(duration.seconds, 1.0) },
                     maxFrames: 32
                 ) { frame in
-                    VideoFrame(frame: try resizedSRGB(from: frame.frame), timeStamp: frame.timeStamp)
+                    VideoFrame(
+                        frame: try resizedSRGB(
+                            from: frame.frame, maxSoftTokens: config.videoMaxSoftTokens),
+                        timeStamp: frame.timeStamp)
                 }
-                videoFrameCounts.append(sequence.frames.count)
+                videoTimestamps.append(
+                    sequence.timestamps.map { $0.seconds.isFinite ? $0.seconds : 0 })
+                // All frames of one video share the same resized size, so the
+                // per-frame soft-token count is uniform; derive it from the first
+                // frame's grid (`(h/patch)*(w/patch)/pool^2`), matching the model's
+                // `videoOutputLength` and the placeholder expansion below.
+                if let first = sequence.frames.first {
+                    let h = first.dim(2)
+                    let w = first.dim(3)
+                    videoSoftTokenCounts.append(
+                        max(1, ((h / config.patchSize) * (w / config.patchSize)) / max(1, poolSq)))
+                } else {
+                    videoSoftTokenCounts.append(config.videoMaxSoftTokens)
+                }
                 frames.append(contentsOf: sequence.frames)
             }
             if !frames.isEmpty {
@@ -1268,11 +1418,13 @@ public struct Gemma4Processor: UserInputProcessor {
 
         // ── Expand placeholders into delimited soft-token blocks ──
         // Gemma4 represents each image / video frame as `boi + soft_token*count +
-        // eoi`. `count` is the per-image/per-frame vision-tower output length
-        // (`imageSeqLength`, which equals the model's `defaultOutputLength`), so
-        // the expanded token count matches the vision features `maskedScatter`
-        // writes. The boi/eoi delimiters are ordinary tokens (not soft tokens) so
-        // they do not change that count or the bidirectional visual-span mask.
+        // eoi`. For images `count` is `imageSeqLength` (== the model's
+        // `defaultOutputLength`); for video frames it is the per-frame video budget
+        // (`video_processor.max_soft_tokens`, derived from the resized grid), and
+        // each block is additionally prefixed with the frame's `mm:ss` timestamp.
+        // Either way the expanded soft-token count matches the vision features
+        // `maskedScatter` writes. The boi/eoi delimiters are ordinary tokens (not
+        // soft tokens) so they do not change that count or the visual-span mask.
         //
         // `convertTokenToId` is used rather than `encode("<|image|>").last` so the
         // lookup goes straight through the tokenizer's special-token map and never
@@ -1295,10 +1447,27 @@ public struct Gemma4Processor: UserInputProcessor {
                 if t == imgId, processedImage != nil {
                     appendBlock(&expanded, imgId, config.imageSeqLength)
                 } else if t == vidId, processedVideo != nil {
-                    // One boi/eoi block per sampled frame of this video.
-                    let frameCount = videoIndex < videoFrameCounts.count ? videoFrameCounts[videoIndex] : 0
-                    for _ in 0 ..< frameCount {
-                        appendBlock(&expanded, vidId, config.imageSeqLength)
+                    // One `mm:ss <boi> <|video|>*count <eoi>` block per sampled frame,
+                    // joined by a space — mirrors HF Gemma4Processor.replace_video_token
+                    // `" ".join("{ts} {boi}{video*n}{eoi}")`. The leading space on
+                    // frames after the first reproduces that join separator. The mm:ss
+                    // prefix is encoded as ordinary text tokens (addSpecialTokens:false
+                    // so no BOS leaks in). One block per frame keeps the total video
+                    // soft-token count equal to the vision features (frames == timestamps
+                    // count); `count` is the per-frame video budget.
+                    let timestamps =
+                        videoIndex < videoTimestamps.count ? videoTimestamps[videoIndex] : []
+                    let count =
+                        videoIndex < videoSoftTokenCounts.count
+                        ? videoSoftTokenCounts[videoIndex] : config.videoMaxSoftTokens
+                    for (frameIdx, seconds) in timestamps.enumerated() {
+                        let totalSeconds = max(0, Int(seconds.rounded(.towardZero)))
+                        let tsString = String(
+                            format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
+                        let prefix = (frameIdx == 0 ? "" : " ") + tsString + " "
+                        expanded.append(
+                            contentsOf: tokenizer.encode(text: prefix, addSpecialTokens: false))
+                        appendBlock(&expanded, vidId, count)
                     }
                     videoIndex += 1
                 } else {

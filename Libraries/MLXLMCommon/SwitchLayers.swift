@@ -7,11 +7,23 @@ import MLXNN
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
 /// Fusing activation + product into one compiled, shapeless kernel cuts kernel
 /// dispatches and intermediates on the hot decode path. Upstream ef85ed0.
-public let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { gate, up in
-    MLXNN.silu(gate) * up
-}
+///
+/// Gated by `MLXHardwareInfo.isCompiledDecodeSupported` (env `MLX_COMPILED_DECODE`,
+/// default on) like the sibling `compiledSwiGLU` / `safeGeluApproximate` fusions.
+/// The default SiLU `SwitchGLU` path wires this in as `activationProduct` (the
+/// highest-precedence branch in `callAsFunction`) and `LFM2MoE` calls it directly,
+/// so without the gate both would keep hitting compiled kernels on the very M1/M2 +
+/// macOS Tahoe machines the opt-out (MLX #3329) is meant to protect. Falls back to
+/// the plain uncompiled closure when off; the default (env unset) stays compiled.
+public let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = { gate, up in
+        MLXNN.silu(gate) * up
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(shapeless: true, body)
+    }
+    return body
+}()
 
 /// Compiled weighted expert-output combine (`(outputs * weights[..., None]).sum(-2)`).
 /// Shared by MoE routers (e.g. Gemma 4) to fuse the scale + reduce. Upstream ef85ed0.
