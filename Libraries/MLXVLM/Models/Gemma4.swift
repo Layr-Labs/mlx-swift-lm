@@ -31,13 +31,30 @@ private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
 }()
 
-// Graph-traceable offset for KV-sharing layers. The vMLX reference reads a
-// Compilable*/Batch* cache `offsetArray` here to keep the shared-KV offset inside
-// the compiled graph. Our integration base does not expose that accessor in the
-// MLXVLM scope, so we fall back to the host-int offset (`sharedOffset`), which is
-// correct for B=1 / non-compiled decode — the path the provider and the decode
-// benchmark exercise. Returns nil to select that fallback.
-private func gemma4VLMGraphOffsetArray(for cache: KVCache?) -> MLXArray? { nil }
+// Graph-traceable / per-row RoPE offset for KV-sharing layers. Mirrors
+// `applyRotaryPosition` (used by the non-shared path) and the proven vMLX
+// behavior: when the source cache carries per-sequence offsets
+// (`BatchPositionedKVCache` — i.e. BatchKVCache / BatchRotatingKVCache /
+// QuantizedBatchKVCache) we thread its per-row `batchOffset`, so mixed-length
+// continuous batches RoPE each row at its own position instead of a single
+// scalar (max-across-rows) offset that corrupts the shorter rows. A
+// `CompilableKVCache` exposes a graph-traceable `offsetArray`, so KV-sharing
+// layers keep the shared-KV offset inside the compiled graph (no host readback
+// of `cache.offset`). The `+ 0` snapshots the value before the source layer's
+// `cache.update` advances it (`CompilableKVCache` mutates `offsetArray` in
+// place via `_updateInternal`; `+ 0` references the captured array, not the
+// repointed wrapper). Plain B=1 / non-compiled decode uses RotatingKVCache /
+// KVCacheSimple, which match neither branch, so this returns nil and the caller
+// keeps the scalar host-int offset — the fast text decode hot path is unchanged.
+private func gemma4VLMGraphOffsetArray(for cache: KVCache?) -> MLXArray? {
+    if let batchCache = cache as? BatchPositionedKVCache {
+        return batchCache.batchOffset + 0
+    }
+    if let compilable = cache as? CompilableKVCache {
+        return compilable.offsetArray + 0
+    }
+    return nil
+}
 
 // Local replacement for vMLX's `QwenVL.intExtent` (absent in our tree). Rejects
 // zero-area / non-finite extents so the scale-factor math below cannot divide by
@@ -189,6 +206,9 @@ struct G4TextConfig: Codable, Sendable {
     let topKExperts: Int
     let ropeTraditional: Bool
     let ropeParameters: [String: [String: StringOrNumber]]
+    // "vision" enables Gemma4 blockwise bidirectional attention within
+    // image/video soft-token spans during prefill. nil/other => ordinary causal.
+    let useBidirectionalAttention: String?
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
@@ -217,6 +237,7 @@ struct G4TextConfig: Codable, Sendable {
         case topKExperts = "top_k_experts"
         case ropeTraditional = "rope_traditional"
         case ropeParameters = "rope_parameters"
+        case useBidirectionalAttention = "use_bidirectional_attention"
     }
 
     init(from decoder: Decoder) throws {
@@ -264,6 +285,7 @@ struct G4TextConfig: Codable, Sendable {
         topKExperts = try c.decodeIfPresent(Int.self, forKey: .topKExperts) ?? 0
         ropeTraditional = try c.decodeIfPresent(Bool.self, forKey: .ropeTraditional) ?? false
         ropeParameters = try c.decodeIfPresent([String: [String: StringOrNumber]].self, forKey: .ropeParameters) ?? [:]
+        useBidirectionalAttention = try c.decodeIfPresent(String.self, forKey: .useBidirectionalAttention)
     }
 }
 
@@ -272,6 +294,7 @@ public struct Gemma4Configuration: Codable, Sendable {
     let visionConfig: Gemma4VisionConfig
     let modelType: String
     let imageTokenId: Int
+    let videoTokenId: Int?
     let visionSoftTokensPerImage: Int
     let quantization: BaseConfiguration.Quantization?
 
@@ -280,8 +303,25 @@ public struct Gemma4Configuration: Codable, Sendable {
         case visionConfig = "vision_config"
         case modelType = "model_type"
         case imageTokenId = "image_token_id"
+        case videoTokenId = "video_token_id"
         case visionSoftTokensPerImage = "vision_soft_tokens_per_image"
         case quantization
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        textConfig = try c.decode(G4TextConfig.self, forKey: .textConfig)
+        visionConfig = try c.decode(Gemma4VisionConfig.self, forKey: .visionConfig)
+        modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"
+        imageTokenId = try c.decodeIfPresent(Int.self, forKey: .imageTokenId) ?? 258_880
+        // Default to the Gemma4 video token id so the model stays in sync with the
+        // processor (which emits video placeholders) even when config.json omits it.
+        videoTokenId = try c.decodeIfPresent(Int.self, forKey: .videoTokenId) ?? 258_884
+        visionSoftTokensPerImage =
+            try c.decodeIfPresent(Int.self, forKey: .visionSoftTokensPerImage)
+            ?? visionConfig.defaultOutputLength
+        quantization = try c.decodeIfPresent(
+            BaseConfiguration.Quantization.self, forKey: .quantization)
     }
 }
 
@@ -317,6 +357,45 @@ private func applyMultidimensionalRope(_ inputs: MLXArray, positions: MLXArray, 
 
 private func oneHot(_ indices: MLXArray, numClasses: Int) -> MLXArray {
     (expandedDimensions(indices, axis: -1) .== MLXArray(0 ..< Int32(numClasses))).asType(.float32)
+}
+
+// MARK: - Bidirectional vision attention overlay
+
+/// Per-token block id for vision spans: each contiguous run of vision tokens
+/// shares an id, non-vision tokens get -1. Mirrors Python
+/// `_block_sequence_ids_for_mask`.
+private func gemma4VisionBlockIds(_ isVision: MLXArray) -> MLXArray {
+    let length = isVision.dim(1)
+    let leading = MLXArray.zeros([isVision.dim(0), 1], dtype: .bool)
+    let prev = concatenated([leading, isVision[0..., ..<(length - 1)]], axis: 1)
+    let starts = logicalAnd(isVision, logicalNot(prev))
+    let groupIds = cumsum(starts.asType(.int32), axis: 1) - 1
+    return MLX.where(isVision, groupIds, MLXArray(Int32(-1)))
+}
+
+/// Overlay blockwise bidirectional attention for vision-token spans onto a
+/// boolean causal mask (True = attend). Tokens in the same image/video block
+/// attend to each other in both directions. Mirrors Python
+/// `_apply_blockwise_bidirectional_overlay`.
+private func gemma4BidirectionalVisionMask(_ baseMask: MLXArray, isVision: MLXArray) -> MLXArray {
+    let blockIds = gemma4VisionBlockIds(isVision)
+    let qBlocks = expandedDimensions(blockIds, axis: -1)  // [B, L, 1]
+    let kBlocks = expandedDimensions(blockIds, axis: -2)  // [B, 1, L]
+    let sameBlock = logicalAnd(qBlocks .!= MLXArray(Int32(-1)), qBlocks .== kBlocks)  // [B, L, L]
+    return logicalOr(baseMask, expandedDimensions(sameBlock, axis: 1))  // -> [B, 1, L, L]
+}
+
+/// If `mode` carries a boolean array mask, overlay the vision bidirectional
+/// attention; pass other modes (`.causal`, `.none`) through unchanged.
+private func gemma4OverlayBidirectionalVision(
+    _ mode: MLXFast.ScaledDotProductAttentionMaskMode, isVision: MLXArray
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    switch mode {
+    case .array(let maskArray):
+        return .array(gemma4BidirectionalVisionMask(maskArray, isVision: isVision))
+    default:
+        return mode
+    }
 }
 
 // Vision Attention
@@ -784,7 +863,7 @@ private class TextModel: Module {
         return (p + pli) * pow(Float(2.0), Float(-0.5))
     }
 
-    func callAsFunction(_ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil) -> MLXArray {
+    func callAsFunction(_ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil, imageTokenMask: MLXArray? = nil) -> MLXArray {
         // Ensure batch dimension — callers may pass 1D tokens [N] on cache-reuse turns
         let inputs = inputs.map { $0.ndim == 1 ? $0.expandedDimensions(axis: 0) : $0 }
         var h: MLXArray
@@ -808,7 +887,19 @@ private class TextModel: Module {
         let sIdx = lt.firstIndex(of: "sliding_attention") ?? 0
         let gc: KVCache? = cache.flatMap { gIdx < $0.count ? $0[gIdx] : nil }
         let sc: KVCache? = cache.flatMap { sIdx < $0.count ? $0[sIdx] : nil }
-        let gm = createAttentionMask(h: h, cache: gc); let sm = createAttentionMask(h: h, cache: sc, windowSize: cfg.slidingWindow)
+        // Gemma4 applies blockwise bidirectional attention within image/video
+        // soft-token spans during prefill. The overlay needs a materialized
+        // boolean mask, so force `returnArray` only when it is active. The
+        // text-only / single-token decode hot path keeps `imageTokenMask == nil`,
+        // so it stays on the symbolic `.causal` mask (no array materialized).
+        let useBidirectionalVision =
+            imageTokenMask != nil && cfg.useBidirectionalAttention == "vision" && h.dim(1) > 1
+        var gm = createAttentionMask(h: h, cache: gc, returnArray: useBidirectionalVision)
+        var sm = createAttentionMask(h: h, cache: sc, windowSize: cfg.slidingWindow, returnArray: useBidirectionalVision)
+        if useBidirectionalVision, let imageTokenMask {
+            gm = gemma4OverlayBidirectionalVision(gm, isVision: imageTokenMask)
+            sm = gemma4OverlayBidirectionalVision(sm, isVision: imageTokenMask)
+        }
 
         var intermediates: [(keys: MLXArray, values: MLXArray, offset: Int, offsetArray: MLXArray?)?] = Array(repeating: nil, count: layers.count)
         for (i, l) in layers.enumerated() {
@@ -818,16 +909,16 @@ private class TextModel: Module {
             if prevIdx != i, let prev = intermediates[prevIdx] { skv = (prev.keys, prev.values); soff = prev.offset; soffArr = prev.offsetArray }
             else { skv = nil; soff = nil; soffArr = nil }
             let ce = prevIdx == i ? (i < lc.count ? lc[i] : nil) : nil
-            let res = l(h, mask: isGlobal ? gm : sm, cache: ce, perLayerInput: pliList[i], sharedKV: skv, sharedOffset: soff, sharedOffsetArray: soffArr)
-            // Mirror `Libraries/MLXLLM/Models/Gemma4Text.swift:762` — use
-            // `graphOffsetArray(for:)` so KV-sharing layers still receive a
-            // graph-traceable offset under Stage 1B.3 compile (covers
-            // CompilableKVCache / CompilableRotatingKVCache /
-            // CompilableTurboQuantKVCache / BatchKVCache / BatchArraysCache).
-            // The prior `(ce as? BatchKVCache)?.offsetArray` cast missed
-            // every Compilable* path, forcing a host readback of
-            // `cache.offset` on the next shared-KV layer.
+            // Capture the per-row / graph offset BEFORE the source layer's
+            // attention advances the cache, so the snapshot matches the
+            // pre-update scalar `res.offset` that KV-sharing consumer layers
+            // also use to RoPE their queries (mirrors `gemma4CapturePositionOffset`
+            // in Libraries/MLXLLM/Models/Gemma4Text.swift). Covers BatchKVCache /
+            // BatchRotatingKVCache / QuantizedBatchKVCache (per-row `batchOffset`)
+            // and CompilableKVCache (graph-traceable `offsetArray`); nil for the
+            // scalar B=1 / non-compiled decode hot path.
             let layerOffArr = gemma4VLMGraphOffsetArray(for: ce)
+            let res = l(h, mask: isGlobal ? gm : sm, cache: ce, perLayerInput: pliList[i], sharedKV: skv, sharedOffset: soff, sharedOffsetArray: soffArr)
             h = res.h; intermediates[i] = (res.keys, res.values, res.offset, layerOffArr)
         }
         return norm(h)
@@ -842,8 +933,8 @@ private class G4LanguageModel: Module {
         if !cfg.tieWordEmbeddings { _lmHead.wrappedValue = Linear(cfg.hiddenSize, cfg.vocabSize, bias: false) }
         super.init()
     }
-    func callAsFunction(_ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil) -> MLXArray {
-        var o = model(inputs, inputEmbedding: inputEmbedding, cache: cache)
+    func callAsFunction(_ inputs: MLXArray?, inputEmbedding: MLXArray? = nil, cache: [KVCache?]? = nil, imageTokenMask: MLXArray? = nil) -> MLXArray {
+        var o = model(inputs, inputEmbedding: inputEmbedding, cache: cache, imageTokenMask: imageTokenMask)
         if let lh = lmHead { o = lh(o) } else { o = model.emb.asLinear(o) }
         if let cap = cfg.finalLogitSoftcapping, cap > 0 { o = compiledLogitSoftcap(o, MLXArray(cap)) }
         return o
@@ -929,34 +1020,60 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         var emb = languageModel.model.emb(input.text.tokens)
         emb = emb * MLXArray(sqrt(Float(config.textConfig.hiddenSize)), dtype: emb.dtype)
 
-        if let pixels = input.image?.pixels {
-            // Process each image through vision tower separately — images may have
-            // different spatial dimensions after resize. Vision features are always
-            // [1, defaultOutputLength, visionHidden] per image regardless of input size.
-            let B = pixels.dim(0)
-            var featuresList = [MLXArray]()
-            for i in 0 ..< B {
-                // Extract image at its original dimensions (stored in frames)
-                // to avoid processing zero-padded regions through the vision tower.
-                if let frames = input.image?.frames, i < frames.count {
-                    let h = frames[i].h; let w = frames[i].w
-                    let singleImage = pixels[i, 0..., ..<h, ..<w].expandedDimensions(axis: 0)
-                    featuresList.append(embedVision(visionTower(singleImage)))
-                } else {
-                    let singleImage = pixels[i].expandedDimensions(axis: 0)
-                    featuresList.append(embedVision(visionTower(singleImage)))
-                }
-            }
-            let imgFeatures = (B == 1 ? featuresList[0] : concatenated(featuresList)).asType(emb.dtype)
+        // Accumulate the image+video soft-token positions so the text tower can
+        // apply Gemma4's blockwise bidirectional attention over those spans. nil
+        // keeps the text-only hot path on the symbolic causal mask.
+        var visualTokenMask: MLXArray? = nil
 
+        if let pixels = input.image?.pixels {
+            let imgFeatures = encodeVisionFeatures(
+                pixels: pixels, frames: input.image?.frames, dtype: emb.dtype)
             let imgMask = MLX.equal(input.text.tokens, MLXArray(Int32(config.imageTokenId)))
             let imgMaskExp = MLX.broadcast(expandedDimensions(imgMask, axis: -1), to: emb.shape)
             emb = try maskedScatter(input: emb, mask: imgMaskExp, source: imgFeatures)
+            visualTokenMask = imgMask
+        }
+
+        // Video frames run through the same vision tower as images; only the
+        // placeholder token they scatter into differs (image_token vs video_token).
+        if let videoPixels = input.video?.pixels, let videoTokenId = config.videoTokenId {
+            let vidFeatures = encodeVisionFeatures(
+                pixels: videoPixels, frames: input.video?.frames, dtype: emb.dtype)
+            let vidMask = MLX.equal(input.text.tokens, MLXArray(Int32(videoTokenId)))
+            let vidMaskExp = MLX.broadcast(expandedDimensions(vidMask, axis: -1), to: emb.shape)
+            emb = try maskedScatter(input: emb, mask: vidMaskExp, source: vidFeatures)
+            visualTokenMask = visualTokenMask.map { logicalOr($0, vidMask) } ?? vidMask
         }
 
         let paddedCache = padCache(cache)
-        let out = languageModel(input.text.tokens, inputEmbedding: emb, cache: paddedCache)
+        let out = languageModel(
+            input.text.tokens, inputEmbedding: emb, cache: paddedCache,
+            imageTokenMask: visualTokenMask)
         return .logits(.init(logits: out))
+    }
+
+    /// Encode one batch of images / video frames through the vision tower and
+    /// project into the text embedding space. Each frame is sliced to its real
+    /// (un-padded) dimensions stored in `frames`, then yields
+    /// `defaultOutputLength` soft tokens regardless of input size.
+    private func encodeVisionFeatures(pixels: MLXArray, frames: [THW]?, dtype: DType) -> MLXArray {
+        let B = pixels.dim(0)
+        var featuresList = [MLXArray]()
+        featuresList.reserveCapacity(B)
+        for i in 0 ..< B {
+            // Extract each frame at its original dimensions (stored in frames)
+            // to avoid processing zero-padded regions through the vision tower.
+            if let frames, i < frames.count {
+                let h = frames[i].h
+                let w = frames[i].w
+                let single = pixels[i, 0..., ..<h, ..<w].expandedDimensions(axis: 0)
+                featuresList.append(embedVision(visionTower(single)))
+            } else {
+                let single = pixels[i].expandedDimensions(axis: 0)
+                featuresList.append(embedVision(visionTower(single)))
+            }
+        }
+        return (B == 1 ? featuresList[0] : concatenated(featuresList)).asType(dtype)
     }
 
     private func padCache(_ cache: [any KVCache]?) -> [KVCache?]? {
@@ -980,8 +1097,17 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             // Skip clipped linear params — training artifacts, not used in inference (we use plain Linear)
             if nk.contains("input_min") || nk.contains("input_max") || nk.contains("output_min") || nk.contains("output_max") { continue }
             if nk.contains("rotary_emb") { continue }
-            // Remap language_model keys to include model. prefix
-            if nk.hasPrefix("language_model.") && !nk.hasPrefix("language_model.model.") {
+            // Remap language_model keys to include model. prefix — EXCEPT
+            // `language_model.lm_head.*`. The untied LM head is the
+            // `G4LanguageModel.lmHead` module (key "lm_head") that lives directly
+            // under `language_model`, NOT under the `model` (TextModel) submodule.
+            // Blanket-remapping it to `language_model.model.lm_head.*` points at a
+            // module that does not exist, so the head silently fails to load for
+            // untied checkpoints (tie_word_embeddings == false). The vocab-trim
+            // loop below already expects it at `language_model.lm_head.*`.
+            if nk.hasPrefix("language_model.") && !nk.hasPrefix("language_model.model.")
+                && !nk.hasPrefix("language_model.lm_head")
+            {
                 nk = "language_model.model." + String(nk.dropFirst("language_model.".count))
             }
             if nk.contains(".switch_mlp.") { nk = nk.replacingOccurrences(of: ".switch_mlp.", with: ".experts.switch_glu.") }
@@ -1011,6 +1137,13 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     public let poolingKernelSize: Int
     public let imageSeqLength: Int
     public let audioSeqLength: Int
+    // Gemma4 wraps every image / video-frame soft-token block with begin-of-image
+    // (boi) and end-of-image (eoi) delimiter tokens, matching the Python
+    // processor. These are ordinary vocab tokens (embedded normally, attended
+    // causally) — they are NOT image/video soft tokens, so they do not affect the
+    // maskedScatter count or the bidirectional visual-span mask.
+    public let boiTokenId: Int
+    public let eoiTokenId: Int?
 
     enum CodingKeys: String, CodingKey {
         case processorClass = "processor_class"
@@ -1019,6 +1152,8 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         case poolingKernelSize = "pooling_kernel_size"
         case imageSeqLength = "image_seq_length"
         case audioSeqLength = "audio_seq_length"
+        case boiTokenId = "boi_token_id"
+        case eoiTokenId = "eoi_token_id"
     }
 
     public init(from decoder: Decoder) throws {
@@ -1029,6 +1164,8 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         poolingKernelSize = try c.decodeIfPresent(Int.self, forKey: .poolingKernelSize) ?? 3
         imageSeqLength = try c.decodeIfPresent(Int.self, forKey: .imageSeqLength) ?? 280
         audioSeqLength = try c.decodeIfPresent(Int.self, forKey: .audioSeqLength) ?? 750
+        boiTokenId = try c.decodeIfPresent(Int.self, forKey: .boiTokenId) ?? 255_999
+        eoiTokenId = try c.decodeIfPresent(Int.self, forKey: .eoiTokenId) ?? 258_882
     }
 }
 
@@ -1040,70 +1177,141 @@ public struct Gemma4Processor: UserInputProcessor {
         self.config = config; self.tokenizer = tokenizer
     }
 
+    /// Resize a single image/frame to Gemma4's soft-token budget and convert it
+    /// to the sRGB tone curve the vision tower was trained on (PIL/Python
+    /// default). Shared by the image and video paths so frames go through the
+    /// exact same pipeline.
+    private func resizedSRGB(from ci: CIImage) throws -> CIImage {
+        let ps = config.patchSize
+        let maxP = config.maxSoftTokens * config.poolingKernelSize * config.poolingKernelSize
+        // Reject zero-area, infinite, and NaN extents explicitly. The scale-factor
+        // math below divides by `w * h`; a CIImage with a zero extent produces an
+        // infinite `f` and a NaN trap inside `Int(floor(.nan))`. A non-finite
+        // extent (e.g. `CIImage(color:)` returns `(.infinity, .infinity)`) traps
+        // even earlier inside `Int(.infinity)`. Both surface as
+        // VLMError.imageProcessingFailure now.
+        let (h, w) = try gemma4IntExtent(ci.extent.size)
+        let f = sqrt(Float(maxP * ps * ps) / Float(w * h))
+        let sm = config.poolingKernelSize * ps
+        var tH = Int(floor(f * Float(h) / Float(sm))) * sm
+        var tW = Int(floor(f * Float(w) / Float(sm))) * sm
+        if tH == 0 { tH = sm }
+        if tW == 0 { tW = sm }
+        let resized = MediaProcessing.resampleBicubic(ci, to: CGSize(width: tW, height: tH))
+        return MediaProcessing.inSRGBToneCurveSpace(resized)
+    }
+
+    /// Resize + convert one image/frame to a `[1, C, H, W]` (NCHW) pixel tensor
+    /// with float values in `[0, 1]`.
+    private func resizedPixels(from ci: CIImage) throws -> MLXArray {
+        MediaProcessing.asMLXArray(try resizedSRGB(from: ci))
+    }
+
+    /// Pack per-image/per-frame `[1, C, H, W]` tensors into one flat batch and
+    /// record each one's real (un-padded) size in `frames`, so the vision tower
+    /// processes each at its original size. Shorter tensors are zero-padded up to
+    /// the batch max so they can share a single storage tensor.
+    private func packFrames(_ arrays: [MLXArray]) -> (pixels: MLXArray, frames: [THW]) {
+        let sizes = arrays.map { THW(1, $0.dim(2), $0.dim(3)) }
+        if arrays.count == 1 { return (arrays[0], sizes) }
+        let maxH = arrays.map { $0.dim(2) }.max()!
+        let maxW = arrays.map { $0.dim(3) }.max()!
+        let stored = arrays.map { arr -> MLXArray in
+            let h = arr.dim(2)
+            let w = arr.dim(3)
+            if h == maxH && w == maxW { return arr }
+            return MLX.padded(arr, widths: [[0, 0], [0, 0], [0, maxH - h], [0, maxW - w]])
+        }
+        return (concatenated(stored), sizes)
+    }
+
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = Qwen2VLMessageGenerator().generate(from: input)
         var tokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools, additionalContext: input.additionalContext)
 
+        // ── Images ── each image is resized independently (aspect-ratio
+        // preserving) and stored as a flat `[N, C, H, W]` batch indexed by
+        // `frames`; the vision tower processes each at its real, un-padded size.
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
-            let ps = config.patchSize; let maxP = config.maxSoftTokens * config.poolingKernelSize * config.poolingKernelSize
-            var arrays = try input.images.map { img -> MLXArray in
-                let ci = try img.asCIImage()
-                // Reject zero-area, infinite, and NaN extents explicitly. The
-                // scale-factor math below divides by `w * h`; a CIImage with
-                // a zero extent produces infinite `f` and a NaN trap inside
-                // `Int(floor(.nan))`. A non-finite extent (e.g.
-                // `CIImage(color:)` returns `(.infinity, .infinity)`) traps
-                // even earlier inside `Int(.infinity)`. Both surface as
-                // VLMError.imageProcessingFailure now.
-                let (h, w) = try gemma4IntExtent(ci.extent.size)
-                let f = sqrt(Float(maxP * ps * ps) / Float(w * h))
-                let sm = config.poolingKernelSize * ps
-                var tH = Int(floor(f * Float(h) / Float(sm))) * sm; var tW = Int(floor(f * Float(w) / Float(sm))) * sm
-                if tH == 0 { tH = sm }; if tW == 0 { tW = sm }
-                let resized = MediaProcessing.resampleBicubic(ci, to: CGSize(width: tW, height: tH))
-                // Convert to sRGB tone curve — CIImage may be in linear space, but the
-                // vision tower was trained on sRGB images (PIL/Python default).
-                let srgb = MediaProcessing.inSRGBToneCurveSpace(resized)
-                // asMLXArray returns [1, C, H, W] (NCHW) with float values in [0, 1]
-                return MediaProcessing.asMLXArray(srgb)
-            }
-            // Store per-image dimensions in frames so prepare() can extract each
-            // image at its original size (before padding for batch storage).
-            let imageSizes = arrays.map { THW(1, $0.dim(2), $0.dim(3)) }
-            if arrays.count == 1 {
-                processedImage = LMInput.ProcessedImage(pixels: arrays[0], frames: imageSizes)
-            } else {
-                // Pad to max dims for storage in a single batched tensor
-                let maxH = arrays.map { $0.dim(2) }.max()!
-                let maxW = arrays.map { $0.dim(3) }.max()!
-                let stored = arrays.map { arr -> MLXArray in
-                    let h = arr.dim(2); let w = arr.dim(3)
-                    if h == maxH && w == maxW { return arr }
-                    return MLX.padded(arr, widths: [[0, 0], [0, 0], [0, maxH - h], [0, maxW - w]])
+            let arrays = try input.images.map { try resizedPixels(from: $0.asCIImage()) }
+            let packed = packFrames(arrays)
+            processedImage = LMInput.ProcessedImage(pixels: packed.pixels, frames: packed.frames)
+        }
+
+        // ── Videos ── frames are sampled (~32 spread uniformly across the whole
+        // clip, matching the Python Gemma4VideoProcessor) and resized with the
+        // exact same per-frame pipeline as images, then stored the same flat way.
+        // Restores the `ProcessedVideo` the provider routes through the processor;
+        // the text tower's bidirectional-vision overlay and `maskedScatter`
+        // consume `input.video`. `videoFrameCounts[i]` is the frame count of the
+        // i-th video, used to expand its `<|video|>` placeholder below.
+        var processedVideo: LMInput.ProcessedVideo?
+        var videoFrameCounts: [Int] = []
+        if !input.videos.isEmpty {
+            var frames: [MLXArray] = []
+            for video in input.videos {
+                let sequence = try await MediaProcessing.asProcessedSequence(
+                    video, targetFPS: { duration in 32.0 / max(duration.seconds, 1.0) },
+                    maxFrames: 32
+                ) { frame in
+                    VideoFrame(frame: try resizedSRGB(from: frame.frame), timeStamp: frame.timeStamp)
                 }
-                processedImage = LMInput.ProcessedImage(pixels: concatenated(stored), frames: imageSizes)
+                videoFrameCounts.append(sequence.frames.count)
+                frames.append(contentsOf: sequence.frames)
             }
-            // Chat template emits <|image|> which tokenizes to image_token_id (258880
-            // for shipped Gemma4 bundles). Expand each single image token into
-            // imageSeqLength copies for the vision features.
-            //
-            // Use `convertTokenToId` rather than `encode("<|image|>").last` so the
-            // lookup goes straight through the tokenizer's special-token map and
-            // never picks up an appended BOS/EOS — `encode(text:)` defaults to
-            // `addSpecialTokens: true` (Tokenizer.swift:23-25) which on some
-            // tokenizers prepends BOS, leaving a 2-token result whose `.last`
-            // is still correct but whose first element silently varies. The
-            // 258880 fallback covers tokenizers that don't expose `<|image|>` as
-            // an addable special token.
-            let imgId = tokenizer.convertTokenToId("<|image|>") ?? 258880
-            var exp = [Int](); for t in tokens { if t == imgId { exp.append(contentsOf: Array(repeating: imgId, count: config.imageSeqLength)) } else { exp.append(t) } }
-            tokens = exp
+            if !frames.isEmpty {
+                let packed = packFrames(frames)
+                processedVideo = LMInput.ProcessedVideo(pixels: packed.pixels, frames: packed.frames)
+            }
+        }
+
+        // ── Expand placeholders into delimited soft-token blocks ──
+        // Gemma4 represents each image / video frame as `boi + soft_token*count +
+        // eoi`. `count` is the per-image/per-frame vision-tower output length
+        // (`imageSeqLength`, which equals the model's `defaultOutputLength`), so
+        // the expanded token count matches the vision features `maskedScatter`
+        // writes. The boi/eoi delimiters are ordinary tokens (not soft tokens) so
+        // they do not change that count or the bidirectional visual-span mask.
+        //
+        // `convertTokenToId` is used rather than `encode("<|image|>").last` so the
+        // lookup goes straight through the tokenizer's special-token map and never
+        // picks up an appended BOS/EOS — `encode(text:)` defaults to
+        // `addSpecialTokens: true`, which on some tokenizers prepends BOS. The
+        // numeric fallbacks cover tokenizers that don't expose the placeholders as
+        // addable special tokens.
+        if processedImage != nil || processedVideo != nil {
+            let imgId = tokenizer.convertTokenToId("<|image|>") ?? 258_880
+            let vidId = tokenizer.convertTokenToId("<|video|>") ?? 258_884
+            func appendBlock(_ acc: inout [Int], _ tokenId: Int, _ count: Int) {
+                acc.append(config.boiTokenId)
+                acc.append(contentsOf: Array(repeating: tokenId, count: count))
+                if let eoi = config.eoiTokenId { acc.append(eoi) }
+            }
+            var expanded = [Int]()
+            expanded.reserveCapacity(tokens.count)
+            var videoIndex = 0
+            for t in tokens {
+                if t == imgId, processedImage != nil {
+                    appendBlock(&expanded, imgId, config.imageSeqLength)
+                } else if t == vidId, processedVideo != nil {
+                    // One boi/eoi block per sampled frame of this video.
+                    let frameCount = videoIndex < videoFrameCounts.count ? videoFrameCounts[videoIndex] : 0
+                    for _ in 0 ..< frameCount {
+                        appendBlock(&expanded, vidId, config.imageSeqLength)
+                    }
+                    videoIndex += 1
+                } else {
+                    expanded.append(t)
+                }
+            }
+            tokens = expanded
         }
 
         let pa = MLXArray(tokens).expandedDimensions(axis: 0)
         return LMInput(
             text: .init(tokens: pa, mask: ones(like: pa).asType(.int8)),
-            image: processedImage)
+            image: processedImage,
+            video: processedVideo)
     }
 }
