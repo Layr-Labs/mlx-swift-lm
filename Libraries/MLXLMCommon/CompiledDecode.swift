@@ -33,13 +33,14 @@ private let compiledDecodeLog = Logger(subsystem: "darkbloom", category: "Compil
 
 public enum CompiledDecode {
 
-    /// Opt-in env var: set `DARKBLOOM_COMPILED_DECODE=1` to enable whole-model
-    /// compiled decode. Default OFF.
+    /// Compiled decode is ON by default. Set `DARKBLOOM_COMPILED_DECODE=0`
+    /// to disable. Guards in GenerationBatch ensure it only activates for
+    /// B=1 solo decode with supported cache types (no MTP, no SSM).
     public static let isEnabled: Bool = {
         if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_COMPILED_DECODE"] {
-            return ["1", "true", "yes", "on"].contains(raw.lowercased())
+            return !["0", "false", "no", "off"].contains(raw.lowercased())
         }
-        return false
+        return true
     }()
 
     /// True iff every layer is a compilable cache type (``CompilableKVCache``
