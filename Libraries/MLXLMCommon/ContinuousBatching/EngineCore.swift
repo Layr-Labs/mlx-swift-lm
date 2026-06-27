@@ -85,7 +85,10 @@ public final class EngineCore: @unchecked Sendable {
     // add-before-start pattern some callers/tests rely on). `addRequest` rejects
     // enqueues only when the engine was actually STOPPED, not merely not-started.
     private var _stopped = false
-    private var _task: Task<Void, Never>?
+    // Engine loop runs purely on engineQueue (GCD self-rescheduling).
+    // No Task, no cooperative pool involvement — eliminates the per-step
+    // cooperative-pool → engineQueue → cooperative-pool round-trip that
+    // starved the engine under concurrent consumer pipeline load.
     private var _startTime: Date?
     public private(set) var stepsExecuted: Int = 0
 
@@ -198,36 +201,41 @@ public final class EngineCore: @unchecked Sendable {
     // MARK: - Lifecycle
 
     /// Start the engine loop.
+    ///
+    /// The loop runs entirely on `engineQueue` via GCD self-rescheduling.
+    /// Each step dispatches the next step directly with `engineQueue.async`,
+    /// keeping the GPU pipeline full without ever touching the cooperative
+    /// thread pool. This eliminates the ~3-8ms per-step scheduling gap that
+    /// halved effective decode TPS under the old `Task`-based loop.
     public func start() {
         guard !_running else { return }
         _running = true
         _startTime = Date()
-        _task = Task { [weak self] in await self?.engineLoop() }
+        engineQueue.async { [weak self] in self?.engineStep() }
     }
 
     /// Stop the engine loop.
     public func stop() {
         _running = false
         _stopped = true
-        _task?.cancel()
-        _task = nil
+        // No Task to cancel — the next engineStep() invocation sees
+        // _running == false and returns without rescheduling.
     }
 
     /// Stop the loop and wait for it to fully exit, so the caller can safely
-    /// release the engine and reclaim its MLX buffers. Unlike `stop()`, this awaits
-    /// the loop task: once it returns, the loop has finished its in-flight step and
-    /// will enqueue no more, and it no longer retains `self`. A final queue drain
-    /// then flushes any abort/cleanup blocks the loop left behind. This is what
-    /// makes a subsequent `Memory.clearCache()` both safe (no step's MLX work runs
-    /// concurrently — the IOKit completeMemory race seen on M4) and effective (the
-    /// engine chain, and thus the batch KV, can actually be released).
+    /// release the engine and reclaim its MLX buffers. Unlike `stop()`, this
+    /// drains the engine queue: once it returns, the in-flight step has finished
+    /// and no more steps will be enqueued. A final queue drain then flushes any
+    /// abort/cleanup blocks the loop left behind. This is what makes a subsequent
+    /// `Memory.clearCache()` both safe (no step's MLX work runs concurrently —
+    /// the IOKit completeMemory race seen on M4) and effective (the engine chain,
+    /// and thus the batch KV, can actually be released).
     public func stopAndWait() async {
         _running = false
         _stopped = true
-        let task = _task
-        _task = nil
-        task?.cancel()
-        await task?.value
+        // Drain the engine queue — the in-flight engineStep() will see
+        // _running == false and return without rescheduling. This block
+        // runs after that step completes (serial queue).
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             engineQueue.async { continuation.resume() }
         }
@@ -425,92 +433,97 @@ public final class EngineCore: @unchecked Sendable {
     /// Output distribution runs INSIDE the `engineQueue.async` block so that
     /// all `outputCollectors` access is serialised with `addRequest` and
     /// `cleanupRequest`, matching omlx's single-executor model.
-    private func engineLoop() async {
-        while _running {
-            if scheduler.hasRequests() {
-                _idleSteps = 0
-                await withCheckedContinuation { continuation in
-                    engineQueue.async { [weak self] in
-                        guard let self else {
-                            continuation.resume()
-                            return
-                        }
-                        let output = scheduler.step()
-                        stepsExecuted += 1
+    /// Single decode step, self-rescheduling on `engineQueue`.
+    ///
+    /// Runs entirely on `engineQueue` — no cooperative pool involvement.
+    /// Each invocation either executes one `scheduler.step()` and dispatches
+    /// the next step immediately via `engineQueue.async`, or (when idle)
+    /// schedules a delayed re-check via `asyncAfter`. The GPU pipeline stays
+    /// full with only GCD dispatch overhead (~1-5μs) between steps instead
+    /// of the ~3-8ms cooperative pool scheduling gap.
+    private func engineStep() {
+        guard _running else { return }
 
-                        // Diagnostic (default-on): observe resource COUNT vs BYTES
-                        // on the real batched-decode path to classify the
-                        // [metal::malloc] Resource limit crash as cached vs live.
-                        // Sample on the fine pressure cadence (which divides the
-                        // coarse one) so the high-pressure check is NOT gated by the
-                        // coarse window: resources can cross 70% and hit the limit
-                        // between coarse samples, and that ramp is exactly what this
-                        // telemetry must capture.
-                        if Self.resourceDebug, stepsExecuted % Self.resourcePressureEverySteps == 0 {
-                            let res = Memory.numResources
-                            let lim = Memory.resourceLimit
-                            let pct = lim > 0 ? Double(res) / Double(lim) * 100 : 0
-                            let highPressure = pct >= Self.resourcePressurePct
-                            let coarseSample = stepsExecuted % Self.resourceDebugEverySteps == 0
-                            // Emit the line on the coarse cadence, or on every fine
-                            // sample while under pressure (dense ramp, still bounded).
-                            if coarseSample || highPressure {
-                                let batch = output.outputs.count
-                                let line = String(
-                                    format: "[rsrc] step=%d batch=%d resources=%d/%d (%.1f%%) cache=%.0fMB active=%.0fMB",
-                                    stepsExecuted, batch, res, lim, pct,
-                                    Double(Memory.cacheMemory) / 1_048_576,
-                                    Double(Memory.activeMemory) / 1_048_576)
-                                if Self.stdoutIsTTY {
-                                    print(line)
-                                    fflush(stdout)
-                                }
-                                // os_log (captured by `darkbloom report`) on the coarse
-                                // report cadence, plus every fine sample while pressure
-                                // is high so the climb toward 499000 is never missed.
-                                if stepsExecuted % Self.resourceLogEverySteps == 0 || highPressure {
-                                    Self.resourceLogger.log("\(line, privacy: .public)")
-                                }
-                            }
-                        }
+        if scheduler.hasRequests() {
+            _idleSteps = 0
+            let output = scheduler.step()
+            stepsExecuted += 1
 
-                        // Distribute outputs to collectors inside the queue block.
-                        if !output.outputs.isEmpty {
-                            for reqOutput in output.outputs {
-                                _lock.lock()
-                                let collector = outputCollectors[reqOutput.requestId]
-                                _lock.unlock()
-                                collector?.put(reqOutput)
-                            }
-                        }
-
-                        if reclaimAfterStep,
-                            stepsExecuted - lastReclaimStep >= Self.reclaimMinStepGap {
-                            reclaimAfterStep = false
-                            lastReclaimStep = stepsExecuted
-                            // scheduler.step() filtered the aborted rows at its start,
-                            // so their KV is now in the reclaimable pool. Return it to
-                            // the OS here rather than waiting for the idle clear, which
-                            // never fires under sustained load. The step gate above
-                            // coalesces bursts so cancel churn can't sync every step.
-                            synchronizeAndClearCache()
-                        }
-
-                        continuation.resume()
+            // Diagnostic (default-on): observe resource COUNT vs BYTES
+            // on the real batched-decode path to classify the
+            // [metal::malloc] Resource limit crash as cached vs live.
+            // Sample on the fine pressure cadence (which divides the
+            // coarse one) so the high-pressure check is NOT gated by the
+            // coarse window: resources can cross 70% and hit the limit
+            // between coarse samples, and that ramp is exactly what this
+            // telemetry must capture.
+            if Self.resourceDebug, stepsExecuted % Self.resourcePressureEverySteps == 0 {
+                let res = Memory.numResources
+                let lim = Memory.resourceLimit
+                let pct = lim > 0 ? Double(res) / Double(lim) * 100 : 0
+                let highPressure = pct >= Self.resourcePressurePct
+                let coarseSample = stepsExecuted % Self.resourceDebugEverySteps == 0
+                // Emit the line on the coarse cadence, or on every fine
+                // sample while under pressure (dense ramp, still bounded).
+                if coarseSample || highPressure {
+                    let batch = output.outputs.count
+                    let line = String(
+                        format: "[rsrc] step=%d batch=%d resources=%d/%d (%.1f%%) cache=%.0fMB active=%.0fMB",
+                        stepsExecuted, batch, res, lim, pct,
+                        Double(Memory.cacheMemory) / 1_048_576,
+                        Double(Memory.activeMemory) / 1_048_576)
+                    if Self.stdoutIsTTY {
+                        print(line)
+                        fflush(stdout)
+                    }
+                    // os_log (captured by `darkbloom report`) on the coarse
+                    // report cadence, plus every fine sample while pressure
+                    // is high so the climb toward 499000 is never missed.
+                    if stepsExecuted % Self.resourceLogEverySteps == 0 || highPressure {
+                        Self.resourceLogger.log("\(line, privacy: .public)")
                     }
                 }
-            } else {
-                _idleSteps += 1
-                // Flush the Metal buffer cache after a brief idle window to
-                // reclaim GPU memory. The delay avoids races with IOKit's
-                // async completeMemory() callbacks (M4 kernel-panic fix).
-                if _idleSteps == Self.deferredClearDelay {
-                    synchronizeAndClearCache()
-                }
-                try? await Task.sleep(nanoseconds: UInt64(config.stepInterval * 1_000_000_000))
             }
 
-            if Task.isCancelled { break }
+            // Distribute outputs to collectors inside the queue block.
+            if !output.outputs.isEmpty {
+                for reqOutput in output.outputs {
+                    _lock.lock()
+                    let collector = outputCollectors[reqOutput.requestId]
+                    _lock.unlock()
+                    collector?.put(reqOutput)
+                }
+            }
+
+            if reclaimAfterStep,
+                stepsExecuted - lastReclaimStep >= Self.reclaimMinStepGap {
+                reclaimAfterStep = false
+                lastReclaimStep = stepsExecuted
+                // scheduler.step() filtered the aborted rows at its start,
+                // so their KV is now in the reclaimable pool. Return it to
+                // the OS here rather than waiting for the idle clear, which
+                // never fires under sustained load. The step gate above
+                // coalesces bursts so cancel churn can't sync every step.
+                synchronizeAndClearCache()
+            }
+
+            // Next step immediately — zero scheduling gap.
+            engineQueue.async { [weak self] in self?.engineStep() }
+        } else {
+            _idleSteps += 1
+            // Flush the Metal buffer cache after a brief idle window to
+            // reclaim GPU memory. The delay avoids races with IOKit's
+            // async completeMemory() callbacks (M4 kernel-panic fix).
+            if _idleSteps == Self.deferredClearDelay {
+                synchronizeAndClearCache()
+            }
+            // Idle: re-check after stepInterval.
+            let intervalNs = config.stepInterval
+            engineQueue.asyncAfter(
+                deadline: .now() + intervalNs
+            ) { [weak self] in
+                self?.engineStep()
+            }
         }
     }
 
