@@ -167,9 +167,12 @@ public final class CompilableBatchRotatingKVCache: BatchRotatingKVCache {
 
         let rinds = maskRinds.reshaped(1, maxCacheSize)
 
-        // Causal: attend to j where j < offsetArray.
-        // Strictly greater-than (`>`) so the next unwritten slot is excluded.
-        let causal = linds .> rinds
+        // Causal: attend to j where j <= query position.
+        // `>=` so the current token's slot is included — models that build
+        // the mask BEFORE cache.update() need it visible; models that build
+        // after update have offsetArray already advanced past the current
+        // token, so `>=` still excludes the next unwritten slot.
+        let causal = linds .>= rinds
 
         // Post-wrap: all maxCacheSize positions are valid → all-true.
         let maxSzArr = MLXArray([Int32(maxCacheSize)]).reshaped(1, 1)
@@ -186,9 +189,12 @@ public final class CompilableBatchRotatingKVCache: BatchRotatingKVCache {
         // Sliding window: use modular token-index comparison (not physical
         // ring-column) so the mask works correctly after ring wrap, when the
         // valid window is split across the buffer end and beginning.
+        // tokenInds maps each position to its distance from the write cursor:
+        // idxArray → 0 (oldest/next-write), idxArray-1 → maxCacheSize-1
+        // (most recent). Keep the RECENT end of the ring.
         if let windowSize {
             let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
-            let windowFilter = tokenInds .< Int32(windowSize)
+            let windowFilter = tokenInds .>= Int32(maxCacheSize - windowSize)
             mask = mask & windowFilter
         }
 

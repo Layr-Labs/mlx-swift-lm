@@ -234,8 +234,18 @@ public final class GenerationBatch: @unchecked Sendable {
             }
 
             if finishReason != nil {
-                let extracted: [any KVCache]? =
-                    capturePromptCacheOnFinish ? promptCache.map { $0.extractBatched(i) } : nil
+                let extracted: [any KVCache]?
+                if capturePromptCacheOnFinish {
+                    if let compiledCache = _compiledCache {
+                        // Compiled decode: _compiledCache has the up-to-date
+                        // single-stream KV state; promptCache is stale.
+                        extracted = compiledCache
+                    } else {
+                        extracted = promptCache.map { $0.extractBatched(i) }
+                    }
+                } else {
+                    extracted = nil
+                }
                 responses.append(
                     GenerationBatchResponse(
                         uid: uids[i],
@@ -329,6 +339,59 @@ public final class GenerationBatch: @unchecked Sendable {
             promptCache.count == other.promptCache.count,
             "Cannot extend with a batch that has a different layer count"
         )
+        // Compiled decode: sync compiled cache state back to promptCache
+        // BEFORE extendBatched() so the merge works with up-to-date KV
+        // state. Extending changes batch size, invalidating the compiled
+        // trace (shape mismatch on the next step).
+        if let compiledCache = _compiledCache {
+            for (i, cc) in compiledCache.enumerated() where i < promptCache.count {
+                // B>1: promoted batch caches live in promptCache; sync counters.
+                if let syncable = cc as? CompilableBatchKVCache {
+                    syncable.syncFromCompiled()
+                } else if let syncable = cc as? CompilableBatchRotatingKVCache {
+                    syncable.syncFromCompiled()
+                }
+                // B=1: compiled caches are separate single-stream instances.
+                // Copy the valid KV data back into the batched promptCache
+                // so extendBatched merges with current (not stale) state.
+                else if let compiled = cc as? CompilableKVCache,
+                        let batch = promptCache[i] as? BatchKVCache {
+                    let validState = compiled.state
+                    if validState.count == 2 {
+                        let off = compiled.offset
+                        batch.keys = validState[0]
+                        batch.values = validState[1]
+                        batch._idx = off
+                        batch.batchOffset = MLXArray([Int32(off)])
+                    }
+                } else if let compiled = cc as? CompilableRotatingKVCache,
+                          let batch = promptCache[i] as? BatchRotatingKVCache {
+                    eval(compiled.idxArray, compiled.offsetArray)
+                    let physIdx = Int(compiled.idxArray[0].item(Int32.self))
+                    let totalOffset = Int(compiled.offsetArray[0].item(Int32.self))
+                    let validLen = min(totalOffset, compiled.maxCacheSize)
+                    if let k = compiled.keys, let v = compiled.values {
+                        if totalOffset > compiled.maxCacheSize, physIdx != 0 {
+                            // Unwind ring to temporal order.
+                            batch.keys = concatenated([
+                                k[.ellipsis, physIdx..., 0...],
+                                k[.ellipsis, ..<physIdx, 0...],
+                            ], axis: 2)
+                            batch.values = concatenated([
+                                v[.ellipsis, physIdx..., 0...],
+                                v[.ellipsis, ..<physIdx, 0...],
+                            ], axis: 2)
+                        } else {
+                            batch.keys = k[.ellipsis, ..<validLen, 0...]
+                            batch.values = v[.ellipsis, ..<validLen, 0...]
+                        }
+                        batch._idx = validLen
+                        batch._base = 0
+                        batch.batchOffset = MLXArray([Int32(totalOffset)])
+                    }
+                }
+            }
+        }
         for (a, b) in zip(promptCache, other.promptCache) {
             a.extendBatched(b)
         }
@@ -351,33 +414,6 @@ public final class GenerationBatch: @unchecked Sendable {
         if let donorState = other._omlxMtpState, _omlxMtpState == nil {
             _omlxMtpState = donorState
             other._omlxMtpState = nil
-        }
-        // Compiled decode: extending changes batch size, invalidating the
-        // compiled trace (shape mismatch on the next step). Sync compiled
-        // cache state back to promptCache before clearing so the original
-        // row's KV state (advanced during compiled steps) is preserved.
-        if let compiledCache = _compiledCache {
-            for (i, cc) in compiledCache.enumerated() where i < promptCache.count {
-                if let syncable = cc as? CompilableBatchKVCache {
-                    // B>1: sync batch compiled cache back to promptCache
-                    syncable.syncFromCompiled()
-                } else if let syncable = cc as? CompilableBatchRotatingKVCache {
-                    syncable.syncFromCompiled()
-                }
-                // B=1: the compiled cache IS the effective cache. Replace the
-                // stale promptCache entry with it so extend() merges with
-                // current KV state. The compilable types are KVCache subclasses
-                // and work directly as BatchKVCache row sources.
-            }
-            // For B=1, replace promptCache with the compiled cache entries
-            // directly — they contain the up-to-date KV state.
-            if _compiledCache?.count == promptCache.count {
-                for (i, cc) in _compiledCache!.enumerated() {
-                    if cc is CompilableKVCache || cc is CompilableRotatingKVCache {
-                        promptCache[i] = cc as! (any BatchedCache)
-                    }
-                }
-            }
         }
         _compiledForward = nil
         _compiledCache = nil

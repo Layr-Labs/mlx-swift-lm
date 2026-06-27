@@ -222,8 +222,11 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
             // After ring wrap, the recent window may be split across buffer
             // end and beginning. Compare in modular token-index space rather
             // than physical ring-column space so both halves are included.
+            // tokenInds maps each physical position to its distance from the
+            // write cursor: idxArray → 0 (oldest/next-write), idxArray-1 →
+            // maxCacheSize-1 (most recent). Keep the RECENT end of the ring.
             let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
-            let windowFilter = tokenInds .< Int32(windowSize)
+            let windowFilter = tokenInds .>= Int32(maxCacheSize - windowSize)
             mask = mask & windowFilter
         }
 

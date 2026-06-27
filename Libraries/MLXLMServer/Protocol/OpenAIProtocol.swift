@@ -497,12 +497,18 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
     public struct Delta: Codable, Sendable, Equatable {
         public var role: String?
         public var content: String?
+        /// AI SDK reads `reasoning_content`; ForgeCode/other clients read
+        /// `reasoning`.  Both are emitted whenever reasoning tokens are
+        /// present so the coordinator can relay chunks without a JSON
+        /// round-trip to duplicate the field.
+        public var reasoning: String?
         public var reasoningContent: String?
         public var toolCalls: [OpenAIToolCall]?
 
         private enum CodingKeys: String, CodingKey {
             case role
             case content
+            case reasoning
             case reasoningContent = "reasoning_content"
             case toolCalls = "tool_calls"
         }
@@ -515,6 +521,9 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
         ) {
             self.role = role
             self.content = content
+            // Emit both fields so the coordinator can pass chunks through
+            // without a JSON unmarshal → re-marshal round-trip.
+            self.reasoning = reasoningContent
             self.reasoningContent = reasoningContent
             self.toolCalls = toolCalls
         }

@@ -150,11 +150,13 @@ public final class CompilableBatchKVCache: BatchKVCache {
         // Key positions over the full buffer
         let rinds = maskRinds.reshaped(1, maxLength)
 
-        // Causal + overflow bin: attend to positions j where j < idxArray.
-        // Strictly greater-than (`>`) so position idxArray (the next
-        // unwritten slot) is excluded. `>=` would attend to one extra
-        // zero-filled position, diluting attention scores.
-        var mask = linds .> rinds
+        // Causal + overflow bin: attend to positions j where j <= query.
+        // `>=` so the slot at idxArray is included — models that build the
+        // mask BEFORE cache.update() (e.g. Gemma 4) need the current
+        // token's slot visible. For models that build the mask after
+        // update, idxArray has already advanced past the current token and
+        // `>=` still excludes the next unwritten slot correctly.
+        var mask = linds .>= rinds
 
         // Per-row leftPadding exclusion: don't attend to j < leftPadding[b]
         // leftPadding [B] → [B, 1, 1, 1] for broadcast with [n, maxLength]
