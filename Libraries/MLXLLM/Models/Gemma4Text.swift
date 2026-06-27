@@ -277,7 +277,17 @@ private class ScaledLinear: Module {
 
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
-    if let batchCache = cache as? BatchPositionedKVCache {
+    if let compilableRot = cache as? CompilableRotatingKVCache {
+        // CompilableRotatingKVCache keeps offset as an MLXArray tracked
+        // through the compute graph, same as CompilableKVCache.
+        .graphArray(compilableRot.offsetArray)
+    } else if let compilable = cache as? CompilableKVCache {
+        // CompilableKVCache keeps offset as an MLXArray tracked through
+        // the compute graph. Reading `.offset` would force a host readback
+        // that breaks compile(). Pass the MLXArray directly so RoPE
+        // stays within the traced graph.
+        .graphArray(compilable.offsetArray)
+    } else if let batchCache = cache as? BatchPositionedKVCache {
         // Snapshot the per-sequence offsets before cache.update(...) advances them.
         .batch(batchCache.batchOffset + 0)
     } else {
@@ -296,6 +306,8 @@ internal func gemma4ApplyRotaryPosition<R: RoPELayer>(
         rope(x, offset: value)
     case .batch(let values):
         rope(x, offset: values)
+    case .graphArray(let offsetArray):
+        rope(x, offset: offsetArray)
     }
 }
 
@@ -525,6 +537,11 @@ private class Gemma4Attention: Module {
         case .scalar(let offset):
             hasCachedPrefix = offset > 0
         case .batch:
+            hasCachedPrefix = true
+        case .graphArray:
+            // CompilableKVCache: can't read Int offset without readback.
+            // During compiled decode L==1, so L>1 && hasCachedPrefix is
+            // false anyway. Setting true is safe for the prefill path.
             hasCachedPrefix = true
         }
 

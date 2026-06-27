@@ -15,6 +15,28 @@ public protocol BatchPositionedKVCache: KVCache {
     var batchOffset: MLXArray { get }
 }
 
+// MARK: - graphOffsetArray Helper
+
+/// Returns a graph-visible cache offset when the cache exposes one.
+///
+/// `KVCache.offset` is an `Int` API for compatibility with upstream model
+/// ports. Compile-safe caches keep the offset as an `MLXArray` so the value
+/// can flow through `compile()` without an `.item()` readback. Model-side
+/// helpers that need positions outside `applyRotaryPosition` should call this
+/// before falling back to `cache.offset`.
+public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
+    if let compilableRot = cache as? CompilableRotatingKVCache {
+        return compilableRot.offsetArray
+    }
+    if let compilable = cache as? CompilableKVCache {
+        return compilable.offsetArray
+    }
+    if let batchCache = cache as? BatchPositionedKVCache {
+        return batchCache.batchOffset
+    }
+    return nil
+}
+
 // MARK: - applyRotaryPosition Helper
 
 /// Apply rotary position embeddings, using the cache offset when available.
@@ -26,6 +48,11 @@ public protocol BatchPositionedKVCache: KVCache {
 /// keys = applyRotaryPosition(rope, to: keys, cache: cache)
 /// ```
 ///
+/// When the cache exposes an `offsetArray` (e.g. `CompilableKVCache`), the
+/// offset is passed as an `MLXArray` so the compile tracer can track it
+/// through the graph without triggering a synchronous GPU readback. For all
+/// other cache types, the standard `Int`-based offset path is used.
+///
 /// - Parameters:
 ///   - rope: A RoPE layer conforming to both `OffsetLayer` and `ArrayOffsetLayer`.
 ///   - x: The input tensor to apply RoPE to.
@@ -35,9 +62,8 @@ public protocol BatchPositionedKVCache: KVCache {
 public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: KVCache?)
     -> MLXArray
 {
-    if let batchCache = cache as? BatchPositionedKVCache {
-        return rope(x, offset: batchCache.batchOffset)
-    } else {
-        return rope(x, offset: cache?.offset ?? 0)
+    if let offsetArray = graphOffsetArray(for: cache) {
+        return rope(x, offset: offsetArray)
     }
+    return rope(x, offset: cache?.offset ?? 0)
 }

@@ -69,6 +69,10 @@ public enum Gemma4 {
     public enum PositionOffset: @unchecked Sendable {
         case scalar(Int)
         case batch(MLXArray)
+        /// Graph-tracked offset from `CompilableKVCache.offsetArray`.
+        /// Must stay as an `MLXArray` so `compile()` can trace through
+        /// the RoPE computation without forcing a host readback.
+        case graphArray(MLXArray)
     }
 }
 
@@ -1072,6 +1076,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         switch positionOffset {
         case .scalar(let v): queryOffset = v
         case .batch(let arr): queryOffset = Int(arr[0].item(Int32.self))
+        case .graphArray(let arr): queryOffset = Int(arr[0].item(Int32.self))
         }
 
         let fullKVLen = sharedKV.fullAttention.0.dim(2)

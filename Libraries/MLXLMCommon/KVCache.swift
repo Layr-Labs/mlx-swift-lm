@@ -472,12 +472,14 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
 /// Rotating KV cache for sliding window attention
 public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
-    private var keep: Int
-    private var keys: MLXArray?
-    private var values: MLXArray?
-    private var maxCacheSize: Int
-    private var step: Int
-    private var idx: Int = 0
+    // `internal` (not `private`) so `CompilableRotatingKVCache` (same module)
+    // can read/write ring state during promotion and compiled update.
+    var keep: Int
+    var keys: MLXArray?
+    var values: MLXArray?
+    var maxCacheSize: Int
+    var step: Int
+    var idx: Int = 0
 
     public override var maxSize: Int? { maxCacheSize }
 

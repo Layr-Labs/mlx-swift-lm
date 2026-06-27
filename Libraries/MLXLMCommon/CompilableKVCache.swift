@@ -68,6 +68,11 @@ public class CompilableKVCache: BaseKVCache {
         super.init()
     }
 
+    /// Static promote helper for symmetry with `CompilableRotatingKVCache.promote`.
+    public static func promote(from cache: KVCacheSimple, maxLength: Int) -> CompilableKVCache {
+        return CompilableKVCache(from: cache, maxLength: maxLength)
+    }
+
     /// Create from an existing KVCacheSimple (e.g., after prefill).
     /// Copies the existing cache state into a fixed-size buffer.
     public convenience init(from cache: KVCache, maxLength: Int = 4096) {

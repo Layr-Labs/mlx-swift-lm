@@ -153,6 +153,141 @@ public func loadWeights(
     try model.update(parameters: parameters, verify: [.all])
     mark("update params")
 
+    // Drop the staging dictionary before dtype conversion so we don't keep
+    // two copies of safetensor arrays alive during the bf16 pass.
+    weights.removeAll(keepingCapacity: false)
+    MLX.Memory.clearCache()
+
+    // Convert fp16 parameters to bf16 to eliminate AsType cascades.
+    // Metal's kernel dispatcher promotes mixed fp16/fp32 operations to full fp32,
+    // causing extra kernel dispatches across all layers. bf16 shares fp32's exponent
+    // range, so the promotion is eliminated. Quantization scales/biases are also
+    // converted — QuantizedMatmul uses scales dtype to determine output dtype.
+    //
+    // Controlled by DARKBLOOM_BF16_WEIGHTS (default: ON, set to "0" to disable).
+    let bf16Env = ProcessInfo.processInfo.environment["DARKBLOOM_BF16_WEIGHTS"] ?? "1"
+    if bf16Env == "1" {
+        convertToBFloat16(model: model)
+        mark("bf16 convert")
+    }
+
     eval(model)
     mark("eval")
+}
+
+// MARK: - BFloat16 Weight Conversion
+
+/// Convert float16 model parameters to bfloat16 to prevent AsType cascades.
+///
+/// Metal's kernel dispatcher promotes mixed float16/float32 operations to full float32,
+/// causing speed regression for models where routing/normalization runs at float32.
+/// bfloat16 avoids this because it shares float32's exponent range.
+///
+/// Quantization scales/biases are also converted — QuantizedMatmul uses scales dtype to
+/// determine output dtype, so float16 scales → float16 output → AsType when multiplied
+/// with bfloat16 norms. Converting scales to bfloat16 eliminates this cascade.
+///
+/// The conversion is chunked to bound transient memory. Large quantized models carry
+/// tens of GB of scale/bias metadata; converting all arrays at once keeps both fp16 and
+/// bf16 copies alive until the final eval.
+private func convertToBFloat16(model: Module) {
+    let t0 = CFAbsoluteTimeGetCurrent()
+
+    let convertibleParams: [(key: String, convertedBytes: Int)] = {
+        let flat = model.parameters().flattened()
+        return flat.compactMap { key, array in
+            guard array.dtype == .float16 else { return nil }
+            return (key: key, convertedBytes: estimatedByteCount(array, as: .bfloat16))
+        }
+    }()
+
+    guard !convertibleParams.isEmpty else { return }
+
+    let totalBytes = convertibleParams.reduce(0) { $0 + $1.convertedBytes }
+    let chunkLimit = bfloat16ConversionChunkLimit()
+    var index = 0
+    var convertedCount = 0
+
+    while index < convertibleParams.count {
+        var converted = [String: MLXArray]()
+        var chunkBytes = 0
+
+        do {
+            let current = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+            while index < convertibleParams.count {
+                let entry = convertibleParams[index]
+                if !converted.isEmpty,
+                    chunkBytes + entry.convertedBytes > chunkLimit
+                {
+                    break
+                }
+
+                guard let array = current[entry.key],
+                    array.dtype == DType.float16
+                else {
+                    index += 1
+                    continue
+                }
+
+                converted[entry.key] = array.asType(DType.bfloat16)
+                chunkBytes += entry.convertedBytes
+                index += 1
+            }
+        }
+
+        guard !converted.isEmpty else { continue }
+
+        let values = Array(converted.values)
+        MLX.eval(values)
+        convertedCount += converted.count
+
+        let params = ModuleParameters.unflattened(converted)
+        do {
+            try model.update(parameters: params, verify: [])
+        } catch {
+            FileHandle.standardError.write(
+                Data("[bf16] model.update failed: \(error)\n".utf8))
+        }
+        MLX.Memory.clearCache()
+    }
+
+    let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+    let mb = Double(totalBytes) / (1024 * 1024)
+    FileHandle.standardError.write(
+        Data(
+            "[bf16] converted \(convertedCount) params (\(String(format: "%.1f", mb)) MB) fp16→bf16 in \(String(format: "%.0f", elapsed)) ms\n"
+                .utf8))
+}
+
+/// Maximum bytes of bf16 output to accumulate per conversion chunk.
+/// Override with DARKBLOOM_BF16_CHUNK_MB environment variable.
+private func bfloat16ConversionChunkLimit() -> Int {
+    if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_BF16_CHUNK_MB"],
+        let mb = Int(raw), mb > 0
+    {
+        return mb * 1024 * 1024
+    }
+    return 256 * 1024 * 1024
+}
+
+private func estimatedByteCount(_ array: MLXArray, as dtype: DType) -> Int {
+    let elements = array.shape.reduce(1) { partial, dim in
+        partial * max(dim, 1)
+    }
+    return elements * dtypeByteWidth(dtype)
+}
+
+private func dtypeByteWidth(_ dtype: DType) -> Int {
+    if dtype == .bool || dtype == .int8 || dtype == .uint8 {
+        return 1
+    }
+    if dtype == .float16 || dtype == .bfloat16
+        || dtype == .int16 || dtype == .uint16
+    {
+        return 2
+    }
+    if dtype == .int64 || dtype == .uint64 {
+        return 8
+    }
+    return 4  // float32, int32, uint32, complex64
 }

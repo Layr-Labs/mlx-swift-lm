@@ -114,6 +114,22 @@ public final class GenerationBatch: @unchecked Sendable {
     /// admission on this (no mid-session `extend`).
     public var hasActiveMTPSession: Bool { mtpSession != nil }
 
+    /// Compiled forward closure for B=1 standard decode. When non-nil,
+    /// `step()` uses this + `_compiledCache` instead of the batched
+    /// `promptCache` for the model forward pass. Built after the init's
+    /// priming step for non-MTP B=1 batches when `DARKBLOOM_COMPILED_DECODE=1`.
+    ///
+    /// This collapses hundreds of per-layer FFI crossings into a single
+    /// compiled call per decode step, significantly improving single-stream
+    /// TPS on Apple Silicon.
+    private var _compiledForward: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+    /// Single-stream compilable caches used by the compiled decode path.
+    /// Contains `CompilableKVCache` / `CompilableRotatingKVCache` instances
+    /// extracted from the batched `promptCache` at setup time. Non-nil iff
+    /// `_compiledForward` is non-nil.
+    private var _compiledCache: [any KVCache]?
+
     public init(
         model: any LanguageModel,
         uids: [Int],
@@ -153,6 +169,12 @@ public final class GenerationBatch: @unchecked Sendable {
             // omlx: batch_generator.py patched_init → _post_init_mtp
             if batchSize == 1, let mtpModel = model as? (any MTPCapable), mtpModel.hasMTPHead {
                 postInitMTP(model: mtpModel)
+            }
+            // Compiled decode for non-MTP B=1 standard decode. MTP paths
+            // bypass step() and call the model directly with promptCache,
+            // so compiled decode is incompatible with active MTP.
+            if _omlxMtpState == nil && mtpRuntime == nil {
+                setupCompiledDecodeIfEligible()
             }
         }
     }
@@ -252,6 +274,11 @@ public final class GenerationBatch: @unchecked Sendable {
 
         if keep.isEmpty {
             promptCache.removeAll()
+            // Compiled decode: release the compiled closure + caches when the
+            // batch empties. The compiled caches are separate from promptCache
+            // and would otherwise retain stale GPU buffers.
+            _compiledForward = nil
+            _compiledCache = nil
         } else {
             for cache in promptCache {
                 cache.filterBatched(batchIndices: keepArr)
@@ -319,6 +346,10 @@ public final class GenerationBatch: @unchecked Sendable {
             _omlxMtpState = donorState
             other._omlxMtpState = nil
         }
+        // Compiled decode is B=1 only; extending grows the batch past 1 row,
+        // invalidating the compiled trace (shape mismatch on the next step).
+        _compiledForward = nil
+        _compiledCache = nil
     }
 
     public var isEmpty: Bool { uids.isEmpty }
@@ -404,7 +435,16 @@ public final class GenerationBatch: @unchecked Sendable {
         let currentTokens = nextTokens
         let inputs = currentTokens.reshaped(uids.count, 1)
 
-        let logits = model.callAsFunction(inputs, cache: promptCache.map { $0 as any KVCache })
+        // Compiled decode: use the compiled forward closure + single-stream
+        // compilable caches instead of the raw model call through batched
+        // caches. The compiled graph fuses hundreds of per-layer FFI crossings
+        // into a single call. Active only for B=1 non-MTP decode.
+        let logits: MLXArray
+        if let compiledForward = _compiledForward {
+            logits = compiledForward([inputs])[0]
+        } else {
+            logits = model.callAsFunction(inputs, cache: promptCache.map { $0 as any KVCache })
+        }
 
         // [B, 1, vocab] -> [B, vocab]
         let stepLogits = logits[0..., -1, 0...]
@@ -459,6 +499,42 @@ public final class GenerationBatch: @unchecked Sendable {
         }
 
         return stepTokens
+    }
+
+    // MARK: - Compiled decode setup
+
+    /// Set up compiled decode for B=1 standard decode.
+    ///
+    /// Extracts single-row caches from the batched `promptCache`, promotes
+    /// them to compilable types (`CompilableKVCache` / `CompilableRotatingKVCache`),
+    /// and builds a compiled forward closure via `CompiledDecode.setupCompiledDecode`.
+    ///
+    /// Skipped when:
+    /// - `DARKBLOOM_COMPILED_DECODE=1` is not set
+    /// - batch size != 1
+    /// - hardware doesn't support compiled decode
+    /// - cache layers include unsupported types (e.g. `ArraysCache`)
+    private func setupCompiledDecodeIfEligible() {
+        guard CompiledDecode.isEnabled, batchSize == 1 else { return }
+
+        // Extract single-row caches from the batched caches.
+        // BatchKVCache → KVCacheSimple, BatchRotatingKVCache → RotatingKVCache.
+        // ArraysCache → ArraysCache (unsupported by CompiledDecode, will bail).
+        var singleCaches: [KVCache] = promptCache.map { $0.extractBatched(0) }
+
+        // Size the compiled buffer to fit the full generation: current prefix
+        // length + remaining decode tokens + headroom, rounded to 256.
+        let currentOffset = singleCaches.map { $0.offset }.max() ?? 0
+        let maxRemaining = maxTokens.first ?? 256
+        let needed = currentOffset + maxRemaining + 64
+        let maxCacheLength = max(4096, ((needed + 255) / 256) * 256)
+
+        if let compiled = CompiledDecode.setupCompiledDecode(
+            model: model, cache: &singleCaches, maxCacheLength: maxCacheLength
+        ) {
+            _compiledForward = compiled
+            _compiledCache = singleCaches
+        }
     }
 
     // MARK: - Drafter-based MTP (Gemma 4) decode
