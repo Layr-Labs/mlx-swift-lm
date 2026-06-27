@@ -353,9 +353,18 @@ public final class GenerationBatch: @unchecked Sendable {
             other._omlxMtpState = nil
         }
         // Compiled decode: extending changes batch size, invalidating the
-        // compiled trace (shape mismatch on the next step). For B=1 the
-        // single-stream caches in _compiledCache are released; for B>1
-        // the promoted caches stay in promptCache and continue uncompiled.
+        // compiled trace (shape mismatch on the next step). Sync compiled
+        // cache state back to promptCache before clearing so the original
+        // row's KV state (advanced during compiled steps) is preserved.
+        if let compiledCache = _compiledCache {
+            for (i, cc) in compiledCache.enumerated() where i < promptCache.count {
+                if let syncable = cc as? CompilableBatchKVCache {
+                    syncable.syncFromCompiled()
+                } else if let syncable = cc as? CompilableBatchRotatingKVCache {
+                    syncable.syncFromCompiled()
+                }
+            }
+        }
         _compiledForward = nil
         _compiledCache = nil
     }

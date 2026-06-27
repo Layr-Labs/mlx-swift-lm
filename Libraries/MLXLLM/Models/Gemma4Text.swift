@@ -278,15 +278,13 @@ private class ScaledLinear: Module {
 @inline(__always)
 internal func gemma4CapturePositionOffset(from cache: KVCache?) -> Gemma4.PositionOffset {
     if let compilableRot = cache as? CompilableRotatingKVCache {
-        // CompilableRotatingKVCache keeps offset as an MLXArray tracked
-        // through the compute graph, same as CompilableKVCache.
-        .graphArray(compilableRot.offsetArray)
+        // Snapshot: `+ 0` creates a graph-safe copy so cache.update()
+        // advancing offsetArray doesn't shift the query RoPE position.
+        .graphArray(compilableRot.offsetArray + 0)
     } else if let compilable = cache as? CompilableKVCache {
-        // CompilableKVCache keeps offset as an MLXArray tracked through
-        // the compute graph. Reading `.offset` would force a host readback
-        // that breaks compile(). Pass the MLXArray directly so RoPE
-        // stays within the traced graph.
-        .graphArray(compilable.offsetArray)
+        // Snapshot: `+ 0` creates a graph-safe copy so cache.update()
+        // advancing offsetArray doesn't shift the query RoPE position.
+        .graphArray(compilable.offsetArray + 0)
     } else if let batchCache = cache as? BatchPositionedKVCache {
         // Snapshot the per-sequence offsets before cache.update(...) advances them.
         .batch(batchCache.batchOffset + 0)

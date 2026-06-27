@@ -329,8 +329,11 @@ public class SwitchGLU: Module {
         // threshold (32 by default) admits single-token + a few prompt
         // tokens as "decode-shaped" and bounces large prefill chunks to
         // the two-call path. Override via BENCH_FUSED_GATE_UP_THRESHOLD.
+        // Restrict fused path to true solo decode. With top_k=8, B=1 gives
+        // indices.size=8. B=2 gives 16 which is slower fused (wider matmul has
+        // worse cache locality). Default threshold 8 = solo only.
         let decodeThreshold: Int =
-            Int(ProcessInfo.processInfo.environment["BENCH_FUSED_GATE_UP_THRESHOLD"] ?? "32") ?? 32
+            Int(ProcessInfo.processInfo.environment["BENCH_FUSED_GATE_UP_THRESHOLD"] ?? "8") ?? 8
         let useFused =
             (fusedGateUpWeight != nil)
             && (indices.size <= decodeThreshold)
@@ -358,7 +361,18 @@ public class SwitchGLU: Module {
                 rhsIndices: idx, transpose: true,
                 groupSize: fusedGroupSize, bits: fusedBits, mode: fusedMode,
                 sortedIndices: doSort)
-            let splits = MLX.split(combined, parts: 2, axis: -1)
+            var splits = MLX.split(combined, parts: 2, axis: -1)
+            // If the original SwitchLinear layers have a learned bias (separate
+            // from quantization biases), add it to each half. Gemma4 uses
+            // bias=false, but this ensures correctness for biased MoE layers.
+            if let g = gateProj as? QuantizedSwitchLinear, let gb = g.bias,
+               let u = upProj as? QuantizedSwitchLinear, let ub = u.bias {
+                let fusedBias = concatenated([gb, ub], axis: -1)
+                let gatheredBias = fusedBias[idx]
+                let biasSplits = MLX.split(gatheredBias, parts: 2, axis: -1)
+                splits[0] = splits[0] + biasSplits[0]
+                splits[1] = splits[1] + biasSplits[1]
+            }
             xGate = splits[0]
             xUp = splits[1]
         } else if let gateUpProj {

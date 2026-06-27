@@ -219,8 +219,12 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
         var mask = MLX.`where`(linds .>= maxSzArr, allTrueMask, causal)
 
         if let windowSize {
-            let windowStart = linds - Int32(windowSize - 1)
-            mask = mask & (rinds .>= windowStart)
+            // After ring wrap, the recent window may be split across buffer
+            // end and beginning. Compare in modular token-index space rather
+            // than physical ring-column space so both halves are included.
+            let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
+            let windowFilter = tokenInds .< Int32(windowSize)
+            mask = mask & windowFilter
         }
 
         return .array(mask)
