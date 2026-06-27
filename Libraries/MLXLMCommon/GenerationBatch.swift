@@ -359,9 +359,23 @@ public final class GenerationBatch: @unchecked Sendable {
         if let compiledCache = _compiledCache {
             for (i, cc) in compiledCache.enumerated() where i < promptCache.count {
                 if let syncable = cc as? CompilableBatchKVCache {
+                    // B>1: sync batch compiled cache back to promptCache
                     syncable.syncFromCompiled()
                 } else if let syncable = cc as? CompilableBatchRotatingKVCache {
                     syncable.syncFromCompiled()
+                }
+                // B=1: the compiled cache IS the effective cache. Replace the
+                // stale promptCache entry with it so extend() merges with
+                // current KV state. The compilable types are KVCache subclasses
+                // and work directly as BatchKVCache row sources.
+            }
+            // For B=1, replace promptCache with the compiled cache entries
+            // directly — they contain the up-to-date KV state.
+            if _compiledCache?.count == promptCache.count {
+                for (i, cc) in _compiledCache!.enumerated() {
+                    if cc is CompilableKVCache || cc is CompilableRotatingKVCache {
+                        promptCache[i] = cc as! (any BatchedCache)
+                    }
                 }
             }
         }

@@ -183,10 +183,13 @@ public final class CompilableBatchRotatingKVCache: BatchRotatingKVCache {
         let lp = leftPadding[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (lp .<= rinds)
 
-        // Sliding window.
+        // Sliding window: use modular token-index comparison (not physical
+        // ring-column) so the mask works correctly after ring wrap, when the
+        // valid window is split across the buffer end and beginning.
         if let windowSize {
-            let windowStart = linds - Int32(windowSize - 1)
-            mask = mask & (rinds .>= windowStart)
+            let tokenInds = (rinds - idxArray + MLXArray(Int32(maxCacheSize))) % Int32(maxCacheSize)
+            let windowFilter = tokenInds .< Int32(windowSize)
+            mask = mask & windowFilter
         }
 
         return .array(mask)

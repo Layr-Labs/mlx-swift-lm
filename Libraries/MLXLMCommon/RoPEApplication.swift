@@ -25,14 +25,17 @@ public protocol BatchPositionedKVCache: KVCache {
 /// helpers that need positions outside `applyRotaryPosition` should call this
 /// before falling back to `cache.offset`.
 public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
+    // Snapshot with `+ 0` so cache.update() advancing offsetArray
+    // doesn't shift the caller's RoPE position. Without this, the query
+    // gets a position one step ahead of the keys in compiled decode.
     if let compilableRot = cache as? CompilableRotatingKVCache {
-        return compilableRot.offsetArray
+        return compilableRot.offsetArray + 0
     }
     if let compilable = cache as? CompilableKVCache {
-        return compilable.offsetArray
+        return compilable.offsetArray + 0
     }
     if let batchCache = cache as? BatchPositionedKVCache {
-        return batchCache.batchOffset
+        return batchCache.batchOffset + 0
     }
     return nil
 }
