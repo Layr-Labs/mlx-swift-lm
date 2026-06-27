@@ -36,7 +36,7 @@ public protocol BatchedCache: KVCache {
 /// for RoPE dispatch through `BatchPositionedKVCache`.
 ///
 /// Not thread-safe; the `BatchGenerator` mutates this from a single task.
-public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
+public class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
 
     public func filterBatched(batchIndices: MLXArray) {
         filter(batchIndices: batchIndices)
@@ -67,27 +67,27 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
     public static let allocationStep = 256
 
     /// `[B, kvHeads, T, headDim]`, nil until the first `update`.
-    public private(set) var keys: MLXArray?
+    public internal(set) var keys: MLXArray?
 
     /// `[B, kvHeads, T, headValueDim]`, nil until the first `update`.
-    public private(set) var values: MLXArray?
+    public internal(set) var values: MLXArray?
 
     /// Per-row position counter `[B]`. Starts at `-leftPadding[b]`; advances
     /// by `keys.dim(2)` per `update`. Read by RoPE via `BatchPositionedKVCache`.
-    public private(set) var batchOffset: MLXArray
+    public internal(set) var batchOffset: MLXArray
 
     /// Per-row left padding `[B]`. Slots `[..., 0..<leftPadding[b], :]` are
     /// zero and the mask blocks them.
-    public private(set) var leftPadding: MLXArray
+    public internal(set) var leftPadding: MLXArray
 
     /// Rightmost-valid slot. Shared scalar across rows because they're kept
     /// right-aligned. Slots past `_idx` are pre-allocated capacity.
-    private var _idx: Int = 0
+    var _idx: Int = 0
 
     /// Right-padding applied at `finalize()`. Set when chunked prefill needs
     /// to roll rows shorter than the prefill window into right-aligned
     /// position.
-    private var _rightPadding: MLXArray?
+    var _rightPadding: MLXArray?
 
     /// Scalar offset for the legacy `KVCache` API. Returns `_idx` (the
     /// rightmost trailing edge); only `makeMask` consumes it on this path,
@@ -495,17 +495,17 @@ public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCac
 /// This cache preserves the per-row position and left-padding semantics of
 /// `BatchKVCache`, while trimming stored keys/values to `maxSize` for sliding
 /// attention layers.
-public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
+public class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, BatchedCache {
     public static let allocationStep = 256
 
-    public private(set) var keys: MLXArray?
-    public private(set) var values: MLXArray?
-    public private(set) var batchOffset: MLXArray
-    public private(set) var leftPadding: MLXArray
+    public internal(set) var keys: MLXArray?
+    public internal(set) var values: MLXArray?
+    public internal(set) var batchOffset: MLXArray
+    public internal(set) var leftPadding: MLXArray
 
-    private let maxCacheSize: Int
-    private var _idx: Int = 0
-    private var _rightPadding: MLXArray?
+    let maxCacheSize: Int
+    var _idx: Int = 0
+    var _rightPadding: MLXArray?
 
     /// Fast decode path: left index of the logical window inside the
     /// over-allocated physical `keys`/`values` buffers. The logical window is
@@ -513,7 +513,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     /// (legacy / freshly normalized layout) `_base == 0` and the buffers are
     /// exactly `_idx` long along axis 2 — byte-for-byte the legacy layout, so
     /// every existing reader is unchanged on that path.
-    private var _base: Int = 0
+    var _base: Int = 0
 
     /// Process default for ``useFastDecodePath``. The in-place decode ring is
     /// ON by default; set `DARKBLOOM_FAST_BATCH_ROTATING_KV` to
@@ -535,12 +535,12 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     /// Logical window over the (possibly over-allocated) physical buffer.
     /// Collapses to the stored buffer itself in the normalized layout so the
     /// legacy path returns exactly what it did before.
-    private var windowKeys: MLXArray? {
+    var windowKeys: MLXArray? {
         guard let k = keys else { return nil }
         if _base == 0, k.dim(2) == _idx { return k }
         return k[.ellipsis, _base ..< (_base + _idx), 0...]
     }
-    private var windowValues: MLXArray? {
+    var windowValues: MLXArray? {
         guard let v = values else { return nil }
         if _base == 0, v.dim(2) == _idx { return v }
         return v[.ellipsis, _base ..< (_base + _idx), 0...]
@@ -550,7 +550,7 @@ public final class BatchRotatingKVCache: BaseKVCache, BatchPositionedKVCache, Ba
     /// (`_base == 0`, physical length == `_idx`). Cheap no-op when already
     /// normalized. Called before every legacy-path mutation so that code can
     /// keep reading `keys`/`values` directly.
-    private func normalizeToWindow() {
+    func normalizeToWindow() {
         guard let k = keys, let v = values else {
             _base = 0
             return

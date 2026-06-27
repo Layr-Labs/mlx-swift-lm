@@ -274,15 +274,21 @@ public final class GenerationBatch: @unchecked Sendable {
 
         if keep.isEmpty {
             promptCache.removeAll()
-            // Compiled decode: release the compiled closure + caches when the
-            // batch empties. The compiled caches are separate from promptCache
-            // and would otherwise retain stale GPU buffers.
-            _compiledForward = nil
-            _compiledCache = nil
         } else {
             for cache in promptCache {
                 cache.filterBatched(batchIndices: keepArr)
             }
+        }
+
+        // Invalidate compiled decode whenever batch size changes. For B=1
+        // this fires on empty (the only transition). For B>1 it also fires
+        // when rows are evicted, because the compiled trace was captured for
+        // the old batch shape. _compiledCache (B=1 single-stream caches)
+        // is released to free stale GPU buffers. For B>1, the promoted
+        // compilable caches live in promptCache and will be used uncompiled.
+        if keep.count < uids.count {
+            _compiledForward = nil
+            _compiledCache = nil
         }
 
         // Drafter-MTP: keep the session carry aligned with the surviving rows.
@@ -346,8 +352,10 @@ public final class GenerationBatch: @unchecked Sendable {
             _omlxMtpState = donorState
             other._omlxMtpState = nil
         }
-        // Compiled decode is B=1 only; extending grows the batch past 1 row,
-        // invalidating the compiled trace (shape mismatch on the next step).
+        // Compiled decode: extending changes batch size, invalidating the
+        // compiled trace (shape mismatch on the next step). For B=1 the
+        // single-stream caches in _compiledCache are released; for B>1
+        // the promoted caches stay in promptCache and continue uncompiled.
         _compiledForward = nil
         _compiledCache = nil
     }
@@ -435,10 +443,11 @@ public final class GenerationBatch: @unchecked Sendable {
         let currentTokens = nextTokens
         let inputs = currentTokens.reshaped(uids.count, 1)
 
-        // Compiled decode: use the compiled forward closure + single-stream
-        // compilable caches instead of the raw model call through batched
-        // caches. The compiled graph fuses hundreds of per-layer FFI crossings
-        // into a single call. Active only for B=1 non-MTP decode.
+        // Compiled decode: use the compiled forward closure instead of the
+        // raw model call. The compiled graph fuses hundreds of per-layer FFI
+        // crossings into a single call. For B=1 uses single-stream caches in
+        // _compiledCache; for B>1 uses promoted batched caches in promptCache.
+        // Inactive during MTP decode.
         let logits: MLXArray
         if let compiledForward = _compiledForward {
             logits = compiledForward([inputs])[0]
@@ -503,37 +512,58 @@ public final class GenerationBatch: @unchecked Sendable {
 
     // MARK: - Compiled decode setup
 
-    /// Set up compiled decode for B=1 standard decode.
+    /// Set up compiled decode for standard decode (any batch size).
     ///
-    /// Extracts single-row caches from the batched `promptCache`, promotes
-    /// them to compilable types (`CompilableKVCache` / `CompilableRotatingKVCache`),
-    /// and builds a compiled forward closure via `CompiledDecode.setupCompiledDecode`.
+    /// **B=1 path**: Extracts single-row caches from the batched
+    /// `promptCache`, promotes them to compilable types
+    /// (`CompilableKVCache` / `CompilableRotatingKVCache`), and builds a
+    /// compiled forward closure stored in `_compiledCache`.
+    ///
+    /// **B>1 path**: Promotes batched caches in-place in `promptCache` to
+    /// `CompilableBatchKVCache` / `CompilableBatchRotatingKVCache` and
+    /// builds a compiled forward closure. The promoted caches remain in
+    /// `promptCache` so filter/extend operate on them directly. On
+    /// filter/extend the compiled forward is invalidated (batch-size
+    /// change) and the caches continue as regular batched caches.
     ///
     /// Skipped when:
-    /// - `DARKBLOOM_COMPILED_DECODE=1` is not set
-    /// - batch size != 1
+    /// - `DARKBLOOM_COMPILED_DECODE` is disabled
     /// - hardware doesn't support compiled decode
     /// - cache layers include unsupported types (e.g. `ArraysCache`)
     private func setupCompiledDecodeIfEligible() {
-        guard CompiledDecode.isEnabled, batchSize == 1 else { return }
+        guard CompiledDecode.isEnabled else { return }
 
-        // Extract single-row caches from the batched caches.
-        // BatchKVCache → KVCacheSimple, BatchRotatingKVCache → RotatingKVCache.
-        // ArraysCache → ArraysCache (unsupported by CompiledDecode, will bail).
-        var singleCaches: [KVCache] = promptCache.map { $0.extractBatched(0) }
+        if batchSize == 1 {
+            // B=1: extract → promote single-stream caches → compile.
+            var singleCaches: [KVCache] = promptCache.map { $0.extractBatched(0) }
 
-        // Size the compiled buffer to fit the full generation: current prefix
-        // length + remaining decode tokens + headroom, rounded to 256.
-        let currentOffset = singleCaches.map { $0.offset }.max() ?? 0
-        let maxRemaining = maxTokens.first ?? 256
-        let needed = currentOffset + maxRemaining + 64
-        let maxCacheLength = max(4096, ((needed + 255) / 256) * 256)
+            let currentOffset = singleCaches.map { $0.offset }.max() ?? 0
+            let maxRemaining = maxTokens.first ?? 256
+            let needed = currentOffset + maxRemaining + 64
+            let maxCacheLength = max(4096, ((needed + 255) / 256) * 256)
 
-        if let compiled = CompiledDecode.setupCompiledDecode(
-            model: model, cache: &singleCaches, maxCacheLength: maxCacheLength
-        ) {
-            _compiledForward = compiled
-            _compiledCache = singleCaches
+            if let compiled = CompiledDecode.setupCompiledDecode(
+                model: model, cache: &singleCaches, maxCacheLength: maxCacheLength
+            ) {
+                _compiledForward = compiled
+                _compiledCache = singleCaches
+            }
+        } else {
+            // B>1: promote batched caches in-place → compile.
+            let currentOffset = promptCache.map { ($0 as any KVCache).offset }.max() ?? 0
+            let maxRemaining = maxTokens.max() ?? 256
+            let needed = currentOffset + maxRemaining + 64
+            // Size tightly for B>1 — the overflow bin overhead (attention
+            // over masked zero positions) scales with B, so minimizing the
+            // buffer width is critical for throughput.
+            let maxCacheLength = max(256, ((needed + 255) / 256) * 256)
+
+            if let compiled = CompiledDecode.setupBatchCompiledDecode(
+                model: model, cache: &promptCache, maxCacheLength: maxCacheLength
+            ) {
+                _compiledForward = compiled
+                // _compiledCache stays nil — the caches live in promptCache.
+            }
         }
     }
 

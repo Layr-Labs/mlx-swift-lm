@@ -43,12 +43,14 @@ public enum CompiledDecode {
         return true
     }()
 
-    /// True iff every layer is a compilable cache type (``CompilableKVCache``
-    /// or ``CompilableRotatingKVCache``) and thus compile-traceable by
-    /// ``compileForward(model:cacheRef:)``.
+    /// True iff every layer is a compilable cache type and thus
+    /// compile-traceable by ``compileForward(model:cacheRef:)``.
+    /// Accepts both single-stream (CompilableKVCache, CompilableRotatingKVCache)
+    /// and batched (CompilableBatchKVCache, CompilableBatchRotatingKVCache) types.
     public static func eligible(_ cache: [KVCache]) -> Bool {
         !cache.isEmpty && cache.allSatisfy {
             $0 is CompilableKVCache || $0 is CompilableRotatingKVCache
+                || $0 is CompilableBatchKVCache || $0 is CompilableBatchRotatingKVCache
         }
     }
 
@@ -58,9 +60,10 @@ public enum CompiledDecode {
     /// array wrapped in a one-element array) and returns `[logits]` (a single
     /// `[B, L, V]` array). The captured cache layers are mutated in place.
     ///
-    /// Supports mixed cache types: both ``CompilableKVCache`` and
-    /// ``CompilableRotatingKVCache`` expose `innerState()` returning MLXArrays
-    /// that are tracked by `compile(inputs:outputs:)`.
+    /// Supports mixed cache types: single-stream (``CompilableKVCache``,
+    /// ``CompilableRotatingKVCache``) and batched (``CompilableBatchKVCache``,
+    /// ``CompilableBatchRotatingKVCache``) all expose `innerState()` returning
+    /// MLXArrays tracked by `compile(inputs:outputs:)`.
     ///
     /// - Precondition: `cacheRef` is non-empty and every element is a
     ///   compilable cache (see ``eligible(_:)``). Call `eval(cacheRef)`
@@ -78,7 +81,7 @@ public enum CompiledDecode {
         precondition(
             eligible(cacheRef),
             "CompiledDecode.compileForward requires a non-empty cache where every "
-                + "layer is a CompilableKVCache or CompilableRotatingKVCache.")
+                + "layer is a compilable type (single-stream or batched).")
 
         let capturedModel = model
         let captured = cacheRef
@@ -161,5 +164,81 @@ public enum CompiledDecode {
             "Compiled decode enabled: \(layerCount) layers (\(simpleCount) simple + \(rotatingCount) rotating), maxLength=\(maxCacheLength)")
 
         return compileForward(model: model, cacheRef: cache)
+    }
+
+    /// Set up compiled decode for batched caches (B >= 1).
+    ///
+    /// Promotes ``BatchKVCache`` layers to ``CompilableBatchKVCache`` and
+    /// ``BatchRotatingKVCache`` layers to ``CompilableBatchRotatingKVCache``
+    /// in place. Layers that are already compilable are kept as-is.
+    ///
+    /// ArraysCache / MambaCache layers are unsupported — if any are present,
+    /// setup is skipped and `nil` is returned.
+    ///
+    /// - Parameters:
+    ///   - model: The language model.
+    ///   - cache: Mutable batched-cache array. On success, entries are replaced
+    ///     with their compilable equivalents in place.
+    ///   - maxCacheLength: Maximum sequence length for full-attention layers.
+    ///     Sliding-window layers use their own maxCacheSize.
+    /// - Returns: A compiled forward closure, or `nil` if setup was skipped.
+    public static func setupBatchCompiledDecode(
+        model: any LanguageModel,
+        cache: inout [any BatchedCache],
+        maxCacheLength: Int = 4096
+    ) -> (@Sendable ([MLXArray]) -> [MLXArray])? {
+        guard isEnabled else { return nil }
+        guard MLXHardwareInfo.isCompiledDecodeSupported else {
+            compiledDecodeLog.info("Batch compiled decode skipped: hardware not supported")
+            return nil
+        }
+
+        // Validate all layers are promotable.
+        for layer in cache {
+            if layer is CompilableBatchKVCache || layer is CompilableBatchRotatingKVCache {
+                continue  // Already compilable
+            }
+            if !(layer is BatchKVCache) && !(layer is BatchRotatingKVCache) {
+                compiledDecodeLog.info(
+                    "Batch compiled decode skipped: unsupported cache type (\(type(of: layer)))")
+                return nil
+            }
+        }
+
+        // Materialize all pending cache operations before conversion.
+        eval(cache)
+
+        // Per-layer promotion.
+        var fullCount = 0
+        var rotatingCount = 0
+        for i in 0..<cache.count {
+            if cache[i] is CompilableBatchKVCache || cache[i] is CompilableBatchRotatingKVCache {
+                // Already compilable — count it.
+                if cache[i] is CompilableBatchKVCache { fullCount += 1 }
+                else { rotatingCount += 1 }
+                continue
+            }
+
+            if let rotating = cache[i] as? BatchRotatingKVCache {
+                cache[i] = CompilableBatchRotatingKVCache.promote(
+                    from: rotating, maxLength: maxCacheLength)
+                rotatingCount += 1
+            } else if let full = cache[i] as? BatchKVCache {
+                cache[i] = CompilableBatchKVCache.promote(
+                    from: full, maxLength: maxCacheLength)
+                fullCount += 1
+            }
+        }
+
+        // Materialize the new compilable cache buffers.
+        eval(cache)
+
+        let layerCount = cache.count
+        compiledDecodeLog.info(
+            "Batch compiled decode enabled: \(layerCount) layers (\(fullCount) full + \(rotatingCount) rotating), maxLength=\(maxCacheLength)")
+
+        // Build compiled forward with the caches cast to [KVCache].
+        let cacheRef = cache.map { $0 as any KVCache }
+        return compileForward(model: model, cacheRef: cacheRef)
     }
 }
