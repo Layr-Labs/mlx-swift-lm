@@ -368,7 +368,16 @@ public class SwitchGLU: Module {
             if let g = gateProj as? QuantizedSwitchLinear, let gb = g.bias,
                let u = upProj as? QuantizedSwitchLinear, let ub = u.bias {
                 let fusedBias = concatenated([gb, ub], axis: -1)
-                let gatheredBias = fusedBias[idx]
+                // Match the unfused QuantizedSwitchLinear path, which adds
+                // `MLX.expandedDimensions(bias[indices], axis: -2)`. The fused
+                // matmul result (`splits[*]`) is shaped [..., topk, 1, H]
+                // because `x` was expanded on axes [-2, -3]. The gathered bias
+                // is [..., topk, H]; without the singleton -2 axis it
+                // right-aligns the bias's topk axis against the result's
+                // matmul axis and mis-broadcasts to [..., topk, topk, H],
+                // corrupting activations (or erroring). Expand on -2 so the
+                // bias broadcasts over the matmul axis like the unfused path.
+                let gatheredBias = MLX.expandedDimensions(fusedBias[idx], axis: -2)
                 let biasSplits = MLX.split(gatheredBias, parts: 2, axis: -1)
                 splits[0] = splits[0] + biasSplits[0]
                 splits[1] = splits[1] + biasSplits[1]
