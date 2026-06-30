@@ -193,4 +193,47 @@ struct CompilableKVCacheTests {
             #expect(Swift.abs(a - b) < 1e-5)
         }
     }
+
+    // MARK: - compiledCaptureSnapshot (prefix capture on finish)
+
+    /// A full-attention `CompilableKVCache` snapshots into a plain
+    /// `KVCacheSimple` holding exactly the valid, temporally ordered prefix,
+    /// so a prefix-cache consumer reads correct state (never the compiled
+    /// object's decode-only buffers).
+    @Test("compiledCaptureSnapshot promotes full-attention cache to KVCacheSimple")
+    func compiledCaptureSnapshotFullAttention() {
+        let B = 1, H = 2, D = 4
+        let cache = CompilableKVCache(maxLength: 16)
+        _ = cache.update(keys: MLXArray.ones([B, H, 3, D]), values: MLXArray.ones([B, H, 3, D]) * 2)
+        _ = cache.update(keys: MLXArray.ones([B, H, 1, D]) * 3, values: MLXArray.ones([B, H, 1, D]) * 4)
+        eval(cache.offsetArray)
+
+        let snap = GenerationBatch.compiledCaptureSnapshot(cache)
+
+        // Must be a plain KVCacheSimple so PrefixCache.storePrefix accepts it.
+        #expect(snap is KVCacheSimple)
+        let s = snap.state
+        #expect(s.count == 2)
+        // Exactly the 4 valid tokens (not the 16-wide overflow buffer).
+        #expect(s[0].dim(2) == 4)
+        #expect(snap.offset == 4)
+        // Temporally ordered: first 3 keys == 1, last key == 3.
+        #expect(maxAbsDiff(s[0][.ellipsis, 0 ..< 3, 0...], MLXArray.ones([B, H, 3, D])) == 0)
+        #expect(maxAbsDiff(s[0][.ellipsis, 3 ..< 4, 0...], MLXArray.ones([B, H, 1, D]) * 3) == 0)
+    }
+
+    /// A sliding-window `CompilableRotatingKVCache` only holds the last
+    /// `windowSize` tokens, so it must NOT be coerced into a `KVCacheSimple`
+    /// (that would present windowed KV as a full-history prefix). It is returned
+    /// unchanged so `PrefixCache`'s `as? KVCacheSimple` guard excludes the
+    /// whole response from block prefix storage.
+    @Test("compiledCaptureSnapshot leaves rotating cache non-KVCacheSimple")
+    func compiledCaptureSnapshotRotatingExcluded() {
+        let B = 1, H = 2, D = 4
+        let cache = CompilableRotatingKVCache(maxSize: 8)
+        _ = cache.update(keys: MLXArray.ones([B, H, 2, D]), values: MLXArray.ones([B, H, 2, D]))
+
+        let snap = GenerationBatch.compiledCaptureSnapshot(cache)
+        #expect(!(snap is KVCacheSimple))
+    }
 }

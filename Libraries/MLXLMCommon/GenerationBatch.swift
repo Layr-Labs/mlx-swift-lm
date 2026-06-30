@@ -237,9 +237,15 @@ public final class GenerationBatch: @unchecked Sendable {
                 let extracted: [any KVCache]?
                 if capturePromptCacheOnFinish {
                     if let compiledCache = _compiledCache {
-                        // Compiled decode: _compiledCache has the up-to-date
-                        // single-stream KV state; promptCache is stale.
-                        extracted = compiledCache
+                        // Compiled decode (B=1): the live KV state lives in
+                        // _compiledCache; the batched promptCache is stale.
+                        // Snapshot each compiled cache into its standard KVCache
+                        // form so a prefix-cache consumer never reads a compiled
+                        // cache's inherited view directly. CompilableRotatingKVCache
+                        // (sliding window) deliberately leaves the inherited
+                        // idx/offset/state stale during compiled decode; returning
+                        // it raw exposed that stale view. See compiledCaptureSnapshot.
+                        extracted = compiledCache.map { Self.compiledCaptureSnapshot($0) }
                     } else {
                         extracted = promptCache.map { $0.extractBatched(i) }
                     }
@@ -417,6 +423,43 @@ public final class GenerationBatch: @unchecked Sendable {
         }
         _compiledForward = nil
         _compiledCache = nil
+    }
+
+    /// Snapshot a compiled-decode cache into a standard `KVCache` for prefix
+    /// capture on finish.
+    ///
+    /// - Full-attention `CompilableKVCache` overrides `state`/`offset` to read
+    ///   the live `offsetArray`, so it already exposes a correct, temporally
+    ///   ordered prefix. We copy that valid slice into a plain `KVCacheSimple`
+    ///   so the captured cache is a normal, reusable, full-history prefix
+    ///   (and is no longer a compiled object carrying decode-only buffers).
+    /// - Sliding-window `CompilableRotatingKVCache` only retains the last
+    ///   `windowSize` tokens and its inherited `idx`/`offset`/`state` are
+    ///   intentionally NOT synced during compiled decode (syncing forces an
+    ///   `eval` that `compile()` rejects). A windowed cache cannot serve as a
+    ///   block-level prefix (which needs full-history KV), so it is returned
+    ///   unchanged: it is not a `KVCacheSimple`, and `PrefixCache.storePrefix`
+    ///   already requires every layer to cast to `KVCacheSimple`, so a response
+    ///   containing any rotating layer is correctly excluded from prefix
+    ///   storage. Coercing it to `KVCacheSimple` would be the actual bug —
+    ///   it would present windowed KV as a full-history prefix.
+    static func compiledCaptureSnapshot(_ cache: any KVCache) -> any KVCache {
+        if let full = cache as? CompilableKVCache {
+            let s = full.state
+            guard s.count == 2 else { return cache }
+            // Materialize so the snapshot owns its storage instead of lazily
+            // aliasing the compiled cache's wide (maxLength) live buffer —
+            // mirrors BatchKVCache.extract(). Defensive: capture happens at
+            // finish (the row is then filtered out, nil-ing _compiledCache), so
+            // the source is not mutated afterward today, but owning the buffer
+            // keeps this correct if capture ever moves off the finish path and
+            // releases the maxLength buffer once storePrefix slices its blocks.
+            eval(s[0], s[1])
+            let simple = KVCacheSimple()
+            simple.state = s
+            return simple
+        }
+        return cache
     }
 
     public var isEmpty: Bool { uids.isEmpty }
