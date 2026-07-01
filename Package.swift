@@ -80,6 +80,7 @@ let package = Package(
             name: "MLXLMCommon",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
@@ -90,6 +91,11 @@ let package = Package(
             path: "Libraries/MLXLMCommon",
             exclude: [
                 "README.md"
+            ],
+            resources: [
+                // CBv2 paged-attention MSL source, JIT-compiled at runtime
+                // via MLXFast.metalKernel (NOT compiled by SwiftPM).
+                .copy("ContinuousBatchingV2/Paged/pagedattention.metal")
             ]
         ),
         .target(

@@ -1,0 +1,292 @@
+// PagedSequenceKV.swift
+//
+// Per-sequence, per-layer KV state for the paged backend (WS-C).
+//
+// A `PagedSequenceKV` owns a page TABLE (`[Int32]` physical page ids into
+// its group's slabs) plus its absolute position counter. There is no shared
+// frontier: joining a batch adds an object, leaving drops it, and nothing a
+// batchmate does can move this sequence's positions or evict its pages.
+//
+// Windowed layers use a RING of pages: token at absolute position `p` lives
+// in table slot `(p / pageSize) % ringPages`, slot `p % pageSize`. Eviction
+// is therefore implicit overwrite keyed to absolute positions — the recent
+// end always survives, no window masks over shared buffers exist, and the
+// ring is sized to hold a full prefill chunk plus the trailing window so
+// every query in a chunk can still see its complete window after the chunk
+// is written.
+
+import Foundation
+import MLX
+
+public final class PagedSequenceKV: CBv2SequenceKV {
+    let pool: PagedKVPool
+    let groupKey: PagedKVGroupKey
+    /// Sliding window in tokens (nil == full attention).
+    public let windowSize: Int?
+    /// Ring capacity in pages for windowed layers (nil for full).
+    let ringPages: Int?
+    /// Worst-case pages this sequence may allocate (reserved at admission;
+    /// the pool guarantees allocations up to this count cannot fail).
+    let reservedPages: Int
+    /// Hard bound on `absoluteOffset` (from the request's maxLength).
+    public let maxLength: Int
+
+    /// Physical page ids. Full: index == logical page. Windowed: index ==
+    /// logical page % ringPages.
+    private(set) var table: [Int32] = []
+    /// Bumped whenever `table` changes — lets the layer cache reuse device
+    /// block tables across steps that only append tokens within a page.
+    private(set) var tableVersion: Int = 0
+
+    public private(set) var absoluteOffset: Int = 0
+    /// Absolute position before which nothing was ever written here
+    /// (nonzero only after `fastForward(to:)` for prefix-adopted rows).
+    private(set) var baseOffset: Int = 0
+    /// Size of the most recent update — governs how much trailing context
+    /// `retainedCount` exposes for windowed layers (a chunk's earliest query
+    /// must see its full window).
+    private var lastUpdateTokens: Int = 1
+
+    private var released = false
+
+    init(
+        pool: PagedKVPool, kind: CBv2LayerKind, maxLength: Int, reservedPages: Int
+    ) {
+        self.pool = pool
+        self.groupKey = PagedKVGroupKey(kind)
+        switch kind.attention {
+        case .full:
+            self.windowSize = nil
+            self.ringPages = nil
+        case .slidingWindow(let window):
+            self.windowSize = window
+            self.ringPages = PagedKVPool.ringPageCount(window: window, config: pool.config)
+        }
+        self.maxLength = maxLength
+        self.reservedPages = reservedPages
+    }
+
+    deinit {
+        assert(released, "[PagedSequenceKV] leaked without release — pages still allocated")
+    }
+
+    // MARK: - CBv2SequenceKV
+
+    public var retainedCount: Int {
+        let written = absoluteOffset - baseOffset
+        guard let window = windowSize else { return written }
+        return min(written, window - 1 + lastUpdateTokens)
+    }
+
+    public var byteCount: Int {
+        table.count * pool.group(groupKey).pageBytes
+    }
+
+    public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        var k = keys
+        var v = values
+        if k.ndim == 4 {
+            precondition(k.dim(0) == 1, "per-sequence update requires batch dim 1")
+            k = k.squeezed(axis: 0)
+            v = v.squeezed(axis: 0)
+        }
+        write(keys: k, values: v)
+        return attendableViews()
+    }
+
+    public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
+        let (k, v) = attendableViews()
+        return (k, v, absoluteOffset)
+    }
+
+    public func rollback(_ n: Int) {
+        precondition(n >= 0 && n <= absoluteOffset - baseOffset, "rollback past written tokens")
+        guard n > 0 else { return }
+        absoluteOffset -= n
+        if ringPages == nil {
+            // Full layer: free pages past the new frontier. Freed pages may
+            // hold stale bytes; they are only ever re-read by their NEXT
+            // owner after that owner writes them (all reads are bounded by
+            // the owner's absoluteOffset), so no scrubbing pass is needed.
+            let keepPages = (absoluteOffset + pool.config.pageSize - 1) / pool.config.pageSize
+            if keepPages < table.count {
+                pool.freePages(group: groupKey, pages: table[keepPages...])
+                table.removeSubrange(keepPages...)
+                tableVersion += 1
+            }
+        }
+        // Windowed rings keep their pages; the rolled-back slots are
+        // overwritten before they can re-enter any attendable range.
+        lastUpdateTokens = 1
+    }
+
+    // MARK: - Writes
+
+    /// Append `keys`/`values` (`[kvHeads, n, headDim]`) at the current
+    /// frontier. Never throws: the pool guarantees pages up to the
+    /// admission-time reservation.
+    func write(keys: MLXArray, values: MLXArray) {
+        let n = keys.dim(1)
+        guard n > 0 else { return }
+        precondition(
+            absoluteOffset + n <= maxLength,
+            "write past maxLength (\(absoluteOffset) + \(n) > \(maxLength))")
+        if windowSize != nil {
+            precondition(
+                n <= pool.config.maxPrefillChunk,
+                "windowed update of \(n) tokens exceeds maxPrefillChunk "
+                    + "\(pool.config.maxPrefillChunk) — the ring cannot hold it")
+        }
+        let s = pool.config.pageSize
+
+        // Split the incoming tokens into per-page segments.
+        struct Segment {
+            var physical: Int32
+            var slotStart: Int
+            var count: Int
+            var srcOffset: Int
+        }
+        var segments: [Segment] = []
+        var pos = absoluteOffset
+        var src = 0
+        while src < n {
+            let lp = pos / s
+            let slot = pos % s
+            let count = min(s - slot, n - src)
+            let physical = ensurePage(logicalPage: lp)
+            segments.append(
+                Segment(physical: physical, slotStart: slot, count: count, srcOffset: src))
+            pos += count
+            src += count
+        }
+
+        // Coalesce physically-consecutive full-page segments into slab-range
+        // writes (fresh allocations pop in ascending order, so long prefill
+        // chunks usually collapse to a single slice update per slab).
+        var i = 0
+        while i < segments.count {
+            let seg = segments[i]
+            if seg.slotStart == 0 && seg.count == s {
+                var runLength = 1
+                while i + runLength < segments.count {
+                    let next = segments[i + runLength]
+                    guard next.slotStart == 0, next.count == s,
+                        next.physical == seg.physical + Int32(runLength)
+                    else { break }
+                    runLength += 1
+                }
+                if runLength > 1 {
+                    pool.writeFullPageRun(
+                        group: groupKey, firstPage: seg.physical, pageRuns: runLength,
+                        keys: keys, values: values, srcOffset: seg.srcOffset)
+                    i += runLength
+                    continue
+                }
+            }
+            pool.write(
+                group: groupKey, page: seg.physical, slot: seg.slotStart,
+                keys: keys, values: values, srcOffset: seg.srcOffset, count: seg.count)
+            i += 1
+        }
+
+        absoluteOffset += n
+        lastUpdateTokens = n
+    }
+
+    private func ensurePage(logicalPage lp: Int) -> Int32 {
+        let slotIndex: Int
+        if let ring = ringPages {
+            slotIndex = lp % ring
+        } else {
+            slotIndex = lp
+        }
+        while table.count <= slotIndex {
+            precondition(
+                table.count < reservedPages,
+                "[PagedSequenceKV] allocation past reservation (\(reservedPages) pages) — "
+                    + "admission accounting bug")
+            table.append(pool.allocatePage(group: groupKey))
+            tableVersion += 1
+        }
+        return table[slotIndex]
+    }
+
+    // MARK: - Reads
+
+    /// Gathered `[1, kvHeads, retainedCount, headDim]` views over the
+    /// attendable range, oldest to newest, in the pool dtype. The views
+    /// reference the live slabs — consume them within the current engine
+    /// step and drop them, or subsequent slab writes stop donating.
+    func attendableViews() -> (keys: MLXArray, values: MLXArray) {
+        let retained = retainedCount
+        let start = absoluteOffset - retained
+        return gatherRange(start: start, count: retained)
+    }
+
+    /// Gather an arbitrary written range (used by prefill fallback and
+    /// snapshots). `start` is an absolute position.
+    func gatherRange(start: Int, count: Int) -> (keys: MLXArray, values: MLXArray) {
+        guard count > 0 else {
+            return pool.gather(group: groupKey, pages: [], firstSlot: 0, count: 0)
+        }
+        precondition(start >= baseOffset && start + count <= absoluteOffset)
+        if let window = windowSize {
+            // The ring only holds the recent end; older positions are gone.
+            let ring = ringPages! * pool.config.pageSize
+            precondition(
+                start >= absoluteOffset - ring,
+                "gather of evicted window range (window \(window))")
+        }
+        let s = pool.config.pageSize
+        let lpFirst = start / s
+        let lpLast = (start + count - 1) / s
+        var pages: [Int32] = []
+        pages.reserveCapacity(lpLast - lpFirst + 1)
+        for lp in lpFirst ... lpLast {
+            let idx = ringPages.map { lp % $0 } ?? lp
+            pages.append(table[idx])
+        }
+        return pool.gather(
+            group: groupKey, pages: pages, firstSlot: start % s, count: count)
+    }
+
+    /// Kernel-facing row descriptor for decode: the absolute range the
+    /// current query may attend to, plus the (modular) table length.
+    /// All plain Swift Int math — never a device sync.
+    var decodeAttendRange: (start: Int, length: Int) {
+        let qPos = absoluteOffset - 1
+        precondition(qPos >= baseOffset, "decode before any token was written")
+        var start = baseOffset
+        if let window = windowSize {
+            start = max(start, qPos - window + 1)
+        }
+        return (start, qPos - start + 1)
+    }
+
+    // MARK: - Lifecycle
+
+    /// Advance the position counter without writing storage. Only valid on
+    /// a fresh WINDOWED state during prefix-cache adoption: the engine
+    /// recomputes the trailing window tokens for windowed layers, and those
+    /// recomputed tokens must land at their true absolute positions.
+    public func fastForward(to offset: Int) {
+        precondition(windowSize != nil, "fastForward is only for windowed layers")
+        precondition(
+            table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
+            "fastForward requires a fresh state")
+        precondition(offset >= 0 && offset <= maxLength)
+        absoluteOffset = offset
+        baseOffset = offset
+    }
+
+    /// Return every page to the pool and release the reservation.
+    /// O(pages) metadata, no device work. Idempotent.
+    func releaseStorage() {
+        guard !released else { return }
+        released = true
+        pool.freePages(group: groupKey, pages: table)
+        table.removeAll()
+        tableVersion += 1
+        pool.unreserve([groupKey: reservedPages])
+    }
+}
