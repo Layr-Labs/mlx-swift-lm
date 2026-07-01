@@ -42,6 +42,14 @@ public func attentionWithCacheUpdate(
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
 ) -> MLXArray {
+    // ContinuousBatchingV2: the layer cache owns BOTH the KV update and the
+    // attention computation (including masking — the `mask` parameter is
+    // ignored by design on this path; sinks-bearing models call
+    // `updateAndAttend` directly with their sinks).
+    if let v2 = cache as? CBv2AttendingLayerCache {
+        return v2.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+    }
     guard let cache else {
         return MLXFast.scaledDotProductAttention(
             queries: queries,
