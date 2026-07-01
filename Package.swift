@@ -212,6 +212,30 @@ let package = Package(
             ],
             path: "Sources/BenchLoad"
         ),
+        // WS-G (engine-v2) benchmark harness: tiny-model v2-style step loop
+        // (CI-runnable) + `--model <path>` legacy-engine baseline for real
+        // weights. Reports land as markdown next to the other benchmarks/
+        // reports. `sources:` keeps the target scoped to the one Swift file.
+        .executableTarget(
+            name: "CBv2Benchmark",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "benchmarks",
+            exclude: [
+                "mtp-2026-05-09-130614.md",
+                "mtp-2026-05-09-142113.md",
+                "mtp-2026-05-09-183133.md",
+                "mtp-2026-05-09-190948.md",
+                "mtp-2026-05-09-203007.md",
+            ],
+            sources: ["CBv2Benchmark.swift"]
+        ),
     ]
 )
 
