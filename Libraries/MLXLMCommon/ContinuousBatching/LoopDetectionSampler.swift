@@ -19,7 +19,15 @@ import MLX
 /// also trivially satisfies the repeat test at its multiples (4, 6, ...), but
 /// the smallest matching period is the real fundamental cycle and the most
 /// useful one to break.
-func detectLoopContinuation(tokens: [Int], maxPatternSize: Int, minCount: Int) -> Int? {
+///
+/// `lookahead` shifts which future position is predicted: `0` (default)
+/// predicts the token immediately after `tokens` (position `tokens.count`);
+/// `1` predicts one position further still (`tokens.count + 1`), skipping a
+/// position `tokens` doesn't cover yet. See ``makeLoopDetectionSampler`` for
+/// why the continuous-batching caller needs `lookahead: 1`.
+func detectLoopContinuation(
+    tokens: [Int], maxPatternSize: Int, minCount: Int, lookahead: Int = 0
+) -> Int? {
     let n = tokens.count
     guard minCount >= 2, n >= minCount else { return nil }
     let upperBound = min(maxPatternSize, n / minCount)
@@ -37,7 +45,12 @@ func detectLoopContinuation(tokens: [Int], maxPatternSize: Int, minCount: Int) -
             }
         }
         if isLoop {
-            return tokens[n - period]
+            // Predicting position (n + lookahead) in a period-`period` cycle:
+            // step back by whole periods until landing on a known index
+            // (<= n - 1). k is the smallest period-count with
+            // n + lookahead - k*period <= n - 1, i.e. k = ceil((lookahead+1)/period).
+            let k = (lookahead + period) / period
+            return tokens[n + lookahead - k * period]
         }
     }
     return nil
@@ -47,6 +60,17 @@ func detectLoopContinuation(tokens: [Int], maxPatternSize: Int, minCount: Int) -
 /// detectable repeating cycle (see ``detectLoopContinuation``), the token
 /// that would continue it is banned (logit set to `-inf`) before `base`
 /// samples, forcing generation off the loop.
+///
+/// Uses `lookahead: 1`, not the immediate-next prediction, because of how
+/// `GenerationBatch.step()` double-buffers: it samples *this* row's next
+/// token from `history.tokens` before `Scheduler.processGenResponses` has
+/// appended the token `step()` is about to return as `currentTokens` (that
+/// append only happens once `step()` fully returns, one level up). So
+/// `history.tokens` is always missing the most recently produced token at
+/// the moment this sampler runs -- predicting the "immediate next" slot would
+/// actually predict a token that's *already happened* and can't be changed,
+/// banning the wrong candidate and never breaking the cycle. `lookahead: 1`
+/// predicts the slot this sampler's own token actually lands in.
 func makeLoopDetectionSampler(
     base: @escaping RowSampler,
     history: TokenHistoryHolder,
@@ -56,7 +80,8 @@ func makeLoopDetectionSampler(
     return { @Sendable logits in
         guard
             let bannedToken = detectLoopContinuation(
-                tokens: history.tokens, maxPatternSize: maxPatternSize, minCount: minCount),
+                tokens: history.tokens, maxPatternSize: maxPatternSize, minCount: minCount,
+                lookahead: 1),
             bannedToken >= 0, bannedToken < logits.dim(-1)
         else {
             return base(logits)

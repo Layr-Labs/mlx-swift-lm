@@ -108,10 +108,20 @@ public struct TailLoopDetector: LogitProcessor {
             let matched = MLX.all(earlier .== later)
             let effectiveMatch = logicalAnd(matched, logicalNot(alreadyMatched))
 
+            // `bannedToken` comes straight from generated/prompt history, which
+            // for multimodal/direct-token inputs can carry placeholder ids
+            // (e.g. an image span) outside `[0, vocabSize)` before the model
+            // swaps them for embeddings. Scattering an out-of-range index is
+            // unsafe, so gate the actual ban on it being in range and clip the
+            // scatter index itself (the continuous-batching sampler already
+            // does the equivalent range check before writing -inf).
             let bannedToken = window.tokens[(historyCount - period) ..< (historyCount - period + 1)]
-            let weight = MLX.where(effectiveMatch, negInf, zero)
+            let inRange = logicalAnd(
+                bannedToken .>= MLXArray(Int32(0)), bannedToken .< MLXArray(Int32(vocabSize)))
+            let safeToken = clip(bannedToken, min: MLXArray(Int32(0)), max: MLXArray(Int32(vocabSize - 1)))
+            let weight = MLX.where(logicalAnd(effectiveMatch, inRange), negInf, zero)
             let contribution = MLXArray.zeros([vocabSize], type: Float32.self)
-                .at[bannedToken].add(weight)
+                .at[safeToken].add(weight)
 
             penalty = (penalty ?? MLXArray.zeros([vocabSize], type: Float32.self)) + contribution
             alreadyMatched = logicalOr(alreadyMatched, matched)
