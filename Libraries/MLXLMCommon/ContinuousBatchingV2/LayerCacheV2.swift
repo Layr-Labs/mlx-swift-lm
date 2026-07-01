@@ -43,6 +43,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     private var cachedPositionOffsets: MLXArray
 
+    /// Times `positionOffsets` was rebuilt from host integers. Tests assert
+    /// this only moves on membership changes — never inside the step loop.
+    public private(set) var positionOffsetsHostRebuilds = 0
+
     public init(layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = []) {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
@@ -116,6 +120,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     // MARK: - Private
 
     private func rebuildPositionOffsets() {
+        positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         cachedPositionOffsets = Self.buildPositionOffsets(rows)
     }
