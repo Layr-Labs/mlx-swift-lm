@@ -9,6 +9,15 @@ import Testing
 @testable import MLXLLM
 @testable import MLXVLM
 
+// DISABLED AT COMPILE TIME: this spike targets the MLXVLM Gemma4 MTP surface
+// (`forwardForMTP`, `mtpConfiguration`, `rollbackSpeculativeCache`,
+// `Gemma4Configuration.textConfiguration`) that was removed when the vMLX
+// decode hot path was ported (8a212b4). The file no longer compiles on
+// main/feat/engine-v2 and blocks the entire MLXLMTests bundle from building.
+// Re-enable with `-Xswiftc -DVLM_MTP_SPIKE_COMPILED` once the VLM MTP surface
+// is restored. (The suite was already env-gated at RUNTIME via VLM_MTP_SPIKE.)
+#if VLM_MTP_SPIKE_COMPILED
+
 /// De-risking spike for VLM MTP speculative decoding.
 ///
 /// The make-or-break question: does the MLXLLM-trained Gemma 4 MTP drafter
