@@ -21,7 +21,6 @@
 
 import Foundation
 import MLX
-import MLXFast
 
 // MARK: - Request & sampling surface
 
