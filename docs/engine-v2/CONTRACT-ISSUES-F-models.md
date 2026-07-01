@@ -36,7 +36,19 @@ threaded through the trunk — and never re-read `source.positionOffsets` after
 the source's update. WS-A's implementation must not invalidate this (e.g. by
 mutating the returned array in place before the step's graph is built).
 
-## 3. No load-time preparation hook for models
+## 3. Branch base cannot compile the MLXLMTests target (pre-existing)
+
+Not a contract-shape issue, but an integration blocker every workstream hits:
+at the branch base (`fe60e17`), `Tests/MLXLMTests/Gemma4VLMMTPSpikeTests.swift`
+calls `Gemma4.forwardForMTP` / expects `Gemma4: Gemma4MTPTarget` on the MLXVLM
+tower, but `Libraries/MLXVLM/Models/Gemma4.swift` at this base has neither
+(zero occurrences of `forwardForMTP`). `swift test --filter CBv2…` therefore
+fails to build for ALL workstreams until integration restores the VLM MTP API
+or drops the spike test. WS-F ran its suites with that file temporarily moved
+aside (it is env-gated `VLM_MTP_SPIKE=1` spike code, so no coverage is lost);
+the file is untouched in the WS-F branch.
+
+## 4. No load-time preparation hook for models
 
 GPT-OSS needs a one-time host probe (`(sinks * sinks).max().item()`) to decide
 whether the learned sinks are active. The contract has no "engine will call X
