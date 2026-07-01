@@ -219,8 +219,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 boolMask: mask, sinks: sinks, softcap: softcap)
         }
 
+        // MLX SDPA requires the sink dtype to promote to the output dtype
+        // (fp16 queries + fp32 sinks trap), so match the query dtype here.
+        // The decode kernel is unaffected: it consumes sinks in fp32.
         return MLXFast.scaledDotProductAttention(
             queries: queries, keys: k, values: v, scale: scale,
-            mask: .array(mask), sinks: sinks)
+            mask: .array(mask), sinks: sinks?.asType(queries.dtype))
     }
 }
