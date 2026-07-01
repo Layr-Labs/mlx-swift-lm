@@ -102,6 +102,16 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// Maximum repeating-cycle period (in tokens) considered when detecting a
+    /// degenerate tail loop (e.g. "a b c a b c ..."). `nil` disables loop
+    /// detection (default). See ``TailLoopDetector``.
+    public var loopDetectionMaxPatternSize: Int?
+
+    /// Minimum number of consecutive identical repeats of a candidate period
+    /// required before it's flagged as a loop. Only meaningful when
+    /// `loopDetectionMaxPatternSize` is set.
+    public var loopDetectionMinCount: Int
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -118,6 +128,8 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
+        loopDetectionMaxPatternSize: Int? = nil,
+        loopDetectionMinCount: Int = 3,
         prefillStepSize: Int = 512
     ) {
         self.maxTokens = maxTokens
@@ -135,6 +147,8 @@ public struct GenerateParameters: Sendable {
         self.presenceContextSize = presenceContextSize
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
+        self.loopDetectionMaxPatternSize = loopDetectionMaxPatternSize
+        self.loopDetectionMinCount = loopDetectionMinCount
         self.prefillStepSize = prefillStepSize
     }
 
@@ -187,14 +201,27 @@ public struct GenerateParameters: Sendable {
             frequencyContext = nil
         }
 
-        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
+        let loopDetector: TailLoopDetector?
+        if let loopDetectionMaxPatternSize, loopDetectionMaxPatternSize > 0 {
+            loopDetector = TailLoopDetector(
+                maxPatternSize: loopDetectionMaxPatternSize,
+                minCount: max(2, loopDetectionMinCount)
+            )
+        } else {
+            loopDetector = nil
+        }
+
+        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil
+            && loopDetector == nil
+        {
             return nil
         }
 
         return PenaltyProcessor(
             repetitionContext: repetitionContext,
             presenceContext: presenceContext,
-            frequencyContext: frequencyContext
+            frequencyContext: frequencyContext,
+            loopDetector: loopDetector
         )
     }
 }
@@ -462,26 +489,32 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 }
 
-/// Processor that composes penalty processors in Python mlx-lm order.
+/// Processor that composes penalty processors in Python mlx-lm order, plus
+/// an optional ``TailLoopDetector`` applied last (a hard ban overriding
+/// whatever the soft penalties above already did to that token's logit).
 public struct PenaltyProcessor: LogitProcessor {
     var repetitionContext: RepetitionContext?
     var presenceContext: PresencePenaltyContext?
     var frequencyContext: FrequencyPenaltyContext?
+    var loopDetector: TailLoopDetector?
 
     public init(
         repetitionContext: RepetitionContext?,
         presenceContext: PresencePenaltyContext?,
-        frequencyContext: FrequencyPenaltyContext?
+        frequencyContext: FrequencyPenaltyContext?,
+        loopDetector: TailLoopDetector? = nil
     ) {
         self.repetitionContext = repetitionContext
         self.presenceContext = presenceContext
         self.frequencyContext = frequencyContext
+        self.loopDetector = loopDetector
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
         repetitionContext?.prompt(prompt)
         presenceContext?.prompt(prompt)
         frequencyContext?.prompt(prompt)
+        loopDetector?.prompt(prompt)
     }
 
     public func process(logits: MLXArray) -> MLXArray {
@@ -489,6 +522,7 @@ public struct PenaltyProcessor: LogitProcessor {
         logits = repetitionContext?.process(logits: logits) ?? logits
         logits = presenceContext?.process(logits: logits) ?? logits
         logits = frequencyContext?.process(logits: logits) ?? logits
+        logits = loopDetector?.process(logits: logits) ?? logits
         return logits
     }
 
@@ -496,6 +530,7 @@ public struct PenaltyProcessor: LogitProcessor {
         repetitionContext?.didSample(token: token)
         presenceContext?.didSample(token: token)
         frequencyContext?.didSample(token: token)
+        loopDetector?.didSample(token: token)
     }
 }
 

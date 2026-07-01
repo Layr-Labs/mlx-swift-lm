@@ -48,6 +48,13 @@ public struct SamplingParams: Sendable, Codable {
     public var repetitionPenalty: Float   // 1.0 = disabled
     public var presencePenalty: Float     // 0.0 = disabled
     public var frequencyPenalty: Float    // 0.0 = disabled
+    // Maximum repeating-cycle period (tokens) considered when detecting a
+    // degenerate tail loop (e.g. "a b c a b c ..."); 0 = disabled.
+    public var loopDetectionMaxPatternSize: Int
+    // Minimum consecutive identical repeats of a candidate period required
+    // before it's flagged as a loop. Only meaningful when
+    // loopDetectionMaxPatternSize > 0.
+    public var loopDetectionMinCount: Int
     public var stop: [String]
     public var stopTokenIds: Set<Int>
 
@@ -67,6 +74,8 @@ public struct SamplingParams: Sendable, Codable {
         repetitionPenalty: Float = 1.0,
         presencePenalty: Float = 0.0,
         frequencyPenalty: Float = 0.0,
+        loopDetectionMaxPatternSize: Int = 0,
+        loopDetectionMinCount: Int = 3,
         stop: [String] = [],
         stopTokenIds: Set<Int> = [],
         logprobs: Bool = false,
@@ -81,6 +90,8 @@ public struct SamplingParams: Sendable, Codable {
         self.repetitionPenalty = repetitionPenalty
         self.presencePenalty = presencePenalty
         self.frequencyPenalty = frequencyPenalty
+        self.loopDetectionMaxPatternSize = loopDetectionMaxPatternSize
+        self.loopDetectionMinCount = loopDetectionMinCount
         self.stop = stop
         self.stopTokenIds = stopTokenIds
         self.logprobs = logprobs

@@ -758,9 +758,11 @@ public final class Scheduler: @unchecked Sendable {
                 minP: params.minP,
                 topK: params.topK
             )
-            let needsPenalty = params.repetitionPenalty != 1.0
+            let needsRepetitionPenalty = params.repetitionPenalty != 1.0
                 || params.presencePenalty != 0.0
                 || params.frequencyPenalty != 0.0
+            let needsLoopDetection = params.loopDetectionMaxPatternSize > 0
+            let needsPenalty = needsRepetitionPenalty || needsLoopDetection
             let history = TokenHistoryHolder(tokens: promptTokens)
             tokenHistories[request.requestId] = history
             // Greedy (temperature 0, no penalty) uses a nil sampler so the
@@ -770,13 +772,20 @@ public final class Scheduler: @unchecked Sendable {
             // so it only engages when every row is nil-sampler greedy). With a
             // non-nil baseSampler here, MTP would never become eligible.
             let isGreedy = params.temperature == 0 && !needsPenalty
-            let sampler: RowSampler? = needsPenalty
+            var sampler: RowSampler? = needsRepetitionPenalty
                 ? makeRepetitionSampler(
                     base: baseSampler, history: history,
                     repetitionPenalty: params.repetitionPenalty,
                     presencePenalty: params.presencePenalty,
                     frequencyPenalty: params.frequencyPenalty)
                 : (isGreedy ? nil : baseSampler)
+            if needsLoopDetection {
+                sampler = makeLoopDetectionSampler(
+                    base: sampler ?? baseSampler,
+                    history: history,
+                    maxPatternSize: params.loopDetectionMaxPatternSize,
+                    minCount: max(2, params.loopDetectionMinCount))
+            }
 
             activeSamplers[request.requestId] = sampler
             activeDetokenizers[request.requestId] = NaiveStreamingDetokenizer(tokenizer: tokenizer)
@@ -1059,18 +1068,23 @@ public final class Scheduler: @unchecked Sendable {
     ///
     /// Safe to skip only when NO row needs normalized logprobs:
     /// - a penalty sampler (repetition/presence/frequency) applies a transform
-    ///   that is not invariant to the constant `logSumExp` shift, and
+    ///   that is not invariant to the constant `logSumExp` shift,
+    /// - loop detection can ban a token on any given step (data-dependent, not
+    ///   knowable in advance), so a row with it enabled is treated the same as
+    ///   an always-on penalty for this purpose, and
     /// - an active top-p (nucleus) filter compares a cumulative probability mass
     ///   against `1 - topP`, which is also not shift-invariant.
     /// Temperature scaling, top-k, min-p, categorical and argMax are all
     /// shift-invariant, so a pure-temperature / greedy batch can skip it.
-    /// Mirrors the exact predicates in `makeRowSampler` / `makeRepetitionSampler`.
+    /// Mirrors the exact predicates in `makeRowSampler` / `makeRepetitionSampler`
+    /// / `makeLoopDetectionSampler`.
     private static func batchCanSkipLogprobNorm(_ params: [SamplingParams]) -> Bool {
         !params.contains { p in
             let needsPenalty =
                 p.repetitionPenalty != 1.0
                 || p.presencePenalty != 0.0
                 || p.frequencyPenalty != 0.0
+                || p.loopDetectionMaxPatternSize > 0
             let topPActive = p.temperature != 0 && p.topP > 0 && p.topP < 1
             return needsPenalty || topPActive
         }
