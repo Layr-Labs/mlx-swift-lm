@@ -44,7 +44,6 @@ import Testing
 // so this env-gated spike no longer compiles and blocks the whole
 // MLXLMTests target. Re-enable once the VLM tower's MTP conformance is
 // restored.
-#if false
 @Suite(.serialized)
 struct Gemma4VLMMTPSpikeTests {
 
