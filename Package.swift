@@ -160,7 +160,12 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                // Stale VLM MTP spike: references Gemma4 (MLXVLM) MTP API
+                // removed by the vMLX decode port (#55). Broken at the
+                // engine-v2 branch base and blocks the whole test target;
+                // excluded until the VLM MTP spike is updated or deleted.
+                "Gemma4VLMMTPSpikeTests.swift",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
