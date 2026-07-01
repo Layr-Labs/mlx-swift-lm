@@ -39,6 +39,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private var cachedTables: MLXArray?
     private var cachedTablesFingerprint: [(ObjectIdentifier, Int)] = []
 
+    // Kernel params `{softcap, scale, 0…}` are constant across steps for a
+    // layer; cache the device array keyed on the scale actually passed.
+    private var cachedParams: MLXArray?
+    private var cachedParamsScale: Float?
+
+    // Sinks prepared for the kernel (fp32, >= 8 elements). Models pass the
+    // same parameter array every step, so key the cache on object identity.
+    private var cachedSinks: MLXArray?
+    private var cachedSinksSource: ObjectIdentifier?
+
     public init(
         layerIndex: Int, kind: CBv2LayerKind, pool: PagedKVPool,
         attentionSoftcap: Float? = nil
@@ -136,12 +146,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
         var info = [Int32]()
         info.reserveCapacity(rows.count * 8)
+        var maxAttendLength = 1
         for row in rows {
             let (start, length) = row.decodeAttendRange
             info.append(Int32(start))
             info.append(Int32(length))
             info.append(Int32(row.table.count))
             info.append(contentsOf: [0, 0, 0, 0, 0])
+            maxAttendLength = max(maxAttendLength, length)
         }
         let seqinfo = MLXArray(info, [rows.count, 8])
 
@@ -151,9 +163,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             vSlab: group.vSlab,
             tables: tables,
             seqinfo: seqinfo,
-            sinks: sinks,
-            scale: scale,
-            softcap: attentionSoftcap,
+            maxAttendLength: maxAttendLength,
+            sinks: preparedSinks(sinks),
+            params: params(scale: scale),
+            softcap: attentionSoftcap != nil,
             pageSize: pool.config.pageSize
         )
         // [B, QH, D] -> [B, QH, 1, D], back in the model dtype.
@@ -162,6 +175,35 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             result = result.asType(queries.dtype)
         }
         return result
+    }
+
+    /// Kernel params `{softcap, scale, 0…}`, cached across steps.
+    private func params(scale: Float) -> MLXArray {
+        if let cached = cachedParams, cachedParamsScale == scale {
+            return cached
+        }
+        var values: [Float] = [attentionSoftcap ?? 1.0, scale]
+        values.append(contentsOf: [Float](repeating: 0, count: 8 - values.count))
+        let params = MLXArray(values)
+        cachedParams = params
+        cachedParamsScale = scale
+        return params
+    }
+
+    /// Sinks prepared for the merge kernel: fp32, padded to >= 8 elements
+    /// so the generated signature keeps the `device` address space.
+    private func preparedSinks(_ sinks: MLXArray?) -> MLXArray? {
+        guard let sinks else { return nil }
+        if let cached = cachedSinks, cachedSinksSource == ObjectIdentifier(sinks) {
+            return cached
+        }
+        var s = sinks.asType(.float32).reshaped([-1])
+        if s.dim(0) < 8 {
+            s = concatenated([s, MLXArray.zeros([8 - s.dim(0)], dtype: .float32)])
+        }
+        cachedSinks = s
+        cachedSinksSource = ObjectIdentifier(sinks)
+        return s
     }
 
     /// Device `[B, maxPages]` int32 block tables, rebuilt only when some

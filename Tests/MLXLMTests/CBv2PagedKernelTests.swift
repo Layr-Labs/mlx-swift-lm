@@ -189,7 +189,10 @@ struct CBv2PagedKernelTests {
 
         // Two fixtures: the probe row solo, and the SAME content batched
         // with two batchmates. Identical content => bitwise-identical
-        // outputs, or the backend leaks batch composition.
+        // outputs, or the backend leaks batch composition. The 600-token
+        // batchmate spans multiple flash-decoding partitions, so the
+        // batched dispatch launches MORE partition threadgroups than the
+        // solo one — the probe row's math must not notice.
         let solo = try Fixture(kind: kind)
         let batched = try Fixture(kind: kind)
 
@@ -197,7 +200,7 @@ struct CBv2PagedKernelTests {
         try solo.addRow(tokens: 37)
         MLXRandom.seed(100)
         try batched.addRow(tokens: 37)
-        try batched.addRow(tokens: 5)
+        try batched.addRow(tokens: 600)
         try batched.addRow(tokens: 90)
 
         MLXRandom.seed(200)
