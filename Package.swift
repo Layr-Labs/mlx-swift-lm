@@ -160,7 +160,12 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                // Stale VLM MTP spike: references Gemma4 (MLXVLM) MTP API
+                // removed by the vMLX decode port (#55). Broken at the
+                // engine-v2 branch base and blocks the whole test target;
+                // excluded until the VLM MTP spike is updated or deleted.
+                "Gemma4VLMMTPSpikeTests.swift",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
@@ -206,6 +211,30 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/BenchLoad"
+        ),
+        // WS-G (engine-v2) benchmark harness: tiny-model v2-style step loop
+        // (CI-runnable) + `--model <path>` legacy-engine baseline for real
+        // weights. Reports land as markdown next to the other benchmarks/
+        // reports. `sources:` keeps the target scoped to the one Swift file.
+        .executableTarget(
+            name: "CBv2Benchmark",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "benchmarks",
+            exclude: [
+                "mtp-2026-05-09-130614.md",
+                "mtp-2026-05-09-142113.md",
+                "mtp-2026-05-09-183133.md",
+                "mtp-2026-05-09-190948.md",
+                "mtp-2026-05-09-203007.md",
+            ],
+            sources: ["CBv2Benchmark.swift"]
         ),
     ]
 )
