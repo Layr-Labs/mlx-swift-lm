@@ -188,11 +188,20 @@ final class CBv2InFlightStep {
 /// `[effective, prompt)` through all layers. The lookup's in-use pin is
 /// balanced by exactly one `endAdoption(tokens:matched:)` when the adoption
 /// is consumed or abandoned.
-struct CBv2PrefixAdoption {
+/// `@unchecked Sendable`: immutable value handed off exactly once, submit
+/// thread → engine queue; the MLXArray views are graph-only until adopted.
+struct CBv2PrefixAdoption: @unchecked Sendable {
     let tokens: [Int]
     let matched: Int
     let effective: Int
     let prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?]
+}
+
+/// Single-consumer cross-queue handoff of engine-owned values (KV state,
+/// donation snapshots). Safe by ownership transfer: the sender never
+/// touches the value after enqueueing.
+private struct CBv2Handoff<Value>: @unchecked Sendable {
+    let value: Value
 }
 
 // MARK: - EngineLoopV2
@@ -785,31 +794,34 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
         let donated = Array(tokens.dropLast())
-        var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
-        snapshots.reserveCapacity(layerKinds.count)
+        var built: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+        built.reserveCapacity(layerKinds.count)
         for (i, kind) in layerKinds.enumerated() {
             var cacheable = kind.sharesKVWithLayer == nil
             if case .slidingWindow = kind.attention { cacheable = false }
             guard cacheable, let seq = state[i] else {
-                snapshots.append(nil)
+                built.append(nil)
                 continue
             }
-            snapshots.append(seq.snapshot())
+            built.append(seq.snapshot())
         }
         let layerKinds = self.layerKinds
+        let handoff = CBv2Handoff(value: (state: state, snapshots: built))
         // Strong self on purpose: the deferred release is a pending
         // obligation of this loop — it must survive until the donation
         // lands, or the retired state leaks its pages (the paged pool is
         // engine-thread-affine, so the free hops back to the engine queue).
         // No cycle: the block releases its captures once it runs.
         donationQueue.async {
-            prefixCache.donate(tokens: donated, snapshots: snapshots, layerKinds: layerKinds)
-            self.releaseOnEngineQueue(state)
+            prefixCache.donate(
+                tokens: donated, snapshots: handoff.value.snapshots, layerKinds: layerKinds)
+            self.releaseOnEngineQueue(handoff.value.state)
         }
     }
 
     private func releaseOnEngineQueue(_ state: [CBv2SequenceKV?]) {
-        engineQueue.async { [backend] in backend.release(state) }
+        let handoff = CBv2Handoff(value: state)
+        engineQueue.async { [self] in backend.release(handoff.value) }
     }
 
     // MARK: Sampler row context

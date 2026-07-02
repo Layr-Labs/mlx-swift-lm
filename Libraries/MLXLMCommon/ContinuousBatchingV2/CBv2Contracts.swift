@@ -394,7 +394,10 @@ public struct CBv2CapacitySnapshot: Sendable {
 /// Content-addressed prefix cache over per-sequence KV snapshots.
 /// Keys are SHA-256 chain hashes at fixed block granularity (256 tokens),
 /// compatible with the existing on-disk checkpoint tier.
-public protocol CBv2PrefixCache: AnyObject {
+///
+/// `Sendable`: implementations MUST be thread-safe — lookup runs on submit
+/// threads while donation runs on the engine's donation queue by design.
+public protocol CBv2PrefixCache: AnyObject, Sendable {
     /// Longest cached prefix for `tokens`, in whole blocks.
     /// Returns nil or (matchedTokenCount, per-layer snapshots for
     /// full-attention layers; windowed layers are always nil — the engine
