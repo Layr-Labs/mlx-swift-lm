@@ -85,6 +85,22 @@
 //
 // Pass A grid: threads = (KVH * 32 * NSG, B, MAXPART), tg = (32 * NSG, 1, 1).
 // Pass B grid: threads = (KVH * GQA * 32, B, 1),       tg = (32, 1, 1).
+//
+// Threadgroup memory — SINGLE SOURCE OF TRUTH for eligibility
+// -----------------------------------------------------------
+// Pass A allocates exactly two threadgroup buffers (in the generated body,
+// PagedAttentionMSL.partBody):
+//   threadgroup float q_smem[GQA * D];
+//   threadgroup float red_smem[NSG * GQA * (D + 2)];   // RSTRIDE = D + 2
+// Pass B allocates NONE. Both buffers are float regardless of T, and the
+// HAS_SOFTCAP / HAS_SINKS variants add none. The Swift-side eligibility
+// math (PagedAttentionKernel.partThreadgroupBytes / ineligibilityReason /
+// mergeRecordMetaFloats / threadgroupMemoryLimit) models these allocations
+// byte-for-byte against Metal's 32 KB per-threadgroup cap; a dispatch over
+// the cap is an UNCATCHABLE process fatal, so PagedKVBackend refuses such
+// shapes at construction. If you change any threadgroup allocation here or
+// in partBody, update those Swift constants (CBv2PagedEligibilityTests
+// guards the pairing).
 
 #include <metal_stdlib>
 #include <metal_simdgroup>
@@ -147,6 +163,7 @@ inline void paged_attention_part_impl(
     constexpr int EPT = D / 32;      // K/V elements owned per lane
     constexpr int TG = 32 * NSG;     // threads per threadgroup
     constexpr int RSTRIDE = D + 2;   // per-(sg, head) merge record: acc[D], m, l
+                                     // (mirrored: PagedAttentionKernel.mergeRecordMetaFloats)
 
     const int kv_head = tgpig.x;
     const int b = tgpig.y;

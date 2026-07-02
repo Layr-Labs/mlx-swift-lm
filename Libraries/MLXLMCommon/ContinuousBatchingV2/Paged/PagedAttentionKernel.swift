@@ -13,6 +13,18 @@
 // gets a distinct kernel NAME: MLX's custom-kernel library cache is keyed
 // by name and re-JITs whenever the generated source for a name changes, so
 // sharing one name across dtypes/head-dims would thrash the pipeline cache.
+//
+// PERFORMANCE NOTE (2026-07, real-weights re-baseline): the kernel is
+// numerically CORRECT but UNOPTIMIZED on real-model shapes — it was
+// validated on synthetic parity only. On GPT-OSS-20B real weights the
+// paged decode path runs ~100x slower than the contiguous backend
+// (~2.0 s/token, all GPU-side); requests correctly error via the engine's
+// 30 s step watchdog (see benchmarks/reports/gptoss-20b-mxfp4q8-main.md).
+// The paged backend remains NON-DEFAULT and gated behind explicit
+// construction; kernel optimization is tracked as follow-up work. Known
+// issue to investigate alongside the perf work: a teardown SIGSEGV was
+// observed after watchdog-errored runs (stack captured during the
+// benchmarks/reports GPT-OSS runs).
 
 import Foundation
 import MLX
@@ -98,9 +110,11 @@ enum PagedAttentionMSL {
 /// Batched single-token (decode) paged attention.
 public enum PagedAttentionKernel {
 
-    /// Head dims with a validated shared-memory/register budget. Gemma-4
-    /// global layers are 512; everything else in the product fleet is
-    /// 64/128/256.
+    /// Head dims with a validated shared-memory/register budget. Necessary
+    /// but NOT sufficient for eligibility: the threadgroup-memory budget
+    /// also depends on the GQA factor (see `ineligibilityReason`) — e.g.
+    /// Gemma-4 global layers (headDim 512, GQA 8) are over budget even at
+    /// one simdgroup. Everything else in the product fleet is 64/128/256.
     public static let supportedHeadDims: Set<Int> = [64, 128, 256, 512]
 
     /// Tokens per flash-decoding partition. Must be a multiple of the page
@@ -110,15 +124,77 @@ public enum PagedAttentionKernel {
     /// from partition count) without bloating the partial buffers.
     public static let partitionTokens = 256
 
-    /// Threadgroup shared memory is capped at 32 KB by the Metal API; pick
-    /// the largest simdgroup count whose staging + merge buffers fit.
-    static func simdgroupsPerThreadgroup(headDim: Int, gqa: Int) -> Int {
-        let limit = 32 * 1024
-        for nsg in [8, 4, 2, 1] {
-            let bytes = (gqa * headDim + nsg * gqa * (headDim + 2)) * 4
-            if bytes <= limit { return nsg }
+    // MARK: - Threadgroup-memory budget (single source of truth)
+    //
+    // These constants mirror the part kernel's threadgroup allocations —
+    // `PagedAttentionMSL.partBody` above plus the RSTRIDE layout in
+    // pagedattention.metal (which carries a matching keep-in-sync comment):
+    //
+    //   threadgroup float q_smem[GQA * D];               // staged queries
+    //   threadgroup float red_smem[NSG * GQA * (D + 2)]; // merge records:
+    //                                                    // acc[D], m, l
+    //
+    // Both buffers are float32 regardless of the slab dtype T (K/V rows are
+    // converted to float on load), the merge pass allocates NO threadgroup
+    // memory, and neither the HAS_SOFTCAP nor the HAS_SINKS variant adds
+    // any — so the budget is a function of (headDim, gqa, simdgroups)
+    // alone. `CBv2PagedEligibilityTests` asserts the generated bodies still
+    // match this model.
+
+    /// Metal's per-threadgroup memory cap (`setThreadgroupMemoryLength`
+    /// limit on Apple GPUs). A dispatch over this limit is an UNCATCHABLE
+    /// process fatal ("Threadgroup memory size (...) exceeds the maximum
+    /// (32768)"), not a thrown error — eligibility must be refused
+    /// statically, before any dispatch.
+    public static let threadgroupMemoryLimit = 32 * 1024
+
+    /// Per-(simdgroup, query head) merge record trailer: the shader's
+    /// RSTRIDE is `D + 2` floats — acc[D] plus (m, l).
+    public static let mergeRecordMetaFloats = 2
+
+    /// Candidate simdgroup counts for the part kernel, largest first.
+    static let simdgroupCandidates = [8, 4, 2, 1]
+
+    /// Exact threadgroup bytes the part kernel allocates for one
+    /// threadgroup: (q_smem + red_smem) float32 elements.
+    public static func partThreadgroupBytes(
+        headDim: Int, gqa: Int, simdgroups: Int
+    ) -> Int {
+        let qSmem = gqa * headDim
+        let redSmem = simdgroups * gqa * (headDim + mergeRecordMetaFloats)
+        return (qSmem + redSmem) * MemoryLayout<Float32>.size
+    }
+
+    /// Largest simdgroup count whose staging + merge buffers fit the Metal
+    /// threadgroup-memory cap, or nil when even NSG=1 exceeds it — the
+    /// configuration is statically ineligible for the paged kernels.
+    static func simdgroupsPerThreadgroup(headDim: Int, gqa: Int) -> Int? {
+        simdgroupCandidates.first {
+            partThreadgroupBytes(headDim: headDim, gqa: gqa, simdgroups: $0)
+                <= threadgroupMemoryLimit
         }
-        return 1
+    }
+
+    /// Static eligibility of one attention shape for the paged decode
+    /// kernels: nil when eligible, else a human-readable reason. Callers
+    /// building paged state (`PagedKVBackend.init`) MUST refuse ineligible
+    /// shapes before any dispatch (see `threadgroupMemoryLimit`).
+    public static func ineligibilityReason(headDim: Int, gqa: Int) -> String? {
+        guard supportedHeadDims.contains(headDim) else {
+            return "paged kernel does not support headDim \(headDim); "
+                + "supported: \(supportedHeadDims.sorted())"
+        }
+        guard gqa >= 1 else {
+            return "invalid GQA factor \(gqa)"
+        }
+        guard simdgroupsPerThreadgroup(headDim: headDim, gqa: gqa) != nil else {
+            let bytes = partThreadgroupBytes(headDim: headDim, gqa: gqa, simdgroups: 1)
+            return "headDim \(headDim) with GQA \(gqa) needs \(bytes) B of "
+                + "threadgroup memory even at 1 simdgroup, over the "
+                + "\(threadgroupMemoryLimit) B Metal limit — the paged part "
+                + "kernel would trap at first dispatch"
+        }
+        return nil
     }
 
     private final class KernelCache: @unchecked Sendable {
@@ -220,7 +296,12 @@ public enum PagedAttentionKernel {
         precondition(maxAttendLength >= 1)
 
         let gqa = queryHeads / kvHeads
-        let nsg = simdgroupsPerThreadgroup(headDim: headDim, gqa: gqa)
+        guard let nsg = simdgroupsPerThreadgroup(headDim: headDim, gqa: gqa) else {
+            preconditionFailure(
+                "paged decode dispatched for a statically ineligible shape: "
+                    + (ineligibilityReason(headDim: headDim, gqa: gqa)
+                        ?? "headDim \(headDim), GQA \(gqa)"))
+        }
         let maxParts = (maxAttendLength + partitionTokens - 1) / partitionTokens
 
         if q.dtype != dtype { q = q.asType(dtype) }

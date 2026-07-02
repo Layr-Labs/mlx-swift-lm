@@ -5,7 +5,10 @@
 // models never see the difference.
 //
 // Eligibility is validated at construction (engine build time), per the
-// contract: unsupported head dims, quant schemes, or malformed KV-sharing
+// contract: unsupported head dims, shapes over the paged kernel's
+// threadgroup-memory budget (`PagedAttentionKernel.ineligibilityReason` —
+// dispatching one is an uncatchable Metal fatal, e.g. Gemma-4 global
+// layers at headDim 512 / GQA 8), quant schemes, or malformed KV-sharing
 // throw `CBv2KVError.backendIneligible` before any request is admitted.
 // Attention sinks ARE supported (they are a kernel parameter here).
 //
@@ -40,18 +43,21 @@ public final class PagedKVBackend: CBv2KVBackend {
                         reason: "layer \(index) KV-shares with structurally different layer "
                             + "\(source)")
                 }
-                continue
-            }
-            guard PagedAttentionKernel.supportedHeadDims.contains(kind.headDim) else {
-                throw CBv2KVError.backendIneligible(
-                    reason: "paged kernel does not support headDim \(kind.headDim) "
-                        + "(layer \(index)); supported: "
-                        + "\(PagedAttentionKernel.supportedHeadDims.sorted())")
             }
             guard kind.kvHeads > 0, kind.queryHeads % kind.kvHeads == 0 else {
                 throw CBv2KVError.backendIneligible(
                     reason: "layer \(index): queryHeads \(kind.queryHeads) not a multiple "
                         + "of kvHeads \(kind.kvHeads)")
+            }
+            // Kernel-level static eligibility (head dim support + the part
+            // kernel's threadgroup-memory budget). Checked for EVERY layer
+            // that will dispatch paged attention — including KV-shared
+            // layers, which borrow storage but launch with their own GQA.
+            // One over-budget layer makes the whole model ineligible.
+            if let reason = PagedAttentionKernel.ineligibilityReason(
+                headDim: kind.headDim, gqa: kind.queryHeads / kind.kvHeads)
+            {
+                throw CBv2KVError.backendIneligible(reason: "layer \(index): \(reason)")
             }
             if case .slidingWindow(let window) = kind.attention, window <= 0 {
                 throw CBv2KVError.backendIneligible(

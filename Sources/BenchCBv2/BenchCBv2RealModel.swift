@@ -117,22 +117,10 @@ func makeV2Engine(
             CBv2LayerCache(layerIndex: index, kind: kind)
         }
     case .paged:
-        // Preflight the part-kernel threadgroup memory budget: the kernel's
-        // own `simdgroupsPerThreadgroup` floor is NSG=1, and when even NSG=1
-        // exceeds the 32 KB Metal threadgroup limit the launch fatals
-        // (uncatchable) instead of throwing. Mirror the kernel's formula
-        // ((GQA*D + NSG*GQA*(D+2)) * 4 bytes) here and refuse eligibility.
-        for (index, kind) in hooks.layerKinds.enumerated()
-        where kind.sharesKVWithLayer == nil {
-            let gqa = kind.queryHeads / max(kind.kvHeads, 1)
-            let bytes = (gqa * kind.headDim + gqa * (kind.headDim + 2)) * 4
-            if bytes > 32 * 1024 {
-                throw CBv2KVError.backendIneligible(
-                    reason: "layer \(index) (headDim \(kind.headDim), GQA \(gqa)) needs "
-                        + "\(bytes) B threadgroup memory at NSG=1 (> 32768); the paged part "
-                        + "kernel would trap at dispatch on this hardware")
-            }
-        }
+        // Static kernel eligibility (head dims + the part kernel's
+        // threadgroup-memory budget, e.g. Gemma-4 global layers at headDim
+        // 512 / GQA 8) is validated inside `PagedKVBackend.init` — it
+        // throws `backendIneligible` before any dispatch could trap.
         let paged = try PagedKVBackend(
             layerKinds: hooks.layerKinds,
             config: PagedKVPoolConfig(
