@@ -82,6 +82,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let schedulerConfig: CBv2SchedulerConfig
     private let loopConfig: CBv2EngineLoopConfig
     private let gauges: CBv2EngineGauges
+    private let layerKinds: [CBv2LayerKind]
+    /// Non-nil only when active (instance supplied AND
+    /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
+    /// the submit thread (hashing is host work — never on the engine step
+    /// thread); adoption and donation are handled by the loop.
+    private let prefixCache: CBv2PrefixCache?
 
     private let stateLock = NSLock()
     private var rejectingSubmissions = false
@@ -107,14 +113,18 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         layerKinds: [CBv2LayerKind],
         backend: CBv2KVBackend,
         cacheProvider: CBv2LayerCacheProvider,
-        sampler: CBv2StepSampler = CBv2GreedySampler(),
+        sampler: CBv2StepSampler = CBv2DefaultSampler(),
         detokenizerFactory: CBv2DetokenizerFactory = CBv2NullDetokenizerFactory(),
         schedulerConfig: CBv2SchedulerConfig = CBv2SchedulerConfig(),
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
-        admissionConfig: AdmissionV2.Config = AdmissionV2.Config()
+        admissionConfig: AdmissionV2.Config = AdmissionV2.Config(),
+        prefixCache: CBv2PrefixCache? = nil
     ) {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
+        self.layerKinds = layerKinds
+        let activePrefixCache = schedulerConfig.enablePrefixCache ? prefixCache : nil
+        self.prefixCache = activePrefixCache
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity, config: admissionConfig)
         self.admission = admission
@@ -129,6 +139,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             detokenizerFactory: detokenizerFactory,
             scheduler: SchedulerV2(config: schedulerConfig, capacity: admission),
             capacity: admission,
+            prefixCache: activePrefixCache,
             config: loopConfig,
             gauges: gauges)
         loop.start()
@@ -182,8 +193,40 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             onBackpressure: { id, paused in loop.setPaused(id, paused) },
             onAbandoned: { id in loop.requestCancel(id) })
         loop.register(stream: stream)
-        loop.enqueue(request)
+        loop.enqueue(request, adoption: makeAdoption(for: request))
         return stream.makeStream()
+    }
+
+    /// Prefix-cache lookup on the SUBMIT thread (SHA-256 hashing is host
+    /// work; slicing is graph-only). Returns a prepared adoption sliced to
+    /// `effective = matched - cbv2RequiredRecompute(...)` — the uniform
+    /// offset every row adopts before the engine replays the trailing
+    /// tokens. The lookup pin travels with the adoption; the loop balances
+    /// it in every outcome.
+    private func makeAdoption(for request: CBv2Request) -> CBv2PrefixAdoption? {
+        guard let prefixCache else { return nil }
+        guard
+            let hit = prefixCache.lookup(
+                tokens: request.promptTokens, layerKinds: layerKinds)
+        else { return nil }
+        let recompute = cbv2RequiredRecompute(layerKinds: layerKinds, matched: hit.matched)
+        let effective = hit.matched - recompute
+        guard effective > 0 else {
+            prefixCache.endAdoption(tokens: request.promptTokens, matched: hit.matched)
+            return nil
+        }
+        let prefix = hit.prefix.map { entry -> (keys: MLXArray, values: MLXArray, offset: Int)? in
+            guard let entry else { return nil }
+            guard entry.offset != effective else { return entry }
+            return (
+                keys: entry.keys[.ellipsis, 0 ..< effective, 0...],
+                values: entry.values[.ellipsis, 0 ..< effective, 0...],
+                offset: effective
+            )
+        }
+        return CBv2PrefixAdoption(
+            tokens: request.promptTokens, matched: hit.matched,
+            effective: effective, prefix: prefix)
     }
 
     /// Cancel promptly: the in-flight step completes, the row is dropped

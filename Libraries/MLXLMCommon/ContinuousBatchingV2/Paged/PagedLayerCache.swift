@@ -65,6 +65,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     /// Set the current batch rows (row order == batch row order). O(B);
     /// join = append a row object, leave = drop it — no storage moves.
+    /// (Contract `CBv2AttendingLayerCache.setRows` — the canonical binding.)
     public func setRows(_ rows: [CBv2SequenceKV]) {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
@@ -267,5 +268,67 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         return MLXFast.scaledDotProductAttention(
             queries: queries, keys: k, values: v, scale: scale,
             mask: .array(mask), sinks: sinks?.asType(queries.dtype))
+    }
+}
+
+// MARK: - Legacy KVCache conformance
+
+/// Same shape as `CBv2LayerCache`'s conformance: lets the paged cache
+/// travel through existing `[KVCache]` model plumbing (the models' v2
+/// branches downcast to `CBv2AttendingLayerCache`); every legacy mutation
+/// path TRAPS — v2-adapted models must call `updateAndAttend`.
+extension PagedLayerCache: KVCache {
+    /// Legacy scalar offset: max row offset. Host integers only — no sync.
+    public var offset: Int {
+        pagedRows.reduce(0) { max($0, $1.absoluteOffset) }
+    }
+
+    public var maxSize: Int? {
+        switch kind.attention {
+        case .full: return nil
+        case .slidingWindow(let window): return window
+        }
+    }
+
+    /// The paged slabs are pool-owned persistent buffers; per-step writes
+    /// are materialized transitively by the engine's step asyncEval.
+    public func innerState() -> [MLXArray] { [] }
+
+    public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        fatalError(
+            "PagedLayerCache.update(keys:values:) is unsupported — v2-adapted models must call updateAndAttend (layer \(layerIndex))"
+        )
+    }
+
+    public var state: [MLXArray] {
+        get { [] }
+        set {
+            fatalError("PagedLayerCache has no serializable state (layer \(layerIndex))")
+        }
+    }
+
+    public var metaState: [String] {
+        get { [] }
+        set {
+            fatalError("PagedLayerCache has no metaState (layer \(layerIndex))")
+        }
+    }
+
+    public var isTrimmable: Bool { false }
+
+    @discardableResult
+    public func trim(_ n: Int) -> Int { 0 }
+
+    public func makeMask(n: Int, windowSize: Int?, returnArray: Bool)
+        -> MLXFast.ScaledDotProductAttentionMaskMode
+    {
+        fatalError(
+            "PagedLayerCache.makeMask is unsupported — v2 attention owns its masks (layer \(layerIndex))"
+        )
+    }
+
+    public func copy() -> any KVCache {
+        fatalError(
+            "PagedLayerCache.copy is unsupported — v2 rows are engine-owned (layer \(layerIndex))")
     }
 }

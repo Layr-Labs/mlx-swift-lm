@@ -316,6 +316,9 @@ struct CBv2SchedHarness {
             layerKinds: layerKinds,
             backend: backend,
             cacheProvider: provider,
+            // Deterministic greedy stub: these suites assert exact scripted
+            // tokens ((input + 1) % vocab), independent of sampling params.
+            sampler: CBv2GreedySampler(),
             detokenizerFactory: detokFactory,
             schedulerConfig: schedulerConfig,
             loopConfig: loopConfig,

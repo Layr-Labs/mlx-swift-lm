@@ -15,7 +15,7 @@
 //    full-attention layer and one sliding-window(16) layer, optional GPT-OSS
 //    style attention sinks. Implements BOTH the legacy path (`LanguageModel`
 //    + `KVCache`, runs through the old Scheduler/EngineCore) and the v2 path
-//    (`CBv2HarnessSteppableModel` + `CBv2AttendingLayerCache`).
+//    (`CBv2SteppableModel` + `CBv2AttendingLayerCache`).
 //  - `HarnessFullSequenceKV` / `HarnessWindowedSequenceKV` — mock
 //    `CBv2SequenceKV` (per-request storage, absolute position counters,
 //    window eviction keyed to absolute positions, recent end kept).
@@ -36,16 +36,10 @@ import XCTest
 
 @testable import MLXLMCommon
 
-// MARK: - Steppable-model mirror (WS-B owns the real protocol)
-
-/// Test-local mirror of WS-B's `CBv2SteppableModel` (defined in
-/// `EngineLoopV2.swift`, unmerged). Same shape:
-/// `func forward(tokens:caches:) -> MLXArray` returning logits [B, L, vocab].
-/// Integration re-points conformances at the real protocol.
-/// See docs/engine-v2/CONTRACT-ISSUES-G-harness.md item 1.
-protocol CBv2HarnessSteppableModel: AnyObject {
-    func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
-}
+// NOTE (integration): WS-G's `CBv2HarnessSteppableModel` mirror protocol is
+// retired — `TinyTestModel` now conforms to the real `CBv2SteppableModel`
+// (EngineLoopV2.swift), which has the identical shape. See
+// docs/engine-v2/CONTRACT-ISSUES-G-harness.md item 1.
 
 // MARK: - Host-sync instrumentation
 
@@ -602,7 +596,7 @@ final class TinyBlock: Module {
 
 /// The fixture model. Layer 0 = full attention, layer 1 = sliding window(16).
 final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
-    CBv2HarnessSteppableModel
+    CBv2SteppableModel
 {
     let config: TinyTestModelConfig
     let embed: Embedding
@@ -680,7 +674,7 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
         ]
     }
 
-    // MARK: v2 path (`CBv2HarnessSteppableModel`)
+    // MARK: v2 path (`CBv2SteppableModel`)
 
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         precondition(caches.count == blocks.count)

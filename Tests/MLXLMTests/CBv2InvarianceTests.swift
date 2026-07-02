@@ -185,11 +185,58 @@ final class CBv2InvarianceTests: XCTestCase {
 
     // MARK: - Stochastic sampling with per-request seeds (WS-E)
 
-    func testPerRequestSeedInvarianceUnderBatching() throws {
-        // The contract keys the RNG on (seed, requestID, stepIndex) so a
-        // seeded stochastic request should reproduce under batching. The
-        // sampler is WS-E's deliverable; this test activates at integration.
-        throw XCTSkip("pending integration: WS-E SamplerV2 (per-request keyed RNG)")
+    /// The contract keys the RNG on (seed, requestID, per-request step), so
+    /// a SEEDED stochastic request must reproduce token-exactly under
+    /// batching. Runs the REAL EngineV2 with the production
+    /// `CBv2DefaultSampler` (LogitsPipelineV2 + SamplerV2): once solo, once
+    /// with two stochastic neighbors — the subject keeps the same request
+    /// id and seed, so its keyed noise stream is identical in both runs.
+    func testPerRequestSeedInvarianceUnderBatching() async throws {
+        let prompt = makePromptTokens(length: 12, seed: 500)
+        let sampling = CBv2SamplingParams(temperature: 0.8, topP: 0.9, seed: 42)
+        let maxTokens = 24
+
+        func run(withNeighbors: Bool) async throws -> [Int] {
+            let engine = EngineV2(
+                model: model,
+                layerKinds: model.layerKinds,
+                backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
+                cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds),
+                sampler: CBv2DefaultSampler(fallbackSeed: 7),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 4, prefillChunkSize: 8))
+            let subject = CBv2Request(
+                id: CBv2RequestID(1), promptTokens: prompt, sampling: sampling,
+                maxTokens: maxTokens)
+            var neighborStreams: [AsyncStream<CBv2Event>] = []
+            let subjectStream = try engine.submit(subject)
+            if withNeighbors {
+                for n: UInt64 in 2 ... 3 {
+                    let neighbor = CBv2Request(
+                        id: CBv2RequestID(n),
+                        promptTokens: makePromptTokens(length: 6 + Int(n) * 9, seed: 500 + n),
+                        sampling: CBv2SamplingParams(
+                            temperature: 0.7, topK: 20, seed: 1000 + n),
+                        maxTokens: maxTokens)
+                    neighborStreams.append(try engine.submit(neighbor))
+                }
+            }
+            let collected = await cbv2SchedCollect(subjectStream)
+            for stream in neighborStreams {
+                _ = await cbv2SchedCollect(stream)
+            }
+            await engine.shutdown()
+            XCTAssertEqual(collected.finishReason, .length)
+            XCTAssertEqual(collected.tokens.count, maxTokens)
+            return collected.tokens
+        }
+
+        let solo = try await run(withNeighbors: false)
+        let batched = try await run(withNeighbors: true)
+        XCTAssertEqual(
+            solo, batched,
+            "seeded stochastic request diverged under batching — keyed RNG must be a pure function of (seed, requestID, per-request step)"
+        )
     }
 
     // MARK: - Churn storm

@@ -405,6 +405,15 @@ public protocol CBv2PrefixCache: AnyObject {
     /// arrays afterwards. Must be called OFF the engine step thread.
     func donate(
         tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind])
+    /// Pre-snapshotted donation (the engine-integration path): per-layer
+    /// snapshots are graph-built on the ENGINE thread — consistent with
+    /// in-flight writes to shared storage (paged slabs) — and donated here
+    /// from the engine's donation queue. Windowed / KV-shared layers are
+    /// nil. Same indexing semantics as `donate(tokens:state:layerKinds:)`.
+    func donate(
+        tokens: [Int],
+        snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind])
     /// Release the in-use pin taken by a successful `lookup` once adoption
     /// has completed (or been abandoned). `matched` is the matched token
     /// count that `lookup` returned for these `tokens`. Pinned entries are

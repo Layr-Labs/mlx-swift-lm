@@ -36,25 +36,43 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache]
 }
 
-// MARK: - Sampler interface (WS-E conforms; greedy stub until then)
+// MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
 
 /// Samples next tokens from last-position logits [B, vocab] → lazy token
 /// array [B] (int32). MUST NOT host-sync; see
-/// CONTRACT-ISSUES-B-scheduler.md §2.
+/// CONTRACT-ISSUES-B-scheduler.md §2 and CONTRACT-DECISIONS.md.
+///
+/// Stateful samplers (penalties, keyed RNG) reconfigure on membership
+/// change using `rowContext` and track per-request progress:
+///  - `params`/`requestIDs`: per-row, row order == logits row order.
+///  - `stepIndex`: global engine step (telemetry only — per-request RNG must
+///    key on per-request progress, never on this).
+///  - `pendingSampledTokens`: lazy [B] tokens sampled for exactly these rows
+///    by the still-in-flight previous step (chained decode), row-aligned;
+///    nil when every row's history is fully confirmed. A sampler that
+///    reconfigures from `rowContext` (confirmed history only) must fold
+///    these in on-device to stay exact.
+///  - `rowContext`: materializes full per-row context (id, params, prompt,
+///    CONFIRMED output tokens). Copies token arrays — only call it on
+///    membership change, never on the chained fast path.
 public protocol CBv2StepSampler: AnyObject {
     func sample(
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
-        stepIndex: Int
+        stepIndex: Int, pendingSampledTokens: MLXArray?,
+        rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray
 }
 
 /// Greedy stub — vectorized argmax, batch-composition invariant by
-/// construction (per-row reduction, no cross-row ops).
+/// construction (per-row reduction, no cross-row ops). Kept as the
+/// deterministic fallback for scheduler/loop tests; production uses
+/// `CBv2DefaultSampler`.
 public final class CBv2GreedySampler: CBv2StepSampler {
     public init() {}
     public func sample(
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
-        stepIndex: Int
+        stepIndex: Int, pendingSampledTokens: MLXArray?,
+        rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray {
         argMax(logits, axis: -1).asType(.int32)
     }
@@ -141,8 +159,14 @@ final class CBv2InFlightStep {
     /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
     /// KV states whose release is fenced behind this step's completion.
-    /// `rollbackOne` scrubs the wasted-token KV tail before release.
-    var deferredReleases: [(id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool)] = []
+    /// `rollbackOne` scrubs the wasted-token KV tail before release;
+    /// `donateTokens` (non-nil for natural finishes with prefix caching on)
+    /// routes the retired state through the donation queue.
+    var deferredReleases:
+        [(
+            id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
+            donateTokens: [Int]?
+        )] = []
 
     init(
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
@@ -153,6 +177,22 @@ final class CBv2InFlightStep {
         self.sampledTokens = sampledTokens
         self.evalTargets = evalTargets
     }
+}
+
+// MARK: - Prefix adoption handoff
+
+/// A prefix-cache hit prepared on the submit thread (lookup + graph-only
+/// slicing) and applied on the engine thread at enqueue. `prefix` is already
+/// sliced to `effective = matched - cbv2RequiredRecompute(...)`, the uniform
+/// offset every storage-owning row adopts; the engine replays
+/// `[effective, prompt)` through all layers. The lookup's in-use pin is
+/// balanced by exactly one `endAdoption(tokens:matched:)` when the adoption
+/// is consumed or abandoned.
+struct CBv2PrefixAdoption {
+    let tokens: [Int]
+    let matched: Int
+    let effective: Int
+    let prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?]
 }
 
 // MARK: - EngineLoopV2
@@ -171,6 +211,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     let sampler: CBv2StepSampler
     let detokenizerFactory: CBv2DetokenizerFactory
     let layerKinds: [CBv2LayerKind]
+    /// Non-nil only when prefix caching is active (instance supplied AND
+    /// `CBv2SchedulerConfig.enablePrefixCache`).
+    let prefixCache: CBv2PrefixCache?
     let config: CBv2EngineLoopConfig
     let gauges: CBv2EngineGauges
 
@@ -178,6 +221,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         label: "com.eigen.cbv2.engine", qos: .userInitiated)
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
+    /// Prefix-cache donation runs here (hashing + indexing + optional device
+    /// materialization) — never on the engine step thread (invariant 6).
+    private let donationQueue = DispatchQueue(
+        label: "com.eigen.cbv2.donation", qos: .utility)
 
     // Cross-thread state (stateLock).
     private let stateLock = NSLock()
@@ -190,6 +237,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     // Engine-thread-confined state.
     private var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
     private var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
+    /// Tokens skipped via prefix-cache adoption, reported in usage.
+    private var prefixHitTokens: [CBv2RequestID: Int] = [:]
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
@@ -217,6 +266,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         detokenizerFactory: CBv2DetokenizerFactory,
         scheduler: SchedulerV2,
         capacity: CBv2StepCapacity?,
+        prefixCache: CBv2PrefixCache? = nil,
         config: CBv2EngineLoopConfig,
         gauges: CBv2EngineGauges
     ) {
@@ -228,6 +278,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.detokenizerFactory = detokenizerFactory
         self.scheduler = scheduler
         self.capacity = capacity
+        self.prefixCache = prefixCache
         self.config = config
         self.gauges = gauges
     }
@@ -282,13 +333,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     /// Runs on the engine queue. The stream must already be registered.
-    func enqueue(_ request: CBv2Request) {
+    func enqueue(_ request: CBv2Request, adoption: CBv2PrefixAdoption? = nil) {
         engineQueue.async { [self] in
             defer {
                 gauges.endSubmit()
                 publishGauges()
             }
             guard running, !draining else {
+                releaseAbandonedAdoption(adoption)
                 takeStream(request.id)?.finish(
                     reason: .error("engine is shutting down"),
                     usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
@@ -300,7 +352,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                     deadline: Date().addingTimeInterval(config.requestTimeout))
                 detokenizers[request.id] =
                     detokenizerFactory.makeDetokenizer(stopStrings: request.stopStrings)
+                if let adoption {
+                    applyAdoption(adoption, requestID: request.id)
+                }
             } catch {
+                releaseAbandonedAdoption(adoption)
                 // Precise maxWaiting enforcement (the submit-side gauge check
                 // is the fast path; this is the authoritative one).
                 takeStream(request.id)?.finish(
@@ -308,6 +364,45 @@ public final class EngineLoopV2: @unchecked Sendable {
                     usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
             }
         }
+    }
+
+    // MARK: Prefix-cache adoption (engine thread)
+
+    /// Adopt a prepared prefix hit into fresh KV state and fast-forward the
+    /// scheduler record. Best-effort: any failure (capacity, backend) falls
+    /// back to a full prefill — the request itself never fails here. Always
+    /// balances the lookup pin.
+    private func applyAdoption(_ adoption: CBv2PrefixAdoption, requestID: CBv2RequestID) {
+        defer {
+            prefixCache?.endAdoption(tokens: adoption.tokens, matched: adoption.matched)
+        }
+        guard let rec = scheduler.record(for: requestID), kvStates[requestID] == nil else {
+            return
+        }
+        if let capacity {
+            do {
+                try capacity.reserve(id: requestID, additionalTokens: adoption.effective)
+            } catch {
+                return  // capacity tight — full prefill with the usual backstops
+            }
+        }
+        do {
+            let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
+            let state = try backend.makeSequenceState(
+                adopting: adoption.prefix, layerKinds: layerKinds, maxLength: maxLength)
+            kvStates[requestID] = state
+            rec.numComputedTokens = adoption.effective
+            prefixHitTokens[requestID] = adoption.effective
+        } catch {
+            capacity?.unreserve(id: requestID, tokens: adoption.effective)
+        }
+    }
+
+    /// Balance a lookup pin for an adoption that never reached
+    /// `applyAdoption` (shutdown, queue-full rejection).
+    private func releaseAbandonedAdoption(_ adoption: CBv2PrefixAdoption?) {
+        guard let adoption else { return }
+        prefixCache?.endAdoption(tokens: adoption.tokens, matched: adoption.matched)
     }
 
     // MARK: Cancellation & backpressure (any thread)
@@ -376,7 +471,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preemptionCount += 1
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
                 if previous.participants.contains(id) {
-                    previous.deferredReleases.append((id: id, state: state, rollbackOne: false))
+                    previous.deferredReleases.append(
+                        (id: id, state: state, rollbackOne: false, donateTokens: nil))
                 } else {
                     backend.release(state)
                 }
@@ -450,8 +546,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         let caches = cacheProvider.layerCaches(rowStates: rowStates)
         let logits = model.forward(tokens: inputs, caches: caches)
         let last = logits[0..., -1, 0...]  // [B, vocab]
+        // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
+        // one launched-but-unconfirmed sample here (the chain invariant).
         let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount)
+            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
+            pendingSampledTokens: lazyTokens,
+            rowContext: { [scheduler] in
+                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+            })
         scheduler.markPendingSamples(ids: ids)
         asyncEval([sampled])
         return CBv2InFlightStep(
@@ -498,7 +600,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 logits: logits[0..., -1, 0...],
                 params: decodeRows.map(\.rec.request.sampling),
                 requestIDs: decodeRows.map(\.rec.id),
-                stepIndex: stepCount)
+                stepIndex: stepCount,
+                pendingSampledTokens: nil,  // finalize preceded: all confirmed
+                rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
         }
 
         // Per-request prefill chunks [1, chunk].
@@ -515,7 +619,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                     logits: logits[0..., -1, 0...],
                     params: [rec.request.sampling],
                     requestIDs: [rec.id],
-                    stepIndex: stepCount)
+                    stepIndex: stepCount,
+                    pendingSampledTokens: nil,
+                    rowContext: { [Self.samplerRow(rec)] })
             } else {
                 // Cheap handle that forces this chunk's graph (incl. KV
                 // writes) without materializing full logits on the host.
@@ -590,12 +696,13 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         // Fenced frees: rows finished/cancelled while this step was in
-        // flight. Scrub the wasted-token KV tail, then release.
-        for (_, state, rollbackOne) in step.deferredReleases {
+        // flight. Scrub the wasted-token KV tail, then retire (donate to
+        // the prefix cache when eligible, else release).
+        for (_, state, rollbackOne, donateTokens) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
-            backend.release(state)
+            retire(state: state, donatingTokens: donateTokens)
         }
     }
 
@@ -605,6 +712,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         guard let rec = scheduler.finish(id: id, reason: reason) else {
             // Unknown to the scheduler (already finished) — make sure no
             // stream leaks regardless.
+            prefixHitTokens.removeValue(forKey: id)
             takeStream(id)?.finish(
                 reason: reason, usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
             return
@@ -612,15 +720,20 @@ public final class EngineLoopV2: @unchecked Sendable {
         capacity?.releaseAll(id: id)
 
         if let state = kvStates.removeValue(forKey: id) {
+            let donateTokens = donationTokens(for: rec, reason: reason)
             if let inFlight, inFlight.participants.contains(id) {
                 // The in-flight step still references this state — fence the
                 // free behind its completion; roll back the wasted token iff
                 // that step sampled for this row.
                 inFlight.discard.insert(id)
                 inFlight.deferredReleases.append(
-                    (id: id, state: state, rollbackOne: inFlight.sampledRows.contains(id)))
+                    (
+                        id: id, state: state,
+                        rollbackOne: inFlight.sampledRows.contains(id),
+                        donateTokens: donateTokens
+                    ))
             } else {
-                backend.release(state)
+                retire(state: state, donatingTokens: donateTokens)
             }
         }
 
@@ -636,7 +749,74 @@ public final class EngineLoopV2: @unchecked Sendable {
             reason: reason,
             usage: CBv2Usage(
                 promptTokens: rec.request.promptTokens.count,
-                completionTokens: rec.generatedTokenCount))
+                completionTokens: rec.generatedTokenCount,
+                prefixCacheHitTokens: prefixHitTokens.removeValue(forKey: id) ?? 0))
+    }
+
+    // MARK: Prefix-cache donation (engine thread → donation queue)
+
+    /// Tokens to donate for a finished request, or nil when donation does
+    /// not apply. Only NATURAL completions donate: their KV is a complete,
+    /// confirmed prefix. The last confirmed token was sampled but never fed
+    /// through the model, so it is dropped at donation time.
+    private func donationTokens(for rec: CBv2ScheduledRequest, reason: CBv2FinishReason)
+        -> [Int]?
+    {
+        guard prefixCache != nil else { return nil }
+        switch reason {
+        case .stop, .length: break
+        case .cancelled, .error: return nil
+        }
+        // Donation requires the full prompt to have been processed (at
+        // least one sampled token) — mid-prefill finishes carry partial KV.
+        guard rec.generatedTokenCount >= 1, rec.tokens.count > 1 else { return nil }
+        return rec.tokens
+    }
+
+    /// Retire a finished request's KV state: donate to the prefix cache
+    /// (snapshots graph-built HERE on the engine thread, so views over
+    /// shared paged slabs are consistent with in-flight writes; hashing +
+    /// indexing + optional materialization run on the donation queue), then
+    /// release the storage back on the engine queue (the paged pool is
+    /// engine-thread-affine).
+    private func retire(state: [CBv2SequenceKV?], donatingTokens: [Int]?) {
+        guard let prefixCache, let tokens = donatingTokens else {
+            backend.release(state)
+            return
+        }
+        let donated = Array(tokens.dropLast())
+        var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+        snapshots.reserveCapacity(layerKinds.count)
+        for (i, kind) in layerKinds.enumerated() {
+            var cacheable = kind.sharesKVWithLayer == nil
+            if case .slidingWindow = kind.attention { cacheable = false }
+            guard cacheable, let seq = state[i] else {
+                snapshots.append(nil)
+                continue
+            }
+            snapshots.append(seq.snapshot())
+        }
+        let layerKinds = self.layerKinds
+        donationQueue.async { [weak self] in
+            prefixCache.donate(tokens: donated, snapshots: snapshots, layerKinds: layerKinds)
+            self?.releaseOnEngineQueue(state)
+        }
+    }
+
+    private func releaseOnEngineQueue(_ state: [CBv2SequenceKV?]) {
+        engineQueue.async { [backend] in backend.release(state) }
+    }
+
+    // MARK: Sampler row context
+
+    /// Full per-row sampler context (confirmed history only; in-flight
+    /// chained samples travel separately as `pendingSampledTokens`).
+    private static func samplerRow(_ rec: CBv2ScheduledRequest) -> CBv2SamplerRow {
+        CBv2SamplerRow(
+            id: rec.id,
+            params: rec.request.sampling,
+            promptTokens: rec.request.promptTokens,
+            outputTokens: Array(rec.tokens.dropFirst(rec.request.promptTokens.count)))
     }
 
     // MARK: Boundary housekeeping
