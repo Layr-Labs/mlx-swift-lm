@@ -336,6 +336,63 @@ final class CBv2CompiledDecodeTests: XCTestCase {
             "~60 accumulated padded steps at kvCapacity 32 must recycle the scratch lane")
     }
 
+    /// Single-token prompts join decode with NO prefill and NO allocated
+    /// buffers — the bind path must allocate compiled-shape storage from
+    /// scratch (`keys == nil`) and stay token-exact.
+    func testSingleTokenPromptParity() async throws {
+        try await assertCompiledMatchesEager(
+            model: TinyTestModel.make(seed: 0xC0FFEE),
+            prompts: [[7], [42]], maxTokens: [24, 24],
+            label: "single-token prompt")
+    }
+
+    /// Prefix-cache donation AFTER compiled decode steps (snapshot views
+    /// over padded buffers) and adoption INTO compiled decode
+    /// (fast-forwarded windowed rows at the adopted offset) must both stay
+    /// token-exact vs the eager engine.
+    func testPrefixAdoptionRoundTripParity() async throws {
+        let model = TinyTestModel.make(seed: 0xC0FFEE)
+        // Long enough that matched-prefix − window recompute (16) leaves a
+        // non-trivial adopted offset: 41 tokens ⇒ matched 40, effective 24.
+        let prompt = makePromptTokens(length: 41, seed: 51)
+        var perMode: [Bool: [[Int]]] = [:]
+        var perModeHits: [Bool: [Int]] = [:]
+        for compiled in [false, true] {
+            let prefixCache = PrefixCacheV2(
+                config: .init(blockSize: 8, modelName: "cbv2-compiled-adopt"))
+            let engine = EngineV2(
+                model: model,
+                layerKinds: model.layerKinds,
+                backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
+                cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds),
+                sampler: CBv2DefaultSampler(fallbackSeed: 7),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
+                    prefillChunkSize: 8, maxWaiting: 8, enablePrefixCache: true),
+                prefixCache: prefixCache,
+                compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: compiled))
+            // Cold run donates on finish (async, on the donation queue);
+            // wait for the entry to land before the warm run looks it up.
+            let cold = await cbv2SchedCollect(
+                try engine.submit(request(id: 1, prompt: prompt, maxTokens: 20)))
+            let donated = await cbv2SchedWait { prefixCache.stats().entryCount >= 1 }
+            XCTAssertTrue(donated, "cold run must donate its prefix")
+            let warm = await cbv2SchedCollect(
+                try engine.submit(request(id: 2, prompt: prompt, maxTokens: 20)))
+            await engine.shutdown()
+            perMode[compiled] = [cold.tokens, warm.tokens]
+            perModeHits[compiled] = [
+                cold.usage?.prefixCacheHitTokens ?? 0, warm.usage?.prefixCacheHitTokens ?? 0,
+            ]
+        }
+        XCTAssertEqual(perMode[true], perMode[false], "adoption round trip diverged")
+        XCTAssertEqual(
+            perModeHits[true], perModeHits[false],
+            "prefix-cache hit accounting diverged between modes")
+        XCTAssertGreaterThan(
+            perModeHits[true]![1], 0, "warm request must adopt a donated prefix")
+    }
+
     // MARK: - Steady-state discipline (DAR-325 class)
 
     /// A stable chained batch must not rebind lanes per step: rebinds track

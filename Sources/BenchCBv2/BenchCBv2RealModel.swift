@@ -96,6 +96,9 @@ func v2Hooks(for model: any LanguageModel) -> V2ModelHooks? {
     return nil
 }
 
+/// Compiled-decode KV capacity override (--kv-capacity), 0 = default 4096.
+nonisolated(unsafe) var benchCompiledKVCapacity = 4096
+
 enum V2Backend: String {
     case contiguous = "v2"
     case paged = "v2-paged"
@@ -144,7 +147,8 @@ func makeV2Engine(
         sampler: CBv2DefaultSampler(),
         detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: context.tokenizer),
         schedulerConfig: schedulerConfig,
-        compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: compiledDecode))
+        compiledDecodeConfig: CBv2CompiledDecodeConfig(
+            enabled: compiledDecode, kvCapacity: benchCompiledKVCapacity))
 }
 
 // MARK: - Request runners
@@ -825,6 +829,10 @@ struct BenchCBv2RealModel {
             case "--label": label = args.isEmpty ? label : args.removeFirst()
             case "--kv-gb":
                 kvBytes = (args.isEmpty ? 16 : Int(args.removeFirst()) ?? 16) << 30
+            case "--kv-capacity":
+                benchCompiledKVCapacity =
+                    args.isEmpty ? benchCompiledKVCapacity
+                    : Int(args.removeFirst()) ?? benchCompiledKVCapacity
             case "--out": outPath = args.isEmpty ? nil : args.removeFirst()
             default:
                 print("usage: BenchCBv2 --model <dir> [--mode all|correctness|perf]")

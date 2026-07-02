@@ -94,7 +94,22 @@ public final class CBv2CompiledDecode {
     /// KV-shared layers (no storage).
     private var layerDTypes: [DType?] = []
 
-    private(set) var stats = CBv2CompiledDecodeStats()
+    /// Telemetry. Mutated on the engine thread; read from arbitrary threads
+    /// (provider heartbeats, tests) — lock-protected snapshot semantics.
+    var stats: CBv2CompiledDecodeStats {
+        statsLock.lock()
+        defer { statsLock.unlock() }
+        return _stats
+    }
+
+    private let statsLock = NSLock()
+    private var _stats = CBv2CompiledDecodeStats()
+
+    private func mutateStats(_ body: (inout CBv2CompiledDecodeStats) -> Void) {
+        statsLock.lock()
+        body(&_stats)
+        statsLock.unlock()
+    }
 
     // MARK: - Build
 
@@ -174,7 +189,7 @@ public final class CBv2CompiledDecode {
                 let started = CFAbsoluteTimeGetCurrent()
                 let bucket = try withError { try traceBucket(size: size) }
                 let seconds = CFAbsoluteTimeGetCurrent() - started
-                stats.warmup.append((bucket: size, seconds: seconds))
+                mutateStats { $0.warmup.append((bucket: size, seconds: seconds)) }
                 buckets.append(bucket)
                 log.info(
                     "CBv2 compiled decode: bucket \(size) traced in \(String(format: "%.2f", seconds))s"
@@ -187,7 +202,7 @@ public final class CBv2CompiledDecode {
         } catch {
             let reason = "trace failed: \(error)"
             state = .disabled(reason)
-            stats.disabledReason = reason
+            mutateStats { $0.disabledReason = reason }
             buckets = []
             log.error("CBv2 compiled decode disabled — \(reason)")
         }
@@ -296,8 +311,10 @@ public final class CBv2CompiledDecode {
                 continue
             }
             guard bindRow(bucket, lane: lane, info: info) else {
-                bucket.bound[lane] = .unbound
-                bucket.boundRows[lane] = nil
+                // Drop the half-updated lane entirely: a partial bind mixes
+                // the new row's and the PREVIOUS binding's buffers, and the
+                // previous row's forgetRows can no longer match this lane.
+                clearLane(bucket, lane: lane)
                 recordFallback("bind_failed(\(lastBindFailure ?? "?"))")
                 return nil
             }
@@ -311,7 +328,7 @@ public final class CBv2CompiledDecode {
                     bucket.counters.hostOffsets[lane] >= config.kvCapacity - 1
                 if case .scratch = bucket.bound[lane], !needsReset { continue }
                 if case .scratch = bucket.bound[lane], needsReset {
-                    stats.scratchResets += 1
+                    mutateStats { $0.scratchResets += 1 }
                 }
                 guard bindScratch(bucket, lane: lane) else {
                     recordFallback("scratch_bind_failed")
@@ -348,7 +365,7 @@ public final class CBv2CompiledDecode {
             }
         }
         bucket.counters.noteAdvance()
-        stats.compiledSteps += 1
+        mutateStats { $0.compiledSteps += 1 }
 
         let logits = out[0]
         return B == bucket.size ? logits : logits[0 ..< B]
@@ -387,12 +404,12 @@ public final class CBv2CompiledDecode {
                     windowed.window == window
                 else { return nil }
                 offset = windowed.absoluteOffset
-                if oldestByWindow[window] == nil {
-                    oldestByWindow[window] = windowed.compiledOldestValidPosition
+                if let existing = oldestByWindow[window] {
+                    // Lockstep advance + uniform adoption make equal-window
+                    // layers agree; if they ever do not, stay eager.
+                    guard existing == windowed.compiledOldestValidPosition else { return nil }
                 } else {
-                    assert(
-                        oldestByWindow[window] == windowed.compiledOldestValidPosition,
-                        "windowed layers with equal windows must share oldest-valid positions")
+                    oldestByWindow[window] = windowed.compiledOldestValidPosition
                 }
             }
             if anchor == nil {
@@ -436,7 +453,7 @@ public final class CBv2CompiledDecode {
         bucket.statics.bind(lane: lane, oldestByWindow: info.oldestByWindow)
         bucket.bound[lane] = .row(info.identity)
         bucket.boundRows[lane] = info.row
-        stats.laneRebinds += 1
+        mutateStats { $0.laneRebinds += 1 }
         return true
     }
 
@@ -495,7 +512,7 @@ public final class CBv2CompiledDecode {
     }
 
     private func recordFallback(_ reason: String) {
-        stats.fallbacks[reason, default: 0] += 1
+        mutateStats { $0.fallbacks[reason, default: 0] += 1 }
     }
 
     /// Last bind refusal, in enough detail to diagnose from fleet stats.
