@@ -305,7 +305,49 @@ always 32 splits; MLX: 64–1024 blocks) or gate on core count
 fix lands — the copy elimination is 3 orders of magnitude, split tuning
 is percent-level at short contexts.
 
-## 5. References
+## 5. Outcome (post-fix, 2026-07-02)
+
+Both fixes landed on this branch (in-place writes bc358e2, head split
+5087663). Measured results:
+
+Profiler (same scenarios as §3.2):
+
+| scenario | before | after |
+|---|---|---|
+| layer sweep, 24 layers, 2 GiB pool, B=1 | 236.4 ms/step (8 GiB step-peak) | **11.4 ms/step (0 transient)** |
+| GPT-OSS emulation, 16 GiB pool, B=1 | 25,470 ms/step | **13.6 ms/step** |
+| GPT-OSS emulation, 16 GiB pool, B=4 | 1,999 ms/step | **14.3 ms/step** |
+
+Real weights (BenchCBv2, same-run v2 vs v2-paged, M4 Max — reports
+`gptoss-20b-mxfp4q8-kernel-opt.md`, `gemma4-26b-a4b-8bit-kernel-opt.md`):
+
+| model | metric | v2 contiguous | v2-paged |
+|---|---|---|---|
+| GPT-OSS-20B | B=1 decode TPS | 99.5 | 89.9 (0.90x) |
+| GPT-OSS-20B | B=4 aggregate TPS | 84.4 | **86.5 (beats)** |
+| Gemma-4-26B | B=1 decode TPS | 67.2 | 66.8 (0.99x) |
+| Gemma-4-26B | B=4 aggregate TPS | 56.3 | **59.3 (beats)** |
+
+- The B=1 targets (≤ 2x of contiguous) are met with wide margin; B≥4
+  paged beats contiguous on both models — the point of paged decode.
+- Gemma-4-26B runs the paged path for the FIRST time: its global layers
+  (d512, GQA 8) were statically ineligible before the head split.
+- The teardown SIGSEGV noted in the original GPT-OSS report did not
+  reproduce: it followed watchdog-errored runs, which no longer occur.
+- Cross-report caution: the original `-main.md` runs were recorded on a
+  contended machine (sibling builds); only same-run engine comparisons
+  are meaningful.
+
+Follow-ups (not blocking):
+
+- Transpose-tile merge (§2 scheme 1) would shrink pass-A smem to ~4 KB
+  at every shape (d64/GQA8: 18.9 KB → ~6 KB) and lift occupancy on
+  M1/M2; percent-level, superseded in urgency by the copy fix.
+- PTOK/split tuning for very short contexts at B=1 (§4 note).
+- Quantized KV pages (PagedKVPool design TODO) can reuse the bulk-write
+  kernel's scatter shape with inline quantization.
+
+## 6. References
 
 - philipturner/metal-benchmarks, Dougall Johnson applegpu docs
 - Apple Metal Feature Set Tables (2026-05); Tech Talks 111375/111374
