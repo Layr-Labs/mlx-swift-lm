@@ -51,8 +51,9 @@ public struct CBv2PrefixCacheConfig: Sendable, Equatable {
     /// them. REQUIRED for the paged backend: donated views reference the
     /// live slabs, whose pages are recycled once the donor state is
     /// released. Not a host readback — device materialization only, and
-    /// donation already runs off the engine step thread. Off by default
-    /// (the contiguous backend's views own their buffers via ARC).
+    /// donation already runs off the engine step thread. ON by default
+    /// (safe for every backend; contiguous deployments whose snapshot views
+    /// own their buffers via ARC may opt out to skip the ~free eval).
     public var materializeOnDonate: Bool
 
     public init(
@@ -60,7 +61,7 @@ public struct CBv2PrefixCacheConfig: Sendable, Equatable {
         modelName: String = "",
         cacheSalt: String = "",
         maxBytes: Int? = nil,
-        materializeOnDonate: Bool = false
+        materializeOnDonate: Bool = true
     ) {
         self.blockSize = blockSize
         self.modelName = modelName
