@@ -501,6 +501,10 @@ public final class CBv2CompiledDecode {
     /// Last bind refusal, in enough detail to diagnose from fleet stats.
     private var lastBindFailure: String?
 
+    /// Stat-key diagnostic for a bind refusal. Deliberately excludes the
+    /// row offset so the fallback dictionary's cardinality stays bounded
+    /// (layer × kind × dtype); a permanently ineligible row must not mint
+    /// a fresh key every step.
     private func bindFailureDiagnostic(
         row: CBv2SequenceKV?, layer: Int, kind: CBv2LayerKind
     ) -> String {
@@ -508,11 +512,9 @@ public final class CBv2CompiledDecode {
         let shape: String
         switch row {
         case let full as CBv2FullSequenceKV:
-            let snap = full.snapshot()
-            shape = "full off=\(full.absoluteOffset) dtype=\(snap.keys.dtype)"
+            shape = "full dtype=\(full.snapshot().keys.dtype)"
         case let windowed as CBv2WindowedSequenceKV:
-            let snap = windowed.snapshot()
-            shape = "win off=\(windowed.absoluteOffset) dtype=\(snap.keys.dtype)"
+            shape = "win dtype=\(windowed.snapshot().keys.dtype)"
         default:
             shape = "type=\(type(of: row))"
         }
