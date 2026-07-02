@@ -105,6 +105,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public var stepCount: Int { loop.stepCount }
     public var chainedStepCount: Int { loop.chainedStepCount }
     public var preemptionCount: Int { loop.preemptionCount }
+    /// Compiled-decode telemetry, or nil when the compiled path was never
+    /// built (config off, ineligible model, unsupported hardware).
+    /// NOTE: counters are engine-thread owned; read at quiescent points
+    /// (after streams finish) for exact values.
+    public var compiledDecodeStats: CBv2CompiledDecodeStats? { loop.compiledDecode?.stats }
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
 
@@ -118,7 +123,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         schedulerConfig: CBv2SchedulerConfig = CBv2SchedulerConfig(),
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
         admissionConfig: AdmissionV2.Config = AdmissionV2.Config(),
-        prefixCache: CBv2PrefixCache? = nil
+        prefixCache: CBv2PrefixCache? = nil,
+        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig()
     ) {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
@@ -130,8 +136,33 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         {
             preconditionFailure(violation)
         }
+        // Compiled [B, 1] decode (Phase 1): traced per bucket at warmup on
+        // the engine queue, replayed for eligible pure-decode steps, eager
+        // fallback everywhere else. nil when statically ineligible —
+        // including when the eager layer caches carry an attention softcap
+        // the compiled path cannot reproduce (numerics guard), or when the
+        // padding reserve would eat too much of the KV byte budget.
+        var effectiveCompiledConfig = compiledDecodeConfig
+        if effectiveCompiledConfig.attentionSoftcap == nil,
+            let bank = cacheProvider as? CBv2LayerCacheBank,
+            let bankSoftcap = bank.uniformAttentionSoftcap, bankSoftcap != nil
+        {
+            // The eager caches softcap attention logits but the compiled
+            // config was not told: propagate so build() refuses (never
+            // silently drift from eager numerics).
+            effectiveCompiledConfig.attentionSoftcap = bankSoftcap
+        }
+        let compiledDecode = CBv2CompiledDecode.build(
+            model: model, layerKinds: layerKinds, config: effectiveCompiledConfig,
+            maxConcurrentRequests: schedulerConfig.maxConcurrentRequests,
+            kvBytesCapacity: backend.bytesCapacity)
+        // Truthful admission under compiled padding: the compiled path pads
+        // full-attention rows to its bucket capacity (more bytes than token
+        // admission would budget), so its worst-case reserve is carved out
+        // of the ledger. Heartbeat capacity stays the hardware truth.
+        let admissionBytes = backend.bytesCapacity - (compiledDecode?.admissionPaddingReserve ?? 0)
         let admission = AdmissionV2(
-            layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity, config: admissionConfig)
+            layerKinds: layerKinds, bytesCapacity: admissionBytes, config: admissionConfig)
         self.admission = admission
         let gauges = CBv2EngineGauges(kvBytesCapacity: backend.bytesCapacity)
         self.gauges = gauges
@@ -145,6 +176,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             scheduler: SchedulerV2(config: schedulerConfig, capacity: admission),
             capacity: admission,
             prefixCache: activePrefixCache,
+            compiledDecode: compiledDecode,
             config: loopConfig,
             gauges: gauges)
         loop.start()

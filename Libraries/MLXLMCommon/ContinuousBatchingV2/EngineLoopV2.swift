@@ -283,6 +283,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Non-nil only when prefix caching is active (instance supplied AND
     /// `CBv2SchedulerConfig.enablePrefixCache`).
     let prefixCache: CBv2PrefixCache?
+    /// Compiled [B, 1] decode executor, or nil (eager only). Warmed on the
+    /// engine queue before the first step; every pure-decode step tries it
+    /// first and falls back to the eager path when it declines.
+    let compiledDecode: CBv2CompiledDecode?
     let config: CBv2EngineLoopConfig
     let gauges: CBv2EngineGauges
 
@@ -318,6 +322,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var running = false
     private var draining = false
     private var drainWaiters: [CBv2DrainWaiter] = []
+    /// True after a compiled decode step advanced rows OUTSIDE the eager
+    /// provider's caches: the next eager bind must be forced to rebuild
+    /// `positionOffsets` from host truth (see `eagerCaches`).
+    private var eagerCompositionStale = false
 
     /// Telemetry / test hooks.
     public private(set) var stepCount = 0
@@ -342,6 +350,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler: SchedulerV2,
         capacity: CBv2StepCapacity?,
         prefixCache: CBv2PrefixCache? = nil,
+        compiledDecode: CBv2CompiledDecode? = nil,
         config: CBv2EngineLoopConfig,
         gauges: CBv2EngineGauges
     ) {
@@ -354,6 +363,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.scheduler = scheduler
         self.capacity = capacity
         self.prefixCache = prefixCache
+        self.compiledDecode = compiledDecode
         self.config = config
         self.gauges = gauges
     }
@@ -364,6 +374,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         engineQueue.async { [self] in
             guard !running else { return }
             running = true
+            // Pre-warm compiled decode BEFORE the first step: compile must
+            // never happen on the request path (the v0.6.30 lesson).
+            // Requests submitted meanwhile queue behind this task.
+            compiledDecode?.warmupIfNeeded()
             startWatchdog()
             engineQueue.async { [weak self] in self?.engineStep() }
         }
@@ -597,6 +611,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // prefix credit no longer describes work that was skipped.
                 prefixHitTokens.removeValue(forKey: id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
+                compiledDecode?.forgetRows(state)
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
                         (id: id, state: state, rollbackOne: false, donation: nil))
@@ -659,6 +674,32 @@ public final class EngineLoopV2: @unchecked Sendable {
         return true
     }
 
+    /// Eager layer caches, with the provider's composition fingerprint
+    /// force-invalidated when compiled steps advanced rows behind its back.
+    private func eagerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+        if eagerCompositionStale {
+            (cacheProvider as? CBv2CompositionInvalidating)?.invalidateBoundComposition()
+            eagerCompositionStale = false
+        }
+        return cacheProvider.layerCaches(rowStates: rowStates)
+    }
+
+    /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
+    /// batch: the compiled step when eligible, else the eager forward.
+    /// Numerics note: both paths are pinned; they may only alternate at
+    /// step boundaries, and the parity suites hold them token-exact.
+    private func decodeLogits(rowStates: [[CBv2SequenceKV?]], tokens: MLXArray) -> MLXArray {
+        if let compiledDecode,
+            let compiled = compiledDecode.decodeStep(rowStates: rowStates, tokens: tokens)
+        {
+            eagerCompositionStale = true
+            return compiled
+        }
+        let caches = eagerCaches(rowStates: rowStates)
+        let logits = model.forward(tokens: tokens, caches: caches)
+        return logits[0..., -1, 0...]
+    }
+
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
@@ -671,14 +712,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
-        let caches = cacheProvider.layerCaches(rowStates: rowStates)
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let logits = model.forward(tokens: inputs, caches: caches)
+        let last = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
         }
-        let last = logits[0..., -1, 0...]  // [B, vocab]
         // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
         // one launched-but-unconfirmed sample here (the chain invariant).
         let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -743,11 +782,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let caches = cacheProvider.layerCaches(
-                rowStates: decodeRows.map { kvStates[$0.rec.id]! })
-            let logits = model.forward(tokens: inputs, caches: caches)
+            let last = decodeLogits(
+                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
             decodeSampled = sampler.sample(
-                logits: logits[0..., -1, 0...],
+                logits: last,
                 params: decodeRows.map(\.rec.request.sampling),
                 requestIDs: decodeRows.map(\.rec.id),
                 stepIndex: stepCount,
@@ -765,7 +803,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
-            let caches = cacheProvider.layerCaches(rowStates: [kvStates[rec.id]!])
+            let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let logits = model.forward(tokens: inputs, caches: caches)
             if row.samples {
                 prefillSampled[rec.id] = sampler.sample(
@@ -921,6 +959,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         capacity?.releaseAll(id: id)
 
         if let state = kvStates.removeValue(forKey: id) {
+            compiledDecode?.forgetRows(state)
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.participants.contains(id) {
                 // The in-flight step still references this state — fence the
@@ -1086,6 +1125,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // usage.prefixCacheHitTokens must not over-credit at finish.
             prefixHitTokens.removeValue(forKey: id)
             if let state = kvStates.removeValue(forKey: id) {
+                compiledDecode?.forgetRows(state)
                 backend.release(state)
             }
         }
