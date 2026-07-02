@@ -1059,13 +1059,22 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Stop-string detection needs the holdback scan synchronously to
             // gate the deterministic one-step-late `.stop` finish; passthrough
             // requests can't stop on a string, so their decode + emit move
-            // OFF the step thread (finding 2 — detokQueue).
+            // OFF the step thread (finding 2 — detokQueue). The buffer slot
+            // is charged NOW, on the engine thread (`reserveEmission`), so
+            // the backpressure pause still gates this request's scheduling
+            // even though the emit itself is deferred — otherwise a slow
+            // detokenizer/consumer could not fill the bounded buffer until
+            // the queued blocks ran, and generation would run unbounded
+            // ahead of it (PR#62 review).
             var matchedStopString = false
             if rec.request.stopStrings.isEmpty {
                 let stream = stream(for: id)
+                stream?.reserveEmission()
                 detokQueue.async {
                     let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
-                    stream?.emit(.delta(text: text, tokens: [token], logprobs: logprobs))
+                    stream?.emit(
+                        .delta(text: text, tokens: [token], logprobs: logprobs),
+                        consumingReservation: true)
                 }
             } else {
                 let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0

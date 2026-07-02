@@ -30,6 +30,12 @@ public final class CBv2OutputStream: @unchecked Sendable {
     /// handler so a cancellation racing the park cannot strand a waiter.
     private var consumerCancelled = false
     private var pausedForBackpressure = false
+    /// Emissions RESERVED on the engine thread but not yet performed (they
+    /// run later on the detokenization queue). Counted toward the buffer
+    /// bound: without this, a producer that defers its emits to another
+    /// queue could generate far past `capacity` before the buffer ever
+    /// fills enough to fire the pause (PR#62 review).
+    private var pendingEmissions = 0
 
     private let capacity: Int
     private var lowWatermark: Int { max(0, capacity / 2) }
@@ -54,11 +60,35 @@ public final class CBv2OutputStream: @unchecked Sendable {
 
     // MARK: Producer (engine thread / watchdog)
 
-    /// Non-blocking append. Buffer may exceed `capacity` only by the steps
-    /// already in flight when the pause fired (bounded, never unbounded).
-    public func emit(_ event: CBv2Event) {
+    /// Charge one buffer slot for an emission that will be performed LATER
+    /// (on the detokenization queue) via `emit(_:consumingReservation:
+    /// true)`. Called on the engine thread at the step boundary, so the
+    /// backpressure pause still gates SCHEDULING even though the actual
+    /// emit is deferred — a slow detokenizer or consumer pauses the request
+    /// exactly as the synchronous path does (PR#62 review). Every
+    /// reservation must be balanced by exactly one consuming emit.
+    public func reserveEmission() {
         var firePause = false
         lock.lock()
+        pendingEmissions += 1
+        if !pausedForBackpressure, !finished, buffer.count + pendingEmissions >= capacity {
+            pausedForBackpressure = true
+            firePause = true
+        }
+        lock.unlock()
+        if firePause { onBackpressure?(id, true) }
+    }
+
+    /// Non-blocking append. Buffer may exceed `capacity` only by the steps
+    /// already in flight when the pause fired (bounded, never unbounded).
+    /// `consumingReservation` balances a prior `reserveEmission()` (the
+    /// deferred-detokenization path); the reservation is consumed even when
+    /// the stream already finished, so the pending count cannot leak.
+    public func emit(_ event: CBv2Event, consumingReservation: Bool = false) {
+        var firePause = false
+        var fireResume = false
+        lock.lock()
+        if consumingReservation { pendingEmissions = max(0, pendingEmissions - 1) }
         if finished {
             lock.unlock()
             return
@@ -67,12 +97,20 @@ public final class CBv2OutputStream: @unchecked Sendable {
         if let waiter {
             self.waiter = nil
             if case .finished = event { terminalDelivered = true }
+            // Direct handoff shrinks the load (a consumed reservation never
+            // reached the buffer) — this may be the drain that crosses the
+            // low watermark, and the parked consumer cannot observe it.
+            if pausedForBackpressure, buffer.count + pendingEmissions <= lowWatermark {
+                pausedForBackpressure = false
+                fireResume = true
+            }
             lock.unlock()
+            if fireResume { onBackpressure?(id, false) }
             waiter.resume(returning: event)
             return
         }
         buffer.append(event)
-        if !pausedForBackpressure, !finished, buffer.count >= capacity {
+        if !pausedForBackpressure, !finished, buffer.count + pendingEmissions >= capacity {
             pausedForBackpressure = true
             firePause = true
         }
@@ -134,7 +172,7 @@ public final class CBv2OutputStream: @unchecked Sendable {
                 } else if !buffer.isEmpty {
                     let event = buffer.removeFirst()
                     if case .finished = event { terminalDelivered = true }
-                    if pausedForBackpressure, buffer.count <= lowWatermark {
+                    if pausedForBackpressure, buffer.count + pendingEmissions <= lowWatermark {
                         pausedForBackpressure = false
                         fireResume = true
                     }
@@ -161,5 +199,12 @@ public final class CBv2OutputStream: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return buffer.count
+    }
+
+    /// Reserved-but-unperformed emissions (tests/telemetry).
+    var pendingEmissionCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingEmissions
     }
 }
