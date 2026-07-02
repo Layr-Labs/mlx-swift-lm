@@ -226,6 +226,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// `CBv2KVError.capacityExhausted` when truthful admission fails (worst
     /// case could never fit), the waiting queue is full, or the engine is
     /// shutting down — the provider maps this to 429/503 exactly as today.
+    /// Throws `CBv2SchedulerError.duplicateRequestID` when the id is still
+    /// live: the duplicate is rejected BEFORE any stream registration, so
+    /// the original request's stream is never touched (PR#62 review).
     public func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
         stateLock.lock()
         let rejecting = rejectingSubmissions
@@ -267,7 +270,15 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             capacity: loopConfig.eventBufferCapacity,
             onBackpressure: { id, paused in loop.setPaused(id, paused) },
             onAbandoned: { id in loop.requestCancel(id) })
-        loop.register(stream: stream)
+        // Registration doubles as the duplicate-id gate: it refuses to
+        // replace a live stream, so the FIRST request keeps delivering and
+        // the duplicate fails here — before the scheduler ever sees it.
+        // (The scheduler's own `duplicateRequestID` rejection remains the
+        // engine-thread backstop.)
+        guard loop.register(stream: stream) else {
+            gauges.endSubmit()
+            throw CBv2SchedulerError.duplicateRequestID(request.id)
+        }
         loop.enqueue(request, adoption: makeAdoption(for: request))
         return stream.makeStream()
     }

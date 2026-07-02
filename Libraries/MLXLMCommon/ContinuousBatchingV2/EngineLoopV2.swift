@@ -490,10 +490,20 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Submission (from EngineV2)
 
-    func register(stream: CBv2OutputStream) {
+    /// Register the stream for a new request. Fails (returns false, state
+    /// untouched) when a stream with the same id is still live: a duplicate
+    /// `submit` must never REPLACE the original request's stream — the
+    /// scheduler would later reject the duplicate id, and the rejection
+    /// path's `takeStream` would tear down the replacement, leaving the
+    /// FIRST request's deltas and terminal event with nowhere to go
+    /// (PR#62 review). Ids only become reusable after `takeStream` removes
+    /// the previous stream (request fully finished).
+    func register(stream: CBv2OutputStream) -> Bool {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard streams[stream.id] == nil else { return false }
         streams[stream.id] = stream
-        stateLock.unlock()
+        return true
     }
 
     /// Runs on the engine queue. The stream must already be registered.

@@ -124,6 +124,13 @@ public final class SchedulerV2 {
     /// Enqueue a new request. Throws `CBv2SchedulerError.duplicateRequestID`
     /// when a request with the same id is still live (waiting or running),
     /// and `capacityExhausted` when the waiting queue is full (`maxWaiting`).
+    ///
+    /// ORDER IS LOAD-BEARING: the duplicate check runs BEFORE any state
+    /// mutation, so a rejected duplicate leaves the live record's `byID`
+    /// entry and queue slot untouched (`enqueue` is the only `byID` writer).
+    /// The engine mirrors this discipline one layer up: `EngineV2.submit`
+    /// refuses to register a stream for a live id, so the duplicate can
+    /// never orphan the original request's stream either (PR#62 review).
     @discardableResult
     public func enqueue(
         _ request: CBv2Request, now: Date = Date(), deadline: Date? = nil
