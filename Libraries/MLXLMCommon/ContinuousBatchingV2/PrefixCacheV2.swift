@@ -247,6 +247,12 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
                 snapshots.append(nil)
                 continue
             }
+            // Lossy snapshots (quantized rows) never enter the cache — a
+            // donate→adopt round trip would re-quantize onto a different
+            // grid (see CBv2SequenceKV.snapshotIsLossless). The donation as
+            // a whole is dropped: an entry missing a cacheable layer is
+            // unusable anyway.
+            guard seq.snapshotIsLossless else { return }
             snapshots.append(seq.snapshot())
         }
         donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds, cacheSalt: cacheSalt)

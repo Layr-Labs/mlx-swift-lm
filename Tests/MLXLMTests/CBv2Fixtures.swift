@@ -482,6 +482,12 @@ struct TinyTestModelConfig {
     /// borrowing bug must corrupt decode, not just discarded prefill
     /// logits). v2 path only — the legacy path traps.
     var withKVSharing = false
+    /// Makes layer 1 FULL attention instead of sliding-window(16), so the
+    /// model has no windowed layers at all (prefix adoption then requires
+    /// zero trailing recompute; every layer's KV can be quantized/donated).
+    /// Mutually exclusive with `withKVSharing` (which wires layer 1 as a
+    /// sliding-window KV-share source).
+    var fullAttentionOnly = false
     var ropeBase: Float = 10_000
     var rmsNormEps: Float = 1e-5
 
@@ -652,7 +658,9 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
                 headDim: config.headDim, kvHeads: config.kvHeads,
                 queryHeads: config.queryHeads),
             CBv2LayerKind(
-                attention: .slidingWindow(config.windowSize), hasSinks: config.withSinks,
+                attention: config.fullAttentionOnly
+                    ? .full : .slidingWindow(config.windowSize),
+                hasSinks: config.withSinks,
                 headDim: config.headDim, kvHeads: config.kvHeads,
                 queryHeads: config.queryHeads),
         ]
@@ -677,13 +685,14 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     /// 512} only, so paged end-to-end runs use headDim 64.
     static func make(
         seed: UInt64 = 0xC0FFEE, withSinks: Bool = false, headDim: Int = 16,
-        withKVSharing: Bool = false
+        withKVSharing: Bool = false, fullAttentionOnly: Bool = false
     ) -> TinyTestModel {
         MLXRandom.seed(seed)
         var config = TinyTestModelConfig()
         config.withSinks = withSinks
         config.headDim = headDim
         config.withKVSharing = withKVSharing
+        config.fullAttentionOnly = fullAttentionOnly
         let model = TinyTestModel(config: config)
         // Force lazy parameter materialization deterministically.
         eval(model)
@@ -691,11 +700,14 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     }
 
     init(config: TinyTestModelConfig) {
+        precondition(
+            !(config.fullAttentionOnly && config.withKVSharing),
+            "fullAttentionOnly is mutually exclusive with withKVSharing")
         self.config = config
         self.embed = Embedding(embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
         var blocks = [
             TinyBlock(config: config, isSliding: false),
-            TinyBlock(config: config, isSliding: true),
+            TinyBlock(config: config, isSliding: !config.fullAttentionOnly),
         ]
         if config.withKVSharing {
             // KV-shared sliding block (borrows layer 1's K/V at attention),
@@ -741,7 +753,9 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
             "TinyTestModel: the KV-sharing variant is v2-only (legacy KVCache path unsupported)")
         return [
             KVCacheSimple(),
-            RotatingKVCache(maxSize: config.windowSize, keep: 0),
+            config.fullAttentionOnly
+                ? KVCacheSimple()
+                : RotatingKVCache(maxSize: config.windowSize, keep: 0),
         ]
     }
 

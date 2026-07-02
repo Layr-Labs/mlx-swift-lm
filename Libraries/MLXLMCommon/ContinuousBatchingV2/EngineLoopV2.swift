@@ -827,7 +827,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         capacity?.releaseAll(id: id)
 
         if let state = kvStates.removeValue(forKey: id) {
-            let donation = donationIntent(for: rec, reason: reason)
+            let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.participants.contains(id) {
                 // The in-flight step still references this state — fence the
                 // free behind its completion; roll back the wasted token iff
@@ -868,9 +868,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// through the model, so it is dropped at donation time. The intent
     /// carries the request's cache salt so the entry lands in the donor's
     /// salt scope (TB-007).
-    private func donationIntent(for rec: CBv2ScheduledRequest, reason: CBv2FinishReason)
-        -> CBv2DonationIntent?
-    {
+    private func donationIntent(
+        for rec: CBv2ScheduledRequest, reason: CBv2FinishReason, state: [CBv2SequenceKV?]
+    ) -> CBv2DonationIntent? {
         guard prefixCache != nil else { return nil }
         switch reason {
         case .stop, .length: break
@@ -879,6 +879,18 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Donation requires the full prompt to have been processed (at
         // least one sampled token) — mid-prefill finishes carry partial KV.
         guard rec.generatedTokenCount >= 1, rec.tokens.count > 1 else { return nil }
+        // Lossy-snapshot rows (quantized KV) never donate: their snapshot
+        // dequantizes, and MLX affine re-quantization is not idempotent —
+        // a donate→adopt round trip would drift the adopted KV off the
+        // cold-run values, compounding with each generation. Explicit,
+        // documented skip (see CBv2SequenceKV.snapshotIsLossless); adoption
+        // of full-precision donations INTO quantized backends stays legal.
+        for (i, kind) in layerKinds.enumerated() {
+            var cacheable = kind.sharesKVWithLayer == nil
+            if case .slidingWindow = kind.attention { cacheable = false }
+            guard cacheable, let sequence = state[i] else { continue }
+            guard sequence.snapshotIsLossless else { return nil }
+        }
         return CBv2DonationIntent(tokens: rec.tokens, cacheSalt: rec.request.cacheSalt)
     }
 

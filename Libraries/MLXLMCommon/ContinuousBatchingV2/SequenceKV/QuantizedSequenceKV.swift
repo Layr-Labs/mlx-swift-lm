@@ -109,7 +109,17 @@ public final class CBv2QuantizedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvid
     }
 
     /// Snapshot returns DEQUANTIZED arrays (a bounded one-time copy, "zero-
-    /// copy-ish") so prefix-cache donation and adoption stay backend-agnostic.
+    /// copy-ish") in the backend-agnostic contract shape.
+    ///
+    /// LOSSY (`snapshotIsLossless == false`): MLX affine quantization snaps
+    /// the group scale to its dominant edge (`scale = edge / round(edge /
+    /// scale)`), so re-quantizing these dequantized values on adoption lands
+    /// on a DIFFERENT grid — up to ~1 quantization step of drift per
+    /// donate→adopt generation, compounding. The engine therefore never
+    /// donates quantized rows to the prefix cache (see
+    /// `CBv2SequenceKV.snapshotIsLossless`); this snapshot remains valid for
+    /// checkpointing/inspection and for adoption INTO fresh state where the
+    /// single re-quantization is explicitly accepted.
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
         guard qKeys != nil, qValues != nil, absoluteOffset > 0 else {
             return (
@@ -124,6 +134,10 @@ public final class CBv2QuantizedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvid
             absoluteOffset
         )
     }
+
+    /// Quantized snapshots dequantize — re-quantization is not value-exact
+    /// (see `snapshot()`), so the engine must not donate this row's state.
+    public var snapshotIsLossless: Bool { false }
 
     /// See `CBv2FullSequenceKV.rollback` — the stale tail is structurally
     /// unreachable (views sliced to `..<absoluteOffset`, overwritten before

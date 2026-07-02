@@ -163,6 +163,18 @@ public protocol CBv2SequenceKV: AnyObject {
     /// Zero-copy-ish snapshot for prefix-cache donation / checkpointing.
     /// Returns (keys, values, absoluteOffset) in temporal order.
     func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int)
+    /// True when `snapshot()` is VALUE-EXACT: adopting the returned arrays
+    /// reproduces this row's effective KV exactly (full-precision storage).
+    /// Quantized storage MUST return false — its snapshot dequantizes, and
+    /// MLX affine re-quantization is not idempotent (the kernel snaps the
+    /// scale to the dominant group edge, so quantize∘dequantize lands on a
+    /// different grid, drifting values by up to one quantization step per
+    /// donate→adopt generation). The engine therefore SKIPS prefix-cache
+    /// donation for states whose cacheable rows report false; adopting
+    /// full-precision donations INTO such backends remains allowed (one
+    /// quantization, same as a cold prefill of the same values). Default:
+    /// true.
+    var snapshotIsLossless: Bool { get }
     /// Rollback the last `n` tokens (speculative rejection). Must scrub
     /// un-confirmed tail state so it can never be attended to.
     func rollback(_ n: Int)
@@ -183,6 +195,9 @@ extension CBv2SequenceKV {
         preconditionFailure(
             "fastForward(to:) is only valid on windowed sequence KV (\(type(of: self)))")
     }
+
+    /// Default: full-precision snapshots are value-exact.
+    public var snapshotIsLossless: Bool { true }
 }
 
 /// Factory for per-sequence KV state; implemented by the v1 contiguous
