@@ -429,13 +429,47 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     }
 
     private func removeLocked(_ entry: Entry) {
-        for hash in entry.chainHashes where index[hash] == entry.id {
-            index.removeValue(forKey: hash)
+        // Before dropping a key, hand it to a resident HEIR that shares this
+        // exact chain-hash boundary (Codex P2): a longer donation that
+        // arrived while `entry` was PINNED could not repoint `entry`'s
+        // boundary hashes (a pinned entry's in-flight adoption must keep
+        // resolving by hash), so it registered only its own extra blocks.
+        // Without this, evicting the (now unpinned) shorter entry would
+        // delete a boundary that the longer entry still physically covers,
+        // and lookups for the shorter prefix would miss forever even though
+        // the KV is resident. Repointing to the longest such heir preserves
+        // the shorter prefix as a slice of the longer entry.
+        for (blockIndex, hash) in entry.chainHashes.enumerated() where index[hash] == entry.id {
+            if let heir = longestHeirLocked(forHash: hash, blockIndex: blockIndex, excluding: entry.id)
+            {
+                index[hash] = heir.id
+                heir.liveKeys += 1
+            } else {
+                index.removeValue(forKey: hash)
+            }
         }
         entry.liveKeys = 0
         if entries.removeValue(forKey: entry.id) != nil {
             _bytesInUse -= entry.bytes
         }
+    }
+
+    /// The longest resident entry (other than `excluding`) whose chain hash
+    /// at `blockIndex` equals `hash` — i.e. one that shares this whole-block
+    /// boundary and can serve the shorter prefix as a slice. Chain hashing
+    /// makes a shared boundary hash imply an identical token prefix through
+    /// that block, so any such entry is a valid owner of the key.
+    private func longestHeirLocked(
+        forHash hash: Data, blockIndex: Int, excluding excludedID: UInt64
+    ) -> Entry? {
+        var best: Entry?
+        for candidate in entries.values where candidate.id != excludedID {
+            guard candidate.chainHashes.count > blockIndex,
+                candidate.chainHashes[blockIndex] == hash
+            else { continue }
+            if best == nil || candidate.blockCount > best!.blockCount { best = candidate }
+        }
+        return best
     }
 
     // MARK: - Accounting
