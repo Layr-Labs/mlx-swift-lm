@@ -389,6 +389,62 @@ struct CBv2CoreContiguousBackendTests {
         }
     }
 
+    /// Admission RESERVES (PR#62 review): rows report `byteCount == 0` until
+    /// their first update, so without a reservation several same-step
+    /// admissions would each see `bytesInUse == 0` and collectively blow past
+    /// `bytesCapacity`. The estimate is charged at admission and freed on
+    /// release.
+    @Test func sameStepAdmissionsReserveAndCannotExceedCapacity() throws {
+        // One full layer, kvHeads 1, headDim 4, fp16 ⇒ initial slots
+        // min(64, 4 + 256) = 64 ⇒ 64 * 1 * 4 * 2 * 2 = 1024 bytes/admission.
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 2)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1500))
+
+        let first = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 64)
+        #expect(backend.bytesInUse == 0)  // allocation is lazy
+        #expect(backend.bytesReserved == 1024)  // but the estimate is reserved
+
+        // Second same-step admission: 1024 more against a 1024 reservation
+        // exceeds the 1500 budget even though bytesInUse is still 0.
+        #expect(throws: CBv2KVError.self) {
+            try backend.makeSequenceState(layerKinds: kinds, promptLength: 4, maxLength: 64)
+        }
+
+        // Releasing the first frees its reservation; a new admission fits.
+        backend.release(first)
+        #expect(backend.bytesReserved == 0)
+        let third = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 64)
+        backend.release(third)
+    }
+
+    /// `bytesReserved` stays truthful: once a row's actual allocation grows
+    /// past its initial reservation (doubling), reservation trues up to the
+    /// real byte count.
+    @Test func bytesReservedTruesUpToActualAllocation() throws {
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 2)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20))
+        let state = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 1, maxLength: 100_000)
+        let reservation = backend.bytesReserved
+        #expect(reservation > 0)
+        #expect(backend.bytesInUse == 0)  // lazy
+
+        // Grow the row well past its initial estimate (buffer doubles).
+        for i in 0 ..< 1000 {
+            _ = state[0]!.update(
+                keys: positionCoded(from: i, count: 1, kvHeads: 1, headDim: 4),
+                values: positionCoded(from: i, count: 1, kvHeads: 1, headDim: 4))
+        }
+        #expect(backend.bytesInUse > reservation, "row grew past its initial reservation")
+        #expect(
+            backend.bytesReserved == backend.bytesInUse,
+            "reservation trues up to actual bytes once exceeded")
+        backend.release(state)
+        #expect(backend.bytesReserved == 0)
+    }
+
     @Test func invalidShareSourceIsRejected() {
         let bad = [
             CBv2LayerKind(
@@ -822,5 +878,43 @@ struct CBv2CoreLayerCacheTests {
         #expect(cache.maxSize == nil)
         #expect(cache.isTrimmable == false)
         #expect(cache.trim(5) == 0)
+    }
+}
+
+// MARK: - Legacy attention multi-row guard (PR#62 review)
+
+/// `attentionWithCacheUpdate`'s CBv2 compatibility branch is B == 1 ONLY: a
+/// non-v2-adapted model applies scalar RoPE via `KVCache.offset` (the MAX row
+/// offset) BEFORE this call, so shorter rows would be silently mis-rotated at
+/// B > 1. The helper must fail loudly there while keeping B == 1 legal.
+@Suite("CBv2Core: legacy attention multi-row guard")
+struct CBv2LegacyAttentionGuardTests {
+
+    @Test func singleRowIsAllowed() {
+        #expect(cbv2LegacyAttentionBatchViolation(batch: 1, layerIndex: 0) == nil)
+    }
+
+    @Test func multiRowIsRejectedWithDiagnostic() {
+        let violation = cbv2LegacyAttentionBatchViolation(batch: 3, layerIndex: 7)
+        let message = try! #require(violation)
+        #expect(message.contains("B=3"))
+        #expect(message.contains("layer 7"))
+        #expect(message.contains("updateAndAttend"))
+    }
+
+    /// B == 1 flows through the guarded compatibility path and drives
+    /// `updateAndAttend` (no precondition trip, KV advanced).
+    @Test func singleRowDrivesUpdateAndAttendThroughCompatPath() {
+        let kind = CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 1)
+        let row = CBv2FullSequenceKV(promptLength: 1, maxLength: 8, kvHeads: 1, headDim: 4)
+        let cache = CBv2LayerCache(layerIndex: 0, kind: kind, rows: [row])
+        let q = MLXRandom.normal([1, 1, 1, 4])
+        let k = MLXRandom.normal([1, 1, 1, 4])
+        let v = MLXRandom.normal([1, 1, 1, 4])
+        let out = attentionWithCacheUpdate(
+            queries: q, keys: k, values: v, cache: cache, scale: 0.5, mask: .causal)
+        eval(out)
+        #expect(out.shape == [1, 1, 1, 4])
+        #expect(row.absoluteOffset == 1)
     }
 }

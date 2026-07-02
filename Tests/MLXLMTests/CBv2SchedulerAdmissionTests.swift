@@ -4,6 +4,7 @@
 // KV-sharing aware), soft reservations with a watermark, rollback symmetry.
 
 import Foundation
+import MLX
 import XCTest
 
 @testable import MLXLMCommon
@@ -33,6 +34,50 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         // Below the window, both storage layers charge fully.
         XCTAssertEqual(admission.estimatedBytes(forTokens: 100), 100 * 64 * 2)
         XCTAssertEqual(admission.estimatedBytes(forTokens: 0), 0)
+    }
+
+    /// Per-layer element bytes (PR#62 review): GPT-OSS caches fp32 K/V on
+    /// full-attention layers but bf16 on sliding ones. A flat 2 B/element
+    /// under-charges the fp32 rows ~2x and over-admits — the estimate must
+    /// honor a per-layer dtype table.
+    func testPerLayerElementBytesForMixedPrecision() {
+        // layer 0 full (fp32, 4 B), layer 1 sliding-window(128) (bf16, 2 B).
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(attention: .slidingWindow(128), headDim: 8, kvHeads: 2, queryHeads: 4),
+        ]
+        let table = AdmissionV2.Config.elementBytes(forDTypes: [.float32, .bfloat16])
+        XCTAssertEqual(table, [4, 2])
+        let mixed = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1 << 20,
+            config: .init(watermarkFraction: 0, layerElementBytes: table))
+        // 1000 tokens: full(fp32) = 1000 × 2 × 2 × 8 × 4 = 128_000;
+        // windowed(bf16) = min(1000,128) × 2 × 2 × 8 × 2 = 8192.
+        XCTAssertEqual(mixed.estimatedBytes(forTokens: 1000), 128_000 + 8192)
+
+        // The flat-2-bytes assumption under-charges the fp32 layer by 2x.
+        let flat = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1 << 20,
+            config: .init(watermarkFraction: 0, elementBytes: 2))
+        XCTAssertEqual(flat.estimatedBytes(forTokens: 1000), 64_000 + 8192)
+        XCTAssertGreaterThan(
+            mixed.estimatedBytes(forTokens: 1000), flat.estimatedBytes(forTokens: 1000),
+            "fp32 full-attention rows must be charged ~2x the flat bf16 assumption")
+
+        // Feasibility + reservation both honor the wider dtype.
+        XCTAssertLessThan(
+            mixed.admissibleBytesCapacity - mixed.estimatedBytes(forTokens: 1000),
+            flat.admissibleBytesCapacity - flat.estimatedBytes(forTokens: 1000))
+    }
+
+    /// A per-layer table shorter/longer than the layer count is a construction
+    /// bug — caught eagerly.
+    func testMismatchedElementBytesTableTraps() {
+        // Length mismatch would silently mis-charge; ensure the helper builds
+        // a correctly-sized table from probed dtypes (nil ⇒ default).
+        let table = AdmissionV2.Config.elementBytes(
+            forDTypes: [.float32, nil, .bfloat16], defaultElementBytes: 2)
+        XCTAssertEqual(table, [4, 2, 2], "nil (KV-shared / unprobed) falls back to default")
     }
 
     func testCanEverFitIsWorstCase() {

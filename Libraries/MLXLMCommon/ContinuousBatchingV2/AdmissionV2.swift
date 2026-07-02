@@ -8,6 +8,7 @@
 // capacity - watermark`; preemption is the backstop when optimism loses.
 
 import Foundation
+import MLX
 
 // MARK: - Capacity oracle (scheduler ↔ admission)
 
@@ -41,17 +42,44 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public struct Config: Sendable {
         /// Fraction of capacity kept free as the optimism watermark.
         public var watermarkFraction: Double
-        /// Bytes per KV element (2 = fp16/bf16).
+        /// Default bytes per KV element (2 = fp16/bf16) — the fallback for
+        /// layers not listed in `layerElementBytes`.
         public var elementBytes: Int
-        public init(watermarkFraction: Double = 0.05, elementBytes: Int = 2) {
+        /// OPTIONAL per-layer bytes-per-element (aligned to `layerKinds`),
+        /// for models whose layers cache K/V at different precisions —
+        /// e.g. GPT-OSS full-attention layers cache fp32 K/V (YarnRoPE
+        /// computes in fp32) while sliding layers cache bf16. Assuming a
+        /// flat 2 bytes/element there under-charges the fp32 rows ~2x and
+        /// over-admits. Derive it from the model's probed cache dtypes
+        /// (the compiled decode path probes per-layer dtypes at warmup —
+        /// see `CBv2CompiledDecode`) via `Config.elementBytes(forDTypes:)`.
+        /// nil ⇒ uniform `elementBytes`. Entries for KV-shared layers are
+        /// ignored (those layers own no storage).
+        public var layerElementBytes: [Int]?
+        public init(
+            watermarkFraction: Double = 0.05, elementBytes: Int = 2,
+            layerElementBytes: [Int]? = nil
+        ) {
             self.watermarkFraction = watermarkFraction
             self.elementBytes = elementBytes
+            self.layerElementBytes = layerElementBytes
+        }
+
+        /// Build a per-layer element-bytes table from probed cache dtypes
+        /// (nil entries — KV-shared layers, unprobed — fall back to
+        /// `defaultElementBytes`). Conservative: a wider dtype is charged
+        /// its full element size.
+        public static func elementBytes(
+            forDTypes dtypes: [DType?], defaultElementBytes: Int = 2
+        ) -> [Int] {
+            dtypes.map { $0.map(\.size) ?? defaultElementBytes }
         }
     }
 
     private let lock = NSLock()
     private let layerKinds: [CBv2LayerKind]
-    private let elementBytes: Int
+    /// Resolved bytes-per-element per layer (aligned to `layerKinds`).
+    private let perLayerElementBytes: [Int]
     private let watermark: Int
     /// Per-token bytes if every storage-owning layer retained the token
     /// (upper bound; used for the conservative headroom probe).
@@ -68,11 +96,20 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public init(layerKinds: [CBv2LayerKind], bytesCapacity: Int, config: Config = .init()) {
         self.layerKinds = layerKinds
         self.bytesCapacity = bytesCapacity
-        self.elementBytes = config.elementBytes
+        if let table = config.layerElementBytes {
+            precondition(
+                table.count == layerKinds.count,
+                "AdmissionV2: layerElementBytes count \(table.count) != layer count \(layerKinds.count)"
+            )
+            self.perLayerElementBytes = table
+        } else {
+            self.perLayerElementBytes = Array(
+                repeating: config.elementBytes, count: layerKinds.count)
+        }
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
         var perToken = 0
-        for kind in layerKinds where kind.sharesKVWithLayer == nil {
-            perToken += 2 * kind.kvHeads * kind.headDim * config.elementBytes
+        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
+            perToken += 2 * kind.kvHeads * kind.headDim * self.perLayerElementBytes[index]
         }
         self.maxPerTokenBytes = perToken
     }
@@ -83,13 +120,13 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public func estimatedBytes(forTokens tokens: Int) -> Int {
         guard tokens > 0 else { return 0 }
         var total = 0
-        for kind in layerKinds where kind.sharesKVWithLayer == nil {
+        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
             let retained: Int
             switch kind.attention {
             case .full: retained = tokens
             case .slidingWindow(let window): retained = min(tokens, window)
             }
-            total += retained * 2 * kind.kvHeads * kind.headDim * elementBytes
+            total += retained * 2 * kind.kvHeads * kind.headDim * perLayerElementBytes[index]
         }
         return total
     }

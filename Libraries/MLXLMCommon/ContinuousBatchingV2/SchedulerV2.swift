@@ -15,6 +15,21 @@
 
 import Foundation
 
+// MARK: - Scheduler errors
+
+/// Submit-side scheduler contract violations (distinct from
+/// `CBv2KVError.capacityExhausted`, which is transient back-off).
+public enum CBv2SchedulerError: Error, Equatable {
+    /// A request with this id is already live (waiting or running). Request
+    /// ids are engine-scoped: reusing one is only legal after the previous
+    /// request carrying it has fully finished. Without this rejection a
+    /// duplicate would silently clobber the live record in `byID` while the
+    /// stale record kept its queue slot — orphaning the first request's
+    /// bookkeeping. The provider already guards against duplicate ids; the
+    /// engine now enforces it (PR#62 review).
+    case duplicateRequestID(CBv2RequestID)
+}
+
 // MARK: - Per-request scheduling record
 
 /// Book-keeping for one request inside the v2 scheduler.
@@ -106,12 +121,16 @@ public final class SchedulerV2 {
 
     // MARK: Submission
 
-    /// Enqueue a new request. Throws `capacityExhausted` when the waiting
-    /// queue is full (`maxWaiting`).
+    /// Enqueue a new request. Throws `CBv2SchedulerError.duplicateRequestID`
+    /// when a request with the same id is still live (waiting or running),
+    /// and `capacityExhausted` when the waiting queue is full (`maxWaiting`).
     @discardableResult
     public func enqueue(
         _ request: CBv2Request, now: Date = Date(), deadline: Date? = nil
     ) throws -> CBv2ScheduledRequest {
+        guard byID[request.id] == nil else {
+            throw CBv2SchedulerError.duplicateRequestID(request.id)
+        }
         guard waiting.count < config.maxWaiting else {
             throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
         }

@@ -37,12 +37,27 @@ public struct CBv2ContiguousBackendConfig: Sendable {
 /// runs on the admission path while `release` runs on the engine loop).
 /// `bytesInUse` is truthful — it sums the ACTUAL allocated bytes of live
 /// rows (which grow by doubling), not a worst-case estimate.
+///
+/// Admission RESERVES: rows allocate lazily (`byteCount == 0` until their
+/// first update), so judging capacity against `bytesInUse` alone would let
+/// several same-step admissions collectively exceed `bytesCapacity`. Each
+/// admitted row therefore holds a reservation equal to its estimated
+/// initial bytes until its actual allocation exceeds it
+/// (`max(byteCount, reservation)` per row — see `bytesReserved`), and the
+/// capacity check + registration are a single atomic section.
 public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     public let config: CBv2ContiguousBackendConfig
 
     private let lock = NSLock()
     private var live: [ObjectIdentifier: CBv2SequenceKV] = [:]
+    /// Admission reservation per live row (estimated initial bytes),
+    /// released with the row. NOTE: estimates assume `config.kvDType`; a
+    /// model that caches wider elements (e.g. fp32) under-reserves until
+    /// the first update trues the row up to its actual `byteCount` —
+    /// `AdmissionV2` (which can carry per-layer element sizes) remains the
+    /// primary admission gate.
+    private var reservations: [ObjectIdentifier: Int] = [:]
 
     public init(config: CBv2ContiguousBackendConfig) {
         self.config = config
@@ -56,6 +71,14 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         return live.values.reduce(0) { $0 + $1.byteCount }
     }
 
+    /// Actual bytes plus outstanding admission reservations — what the
+    /// capacity check judges against (`CBv2KVBackend.bytesReserved`).
+    public var bytesReserved: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return accountedBytesLocked()
+    }
+
     public func makeSequenceState(
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
@@ -65,14 +88,13 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 reason: "promptLength \(promptLength) exceeds maxLength \(maxLength)")
         }
 
-        let needed = estimatedInitialBytes(
-            layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength)
-        try admit(needed: needed)
-
         let state = layerKinds.map { kind -> CBv2SequenceKV? in
             makeRow(kind: kind, promptLength: promptLength, maxLength: maxLength)
         }
-        register(state)
+        try registerReserving(
+            state,
+            estimates: rowEstimates(
+                layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength))
         return state
     }
 
@@ -115,10 +137,6 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 reason: "prefix offset \(matched) exceeds maxLength \(maxLength)")
         }
 
-        let needed = estimatedInitialBytes(
-            layerKinds: layerKinds, promptLength: matched, maxLength: maxLength)
-        try admit(needed: needed)
-
         let state = layerKinds.enumerated().map { index, kind -> CBv2SequenceKV? in
             guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
@@ -142,7 +160,10 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 return row
             }
         }
-        register(state)
+        try registerReserving(
+            state,
+            estimates: rowEstimates(
+                layerKinds: layerKinds, promptLength: matched, maxLength: maxLength))
         return state
     }
 
@@ -151,11 +172,45 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         defer { lock.unlock() }
         for row in state {
             guard let row else { continue }
-            live.removeValue(forKey: ObjectIdentifier(row))
+            let key = ObjectIdentifier(row)
+            live.removeValue(forKey: key)
+            reservations.removeValue(forKey: key)
         }
     }
 
     // MARK: - Private
+
+    /// Bytes currently charged against capacity: each live row counts for
+    /// the LARGER of its actual allocation and its outstanding admission
+    /// reservation, so a not-yet-allocated row still occupies its estimate
+    /// and a grown row is charged its true size (`bytesInUse`-truthful).
+    /// Caller holds `lock`.
+    private func accountedBytesLocked() -> Int {
+        live.reduce(0) { total, entry in
+            total + max(entry.value.byteCount, reservations[entry.key] ?? 0)
+        }
+    }
+
+    /// Atomically admit + register: the capacity check and the reservation
+    /// write share one critical section so N same-step admissions cannot
+    /// collectively overshoot `bytesCapacity` (the pre-fix bug — rows report
+    /// `byteCount == 0` until first update).
+    private func registerReserving(_ state: [CBv2SequenceKV?], estimates: [Int?]) throws {
+        precondition(state.count == estimates.count, "estimate/state count mismatch")
+        lock.lock()
+        defer { lock.unlock() }
+        let needed = estimates.reduce(0) { $0 + ($1 ?? 0) }
+        let available = bytesCapacity - accountedBytesLocked()
+        guard needed <= available else {
+            throw CBv2KVError.capacityExhausted(needed: needed, available: max(0, available))
+        }
+        for (row, estimate) in zip(state, estimates) {
+            guard let row else { continue }
+            let key = ObjectIdentifier(row)
+            live[key] = row
+            reservations[key] = estimate ?? 0
+        }
+    }
 
     private func makeRow(kind: CBv2LayerKind, promptLength: Int, maxLength: Int)
         -> CBv2SequenceKV?
@@ -175,22 +230,6 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             return CBv2FullSequenceKV(
                 promptLength: promptLength, maxLength: maxLength,
                 kvHeads: kind.kvHeads, headDim: kind.headDim)
-        }
-    }
-
-    private func register(_ state: [CBv2SequenceKV?]) {
-        lock.lock()
-        defer { lock.unlock() }
-        for row in state {
-            guard let row else { continue }
-            live[ObjectIdentifier(row)] = row
-        }
-    }
-
-    private func admit(needed: Int) throws {
-        let available = bytesCapacity - bytesInUse
-        guard needed <= available else {
-            throw CBv2KVError.capacityExhausted(needed: needed, available: max(0, available))
         }
     }
 
@@ -216,18 +255,20 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         }
     }
 
-    /// Bytes the initial allocations will take (full layers allocate
+    /// Per-layer estimated initial allocation bytes, aligned to `layerKinds`
+    /// (nil for KV-shared layers, which own no storage). Full layers allocate
     /// `promptLength + 256` slots capped at maxLength; windowed layers
-    /// allocate their full ring up front).
-    private func estimatedInitialBytes(
+    /// allocate their full ring up front. The sum is the reservation charged
+    /// against capacity at admission.
+    private func rowEstimates(
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int
-    ) -> Int {
+    ) -> [Int?] {
         let itemSize = config.kvDType.size
-        var total = 0
-        for kind in layerKinds where kind.sharesKVWithLayer == nil {
+        return layerKinds.map { kind -> Int? in
+            guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
             case .slidingWindow(let window):
-                total += window * kind.kvHeads * kind.headDim * itemSize * 2
+                return window * kind.kvHeads * kind.headDim * itemSize * 2
             case .full:
                 let slots = min(maxLength, max(1, promptLength + CBv2FullSequenceKV.initialSlack))
                 if let quantization = config.quantization {
@@ -237,12 +278,10 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                     let perToken =
                         kind.headDim * quantization.bits / 8
                         + 2 * (kind.headDim / groupSize) * itemSize
-                    total += slots * kind.kvHeads * perToken * 2
-                } else {
-                    total += slots * kind.kvHeads * kind.headDim * itemSize * 2
+                    return slots * kind.kvHeads * perToken * 2
                 }
+                return slots * kind.kvHeads * kind.headDim * itemSize * 2
             }
         }
-        return total
     }
 }

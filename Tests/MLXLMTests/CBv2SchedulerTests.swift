@@ -135,6 +135,54 @@ final class CBv2SchedulerTests: XCTestCase {
         }
     }
 
+    // MARK: Duplicate request ids (PR#62 review)
+
+    func testDuplicateRequestIDWhileWaitingIsRejected() throws {
+        let scheduler = makeScheduler()
+        let first = CBv2SchedFixtures.request(prompt: [1, 2, 3], maxTokens: 5)
+        try scheduler.enqueue(first)
+
+        // Same id, original still WAITING (no plan yet).
+        let dup = CBv2Request(id: first.id, promptTokens: [9], maxTokens: 5)
+        XCTAssertThrowsError(try scheduler.enqueue(dup)) { error in
+            XCTAssertEqual(
+                error as? CBv2SchedulerError, .duplicateRequestID(first.id),
+                "duplicate must be rejected, not silently clobber byID")
+        }
+        // The original record is untouched and no phantom queue entry exists.
+        XCTAssertEqual(scheduler.record(for: first.id)?.request.promptTokens, [1, 2, 3])
+        XCTAssertEqual(scheduler.waitingCount, 1)
+        XCTAssertEqual(scheduler.runningCount, 0)
+    }
+
+    func testDuplicateRequestIDWhileRunningIsRejected() throws {
+        let scheduler = makeScheduler()
+        let first = CBv2SchedFixtures.request(prompt: [1, 2, 3], maxTokens: 5)
+        try scheduler.enqueue(first)
+        _ = scheduler.plan()  // promotes to RUNNING
+        XCTAssertEqual(scheduler.runningCount, 1)
+
+        let dup = CBv2Request(id: first.id, promptTokens: [9], maxTokens: 5)
+        XCTAssertThrowsError(try scheduler.enqueue(dup)) { error in
+            XCTAssertEqual(error as? CBv2SchedulerError, .duplicateRequestID(first.id))
+        }
+        // Running record intact; no stale waiting entry orphaned in a queue.
+        XCTAssertEqual(scheduler.runningCount, 1)
+        XCTAssertEqual(scheduler.waitingCount, 0)
+        XCTAssertEqual(scheduler.record(for: first.id)?.request.promptTokens, [1, 2, 3])
+    }
+
+    func testRequestIDReusableAfterFinish() throws {
+        let scheduler = makeScheduler()
+        let first = CBv2SchedFixtures.request(prompt: [1], maxTokens: 1)
+        try scheduler.enqueue(first)
+        scheduler.finish(id: first.id, reason: .cancelled)
+        // Once fully finished, the id is free to reuse.
+        let reuse = CBv2Request(id: first.id, promptTokens: [7], maxTokens: 1)
+        XCTAssertNoThrow(try scheduler.enqueue(reuse))
+        XCTAssertEqual(scheduler.record(for: first.id)?.request.promptTokens, [7])
+    }
+
     // MARK: Preemption
 
     func testPreemptionPicksLowestPriorityYoungestAndRequeuesFront() throws {

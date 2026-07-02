@@ -44,6 +44,15 @@ import MLX
 /// (e.g. bidirectional/prefix-LM or padding masks) and any attention
 /// sinks; sinks-bearing or custom-mask models must call `updateAndAttend`
 /// directly instead. A debug assertion rejects array masks here.
+///
+/// MULTI-ROW LIMITATION: this compatibility path is B == 1 ONLY. Legacy
+/// (non-v2-adapted) models apply scalar RoPE via `KVCache.offset` BEFORE
+/// calling this helper; a CBv2 cache's legacy `offset` is the MAX row
+/// offset, so at B > 1 every shorter row would be silently mis-rotated.
+/// B == 1 stays allowed (the scalar offset is exact for a single row).
+/// Generic models must be v2-adapted — capture `positionOffsets` before
+/// dispatch and call `updateAndAttend` directly — before they can serve
+/// multi-row CBv2 batches. This fails loudly rather than mis-rotating.
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,
@@ -52,7 +61,7 @@ public func attentionWithCacheUpdate(
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
 ) -> MLXArray {
-    // ContinuousBatchingV2 hook — see the LIMITATION note above.
+    // ContinuousBatchingV2 hook — see the LIMITATION notes above.
     if let v2 = cache as? CBv2AttendingLayerCache {
         switch mask {
         case .none, .causal:
@@ -65,6 +74,11 @@ public func attentionWithCacheUpdate(
                 masks and DISCARD this parameter — the model must be v2-adapted \
                 (call updateAndAttend with its own semantics) instead.
                 """)
+        }
+        if let violation = cbv2LegacyAttentionBatchViolation(
+            batch: queries.dim(0), layerIndex: v2.layerIndex)
+        {
+            preconditionFailure(violation)
         }
         return v2.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
@@ -101,4 +115,21 @@ public func attentionWithCacheUpdate(
             mask: mask
         )
     }
+}
+
+/// Multi-row guard for the CBv2 branch of `attentionWithCacheUpdate` (see
+/// the MULTI-ROW LIMITATION doc there). Returns the failure description for
+/// an illegal call, or nil when the call is allowed. Internal (not private)
+/// so tests can pin the exact condition without tripping the precondition.
+func cbv2LegacyAttentionBatchViolation(batch: Int, layerIndex: Int) -> String? {
+    guard batch > 1 else { return nil }
+    return """
+        attentionWithCacheUpdate: a multi-row batch (B=\(batch)) reached the \
+        legacy CBv2 compatibility path (layer \(layerIndex)). Legacy models \
+        apply scalar RoPE via `KVCache.offset` — the MAX row offset — so \
+        shorter rows would be silently mis-rotated at B > 1. This model must \
+        be v2-adapted (read `positionOffsets` before dispatch and call \
+        `updateAndAttend` directly) before multi-row CBv2 serving; B == 1 \
+        remains supported.
+        """
 }
