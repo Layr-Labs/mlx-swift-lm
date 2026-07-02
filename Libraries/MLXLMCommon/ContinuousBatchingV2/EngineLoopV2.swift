@@ -264,6 +264,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
     /// materialization) — never on the engine step thread (invariant 6).
+    /// Safe to eval CONCURRENTLY with engine-step evals over the same paged
+    /// slabs: the snapshot views were graph-built on the engine thread, so
+    /// MLX array versioning pins them to the slab contents as of that step
+    /// (later slab writes produce new versions, never mutating pinned
+    /// ones), and the release-after-donate ordering in `retire` keeps the
+    /// donor's pages out of the pool until the donation has materialized.
     private let donationQueue = DispatchQueue(
         label: "com.eigen.cbv2.donation", qos: .utility)
 

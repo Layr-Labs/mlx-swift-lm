@@ -420,6 +420,13 @@ public protocol CBv2PrefixCache: AnyObject, Sendable {
     /// Returns nil or (matchedTokenCount, per-layer snapshots for
     /// full-attention layers; windowed layers are always nil — the engine
     /// recomputes the trailing `window` tokens for those layers).
+    ///
+    /// PIN BALANCE: a successful lookup MAY take an in-use pin on the
+    /// matched entry (pinning implementations never evict pinned entries).
+    /// The caller MUST balance every hit with exactly one
+    /// `endAdoption(tokens:matched:)` once the adoption is consumed or
+    /// abandoned — on every path, including rejection and shutdown —
+    /// or the entry leaks as unevictable.
     func lookup(tokens: [Int], layerKinds: [CBv2LayerKind])
         -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
     /// Donate a finished request's state. Zero-copy move; the cache owns the

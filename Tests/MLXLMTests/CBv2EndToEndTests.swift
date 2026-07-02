@@ -14,10 +14,14 @@
 //  (iii) cancel mid-decode frees the slot promptly and batchmates are
 //        unaffected (still token-exact vs solo);
 //  (iv)  a second submit of the same prompt hits the prefix cache
-//        (usage.prefixCacheHitTokens > 0) with IDENTICAL greedy output —
-//        exact by construction on this model: full-attention KV is adopted,
+//        (usage.prefixCacheHitTokens > 0) with IDENTICAL greedy output.
+//        The adopted full-attention KV is bit-identical (donated arrays),
 //        and the windowed layer is last, so the trailing-window replay
-//        reproduces every retained K/V bit-for-bit;
+//        recomputes the same values — but the replay's SDPA calls run at
+//        different shapes than the cold run's chunks, and cross-shape SDPA
+//        determinism is an empirical property of the kernels on this
+//        hardware, not a guarantee. Greedy argmax over these logit gaps
+//        makes the token-exact assertion stable in practice;
 //  (v)   the same suite runs green with the paged backend (fp16 pages,
 //        custom Metal decode kernel) substituted for the contiguous one.
 //

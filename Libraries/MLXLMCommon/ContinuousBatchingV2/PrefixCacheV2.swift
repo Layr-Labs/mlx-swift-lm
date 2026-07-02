@@ -279,9 +279,18 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
         // Dedup: this exact whole-block prefix is already represented (the
         // entry holding its terminal hash covers at least these blocks).
+        // Re-register any missing intermediate block keys while we're here:
+        // an intermediate key can be lost when a shorter entry that owned
+        // it (a pinned entry survives repointing) is later evicted — after
+        // which shorter prefixes of this donation stopped hitting.
         if let existingID = index[hashes[blockCount - 1]], let existing = entries[existingID] {
             tick += 1
             existing.lastAccess = tick
+            for hash in hashes {
+                guard index[hash].map({ entries[$0] == nil }) ?? true else { continue }
+                index[hash] = existing.id
+                existing.liveKeys += 1
+            }
             return
         }
 

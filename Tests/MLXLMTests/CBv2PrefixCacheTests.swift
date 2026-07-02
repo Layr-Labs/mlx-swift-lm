@@ -450,6 +450,43 @@ final class CBv2PrefixCacheEvictionTests: XCTestCase {
         XCTAssertEqual(cache.bytesInUse, mockBytes(offset: 13))
     }
 
+    /// Nit-regression: an intermediate block key can be lost when a shorter
+    /// pinned entry that owned it (repointing never steals from pinned
+    /// entries) is later evicted — shorter prefixes of a long donation then
+    /// stopped hitting FOREVER, because the dedup path returned early
+    /// without re-registering. A dedup hit now re-registers missing keys.
+    func testDedupReregistersMissingIntermediateKeys() {
+        let cache = makeCache()
+        let short = Array(0 ..< 5)
+        let long = Array(0 ..< 13)
+
+        // Short entry owns block-0's key; pin it so the long donation
+        // cannot steal that key.
+        cache.donate(tokens: short, state: [MockSequenceKV(offset: 5)], layerKinds: kinds)
+        XCTAssertEqual(cache.lookup(tokens: short, layerKinds: kinds)?.matched, 4)
+        cache.donate(tokens: long, state: [MockSequenceKV(offset: 13)], layerKinds: kinds)
+
+        // Unpin and evict the short entry: block-0's key vanishes with it,
+        // so the long entry's 1-block prefix no longer resolves.
+        cache.endAdoption(tokens: short, matched: 4)
+        cache.evict(toFit: mockBytes(offset: 13))
+        XCTAssertEqual(cache.stats().entryCount, 1)
+        XCTAssertNil(
+            cache.lookup(tokens: Array(long[..<5]), layerKinds: kinds),
+            "block-0 key was owned by the evicted short entry")
+
+        // Re-donating the same prefix dedups against the surviving entry
+        // AND must re-register the missing intermediate key.
+        cache.donate(tokens: long, state: [MockSequenceKV(offset: 13)], layerKinds: kinds)
+        XCTAssertEqual(cache.stats().entryCount, 1, "dedup keeps a single entry")
+        XCTAssertEqual(cache.bytesInUse, mockBytes(offset: 13), "dedup stores nothing new")
+        guard let hit = cache.lookup(tokens: Array(long[..<5]), layerKinds: kinds) else {
+            return XCTFail("1-block prefix must hit again after dedup re-registration")
+        }
+        XCTAssertEqual(hit.matched, 4)
+        cache.endAdoption(tokens: Array(long[..<5]), matched: 4)
+    }
+
     func testEndAdoptionOnUnknownPrefixIsNoOp() {
         let cache = makeCache()
         cache.endAdoption(tokens: Array(0 ..< 8), matched: 4)  // nothing stored

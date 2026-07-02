@@ -100,6 +100,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let b = queries.dim(0)
         let l = queries.dim(2)
         precondition(b == pagedRows.count, "queries batch \(b) != rows \(pagedRows.count)")
+        // Sinks apply only to layers that declare them (same gate as
+        // CBv2AttentionV1) — a sink-free layer must ignore a passed array.
+        let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if l == 1 {
             // Decode: write each row's K/V, then one kernel dispatch.
@@ -107,13 +110,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 row.write(keys: keys[i], values: values[i])
             }
             return dispatchDecode(
-                queries: queries, rows: pagedRows, scale: scale, sinks: sinks)
+                queries: queries, rows: pagedRows, scale: scale, sinks: effectiveSinks)
         } else {
             precondition(b == 1, "prefill chunks are per-request [1, chunk]")
             let row = pagedRows[0]
             row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
             return prefillAttend(
-                queries: queries, row: row, scale: scale, sinks: sinks)
+                queries: queries, row: row, scale: scale, sinks: effectiveSinks)
         }
     }
 
@@ -129,14 +132,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             kind.attention == src.kind.attention,
             "KV-shared layer must share the source layer's attention type")
         let l = queries.dim(2)
+        // Same sink gate as updateAndAttend, keyed on THIS layer's kind.
+        let effectiveSinks = kind.hasSinks ? sinks : nil
         if l == 1 {
             return dispatchDecode(
-                queries: queries, rows: src.pagedRows, scale: scale, sinks: sinks,
+                queries: queries, rows: src.pagedRows, scale: scale, sinks: effectiveSinks,
                 tableProvider: src)
         } else {
             precondition(queries.dim(0) == 1 && src.pagedRows.count == 1)
             return prefillAttend(
-                queries: queries, row: src.pagedRows[0], scale: scale, sinks: sinks)
+                queries: queries, row: src.pagedRows[0], scale: scale, sinks: effectiveSinks)
         }
     }
 

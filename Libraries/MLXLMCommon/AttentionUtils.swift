@@ -34,6 +34,16 @@ import MLX
 ///   - scale: Attention scale factor
 ///   - mask: Attention mask
 /// - Returns: Attention output [B, nHeads, L, D]
+///
+/// LIMITATION (ContinuousBatchingV2 caches): when `cache` is a
+/// `CBv2AttendingLayerCache`, the layer cache owns BOTH the KV update and
+/// the attention computation, INCLUDING masking — the `mask` parameter is
+/// DISCARDED on that path (v2 derives causal/window masks from per-row
+/// absolute positions), and `sinks` are passed as nil. A non-adapted model
+/// driven with CBv2 caches therefore silently loses any CUSTOM array mask
+/// (e.g. bidirectional/prefix-LM or padding masks) and any attention
+/// sinks; sinks-bearing or custom-mask models must call `updateAndAttend`
+/// directly instead. A debug assertion rejects array masks here.
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,
@@ -42,11 +52,20 @@ public func attentionWithCacheUpdate(
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
 ) -> MLXArray {
-    // ContinuousBatchingV2: the layer cache owns BOTH the KV update and the
-    // attention computation (including masking — the `mask` parameter is
-    // ignored by design on this path; sinks-bearing models call
-    // `updateAndAttend` directly with their sinks).
+    // ContinuousBatchingV2 hook — see the LIMITATION note above.
     if let v2 = cache as? CBv2AttendingLayerCache {
+        switch mask {
+        case .none, .causal:
+            break  // v2's own position-derived masks subsume these
+        default:
+            assertionFailure(
+                """
+                attentionWithCacheUpdate: a custom array mask was passed with a \
+                CBv2 layer cache (layer \(v2.layerIndex)). CBv2 caches own their \
+                masks and DISCARD this parameter — the model must be v2-adapted \
+                (call updateAndAttend with its own semantics) instead.
+                """)
+        }
         return v2.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
     }

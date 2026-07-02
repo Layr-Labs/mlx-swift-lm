@@ -349,6 +349,52 @@ struct CBv2PagedBackendTests {
         backend.release(state)
     }
 
+    // MARK: - Sink gating
+
+    /// A layer whose kind declares `hasSinks == false` must IGNORE a
+    /// (mistakenly) passed sinks array — the same gate CBv2AttentionV1
+    /// applies — on both the prefill and decode dispatch paths.
+    /// (Deterministic position-coded inputs, NOT the global MLXRandom
+    /// state: Swift Testing runs suites in parallel, and a concurrent test
+    /// advancing the global RNG between runs would break the comparison.)
+    @Test func sinksGatedByLayerKind() throws {
+        let kinds = [fullKind()]
+        #expect(!kinds[0].hasSinks)
+        let garbageSinks = MLXArray(converting: [50.0, 50.0, 50.0, 50.0])
+
+        func coded(_ shape: [Int], seed: Float) -> MLXArray {
+            let count = shape.reduce(1, *)
+            return MLXArray(0 ..< Int32(count)).asType(.float16)
+                .reshaped(shape) * 0.001 + seed
+        }
+
+        func run(sinks: MLXArray?) throws -> (prefill: MLXArray, decode: MLXArray) {
+            let backend = try PagedKVBackend(layerKinds: kinds, config: config())
+            let cache = backend.makeLayerCaches()[0]
+            let state = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: 8, maxLength: 32)
+            defer { backend.release(state) }
+            cache.setRows([state[0]!])
+            let prefill = cache.updateAndAttend(
+                queries: coded([1, 4, 8, 64], seed: 0.3),
+                keys: coded([1, 2, 8, 64], seed: 0.1),
+                values: coded([1, 2, 8, 64], seed: 0.2),
+                scale: 0.125, sinks: sinks)
+            let decode = cache.updateAndAttend(
+                queries: coded([1, 4, 1, 64], seed: 0.6),
+                keys: coded([1, 2, 1, 64], seed: 0.4),
+                values: coded([1, 2, 1, 64], seed: 0.5),
+                scale: 0.125, sinks: sinks)
+            eval(prefill, decode)
+            return (prefill, decode)
+        }
+
+        let with = try run(sinks: garbageSinks)
+        let without = try run(sinks: nil)
+        assertEqualArrays(with.prefill, without.prefill)
+        assertEqualArrays(with.decode, without.decode)
+    }
+
     // MARK: - Device block-table cache identity
 
     /// Regression (cross-request page-table reuse): the device-table cache
