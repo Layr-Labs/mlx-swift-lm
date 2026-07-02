@@ -125,6 +125,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.layerKinds = layerKinds
         let activePrefixCache = schedulerConfig.enablePrefixCache ? prefixCache : nil
         self.prefixCache = activePrefixCache
+        if let violation = Self.prefixCachePairingViolation(
+            backend: backend, prefixCache: activePrefixCache)
+        {
+            preconditionFailure(violation)
+        }
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity, config: admissionConfig)
         self.admission = admission
@@ -143,6 +148,33 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             config: loopConfig,
             gauges: gauges)
         loop.start()
+    }
+
+    /// Structural safety check for the (backend, prefix-cache) pairing,
+    /// enforced by `init` as a precondition: a backend whose donated
+    /// snapshot views reference RECYCLABLE storage
+    /// (`CBv2KVBackend.requiresMaterializedSnapshots`, e.g. the paged
+    /// slabs) must never feed a `PrefixCacheV2` configured with
+    /// `materializeOnDonate: false` — its entries would silently decay
+    /// into other requests' bytes once the donor's pages are recycled.
+    /// Returns the violation description, or nil when the pairing is safe.
+    /// Custom `CBv2PrefixCache` implementations cannot be inspected
+    /// structurally; they own this obligation themselves (see the
+    /// `requiresMaterializedSnapshots` contract doc). Internal so tests
+    /// can assert the rule without tripping the precondition.
+    static func prefixCachePairingViolation(
+        backend: CBv2KVBackend, prefixCache: CBv2PrefixCache?
+    ) -> String? {
+        guard backend.requiresMaterializedSnapshots,
+            let concrete = prefixCache as? PrefixCacheV2,
+            !concrete.config.materializeOnDonate
+        else { return nil }
+        return """
+            EngineV2: \(type(of: backend)) donates snapshot views over recyclable \
+            storage (requiresMaterializedSnapshots), but the prefix cache is \
+            configured with materializeOnDonate: false — cached entries would \
+            reference recycled pages. Use materializeOnDonate: true (the default).
+            """
     }
 
     // MARK: CBv2Engine

@@ -354,4 +354,60 @@ final class CBv2EndToEndTests: XCTestCase {
     func testPrefixCacheRoundTrip_Paged() async throws {
         try await runPrefixCacheRoundTrip(.paged)
     }
+
+    // MARK: (v) Backend / prefix-cache pairing guard
+
+    /// `EngineV2.init` preconditions on `prefixCachePairingViolation`: a
+    /// backend whose donated snapshots reference recyclable storage (paged
+    /// slabs) must never feed a prefix cache with `materializeOnDonate:
+    /// false`. Asserted through the internal validator (a precondition is
+    /// not catchable in-process); construction with a safe pairing is also
+    /// exercised for real.
+    func testPagedBackendRejectsNonMaterializingPrefixCache() throws {
+        let model = makeModel(.paged)
+        let paged: PagedKVBackend
+        do {
+            paged = try PagedKVBackend(
+                layerKinds: model.layerKinds,
+                config: PagedKVPoolConfig(
+                    capacityBytes: 64 << 20, maxPrefillChunk: 64,
+                    nominalMaxSequenceLength: 512))
+        } catch let error as CBv2KVError {
+            throw XCTSkip("paged backend unavailable on this hardware: \(error)")
+        }
+        let contiguous = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 24))
+        XCTAssertTrue(paged.requiresMaterializedSnapshots)
+        XCTAssertFalse(contiguous.requiresMaterializedSnapshots)
+
+        let unsafeCache = PrefixCacheV2(
+            config: .init(blockSize: blockSize, materializeOnDonate: false))
+        let safeCache = PrefixCacheV2(config: .init(blockSize: blockSize))  // default: true
+
+        XCTAssertNotNil(
+            EngineV2.prefixCachePairingViolation(backend: paged, prefixCache: unsafeCache),
+            "paged + materializeOnDonate:false must be rejected at construction")
+        XCTAssertNil(
+            EngineV2.prefixCachePairingViolation(backend: paged, prefixCache: safeCache))
+        XCTAssertNil(EngineV2.prefixCachePairingViolation(backend: paged, prefixCache: nil))
+        XCTAssertNil(
+            EngineV2.prefixCachePairingViolation(backend: contiguous, prefixCache: unsafeCache),
+            "contiguous snapshot views own their buffers via ARC — opt-out stays legal")
+
+        // A safe pairing constructs and shuts down cleanly.
+        let engine = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: paged,
+            cacheProvider: CBv2LayerCacheBank(caches: paged.makeLayerCaches()),
+            sampler: CBv2DefaultSampler(fallbackSeed: 11),
+            detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: CBv2E2ETokenizer()),
+            schedulerConfig: CBv2SchedulerConfig(enablePrefixCache: true),
+            prefixCache: safeCache)
+        let drained = expectation(description: "shutdown")
+        Task {
+            await engine.shutdown()
+            drained.fulfill()
+        }
+        wait(for: [drained], timeout: 10)
+    }
 }

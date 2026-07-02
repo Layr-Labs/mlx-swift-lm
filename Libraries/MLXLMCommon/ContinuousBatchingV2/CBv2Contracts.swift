@@ -218,10 +218,20 @@ public protocol CBv2KVBackend: AnyObject {
     /// (paged backend reserves pages up front so `update` can never fail).
     /// Defaults to `bytesInUse` for backends that do not reserve.
     var bytesReserved: Int { get }
+    /// True when `snapshot()` views over this backend's storage reference
+    /// RECYCLABLE memory (the paged backend's shared slabs: pages return to
+    /// the pool on `release` and are rewritten by later requests). A prefix
+    /// cache fed by such a backend MUST materialize donated snapshots
+    /// before indexing them (`PrefixCacheV2.Config.materializeOnDonate`),
+    /// or cached entries silently decay into other requests' bytes.
+    /// `EngineV2` enforces this pairing at construction. Defaults to false
+    /// (contiguous per-sequence buffers are ARC-owned by their views).
+    var requiresMaterializedSnapshots: Bool { get }
 }
 
 extension CBv2KVBackend {
     public var bytesReserved: Int { bytesInUse }
+    public var requiresMaterializedSnapshots: Bool { false }
 }
 
 public enum CBv2KVError: Error {

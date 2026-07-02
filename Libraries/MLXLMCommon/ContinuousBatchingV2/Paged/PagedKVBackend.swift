@@ -148,6 +148,10 @@ public final class PagedKVBackend: CBv2KVBackend {
     public var bytesCapacity: Int { pool.bytesCapacity }
     /// Admission-relevant bytes (worst-case reservations of live requests).
     public var bytesReserved: Int { pool.bytesReserved }
+    /// Paged snapshots are views over the SHARED slabs; the donor's pages
+    /// are recycled once its state is released, so donated snapshots must
+    /// be device-materialized before the prefix cache indexes them.
+    public var requiresMaterializedSnapshots: Bool { true }
 
     // MARK: - Helpers
 
