@@ -44,6 +44,74 @@ final class CBv2SchedulerLoopTests: XCTestCase {
             "the loser must have gone through requeue-on-capacity")
     }
 
+    /// PR#62 review: request ids are legally reusable after finish, so the
+    /// per-id capacity requeue tally must be cleared on EVERY finish path —
+    /// including the error-finish that exhausted it. Phase 1 exhausts
+    /// `maxCapacityRequeues` for an id (a hog pins the only KV slot for
+    /// more steps than the attempt budget; the victim burns one attempt per
+    /// step). Phase 2 resubmits the SAME id behind a SHORT hog: it must get
+    /// a full requeue window and complete, not inherit the stale tally and
+    /// error-finish on its first transient trip.
+    ///
+    /// Determinism: within one engine, submission order = waiting FCFS
+    /// order = allocation order, so a hog submitted first ALWAYS wins the
+    /// only KV slot and the second request always trips capacityExhausted
+    /// while the hog runs. No sleeps or polling on the contention path.
+    func testReusedIDGetsFreshCapacityRequeueBudget() async throws {
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 8))
+        harness.backend.maxLiveStates = 1
+        let reusedID = CBv2RequestID(9002)
+        func request(_ id: CBv2RequestID, prompt: [Int], maxTokens: Int) -> CBv2Request {
+            CBv2Request(id: id, promptTokens: prompt, maxTokens: maxTokens)
+        }
+
+        // Phase 1 — exhaust the attempt budget: the hog decodes for well
+        // over maxCapacityRequeues steps, so the victim error-finishes
+        // while the hog still holds the only slot.
+        let hogStream = try harness.engine.submit(
+            request(
+                CBv2RequestID(9001), prompt: [3],
+                maxTokens: EngineLoopV2.maxCapacityRequeues * 2 + 50))
+        let victim = await cbv2SchedCollect(
+            try harness.engine.submit(request(reusedID, prompt: [9], maxTokens: 2)))
+        guard case .error(let message)? = victim.finishReason else {
+            XCTFail(
+                "victim must exhaust its requeue budget, got \(String(describing: victim.finishReason))"
+            )
+            return
+        }
+        XCTAssertTrue(message.contains("KV allocation failed"), "unexpected error: \(message)")
+        let hog = await cbv2SchedCollect(hogStream)
+        XCTAssertEqual(hog.finishReason, .length)
+        let drained = await cbv2SchedWait { harness.backend.liveStates == 0 }
+        XCTAssertTrue(drained, "phase 1 KV must be released")
+        let requeuesAfterPhase1 = harness.engine.loopForTesting.capacityRequeueCount
+        XCTAssertEqual(
+            requeuesAfterPhase1, EngineLoopV2.maxCapacityRequeues,
+            "phase 1 must have burned exactly the victim's attempt budget")
+
+        // Phase 2 — reuse the id behind a short hog (well under the attempt
+        // budget). The reused id's first capacityExhausted must REQUEUE
+        // (fresh budget) and the request must complete once the hog frees
+        // the slot — not error-finish off the stale phase-1 tally.
+        let secondHogStream = try harness.engine.submit(
+            request(CBv2RequestID(9003), prompt: [5], maxTokens: 24))
+        let reused = await cbv2SchedCollect(
+            try harness.engine.submit(request(reusedID, prompt: [7], maxTokens: 2)))
+        let secondHog = await cbv2SchedCollect(secondHogStream)
+        await harness.engine.shutdown()
+        XCTAssertEqual(secondHog.finishReason, .length)
+        XCTAssertEqual(
+            reused.finishReason, .length,
+            "reused id must complete with a fresh requeue budget, not inherit the exhausted tally"
+        )
+        XCTAssertGreaterThan(
+            harness.engine.loopForTesting.capacityRequeueCount, requeuesAfterPhase1,
+            "the reused id must actually have tripped capacity and been requeued")
+    }
 
     /// Expected scripted-model generation: prompt's last token + 1, +2, ...
     private func expectedTokens(prompt: [Int], count: Int, vocab: Int = 64) -> [Int] {

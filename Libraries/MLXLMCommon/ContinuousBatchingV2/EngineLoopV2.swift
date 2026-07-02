@@ -1119,6 +1119,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Request completion
 
     private func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+        // Ids are legally reusable after finish: drop the per-id capacity
+        // requeue count on EVERY finish path (including the error-finish
+        // that exhausted it), or a reused id inherits the previous
+        // attempt tally and its first transient KV-capacity trip
+        // error-finishes immediately instead of requeueing (PR#62 review).
+        capacityRequeues.removeValue(forKey: id)
         guard let rec = scheduler.finish(id: id, reason: reason) else {
             // Unknown to the scheduler (already finished) — make sure no
             // stream leaks regardless.
