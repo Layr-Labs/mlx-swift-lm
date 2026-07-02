@@ -393,6 +393,79 @@ final class CBv2CompiledDecodeTests: XCTestCase {
             perModeHits[true]![1], 0, "warm request must adopt a donated prefix")
     }
 
+    /// An eager bank built WITH an attention softcap must veto compiled
+    /// decode (the compiled path has no softcap; silently skipping it would
+    /// drift from eager numerics) even when the compiled config forgot to
+    /// mirror it.
+    func testSoftcappedBankVetoesCompiledDecode() async throws {
+        let model = TinyTestModel.make(seed: 0xC0FFEE)
+        let engine = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
+            cacheProvider: CBv2LayerCacheBank(
+                layerKinds: model.layerKinds, attentionSoftcap: 50),
+            sampler: CBv2DefaultSampler(fallbackSeed: 7),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 8),
+            compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: true))
+        let collected = await cbv2SchedCollect(
+            try engine.submit(
+                request(id: 1, prompt: makePromptTokens(length: 9, seed: 61), maxTokens: 8)))
+        await engine.shutdown()
+        XCTAssertEqual(collected.finishReason, .length)
+        XCTAssertNil(
+            engine.compiledDecodeStats,
+            "softcapped eager caches must veto the compiled path entirely")
+    }
+
+    /// The compiled padding reserve must be carved out of the admission
+    /// ledger (real padded bytes may exceed what token admission budgets),
+    /// and a budget too small for the reserve must refuse to build the
+    /// compiled path rather than over-commit.
+    func testPaddingReserveGatesAdmissionAndBuild() throws {
+        let model = TinyTestModel.make(seed: 0xC0FFEE)
+        let reserve = CBv2CompiledDecode.paddingReserveBytes(
+            layerKinds: model.layerKinds, kvCapacity: 4096,
+            bucketSizes: [1, 2, 4], maxConcurrentRequests: 4)
+        // TinyTestModel: full layer = 2·2·4096·16·4 bytes; window ring =
+        // 2·2·16·16·4 bytes; 4 real rows + 1 scratch lane (bucket 4).
+        let fullPerRow = 2 * 2 * 4096 * 16 * 4
+        let ringPerRow = 2 * 2 * 16 * 16 * 4
+        XCTAssertEqual(reserve, 4 * fullPerRow + 1 * (fullPerRow + ringPerRow))
+
+        // Budget below 2× the reserve ⇒ compiled decode refuses to build.
+        let tight = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: reserve + (1 << 20))),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds),
+            sampler: CBv2DefaultSampler(fallbackSeed: 7),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 8),
+            compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: true))
+        XCTAssertNil(
+            tight.compiledDecodeStats,
+            "a KV budget the padding reserve would halve must refuse the compiled path")
+
+        // Ample budget ⇒ builds, and the admission ledger is reduced by
+        // exactly the reserve while heartbeats keep the hardware truth.
+        let ample = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds),
+            sampler: CBv2DefaultSampler(fallbackSeed: 7),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 8),
+            compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: true))
+        XCTAssertNotNil(ample.compiledDecodeStats)
+        XCTAssertEqual(ample.capacity().kvBytesCapacity, 1 << 28)
+    }
+
     // MARK: - Steady-state discipline (DAR-325 class)
 
     /// A stable chained batch must not rebind lanes per step: rebinds track

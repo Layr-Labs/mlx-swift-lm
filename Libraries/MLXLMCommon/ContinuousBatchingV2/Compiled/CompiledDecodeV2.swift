@@ -115,11 +115,19 @@ public final class CBv2CompiledDecode {
 
     /// Build the compiled-decode executor, or nil when statically
     /// ineligible. `nil` is normal — the engine simply stays eager.
+    ///
+    /// `kvBytesCapacity` is the backend's byte budget: the compiled path
+    /// pads full-attention rows to `kvCapacity` slots (beyond what token
+    /// admission budgets), so a worst-case padding reserve is computed here
+    /// and — when the executor builds — the engine carves it out of the
+    /// admission ledger (`admissionPaddingReserve`). If the reserve would
+    /// eat half the budget, compiled decode refuses to build on this box.
     public static func build(
         model: CBv2SteppableModel,
         layerKinds: [CBv2LayerKind],
         config: CBv2CompiledDecodeConfig,
-        maxConcurrentRequests: Int
+        maxConcurrentRequests: Int,
+        kvBytesCapacity: Int = .max
     ) -> CBv2CompiledDecode? {
         guard config.enabled else { return nil }
         guard CBv2CompiledDecodeConfig.envEnabled else { return nil }
@@ -140,17 +148,68 @@ public final class CBv2CompiledDecode {
             .sorted()
         guard !buckets.isEmpty else { return nil }
         guard !layerKinds.isEmpty else { return nil }
+        let reserve = paddingReserveBytes(
+            layerKinds: layerKinds, kvCapacity: config.kvCapacity,
+            bucketSizes: buckets, maxConcurrentRequests: maxConcurrentRequests)
+        guard reserve <= kvBytesCapacity / 2 else {
+            log.info(
+                "CBv2 compiled decode skipped: padding reserve \(reserve >> 20) MiB exceeds half of the \(kvBytesCapacity >> 20) MiB KV budget (lower kvCapacity or raise the budget)"
+            )
+            return nil
+        }
         return CBv2CompiledDecode(
-            model: model, layerKinds: layerKinds, config: config, bucketSizes: buckets)
+            model: model, layerKinds: layerKinds, config: config, bucketSizes: buckets,
+            admissionPaddingReserve: reserve)
     }
+
+    /// Worst-case EXTRA bytes the compiled path may hold beyond what token
+    /// admission budgets: every concurrent request's full-attention buffers
+    /// padded to `kvCapacity` slots, plus scratch lanes (full padding AND
+    /// window rings — scratch rows are invisible to admission entirely).
+    /// 4 bytes/element worst case: GPT-OSS full-attention layers cache fp32
+    /// K/V. Deliberately conservative — the reserve is subtracted from the
+    /// admission ledger so real usage can never silently exceed the
+    /// backend's byte budget (review P1).
+    static func paddingReserveBytes(
+        layerKinds: [CBv2LayerKind], kvCapacity: Int,
+        bucketSizes: [Int], maxConcurrentRequests: Int
+    ) -> Int {
+        let bytesPerElement = 4
+        var fullPerRow = 0
+        var windowedPerRow = 0
+        for kind in layerKinds where kind.sharesKVWithLayer == nil {
+            switch kind.attention {
+            case .full:
+                fullPerRow += 2 * kind.kvHeads * kvCapacity * kind.headDim * bytesPerElement
+            case .slidingWindow(let window):
+                windowedPerRow += 2 * kind.kvHeads * window * kind.headDim * bytesPerElement
+            }
+        }
+        // Padded lanes a bucket can hold beyond the smallest batch it
+        // serves (B in (prevBucket, size] ⇒ up to size - prev - 1 scratch).
+        var scratchLanes = 0
+        var previous = 0
+        for size in bucketSizes {
+            scratchLanes += max(0, size - previous - 1)
+            previous = size
+        }
+        return maxConcurrentRequests * fullPerRow
+            + scratchLanes * (fullPerRow + windowedPerRow)
+    }
+
+    /// Worst-case padding bytes the engine must carve out of the admission
+    /// ledger while this executor exists (see `paddingReserveBytes`).
+    public let admissionPaddingReserve: Int
 
     private init(
         model: CBv2SteppableModel, layerKinds: [CBv2LayerKind],
-        config: CBv2CompiledDecodeConfig, bucketSizes: [Int]
+        config: CBv2CompiledDecodeConfig, bucketSizes: [Int],
+        admissionPaddingReserve: Int
     ) {
         self.model = model
         self.layerKinds = layerKinds
         self.config = config
+        self.admissionPaddingReserve = admissionPaddingReserve
         var windowSet = Set<Int>()
         for kind in layerKinds where kind.sharesKVWithLayer == nil {
             if case .slidingWindow(let window) = kind.attention { windowSet.insert(window) }
@@ -190,14 +249,15 @@ public final class CBv2CompiledDecode {
                 let bucket = try withError { try traceBucket(size: size) }
                 let seconds = CFAbsoluteTimeGetCurrent() - started
                 mutateStats { $0.warmup.append((bucket: size, seconds: seconds)) }
+                // Drop this bucket's throwaway scratch before tracing the
+                // next one: warmup's transient footprint stays bounded by
+                // a single bucket's lanes.
+                releaseAllLanes(bucket)
                 buckets.append(bucket)
                 log.info(
                     "CBv2 compiled decode: bucket \(size) traced in \(String(format: "%.2f", seconds))s"
                 )
             }
-            // Warmup bound every lane to throwaway scratch; drop it so the
-            // memory is returned. First real steps rebind.
-            for bucket in buckets { releaseAllLanes(bucket) }
             state = .ready
         } catch {
             let reason = "trace failed: \(error)"
