@@ -33,6 +33,18 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     private var pagedRows: [PagedSequenceKV] = []
 
+    // Per-row absolute RoPE offsets `[B]` (int32, device array). REBUILT from
+    // host integers only on membership changes (`setRows`); ADVANCED
+    // on-device (`+ L`) inside `updateAndAttend`, mirroring `CBv2LayerCache`.
+    // The step loop therefore never uploads a fresh host array per layer per
+    // step, and never syncs — the model reads this each step and feeds it
+    // into the forward graph, which the step's `asyncEval` collapses so the
+    // lazy `+ L` chain cannot grow O(steps).
+    private var cachedPositionOffsets: MLXArray = MLXArray([] as [Int32])
+    /// Times `positionOffsets` was rebuilt from host integers (test hook);
+    /// must only move on batch membership changes, never inside the step loop.
+    private(set) var positionOffsetsHostRebuilds = 0
+
     // Device block-table cache: rebuilt only when a row's page table
     // changes (page allocated / rollback / composition change), not on
     // every step. Fingerprinted by the pool-issued row SERIAL (never
@@ -84,10 +96,20 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 "row group \(paged.groupKey) does not match layer kind")
             return paged
         }
+        rebuildPositionOffsets()
     }
 
-    public var positionOffsets: MLXArray {
-        MLXArray(pagedRows.map { Int32($0.absoluteOffset) })
+    /// Per-row absolute RoPE offsets `[B]` (device int32). Read BEFORE
+    /// `updateAndAttend` for the step — it holds the PRE-update offsets of
+    /// the tokens about to be processed (snapshot semantics). KV-shared
+    /// layers own no rows, so their own value is empty (they reuse the
+    /// source layer's pre-update capture).
+    public var positionOffsets: MLXArray { cachedPositionOffsets }
+
+    private func rebuildPositionOffsets() {
+        positionOffsetsHostRebuilds += 1
+        CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
+        cachedPositionOffsets = MLXArray(pagedRows.map { Int32($0.absoluteOffset) })
     }
 
     // MARK: - Attention
@@ -104,12 +126,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // CBv2AttentionV1) — a sink-free layer must ignore a passed array.
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
+        let output: MLXArray
         if l == 1 {
             // Decode: reserve each row's destination host-side; the kernel
             // writes the tiles IN PLACE before attending (fused write —
             // the slabs are never versioned through MLX ops).
             let targets = pagedRows.map { $0.prepareDecodeWrite() }
-            return dispatchDecode(
+            output = dispatchDecode(
                 queries: queries,
                 newKeys: keys.squeezed(axis: 2),
                 newValues: values.squeezed(axis: 2),
@@ -119,9 +142,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             precondition(b == 1, "prefill chunks are per-request [1, chunk]")
             let row = pagedRows[0]
             row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
-            return prefillAttend(
+            output = prefillAttend(
                 queries: queries, row: row, scale: scale, sinks: effectiveSinks)
         }
+        // Advance offsets ON-DEVICE (uniform L for every row in the call:
+        // decode is [B,1], prefill is [1,chunk]) — the rows just advanced
+        // their absolute counters by exactly L, so the cached device array
+        // tracks them without a per-step host rebuild.
+        cachedPositionOffsets = cachedPositionOffsets + Int32(l)
+        return output
     }
 
     public func attendBorrowing(
@@ -175,7 +204,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             let (start, length) = row.decodeAttendRange
             info.append(Int32(start))
             info.append(Int32(length))
-            info.append(Int32(row.table.count))
+            // Windowed rows report the FULL ring length, not table.count —
+            // a partially-allocated ring (prefix-adopted row) would else
+            // wrap at the wrong divisor and alias wrong pages (Codex P2).
+            info.append(Int32(row.decodeTableLength))
             if let targets = writeTargets {
                 info.append(targets[i].page)
                 info.append(Int32(targets[i].slot))
@@ -331,8 +363,11 @@ extension PagedLayerCache: KVCache {
     }
 
     /// The paged slabs are pool-owned persistent buffers; per-step writes
-    /// are materialized transitively by the engine's step asyncEval.
-    public func innerState() -> [MLXArray] { [] }
+    /// are materialized transitively by the engine's step asyncEval. The
+    /// on-device `positionOffsets` advance chain is surfaced here (same
+    /// convention as `CBv2LayerCache.innerState`) so it rides the step's
+    /// eval set and cannot grow O(steps).
+    public func innerState() -> [MLXArray] { [cachedPositionOffsets] }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError(

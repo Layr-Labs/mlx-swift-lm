@@ -13,11 +13,17 @@
 // throw `CBv2KVError.backendIneligible` before any request is admitted.
 // Attention sinks ARE supported (they are a kernel parameter here).
 //
-// Admission model: `makeSequenceState` reserves the worst-case page count
-// for the request's `maxLength` and throws `capacityExhausted` when the
-// pool cannot honor it. Physical pages materialize lazily as tokens are
-// written (`bytesInUse` stays truthful); `CBv2SequenceKV.update` therefore
-// never fails mid-decode. See PagedKVPool.swift for the rationale.
+// Admission model: the worst-case page count for a request's `maxLength`
+// is reserved UP FRONT — at admission via `reserve(layerKinds:maxLength:)`,
+// or (when no admission-time reservation was taken) lazily by
+// `makeSequenceState`, which reconciles against any prior reservation so the
+// pages are charged exactly once. `reserve` throws `capacityExhausted` when
+// the pool cannot honor the demand, so an admission controller can reject or
+// queue a request that would otherwise fail at materialization (Codex P2:
+// several same-step admissions must not over-commit the pool). Physical
+// pages materialize lazily as tokens are written (`bytesInUse` stays
+// truthful); `CBv2SequenceKV.update` therefore never fails mid-decode. See
+// PagedKVPool.swift for the rationale.
 
 import Foundation
 import MLX
@@ -69,14 +75,53 @@ public final class PagedKVBackend: CBv2KVBackend {
         self.pool = try PagedKVPool(layerKinds: layerKinds, config: config)
     }
 
+    // MARK: - Admission-time reservation (Codex P2)
+
+    /// Reserve the worst-case page demand for a request of `maxLength` tokens
+    /// BEFORE it is admitted, so several same-step admissions cannot
+    /// over-commit the pool. Charges the pool up front (reflected in
+    /// `bytesReserved`) and throws `capacityExhausted` when it cannot fit —
+    /// the admission controller then rejects or queues the request instead of
+    /// accepting one that would only fail at `makeSequenceState`.
+    ///
+    /// A subsequent `makeSequenceState` for the SAME request must be told the
+    /// pages are already held (`reserved: true`) so it does not double-charge;
+    /// `release`/`makeSequenceState(adopting:)`/finish balance the hold via
+    /// the per-row `reservedPages` bookkeeping exactly once. Balance an
+    /// admission that never materializes with `unreserve(layerKinds:maxLength:)`.
+    public func reserve(layerKinds: [CBv2LayerKind], maxLength: Int) throws {
+        precondition(maxLength > 0)
+        try pool.reserve(pageNeeds(layerKinds: layerKinds, maxLength: maxLength))
+    }
+
+    /// Release an admission-time `reserve` that never reached
+    /// `makeSequenceState` (rejected, superseded, or shut down).
+    public func unreserve(layerKinds: [CBv2LayerKind], maxLength: Int) {
+        pool.unreserve(pageNeeds(layerKinds: layerKinds, maxLength: maxLength))
+    }
+
     // MARK: - CBv2KVBackend
 
     public func makeSequenceState(
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
+        try makeSequenceState(
+            layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength,
+            reserved: false)
+    }
+
+    /// `reserved: true` skips the pool reservation because `reserve(...)`
+    /// already charged the pages at admission — the per-row `reservedPages`
+    /// still governs allocation and `release` still unreserves them, so the
+    /// hold is charged and released exactly once.
+    public func makeSequenceState(
+        layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int, reserved: Bool
+    ) throws -> [CBv2SequenceKV?] {
         precondition(maxLength >= promptLength && maxLength > 0)
         let needs = pageNeeds(layerKinds: layerKinds, maxLength: maxLength)
-        try pool.reserve(needs)
+        if !reserved {
+            try pool.reserve(needs)
+        }
         var states: [CBv2SequenceKV?] = []
         states.reserveCapacity(layerKinds.count)
         for kind in layerKinds {

@@ -232,6 +232,25 @@ public final class PagedSequenceKV: CBv2SequenceKV {
             group: groupKey, pages: pages, firstSlot: start % s, count: count)
     }
 
+    /// Modular table length the decode kernel divides by to resolve a
+    /// logical page to a physical one (`phys = table[logicalPage % len]`).
+    ///
+    /// WINDOWED rows MUST report the FULL ring length, never `table.count`.
+    /// Pages are placed at `logicalPage % ringPages` (`ensurePage`), but the
+    /// physical table is grown LAZILY only up to the slots the writes/replay
+    /// touched. A prefix-adopted row (`fastForward` then a trailing replay
+    /// that covers less than the ring) can leave `table.count < ringPages`;
+    /// feeding that as the divisor makes the kernel wrap at the wrong length
+    /// and alias the WRONG physical pages during decode. The ring length is
+    /// the divisor the writes used, so it is the only correct divisor.
+    /// Every position the decode actually attends was written, so its ring
+    /// slot (`< table.count`) is allocated — the larger divisor never indexes
+    /// an unallocated slot.
+    ///
+    /// FULL rows keep `table.count` (identity modulo: `table.count` already
+    /// exceeds every logical page a full row can reach).
+    var decodeTableLength: Int { ringPages ?? table.count }
+
     /// Kernel-facing row descriptor for decode: the absolute range the
     /// current query may attend to, plus the (modular) table length.
     /// All plain Swift Int math — never a device sync.

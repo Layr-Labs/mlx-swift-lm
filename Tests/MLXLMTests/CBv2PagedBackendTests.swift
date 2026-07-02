@@ -449,4 +449,179 @@ struct CBv2PagedBackendTests {
         )
         backend.release(stateB)
     }
+
+    // MARK: - Admission-time page reservation (Codex P2)
+
+    /// Reserving worst-case pages UP FRONT means several same-step admissions
+    /// cannot over-commit the pool: the excess reservation throws before any
+    /// request is accepted, and `bytesReserved` never exceeds capacity.
+    @Test func admissionReservationCannotOvercommitPool() throws {
+        let kinds = [fullKind()]  // one group, kv2 x d64
+        // Pool sized for exactly 2 requests of maxLength 128 (8 pages each).
+        let perRequestPages = PagedKVPool.pageDemand(
+            kind: kinds[0], maxLength: 128,
+            config: config(nominalMaxLen: 128))
+        let pageBytes = 2 * 2 * 16 * 64 * 2
+        let backend = try PagedKVBackend(
+            layerKinds: kinds,
+            config: config(capacityBytes: pageBytes * (perRequestPages * 2), nominalMaxLen: 128))
+        #expect(backend.bytesReserved == 0)
+
+        try backend.reserve(layerKinds: kinds, maxLength: 128)
+        try backend.reserve(layerKinds: kinds, maxLength: 128)
+        #expect(backend.bytesReserved <= backend.bytesCapacity)
+        let reservedAtCap = backend.bytesReserved
+
+        // The third same-step admission cannot fit — it must throw, not
+        // over-commit the pool.
+        #expect(throws: CBv2KVError.self) {
+            try backend.reserve(layerKinds: kinds, maxLength: 128)
+        }
+        #expect(backend.bytesReserved == reservedAtCap, "failed reserve leaves no partial state")
+
+        // A pre-reserved request materializes WITHOUT double-charging, and
+        // release returns exactly what admission held.
+        let state = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 0, maxLength: 128, reserved: true)
+        #expect(backend.bytesReserved == reservedAtCap, "materialization must not re-charge")
+        backend.release(state)
+        backend.unreserve(layerKinds: kinds, maxLength: 128)  // release the 2nd hold
+        #expect(backend.bytesReserved == 0, "every hold balanced")
+    }
+
+    // MARK: - position offsets: device-cached, membership-gated (Codex P2)
+
+    private func decodeQKV(queryHeads: Int, kvHeads: Int, dim: Int, tokens: Int)
+        -> (q: MLXArray, k: MLXArray, v: MLXArray)
+    {
+        (
+            MLXRandom.normal([1, queryHeads, tokens, dim], dtype: .float16),
+            MLXRandom.normal([1, kvHeads, tokens, dim], dtype: .float16),
+            MLXRandom.normal([1, kvHeads, tokens, dim], dtype: .float16)
+        )
+    }
+
+    @Test func positionOffsetsAdvanceOnDeviceWithoutHostRebuild() throws {
+        let kind = fullKind()
+        let backend = try PagedKVBackend(layerKinds: [kind], config: config())
+        let cache = backend.makeLayerCaches()[0]
+        let scale = 1.0 / Float(kind.headDim).squareRoot()
+
+        let state = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 512)
+        defer { backend.release(state) }
+        cache.setRows([state[0]!])
+        #expect(cache.positionOffsetsHostRebuilds == 1, "setRows rebuilds once")
+
+        // Prefill chunk of 4 tokens: offset 0 -> 4 on device, no host rebuild.
+        let pf = decodeQKV(queryHeads: kind.queryHeads, kvHeads: kind.kvHeads, dim: kind.headDim, tokens: 4)
+        _ = cache.updateAndAttend(queries: pf.q, keys: pf.k, values: pf.v, scale: scale, sinks: nil)
+        #expect(cache.positionOffsetsHostRebuilds == 1)
+        #expect(cache.positionOffsets.item(Int32.self) == 4)
+
+        // 20 decode steps: offsets advance on device, counter stays 1.
+        for _ in 0 ..< 20 {
+            let d = decodeQKV(
+                queryHeads: kind.queryHeads, kvHeads: kind.kvHeads, dim: kind.headDim, tokens: 1)
+            _ = cache.updateAndAttend(queries: d.q, keys: d.k, values: d.v, scale: scale, sinks: nil)
+        }
+        #expect(cache.positionOffsetsHostRebuilds == 1, "decode loop must not host-rebuild offsets")
+        #expect(cache.positionOffsets.item(Int32.self) == 24, "4 prefill + 20 decode tokens")
+
+        // A batch membership change rebuilds from host truth.
+        let state2 = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 512)
+        defer { backend.release(state2) }
+        cache.setRows([state[0]!, state2[0]!])
+        #expect(cache.positionOffsetsHostRebuilds == 2, "membership change rebuilds")
+    }
+
+    // MARK: - windowed adoption decode-table length (Codex P2)
+
+    private func assertClose(
+        _ got: MLXArray, _ want: MLXArray, rtol: Float = 1e-2, atol: Float = 2e-3,
+        sourceLocation: SourceLocation = #_sourceLocation
+    ) {
+        #expect(got.shape == want.shape, sourceLocation: sourceLocation)
+        let ok = allClose(
+            got.asType(.float32), want.asType(.float32), rtol: Double(rtol), atol: Double(atol)
+        ).item(Bool.self)
+        if !ok {
+            let diff = abs(got.asType(.float32) - want.asType(.float32)).max().item(Float.self)
+            Issue.record("arrays differ, max abs err \(diff)", sourceLocation: sourceLocation)
+        }
+    }
+
+    /// A prefix-adopted windowed row whose trailing replay covers LESS than
+    /// the ring leaves `table.count < ringPages`. The decode kernel must
+    /// divide logical pages by the RING length, not `table.count`, or it
+    /// wraps at the wrong divisor and reads the wrong physical pages — decode
+    /// then diverges from a fresh-prefill reference. Token-exact regression.
+    @Test func windowedAdoptionUsesRingLengthForDecodeTable() throws {
+        let window = 32
+        let kind = windowedKind(window, headDim: 64, kvHeads: 2, queryHeads: 4)
+        let dim = kind.headDim
+        let heads = kind.kvHeads
+        let scale = 1.0 / Float(dim).squareRoot()
+        // pageSize 16, maxPrefillChunk 16 ⇒ ring = (32+16)/16 + 1 = 4 pages.
+        let backend = try PagedKVBackend(
+            layerKinds: [kind],
+            config: config(capacityBytes: 32 << 20, maxPrefillChunk: 16, nominalMaxLen: 4096))
+        let ring = PagedKVPool.ringPageCount(window: window, config: backend.pool.config)
+        #expect(ring == 4)
+
+        // Deterministic position-coded K/V so a mis-resolved page is visible:
+        // every absolute position gets a distinct vector.
+        func coded(_ positions: Range<Int>) -> (MLXArray, MLXArray) {
+            let n = positions.count
+            var kflat = [Float](repeating: 0, count: heads * n * dim)
+            var vflat = [Float](repeating: 0, count: heads * n * dim)
+            var i = 0
+            for h in 0 ..< heads {
+                for p in positions {
+                    for d in 0 ..< dim {
+                        kflat[i] = Float(p % 97) * 0.01 + Float(d) * 0.001 + Float(h) * 0.1
+                        vflat[i] = Float(p % 97) * 0.02 - Float(d) * 0.0005 + Float(h) * 0.05
+                        i += 1
+                    }
+                }
+            }
+            return (
+                MLXArray(kflat, [heads, n, dim]).asType(.float16),
+                MLXArray(vflat, [heads, n, dim]).asType(.float16)
+            )
+        }
+
+        // Adopt at position 64 (logical page 4), replay [64, 96): logical
+        // pages 4,5 → ring slots 0,1 ⇒ table.count = 2 (slot 3 never touched).
+        let cache = backend.makeLayerCaches()[0]
+        let state = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 4096)
+        defer { backend.release(state) }
+        let row = state[0] as! PagedSequenceKV
+        row.fastForward(to: 64)
+        for chunkStart in stride(from: 64, to: 96, by: 16) {
+            let (ck, cv) = coded(chunkStart ..< chunkStart + 16)
+            row.write(keys: ck, values: cv)
+        }
+        #expect(row.table.count < ring, "replay must leave the ring partially allocated")
+        #expect(row.decodeTableLength == ring, "windowed decode must divide by the ring length")
+        cache.setRows([row])
+
+        // Decode at position 96: window [65, 96].
+        let q = MLXRandom.normal([1, kind.queryHeads, 1, dim], dtype: .float16)
+        let (nk, nv) = coded(96 ..< 97)
+        let out = cache.updateAndAttend(
+            queries: q,
+            keys: nk.expandedDimensions(axis: 0),
+            values: nv.expandedDimensions(axis: 0),
+            scale: scale, sinks: nil)
+
+        // Reference: attention over the true window [65, 96].
+        let (wk, wv) = coded(65 ..< 97)
+        let reference = PagedAttentionReference.composedAttention(
+            queries: q, keys: wk.expandedDimensions(axis: 0),
+            values: wv.expandedDimensions(axis: 0), scale: scale)
+        assertClose(out, reference)
+    }
 }
