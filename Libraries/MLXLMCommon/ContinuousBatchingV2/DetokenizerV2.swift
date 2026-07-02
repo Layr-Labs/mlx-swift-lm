@@ -62,10 +62,17 @@ public final class DetokenizerV2 {
         let emitted = emit(upTo: stable)
 
         // Restart the segment at clean boundaries so decode cost stays
-        // bounded. Only when nothing is held back (stable == decoded).
+        // bounded. BOTH triggers (newline, maxSegmentTokens) sit inside the
+        // clean-boundary guard: the first two conditions require that no
+        // bytes are held back (`stable == decoded`) and everything stable
+        // was emitted — a restart while a multi-byte sequence straddles the
+        // boundary would record its U+FFFD decode as "already emitted" and
+        // the completing token's real bytes would never be released. The
+        // `maxSegmentTokens` cap is therefore SOFT: it defers past the limit
+        // until the holdback clears (PR#62 review).
         if stable.count == decoded.count,
             stable.count == emittedBytes,
-            decoded.last == UInt8(ascii: "\n") || segmentTokens.count >= maxSegmentTokens
+            (decoded.last == UInt8(ascii: "\n") || segmentTokens.count >= maxSegmentTokens)
         {
             startNewSegment()
         }

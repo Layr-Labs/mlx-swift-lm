@@ -670,6 +670,33 @@ final class CBv2SamplingDetokenizerTests: XCTestCase {
         XCTAssertEqual(text, String(repeating: "ab中 ", count: 20))
     }
 
+    /// PR#62 review: reaching `maxSegmentTokens` on a token that leaves an
+    /// incomplete UTF-8 sequence held back must NOT restart the segment —
+    /// a restart there would record the last token's U+FFFD decode as
+    /// already emitted and the completing token's real bytes would never be
+    /// released. The cap is soft: the restart defers until the holdback
+    /// clears.
+    func testMultiByteCharStraddlingSegmentLimitEmitsNoReplacementChar() {
+        // "€" = E2 82 AC split 2+1; the incomplete [E2 82] token arrives
+        // exactly at maxSegmentTokens (2, the floor).
+        let tokenizer = ByteStubTokenizer(table: [
+            0: Array("a".utf8), 1: [0xE2, 0x82], 2: [0xAC], 3: Array("b".utf8),
+        ])
+        let detok = DetokenizerV2(tokenizer: tokenizer, maxSegmentTokens: 2)
+        var chunks = [String]()
+        for token in [0, 1, 2, 3] { chunks.append(detok.append(token)) }
+        chunks.append(detok.flush())
+
+        for chunk in chunks {
+            XCTAssertFalse(
+                chunk.contains("\u{fffd}"),
+                "segment-cap restart leaked a replacement char: \(chunks)")
+        }
+        XCTAssertEqual(chunks[1], "", "incomplete € bytes held back across the segment cap")
+        XCTAssertEqual(chunks[2], "€", "the completing token must release the character")
+        XCTAssertEqual(chunks.joined(), "a€b", "byte-exact despite the straddling restart")
+    }
+
     func testGenuineReplacementCharSurvivesToFlush() {
         // A token whose bytes ARE a replacement char (EF BF BD) is held
         // (indistinguishable from an incomplete sequence) and released once
