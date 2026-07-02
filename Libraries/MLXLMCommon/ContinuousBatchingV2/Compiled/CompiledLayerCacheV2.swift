@@ -104,6 +104,17 @@ final class CBv2CompiledLayerCache: CBv2AttendingLayerCache {
         }
     }
 
+    /// Drop a lane's buffer references (row finished/preempted) so a
+    /// retired request's padded buffers are not kept alive by this bucket.
+    /// The lane MUST be rebound before the next compiled call (the
+    /// orchestrator marks it unbound).
+    func clearLane(_ lane: Int) {
+        guard kind.sharesKVWithLayer == nil, lane < laneKeys.count else { return }
+        let placeholder = MLXArray(Int32(0))
+        laneKeys[lane] = placeholder
+        laneValues[lane] = placeholder
+    }
+
     // MARK: - CBv2AttendingLayerCache
 
     /// Lane binding replaces row binding here; the engine's eager providers

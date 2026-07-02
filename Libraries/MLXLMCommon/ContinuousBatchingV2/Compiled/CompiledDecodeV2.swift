@@ -458,8 +458,31 @@ public final class CBv2CompiledDecode {
     }
 
     private func releaseAllLanes(_ bucket: Bucket) {
-        bucket.bound = Array(repeating: .unbound, count: bucket.size)
-        bucket.boundRows = Array(repeating: nil, count: bucket.size)
+        for lane in 0 ..< bucket.size { clearLane(bucket, lane: lane) }
+    }
+
+    private func clearLane(_ bucket: Bucket, lane: Int) {
+        for cache in bucket.caches { cache.clearLane(lane) }
+        bucket.counters.bind(lane: lane, offset: 0)
+        bucket.bound[lane] = .unbound
+        bucket.boundRows[lane] = nil
+    }
+
+    /// Release any lane bindings referencing this retired row state so its
+    /// (padded) buffers are not kept alive by an idle bucket. Called by the
+    /// engine loop wherever KV state is released (finish, cancel,
+    /// preemption). The in-flight step's graph holds its own references, so
+    /// clearing immediately is safe even for fenced releases.
+    public func forgetRows(_ state: [CBv2SequenceKV?]) {
+        guard let anchor = state.compactMap({ $0 }).first else { return }
+        let identity = ObjectIdentifier(anchor)
+        for bucket in buckets {
+            for lane in 0 ..< bucket.size {
+                if case .row(let bound) = bucket.bound[lane], bound == identity {
+                    clearLane(bucket, lane: lane)
+                }
+            }
+        }
     }
 
     private func recordFallback(_ reason: String) {

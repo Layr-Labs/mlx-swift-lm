@@ -600,6 +600,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // prefix credit no longer describes work that was skipped.
                 prefixHitTokens.removeValue(forKey: id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
+                compiledDecode?.forgetRows(state)
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
                         (id: id, state: state, rollbackOne: false, donation: nil))
@@ -915,6 +916,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         capacity?.releaseAll(id: id)
 
         if let state = kvStates.removeValue(forKey: id) {
+            compiledDecode?.forgetRows(state)
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.participants.contains(id) {
                 // The in-flight step still references this state — fence the
@@ -1080,6 +1082,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // usage.prefixCacheHitTokens must not over-credit at finish.
             prefixHitTokens.removeValue(forKey: id)
             if let state = kvStates.removeValue(forKey: id) {
+                compiledDecode?.forgetRows(state)
                 backend.release(state)
             }
         }
