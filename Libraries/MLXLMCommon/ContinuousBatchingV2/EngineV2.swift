@@ -9,6 +9,9 @@
 
 import Foundation
 import MLX
+import os
+
+private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
 
 // MARK: - Shared gauges (submit-side admission ⇄ engine-thread truth)
 
@@ -115,6 +118,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public var compiledDecodeStats: CBv2CompiledDecodeStats? { loop.compiledDecode?.stats }
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
+    /// Internal test hook: the admission ledger, for asserting the compiled
+    /// padding reserve is charged (or not) at construction.
+    var admissionForTesting: AdmissionV2 { admission }
 
     public init(
         model: CBv2SteppableModel,
@@ -143,8 +149,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // the engine queue, replayed for eligible pure-decode steps, eager
         // fallback everywhere else. nil when statically ineligible —
         // including when the eager layer caches carry an attention softcap
-        // the compiled path cannot reproduce (numerics guard), or when the
-        // padding reserve would eat too much of the KV byte budget.
+        // the compiled path cannot reproduce (numerics guard), when the
+        // padding reserve would eat too much of the KV byte budget, or when
+        // the backend mints rows the compiled path cannot bind (quantized
+        // KV, paged slabs — see `producesCompiledDecodeEligibleRows`).
         var effectiveCompiledConfig = compiledDecodeConfig
         var softcapVeto = false
         if effectiveCompiledConfig.attentionSoftcap == nil {
@@ -160,8 +168,22 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 softcapVeto = true
             }
         }
+        // Backend row-type veto (PR#62 review): the compiled path can only
+        // bind CBv2FullSequenceKV/CBv2WindowedSequenceKV rows. A backend
+        // that mints anything else (contiguous with KV quantization, paged
+        // slabs) would still warm the compiled graphs against fp16 scratch
+        // and charge the admission padding reserve — then laneInfo rejects
+        // every LIVE row, every step falls back eager, and the reserve
+        // permanently tightens admission for zero benefit. Skip the build
+        // entirely: nil executor, no reserve, stay eager.
+        let backendVeto = !backend.producesCompiledDecodeEligibleRows
+        if backendVeto, effectiveCompiledConfig.enabled, CBv2CompiledDecodeConfig.envEnabled {
+            log.info(
+                "CBv2 compiled decode skipped: \(type(of: backend), privacy: .public) mints rows the compiled path cannot bind (e.g. quantized KV) — staying eager, no padding reserve"
+            )
+        }
         let compiledDecode: CBv2CompiledDecode? =
-            softcapVeto
+            (softcapVeto || backendVeto)
             ? nil
             : CBv2CompiledDecode.build(
                 model: model, layerKinds: layerKinds, config: effectiveCompiledConfig,

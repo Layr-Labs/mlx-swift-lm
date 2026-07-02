@@ -49,6 +49,13 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     public let config: CBv2ContiguousBackendConfig
 
+    /// Compiled [B, 1] decode can bind the fp16 rows this backend mints
+    /// (`CBv2FullSequenceKV` / `CBv2WindowedSequenceKV`) — but NOT the
+    /// `CBv2QuantizedSequenceKV` rows a quantized config produces for
+    /// full-attention layers, so a quantized backend must veto the compiled
+    /// build (no warmup, no admission padding reserve — PR#62 review).
+    public var producesCompiledDecodeEligibleRows: Bool { config.quantization == nil }
+
     private let lock = NSLock()
     private var live: [ObjectIdentifier: CBv2SequenceKV] = [:]
     /// Admission reservation per live row (estimated initial bytes),

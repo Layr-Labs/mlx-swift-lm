@@ -274,33 +274,67 @@ final class CBv2CompiledDecodeTests: XCTestCase {
             label: "oversized allocation")
     }
 
-    /// Quantized-KV rows are never eligible; the engine must stay eager and
-    /// record the fallback (token parity with the unquantized eager run is
-    /// NOT expected — quantization changes numerics — so only behavior is
-    /// asserted here).
-    func testQuantizedRowsStayEager() async throws {
+    /// Quantized-KV rows can never take the compiled path, so the engine
+    /// must VETO the compiled build up front (PR#62 review): previously it
+    /// built + warmed against fp16 scratch, charged the admission padding
+    /// reserve, and then `laneInfo` rejected every LIVE quantized row —
+    /// permanent eager fallback with a permanently tighter admission
+    /// ceiling for zero benefit. Asserts: no executor, no reserve (ceiling
+    /// identical to a no-compiled engine), eager decode still completes.
+    /// (Token parity with the unquantized run is NOT expected —
+    /// quantization changes numerics — so only behavior is asserted here.)
+    func testQuantizedBackendVetoesCompiledBuildAndReserve() async throws {
         // headDim 64: the quantized cache requires headDim divisible by a
         // supported group size.
         let model = TinyTestModel.make(seed: 0xC0FFEE, headDim: 64, fullAttentionOnly: true)
-        let engine = EngineV2(
-            model: model,
-            layerKinds: model.layerKinds,
-            backend: CBv2ContiguousKVBackend(
-                config: .init(bytesCapacity: 1 << 28, quantization: (groupSize: 32, bits: 8))),
-            cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds),
-            sampler: CBv2DefaultSampler(fallbackSeed: 7),
-            schedulerConfig: CBv2SchedulerConfig(
-                maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
-                prefillChunkSize: 16, maxWaiting: 8),
-            compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: true))
+        func makeEngine(quantized: Bool, compiled: Bool) -> EngineV2 {
+            EngineV2(
+                model: model,
+                layerKinds: model.layerKinds,
+                backend: CBv2ContiguousKVBackend(
+                    config: .init(
+                        bytesCapacity: 1 << 28,
+                        quantization: quantized ? (groupSize: 32, bits: 8) : nil)),
+                cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds),
+                sampler: CBv2DefaultSampler(fallbackSeed: 7),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
+                    prefillChunkSize: 16, maxWaiting: 8),
+                compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: compiled))
+        }
+        let quantizedCompiled = makeEngine(quantized: true, compiled: true)
+        let quantizedEager = makeEngine(quantized: true, compiled: false)
+        let fp16Compiled = makeEngine(quantized: false, compiled: true)
+
+        // The veto: no executor at all — not a built executor that stays
+        // `.ready` while falling back on every step.
+        XCTAssertNil(
+            quantizedCompiled.compiledDecodeStats,
+            "quantized-KV backend must veto the compiled build entirely")
+        XCTAssertNotNil(
+            fp16Compiled.compiledDecodeStats,
+            "control: the fp16 backend must still build the compiled path")
+
+        // No padding reserve: the admission ceiling matches a no-compiled
+        // engine exactly…
+        XCTAssertEqual(
+            quantizedCompiled.admissionForTesting.admissibleBytesCapacity,
+            quantizedEager.admissionForTesting.admissibleBytesCapacity,
+            "vetoed compiled decode must not charge the admission padding reserve")
+        // …while an eligible fp16 engine really does carve one out.
+        XCTAssertLessThan(
+            fp16Compiled.admissionForTesting.admissibleBytesCapacity,
+            quantizedCompiled.admissionForTesting.admissibleBytesCapacity,
+            "control: an eligible engine charges a nonzero padding reserve")
+
+        // The vetoed engine still serves, end to end, on the eager path.
         let collected = await cbv2SchedCollect(
-            try engine.submit(request(id: 1, prompt: makePromptTokens(length: 9, seed: 32),
-                maxTokens: 12)))
-        await engine.shutdown()
+            try quantizedCompiled.submit(
+                request(id: 1, prompt: makePromptTokens(length: 9, seed: 32), maxTokens: 12)))
         XCTAssertEqual(collected.finishReason, .length)
-        let stats = try XCTUnwrap(engine.compiledDecodeStats)
-        XCTAssertEqual(stats.compiledSteps, 0, "quantized rows must never take the compiled path")
-        XCTAssertGreaterThan(stats.fallbacks["ineligible_row", default: 0], 0)
+        await quantizedCompiled.shutdown()
+        await quantizedEager.shutdown()
+        await fp16Compiled.shutdown()
     }
 
     /// Scratch lanes must recycle before a full-attention scratch buffer
