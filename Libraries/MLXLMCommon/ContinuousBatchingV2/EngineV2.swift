@@ -180,7 +180,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             throw CBv2KVError.capacityExhausted(
                 needed: admission.estimatedBytes(
                     forTokens: request.promptTokens.count + request.maxTokens),
-                available: admission.bytesCapacity)
+                available: admission.admissibleBytesCapacity)
         }
         guard gauges.beginSubmit(maxWaiting: schedulerConfig.maxWaiting) else {
             throw CBv2KVError.capacityExhausted(needed: 1, available: 0)

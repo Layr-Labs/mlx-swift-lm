@@ -298,6 +298,31 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         }
     }
 
+    /// Regression (livelock): a request in `(capacity - watermark, capacity]`
+    /// used to pass `canEverFit` (full capacity) but could never complete a
+    /// reservation (`reserve` enforces capacity - watermark) — it hit the
+    /// wall, self-preempted, restarted, and looped until its deadline. It
+    /// must be rejected at submit with capacityExhausted instead.
+    func testRequestInsideWatermarkBandRejectedAtSubmit() throws {
+        // 16 B/token, capacity 1600 B, watermark 5 % (80 B) ⇒ 95 tokens is
+        // the true ceiling; 96..100 tokens sit in the livelock band.
+        let harness = CBv2SchedHarness(
+            backendCapacity: 1600,
+            admissionConfig: .init(watermarkFraction: 0.05))
+        XCTAssertThrowsError(
+            try harness.engine.submit(
+                CBv2SchedFixtures.request(prompt: Array(0 ..< 48), maxTokens: 50))
+        ) { error in
+            guard case CBv2KVError.capacityExhausted = error else {
+                return XCTFail("expected capacityExhausted, got \(error)")
+            }
+        }
+        // Just under the watermark-adjusted ceiling still admits.
+        XCTAssertNoThrow(
+            try harness.engine.submit(
+                CBv2SchedFixtures.request(prompt: Array(0 ..< 45), maxTokens: 50)))
+    }
+
     // MARK: Shutdown
 
     func testShutdownDrainsRunningCancelsWaitingAndRejectsNew() async throws {

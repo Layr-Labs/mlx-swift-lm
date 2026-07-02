@@ -94,12 +94,21 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         return total
     }
 
-    /// Truthful submit-time check: worst case (promptLen + maxTokens) vs
-    /// TOTAL capacity. Requests that could never fit are rejected up front;
-    /// requests that fit only sometimes are admitted optimistically and
-    /// preempted if optimism loses.
+    /// Bytes a single request may ever reserve: `reserve` enforces
+    /// `capacity - watermark`, so feasibility must be judged against the
+    /// same ceiling. (Judging against full capacity admitted requests in
+    /// `(capacity - watermark, capacity]` that could NEVER reserve their
+    /// last tokens — they hit the wall, self-preempted, restarted, and
+    /// livelocked until their deadline.)
+    public var admissibleBytesCapacity: Int { bytesCapacity - watermark }
+
+    /// Truthful submit-time check: worst case (promptLen + maxTokens) vs the
+    /// watermark-adjusted capacity (`admissibleBytesCapacity` — the most
+    /// `reserve` will ever grant). Requests that could never fit are
+    /// rejected up front; requests that fit only sometimes are admitted
+    /// optimistically and preempted if optimism loses.
     public func canEverFit(promptTokens: Int, maxTokens: Int) -> Bool {
-        estimatedBytes(forTokens: promptTokens + max(maxTokens, 0)) <= bytesCapacity
+        estimatedBytes(forTokens: promptTokens + max(maxTokens, 0)) <= admissibleBytesCapacity
     }
 
     // MARK: CBv2StepCapacity

@@ -48,6 +48,38 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertTrue(admission.canEverFit(promptTokens: 50, maxTokens: 50))
     }
 
+    /// Regression (admission/reserve livelock): `canEverFit` judged against
+    /// FULL capacity while `reserve` enforces `capacity - watermark`. A
+    /// request whose worst case landed in `(capacity - watermark, capacity]`
+    /// was admitted, could never reserve its final tokens, self-preempted,
+    /// restarted, and livelocked until its deadline. Feasibility must use
+    /// the same watermark-adjusted ceiling `reserve` enforces.
+    func testCanEverFitRespectsWatermark() throws {
+        // 1 full layer, kv1 hd8 eb2 → 32 B/token. Capacity 3200, watermark
+        // 5% (160 B) → 3040 usable → 95 tokens is the true ceiling.
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 2)]
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 3200, config: .init(watermarkFraction: 0.05))
+        XCTAssertEqual(admission.admissibleBytesCapacity, 3040)
+
+        // 95 tokens: admissible AND reservable end to end.
+        XCTAssertTrue(admission.canEverFit(promptTokens: 45, maxTokens: 50))
+        try admission.reserve(id: id(1), additionalTokens: 95)
+        admission.releaseAll(id: id(1))
+
+        // 96..100 tokens: previously admitted (<= full capacity) but the
+        // solo reservation can never complete — must be rejected up front.
+        for total in 96 ... 100 {
+            XCTAssertFalse(
+                admission.canEverFit(promptTokens: total - 50, maxTokens: 50),
+                "\(total)-token worst case exceeds capacity - watermark")
+            XCTAssertThrowsError(
+                try admission.reserve(id: id(2), additionalTokens: total),
+                "reserve agrees: \(total) tokens can never be granted")
+            admission.releaseAll(id: id(2))
+        }
+    }
+
     func testSoftReserveThrowsAtWatermark() throws {
         // 1 full layer, kv1 hd1 eb2 → 4 B/token. Capacity 1000, watermark
         // 10% → 900 usable → 225 tokens.
