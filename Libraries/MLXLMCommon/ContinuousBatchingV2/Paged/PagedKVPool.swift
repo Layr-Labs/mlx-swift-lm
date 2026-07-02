@@ -200,6 +200,18 @@ public final class PagedKVPool {
     public let config: PagedKVPoolConfig
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
 
+    /// Monotonic identity for every `PagedSequenceKV` minted against this
+    /// pool. Unlike `ObjectIdentifier` (a heap address, reusable after
+    /// dealloc), serials are NEVER reused, so device block-table caches
+    /// fingerprinted by serial can never confuse a finished request's rows
+    /// with a new request's (see `PagedLayerCache.deviceTables`).
+    private var lastRowSerial: UInt64 = 0
+
+    func nextRowSerial() -> UInt64 {
+        lastRowSerial += 1
+        return lastRowSerial
+    }
+
     /// Groups in deterministic order (for tests/telemetry).
     public var groupKeys: [PagedKVGroupKey] {
         groups.keys.sorted { ($0.headDim, $0.kvHeads) < ($1.headDim, $1.kvHeads) }

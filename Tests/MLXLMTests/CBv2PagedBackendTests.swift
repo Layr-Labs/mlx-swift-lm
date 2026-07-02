@@ -348,4 +348,59 @@ struct CBv2PagedBackendTests {
         #expect(row.table.count == 2)
         backend.release(state)
     }
+
+    // MARK: - Device block-table cache identity
+
+    /// Regression (cross-request page-table reuse): the device-table cache
+    /// used to fingerprint rows by (ObjectIdentifier, tableVersion). A heap
+    /// address can be recycled after a finished row deallocates, and — via
+    /// the LIFO free list — the replacement row gets the SAME page ids and
+    /// the SAME tableVersion trajectory, so a stale fingerprint hit would
+    /// make the kernel attend the finished request's cached tables. The
+    /// fingerprint is now a pool-issued monotonic serial: never reused, so
+    /// two identical-geometry rows can NEVER collide, and any row-identity
+    /// change forces a rebuild.
+    @Test func deviceTablesRebuildOnRowIdentityReuse() throws {
+        let kinds = [fullKind()]
+        let backend = try PagedKVBackend(layerKinds: kinds, config: config())
+        let cache = backend.makeLayerCaches()[0]
+
+        func makeWrittenRow() throws -> [CBv2SequenceKV?] {
+            let state = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: 8, maxLength: 32)
+            let row = try #require(state[0] as? PagedSequenceKV)
+            row.write(
+                keys: randomKV(heads: 2, tokens: 8, dim: 64),
+                values: randomKV(heads: 2, tokens: 8, dim: 64))
+            return state
+        }
+
+        let stateA = try makeWrittenRow()
+        let rowA = try #require(stateA[0] as? PagedSequenceKV)
+        cache.setRows([rowA])
+        _ = cache.deviceTables(rows: [rowA])
+        #expect(cache.tablesRebuildCount == 1)
+        _ = cache.deviceTables(rows: [rowA])
+        #expect(cache.tablesRebuildCount == 1, "unchanged table must hit the cache")
+        let tableA = rowA.table
+        let versionA = rowA.tableVersion
+
+        // Release A, then allocate B with identical geometry: the LIFO free
+        // list hands B the same physical page ids and B's tableVersion
+        // trajectory matches A's — only the pool serial tells them apart.
+        backend.release(stateA)
+        let stateB = try makeWrittenRow()
+        let rowB = try #require(stateB[0] as? PagedSequenceKV)
+        #expect(rowB.table == tableA, "LIFO free list reuses the same page ids")
+        #expect(rowB.tableVersion == versionA, "same allocation trajectory")
+        #expect(rowB.serial != rowA.serial, "pool serials are never reused")
+
+        cache.setRows([rowB])
+        _ = cache.deviceTables(rows: [rowB])
+        #expect(
+            cache.tablesRebuildCount == 2,
+            "a row-identity change must rebuild the device tables even when page ids and tableVersion match"
+        )
+        backend.release(stateB)
+    }
 }

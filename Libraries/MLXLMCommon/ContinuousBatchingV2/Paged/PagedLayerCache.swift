@@ -35,9 +35,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     // Device block-table cache: rebuilt only when a row's page table
     // changes (page allocated / rollback / composition change), not on
-    // every step.
+    // every step. Fingerprinted by the pool-issued row SERIAL (never
+    // reused), not ObjectIdentifier — a heap address can be recycled after
+    // a finished request's row deallocates, and a same-shape decode would
+    // then attend the FINISHED request's page ids (cross-request read).
     private var cachedTables: MLXArray?
-    private var cachedTablesFingerprint: [(ObjectIdentifier, Int)] = []
+    private var cachedTablesFingerprint: [(serial: UInt64, tableVersion: Int)] = []
+    /// Times the device tables were rebuilt (test/telemetry hook).
+    private(set) var tablesRebuildCount = 0
 
     // Kernel params `{softcap, scale, 0…}` are constant across steps for a
     // layer; cache the device array keyed on the scale actually passed.
@@ -208,15 +213,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     }
 
     /// Device `[B, maxPages]` int32 block tables, rebuilt only when some
-    /// row's page table changed since the last dispatch.
-    private func deviceTables(rows: [PagedSequenceKV]) -> MLXArray {
-        let fingerprint = rows.map { (ObjectIdentifier($0), $0.tableVersion) }
+    /// row's identity (pool serial) or page table changed since the last
+    /// dispatch. Internal (not private) for regression tests.
+    func deviceTables(rows: [PagedSequenceKV]) -> MLXArray {
+        let fingerprint = rows.map { (serial: $0.serial, tableVersion: $0.tableVersion) }
         if let cached = cachedTables,
             fingerprint.count == cachedTablesFingerprint.count,
             zip(fingerprint, cachedTablesFingerprint).allSatisfy({ $0 == $1 })
         {
             return cached
         }
+        tablesRebuildCount += 1
         // Pad to >= 8 columns so the kernel signature's address space is
         // stable across batch shapes (see PagedAttentionKernel).
         let maxPages = max(8, rows.map { $0.table.count }.max() ?? 0)

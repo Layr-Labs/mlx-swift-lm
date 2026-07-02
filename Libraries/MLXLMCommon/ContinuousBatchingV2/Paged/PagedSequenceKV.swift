@@ -21,6 +21,10 @@ import MLX
 public final class PagedSequenceKV: CBv2SequenceKV {
     let pool: PagedKVPool
     let groupKey: PagedKVGroupKey
+    /// Pool-issued monotonic identity (never reused, unlike a heap address).
+    /// Device block-table caches fingerprint rows by (serial, tableVersion)
+    /// so a new row can never alias a released one.
+    let serial: UInt64
     /// Sliding window in tokens (nil == full attention).
     public let windowSize: Int?
     /// Ring capacity in pages for windowed layers (nil for full).
@@ -54,6 +58,7 @@ public final class PagedSequenceKV: CBv2SequenceKV {
     ) {
         self.pool = pool
         self.groupKey = PagedKVGroupKey(kind)
+        self.serial = pool.nextRowSerial()
         switch kind.attention {
         case .full:
             self.windowSize = nil
