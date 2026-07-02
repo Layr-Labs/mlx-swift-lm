@@ -223,9 +223,22 @@ public final class SchedulerV2 {
 
         // 2. WAITING admission — skipped entirely if anything was preempted.
         if preemptions.isEmpty, !stopScheduling {
+            var wIdx = 0
             while budget > 0, running.count < config.maxConcurrentRequests,
-                let rec = waiting.first
+                wIdx < waiting.count
             {
+                let rec = waiting[wIdx]
+                // Backpressure survives preemption: a paused row demoted
+                // back to waiting must NOT be re-admitted while its consumer
+                // is still over the high watermark — `resume` clears the
+                // flag. Skip it (slot NOT consumed, nothing reserved, no
+                // optimistic advance) exactly like the running path skips
+                // paused rows; later waiting rows may still admit (PR#62
+                // review).
+                if rec.isPaused {
+                    wIdx += 1
+                    continue
+                }
                 if rec.cancelRequested { break }  // engine cleans at the boundary
                 // A preempted request whose in-flight sample is unconfirmed
                 // cannot re-prefill yet (its token values are not host-visible).
@@ -237,7 +250,7 @@ public final class SchedulerV2 {
                         break  // no preemption on behalf of WAITING requests
                     }
                 }
-                waiting.removeFirst()
+                waiting.remove(at: wIdx)  // wIdx now points at the next record
                 rec.status = .running
                 rec.numComputedTokens += chunk
                 budget -= chunk

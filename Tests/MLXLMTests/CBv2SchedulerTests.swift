@@ -415,6 +415,60 @@ final class CBv2SchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.plan().assignments.map(\.id), [paused.id])
     }
 
+    /// PR#62 review: backpressure must survive preemption. A request paused
+    /// for stream backpressure that is demoted back to WAITING keeps
+    /// `isPaused`, and waiting admission must skip it — not re-admit it and
+    /// decode into an overwhelmed consumer — until `resume` clears the
+    /// flag. Skipping is per-row: unpaused rows behind it still admit, and
+    /// the skipped row costs no budget and no capacity reservation.
+    func testPausedPreemptedRequestNotReadmittedUntilResumed() throws {
+        let capacity = CBv2SchedMockCapacity()
+        let scheduler = makeScheduler(maxConcurrent: 2, capacity: capacity)
+        let slow = CBv2SchedFixtures.request(prompt: [1], maxTokens: 4)
+        try scheduler.enqueue(slow)
+        CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())  // prefill + sample
+
+        // Consumer over the high watermark → paused; then demoted back to
+        // waiting (capacity requeue / preemption preserves the flag).
+        scheduler.pause(slow.id)
+        XCTAssertTrue(scheduler.requeueOnCapacity(slow.id))
+        XCTAssertEqual(scheduler.record(for: slow.id)?.isPaused, true)
+        XCTAssertEqual(scheduler.waiting.first?.id, slow.id)
+
+        // A later, unpaused arrival behind the paused head must admit; the
+        // paused row stays waiting with nothing reserved and no progress.
+        let eager = CBv2SchedFixtures.request(prompt: [2], maxTokens: 4)
+        try scheduler.enqueue(eager)
+        let plan = scheduler.plan()
+        assertInvariants(scheduler, plan: plan)
+        XCTAssertEqual(plan.assignments.map(\.id), [eager.id])
+        XCTAssertTrue(
+            scheduler.waiting.contains { $0.id == slow.id },
+            "paused row must remain in waiting")
+        XCTAssertNil(capacity.reserved[slow.id], "skipped row must reserve nothing")
+        XCTAssertEqual(scheduler.record(for: slow.id)?.numComputedTokens, 0)
+        CBv2SchedSim.confirm(scheduler, plan: plan)
+
+        // Still paused on subsequent plans.
+        CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())
+        XCTAssertTrue(scheduler.waiting.contains { $0.id == slow.id })
+
+        // Resume → re-admitted and runs to completion.
+        scheduler.resume(slow.id)
+        var resumedPlan = scheduler.plan()
+        XCTAssertTrue(
+            resumedPlan.assignments.contains { $0.id == slow.id },
+            "resumed request must be re-admitted")
+        var guardStep = 0
+        while scheduler.record(for: slow.id)!.generatedTokenCount < 4 {
+            CBv2SchedSim.confirm(scheduler, plan: resumedPlan)
+            resumedPlan = scheduler.plan()
+            guardStep += 1
+            XCTAssertLessThan(guardStep, 32, "resumed request must make progress")
+        }
+        XCTAssertEqual(scheduler.record(for: slow.id)?.generatedTokenCount, 4)
+    }
+
     // MARK: Poisson simulation
 
     func testPoissonSimulationHoldsInvariantsAndCompletesEverything() throws {
