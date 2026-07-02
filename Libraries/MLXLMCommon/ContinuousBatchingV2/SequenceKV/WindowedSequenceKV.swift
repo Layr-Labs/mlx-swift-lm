@@ -59,6 +59,18 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     private var keys: MLXArray?
     private var values: MLXArray?
 
+    /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
+    /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
+    /// KV-borrowing layers (Gemma-4 cross-layer sharing) attend these instead
+    /// of the post-eviction ring, so a chunk's earliest queries still see
+    /// their full window — the ring writes have already destroyed those
+    /// entries (slot aliasing at distance `window`). nil after a decode
+    /// update, rollback, or before any update. Retaining these views keeps
+    /// the pre-write buffer alive only until the next `update()` replaces
+    /// them (bounded: one extra window-sized buffer between a chunk update
+    /// and the following update).
+    private var borrowableChunkViews: (keys: MLXArray, values: MLXArray)?
+
     /// - Parameters:
     ///   - window: sliding window in tokens (> 0).
     ///   - initialOffset: absolute position this sequence starts at. Non-zero
@@ -95,6 +107,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         if n == 1 {
             // Decode fast path: one modular slot write, then the retained
             // window in temporal order (1 slice pre-wrap, 2-slice concat after).
+            borrowableChunkViews = nil  // ring == window: snapshot is exact
             writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
             writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
             absoluteOffset += 1
@@ -129,7 +142,22 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         absoluteOffset += n
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
 
+        borrowableChunkViews = (returnedKeys, returnedValues)
         return (returnedKeys, returnedValues)
+    }
+
+    /// Views a KV-BORROWING layer must attend against in the CURRENT step:
+    /// exactly what the most recent `update()` returned. After a multi-token
+    /// (prefill-chunk) update this is the PRE-eviction history + chunk — the
+    /// borrowing layer's chunk queries need the same `window - 1 + n` entries
+    /// the source layer attended, and the ring has already evicted the old
+    /// ones. After a decode update (or a rollback) it is the retained ring,
+    /// identical to `snapshot()`. Step-scoped: valid between the source
+    /// layer's `update()` and the next mutation; never retain across steps.
+    public func borrowableViews() -> (keys: MLXArray, values: MLXArray) {
+        if let views = borrowableChunkViews { return views }
+        let snap = snapshot()
+        return (snap.keys, snap.values)
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
@@ -171,6 +199,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         // window shrinks until refilled. Pre-wrap, oldestValidPosition is
         // still the initial offset and the rollback is a full recovery.
         absoluteOffset -= n
+        // Any captured pre-eviction chunk views now cover rolled-back
+        // positions — invalidate so borrowing falls back to the ring.
+        borrowableChunkViews = nil
     }
 
     func cbv2InnerState() -> [MLXArray] {

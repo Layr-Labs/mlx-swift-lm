@@ -108,6 +108,19 @@ enum CBv2AttentionV1 {
     /// KV sharing: shared layers project Q only and borrow the source
     /// layer's K/V — the source layer already appended this step's tokens
     /// earlier in the forward pass).
+    ///
+    /// View selection is a pure function of L (pinned-path discipline):
+    ///  - CHUNK borrow (`L > 1`): `chunkBorrowViews(of:)`, NOT `snapshot()`.
+    ///    After a windowed source's multi-token update, `snapshot()` is the
+    ///    POST-eviction ring (≤ window entries), while the source layer's
+    ///    own attention saw the PRE-eviction history + chunk
+    ///    (`window - 1 + n` entries) so the chunk's earliest queries keep
+    ///    their full window. Borrowing must attend the same view, with the
+    ///    same `kL > window` array-mask path (the paged backend is already
+    ///    exact here by construction — this mirrors its semantics).
+    ///  - DECODE borrow (`L == 1`): `snapshot()`. The retained ring IS the
+    ///    window (the source's same-step decode update already evicted),
+    ///    so the mask-free decode path stays exact.
     static func attendBorrowing(
         sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind, kind: CBv2LayerKind,
         queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil
@@ -124,8 +137,8 @@ enum CBv2AttentionV1 {
         )
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
-        if B == 1 {
-            let (cachedKeys, cachedValues, _) = sourceRows[0].snapshot()
+        if B == 1, L > 1 {
+            let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRows[0])
             return attend(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
@@ -138,12 +151,24 @@ enum CBv2AttentionV1 {
             let (cachedKeys, cachedValues, _) = row.snapshot()
             outputs.append(
                 attend(
-                    queries: queries[index ..< (index + 1)],
+                    queries: B == 1 ? queries : queries[index ..< (index + 1)],
                     keys: cachedKeys, values: cachedValues, scale: scale,
                     L: 1, kL: cachedKeys.dim(2), window: nil,
                     sinks: effectiveSinks, softcap: softcap))
         }
-        return concatenated(outputs, axis: 0)
+        return B == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+    }
+
+    /// The views a borrowing layer must attend for the current PREFILL-CHUNK
+    /// step: the windowed source's step-scoped pre-eviction views (see
+    /// `CBv2WindowedSequenceKV.borrowableViews()`), else `snapshot()`
+    /// (full-attention sources retain everything).
+    private static func chunkBorrowViews(of row: CBv2SequenceKV) -> (MLXArray, MLXArray) {
+        if let windowed = row as? CBv2WindowedSequenceKV {
+            return windowed.borrowableViews()
+        }
+        let (keys, values, _) = row.snapshot()
+        return (keys, values)
     }
 
     // MARK: - Private

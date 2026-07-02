@@ -474,6 +474,14 @@ struct TinyTestModelConfig {
     var windowSize = 16
     var mlpSize = 128
     var withSinks = false
+    /// Adds a THIRD block that KV-shares with the sliding-window layer 1
+    /// (Gemma-4 style: projects Q only, borrows the source layer's K/V via
+    /// `attendBorrowing`) plus a FOURTH full-attention block AFTER it, so
+    /// the borrowing layer's prefill outputs feed persistent downstream KV
+    /// (Gemma-4 interleaves shared layers between storage-owning ones — a
+    /// borrowing bug must corrupt decode, not just discarded prefill
+    /// logits). v2 path only — the legacy path traps.
+    var withKVSharing = false
     var ropeBase: Float = 10_000
     var rmsNormEps: Float = 1e-5
 
@@ -555,6 +563,23 @@ final class TinyAttention: Module {
             scale: config.scale, sinks: sinks)
         return oProj(out.swappedAxes(1, 2).reshaped(B, L, -1))
     }
+
+    /// v2 path for a KV-SHARED layer (Gemma-4 style): project Q only, RoPE
+    /// with the SOURCE layer's PRE-update offsets (a KV-shared cache owns no
+    /// rows, so its own `positionOffsets` is empty — the
+    /// `gemma4CapturePositionOffset` discipline), and borrow the source K/V.
+    func forwardV2Borrowing(
+        _ x: MLXArray, cache: CBv2AttendingLayerCache,
+        source: CBv2AttendingLayerCache, sourceOffsets: MLXArray
+    ) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let q = rope(
+            qProj(x).reshaped(B, L, -1, config.headDim).swappedAxes(1, 2),
+            offset: sourceOffsets)
+        let out = cache.attendBorrowing(
+            source: source, queries: q, scale: config.scale, sinks: sinks)
+        return oProj(out.swappedAxes(1, 2).reshaped(B, L, -1))
+    }
 }
 
 final class TinyBlock: Module {
@@ -592,6 +617,18 @@ final class TinyBlock: Module {
         h = h + mlp(mlpNorm(h))
         return h
     }
+
+    func forwardV2Borrowing(
+        _ x: MLXArray, cache: CBv2AttendingLayerCache,
+        source: CBv2AttendingLayerCache, sourceOffsets: MLXArray
+    ) -> MLXArray {
+        var h =
+            x
+            + attention.forwardV2Borrowing(
+                attnNorm(x), cache: cache, source: source, sourceOffsets: sourceOffsets)
+        h = h + mlp(mlpNorm(h))
+        return h
+    }
 }
 
 /// The fixture model. Layer 0 = full attention, layer 1 = sliding window(16).
@@ -609,7 +646,7 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
 
     /// Model structure as data (report 10 §4 invariant 11).
     var layerKinds: [CBv2LayerKind] {
-        [
+        var kinds = [
             CBv2LayerKind(
                 attention: .full, hasSinks: config.withSinks,
                 headDim: config.headDim, kvHeads: config.kvHeads,
@@ -619,18 +656,34 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
                 headDim: config.headDim, kvHeads: config.kvHeads,
                 queryHeads: config.queryHeads),
         ]
+        if config.withKVSharing {
+            kinds.append(
+                CBv2LayerKind(
+                    attention: .slidingWindow(config.windowSize), sharesKVWithLayer: 1,
+                    hasSinks: config.withSinks,
+                    headDim: config.headDim, kvHeads: config.kvHeads,
+                    queryHeads: config.queryHeads))
+            kinds.append(
+                CBv2LayerKind(
+                    attention: .full, hasSinks: config.withSinks,
+                    headDim: config.headDim, kvHeads: config.kvHeads,
+                    queryHeads: config.queryHeads))
+        }
+        return kinds
     }
 
     /// Build with deterministic seeded weights. Same seed ⇒ same weights.
     /// `headDim` override: the paged Metal kernel supports {64, 128, 256,
     /// 512} only, so paged end-to-end runs use headDim 64.
     static func make(
-        seed: UInt64 = 0xC0FFEE, withSinks: Bool = false, headDim: Int = 16
+        seed: UInt64 = 0xC0FFEE, withSinks: Bool = false, headDim: Int = 16,
+        withKVSharing: Bool = false
     ) -> TinyTestModel {
         MLXRandom.seed(seed)
         var config = TinyTestModelConfig()
         config.withSinks = withSinks
         config.headDim = headDim
+        config.withKVSharing = withKVSharing
         let model = TinyTestModel(config: config)
         // Force lazy parameter materialization deterministically.
         eval(model)
@@ -640,10 +693,17 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     init(config: TinyTestModelConfig) {
         self.config = config
         self.embed = Embedding(embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
-        self.blocks = [
+        var blocks = [
             TinyBlock(config: config, isSliding: false),
             TinyBlock(config: config, isSliding: true),
         ]
+        if config.withKVSharing {
+            // KV-shared sliding block (borrows layer 1's K/V at attention),
+            // then a storage-owning full block downstream of it.
+            blocks.append(TinyBlock(config: config, isSliding: true))
+            blocks.append(TinyBlock(config: config, isSliding: false))
+        }
+        self.blocks = blocks
         self.finalNorm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         self.lmHead = Linear(config.hiddenSize, config.vocabSize, bias: false)
         super.init()
@@ -657,6 +717,9 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        precondition(
+            !config.withKVSharing,
+            "TinyTestModel: the KV-sharing variant is v2-only (legacy KVCache path unsupported)")
         var h = embed(inputs)
         let caches: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: blocks.count)
         let n = inputs.dim(1)
@@ -673,7 +736,10 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     }
 
     func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        [
+        precondition(
+            !config.withKVSharing,
+            "TinyTestModel: the KV-sharing variant is v2-only (legacy KVCache path unsupported)")
+        return [
             KVCacheSimple(),
             RotatingKVCache(maxSize: config.windowSize, keep: 0),
         ]
@@ -684,8 +750,21 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         precondition(caches.count == blocks.count)
         var h = embed(tokens)
+        // KV-shared layers reuse the SOURCE layer's PRE-update position
+        // offsets — capture before the source layer's updateAndAttend
+        // advances them (the gemma4CapturePositionOffset discipline).
+        let sharedSourceOffsets: [Int: MLXArray] = Dictionary(
+            uniqueKeysWithValues: layerKinds.enumerated().compactMap { index, kind in
+                kind.sharesKVWithLayer.map { source in (index, caches[source].positionOffsets) }
+            })
         for (i, block) in blocks.enumerated() {
-            h = block.forwardV2(h, cache: caches[i])
+            if let source = layerKinds[i].sharesKVWithLayer {
+                h = block.forwardV2Borrowing(
+                    h, cache: caches[i], source: caches[source],
+                    sourceOffsets: sharedSourceOffsets[i]!)
+            } else {
+                h = block.forwardV2(h, cache: caches[i])
+            }
         }
         return lmHead(finalNorm(h))
     }
