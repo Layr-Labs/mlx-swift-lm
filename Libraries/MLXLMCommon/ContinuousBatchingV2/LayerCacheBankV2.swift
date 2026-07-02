@@ -27,6 +27,15 @@ import Foundation
 /// on-device advance chain.
 public protocol CBv2CompositionInvalidating: AnyObject {
     func invalidateBoundComposition()
+
+    /// Drop the provider's strong row bindings entirely (each cache's
+    /// `rows` array). The loop calls this when the eager caches will not be
+    /// rebound for an unbounded time — the engine went idle, or compiled
+    /// decode took over the step stream — so retired rows' KV buffers are
+    /// not pinned by a stale binding until some future eager rebind
+    /// (PR#62 review). Implies `invalidateBoundComposition()`; must be a
+    /// cheap no-op when nothing is bound.
+    func releaseBoundRows()
 }
 
 public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionInvalidating {
@@ -59,6 +68,21 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     /// steps advanced the rows outside these caches (their cached
     /// `positionOffsets` no longer reflect the rows' true positions).
     public func invalidateBoundComposition() {
+        hasBound = false
+        boundRowIdentity = []
+    }
+
+    /// Unbind every storage-owning cache (`setRows([])`) and reset the
+    /// fingerprint. Without this, the previous eager batch's row objects —
+    /// including RETIRED rows whose backend accounting was already released
+    /// — stay strongly retained by the caches' `rows` arrays for as long as
+    /// the engine is idle or serving compiled-only steps (PR#62 review).
+    /// No-op when nothing is bound, so idle-loop callers pay nothing.
+    public func releaseBoundRows() {
+        guard hasBound else { return }
+        for cache in caches where cache.kind.sharesKVWithLayer == nil {
+            cache.setRows([])
+        }
         hasBound = false
         boundRowIdentity = []
     }

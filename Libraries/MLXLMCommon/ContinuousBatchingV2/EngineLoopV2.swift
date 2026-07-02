@@ -713,6 +713,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         guard scheduler.hasWork else {
+            // Idle: no future step will rebind the eager caches, so drop
+            // their row bindings now — otherwise the last batch's (retired)
+            // rows stay strongly retained by the provider until some future
+            // rebind, pinning dead KV on an idle engine (PR#62 review).
+            // No-op after the first call while idle.
+            (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             publishGauges()
             if draining {
                 completeStop()
@@ -792,7 +798,17 @@ public final class EngineLoopV2: @unchecked Sendable {
         if let compiledDecode,
             let compiled = compiledDecode.decodeStep(rowStates: rowStates, tokens: tokens)
         {
-            eagerCompositionStale = true
+            // First compiled step after an eager bind: release the eager
+            // caches' row bindings alongside marking them stale. Compiled
+            // steps never rebind the eager caches, so a compiled-only
+            // stretch would otherwise pin the last eager batch's rows —
+            // retired ones included — indefinitely (PR#62 review). Guarded
+            // by the stale flag so the chained compiled hot path pays this
+            // exactly once per eager→compiled transition.
+            if !eagerCompositionStale {
+                eagerCompositionStale = true
+                (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            }
             return (compiled, [])
         }
         let caches = eagerCaches(rowStates: rowStates)
