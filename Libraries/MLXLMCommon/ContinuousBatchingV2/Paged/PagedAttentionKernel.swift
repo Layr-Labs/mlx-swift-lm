@@ -180,16 +180,19 @@ public enum PagedAttentionKernel {
     // `PagedAttentionMSL.partBody` above plus the RSTRIDE layout in
     // pagedattention.metal (which carries a matching keep-in-sync comment):
     //
-    //   threadgroup float q_smem[GQA * D];               // staged queries
-    //   threadgroup float red_smem[NSG * GQA * (D + 2)]; // merge records:
+    //   threadgroup float q_smem[HPT * D];               // staged queries
+    //   threadgroup float red_smem[NSG * HPT * (D + 2)]; // merge records:
     //                                                    // acc[D], m, l
     //
-    // Both buffers are float32 regardless of the slab dtype T (K/V rows are
-    // converted to float on load), the merge pass allocates NO threadgroup
-    // memory, and neither the HAS_SOFTCAP nor the HAS_SINKS variant adds
-    // any — so the budget is a function of (headDim, gqa, simdgroups)
-    // alone. `CBv2PagedEligibilityTests` asserts the generated bodies still
-    // match this model.
+    // HPT is the HEAD SPLIT (`headsPerThreadgroup`), NOT the full GQA
+    // factor — sizing these by GQA is exactly the bug that made Gemma-4
+    // global layers (d512, GQA 8) a 32,832 B process fatal. Both buffers
+    // are float32 regardless of the slab dtype T (K/V rows are converted
+    // to float on load), the merge pass and the bulk-write kernel allocate
+    // NO threadgroup memory, and neither the HAS_SOFTCAP, HAS_SINKS nor
+    // HAS_WRITE variant adds any — so the budget is a function of
+    // (headDim, gqa, simdgroups) alone. `CBv2PagedEligibilityTests`
+    // asserts the generated bodies still match this model.
 
     /// Metal's per-threadgroup memory cap (`setThreadgroupMemoryLength`
     /// limit on Apple GPUs). A dispatch over this limit is an UNCATCHABLE

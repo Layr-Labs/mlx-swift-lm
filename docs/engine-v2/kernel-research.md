@@ -100,7 +100,8 @@ half KV. (Sources: vendored MLX at libs/mlx-swift; mistral.rs
 | vllm-metal vector | 256 | registers (per-warp m,l,O) | D·szT + 64 + 32·max(BS, D+2) ⇒ ~17.5 KB @ D=512 | ⌈D/32⌉ | (H_q,1,P) | none | 512 contiguous, cores-aware gate |
 | vllm-metal MLA (576/512) | 1024/512 | registers | **(2·G·32 + 1024)·4 ≈ 4.35 KB (const)** | G·16 | (H_q/G,1,1) | **yes** (G heads/tg, K regs reused) | no |
 | llama.cpp vec (incl. 576/512) | 32·nsg | **threadgroup** (full padded-DV per sg) + transient regs | (PAD(DK,128)+128+2·PAD(DV,128))·nsg·2 ⇒ ≤14.3 KB @ 576/512 | DV·NE/32 transient | (1,H_q,32) | none | **fixed nwg=32**, strided |
-| **ours (cbv2 part)** | 32·NSG | registers acc[GQA][D/32] | **(GQA·D + NSG·GQA·(D+2))·4** | **GQA·D/32** | (H_kv,B,⌈L/256⌉) | **yes** (all GQA heads per KV load) | PTOK=256 contiguous |
+| **ours (cbv2 part), pre-fix** | 32·NSG | registers acc[GQA][D/32] | **(GQA·D + NSG·GQA·(D+2))·4** | **GQA·D/32** | (H_kv,B,⌈L/256⌉) | **yes** (all GQA heads per KV load) | PTOK=256 contiguous |
+| **ours, post head-split (§5)** | 32·NSG | registers acc[HPT][D/32] | (HPT·D + NSG·HPT·(D+2))·4 | HPT·D/32 ≤ 32 | (H_kv·GQA/HPT,B,⌈L/256⌉) | yes, HPT heads per KV load | PTOK=256 contiguous |
 
 Why the reference caps are where they are:
 
@@ -232,13 +233,14 @@ KV cache through functional updates: the cache is a stable buffer written
 **in place by a kernel**. The MLX-shaped equivalent:
 
 1. **Decode: fuse the KV write into pass A.** The `[B, kvh, D]` K/V tiles
-   become kernel inputs; the one threadgroup per (row, kv-head) whose
-   partition contains the row's newest position writes the tile into the
-   page slot (device-scope barrier inside the threadgroup), then attends.
-   No other threadgroup reads that slot in the same dispatch, other
-   layers/rows touch disjoint bytes, and the slab MLXArray never changes
-   version → nothing to donate, no copies, and 2 slice-update dispatches
-   per layer disappear.
+   become kernel inputs; ONE threadgroup per (row, kv-head) — hgroup 0 of
+   the row's last partition — stores the tile into the page slot, and NO
+   threadgroup reads that slot from the slab in the same dispatch: the
+   newest position is always loaded from the knew/vnew inputs
+   (bit-identical bytes), so the write is race-free without any
+   cross-threadgroup primitive. Other layers/rows touch disjoint bytes,
+   and the slab MLXArray never changes version → nothing to donate, no
+   copies, and 2 slice-update dispatches per layer disappear.
 2. **Prefill/bulk: a dedicated write kernel** (`const_cast` the slab input,
    vLLM reshape_and_cache shape) emitting a tiny fence array. MLX encoders
    are `MTL::DispatchTypeConcurrent` with hazard tracking at declared
@@ -288,12 +290,14 @@ loss from GQA re-reads at g=8 — acceptable for eligibility, not optimal).
 when registers are needed for something else (e.g. quantized-KV dequant
 scratch).
 
-Chosen for C.2: **B + C combined** — transpose-tile merge (fixes the smem
-formula for every shape and improves occupancy fleet-wide) plus a
-head-split factor G chosen so `G·D/32 ≤ 32` acc floats (d512 → G=2, d64 →
-G=8 == GQA, unchanged). Eligibility formula becomes a function of
-(headDim, gqa, nsg, headsPerTG) modelling exactly the new allocations;
-`CBv2PagedEligibilityTests` pins the pairing.
+Chosen for C.2: **C**, the head split (LANDED — see §5): factor
+G = HPT chosen so `G·D/32 ≤ 32` acc floats per thread (d512 → G=2,
+d256 → G=4 at GQA 8; d64/d128 → G == GQA, kernel unchanged). The
+eligibility formula models the split exactly (`headsPerThreadgroup` +
+`partThreadgroupBytes`); `CBv2PagedEligibilityTests` pins the pairing.
+**B**'s transpose-tile merge remains a follow-up: it would shrink the
+smem formula for every shape and improve occupancy fleet-wide, but the
+head split alone already brings every supported head dim under the cap.
 
 ### Split sizing note (B=1 parallelism)
 

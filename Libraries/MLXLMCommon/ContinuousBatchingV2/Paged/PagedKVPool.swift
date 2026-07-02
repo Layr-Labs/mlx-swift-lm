@@ -399,8 +399,10 @@ public final class PagedKVPool {
     ///
     /// This materializes a copy (MLX gathers always do); callers on the hot
     /// decode path must prefer the kernel, which reads the slabs in place.
-    /// The returned arrays reference the CURRENT slabs — do not retain them
-    /// across engine steps or slab writes stop donating.
+    /// The returned arrays are LAZY reads of the shared slabs — evaluate
+    /// or drop them within the current engine step: the slabs are mutated
+    /// in place, so a stale unevaluated gather could observe pages after
+    /// they were recycled and rewritten by another row.
     func gather(
         group key: PagedKVGroupKey, pages: [Int32], firstSlot: Int, count: Int
     ) -> (keys: MLXArray, values: MLXArray) {

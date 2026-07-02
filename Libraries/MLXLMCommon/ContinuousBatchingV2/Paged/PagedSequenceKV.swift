@@ -196,8 +196,9 @@ public final class PagedSequenceKV: CBv2SequenceKV {
 
     /// Gathered `[1, kvHeads, retainedCount, headDim]` views over the
     /// attendable range, oldest to newest, in the pool dtype. The views
-    /// reference the live slabs — consume them within the current engine
-    /// step and drop them, or subsequent slab writes stop donating.
+    /// are lazy reads of the live slabs — consume them within the current
+    /// engine step and drop them: the slabs are mutated in place, so a
+    /// stale unevaluated gather could observe recycled pages.
     func attendableViews() -> (keys: MLXArray, values: MLXArray) {
         let retained = retainedCount
         let start = absoluteOffset - retained
@@ -262,6 +263,14 @@ public final class PagedSequenceKV: CBv2SequenceKV {
 
     /// Return every page to the pool and release the reservation.
     /// O(pages) metadata, no device work. Idempotent.
+    ///
+    /// RECYCLE INVARIANT: the freed pages may be handed to a new row whose
+    /// bulk writes have no graph edge to THIS row's in-flight reads (the
+    /// no-write kernel variants and gathers consume fences but never
+    /// advance them). Callers must therefore only release a row after its
+    /// last consuming step has been host-synced (the engine's finalize
+    /// discipline — releases happen on the engine thread between steps).
+    /// A release-without-host-sync fast path would race silently.
     func releaseStorage() {
         guard !released else { return }
         released = true

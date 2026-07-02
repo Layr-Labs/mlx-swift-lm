@@ -93,8 +93,10 @@ public final class PagedKVBackend: CBv2KVBackend {
         return states
     }
 
-    /// Adopt a donated prefix. Snapshots are written into fresh pages
-    /// (bulk page-run slice updates — off the hot decode path). Reconciled
+    /// Adopt a donated prefix. Snapshots are written into fresh pages via
+    /// the in-place bulk-write kernel (off the hot decode path; the writes
+    /// ride the group's fence chain and evaluate with the row's first
+    /// consuming step). Reconciled
     /// adoption semantics (contract `makeSequenceState(adopting:)`): the
     /// engine already sliced the prefix down by `cbv2RequiredRecompute`, so
     /// every non-nil entry carries the same uniform offset; windowed layers

@@ -18,10 +18,12 @@
 //      context into PTOK-token partitions launches B*KVH*ceil(len/PTOK)
 //      threadgroups (vLLM V1/V2 partitioning, MLX sdpa_vector_2pass shape),
 //      instead of B*KVH.
-//   3. KV bytes are read exactly once per step: all GQA query heads that
-//      share a kv head are processed by the same pass-A threadgroup, so K/V
-//      rows are loaded once and reused for every query head (unlike the
-//      vLLM/mistral.rs ports which launch one threadgroup per QUERY head).
+//   3. KV bytes are read once per HEAD GROUP: a kv head's GQA query heads
+//      are processed HPT at a time (GQA/HPT threadgroups — HPT == GQA and
+//      exactly one read for the fleet's d64/d128 shapes; large head dims
+//      split so smem/registers stay bounded), each K/V row load serving
+//      every query head in the group (unlike the vLLM/mistral.rs ports
+//      which launch one threadgroup per QUERY head).
 //   4. Sliding windows are start-offset arithmetic (storage eviction is
 //      handled by the host-side ring page tables) — never mask arrays.
 //   5. Attention sinks (GPT-OSS) contribute to the softmax DENOMINATOR only,
@@ -59,7 +61,8 @@
 //              the register accumulator never scale with full GQA at
 //              large D — PagedAttentionKernel.headsPerThreadgroup)
 //   NSG        simdgroups per pass-A threadgroup (32 KB smem budget)
-//   PTOK       tokens per partition (512; PTOK % S == 0)
+//   PTOK       tokens per partition (PagedAttentionKernel.partitionTokens,
+//              256; PTOK % S == 0)
 //   HAS_WRITE  (pass A) fuse the decode KV write: each row's new K/V tile
 //              is written IN PLACE into the slabs before attending (see
 //              "In-place slab writes" below)
@@ -94,12 +97,14 @@
 // Safety argument (MLX encoders are concurrent with hazard tracking at
 // declared-buffer granularity, so in-place writes are invisible to the
 // tracker and ordering must come from graph edges):
-//   - Decode (HAS_WRITE): the ONLY threadgroup that reads a row's newest
-//     position is the one owning its last partition — the same threadgroup
-//     that writes it (device-scope barrier in between). All other
-//     threadgroups touch disjoint bytes. Windowed rings cannot alias: the
-//     overwritten slot held a position >= ring*S older than the query,
-//     which is outside every attendable window.
+//   - Decode (HAS_WRITE): SINGLE writer per byte — only the hgroup-0
+//     threadgroup of a row's last partition stores the tile, and NO
+//     threadgroup reads that slot from the slab in the same dispatch:
+//     the newest position is always loaded from the knew/vnew inputs
+//     (bit-identical bytes). Every other slab byte a dispatch reads was
+//     written by an earlier, fence/graph-ordered dispatch. Windowed rings
+//     cannot alias: the overwritten slot held a position >= ring*S older
+//     than the query, outside every attendable window.
 //   - Bulk writes (paged_kv_write, prefill chunks / prefix adoption): the
 //     kernel emits a fence array chained through the group
 //     (fence = prev + 1); every gather of the group's slabs consumes the
@@ -242,25 +247,27 @@ inline void paged_attention_part_impl(
     const float softcap = params[0];
     const float scale = params[1];
 
-    // Fused decode write: the row's newest position lives in THIS row's
-    // last partition, and only that partition's threadgroups ever read it
-    // — write the step's K/V tile in place before attending (see file
-    // header). Under a head split every one of the (kv head, partition)'s
-    // SPLITS threadgroups writes the same bytes with the same values
-    // (idempotent), so each is self-sufficient after its own barrier. The
-    // slabs are stable buffers; the const_cast is the documented in-place
-    // write contract, not a hack around MLX donation.
-    if (HAS_WRITE && part == (attend_len - 1) / PTOK) {
+    // Fused decode write, SINGLE writer per byte: only the hgroup-0
+    // threadgroup of the row's last partition stores the step's K/V tile.
+    // NOTHING in this dispatch reads the written slot from the slab —
+    // every threadgroup that attends the newest position loads it from
+    // the knew/vnew INPUTS instead (bit-identical to the stored bytes, so
+    // numerics cannot differ), which makes the write race-free without a
+    // cross-threadgroup ordering primitive. Later dispatches order after
+    // this one through the write-fence chain / step-graph edges (file
+    // header). The slabs are stable buffers; the const_cast is the
+    // documented in-place write contract, not a hack around MLX donation.
+    const size_t tile_src = ((size_t)b * (size_t)kvh + (size_t)kv_head) * D;
+    if (HAS_WRITE && hgroup == 0 && part == (attend_len - 1) / PTOK) {
         const int wpage = info[3];
         const int wslot = info[4];
         const size_t dst =
             (((size_t)wpage * (size_t)kvh + (size_t)kv_head) * S + (size_t)wslot) * D;
         device T* kdst = const_cast<device T*>(kcache) + dst;
         device T* vdst = const_cast<device T*>(vcache) + dst;
-        const size_t src = ((size_t)b * (size_t)kvh + (size_t)kv_head) * D;
         for (int i = lin; i < D; i += TG) {
-            kdst[i] = knew[src + i];
-            vdst[i] = vnew[src + i];
+            kdst[i] = knew[tile_src + i];
+            vdst[i] = vnew[tile_src + i];
         }
     }
 
@@ -270,9 +277,7 @@ inline void paged_attention_part_impl(
     for (int i = lin; i < HPT * D; i += TG) {
         q_smem[i] = float(q_base[i]) * scale;
     }
-    // mem_device: the fused write above must be visible to this
-    // threadgroup's own K/V loads below.
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Per-simdgroup online softmax state (identical across lanes for m/l,
     // per-lane slices of the value accumulator).
@@ -292,13 +297,22 @@ inline void paged_attention_part_impl(
     float kf[EPT];
     float vf[EPT];
     for (int i = lo + (int)sgitg; i < hi; i += NSG) {
-        const int pos = attend_start + i;
-        const int lpage = pos / S;
-        const int slot = pos % S;
-        const int phys = table[lpage % table_len];
-        const size_t base = (((size_t)phys * (size_t)kvh + (size_t)kv_head) * S + (size_t)slot) * D;
-        load_row<T, EPT>(kcache + base, lane, kf);
-        load_row<T, EPT>(vcache + base, lane, vf);
+        if (HAS_WRITE && i == attend_len - 1) {
+            // The newest position: read the step's tile from the INPUTS,
+            // never from the slab slot the fused write races on (see the
+            // single-writer comment above). Bit-identical values.
+            load_row<T, EPT>(knew + tile_src, lane, kf);
+            load_row<T, EPT>(vnew + tile_src, lane, vf);
+        } else {
+            const int pos = attend_start + i;
+            const int lpage = pos / S;
+            const int slot = pos % S;
+            const int phys = table[lpage % table_len];
+            const size_t base =
+                (((size_t)phys * (size_t)kvh + (size_t)kv_head) * S + (size_t)slot) * D;
+            load_row<T, EPT>(kcache + base, lane, kf);
+            load_row<T, EPT>(vcache + base, lane, vf);
+        }
 
 #pragma unroll
         for (int g = 0; g < HPT; g++) {
