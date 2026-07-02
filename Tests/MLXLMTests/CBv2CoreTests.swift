@@ -918,3 +918,30 @@ struct CBv2LegacyAttentionGuardTests {
         #expect(row.absoluteOffset == 1)
     }
 }
+
+// MARK: - Legacy attention custom-mask guard (PR#62 review)
+
+/// `attentionWithCacheUpdate`'s CBv2 branch DISCARDS the `mask` parameter
+/// (v2 derives its own causal/window masks), so a custom `.array` mask must
+/// fail loudly in ALL build configurations — the previous debug-only
+/// `assertionFailure` compiled out of release builds and let the wrong mask
+/// ship silently. The helper carries the exact condition; the call site
+/// trips `preconditionFailure` on a non-nil violation.
+@Suite("CBv2Core: legacy attention custom-mask guard")
+struct CBv2CustomMaskGuardTests {
+
+    @Test func noneAndCausalMasksAreAllowed() {
+        #expect(cbv2CustomMaskViolation(mask: .none, layerIndex: 0) == nil)
+        #expect(cbv2CustomMaskViolation(mask: .causal, layerIndex: 0) == nil)
+    }
+
+    @Test func customArrayMaskIsRejectedWithDiagnostic() {
+        let mask = MLXFast.ScaledDotProductAttentionMaskMode.array(
+            MLXArray.zeros([1, 1, 1, 4]))
+        let violation = cbv2CustomMaskViolation(mask: mask, layerIndex: 3)
+        let message = try! #require(violation)
+        #expect(message.contains("layer 3"))
+        #expect(message.contains("custom array mask"))
+        #expect(message.contains("updateAndAttend"))
+    }
+}

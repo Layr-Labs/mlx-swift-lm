@@ -43,7 +43,10 @@ import MLX
 /// driven with CBv2 caches therefore silently loses any CUSTOM array mask
 /// (e.g. bidirectional/prefix-LM or padding masks) and any attention
 /// sinks; sinks-bearing or custom-mask models must call `updateAndAttend`
-/// directly instead. A debug assertion rejects array masks here.
+/// directly instead. Array masks fail HARD here — in release builds too
+/// (`preconditionFailure`, not a debug-only assertion): silently swapping
+/// the model's required mask for v2's causal/window mask would corrupt
+/// output in exactly the builds users run (PR#62 review).
 ///
 /// MULTI-ROW LIMITATION: this compatibility path is B == 1 ONLY. Legacy
 /// (non-v2-adapted) models apply scalar RoPE via `KVCache.offset` BEFORE
@@ -63,17 +66,8 @@ public func attentionWithCacheUpdate(
 ) -> MLXArray {
     // ContinuousBatchingV2 hook — see the LIMITATION notes above.
     if let v2 = cache as? CBv2AttendingLayerCache {
-        switch mask {
-        case .none, .causal:
-            break  // v2's own position-derived masks subsume these
-        default:
-            assertionFailure(
-                """
-                attentionWithCacheUpdate: a custom array mask was passed with a \
-                CBv2 layer cache (layer \(v2.layerIndex)). CBv2 caches own their \
-                masks and DISCARD this parameter — the model must be v2-adapted \
-                (call updateAndAttend with its own semantics) instead.
-                """)
+        if let violation = cbv2CustomMaskViolation(mask: mask, layerIndex: v2.layerIndex) {
+            preconditionFailure(violation)
         }
         if let violation = cbv2LegacyAttentionBatchViolation(
             batch: queries.dim(0), layerIndex: v2.layerIndex)
@@ -114,6 +108,31 @@ public func attentionWithCacheUpdate(
             scale: scale,
             mask: mask
         )
+    }
+}
+
+/// Custom-mask guard for the CBv2 branch of `attentionWithCacheUpdate` (see
+/// the LIMITATION doc there). `.none`/`.causal` are subsumed by v2's own
+/// position-derived masks; any other mode (custom `.array`/`.arrays`) would
+/// be silently DISCARDED by `updateAndAttend`, so it must fail in ALL build
+/// configurations — a debug-only `assertionFailure` compiles out of release
+/// builds and lets the wrong mask ship (PR#62 review). Returns the failure
+/// description for an illegal call, or nil when the call is allowed.
+/// Internal (not private) so tests can pin the exact condition without
+/// tripping the precondition.
+func cbv2CustomMaskViolation(
+    mask: MLXFast.ScaledDotProductAttentionMaskMode, layerIndex: Int
+) -> String? {
+    switch mask {
+    case .none, .causal:
+        return nil
+    default:
+        return """
+            attentionWithCacheUpdate: a custom array mask was passed with a \
+            CBv2 layer cache (layer \(layerIndex)). CBv2 caches own their \
+            masks and DISCARD this parameter — the model must be v2-adapted \
+            (call updateAndAttend with its own semantics) instead.
+            """
     }
 }
 
