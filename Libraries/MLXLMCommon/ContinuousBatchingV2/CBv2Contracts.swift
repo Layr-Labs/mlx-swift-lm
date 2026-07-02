@@ -518,19 +518,74 @@ extension CBv2PrefixCache {
 
 /// Tokens the engine must re-prefill through ALL layers after adopting a
 /// `matched`-token prefix, so WINDOWED layers (whose KV is never cached —
-/// report 10 invariant 6) are rebuilt at true absolute positions: the max
-/// sliding window across the model's layers, clamped to the matched prefix.
-/// 0 for all-full-attention models. Pure model-shape logic, shared by every
-/// backend and the engine.
+/// report 10 invariant 6) are rebuilt at true absolute positions, clamped
+/// to the matched prefix. 0 for all-full-attention models. Pure model-shape
+/// logic, shared by every backend and the engine.
+///
+/// DERIVATION (why a single window is NOT enough — Codex P1).
+///
+/// Adoption replays `[effective, prompt)` through ALL layers, where
+/// `effective = matched - recompute`. Full-attention layers restore
+/// `[0, effective)` from the cached snapshot; windowed layers own no cached
+/// KV and are rebuilt only from the replay. A windowed layer's stored K/V
+/// PROJECTIONS are a pure function of that layer's INPUT (the previous
+/// layer's output), so they are exact wherever the input is exact. Its
+/// windowed-attention OUTPUT, however, is only exact once the replay has
+/// filled a full window BEHIND the query: the first `window-1` replayed
+/// positions attend an incomplete window (their true window reaches below
+/// `effective`, where no windowed KV was replayed) and therefore DEVIATE.
+///
+/// That deviation is not contained to the windowed layer. The polluted
+/// output feeds the next layer's input, so:
+///   - each additional windowed layer in DEPTH ORDER pushes the
+///     "first exact position" forward by another ~window (its own window
+///     must clear the upstream layer's polluted band before its output is
+///     exact) — the receptive field grows LINEARLY with the number of
+///     stacked windowed layers, and
+///   - any downstream FULL-attention layer caches K/V for the polluted
+///     positions and attends them during decode, so a hybrid that
+///     interleaves windowed and full layers (real Gemma-4 / GPT-OSS) can
+///     only be made exact for the retained tail by pushing `effective` back
+///     far enough that NO windowed layer's polluted band overlaps the
+///     retained region — i.e. essentially the whole prompt.
+///
+/// The safe, model-shape-only bound that captures this is
+///   recompute = (number of windowed layers) × (largest window),
+/// clamped to `matched`. Rationale for each factor:
+///   - `largest window` is the per-layer receptive-field step (a layer with
+///     a smaller window still needs at most the largest window cleared once
+///     the compounding is folded into a single uniform bound);
+///   - `number of windowed layers` is the depth of compounding — every
+///     windowed layer (including KV-SHARED windowed layers, whose borrowed
+///     attention output still pollutes downstream) contributes one step.
+///
+/// Consequences that are CORRECT and intended:
+///   - Full-attention-only models: 0 windowed layers ⇒ recompute 0 ⇒ full
+///     prefix-cache benefit, unchanged.
+///   - Windowed-LAST single-window models (e.g. TinyTestModel: 1 windowed
+///     layer): recompute == window, unchanged from the old bound — the
+///     single windowed layer is last, so its polluted early outputs feed
+///     nothing downstream.
+///   - Deep hybrids on long prompts (Gemma-4: dozens of windowed layers ×
+///     512): the product exceeds the prompt, so the clamp collapses it to
+///     `matched` and adoption degrades to near-full recompute. That is the
+///     CORRECT outcome — those models simply cannot reuse a windowed prefix
+///     exactly, and the safe fallback is to recompute.
 public func cbv2RequiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
     guard matched > 0 else { return 0 }
     var maxWindow = 0
+    var windowCount = 0
     for kind in layerKinds {
         if case .slidingWindow(let window) = kind.attention {
             maxWindow = max(maxWindow, window)
+            windowCount += 1
         }
     }
-    return min(maxWindow, matched)
+    guard windowCount > 0 else { return 0 }
+    // windowCount × maxWindow can overflow only at absurd model shapes; the
+    // clamp to `matched` (a real token count) makes the product harmless.
+    let bound = windowCount * maxWindow
+    return min(bound, matched)
 }
 
 // MARK: - Engine public API (what the provider binds to)

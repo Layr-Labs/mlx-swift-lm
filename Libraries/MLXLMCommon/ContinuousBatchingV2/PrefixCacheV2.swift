@@ -23,7 +23,11 @@
 //    NEVER enter full-history prefix reuse. Donation stores snapshots for
 //    full-attention layers that own storage; windowed and KV-sharing layers
 //    are nil. The engine re-prefills the trailing `requiredRecompute(...)`
-//    tokens for windowed layers after adopting a prefix.
+//    tokens through ALL layers after adopting a prefix. That span is
+//    (windowed-layer count × largest window), clamped to the match, because
+//    each stacked windowed layer compounds the receptive field and any
+//    downstream full layer caches its polluted early outputs — see the
+//    derivation on `cbv2RequiredRecompute`.
 //  - Eviction is LRU by last access; entries currently being adopted
 //    (in-use refcount > 0) are never evicted, and key repointing skips
 //    pinned entries so an in-flight adoption always stays resolvable.
@@ -453,10 +457,12 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
     // MARK: - Windowed-layer policy
 
-    /// Tokens the engine must re-prefill for WINDOWED layers after adopting
-    /// a `matched`-token prefix. Delegates to the contract-level free
-    /// function `cbv2RequiredRecompute` (pure model-shape logic, shared by
-    /// all backends).
+    /// Tokens the engine must re-prefill through ALL layers after adopting
+    /// a `matched`-token prefix so windowed layers are exact for the
+    /// retained tail. Delegates to the contract-level free function
+    /// `cbv2RequiredRecompute` (pure model-shape logic, shared by all
+    /// backends); see its derivation for why the span scales with the
+    /// number of stacked windowed layers.
     public static func requiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
         cbv2RequiredRecompute(layerKinds: layerKinds, matched: matched)
     }

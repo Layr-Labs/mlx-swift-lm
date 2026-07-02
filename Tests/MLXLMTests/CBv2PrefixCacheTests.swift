@@ -544,14 +544,21 @@ final class CBv2PrefixCacheWindowedPolicyTests: XCTestCase {
         [windowedLayer(128), fullLayer(), windowedLayer(128), fullLayer()]
     }
 
-    func testGemma4LikeRequiresMaxWindowRecompute() {
+    func testGemma4LikeRecomputeScalesWithWindowedDepth() {
+        // gemma4Like has 4 windowed layers (indices 0, 1, 5 own storage;
+        // index 3 is a KV-shared windowed layer whose borrowed attention
+        // output still pollutes downstream). 4 × 512 = 2048 > 1024, so the
+        // recompute clamps to the whole matched prefix (near-full recompute
+        // — the correct fallback for a deep hybrid).
         XCTAssertEqual(
-            PrefixCacheV2.requiredRecompute(layerKinds: gemma4Like, matched: 1024), 512)
+            PrefixCacheV2.requiredRecompute(layerKinds: gemma4Like, matched: 1024), 1024)
     }
 
-    func testGPTOSSLikeRequiresMaxWindowRecompute() {
+    func testGPTOSSLikeRecomputeScalesWithWindowedDepth() {
+        // gptossLike has 2 windowed(128) layers: 2 × 128 = 256 trailing
+        // tokens replayed (was 128 under the single-window bound).
         XCTAssertEqual(
-            PrefixCacheV2.requiredRecompute(layerKinds: gptossLike, matched: 1024), 128)
+            PrefixCacheV2.requiredRecompute(layerKinds: gptossLike, matched: 1024), 256)
     }
 
     func testAllFullModelRequiresNoRecompute() {
@@ -559,8 +566,17 @@ final class CBv2PrefixCacheWindowedPolicyTests: XCTestCase {
         XCTAssertEqual(PrefixCacheV2.requiredRecompute(layerKinds: kinds, matched: 1024), 0)
     }
 
+    func testSingleWindowedLastLayerRecomputesOneWindow() {
+        // The TinyTestModel shape: full then a single windowed(16) layer.
+        // One windowed layer ⇒ recompute == window (unchanged), because its
+        // polluted early outputs feed nothing downstream.
+        let kinds = [fullLayer(), windowedLayer(16)]
+        XCTAssertEqual(PrefixCacheV2.requiredRecompute(layerKinds: kinds, matched: 1024), 16)
+    }
+
     func testRecomputeClampedToMatchedPrefix() {
-        // A 256-token match cannot re-prefill 512 tokens.
+        // A 256-token match cannot re-prefill more than 256 tokens (the
+        // gemma4Like product 4 × 512 already exceeds it).
         XCTAssertEqual(
             PrefixCacheV2.requiredRecompute(layerKinds: gemma4Like, matched: 256), 256)
         XCTAssertEqual(

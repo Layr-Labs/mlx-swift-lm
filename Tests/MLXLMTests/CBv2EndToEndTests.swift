@@ -402,6 +402,51 @@ final class CBv2EndToEndTests: XCTestCase {
         try await runPrefixCacheRoundTrip(.paged)
     }
 
+    // MARK: (iv-c) Stacked-sliding + downstream-full drift (Codex P1)
+
+    /// Regression for the under-replayed sliding-window adoption bound.
+    ///
+    /// Model shape [full, sliding(16), sliding(16), full]: two STACKED
+    /// windowed layers whose first `window-1` replayed outputs are polluted
+    /// (their true window reaches below `effective`, where no windowed KV was
+    /// replayed), and a DOWNSTREAM full layer that CACHES those polluted
+    /// outputs as K/V inside the retained region. The old single-window bound
+    /// (`recompute = window`) adopts `effective = matched - 16`, so the full
+    /// layer decodes against corrupted KV and drifts. The revised bound
+    /// (`windowedCount × window = 32 ≥ matched = 24`) clamps to the whole
+    /// match, degrading adoption to full recompute — which is exact. Under
+    /// the OLD bound this assertion FAILS; under the fix it holds.
+    func testStackedSlidingRecomputeIsTokenExact() async throws {
+        // blockSize 8, window 16, prompt 25 ⇒ matched = 3×8 = 24 (capped at
+        // prompt-1). windowedCount 2 × window 16 = 32 ≥ 24 ⇒ full recompute.
+        let model = TinyTestModel.make(seed: 0xD00D_F00D, stackedSlidingFull: true)
+        XCTAssertEqual(model.layerKinds.count, 4, "shape must be [full, sliding, sliding, full]")
+        let prompt = makePromptTokens(length: 25, seed: 0x5EED)
+        let budget = 16
+
+        let stack = try makeStack(.contiguous, model: model, enablePrefixCache: true)
+
+        let first = await cbv2SchedCollect(
+            try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: budget)))
+        XCTAssertEqual(first.finishReason, .length)
+        XCTAssertEqual(first.usage?.prefixCacheHitTokens, 0, "first run is a miss")
+
+        // Donation is asynchronous (off the engine queue) — wait for it.
+        let donated = await cbv2SchedWait { stack.prefixCache.stats().entryCount >= 1 }
+        XCTAssertTrue(donated, "finished request must donate its prefix")
+
+        let second = await cbv2SchedCollect(
+            try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: budget)))
+        await stack.engine.shutdown()
+
+        XCTAssertEqual(second.finishReason, .length)
+        XCTAssertEqual(
+            second.tokens, first.tokens,
+            "stacked-sliding adoption must be token-exact vs the cold run "
+                + "(the windowed-layer-count recompute bound guarantees it)")
+        XCTAssertEqual(second.text, first.text)
+    }
+
     // MARK: (iv-b) Per-request cache salt isolation (TB-007)
 
     /// Requests carrying different `cacheSalt`s must never share cached KV
