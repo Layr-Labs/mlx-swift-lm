@@ -23,7 +23,11 @@
 //    NEVER enter full-history prefix reuse. Donation stores snapshots for
 //    full-attention layers that own storage; windowed and KV-sharing layers
 //    are nil. The engine re-prefills the trailing `requiredRecompute(...)`
-//    tokens for windowed layers after adopting a prefix.
+//    tokens through ALL layers after adopting a prefix. That span is
+//    (windowed-layer count × largest window), clamped to the match, because
+//    each stacked windowed layer compounds the receptive field and any
+//    downstream full layer caches its polluted early outputs — see the
+//    derivation on `cbv2RequiredRecompute`.
 //  - Eviction is LRU by last access; entries currently being adopted
 //    (in-use refcount > 0) are never evicted, and key repointing skips
 //    pinned entries so an in-flight adoption always stays resolvable.
@@ -425,13 +429,47 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     }
 
     private func removeLocked(_ entry: Entry) {
-        for hash in entry.chainHashes where index[hash] == entry.id {
-            index.removeValue(forKey: hash)
+        // Before dropping a key, hand it to a resident HEIR that shares this
+        // exact chain-hash boundary (Codex P2): a longer donation that
+        // arrived while `entry` was PINNED could not repoint `entry`'s
+        // boundary hashes (a pinned entry's in-flight adoption must keep
+        // resolving by hash), so it registered only its own extra blocks.
+        // Without this, evicting the (now unpinned) shorter entry would
+        // delete a boundary that the longer entry still physically covers,
+        // and lookups for the shorter prefix would miss forever even though
+        // the KV is resident. Repointing to the longest such heir preserves
+        // the shorter prefix as a slice of the longer entry.
+        for (blockIndex, hash) in entry.chainHashes.enumerated() where index[hash] == entry.id {
+            if let heir = longestHeirLocked(forHash: hash, blockIndex: blockIndex, excluding: entry.id)
+            {
+                index[hash] = heir.id
+                heir.liveKeys += 1
+            } else {
+                index.removeValue(forKey: hash)
+            }
         }
         entry.liveKeys = 0
         if entries.removeValue(forKey: entry.id) != nil {
             _bytesInUse -= entry.bytes
         }
+    }
+
+    /// The longest resident entry (other than `excluding`) whose chain hash
+    /// at `blockIndex` equals `hash` — i.e. one that shares this whole-block
+    /// boundary and can serve the shorter prefix as a slice. Chain hashing
+    /// makes a shared boundary hash imply an identical token prefix through
+    /// that block, so any such entry is a valid owner of the key.
+    private func longestHeirLocked(
+        forHash hash: Data, blockIndex: Int, excluding excludedID: UInt64
+    ) -> Entry? {
+        var best: Entry?
+        for candidate in entries.values where candidate.id != excludedID {
+            guard candidate.chainHashes.count > blockIndex,
+                candidate.chainHashes[blockIndex] == hash
+            else { continue }
+            if best == nil || candidate.blockCount > best!.blockCount { best = candidate }
+        }
+        return best
     }
 
     // MARK: - Accounting
@@ -453,10 +491,12 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
     // MARK: - Windowed-layer policy
 
-    /// Tokens the engine must re-prefill for WINDOWED layers after adopting
-    /// a `matched`-token prefix. Delegates to the contract-level free
-    /// function `cbv2RequiredRecompute` (pure model-shape logic, shared by
-    /// all backends).
+    /// Tokens the engine must re-prefill through ALL layers after adopting
+    /// a `matched`-token prefix so windowed layers are exact for the
+    /// retained tail. Delegates to the contract-level free function
+    /// `cbv2RequiredRecompute` (pure model-shape logic, shared by all
+    /// backends); see its derivation for why the span scales with the
+    /// number of stacked windowed layers.
     public static func requiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
         cbv2RequiredRecompute(layerKinds: layerKinds, matched: matched)
     }

@@ -488,6 +488,14 @@ struct TinyTestModelConfig {
     /// Mutually exclusive with `withKVSharing` (which wires layer 1 as a
     /// sliding-window KV-share source).
     var fullAttentionOnly = false
+    /// Wires TWO stacked sliding-window layers (1, 2) followed by a
+    /// DOWNSTREAM full-attention layer (3): [full, sliding(W), sliding(W),
+    /// full]. The two stacked windowed layers compound the prefix-adoption
+    /// receptive field, and the trailing full layer CACHES their polluted
+    /// early-replay outputs — so a single-window trailing recompute drifts
+    /// the retained region (Codex P1). Mutually exclusive with
+    /// `withKVSharing` / `fullAttentionOnly`.
+    var stackedSlidingFull = false
     var ropeBase: Float = 10_000
     var rmsNormEps: Float = 1e-5
 
@@ -677,6 +685,20 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
                     headDim: config.headDim, kvHeads: config.kvHeads,
                     queryHeads: config.queryHeads))
         }
+        if config.stackedSlidingFull {
+            // Second stacked sliding layer, then a downstream full layer.
+            kinds.append(
+                CBv2LayerKind(
+                    attention: .slidingWindow(config.windowSize),
+                    hasSinks: config.withSinks,
+                    headDim: config.headDim, kvHeads: config.kvHeads,
+                    queryHeads: config.queryHeads))
+            kinds.append(
+                CBv2LayerKind(
+                    attention: .full, hasSinks: config.withSinks,
+                    headDim: config.headDim, kvHeads: config.kvHeads,
+                    queryHeads: config.queryHeads))
+        }
         return kinds
     }
 
@@ -685,7 +707,8 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     /// 512} only, so paged end-to-end runs use headDim 64.
     static func make(
         seed: UInt64 = 0xC0FFEE, withSinks: Bool = false, headDim: Int = 16,
-        withKVSharing: Bool = false, fullAttentionOnly: Bool = false
+        withKVSharing: Bool = false, fullAttentionOnly: Bool = false,
+        stackedSlidingFull: Bool = false, windowSize: Int? = nil
     ) -> TinyTestModel {
         MLXRandom.seed(seed)
         var config = TinyTestModelConfig()
@@ -693,6 +716,8 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
         config.headDim = headDim
         config.withKVSharing = withKVSharing
         config.fullAttentionOnly = fullAttentionOnly
+        config.stackedSlidingFull = stackedSlidingFull
+        if let windowSize { config.windowSize = windowSize }
         let model = TinyTestModel(config: config)
         // Force lazy parameter materialization deterministically.
         eval(model)
@@ -703,6 +728,9 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
         precondition(
             !(config.fullAttentionOnly && config.withKVSharing),
             "fullAttentionOnly is mutually exclusive with withKVSharing")
+        precondition(
+            !(config.stackedSlidingFull && (config.withKVSharing || config.fullAttentionOnly)),
+            "stackedSlidingFull is mutually exclusive with withKVSharing / fullAttentionOnly")
         self.config = config
         self.embed = Embedding(embeddingCount: config.vocabSize, dimensions: config.hiddenSize)
         var blocks = [
@@ -712,6 +740,12 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
         if config.withKVSharing {
             // KV-shared sliding block (borrows layer 1's K/V at attention),
             // then a storage-owning full block downstream of it.
+            blocks.append(TinyBlock(config: config, isSliding: true))
+            blocks.append(TinyBlock(config: config, isSliding: false))
+        }
+        if config.stackedSlidingFull {
+            // A SECOND stacked sliding block, then a downstream full block:
+            // [full, sliding, sliding, full].
             blocks.append(TinyBlock(config: config, isSliding: true))
             blocks.append(TinyBlock(config: config, isSliding: false))
         }
