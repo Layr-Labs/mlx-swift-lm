@@ -687,12 +687,20 @@ public final class EngineLoopV2: @unchecked Sendable {
             let token = Int(host[i])
             scheduler.recordSampled(id: id, token: token)
 
+            // A stop TOKEN's text is never emitted (OpenAI behavior: the
+            // stop token terminates the stream and its rendering is
+            // excluded from content). It still counts toward
+            // usage.completionTokens (recordSampled above) and still rides
+            // in the delta's raw `tokens` — see the CBv2Event.delta doc.
+            // Skipping the detokenizer push keeps its held-back text
+            // intact for the finish-time flush.
+            let isStopToken = rec.request.stopTokens.contains(token)
             let detokenizer = detokenizers[id]
-            let text = detokenizer?.push([token]) ?? ""
+            let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
             stream(for: id)?.emit(.delta(text: text, tokens: [token], logprobs: nil))
 
             // Stop detection — one step late by construction.
-            if rec.request.stopTokens.contains(token) {
+            if isStopToken {
                 finishRequest(id, reason: .stop)
             } else if let detokenizer, detokenizer.matchedStopString {
                 finishRequest(id, reason: .stop)

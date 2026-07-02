@@ -251,6 +251,49 @@ final class CBv2EndToEndTests: XCTestCase {
         try await runStopStringTruncation(.paged)
     }
 
+    // MARK: (ii-b) Stop TOKEN text suppression
+
+    /// Regression: the stop token's rendering used to be emitted in the
+    /// final delta before the `.stop` finish. OpenAI behavior excludes it:
+    /// `text` must end exactly before the stop token, while the raw delta
+    /// `tokens` still carry its id and usage still counts it (see the
+    /// CBv2Event.delta contract doc).
+    private func runStopTokenTextSuppression(_ kind: BackendKind) async throws {
+        let model = makeModel(kind)
+        let prompt = makePromptTokens(length: 12, seed: 88)
+        let budget = 48
+
+        // Baseline greedy run discovers a token to stop on mid-stream.
+        let baseline = try await soloRun(kind, model: model, prompt: prompt, maxTokens: budget)
+        XCTAssertEqual(baseline.tokens.count, budget)
+        let stopToken = baseline.tokens[budget / 2]
+        let firstHit = baseline.tokens.firstIndex(of: stopToken)!
+
+        let stack = try makeStack(kind, model: model, enablePrefixCache: false)
+        var request = greedyRequest(id: 1, prompt: prompt, maxTokens: budget)
+        request.stopTokens = [stopToken]
+        let collected = await cbv2SchedCollect(try stack.engine.submit(request))
+        await stack.engine.shutdown()
+
+        XCTAssertEqual(collected.finishReason, .stop)
+        // Raw ids include the stop token; text must NOT.
+        XCTAssertEqual(collected.tokens, Array(baseline.tokens[...firstHit]))
+        XCTAssertEqual(
+            collected.text, renderedText(Array(baseline.tokens[..<firstHit])),
+            "the stop token's rendering must never be emitted")
+        XCTAssertFalse(collected.text.contains(renderedText([stopToken])))
+        // Usage still counts the sampled stop token.
+        XCTAssertEqual(collected.usage?.completionTokens, firstHit + 1)
+    }
+
+    func testStopTokenTextSuppression_Contiguous() async throws {
+        try await runStopTokenTextSuppression(.contiguous)
+    }
+
+    func testStopTokenTextSuppression_Paged() async throws {
+        try await runStopTokenTextSuppression(.paged)
+    }
+
     // MARK: (iii) Cancel mid-decode
 
     private func runCancelMidDecode(_ kind: BackendKind) async throws {

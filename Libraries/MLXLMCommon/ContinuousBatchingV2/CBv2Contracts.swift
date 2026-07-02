@@ -359,6 +359,14 @@ public struct CBv2TokenLogprob: Sendable {
 public enum CBv2Event: Sendable {
     /// New generated text, already detokenized incrementally with UTF-8 and
     /// stop-string holdback applied (never emits text past a stop match).
+    ///
+    /// `text` is the AUTHORITATIVE user-facing content: a matched stop
+    /// TOKEN's rendering is suppressed and text at/past a stop-string
+    /// match is withheld (OpenAI behavior). `tokens` are the RAW sampled
+    /// ids for consumers that count or replay tokens — they MAY include
+    /// the stop token itself and MAY extend past a stop-string match
+    /// (those ids still count toward `usage.completionTokens`). Do not
+    /// detokenize `tokens` to reconstruct content; use `text`.
     case delta(text: String, tokens: [Int], logprobs: [CBv2TokenLogprob]?)
     case finished(reason: CBv2FinishReason, usage: CBv2Usage)
 }
