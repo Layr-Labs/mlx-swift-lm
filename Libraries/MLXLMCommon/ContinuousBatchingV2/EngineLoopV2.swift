@@ -543,8 +543,15 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private func engineStep() {
         guard running else { return }
+        let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         markStepStarted()
-        defer { markStepEnded() }
+        defer {
+            markStepEnded()
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.step.wall", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
+            }
+        }
 
         processCancellations()
         processDeadlines()
@@ -559,6 +566,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         {
             let plan = scheduler.plan()
             if isPureDecodePlan(plan, matching: ids) {
+                if CBv2StepProfiler.enabled {
+                    CBv2StepProfiler.record(
+                        "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
+                }
                 let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
                 inFlight = next
                 chainedStepCount += 1
@@ -652,6 +663,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
     ) -> CBv2InFlightStep {
+        let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
         var params: [CBv2SamplingParams] = []
@@ -660,10 +672,16 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let caches = cacheProvider.layerCaches(rowStates: rowStates)
+        let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let logits = model.forward(tokens: inputs, caches: caches)
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+        }
         let last = logits[0..., -1, 0...]  // [B, vocab]
         // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
         // one launched-but-unconfirmed sample here (the chain invariant).
+        let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let sampled = sampler.sample(
             logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
             pendingSampledTokens: lazyTokens,
@@ -671,10 +689,20 @@ public final class EngineLoopV2: @unchecked Sendable {
                 ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
             })
         let stepLogprobs = sampler.takeStepLogprobs()
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+        }
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]
         if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
+        let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         asyncEval(toEval)
+        if CBv2StepProfiler.enabled {
+            let now = CFAbsoluteTimeGetCurrent()
+            CBv2StepProfiler.record("v2.asyncEval.submit", seconds: now - evalStart)
+            CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
+        }
         let step = CBv2InFlightStep(
             participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [])
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
@@ -796,11 +824,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
         // graph pipelining stays bounded at two steps.
+        let readbackStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         var host: [Int32] = []
         if let tokens = step.sampledTokens {
             host = tokens.asArray(Int32.self)
         } else if !step.evalTargets.isEmpty {
             eval(step.evalTargets)
+        }
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)
         }
 
         // Materialize any lazy logprob gathers at this same boundary (they
@@ -836,9 +869,19 @@ public final class EngineLoopV2: @unchecked Sendable {
             // intact for the finish-time flush.
             let isStopToken = rec.request.stopTokens.contains(token)
             let detokenizer = detokenizers[id]
+            let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
             let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.detok.push", seconds: CFAbsoluteTimeGetCurrent() - detokStart)
+            }
+            let emitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
             stream(for: id)?.emit(
                 .delta(text: text, tokens: [token], logprobs: logprobsByID[id].map { [$0] }))
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.stream.emit", seconds: CFAbsoluteTimeGetCurrent() - emitStart)
+            }
 
             // Stop detection — one step late by construction.
             if isStopToken {

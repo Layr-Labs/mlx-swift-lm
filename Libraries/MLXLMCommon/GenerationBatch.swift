@@ -542,6 +542,7 @@ public final class GenerationBatch: @unchecked Sendable {
     /// synchronously materializing the current tokens for CPU-side stop
     /// detection / response dispatch.
     private func step() -> [Int] {
+        let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let currentTokens = nextTokens
         let inputs = currentTokens.reshaped(uids.count, 1)
 
@@ -555,6 +556,10 @@ public final class GenerationBatch: @unchecked Sendable {
             logits = compiledForward([inputs])[0]
         } else {
             logits = model.callAsFunction(inputs, cache: promptCache.map { $0 as any KVCache })
+        }
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "leg.forward.build", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
         }
 
         // [B, 1, vocab] -> [B, vocab]
@@ -592,8 +597,13 @@ public final class GenerationBatch: @unchecked Sendable {
         // values back to the CPU. This overlaps GPU work with the CPU
         // extraction / response-building path.
         nextTokens = sampledTokens
+        let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         asyncEval(sampledTokens)
 
+        let readbackStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record("leg.asyncEval.submit", seconds: readbackStart - evalStart)
+        }
         eval(currentTokens)
         // For the common single-row batch, read the one scalar via `item`
         // instead of materializing a 1-element Swift array. Multi-row batches
@@ -603,6 +613,11 @@ public final class GenerationBatch: @unchecked Sendable {
             stepTokens = [currentTokens.item(Int.self)]
         } else {
             stepTokens = currentTokens.asArray(UInt32.self).map { Int($0) }
+        }
+        if CBv2StepProfiler.enabled {
+            let now = CFAbsoluteTimeGetCurrent()
+            CBv2StepProfiler.record("leg.readback.wait", seconds: now - readbackStart)
+            CBv2StepProfiler.record("leg.step.wall", seconds: now - stepStart)
         }
 
         for (i, t) in stepTokens.enumerated() {

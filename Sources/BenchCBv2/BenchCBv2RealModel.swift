@@ -658,6 +658,46 @@ func sysctlString(_ name: String) -> String {
     return String(decoding: buffer.prefix(while: { $0 != 0 }), as: UTF8.self)
 }
 
+/// 1-minute load average — stamped into the report header so a benchmark
+/// taken on a contended host is visibly suspect. A busy host (parallel
+/// swift build, a serving provider) halves eager decode TPS and skews
+/// engine comparisons; that is exactly how the first GPT-OSS report came
+/// to show v2 26 TPS vs legacy 35 when a clean host shows 107 vs 79.
+func loadAverage1m() -> Double {
+    var loads = [Double](repeating: 0, count: 3)
+    guard getloadavg(&loads, 3) >= 1 else { return -1 }
+    return loads[0]
+}
+
+/// Contention sentinel for the report header: 1m load average plus whether
+/// any darkbloom provider process is alive (the usual GPU/CPU competitor on
+/// dev machines).
+func hostContentionSummary() -> (line: String, contended: Bool) {
+    let load = loadAverage1m()
+    let cores = ProcessInfo.processInfo.processorCount
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    // -x (exact process name): -f would false-positive on any shell whose
+    // command line merely contains "DARKBLOOM_COMPILED_DECODE=…" — including
+    // the one that launched this benchmark.
+    task.arguments = ["-x", "darkbloom"]
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    task.standardError = Pipe()
+    var darkbloom = ""
+    if (try? task.run()) != nil {
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        darkbloom = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    let contended = load > Double(cores) / 2 || !darkbloom.isEmpty
+    var line = String(format: "load avg (1m) %.1f / %d cores", load, cores)
+    line += darkbloom.isEmpty ? "; no darkbloom process" : "; DARKBLOOM RUNNING"
+    if contended { line += " — **HOST CONTENDED, numbers suspect**" }
+    return (line, contended)
+}
+
 @main
 struct BenchCBv2RealModel {
     static func main() async {
@@ -708,10 +748,15 @@ struct BenchCBv2RealModel {
 
         let compiled = CompiledDecode.isEnabled
         let legacyLabel = label.isEmpty ? (compiled ? "legacy-compiled" : "legacy") : label
+        let contention = hostContentionSummary()
         print("== BenchCBv2RealModel ==")
         print("model: \(modelPath)")
         print("mode: \(mode)  engines: \(engines)  batches: \(batches)  steps: \(steps)")
         print("DARKBLOOM_COMPILED_DECODE resolved: \(compiled) (affects legacy engine only)")
+        print("host: \(contention.line)")
+        if contention.contended {
+            print("WARNING: host is contended — eager decode is CPU-bound, results will be skewed")
+        }
 
         do {
             let loadStart = CFAbsoluteTimeGetCurrent()
@@ -762,6 +807,48 @@ struct BenchCBv2RealModel {
                     emit("")
                     for o in outcomes {
                         emit("- **\(o.name)**: \(o.pass ? "PASS" : "FAIL") — \(o.detail)")
+                    }
+                }
+
+                // Profile ----------------------------------------------------
+                // Phase-timer decomposition of the B=1 decode step for the
+                // legacy engine (eager) and v2 (contiguous). One warmup cell
+                // per engine absorbs kernel-compile costs; the measured cell
+                // then runs with CBv2StepProfiler enabled.
+                if modeCopy == "profile" {
+                    emit("\n## Decode-step profile (B=1, maxTokens \(stepsCopy))\n")
+                    for engineName in enginesCopy where engineName != "v2-paged" {
+                        switch engineName {
+                        case "legacy":
+                            _ = await runLegacyCell(
+                                context: context, batch: 1, promptLengths: [100],
+                                steps: 8, vocabSize: vocabSize, label: "warmup")
+                            CBv2StepProfiler.reset()
+                            CBv2StepProfiler.enabled = true
+                            let cell = await runLegacyCell(
+                                context: context, batch: 1, promptLengths: [500],
+                                steps: stepsCopy, vocabSize: vocabSize,
+                                label: legacyLabelCopy)
+                            CBv2StepProfiler.enabled = false
+                            emit("### legacy (\(legacyLabelCopy)) B=1 — decodeTPS \(String(format: "%.1f", cell.decodeTPSPerRequest))\n")
+                            emit(CBv2StepProfiler.summaryTable())
+                        case "v2":
+                            _ = try? await runV2Cell(
+                                context: context, hooks: hooks, backend: .contiguous,
+                                batch: 1, promptLengths: [100], steps: 8,
+                                vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                            CBv2StepProfiler.reset()
+                            CBv2StepProfiler.enabled = true
+                            let cell = try await runV2Cell(
+                                context: context, hooks: hooks, backend: .contiguous,
+                                batch: 1, promptLengths: [500], steps: stepsCopy,
+                                vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                            CBv2StepProfiler.enabled = false
+                            emit("### v2 (contiguous) B=1 — decodeTPS \(String(format: "%.1f", cell.decodeTPSPerRequest))\n")
+                            emit(CBv2StepProfiler.summaryTable())
+                        default:
+                            continue
+                        }
                     }
                 }
 
@@ -841,6 +928,7 @@ struct BenchCBv2RealModel {
                 | RAM | \(ram) GB |
                 | OS | \(os) |
                 | Compiled decode (legacy) | \(compiled) |
+                | Host at start | \(contention.line) |
                 | Date | \(ISO8601DateFormatter().string(from: Date())) |
 
 

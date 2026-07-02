@@ -1294,9 +1294,14 @@ extension Scheduler {
             if !isFinished {
                 request.appendOutputToken(tokenId)
                 tokenHistories[rid]?.append(tokenId)
+                let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                 var detok = activeDetokenizers[rid]!
                 detok.append(token: tokenId)
                 activeDetokenizers[rid] = detok
+                if CBv2StepProfiler.enabled {
+                    CBv2StepProfiler.record(
+                        "leg.detok.append", seconds: CFAbsoluteTimeGetCurrent() - detokStart)
+                }
             } else if resp.finishReason == "length" {
                 request.appendOutputToken(tokenId)
                 tokenHistories[rid]?.append(tokenId)
@@ -1358,9 +1363,14 @@ extension Scheduler {
                 // decoded text since the last next() call, covering every
                 // token appended since the previous emission (up to
                 // streamInterval tokens' worth).
+                let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                 var detok = activeDetokenizers[rid]!
                 let newText = detok.next() ?? ""
                 activeDetokenizers[rid] = detok
+                if CBv2StepProfiler.enabled {
+                    CBv2StepProfiler.record(
+                        "leg.detok.next", seconds: CFAbsoluteTimeGetCurrent() - detokStart)
+                }
 
                 output = RequestOutput(
                     requestId: rid,
