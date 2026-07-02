@@ -100,4 +100,16 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         defer { pendingStepLogprobs = nil }
         return pendingStepLogprobs
     }
+
+    /// Invalidate the configured fingerprint when a finished request's id
+    /// was part of it: a FUTURE request may legally reuse that id, and an
+    /// identical `requestIDs` array must then reconfigure (fresh penalties,
+    /// RNG step 0) instead of inheriting the retired request's state
+    /// (PR#62 review). Forcing a full `setRows` on the next `sample` is
+    /// exact — reconfiguration is a pure function of `rowContext()`.
+    public func requestDidFinish(_ id: CBv2RequestID) {
+        if configuredIDs.contains(id) {
+            configuredIDs = []
+        }
+    }
 }

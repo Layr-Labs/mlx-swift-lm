@@ -79,10 +79,22 @@ public protocol CBv2StepSampler: AnyObject {
     /// host sync on the chained decode path. Called at most once per `sample`
     /// (take semantics). Default: nil (samplers without logprob support).
     func takeStepLogprobs() -> CBv2StepLogprobs?
+
+    /// The request left the engine for good (finish, cancel, error). Its id
+    /// may legally be REUSED by a FUTURE request, so stateful samplers must
+    /// drop any per-request configured state: without this, a later request
+    /// whose row-id fingerprint matches the retired one exactly (e.g. the
+    /// same id resubmitted solo) would skip reconfiguration and inherit the
+    /// finished request's penalty counts and RNG step index (PR#62 review).
+    /// NOT called on preemption — a preempted request is the SAME request
+    /// and its sampler state remains a pure function of its history.
+    /// Default: no-op (stateless samplers).
+    func requestDidFinish(_ id: CBv2RequestID)
 }
 
 extension CBv2StepSampler {
     public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
+    public func requestDidFinish(_ id: CBv2RequestID) {}
 }
 
 /// Greedy stub — vectorized argmax, batch-composition invariant by
@@ -1076,6 +1088,11 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
         capacity?.releaseAll(id: id)
+        // Retire the id from the sampler's configured fingerprint: the id is
+        // legally reusable after this finish, and a reused id with an
+        // identical row set must reconfigure, not inherit stale penalties /
+        // RNG progress (PR#62 review).
+        sampler.requestDidFinish(id)
 
         if let state = kvStates.removeValue(forKey: id) {
             compiledDecode?.forgetRows(state)

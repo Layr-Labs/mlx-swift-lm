@@ -476,6 +476,88 @@ final class CBv2SamplingSamplerTests: XCTestCase {
     }
 }
 
+// MARK: - CBv2DefaultSampler request-id lifecycle (PR#62 review)
+
+final class CBv2SamplingDefaultSamplerLifecycleTests: XCTestCase {
+
+    /// A finished request's id may legally be reused by a FUTURE request.
+    /// When the reused row set matches the retired configuration exactly
+    /// (same single id), the fingerprint check would skip `setRows` and the
+    /// new request would inherit the retired request's RNG step index and
+    /// penalty state. `requestDidFinish` must invalidate the fingerprint so
+    /// the reused id starts fresh (RNG step 0, empty penalties).
+    func testRequestIDReuseAfterFinishGetsFreshSamplerState() {
+        let requestID = CBv2RequestID(9001)
+        let samplingRow = row(id: 9001, temperature: 1.5, seed: 4242, prompt: [1])
+        var rng = TestRNG(2026)
+        let logits = batchArray([rng.logits(vocab)])
+        eval(logits)
+
+        func draw(_ sampler: CBv2DefaultSampler, steps: Int) -> [Int32] {
+            (0 ..< steps).map { _ in
+                sampler.sample(
+                    logits: logits, params: [samplingRow.params], requestIDs: [requestID],
+                    stepIndex: 0, pendingSampledTokens: nil,
+                    rowContext: { [samplingRow] }
+                ).item(Int32.self)
+            }
+        }
+
+        let sampler = CBv2DefaultSampler(fallbackSeed: 3)
+        let firstRun = draw(sampler, steps: 3)
+
+        // Sanity: the keyed RNG stream must actually advance step to step,
+        // otherwise stale reuse would be undetectable by this test.
+        let continued = draw(sampler, steps: 3)
+        XCTAssertNotEqual(
+            continued, firstRun,
+            "sampler draws must differ across RNG steps for this regression to bite")
+
+        // The request finishes; a fresh request reuses the id solo — the
+        // exact fingerprint-collision scenario.
+        sampler.requestDidFinish(requestID)
+        let reused = draw(sampler, steps: 3)
+        XCTAssertEqual(
+            reused, firstRun,
+            "a reused id must restart from RNG step 0 with fresh state, not continue the retired request's stream"
+        )
+
+        // Cross-check against a brand-new sampler (defines "fresh").
+        let fresh = CBv2DefaultSampler(fallbackSeed: 3)
+        XCTAssertEqual(draw(fresh, steps: 3), firstRun)
+    }
+
+    /// Retiring an id that is NOT part of the configured fingerprint must
+    /// not disturb the current batch's incremental state.
+    func testUnrelatedFinishDoesNotResetConfiguredRows() {
+        let requestID = CBv2RequestID(7)
+        let samplingRow = row(id: 7, temperature: 1.2, seed: 11, prompt: [2])
+        var rng = TestRNG(99)
+        let logits = batchArray([rng.logits(vocab)])
+        eval(logits)
+
+        func draw(_ sampler: CBv2DefaultSampler, steps: Int) -> [Int32] {
+            (0 ..< steps).map { _ in
+                sampler.sample(
+                    logits: logits, params: [samplingRow.params], requestIDs: [requestID],
+                    stepIndex: 0, pendingSampledTokens: nil,
+                    rowContext: { [samplingRow] }
+                ).item(Int32.self)
+            }
+        }
+
+        // Reference: six uninterrupted draws.
+        let reference = draw(CBv2DefaultSampler(fallbackSeed: 5), steps: 6)
+
+        // Same draws with an UNRELATED id retiring mid-stream.
+        let sampler = CBv2DefaultSampler(fallbackSeed: 5)
+        var interrupted = draw(sampler, steps: 3)
+        sampler.requestDidFinish(CBv2RequestID(999))
+        interrupted.append(contentsOf: draw(sampler, steps: 3))
+        XCTAssertEqual(interrupted, reference)
+    }
+}
+
 // MARK: - DetokenizerV2
 
 /// Byte-table tokenizer stub: each token id maps to raw UTF-8 bytes, so
