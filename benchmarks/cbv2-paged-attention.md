@@ -89,3 +89,53 @@ per-step upload.
 - 2026-07-01 v2 (two-pass flash-decoding, 256-token partitions, ≤8
   simdgroups/threadgroup): all B ≥ 2 cells pass; B=1 within 15% at 16k,
   near-miss at 4k, miss at 512 (dispatch overhead-bound).
+
+## Results (2026-07-02, kernel-opt: in-place writes + head split)
+
+Same matrix re-run after the in-place-write fix (bc358e2) and the head
+split (5087663). Paged now beats per-row SDPA at EVERY B >= 2 cell (up to
+4x at B=8) and at B=1/16K; the sole gate miss is B=1 ctx=512 (1.046 vs
+0.813 ms = 1.29x, gate 1.15x) — fixed two-dispatch overhead at tiny
+contexts. NOTE: that cell was ALREADY red at the recorded 2026-07-01
+baseline (1.075 vs 0.790 ms = 1.36x); the kernel-opt changes improved it.
+Real-model B=1 (BenchCBv2, GPT-OSS-20B) is 0.90x of contiguous — see
+benchmarks/reports/gptoss-20b-mxfp4q8-kernel-opt.md.
+
+| B | context | engine | ms/step | KV GB/s | tokens/s |
+|---|---------|--------|---------|---------|----------|
+| 1 | 512 | paged-kernel | 1.046 | 1.1 | 956 |
+| 1 | 512 | v1-per-row-sdpa | 0.813 | 1.4 | 1229 |
+| 1 | 512 | legacy-dense-batch | 0.840 | 1.3 | 1191 |
+| 2 | 512 | paged-kernel | 1.034 | 2.1 | 1934 |
+| 2 | 512 | v1-per-row-sdpa | 1.415 | 1.6 | 1414 |
+| 2 | 512 | legacy-dense-batch | 0.833 | 2.7 | 2402 |
+| 4 | 512 | paged-kernel | 1.115 | 4.0 | 3589 |
+| 4 | 512 | v1-per-row-sdpa | 2.421 | 1.8 | 1653 |
+| 4 | 512 | legacy-dense-batch | 1.210 | 3.7 | 3305 |
+| 8 | 512 | paged-kernel | 1.137 | 7.8 | 7034 |
+| 8 | 512 | v1-per-row-sdpa | 4.607 | 1.9 | 1737 |
+| 8 | 512 | legacy-dense-batch | 1.051 | 8.5 | 7615 |
+| 1 | 4096 | paged-kernel | 1.157 | 7.3 | 864 |
+| 1 | 4096 | v1-per-row-sdpa | 1.041 | 8.1 | 960 |
+| 1 | 4096 | legacy-dense-batch | 0.991 | 8.5 | 1009 |
+| 2 | 4096 | paged-kernel | 1.306 | 12.9 | 1531 |
+| 2 | 4096 | v1-per-row-sdpa | 1.729 | 9.8 | 1157 |
+| 2 | 4096 | legacy-dense-batch | 1.241 | 13.6 | 1611 |
+| 4 | 4096 | paged-kernel | 1.626 | 20.8 | 2460 |
+| 4 | 4096 | v1-per-row-sdpa | 3.058 | 11.1 | 1308 |
+| 4 | 4096 | legacy-dense-batch | 1.299 | 26.0 | 3079 |
+| 8 | 4096 | paged-kernel | 1.712 | 39.5 | 4674 |
+| 8 | 4096 | v1-per-row-sdpa | 5.622 | 12.0 | 1423 |
+| 8 | 4096 | legacy-dense-batch | 1.373 | 49.2 | 5827 |
+| 1 | 16384 | paged-kernel | 1.344 | 25.0 | 744 |
+| 1 | 16384 | v1-per-row-sdpa | 1.437 | 23.4 | 696 |
+| 1 | 16384 | legacy-dense-batch | 1.283 | 26.2 | 780 |
+| 2 | 16384 | paged-kernel | 1.581 | 42.5 | 1265 |
+| 2 | 16384 | v1-per-row-sdpa | 1.790 | 37.6 | 1117 |
+| 2 | 16384 | legacy-dense-batch | 1.223 | 55.0 | 1635 |
+| 4 | 16384 | paged-kernel | 1.684 | 79.8 | 2375 |
+| 4 | 16384 | v1-per-row-sdpa | 2.888 | 46.6 | 1385 |
+| 4 | 16384 | legacy-dense-batch | 1.239 | 108.5 | 3227 |
+| 8 | 16384 | paged-kernel | 1.898 | 141.7 | 4214 |
+| 8 | 16384 | v1-per-row-sdpa | 5.752 | 46.8 | 1391 |
+| 8 | 16384 | legacy-dense-batch | 1.915 | 140.4 | 4178 |
