@@ -104,9 +104,13 @@ enum V2Backend: String {
 /// Build a fresh EngineV2 over the (already loaded) model. Throws
 /// CBv2KVError.backendIneligible when the paged kernel cannot serve this
 /// model/hardware — callers skip gracefully.
+///
+/// `compiledDecode` is EXPLICIT here (the engine's own default is on for
+/// eligible models): the bench compares eager v2 against compiled v2, so
+/// plain "v2" cells must stay eager.
 func makeV2Engine(
     context: ModelContext, hooks: V2ModelHooks, backend: V2Backend,
-    schedulerConfig: CBv2SchedulerConfig, kvBytes: Int
+    schedulerConfig: CBv2SchedulerConfig, kvBytes: Int, compiledDecode: Bool = false
 ) throws -> EngineV2 {
     let kvBackend: CBv2KVBackend
     let caches: [any CBv2AttendingLayerCache]
@@ -139,7 +143,8 @@ func makeV2Engine(
         cacheProvider: CBv2LayerCacheBank(caches: caches),
         sampler: CBv2DefaultSampler(),
         detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: context.tokenizer),
-        schedulerConfig: schedulerConfig)
+        schedulerConfig: schedulerConfig,
+        compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: compiledDecode))
 }
 
 // MARK: - Request runners
@@ -328,14 +333,34 @@ func promptMix(batch: Int) -> [Int] {
 
 func runV2Cell(
     context: ModelContext, hooks: V2ModelHooks, backend: V2Backend,
-    batch: Int, promptLengths: [Int], steps: Int, vocabSize: Int, kvBytes: Int
+    batch: Int, promptLengths: [Int], steps: Int, vocabSize: Int, kvBytes: Int,
+    compiledDecode: Bool = false, emit: ((String) -> Void)? = nil
 ) async throws -> CellResult {
     let engine = try makeV2Engine(
         context: context, hooks: hooks, backend: backend,
         schedulerConfig: CBv2SchedulerConfig(
             maxConcurrentRequests: batch, maxBatchedTokensPerStep: 2048,
             prefillChunkSize: 512, maxWaiting: 16),
-        kvBytes: kvBytes)
+        kvBytes: kvBytes, compiledDecode: compiledDecode)
+    if compiledDecode {
+        // Absorb this fresh engine's per-bucket traces (the compile cache is
+        // per engine instance) so measured TTFTs reflect steady state; the
+        // production provider pays this once at model load.
+        let warmStart = CFAbsoluteTimeGetCurrent()
+        _ = try? await runV2Request(
+            engine: engine, id: 999_999,
+            promptTokens: syntheticPrompt(length: 8, seed: 0xBEEF, vocabSize: vocabSize),
+            maxTokens: 2, stopTokens: [])
+        if let emit, let stats = engine.compiledDecodeStats {
+            let perBucket = stats.warmup
+                .map { String(format: "b%d=%.2fs", $0.bucket, $0.seconds) }
+                .joined(separator: " ")
+            emit(String(
+                format: "    [v2-compiled B=%d] warmup %.2fs (%@)%@",
+                batch, CFAbsoluteTimeGetCurrent() - warmStart, perBucket,
+                stats.disabledReason.map { " DISABLED: \($0)" } ?? ""))
+        }
+    }
     let results = await withTaskGroup(of: (Int, RunResult).self) { group in
         for (i, length) in promptLengths.enumerated() {
             let prompt = syntheticPrompt(
@@ -352,8 +377,15 @@ func runV2Cell(
         return all.sorted { $0.0 < $1.0 }.map(\.1)
     }
     await engine.shutdown()
+    if compiledDecode, let emit, let stats = engine.compiledDecodeStats {
+        emit(
+            "    [v2-compiled B=\(batch)] compiledSteps=\(stats.compiledSteps) "
+                + "rebinds=\(stats.laneRebinds) scratchResets=\(stats.scratchResets) "
+                + "fallbacks=\(stats.fallbacks)")
+    }
     return summarize(
-        engine: backend.rawValue, batch: batch, promptMix: promptLengths, results: results)
+        engine: compiledDecode ? "v2-compiled" : backend.rawValue,
+        batch: batch, promptMix: promptLengths, results: results)
 }
 
 func runLegacyCell(
@@ -638,6 +670,111 @@ func runCorrectness(
             CorrectnessOutcome(name: "chunked-prefill", pass: false, detail: "error: \(error)"))
     }
 
+    // 1d. Compiled-decode parity + invariance ------------------------------
+    // The compiled [B,1] path must reproduce eager v2 greedy tokens on real
+    // weights. Full-buffer+mask SDPA vs sliced+maskless SDPA can reorder
+    // reductions, so a divergence AT A NEAR-TIE (top1−top2 gap ≈ 0) is
+    // kernel numerics, not an engine bug — reported distinctly.
+    do {
+        func compiledEngine() throws -> EngineV2 {
+            try makeV2Engine(
+                context: context, hooks: hooks, backend: .contiguous,
+                schedulerConfig: defaultConfig, kvBytes: kvBytes, compiledDecode: true)
+        }
+
+        let eagerEngine = try freshEngine()
+        let eagerSolo = try await runV2Request(
+            engine: eagerEngine, id: 50, promptTokens: target, maxTokens: 64,
+            stopTokens: eos, topLogprobs: 4)
+        await eagerEngine.shutdown()
+
+        let engine = try compiledEngine()
+        let compiledSolo = try await runV2Request(
+            engine: engine, id: 51, promptTokens: target, maxTokens: 64,
+            stopTokens: eos, topLogprobs: 4)
+        let stats = engine.compiledDecodeStats
+        await engine.shutdown()
+
+        let soloDiv = firstDivergence(eagerSolo.tokens, compiledSolo.tokens)
+        let compiledSteps = stats?.compiledSteps ?? 0
+        let warmup = (stats?.warmup ?? [])
+            .map { String(format: "b%d=%.2fs", $0.bucket, $0.seconds) }
+            .joined(separator: " ")
+        log(
+            "[compiled] solo divergence=\(String(describing: soloDiv)) "
+                + "compiledSteps=\(compiledSteps) fallbacks=\(stats?.fallbacks ?? [:]) "
+                + "warmup: \(warmup)"
+                + (stats?.disabledReason.map { " DISABLED: \($0)" } ?? ""))
+        if let d = soloDiv {
+            log("[compiled] " + logprobDetail(eagerSolo, at: d, label: "eager @\(d)"))
+            log("[compiled] " + logprobDetail(compiledSolo, at: d, label: "compiled @\(d)"))
+        }
+        log("[compiled] text: \(compiledSolo.text)")
+
+        // Near-tie tolerance for the eager-vs-compiled cross-path check.
+        var nearTie = false
+        if let d = soloDiv, let lp = eagerSolo.logprobs[safe: d], lp.topLogprobs.count >= 2 {
+            nearTie = abs(lp.topLogprobs[0].logprob - lp.topLogprobs[1].logprob) < 0.005
+        }
+        let soloPass = compiledSteps > 0 && (soloDiv == nil || nearTie)
+        var detail =
+            "compiledSteps=\(compiledSteps)"
+            + (stats?.disabledReason.map { "; DISABLED: \($0)" } ?? "")
+        if let d = soloDiv {
+            detail += nearTie
+                ? "; diverges from eager at index \(d) at a NEAR-TIE (kernel numerics)"
+                : "; DIVERGES from eager at index \(d)"
+        } else {
+            detail += "; token-exact vs eager over \(compiledSolo.tokens.count) tokens"
+        }
+        outcomes.append(
+            CorrectnessOutcome(name: "compiled-parity", pass: soloPass, detail: detail))
+
+        // Same-mode invariance: compiled solo vs compiled B=3 burst target
+        // (per-lane attention ⇒ neighbors must not change the target row).
+        let burstEngine = try compiledEngine()
+        let burst = try await withThrowingTaskGroup(of: (Int, RunResult).self) { group in
+            let submissions: [(Int, [Int], Int)] = [
+                (0, shortNeighbor, 96), (1, longNeighbor, 96), (2, target, 64),
+            ]
+            for (i, prompt, budget) in submissions {
+                group.addTask { @Sendable in
+                    (
+                        i,
+                        try await runV2Request(
+                            engine: burstEngine, id: UInt64(60 + i), promptTokens: prompt,
+                            maxTokens: budget, stopTokens: eos, topLogprobs: 4)
+                    )
+                }
+            }
+            var all: [(Int, RunResult)] = []
+            for try await entry in group { all.append(entry) }
+            return all.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+        let burstStats = burstEngine.compiledDecodeStats
+        await burstEngine.shutdown()
+        let burstDiv = firstDivergence(compiledSolo.tokens, burst[2].tokens)
+        log(
+            "[compiled] burst-vs-solo divergence=\(String(describing: burstDiv)) "
+                + "compiledSteps=\(burstStats?.compiledSteps ?? 0) "
+                + "fallbacks=\(burstStats?.fallbacks ?? [:])")
+        if let d = burstDiv {
+            log("[compiled] " + logprobDetail(compiledSolo, at: d, label: "solo @\(d)"))
+            log("[compiled] " + logprobDetail(burst[2], at: d, label: "burst @\(d)"))
+        }
+        outcomes.append(
+            CorrectnessOutcome(
+                name: "compiled-invariance",
+                pass: burstDiv == nil && (burstStats?.compiledSteps ?? 0) > 0,
+                detail: burstDiv == nil
+                    ? "compiled burst identical to compiled solo "
+                        + "(compiledSteps=\(burstStats?.compiledSteps ?? 0))"
+                    : "COMPILED BURST DIVERGES from compiled solo at index \(burstDiv!)"))
+    } catch {
+        outcomes.append(
+            CorrectnessOutcome(name: "compiled-parity", pass: false, detail: "error: \(error)"))
+    }
+
     return outcomes
 }
 
@@ -665,7 +802,7 @@ struct BenchCBv2RealModel {
         setvbuf(stdout, nil, _IONBF, 0)
         var modelPath: String?
         var mode = "all"
-        var engines = ["legacy", "v2", "v2-paged"]
+        var engines = ["legacy", "v2", "v2-compiled", "v2-paged"]
         var batches = [1, 2, 4]
         var steps = 128
         var label = ""
@@ -691,7 +828,7 @@ struct BenchCBv2RealModel {
             case "--out": outPath = args.isEmpty ? nil : args.removeFirst()
             default:
                 print("usage: BenchCBv2 --model <dir> [--mode all|correctness|perf]")
-                print("       [--engines legacy,v2,v2-paged] [--batches 1,2,4]")
+                print("       [--engines legacy,v2,v2-compiled,v2-paged] [--batches 1,2,4]")
                 print("       [--steps N] [--label tag] [--kv-gb N] [--out report.md]")
                 exit(64)
             }
@@ -783,6 +920,12 @@ struct BenchCBv2RealModel {
                                 context: context, hooks: hooks, backend: .contiguous,
                                 batch: 1, promptLengths: warmPrompt, steps: 8,
                                 vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                        case "v2-compiled":
+                            _ = try? await runV2Cell(
+                                context: context, hooks: hooks, backend: .contiguous,
+                                batch: 1, promptLengths: warmPrompt, steps: 8,
+                                vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                                compiledDecode: true, emit: { emit($0) })
                         case "v2-paged":
                             do {
                                 _ = try await runV2Cell(
@@ -812,6 +955,13 @@ struct BenchCBv2RealModel {
                                     context: context, hooks: hooks, backend: .contiguous,
                                     batch: batch, promptLengths: mix, steps: stepsCopy,
                                     vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                            case "v2-compiled":
+                                cell = try await runV2Cell(
+                                    context: context, hooks: hooks, backend: .contiguous,
+                                    batch: batch, promptLengths: mix, steps: stepsCopy,
+                                    vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                                    compiledDecode: true,
+                                    emit: { details.append($0) })
                             default:
                                 cell = try await runV2Cell(
                                     context: context, hooks: hooks, backend: .paged,
