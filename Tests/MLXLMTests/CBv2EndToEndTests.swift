@@ -1,0 +1,357 @@
+// CBv2EndToEndTests.swift — integration: the REAL engine assembly, end to end.
+//
+// Constructs the production EngineV2 from the real subsystems — TinyTestModel
+// (a real 2-layer transformer conforming to CBv2SteppableModel; layer 0 full
+// attention, layer 1 sliding-window(16)), a real KV backend
+// (CBv2ContiguousKVBackend or PagedKVBackend), CBv2LayerCacheBank,
+// CBv2DefaultSampler (LogitsPipelineV2 + SamplerV2), CBv2TextDetokenizerFactory
+// (DetokenizerV2 + StopHoldback), and PrefixCacheV2 — and asserts:
+//
+//  (i)   3 concurrent streaming requests with mixed prompt lengths finish
+//        with correct text and TOKEN-EXACT batch invariance vs solo runs;
+//  (ii)  a stop string completed mid-stream truncates the text exactly at
+//        the match start (holdback: no text at/past the match ever emitted);
+//  (iii) cancel mid-decode frees the slot promptly and batchmates are
+//        unaffected (still token-exact vs solo);
+//  (iv)  a second submit of the same prompt hits the prefix cache
+//        (usage.prefixCacheHitTokens > 0) with IDENTICAL greedy output —
+//        exact by construction on this model: full-attention KV is adopted,
+//        and the windowed layer is last, so the trailing-window replay
+//        reproduces every retained K/V bit-for-bit;
+//  (v)   the same suite runs green with the paged backend (fp16 pages,
+//        custom Metal decode kernel) substituted for the contiguous one.
+//
+// No model downloads; weights are seeded random.
+
+import Foundation
+import MLX
+import XCTest
+
+@testable import MLXLMCommon
+
+// MARK: - Test tokenizer
+
+/// Deterministic id → text mapping ("<id>") so expected text is a pure
+/// function of the token stream; distinct ids can never be substrings of
+/// each other's rendering ("<12>" vs "<123>").
+private struct CBv2E2ETokenizer: Tokenizer {
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map { "<\($0)>" }.joined()
+    }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { throw TokenizerError.missingChatTemplate }
+}
+
+private func renderedText(_ tokens: [Int]) -> String {
+    tokens.map { "<\($0)>" }.joined()
+}
+
+// MARK: - Suite
+
+final class CBv2EndToEndTests: XCTestCase {
+
+    private enum BackendKind {
+        case contiguous
+        case paged
+    }
+
+    private struct Stack {
+        let engine: EngineV2
+        let model: TinyTestModel
+        let prefixCache: PrefixCacheV2
+    }
+
+    /// Window of the fixture model (both head-dim variants).
+    private let window = TinyTestModelConfig().windowSize  // 16
+    /// Small hash blocks so short prompts produce multi-block hits.
+    private let blockSize = 8
+
+    /// One model per backend kind per test (seeded ⇒ identical weights for
+    /// every stack built from it, so solo and batched runs share weights).
+    private func makeModel(_ kind: BackendKind) -> TinyTestModel {
+        switch kind {
+        case .contiguous: return TinyTestModel.make(seed: 0xC0FFEE)
+        // The paged Metal kernel supports headDim ∈ {64,128,256,512}.
+        case .paged: return TinyTestModel.make(seed: 0xC0FFEE, headDim: 64)
+        }
+    }
+
+    private func makeStack(
+        _ kind: BackendKind, model: TinyTestModel, enablePrefixCache: Bool = true
+    ) throws -> Stack {
+        let backend: CBv2KVBackend
+        let bank: CBv2LayerCacheBank
+        var materializeOnDonate = false
+        switch kind {
+        case .contiguous:
+            backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28))
+            bank = CBv2LayerCacheBank(layerKinds: model.layerKinds)
+        case .paged:
+            let paged: PagedKVBackend
+            do {
+                paged = try PagedKVBackend(
+                    layerKinds: model.layerKinds,
+                    config: PagedKVPoolConfig(
+                        capacityBytes: 64 << 20,
+                        maxPrefillChunk: 64,
+                        nominalMaxSequenceLength: 512))
+            } catch let error as CBv2KVError {
+                throw XCTSkip("paged backend unavailable on this hardware: \(error)")
+            }
+            backend = paged
+            bank = CBv2LayerCacheBank(caches: paged.makeLayerCaches())
+            // Donated views reference the live fp16 slabs; pages are
+            // recycled after release, so donations must materialize.
+            materializeOnDonate = true
+        }
+        let prefixCache = PrefixCacheV2(
+            config: .init(
+                blockSize: blockSize, modelName: "cbv2-e2e",
+                materializeOnDonate: materializeOnDonate))
+        let engine = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: backend,
+            cacheProvider: bank,
+            sampler: CBv2DefaultSampler(fallbackSeed: 11),
+            detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: CBv2E2ETokenizer()),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 16,
+                enablePrefixCache: enablePrefixCache),
+            prefixCache: prefixCache)
+        return Stack(engine: engine, model: model, prefixCache: prefixCache)
+    }
+
+    private func greedyRequest(
+        id: UInt64, prompt: [Int], maxTokens: Int, stopStrings: [String] = []
+    ) -> CBv2Request {
+        CBv2Request(
+            id: CBv2RequestID(id), promptTokens: prompt,
+            sampling: CBv2SamplingParams(temperature: 0),
+            maxTokens: maxTokens, stopStrings: stopStrings)
+    }
+
+    /// Run one greedy request to completion on a FRESH engine (the solo
+    /// baseline) and return what it produced.
+    private func soloRun(
+        _ kind: BackendKind, model: TinyTestModel, prompt: [Int], maxTokens: Int
+    ) async throws -> CBv2SchedCollected {
+        let stack = try makeStack(kind, model: model, enablePrefixCache: false)
+        let collected = await cbv2SchedCollect(
+            try stack.engine.submit(
+                greedyRequest(id: 900, prompt: prompt, maxTokens: maxTokens)))
+        await stack.engine.shutdown()
+        return collected
+    }
+
+    // MARK: (i) Concurrent streaming — text correctness + batch invariance
+
+    private func runConcurrentStreamingInvariance(_ kind: BackendKind) async throws {
+        let model = makeModel(kind)
+        // Mixed prompt lengths: shorter than the window, spanning it, and
+        // several prefill chunks long.
+        let prompts = [
+            makePromptTokens(length: 5, seed: 11),
+            makePromptTokens(length: 24, seed: 22),
+            makePromptTokens(length: 41, seed: 33),
+        ]
+        let maxTokens = [32, 24, 40]
+
+        var solos: [CBv2SchedCollected] = []
+        for (prompt, budget) in zip(prompts, maxTokens) {
+            solos.append(
+                try await soloRun(kind, model: model, prompt: prompt, maxTokens: budget))
+        }
+
+        let stack = try makeStack(kind, model: model, enablePrefixCache: false)
+        var streams: [AsyncStream<CBv2Event>] = []
+        for (i, prompt) in prompts.enumerated() {
+            streams.append(
+                try stack.engine.submit(
+                    greedyRequest(id: UInt64(i + 1), prompt: prompt, maxTokens: maxTokens[i])))
+        }
+        var batched: [CBv2SchedCollected] = []
+        for stream in streams {
+            batched.append(await cbv2SchedCollect(stream))
+        }
+        await stack.engine.shutdown()
+
+        for i in prompts.indices {
+            XCTAssertEqual(batched[i].finishReason, .length, "request \(i)")
+            XCTAssertEqual(batched[i].tokens.count, maxTokens[i], "request \(i)")
+            XCTAssertEqual(
+                batched[i].tokens, solos[i].tokens,
+                "request \(i) diverged from its solo run under batching")
+            XCTAssertEqual(
+                batched[i].text, renderedText(batched[i].tokens),
+                "request \(i): streamed text must be the exact rendering of its tokens")
+            XCTAssertEqual(batched[i].usage?.promptTokens, prompts[i].count, "request \(i)")
+            XCTAssertEqual(batched[i].usage?.completionTokens, maxTokens[i], "request \(i)")
+        }
+        XCTAssertGreaterThan(
+            stack.engine.capacity().stepsExecuted, 0, "step counter must be published")
+    }
+
+    func testConcurrentStreamingInvariance_Contiguous() async throws {
+        try await runConcurrentStreamingInvariance(.contiguous)
+    }
+
+    func testConcurrentStreamingInvariance_Paged() async throws {
+        try await runConcurrentStreamingInvariance(.paged)
+    }
+
+    // MARK: (ii) Stop string mid-stream
+
+    private func runStopStringTruncation(_ kind: BackendKind) async throws {
+        let model = makeModel(kind)
+        let prompt = makePromptTokens(length: 12, seed: 44)
+        let budget = 48
+
+        // Baseline (no stop) discovers the greedy continuation, from which
+        // a mid-stream stop string is derived.
+        let baseline = try await soloRun(kind, model: model, prompt: prompt, maxTokens: budget)
+        XCTAssertEqual(baseline.tokens.count, budget)
+        let stopToken = baseline.tokens[budget / 2]
+        let stopString = renderedText([stopToken])
+        let firstHit = baseline.tokens.firstIndex(of: stopToken)!
+        let expectedText = renderedText(Array(baseline.tokens[..<firstHit]))
+
+        let stack = try makeStack(kind, model: model, enablePrefixCache: false)
+        let collected = await cbv2SchedCollect(
+            try stack.engine.submit(
+                greedyRequest(
+                    id: 1, prompt: prompt, maxTokens: budget, stopStrings: [stopString])))
+        await stack.engine.shutdown()
+
+        XCTAssertEqual(collected.finishReason, .stop)
+        XCTAssertEqual(
+            collected.text, expectedText,
+            "stop-string truncation must cut EXACTLY at the match start")
+        XCTAssertFalse(
+            collected.text.contains(stopString),
+            "no text at or past the stop match may ever be emitted")
+    }
+
+    func testStopStringTruncation_Contiguous() async throws {
+        try await runStopStringTruncation(.contiguous)
+    }
+
+    func testStopStringTruncation_Paged() async throws {
+        try await runStopStringTruncation(.paged)
+    }
+
+    // MARK: (iii) Cancel mid-decode
+
+    private func runCancelMidDecode(_ kind: BackendKind) async throws {
+        let model = makeModel(kind)
+        let victimPrompt = makePromptTokens(length: 9, seed: 55)
+        let survivorPrompt = makePromptTokens(length: 21, seed: 66)
+        let survivorBudget = 40
+
+        let survivorSolo = try await soloRun(
+            kind, model: model, prompt: survivorPrompt, maxTokens: survivorBudget)
+
+        let stack = try makeStack(kind, model: model, enablePrefixCache: false)
+        let victimID = CBv2RequestID(1)
+        let victimStream = try stack.engine.submit(
+            greedyRequest(id: 1, prompt: victimPrompt, maxTokens: 400))
+        let survivorStream = try stack.engine.submit(
+            greedyRequest(id: 2, prompt: survivorPrompt, maxTokens: survivorBudget))
+
+        // Consume a few victim deltas mid-decode, then cancel.
+        var victimTokens: [Int] = []
+        var victimReason: CBv2FinishReason?
+        for await event in victimStream {
+            switch event {
+            case .delta(_, let tokens, _):
+                victimTokens.append(contentsOf: tokens)
+                if victimTokens.count == 5 {
+                    stack.engine.cancel(victimID)
+                }
+            case .finished(let reason, _):
+                victimReason = reason
+            }
+        }
+        XCTAssertEqual(victimReason, .cancelled)
+        XCTAssertLessThan(victimTokens.count, 400, "cancel must stop generation promptly")
+
+        // The batchmate is unaffected: finishes with its solo output.
+        let survivor = await cbv2SchedCollect(survivorStream)
+        XCTAssertEqual(survivor.finishReason, .length)
+        XCTAssertEqual(
+            survivor.tokens, survivorSolo.tokens,
+            "cancelling a batchmate must not perturb other requests")
+
+        // The victim's slot is freed: capacity drains to zero active.
+        let drained = await cbv2SchedWait {
+            stack.engine.capacity().activeRequests == 0
+        }
+        XCTAssertTrue(drained, "cancelled + finished requests must free their slots")
+        await stack.engine.shutdown()
+    }
+
+    func testCancelMidDecode_Contiguous() async throws {
+        try await runCancelMidDecode(.contiguous)
+    }
+
+    func testCancelMidDecode_Paged() async throws {
+        try await runCancelMidDecode(.paged)
+    }
+
+    // MARK: (iv) Prefix-cache hit round trip
+
+    private func runPrefixCacheRoundTrip(_ kind: BackendKind) async throws {
+        let model = makeModel(kind)
+        // 41-token prompt, blockSize 8: lookup is capped at prompt-1 = 40
+        // tokens = 5 whole blocks; window 16 ⇒ recompute 16 ⇒ 24 adopted.
+        let prompt = makePromptTokens(length: 41, seed: 77)
+        let budget = 8
+        let expectedHit = 5 * blockSize - window  // 24
+
+        let stack = try makeStack(kind, model: model, enablePrefixCache: true)
+
+        let first = await cbv2SchedCollect(
+            try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: budget)))
+        XCTAssertEqual(first.finishReason, .length)
+        XCTAssertEqual(first.usage?.prefixCacheHitTokens, 0, "first run is a miss")
+
+        // Donation is asynchronous (off the engine queue) — wait for it.
+        let donated = await cbv2SchedWait {
+            stack.prefixCache.stats().entryCount >= 1
+        }
+        XCTAssertTrue(donated, "finished request must donate its prefix")
+
+        let second = await cbv2SchedCollect(
+            try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: budget)))
+        await stack.engine.shutdown()
+
+        XCTAssertEqual(second.finishReason, .length)
+        let hit = second.usage?.prefixCacheHitTokens ?? 0
+        XCTAssertGreaterThan(hit, 0, "second submit of the same prompt must hit")
+        XCTAssertEqual(hit, expectedHit, "hit = whole-block match minus windowed recompute")
+        XCTAssertEqual(
+            second.tokens, first.tokens,
+            "prefix-cache adoption must be token-exact vs the cold run")
+        XCTAssertEqual(second.text, first.text)
+        XCTAssertGreaterThan(stack.prefixCache.stats().hits, 0)
+    }
+
+    func testPrefixCacheRoundTrip_Contiguous() async throws {
+        try await runPrefixCacheRoundTrip(.contiguous)
+    }
+
+    func testPrefixCacheRoundTrip_Paged() async throws {
+        try await runPrefixCacheRoundTrip(.paged)
+    }
+}

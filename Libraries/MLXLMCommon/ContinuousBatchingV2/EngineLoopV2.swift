@@ -797,9 +797,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             snapshots.append(seq.snapshot())
         }
         let layerKinds = self.layerKinds
-        donationQueue.async { [weak self] in
+        // Strong self on purpose: the deferred release is a pending
+        // obligation of this loop — it must survive until the donation
+        // lands, or the retired state leaks its pages (the paged pool is
+        // engine-thread-affine, so the free hops back to the engine queue).
+        // No cycle: the block releases its captures once it runs.
+        donationQueue.async {
             prefixCache.donate(tokens: donated, snapshots: snapshots, layerKinds: layerKinds)
-            self?.releaseOnEngineQueue(state)
+            self.releaseOnEngineQueue(state)
         }
     }
 

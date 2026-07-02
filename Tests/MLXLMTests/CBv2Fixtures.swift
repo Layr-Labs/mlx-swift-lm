@@ -622,10 +622,15 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     }
 
     /// Build with deterministic seeded weights. Same seed ⇒ same weights.
-    static func make(seed: UInt64 = 0xC0FFEE, withSinks: Bool = false) -> TinyTestModel {
+    /// `headDim` override: the paged Metal kernel supports {64, 128, 256,
+    /// 512} only, so paged end-to-end runs use headDim 64.
+    static func make(
+        seed: UInt64 = 0xC0FFEE, withSinks: Bool = false, headDim: Int = 16
+    ) -> TinyTestModel {
         MLXRandom.seed(seed)
         var config = TinyTestModelConfig()
         config.withSinks = withSinks
+        config.headDim = headDim
         let model = TinyTestModel(config: config)
         // Force lazy parameter materialization deterministically.
         eval(model)
