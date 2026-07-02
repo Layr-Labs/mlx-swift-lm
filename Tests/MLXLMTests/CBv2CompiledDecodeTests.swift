@@ -502,6 +502,96 @@ final class CBv2CompiledDecodeTests: XCTestCase {
         XCTAssertEqual(ample.capacity().kvBytesCapacity, 1 << 28)
     }
 
+    /// PR#62 review: the padding reserve is charged at engine BUILD, but
+    /// warmup tracing can disable compiled decode (a model structure that
+    /// resists tracing). The engine then serves eagerly forever — the
+    /// reserve must be REFUNDED, or admission stays permanently tighter
+    /// than the hardware truth and otherwise-fitting requests are rejected.
+    func testTraceFailureRefundsCompiledPaddingReserve() async throws {
+        /// Opts into compiled decode but host-syncs on EVERY forward:
+        /// harmless on the eager path (including the warmup dtype probe),
+        /// fatal inside `compile`'s trace — warmup disables with
+        /// "trace failed". This is the GPT-OSS-style lazy-host-probe
+        /// failure class, made permanent.
+        final class TraceHostileModel: CBv2SteppableModel, CBv2CompiledSteppableModel {
+            let inner: TinyTestModel
+            init(_ inner: TinyTestModel) { self.inner = inner }
+            func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+                let logits = inner.forward(tokens: tokens, caches: caches)
+                _ = logits.sum().item(Float.self)  // host sync — kills the trace
+                return logits
+            }
+        }
+
+        let inner = TinyTestModel.make(seed: 0xC0FFEE)
+        let reserve = CBv2CompiledDecode.paddingReserveBytes(
+            layerKinds: inner.layerKinds, kvCapacity: 4096,
+            bucketSizes: [1], maxConcurrentRequests: 4)
+        let capacityBytes = 2 * reserve + (1 << 20)
+
+        // A request whose worst case fits the FULL budget but NOT the
+        // reserve-reduced one (target: capacity - reserve/2).
+        let probe = AdmissionV2(
+            layerKinds: inner.layerKinds, bytesCapacity: capacityBytes,
+            config: .init(watermarkFraction: 0))
+        let target = capacityBytes - reserve / 2
+        var lo = 1
+        var hi = 8_000_000
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if probe.estimatedBytes(forTokens: mid) < target { lo = mid + 1 } else { hi = mid }
+        }
+        let prompt = [1, 2, 3]
+        let bigRequest = request(id: 42, prompt: prompt, maxTokens: lo - prompt.count)
+
+        func engine(model: CBv2SteppableModel) -> EngineV2 {
+            EngineV2(
+                model: model,
+                layerKinds: inner.layerKinds,
+                backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: capacityBytes)),
+                cacheProvider: CBv2LayerCacheBank(layerKinds: inner.layerKinds),
+                sampler: CBv2DefaultSampler(fallbackSeed: 7),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
+                    prefillChunkSize: 16, maxWaiting: 8),
+                compiledDecodeConfig: CBv2CompiledDecodeConfig(
+                    enabled: true, buckets: [1], kvCapacity: 4096))
+        }
+
+        // Control: with compiled decode LIVE the reserve is rightly held,
+        // so the same request is rejected at submit (proves the request
+        // really straddles the carve-out boundary).
+        let control = engine(model: inner)
+        XCTAssertNotNil(control.compiledDecodeStats, "control must build the compiled path")
+        XCTAssertThrowsError(try control.submit(bigRequest)) { error in
+            guard case CBv2KVError.capacityExhausted = error else {
+                return XCTFail("expected capacityExhausted while the reserve is held, got \(error)")
+            }
+        }
+        await control.shutdown()
+
+        // Trace-hostile engine: warmup disables compiled decode → the
+        // reserve is refunded → the same request is admitted.
+        let hostile = engine(model: TraceHostileModel(inner))
+        let disabled = await cbv2SchedWait(timeoutSeconds: 30) {
+            hostile.compiledDecodeStats?.disabledReason != nil
+        }
+        XCTAssertTrue(disabled, "warmup must disable compiled decode for the trace-hostile model")
+        XCTAssertTrue(
+            hostile.compiledDecodeStats?.disabledReason?.contains("trace failed") == true,
+            "disable reason should be the trace failure: \(String(describing: hostile.compiledDecodeStats?.disabledReason))"
+        )
+        // Engine-queue barrier: the refund runs in the same start() block as
+        // warmup; sync so the submit below observes it deterministically.
+        _ = hostile.loopForTesting.pausedIDsSnapshot()
+
+        let stream = try hostile.submit(bigRequest)  // must NOT throw post-refund
+        hostile.cancel(bigRequest.id)
+        let collected = await cbv2SchedCollect(stream)
+        XCTAssertEqual(collected.finishReason, .cancelled)
+        await hostile.shutdown()
+    }
+
     // MARK: - Steady-state discipline (DAR-325 class)
 
     /// A stable chained batch must not rebind lanes per step: rebinds track

@@ -87,15 +87,27 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     public let bytesCapacity: Int
 
+    /// Bytes carved out of the budget for an EXTERNAL worst-case obligation
+    /// the ledger cannot see per-request — today the compiled decode path's
+    /// padding reserve. REFUNDABLE: if the obligation disappears (compiled
+    /// decode disables itself at warmup after a trace failure), the engine
+    /// calls `refundExternalReserve()` so admission is not permanently
+    /// tighter than the hardware truth (PR#62 review). Lock-protected.
+    private var externalReserveBytes: Int
+
     /// Cumulative reserved tokens per request (window capping is applied when
     /// converting to bytes, so decode reservations past a layer's window add
     /// zero bytes for that layer).
     private var reservedTokens: [CBv2RequestID: Int] = [:]
     private var ledgerBytes = 0
 
-    public init(layerKinds: [CBv2LayerKind], bytesCapacity: Int, config: Config = .init()) {
+    public init(
+        layerKinds: [CBv2LayerKind], bytesCapacity: Int, config: Config = .init(),
+        externalReserveBytes: Int = 0
+    ) {
         self.layerKinds = layerKinds
         self.bytesCapacity = bytesCapacity
+        self.externalReserveBytes = max(0, externalReserveBytes)
         if let table = config.layerElementBytes {
             precondition(
                 table.count == layerKinds.count,
@@ -132,12 +144,29 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     }
 
     /// Bytes a single request may ever reserve: `reserve` enforces
-    /// `capacity - watermark`, so feasibility must be judged against the
-    /// same ceiling. (Judging against full capacity admitted requests in
-    /// `(capacity - watermark, capacity]` that could NEVER reserve their
-    /// last tokens — they hit the wall, self-preempted, restarted, and
-    /// livelocked until their deadline.)
-    public var admissibleBytesCapacity: Int { bytesCapacity - watermark }
+    /// `capacity - externalReserve - watermark`, so feasibility must be
+    /// judged against the same ceiling. (Judging against full capacity
+    /// admitted requests in `(ceiling, capacity]` that could NEVER reserve
+    /// their last tokens — they hit the wall, self-preempted, restarted,
+    /// and livelocked until their deadline.)
+    public var admissibleBytesCapacity: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return bytesCapacity - externalReserveBytes - watermark
+    }
+
+    /// The ceiling every reservation is checked against. Callers hold `lock`.
+    private var reserveCeiling: Int { bytesCapacity - externalReserveBytes - watermark }
+
+    /// Release the external carve-out (idempotent). Called by the engine
+    /// when the obligation it covered no longer exists — compiled decode
+    /// disabled itself at warmup, so its padding can never materialize and
+    /// the bytes belong to regular admission again (PR#62 review).
+    public func refundExternalReserve() {
+        lock.lock()
+        externalReserveBytes = 0
+        lock.unlock()
+    }
 
     /// Truthful submit-time check: worst case (promptLen + maxTokens) vs the
     /// watermark-adjusted capacity (`admissibleBytesCapacity` — the most
@@ -157,10 +186,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let new = old + additionalTokens
         let delta = estimatedBytes(forTokens: new) - estimatedBytes(forTokens: old)
         let after = ledgerBytes + delta
-        guard after <= bytesCapacity - watermark else {
+        guard after <= reserveCeiling else {
             throw CBv2KVError.capacityExhausted(
                 needed: delta,
-                available: max(0, bytesCapacity - watermark - ledgerBytes))
+                available: max(0, reserveCeiling - ledgerBytes))
         }
         reservedTokens[id] = new
         ledgerBytes = after
@@ -191,7 +220,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public func hasHeadroom(additionalTokens: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return ledgerBytes + additionalTokens * maxPerTokenBytes <= bytesCapacity - watermark
+        return ledgerBytes + additionalTokens * maxPerTokenBytes <= reserveCeiling
     }
 
     // MARK: Telemetry

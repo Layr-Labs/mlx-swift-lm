@@ -170,10 +170,14 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // Truthful admission under compiled padding: the compiled path pads
         // full-attention rows to its bucket capacity (more bytes than token
         // admission would budget), so its worst-case reserve is carved out
-        // of the ledger. Heartbeat capacity stays the hardware truth.
-        let admissionBytes = backend.bytesCapacity - (compiledDecode?.admissionPaddingReserve ?? 0)
+        // of the ledger as a REFUNDABLE external reserve — if warmup tracing
+        // later disables compiled decode, the loop refunds it so admission
+        // does not stay permanently tighter than the hardware truth (PR#62
+        // review). Heartbeat capacity stays the hardware truth.
         let admission = AdmissionV2(
-            layerKinds: layerKinds, bytesCapacity: admissionBytes, config: admissionConfig)
+            layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
+            config: admissionConfig,
+            externalReserveBytes: compiledDecode?.admissionPaddingReserve ?? 0)
         self.admission = admission
         let gauges = CBv2EngineGauges(kvBytesCapacity: backend.bytesCapacity)
         self.gauges = gauges

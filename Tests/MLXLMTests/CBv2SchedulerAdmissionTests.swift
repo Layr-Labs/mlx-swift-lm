@@ -196,4 +196,46 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
             activeRequests: 1, waitingRequests: 2, activeTokens: 25, backendBytesInUse: 88)
         XCTAssertEqual(hard.kvBytesInUse, 88, "backend truth wins when provided")
     }
+
+    // MARK: External reserve (compiled padding carve-out, PR#62 review)
+
+    /// The compiled decode path carves its worst-case padding reserve out of
+    /// the ledger at engine build. If warmup tracing disables compiled
+    /// decode, the engine refunds the carve-out — admission must then judge
+    /// against the FULL budget again, not stay permanently tighter than the
+    /// hardware truth.
+    func testExternalReserveTightensAdmissionAndRefundRestores() throws {
+        // Single full layer, kvHeads 1, headDim 4 ⇒ 16 B/token.
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 2)]
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1600,
+            config: .init(watermarkFraction: 0),
+            externalReserveBytes: 800)
+
+        // 60 tokens = 960 B: fits the hardware budget (1600) but not the
+        // reserve-reduced ceiling (800).
+        XCTAssertEqual(admission.admissibleBytesCapacity, 800)
+        XCTAssertFalse(admission.canEverFit(promptTokens: 40, maxTokens: 20))
+        XCTAssertFalse(admission.hasHeadroom(additionalTokens: 60))
+        XCTAssertThrowsError(try admission.reserve(id: id(1), additionalTokens: 60)) { error in
+            guard case CBv2KVError.capacityExhausted(_, let available) = error else {
+                return XCTFail("expected capacityExhausted, got \(error)")
+            }
+            XCTAssertEqual(available, 800, "available must reflect the carve-out")
+        }
+
+        // Refund (compiled decode disabled at warmup): full budget again.
+        admission.refundExternalReserve()
+        XCTAssertEqual(admission.admissibleBytesCapacity, 1600)
+        XCTAssertTrue(admission.canEverFit(promptTokens: 40, maxTokens: 20))
+        XCTAssertTrue(admission.hasHeadroom(additionalTokens: 60))
+        XCTAssertNoThrow(try admission.reserve(id: id(1), additionalTokens: 60))
+        // 960 B reserved; 40 more tokens (640 B) tops out exactly at 1600.
+        XCTAssertNoThrow(try admission.reserve(id: id(2), additionalTokens: 40))
+        XCTAssertThrowsError(try admission.reserve(id: id(3), additionalTokens: 1))
+
+        // Refund is idempotent.
+        admission.refundExternalReserve()
+        XCTAssertEqual(admission.admissibleBytesCapacity, 1600)
+    }
 }

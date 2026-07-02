@@ -430,9 +430,24 @@ public final class EngineLoopV2: @unchecked Sendable {
             // never happen on the request path (the v0.6.30 lesson).
             // Requests submitted meanwhile queue behind this task.
             compiledDecode?.warmupIfNeeded()
+            refundCompiledReserveIfDisabled()
             startWatchdog()
             engineQueue.async { [weak self] in self?.engineStep() }
         }
+    }
+
+    /// The compiled padding reserve was carved out of the admission ledger
+    /// at engine build, but warmup tracing can DISABLE compiled decode (a
+    /// model structure that resists tracing). The engine then serves eagerly
+    /// forever and the padded buffers can never materialize — so the reserve
+    /// must be refunded, or admission stays permanently tighter than the
+    /// hardware truth (PR#62 review). Warmup is the only pending→disabled
+    /// transition, so this runs exactly once, right after it, on the engine
+    /// queue. (`AdmissionV2` is the only capacity oracle carrying the
+    /// reserve; scripted test oracles never charge one.)
+    private func refundCompiledReserveIfDisabled() {
+        guard let compiledDecode, compiledDecode.disabledReason != nil else { return }
+        (capacity as? AdmissionV2)?.refundExternalReserve()
     }
 
     /// Graceful drain: waiting requests are cancelled, running requests
