@@ -7,8 +7,8 @@
 | RAM | 128 GB |
 | OS | Version 26.5 (Build 25F71) |
 | Compiled decode (legacy) | true |
-| Host at start | load avg (1m) 49.0 / 16 cores; no darkbloom process — **HOST CONTENDED, numbers suspect** |
-| Date | 2026-07-02T17:11:02Z |
+| Host at start | load avg (1m) 11.0 / 16 cores; no darkbloom process — **HOST CONTENDED, numbers suspect** |
+| Date | 2026-07-02T19:12:55Z |
 
 model class: Gemma4Model; layers: 30
 vocabSize=262144
@@ -22,11 +22,11 @@ prompt tokens: target=24 short=19 long=1543 eos=[1, 50, 106]
 [invariance] solo-repeat divergence=nil
 [invariance] solo text: The sky appears blue because sunlight is scattered by the gases and particles in Earth's atmosphere. Blue light travels in shorter, smaller waves and is scattered more strongly than other colors, making the sky look blue from the ground.
 [invariance] burst target tokens=46 divergence=nil
-[invariance] mid-join: neighbors had (9, 5) tokens at join; target tokens=46 divergence=nil
+[invariance] mid-join: neighbors had (8, 5) tokens at join; target tokens=46 divergence=nil
 [invariance] neighbor-invariance (burst vs mid-join at B=3): divergence=nil
 [chunked-prefill] chunked=32 tok unchunked=32 tok divergence=nil
 [chunked-prefill] chunked text: A quick brown fox jumps over a lazy dog while a seasoned cartographer meticulously annotates ancient maps with details regarding tides, trade winds, and continental drift.
-[compiled] solo divergence=nil compiledSteps=46 fallbacks=[:] warmup: b1=1.36s b2=0.10s b4=0.06s
+[compiled] solo divergence=nil compiledSteps=46 fallbacks=[:] warmup: b1=0.05s b2=0.03s b4=0.05s
 [compiled] text: The sky appears blue because sunlight is scattered by the gases and particles in Earth's atmosphere. Blue light travels in shorter, smaller waves and is scattered more strongly than other colors, making the sky look blue from the ground.
 [compiled] burst-vs-solo divergence=nil compiledSteps=46 fallbacks=[:]
 
