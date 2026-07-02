@@ -147,11 +147,30 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         )
     }
 
+    /// Hasher for a request-scoped salt (TB-007). A non-nil request salt
+    /// REPLACES the cache-level salt in the first block hash — the chain
+    /// then propagates the scope to every later block — so entries donated
+    /// under different salts can never resolve each other. nil falls back
+    /// to the configured cache-level hasher (byte-identical hash vectors to
+    /// the pre-salt behavior).
+    func hasher(cacheSalt: String?) -> CBv2BlockHasher {
+        guard let cacheSalt else { return hasher }
+        return CBv2BlockHasher(
+            blockSize: config.blockSize, modelName: config.modelName, cacheSalt: cacheSalt)
+    }
+
     // MARK: - CBv2PrefixCache: lookup
 
     public func lookup(
         tokens: [Int], layerKinds: [CBv2LayerKind]
     ) -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])? {
+        lookup(tokens: tokens, layerKinds: layerKinds, cacheSalt: nil)
+    }
+
+    public func lookup(
+        tokens: [Int], layerKinds: [CBv2LayerKind], cacheSalt: String?
+    ) -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])? {
+        let hasher = hasher(cacheSalt: cacheSalt)
         let maxBlocks = hasher.maxLookupBlocks(tokenCount: tokens.count)
         guard maxBlocks > 0 else { return nil }
         let hashes = hasher.chainHashes(tokens: tokens, maxBlocks: maxBlocks)
@@ -208,6 +227,15 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     // MARK: - CBv2PrefixCache: donate
 
     public func donate(tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind]) {
+        donate(tokens: tokens, state: state, layerKinds: layerKinds, cacheSalt: nil)
+    }
+
+    /// Salted state-based donation (concrete-type convenience; the engine
+    /// path uses the pre-snapshotted protocol overload).
+    public func donate(
+        tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind],
+        cacheSalt: String?
+    ) {
         guard state.count == layerKinds.count else { return }
         // Snapshot the full-attention storage-owning layers. Windowed layers
         // must not enter full-history prefix reuse (report 10 invariant 6);
@@ -221,7 +249,7 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
             }
             snapshots.append(seq.snapshot())
         }
-        donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds)
+        donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds, cacheSalt: cacheSalt)
     }
 
     /// Pre-snapshotted donation (the engine-integration path): the per-layer
@@ -230,10 +258,19 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     /// from the donation queue. Windowed / KV-sharing layers must be nil.
     public func donate(
         tokens: [Int],
-        snapshots rawSnapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind]
     ) {
+        donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds, cacheSalt: nil)
+    }
+
+    public func donate(
+        tokens: [Int],
+        snapshots rawSnapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind], cacheSalt: String?
+    ) {
         guard rawSnapshots.count == layerKinds.count else { return }
+        let hasher = hasher(cacheSalt: cacheSalt)
         let blockCount = hasher.fullBlockCount(tokenCount: tokens.count)
         guard blockCount > 0 else { return }  // nothing block-aligned to keep
         let prefixTokens = blockCount * hasher.blockSize
@@ -341,6 +378,11 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     /// docs/engine-v2/CONTRACT-ISSUES-D-prefix-cache.md). Pinned entries
     /// always keep their index keys, so resolving by hash here is exact.
     public func endAdoption(tokens: [Int], matched: Int) {
+        endAdoption(tokens: tokens, matched: matched, cacheSalt: nil)
+    }
+
+    public func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?) {
+        let hasher = hasher(cacheSalt: cacheSalt)
         guard matched > 0, matched % hasher.blockSize == 0 else { return }
         let blocks = matched / hasher.blockSize
         guard blocks * hasher.blockSize <= tokens.count else { return }

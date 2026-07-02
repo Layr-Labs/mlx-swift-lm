@@ -239,12 +239,15 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         guard let prefixCache else { return nil }
         guard
             let hit = prefixCache.lookup(
-                tokens: request.promptTokens, layerKinds: layerKinds)
+                tokens: request.promptTokens, layerKinds: layerKinds,
+                cacheSalt: request.cacheSalt)
         else { return nil }
         let recompute = cbv2RequiredRecompute(layerKinds: layerKinds, matched: hit.matched)
         let effective = hit.matched - recompute
         guard effective > 0 else {
-            prefixCache.endAdoption(tokens: request.promptTokens, matched: hit.matched)
+            prefixCache.endAdoption(
+                tokens: request.promptTokens, matched: hit.matched,
+                cacheSalt: request.cacheSalt)
             return nil
         }
         let prefix = hit.prefix.map { entry -> (keys: MLXArray, values: MLXArray, offset: Int)? in
@@ -258,7 +261,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         }
         return CBv2PrefixAdoption(
             tokens: request.promptTokens, matched: hit.matched,
-            effective: effective, prefix: prefix)
+            effective: effective, prefix: prefix, cacheSalt: request.cacheSalt)
     }
 
     /// Cancel promptly: the in-flight step completes, the row is dropped

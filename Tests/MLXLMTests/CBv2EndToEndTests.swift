@@ -402,6 +402,51 @@ final class CBv2EndToEndTests: XCTestCase {
         try await runPrefixCacheRoundTrip(.paged)
     }
 
+    // MARK: (iv-b) Per-request cache salt isolation (TB-007)
+
+    /// Requests carrying different `cacheSalt`s must never share cached KV
+    /// (in either direction, nil included), while the same salt round-trips
+    /// with a hit — end to end through the real engine, donation queue, and
+    /// PrefixCacheV2.
+    func testPrefixCacheSaltIsolation_Contiguous() async throws {
+        let model = makeModel(.contiguous)
+        let prompt = makePromptTokens(length: 41, seed: 99)
+        let budget = 8
+        let expectedHit = 5 * blockSize - window  // 24, as in the round trip
+
+        let stack = try makeStack(.contiguous, model: model, enablePrefixCache: true)
+        func salted(_ id: UInt64, _ salt: String?) -> CBv2Request {
+            var request = greedyRequest(id: id, prompt: prompt, maxTokens: budget)
+            request.cacheSalt = salt
+            return request
+        }
+
+        let first = await cbv2SchedCollect(try stack.engine.submit(salted(1, "tenantA")))
+        XCTAssertEqual(first.finishReason, .length)
+        XCTAssertEqual(first.usage?.prefixCacheHitTokens, 0, "first run is a miss")
+        let donated = await cbv2SchedWait { stack.prefixCache.stats().entryCount >= 1 }
+        XCTAssertTrue(donated, "finished request must donate under its salt")
+
+        // Different salt and nil salt: no cross-hit, greedy output unchanged.
+        let otherTenant = await cbv2SchedCollect(try stack.engine.submit(salted(2, "tenantB")))
+        XCTAssertEqual(
+            otherTenant.usage?.prefixCacheHitTokens, 0,
+            "a different salt must never adopt tenantA's KV")
+        XCTAssertEqual(otherTenant.tokens, first.tokens)
+
+        let unsalted = await cbv2SchedCollect(try stack.engine.submit(salted(3, nil)))
+        XCTAssertEqual(
+            unsalted.usage?.prefixCacheHitTokens, 0,
+            "a nil-salt request must never adopt salted KV")
+        XCTAssertEqual(unsalted.tokens, first.tokens)
+
+        // Same salt: hits, token-exact.
+        let second = await cbv2SchedCollect(try stack.engine.submit(salted(4, "tenantA")))
+        await stack.engine.shutdown()
+        XCTAssertEqual(second.usage?.prefixCacheHitTokens, expectedHit, "same salt must hit")
+        XCTAssertEqual(second.tokens, first.tokens)
+    }
+
     // MARK: (v) Backend / prefix-cache pairing guard
 
     /// `EngineV2.init` preconditions on `prefixCachePairingViolation`: a

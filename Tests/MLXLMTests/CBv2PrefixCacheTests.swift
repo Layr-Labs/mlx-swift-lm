@@ -574,3 +574,96 @@ final class CBv2PrefixCacheWindowedPolicyTests: XCTestCase {
             PrefixCacheV2.requiredRecompute(layerKinds: gptossLike, matched: 512))
     }
 }
+
+// MARK: - §5 Per-request cache salt (TB-007)
+
+final class CBv2PrefixCacheRequestSaltTests: XCTestCase {
+
+    private let kinds = [fullLayer()]
+    private let tokens = Array(0 ..< 10)  // 2 whole blocks at blockSize 4
+
+    private func donate(_ cache: PrefixCacheV2, salt: String?) {
+        cache.donate(
+            tokens: tokens, state: [MockSequenceKV(offset: 10)], layerKinds: kinds,
+            cacheSalt: salt)
+    }
+
+    func testDifferentRequestSaltsNeverCrossHit() {
+        // Direction 1: donated under "A" — invisible to "B" and to nil.
+        let cache = makeCache()
+        donate(cache, salt: "A")
+        XCTAssertNil(cache.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "B"))
+        XCTAssertNil(cache.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: nil))
+        XCTAssertEqual(
+            cache.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "A")?.matched, 8)
+        cache.endAdoption(tokens: tokens, matched: 8, cacheSalt: "A")
+
+        // Direction 2: donated under "B" — invisible to "A" and to nil.
+        let reversed = makeCache()
+        donate(reversed, salt: "B")
+        XCTAssertNil(reversed.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "A"))
+        XCTAssertNil(reversed.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: nil))
+        XCTAssertEqual(
+            reversed.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "B")?.matched, 8)
+        reversed.endAdoption(tokens: tokens, matched: 8, cacheSalt: "B")
+
+        // And a nil-salt donation is invisible to any request salt.
+        let unsalted = makeCache()
+        donate(unsalted, salt: nil)
+        XCTAssertNil(unsalted.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "A"))
+        XCTAssertEqual(
+            unsalted.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: nil)?.matched, 8)
+        unsalted.endAdoption(tokens: tokens, matched: 8, cacheSalt: nil)
+    }
+
+    func testNilRequestSaltIsByteIdenticalToUnsaltedBehavior() {
+        // nil request salt resolves through the cache-level hasher — the
+        // salted overloads are then interchangeable with the legacy ones,
+        // so existing hash vectors keep applying verbatim.
+        let cache = makeCache()
+        XCTAssertEqual(cache.hasher(cacheSalt: nil), cache.hasher)
+
+        cache.donate(
+            tokens: tokens, state: [MockSequenceKV(offset: 10)], layerKinds: kinds)
+        XCTAssertEqual(
+            cache.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: nil)?.matched, 8)
+        cache.endAdoption(tokens: tokens, matched: 8, cacheSalt: nil)
+        XCTAssertEqual(cache.lookup(tokens: tokens, layerKinds: kinds)?.matched, 8)
+        cache.endAdoption(tokens: tokens, matched: 8)
+        cache.evict(toFit: 0)
+        XCTAssertEqual(cache.bytesInUse, 0, "both pins released — nothing leaks")
+    }
+
+    func testRequestSaltReplacesCacheLevelSaltWithNilFallback() {
+        // Cache-level salt "tenant": nil falls back to it, an explicit
+        // request salt equal to it resolves the SAME namespace, and any
+        // other request salt is isolated.
+        let cache = makeCache(salt: "tenant")
+        XCTAssertEqual(cache.hasher(cacheSalt: "tenant"), cache.hasher)
+        XCTAssertNotEqual(cache.hasher(cacheSalt: "other"), cache.hasher)
+
+        donate(cache, salt: nil)
+        XCTAssertEqual(
+            cache.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "tenant")?.matched, 8)
+        cache.endAdoption(tokens: tokens, matched: 8, cacheSalt: "tenant")
+        XCTAssertNil(cache.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "other"))
+    }
+
+    func testSaltedPinBalanceRequiresMatchingSalt() {
+        // endAdoption in the WRONG salt scope must not release the pin.
+        let cache = makeCache()
+        donate(cache, salt: "A")
+        XCTAssertEqual(
+            cache.lookup(tokens: tokens, layerKinds: kinds, cacheSalt: "A")?.matched, 8)
+
+        cache.endAdoption(tokens: tokens, matched: 8, cacheSalt: "B")  // wrong scope
+        cache.evict(toFit: 0)
+        XCTAssertEqual(
+            cache.bytesInUse, mockBytes(offset: 10),
+            "a mismatched-salt release must not unpin the entry")
+
+        cache.endAdoption(tokens: tokens, matched: 8, cacheSalt: "A")  // matching scope
+        cache.evict(toFit: 0)
+        XCTAssertEqual(cache.bytesInUse, 0)
+    }
+}

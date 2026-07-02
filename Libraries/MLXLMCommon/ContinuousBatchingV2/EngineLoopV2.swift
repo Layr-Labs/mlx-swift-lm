@@ -169,12 +169,12 @@ final class CBv2InFlightStep {
     var discard: Set<CBv2RequestID> = []
     /// KV states whose release is fenced behind this step's completion.
     /// `rollbackOne` scrubs the wasted-token KV tail before release;
-    /// `donateTokens` (non-nil for natural finishes with prefix caching on)
+    /// `donation` (non-nil for natural finishes with prefix caching on)
     /// routes the retired state through the donation queue.
     var deferredReleases:
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
-            donateTokens: [Int]?
+            donation: CBv2DonationIntent?
         )] = []
 
     init(
@@ -204,6 +204,17 @@ struct CBv2PrefixAdoption: @unchecked Sendable {
     let matched: Int
     let effective: Int
     let prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?]
+    /// Request-scoped salt the lookup used (TB-007); the pin release and any
+    /// fallback paths must carry the SAME salt or the pin leaks.
+    let cacheSalt: String?
+}
+
+/// A finished request's donation intent: which tokens to donate and under
+/// which salt scope (TB-007 — the entry must be indexed with the same salt
+/// its donor request carried, or a differently-salted request could hit it).
+struct CBv2DonationIntent {
+    let tokens: [Int]
+    let cacheSalt: String?
 }
 
 /// Single-consumer cross-queue handoff of engine-owned values (KV state,
@@ -456,7 +467,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// balances the lookup pin.
     private func applyAdoption(_ adoption: CBv2PrefixAdoption, requestID: CBv2RequestID) {
         defer {
-            prefixCache?.endAdoption(tokens: adoption.tokens, matched: adoption.matched)
+            prefixCache?.endAdoption(
+                tokens: adoption.tokens, matched: adoption.matched,
+                cacheSalt: adoption.cacheSalt)
         }
         guard let rec = scheduler.record(for: requestID), kvStates[requestID] == nil else {
             return
@@ -484,7 +497,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `applyAdoption` (shutdown, queue-full rejection).
     private func releaseAbandonedAdoption(_ adoption: CBv2PrefixAdoption?) {
         guard let adoption else { return }
-        prefixCache?.endAdoption(tokens: adoption.tokens, matched: adoption.matched)
+        prefixCache?.endAdoption(
+            tokens: adoption.tokens, matched: adoption.matched, cacheSalt: adoption.cacheSalt)
     }
 
     // MARK: Cancellation & backpressure (any thread)
@@ -557,7 +571,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
-                        (id: id, state: state, rollbackOne: false, donateTokens: nil))
+                        (id: id, state: state, rollbackOne: false, donation: nil))
                 } else {
                     backend.release(state)
                 }
@@ -791,11 +805,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
-        for (_, state, rollbackOne, donateTokens) in step.deferredReleases {
+        for (_, state, rollbackOne, donation) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
-            retire(state: state, donatingTokens: donateTokens)
+            retire(state: state, donating: donation)
         }
     }
 
@@ -813,7 +827,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         capacity?.releaseAll(id: id)
 
         if let state = kvStates.removeValue(forKey: id) {
-            let donateTokens = donationTokens(for: rec, reason: reason)
+            let donation = donationIntent(for: rec, reason: reason)
             if let inFlight, inFlight.participants.contains(id) {
                 // The in-flight step still references this state — fence the
                 // free behind its completion; roll back the wasted token iff
@@ -823,10 +837,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                     (
                         id: id, state: state,
                         rollbackOne: inFlight.sampledRows.contains(id),
-                        donateTokens: donateTokens
+                        donation: donation
                     ))
             } else {
-                retire(state: state, donatingTokens: donateTokens)
+                retire(state: state, donating: donation)
             }
         }
 
@@ -848,12 +862,14 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Prefix-cache donation (engine thread → donation queue)
 
-    /// Tokens to donate for a finished request, or nil when donation does
+    /// Donation intent for a finished request, or nil when donation does
     /// not apply. Only NATURAL completions donate: their KV is a complete,
     /// confirmed prefix. The last confirmed token was sampled but never fed
-    /// through the model, so it is dropped at donation time.
-    private func donationTokens(for rec: CBv2ScheduledRequest, reason: CBv2FinishReason)
-        -> [Int]?
+    /// through the model, so it is dropped at donation time. The intent
+    /// carries the request's cache salt so the entry lands in the donor's
+    /// salt scope (TB-007).
+    private func donationIntent(for rec: CBv2ScheduledRequest, reason: CBv2FinishReason)
+        -> CBv2DonationIntent?
     {
         guard prefixCache != nil else { return nil }
         switch reason {
@@ -863,7 +879,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Donation requires the full prompt to have been processed (at
         // least one sampled token) — mid-prefill finishes carry partial KV.
         guard rec.generatedTokenCount >= 1, rec.tokens.count > 1 else { return nil }
-        return rec.tokens
+        return CBv2DonationIntent(tokens: rec.tokens, cacheSalt: rec.request.cacheSalt)
     }
 
     /// Retire a finished request's KV state: donate to the prefix cache
@@ -872,12 +888,13 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// indexing + optional materialization run on the donation queue), then
     /// release the storage back on the engine queue (the paged pool is
     /// engine-thread-affine).
-    private func retire(state: [CBv2SequenceKV?], donatingTokens: [Int]?) {
-        guard let prefixCache, let tokens = donatingTokens else {
+    private func retire(state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?) {
+        guard let prefixCache, let donation else {
             backend.release(state)
             return
         }
-        let donated = Array(tokens.dropLast())
+        let donated = Array(donation.tokens.dropLast())
+        let cacheSalt = donation.cacheSalt
         var built: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
         built.reserveCapacity(layerKinds.count)
         for (i, kind) in layerKinds.enumerated() {
@@ -898,7 +915,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         // No cycle: the block releases its captures once it runs.
         donationQueue.async {
             prefixCache.donate(
-                tokens: donated, snapshots: handoff.value.snapshots, layerKinds: layerKinds)
+                tokens: donated, snapshots: handoff.value.snapshots, layerKinds: layerKinds,
+                cacheSalt: cacheSalt)
             self.releaseOnEngineQueue(handoff.value.state)
         }
     }

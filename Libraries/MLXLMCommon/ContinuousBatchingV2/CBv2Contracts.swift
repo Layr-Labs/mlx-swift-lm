@@ -84,10 +84,16 @@ public struct CBv2Request: Sendable {
     public var stopStrings: [String]
     /// Higher value = more important. Used by admission and preemption.
     public var priority: Int
+    /// Per-request prefix-cache scope (TB-007). When non-nil it REPLACES the
+    /// cache-level salt in the first block hash (h_0), so requests carrying
+    /// different salts can never share cached KV; nil falls back to the
+    /// cache-level salt (byte-identical hashes to the pre-salt behavior).
+    public var cacheSalt: String?
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
-        maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0
+        maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0,
+        cacheSalt: String? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -96,6 +102,7 @@ public struct CBv2Request: Sendable {
         self.stopTokens = stopTokens
         self.stopStrings = stopStrings
         self.priority = priority
+        self.cacheSalt = cacheSalt
     }
 }
 
@@ -451,10 +458,47 @@ public protocol CBv2PrefixCache: AnyObject, Sendable {
     /// Evict to fit `byteBudget`. LRU.
     func evict(toFit byteBudget: Int)
     var bytesInUse: Int { get }
+
+    // MARK: Per-request salt scope (TB-007; additive, D§2 follow-up)
+
+    /// Salted `lookup`: a non-nil `cacheSalt` replaces the cache-level salt
+    /// in the key chain's first block hash, so different salts can never
+    /// resolve each other's entries; nil behaves exactly like the unsalted
+    /// overload. Every hit is balanced with `endAdoption(...cacheSalt:)`
+    /// carrying the SAME salt. Default: ignores the salt (delegates to the
+    /// unsalted method), so pre-salt implementations stay conformant.
+    func lookup(tokens: [Int], layerKinds: [CBv2LayerKind], cacheSalt: String?)
+        -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
+    /// Salted pre-snapshotted donation; same semantics as the unsalted
+    /// overload with the entry indexed under the request's salt scope.
+    func donate(
+        tokens: [Int],
+        snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind], cacheSalt: String?)
+    /// Salted pin release; must carry the salt the balancing `lookup` used.
+    func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?)
 }
 
 extension CBv2PrefixCache {
     public func endAdoption(tokens: [Int], matched: Int) {}
+
+    public func lookup(tokens: [Int], layerKinds: [CBv2LayerKind], cacheSalt: String?)
+        -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
+    {
+        lookup(tokens: tokens, layerKinds: layerKinds)
+    }
+
+    public func donate(
+        tokens: [Int],
+        snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind], cacheSalt: String?
+    ) {
+        donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds)
+    }
+
+    public func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?) {
+        endAdoption(tokens: tokens, matched: matched)
+    }
 }
 
 /// Tokens the engine must re-prefill through ALL layers after adopting a
