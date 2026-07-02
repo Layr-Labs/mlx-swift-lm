@@ -313,6 +313,19 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// donor's pages out of the pool until the donation has materialized.
     private let donationQueue = DispatchQueue(
         label: "com.eigen.cbv2.donation", qos: .utility)
+    /// Detokenization (Tokenizer.decode + UTF-8 holdback) + stream emission
+    /// for PASSTHROUGH requests (no stop strings) runs here, OFF the serial
+    /// step thread — that host string work is bounded per token but at B>1
+    /// it otherwise sits on the critical path between GPU steps for every
+    /// row (PR#62 review). A single serial queue preserves global FIFO
+    /// order, so each request's deltas + trailing flush + terminal event
+    /// stay ordered (per-request order is a subsequence of global order).
+    /// Requests WITH stop strings keep the fully synchronous engine-thread
+    /// path: their holdback scan gates the deterministic one-step-late
+    /// stop-string finish, which cannot be deferred without generating text
+    /// past the stop (contract) or breaking the parity suites.
+    private let detokQueue = DispatchQueue(
+        label: "com.eigen.cbv2.detok", qos: .userInitiated)
 
     // Cross-thread state (stateLock).
     private let stateLock = NSLock()
@@ -340,8 +353,21 @@ public final class EngineLoopV2: @unchecked Sendable {
     public private(set) var stepCount = 0
     public private(set) var chainedStepCount = 0
     public private(set) var preemptionCount = 0
+    /// Steps that submitted eager layer-cache inner state (the offset chain +
+    /// KV buffers) into the step's `asyncEval` set. The DAR-325 guard:
+    /// evaluating the offset chain every eager step keeps its lazy `+ L`
+    /// advance from accumulating O(steps) of graph. Zero for the compiled
+    /// path (its counters advance in-graph) and for caches that vend no
+    /// inner state (mocks). Test hook.
+    public private(set) var offsetChainEvalSteps = 0
     /// Fired (from the watchdog thread) when a step exceeds `stepTimeout`.
     public var onStepWedge: (@Sendable (TimeInterval) -> Void)?
+    /// Test hook: artificial delay at the START of the enqueue engine block,
+    /// before the request reaches the scheduler. Widens the early-cancel race
+    /// window (a cancel arriving after `submit` registered the stream but
+    /// before enqueue ran) so the regression is deterministic. Zero in
+    /// production. Set before submitting.
+    var enqueueStartDelayForTesting: TimeInterval = 0
 
     public var isHealthy: Bool {
         stateLock.lock()
@@ -472,10 +498,25 @@ public final class EngineLoopV2: @unchecked Sendable {
                 gauges.endSubmit()
                 publishGauges()
             }
+            if enqueueStartDelayForTesting > 0 {
+                Thread.sleep(forTimeInterval: enqueueStartDelayForTesting)
+            }
             guard running, !draining else {
                 releaseAbandonedAdoption(adoption)
                 takeStream(request.id)?.finish(
                     reason: .error("engine is shutting down"),
+                    usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+                return
+            }
+            // Early-cancel race: a cancel can arrive after `submit` registered
+            // the stream but BEFORE this block runs — at which point the
+            // scheduler has no record for it, so `processCancellations` cannot
+            // act. A pending cancel is remembered until this point and
+            // consumed here so the request is never started (PR#62 review).
+            if consumeEarlyCancel(request.id) {
+                releaseAbandonedAdoption(adoption)
+                takeStream(request.id)?.finish(
+                    reason: .cancelled,
                     usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
                 return
             }
@@ -488,6 +529,13 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if let adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
+            } catch let error as CBv2SchedulerError {
+                releaseAbandonedAdoption(adoption)
+                // Contract violation (duplicate live request id) — surfaced
+                // distinctly from capacity backpressure.
+                takeStream(request.id)?.finish(
+                    reason: .error("scheduler rejected request: \(error)"),
+                    usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
             } catch {
                 releaseAbandonedAdoption(adoption)
                 // Precise maxWaiting enforcement (the submit-side gauge check
@@ -693,20 +741,36 @@ public final class EngineLoopV2: @unchecked Sendable {
         return cacheProvider.layerCaches(rowStates: rowStates)
     }
 
+    /// Inner-state arrays (lazily-mutated KV buffers + the on-device
+    /// `positionOffsets` chain) of the eager layer caches, collected so the
+    /// step's `asyncEval` collapses those lazy chains every step instead of
+    /// letting `updateAndAttend`'s `+ L` offset advance accumulate O(steps)
+    /// of unevaluated graph — the DAR-325 bug class (legacy `BatchKVCache`
+    /// had exactly this). Empty for the compiled path (its counters advance
+    /// in-graph) and for caches that vend no inner state (mocks).
+    private func eagerCacheInnerState(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
+        caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
+    }
+
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
-    /// batch: the compiled step when eligible, else the eager forward.
+    /// batch: the compiled step when eligible, else the eager forward. The
+    /// second tuple element is the eager caches' inner state (offset chain +
+    /// KV buffers) that must ride the step's `asyncEval` (DAR-325); it is
+    /// empty on the compiled path.
     /// Numerics note: both paths are pinned; they may only alternate at
     /// step boundaries, and the parity suites hold them token-exact.
-    private func decodeLogits(rowStates: [[CBv2SequenceKV?]], tokens: MLXArray) -> MLXArray {
+    private func decodeLogits(
+        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray
+    ) -> (logits: MLXArray, cacheInnerState: [MLXArray]) {
         if let compiledDecode,
             let compiled = compiledDecode.decodeStep(rowStates: rowStates, tokens: tokens)
         {
             eagerCompositionStale = true
-            return compiled
+            return (compiled, [])
         }
         let caches = eagerCaches(rowStates: rowStates)
         let logits = model.forward(tokens: tokens, caches: caches)
-        return logits[0..., -1, 0...]
+        return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
     }
 
     /// Pure-decode step fed by the previous step's still-lazy tokens.
@@ -722,7 +786,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let last = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+        let (last, cacheInnerState) = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
@@ -744,6 +808,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler.markPendingSamples(ids: ids)
         var toEval = [sampled]
         if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
+        // Collapse the eager caches' lazy offset/KV chains this step (DAR-325).
+        if !cacheInnerState.isEmpty {
+            toEval.append(contentsOf: cacheInnerState)
+            offsetChainEvalSteps += 1
+        }
         let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         asyncEval(toEval)
         if CBv2StepProfiler.enabled {
@@ -784,6 +853,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         guard !work.isEmpty else { return nil }
 
+        // Lazy offset/KV chains of every eager cache touched this step; ride
+        // the step's asyncEval so the `+ L` offset advance can't accumulate
+        // O(steps) of unevaluated graph (DAR-325).
+        var cacheInnerState: [MLXArray] = []
+
         // Rectangular decode batch, in plan order.
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
@@ -791,8 +865,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let last = decodeLogits(
+            let (last, decodeInnerState) = decodeLogits(
                 rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
+            cacheInnerState.append(contentsOf: decodeInnerState)
             decodeSampled = sampler.sample(
                 logits: last,
                 params: decodeRows.map(\.rec.request.sampling),
@@ -814,6 +889,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let logits = model.forward(tokens: inputs, caches: caches)
+            cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
                 prefillSampled[rec.id] = sampler.sample(
                     logits: logits[0..., -1, 0...],
@@ -854,6 +930,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         var toEval = evalTargets
         if let sampledTokens { toEval.append(sampledTokens) }
         for segment in logprobSegments { toEval.append(contentsOf: segment.evalTargets) }
+        if !cacheInnerState.isEmpty {
+            toEval.append(contentsOf: cacheInnerState)
+            offsetChainEvalSteps += 1
+        }
         asyncEval(toEval)
 
         let step = CBv2InFlightStep(
@@ -916,24 +996,39 @@ public final class EngineLoopV2: @unchecked Sendable {
             // intact for the finish-time flush.
             let isStopToken = rec.request.stopTokens.contains(token)
             let detokenizer = detokenizers[id]
-            let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-            let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
-            if CBv2StepProfiler.enabled {
-                CBv2StepProfiler.record(
-                    "v2.detok.push", seconds: CFAbsoluteTimeGetCurrent() - detokStart)
-            }
-            let emitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-            stream(for: id)?.emit(
-                .delta(text: text, tokens: [token], logprobs: logprobsByID[id].map { [$0] }))
-            if CBv2StepProfiler.enabled {
-                CBv2StepProfiler.record(
-                    "v2.stream.emit", seconds: CFAbsoluteTimeGetCurrent() - emitStart)
+            let logprobs = logprobsByID[id].map { [$0] }
+
+            // Stop-string detection needs the holdback scan synchronously to
+            // gate the deterministic one-step-late `.stop` finish; passthrough
+            // requests can't stop on a string, so their decode + emit move
+            // OFF the step thread (finding 2 — detokQueue).
+            var matchedStopString = false
+            if rec.request.stopStrings.isEmpty {
+                let stream = stream(for: id)
+                detokQueue.async {
+                    let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
+                    stream?.emit(.delta(text: text, tokens: [token], logprobs: logprobs))
+                }
+            } else {
+                let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+                let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
+                if CBv2StepProfiler.enabled {
+                    CBv2StepProfiler.record(
+                        "v2.detok.push", seconds: CFAbsoluteTimeGetCurrent() - detokStart)
+                }
+                let emitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+                stream(for: id)?.emit(.delta(text: text, tokens: [token], logprobs: logprobs))
+                if CBv2StepProfiler.enabled {
+                    CBv2StepProfiler.record(
+                        "v2.stream.emit", seconds: CFAbsoluteTimeGetCurrent() - emitStart)
+                }
+                matchedStopString = detokenizer?.matchedStopString ?? false
             }
 
             // Stop detection — one step late by construction.
             if isStopToken {
                 finishRequest(id, reason: .stop)
-            } else if let detokenizer, detokenizer.matchedStopString {
+            } else if matchedStopString {
                 finishRequest(id, reason: .stop)
             } else if rec.generatedTokenCount >= rec.request.maxTokens {
                 finishRequest(id, reason: .length)
@@ -986,20 +1081,31 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        var trailing = ""
-        if let detokenizer = detokenizers.removeValue(forKey: id) {
-            trailing = detokenizer.flush()
-        }
+        let detokenizer = detokenizers.removeValue(forKey: id)
         let stream = takeStream(id)
-        if !trailing.isEmpty {
-            stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
+        let usage = CBv2Usage(
+            promptTokens: rec.request.promptTokens.count,
+            completionTokens: rec.generatedTokenCount,
+            prefixCacheHitTokens: prefixHitTokens.removeValue(forKey: id) ?? 0)
+
+        // Passthrough requests emit deltas on the detok queue; the trailing
+        // flush + terminal MUST ride the same queue so they land AFTER those
+        // deltas (FIFO ordering). Stop-string requests stay synchronous.
+        if rec.request.stopStrings.isEmpty {
+            detokQueue.async {
+                let trailing = detokenizer?.flush() ?? ""
+                if !trailing.isEmpty {
+                    stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
+                }
+                stream?.finish(reason: reason, usage: usage)
+            }
+        } else {
+            let trailing = detokenizer?.flush() ?? ""
+            if !trailing.isEmpty {
+                stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
+            }
+            stream?.finish(reason: reason, usage: usage)
         }
-        stream?.finish(
-            reason: reason,
-            usage: CBv2Usage(
-                promptTokens: rec.request.promptTokens.count,
-                completionTokens: rec.generatedTokenCount,
-                prefixCacheHitTokens: prefixHitTokens.removeValue(forKey: id) ?? 0))
     }
 
     // MARK: Prefix-cache donation (engine thread → donation queue)
@@ -1097,12 +1203,43 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func processCancellations() {
         stateLock.lock()
         let cancels = pendingCancels
-        pendingCancels.removeAll()
         stateLock.unlock()
+
+        // Which cancels are fully resolved this boundary (drop from the set).
+        // A cancel with no scheduler record AND a still-registered stream is
+        // an EARLY cancel racing `enqueue` — keep it so the enqueue block
+        // refuses to start the request (PR#62 review). A cancel with neither
+        // is stale (request already finished) — drop it.
+        var resolved: Set<CBv2RequestID> = []
         for id in cancels {
-            guard scheduler.record(for: id) != nil else { continue }
-            finishRequest(id, reason: .cancelled)
+            if scheduler.record(for: id) != nil {
+                finishRequest(id, reason: .cancelled)
+                resolved.insert(id)
+            } else if !hasRegisteredStream(id) {
+                resolved.insert(id)
+            }
         }
+        guard !resolved.isEmpty else { return }
+        stateLock.lock()
+        pendingCancels.subtract(resolved)
+        stateLock.unlock()
+    }
+
+    /// True when a stream is still registered for `id` (used to tell a
+    /// racing pre-enqueue cancel from a stale post-finish one).
+    private func hasRegisteredStream(_ id: CBv2RequestID) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return streams[id] != nil
+    }
+
+    /// Consume a remembered early cancel for `id` at enqueue time. Returns
+    /// true when the request was cancelled before it started (the caller
+    /// must finish its stream and never enqueue it).
+    private func consumeEarlyCancel(_ id: CBv2RequestID) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return pendingCancels.remove(id) != nil
     }
 
     private func processDeadlines() {

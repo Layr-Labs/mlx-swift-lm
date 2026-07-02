@@ -105,6 +105,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public var stepCount: Int { loop.stepCount }
     public var chainedStepCount: Int { loop.chainedStepCount }
     public var preemptionCount: Int { loop.preemptionCount }
+    /// Steps that evaluated the eager caches' offset/KV inner state (DAR-325
+    /// guard). Test hook; engine-thread owned, read at quiescent points.
+    public var offsetChainEvalSteps: Int { loop.offsetChainEvalSteps }
     /// Compiled-decode telemetry, or nil when the compiled path was never
     /// built (config off, ineligible model, unsupported hardware).
     /// NOTE: counters are engine-thread owned; read at quiescent points

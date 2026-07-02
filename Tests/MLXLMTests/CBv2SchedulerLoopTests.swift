@@ -161,6 +161,33 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         XCTAssertTrue(released, "cancelled request's KV must be freed")
     }
 
+    func testCancelImmediatelyAfterSubmitIsHonored() async throws {
+        // Race: a cancel arrives after `submit` registered the stream but
+        // BEFORE the engine's enqueue block runs (the scheduler has no record
+        // yet). Artificially delay enqueue to make the window deterministic;
+        // the request must never start (PR#62 review). Without the fix the
+        // cancel is dropped and the request generates its full budget.
+        let harness = CBv2SchedHarness()
+        harness.engine.loopForTesting.enqueueStartDelayForTesting = 0.2
+
+        let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 50)
+        let stream = try harness.engine.submit(request)
+        // Cancel while the enqueue block is still sleeping (pre-scheduler).
+        harness.engine.cancel(request.id)
+
+        let collected = await cbv2SchedCollect(stream)
+        XCTAssertEqual(
+            collected.finishReason, .cancelled,
+            "an early cancel must abort the request before it starts")
+        XCTAssertTrue(
+            collected.tokens.isEmpty, "a request cancelled before start must emit no tokens")
+
+        // Nothing was ever admitted / allocated.
+        XCTAssertEqual(harness.backend.makeCalls, 0, "KV must never be allocated")
+        let idle = await cbv2SchedWait { harness.engine.capacity().activeRequests == 0 }
+        XCTAssertTrue(idle)
+    }
+
     // MARK: Backpressure
 
     func testBackpressurePausesExactlyTheSlowStream() async throws {
