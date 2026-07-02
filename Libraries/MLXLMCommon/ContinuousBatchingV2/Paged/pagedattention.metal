@@ -54,6 +54,10 @@
 //   D          head dimension, one of {64, 128, 256, 512} (D % 32 == 0)
 //   S          page size in tokens (16)
 //   GQA        query heads per kv head (queryHeads / kvHeads)
+//   HPT        query heads per pass-A threadgroup (divides GQA; a kv
+//              head's heads split across GQA/HPT threadgroups so smem and
+//              the register accumulator never scale with full GQA at
+//              large D — PagedAttentionKernel.headsPerThreadgroup)
 //   NSG        simdgroups per pass-A threadgroup (32 KB smem budget)
 //   PTOK       tokens per partition (512; PTOK % S == 0)
 //   HAS_WRITE  (pass A) fuse the decode KV write: each row's new K/V tile
@@ -118,15 +122,16 @@
 // the current query may attend to (window clamping happens on the host
 // from absolute positions — plain Swift Int math, no device sync).
 //
-// Pass A grid: threads = (KVH * 32 * NSG, B, MAXPART), tg = (32 * NSG, 1, 1).
-// Pass B grid: threads = (KVH * GQA * 32, B, 1),       tg = (32, 1, 1).
+// Pass A grid: threads = (KVH * (GQA/HPT) * 32 * NSG, B, MAXPART),
+//              tg = (32 * NSG, 1, 1).
+// Pass B grid: threads = (KVH * GQA * 32, B, 1), tg = (32, 1, 1).
 //
 // Threadgroup memory — SINGLE SOURCE OF TRUTH for eligibility
 // -----------------------------------------------------------
 // Pass A allocates exactly two threadgroup buffers (in the generated body,
 // PagedAttentionMSL.partBody):
-//   threadgroup float q_smem[GQA * D];
-//   threadgroup float red_smem[NSG * GQA * (D + 2)];   // RSTRIDE = D + 2
+//   threadgroup float q_smem[HPT * D];
+//   threadgroup float red_smem[NSG * HPT * (D + 2)];   // RSTRIDE = D + 2
 // Pass B allocates NONE. Both buffers are float regardless of T, and the
 // HAS_SOFTCAP / HAS_SINKS variants add none. The Swift-side eligibility
 // math (PagedAttentionKernel.partThreadgroupBytes / ineligibilityReason /
@@ -175,8 +180,16 @@ inline void load_row(const device T* row, uint lane, thread float* dst) {
 // softmax per query head; the simdgroup states are merged through
 // threadgroup memory and written out UNNORMALIZED with their (m, l) meta
 // (flash-decoding split-K).
+// HPT (heads per threadgroup) splits a kv head's GQA query heads across
+// GQA/HPT threadgroups so neither the threadgroup-memory surfaces
+// (q_smem, red_smem) nor the per-thread accumulator (HPT * D / 32 floats)
+// scale with the full GQA factor at large head dims. HPT == GQA keeps the
+// original single-threadgroup-per-kv-head shape (the fleet's d64/d128
+// configs); Gemma-4 global layers (D=512, GQA=8) run HPT=2. The split is
+// per-HEAD, so no head's summation order changes — batch-composition
+// invariance and per-row determinism are untouched.
 template <
-    typename T, int D, int S, int GQA, int NSG, int PTOK, bool HAS_WRITE,
+    typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, bool HAS_WRITE,
     bool HAS_SOFTCAP>
 inline void paged_attention_part_impl(
     const device T* q,
@@ -190,8 +203,8 @@ inline void paged_attention_part_impl(
     const int kvh,
     const int maxp,
     const int maxpart,
-    threadgroup float* q_smem,   // [GQA * D]
-    threadgroup float* red_smem, // [NSG * GQA * (D + 2)]
+    threadgroup float* q_smem,   // [HPT * D]
+    threadgroup float* red_smem, // [NSG * HPT * (D + 2)]
     device float* partials,
     device float* meta,
     uint3 tgpig,
@@ -199,12 +212,15 @@ inline void paged_attention_part_impl(
     uint sgitg,
     uint lane
 ) {
+    static_assert(GQA % HPT == 0, "HPT must divide GQA");
+    constexpr int SPLITS = GQA / HPT; // threadgroups per (kv head, partition)
     constexpr int EPT = D / 32;      // K/V elements owned per lane
     constexpr int TG = 32 * NSG;     // threads per threadgroup
     constexpr int RSTRIDE = D + 2;   // per-(sg, head) merge record: acc[D], m, l
                                      // (mirrored: PagedAttentionKernel.mergeRecordMetaFloats)
 
-    const int kv_head = tgpig.x;
+    const int kv_head = tgpig.x / SPLITS;
+    const int hgroup = tgpig.x % SPLITS;
     const int b = tgpig.y;
     const int part = tgpig.z;
     const int lin = tpitg.x;
@@ -227,12 +243,13 @@ inline void paged_attention_part_impl(
     const float scale = params[1];
 
     // Fused decode write: the row's newest position lives in THIS row's
-    // last partition, and only this threadgroup ever reads it — write the
-    // step's K/V tile in place before attending (see file header). The
+    // last partition, and only that partition's threadgroups ever read it
+    // — write the step's K/V tile in place before attending (see file
+    // header). Under a head split every one of the (kv head, partition)'s
+    // SPLITS threadgroups writes the same bytes with the same values
+    // (idempotent), so each is self-sufficient after its own barrier. The
     // slabs are stable buffers; the const_cast is the documented in-place
-    // write contract, not a hack around MLX donation. The (0, 0, 0)
-    // threadgroup's lane 0 also advances the group's write-fence chain so
-    // later dispatches that read the slabs order after this one.
+    // write contract, not a hack around MLX donation.
     if (HAS_WRITE && part == (attend_len - 1) / PTOK) {
         const int wpage = info[3];
         const int wslot = info[4];
@@ -247,10 +264,10 @@ inline void paged_attention_part_impl(
         }
     }
 
-    // Stage the (scaled) queries for this kv head's GQA query heads.
-    const int q_head0 = kv_head * GQA;
+    // Stage the (scaled) queries for this threadgroup's HPT query heads.
+    const int q_head0 = kv_head * GQA + hgroup * HPT;
     const device T* q_base = q + ((size_t)b * (size_t)(kvh * GQA) + (size_t)q_head0) * D;
-    for (int i = lin; i < GQA * D; i += TG) {
+    for (int i = lin; i < HPT * D; i += TG) {
         q_smem[i] = float(q_base[i]) * scale;
     }
     // mem_device: the fused write above must be visible to this
@@ -259,11 +276,11 @@ inline void paged_attention_part_impl(
 
     // Per-simdgroup online softmax state (identical across lanes for m/l,
     // per-lane slices of the value accumulator).
-    float m[GQA];
-    float l[GQA];
-    float acc[GQA][EPT];
+    float m[HPT];
+    float l[HPT];
+    float acc[HPT][EPT];
 #pragma unroll
-    for (int g = 0; g < GQA; g++) {
+    for (int g = 0; g < HPT; g++) {
         m[g] = -FLT_MAX;
         l[g] = 0.0f;
 #pragma unroll
@@ -284,7 +301,7 @@ inline void paged_attention_part_impl(
         load_row<T, EPT>(vcache + base, lane, vf);
 
 #pragma unroll
-        for (int g = 0; g < GQA; g++) {
+        for (int g = 0; g < HPT; g++) {
             float partial = 0.0f;
 #pragma unroll
             for (int e = 0; e < EPT; e++) {
@@ -309,9 +326,9 @@ inline void paged_attention_part_impl(
     }
 
     // Publish per-simdgroup states.
-    threadgroup float* mine = red_smem + (size_t)(sgitg * GQA) * RSTRIDE;
+    threadgroup float* mine = red_smem + (size_t)(sgitg * HPT) * RSTRIDE;
 #pragma unroll
-    for (int g = 0; g < GQA; g++) {
+    for (int g = 0; g < HPT; g++) {
 #pragma unroll
         for (int e = 0; e < EPT; e++) {
             mine[g * RSTRIDE + lane * EPT + e] = acc[g][e];
@@ -326,15 +343,15 @@ inline void paged_attention_part_impl(
     // Merge across simdgroups and write the UNNORMALIZED partition partial
     // plus its (m, l) meta. Query heads round-robin over simdgroups; lanes
     // cover the head dim.
-    for (int g = sgitg; g < GQA; g += NSG) {
+    for (int g = sgitg; g < HPT; g += NSG) {
         float pm = -FLT_MAX;
         for (int s = 0; s < NSG; s++) {
-            pm = max(pm, red_smem[(size_t)(s * GQA + g) * RSTRIDE + D]);
+            pm = max(pm, red_smem[(size_t)(s * HPT + g) * RSTRIDE + D]);
         }
         float pl = 0.0f;
         for (int s = 0; s < NSG; s++) {
-            const float ms = red_smem[(size_t)(s * GQA + g) * RSTRIDE + D];
-            const float ls = red_smem[(size_t)(s * GQA + g) * RSTRIDE + D + 1];
+            const float ms = red_smem[(size_t)(s * HPT + g) * RSTRIDE + D];
+            const float ls = red_smem[(size_t)(s * HPT + g) * RSTRIDE + D + 1];
             pl += ls * exp2(ms - pm);
         }
 
@@ -345,8 +362,8 @@ inline void paged_attention_part_impl(
         for (int e = (int)lane; e < D; e += 32) {
             float v = 0.0f;
             for (int s = 0; s < NSG; s++) {
-                const float ms = red_smem[(size_t)(s * GQA + g) * RSTRIDE + D];
-                v += red_smem[(size_t)(s * GQA + g) * RSTRIDE + e] * exp2(ms - pm);
+                const float ms = red_smem[(size_t)(s * HPT + g) * RSTRIDE + D];
+                v += red_smem[(size_t)(s * HPT + g) * RSTRIDE + e] * exp2(ms - pm);
             }
             prow[e] = v;
         }

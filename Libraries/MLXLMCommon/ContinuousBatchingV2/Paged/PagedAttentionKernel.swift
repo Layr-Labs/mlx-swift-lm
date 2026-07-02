@@ -14,17 +14,15 @@
 // by name and re-JITs whenever the generated source for a name changes, so
 // sharing one name across dtypes/head-dims would thrash the pipeline cache.
 //
-// PERFORMANCE NOTE (2026-07, real-weights re-baseline): the kernel is
-// numerically CORRECT but UNOPTIMIZED on real-model shapes — it was
-// validated on synthetic parity only. On GPT-OSS-20B real weights the
-// paged decode path runs ~100x slower than the contiguous backend
-// (~2.0 s/token, all GPU-side); requests correctly error via the engine's
-// 30 s step watchdog (see benchmarks/reports/gptoss-20b-mxfp4q8-main.md).
-// The paged backend remains NON-DEFAULT and gated behind explicit
-// construction; kernel optimization is tracked as follow-up work. Known
-// issue to investigate alongside the perf work: a teardown SIGSEGV was
-// observed after watchdog-errored runs (stack captured during the
-// benchmarks/reports GPT-OSS runs).
+// PERFORMANCE NOTE (2026-07, kernel-opt track): the original real-model
+// ~100x slowdown (GPT-OSS-20B at ~2 s/token, 30 s step-watchdog kills —
+// benchmarks/reports/gptoss-20b-mxfp4q8-main.md) was NOT kernel math: MLX
+// retains kernel-INPUT data handles until the command buffer completes, so
+// per-layer slab slice-updates failed donation and copied the full multi-
+// GiB slab (~370 GiB of copies per token). Fixed by writing the slabs IN
+// PLACE (fused decode write in pass A + `bulkWrite` for chunks) with a
+// per-group write-fence chain for ordering; measured 25.5 s -> 13.6 ms per
+// 24-layer step at the 16 GiB pool (docs/engine-v2/kernel-research.md §3).
 
 import Foundation
 import MLX
@@ -109,9 +107,9 @@ enum PagedAttentionMSL {
                 && thread_position_in_grid.z == 0) {
                 fence[0] = wfence[0] + 1;
             }
-            threadgroup float q_smem[GQA * D];
-            threadgroup float red_smem[NSG * GQA * (D + 2)];
-            cbv2::paged_attention_part_impl<T, D, S, GQA, NSG, PTOK, true, HAS_SOFTCAP>(
+            threadgroup float q_smem[HPT * D];
+            threadgroup float red_smem[NSG * HPT * (D + 2)];
+            cbv2::paged_attention_part_impl<T, D, S, GQA, HPT, NSG, PTOK, true, HAS_SOFTCAP>(
                 q, knew, vnew, kcache, vcache, tables, seqinfo, params,
                 kvh, maxp, maxpart, q_smem, red_smem, partials, meta,
                 threadgroup_position_in_grid,
@@ -126,9 +124,9 @@ enum PagedAttentionMSL {
             // grid z extent == the partial buffers' partition capacity
             // (output `_shape` params are not injected by MLX, only inputs').
             const int maxpart = threadgroups_per_grid.z;
-            threadgroup float q_smem[GQA * D];
-            threadgroup float red_smem[NSG * GQA * (D + 2)];
-            cbv2::paged_attention_part_impl<T, D, S, GQA, NSG, PTOK, false, HAS_SOFTCAP>(
+            threadgroup float q_smem[HPT * D];
+            threadgroup float red_smem[NSG * HPT * (D + 2)];
+            cbv2::paged_attention_part_impl<T, D, S, GQA, HPT, NSG, PTOK, false, HAS_SOFTCAP>(
                 q, q, q, kcache, vcache, tables, seqinfo, params,
                 kvh, maxp, maxpart, q_smem, red_smem, partials, meta,
                 threadgroup_position_in_grid,
@@ -162,11 +160,11 @@ enum PagedAttentionMSL {
 /// Batched single-token (decode) paged attention.
 public enum PagedAttentionKernel {
 
-    /// Head dims with a validated shared-memory/register budget. Necessary
-    /// but NOT sufficient for eligibility: the threadgroup-memory budget
-    /// also depends on the GQA factor (see `ineligibilityReason`) — e.g.
-    /// Gemma-4 global layers (headDim 512, GQA 8) are over budget even at
-    /// one simdgroup. Everything else in the product fleet is 64/128/256.
+    /// Head dims with a validated shared-memory/register budget. The
+    /// threadgroup-memory budget additionally depends on the GQA factor,
+    /// but the head split (`headsPerThreadgroup`) keeps every supported
+    /// head dim within it at any fleet GQA — Gemma-4 global layers
+    /// (headDim 512, GQA 8) run split 2-heads-per-threadgroup.
     public static let supportedHeadDims: Set<Int> = [64, 128, 256, 512]
 
     /// Tokens per flash-decoding partition. Must be a multiple of the page
@@ -207,13 +205,35 @@ public enum PagedAttentionKernel {
     /// Candidate simdgroup counts for the part kernel, largest first.
     static let simdgroupCandidates = [8, 4, 2, 1]
 
+    /// Per-thread float32 budget for the pass-A value accumulator
+    /// (`acc[HPT][D/32]`): caps the head split so registers never explode
+    /// at large head dims (32 floats == the level the fleet's validated
+    /// d64/GQA-8 shape already runs at).
+    static let maxAccumulatorFloatsPerThread = 32
+
+    /// Query heads per pass-A threadgroup (the kernel's HPT template
+    /// parameter): the largest divisor of `gqa` whose per-thread value
+    /// accumulator stays within `maxAccumulatorFloatsPerThread`. A kv
+    /// head's GQA query heads split across `gqa / hpt` threadgroups; the
+    /// split is per-head, so no head's arithmetic changes. d64/d128 fleet
+    /// shapes keep hpt == gqa (identical to the unsplit kernel); d512 at
+    /// GQA 8 (Gemma-4 global layers) runs hpt == 2.
+    public static func headsPerThreadgroup(headDim: Int, gqa: Int) -> Int {
+        let cap = max(1, maxAccumulatorFloatsPerThread * 32 / headDim)
+        var hpt = min(gqa, cap)
+        while gqa % hpt != 0 { hpt -= 1 }
+        return hpt
+    }
+
     /// Exact threadgroup bytes the part kernel allocates for one
-    /// threadgroup: (q_smem + red_smem) float32 elements.
+    /// threadgroup: (q_smem + red_smem) float32 elements, sized by the
+    /// HEAD-SPLIT group (`headsPerThreadgroup`), not the full GQA factor.
     public static func partThreadgroupBytes(
         headDim: Int, gqa: Int, simdgroups: Int
     ) -> Int {
-        let qSmem = gqa * headDim
-        let redSmem = simdgroups * gqa * (headDim + mergeRecordMetaFloats)
+        let hpt = headsPerThreadgroup(headDim: headDim, gqa: gqa)
+        let qSmem = hpt * headDim
+        let redSmem = simdgroups * hpt * (headDim + mergeRecordMetaFloats)
         return (qSmem + redSmem) * MemoryLayout<Float32>.size
     }
 
@@ -418,6 +438,8 @@ public enum PagedAttentionKernel {
         }
         partInputs.append(contentsOf: [kSlab, vSlab, tables, seqinfo, params, writeFence])
 
+        let hpt = headsPerThreadgroup(headDim: headDim, gqa: gqa)
+        let splits = gqa / hpt
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap, hasWrite: hasWrite)
@@ -429,11 +451,12 @@ public enum PagedAttentionKernel {
                 ("D", headDim),
                 ("S", pageSize),
                 ("GQA", gqa),
+                ("HPT", hpt),
                 ("NSG", nsg),
                 ("PTOK", partitionTokens),
                 ("HAS_SOFTCAP", softcap),
             ],
-            grid: (kvHeads * tg, b, maxParts),
+            grid: (kvHeads * splits * tg, b, maxParts),
             threadGroup: (tg, 1, 1),
             outputShapes: hasWrite
                 ? [[b, queryHeads, maxParts, headDim], [b, queryHeads, maxParts, 2], [1]]

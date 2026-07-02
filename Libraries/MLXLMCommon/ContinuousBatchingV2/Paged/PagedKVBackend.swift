@@ -7,7 +7,8 @@
 // Eligibility is validated at construction (engine build time), per the
 // contract: unsupported head dims, shapes over the paged kernel's
 // threadgroup-memory budget (`PagedAttentionKernel.ineligibilityReason` —
-// dispatching one is an uncatchable Metal fatal, e.g. Gemma-4 global
+// dispatching one is an uncatchable Metal fatal; the kernel's head split
+// keeps every supported head dim within budget, incl. Gemma-4 global
 // layers at headDim 512 / GQA 8), quant schemes, or malformed KV-sharing
 // throw `CBv2KVError.backendIneligible` before any request is admitted.
 // Attention sinks ARE supported (they are a kernel parameter here).
