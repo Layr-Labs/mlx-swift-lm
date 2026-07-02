@@ -400,4 +400,40 @@ final class CBv2SchedulerLoopTests: XCTestCase {
             }
         }
     }
+
+    /// Regression: `shutdown()` waits for the drain on the ENGINE queue, so
+    /// a wedged queue (a step blocked inside eval) hung it forever. It is
+    /// now bounded by `shutdownTimeout`: live streams are force-finished
+    /// with `.error` and shutdown returns while the wedged step is still
+    /// blocked.
+    func testShutdownTimesOutWhenEngineQueueIsWedged() async throws {
+        let harness = CBv2SchedHarness(
+            loopConfig: CBv2EngineLoopConfig(
+                requestTimeout: 60,
+                stepTimeout: 60,  // keep the step watchdog out of the way
+                shutdownTimeout: 0.3))
+        harness.model.forwardDelay = 3.0  // wedge the engine queue
+
+        let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 100)
+        let stream = try harness.engine.submit(request)
+        async let collectedOut = cbv2SchedCollect(stream)
+
+        // Give the engine a moment to enter the wedged step.
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        let started = Date()
+        await harness.engine.shutdown()
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertLessThan(
+            elapsed, 2.5,
+            "shutdown must return at the timeout, not wait out the wedged step")
+
+        let collected = await collectedOut
+        guard case .error(let message)? = collected.finishReason else {
+            return XCTFail(
+                "expected shutdown-timeout error, got \(String(describing: collected.finishReason))"
+            )
+        }
+        XCTAssertTrue(message.contains("shutdown"), message)
+    }
 }

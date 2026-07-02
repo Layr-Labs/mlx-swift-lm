@@ -275,6 +275,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
 
     /// Graceful drain: new submissions are rejected, waiting requests are
     /// cancelled, running requests finish naturally, then the loop stops.
+    /// Bounded by `CBv2EngineLoopConfig.shutdownTimeout` (default 10 s): if
+    /// the engine queue is wedged, live streams are force-finished with
+    /// `.error` and this returns instead of hanging forever.
     public func shutdown() async {
         beginRejectingSubmissions()
         await loop.drain()

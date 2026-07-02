@@ -125,17 +125,26 @@ public struct CBv2EngineLoopConfig: Sendable {
     public var idleRecheckInterval: TimeInterval
     /// Per-request event buffer before backpressure pauses scheduling.
     public var eventBufferCapacity: Int
+    /// Upper bound on a graceful drain. `shutdown()` waits for running
+    /// requests to finish naturally; if the engine queue is wedged (a step
+    /// blocked inside an eval), the drain would otherwise never complete —
+    /// after this timeout every live stream is force-finished with
+    /// `.error` and `shutdown()` returns. The wedged step may still be
+    /// executing in the background; the process-level owner decides
+    /// whether to exit.
+    public var shutdownTimeout: TimeInterval
 
     public init(
         requestTimeout: TimeInterval = 120, stepTimeout: TimeInterval = 30,
         watchdogInterval: TimeInterval = 0.25, idleRecheckInterval: TimeInterval = 0.001,
-        eventBufferCapacity: Int = 256
+        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10
     ) {
         self.requestTimeout = requestTimeout
         self.stepTimeout = stepTimeout
         self.watchdogInterval = watchdogInterval
         self.idleRecheckInterval = idleRecheckInterval
         self.eventBufferCapacity = eventBufferCapacity
+        self.shutdownTimeout = shutdownTimeout
     }
 }
 
@@ -204,6 +213,29 @@ private struct CBv2Handoff<Value>: @unchecked Sendable {
     let value: Value
 }
 
+/// Resume-exactly-once wrapper for a drain continuation: the engine queue
+/// (natural drain completion) and the shutdown-timeout timer race to
+/// resume it; whichever wins consumes the continuation, the loser no-ops.
+private final class CBv2DrainWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    /// Resume if not already resumed; returns true when this call won.
+    @discardableResult
+    func resume() -> Bool {
+        lock.lock()
+        let c = continuation
+        continuation = nil
+        lock.unlock()
+        c?.resume()
+        return c != nil
+    }
+}
+
 // MARK: - EngineLoopV2
 
 /// The engine thread. All scheduler and MLX mutations happen on
@@ -251,7 +283,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
-    private var drainContinuations: [CheckedContinuation<Void, Never>] = []
+    private var drainWaiters: [CBv2DrainWaiter] = []
 
     /// Telemetry / test hooks.
     public private(set) var stepCount = 0
@@ -305,11 +337,28 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// Graceful drain: waiting requests are cancelled, running requests
     /// finish naturally, then the loop stops. Idempotent.
+    ///
+    /// Bounded by `config.shutdownTimeout`: the drain waits on the engine
+    /// queue, so a wedged queue (a step blocked inside an eval) would hang
+    /// it forever. The timeout runs on the watchdog queue; when it wins,
+    /// every live stream is force-finished with `.error`, live requests
+    /// are marked for cancellation (cleaned up if the loop ever resumes),
+    /// and `drain()` returns — the wedged step may still be executing.
     func drain() async {
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let waiter = CBv2DrainWaiter(c)
+            watchdogQueue.asyncAfter(deadline: .now() + config.shutdownTimeout) { [weak self] in
+                guard let self else {
+                    waiter.resume()
+                    return
+                }
+                if waiter.resume() {
+                    self.forceFinishStreamsOnShutdownTimeout()
+                }
+            }
             engineQueue.async { [self] in
                 guard running else {
-                    c.resume()
+                    waiter.resume()
                     return
                 }
                 draining = true
@@ -319,11 +368,29 @@ public final class EngineLoopV2: @unchecked Sendable {
                 publishGauges()
                 if !scheduler.hasWork, inFlight == nil {
                     completeStop()
-                    c.resume()
+                    waiter.resume()
                 } else {
-                    drainContinuations.append(c)
+                    drainWaiters.append(waiter)
                 }
             }
+        }
+    }
+
+    /// Shutdown-timeout path (watchdog queue): the engine queue is not
+    /// making progress, so touch ONLY lock-protected state and the
+    /// (thread-safe) streams — the same discipline as `watchdogTick()`.
+    /// Stream `finish` is idempotent, so a later natural finish (if the
+    /// loop ever resumes) is a harmless no-op.
+    private func forceFinishStreamsOnShutdownTimeout() {
+        stateLock.lock()
+        let liveStreams = streams
+        pendingCancels.formUnion(liveStreams.keys)
+        stateLock.unlock()
+        for (_, stream) in liveStreams {
+            stream.finish(
+                reason: .error(
+                    "engine shutdown timed out after \(Int(config.shutdownTimeout))s"),
+                usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
         }
     }
 
@@ -502,9 +569,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             publishGauges()
             if draining {
                 completeStop()
-                let continuations = drainContinuations
-                drainContinuations = []
-                for c in continuations { c.resume() }
+                let waiters = drainWaiters
+                drainWaiters = []
+                for waiter in waiters { waiter.resume() }
                 return
             }
             scheduleIdleRecheck()
