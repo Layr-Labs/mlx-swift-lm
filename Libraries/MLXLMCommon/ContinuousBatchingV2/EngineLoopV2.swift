@@ -353,6 +353,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     public private(set) var stepCount = 0
     public private(set) var chainedStepCount = 0
     public private(set) var preemptionCount = 0
+    /// Requests demoted back to waiting after a capacityExhausted at first
+    /// allocation (test/telemetry hook), and the per-request attempt cap.
+    private(set) var capacityRequeueCount = 0
+    private var capacityRequeues: [CBv2RequestID: Int] = [:]
+    static let maxCapacityRequeues = 64
     /// Steps that submitted eager layer-cache inner state (the offset chain +
     /// KV buffers) into the step's `asyncEval` set. The DAR-325 guard:
     /// evaluating the offset chain every eager step keeps its lazy `+ L`
@@ -1277,9 +1282,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    /// Create per-layer KV state on first execution. On allocation failure
-    /// (admission + preemption should prevent this; backstop only) the
-    /// request is error-finished.
+    /// Create per-layer KV state on first execution. On `capacityExhausted`
+    /// (several same-step admissions racing for the last bytes/pages — the
+    /// backend's charge is atomic, so losers surface here) the request is
+    /// requeued to waiting instead of error-finished: accepted requests wait
+    /// for room. Bounded by `maxCapacityRequeues` (then error-finish) and by
+    /// the request deadline. Other failures error-finish as before.
     private func ensureKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
         if let state = kvStates[rec.id] { return state }
         do {
@@ -1287,7 +1295,19 @@ public final class EngineLoopV2: @unchecked Sendable {
             let state = try backend.makeSequenceState(
                 layerKinds: layerKinds, promptLength: rec.tokens.count, maxLength: maxLength)
             kvStates[rec.id] = state
+            capacityRequeues.removeValue(forKey: rec.id)
             return state
+        } catch let kvError as CBv2KVError {
+            if case .capacityExhausted = kvError {
+                let attempts = capacityRequeues[rec.id, default: 0]
+                if attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(rec.id) {
+                    capacityRequeues[rec.id] = attempts + 1
+                    capacityRequeueCount += 1
+                    return nil
+                }
+            }
+            finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
+            return nil
         } catch {
             finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
             return nil

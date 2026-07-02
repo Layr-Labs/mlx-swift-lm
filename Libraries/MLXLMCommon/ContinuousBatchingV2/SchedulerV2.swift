@@ -357,6 +357,24 @@ public final class SchedulerV2 {
         insertWaiting(victim, preemptedRequeue: true)
     }
 
+    /// Loop-side capacity backstop: a running request whose first KV
+    /// allocation threw `capacityExhausted` is demoted back to waiting
+    /// (preempted-style full restart — generated tokens kept, capacity
+    /// released, front-of-class requeue) instead of error-finishing, so an
+    /// ACCEPTED request waits for room rather than failing when several
+    /// same-step admissions race for the last bytes (PR#62 review, paged
+    /// admission alignment). Returns false when the id is not running.
+    public func requeueOnCapacity(_ id: CBv2RequestID) -> Bool {
+        guard let rec = running.first(where: { $0.id == id }) else { return false }
+        capacity?.releaseAll(id: rec.id)
+        running.removeAll { $0 === rec }
+        rec.numComputedTokens = 0
+        rec.status = .preempted
+        rec.preemptionCount += 1
+        insertWaiting(rec, preemptedRequeue: true)
+        return true
+    }
+
     /// New arrivals: before the first STRICTLY lower priority (FCFS within a
     /// class). Preempted requeues: before the first SAME-or-lower priority
     /// (front of their class — vLLM prepends preempted requests).

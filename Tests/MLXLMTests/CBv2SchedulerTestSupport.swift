@@ -112,6 +112,11 @@ final class CBv2SchedMockBackend: CBv2KVBackend, @unchecked Sendable {
         return _releasedStates
     }
 
+    /// When set, makeSequenceState throws capacityExhausted while
+    /// `liveStates >= maxLiveStates` (simulates a full pool so requeue-on-
+    /// capacity can be exercised deterministically).
+    var maxLiveStates: Int? = nil
+
     init(capacity: Int = 1 << 30) { self.capacity = capacity }
 
     func makeSequenceState(
@@ -119,6 +124,10 @@ final class CBv2SchedMockBackend: CBv2KVBackend, @unchecked Sendable {
     ) throws -> [CBv2SequenceKV?] {
         lock.lock()
         _makeCalls += 1
+        if let cap = maxLiveStates, _liveStates >= cap {
+            lock.unlock()
+            throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
+        }
         _liveStates += 1
         lock.unlock()
         return layerKinds.map { $0.sharesKVWithLayer == nil ? CBv2SchedMockSequenceKV() : nil }

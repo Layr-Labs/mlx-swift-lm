@@ -16,6 +16,34 @@ import XCTest
 
 final class CBv2SchedulerLoopTests: XCTestCase {
 
+    /// PR#62 review (paged admission alignment): when several same-step
+    /// admissions race for the last capacity, the loser of the backend's
+    /// atomic charge must be REQUEUED to waiting — an accepted request waits
+    /// for room; it never error-finishes on capacity.
+    func testCapacityLoserIsRequeuedNotErrored() async throws {
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 8))
+        harness.backend.maxLiveStates = 1
+        async let a = cbv2SchedCollect(
+            try harness.engine.submit(
+                CBv2SchedFixtures.request(prompt: Array(0 ..< 6), maxTokens: 4)))
+        async let b = cbv2SchedCollect(
+            try harness.engine.submit(
+                CBv2SchedFixtures.request(prompt: Array(6 ..< 12), maxTokens: 4)))
+        let (ra, rb) = try await (a, b)
+        await harness.engine.shutdown()
+        XCTAssertEqual(ra.finishReason, .length, "first request must complete")
+        XCTAssertEqual(
+            rb.finishReason, .length,
+            "capacity loser must complete after room frees, not error")
+        XCTAssertGreaterThanOrEqual(
+            harness.engine.loopForTesting.capacityRequeueCount, 1,
+            "the loser must have gone through requeue-on-capacity")
+    }
+
+
     /// Expected scripted-model generation: prompt's last token + 1, +2, ...
     private func expectedTokens(prompt: [Int], count: Int, vocab: Int = 64) -> [Int] {
         var current = prompt.last!
