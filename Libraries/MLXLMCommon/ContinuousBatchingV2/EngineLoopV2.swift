@@ -581,9 +581,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             } catch {
                 releaseAbandonedAdoption(adoption)
                 // Precise maxWaiting enforcement (the submit-side gauge check
-                // is the fast path; this is the authoritative one).
+                // is the fast path; this is the authoritative one). The
+                // MESSAGE IS A CONTRACT: it must classify exactly like
+                // `EngineV2.submit`'s thrown queue-full sentinel
+                // (`capacityExhausted(needed: 1, available: 0)`), which the
+                // provider renders as this canonical string and maps to a
+                // retryable 429 (`MultiModelBatchSchedulerEngineError
+                // .fromSchedulerMessage` matches "queue full"). A divergent
+                // wording here classified the SAME condition as a 500
+                // (PR#62 review).
                 takeStream(request.id)?.finish(
-                    reason: .error("capacity: waiting queue is full"),
+                    reason: .error("token_budget_exhausted: request queue full"),
                     usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
             }
         }

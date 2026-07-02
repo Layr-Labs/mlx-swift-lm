@@ -113,6 +113,60 @@ final class CBv2SchedulerLoopTests: XCTestCase {
             "the reused id must actually have tripped capacity and been requeued")
     }
 
+    /// PR#62 review (provider classification parity): the engine-thread
+    /// maxWaiting backstop (authoritative; `EngineV2.submit`'s gauge check
+    /// is only the fast path) must reject with the SAME canonical
+    /// queue-full marker the submit path produces — submit throws
+    /// `capacityExhausted(needed: 1, available: 0)`, which the provider
+    /// renders as "token_budget_exhausted: request queue full" and
+    /// classifies as a retryable 429 via a "queue full" substring match.
+    /// The backstop's previous wording ("waiting queue is full") missed
+    /// that match and turned the same condition into a 500.
+    func testWaitingQueueBackstopEmitsCanonicalQueueFullMarker() async throws {
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 1))
+        // Hog pins the single RUNNING slot for many steps… (wait on the
+        // PUBLISHED gauge, not the backend, so the waiter's submit-side
+        // fast path is guaranteed to see the waiting queue as empty).
+        let hogStream = try harness.engine.submit(
+            CBv2Request(id: CBv2RequestID(9101), promptTokens: [3], maxTokens: 60))
+        let hogRunning = await cbv2SchedWait {
+            let snapshot = harness.engine.capacity()
+            return snapshot.activeRequests == 1 && snapshot.waitingRequests == 0
+        }
+        XCTAssertTrue(hogRunning, "hog must be running before filling the waiting queue")
+        // …and the waiter fills the single WAITING slot (it cannot be
+        // admitted while the hog runs).
+        let waiterStream = try harness.engine.submit(
+            CBv2Request(id: CBv2RequestID(9102), promptTokens: [5], maxTokens: 2))
+
+        // Drive the loop's enqueue path directly, the way EngineV2.submit
+        // does AFTER its gauge fast path — this is exactly the backstop
+        // that fires when the fast path raced a stale gauge snapshot.
+        let loop = harness.engine.loopForTesting
+        let overflow = CBv2OutputStream(id: CBv2RequestID(9103))
+        XCTAssertTrue(loop.register(stream: overflow))
+        loop.enqueue(CBv2Request(id: CBv2RequestID(9103), promptTokens: [7], maxTokens: 2))
+        let rejected = await cbv2SchedCollect(overflow.makeStream())
+        guard case .error(let message)? = rejected.finishReason else {
+            XCTFail(
+                "backstop must reject the overflow request, got \(String(describing: rejected.finishReason))"
+            )
+            return
+        }
+        XCTAssertEqual(
+            message, "token_budget_exhausted: request queue full",
+            "backstop rejection must carry the provider's canonical queue-full marker")
+
+        let hog = await cbv2SchedCollect(hogStream)
+        let waiter = await cbv2SchedCollect(waiterStream)
+        await harness.engine.shutdown()
+        XCTAssertEqual(hog.finishReason, .length)
+        XCTAssertEqual(waiter.finishReason, .length, "the queued waiter still completes")
+    }
+
     /// Expected scripted-model generation: prompt's last token + 1, +2, ...
     private func expectedTokens(prompt: [Int], count: Int, vocab: Int = 64) -> [Int] {
         var current = prompt.last!
