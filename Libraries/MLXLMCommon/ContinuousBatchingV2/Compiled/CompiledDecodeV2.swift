@@ -86,10 +86,13 @@ public final class CBv2CompiledDecode {
     private let windows: [Int]
     private var buckets: [Bucket] = []
     private var state: State = .pending
-    /// KV dtype the traces are specialized on (probed at warmup from a real
-    /// forward — binding rejects rows whose buffers differ, so a replay can
-    /// never silently retrace on the request path).
-    private var kvDType: DType = .float16
+    /// Per-layer KV dtypes the traces are specialized on (probed at warmup
+    /// from a real forward — binding rejects rows whose buffers differ, so
+    /// a replay can never silently retrace on the request path). Layers CAN
+    /// disagree: GPT-OSS full-attention layers cache float32 K/V (YarnRoPE
+    /// computes in fp32) while its sliding layers cache bfloat16. nil for
+    /// KV-shared layers (no storage).
+    private var layerDTypes: [DType?] = []
 
     private(set) var stats = CBv2CompiledDecodeStats()
 
@@ -165,8 +168,8 @@ public final class CBv2CompiledDecode {
     func warmupIfNeeded() {
         guard case .pending = state else { return }
         do {
-            let probed = try withError { try probeKVDTypeAndPrime() }
-            self.kvDType = probed
+            let probed = try withError { try probeLayerDTypesAndPrime() }
+            self.layerDTypes = probed
             for size in bucketSizes {
                 let started = CFAbsoluteTimeGetCurrent()
                 let bucket = try withError { try traceBucket(size: size) }
@@ -193,20 +196,22 @@ public final class CBv2CompiledDecode {
     /// One EAGER forward through the production layer-cache path with
     /// throwaway contiguous rows: primes any lazy model-side host probes
     /// (e.g. GPT-OSS `sinksActiveResolved`) OFF the traced region — compile
-    /// rejects host syncs inside a trace — and reveals the model's actual
-    /// KV dtype, which the traces must be specialized on.
-    private func probeKVDTypeAndPrime() throws -> DType {
+    /// rejects host syncs inside a trace — and reveals each layer's actual
+    /// KV dtype, which the traces must be specialized on (per LAYER: e.g.
+    /// GPT-OSS caches fp32 on full-attention layers, bf16 on sliding ones).
+    private func probeLayerDTypesAndPrime() throws -> [DType?] {
         let rows = makeScratchRow(fullCapacity: 8)
         let bank = CBv2LayerCacheBank(layerKinds: layerKinds)
         let caches = bank.layerCaches(rowStates: [rows])
         let logits = model.forward(
             tokens: MLXArray([Int32(0)]).reshaped(1, 1), caches: caches)
         eval(logits)
-        guard let anchor = rows.compactMap({ $0 }).first else {
+        guard rows.contains(where: { $0 != nil }) else {
             throw CBv2KVError.backendIneligible(reason: "model owns no KV storage")
         }
-        let dtype = anchor.snapshot().keys.dtype
-        return dtype
+        // dtype is graph metadata — no readback. The forward wrote one
+        // token into every storage-owning row, so snapshots are real.
+        return rows.map { $0.map { $0.snapshot().keys.dtype } }
     }
 
     /// Build + trace one bucket: bind every lane to fresh scratch, compile
@@ -293,7 +298,7 @@ public final class CBv2CompiledDecode {
             guard bindRow(bucket, lane: lane, info: info) else {
                 bucket.bound[lane] = .unbound
                 bucket.boundRows[lane] = nil
-                recordFallback("bind_failed")
+                recordFallback("bind_failed(\(lastBindFailure ?? "?"))")
                 return nil
             }
         }
@@ -410,17 +415,21 @@ public final class CBv2CompiledDecode {
     /// Bind a real request row into a lane (membership change / self-heal).
     private func bindRow(_ bucket: Bucket, lane: Int, info: LaneInfo) -> Bool {
         for (index, kind) in layerKinds.enumerated() {
-            guard kind.sharesKVWithLayer == nil else { continue }
+            guard kind.sharesKVWithLayer == nil, let dtype = layerDTypes[index] else { continue }
             let storage: (keys: MLXArray, values: MLXArray)?
             switch kind.attention {
             case .full:
                 storage = (info.row[index] as? CBv2FullSequenceKV)?
-                    .compiledStorage(capacity: config.kvCapacity, dtype: kvDType)
+                    .compiledStorage(capacity: config.kvCapacity, dtype: dtype)
             case .slidingWindow:
                 storage = (info.row[index] as? CBv2WindowedSequenceKV)?
-                    .compiledStorage(dtype: kvDType)
+                    .compiledStorage(dtype: dtype)
             }
-            guard let storage else { return false }
+            guard let storage else {
+                lastBindFailure = bindFailureDiagnostic(
+                    row: info.row[index], layer: index, kind: kind)
+                return false
+            }
             bucket.caches[index].bindLane(lane, keys: storage.keys, values: storage.values)
         }
         bucket.counters.bind(lane: lane, offset: info.anchorOffset)
@@ -487,5 +496,33 @@ public final class CBv2CompiledDecode {
 
     private func recordFallback(_ reason: String) {
         stats.fallbacks[reason, default: 0] += 1
+    }
+
+    /// Last bind refusal, in enough detail to diagnose from fleet stats.
+    private var lastBindFailure: String?
+
+    private func bindFailureDiagnostic(
+        row: CBv2SequenceKV?, layer: Int, kind: CBv2LayerKind
+    ) -> String {
+        guard let row else { return "layer\(layer)_missing" }
+        let shape: String
+        switch row {
+        case let full as CBv2FullSequenceKV:
+            let snap = full.snapshot()
+            shape = "full off=\(full.absoluteOffset) dtype=\(snap.keys.dtype)"
+        case let windowed as CBv2WindowedSequenceKV:
+            let snap = windowed.snapshot()
+            shape = "win off=\(windowed.absoluteOffset) dtype=\(snap.keys.dtype)"
+        default:
+            shape = "type=\(type(of: row))"
+        }
+        let expected = layerDTypes[safe: layer].flatMap { $0 }.map(String.init(describing:)) ?? "?"
+        return "layer\(layer) \(kind.attention) \(shape) expected=\(expected)"
+    }
+}
+
+extension Array {
+    fileprivate subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
