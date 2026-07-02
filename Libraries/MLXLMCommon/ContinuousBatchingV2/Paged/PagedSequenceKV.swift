@@ -128,8 +128,8 @@ public final class PagedSequenceKV: CBv2SequenceKV {
     // MARK: - Writes
 
     /// Append `keys`/`values` (`[kvHeads, n, headDim]`) at the current
-    /// frontier. Never throws: the pool guarantees pages up to the
-    /// admission-time reservation.
+    /// frontier via ONE in-place write-kernel dispatch. Never throws: the
+    /// pool guarantees pages up to the admission-time reservation.
     func write(keys: MLXArray, values: MLXArray) {
         let n = keys.dim(1)
         guard n > 0 else { return }
@@ -144,58 +144,34 @@ public final class PagedSequenceKV: CBv2SequenceKV {
         }
         let s = pool.config.pageSize
 
-        // Split the incoming tokens into per-page segments.
-        struct Segment {
-            var physical: Int32
-            var slotStart: Int
-            var count: Int
-            var srcOffset: Int
+        // Physical destination (page * pageSize + slot) per token.
+        var slots = [Int32]()
+        slots.reserveCapacity(n)
+        for i in 0 ..< n {
+            let pos = absoluteOffset + i
+            let physical = ensurePage(logicalPage: pos / s)
+            slots.append(physical * Int32(s) + Int32(pos % s))
         }
-        var segments: [Segment] = []
-        var pos = absoluteOffset
-        var src = 0
-        while src < n {
-            let lp = pos / s
-            let slot = pos % s
-            let count = min(s - slot, n - src)
-            let physical = ensurePage(logicalPage: lp)
-            segments.append(
-                Segment(physical: physical, slotStart: slot, count: count, srcOffset: src))
-            pos += count
-            src += count
-        }
-
-        // Coalesce physically-consecutive full-page segments into slab-range
-        // writes (fresh allocations pop in ascending order, so long prefill
-        // chunks usually collapse to a single slice update per slab).
-        var i = 0
-        while i < segments.count {
-            let seg = segments[i]
-            if seg.slotStart == 0 && seg.count == s {
-                var runLength = 1
-                while i + runLength < segments.count {
-                    let next = segments[i + runLength]
-                    guard next.slotStart == 0, next.count == s,
-                        next.physical == seg.physical + Int32(runLength)
-                    else { break }
-                    runLength += 1
-                }
-                if runLength > 1 {
-                    pool.writeFullPageRun(
-                        group: groupKey, firstPage: seg.physical, pageRuns: runLength,
-                        keys: keys, values: values, srcOffset: seg.srcOffset)
-                    i += runLength
-                    continue
-                }
-            }
-            pool.write(
-                group: groupKey, page: seg.physical, slot: seg.slotStart,
-                keys: keys, values: values, srcOffset: seg.srcOffset, count: seg.count)
-            i += 1
-        }
+        pool.writeTokens(group: groupKey, slots: slots, keys: keys, values: values)
 
         absoluteOffset += n
         lastUpdateTokens = n
+    }
+
+    /// Reserve the destination for ONE decode token and advance the
+    /// frontier WITHOUT touching storage — the paged decode kernel writes
+    /// the tile in place (fused write, see PagedAttentionKernel.decode).
+    /// Host Int math only; never a device sync.
+    func prepareDecodeWrite() -> (page: Int32, slot: Int) {
+        precondition(
+            absoluteOffset + 1 <= maxLength,
+            "write past maxLength (\(absoluteOffset) + 1 > \(maxLength))")
+        let s = pool.config.pageSize
+        let page = ensurePage(logicalPage: absoluteOffset / s)
+        let slot = absoluteOffset % s
+        absoluteOffset += 1
+        lastUpdateTokens = 1
+        return (page, slot)
     }
 
     private func ensurePage(logicalPage lp: Int) -> Int32 {
@@ -220,8 +196,9 @@ public final class PagedSequenceKV: CBv2SequenceKV {
 
     /// Gathered `[1, kvHeads, retainedCount, headDim]` views over the
     /// attendable range, oldest to newest, in the pool dtype. The views
-    /// reference the live slabs — consume them within the current engine
-    /// step and drop them, or subsequent slab writes stop donating.
+    /// are lazy reads of the live slabs — consume them within the current
+    /// engine step and drop them: the slabs are mutated in place, so a
+    /// stale unevaluated gather could observe recycled pages.
     func attendableViews() -> (keys: MLXArray, values: MLXArray) {
         let retained = retainedCount
         let start = absoluteOffset - retained
@@ -286,6 +263,14 @@ public final class PagedSequenceKV: CBv2SequenceKV {
 
     /// Return every page to the pool and release the reservation.
     /// O(pages) metadata, no device work. Idempotent.
+    ///
+    /// RECYCLE INVARIANT: the freed pages may be handed to a new row whose
+    /// bulk writes have no graph edge to THIS row's in-flight reads (the
+    /// no-write kernel variants and gathers consume fences but never
+    /// advance them). Callers must therefore only release a row after its
+    /// last consuming step has been host-synced (the engine's finalize
+    /// discipline — releases happen on the engine thread between steps).
+    /// A release-without-host-sync fast path would race silently.
     func releaseStorage() {
         guard !released else { return }
         released = true

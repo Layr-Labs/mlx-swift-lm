@@ -118,6 +118,10 @@ struct CBv2PagedKernelTests {
         (headDim: 128, kvHeads: 4, queryHeads: 8, window: Int?(33), sinks: false),
         (headDim: 256, kvHeads: 2, queryHeads: 4, window: Int?.none, sinks: false),
         (headDim: 512, kvHeads: 2, queryHeads: 4, window: Int?.none, sinks: false),
+        // Gemma-4-26B global-layer shape (d512, GQA 8) — exercises the
+        // head split (HPT=2, 4 threadgroups per kv head).
+        (headDim: 512, kvHeads: 2, queryHeads: 16, window: Int?.none, sinks: false),
+        (headDim: 512, kvHeads: 1, queryHeads: 8, window: Int?(24), sinks: false),
     ])
     func decodeKernelParity(
         _ shape: (headDim: Int, kvHeads: Int, queryHeads: Int, window: Int?, sinks: Bool)

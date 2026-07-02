@@ -25,12 +25,21 @@
 //   Physical pages are still allocated LAZILY as tokens are written, so
 //   `bytesInUse` reports truthful actual usage; `bytesReserved` reports the
 //   admission-relevant figure.
-// - Writes go through MLX slice updates on the slabs. On GPU these donate
-//   the input buffer (O(tokens written), not O(slab)) as long as no other
-//   live MLXArray references the slab. Consumers MUST NOT retain gathered
-//   views or kernel inputs across engine steps, and the engine loop must
-//   asyncEval each step — otherwise the next write degrades into a full
-//   slab copy (still correct, catastrophically slow).
+// - Writes go through IN-PLACE Metal kernels (`PagedAttentionKernel
+//   .bulkWrite` here; the decode path fuses its single-token write into
+//   pass A). The slabs are STABLE buffers — never versioned through MLX
+//   slice updates. Slice updates are unusable at slab scale: MLX's
+//   gpu::eval retains every op's INPUT data handles until the command
+//   buffer completes, so a slice-update following any kernel read of the
+//   slab fails donation and degrades into a full-slab copy (~370 GiB of
+//   copies per decoded token on GPT-OSS-20B at a 16 GiB pool — the
+//   original ~100x real-model slowdown; docs/engine-v2/kernel-research.md
+//   §3). In-place writes are invisible to MLX's hazard tracking, so each
+//   bulk write emits a FENCE (chained per group) and every gather of the
+//   group's slabs consumes the latest fence for scheduling order + memory
+//   barriers. Decode dispatches don't consume fences: a row's decode
+//   always follows its writes via host syncs or step-graph dependencies
+//   (see pagedattention.metal, "In-place slab writes").
 //
 // KV quantization (`CBv2KVQuantScheme`) — design TODO
 // ---------------------------------------------------
@@ -135,9 +144,13 @@ final class PagedKVGroup {
     let pageSize: Int
     let dtype: DType
     let pageCount: Int
-    /// `[pageCount, kvHeads, pageSize, headDim]`
-    var kSlab: MLXArray
-    var vSlab: MLXArray
+    /// `[pageCount, kvHeads, pageSize, headDim]`. STABLE arrays: written
+    /// in place by the write kernels, never replaced (see file header).
+    let kSlab: MLXArray
+    let vSlab: MLXArray
+    /// Latest fence of the group's bulk-write chain (`[1]` int32). Gathers
+    /// consume it so page reads order after every prior bulk write.
+    var writeFence: MLXArray
     /// Stack of free page ids — O(1) alloc/free.
     var freeList: [Int32]
     /// Per-page refcount (>1 reserved for future prefix sharing).
@@ -160,6 +173,7 @@ final class PagedKVGroup {
         let shape = [pageCount, key.kvHeads, pageSize, key.headDim]
         self.kSlab = MLXArray.zeros(shape, dtype: dtype)
         self.vSlab = MLXArray.zeros(shape, dtype: dtype)
+        self.writeFence = MLXArray.zeros([1], dtype: .int32)
         // LIFO stack: lowest ids pop first, so fresh sequential allocations
         // tend to be physically consecutive (enables run-coalesced writes).
         self.freeList = Array((0 ..< Int32(pageCount)).reversed())
@@ -349,46 +363,32 @@ public final class PagedKVPool {
 
     // MARK: - Writes
     //
-    // All writes are MLX slice updates on the slabs — the only in-place-able
-    // write primitive (custom Metal kernels cannot donate outputs). Values
-    // are converted to the pool dtype on the way in.
+    // All bulk writes go through the in-place write kernel and advance the
+    // group's fence chain (see file header — slice updates on the slabs
+    // are forbidden). Values are converted to the pool dtype on the way in.
 
-    /// Write `count` tokens into a single page starting at `slot`.
-    /// `keys`/`values` are `[kvHeads, n, headDim]` slices with `srcOffset`
-    /// selecting the segment to write.
-    func write(
-        group key: PagedKVGroupKey, page: Int32, slot: Int,
-        keys: MLXArray, values: MLXArray, srcOffset: Int, count: Int
+    /// Scatter `slots.count` tokens into the group's slabs. `keys`/`values`
+    /// are `[kvHeads, n, headDim]`; `slots[i]` is token `i`'s physical
+    /// position as `page * pageSize + slot`.
+    func writeTokens(
+        group key: PagedKVGroupKey, slots: [Int32], keys: MLXArray, values: MLXArray
     ) {
+        guard !slots.isEmpty else { return }
         let g = group(key)
-        precondition(slot + count <= g.pageSize)
-        let p = Int(page)
-        let k = keys[0..., srcOffset ..< (srcOffset + count), 0...].asType(g.dtype)
-        let v = values[0..., srcOffset ..< (srcOffset + count), 0...].asType(g.dtype)
-        g.kSlab[p, 0..., slot ..< (slot + count), 0...] = k
-        g.vSlab[p, 0..., slot ..< (slot + count), 0...] = v
-    }
-
-    /// Write whole pages into a PHYSICALLY CONSECUTIVE run `[firstPage,
-    /// firstPage + pageRuns)`. `keys`/`values` are `[kvHeads, n, headDim]`
-    /// with `srcOffset ..< srcOffset + pageRuns*pageSize` covering the run.
-    func writeFullPageRun(
-        group key: PagedKVGroupKey, firstPage: Int32, pageRuns: Int,
-        keys: MLXArray, values: MLXArray, srcOffset: Int
-    ) {
-        let g = group(key)
-        let s = g.pageSize
-        let h = g.key.kvHeads
-        let d = g.key.headDim
-        let p = Int(firstPage)
-        let n = pageRuns * s
-        // [H, n, D] -> [H, runs, S, D] -> [runs, H, S, D]
-        let k = keys[0..., srcOffset ..< (srcOffset + n), 0...]
-            .reshaped([h, pageRuns, s, d]).transposed(1, 0, 2, 3).asType(g.dtype)
-        let v = values[0..., srcOffset ..< (srcOffset + n), 0...]
-            .reshaped([h, pageRuns, s, d]).transposed(1, 0, 2, 3).asType(g.dtype)
-        g.kSlab[p ..< (p + pageRuns), 0..., 0..., 0...] = k
-        g.vSlab[p ..< (p + pageRuns), 0..., 0..., 0...] = v
+        precondition(keys.dim(1) == slots.count && values.dim(1) == slots.count)
+        let k = keys.dtype == g.dtype ? keys : keys.asType(g.dtype)
+        let v = values.dtype == g.dtype ? values : values.asType(g.dtype)
+        // Pad to >= 8 entries so the generated kernel signature keeps the
+        // device address space (padding is never read — the kernel's token
+        // loop is bounded by the tile shape).
+        var padded = slots
+        while padded.count < 8 { padded.append(slots[slots.count - 1]) }
+        g.writeFence = PagedAttentionKernel.bulkWrite(
+            kSlab: g.kSlab, vSlab: g.vSlab,
+            keys: k, values: v,
+            slots: MLXArray(padded),
+            prevFence: g.writeFence,
+            pageSize: g.pageSize)
     }
 
     // MARK: - Reads
@@ -399,8 +399,10 @@ public final class PagedKVPool {
     ///
     /// This materializes a copy (MLX gathers always do); callers on the hot
     /// decode path must prefer the kernel, which reads the slabs in place.
-    /// The returned arrays reference the CURRENT slabs — do not retain them
-    /// across engine steps or slab writes stop donating.
+    /// The returned arrays are LAZY reads of the shared slabs — evaluate
+    /// or drop them within the current engine step: the slabs are mutated
+    /// in place, so a stale unevaluated gather could observe pages after
+    /// they were recycled and rewritten by another row.
     func gather(
         group key: PagedKVGroupKey, pages: [Int32], firstSlot: Int, count: Int
     ) -> (keys: MLXArray, values: MLXArray) {
@@ -414,7 +416,11 @@ public final class PagedKVPool {
         }
         precondition(firstSlot < s)
         precondition(pages.count * s >= firstSlot + count, "gather range exceeds page list")
-        let idx = MLXArray(pages)
+        // Consume the group's write fence: in-place writes are invisible
+        // to MLX's hazard tracking, so the dependency edge (and the memory
+        // barrier it induces) is what orders this gather after every prior
+        // bulk write of the group.
+        let idx = MLXArray(pages) + g.writeFence * 0
         func assemble(_ slab: MLXArray) -> MLXArray {
             // [np, H, S, D] -> [H, np, S, D] -> [H, np*S, D] -> slice -> [1, H, count, D]
             take(slab, idx, axis: 0)

@@ -125,9 +125,10 @@ func makeV2Engine(
         }
     case .paged:
         // Static kernel eligibility (head dims + the part kernel's
-        // threadgroup-memory budget, e.g. Gemma-4 global layers at headDim
-        // 512 / GQA 8) is validated inside `PagedKVBackend.init` — it
-        // throws `backendIneligible` before any dispatch could trap.
+        // threadgroup-memory budget) is validated inside
+        // `PagedKVBackend.init` — it throws `backendIneligible` before any
+        // dispatch could trap. Gemma-4 global layers (headDim 512 / GQA 8)
+        // are eligible via the kernel's head split.
         let paged = try PagedKVBackend(
             layerKinds: hooks.layerKinds,
             config: PagedKVPoolConfig(

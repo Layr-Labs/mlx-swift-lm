@@ -2,13 +2,16 @@
 //
 // Static eligibility of attention shapes for the paged decode kernels.
 // The Swift-side threadgroup-memory model (PagedAttentionKernel
-// .partThreadgroupBytes / ineligibilityReason) must match the shader's
-// allocations byte-for-byte, and PagedKVBackend must refuse over-budget
-// shapes at construction: dispatching one is an UNCATCHABLE Metal fatal
-// ("Threadgroup memory size (32832) exceeds the maximum (32768)"), not a
-// thrown error. Regression anchor: Gemma-4 global layers (headDim 512,
-// GQA 8) passed the old head-dim-only eligibility and killed the process
-// on the first dispatch. No model weights or GPU dispatch required.
+// .partThreadgroupBytes / headsPerThreadgroup / ineligibilityReason) must
+// match the shader's allocations byte-for-byte — INCLUDING the head split
+// (HPT), which is what keeps large head dims under the cap — and
+// PagedKVBackend must refuse over-budget shapes at construction:
+// dispatching one is an UNCATCHABLE Metal fatal ("Threadgroup memory size
+// (32832) exceeds the maximum (32768)"), not a thrown error. History:
+// Gemma-4 global layers (headDim 512, GQA 8) passed the old head-dim-only
+// eligibility and killed the process on the first dispatch; they are now
+// eligible again via the head split, and the formula models it. No model
+// weights or GPU dispatch required.
 
 import Foundation
 import Testing
@@ -55,21 +58,52 @@ struct CBv2PagedEligibilityTests {
 
     // MARK: - (c) Budget math vs the shader's constants
 
+    @Test func headSplitModel() {
+        // HPT = largest divisor of GQA with acc floats (HPT * D / 32)
+        // within the 32-float per-thread budget. Fleet d64/d128 shapes are
+        // unsplit (HPT == GQA); d256 splits at GQA 8; d512 runs 2 heads
+        // per threadgroup (Gemma-4 global layers).
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 64, gqa: 8) == 8)
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 128, gqa: 8) == 8)
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 256, gqa: 8) == 4)
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 512, gqa: 8) == 2)
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 512, gqa: 2) == 2)
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 512, gqa: 1) == 1)
+        // Non-divisible caps fall back to the largest divisor.
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 512, gqa: 3) == 1)
+        #expect(PagedAttentionKernel.headsPerThreadgroup(headDim: 256, gqa: 6) == 3)
+
+        // The split must always divide GQA and respect the register cap.
+        for d in PagedAttentionKernel.supportedHeadDims {
+            for g in 1 ... 16 {
+                let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: g)
+                #expect(hpt >= 1 && g % hpt == 0, "d=\(d) gqa=\(g)")
+                #expect(hpt * d / 32 <= 32 || hpt == 1, "d=\(d) gqa=\(g): acc over budget")
+            }
+        }
+    }
+
     @Test func budgetFormulaMatchesShaderAllocations() {
-        // The shader allocates q_smem[GQA*D] + red_smem[NSG*GQA*(D+2)]
-        // floats (see pagedattention.metal "single source of truth").
-        // Exact bytes for the shape that fataled in the field: Gemma-4
-        // global layers, (8*512 + 1*8*514) * 4 = 32,832 B — 64 B over the
-        // 32,768 B Metal cap even at one simdgroup.
+        // The shader allocates q_smem[HPT*D] + red_smem[NSG*HPT*(D+2)]
+        // floats (see pagedattention.metal "single source of truth"),
+        // where HPT is the head split — NOT the full GQA factor.
+        // Regression anchor: Gemma-4 global layers (d512, GQA 8) needed
+        // (8*512 + 1*8*514) * 4 = 32,832 B unsplit — 64 B over the cap and
+        // a process-fatal at first dispatch. Split at HPT=2 they need
+        // (2*512 + NSG*2*514) * 4 → 20,544 B at NSG=4.
         #expect(
             PagedAttentionKernel.partThreadgroupBytes(headDim: 512, gqa: 8, simdgroups: 1)
-                == 32832)
+                == 8208)
+        #expect(
+            PagedAttentionKernel.partThreadgroupBytes(headDim: 512, gqa: 8, simdgroups: 4)
+                == 20544)
         #expect(PagedAttentionKernel.threadgroupMemoryLimit == 32768)
         #expect(PagedAttentionKernel.mergeRecordMetaFloats == 2)
 
         // General formula on a spread of shapes.
         for (d, g, n) in [(64, 8, 8), (128, 8, 4), (256, 2, 2), (512, 1, 8), (512, 4, 2)] {
-            let expected = (g * d + n * g * (d + 2)) * 4
+            let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: g)
+            let expected = (hpt * d + n * hpt * (d + 2)) * 4
             #expect(
                 PagedAttentionKernel.partThreadgroupBytes(headDim: d, gqa: g, simdgroups: n)
                     == expected,
@@ -79,29 +113,38 @@ struct CBv2PagedEligibilityTests {
 
     /// Drift guard: the generated kernel bodies must still allocate exactly
     /// the buffers the Swift budget models — two float threadgroup buffers
-    /// in pass A (q_smem, red_smem with RSTRIDE = D + 2), none in pass B.
+    /// in each pass-A variant (q_smem, red_smem with RSTRIDE = D + 2), none
+    /// in pass B or the bulk-write kernel.
     @Test func shaderSourceStillMatchesBudgetModel() {
-        let part = PagedAttentionMSL.partBody
-        #expect(part.contains("threadgroup float q_smem[GQA * D];"))
-        #expect(part.contains("threadgroup float red_smem[NSG * GQA * (D + 2)];"))
-        #expect(
-            part.components(separatedBy: "threadgroup float").count - 1 == 2,
-            "part body must allocate exactly the two modeled buffers")
+        for part in [PagedAttentionMSL.partBody, PagedAttentionMSL.partBodyNoWrite] {
+            #expect(part.contains("threadgroup float q_smem[HPT * D];"))
+            #expect(part.contains("threadgroup float red_smem[NSG * HPT * (D + 2)];"))
+            #expect(
+                part.components(separatedBy: "threadgroup float").count - 1 == 2,
+                "part bodies must allocate exactly the two modeled buffers")
+        }
         #expect(
             !PagedAttentionMSL.mergeBody.contains("threadgroup float"),
             "merge body must allocate no threadgroup memory")
+        #expect(
+            !PagedAttentionMSL.writeBody.contains("threadgroup"),
+            "bulk-write body must allocate no threadgroup memory")
         // RSTRIDE in the .metal impl mirrors mergeRecordMetaFloats.
         #expect(PagedAttentionMSL.header.contains("RSTRIDE = D + 2"))
     }
 
     @Test func simdgroupSelectionRespectsBudget() {
-        // Largest NSG whose staging + merge buffers fit 32 KB.
+        // Largest NSG whose staging + merge buffers fit 32 KB (with the
+        // head split applied). d64/d128 fleet shapes are unsplit and keep
+        // their historical NSG; d256/d512 split and gain simdgroups.
         #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 64, gqa: 8) == 8)
         #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 128, gqa: 8) == 4)
-        #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 256, gqa: 8) == 2)
-        #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 512, gqa: 4) == 2)
-        // Gemma-4 global layers: over budget even at NSG=1 → nil.
-        #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 512, gqa: 8) == nil)
+        #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 256, gqa: 8) == 4)
+        #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 512, gqa: 4) == 4)
+        // Gemma-4 global layers (d512, GQA 8): unsplit these were over
+        // budget even at NSG=1 (the field fatal); split at HPT=2 they run
+        // NSG=4 comfortably.
+        #expect(PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: 512, gqa: 8) == 4)
 
         // Whenever an NSG is returned it fits the budget, and the next
         // larger candidate would not (largest-fit invariant).
@@ -127,27 +170,35 @@ struct CBv2PagedEligibilityTests {
         }
     }
 
-    // MARK: - (a) Over-budget shapes are refused at construction
+    // MARK: - (a) Ineligible shapes are refused at construction
 
-    @Test func gemma4GlobalLayerShapeIsIneligible() {
-        let reason = PagedAttentionKernel.ineligibilityReason(headDim: 512, gqa: 8)
-        #expect(reason?.contains("threadgroup memory") == true)
-        #expect(reason?.contains("32832") == true)
+    /// The former field-fatal shape — Gemma-4 global layers (d512, GQA 8)
+    /// — is now ELIGIBLE via the head split. Regression anchor for the
+    /// original bug: the UNSPLIT budget (GQA in place of HPT) would still
+    /// be over the cap, so the formula must keep modelling the split.
+    @Test func gemma4GlobalLayerShapeIsEligibleViaHeadSplit() throws {
+        #expect(PagedAttentionKernel.ineligibilityReason(headDim: 512, gqa: 8) == nil)
+        let unsplit = (8 * 512 + 1 * 8 * (512 + 2)) * 4
+        #expect(unsplit > PagedAttentionKernel.threadgroupMemoryLimit)
+        #expect(
+            PagedAttentionKernel.partThreadgroupBytes(headDim: 512, gqa: 8, simdgroups: 4)
+                <= PagedAttentionKernel.threadgroupMemoryLimit)
 
-        // f16 pool slabs are the default; PagedKVBackend.init must throw
-        // backendIneligible before any kernel is built or dispatched.
-        expectIneligible(
-            [fullKind(headDim: 512, kvHeads: 1, queryHeads: 8)],
-            reasonContains: "threadgroup memory")
+        // The real Gemma-4-26B global-layer shape (global_head_dim 512,
+        // num_global_key_value_heads 2, 16 query heads) constructs.
+        let backend = try PagedKVBackend(
+            layerKinds: [fullKind(headDim: 512, kvHeads: 2, queryHeads: 16)],
+            config: poolConfig())
+        #expect(backend.layerKinds.count == 1)
     }
 
-    /// Per-layer-kind: ONE over-budget layer makes the whole model
+    /// Per-layer-kind: ONE ineligible layer makes the whole model
     /// ineligible, even when every other layer fits.
-    @Test func anyOverBudgetLayerMakesModelIneligible() {
+    @Test func anyIneligibleLayerMakesModelIneligible() {
         expectIneligible(
             [
                 fullKind(headDim: 128, kvHeads: 8, queryHeads: 64),
-                fullKind(headDim: 512, kvHeads: 1, queryHeads: 8),
+                fullKind(headDim: 96, kvHeads: 1, queryHeads: 8),
             ],
             reasonContains: "layer 1")
     }
@@ -181,7 +232,16 @@ struct CBv2PagedEligibilityTests {
         #expect(sinks.layerKinds.count == 1)
 
         // d512 stays supported at small GQA (headDim inclusion alone was
-        // never the problem).
+        // never the problem)...
         #expect(PagedAttentionKernel.ineligibilityReason(headDim: 512, gqa: 1) == nil)
+        // ...and — via the head split — every supported head dim is now
+        // eligible at every fleet GQA factor.
+        for d in PagedAttentionKernel.supportedHeadDims {
+            for g in [1, 2, 4, 8, 16] {
+                #expect(
+                    PagedAttentionKernel.ineligibilityReason(headDim: d, gqa: g) == nil,
+                    "d=\(d) gqa=\(g)")
+            }
+        }
     }
 }
