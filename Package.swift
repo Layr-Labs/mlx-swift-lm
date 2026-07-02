@@ -242,6 +242,20 @@ let package = Package(
             ],
             sources: ["CBv2Benchmark.swift"]
         ),
+        // Real-weights validation driver for the CBv2 engine: correctness
+        // smoke (batch-composition + chunked-prefill invariance) and the
+        // legacy-vs-v2 perf matrix on local model directories.
+        .executableTarget(
+            name: "BenchCBv2",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/BenchCBv2"
+        ),
     ]
 )
 
