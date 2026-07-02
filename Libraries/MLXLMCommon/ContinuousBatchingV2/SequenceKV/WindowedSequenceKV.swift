@@ -216,16 +216,20 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// directly — the SAME `MLXArray` objects, mutated via `_updateInternal`
     /// by the compiled graph and by slice-assignment on the eager path.
     /// Allocates zeros when the row has never been written (single-token
-    /// prompt joins decode straight away). Returns nil on dtype mismatch
-    /// with the traced dtype.
+    /// prompt joins decode straight away). K and V dtypes are checked
+    /// INDEPENDENTLY against their traced dtypes (PR#62 review).
     ///
     /// Bind-time only (membership changes) — never on the per-step path.
-    func compiledStorage(dtype: DType) -> (keys: MLXArray, values: MLXArray)? {
+    func compiledStorage(
+        keysDType: DType, valuesDType: DType
+    ) -> (keys: MLXArray, values: MLXArray)? {
         if keys == nil {
-            keys = MLXArray.zeros([1, kvHeads, window, headDim], dtype: dtype)
-            values = MLXArray.zeros([1, kvHeads, window, headDim], dtype: dtype)
+            keys = MLXArray.zeros([1, kvHeads, window, headDim], dtype: keysDType)
+            values = MLXArray.zeros([1, kvHeads, window, headDim], dtype: valuesDType)
         }
-        guard let keys, let values, keys.dtype == dtype else { return nil }
+        guard let keys, let values, keys.dtype == keysDType, values.dtype == valuesDType else {
+            return nil
+        }
         return (keys, values)
     }
 

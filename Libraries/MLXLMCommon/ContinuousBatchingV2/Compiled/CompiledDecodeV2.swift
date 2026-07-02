@@ -88,11 +88,14 @@ public final class CBv2CompiledDecode {
     private var state: State = .pending
     /// Per-layer KV dtypes the traces are specialized on (probed at warmup
     /// from a real forward — binding rejects rows whose buffers differ, so
-    /// a replay can never silently retrace on the request path). Layers CAN
-    /// disagree: GPT-OSS full-attention layers cache float32 K/V (YarnRoPE
-    /// computes in fp32) while its sliding layers cache bfloat16. nil for
-    /// KV-shared layers (no storage).
-    private var layerDTypes: [DType?] = []
+    /// a replay can never silently retrace on the request path). K and V are
+    /// probed and specialized INDEPENDENTLY: a layer can cache K and V at
+    /// different precisions, and the trace binds each accordingly (PR#62
+    /// review). Layers CAN also disagree with each other: GPT-OSS
+    /// full-attention layers cache float32 K/V (YarnRoPE computes in fp32)
+    /// while its sliding layers cache bfloat16. nil for KV-shared layers
+    /// (no storage).
+    private var layerDTypes: [(keys: DType, values: DType)?] = []
 
     /// Telemetry. Mutated on the engine thread; read from arbitrary threads
     /// (provider heartbeats, tests) — lock-protected snapshot semantics.
@@ -272,9 +275,11 @@ public final class CBv2CompiledDecode {
     /// throwaway contiguous rows: primes any lazy model-side host probes
     /// (e.g. GPT-OSS `sinksActiveResolved`) OFF the traced region — compile
     /// rejects host syncs inside a trace — and reveals each layer's actual
-    /// KV dtype, which the traces must be specialized on (per LAYER: e.g.
-    /// GPT-OSS caches fp32 on full-attention layers, bf16 on sliding ones).
-    private func probeLayerDTypesAndPrime() throws -> [DType?] {
+    /// K AND V dtypes, which the traces must be specialized on independently
+    /// (per LAYER, and per K/V within a layer: e.g. GPT-OSS caches fp32 on
+    /// full-attention layers, bf16 on sliding ones, and a layer could cache
+    /// K and V at different precisions).
+    private func probeLayerDTypesAndPrime() throws -> [(keys: DType, values: DType)?] {
         let rows = makeScratchRow(fullCapacity: 8)
         let bank = CBv2LayerCacheBank(layerKinds: layerKinds)
         let caches = bank.layerCaches(rowStates: [rows])
@@ -286,7 +291,12 @@ public final class CBv2CompiledDecode {
         }
         // dtype is graph metadata — no readback. The forward wrote one
         // token into every storage-owning row, so snapshots are real.
-        return rows.map { $0.map { $0.snapshot().keys.dtype } }
+        return rows.map { row in
+            row.map { seq in
+                let snap = seq.snapshot()
+                return (keys: snap.keys.dtype, values: snap.values.dtype)
+            }
+        }
     }
 
     /// Build + trace one bucket: bind every lane to fresh scratch, compile
@@ -492,15 +502,17 @@ public final class CBv2CompiledDecode {
     /// Bind a real request row into a lane (membership change / self-heal).
     private func bindRow(_ bucket: Bucket, lane: Int, info: LaneInfo) -> Bool {
         for (index, kind) in layerKinds.enumerated() {
-            guard kind.sharesKVWithLayer == nil, let dtype = layerDTypes[index] else { continue }
+            guard kind.sharesKVWithLayer == nil, let dtypes = layerDTypes[index] else { continue }
             let storage: (keys: MLXArray, values: MLXArray)?
             switch kind.attention {
             case .full:
                 storage = (info.row[index] as? CBv2FullSequenceKV)?
-                    .compiledStorage(capacity: config.kvCapacity, dtype: dtype)
+                    .compiledStorage(
+                        capacity: config.kvCapacity,
+                        keysDType: dtypes.keys, valuesDType: dtypes.values)
             case .slidingWindow:
                 storage = (info.row[index] as? CBv2WindowedSequenceKV)?
-                    .compiledStorage(dtype: dtype)
+                    .compiledStorage(keysDType: dtypes.keys, valuesDType: dtypes.values)
             }
             guard let storage else {
                 lastBindFailure = bindFailureDiagnostic(
@@ -589,13 +601,16 @@ public final class CBv2CompiledDecode {
         let shape: String
         switch row {
         case let full as CBv2FullSequenceKV:
-            shape = "full dtype=\(full.snapshot().keys.dtype)"
+            let snap = full.snapshot()
+            shape = "full k=\(snap.keys.dtype) v=\(snap.values.dtype)"
         case let windowed as CBv2WindowedSequenceKV:
-            shape = "win dtype=\(windowed.snapshot().keys.dtype)"
+            let snap = windowed.snapshot()
+            shape = "win k=\(snap.keys.dtype) v=\(snap.values.dtype)"
         default:
             shape = "type=\(type(of: row))"
         }
-        let expected = layerDTypes[safe: layer].flatMap { $0 }.map(String.init(describing:)) ?? "?"
+        let expected =
+            layerDTypes[safe: layer].flatMap { $0 }.map { "k=\($0.keys) v=\($0.values)" } ?? "?"
         return "layer\(layer) \(kind.attention) \(shape) expected=\(expected)"
     }
 }

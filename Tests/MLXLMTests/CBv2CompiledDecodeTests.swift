@@ -533,6 +533,33 @@ final class CBv2CompiledDecodeTests: XCTestCase {
         }
     }
 
+    /// The EAGER decode path must submit the layer caches' inner state (the
+    /// on-device `positionOffsets` `+ L` chain plus KV buffers) into the
+    /// step's `asyncEval` EVERY step, so the offset chain can never grow
+    /// O(steps) of unevaluated graph (DAR-325; legacy BatchKVCache had this
+    /// exact bug). The engine exposes a per-step counter; without the fix it
+    /// stays 0 across a long eager decode. Bounded-graph proxy: the counter
+    /// tracks ~1 evaluation per eager step, and the tokens stay correct.
+    func testEagerDecodeEvaluatesOffsetChainEveryStep() async throws {
+        let model = TinyTestModel.make(seed: 0xC0FFEE)
+        // compiled:false ⇒ every step runs the eager caches (whose offsets
+        // advance lazily on-device); this is the path the guard protects.
+        let engine = makeEngine(model: model, compiled: false)
+        let budget = 40
+        let collected = await cbv2SchedCollect(
+            try engine.submit(
+                request(id: 1, prompt: makePromptTokens(length: 8, seed: 3), maxTokens: budget)))
+        await engine.shutdown()
+
+        XCTAssertEqual(collected.finishReason, .length)
+        XCTAssertEqual(collected.tokens.count, budget, "long decode must complete correctly")
+        // ~1 prefill step + ~budget decode steps, each evaluating the offset
+        // chain. Well above a conservative floor; exactly 0 without the fix.
+        XCTAssertGreaterThanOrEqual(
+            engine.offsetChainEvalSteps, 30,
+            "eager decode must evaluate the offset/KV inner state every step (DAR-325)")
+    }
+
     // MARK: - Unit: compiled layer cache vs eager attention numerics
 
     /// Drive `CBv2CompiledLayerCache` EAGERLY (outside compile) against
@@ -593,9 +620,12 @@ final class CBv2CompiledDecodeTests: XCTestCase {
                 let storage: (keys: MLXArray, values: MLXArray)
                 switch row {
                 case let full as CBv2FullSequenceKV:
-                    storage = try XCTUnwrap(full.compiledStorage(capacity: 32, dtype: .float32))
+                    storage = try XCTUnwrap(
+                        full.compiledStorage(
+                            capacity: 32, keysDType: .float32, valuesDType: .float32))
                 case let windowed as CBv2WindowedSequenceKV:
-                    storage = try XCTUnwrap(windowed.compiledStorage(dtype: .float32))
+                    storage = try XCTUnwrap(
+                        windowed.compiledStorage(keysDType: .float32, valuesDType: .float32))
                 default:
                     XCTFail("unexpected row type")
                     return
@@ -642,7 +672,8 @@ final class CBv2CompiledDecodeTests: XCTestCase {
         let compiled = CBv2CompiledLayerCache(
             layerIndex: 0, kind: kind, kvCapacity: 64, counters: counters, statics: statics)
         // Poison the scratch ring with garbage the mask must exclude.
-        let storage = try XCTUnwrap(compiledRow.compiledStorage(dtype: .float32))
+        let storage = try XCTUnwrap(
+            compiledRow.compiledStorage(keysDType: .float32, valuesDType: .float32))
         storage.keys._updateInternal(MLXArray.full(storage.keys.shape, values: MLXArray(7.5)))
         storage.values._updateInternal(MLXArray.full(storage.values.shape, values: MLXArray(-3.25)))
         compiled.bindLane(0, keys: storage.keys, values: storage.values)
@@ -658,5 +689,54 @@ final class CBv2CompiledDecodeTests: XCTestCase {
         XCTAssertTrue(
             allClose(eagerOut, compiledOut, atol: 1e-5).item(Bool.self),
             "fast-forwarded lane attended poisoned (unwritten) ring slots")
+    }
+
+    // MARK: - Independent K/V dtype specialization (PR#62 review)
+
+    /// The compiled trace is specialized on K and V dtypes INDEPENDENTLY: a
+    /// row that caches K and V at different precisions must bind only when
+    /// BOTH match the traced dtypes, and cleanly fall back (nil) otherwise.
+    /// Before the fix the probe recorded only K's dtype and reused it for V,
+    /// so a V-dtype mismatch bound silently and could mistrace.
+    func testFullRowCompiledStorageChecksKAndVIndependently() throws {
+        let row = CBv2FullSequenceKV(promptLength: 2, maxLength: 16, kvHeads: 1, headDim: 4)
+        // Synthetic layer: K cached fp16, V cached fp32 (K != V dtype).
+        _ = row.update(
+            keys: MLXArray.zeros([1, 1, 2, 4], dtype: .float16),
+            values: MLXArray.zeros([1, 1, 2, 4], dtype: .float32))
+
+        // Traced (fp16 K, fp32 V) matches → binds.
+        XCTAssertNotNil(
+            row.compiledStorage(capacity: 16, keysDType: .float16, valuesDType: .float32),
+            "matching K and V dtypes must bind")
+        // The pre-fix bug: reusing K's dtype for V (fp16) must now be rejected
+        // as a V mismatch → eager fallback, never a silent mistrace.
+        XCTAssertNil(
+            row.compiledStorage(capacity: 16, keysDType: .float16, valuesDType: .float16),
+            "V-dtype mismatch must fall back, not bind K's dtype for V")
+        // Symmetric: a K mismatch also falls back.
+        XCTAssertNil(
+            row.compiledStorage(capacity: 16, keysDType: .float32, valuesDType: .float32))
+    }
+
+    /// A fresh full row allocates K and V at their SEPARATE traced dtypes.
+    func testFreshFullRowAllocatesSeparateKAndVDTypes() throws {
+        let row = CBv2FullSequenceKV(promptLength: 0, maxLength: 16, kvHeads: 1, headDim: 4)
+        let storage = try XCTUnwrap(
+            row.compiledStorage(capacity: 16, keysDType: .bfloat16, valuesDType: .float32))
+        XCTAssertEqual(storage.keys.dtype, .bfloat16)
+        XCTAssertEqual(storage.values.dtype, .float32)
+    }
+
+    /// Windowed rows likewise check K and V dtypes independently.
+    func testWindowedRowCompiledStorageChecksKAndVIndependently() {
+        let row = CBv2WindowedSequenceKV(window: 8, kvHeads: 1, headDim: 4)
+        _ = row.update(
+            keys: MLXArray.zeros([1, 1, 1, 4], dtype: .float16),
+            values: MLXArray.zeros([1, 1, 1, 4], dtype: .float32))
+        XCTAssertNotNil(row.compiledStorage(keysDType: .float16, valuesDType: .float32))
+        XCTAssertNil(
+            row.compiledStorage(keysDType: .float16, valuesDType: .float16),
+            "V-dtype mismatch must fall back")
     }
 }
