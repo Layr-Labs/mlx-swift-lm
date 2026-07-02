@@ -10,6 +10,7 @@
 // preemption end-to-end; cancel; shutdown drain.
 
 import Foundation
+import MLX
 import XCTest
 
 @testable import MLXLMCommon
@@ -491,4 +492,208 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         }
         XCTAssertTrue(message.contains("shutdown"), message)
     }
+
+    // MARK: Duplicate request ids at the engine surface (PR#62 review)
+
+    /// A second `submit` reusing a still-live id must throw WITHOUT touching
+    /// the first request's stream. Regression: registration used to
+    /// overwrite `streams[id]` before the scheduler rejected the duplicate,
+    /// and the rejection path then tore down the replacement — orphaning the
+    /// FIRST request's deltas and terminal event.
+    func testDuplicateSubmitThrowsAndFirstStreamStillDelivers() async throws {
+        let harness = CBv2SchedHarness(
+            loopConfig: CBv2EngineLoopConfig(eventBufferCapacity: 4))
+        let first = CBv2SchedFixtures.request(prompt: [1], maxTokens: 30)
+        let firstStream = try harness.engine.submit(first)
+        // Hold the first request live deterministically: the unread stream
+        // hits backpressure and the request pauses with its slot retained.
+        let held = await cbv2SchedWait {
+            harness.engine.loopForTesting.pausedIDsSnapshot() == [first.id]
+        }
+        XCTAssertTrue(held, "first request must be live (paused) before the duplicate arrives")
+
+        let dup = CBv2Request(id: first.id, promptTokens: [9], maxTokens: 5)
+        XCTAssertThrowsError(try harness.engine.submit(dup)) { error in
+            XCTAssertEqual(
+                error as? CBv2SchedulerError, .duplicateRequestID(first.id),
+                "duplicate id must be rejected before any stream registration")
+        }
+
+        // The FIRST request's stream is untouched: draining it resumes
+        // decoding and the full scripted sequence + terminal arrive.
+        let out = await cbv2SchedCollect(firstStream)
+        XCTAssertEqual(out.tokens, expectedTokens(prompt: [1], count: 30))
+        XCTAssertEqual(out.finishReason, .length)
+
+        // After the finish the id is legally reusable.
+        let reuse = CBv2Request(id: first.id, promptTokens: [5], maxTokens: 3)
+        let reuseOut = await cbv2SchedCollect(try harness.engine.submit(reuse))
+        XCTAssertEqual(reuseOut.tokens, expectedTokens(prompt: [5], count: 3))
+        XCTAssertEqual(reuseOut.finishReason, .length)
+        await harness.engine.shutdown()
+    }
+
+    // MARK: Sampler id retirement (PR#62 review)
+
+    /// Every finish must retire the id from the sampler, so a FUTURE request
+    /// reusing it cannot inherit stale per-request sampler state.
+    func testFinishNotifiesSamplerOfRetiredID() async throws {
+        final class SpySampler: CBv2StepSampler, @unchecked Sendable {
+            private let inner = CBv2GreedySampler()
+            private let lock = NSLock()
+            private var _retired: [CBv2RequestID] = []
+            var retired: [CBv2RequestID] {
+                lock.lock()
+                defer { lock.unlock() }
+                return _retired
+            }
+            func sample(
+                logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
+                stepIndex: Int, pendingSampledTokens: MLXArray?,
+                rowContext: () -> [CBv2SamplerRow]
+            ) -> MLXArray {
+                inner.sample(
+                    logits: logits, params: params, requestIDs: requestIDs,
+                    stepIndex: stepIndex, pendingSampledTokens: pendingSampledTokens,
+                    rowContext: rowContext)
+            }
+            func requestDidFinish(_ id: CBv2RequestID) {
+                lock.lock()
+                _retired.append(id)
+                lock.unlock()
+            }
+        }
+
+        let layerKinds = CBv2SchedFixtures.tinyLayerKinds()
+        let sampler = SpySampler()
+        let engine = EngineV2(
+            model: CBv2SchedScriptedModel(),
+            layerKinds: layerKinds,
+            backend: CBv2SchedMockBackend(),
+            cacheProvider: CBv2SchedMockCacheProvider(layerKinds: layerKinds),
+            sampler: sampler,
+            admissionConfig: .init(watermarkFraction: 0))
+
+        let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 4)
+        let collected = await cbv2SchedCollect(try engine.submit(request))
+        XCTAssertEqual(collected.finishReason, .length)
+        let told = await cbv2SchedWait { sampler.retired.contains(request.id) }
+        XCTAssertTrue(told, "finishRequest must retire the id from the sampler")
+        await engine.shutdown()
+    }
+
+    // MARK: Idle KV retention (PR#62 review)
+
+    /// After a request finishes and the engine goes idle, NO sequence-KV row
+    /// may remain strongly retained: the eager layer-cache bank must drop
+    /// its row bindings at idle instead of pinning the last batch's retired
+    /// rows until some future rebind.
+    func testIdleEngineDropsEagerBankRowBindings() async throws {
+        let layerKinds = CBv2SchedFixtures.tinyLayerKinds()
+        let backend = CBv2SchedWeakTrackingBackend()
+        let engine = EngineV2(
+            model: CBv2SchedScriptedModel(),
+            layerKinds: layerKinds,
+            backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: layerKinds),
+            sampler: CBv2GreedySampler(),
+            admissionConfig: .init(watermarkFraction: 0))
+
+        let request = CBv2SchedFixtures.request(prompt: [1, 2], maxTokens: 5)
+        let collected = await cbv2SchedCollect(try engine.submit(request))
+        XCTAssertEqual(collected.finishReason, .length)
+        XCTAssertGreaterThan(backend.trackedRowCount, 0, "sanity: rows were minted")
+
+        let released = await cbv2SchedWait { backend.liveTrackedRowCount == 0 }
+        XCTAssertTrue(
+            released,
+            "idle engine still retains \(backend.liveTrackedRowCount) retired KV row(s) — the eager bank must drop its bindings at idle"
+        )
+        await engine.shutdown()
+    }
+
+    /// Bank-level pin: `releaseBoundRows` drops the strong row bindings and
+    /// a later bind starts a fresh composition.
+    func testBankReleaseBoundRowsDropsRowRetention() {
+        let layerKinds = CBv2SchedFixtures.tinyLayerKinds()
+        let bank = CBv2LayerCacheBank(layerKinds: layerKinds)
+
+        func bindDisposableRow() -> () -> Bool {
+            weak var weakRow: CBv2SchedMockSequenceKV?
+            let row = CBv2SchedMockSequenceKV()
+            weakRow = row
+            _ = bank.layerCaches(rowStates: [[row]])
+            return { weakRow == nil }
+        }
+
+        let rowIsGone = bindDisposableRow()
+        XCTAssertFalse(rowIsGone(), "bank retains bound rows until released")
+        bank.releaseBoundRows()
+        XCTAssertTrue(rowIsGone(), "releaseBoundRows must drop the strong binding")
+
+        // Rebinding afterwards works (fresh composition), and releasing an
+        // already-empty bank is a no-op.
+        let row = CBv2SchedMockSequenceKV()
+        let caches = bank.layerCaches(rowStates: [[row]])
+        XCTAssertEqual((caches[0] as? CBv2LayerCache)?.rows.count, 1)
+        bank.releaseBoundRows()
+        bank.releaseBoundRows()
+    }
+}
+
+// MARK: - Weak-tracking backend (idle-retention tests)
+
+/// Mints mock rows and tracks each one WEAKLY, retaining nothing itself
+/// (unlike `CBv2SchedMockBackend`, whose `releasedStates` log keeps rows
+/// alive) — so a live weak reference after finish + idle can only mean the
+/// engine side still pins the row.
+private final class CBv2SchedWeakTrackingBackend: CBv2KVBackend, @unchecked Sendable {
+    private final class WeakRow {
+        weak var value: AnyObject?
+        init(_ value: AnyObject) { self.value = value }
+    }
+
+    private let lock = NSLock()
+    private var tracked: [WeakRow] = []
+
+    var trackedRowCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return tracked.count
+    }
+
+    var liveTrackedRowCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return tracked.filter { $0.value != nil }.count
+    }
+
+    private func mint(layerKinds: [CBv2LayerKind]) -> [CBv2SequenceKV?] {
+        let state = layerKinds.map { kind -> CBv2SequenceKV? in
+            kind.sharesKVWithLayer == nil ? CBv2SchedMockSequenceKV() : nil
+        }
+        lock.lock()
+        for row in state {
+            if let row { tracked.append(WeakRow(row)) }
+        }
+        lock.unlock()
+        return state
+    }
+
+    func makeSequenceState(
+        layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int
+    ) throws -> [CBv2SequenceKV?] {
+        mint(layerKinds: layerKinds)
+    }
+
+    func makeSequenceState(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind], maxLength: Int
+    ) throws -> [CBv2SequenceKV?] {
+        mint(layerKinds: layerKinds)
+    }
+
+    func release(_ state: [CBv2SequenceKV?]) {}
+    var bytesInUse: Int { 0 }
+    var bytesCapacity: Int { 1 << 30 }
 }
