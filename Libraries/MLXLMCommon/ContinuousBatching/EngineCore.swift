@@ -446,7 +446,12 @@ public final class EngineCore: @unchecked Sendable {
 
         if scheduler.hasRequests() {
             _idleSteps = 0
+            let outerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
             let output = scheduler.step()
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "leg.schedstep.wall", seconds: CFAbsoluteTimeGetCurrent() - outerStart)
+            }
             stepsExecuted += 1
 
             // Diagnostic (default-on): observe resource COUNT vs BYTES

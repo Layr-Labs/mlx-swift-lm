@@ -470,8 +470,19 @@ private class Gemma4Attention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
-        positionOffset: Gemma4.PositionOffset? = nil
+        positionOffset: Gemma4.PositionOffset? = nil,
+        v2SharedSource: (any CBv2AttendingLayerCache)? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
+        // ContinuousBatchingV2: the layer cache owns both the KV update and
+        // the attention computation (no masks, no padding — see
+        // CBv2Contracts.swift). Entirely separate branch; the legacy paths
+        // below are untouched.
+        if let layerCacheV2 = cache as? (any CBv2AttendingLayerCache) {
+            return forwardV2(
+                x, layerCache: layerCacheV2, source: v2SharedSource,
+                sharedKV: sharedKV, positionOffset: positionOffset)
+        }
+
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
@@ -566,6 +577,86 @@ private class Gemma4Attention: Module {
         .reshaped(B, L, -1)
 
         return (oProj(output), (keys, values), activePositionOffset)
+    }
+
+    /// ContinuousBatchingV2 attention path. The `CBv2AttendingLayerCache`
+    /// owns the KV update AND the attention computation, so this method only
+    /// projects/normalizes/ropes Q (and K/V for non-shared layers) and
+    /// dispatches. The model never builds masks and never pads — decode is
+    /// rectangular `[B, 1]`, prefill is per-request `[1, chunk]`.
+    ///
+    /// Invariant 1 (report 10 §4): RoPE offsets are per-row absolutes,
+    /// snapshotted BEFORE `updateAndAttend` advances the rows, and KV-shared
+    /// layers reuse the SOURCE layer's captured snapshot byte-identically.
+    private func forwardV2(
+        _ x: MLXArray,
+        layerCache: any CBv2AttendingLayerCache,
+        source: (any CBv2AttendingLayerCache)?,
+        sharedKV: (MLXArray, MLXArray)?,
+        positionOffset: Gemma4.PositionOffset?
+    ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
+        let (B, L) = (x.dim(0), x.dim(1))
+
+        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+        queries = qNorm(queries)
+        queries = queries.transposed(0, 2, 1, 3)
+
+        if usesSharedKV {
+            // KV-shared layer: projects queries only and borrows (K, V) from
+            // the source layer's cache at attention time. The RoPE offsets
+            // MUST be the source layer's pre-update snapshot (threaded by the
+            // trunk) — reading `source.positionOffsets` here would observe
+            // positions already advanced by the source's update this step.
+            guard let source, let positionOffset, let sharedKV else {
+                preconditionFailure(
+                    """
+                    Gemma4 CBv2 shared-KV layer \(layerIdx) requires the source \
+                    layer cache, its captured position offsets, and its per-step \
+                    K/V (threaded by Gemma4TextModelInner)
+                    """)
+            }
+            queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
+            let attention = layerCache.attendBorrowing(
+                source: source, queries: queries, scale: scale, sinks: nil)
+            let output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            return (oProj(output), sharedKV, positionOffset)
+        }
+
+        guard let kProj, let kNorm, let vNorm else {
+            preconditionFailure("Gemma4 non-shared layers require K/V projection modules")
+        }
+
+        // Snapshot the per-row absolute offsets BEFORE updateAndAttend
+        // advances the rows (`+ 0` = graph-safe copy, same convention as
+        // gemma4CapturePositionOffset). KV-shared consumers of this layer
+        // reuse this exact snapshot via the returned PositionOffset.
+        let capturedOffsets = layerCache.positionOffsets + 0
+        let captured = Gemma4.PositionOffset.batch(capturedOffsets)
+
+        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: captured)
+
+        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        var k = kNorm(kRaw)
+        k = k.transposed(0, 2, 1, 3)
+        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+
+        // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B): values reuse
+        // the raw key projection (pre-norm) through their own vNorm — same as
+        // the legacy path.
+        var v: MLXArray
+        if let vProj {
+            v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        } else {
+            v = kRaw
+        }
+        v = vNorm(v)
+        v = v.transposed(0, 2, 1, 3)
+
+        let attention = layerCache.updateAndAttend(
+            queries: queries, keys: k, values: v, scale: scale, sinks: nil)
+
+        let output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        return (oProj(output), (k, v), captured)
     }
 }
 
@@ -760,13 +851,15 @@ public class Gemma4DecoderLayer: Module {
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
-        positionOffset: Gemma4.PositionOffset? = nil
+        positionOffset: Gemma4.PositionOffset? = nil,
+        v2SharedSource: (any CBv2AttendingLayerCache)? = nil
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let residual = x
 
         let h = inputLayernorm(x)
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
-            h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset)
+            h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
+            v2SharedSource: v2SharedSource)
         let postAttn = postAttentionLayernorm(attnOut)
         var out = residual + postAttn
 
@@ -986,16 +1079,24 @@ public class Gemma4TextModelInner: Module {
             fullCache = Array(repeating: nil, count: config.numHiddenLayers)
         }
 
-        // Build masks: one per attention type.
+        // ContinuousBatchingV2 detection: v2 layer caches own attention AND
+        // masking, so the trunk builds no masks at all on that path (there is
+        // no padding and no shared frontier to mask). In v2 mode every layer
+        // (including KV-shared ones) has a cache object.
+        let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
+
+        // Build masks: one per attention type (legacy path only).
         var maskByType = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
-        for (i, layer) in layers.enumerated() {
-            let lt = layer.layerType
-            if maskByType[lt] == nil {
-                if lt == "sliding_attention" {
-                    maskByType[lt] = createAttentionMask(
-                        h: h, cache: fullCache[i], windowSize: config.slidingWindow)
-                } else {
-                    maskByType[lt] = createAttentionMask(h: h, cache: fullCache[i])
+        if !isCBv2 {
+            for (i, layer) in layers.enumerated() {
+                let lt = layer.layerType
+                if maskByType[lt] == nil {
+                    if lt == "sliding_attention" {
+                        maskByType[lt] = createAttentionMask(
+                            h: h, cache: fullCache[i], windowSize: config.slidingWindow)
+                    } else {
+                        maskByType[lt] = createAttentionMask(h: h, cache: fullCache[i])
+                    }
                 }
             }
         }
@@ -1009,6 +1110,14 @@ public class Gemma4TextModelInner: Module {
             let sharedKV = intermediates[prevIdx].kv
             let sharedPositionOffset = intermediates[prevIdx].positionOffset
 
+            // CBv2: KV-shared layers attend by borrowing the SOURCE layer's
+            // cache object (attendBorrowing) instead of consuming raw K/V
+            // tensors. Thread the source cache alongside the source's
+            // captured (pre-update) position offsets.
+            let v2SharedSource: (any CBv2AttendingLayerCache)? =
+                isCBv2 && prevIdx != idx
+                ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
+
             let mask = maskByType[layer.layerType]
             let (out, kvPair, positionOffset) = layer(
                 h,
@@ -1016,7 +1125,8 @@ public class Gemma4TextModelInner: Module {
                 cache: fullCache[idx],
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
-                positionOffset: sharedPositionOffset
+                positionOffset: sharedPositionOffset,
+                v2SharedSource: v2SharedSource
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
@@ -1173,5 +1283,51 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 extension Gemma4TextModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers.map { $0.selfAttn }
+    }
+}
+
+// MARK: - ContinuousBatchingV2
+
+extension Gemma4TextConfiguration {
+    /// Per-layer attention structure for the CBv2 engine, derived purely
+    /// from this configuration (invariant 11: model structure is data).
+    /// Matches `Gemma4Attention.init` / `Gemma4TextModelInner.previousKvs`
+    /// layer for layer.
+    public var cbv2LayerKinds: [CBv2LayerKind] {
+        CBv2LayerKindDerivation.gemma4LayerKinds(
+            layerTypes: layerTypes,
+            slidingWindow: slidingWindow,
+            numKvSharedLayers: numKvSharedLayers,
+            headDim: headDim,
+            globalHeadDim: globalHeadDim,
+            numAttentionHeads: numAttentionHeads,
+            numKeyValueHeads: numKeyValueHeads,
+            numGlobalKeyValueHeads: numGlobalKeyValueHeads,
+            attentionKeqV: attentionKeqV
+        )
+    }
+}
+
+extension Gemma4TextModel {
+    /// Per-layer CBv2 attention structure for this model (one entry per
+    /// hidden layer, including the trailing KV-shared block).
+    public var cbv2LayerKinds: [CBv2LayerKind] {
+        config.cbv2LayerKinds
+    }
+
+    /// Build the per-layer CBv2 attending caches for this model: one
+    /// `CBv2AttendingLayerCache` per hidden layer (KV-shared layers get a
+    /// cache object too — it owns no storage and serves `attendBorrowing`).
+    ///
+    /// The concrete layer-cache classes are owned by the CBv2 core runtime;
+    /// `makeLayerCache` is the injection point (typically wrapping a
+    /// `CBv2KVBackend`). This model file codes purely against the contract.
+    public func newCacheV2(
+        makeLayerCache: (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
+            any CBv2AttendingLayerCache
+    ) rethrows -> [any CBv2AttendingLayerCache] {
+        try cbv2LayerKinds.enumerated().map { index, kind in
+            try makeLayerCache(index, kind)
+        }
     }
 }

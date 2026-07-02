@@ -205,6 +205,23 @@ class AttentionBlock: Module {
         }
     }
 
+    /// Whether the learned per-head sinks parameter is active (non-zero).
+    /// The probe is a host readback (`.item()`), so it runs at most once per
+    /// block: `prepareSinksActivation()` primes the cached Bool at model
+    /// load / CBv2 engine build so the decode hot path never host-syncs.
+    func sinksActiveResolved() -> Bool {
+        if let cached = cachedSinksActive { return cached }
+        let active = (sinks * sinks).max().item(Float.self) > 0
+        cachedSinksActive = active
+        return active
+    }
+
+    /// Prime `cachedSinksActive` eagerly (off the step path). Called by
+    /// `GPTOSSModel.newCacheV2` after weights are loaded.
+    func prepareSinksActivation() {
+        _ = sinksActiveResolved()
+    }
+
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -216,13 +233,27 @@ class AttentionBlock: Module {
         var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        let sinksActive =
-            cachedSinksActive
-            ?? {
-                let active = (sinks * sinks).max().item(Float.self) > 0
-                cachedSinksActive = active
-                return active
-            }()
+
+        // ContinuousBatchingV2: the layer cache owns the KV update and the
+        // attention computation (per-row storage, no masks, no padding).
+        // Sinks are passed straight through — the contract guarantees
+        // denominator-only handling, and `sinksActiveResolved()` reads the
+        // Bool cached at load (`prepareSinksActivation`), so this path never
+        // performs the `.item()` sinks probe on the step loop.
+        if let layerCacheV2 = cache as? (any CBv2AttendingLayerCache) {
+            // Snapshot per-row absolute RoPE offsets BEFORE updateAndAttend
+            // advances the rows (`+ 0` = graph-safe copy; invariant 1).
+            let offsets = layerCacheV2.positionOffsets + 0
+            q = rope(q, offset: offsets)
+            k = rope(k, offset: offsets)
+            let vHat = layerCacheV2.updateAndAttend(
+                queries: q, keys: k, values: v,
+                scale: smScale,
+                sinks: sinksActiveResolved() ? sinks : nil)
+            return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+        }
+
+        let sinksActive = sinksActiveResolved()
 
         // Quantized cache path (taken when the cache conforms to
         // QuantizedKVCacheProtocol, i.e. the native quantized-attention kernel).
@@ -385,7 +416,12 @@ public class GPTOSSModelInner: Module {
 
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
+            if (cache[i] as? (any CBv2AttendingLayerCache)) != nil {
+                // ContinuousBatchingV2: attention and any masking are owned
+                // by the layer cache object — the model never builds masks
+                // (no left padding / shared frontier exists by construction).
+                maskMode = .none
+            } else if let mask {
                 maskMode = mask
             } else if layerTypes[i] == "full_attention" {
                 if fullMask == nil {
@@ -413,6 +449,15 @@ public class GPTOSSModelInner: Module {
         x = norm(x)
 
         return x
+    }
+
+    /// Prime every attention block's sinks-activation flag (one `.item()`
+    /// probe per layer, off the step path). Called at CBv2 engine build so
+    /// the decode hot loop never host-syncs on the sinks probe.
+    func prepareSinksActivation() {
+        for layer in layers {
+            layer.selfAttn.prepareSinksActivation()
+        }
     }
 }
 
@@ -542,5 +587,60 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
 extension GPTOSSModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - ContinuousBatchingV2
+
+extension GPTOSSConfiguration {
+    /// Per-layer attention structure for the CBv2 engine, derived purely
+    /// from this configuration (invariant 11: model structure is data).
+    /// Every layer carries learned attention sinks (`hasSinks == true`);
+    /// backends that cannot honor sinks must refuse at engine build.
+    public var cbv2LayerKinds: [CBv2LayerKind] {
+        CBv2LayerKindDerivation.gptossLayerKinds(
+            layerTypes: layerTypes,
+            numHiddenLayers: hiddenLayers,
+            slidingWindow: slidingWindow,
+            headDim: headDim,
+            numAttentionHeads: attentionHeads,
+            numKeyValueHeads: kvHeads
+        )
+    }
+}
+
+extension GPTOSSModel {
+    /// Per-layer CBv2 attention structure for this model. Derived from the
+    /// loaded trunk's resolved `layerTypes` so it is congruent with the
+    /// actual layers even when the config omits `layer_types`.
+    public var cbv2LayerKinds: [CBv2LayerKind] {
+        CBv2LayerKindDerivation.gptossLayerKinds(
+            layerTypes: model.layerTypes,
+            numHiddenLayers: configuration.hiddenLayers,
+            slidingWindow: configuration.slidingWindow,
+            headDim: configuration.headDim,
+            numAttentionHeads: configuration.attentionHeads,
+            numKeyValueHeads: configuration.kvHeads
+        )
+    }
+
+    /// Build the per-layer CBv2 attending caches for this model.
+    ///
+    /// Also primes each attention block's sinks-activation Bool (one
+    /// `.item()` probe per layer, HERE at load time) so the CBv2 step loop
+    /// never performs a host readback for the sinks decision. Call this
+    /// after weights are loaded.
+    ///
+    /// The concrete layer-cache classes are owned by the CBv2 core runtime;
+    /// `makeLayerCache` is the injection point (typically wrapping a
+    /// `CBv2KVBackend`). This model file codes purely against the contract.
+    public func newCacheV2(
+        makeLayerCache: (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
+            any CBv2AttendingLayerCache
+    ) rethrows -> [any CBv2AttendingLayerCache] {
+        model.prepareSinksActivation()
+        return try cbv2LayerKinds.enumerated().map { index, kind in
+            try makeLayerCache(index, kind)
+        }
     }
 }

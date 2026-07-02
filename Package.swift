@@ -80,6 +80,7 @@ let package = Package(
             name: "MLXLMCommon",
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
                 .product(name: "MLXRandom", package: "mlx-swift"),
@@ -90,6 +91,11 @@ let package = Package(
             path: "Libraries/MLXLMCommon",
             exclude: [
                 "README.md"
+            ],
+            resources: [
+                // CBv2 paged-attention MSL source, JIT-compiled at runtime
+                // via MLXFast.metalKernel (NOT compiled by SwiftPM).
+                .copy("ContinuousBatchingV2/Paged/pagedattention.metal")
             ]
         ),
         .target(
@@ -160,7 +166,12 @@ let package = Package(
             ],
             path: "Tests/MLXLMTests",
             exclude: [
-                "README.md"
+                "README.md",
+                // Stale VLM MTP spike: references Gemma4 (MLXVLM) MTP API
+                // removed by the vMLX decode port (#55). Broken at the
+                // engine-v2 branch base and blocks the whole test target;
+                // excluded until the VLM MTP spike is updated or deleted.
+                "Gemma4VLMMTPSpikeTests.swift",
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
@@ -206,6 +217,44 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Sources/BenchLoad"
+        ),
+        // WS-G (engine-v2) benchmark harness: tiny-model v2-style step loop
+        // (CI-runnable) + `--model <path>` legacy-engine baseline for real
+        // weights. Reports land as markdown next to the other benchmarks/
+        // reports. `sources:` keeps the target scoped to the one Swift file.
+        .executableTarget(
+            name: "CBv2Benchmark",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
+            path: "benchmarks",
+            exclude: [
+                "mtp-2026-05-09-130614.md",
+                "mtp-2026-05-09-142113.md",
+                "mtp-2026-05-09-183133.md",
+                "mtp-2026-05-09-190948.md",
+                "mtp-2026-05-09-203007.md",
+            ],
+            sources: ["CBv2Benchmark.swift"]
+        ),
+        // Real-weights validation driver for the CBv2 engine: correctness
+        // smoke (batch-composition + chunked-prefill invariance) and the
+        // legacy-vs-v2 perf matrix on local model directories.
+        .executableTarget(
+            name: "BenchCBv2",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/BenchCBv2"
         ),
     ]
 )
