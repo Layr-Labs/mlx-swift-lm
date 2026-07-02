@@ -244,4 +244,42 @@ struct CBv2PagedEligibilityTests {
             }
         }
     }
+
+    // MARK: - Page size ↔ kernel partition alignment (PR#62 review)
+
+    /// The decode kernel preconditions `partitionTokens % pageSize == 0` at
+    /// dispatch (an uncatchable trap). A misaligned page size must therefore
+    /// fail POOL construction with a clear `backendIneligible`, not the
+    /// first decode.
+    @Test func misalignedPageSizeIsRejectedAtConstruction() {
+        let kinds = [fullKind(headDim: 64, kvHeads: 4, queryHeads: 8)]
+        for pageSize in [24, 48, 512] {
+            do {
+                _ = try PagedKVPool(
+                    layerKinds: kinds,
+                    config: PagedKVPoolConfig(
+                        pageSize: pageSize, capacityBytes: 8 << 20, maxPrefillChunk: 64,
+                        nominalMaxSequenceLength: 1024))
+                Issue.record("expected backendIneligible for pageSize \(pageSize)")
+            } catch CBv2KVError.backendIneligible(let reason) {
+                #expect(reason.contains("pageSize \(pageSize)"), "reason: \(reason)")
+                #expect(reason.contains("\(PagedAttentionKernel.partitionTokens)"))
+            } catch {
+                Issue.record("unexpected error for pageSize \(pageSize): \(error)")
+            }
+        }
+    }
+
+    /// Divisors of the kernel partition stay constructible.
+    @Test func divisorPageSizesRemainEligible() throws {
+        let kinds = [fullKind(headDim: 64, kvHeads: 4, queryHeads: 8)]
+        for pageSize in [8, 16, 32, 64, PagedAttentionKernel.partitionTokens] {
+            let pool = try PagedKVPool(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    pageSize: pageSize, capacityBytes: 8 << 20, maxPrefillChunk: 64,
+                    nominalMaxSequenceLength: 1024))
+            #expect(pool.config.pageSize == pageSize)
+        }
+    }
 }

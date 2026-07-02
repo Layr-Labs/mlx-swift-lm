@@ -250,6 +250,20 @@ public final class PagedKVPool {
         guard config.pageSize > 0, config.capacityBytes > 0 else {
             throw CBv2KVError.backendIneligible(reason: "PagedKVPool: invalid config")
         }
+        // The decode kernel partitions attention into fixed
+        // `PagedAttentionKernel.partitionTokens`-token slices and requires
+        // page boundaries to align with them (`PTOK % pageSize == 0` is a
+        // kernel-launch precondition). Reject misaligned page sizes HERE,
+        // at construction, so a bad config fails engine build with a clear
+        // `backendIneligible` instead of trapping on the first decode
+        // (PR#62 review).
+        guard PagedAttentionKernel.partitionTokens % config.pageSize == 0 else {
+            throw CBv2KVError.backendIneligible(
+                reason: "PagedKVPool: pageSize \(config.pageSize) must evenly divide "
+                    + "PagedAttentionKernel.partitionTokens "
+                    + "(\(PagedAttentionKernel.partitionTokens)) — use a power-of-two "
+                    + "divisor such as \(CBv2PagedDefaults.pageSize)")
+        }
         self.config = config
 
         // Demand-proportional capacity split.
