@@ -104,7 +104,8 @@ public struct PagedBackendBenchmark {
             }
         }
         cache.setRows(rows)
-        eval([backend.pool.group(rows[0].groupKey).kSlab])
+        // Force the prefill write chain (in-place writes ride the fence).
+        eval([backend.pool.group(rows[0].groupKey).writeFence])
 
         let scale = Float(1.0 / Double(s.headDim).squareRoot())
         let step: () -> MLXArray = {

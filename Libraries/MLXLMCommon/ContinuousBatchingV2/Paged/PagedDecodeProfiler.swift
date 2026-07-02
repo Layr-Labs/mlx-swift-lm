@@ -153,7 +153,8 @@ public struct PagedDecodeProfiler {
             caches[layer].setRows(rows)
         }
         let group = backend.pool.group(PagedKVGroupKey(kinds[0]))
-        eval([group.kSlab, group.vSlab])
+        // Force the prefill write chain (in-place writes ride the fence).
+        eval([group.writeFence])
 
         // Pre-generate per-layer tiles; the carry threads a value
         // dependency through the step so the tape interleaves writes and
@@ -197,7 +198,7 @@ public struct PagedDecodeProfiler {
                         ])
                         maxAttend = max(maxAttend, length)
                     }
-                    let out = PagedAttentionKernel.decode(
+                    let (out, _) = PagedAttentionKernel.decode(
                         queries: q,
                         kSlab: group.kSlab,
                         vSlab: group.vSlab,
@@ -207,14 +208,15 @@ public struct PagedDecodeProfiler {
                         sinks: sinks,
                         params: MLXArray([Float(1), scale, 0, 0, 0, 0, 0, 0]),
                         softcap: false,
-                        pageSize: backend.pool.config.pageSize)
+                        pageSize: backend.pool.config.pageSize,
+                        writeFence: group.writeFence)
                     carry = out[0, 0, 0] * zero
                 }
             }
             switch mode {
             case .writeOnly:
-                // Nothing consumes the writes; force the slab chain.
-                eval([group.kSlab, group.vSlab])
+                // Nothing consumes the writes; force the fence chain.
+                eval([group.writeFence])
             case .writeAndDispatch, .dispatchOnly:
                 eval(carry)
             }

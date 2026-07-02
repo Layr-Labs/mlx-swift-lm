@@ -105,12 +105,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if l == 1 {
-            // Decode: write each row's K/V, then one kernel dispatch.
-            for (i, row) in pagedRows.enumerated() {
-                row.write(keys: keys[i], values: values[i])
-            }
+            // Decode: reserve each row's destination host-side; the kernel
+            // writes the tiles IN PLACE before attending (fused write —
+            // the slabs are never versioned through MLX ops).
+            let targets = pagedRows.map { $0.prepareDecodeWrite() }
             return dispatchDecode(
-                queries: queries, rows: pagedRows, scale: scale, sinks: effectiveSinks)
+                queries: queries,
+                newKeys: keys.squeezed(axis: 2),
+                newValues: values.squeezed(axis: 2),
+                writeTargets: targets,
+                rows: pagedRows, scale: scale, sinks: effectiveSinks)
         } else {
             precondition(b == 1, "prefill chunks are per-request [1, chunk]")
             let row = pagedRows[0]
@@ -147,10 +151,19 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     // MARK: - Decode path (paged kernel)
 
+    /// One fused kernel dispatch for the batch. `newKeys`/`newValues`
+    /// (`[B, kvHeads, D]`) with per-row `writeTargets` make pass A write
+    /// the step's tiles in place before attending; both are nil on the
+    /// KV-borrowing path (the owning layer already wrote).
     private func dispatchDecode(
-        queries: MLXArray, rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
+        queries: MLXArray,
+        newKeys: MLXArray? = nil,
+        newValues: MLXArray? = nil,
+        writeTargets: [(page: Int32, slot: Int)]? = nil,
+        rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
         tableProvider: PagedLayerCache? = nil
     ) -> MLXArray {
+        precondition((newKeys == nil) == (writeTargets == nil))
         let provider = tableProvider ?? self
         let group = pool.group(rows[0].groupKey)
         let tables = provider.deviceTables(rows: rows)
@@ -158,18 +171,26 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var info = [Int32]()
         info.reserveCapacity(rows.count * 8)
         var maxAttendLength = 1
-        for row in rows {
+        for (i, row) in rows.enumerated() {
             let (start, length) = row.decodeAttendRange
             info.append(Int32(start))
             info.append(Int32(length))
             info.append(Int32(row.table.count))
-            info.append(contentsOf: [0, 0, 0, 0, 0])
+            if let targets = writeTargets {
+                info.append(targets[i].page)
+                info.append(Int32(targets[i].slot))
+            } else {
+                info.append(contentsOf: [0, 0])
+            }
+            info.append(contentsOf: [0, 0, 0])
             maxAttendLength = max(maxAttendLength, length)
         }
         let seqinfo = MLXArray(info, [rows.count, 8])
 
-        let out = PagedAttentionKernel.decode(
+        let (out, nextFence) = PagedAttentionKernel.decode(
             queries: queries,
+            newKeys: newKeys,
+            newValues: newValues,
             kSlab: group.kSlab,
             vSlab: group.vSlab,
             tables: tables,
@@ -178,8 +199,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             sinks: preparedSinks(sinks),
             params: params(scale: scale),
             softcap: attentionSoftcap != nil,
-            pageSize: pool.config.pageSize
+            pageSize: pool.config.pageSize,
+            writeFence: group.writeFence
         )
+        // The fused write advanced the group's write-fence chain: later
+        // slab readers (KV-borrowing layers, next steps' dispatches,
+        // gathers) consume it and order after this dispatch's writes.
+        if let nextFence {
+            group.writeFence = nextFence
+        }
         // [B, QH, D] -> [B, QH, 1, D], back in the model dtype.
         var result = out.expandedDimensions(axis: 2)
         if result.dtype != queries.dtype {

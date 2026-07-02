@@ -79,17 +79,22 @@ struct CBv2PagedEligibilityTests {
 
     /// Drift guard: the generated kernel bodies must still allocate exactly
     /// the buffers the Swift budget models — two float threadgroup buffers
-    /// in pass A (q_smem, red_smem with RSTRIDE = D + 2), none in pass B.
+    /// in each pass-A variant (q_smem, red_smem with RSTRIDE = D + 2), none
+    /// in pass B or the bulk-write kernel.
     @Test func shaderSourceStillMatchesBudgetModel() {
-        let part = PagedAttentionMSL.partBody
-        #expect(part.contains("threadgroup float q_smem[GQA * D];"))
-        #expect(part.contains("threadgroup float red_smem[NSG * GQA * (D + 2)];"))
-        #expect(
-            part.components(separatedBy: "threadgroup float").count - 1 == 2,
-            "part body must allocate exactly the two modeled buffers")
+        for part in [PagedAttentionMSL.partBody, PagedAttentionMSL.partBodyNoWrite] {
+            #expect(part.contains("threadgroup float q_smem[GQA * D];"))
+            #expect(part.contains("threadgroup float red_smem[NSG * GQA * (D + 2)];"))
+            #expect(
+                part.components(separatedBy: "threadgroup float").count - 1 == 2,
+                "part bodies must allocate exactly the two modeled buffers")
+        }
         #expect(
             !PagedAttentionMSL.mergeBody.contains("threadgroup float"),
             "merge body must allocate no threadgroup memory")
+        #expect(
+            !PagedAttentionMSL.writeBody.contains("threadgroup"),
+            "bulk-write body must allocate no threadgroup memory")
         // RSTRIDE in the .metal impl mirrors mergeRecordMetaFloats.
         #expect(PagedAttentionMSL.header.contains("RSTRIDE = D + 2"))
     }

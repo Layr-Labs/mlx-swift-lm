@@ -56,18 +56,53 @@
 //   GQA        query heads per kv head (queryHeads / kvHeads)
 //   NSG        simdgroups per pass-A threadgroup (32 KB smem budget)
 //   PTOK       tokens per partition (512; PTOK % S == 0)
+//   HAS_WRITE  (pass A) fuse the decode KV write: each row's new K/V tile
+//              is written IN PLACE into the slabs before attending (see
+//              "In-place slab writes" below)
 //   HAS_SOFTCAP (pass A) apply logit softcapping: qk = cap * tanh(qk / cap)
 //   HAS_SINKS   (pass B) fold per-head sink logits into the denominator
 //
 // Pass A inputs (all row-contiguous):
 //   q        [B, KVH*GQA, D]   queries for this step (NOT pre-scaled;
 //                              scale arrives via params[1])
+//   knew     [B, KVH, D]       this step's key tile, slab dtype
+//                              (HAS_WRITE only)
+//   vnew     [B, KVH, D]       this step's value tile (HAS_WRITE only)
 //   kcache   [P, KVH, S, D]    key slab for this layer group
 //   vcache   [P, KVH, S, D]    value slab for this layer group
 //   tables   [B, MAXP] int32   physical page id per logical page slot;
 //                              windowed rows are ring-indexed (see below)
-//   seqinfo  [B, 8]    int32   {attendStart, attendLen, tableLen, 0, ...}
+//   seqinfo  [B, 8]    int32   {attendStart, attendLen, tableLen,
+//                               writePage, writeSlot, 0, 0, 0}
+//                              (writePage/writeSlot read under HAS_WRITE)
 //   params   [8]       float   {softcap, scale, 0...}
+//
+// In-place slab writes (HAS_WRITE + paged_kv_write)
+// -------------------------------------------------
+// The slabs are STABLE buffers written in place through const-cast device
+// pointers — never versioned through MLX slice updates. Rationale: MLX's
+// gpu::eval retains every op's INPUT data handles until the command buffer
+// completes, so a slice-update on a slab that an attention kernel read in
+// the same (or any in-flight) command buffer fails donation and degrades
+// into a FULL-SLAB copy — measured at ~370 GiB of copies per decoded token
+// on GPT-OSS-20B (docs/engine-v2/kernel-research.md §3).
+//
+// Safety argument (MLX encoders are concurrent with hazard tracking at
+// declared-buffer granularity, so in-place writes are invisible to the
+// tracker and ordering must come from graph edges):
+//   - Decode (HAS_WRITE): the ONLY threadgroup that reads a row's newest
+//     position is the one owning its last partition — the same threadgroup
+//     that writes it (device-scope barrier in between). All other
+//     threadgroups touch disjoint bytes. Windowed rings cannot alias: the
+//     overwritten slot held a position >= ring*S older than the query,
+//     which is outside every attendable window.
+//   - Bulk writes (paged_kv_write, prefill chunks / prefix adoption): the
+//     kernel emits a fence array chained through the group
+//     (fence = prev + 1); every gather of the group's slabs consumes the
+//     latest fence, giving both scheduling order and the memory barrier.
+//   - Across engine steps, step N+1's graph always consumes step N's
+//     outputs (chained decode feeds lazy tokens) or the loop host-syncs
+//     at finalize — either forces step N's writes to complete first.
 // Pass A outputs:
 //   partials [B, KVH*GQA, MAXPART, D] float  unnormalized value partials
 //   meta     [B, KVH*GQA, MAXPART, 2] float  {m, l} per partition (log2
@@ -140,9 +175,13 @@ inline void load_row(const device T* row, uint lane, thread float* dst) {
 // softmax per query head; the simdgroup states are merged through
 // threadgroup memory and written out UNNORMALIZED with their (m, l) meta
 // (flash-decoding split-K).
-template <typename T, int D, int S, int GQA, int NSG, int PTOK, bool HAS_SOFTCAP>
+template <
+    typename T, int D, int S, int GQA, int NSG, int PTOK, bool HAS_WRITE,
+    bool HAS_SOFTCAP>
 inline void paged_attention_part_impl(
     const device T* q,
+    const device T* knew,
+    const device T* vnew,
     const device T* kcache,
     const device T* vcache,
     const device int32_t* tables,
@@ -187,13 +226,36 @@ inline void paged_attention_part_impl(
     const float softcap = params[0];
     const float scale = params[1];
 
+    // Fused decode write: the row's newest position lives in THIS row's
+    // last partition, and only this threadgroup ever reads it — write the
+    // step's K/V tile in place before attending (see file header). The
+    // slabs are stable buffers; the const_cast is the documented in-place
+    // write contract, not a hack around MLX donation. The (0, 0, 0)
+    // threadgroup's lane 0 also advances the group's write-fence chain so
+    // later dispatches that read the slabs order after this one.
+    if (HAS_WRITE && part == (attend_len - 1) / PTOK) {
+        const int wpage = info[3];
+        const int wslot = info[4];
+        const size_t dst =
+            (((size_t)wpage * (size_t)kvh + (size_t)kv_head) * S + (size_t)wslot) * D;
+        device T* kdst = const_cast<device T*>(kcache) + dst;
+        device T* vdst = const_cast<device T*>(vcache) + dst;
+        const size_t src = ((size_t)b * (size_t)kvh + (size_t)kv_head) * D;
+        for (int i = lin; i < D; i += TG) {
+            kdst[i] = knew[src + i];
+            vdst[i] = vnew[src + i];
+        }
+    }
+
     // Stage the (scaled) queries for this kv head's GQA query heads.
     const int q_head0 = kv_head * GQA;
     const device T* q_base = q + ((size_t)b * (size_t)(kvh * GQA) + (size_t)q_head0) * D;
     for (int i = lin; i < GQA * D; i += TG) {
         q_smem[i] = float(q_base[i]) * scale;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // mem_device: the fused write above must be visible to this
+    // threadgroup's own K/V loads below.
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     // Per-simdgroup online softmax state (identical across lanes for m/l,
     // per-lane slices of the value accumulator).
@@ -360,6 +422,47 @@ inline void paged_attention_merge_impl(
 #pragma unroll
     for (int e = 0; e < EPT; e++) {
         orow[lane * EPT + e] = T(acc[e] * inv);
+    }
+}
+
+// Bulk in-place KV write (prefill chunks, prefix adoption): scatter an
+// [KVH, N, D] tile into the slabs at host-computed physical slots
+// (page * S + slot per token). Emits a chained fence value so gathers of
+// the same group order after every prior bulk write (file header,
+// "In-place slab writes"). Grid: threads = (D, KVH, N).
+template <typename T, int S>
+inline void paged_kv_write_impl(
+    const device T* ktile,        // [KVH, N, D]
+    const device T* vtile,        // [KVH, N, D]
+    const device int32_t* slots,  // [>= max(N, 8)] physical page * S + slot
+                                  // (padded to >= 8 so the generated
+                                  // signature keeps the device space)
+    const constant int32_t* prev, // [1] previous fence in the group chain
+                                  // (constant space: MLX places < 8-element
+                                  // inputs there)
+    const device T* kcache,       // [P, KVH, S, D] written in place
+    const device T* vcache,       // [P, KVH, S, D] written in place
+    const int kvh,
+    const int n,
+    const int d,
+    device int32_t* fence,        // [1] fence output (prev + 1)
+    uint3 tpig
+) {
+    const int e = tpig.x;
+    const int h = tpig.y;
+    const int t = tpig.z;
+    if (e >= d || h >= kvh || t >= n) {
+        return;
+    }
+    const int idx = slots[t];
+    const int page = idx / S;
+    const int slot = idx % S;
+    const size_t dst = (((size_t)page * (size_t)kvh + (size_t)h) * S + (size_t)slot) * d;
+    const size_t src = ((size_t)h * (size_t)n + (size_t)t) * d;
+    const_cast<device T*>(kcache)[dst + e] = ktile[src + e];
+    const_cast<device T*>(vcache)[dst + e] = vtile[src + e];
+    if (e == 0 && h == 0 && t == 0) {
+        fence[0] = prev[0] + 1;
     }
 }
 
