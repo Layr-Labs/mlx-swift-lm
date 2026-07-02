@@ -20,7 +20,16 @@
 
 import Foundation
 
-public final class CBv2LayerCacheBank: CBv2LayerCacheProvider {
+/// A layer-cache provider whose composition fingerprint can be forced
+/// stale. The engine loop invalidates after compiled decode steps advanced
+/// rows OUTSIDE the provider's caches, so the next eager bind rebuilds
+/// `positionOffsets` from host truth instead of trusting its own stale
+/// on-device advance chain.
+public protocol CBv2CompositionInvalidating: AnyObject {
+    func invalidateBoundComposition()
+}
+
+public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionInvalidating {
 
     private let caches: [any CBv2AttendingLayerCache]
     private var boundRowIdentity: [ObjectIdentifier] = []
@@ -43,6 +52,15 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider {
                 CBv2LayerCache(
                     layerIndex: index, kind: kind, attentionSoftcap: attentionSoftcap)
             })
+    }
+
+    /// Force the next `layerCaches` call to rebind rows even when the
+    /// composition is identity-identical — required after compiled decode
+    /// steps advanced the rows outside these caches (their cached
+    /// `positionOffsets` no longer reflect the rows' true positions).
+    public func invalidateBoundComposition() {
+        hasBound = false
+        boundRowIdentity = []
     }
 
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {

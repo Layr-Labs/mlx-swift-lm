@@ -165,6 +165,62 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         [keys, values].compactMap { $0 }
     }
 
+    // MARK: - Compiled-decode bridge (CBv2CompiledDecode)
+
+    /// Fixed-shape storage for the compiled [B, 1] decode step.
+    ///
+    /// The compiled graph is shape-specialized: every full-attention lane
+    /// must present a `[1, kvHeads, capacity, headDim]` buffer. This method
+    /// pads (never shrinks) this row's buffer to exactly `capacity` slots and
+    /// returns the live buffer objects — the SAME `MLXArray` instances the
+    /// row reads and writes, so compiled-step `_updateInternal` writes are
+    /// immediately visible to every eager consumer (snapshot, donation,
+    /// eager fallback steps). Returns nil when this row cannot take the
+    /// compiled path:
+    ///  - the next token would not fit (`absoluteOffset >= capacity`),
+    ///  - the buffer already grew past `capacity` (long request — shrinking
+    ///    would discard KV), or
+    ///  - the buffer dtype differs from the traced dtype (`dtype`) — a
+    ///    mismatch would silently retrace on the request path.
+    ///
+    /// Bind-time only (membership changes) — never on the per-step path.
+    func compiledStorage(capacity: Int, dtype: DType) -> (keys: MLXArray, values: MLXArray)? {
+        guard absoluteOffset < capacity else { return nil }
+        if keys == nil {
+            // Fresh row (single-token prompt joins decode before any eager
+            // write). Allocate directly at compiled shape.
+            keys = MLXArray.zeros([1, kvHeads, capacity, headDim], dtype: dtype)
+            values = MLXArray.zeros([1, kvHeads, capacity, headDim], dtype: dtype)
+            self.capacity = capacity
+            return (keys!, values!)
+        }
+        guard let keys, let values, keys.dtype == dtype else { return nil }
+        let current = keys.dim(2)
+        if current > capacity { return nil }
+        if current < capacity {
+            let growth = capacity - current
+            self.keys = concatenated(
+                [keys, MLXArray.zeros([1, kvHeads, growth, keys.dim(3)], dtype: keys.dtype)],
+                axis: 2)
+            self.values = concatenated(
+                [values, MLXArray.zeros([1, kvHeads, growth, values.dim(3)], dtype: values.dtype)],
+                axis: 2)
+            self.capacity = capacity
+        }
+        return (self.keys!, self.values!)
+    }
+
+    /// Host-side bookkeeping for one compiled decode step: the compiled
+    /// graph wrote one token at index `absoluteOffset` and advanced the
+    /// device-side offset state; mirror it on the host counter so every
+    /// eager consumer (views, admission, the next bind) stays consistent.
+    func noteCompiledAdvance() {
+        precondition(
+            absoluteOffset < capacity,
+            "CBv2FullSequenceKV: compiled advance past storage capacity — eligibility bug")
+        absoluteOffset += 1
+    }
+
     // MARK: - Private
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {

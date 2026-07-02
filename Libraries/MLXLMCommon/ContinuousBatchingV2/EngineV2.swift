@@ -105,6 +105,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public var stepCount: Int { loop.stepCount }
     public var chainedStepCount: Int { loop.chainedStepCount }
     public var preemptionCount: Int { loop.preemptionCount }
+    /// Compiled-decode telemetry, or nil when the compiled path was never
+    /// built (config off, ineligible model, unsupported hardware).
+    /// NOTE: counters are engine-thread owned; read at quiescent points
+    /// (after streams finish) for exact values.
+    public var compiledDecodeStats: CBv2CompiledDecodeStats? { loop.compiledDecode?.stats }
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
 
@@ -118,7 +123,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         schedulerConfig: CBv2SchedulerConfig = CBv2SchedulerConfig(),
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
         admissionConfig: AdmissionV2.Config = AdmissionV2.Config(),
-        prefixCache: CBv2PrefixCache? = nil
+        prefixCache: CBv2PrefixCache? = nil,
+        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig()
     ) {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
@@ -135,6 +141,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.admission = admission
         let gauges = CBv2EngineGauges(kvBytesCapacity: backend.bytesCapacity)
         self.gauges = gauges
+        // Compiled [B, 1] decode (Phase 1): traced per bucket at warmup on
+        // the engine queue, replayed for eligible pure-decode steps, eager
+        // fallback everywhere else. nil when statically ineligible.
+        let compiledDecode = CBv2CompiledDecode.build(
+            model: model, layerKinds: layerKinds, config: compiledDecodeConfig,
+            maxConcurrentRequests: schedulerConfig.maxConcurrentRequests)
         self.loop = EngineLoopV2(
             model: model,
             layerKinds: layerKinds,
@@ -145,6 +157,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             scheduler: SchedulerV2(config: schedulerConfig, capacity: admission),
             capacity: admission,
             prefixCache: activePrefixCache,
+            compiledDecode: compiledDecode,
             config: loopConfig,
             gauges: gauges)
         loop.start()
