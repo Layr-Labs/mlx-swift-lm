@@ -216,6 +216,49 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         XCTAssertGreaterThan(harness.engine.preemptionCount, 0, "capacity forces preemption")
     }
 
+    /// Regression: `prefixHitTokens` was not cleared when an ADOPTED request
+    /// was preempted. Preemption discards the adopted KV and recomputes the
+    /// full prompt from scratch, so a stale entry over-credited
+    /// usage.prefixCacheHitTokens at finish. Both preemption paths now drop
+    /// the entry; a non-preempted adopted batchmate keeps its true credit.
+    func testPreemptedAdoptedRequestReportsZeroPrefixHitTokens() async throws {
+        // Same capacity shape as the preemption test above (12-token soft
+        // ledger), plus a scripted prefix cache that claims a 2-token hit
+        // for every prompt. Victim = youngest ⇒ the second request is
+        // preempted mid-decode and recomputes everything.
+        let matched = 2
+        let prefixCache = CBv2SchedScriptedPrefixCache(matched: matched)
+        let harness = CBv2SchedHarness(
+            backendCapacity: 200,
+            schedulerConfig: CBv2SchedulerConfig(enablePrefixCache: true),
+            prefixCache: prefixCache)
+        let older = CBv2SchedFixtures.request(prompt: [1, 2, 3, 4], maxTokens: 6)
+        let younger = CBv2SchedFixtures.request(prompt: [40, 41, 42, 43], maxTokens: 6)
+        let olderStream = try harness.engine.submit(older)
+        let youngerStream = try harness.engine.submit(younger)
+        async let olderOut = cbv2SchedCollect(olderStream)
+        async let youngerOut = cbv2SchedCollect(youngerStream)
+        let (olderCollected, youngerCollected) = await (olderOut, youngerOut)
+
+        XCTAssertGreaterThan(harness.engine.preemptionCount, 0, "capacity forces preemption")
+        // Token streams stay seamless either way.
+        XCTAssertEqual(olderCollected.tokens, [5, 6, 7, 8, 9, 10])
+        XCTAssertEqual(youngerCollected.tokens, [44, 45, 46, 47, 48, 49])
+
+        // Control: the non-preempted adopted request keeps its true credit.
+        XCTAssertEqual(
+            olderCollected.usage?.prefixCacheHitTokens, matched,
+            "adopted, never preempted: usage reports the skipped tokens")
+        // Regression: preemption + full recompute means NOTHING was skipped.
+        XCTAssertEqual(
+            youngerCollected.usage?.prefixCacheHitTokens, 0,
+            "preempted-adopted request recomputed everything; stale credit must be dropped")
+
+        // Every lookup pin was balanced by exactly one endAdoption.
+        XCTAssertEqual(prefixCache.lookups, 2)
+        XCTAssertEqual(prefixCache.endAdoptions, prefixCache.lookups)
+    }
+
     // MARK: Deadlines & watchdog
 
     func testRequestDeadlineErrorFinishes() async throws {

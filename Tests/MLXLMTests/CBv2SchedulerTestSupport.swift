@@ -260,6 +260,69 @@ final class CBv2SchedScriptedDetokFactory: CBv2DetokenizerFactory, @unchecked Se
     }
 }
 
+// MARK: - Scripted prefix cache
+
+/// Scripted `CBv2PrefixCache`: claims a fixed `matched`-token hit for every
+/// prompt longer than `matched` (full-attention layers get dummy snapshots;
+/// windowed/KV-shared layers stay nil, per the contract). Tracks the
+/// lookup-pin balance so tests can assert every hit is released.
+final class CBv2SchedScriptedPrefixCache: CBv2PrefixCache, @unchecked Sendable {
+    let matched: Int
+    private let lock = NSLock()
+    private var _lookups = 0
+    private var _endAdoptions = 0
+
+    init(matched: Int) { self.matched = matched }
+
+    var lookups: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lookups
+    }
+    var endAdoptions: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _endAdoptions
+    }
+
+    func lookup(tokens: [Int], layerKinds: [CBv2LayerKind])
+        -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
+    {
+        guard tokens.count > matched, matched > 0 else { return nil }
+        lock.lock()
+        _lookups += 1
+        lock.unlock()
+        return (
+            matched,
+            layerKinds.map { kind in
+                guard kind.sharesKVWithLayer == nil, case .full = kind.attention else {
+                    return nil
+                }
+                let snap = MLXArray.zeros([1, kind.kvHeads, matched, kind.headDim])
+                return (keys: snap, values: snap, offset: matched)
+            }
+        )
+    }
+
+    func donate(tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind]) {}
+
+    func donate(
+        tokens: [Int],
+        snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind]
+    ) {}
+
+    func endAdoption(tokens: [Int], matched: Int) {
+        lock.lock()
+        _endAdoptions += 1
+        lock.unlock()
+    }
+
+    func evict(toFit byteBudget: Int) {}
+
+    var bytesInUse: Int { 0 }
+}
+
 // MARK: - Builders
 
 enum CBv2SchedFixtures {
@@ -301,7 +364,8 @@ struct CBv2SchedHarness {
         schedulerConfig: CBv2SchedulerConfig = CBv2SchedulerConfig(),
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
         admissionConfig: AdmissionV2.Config = .init(watermarkFraction: 0),
-        stopTrigger: Int? = nil
+        stopTrigger: Int? = nil,
+        prefixCache: CBv2PrefixCache? = nil
     ) {
         let model = CBv2SchedScriptedModel(vocab: vocab)
         let backend = CBv2SchedMockBackend(capacity: backendCapacity)
@@ -322,7 +386,8 @@ struct CBv2SchedHarness {
             detokenizerFactory: detokFactory,
             schedulerConfig: schedulerConfig,
             loopConfig: loopConfig,
-            admissionConfig: admissionConfig)
+            admissionConfig: admissionConfig,
+            prefixCache: prefixCache)
     }
 }
 

@@ -478,6 +478,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduler.rollback(plan)
             for id in plan.preemptions {
                 preemptionCount += 1
+                // A preempted request recomputes from scratch — any adopted
+                // prefix credit no longer describes work that was skipped.
+                prefixHitTokens.removeValue(forKey: id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
@@ -881,6 +884,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         assert(inFlight == nil, "preemption with a step in flight")
         for id in ids {
             preemptionCount += 1
+            // A preempted request recomputes from scratch — any adopted
+            // prefix credit no longer describes work that was skipped, so
+            // usage.prefixCacheHitTokens must not over-credit at finish.
+            prefixHitTokens.removeValue(forKey: id)
             if let state = kvStates.removeValue(forKey: id) {
                 backend.release(state)
             }
