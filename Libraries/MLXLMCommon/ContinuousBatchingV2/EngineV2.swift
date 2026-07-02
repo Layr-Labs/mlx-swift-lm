@@ -143,19 +143,27 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // the compiled path cannot reproduce (numerics guard), or when the
         // padding reserve would eat too much of the KV byte budget.
         var effectiveCompiledConfig = compiledDecodeConfig
-        if effectiveCompiledConfig.attentionSoftcap == nil,
-            let bank = cacheProvider as? CBv2LayerCacheBank,
-            let bankSoftcap = bank.uniformAttentionSoftcap, bankSoftcap != nil
-        {
-            // The eager caches softcap attention logits but the compiled
-            // config was not told: propagate so build() refuses (never
-            // silently drift from eager numerics).
-            effectiveCompiledConfig.attentionSoftcap = bankSoftcap
+        var softcapVeto = false
+        if effectiveCompiledConfig.attentionSoftcap == nil {
+            if let claim = cacheProvider.uniformAttentionSoftcap {
+                // `.some(x)`: propagate so build() refuses (compiled SDPA
+                // has no softcap path — never silently drift from eager
+                // numerics). `.some(nil)`: uniformly uncapped, safe.
+                effectiveCompiledConfig.attentionSoftcap = claim
+            } else {
+                // No claim (mixed caches, paged-only bank, or a custom
+                // provider that cannot vouch): fail-safe — compiled decode
+                // is vetoed rather than trusted to match eager numerics.
+                softcapVeto = true
+            }
         }
-        let compiledDecode = CBv2CompiledDecode.build(
-            model: model, layerKinds: layerKinds, config: effectiveCompiledConfig,
-            maxConcurrentRequests: schedulerConfig.maxConcurrentRequests,
-            kvBytesCapacity: backend.bytesCapacity)
+        let compiledDecode: CBv2CompiledDecode? =
+            softcapVeto
+            ? nil
+            : CBv2CompiledDecode.build(
+                model: model, layerKinds: layerKinds, config: effectiveCompiledConfig,
+                maxConcurrentRequests: schedulerConfig.maxConcurrentRequests,
+                kvBytesCapacity: backend.bytesCapacity)
         // Truthful admission under compiled padding: the compiled path pads
         // full-attention rows to its bucket capacity (more bytes than token
         // admission would budget), so its worst-case reserve is carved out

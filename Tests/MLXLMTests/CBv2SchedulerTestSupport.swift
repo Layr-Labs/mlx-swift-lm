@@ -174,6 +174,7 @@ final class CBv2SchedMockLayerCache: CBv2AttendingLayerCache {
 }
 
 final class CBv2SchedMockCacheProvider: CBv2LayerCacheProvider, @unchecked Sendable {
+    var uniformAttentionSoftcap: Float?? { .some(nil) }
     let layerKinds: [CBv2LayerKind]
     private let lock = NSLock()
     private var _callRowCounts: [Int] = []

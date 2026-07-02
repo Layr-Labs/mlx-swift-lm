@@ -69,7 +69,7 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     /// / they disagree (then no claim is made). `EngineV2` cross-checks the
     /// compiled-decode config against this so the compiled path can never
     /// silently skip a softcap the eager path applies.
-    var uniformAttentionSoftcap: Float?? {
+    public var uniformAttentionSoftcap: Float?? {
         var softcaps: [Float?] = []
         for cache in caches {
             guard let contiguous = cache as? CBv2LayerCache else { continue }

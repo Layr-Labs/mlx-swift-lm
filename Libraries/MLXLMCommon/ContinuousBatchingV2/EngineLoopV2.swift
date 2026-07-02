@@ -34,6 +34,15 @@ public protocol CBv2SteppableModel: AnyObject {
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
 public protocol CBv2LayerCacheProvider: AnyObject {
     func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache]
+    /// Attention-softcap claim for the eager caches this provider vends.
+    /// `.some(nil)` = uniformly no softcap (compiled decode may build);
+    /// `.some(x)` = uniform softcap x (propagated into the compiled config
+    /// so `CBv2CompiledDecode.build` refuses — it has no softcap path);
+    /// `nil` = no claim / mixed / unknown, which FAIL-SAFE VETOES compiled
+    /// decode entirely. Conformers must answer truthfully: a provider that
+    /// claims `.some(nil)` while vending softcapped caches produces silent
+    /// numeric drift between eager and compiled steps.
+    var uniformAttentionSoftcap: Float?? { get }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)

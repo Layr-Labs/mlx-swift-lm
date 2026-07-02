@@ -420,6 +420,42 @@ final class CBv2CompiledDecodeTests: XCTestCase {
             "softcapped eager caches must veto the compiled path entirely")
     }
 
+    /// A provider that makes NO softcap claim (nil) must fail-safe veto
+    /// compiled decode: the engine cannot verify eager/compiled numeric
+    /// agreement, so it must not build the compiled path (Codex P2 round-3:
+    /// the veto is a protocol obligation, not a CBv2LayerCacheBank cast).
+    func testNoClaimProviderFailSafeVetoesCompiledDecode() async throws {
+        final class NoClaimProvider: CBv2LayerCacheProvider {
+            let inner: CBv2LayerCacheBank
+            init(layerKinds: [CBv2LayerKind]) {
+                self.inner = CBv2LayerCacheBank(layerKinds: layerKinds)
+            }
+            var uniformAttentionSoftcap: Float?? { nil }
+            func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+                inner.layerCaches(rowStates: rowStates)
+            }
+        }
+        let model = TinyTestModel.make(seed: 0xC0FFEE)
+        let engine = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
+            cacheProvider: NoClaimProvider(layerKinds: model.layerKinds),
+            sampler: CBv2DefaultSampler(fallbackSeed: 7),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 8),
+            compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: true))
+        let collected = await cbv2SchedCollect(
+            try engine.submit(
+                request(id: 1, prompt: makePromptTokens(length: 9, seed: 61), maxTokens: 8)))
+        await engine.shutdown()
+        XCTAssertEqual(collected.finishReason, .length)
+        XCTAssertNil(
+            engine.compiledDecodeStats,
+            "a no-claim provider must fail-safe veto the compiled path")
+    }
+
     /// The compiled padding reserve must be carved out of the admission
     /// ledger (real padded bytes may exceed what token admission budgets),
     /// and a budget too small for the reserve must refuse to build the
