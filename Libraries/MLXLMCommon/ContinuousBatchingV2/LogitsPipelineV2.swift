@@ -83,6 +83,11 @@ public final class LogitsPipelineV2 {
     public private(set) var allGreedy = true
     /// True when at least one row requested logprobs.
     public private(set) var wantsLogprobs = false
+    /// Count of `process` calls that built logprob graph nodes (the raw
+    /// log_softmax capture). Telemetry/test hook: batches where no row
+    /// requests logprobs must keep this at zero — logprob capture is the
+    /// ONLY extra tensor work the logprobs feature adds to the step path.
+    public private(set) var logprobBuildCount = 0
 
     // Per-batch flags, fixed between membership changes so the graph shape
     // is stable step to step (numerically pinned path per composition).
@@ -268,9 +273,15 @@ public final class LogitsPipelineV2 {
         // the same). f16→f32 is exact, so greedy argmax is unaffected.
         var x = logits.asType(.float32)
 
-        // (0) Raw logprobs BEFORE any transform.
-        let rawLogprobs: MLXArray? =
-            wantsLogprobs ? x - logSumExp(x, axis: -1, keepDims: true) : nil
+        // (0) Raw logprobs BEFORE any transform. (The counter is a telemetry
+        // side effect only; the transform pipeline itself stays pure.)
+        let rawLogprobs: MLXArray?
+        if wantsLogprobs {
+            logprobBuildCount += 1
+            rawLogprobs = x - logSumExp(x, axis: -1, keepDims: true)
+        } else {
+            rawLogprobs = nil
+        }
 
         // (1) Logit bias.
         if let biasMatrix {
@@ -471,7 +482,10 @@ public enum CBv2Logprobs {
 
     /// Turn a materialized `Gathered` plus host token ids into per-row
     /// `CBv2TokenLogprob`s. Rows whose `topLogprobs` is 0 get nil.
-    /// Synchronizes on the arrays — call OFF the engine step thread.
+    /// Synchronizes on the arrays — only call at a sanctioned readback
+    /// boundary: the engine calls this at step FINALIZATION, right where
+    /// the sampled tokens are read back (the arrays rode the step's
+    /// `asyncEval`, so no extra GPU work is forced), never mid graph-build.
     public static func assemble(
         _ gathered: Gathered, sampledTokens: [Int], topLogprobsPerRow: [Int]
     ) -> [CBv2TokenLogprob?] {
@@ -497,5 +511,35 @@ public enum CBv2Logprobs {
                     token: sampledTokens[row], logprob: chosen[row], topLogprobs: top))
         }
         return out
+    }
+}
+
+// MARK: - Per-step logprob handoff (sampler → engine loop)
+
+/// One `sample` call's LAZY logprob gather, handed from the sampler to the
+/// engine loop (`CBv2StepSampler.takeStepLogprobs`). `gathered` holds
+/// graph-only handles over the RAW (pre-transform) logprobs; the loop adds
+/// `evalTargets` to the step's `asyncEval` set and materializes the values
+/// at the finalize boundary — one step late, alongside the sampled tokens,
+/// matching the engine's readback discipline.
+public struct CBv2StepLogprobs {
+    /// Row ids in the gather's row order (== the `sample` call's row order).
+    public let rows: [CBv2RequestID]
+    /// Each row's requested `topLogprobs` (0 ⇒ that row reports nothing).
+    public let topLogprobsPerRow: [Int]
+    public let gathered: CBv2Logprobs.Gathered
+
+    public init(
+        rows: [CBv2RequestID], topLogprobsPerRow: [Int], gathered: CBv2Logprobs.Gathered
+    ) {
+        self.rows = rows
+        self.topLogprobsPerRow = topLogprobsPerRow
+        self.gathered = gathered
+    }
+
+    /// Arrays the engine adds to the step's `asyncEval` so finalization's
+    /// readback finds them already computed.
+    public var evalTargets: [MLXArray] {
+        [gathered.chosen, gathered.topValues, gathered.topIndices]
     }
 }

@@ -61,6 +61,19 @@ public protocol CBv2StepSampler: AnyObject {
         stepIndex: Int, pendingSampledTokens: MLXArray?,
         rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray
+
+    /// Consume the LAZY logprob gather built by the immediately preceding
+    /// `sample` call (raw pre-transform logprobs; contract rule), or nil when
+    /// no row of that call requested `topLogprobs > 0`. Graph-only handles:
+    /// the loop adds them to the step's `asyncEval` set and materializes them
+    /// at the finalize boundary alongside the sampled tokens — never an extra
+    /// host sync on the chained decode path. Called at most once per `sample`
+    /// (take semantics). Default: nil (samplers without logprob support).
+    func takeStepLogprobs() -> CBv2StepLogprobs?
+}
+
+extension CBv2StepSampler {
+    public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
 }
 
 /// Greedy stub — vectorized argmax, batch-composition invariant by
@@ -167,6 +180,10 @@ final class CBv2InFlightStep {
     /// Rows finished/cancelled AFTER launch: their sampled token is
     /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
+    /// Lazy per-step logprob gathers (rows that requested topLogprobs > 0
+    /// exist in the batch). Graph-only until finalization, where they are
+    /// materialized at the SAME boundary as the sampled tokens.
+    var logprobSegments: [CBv2StepLogprobs] = []
     /// KV states whose release is fenced behind this step's completion.
     /// `rollbackOne` scrubs the wasted-token KV tail before release;
     /// `donation` (non-nil for natural finishes with prefix caching on)
@@ -653,10 +670,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             rowContext: { [scheduler] in
                 ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
             })
+        let stepLogprobs = sampler.takeStepLogprobs()
         scheduler.markPendingSamples(ids: ids)
-        asyncEval([sampled])
-        return CBv2InFlightStep(
+        var toEval = [sampled]
+        if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
+        asyncEval(toEval)
+        let step = CBv2InFlightStep(
             participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [])
+        if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
+        return step
     }
 
     /// General step: decode batch [B, 1] + per-request [1, chunk] prefills,
@@ -689,6 +711,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Rectangular decode batch, in plan order.
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
+        var logprobSegments: [CBv2StepLogprobs] = []
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
@@ -702,6 +725,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,  // finalize preceded: all confirmed
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+            if let stepLogprobs = sampler.takeStepLogprobs() {
+                logprobSegments.append(stepLogprobs)
+            }
         }
 
         // Per-request prefill chunks [1, chunk].
@@ -721,6 +747,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                     stepIndex: stepCount,
                     pendingSampledTokens: nil,
                     rowContext: { [Self.samplerRow(rec)] })
+                if let stepLogprobs = sampler.takeStepLogprobs() {
+                    logprobSegments.append(stepLogprobs)
+                }
             } else {
                 // Cheap handle that forces this chunk's graph (incl. KV
                 // writes) without materializing full logits on the host.
@@ -749,13 +778,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler.markPendingSamples(ids: sampledRows)
         var toEval = evalTargets
         if let sampledTokens { toEval.append(sampledTokens) }
+        for segment in logprobSegments { toEval.append(contentsOf: segment.evalTargets) }
         asyncEval(toEval)
 
-        return CBv2InFlightStep(
+        let step = CBv2InFlightStep(
             participants: Set(work.map(\.rec.id)),
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
             evalTargets: evalTargets)
+        step.logprobSegments = logprobSegments
+        return step
     }
 
     // MARK: Finalization (deferred stop detection)
@@ -769,6 +801,24 @@ public final class EngineLoopV2: @unchecked Sendable {
             host = tokens.asArray(Int32.self)
         } else if !step.evalTargets.isEmpty {
             eval(step.evalTargets)
+        }
+
+        // Materialize any lazy logprob gathers at this same boundary (they
+        // rode the step's asyncEval, so this reads back finished results —
+        // no extra GPU work, and only when a row asked for logprobs).
+        var logprobsByID: [CBv2RequestID: CBv2TokenLogprob] = [:]
+        if !step.logprobSegments.isEmpty {
+            var tokenByID: [CBv2RequestID: Int] = [:]
+            for (i, id) in step.sampledRows.enumerated() { tokenByID[id] = Int(host[i]) }
+            for segment in step.logprobSegments {
+                let sampledTokens = segment.rows.map { tokenByID[$0] ?? -1 }
+                let assembled = CBv2Logprobs.assemble(
+                    segment.gathered, sampledTokens: sampledTokens,
+                    topLogprobsPerRow: segment.topLogprobsPerRow)
+                for (row, logprob) in zip(segment.rows, assembled) {
+                    if let logprob { logprobsByID[row] = logprob }
+                }
+            }
         }
 
         for (i, id) in step.sampledRows.enumerated() {
@@ -787,7 +837,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             let isStopToken = rec.request.stopTokens.contains(token)
             let detokenizer = detokenizers[id]
             let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
-            stream(for: id)?.emit(.delta(text: text, tokens: [token], logprobs: nil))
+            stream(for: id)?.emit(
+                .delta(text: text, tokens: [token], logprobs: logprobsByID[id].map { [$0] }))
 
             // Stop detection — one step late by construction.
             if isStopToken {

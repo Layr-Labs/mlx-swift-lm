@@ -30,6 +30,14 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     private var pipeline: LogitsPipelineV2?
     private let sampler: SamplerV2
     private var configuredIDs: [CBv2RequestID] = []
+    /// The lazy logprob gather built by the most recent `sample` call, until
+    /// the loop consumes it via `takeStepLogprobs` (take semantics).
+    private var pendingStepLogprobs: CBv2StepLogprobs?
+    /// Number of `sample` calls that built logprob gather nodes
+    /// (telemetry/test hook — must stay 0 when no row asks for logprobs).
+    public private(set) var logprobGatherCount = 0
+    /// Test hook: the composed pipeline's logprob-capture counter.
+    var pipelineLogprobBuildCount: Int { pipeline?.logprobBuildCount ?? 0 }
 
     /// - Parameter fallbackSeed: engine-level seed for rows without a
     ///   per-request seed (fixed at init so nil-seed rows stay
@@ -69,6 +77,27 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         let tokens = sampler.sample(from: output.sampling)
         pipeline.commit(sampledTokens: tokens)
         sampler.commit()
+
+        // Lazy logprob gather from the RAW (pre-transform) logprobs — graph
+        // nodes only, no host sync; the loop materializes at finalization.
+        // Rows with topLogprobs == 0 pay nothing beyond riding the batch's
+        // shared capture (and the whole branch is skipped when NO row asks).
+        if let rawLogprobs = output.rawLogprobs {
+            let k = params.reduce(0) { max($0, $1.topLogprobs) }
+            pendingStepLogprobs = CBv2StepLogprobs(
+                rows: requestIDs,
+                topLogprobsPerRow: params.map(\.topLogprobs),
+                gathered: CBv2Logprobs.gather(
+                    rawLogprobs: rawLogprobs, sampledTokens: tokens, k: k))
+            logprobGatherCount += 1
+        } else {
+            pendingStepLogprobs = nil
+        }
         return tokens
+    }
+
+    public func takeStepLogprobs() -> CBv2StepLogprobs? {
+        defer { pendingStepLogprobs = nil }
+        return pendingStepLogprobs
     }
 }
