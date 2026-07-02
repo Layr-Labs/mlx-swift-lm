@@ -70,6 +70,12 @@ final class CBv2EngineGauges: @unchecked Sendable {
 /// let events = try engine.submit(request)
 /// for await event in events { ... }
 /// ```
+/// `@unchecked Sendable` justification (contract `CBv2Engine: Sendable`):
+/// all mutable state is either lock-protected (`stateLock`,
+/// `CBv2EngineGauges`) or confined to the engine's serial dispatch queue
+/// inside `EngineLoopV2`; the only cross-thread surfaces are `submit`
+/// (lock + queue hop), `cancel` (lock), `capacity()` (lock), and
+/// `shutdown()` (queue-synchronized drain).
 public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let loop: EngineLoopV2
     private let admission: AdmissionV2

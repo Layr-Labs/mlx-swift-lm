@@ -358,7 +358,10 @@ final class CBv2InvariantSuiteTests: XCTestCase {
             adopting: [(fullSnap.keys, fullSnap.values, fullSnap.offset), nil],
             layerKinds: kinds, maxLength: 128)
         XCTAssertEqual(adopted[0]?.absoluteOffset, 6)
-        XCTAssertEqual(adopted[1]?.absoluteOffset, 0, "windowed layer must start empty")
+        XCTAssertEqual(
+            adopted[1]?.absoluteOffset, 6,
+            "windowed layer fast-forwards to the uniform adopted offset")
+        XCTAssertEqual(adopted[1]?.retainedCount, 0, "windowed storage must start empty")
     }
 
     // MARK: - Invariant 9: sinks are a first-class capability

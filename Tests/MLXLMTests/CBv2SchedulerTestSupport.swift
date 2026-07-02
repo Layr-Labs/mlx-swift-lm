@@ -147,12 +147,16 @@ final class CBv2SchedMockBackend: CBv2KVBackend, @unchecked Sendable {
 final class CBv2SchedMockLayerCache: CBv2AttendingLayerCache {
     let layerIndex: Int
     let kind: CBv2LayerKind
-    let rows: [CBv2SequenceKV]
+    private(set) var rows: [CBv2SequenceKV]
     var positionOffsets: MLXArray { MLXArray(rows.map { Int32($0.absoluteOffset) }) }
 
     init(layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV]) {
         self.layerIndex = layerIndex
         self.kind = kind
+        self.rows = rows
+    }
+
+    func setRows(_ rows: [CBv2SequenceKV]) {
         self.rows = rows
     }
 

@@ -53,11 +53,15 @@ enum CBv2AttentionV1 {
     ///
     /// - queries/keys/values: `[B, heads, L, headDim]` with `L == 1` for
     ///   decode (B == rows.count) or `B == 1` for a prefill chunk.
+    /// - softcap: construction-time attention-logit soft cap
+    ///   (`cap * tanh(qk / cap)` before softmax, Gemma-2 style). When set,
+    ///   BOTH phases take the composed reference path (SDPA cannot express
+    ///   softcapping) — still one pinned path per phase.
     /// - Returns `[B, queryHeads, L, headDim]`.
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?
+        scale: Float, sinks: MLXArray?, softcap: Float? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -74,10 +78,10 @@ enum CBv2AttentionV1 {
 
         if B == 1 {
             let (cachedKeys, cachedValues) = rows[0].update(keys: keys, values: values)
-            return sdpa(
+            return attend(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                mask: maskMode(L: L, kL: cachedKeys.dim(2), window: window(of: kind)),
-                sinks: effectiveSinks)
+                L: L, kL: cachedKeys.dim(2), window: window(of: kind),
+                sinks: effectiveSinks, softcap: softcap)
         }
 
         // Batched decode: split queries per row, per-row update + SDPA
@@ -91,10 +95,11 @@ enum CBv2AttentionV1 {
                 keys: keys[index ..< (index + 1)],
                 values: values[index ..< (index + 1)])
             outputs.append(
-                sdpa(
+                attend(
                     queries: queries[index ..< (index + 1)],
                     keys: cachedKeys, values: cachedValues, scale: scale,
-                    mask: .none, sinks: effectiveSinks))
+                    L: 1, kL: cachedKeys.dim(2), window: nil,
+                    sinks: effectiveSinks, softcap: softcap))
         }
         return concatenated(outputs, axis: 0)
     }
@@ -105,7 +110,7 @@ enum CBv2AttentionV1 {
     /// earlier in the forward pass).
     static func attendBorrowing(
         sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind, kind: CBv2LayerKind,
-        queries: MLXArray, scale: Float, sinks: MLXArray?
+        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -121,10 +126,10 @@ enum CBv2AttentionV1 {
 
         if B == 1 {
             let (cachedKeys, cachedValues, _) = sourceRows[0].snapshot()
-            return sdpa(
+            return attend(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                mask: maskMode(L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind)),
-                sinks: effectiveSinks)
+                L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
+                sinks: effectiveSinks, softcap: softcap)
         }
 
         var outputs: [MLXArray] = []
@@ -132,10 +137,11 @@ enum CBv2AttentionV1 {
         for (index, row) in sourceRows.enumerated() {
             let (cachedKeys, cachedValues, _) = row.snapshot()
             outputs.append(
-                sdpa(
+                attend(
                     queries: queries[index ..< (index + 1)],
                     keys: cachedKeys, values: cachedValues, scale: scale,
-                    mask: .none, sinks: effectiveSinks))
+                    L: 1, kL: cachedKeys.dim(2), window: nil,
+                    sinks: effectiveSinks, softcap: softcap))
         }
         return concatenated(outputs, axis: 0)
     }
@@ -149,12 +155,39 @@ enum CBv2AttentionV1 {
         }
     }
 
-    private static func sdpa(
+    /// Single-request attention dispatch. Without a softcap this is MLXFast
+    /// SDPA with `maskMode(L:kL:window:)`; with a softcap it is the composed
+    /// fp32 reference (SDPA cannot express logit softcapping) with the
+    /// EQUIVALENT boolean mask — both are pure functions of (L, kL, window),
+    /// so each configuration keeps exactly one pinned path per phase.
+    private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode, sinks: MLXArray?
+        L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
-        MLXFast.scaledDotProductAttention(
+        guard let softcap else {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale,
+                mask: maskMode(L: L, kL: kL, window: window),
+                sinks: sinks)
+        }
+        return PagedAttentionReference.composedAttention(
             queries: queries, keys: keys, values: values, scale: scale,
-            mask: mask, sinks: sinks)
+            boolMask: boolMask(L: L, kL: kL, window: window),
+            sinks: sinks, softcap: softcap)
+    }
+
+    /// Boolean causal(∧window) mask (true == attend) equivalent to
+    /// `maskMode(L:kL:window:)`, for the composed softcap path. nil for
+    /// decode (L == 1: the retained KV IS the window).
+    static func boolMask(L: Int, kL: Int, window: Int?) -> MLXArray? {
+        guard L > 1 else { return nil }
+        // Relative coordinates: keys span [0, kL), queries are the last L.
+        let qpos = MLXArray(Int32(kL - L) ..< Int32(kL)).expandedDimensions(axis: 1)
+        let kpos = MLXArray(Int32(0) ..< Int32(kL)).expandedDimensions(axis: 0)
+        var mask = kpos .<= qpos
+        if let window, kL > window {
+            mask = mask .&& (kpos .> (qpos - Int32(window)))
+        }
+        return mask
     }
 }

@@ -730,7 +730,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 waitingRequests: scheduler.waitingCount,
                 kvBytesInUse: backend.bytesInUse,
                 kvBytesCapacity: backend.bytesCapacity,
-                activeTokens: scheduler.activeTokens))
+                activeTokens: scheduler.activeTokens,
+                stepsExecuted: stepCount))
     }
 
     // MARK: Watchdog (engine health signal)

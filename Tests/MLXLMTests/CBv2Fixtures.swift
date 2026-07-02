@@ -166,6 +166,13 @@ final class HarnessWindowedSequenceKV: CBv2SequenceKV, HarnessReadableKV {
         self.window = window
     }
 
+    /// Contract `fastForward(to:)` — advance the counter without storage
+    /// (prefix adoption places windowed rows at the uniform adopted offset).
+    func fastForward(to offset: Int) {
+        precondition(keys == nil && absoluteOffset == 0, "fastForward requires a fresh state")
+        absoluteOffset = offset
+    }
+
     var retainedCount: Int { keys?.dim(2) ?? 0 }
 
     var byteCount: Int {
@@ -263,6 +270,10 @@ final class HarnessLayerCache: CBv2AttendingLayerCache {
     init(layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = []) {
         self.layerIndex = layerIndex
         self.kind = kind
+        self.rows = rows
+    }
+
+    func setRows(_ rows: [CBv2SequenceKV]) {
         self.rows = rows
     }
 
@@ -424,6 +435,10 @@ final class HarnessKVBackend: CBv2KVBackend {
     ) throws -> [CBv2SequenceKV?] {
         try check(layerKinds: layerKinds)
         precondition(prefix.count == layerKinds.count)
+        // Uniform adopted offset (the engine slices the matched prefix by
+        // cbv2RequiredRecompute before adopting, so all non-nil entries
+        // agree).
+        let matched = prefix.compactMap { $0?.offset }.first ?? 0
         let state: [CBv2SequenceKV?] = zip(layerKinds, prefix).map { kind, donated in
             guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
@@ -435,10 +450,12 @@ final class HarnessKVBackend: CBv2KVBackend {
                 return kv
             case .slidingWindow(let w):
                 // Windowed layers never adopt full-history prefixes — the
-                // engine recomputes the trailing window (contract:
+                // engine replays the trailing tokens (contract:
                 // CBv2PrefixCache.lookup returns nil for windowed layers).
                 precondition(donated == nil, "windowed layer must not adopt a prefix")
-                return HarnessWindowedSequenceKV(window: w)
+                let kv = HarnessWindowedSequenceKV(window: w)
+                if matched > 0 { kv.fastForward(to: matched) }
+                return kv
             }
         }
         track(state)

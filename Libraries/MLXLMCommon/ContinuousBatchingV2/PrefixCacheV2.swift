@@ -47,17 +47,26 @@ public struct CBv2PrefixCacheConfig: Sendable, Equatable {
     /// Byte budget enforced automatically after each donation.
     /// nil ⇒ unbounded; the owner calls `evict(toFit:)` explicitly.
     public var maxBytes: Int?
+    /// Materialize (device-eval) donated snapshot arrays before indexing
+    /// them. REQUIRED for the paged backend: donated views reference the
+    /// live slabs, whose pages are recycled once the donor state is
+    /// released. Not a host readback — device materialization only, and
+    /// donation already runs off the engine step thread. Off by default
+    /// (the contiguous backend's views own their buffers via ARC).
+    public var materializeOnDonate: Bool
 
     public init(
         blockSize: Int = CBv2BlockHasher.defaultBlockSize,
         modelName: String = "",
         cacheSalt: String = "",
-        maxBytes: Int? = nil
+        maxBytes: Int? = nil,
+        materializeOnDonate: Bool = false
     ) {
         self.blockSize = blockSize
         self.modelName = modelName
         self.cacheSalt = cacheSalt
         self.maxBytes = maxBytes
+        self.materializeOnDonate = materializeOnDonate
     }
 }
 
@@ -199,13 +208,35 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
     public func donate(tokens: [Int], state: [CBv2SequenceKV?], layerKinds: [CBv2LayerKind]) {
         guard state.count == layerKinds.count else { return }
+        // Snapshot the full-attention storage-owning layers. Windowed layers
+        // must not enter full-history prefix reuse (report 10 invariant 6);
+        // KV-sharing layers own no storage. Both stay nil.
+        var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+        snapshots.reserveCapacity(layerKinds.count)
+        for (i, kind) in layerKinds.enumerated() {
+            guard Self.isCacheable(kind), let seq = state[i] else {
+                snapshots.append(nil)
+                continue
+            }
+            snapshots.append(seq.snapshot())
+        }
+        donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds)
+    }
+
+    /// Pre-snapshotted donation (the engine-integration path): the per-layer
+    /// snapshots are built ON the engine thread (graph-only, so views over
+    /// shared slabs are consistent with in-flight writes) and handed here
+    /// from the donation queue. Windowed / KV-sharing layers must be nil.
+    public func donate(
+        tokens: [Int],
+        snapshots rawSnapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind]
+    ) {
+        guard rawSnapshots.count == layerKinds.count else { return }
         let blockCount = hasher.fullBlockCount(tokenCount: tokens.count)
         guard blockCount > 0 else { return }  // nothing block-aligned to keep
         let prefixTokens = blockCount * hasher.blockSize
 
-        // Snapshot the full-attention storage-owning layers. Windowed layers
-        // must not enter full-history prefix reuse (report 10 invariant 6);
-        // KV-sharing layers own no storage. Both stay nil.
         var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
         snapshots.reserveCapacity(layerKinds.count)
         var cacheableLayers = 0
@@ -216,16 +247,25 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
             }
             // A cacheable layer with missing or too-short state cannot cover
             // the prefix — the donation as a whole is unusable.
-            guard let seq = state[i] else { return }
-            let snap = seq.snapshot()
-            guard snap.offset >= prefixTokens,
+            guard let snap = rawSnapshots[i],
+                snap.offset >= prefixTokens,
                 snap.keys.ndim == 4, snap.keys.dim(2) >= prefixTokens
             else { return }
-            snapshots.append((keys: snap.keys, values: snap.values, offset: snap.offset))
+            snapshots.append(snap)
             cacheableLayers += 1
         }
         // All-windowed/all-shared model: an entry would carry no KV at all.
         guard cacheableLayers > 0 else { return }
+
+        if config.materializeOnDonate {
+            var toEval: [MLXArray] = []
+            for snap in snapshots {
+                guard let snap else { continue }
+                toEval.append(snap.keys)
+                toEval.append(snap.values)
+            }
+            eval(toEval)
+        }
 
         let hashes = hasher.chainHashes(tokens: tokens, maxBlocks: blockCount)
         let bytes = snapshots.reduce(0) { sum, snap in
@@ -356,23 +396,16 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     // MARK: - Windowed-layer policy
 
     /// Tokens the engine must re-prefill for WINDOWED layers after adopting
-    /// a `matched`-token prefix: the max sliding window across the model's
-    /// layers (windowed KV is never cached — report 10 invariant 6), clamped
-    /// to the matched prefix. 0 for all-full-attention models.
+    /// a `matched`-token prefix. Delegates to the contract-level free
+    /// function `cbv2RequiredRecompute` (pure model-shape logic, shared by
+    /// all backends).
     public static func requiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
-        guard matched > 0 else { return 0 }
-        var maxWindow = 0
-        for kind in layerKinds {
-            if case .slidingWindow(let window) = kind.attention {
-                maxWindow = max(maxWindow, window)
-            }
-        }
-        return min(maxWindow, matched)
+        cbv2RequiredRecompute(layerKinds: layerKinds, matched: matched)
     }
 
     /// Instance convenience for callers holding the cache.
     public func requiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
-        Self.requiredRecompute(layerKinds: layerKinds, matched: matched)
+        cbv2RequiredRecompute(layerKinds: layerKinds, matched: matched)
     }
 
     /// A layer's KV enters the prefix cache only when it is full-attention

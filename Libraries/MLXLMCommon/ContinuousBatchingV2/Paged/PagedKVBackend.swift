@@ -87,34 +87,49 @@ public final class PagedKVBackend: CBv2KVBackend {
     }
 
     /// Adopt a donated prefix. Snapshots are written into fresh pages
-    /// (bulk page-run slice updates — off the hot decode path); windowed
-    /// layers receive fresh EMPTY states, per the contract ("windowed
-    /// layers are recomputed by the scheduler"). The scheduler can use
-    /// `PagedSequenceKV.fastForward(to:)` to place the recompute at true
-    /// absolute positions once the replay policy is fixed at integration
-    /// (see docs/engine-v2/CONTRACT-ISSUES-C-paged-backend.md).
+    /// (bulk page-run slice updates — off the hot decode path). Reconciled
+    /// adoption semantics (contract `makeSequenceState(adopting:)`): the
+    /// engine already sliced the prefix down by `cbv2RequiredRecompute`, so
+    /// every non-nil entry carries the same uniform offset; windowed layers
+    /// are fast-forwarded to that offset (counter only, no storage) and the
+    /// engine replays the trailing tokens through all layers.
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
         precondition(prefix.count == layerKinds.count, "prefix/layer count mismatch")
+        var matched = 0
+        for (index, entry) in prefix.enumerated() {
+            guard let entry else { continue }
+            precondition(
+                layerKinds[index].sharesKVWithLayer == nil,
+                "prefix donated to a KV-shared layer \(index)")
+            precondition(
+                matched == 0 || matched == entry.offset,
+                "non-uniform prefix offsets (\(entry.offset) vs \(matched))")
+            matched = entry.offset
+        }
         let states = try makeSequenceState(
             layerKinds: layerKinds, promptLength: 0, maxLength: maxLength)
-        for (index, snapshot) in prefix.enumerated() {
-            guard let snapshot else { continue }
-            guard let state = states[index] as? PagedSequenceKV else {
-                preconditionFailure("prefix donated to a KV-shared layer \(index)")
+        for (index, state) in states.enumerated() {
+            guard let state = state as? PagedSequenceKV else { continue }
+            if let snapshot = prefix[index] {
+                precondition(
+                    state.windowSize == nil,
+                    "prefix donated to a windowed layer \(index)")
+                var keys = snapshot.keys
+                var values = snapshot.values
+                if keys.ndim == 4 {
+                    keys = keys.squeezed(axis: 0)
+                    values = values.squeezed(axis: 0)
+                }
+                precondition(
+                    keys.dim(1) == snapshot.offset,
+                    "full-attention prefix snapshot must cover [0, offset)")
+                state.write(keys: keys, values: values)
+            } else if state.windowSize != nil, matched > 0 {
+                state.fastForward(to: matched)
             }
-            var keys = snapshot.keys
-            var values = snapshot.values
-            if keys.ndim == 4 {
-                keys = keys.squeezed(axis: 0)
-                values = values.squeezed(axis: 0)
-            }
-            precondition(
-                keys.dim(1) == snapshot.offset,
-                "full-attention prefix snapshot must cover [0, offset)")
-            state.write(keys: keys, values: values)
         }
         return states
     }

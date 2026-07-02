@@ -436,10 +436,11 @@ struct CBv2CoreContiguousBackendTests {
         #expect(adopted.absoluteOffset == 12)
         expectClose(adopted.snapshot().keys, donated.keys, "adopted full-layer keys")
 
-        // Windowed rows start at matched - window so absolute positions line
-        // up after the scheduler recomputes the trailing window tokens.
+        // Windowed rows start at the UNIFORM adopted offset (the engine
+        // slices the matched prefix by cbv2RequiredRecompute before
+        // adopting, then replays [offset, prompt) through all layers).
         let windowed = state[1] as! CBv2WindowedSequenceKV
-        #expect(windowed.absoluteOffset == 4)  // 12 - window(8)
+        #expect(windowed.absoluteOffset == 12)
         #expect(windowed.retainedCount == 0)
         #expect(state[2] == nil)
         backend.release(state)

@@ -47,13 +47,23 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// this only moves on membership changes — never inside the step loop.
     public private(set) var positionOffsetsHostRebuilds = 0
 
-    public init(layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = []) {
+    /// Optional attention-logit soft cap (`cap * tanh(qk / cap)` before
+    /// softmax, Gemma-2 style). Construction-time configuration from model
+    /// config — identical plumbing on both backends (`PagedLayerCache` takes
+    /// the same parameter); never part of the per-call contract surface.
+    public let attentionSoftcap: Float?
+
+    public init(
+        layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
+        attentionSoftcap: Float? = nil
+    ) {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
             "CBv2LayerCache: KV-shared layers own no rows")
         self.layerIndex = layerIndex
         self.kind = kind
         self.rows = rows
+        self.attentionSoftcap = attentionSoftcap
         self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
     }
 
@@ -94,7 +104,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: sinks)
+            scale: scale, sinks: sinks, softcap: attentionSoftcap)
         // Advance offsets ON-DEVICE (uniform: decode is [B,1], prefill is
         // [1,chunk] — L is the same for every row in the call).
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -114,7 +124,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         )
         return CBv2AttentionV1.attendBorrowing(
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
-            queries: queries, scale: scale, sinks: sinks)
+            queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap)
     }
 
     // MARK: - Private

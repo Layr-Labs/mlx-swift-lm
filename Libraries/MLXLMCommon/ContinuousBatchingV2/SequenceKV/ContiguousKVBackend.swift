@@ -123,13 +123,15 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
             case .slidingWindow(let window):
-                // Windowed layers never receive a snapshot; the scheduler
-                // recomputes the trailing `window` tokens for them. Rows
-                // start at `matched - window` so absolute positions line up
-                // once the recompute lands.
+                // Windowed layers never receive a snapshot. Reconciled
+                // adoption semantics (contract `makeSequenceState(adopting:)`):
+                // the engine already sliced the prefix down by
+                // `cbv2RequiredRecompute`, so EVERY row starts at the uniform
+                // adopted offset and the engine replays [matched, prompt)
+                // through all layers.
                 return CBv2WindowedSequenceKV(
                     window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
-                    initialOffset: max(0, matched - window))
+                    initialOffset: matched)
             case .full:
                 let row = makeRow(kind: kind, promptLength: matched, maxLength: maxLength)!
                 if let entry = prefix[index], entry.offset > 0 {

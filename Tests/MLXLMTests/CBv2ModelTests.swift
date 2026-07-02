@@ -114,6 +114,15 @@ private final class CBv2ModelMockLayerCache: CBv2AttendingLayerCache, KVCache {
 
     var rows: [CBv2SequenceKV] { mockRows }
 
+    func setRows(_ rows: [CBv2SequenceKV]) {
+        mockRows = rows.map { row in
+            guard let mock = row as? CBv2ModelMockSequenceKV else {
+                fatalError("mock layer cache only binds mock rows")
+            }
+            return mock
+        }
+    }
+
     var positionOffsets: MLXArray {
         positionOffsetsReads += 1
         events.append(.offsetsRead)

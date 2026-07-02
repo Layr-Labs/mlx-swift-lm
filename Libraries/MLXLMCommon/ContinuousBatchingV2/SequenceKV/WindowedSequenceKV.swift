@@ -147,6 +147,19 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         )
     }
 
+    /// Advance the position counter WITHOUT writing storage (contract
+    /// `CBv2SequenceKV.fastForward(to:)`). Only valid on a FRESH state, used
+    /// during prefix-cache adoption so the engine's trailing-window replay
+    /// lands at true absolute positions.
+    public func fastForward(to offset: Int) {
+        precondition(
+            keys == nil && absoluteOffset == oldestValidPosition,
+            "CBv2WindowedSequenceKV.fastForward requires a fresh state")
+        precondition(offset >= absoluteOffset, "fastForward cannot move backwards")
+        absoluteOffset = offset
+        oldestValidPosition = offset
+    }
+
     public func rollback(_ n: Int) {
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
         precondition(
