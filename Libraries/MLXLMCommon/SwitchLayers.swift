@@ -363,7 +363,12 @@ public class SwitchGLU: Module {
     /// mismatched quantization, cache-limit exceeded, or the
     /// `BENCH_NO_FUSED_GATE_UP` opt-out), `other` inherits the same verdict:
     /// neither tree will build a fused cache, and both use the unfused path.
-    public func shareFusedGateUpCache(with other: SwitchGLU) {
+    ///
+    /// Returns whether a fused cache actually exists and was shared (false
+    /// when the eligibility verdict — equally propagated — was "no fusion"),
+    /// so callers can log truthful share counts.
+    @discardableResult
+    public func shareFusedGateUpCache(with other: SwitchGLU) -> Bool {
         ensureFusedGateUp()
         other.fusionAttempted = true
         other.fusedGateUpWeight = fusedGateUpWeight
@@ -372,6 +377,7 @@ public class SwitchGLU: Module {
         other.fusedGroupSize = fusedGroupSize
         other.fusedBits = fusedBits
         other.fusedMode = fusedMode
+        return fusedGateUpWeight != nil
     }
 
     /// Whether the fused gate+up cache is populated, its total byte size, and
