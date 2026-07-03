@@ -95,10 +95,20 @@ public final class PrefetchCoordinator: @unchecked Sendable {
         self.queue = queue
     }
 
-    /// Reads `DSV4_STREAM_PREFETCH` (default enabled -- set to `"0"` to
-    /// disable).
+    /// Reads `DSV4_STREAM_PREFETCH` (default DISABLED -- set to `"1"` to
+    /// enable).
+    ///
+    /// Opt-in, not opt-out, per the measured result that motivated it
+    /// (dd3f27d + review): at production cache sizes (70 GiB) the previous-
+    /// token signal schedules ZERO real fetches -- everything it would warm
+    /// is already resident from that token's own foreground fetch -- and at
+    /// eviction-heavy cache sizes where it DOES fire it measured neutral to
+    /// slightly NEGATIVE (I/O contention with the foreground fetch on an
+    /// already I/O-bound path). The machinery is kept for a future smarter
+    /// signal (frequency-based prediction, deeper lookahead); flip the
+    /// default back only with a measurement that justifies it.
     public static func enabledFromEnv() -> Bool {
-        ProcessInfo.processInfo.environment["DSV4_STREAM_PREFETCH"] != "0"
+        ProcessInfo.processInfo.environment["DSV4_STREAM_PREFETCH"] == "1"
     }
 
     /// Reads `DSV4_STREAM_PREFETCH_LOOKAHEAD` (int, default 2 -- matches
