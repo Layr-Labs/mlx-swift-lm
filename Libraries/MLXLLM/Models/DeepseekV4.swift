@@ -753,6 +753,25 @@ func hcHeadReduce(
 
 // MARK: - Helpers
 
+/// Debug-only (DSV4_DUMP_ATTN_DIR): dump named attention internals from the
+/// FIRST attention invocation of the process for elementwise reference diffs.
+/// Non-reentrant by design (single-threaded smoke harness only).
+enum DSV4AttnDump {
+    nonisolated(unsafe) static var armed =
+        ProcessInfo.processInfo.environment["DSV4_DUMP_ATTN_DIR"] != nil
+    static func dump(_ name: String, _ a: MLXArray) {
+        guard armed,
+            let dir = ProcessInfo.processInfo.environment["DSV4_DUMP_ATTN_DIR"]
+        else { return }
+        let f = a.flattened().asType(.float32)
+        eval(f)
+        let vals = f.asArray(Float.self)
+        let json = "[" + vals.map { String($0) }.joined(separator: ",") + "]"
+        try? json.write(toFile: "\(dir)/\(name).json", atomically: true, encoding: .utf8)
+        print("[attn-dump] \(name) \(a.shape)")
+    }
+}
+
 private func sqrtSoftplus(_ x: MLXArray) -> MLXArray {
     let sp = MLX.maximum(x, MLXArray(Float(0))) + MLX.log1p(MLX.exp(-MLX.abs(x)))
     return MLX.sqrt(sp)
@@ -1198,14 +1217,18 @@ final class LocalAttention: Module {
         let B = x.dim(0), L = x.dim(1)
         let offset = cache?.offset ?? 0
 
-        var q = wq_b(qNorm(wq_a(x)))
+        let qRes = qNorm(wq_a(x))
+        DSV4AttnDump.dump("q_residual", qRes)
+        var q = wq_b(qRes)
         q = q.reshaped([B, L, numHeads, headDim])
         q = headRmsNorm(q, eps: eps)
         q = q.transposed(0, 2, 1, 3)       // [B, numHeads, L, headDim]
         q = rope.callAsFunction(q, offset: offset)
+        DSV4AttnDump.dump("q_roped", q)
 
         var kv = kvNorm(wkv(x)).reshaped([B, 1, L, headDim])
         kv = rope.callAsFunction(kv, offset: offset)
+        DSV4AttnDump.dump("kv_roped", kv)
         if let c = cache {
             let (cached, _) = c.update(keys: kv, values: kv)
             kv = cached
@@ -1218,11 +1241,15 @@ final class LocalAttention: Module {
         var out = MLXFast.scaledDotProductAttention(
             queries: q, keys: kv, values: kv,
             scale: scale, mask: mask, sinks: sinks)  // [B, numHeads, L, headDim]
+        DSV4AttnDump.dump("sdpa_out", out)
 
         out = rope.callAsFunction(out, offset: offset, inverse: true)
 
-        return applyOutputProjection(out, woA: wo_a, woB: wo_b,
+        let projected = applyOutputProjection(out, woA: wo_a, woB: wo_b,
             oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
+        DSV4AttnDump.dump("attn_projected", projected)
+        DSV4AttnDump.armed = false
+        return projected
     }
 }
 
