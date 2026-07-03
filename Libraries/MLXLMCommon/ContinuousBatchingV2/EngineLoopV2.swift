@@ -548,6 +548,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         return true
     }
 
+    /// Submit-side unwind: remove a stream registered by `submit` whose
+    /// request never reached `enqueue` (multimodal materialization failed
+    /// after registration — PR#63 review). Only legal BEFORE `enqueue`; a
+    /// live request's stream is removed via `takeStream` at finish.
+    func unregister(_ id: CBv2RequestID) {
+        stateLock.lock()
+        streams.removeValue(forKey: id)
+        stateLock.unlock()
+    }
+
     /// Runs on the engine queue. The stream must already be registered.
     /// `multimodal` is the submit-thread resolution of the request's vision
     /// input (nil for text requests) — mutually exclusive with `adoption`
@@ -937,7 +947,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             // (`pendingSamples == 0` here: finalize always precedes
             // executeMixed, so every planned token value is host-visible.)
             let samples = rec.numComputedTokens == rec.effectiveTokenCount
-            let isDecode = n == 1 && samples && start == rec.tokens.count - 1
+            // A length-1 image span on the FINAL prompt token produces an
+            // assignment shaped exactly like a decode row (n == 1, samples,
+            // last known token) — but its placeholder token must take the
+            // embedding-splice prefill path below, not the decode batch's
+            // plain token-embedding path (PR#63 review). Genuine decode rows
+            // never trip this: their positions are past every span.
+            let finalTokenIsImageSpan =
+                multimodalByID[id]?.containsSpan(at: rec.tokens.count - 1) ?? false
+            let isDecode =
+                n == 1 && samples && start == rec.tokens.count - 1 && !finalTokenIsImageSpan
             work.append(
                 RowWork(rec: rec, start: start, count: n, samples: samples, isDecode: isDecode))
         }

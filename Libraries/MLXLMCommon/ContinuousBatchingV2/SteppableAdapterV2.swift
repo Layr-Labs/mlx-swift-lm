@@ -49,13 +49,20 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2CompiledSteppableModel
 
 /// The adapter answers the multimodal capability at RUNTIME: it can wrap any
 /// `LanguageModel`, and only models conforming to `CBv2EmbeddingForwardable`
-/// (Gemma4TextModel) can prefill from spliced embeddings. Requests against
-/// non-conforming models are rejected at submit
+/// (Gemma4TextModel) can prefill from spliced embeddings. Conformance alone
+/// is structural, not capability — a Gemma4TextModel loaded from a TEXT-ONLY
+/// config (`use_bidirectional_attention` nil/non-`vision`) can execute the
+/// embedding forward but was never trained for the bidirectional span masks
+/// CBv2 applies, so the capability check also consults the model-level
+/// `supportsVisionSpanPrefill` flag (PR#63 review). Requests against
+/// non-conforming models or unsupported configs are rejected at submit
 /// (`CBv2MultimodalError.unsupportedModel`), so the trapping guards below
 /// are unreachable in a correctly gated engine.
 extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
 
-    public var supportsMultimodalPrefill: Bool { model is CBv2EmbeddingForwardable }
+    public var supportsMultimodalPrefill: Bool {
+        (model as? CBv2EmbeddingForwardable)?.supportsVisionSpanPrefill ?? false
+    }
 
     public func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
         guard let embeddable = model as? CBv2EmbeddingForwardable else {

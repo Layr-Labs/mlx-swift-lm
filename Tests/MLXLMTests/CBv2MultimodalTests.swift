@@ -444,6 +444,43 @@ final class CBv2MultimodalTests: XCTestCase {
         XCTAssertEqual(driverA.generated(for: idA), driverB.generated(for: idB))
     }
 
+    func testLengthOneSpanOnFinalPromptToken() async throws {
+        // Regression (PR#63 review): a length-1 image span on the FINAL
+        // prompt token lands as an n == 1, sampling, last-token assignment —
+        // shaped exactly like a decode row. `executeMixed` must still route
+        // it through the embedding-splice path; the decode batch would feed
+        // the raw placeholder token id and compute the first sampled token
+        // (and its KV) without the image embedding.
+        let model = TinyTestModel.make(seed: 0xC0FFEE)
+        let spans = [CBv2ImageSpan(tokenOffset: 8, length: 1)]
+        let (prompt, images) = CBv2VisionFixtures.make(
+            model: model, length: 9, spans: spans, seed: 110)
+        let decodeSteps = 6
+        let reference = CBv2VisionReference.greedy(
+            model: model, prompt: prompt, images: images, decodeSteps: decodeSteps)
+
+        // prefillChunkSize 8 ⇒ chunk0 = [0,8), chunk1 = [8,9): exactly one
+        // token — the span — computing through the last known token.
+        let engine = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 27)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds),
+            sampler: CBv2DefaultSampler(fallbackSeed: 5),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxBatchedTokensPerStep: 256, prefillChunkSize: 8, maxWaiting: 4))
+        let request = CBv2Request(
+            id: CBv2RequestID(1), promptTokens: prompt,
+            sampling: .init(temperature: 0), maxTokens: decodeSteps,
+            multimodal: CBv2VisionFixtures.input(images))
+        let collected = await cbv2SchedCollect(try engine.submit(request))
+        XCTAssertEqual(collected.finishReason, .length)
+        XCTAssertEqual(
+            collected.tokens, reference,
+            "a final-token image span must be spliced, not fed as a decode token")
+        await engine.shutdown()
+    }
+
     // MARK: (b) Batch invariance — vision + text neighbors
 
     func testBatchInvarianceVisionWithTextNeighbors() throws {
@@ -672,6 +709,104 @@ final class CBv2MultimodalTests: XCTestCase {
         XCTAssertEqual(record.snappedChunkTokens(start: 0, proposed: 7, budget: 100), 7)
     }
 
+    func testBlockSizedChunkDoesNotStarveBehindDecodeRow() throws {
+        // Regression (PR#63 review): an older decode row consumes 1 token of
+        // budget every step, so a block needing the FULL budget snaps to 0
+        // on every plan and the vision row starves until the decode row
+        // finishes (it can time out first). The starvation guard must give
+        // the starved row first claim on the NEXT step's fresh budget.
+        let config = CBv2SchedulerConfig(
+            maxConcurrentRequests: 4, maxBatchedTokensPerStep: 8,
+            prefillChunkSize: 8, maxWaiting: 8)
+        let scheduler = SchedulerV2(config: config)
+
+        func tokensAssigned(_ plan: CBv2StepPlan, _ id: UInt64) -> Int? {
+            plan.assignments.first { $0.id == CBv2RequestID(id) }?.numTokens
+        }
+
+        // Older text row, driven to decode (whole prompt computed + sampled).
+        try scheduler.enqueue(
+            CBv2Request(id: CBv2RequestID(1), promptTokens: [1, 2, 3], maxTokens: 32))
+        CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())
+
+        // Vision row: 2 leading text tokens, then a block of 8 (== budget).
+        var vision = CBv2Request(
+            id: CBv2RequestID(2), promptTokens: [Int](repeating: 0, count: 12), maxTokens: 4)
+        vision.multimodal = CBv2MultimodalInput(
+            spans: [CBv2ImageSpan(tokenOffset: 2, length: 8)]) { [] }
+        try scheduler.enqueue(vision)
+
+        // Step A: decode takes 1; vision admits its 2 leading text tokens
+        // (the snap shrinks the chunk to the block start).
+        let planA = scheduler.plan()
+        XCTAssertEqual(tokensAssigned(planA, 1), 1)
+        XCTAssertEqual(tokensAssigned(planA, 2), 2)
+        CBv2SchedSim.confirm(scheduler, plan: planA)
+
+        // Step B: decode takes 1 first, leaving budget 7 < block 8 — the
+        // block cannot be assigned this step; the guard arms.
+        let planB = scheduler.plan()
+        XCTAssertEqual(tokensAssigned(planB, 1), 1)
+        XCTAssertNil(tokensAssigned(planB, 2), "block cannot fit the leftover budget")
+        CBv2SchedSim.confirm(scheduler, plan: planB)
+
+        // Step C: the starved row gets first claim on the FULL budget — the
+        // whole block schedules; the decode row waits exactly one step.
+        let planC = scheduler.plan()
+        XCTAssertEqual(
+            tokensAssigned(planC, 2), 8,
+            "starvation guard must front-run the block-bearing row")
+        XCTAssertNil(tokensAssigned(planC, 1), "budget exhausted by the block this step")
+        CBv2SchedSim.confirm(scheduler, plan: planC)
+
+        // Step D: back to normal — decode resumes alongside the remaining
+        // vision prefill.
+        let planD = scheduler.plan()
+        XCTAssertEqual(tokensAssigned(planD, 1), 1)
+        XCTAssertEqual(tokensAssigned(planD, 2), 2, "trailing text tokens after the block")
+    }
+
+    func testBlockSizedFirstChunkDoesNotStarveInWaiting() throws {
+        // Same starvation shape from the WAITING side: a request whose FIRST
+        // block needs the full budget can never admit behind a decode row
+        // without the guard (admission breaks on chunk == 0 to keep FCFS).
+        let config = CBv2SchedulerConfig(
+            maxConcurrentRequests: 4, maxBatchedTokensPerStep: 8,
+            prefillChunkSize: 8, maxWaiting: 8)
+        let scheduler = SchedulerV2(config: config)
+
+        func tokensAssigned(_ plan: CBv2StepPlan, _ id: UInt64) -> Int? {
+            plan.assignments.first { $0.id == CBv2RequestID(id) }?.numTokens
+        }
+
+        try scheduler.enqueue(
+            CBv2Request(id: CBv2RequestID(1), promptTokens: [1, 2, 3], maxTokens: 32))
+        CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())
+
+        // Vision prompt BEGINS with the block (position 0, length 8).
+        var vision = CBv2Request(
+            id: CBv2RequestID(2), promptTokens: [Int](repeating: 0, count: 10), maxTokens: 4)
+        vision.multimodal = CBv2MultimodalInput(
+            spans: [CBv2ImageSpan(tokenOffset: 0, length: 8)]) { [] }
+        try scheduler.enqueue(vision)
+
+        // Step A: decode takes 1, budget 7 < 8 — vision cannot admit; the
+        // guard arms.
+        let planA = scheduler.plan()
+        XCTAssertEqual(tokensAssigned(planA, 1), 1)
+        XCTAssertNil(tokensAssigned(planA, 2))
+        CBv2SchedSim.confirm(scheduler, plan: planA)
+
+        // Step B: the deferred waiting row admits FIRST with the full
+        // budget; the decode row waits one step.
+        let planB = scheduler.plan()
+        XCTAssertEqual(
+            tokensAssigned(planB, 2), 8,
+            "deferred waiting row must admit ahead of the running pass")
+        XCTAssertNil(tokensAssigned(planB, 1))
+        XCTAssertEqual(scheduler.record(for: CBv2RequestID(2))?.status, .running)
+    }
+
     private func makeRecord(spans: [CBv2ImageSpan]) -> CBv2ScheduledRequest {
         var request = CBv2Request(id: CBv2RequestID(1), promptTokens: [Int](repeating: 0, count: 64), maxTokens: 8)
         if !spans.isEmpty {
@@ -790,6 +925,106 @@ final class CBv2MultimodalTests: XCTestCase {
         assertResolveThrows(wrongHidden, model: model, bank: bank, promptCount: 10) {
             if case .embeddingMismatch = $0 { return true }; return false
         }
+    }
+
+    // MARK: - (f) Admission order — no heavy work for rejected submissions
+
+    /// Counts provider invocations (the heavy vision-tower call).
+    private final class ProviderCallBox: @unchecked Sendable {
+        var count = 0
+    }
+
+    func testCanEverFitRejectionSkipsEmbeddingMaterialization() async throws {
+        // PR#63 review: a request rejected by a cheap admission gate must
+        // never invoke the embeddings provider (vision tower / MLX graphs).
+        let model = TinyTestModel.make(seed: 0xC0FFEE, fullAttentionOnly: true)
+        // Tiny KV byte budget: canEverFit rejects the worst case outright.
+        let engine = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 12)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds))
+        let box = ProviderCallBox()
+        let request = CBv2Request(
+            id: CBv2RequestID(1), promptTokens: makePromptTokens(length: 24, seed: 500),
+            sampling: .init(temperature: 0), maxTokens: 100_000,
+            multimodal: CBv2MultimodalInput(
+                spans: [CBv2ImageSpan(tokenOffset: 4, length: 6)],
+                embeddings: { [box] in
+                    box.count += 1
+                    return [MLXArray.zeros([1, 6, 16])]
+                }))
+        XCTAssertThrowsError(try engine.submit(request)) { error in
+            guard case CBv2KVError.capacityExhausted = error else {
+                return XCTFail("expected capacityExhausted, got \(error)")
+            }
+        }
+        XCTAssertEqual(
+            box.count, 0, "a canEverFit-rejected request must not materialize embeddings")
+        await engine.shutdown()
+    }
+
+    func testDuplicateIDRejectionSkipsEmbeddingMaterialization() async throws {
+        let model = TinyTestModel.make(seed: 0xC0FFEE, fullAttentionOnly: true)
+        let (engine, _) = makeMultimodalEngine(model)
+        let prompt = makePromptTokens(length: 12, seed: 501)
+
+        // Live first request: registered synchronously by submit; its stream
+        // is deliberately not consumed (backpressure keeps the id live).
+        let first = try engine.submit(
+            CBv2Request(
+                id: CBv2RequestID(7), promptTokens: prompt,
+                sampling: .init(temperature: 0), maxTokens: 512))
+        _ = first
+
+        let box = ProviderCallBox()
+        let spans = [CBv2ImageSpan(tokenOffset: 2, length: 4)]
+        let duplicate = CBv2Request(
+            id: CBv2RequestID(7), promptTokens: prompt,
+            sampling: .init(temperature: 0), maxTokens: 4,
+            multimodal: CBv2MultimodalInput(spans: spans) { [box] in
+                box.count += 1
+                return [MLXArray.zeros([1, 4, 16])]
+            })
+        XCTAssertThrowsError(try engine.submit(duplicate)) { error in
+            guard case CBv2SchedulerError.duplicateRequestID = error else {
+                return XCTFail("expected duplicateRequestID, got \(error)")
+            }
+        }
+        XCTAssertEqual(
+            box.count, 0, "a duplicate-id-rejected request must not materialize embeddings")
+        engine.cancel(CBv2RequestID(7))
+        await engine.shutdown()
+    }
+
+    func testMaterializationFailureUnwindsRegistration() async throws {
+        // A materialization failure happens AFTER stream registration; the
+        // registration (and pending-submit count) must unwind so the id is
+        // immediately reusable.
+        let model = TinyTestModel.make(seed: 0xC0FFEE, fullAttentionOnly: true)
+        let (engine, _) = makeMultimodalEngine(model)
+        let prompt = makePromptTokens(length: 12, seed: 502)
+
+        let bad = CBv2Request(
+            id: CBv2RequestID(9), promptTokens: prompt,
+            sampling: .init(temperature: 0), maxTokens: 4,
+            multimodal: CBv2MultimodalInput(
+                spans: [CBv2ImageSpan(tokenOffset: 2, length: 4)],
+                embeddings: { [] }))  // wrong count ⇒ embeddingMismatch
+        XCTAssertThrowsError(try engine.submit(bad)) { error in
+            guard case CBv2MultimodalError.embeddingMismatch = error else {
+                return XCTFail("expected embeddingMismatch, got \(error)")
+            }
+        }
+
+        // Same id must be accepted now — registration was unwound.
+        let retry = await cbv2SchedCollect(
+            try engine.submit(
+                CBv2Request(
+                    id: CBv2RequestID(9), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: 4)))
+        XCTAssertEqual(retry.finishReason, .length)
+        await engine.shutdown()
     }
 
     private func assertResolveThrows(

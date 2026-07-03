@@ -275,14 +275,17 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
         }
 
-        // Vision requests: validate + materialize the image embeddings ONCE,
-        // here on the submit thread (the one provider call per request —
-        // never on the engine step thread). All multimodal failures are
-        // submit-time throws (`CBv2MultimodalError`); nothing reaches the
-        // scheduler.
-        var multimodal: CBv2ResolvedMultimodal? = nil
+        // Vision requests, CHEAP half only: span structure, model/backend
+        // capability, block-vs-budget — no provider call, no MLX graphs.
+        // The heavy embedding materialization waits until EVERY cheap
+        // admission gate (canEverFit, maxWaiting, duplicate id) has passed,
+        // so a rejected request never runs the vision tower and heavy work
+        // is always counted in `pendingSubmits` (PR#63 review). All
+        // multimodal failures remain submit-time throws
+        // (`CBv2MultimodalError`); nothing reaches the scheduler.
+        var multimodalBlocks: [CBv2ImageSpan] = []
         if let input = request.multimodal {
-            multimodal = try CBv2MultimodalPlan.resolve(
+            multimodalBlocks = try CBv2MultimodalPlan.validate(
                 input,
                 promptTokenCount: request.promptTokens.count,
                 model: loop.model,
@@ -320,6 +323,24 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             gauges.endSubmit()
             throw CBv2SchedulerError.duplicateRequestID(request.id)
         }
+
+        // Vision requests, HEAVY half: materialize the image embeddings ONCE,
+        // here on the submit thread (the one provider call per request —
+        // never on the engine step thread), now that every cheap gate has
+        // passed. A failure must unwind the registration + pending-submit
+        // count taken above (the stream was never handed to the caller).
+        var multimodal: CBv2ResolvedMultimodal? = nil
+        if let input = request.multimodal {
+            do {
+                multimodal = try CBv2MultimodalPlan.materialize(
+                    input, blocks: multimodalBlocks, model: loop.model)
+            } catch {
+                loop.unregister(request.id)
+                gauges.endSubmit()
+                throw error
+            }
+        }
+
         loop.enqueue(request, adoption: makeAdoption(for: request), multimodal: multimodal)
         return stream.makeStream()
     }

@@ -137,7 +137,9 @@ public final class SchedulerV2 {
     /// can run without any capacity model.
     let capacity: CBv2StepCapacity?
 
-    /// RUNNING requests, in admission order (plan preserves this order).
+    /// RUNNING requests, in admission order (plan preserves this order,
+    /// with ONE exception: a row starved by the block-chunk guard is moved
+    /// to the front — see `deferredBlockRequestID`).
     public private(set) var running: [CBv2ScheduledRequest] = []
     /// WAITING requests, sorted by (priority desc, arrivalSeq asc); preempted
     /// requests are re-inserted at the FRONT of their priority class.
@@ -145,6 +147,17 @@ public final class SchedulerV2 {
 
     private var byID: [CBv2RequestID: CBv2ScheduledRequest] = [:]
     private var nextArrivalSeq: UInt64 = 0
+
+    /// Starvation guard for block-sized vision chunks (PR#63 review): the id
+    /// of a row whose next multimodal block fits a FULL step budget (submit
+    /// validates that) but not the budget REMAINING after earlier rows were
+    /// assigned this step. The NEXT `plan()` gives that row first claim on
+    /// the fresh budget — a running row is moved to the front of `running`,
+    /// a waiting row is admitted ahead of the running pass — because
+    /// otherwise persistent earlier rows (e.g. long decodes at 1 token/step)
+    /// can pin the remaining budget below the block size for the row's whole
+    /// deadline and it never progresses.
+    private var deferredBlockRequestID: CBv2RequestID?
 
     public init(config: CBv2SchedulerConfig, capacity: CBv2StepCapacity? = nil) {
         self.config = config
@@ -214,11 +227,31 @@ public final class SchedulerV2 {
         var preemptions: [CBv2RequestID] = []
         var stopScheduling = false
 
+        // 0. Starved block-sized chunk from the previous step: first claim on
+        // this step's full budget (see `deferredBlockRequestID`). One-shot —
+        // re-armed below if the row starves again.
+        var deferredAdmittedID: CBv2RequestID? = nil
+        if let deferredID = deferredBlockRequestID {
+            deferredBlockRequestID = nil
+            if let dIdx = running.firstIndex(where: { $0.id == deferredID }) {
+                // Move to the FRONT of the running order (persistently, so a
+                // chunk of leading text this step still leaves it in front
+                // for the block itself next step).
+                if dIdx > 0 { running.insert(running.remove(at: dIdx), at: 0) }
+            } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
+                deferredAdmittedID = admitDeferredBlockRow(
+                    at: wIdx, budget: &budget,
+                    assignments: &assignments, assignmentIndex: &assignmentIndex)
+            }
+        }
+
         // 1. RUNNING first, in order.
         var idx = 0
         while idx < running.count, budget > 0, !stopScheduling {
             let rec = running[idx]
-            if rec.isPaused || rec.cancelRequested || rec.remainingTokens <= 0 {
+            if rec.isPaused || rec.cancelRequested || rec.remainingTokens <= 0
+                || rec.id == deferredAdmittedID
+            {
                 idx += 1
                 continue
             }
@@ -228,10 +261,12 @@ public final class SchedulerV2 {
             // Vision requests: never split a multimodal block across chunks
             // (snap to block edges; extend over prefillChunkSize when the
             // chunk starts at a block, bounded by the step budget). 0 ⇒ the
-            // block cannot fit this step's remaining budget — skip the row,
-            // it retries when budget frees up.
+            // block cannot fit this step's remaining budget — skip the row
+            // and arm the starvation guard so the NEXT step schedules it
+            // first (earlier rows would otherwise starve it indefinitely).
             n = rec.snappedChunkTokens(start: rec.numComputedTokens, proposed: n, budget: budget)
             if n <= 0 {
+                if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
                 idx += 1
                 continue
             }
@@ -302,7 +337,13 @@ public final class SchedulerV2 {
                 // block-bearing elder).
                 chunk = rec.snappedChunkTokens(
                     start: rec.numComputedTokens, proposed: chunk, budget: budget)
-                guard chunk > 0 else { break }
+                guard chunk > 0 else {
+                    // Same starvation guard as the running path: a head-of-
+                    // queue block that fits a full budget but not what the
+                    // running rows left over gets first claim next step.
+                    if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
+                    break
+                }
                 if let capacity {
                     do { try capacity.reserve(id: rec.id, additionalTokens: chunk) } catch {
                         break  // no preemption on behalf of WAITING requests
@@ -321,6 +362,42 @@ public final class SchedulerV2 {
         return CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
             preemptions: preemptions)
+    }
+
+    /// One-off admission of a starved block-bearing WAITING row ahead of the
+    /// running pass — the ONLY departure from RUNNING-first, taken at most
+    /// once per step for the single deferred row: with the full step budget
+    /// available its block is guaranteed to fit (submit validates every
+    /// block against a full budget). Same eligibility rules as the regular
+    /// admission path; no preemption on its behalf. Returns the admitted id
+    /// (so the running pass skips it — one assignment per row per plan), or
+    /// nil when the row is not currently admissible.
+    private func admitDeferredBlockRow(
+        at wIdx: Int, budget: inout Int,
+        assignments: inout [(id: CBv2RequestID, numTokens: Int)],
+        assignmentIndex: inout [CBv2RequestID: Int]
+    ) -> CBv2RequestID? {
+        let rec = waiting[wIdx]
+        guard !rec.isPaused, !rec.cancelRequested, rec.pendingSamples == 0,
+            running.count < config.maxConcurrentRequests
+        else { return nil }
+        var chunk = min(rec.remainingTokens, config.prefillChunkSize, budget)
+        chunk = rec.snappedChunkTokens(
+            start: rec.numComputedTokens, proposed: chunk, budget: budget)
+        guard chunk > 0 else { return nil }
+        if let capacity {
+            do { try capacity.reserve(id: rec.id, additionalTokens: chunk) } catch {
+                return nil  // no preemption on behalf of WAITING requests
+            }
+        }
+        waiting.remove(at: wIdx)
+        rec.status = .running
+        rec.numComputedTokens += chunk
+        budget -= chunk
+        assignmentIndex[rec.id] = assignments.count
+        assignments.append((id: rec.id, numTokens: chunk))
+        running.append(rec)
+        return rec.id
     }
 
     /// Undo the optimistic advance of an UNEXECUTED plan (failure/rejection

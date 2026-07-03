@@ -662,6 +662,70 @@ struct CBv2ModelGemma4ForwardTests {
             allClose(tokenLogits, embeddingLogits, atol: 1e-5).item(Bool.self),
             "splicing the model's own embeddings must reproduce the token forward")
     }
+
+    /// PR#63 review: structural `CBv2EmbeddingForwardable` conformance must
+    /// NOT grant multimodal capability by itself — a Gemma4TextModel from a
+    /// TEXT-ONLY config (`use_bidirectional_attention` nil/non-"vision") was
+    /// never trained for the bidirectional span masks CBv2 applies, and the
+    /// adapter must reject vision requests against it at submit.
+    @Test func adapterGatesMultimodalOnVisionConfig() throws {
+        let textModel = Gemma4TextModel(try tinyConfig())
+        #expect((textModel as CBv2EmbeddingForwardable).supportsVisionSpanPrefill == false)
+        let textAdapter = CBv2SteppableLanguageModelAdapter(textModel)
+        #expect(
+            textAdapter.supportsMultimodalPrefill == false,
+            "text-only Gemma4 config must not advertise multimodal prefill")
+
+        var visionConfig = try tinyConfig()
+        visionConfig.useBidirectionalAttention = "vision"
+        let visionModel = Gemma4TextModel(visionConfig)
+        #expect((visionModel as CBv2EmbeddingForwardable).supportsVisionSpanPrefill)
+        let visionAdapter = CBv2SteppableLanguageModelAdapter(visionModel)
+        #expect(visionAdapter.supportsMultimodalPrefill)
+    }
+
+    /// PR#63 review: the legacy `imageTokenMask` overlay with a NON-EMPTY KV
+    /// cache — `baseMask` covers `offset + L` key columns while the
+    /// same-block overlay describes only the current window's L columns. The
+    /// overlay must land on the LAST L key columns (cached keys stay
+    /// causal); pre-fix this either failed to broadcast or misaligned the
+    /// bidirectional block. Chunked cached prefill must match the
+    /// whole-prompt forward exactly.
+    @Test func legacyImageTokenMaskAlignsWithCachedKeys() throws {
+        var config = try tinyConfig()
+        config.useBidirectionalAttention = "vision"
+        let model = Gemma4TextModel(config)
+        eval(model)
+
+        let T = 10
+        let split = 5
+        let tokens = MLXArray((0 ..< T).map { Int32($0 % 8 + 1) }).reshaped(1, T)
+        // Image block at absolute positions [6, 9).
+        let fullVision = MLXArray((0 ..< T).map { $0 >= 6 && $0 < 9 }).reshaped(1, T)
+
+        // Whole-prompt reference (offset 0 — the previously working shape).
+        let reference = model(
+            tokens, inputEmbedding: nil, cache: model.newCache(parameters: nil),
+            imageTokenMask: fullVision)
+
+        // Chunked: text chunk [0,5) fills the cache, then the vision chunk
+        // [5,10) runs with offset 5 — baseMask [5, 10] vs overlay [1, 5, 5].
+        let caches = model.newCache(parameters: nil)
+        _ = model(tokens[0..., 0 ..< split], cache: caches)
+        let chunkVision = MLXArray((split ..< T).map { $0 >= 6 && $0 < 9 }).reshaped(
+            1, T - split)
+        let chunked = model(
+            tokens[0..., split ..< T], inputEmbedding: nil, cache: caches,
+            imageTokenMask: chunkVision)
+
+        eval(reference, chunked)
+        #expect(chunked.shape == [1, T - split, 64])
+        #expect(
+            allClose(
+                chunked[0..., -1, 0...], reference[0..., -1, 0...], atol: 1e-5
+            ).item(Bool.self),
+            "cached vision overlay must align with the last L key columns")
+    }
 }
 
 // MARK: - GPT-OSS forward smoke tests (v2 branch)

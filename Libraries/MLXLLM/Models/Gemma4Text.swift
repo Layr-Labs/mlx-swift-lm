@@ -1207,8 +1207,21 @@ private func gemma4TextBidirectionalVisionMask(
     let blockIds = gemma4TextVisionBlockIds(isVision)
     let qBlocks = expandedDimensions(blockIds, axis: -1)  // [B, L, 1]
     let kBlocks = expandedDimensions(blockIds, axis: -2)  // [B, 1, L]
-    let sameBlock = logicalAnd(qBlocks .!= MLXArray(Int32(-1)), qBlocks .== kBlocks)  // [B, L, L]
-    return logicalOr(baseMask, expandedDimensions(sameBlock, axis: 1))  // -> [B, 1, L, L]
+    var sameBlock = logicalAnd(qBlocks .!= MLXArray(Int32(-1)), qBlocks .== kBlocks)  // [B, L, L]
+    // Cached (chunked) prefill: `baseMask` covers ALL key columns
+    // (`offset + L`) while `sameBlock` only describes the current window's
+    // L columns. Left-pad with `false` so the overlay lands on the LAST L
+    // key columns — cached keys stay causal. Callers must never split an
+    // image block across the cache boundary (the CBv2 scheduler snaps
+    // chunks to block edges; whole-prompt prefill has offset 0), or the
+    // overlay could not see the cached half of the block (PR#63 review).
+    let L = isVision.dim(1)
+    let keyColumns = baseMask.dim(-1)
+    if keyColumns > L {
+        let pad = MLXArray.zeros([sameBlock.dim(0), L, keyColumns - L], dtype: .bool)
+        sameBlock = concatenated([pad, sameBlock], axis: -1)  // [B, L, offset+L]
+    }
+    return logicalOr(baseMask, expandedDimensions(sameBlock, axis: 1))  // -> [B, 1, L, offset+L]
 }
 
 /// If `mode` carries a boolean array mask, overlay the vision bidirectional
@@ -1444,6 +1457,16 @@ extension Gemma4TextModel {
 /// the span-mask context on them) — only the embedding source differs.
 /// Positions, KV sharing, and dual RoPE are untouched.
 extension Gemma4TextModel: CBv2EmbeddingForwardable {
+
+    /// Only configs whose weights were trained with the bidirectional
+    /// image-span attention may serve CBv2 vision spans — the same gate the
+    /// legacy `imageTokenMask` path applies. Text-only Gemma4 configs
+    /// (nil / non-`"vision"`) reject multimodal requests at submit instead
+    /// of silently serving logits under masks the weights never saw
+    /// (PR#63 review).
+    public var supportsVisionSpanPrefill: Bool {
+        config.useBidirectionalAttention == "vision"
+    }
 
     /// `embed(tokens) * embedScale` — exactly the trunk's pre-layer-0 hidden
     /// state, the tensor the engine splices image embeddings into (the

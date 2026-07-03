@@ -101,6 +101,16 @@ extension CBv2MultimodalSteppableModel {
 /// KVCache-shaped twins of the two `CBv2MultimodalSteppableModel`
 /// requirements.
 public protocol CBv2EmbeddingForwardable {
+    /// True only when the model's WEIGHTS were trained for the blockwise
+    /// bidirectional image-span attention the CBv2 span masks implement
+    /// (Gemma4: `use_bidirectional_attention == "vision"`). Structural
+    /// conformance is NOT capability: a text-only Gemma4TextModel can
+    /// execute the embedding forward, but serving vision spans through it
+    /// would apply attention its weights never saw — the legacy text path
+    /// only enables the overlay for `"vision"` configs, and the adapter's
+    /// `supportsMultimodalPrefill` must match, so such configs reject
+    /// multimodal requests at submit (PR#63 review).
+    var supportsVisionSpanPrefill: Bool { get }
     /// `embed(tokens) * embedScale` — the trunk's pre-layer-0 hidden state.
     func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray
     /// Forward with the trunk's embedding lookup replaced by
@@ -155,6 +165,17 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
             span.tokenOffset >= start && span.end <= end
         }
     }
+
+    /// True when `position` lies inside a coalesced image block. Used by the
+    /// engine's decode-row classification: a length-1 span landing on the
+    /// FINAL prompt token produces an assignment shaped exactly like a decode
+    /// row (n == 1, samples, last token), but its placeholder token must
+    /// still take the embedding-splice path (PR#63 review). Genuine decode
+    /// rows never trip this — their positions are past every span (spans
+    /// live inside the prompt).
+    func containsSpan(at position: Int) -> Bool {
+        blocks.contains { $0.tokenOffset <= position && position < $0.end }
+    }
 }
 
 // MARK: - Validation, coalescing, splicing
@@ -180,15 +201,20 @@ enum CBv2MultimodalPlan {
         return blocks
     }
 
-    /// Full submit-time validation + materialization. Throws
-    /// `CBv2MultimodalError`; never partially succeeds.
-    static func resolve(
+    /// CHEAP submit-time validation — no provider call, no MLX graph work:
+    /// model + backend capability, span structure, block-vs-budget. Returns
+    /// the coalesced blocks. Split from `materialize` so `EngineV2.submit`
+    /// can run every cheap admission gate (`canEverFit`, `maxWaiting`,
+    /// duplicate id) BEFORE the vision tower's embeddings are materialized —
+    /// a rejected request must never pay for heavy image work (PR#63
+    /// review).
+    static func validate(
         _ input: CBv2MultimodalInput,
         promptTokenCount: Int,
         model: CBv2SteppableModel,
         cacheProvider: CBv2LayerCacheProvider,
         maxBatchedTokensPerStep: Int
-    ) throws -> CBv2ResolvedMultimodal {
+    ) throws -> [CBv2ImageSpan] {
         guard let mmModel = model as? CBv2MultimodalSteppableModel,
             mmModel.supportsMultimodalPrefill
         else {
@@ -228,6 +254,38 @@ enum CBv2MultimodalPlan {
                 blockTokens: oversized.length,
                 maxBatchedTokensPerStep: maxBatchedTokensPerStep)
         }
+        return blocks
+    }
+
+    /// Full submit-time validation + materialization. Throws
+    /// `CBv2MultimodalError`; never partially succeeds.
+    static func resolve(
+        _ input: CBv2MultimodalInput,
+        promptTokenCount: Int,
+        model: CBv2SteppableModel,
+        cacheProvider: CBv2LayerCacheProvider,
+        maxBatchedTokensPerStep: Int
+    ) throws -> CBv2ResolvedMultimodal {
+        let blocks = try validate(
+            input, promptTokenCount: promptTokenCount, model: model,
+            cacheProvider: cacheProvider,
+            maxBatchedTokensPerStep: maxBatchedTokensPerStep)
+        return try materialize(input, blocks: blocks, model: model)
+    }
+
+    /// HEAVY half of `resolve`: run the embeddings provider and shape-check
+    /// its output. `blocks` must come from `validate` on the same input.
+    static func materialize(
+        _ input: CBv2MultimodalInput,
+        blocks: [CBv2ImageSpan],
+        model: CBv2SteppableModel
+    ) throws -> CBv2ResolvedMultimodal {
+        guard let mmModel = model as? CBv2MultimodalSteppableModel else {
+            // Unreachable after `validate`; kept as the type-safety backstop.
+            throw CBv2MultimodalError.unsupportedModel(
+                "\(type(of: model)) does not support embedding-spliced prefill")
+        }
+        let spans = input.spans
 
         // Materialize the embeddings — the ONE provider call per request,
         // on the submit thread (graph metadata only; no eval forced here).
@@ -282,6 +340,7 @@ enum CBv2MultimodalPlan {
         guard !spans.isEmpty else { return textEmbeddings }
         let L = textEmbeddings.dim(1)
         var segments: [MLXArray] = []
+        segments.reserveCapacity(spans.count * 2 + 1)
         var cursor = 0  // chunk-relative
         for (span, embedding) in spans {
             let lo = span.tokenOffset - chunkStart
