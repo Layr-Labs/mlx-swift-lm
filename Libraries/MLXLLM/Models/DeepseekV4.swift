@@ -1678,6 +1678,9 @@ public class DeepseekV4ModelInner: Module {
         // stats to locate the first non-finite layer on a real checkpoint.
         // Forces a per-layer eval — smoke-test use only.
         let debugNorms = ProcessInfo.processInfo.environment["DSV4_DEBUG_LAYER_NORMS"] == "1"
+        // DSV4_DUMP_LAYER_DIR: dump each layer's last-position 4D hidden
+        // ([hc*D] flattened, float32 JSON) for elementwise reference diffing.
+        let dumpDir = ProcessInfo.processInfo.environment["DSV4_DUMP_LAYER_DIR"]
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: maskMode, cache: cache?[i], inputIds: inputIds)
             if debugNorms {
@@ -1687,6 +1690,14 @@ public class DeepseekV4ModelInner: Module {
                 print(String(format: "[dsv4-debug] layer %02d ratio=%d absMax=%.4e mean=%+.4e",
                     i, i < config.compressRatios.count ? config.compressRatios[i] : -1,
                     absMax, mean))
+            }
+            if let dumpDir {
+                let f = h[0, -1, 0..., 0...].flattened().asType(.float32)
+                eval(f)
+                let vals = f.asArray(Float.self)
+                let json = "[" + vals.map { String($0) }.joined(separator: ",") + "]"
+                try? json.write(
+                    toFile: "\(dumpDir)/layer\(i).json", atomically: true, encoding: .utf8)
             }
         }
 
