@@ -693,8 +693,10 @@ func hcPre(
     let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + normEps)
     let mixes = matmul(xFlat, hcFn.T) * normScale  // [B, S, (2+hc)*hc]
 
-    // Fused Metal kernel: Sinkhorn + collapse in one dispatch
-    if Device.defaultDevice().deviceType == .gpu {
+    // Fused Metal kernel: Sinkhorn + collapse in one dispatch.
+    // DSV4_HC_OPS=1 forces the pure-ops fallback (kernel bisection).
+    let forceOps = ProcessInfo.processInfo.environment["DSV4_HC_OPS"] == "1"
+    if !forceOps, Device.defaultDevice().deviceType == .gpu {
         return hcKernel(
             x: x,
             mixes: mixes.reshaped([B * S, mixes.dim(2)]),
