@@ -298,10 +298,14 @@ final class DeepseekV4RoPE {
         self.dims = dims
         self.freqScale = freqScale
 
-        // inv_freq[i] = base^(2i/dims)
+        // inv_freq[i] = base^(-2i/dims)  (reference: 1 / base^(2i/dims)).
+        // Getting this backwards is catastrophic-but-self-consistent: baseFreqs
+        // below then holds inverse frequencies where mx.fast.rope expects
+        // PERIODS, silently mis-rotating every position (caught by real-weight
+        // parity vs mlx-lm#1192, invisible to self-consistency tests).
         let exponents =
             MLXArray(stride(from: 0, to: dims, by: 2)).asType(.float32) / Float(dims)
-        var invFreq = MLX.pow(base, exponents)  // [dims/2]
+        var invFreq = MLXArray(1.0) / MLX.pow(base, exponents)  // [dims/2]
 
         // Yarn / DeepSeek-Yarn scaling
         let ropeType: String?
