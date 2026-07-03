@@ -32,8 +32,8 @@ final class DeepseekV4MTPBlock: Module {
 
     var block: DeepseekV4Block
 
-    var e_proj: Linear
-    var h_proj: Linear
+    @ModuleInfo var e_proj: Linear
+    @ModuleInfo var h_proj: Linear
     var enorm: RMSNorm
     var hnorm: RMSNorm
     var norm: RMSNorm
@@ -160,7 +160,7 @@ extension DeepseekV4Model: MTPCapable {
         // Collapse hc dimension with the last block's hc_head, then norm + lm_head.
         let out = hcHeadReduce(
             x: h, hcFn: lb.hc_head.fn, hcScale: lb.hc_head.scale,
-            hcBase: lb.hc_head.base, eps: args.hcEps)
+            hcBase: lb.hc_head.base, eps: args.hcEps, normEps: args.rmsNormEps)
         return lmHead(lb.norm(out))
     }
 
