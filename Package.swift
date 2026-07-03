@@ -256,6 +256,17 @@ let package = Package(
             ],
             path: "Sources/BenchCBv2"
         ),
+        .executableTarget(
+            name: "DSV4Smoke",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Sources/DSV4Smoke"
+        ),
     ]
 )
 
