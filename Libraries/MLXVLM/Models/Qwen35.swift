@@ -765,7 +765,13 @@ enum Qwen35Language {
         let modelType: String
         let kvHeads: [Int]
 
-        fileprivate var precomputedPositionIds: MLXArray? = nil
+        /// Rope deltas from the most recent prefill, used by the decode-step
+        /// offset path. NOTE: module-level state — request-scoped in spirit.
+        /// Safe for text-only traffic (deltas are always 0) and for the
+        /// serialized media path (prepare() resets + recomputes per request),
+        /// but concurrent media + batched-text traffic on one module could
+        /// race it (pre-existing design constraint inherited from the
+        /// HF/mlx-vlm ports, which keep rope_deltas on the model too).
         fileprivate var ropeDeltas: MLXArray? = nil
 
         init(_ config: Qwen35Configuration) {
@@ -788,7 +794,6 @@ enum Qwen35Language {
         }
 
         func resetPositionState() {
-            precomputedPositionIds = nil
             ropeDeltas = nil
         }
 
@@ -807,7 +812,6 @@ enum Qwen35Language {
             let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
 
             if pixelValues != nil {
-                precomputedPositionIds = nil
                 ropeDeltas = nil
             }
 
@@ -827,25 +831,30 @@ enum Qwen35Language {
                     || ropeDeltas == nil
                     || cache == nil
                 {
-                    if let precomputedPositionIds {
-                        let seqLength = inputs.dim(1)
-                        positionIds =
-                            precomputedPositionIds[
-                                0..., 0..., cacheOffset ..< (cacheOffset + seqLength)]
-                    } else {
-                        let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
-                            inputIds: inputs,
-                            imageGridTHW: imageGridTHW,
-                            videoGridTHW: videoGridTHW,
-                            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
-                            imageTokenId: config.imageTokenId,
-                            videoTokenId: config.videoTokenId,
-                            visionStartTokenId: config.visionStartTokenId,
-                            attentionMask: ropeMask)
-                        positionIds = computed
-                        precomputedPositionIds = computed
-                        ropeDeltas = deltas
-                    }
+                    // ALWAYS recompute at the start of a sequence (offset 0) or
+                    // when no deltas exist — mirrors Qwen3VL.swift and HF
+                    // transformers (`cache_position[0] == 0` ⇒ recompute).
+                    //
+                    // This branch previously reused a `precomputedPositionIds`
+                    // module property when set. That was per-REQUEST state cached
+                    // on the long-lived model module: the NEXT text-only request
+                    // (fresh cache, offset 0) would slice the previous request's
+                    // position ids, MLX clamps the out-of-range slice to the OLD
+                    // prompt length, and the first full-attention layer died with
+                    //   [broadcast_shapes] (1,H,L_new,64) vs (1,1,L_old,64)
+                    // whenever the new prompt was longer (provider crash: any
+                    // request after the startup self-test decode).
+                    let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
+                        inputIds: inputs,
+                        imageGridTHW: imageGridTHW,
+                        videoGridTHW: videoGridTHW,
+                        spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                        imageTokenId: config.imageTokenId,
+                        videoTokenId: config.videoTokenId,
+                        visionStartTokenId: config.visionStartTokenId,
+                        attentionMask: ropeMask)
+                    positionIds = computed
+                    ropeDeltas = deltas
                 } else {
                     let batchSize = inputs.dim(0)
                     let seqLength = inputs.dim(1)
