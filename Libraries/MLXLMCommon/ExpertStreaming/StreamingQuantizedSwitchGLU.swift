@@ -41,6 +41,10 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
 
     private let cache: ExpertCache
     private let store: ExpertShardStore
+    /// Optional cross-token speculative prefetch (see PrefetchCoordinator.swift).
+    /// Nil disables prefetch entirely (e.g. `DSV4_STREAM_PREFETCH=0`, or
+    /// callers/tests that don't want the background queue at all).
+    private let prefetch: PrefetchCoordinator?
 
     /// Max experts fetched/stacked into one `gatherQuantizedMM` call. Bounds
     /// peak transient memory for prefill batches that touch most/all of the
@@ -68,7 +72,8 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         store: ExpertShardStore,
         activationProduct: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray,
         maxExpertsPerChunk: Int? = nil,
-        evalThresholdBytes: Int? = nil
+        evalThresholdBytes: Int? = nil,
+        prefetch: PrefetchCoordinator? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -82,6 +87,7 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         self.activationProduct = activationProduct
         self.maxExpertsPerChunk = maxExpertsPerChunk ?? Self.chunkSizeFromEnv()
         self.evalThresholdBytes = evalThresholdBytes ?? Self.evalThresholdBytesFromEnv()
+        self.prefetch = prefetch
     }
 
     private static func chunkSizeFromEnv() -> Int {
@@ -149,6 +155,17 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
                 groups.append((Int(sortedExpertIds[groupStart]), groupStart ..< i))
                 groupStart = i
             }
+        }
+
+        // Record this layer's unique expert selection for the CURRENT token
+        // and kick speculative background prefetch for layers ahead of us,
+        // using THEIR previous-token selections (see PrefetchCoordinator.swift).
+        // Placed before the fetch loop below (not after) so the background
+        // reads run concurrently with this layer's own foreground fetch +
+        // compute, not after it — maximizing SSD idle-time overlap.
+        if let prefetch {
+            prefetch.recordSelection(layer: layerIndex, experts: groups.map { $0.expert })
+            prefetch.prefetchAhead(fromLayer: layerIndex)
         }
 
         // Bucket consecutive groups into fetch chunks. Because groups are

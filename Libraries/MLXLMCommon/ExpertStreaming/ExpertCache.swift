@@ -58,6 +58,19 @@ public final class ExpertCache: @unchecked Sendable {
         return value
     }
 
+    /// Membership check that does NOT touch hit/miss counters or recency
+    /// order. Used by the prefetch coordinator to decide whether an expert
+    /// is worth fetching without polluting the reported cache-hit-rate
+    /// stats with speculative lookups (a prefetch "miss" isn't a real
+    /// decode-path miss) or promoting recency for an expert nothing has
+    /// actually used yet.
+    public func contains(layer: Int, expert: Int) -> Bool {
+        let key = Key(layer: layer, expert: expert)
+        lock.lock()
+        defer { lock.unlock() }
+        return storage[key] != nil
+    }
+
     /// Insert a freshly-fetched expert. A no-op if another concurrent fetch
     /// (e.g. from a sibling `DispatchQueue.concurrentPerform` iteration in
     /// `ExpertShardStore.fetch`) already inserted the same key — the

@@ -575,4 +575,178 @@ final class ExpertStreamingTests: XCTestCase {
             StreamingQuantizedSwitchGLU.shouldEvalChunk(
                 totalChunksInThisCall: 1, chunkBytes: threshold + 1, evalThresholdBytes: threshold))
     }
+
+    // MARK: - (f) PrefetchCoordinator bookkeeping (pure, no I/O)
+
+    /// A coordinator with no store/cache I/O ever exercised -- safe for
+    /// the pure bookkeeping tests below, which only call
+    /// `recordSelection`/`plannedPrefetchTargets`/`recordedSelection`.
+    private func makeBookkeepingOnlyCoordinator(
+        totalLayers: Int, lookaheadLayers: Int = 2
+    ) -> PrefetchCoordinator {
+        // The store/cache are real but never touched by I/O in these tests
+        // -- an empty layout is enough since `plannedPrefetchTargets` does
+        // no I/O at all.
+        let store = ExpertShardStore(layout: SafetensorsLayout(tensors: [:]), numExperts: 8)
+        let cache = ExpertCache(byteBudget: 1_000_000)
+        return PrefetchCoordinator(
+            cache: cache, store: store, totalLayers: totalLayers,
+            lookaheadLayers: lookaheadLayers, maxInFlight: 2)
+    }
+
+    func testRecordSelectionIsRetrievablePerLayer() {
+        let coordinator = makeBookkeepingOnlyCoordinator(totalLayers: 10)
+        XCTAssertNil(coordinator.recordedSelection(layer: 3), "nothing recorded yet")
+
+        coordinator.recordSelection(layer: 3, experts: [10, 20, 30])
+        XCTAssertEqual(coordinator.recordedSelection(layer: 3), [10, 20, 30])
+
+        // Different layer must not collide.
+        XCTAssertNil(coordinator.recordedSelection(layer: 4))
+
+        // Re-recording OVERWRITES (this token's pick replaces last token's).
+        coordinator.recordSelection(layer: 3, experts: [99])
+        XCTAssertEqual(coordinator.recordedSelection(layer: 3), [99])
+    }
+
+    func testPlannedPrefetchTargetsUsesLookaheadLayersPreviousSelection() {
+        let coordinator = makeBookkeepingOnlyCoordinator(totalLayers: 10, lookaheadLayers: 2)
+
+        // Simulate: token t-1 already ran through every layer, so layers
+        // 3 and 4 (lookahead 1 and 2 from layer 2) hold t-1's picks.
+        coordinator.recordSelection(layer: 2, experts: [1, 2])
+        coordinator.recordSelection(layer: 3, experts: [5, 6])
+        coordinator.recordSelection(layer: 4, experts: [7, 8])
+        coordinator.recordSelection(layer: 5, experts: [9])
+
+        // Token t's forward pass just finished layer 2's router. Planned
+        // targets must be layers 3 and 4's PREVIOUSLY recorded picks (not
+        // layer 2's own, and not layer 5's -- lookahead is exactly 2).
+        let targets = coordinator.plannedPrefetchTargets(fromLayer: 2)
+        let targetSet = Set(targets.map { "\($0.layer):\($0.expert)" })
+        XCTAssertEqual(targetSet, Set(["3:5", "3:6", "4:7", "4:8"]))
+    }
+
+    func testPlannedPrefetchTargetsClipsAtTotalLayers() {
+        let coordinator = makeBookkeepingOnlyCoordinator(totalLayers: 5, lookaheadLayers: 2)
+        // Layer 5 and 6 don't exist (totalLayers=5, so valid indices are 0..<5).
+        coordinator.recordSelection(layer: 4, experts: [1])
+
+        // From layer 3: lookahead 1 -> layer 4 (valid, in range), lookahead
+        // 2 -> layer 5 (out of range, must be dropped even if something had
+        // been recorded for it, which nothing is here anyway).
+        let targets = coordinator.plannedPrefetchTargets(fromLayer: 3)
+        XCTAssertEqual(targets.count, 1)
+        XCTAssertEqual(targets.first?.layer, 4)
+        XCTAssertEqual(targets.first?.expert, 1)
+
+        // From the last real layer, there's nothing ahead to prefetch.
+        XCTAssertTrue(coordinator.plannedPrefetchTargets(fromLayer: 4).isEmpty)
+    }
+
+    func testPlannedPrefetchTargetsEmptyWhenNothingRecordedYet() {
+        // Cold start (first token ever processed): no layer has run before,
+        // so there's nothing to speculate from. Must not crash or fabricate
+        // targets.
+        let coordinator = makeBookkeepingOnlyCoordinator(totalLayers: 10)
+        XCTAssertTrue(coordinator.plannedPrefetchTargets(fromLayer: 0).isEmpty)
+    }
+
+    func testPlannedPrefetchTargetsEmptyWhenLookaheadIsZero() {
+        let coordinator = makeBookkeepingOnlyCoordinator(totalLayers: 10, lookaheadLayers: 0)
+        coordinator.recordSelection(layer: 1, experts: [1, 2, 3])
+        XCTAssertTrue(coordinator.plannedPrefetchTargets(fromLayer: 0).isEmpty)
+    }
+
+    // MARK: - (g) PrefetchCoordinator scheduling: actually warms the cache
+
+    /// Build a tiny on-disk checkpoint (2 layers) so the scheduling tests
+    /// can exercise real (bounded, background) I/O, not just bookkeeping.
+    private func makeTinyStreamingCheckpoint(numExperts: Int, numLayers: Int) throws -> (
+        dir: URL, store: ExpertShardStore
+    ) {
+        let dir = try makeTempDirectory()
+        MLXRandom.seed(23)
+        func mkStack() -> MLXArray {
+            MLXRandom.randInt(low: 0, high: 1000, [numExperts, 4, 2], type: UInt32.self)
+        }
+        var arrays: [String: MLXArray] = [:]
+        for layer in 0 ..< numLayers {
+            let prefix = "model.layers.\(layer).ffn.switch_mlp"
+            arrays["\(prefix).gate_proj.weight"] = mkStack()
+            arrays["\(prefix).gate_proj.scales"] = mkStack()
+            arrays["\(prefix).up_proj.weight"] = mkStack()
+            arrays["\(prefix).up_proj.scales"] = mkStack()
+            arrays["\(prefix).down_proj.weight"] = mkStack()
+            arrays["\(prefix).down_proj.scales"] = mkStack()
+        }
+        eval(Array(arrays.values))
+        try MLX.save(arrays: arrays, url: dir.appendingPathComponent("model.safetensors"))
+        let layout = try SafetensorsLayout.load(modelDirectory: dir)
+        return (dir, ExpertShardStore(layout: layout, numExperts: numExperts))
+    }
+
+    func testPrefetchAheadWarmsCacheForRecordedLookaheadLayer() throws {
+        let (dir, store) = try makeTinyStreamingCheckpoint(numExperts: 8, numLayers: 3)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cache = ExpertCache(byteBudget: 1_000_000)
+        let coordinator = PrefetchCoordinator(
+            cache: cache, store: store, totalLayers: 3, lookaheadLayers: 2, maxInFlight: 2)
+
+        // Layer 1 "ran last token" and picked experts {2, 4}.
+        coordinator.recordSelection(layer: 1, experts: [2, 4])
+        XCTAssertFalse(cache.contains(layer: 1, expert: 2))
+
+        // Now the forward pass just finished layer 0's router for THIS
+        // token -- kick prefetch for layers ahead (1, 2).
+        coordinator.prefetchAhead(fromLayer: 0)
+        coordinator.waitUntilIdleForTesting()
+
+        XCTAssertTrue(cache.contains(layer: 1, expert: 2), "prefetch must warm the cache")
+        XCTAssertTrue(cache.contains(layer: 1, expert: 4), "prefetch must warm the cache")
+        // A speculative peek (`contains`) must not have touched hit/miss
+        // stats -- only the ACTUAL background fetch (a real store.fetch,
+        // which doesn't go through ExpertCache.get) does, and that path
+        // doesn't touch hit/miss counters either (only `insert`).
+        XCTAssertEqual(cache.stats.hits, 0)
+        XCTAssertEqual(cache.stats.misses, 0)
+    }
+
+    func testPrefetchAheadSkipsAlreadyCachedExperts() throws {
+        let (dir, store) = try makeTinyStreamingCheckpoint(numExperts: 8, numLayers: 3)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cache = ExpertCache(byteBudget: 1_000_000)
+        let coordinator = PrefetchCoordinator(
+            cache: cache, store: store, totalLayers: 3, lookaheadLayers: 2, maxInFlight: 2)
+
+        // Warm the cache through the normal foreground path first.
+        _ = try cache.fetch(layer: 1, experts: [2], from: store)
+        XCTAssertEqual(cache.stats.misses, 1)
+
+        coordinator.recordSelection(layer: 1, experts: [2])
+        coordinator.prefetchAhead(fromLayer: 0)
+        coordinator.waitUntilIdleForTesting()
+
+        // Already-cached expert must be skipped entirely -- no redundant
+        // background fetch, and definitely no extra recorded miss (misses
+        // only come from the foreground `ExpertCache.get`/`fetch` path).
+        XCTAssertEqual(cache.stats.misses, 1, "prefetch must not re-fetch an already-cached expert")
+        XCTAssertEqual(coordinator.inFlightCountForTesting, 0)
+    }
+
+    func testPrefetchAheadNoOpWhenDisabled() throws {
+        let (dir, store) = try makeTinyStreamingCheckpoint(numExperts: 8, numLayers: 3)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cache = ExpertCache(byteBudget: 1_000_000)
+        let coordinator = PrefetchCoordinator(
+            cache: cache, store: store, totalLayers: 3, lookaheadLayers: 2, maxInFlight: 2,
+            enabled: false)
+
+        coordinator.recordSelection(layer: 1, experts: [2, 4])
+        coordinator.prefetchAhead(fromLayer: 0)
+        coordinator.waitUntilIdleForTesting()
+
+        XCTAssertFalse(cache.contains(layer: 1, expert: 2), "disabled coordinator must never fetch")
+        XCTAssertFalse(cache.contains(layer: 1, expert: 4))
+    }
 }

@@ -289,6 +289,14 @@ struct DSV4Smoke {
                         format: "[expert-cache] hits=%d misses=%d hitRate=%.1f%% resident=%.1f GiB entries=%d",
                         s.hits, s.misses, hitRate,
                         Double(s.residentBytes) / 1073741824, s.residentCount))
+                    if let p = DeepseekV4ExpertStreaming.prefetchCoordinatorForDiagnostics {
+                        let ps = p.stats
+                        print(String(
+                            format: "[prefetch] scheduled=%d completed=%d alreadyWarm=%d",
+                            ps.scheduled, ps.completed, ps.alreadySkippedWarm))
+                    } else {
+                        print("[prefetch] disabled or not yet constructed")
+                    }
                 }
 
                 let text = pieces.joined()

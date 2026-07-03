@@ -1140,6 +1140,13 @@ public enum DeepseekV4ExpertStreaming {
 
     private nonisolated(unsafe) static var cachedStore: ExpertShardStore?
     private nonisolated(unsafe) static var cachedBaseConfiguration: BaseConfiguration?
+    private nonisolated(unsafe) static var cachedPrefetchCoordinator: PrefetchCoordinator?
+
+    /// The shared prefetch coordinator, if one has been constructed (nil
+    /// before the first streamed layer is built, or if prefetch is
+    /// disabled). Exposed for diagnostics/telemetry callers (e.g. DSV4Smoke)
+    /// that want to report `PrefetchCoordinator.Stats` alongside cache stats.
+    public static var prefetchCoordinatorForDiagnostics: PrefetchCoordinator? { cachedPrefetchCoordinator }
 
     /// Lazily parses `modelDirectory`'s safetensors headers into a
     /// `SafetensorsLayout` on first use (shared across all layers). Parsing
@@ -1159,6 +1166,25 @@ public enum DeepseekV4ExpertStreaming {
         } catch {
             fatalError("DeepseekV4ExpertStreaming: failed to parse safetensors layout: \(error)")
         }
+    }
+
+    /// Lazily builds the process-wide `PrefetchCoordinator` (shared across
+    /// every streamed MoE layer, same rationale as `cache`/`store` above:
+    /// only one model is ever loaded per process). Returns nil when
+    /// prefetch is disabled (`DSV4_STREAM_PREFETCH=0`) so
+    /// `StreamingQuantizedSwitchGLU` can treat "no prefetch" and "prefetch
+    /// disabled" identically (both just skip the coordinator calls).
+    static func prefetchCoordinator(totalLayers: Int, numExperts: Int) -> PrefetchCoordinator? {
+        guard PrefetchCoordinator.enabledFromEnv() else { return nil }
+        if let cachedPrefetchCoordinator { return cachedPrefetchCoordinator }
+        let coordinator = PrefetchCoordinator(
+            cache: cache,
+            store: store(numExperts: numExperts),
+            totalLayers: totalLayers,
+            lookaheadLayers: PrefetchCoordinator.lookaheadFromEnv(),
+            maxInFlight: PrefetchCoordinator.maxInFlightFromEnv())
+        cachedPrefetchCoordinator = coordinator
+        return coordinator
     }
 
     /// Reads `config.json`'s `quantization` dict for a given module path
@@ -1240,7 +1266,9 @@ class DeepseekV4MoE: Module {
                 groupSize: groupSize, bits: bits, mode: mode,
                 cache: DeepseekV4ExpertStreaming.cache,
                 store: DeepseekV4ExpertStreaming.store(numExperts: config.nRoutedExperts),
-                activationProduct: clampedSwiGLU)
+                activationProduct: clampedSwiGLU,
+                prefetch: DeepseekV4ExpertStreaming.prefetchCoordinator(
+                    totalLayers: config.numHiddenLayers, numExperts: config.nRoutedExperts))
         } else {
             self.streamingSwitchMLP = nil
             self._switchMLP.wrappedValue = SwitchGLU(
