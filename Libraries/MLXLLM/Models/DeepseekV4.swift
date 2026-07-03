@@ -699,7 +699,7 @@ func hcPre(
 
     // Fused Metal kernel: Sinkhorn + collapse in one dispatch.
     // DSV4_HC_OPS=1 forces the pure-ops fallback (kernel bisection).
-    let forceOps = ProcessInfo.processInfo.environment["DSV4_HC_OPS"] == "1"
+    let forceOps = DSV4Debug.forceHcOps
     if !forceOps, Device.defaultDevice().deviceType == .gpu {
         return hcKernel(
             x: x,
@@ -756,6 +756,26 @@ func hcHeadReduce(
 }
 
 // MARK: - Helpers
+
+/// `ProcessInfo.processInfo.environment` snapshots the whole environ on
+/// EVERY access (µs-scale) — too slow to call per-token from the hot path.
+/// These debug probes are read from the environment exactly once, at
+/// process start, and cached here (mirrors `DSV4AttnDump.armed` below).
+/// Behavior when the env vars are set is unchanged; only the read is hoisted.
+private enum DSV4Debug {
+    /// `DSV4_DEBUG_LAYER_NORMS`: 0 (unset), 1, or 2.
+    static let layerNorms: Int = {
+        switch ProcessInfo.processInfo.environment["DSV4_DEBUG_LAYER_NORMS"] {
+        case "1": return 1
+        case "2": return 2
+        default: return 0
+        }
+    }()
+    /// `DSV4_DUMP_LAYER_DIR`: directory to dump per-layer hidden states into.
+    static let dumpLayerDir: String? = ProcessInfo.processInfo.environment["DSV4_DUMP_LAYER_DIR"]
+    /// `DSV4_HC_OPS=1`: force the pure-ops Sinkhorn fallback (kernel bisection).
+    static let forceHcOps: Bool = ProcessInfo.processInfo.environment["DSV4_HC_OPS"] == "1"
+}
 
 /// Debug-only (DSV4_DUMP_ATTN_DIR): dump named attention internals from the
 /// FIRST attention invocation of the process for elementwise reference diffs.
@@ -1721,7 +1741,7 @@ class DeepseekV4Block: Module {
         cache: (any KVCache)?,
         inputIds: MLXArray
     ) -> MLXArray {
-        let debug = ProcessInfo.processInfo.environment["DSV4_DEBUG_LAYER_NORMS"] == "2"
+        let debug = DSV4Debug.layerNorms == 2
         func probe(_ name: String, _ a: MLXArray) {
             guard debug else { return }
             let f = a.asType(.float32)
@@ -1828,10 +1848,10 @@ public class DeepseekV4ModelInner: Module {
         // Debug probe (env DSV4_DEBUG_LAYER_NORMS=1): print per-layer hidden
         // stats to locate the first non-finite layer on a real checkpoint.
         // Forces a per-layer eval — smoke-test use only.
-        let debugNorms = ProcessInfo.processInfo.environment["DSV4_DEBUG_LAYER_NORMS"] == "1"
+        let debugNorms = DSV4Debug.layerNorms == 1
         // DSV4_DUMP_LAYER_DIR: dump each layer's last-position 4D hidden
         // ([hc*D] flattened, float32 JSON) for elementwise reference diffing.
-        let dumpDir = ProcessInfo.processInfo.environment["DSV4_DUMP_LAYER_DIR"]
+        let dumpDir = DSV4Debug.dumpLayerDir
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: maskMode, cache: cache?[i], inputIds: inputIds)
             if debugNorms {
