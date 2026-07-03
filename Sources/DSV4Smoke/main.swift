@@ -7,6 +7,8 @@
 //
 // usage: DSV4Smoke <model-directory> [--prompt "..."] [--max-tokens N] [--raw]
 //        --raw skips the chat template (plain completion of the prompt)
+//        --logits "id1,id2,..." forwards exact token ids and prints the
+//        last-position top-10 logits (for cross-implementation parity checks)
 
 import Foundation
 import MLX
@@ -27,6 +29,7 @@ struct DSV4Smoke {
         var prompt = "Give me three facts about the Apple M5 Max."
         var maxTokens = 64
         var raw = false
+        var logitTokens: [Int]? = nil
         var i = 0
         while i < args.count {
             switch args[i] {
@@ -39,6 +42,9 @@ struct DSV4Smoke {
             case "--raw":
                 raw = true
                 i += 1
+            case "--logits" where i + 1 < args.count:
+                logitTokens = args[i + 1].split(separator: ",").compactMap { Int($0) }
+                i += 2
             default:
                 print("unknown arg: \(args[i])")
                 exit(64)
@@ -54,6 +60,35 @@ struct DSV4Smoke {
                 loadSecs,
                 Double(Memory.activeMemory) / 1073741824,
                 Double(Memory.peakMemory) / 1073741824))
+
+            // Logit-parity mode: forward exact ids (no cache), print
+            // per-position top-10 (token, logit) of the LAST position. The
+            // Python reference (mlx-lm PR #1192) run on the same ids must
+            // produce matching values within quantization noise.
+            if let ids = logitTokens {
+                try await container.perform { (context: ModelContext) async throws in
+                    print("[model] class=\(type(of: context.model))")
+                    let model = context.model
+                    guard let lm = model as? DeepseekV4Model else {
+                        print("not a DeepseekV4Model: \(type(of: model))")
+                        exit(64)
+                    }
+                    let cache = lm.makeCache(parameters: GenerateParameters())
+                    let logits = lm(MLXArray(ids.map(Int32.init), [1, ids.count]), cache: cache)
+                    let last = logits[0, -1, 0...].asType(.float32)
+                    eval(last)
+                    let vals = last.asArray(Float.self)
+                    let top = vals.enumerated().sorted { $0.element > $1.element }.prefix(10)
+                    print("[logits] last position top-10:")
+                    for (tok, v) in top {
+                        print(String(format: "  %6d  %+.4f", tok, v))
+                    }
+                    let mean = vals.reduce(0, +) / Float(vals.count)
+                    let l2 = vals.map { Double($0) * Double($0) }.reduce(0, +).squareRoot()
+                    print(String(format: "[logits] mean=%+.5f l2=%.3f vocab=%d", mean, l2, vals.count))
+                }
+                return
+            }
 
             let (promptCopy, maxTokensCopy, rawCopy) = (prompt, maxTokens, raw)
             try await container.perform { (context: ModelContext) async throws in
