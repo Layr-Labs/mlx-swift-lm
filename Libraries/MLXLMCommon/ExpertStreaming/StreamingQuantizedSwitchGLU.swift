@@ -25,8 +25,37 @@
 // for how the resident `SwitchGLU` is swapped out for this type wholesale
 // rather than nested inside the module tree.
 
+import Cmlx
 import Foundation
 import MLX
+
+/// Pin the calling thread's MLX default streams to the process-global
+/// thread-unsafe streams (`Stream.gpu` / `Stream.cpu` in mlx-swift's
+/// Stream.swift).
+///
+/// WHY: MLX 0.32 made default streams thread-local (mlx/stream.cpp:
+/// `default_stream_storage` is `thread_local`, lazily calling `new_stream`).
+/// The first `eval()` on ANY thread therefore creates a fresh Stream(gpu, N)
+/// whose Metal command encoder is registered only in that thread's
+/// `thread_local` encoder map. `eval_impl` (mlx/transforms.cpp) consults
+/// `default_stream(default_device())` for its synchronizer/event bookkeeping,
+/// so state tagged with that per-thread stream can be observed by a LATER
+/// eval on a DIFFERENT thread — which aborts with "There is no Stream(gpu, N)
+/// in current thread" because neither that thread's encoder map nor the
+/// global one knows the stream.
+///
+/// The resident engine never trips this: it only evals at token boundaries
+/// through code built around the process-global streams (see the Stream.gpu
+/// rationale in mlx-swift's Stream.swift). Expert streaming introduces
+/// mid-forward `eval()` calls on whatever thread runs the forward — the
+/// ModelContainer actor thread during prefill, the generate-loop task thread
+/// during decode — so each such thread must have its default streams pinned
+/// to the globals before its first eval. Idempotent and cheap (two
+/// thread-local writes), called unconditionally per forward.
+private func pinThreadDefaultStreamsToGlobal() {
+    mlx_set_default_stream(StreamOrDevice.gpu.ctx)
+    mlx_set_default_stream(StreamOrDevice.cpu.ctx)
+}
 
 public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
     public let inputDims: Int
@@ -92,6 +121,8 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
     /// score-weighted sum over the topK axis itself, exactly as it does for
     /// the resident path.
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        pinThreadDefaultStreamsToGlobal()
+
         let expanded = MLX.expandedDimensions(x, axes: [-2, -3])
         let (xSorted, idxSorted, inverseOrder) = gatherSort(x: expanded, indices: indices)
 
