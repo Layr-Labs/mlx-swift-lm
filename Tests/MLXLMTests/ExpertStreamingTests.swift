@@ -31,7 +31,11 @@ final class ExpertStreamingTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let shard0: [String: MLXArray] = [
-            "a.weight": MLXArray((0 ..< 24).map { Float($0) }, [2, 3, 4])
+            "a.weight": MLXArray((0 ..< 24).map { Float($0) }, [2, 3, 4]),
+            // Regression: real DeepSeek-V4 shards carry int64 hash-routing
+            // tables (tid2eid). The parser scans whole shard headers, so it
+            // must decode dtypes streaming never reads without failing.
+            "a.tid2eid": MLXArray((0 ..< 8).map { Int64($0) }, [4, 2]),
         ]
         let shard1: [String: MLXArray] = [
             "b.weight": MLXArray((0 ..< 16).map { UInt32($0) }, [2, 8])
@@ -42,6 +46,7 @@ final class ExpertStreamingTests: XCTestCase {
         let index: [String: [String: String]] = [
             "weight_map": [
                 "a.weight": "model-00001-of-00002.safetensors",
+                "a.tid2eid": "model-00001-of-00002.safetensors",
                 "b.weight": "model-00002-of-00002.safetensors",
             ]
         ]
@@ -54,6 +59,10 @@ final class ExpertStreamingTests: XCTestCase {
         XCTAssertEqual(aLoc.shape, [2, 3, 4])
         XCTAssertEqual(aLoc.dtype, .float32)
         XCTAssertEqual(aLoc.byteRange.count, 24 * 4)
+
+        let tidLoc = try XCTUnwrap(layout["a.tid2eid"], "int64 tensors must parse, not fail the shard")
+        XCTAssertEqual(tidLoc.dtype, .int64)
+        XCTAssertEqual(tidLoc.byteRange.count, 8 * 8)
 
         let bLoc = try XCTUnwrap(layout["b.weight"])
         XCTAssertEqual(bLoc.shape, [2, 8])

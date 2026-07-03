@@ -17,24 +17,35 @@
 
 import Foundation
 
-/// Restricted to the dtypes MoE expert streaming actually needs to read:
-/// packed quantized weights (`uint32`), MX-format scale bytes (`uint8`), and
-/// unquantized/affine side tables (`bfloat16`/`float16`/`float32`). Extend as
-/// needed if a future streamed format uses others.
+/// The standard safetensors dtype table (upstream mlx/io/safetensors.cpp).
+/// Expert streaming only ever READS uint32 packed weights, uint8 MX scales,
+/// and bf16/f16/f32 affine side tables — but the parser scans entire shard
+/// headers, and real checkpoints carry other dtypes in non-expert tensors
+/// (e.g. DeepSeek-V4's int64 `tid2eid` hash-routing tables), so the full
+/// table must decode. Truly exotic dtypes (F8_*) are skipped by the parser
+/// rather than failing the whole layout.
 public enum SafetensorsDType: String, Sendable {
+    case bool = "BOOL"
     case uint8 = "U8"
+    case uint16 = "U16"
     case uint32 = "U32"
+    case uint64 = "U64"
+    case int8 = "I8"
+    case int16 = "I16"
+    case int32 = "I32"
+    case int64 = "I64"
     case bfloat16 = "BF16"
     case float16 = "F16"
     case float32 = "F32"
+    case float64 = "F64"
 
     /// Bytes per element, used for shape/offset validation.
     public var byteWidth: Int {
         switch self {
-        case .uint8: return 1
-        case .uint32: return 4
-        case .bfloat16, .float16: return 2
-        case .float32: return 4
+        case .bool, .uint8, .int8: return 1
+        case .uint16, .int16, .bfloat16, .float16: return 2
+        case .uint32, .int32, .float32: return 4
+        case .uint64, .int64, .float64: return 8
         }
     }
 }
@@ -62,7 +73,6 @@ public struct SafetensorsTensorLocation: Sendable {
 public enum SafetensorsLayoutError: Error, Equatable {
     case fileTooShort(URL)
     case invalidHeader(URL)
-    case unsupportedDType(String, key: String)
     case sizeMismatch(key: String, expected: Int, got: Int)
 }
 
@@ -144,9 +154,12 @@ public struct SafetensorsLayout: Sendable {
             else {
                 throw SafetensorsLayoutError.invalidHeader(url)
             }
-            guard let dtype = SafetensorsDType(rawValue: dtypeString) else {
-                throw SafetensorsLayoutError.unsupportedDType(dtypeString, key: key)
-            }
+            // Skip (don't fail on) dtypes outside the standard table, e.g.
+            // F8_E4M3: the layout only has to resolve the tensors streaming
+            // actually reads; an exotic dtype on some unrelated tensor must
+            // not block the whole checkpoint. A lookup of a skipped key
+            // surfaces later as .missingTensor, which names the key.
+            guard let dtype = SafetensorsDType(rawValue: dtypeString) else { continue }
             let shape = shapeAny.compactMap { ($0 as? NSNumber)?.intValue }
             guard shape.count == shapeAny.count,
                 let start = (offsetsAny[0] as? NSNumber)?.intValue,
