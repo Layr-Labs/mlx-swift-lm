@@ -17,13 +17,113 @@ import MLXLLM
 import MLXLMCommon
 import Tokenizers
 
+/// Determinism stress for the primitive ops DeepSeek-V4 leans on that other
+/// fleet models don't. Runs each op N times on identical inputs and reports
+/// any run-to-run drift (bitwise, via float32 sum + abs-diff vs first run).
+func runOpStress(iterations: Int) {
+    MLXRandom.seed(42)
+
+    func drift(_ name: String, _ make: () -> MLXArray) {
+        var reference: [Float]? = nil
+        var maxDrift: Float = 0
+        var nanRuns = 0
+        for _ in 0 ..< iterations {
+            let out = make().asType(.float32)
+            eval(out)
+            let vals = out.asArray(Float.self)
+            if vals.contains(where: { $0.isNaN }) { nanRuns += 1; continue }
+            if let ref = reference {
+                var d: Float = 0
+                for (a, b) in zip(vals, ref) { d = max(d, abs(a - b)) }
+                maxDrift = max(maxDrift, d)
+            } else {
+                reference = vals
+            }
+        }
+        let verdict = (nanRuns > 0 || maxDrift > 0) ? "DRIFT" : "ok"
+        print(String(format: "[op-stress] %-28@ maxDrift=%.3e nanRuns=%d/%d  %@",
+            name, maxDrift, nanRuns, iterations, verdict))
+    }
+
+    // Shapes mirror the real model (hidden 4096, moe 2048, experts 256, top-6).
+    let x = MLXRandom.normal([7, 4096]).asType(.bfloat16)
+    eval(x)
+
+    // 1. Plain dense matmul (control; steel gemm / nax on M5).
+    let denseW = MLXRandom.normal([4096, 1024]).asType(.bfloat16)
+    eval(denseW)
+    drift("dense matmul (control)") { matmul(x, denseW) }
+
+    // 2. Affine-quantized matmul g64 (attention projections).
+    let wq = MLXRandom.normal([1024, 4096])
+    let (qw, qs, qb) = MLX.quantized(wq, groupSize: 64, bits: 4, mode: .affine)
+    eval(qw, qs, qb ?? MLXArray(0))
+    drift("qmm affine g64") {
+        quantizedMM(x, qw, scales: qs, biases: qb, transpose: true,
+            groupSize: 64, bits: 4, mode: .affine)
+    }
+
+    // 3. Batched (3D) affine quantized matmul (wo_a MultiLinear).
+    let wq3 = MLXRandom.normal([8, 1024, 4096])
+    let (qw3, qs3, qb3) = MLX.quantized(wq3, groupSize: 64, bits: 4, mode: .affine)
+    let x4 = MLXRandom.normal([1, 8, 7, 4096]).asType(.bfloat16)
+    eval(qw3, qs3, x4)
+    drift("qmm batched 3D (wo_a)") {
+        quantizedMM(x4, qw3, scales: qs3, biases: qb3, transpose: true,
+            groupSize: 64, bits: 4, mode: .affine)
+    }
+
+    // 4. mxfp4 gather-quantized matmul (routed experts).
+    let we = MLXRandom.normal([256, 2048, 4096])
+    let (qwe, qse, qbe) = MLX.quantized(we, groupSize: 32, bits: 4, mode: .mxfp4)
+    let inds = MLXArray([Int32(3), 17, 40, 99, 200, 255], [1, 1, 6])
+    let xg = MLXRandom.normal([1, 1, 1, 4096]).asType(.bfloat16)
+    eval(qwe, qse, xg)
+    drift("gather-qmm mxfp4 g32") {
+        gatherQuantizedMM(
+            xg, qwe, scales: qse, biases: qbe, rhsIndices: inds, transpose: true,
+            groupSize: 32, bits: 4, mode: .mxfp4)
+    }
+
+    // 5. fast.rope with infinite NOPE frequencies (DeepseekV4RoPE).
+    let ropeFreqs = concatenated([
+        MLXArray(Array(repeating: Float.infinity, count: 224)),
+        MLXArray((0 ..< 32).map { Float(pow(10000.0, Double($0) / 32.0)) }),
+    ])
+    let ropeX = MLXRandom.normal([1, 64, 7, 512]).asType(.bfloat16)
+    eval(ropeFreqs, ropeX)
+    drift("fast.rope inf freqs (NOPE)") {
+        MLXFast.RoPE(
+            ropeX, dimensions: 512, traditional: true, base: nil, scale: 1.0,
+            offset: 0, freqs: ropeFreqs)
+    }
+
+    // 6. SDPA with sinks + bool array mask (1 KV head).
+    let q = MLXRandom.normal([1, 64, 7, 512]).asType(.bfloat16)
+    let kv = MLXRandom.normal([1, 1, 7, 512]).asType(.bfloat16)
+    let sinks = MLXRandom.normal([64]).asType(.bfloat16)
+    let boolMask = MLXArray((0 ..< 49).map { Int32($0 % 7 <= $0 / 7 ? 1 : 0) }, [7, 7])
+        .asType(.bool)
+    eval(q, kv, sinks, boolMask)
+    drift("sdpa sinks + bool mask") {
+        MLXFast.scaledDotProductAttention(
+            queries: q, keys: kv, values: kv, scale: 0.044,
+            mask: .array(boolMask), sinks: sinks)
+    }
+}
+
 @main
 struct DSV4Smoke {
     static func main() async {
         var args = Array(CommandLine.arguments.dropFirst())
         guard !args.isEmpty else {
             print("usage: DSV4Smoke <model-directory> [--prompt \"...\"] [--max-tokens N] [--raw]")
+            print("       DSV4Smoke --op-stress [iterations]")
             exit(64)
+        }
+        if args[0] == "--op-stress" {
+            runOpStress(iterations: args.count > 1 ? Int(args[1]) ?? 12 : 12)
+            return
         }
         let directory = URL(fileURLWithPath: args.removeFirst())
         var prompt = "Give me three facts about the Apple M5 Max."
