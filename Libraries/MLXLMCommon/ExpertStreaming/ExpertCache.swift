@@ -29,7 +29,11 @@ public final class ExpertCache: @unchecked Sendable {
     /// Recency order, least-recently-used first.
     private var order: [Key] = []
     private var currentBytes: Int = 0
-    private let byteBudget: Int
+    /// Locked (not `let`) so `setByteBudget(_:)` can resize a live cache —
+    /// e.g. a provider reloading DeepSeek-V4 with a different
+    /// `expert_cache_gb` no longer has to live with whatever budget the
+    /// FIRST load picked for the lifetime of the process.
+    private var byteBudget: Int
 
     private var hitCountLocked: Int = 0
     private var missCountLocked: Int = 0
@@ -110,6 +114,50 @@ public final class ExpertCache: @unchecked Sendable {
             resolved[e] = w
         }
         return resolved
+    }
+
+    /// Drop every cached entry and reset occupancy to zero — used when a
+    /// model unloads so its (potentially tens-of-GB) resident expert
+    /// weights are actually released rather than lingering until the next
+    /// model's cache pressure evicts them one LRU entry at a time.
+    ///
+    /// Hit/miss counters are reset to zero as well: they are reported as
+    /// per-model-lifetime cache statistics (e.g. provider diagnostics), and
+    /// carrying counts across an unrelated model's load would make the
+    /// reported hit rate meaningless. A caller that wants cumulative
+    /// process-lifetime stats should snapshot `stats` before purging.
+    ///
+    /// Freeing the underlying `MLXArray`s is a side effect of dropping the
+    /// last Swift reference here, not something this method does directly
+    /// — callers that want the freed bytes to actually return to the OS in
+    /// the same sweep should call `MLX.Memory.clearCache()` (or equivalent)
+    /// shortly after this returns.
+    public func purgeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        storage.removeAll()
+        order.removeAll()
+        currentBytes = 0
+        hitCountLocked = 0
+        missCountLocked = 0
+    }
+
+    /// Resize the byte budget of a live cache, evicting LRU entries
+    /// immediately if the new budget is smaller than current occupancy.
+    /// Growing the budget never evicts (it just raises the ceiling future
+    /// inserts are checked against).
+    public func setByteBudget(_ newBudget: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        byteBudget = max(0, newBudget)
+        evictLocked()
+    }
+
+    /// Current byte budget (primarily for tests/diagnostics).
+    public var currentByteBudget: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return byteBudget
     }
 
     private func touchLocked(_ key: Key) {

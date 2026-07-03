@@ -576,6 +576,276 @@ final class ExpertStreamingTests: XCTestCase {
                 totalChunksInThisCall: 1, chunkBytes: threshold + 1, evalThresholdBytes: threshold))
     }
 
+    // MARK: - (f2) ExpertCache lifecycle: purgeAll / setByteBudget
+
+    func testPurgeAllEmptiesCacheAndResetsCounters() throws {
+        let placeholder = MLXArray.zeros([1])
+        let weights = ExpertWeights(
+            gateWeight: placeholder, gateScales: placeholder, gateBiases: nil,
+            upWeight: placeholder, upScales: placeholder, upBiases: nil,
+            downWeight: placeholder, downScales: placeholder, downBiases: nil,
+            byteCount: 10)
+        let cache = ExpertCache(byteBudget: 1000)
+
+        cache.insert(layer: 0, expert: 0, weights: weights)
+        XCTAssertNotNil(cache.get(layer: 0, expert: 0))  // hit
+        XCTAssertNil(cache.get(layer: 0, expert: 1))  // miss
+        XCTAssertEqual(cache.stats.residentCount, 1)
+
+        cache.purgeAll()
+
+        let stats = cache.stats
+        XCTAssertEqual(stats.residentCount, 0, "purgeAll must drop every entry")
+        XCTAssertEqual(stats.residentBytes, 0, "purgeAll must reset occupancy to zero")
+        XCTAssertEqual(stats.hits, 0, "purgeAll resets hit/miss counters (documented contract)")
+        XCTAssertEqual(stats.misses, 0)
+        XCTAssertFalse(cache.contains(layer: 0, expert: 0), "purged entry must not be a member")
+    }
+
+    /// Regression: after a purge, a subsequent `fetch` must genuinely miss
+    /// and re-read from disk -- not silently short-circuit because the
+    /// store thinks the expert is still resident.
+    func testFetchAfterPurgeReReadsFromDiskAndRecordsAMiss() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let numExperts = 2
+        let gateW = MLXRandom.randInt(low: 0, high: 1000, [numExperts, 4, 2], type: UInt32.self)
+        let gateS = MLXRandom.randInt(low: 0, high: 255, [numExperts, 4, 1], type: UInt8.self)
+        let upW = MLXRandom.randInt(low: 0, high: 1000, [numExperts, 4, 2], type: UInt32.self)
+        let upS = MLXRandom.randInt(low: 0, high: 255, [numExperts, 4, 1], type: UInt8.self)
+        let downW = MLXRandom.randInt(low: 0, high: 1000, [numExperts, 2, 2], type: UInt32.self)
+        let downS = MLXRandom.randInt(low: 0, high: 255, [numExperts, 2, 1], type: UInt8.self)
+        eval(gateW, gateS, upW, upS, downW, downS)
+
+        let prefix = "model.layers.0.ffn.switch_mlp"
+        try MLX.save(
+            arrays: [
+                "\(prefix).gate_proj.weight": gateW, "\(prefix).gate_proj.scales": gateS,
+                "\(prefix).up_proj.weight": upW, "\(prefix).up_proj.scales": upS,
+                "\(prefix).down_proj.weight": downW, "\(prefix).down_proj.scales": downS,
+            ], url: dir.appendingPathComponent("model.safetensors"))
+
+        let layout = try SafetensorsLayout.load(modelDirectory: dir)
+        let store = ExpertShardStore(layout: layout, numExperts: numExperts)
+        let cache = ExpertCache(byteBudget: 1_000_000)
+
+        _ = try cache.fetch(layer: 0, experts: [0], from: store)
+        XCTAssertEqual(cache.stats.misses, 1, "first fetch must miss and read from disk")
+        _ = try cache.fetch(layer: 0, experts: [0], from: store)
+        XCTAssertEqual(cache.stats.hits, 1, "second fetch must hit the warm cache")
+
+        cache.purgeAll()
+
+        _ = try cache.fetch(layer: 0, experts: [0], from: store)
+        XCTAssertEqual(
+            cache.stats.misses, 1,
+            "post-purge fetch must miss again (counters reset by purgeAll) and re-read from disk")
+        XCTAssertEqual(cache.stats.hits, 0)
+    }
+
+    func testSetByteBudgetEvictsImmediatelyToTheNewBudget() {
+        let placeholder = MLXArray.zeros([1])
+        func fakeWeights(bytes: Int) -> ExpertWeights {
+            ExpertWeights(
+                gateWeight: placeholder, gateScales: placeholder, gateBiases: nil,
+                upWeight: placeholder, upScales: placeholder, upBiases: nil,
+                downWeight: placeholder, downScales: placeholder, downBiases: nil,
+                byteCount: bytes)
+        }
+
+        // Room for 3 entries at the initial budget.
+        let cache = ExpertCache(byteBudget: 300)
+        cache.insert(layer: 0, expert: 0, weights: fakeWeights(bytes: 100))
+        cache.insert(layer: 0, expert: 1, weights: fakeWeights(bytes: 100))
+        cache.insert(layer: 0, expert: 2, weights: fakeWeights(bytes: 100))
+        XCTAssertEqual(cache.stats.residentCount, 3)
+
+        // Shrink to fit only one entry -- must evict the two LRU entries
+        // (0 and 1) immediately, without waiting for the next insert.
+        cache.setByteBudget(100)
+        XCTAssertEqual(cache.currentByteBudget, 100)
+        XCTAssertLessThanOrEqual(cache.stats.residentBytes, 100)
+        XCTAssertEqual(cache.stats.residentCount, 1, "shrinking the budget must evict immediately")
+        XCTAssertTrue(cache.contains(layer: 0, expert: 2), "most-recently-used entry must survive")
+        XCTAssertFalse(cache.contains(layer: 0, expert: 0), "LRU entries must be evicted on shrink")
+        XCTAssertFalse(cache.contains(layer: 0, expert: 1))
+    }
+
+    /// Shrink-then-grow: growing the budget back up must not resurrect
+    /// evicted entries (they're gone), but must allow new inserts to fill
+    /// the newly available headroom without further eviction.
+    func testSetByteBudgetShrinkThenGrowWorks() {
+        let placeholder = MLXArray.zeros([1])
+        func fakeWeights(bytes: Int) -> ExpertWeights {
+            ExpertWeights(
+                gateWeight: placeholder, gateScales: placeholder, gateBiases: nil,
+                upWeight: placeholder, upScales: placeholder, upBiases: nil,
+                downWeight: placeholder, downScales: placeholder, downBiases: nil,
+                byteCount: bytes)
+        }
+
+        let cache = ExpertCache(byteBudget: 300)
+        cache.insert(layer: 0, expert: 0, weights: fakeWeights(bytes: 100))
+        cache.insert(layer: 0, expert: 1, weights: fakeWeights(bytes: 100))
+        cache.insert(layer: 0, expert: 2, weights: fakeWeights(bytes: 100))
+
+        cache.setByteBudget(100)
+        XCTAssertEqual(cache.stats.residentCount, 1)
+
+        // Grow back up -- no eviction happens just from raising the
+        // ceiling, and new inserts can now use the extra headroom.
+        cache.setByteBudget(300)
+        XCTAssertEqual(
+            cache.stats.residentCount, 1, "growing the budget alone must not resurrect evicted entries")
+        cache.insert(layer: 0, expert: 3, weights: fakeWeights(bytes: 100))
+        cache.insert(layer: 0, expert: 4, weights: fakeWeights(bytes: 100))
+        XCTAssertEqual(cache.stats.residentCount, 3, "grown budget must accept new inserts without evicting")
+        XCTAssertTrue(cache.contains(layer: 0, expert: 2))
+        XCTAssertTrue(cache.contains(layer: 0, expert: 3))
+        XCTAssertTrue(cache.contains(layer: 0, expert: 4))
+    }
+
+    func testSetByteBudgetToZeroEvictsEverything() {
+        let placeholder = MLXArray.zeros([1])
+        let weights = ExpertWeights(
+            gateWeight: placeholder, gateScales: placeholder, gateBiases: nil,
+            upWeight: placeholder, upScales: placeholder, upBiases: nil,
+            downWeight: placeholder, downScales: placeholder, downBiases: nil,
+            byteCount: 10)
+        let cache = ExpertCache(byteBudget: 1000)
+        cache.insert(layer: 0, expert: 0, weights: weights)
+        cache.insert(layer: 1, expert: 0, weights: weights)
+
+        cache.setByteBudget(0)
+
+        XCTAssertEqual(cache.stats.residentCount, 0)
+        XCTAssertEqual(cache.stats.residentBytes, 0)
+    }
+
+    // MARK: - (f3) DeepseekV4ExpertStreaming lifecycle: purgeCache / setCacheBudgetBytes
+
+    func testDeepseekV4ExpertStreamingPurgeCacheEmptiesTheSharedCache() {
+        // Belt-and-suspenders: don't let a leaked `enabled=true` from
+        // another test change behavior; this test only touches the
+        // shared `cache`/`purgeCache()` surface, not model construction.
+        defer { DeepseekV4ExpertStreaming.purgeCache() }
+
+        let placeholder = MLXArray.zeros([1])
+        let weights = ExpertWeights(
+            gateWeight: placeholder, gateScales: placeholder, gateBiases: nil,
+            upWeight: placeholder, upScales: placeholder, upBiases: nil,
+            downWeight: placeholder, downScales: placeholder, downBiases: nil,
+            byteCount: 10)
+        DeepseekV4ExpertStreaming.cache.insert(layer: 0, expert: 0, weights: weights)
+        XCTAssertTrue(DeepseekV4ExpertStreaming.cache.contains(layer: 0, expert: 0))
+
+        DeepseekV4ExpertStreaming.purgeCache()
+
+        XCTAssertFalse(DeepseekV4ExpertStreaming.cache.contains(layer: 0, expert: 0))
+        XCTAssertEqual(DeepseekV4ExpertStreaming.cache.stats.residentCount, 0)
+    }
+
+    func testDeepseekV4ExpertStreamingSetCacheBudgetBytesResizesTheSharedCache() {
+        let originalBudget = DeepseekV4ExpertStreaming.cache.currentByteBudget
+        defer {
+            DeepseekV4ExpertStreaming.setCacheBudgetBytes(originalBudget)
+            DeepseekV4ExpertStreaming.purgeCache()
+        }
+
+        DeepseekV4ExpertStreaming.setCacheBudgetBytes(12345)
+        XCTAssertEqual(DeepseekV4ExpertStreaming.cache.currentByteBudget, 12345)
+
+        let placeholder = MLXArray.zeros([1])
+        let weights = ExpertWeights(
+            gateWeight: placeholder, gateScales: placeholder, gateBiases: nil,
+            upWeight: placeholder, upScales: placeholder, upBiases: nil,
+            downWeight: placeholder, downScales: placeholder, downBiases: nil,
+            byteCount: 10000)
+        DeepseekV4ExpertStreaming.cache.insert(layer: 0, expert: 0, weights: weights)
+        // 10000 bytes > 12345-byte budget minus nothing else resident --
+        // actually fits (10000 < 12345), so use a second, bigger insert to
+        // force eviction under the shrunk budget.
+        let bigWeights = ExpertWeights(
+            gateWeight: placeholder, gateScales: placeholder, gateBiases: nil,
+            upWeight: placeholder, upScales: placeholder, upBiases: nil,
+            downWeight: placeholder, downScales: placeholder, downBiases: nil,
+            byteCount: 5000)
+        DeepseekV4ExpertStreaming.cache.insert(layer: 0, expert: 1, weights: bigWeights)
+        XCTAssertLessThanOrEqual(DeepseekV4ExpertStreaming.cache.stats.residentBytes, 12345)
+
+        // Shrinking further must evict immediately.
+        DeepseekV4ExpertStreaming.setCacheBudgetBytes(1000)
+        XCTAssertLessThanOrEqual(DeepseekV4ExpertStreaming.cache.stats.residentBytes, 1000)
+    }
+
+    /// `purgeCache()` must also drop the cached safetensors layout/config so
+    /// a stale layout parsed against an old checkpoint directory can never
+    /// serve byte ranges for a re-downloaded/different checkpoint at a
+    /// reused `modelDirectory`.
+    func testDeepseekV4ExpertStreamingPurgeCacheForcesLayoutReparse() throws {
+        let originalModelDirectory = DeepseekV4ExpertStreaming.modelDirectory
+        let originalEnabled = DeepseekV4ExpertStreaming.enabled
+        defer {
+            DeepseekV4ExpertStreaming.modelDirectory = originalModelDirectory
+            DeepseekV4ExpertStreaming.enabled = originalEnabled
+            DeepseekV4ExpertStreaming.purgeCache()
+        }
+
+        let dirA = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dirA) }
+        let numExpertsA = 2
+        let gateWA = MLXRandom.randInt(low: 0, high: 1000, [numExpertsA, 4, 2], type: UInt32.self)
+        let gateSA = MLXRandom.randInt(low: 0, high: 255, [numExpertsA, 4, 1], type: UInt8.self)
+        let upWA = MLXRandom.randInt(low: 0, high: 1000, [numExpertsA, 4, 2], type: UInt32.self)
+        let upSA = MLXRandom.randInt(low: 0, high: 255, [numExpertsA, 4, 1], type: UInt8.self)
+        let downWA = MLXRandom.randInt(low: 0, high: 1000, [numExpertsA, 2, 2], type: UInt32.self)
+        let downSA = MLXRandom.randInt(low: 0, high: 255, [numExpertsA, 2, 1], type: UInt8.self)
+        eval(gateWA, gateSA, upWA, upSA, downWA, downSA)
+        let prefixA = "model.layers.0.ffn.switch_mlp"
+        try MLX.save(
+            arrays: [
+                "\(prefixA).gate_proj.weight": gateWA, "\(prefixA).gate_proj.scales": gateSA,
+                "\(prefixA).up_proj.weight": upWA, "\(prefixA).up_proj.scales": upSA,
+                "\(prefixA).down_proj.weight": downWA, "\(prefixA).down_proj.scales": downSA,
+            ], url: dirA.appendingPathComponent("model.safetensors"))
+
+        DeepseekV4ExpertStreaming.modelDirectory = dirA
+        let storeA = DeepseekV4ExpertStreaming.store(numExperts: numExpertsA)
+        XCTAssertNotNil(try? storeA.fetch(layerIndex: 0, experts: [0]), "layout A must parse and serve")
+
+        // Purge, then point at a DIFFERENT checkpoint directory (simulates
+        // a reload with a re-downloaded / different-version checkpoint at
+        // a fresh path). Without clearing `cachedStore`, `store(numExperts:)`
+        // would keep returning the stale store built from `dirA`.
+        DeepseekV4ExpertStreaming.purgeCache()
+
+        let dirB = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dirB) }
+        let numExpertsB = 3
+        let gateWB = MLXRandom.randInt(low: 0, high: 1000, [numExpertsB, 4, 2], type: UInt32.self)
+        let gateSB = MLXRandom.randInt(low: 0, high: 255, [numExpertsB, 4, 1], type: UInt8.self)
+        let upWB = MLXRandom.randInt(low: 0, high: 1000, [numExpertsB, 4, 2], type: UInt32.self)
+        let upSB = MLXRandom.randInt(low: 0, high: 255, [numExpertsB, 4, 1], type: UInt8.self)
+        let downWB = MLXRandom.randInt(low: 0, high: 1000, [numExpertsB, 2, 2], type: UInt32.self)
+        let downSB = MLXRandom.randInt(low: 0, high: 255, [numExpertsB, 2, 1], type: UInt8.self)
+        eval(gateWB, gateSB, upWB, upSB, downWB, downSB)
+        let prefixB = "model.layers.0.ffn.switch_mlp"
+        try MLX.save(
+            arrays: [
+                "\(prefixB).gate_proj.weight": gateWB, "\(prefixB).gate_proj.scales": gateSB,
+                "\(prefixB).up_proj.weight": upWB, "\(prefixB).up_proj.scales": upSB,
+                "\(prefixB).down_proj.weight": downWB, "\(prefixB).down_proj.scales": downSB,
+            ], url: dirB.appendingPathComponent("model.safetensors"))
+
+        DeepseekV4ExpertStreaming.modelDirectory = dirB
+        let storeB = DeepseekV4ExpertStreaming.store(numExperts: numExpertsB)
+        let fetchedB = try storeB.fetch(layerIndex: 0, experts: Array(0 ..< numExpertsB))
+        XCTAssertEqual(
+            fetchedB.count, numExpertsB,
+            "post-purge store(numExperts:) must re-parse dirB's layout, not reuse a store built from dirA")
+    }
+
     // MARK: - (f) PrefetchCoordinator bookkeeping (pure, no I/O)
 
     /// A coordinator with no store/cache I/O ever exercised -- safe for

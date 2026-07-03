@@ -1135,7 +1135,11 @@ public enum DeepseekV4ExpertStreaming {
 
     /// Process-wide expert cache shared by every streamed MoE layer in the
     /// loaded model (only one model is ever loaded per process today).
-    /// Sized from `DSV4_EXPERT_CACHE_GB` (default 8 GiB).
+    /// Bootstrap-sized from `DSV4_EXPERT_CACHE_GB` (default 8 GiB) the
+    /// first time this static is touched; call `setCacheBudgetBytes(_:)`
+    /// to resize it later (e.g. on a reload with a different configured
+    /// budget) and `purgeCache()` to empty it (e.g. on model unload) — see
+    /// the lifecycle section below.
     public static let cache = ExpertCache(byteBudget: ExpertCache.budgetFromEnv())
 
     private nonisolated(unsafe) static var cachedStore: ExpertShardStore?
@@ -1185,6 +1189,78 @@ public enum DeepseekV4ExpertStreaming {
             maxInFlight: PrefetchCoordinator.maxInFlightFromEnv())
         cachedPrefetchCoordinator = coordinator
         return coordinator
+    }
+
+    // MARK: - Lifecycle (unload / reload)
+    //
+    // Concurrency contract: `modelDirectory`, `enabled`, `cachedStore`,
+    // `cachedBaseConfiguration`, and `cachedPrefetchCoordinator` are
+    // `nonisolated(unsafe)` process-wide statics. That is only sound
+    // because every mutation (including the two calls below) is made by
+    // the host process's single model-lifecycle actor (the provider's
+    // `ProviderLoop`/`BatchScheduler` load/unload path, or the CLI smoke
+    // harness's single-threaded setup) STRICTLY BETWEEN forward passes —
+    // never concurrently with one. A forward pass only ever READS
+    // `modelDirectory`/`enabled` and calls into `cache`/`store`, and the
+    // host is required to fence out in-flight generation (await any
+    // running decode/prefill tasks to completion) before calling
+    // `purgeCache()` or `setCacheBudgetBytes(_:)` and before starting the
+    // next load. We do not add a lock here on top of that contract —
+    // `ExpertCache`'s own internals stay lock-correct independently (its
+    // `get`/`insert`/`fetch` race against each other from prefetch and
+    // foreground fetch threads DURING a forward pass), but these two
+    // lifecycle entry points are load/unload-time-only and single-writer
+    // by construction, so a second lock here would just be dead weight.
+    //
+    // Callers: today that's `ProviderLoop`/`BatchScheduler.stopCurrentEngine()`
+    // (purge on unload/idle-timeout/reload) and the provider's model-load
+    // path (budget resize before building the new model's streaming
+    // layers).
+
+    /// Release every entry in the shared expert cache and forget the
+    /// checkpoint-specific layout/config state cached alongside it.
+    ///
+    /// Call this AFTER the departing model's forward passes have been
+    /// fully fenced (no in-flight decode/prefill) and BEFORE the caller
+    /// does its own `MLX.Memory.clearCache()` sweep, so the freed expert
+    /// arrays return to the OS in the same pass as the rest of the
+    /// unloaded model's resident weights.
+    ///
+    /// `cachedStore` and `cachedBaseConfiguration` are cleared here (not
+    /// just the byte cache) because both are keyed by whatever
+    /// `modelDirectory` was set at the time they were built. The model
+    /// directory CAN change between loads — a re-downloaded checkpoint at
+    /// the same path, or a different DeepSeek-V4 version entirely — and a
+    /// stale `SafetensorsLayout`/`BaseConfiguration` would silently try to
+    /// serve byte ranges computed against the OLD checkpoint's shard
+    /// layout. `modelDirectory` itself and `enabled` are intentionally
+    /// left untouched: the next load's setup path (same one that runs on
+    /// the very first load) is responsible for pointing `modelDirectory`
+    /// at the new checkpoint and flipping `enabled`, exactly as it already
+    /// does today.
+    public static func purgeCache() {
+        cache.purgeAll()
+        cachedStore = nil
+        cachedBaseConfiguration = nil
+        cachedPrefetchCoordinator = nil
+    }
+
+    /// Resize the shared expert cache's byte budget, evicting immediately
+    /// if the new budget is smaller than current occupancy. Replaces the
+    /// old "static let, sized once from `DSV4_EXPERT_CACHE_GB` on first
+    /// access, can't resize" limitation — a provider reloading with a
+    /// different `expert_cache_gb` now calls this instead of relying on
+    /// the environment variable being read exactly once per process.
+    ///
+    /// `DSV4_EXPERT_CACHE_GB` / `ExpertCache.budgetFromEnv()` remains the
+    /// bootstrap value `cache` is constructed with (still needed for
+    /// out-of-process consumers like the CLI smoke harness that never call
+    /// this setter), but any in-process caller that knows the desired
+    /// budget should call this directly rather than mutating the
+    /// environment after the process has started (env vars are read once
+    /// at cache-construction time, not on every access).
+    public static func setCacheBudgetBytes(_ bytes: Int) {
+        cache.setByteBudget(bytes)
     }
 
     /// Reads `config.json`'s `quantization` dict for a given module path
