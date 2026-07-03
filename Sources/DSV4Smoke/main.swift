@@ -174,7 +174,16 @@ struct DSV4Smoke {
                         exit(64)
                     }
                     let cache = lm.makeCache(parameters: GenerateParameters())
-                    let logits = lm(MLXArray(ids.map(Int32.init), [1, ids.count]), cache: cache)
+                    let (hidden, _) = lm.model.forward(
+                        MLXArray(ids.map(Int32.init), [1, ids.count]),
+                        cache: cache, returnRawHidden: false)
+                    let hLast = hidden[0, -1, 0...].asType(.float32)
+                    eval(hLast)
+                    print(String(format: "[hidden] last absMax=%.5e mean=%+.5e l2=%.4f",
+                        MLX.abs(hLast).max().item(Float.self),
+                        hLast.mean().item(Float.self),
+                        MLX.sqrt(hLast.square().sum()).item(Float.self)))
+                    let logits = lm.lmHead(hidden)
                     let last = logits[0, -1, 0...].asType(.float32)
                     eval(last)
                     let vals = last.asArray(Float.self)

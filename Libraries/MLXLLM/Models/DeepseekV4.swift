@@ -1649,7 +1649,9 @@ public class DeepseekV4ModelInner: Module {
     }
 
     /// Forward with optional return of the raw 4D hidden state (for MTP).
-    func forward(
+    /// Public so out-of-module harnesses (DSV4Smoke) can probe the pre-head
+    /// hidden state for parity debugging.
+    public func forward(
         _ inputIds: MLXArray,
         cache: [any KVCache]?,
         returnRawHidden: Bool
@@ -1703,7 +1705,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     var args: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
-    @ModuleInfo(key: "lm_head") var lmHead: Linear
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear
 
     /// MTP prediction blocks. Non-nil only when `_deepseekV4MTPEnabled == true` at init time.
     var mtp: [DeepseekV4MTPBlock]?
