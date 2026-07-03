@@ -32,6 +32,19 @@ public protocol ToolCallParser: Sendable {
     /// - Returns: A `ToolCall` if parsing succeeds, `nil` otherwise
     func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall?
 
+    /// Parse the content into zero or more `ToolCall`s.
+    ///
+    /// Most formats emit exactly one call per tagged block, so the default
+    /// implementation wraps `parse(content:tools:)`. Formats whose wrapper
+    /// block can contain multiple invocations (e.g. DeepSeek-V4's DSML
+    /// `<｜DSML｜tool_calls>` block, which may hold several `<｜DSML｜invoke>`
+    /// elements) override this to return all of them in document order.
+    /// - Parameters:
+    ///   - content: The text content to parse (may include tags)
+    ///   - tools: Optional tool schemas for type-aware parsing
+    /// - Returns: All `ToolCall`s found, in order. Empty if none parsed.
+    func parseMultiple(content: String, tools: [[String: any Sendable]]?) -> [ToolCall]
+
     /// Parse remaining buffered content at end-of-sequence.
     ///
     /// Called when generation ends to extract any tool calls still in the buffer.
@@ -52,6 +65,10 @@ extension ToolCallParser {
         ([endTag].compactMap { $0 } + alternateEndTags)
     }
 
+    public func parseMultiple(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        parse(content: content, tools: tools).map { [$0] } ?? []
+    }
+
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         let startTags = acceptedStartTags
         if let startTag = startTags.first {
@@ -63,12 +80,9 @@ extension ToolCallParser {
                 normalized
                 .components(separatedBy: startTag)
                 .filter { !$0.isEmpty }
-                .compactMap { parse(content: $0, tools: tools) }
+                .flatMap { parseMultiple(content: $0, tools: tools) }
         } else {
-            guard let toolCall = parse(content: toolCallBuffer, tools: tools) else {
-                return []
-            }
-            return [toolCall]
+            return parseMultiple(content: toolCallBuffer, tools: tools)
         }
     }
 }
@@ -128,6 +142,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{"k":"v"}<|call|>`
     case harmony
 
+    /// DeepSeek-V4 DSML format with invoke/parameter tags wrapped in a
+    /// `tool_calls` block. A single block may contain multiple `invoke`
+    /// elements, each producing its own `ToolCall` (see `parseMultiple`).
+    /// Example: `<｜DSML｜tool_calls><｜DSML｜invoke name="f"><｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`
+    case dsml
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -155,6 +175,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return Llama3ToolCallParser()
         case .harmony:
             return HarmonyToolCallParser()
+        case .dsml:
+            return DSMLToolCallParser()
         }
     }
 
@@ -234,6 +256,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Mistral3 family (mistral3, mistral3_text, etc.)
         if type.hasPrefix("mistral3") {
             return .mistral
+        }
+
+        // DeepSeek-V4 family (deepseek_v4, deepseek_v4_flash, etc.) — DSML
+        // tool-call syntax, distinct from DeepSeek-R1's plain <think> format.
+        if type.hasPrefix("deepseek_v4") {
+            return .dsml
         }
 
         return nil

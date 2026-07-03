@@ -273,10 +273,10 @@ public class ToolCallProcessor {
                 let trailingToken = separateToken(
                     from: &toolCallBuffer, separators: endTags, returnLeading: false)
 
-                // Parse the tool call using the parser
-                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
-                    toolCalls.append(toolCall)
-                }
+                // Parse the tool call(s) using the parser. Most formats emit a
+                // single call per block; DSML's `tool_calls` wrapper can hold
+                // several `invoke` elements, all extracted here in order.
+                toolCalls.append(contentsOf: parser.parseMultiple(content: toolCallBuffer, tools: tools))
 
                 state = .normal
                 toolCallBuffer = ""

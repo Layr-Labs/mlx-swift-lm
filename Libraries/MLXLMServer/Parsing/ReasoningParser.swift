@@ -18,7 +18,7 @@ public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
         switch raw {
         case "none", "off", "disabled":
             self = .none
-        case "deepseek_r1", "deepseek", "r1", "think":
+        case "deepseek_r1", "deepseek", "deepseek_v4", "r1", "think":
             self = .deepseekR1
         case "qwen3", "qwen":
             self = .qwen3

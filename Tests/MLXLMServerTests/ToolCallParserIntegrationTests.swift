@@ -729,6 +729,9 @@ struct ToolCallParserIntegrationTests {
             case .llama3:
                 #expect(parser.startTag == nil)  // Llama 3 uses inline format
                 #expect(parser.endTag == nil)
+            case .dsml:
+                #expect(parser.startTag == "<｜DSML｜tool_calls>")
+                #expect(parser.endTag == "</｜DSML｜tool_calls>")
             }
         }
     }

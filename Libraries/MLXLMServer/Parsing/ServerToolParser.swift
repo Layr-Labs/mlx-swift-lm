@@ -46,6 +46,8 @@ public enum ServerToolParser {
             return .llama3
         case "harmony", "gpt_oss", "openai_harmony":
             return .harmony
+        case "dsml", "deepseek_v4":
+            return .dsml
         case .some(let name):
             throw ServerToolParserError.unsupported(name)
         case .none:

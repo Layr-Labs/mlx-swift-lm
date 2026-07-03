@@ -949,4 +949,208 @@ struct ToolTests {
         #expect(toolCall.function.arguments["location"] == .string("Tokyo, Japan"))
         #expect(toolCall.function.arguments["unit"] == .string("celsius"))
     }
+
+    // MARK: - DeepSeek-V4 DSML Format Tests
+
+    @Test("Test DSML Tool Call Parser - Single Invoke, String and JSON Parameters")
+    func testDSMLParserSingleInvoke() throws {
+        let parser = DSMLToolCallParser()
+        let content = """
+            <｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_weather">
+            <｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+            <｜DSML｜parameter name="unit" string="true">celsius</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            </｜DSML｜tool_calls>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Beijing"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test DSML Tool Call Parser - JSON-typed Parameters (number, bool, array, object)")
+    func testDSMLParserJSONParameters() throws {
+        let parser = DSMLToolCallParser()
+        let content = """
+            <｜DSML｜tool_calls>
+            <｜DSML｜invoke name="search">
+            <｜DSML｜parameter name="query" string="true">weather</｜DSML｜parameter>
+            <｜DSML｜parameter name="num_results" string="false">5</｜DSML｜parameter>
+            <｜DSML｜parameter name="verbose" string="false">true</｜DSML｜parameter>
+            <｜DSML｜parameter name="tags" string="false">["a", "b"]</｜DSML｜parameter>
+            <｜DSML｜parameter name="filter" string="false">{"lang": "en"}</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            </｜DSML｜tool_calls>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("weather"))
+        #expect(toolCall.function.arguments["num_results"] == .int(5))
+        #expect(toolCall.function.arguments["verbose"] == .bool(true))
+        #expect(toolCall.function.arguments["tags"] == .array([.string("a"), .string("b")]))
+        #expect(toolCall.function.arguments["filter"] == .object(["lang": .string("en")]))
+    }
+
+    @Test("Test DSML Tool Call Parser - Multiple Invokes in One Block")
+    func testDSMLParserMultipleInvokes() throws {
+        let parser = DSMLToolCallParser()
+        let content = """
+            <｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_weather">
+            <｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            <｜DSML｜invoke name="get_time">
+            <｜DSML｜parameter name="timezone" string="true">UTC</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            </｜DSML｜tool_calls>
+            """
+
+        // `parse` (single-call contract) returns the first invoke.
+        let first = try #require(parser.parse(content: content, tools: nil))
+        #expect(first.function.name == "get_weather")
+
+        // `parseMultiple` extracts every invoke, in document order.
+        let calls = parser.parseMultiple(content: content, tools: nil)
+        #expect(calls.count == 2)
+        #expect(calls[0].function.name == "get_weather")
+        #expect(calls[0].function.arguments["location"] == .string("Beijing"))
+        #expect(calls[1].function.name == "get_time")
+        #expect(calls[1].function.arguments["timezone"] == .string("UTC"))
+    }
+
+    @Test("Test DSML Format via ToolCallProcessor - Single Invoke")
+    func testDSMLFormatProcessorSingleInvoke() throws {
+        let processor = ToolCallProcessor(format: .dsml)
+        let content = """
+            <｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_weather">
+            <｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+            <｜DSML｜parameter name="unit" string="true">celsius</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            </｜DSML｜tool_calls>
+            """
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Beijing"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test DSML Format via ToolCallProcessor - Multiple Invokes Yield Multiple ToolCalls")
+    func testDSMLFormatProcessorMultipleInvokes() throws {
+        let processor = ToolCallProcessor(format: .dsml)
+        let content = """
+            <｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_weather">
+            <｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            <｜DSML｜invoke name="search">
+            <｜DSML｜parameter name="query" string="true">news</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            </｜DSML｜tool_calls>
+            """
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 2)
+        #expect(processor.toolCalls[0].function.name == "get_weather")
+        #expect(processor.toolCalls[0].function.arguments["location"] == .string("Beijing"))
+        #expect(processor.toolCalls[1].function.name == "search")
+        #expect(processor.toolCalls[1].function.arguments["query"] == .string("news"))
+    }
+
+    @Test("Test DSML Format via ToolCallProcessor - Text Before and After Block")
+    func testDSMLFormatProcessorTextSurroundingBlock() throws {
+        let processor = ToolCallProcessor(format: .dsml)
+        var content = ""
+
+        if let emitted = processor.processChunk("Let me check that for you.\n\n") {
+            content += emitted
+        }
+        _ = processor.processChunk(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Beijing</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        )
+        if let emitted = processor.processChunk("Done.") {
+            content += emitted
+        }
+
+        #expect(content == "Let me check that for you.\n\nDone.")
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls[0].function.name == "get_weather")
+    }
+
+    @Test("Test DSML Format via ToolCallProcessor - Markers Split Across Streaming Chunks")
+    func testDSMLFormatProcessorStreamingChunkSplit() throws {
+        let processor = ToolCallProcessor(format: .dsml)
+        // Split the block at arbitrary byte-unfriendly boundaries, including
+        // mid-marker splits of the fullwidth-pipe DSML token itself.
+        let chunks = [
+            "<｜DSML",
+            "｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜param",
+            "eter name=\"location\" string=\"true\">Bei",
+            "jing</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"fal",
+            "se\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_ca",
+            "lls>",
+        ]
+
+        var visibleText = ""
+        for chunk in chunks {
+            if let emitted = processor.processChunk(chunk) {
+                visibleText += emitted
+            }
+        }
+
+        #expect(visibleText.isEmpty)
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Beijing"))
+        #expect(toolCall.function.arguments["unit"] == .int(1))
+    }
+
+    @Test("Test DSML Tool Call Parser - Malformed Block Yields No Tool Calls")
+    func testDSMLParserMalformedBlock() throws {
+        let parser = DSMLToolCallParser()
+
+        // Missing closing </｜DSML｜invoke> tag.
+        let truncated = """
+            <｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_weather">
+            <｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+            </｜DSML｜tool_calls>
+            """
+        #expect(parser.parse(content: truncated, tools: nil) == nil)
+        #expect(parser.parseMultiple(content: truncated, tools: nil).isEmpty)
+
+        // Missing name attribute entirely.
+        let noName = """
+            <｜DSML｜tool_calls>
+            <｜DSML｜invoke>
+            <｜DSML｜parameter name="location" string="true">Beijing</｜DSML｜parameter>
+            </｜DSML｜invoke>
+            </｜DSML｜tool_calls>
+            """
+        #expect(parser.parse(content: noName, tools: nil) == nil)
+    }
+
+    @Test("Test DSML Format Inference from Model Type")
+    func testDSMLFormatInference() throws {
+        #expect(ToolCallFormat.infer(from: "deepseek_v4") == .dsml)
+        #expect(ToolCallFormat.infer(from: "DEEPSEEK_V4") == .dsml)
+        #expect(ToolCallFormat.infer(from: "deepseek_v4_flash") == .dsml)
+        // DeepSeek-R1/V3 are plain <think> models with a different (non-DSML)
+        // tool syntax and must not collapse onto .dsml via a bare prefix match.
+        #expect(ToolCallFormat.infer(from: "deepseek") == nil)
+        #expect(ToolCallFormat.infer(from: "deepseek_r1") == nil)
+        #expect(ToolCallFormat.infer(from: "deepseek_v3") == nil)
+
+        #expect(ToolCallFormat.dsml.rawValue == "dsml")
+        #expect(ToolCallFormat(rawValue: "dsml") == .dsml)
+    }
 }

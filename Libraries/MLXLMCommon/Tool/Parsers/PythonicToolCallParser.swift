@@ -67,13 +67,13 @@ public struct PythonicToolCallParser: ToolCallParser, Sendable {
                 toolCallBuffer
                 .components(separatedBy: startTag)
                 .filter { !$0.isEmpty }
-                .flatMap { parseMultiple(content: $0, tools: tools) }
+                .flatMap { parseAllCalls(content: $0, tools: tools) }
         } else {
-            return parseMultiple(content: toolCallBuffer, tools: tools)
+            return parseAllCalls(content: toolCallBuffer, tools: tools)
         }
     }
 
-    private func parseMultiple(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+    private func parseAllCalls(content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         var text = content
 
         if let end = endTag, let endRange = text.range(of: end) {
