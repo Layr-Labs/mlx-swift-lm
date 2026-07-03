@@ -228,10 +228,22 @@ struct DSV4Smoke {
                 let tokens: [Int]
                 if rawCopy {
                     tokens = context.tokenizer.encode(text: promptCopy, addSpecialTokens: true)
+                } else if let templated = try? context.tokenizer.applyChatTemplate(
+                    messages: [["role": "user", "content": promptCopy]],
+                    tools: nil, additionalContext: nil)
+                {
+                    tokens = templated
                 } else {
-                    tokens = try context.tokenizer.applyChatTemplate(
-                        messages: [["role": "user", "content": promptCopy]],
-                        tools: nil, additionalContext: nil)
+                    // DeepSeek-V4 checkpoints ship without a chat_template in
+                    // tokenizer_config.json but DO carry the DeepSeek chat
+                    // marker tokens. Fall back to the DeepSeek-V3-style turn
+                    // format so instruct-tuned weights see the chat shape
+                    // they were trained on (raw completion of a question
+                    // yields much less coherent output).
+                    let chat =
+                        "<｜begin▁of▁sentence｜><｜User｜>\(promptCopy)<｜Assistant｜>"
+                    tokens = context.tokenizer.encode(text: chat, addSpecialTokens: false)
+                    print("[prompt] no chat template; using DeepSeek turn format fallback")
                 }
                 print("[prompt] \(tokens.count) tokens")
 
