@@ -1557,12 +1557,23 @@ class DeepseekV4Block: Module {
         cache: (any KVCache)?,
         inputIds: MLXArray
     ) -> MLXArray {
+        let debug = ProcessInfo.processInfo.environment["DSV4_DEBUG_LAYER_NORMS"] == "2"
+        func probe(_ name: String, _ a: MLXArray) {
+            guard debug else { return }
+            let f = a.asType(.float32)
+            print(String(format: "[dsv4-block] %@ absMax=%.4e mean=%+.4e",
+                name, MLX.abs(f).max().item(Float.self), f.mean().item(Float.self)))
+        }
+
         // Attention sub-block
         var residual = x
         let (xAttn, postAttn, combAttn) = hcPre(
             x: residual, hcFn: attn_hc.fn, hcScale: attn_hc.scale, hcBase: attn_hc.base,
             hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps,
             normEps: config.rmsNormEps)
+        probe("hcPre.x", xAttn)
+        probe("hcPre.post", postAttn)
+        probe("hcPre.comb", combAttn)
 
         let attnOut: MLXArray
         let normedAttn = attnNorm(xAttn)
@@ -1575,8 +1586,10 @@ class DeepseekV4Block: Module {
         } else {
             fatalError("Unknown attention type in DeepseekV4Block")
         }
+        probe("attnOut", attnOut)
 
         let h = hcPost(x: attnOut, residual: residual, post: postAttn, comb: combAttn)
+        probe("postAttn.h", h)
 
         // FFN sub-block
         residual = h
@@ -1585,6 +1598,7 @@ class DeepseekV4Block: Module {
             hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps,
             normEps: config.rmsNormEps)
         let ffnOut = ffn(ffnNorm(xFfn), inputIds: inputIds)
+        probe("ffnOut", ffnOut)
         return hcPost(x: ffnOut, residual: residual, post: postFfn, comb: combFfn)
     }
 }

@@ -383,8 +383,11 @@ final class DeepseekV4Tests: XCTestCase {
         let model = makeModel(config)
 
         quantize(model: model) { path, module in
-            // Same predicate shape as Load.swift: quantize everything quantizable
-            // whose innermost dim fits the minimum supported group size (32).
+            // Mirror the real checkpoint's recipe: mxfp4 g32 for routed experts
+            // (switch_mlp), affine 4-bit for everything else quantizable.
+            if path.contains("switch_mlp") {
+                return (32, 4, .mxfp4)
+            }
             if let ml = module as? DeepseekV4MultiLinear, ml.weight.dim(-1) % 32 == 0 {
                 return (32, 4, .affine)
             }
