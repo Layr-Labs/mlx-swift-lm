@@ -530,4 +530,49 @@ final class ExpertStreamingTests: XCTestCase {
     func testStreamingMatchesResidentPrefill() throws {
         try assertStreamingMatchesResident(seqLen: 16)
     }
+
+    // MARK: - (e) shouldEvalChunk: conditional per-chunk sync
+
+    func testShouldEvalChunkAlwaysEvalsWhenMultipleChunks() {
+        // Multiple chunks in one forward call -- must ALWAYS eval so the
+        // next chunk's stacked tensors can reuse the freed memory, even
+        // when this chunk is tiny.
+        XCTAssertTrue(
+            StreamingQuantizedSwitchGLU.shouldEvalChunk(
+                totalChunksInThisCall: 2, chunkBytes: 1, evalThresholdBytes: 400 * 1024 * 1024))
+        XCTAssertTrue(
+            StreamingQuantizedSwitchGLU.shouldEvalChunk(
+                totalChunksInThisCall: 5, chunkBytes: 0, evalThresholdBytes: 400 * 1024 * 1024))
+    }
+
+    func testShouldEvalChunkSkipsSingleSmallChunk() {
+        // The decode fast path: exactly one chunk, comfortably under the
+        // threshold -- must NOT eval (this is the whole point of the fix).
+        let decodeChunkBytes = 6 * 13_600_000  // 6 experts, ~13.6 MB each
+        XCTAssertFalse(
+            StreamingQuantizedSwitchGLU.shouldEvalChunk(
+                totalChunksInThisCall: 1, chunkBytes: decodeChunkBytes,
+                evalThresholdBytes: 400 * 1024 * 1024))
+    }
+
+    func testShouldEvalChunkEvalsSingleChunkAboveThreshold() {
+        // Single chunk, but big enough to matter (e.g. an unusually large
+        // unique-expert count from batched decode) -- the byte-threshold
+        // safety net must still force an eval.
+        XCTAssertTrue(
+            StreamingQuantizedSwitchGLU.shouldEvalChunk(
+                totalChunksInThisCall: 1, chunkBytes: 500 * 1024 * 1024,
+                evalThresholdBytes: 400 * 1024 * 1024))
+    }
+
+    func testShouldEvalChunkBoundaryIsExclusive() {
+        let threshold = 400 * 1024 * 1024
+        XCTAssertFalse(
+            StreamingQuantizedSwitchGLU.shouldEvalChunk(
+                totalChunksInThisCall: 1, chunkBytes: threshold, evalThresholdBytes: threshold),
+            "exactly at threshold must NOT force an eval (strictly greater-than)")
+        XCTAssertTrue(
+            StreamingQuantizedSwitchGLU.shouldEvalChunk(
+                totalChunksInThisCall: 1, chunkBytes: threshold + 1, evalThresholdBytes: threshold))
+    }
 }

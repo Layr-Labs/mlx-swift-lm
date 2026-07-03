@@ -50,6 +50,12 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
     /// defeats the point of streaming. Override via `DSV4_STREAM_CHUNK_EXPERTS`.
     private let maxExpertsPerChunk: Int
 
+    /// Byte threshold above which a chunk's stacked weights are eval'd
+    /// immediately even when it's the ONLY chunk in this forward call. See
+    /// `shouldEvalChunk` for the full reasoning. Override via
+    /// `DSV4_STREAM_EVAL_THRESHOLD_MB`.
+    private let evalThresholdBytes: Int
+
     public init(
         inputDims: Int,
         hiddenDims: Int,
@@ -61,7 +67,8 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         cache: ExpertCache,
         store: ExpertShardStore,
         activationProduct: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray,
-        maxExpertsPerChunk: Int? = nil
+        maxExpertsPerChunk: Int? = nil,
+        evalThresholdBytes: Int? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -74,6 +81,7 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         self.store = store
         self.activationProduct = activationProduct
         self.maxExpertsPerChunk = maxExpertsPerChunk ?? Self.chunkSizeFromEnv()
+        self.evalThresholdBytes = evalThresholdBytes ?? Self.evalThresholdBytesFromEnv()
     }
 
     private static func chunkSizeFromEnv() -> Int {
@@ -83,6 +91,20 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
             return n
         }
         return 16
+    }
+
+    /// Reads `DSV4_STREAM_EVAL_THRESHOLD_MB` (int, default 400). 400 MiB
+    /// comfortably exceeds a full `maxExpertsPerChunk`-sized (default 16)
+    /// mxfp4 chunk (~13.6 MB/expert x 16 = ~218 MB), which is the common
+    /// decode case this threshold is meant to let through WITHOUT an eval —
+    /// see `shouldEvalChunk`.
+    private static func evalThresholdBytesFromEnv() -> Int {
+        if let raw = ProcessInfo.processInfo.environment["DSV4_STREAM_EVAL_THRESHOLD_MB"],
+            let mb = Int(raw), mb > 0
+        {
+            return mb * 1024 * 1024
+        }
+        return 400 * 1024 * 1024
     }
 
     /// Same call surface as `SwitchGLU.callAsFunction`: `x` is the MoE
@@ -102,7 +124,13 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         // everything downstream — run-length grouping, chunk boundaries,
         // local-id remap — is Swift bookkeeping over this array. The actual
         // activations and weights never leave MLX/GPU memory.
-        eval(idxSorted)
+        //
+        // No explicit `eval(idxSorted)` here: `MLXArray.asArray` already
+        // funnels through the same lazy-eval path internally (mlx-swift's
+        // `eval()`/`item()`/`asArray()`/`asData()` all synchronize through
+        // the same `evalLock` — see mlx-swift's MLXArray.swift). Calling
+        // both was a redundant second synchronization point per forward
+        // pass for no benefit.
         let sortedExpertIds = idxSorted.asArray(Int32.self)
         let n = sortedExpertIds.count
 
@@ -127,8 +155,9 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         // already in ascending-expert / ascending-row order, a chunk's
         // combined row range is exactly [first group's start, last group's
         // end) — a single contiguous slice, no gather needed.
+        let totalChunks = (groups.count + maxExpertsPerChunk - 1) / maxExpertsPerChunk
         var chunkResults: [MLXArray] = []
-        chunkResults.reserveCapacity((groups.count + maxExpertsPerChunk - 1) / maxExpertsPerChunk)
+        chunkResults.reserveCapacity(totalChunks)
 
         var gi = 0
         while gi < groups.count {
@@ -153,6 +182,7 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
             let localIdxChunk = MLXArray(localIds)
 
             let fetched = fetchChunk(experts: chunkExperts)
+            let chunkBytes = chunkExperts.reduce(0) { $0 + (fetched[$1]?.byteCount ?? 0) }
             let stackedGateW = MLX.stacked(chunkExperts.map { fetched[$0]!.gateWeight })
             let stackedGateS = MLX.stacked(chunkExperts.map { fetched[$0]!.gateScales })
             let stackedUpW = MLX.stacked(chunkExperts.map { fetched[$0]!.upWeight })
@@ -177,13 +207,18 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
                 rhsIndices: localIdxChunk, transpose: true,
                 groupSize: groupSize, bits: bits, mode: mode, sortedIndices: true)
 
-            // Force this chunk's compute now so its (potentially large)
-            // stacked weight arrays are freed before the next chunk's fetch.
-            // Without this, MLX's lazy graph keeps every chunk's stacked
-            // tensors alive until the single eval() the caller eventually
-            // runs on the model output — reintroducing the exact resident-
-            // memory blowup streaming is meant to avoid.
-            eval(down)
+            // Only force this chunk's compute now if NOT doing so risks a
+            // real memory blowup -- see `shouldEvalChunk`. Every eval() is a
+            // full GPU sync that stalls MLX's async command-buffer
+            // pipeline; at decode (1 chunk/layer x 41 layers) an
+            // unconditional eval() here was 41 forced round-trip syncs per
+            // generated token.
+            if Self.shouldEvalChunk(
+                totalChunksInThisCall: totalChunks, chunkBytes: chunkBytes,
+                evalThresholdBytes: evalThresholdBytes)
+            {
+                eval(down)
+            }
             chunkResults.append(down)
 
             gi = end
@@ -192,6 +227,43 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         let ySorted = chunkResults.count == 1 ? chunkResults[0] : concatenated(chunkResults, axis: 0)
         let y = scatterUnsort(x: ySorted, invOrder: inverseOrder, shape: indices.shape)
         return MLX.squeezed(y, axis: -2)
+    }
+
+    /// Whether to force-eval a chunk's compute immediately, rather than
+    /// leaving it in MLX's lazy graph until the caller's own eventual
+    /// eval() on the full model output.
+    ///
+    /// TWO independent reasons to eval, matching the two ways skipping it
+    /// can blow up memory:
+    ///
+    /// 1. `totalChunksInThisCall > 1` (this forward call needed MULTIPLE
+    ///    chunks — the common prefill case when a big batch touches more
+    ///    unique experts than `maxExpertsPerChunk`). Without evaling each
+    ///    chunk, EVERY chunk's stacked weight tensors for THIS SINGLE LAYER
+    ///    stay resident simultaneously until the final eval — reintroducing
+    ///    a resident-sized blowup within one layer, exactly what chunking
+    ///    exists to avoid. This is unconditional: always eval when there's
+    ///    a next chunk waiting to reuse that memory.
+    ///
+    /// 2. `chunkBytes > evalThresholdBytes` even for a call with only ONE
+    ///    chunk. The default threshold (400 MiB) is comfortably above a
+    ///    full `maxExpertsPerChunk`-sized (16) mxfp4 chunk (~218 MB) — the
+    ///    common single-chunk DECODE case — so decode's one chunk per layer
+    ///    is normally left un-evaluated. Across 41 MoE layers those
+    ///    un-evaluated chunks accumulate in the lazy graph until the
+    ///    generate loop's own eval, which is fine at ~41 x ~80 MB (a
+    ///    typical topK=6 decode chunk) ≈ 3 GB of transient memory — but a
+    ///    pathological single-chunk call with an unusually large unique-
+    ///    expert count (e.g. continuous batching with many concurrent
+    ///    decode sequences routing to many distinct experts, all still
+    ///    fitting under `maxExpertsPerChunk`) could make that 41-layer
+    ///    accumulation large enough to matter. The threshold is the safety
+    ///    valve for that case: it forces an eval (and therefore a free)
+    ///    once a single chunk alone is already big.
+    static func shouldEvalChunk(
+        totalChunksInThisCall: Int, chunkBytes: Int, evalThresholdBytes: Int
+    ) -> Bool {
+        totalChunksInThisCall > 1 || chunkBytes > evalThresholdBytes
     }
 
     /// Stack a chunk's per-expert bias arrays, or return nil if this
