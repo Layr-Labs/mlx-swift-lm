@@ -28,6 +28,23 @@ private func prefetchShards(_ urls: [URL]) {
 private func prefetchShards(_ urls: [URL]) { }
 #endif
 
+/// Sendable wrapper around a ``StreamedWeightsModel``'s key predicate so the
+/// parallel shard closures can consult it. The predicate is a pure function
+/// of the key string (plus process-global config), never of mutable model
+/// state, so sharing it across the concurrent reads is safe.
+private final class StreamedWeightFilter: @unchecked Sendable {
+    private let model: StreamedWeightsModel
+
+    init?(model: BaseLanguageModel) {
+        guard let streamed = model as? StreamedWeightsModel else { return nil }
+        self.model = streamed
+    }
+
+    func shouldStream(_ key: String) -> Bool {
+        model.shouldStreamWeight(key: key)
+    }
+}
+
 /// Lock-protected scratch space used by the parallel shard reader. Wrapped in
 /// a final class so Swift 6 strict concurrency can see we mean to share it
 /// across the concurrent closures.
@@ -103,10 +120,21 @@ public func loadWeights(
     typealias ShardResult = (weights: [String: MLXArray], metadata: [String: String])
     let shared = ParallelShardState(shardCount: shardURLs.count)
     let urls = shardURLs  // immutable Sendable snapshot for the closure
+    let streamedFilter = StreamedWeightFilter(model: model)
 
     DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
         do {
-            let (w, m) = try loadArraysAndMetadata(url: urls[idx])
+            var (w, m) = try loadArraysAndMetadata(url: urls[idx])
+            // Weights served by a streaming path (StreamedWeightsModel) must
+            // be dropped BEFORE the eval below, while they are still lazy
+            // Load nodes whose bytes have not been read. Waiting for
+            // sanitize() to drop them is too late: every shard has been
+            // eval'd by then, so a 141 GB checkpoint would transiently
+            // materialize in full — the exact resident-memory blowup expert
+            // streaming exists to avoid.
+            if let streamedFilter {
+                w = w.filter { !streamedFilter.shouldStream($0.key) }
+            }
             if !w.isEmpty {
                 eval(Array(w.values))
             }

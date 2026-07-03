@@ -2078,3 +2078,22 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     public var loraLayers: [Module] { model.layers }
 }
+
+// MARK: - StreamedWeightsModel
+
+extension DeepseekV4Model: StreamedWeightsModel {
+    /// Consulted by `loadWeights` BEFORE shard materialization: the parallel
+    /// shard reader evals every shard as it reads it, so waiting for
+    /// `sanitize` to drop switch_mlp keys would transiently materialize the
+    /// full ~141 GB checkpoint (OOM on a 128 GB box). Keys matched here stay
+    /// unevaluated lazy loads and their bytes are never read.
+    ///
+    /// Keys are pre-`sanitize` spellings: mlx-canonical checkpoints use
+    /// `model.layers.N.ffn.switch_mlp....`, older exports `layers.N....` —
+    /// both contain `.ffn.switch_mlp.`. MTP keys (`mtp.`) are excluded
+    /// because MTP layers always keep the resident path (see DeepseekV4MoE).
+    public func shouldStreamWeight(key: String) -> Bool {
+        guard DeepseekV4ExpertStreaming.enabled else { return false }
+        return !key.hasPrefix("mtp.") && key.contains(".ffn.switch_mlp.")
+    }
+}
