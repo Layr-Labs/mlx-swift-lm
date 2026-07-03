@@ -384,6 +384,73 @@ final class DeepseekV4Tests: XCTestCase {
             "shared experts must compute exact (unclamped) SwiGLU")
     }
 
+    /// Regression for commit 3e205c1: `SwitchGLU`'s single-point silu probe
+    /// (evaluates the activation closure at x=1.0) mis-detects DeepSeek's
+    /// clamped SwiGLU as plain SiLU and silently drops BOTH clamps
+    /// (`min(gate, limit)` and `clip(up, ±limit)`). `testSharedExpertsAreNotClamped`
+    /// above only pins the shared experts' UNclamped path; this pins that the
+    /// ROUTED experts (via `switchMLP`, built through the `activationProduct:`
+    /// initializer specifically to dodge that probe) actually clamp.
+    ///
+    /// Bypasses the gate/router entirely and calls `switchMLP` directly with
+    /// an explicit expert index — simpler than steering the router, and the
+    /// module is internal so `@testable import` gives access.
+    func testRoutedExpertsAreClamped() throws {
+        let config = try makeConfig()
+        let moe = DeepseekV4MoE(config: config, layerIdx: 3)
+        let switchMLP = try XCTUnwrap(
+            moe.switchMLP,
+            "resident switch_mlp must be present (DeepseekV4ExpertStreaming.enabled must be false)")
+
+        let hiddenSize = config.hiddenSize  // 32
+        let expertIdx = 2
+
+        // Diagonal per-expert weights so gate/up pre-activations reduce to a
+        // simple scalar per element, easy to hand-compute against.
+        var gateW = [Float](repeating: 0, count: config.nRoutedExperts * hiddenSize * hiddenSize)
+        var upW = [Float](repeating: 0, count: config.nRoutedExperts * hiddenSize * hiddenSize)
+        var downW = [Float](repeating: 0, count: config.nRoutedExperts * hiddenSize * hiddenSize)
+        for i in 0 ..< hiddenSize {
+            gateW[expertIdx * hiddenSize * hiddenSize + i * hiddenSize + i] = 3.0
+            upW[expertIdx * hiddenSize * hiddenSize + i * hiddenSize + i] = -4.0
+            downW[expertIdx * hiddenSize * hiddenSize + i * hiddenSize + i] = 0.1
+        }
+        try switchMLP.update(
+            parameters: ModuleParameters.unflattened([
+                "gate_proj.weight": MLXArray(gateW, [config.nRoutedExperts, hiddenSize, hiddenSize]),
+                "up_proj.weight": MLXArray(upW, [config.nRoutedExperts, hiddenSize, hiddenSize]),
+                "down_proj.weight": MLXArray(downW, [config.nRoutedExperts, hiddenSize, hiddenSize]),
+            ]), verify: .none)
+
+        // gatePre = 3*5 = 15 (> limit 10); upPre = -4*5 = -20 (< -limit).
+        let x = MLXArray(Array(repeating: Float(5.0), count: hiddenSize), [1, 1, hiddenSize])
+        let indices = MLXArray([Int32(expertIdx)], [1, 1, 1])
+
+        let out = switchMLP(x, indices)
+        eval(out)
+        let got = out.reshaped([hiddenSize]).asArray(Float.self)
+
+        let limit = config.swiguLimit
+        let gatePre: Float = 15.0
+        let upPre: Float = -20.0
+        func siluScalar(_ v: Float) -> Float { v / (1 + exp(-v)) }
+
+        let gateClamped = min(gatePre, limit)
+        let upClamped = max(-limit, min(upPre, limit))
+        let clampedExpected = 0.1 * (siluScalar(gateClamped) * upClamped)
+
+        let unclampedExpected = 0.1 * (siluScalar(gatePre) * upPre)
+
+        for (i, v) in got.enumerated() {
+            XCTAssertEqual(
+                v, clampedExpected, accuracy: 1e-4,
+                "routed expert output[\(i)] must equal down(silu(min(gate,limit)) * clip(up,±limit))")
+        }
+        XCTAssertGreaterThan(
+            abs(unclampedExpected - clampedExpected), 1e-2,
+            "fixture must actually exercise the clamp: unclamped and clamped values must differ")
+    }
+
     // MARK: - Cache semantics
 
     func testMakeCacheLayoutFollowsCompressRatios() throws {
