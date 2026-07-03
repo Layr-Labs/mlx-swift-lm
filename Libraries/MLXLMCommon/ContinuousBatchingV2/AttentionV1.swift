@@ -57,11 +57,15 @@ enum CBv2AttentionV1 {
     ///   (`cap * tanh(qk / cap)` before softmax, Gemma-2 style). When set,
     ///   BOTH phases take the composed reference path (SDPA cannot express
     ///   softcapping) — still one pinned path per phase.
+    /// - spanContext: non-nil ONLY for a vision prefill chunk containing
+    ///   image spans (a NEW pinned path — see `spanChunkMask`). Text-only
+    ///   chunks and decode always pass nil and are untouched.
     /// - Returns `[B, queryHeads, L, headDim]`.
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float? = nil
+        scale: Float, sinks: MLXArray?, softcap: Float? = nil,
+        spanContext: CBv2SpanChunkContext? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -74,10 +78,20 @@ enum CBv2AttentionV1 {
             B == 1 || L == 1,
             "CBv2AttentionV1: ragged shapes are impossible in v2 — decode is [B, 1], prefill is [1, chunk]"
         )
+        precondition(
+            spanContext == nil || (B == 1 && L > 1),
+            "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
+        )
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if B == 1 {
             let (cachedKeys, cachedValues) = rows[0].update(keys: keys, values: values)
+            if let spanContext, L > 1 {
+                return attendSpanChunk(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                    L: L, kL: cachedKeys.dim(2), window: window(of: kind),
+                    context: spanContext, sinks: effectiveSinks, softcap: softcap)
+            }
             return attend(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
@@ -123,7 +137,8 @@ enum CBv2AttentionV1 {
     ///    so the mask-free decode path stays exact.
     static func attendBorrowing(
         sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind, kind: CBv2LayerKind,
-        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil
+        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil,
+        spanContext: CBv2SpanChunkContext? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -135,10 +150,24 @@ enum CBv2AttentionV1 {
             B == 1 || L == 1,
             "CBv2AttentionV1: ragged shapes are impossible in v2 — decode is [B, 1], prefill is [1, chunk]"
         )
+        precondition(
+            spanContext == nil || (B == 1 && L > 1),
+            "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
+        )
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if B == 1, L > 1 {
             let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRows[0])
+            if let spanContext {
+                // Same overlay as the storage-owning path: the MLXVLM
+                // reference applies the bidirectional-span overlay to the
+                // masks KV-shared layers reuse (they share their source's
+                // layer type, hence its window).
+                return attendSpanChunk(
+                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                    L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
+                    context: spanContext, sinks: effectiveSinks, softcap: softcap)
+            }
             return attend(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
@@ -214,5 +243,56 @@ enum CBv2AttentionV1 {
             mask = mask .&& (kpos .> (qpos - Int32(window)))
         }
         return mask
+    }
+
+    // MARK: - Vision span-chunk path (pinned; span-containing chunks only)
+
+    /// Boolean mask for a span-containing prefill chunk: the causal(∧window)
+    /// base OR bidirectional-within-block, matching MLXVLM Gemma4's
+    /// `gemma4BidirectionalVisionMask` overlay exactly (`baseMask ∨
+    /// sameBlock`, where sameBlock un-masks BOTH forward attention inside an
+    /// image block and window-evicted backward attention inside it).
+    ///
+    /// Coordinates: queries are the last `L` absolute positions before
+    /// `context.chunkEnd`; keys are the last `kL` (both backends' chunk
+    /// views end at the chunk's last token). Blocks are absolute and fully
+    /// inside the chunk, so every same-block (q, k) pair is present in the
+    /// returned KV view by construction.
+    static func spanChunkMask(
+        L: Int, kL: Int, window: Int?, context: CBv2SpanChunkContext
+    ) -> MLXArray {
+        precondition(L > 1, "span chunks are multi-token by construction")
+        var mask = boolMask(L: L, kL: kL, window: window)!
+        let chunkEnd = context.chunkEnd
+        let qAbs = MLXArray(Int32(chunkEnd - L) ..< Int32(chunkEnd)).expandedDimensions(axis: 1)
+        let kAbs = MLXArray(Int32(chunkEnd - kL) ..< Int32(chunkEnd)).expandedDimensions(axis: 0)
+        for block in context.blocks {
+            let lo = Int32(block.tokenOffset)
+            let hi = Int32(block.end)
+            let qIn = (qAbs .>= lo) .&& (qAbs .< hi)  // [L, 1]
+            let kIn = (kAbs .>= lo) .&& (kAbs .< hi)  // [1, kL]
+            mask = mask .|| (qIn .&& kIn)
+        }
+        return mask
+    }
+
+    /// Span-chunk attention dispatch: always an explicit boolean array mask
+    /// (the bidirectional overlay cannot ride the symbolic `.causal` mode).
+    /// One pinned path per configuration — plain SDPA, or the composed fp32
+    /// reference when a softcap is configured (same split as `attend`).
+    private static func attendSpanChunk(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
+        L: Int, kL: Int, window: Int?, context: CBv2SpanChunkContext,
+        sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray {
+        let mask = spanChunkMask(L: L, kL: kL, window: window, context: context)
+        guard let softcap else {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale,
+                mask: .array(mask), sinks: sinks)
+        }
+        return PagedAttentionReference.composedAttention(
+            queries: queries, keys: keys, values: values, scale: scale,
+            boolMask: mask, sinks: sinks, softcap: softcap)
     }
 }

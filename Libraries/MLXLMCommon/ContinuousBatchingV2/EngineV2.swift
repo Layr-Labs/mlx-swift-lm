@@ -275,6 +275,21 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
         }
 
+        // Vision requests: validate + materialize the image embeddings ONCE,
+        // here on the submit thread (the one provider call per request —
+        // never on the engine step thread). All multimodal failures are
+        // submit-time throws (`CBv2MultimodalError`); nothing reaches the
+        // scheduler.
+        var multimodal: CBv2ResolvedMultimodal? = nil
+        if let input = request.multimodal {
+            multimodal = try CBv2MultimodalPlan.resolve(
+                input,
+                promptTokenCount: request.promptTokens.count,
+                model: loop.model,
+                cacheProvider: loop.cacheProvider,
+                maxBatchedTokensPerStep: schedulerConfig.maxBatchedTokensPerStep)
+        }
+
         // Truthful admission: reject what could NEVER fit; everything else
         // is admitted optimistically (preemption is the backstop).
         guard
@@ -305,7 +320,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             gauges.endSubmit()
             throw CBv2SchedulerError.duplicateRequestID(request.id)
         }
-        loop.enqueue(request, adoption: makeAdoption(for: request))
+        loop.enqueue(request, adoption: makeAdoption(for: request), multimodal: multimodal)
         return stream.makeStream()
     }
 
@@ -317,6 +332,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// it in every outcome.
     private func makeAdoption(for request: CBv2Request) -> CBv2PrefixAdoption? {
         guard let prefixCache else { return nil }
+        // Vision requests NEVER look up the prefix cache (v1 policy — the
+        // donation side is excluded symmetrically in
+        // `EngineLoopV2.donationIntent`): token-id hashes cannot see image
+        // content, so an adopted "hit" over another request's image span
+        // would be silently wrong KV.
+        guard request.multimodal == nil else { return nil }
         guard
             let hit = prefixCache.lookup(
                 tokens: request.promptTokens, layerKinds: layerKinds,

@@ -73,12 +73,54 @@ public final class CBv2ScheduledRequest {
     public var isDecodeReady: Bool { effectiveTokenCount - numComputedTokens == 1 }
     var remainingTokens: Int { effectiveTokenCount - numComputedTokens }
 
+    /// Coalesced multimodal mask blocks (absolute prompt positions; adjacent
+    /// image spans merge — they attend bidirectionally as one block). Empty
+    /// for text requests. Chunk planning must NEVER split one of these
+    /// across prefill chunks (`snappedChunkTokens`); the whole block's
+    /// bidirectional attention needs all of its keys in one forward.
+    public let multimodalBlocks: [CBv2ImageSpan]
+
     init(request: CBv2Request, arrivalSeq: UInt64, submittedAt: Date, deadline: Date?) {
         self.request = request
         self.arrivalSeq = arrivalSeq
         self.submittedAt = submittedAt
         self.deadline = deadline
         self.tokens = request.promptTokens
+        self.multimodalBlocks = CBv2MultimodalPlan.coalescedBlocks(
+            spans: request.multimodal?.spans ?? [])
+    }
+
+    /// Snap a proposed prefill chunk `[start, start + proposed)` so no
+    /// multimodal block is split across chunk boundaries:
+    ///  - a proposed end STRICTLY inside a block SHRINKS to the block's
+    ///    start (the block rides a later chunk whole), unless the chunk
+    ///    begins exactly at that block — then it EXTENDS to the block's end
+    ///    (may exceed `prefillChunkSize`; that is the intended "snap over"),
+    ///    bounded by the step's remaining token `budget`;
+    ///  - returns 0 when the block cannot fit this step's remaining budget
+    ///    (the row simply waits for a step with more headroom — submit-time
+    ///    validation guarantees every block fits a FULL step budget).
+    /// Text requests (no blocks) return `proposed` unchanged.
+    func snappedChunkTokens(start: Int, proposed: Int, budget: Int) -> Int {
+        guard proposed > 0, !multimodalBlocks.isEmpty else { return proposed }
+        // Chunks never split blocks, so a chunk can never START strictly
+        // inside one (preemption restarts at 0; adoption is excluded for
+        // multimodal requests).
+        assert(
+            !multimodalBlocks.contains { start > $0.tokenOffset && start < $0.end },
+            "CBv2 multimodal: chunk start \(start) lies inside a block — a previous chunk split it"
+        )
+        let end = start + proposed
+        guard let block = multimodalBlocks.first(where: { $0.tokenOffset < end && end < $0.end })
+        else { return proposed }
+        if block.tokenOffset > start {
+            return block.tokenOffset - start
+        }
+        // The chunk begins at the block's start: the whole block must ride
+        // this chunk (blocks are maximal contiguous runs, so the extended
+        // end lands on a block edge, never inside another block).
+        let needed = block.end - start
+        return needed <= budget ? needed : 0
     }
 }
 
@@ -183,6 +225,16 @@ public final class SchedulerV2 {
             var n = rec.remainingTokens
             if n > 1 { n = min(n, config.prefillChunkSize) }  // chunk prefill only
             n = min(n, budget)
+            // Vision requests: never split a multimodal block across chunks
+            // (snap to block edges; extend over prefillChunkSize when the
+            // chunk starts at a block, bounded by the step budget). 0 ⇒ the
+            // block cannot fit this step's remaining budget — skip the row,
+            // it retries when budget frees up.
+            n = rec.snappedChunkTokens(start: rec.numComputedTokens, proposed: n, budget: budget)
+            if n <= 0 {
+                idx += 1
+                continue
+            }
 
             // Reserve KV headroom; preemption is the backstop.
             var reserved = capacity == nil
@@ -243,7 +295,13 @@ public final class SchedulerV2 {
                 // A preempted request whose in-flight sample is unconfirmed
                 // cannot re-prefill yet (its token values are not host-visible).
                 guard rec.pendingSamples == 0 else { break }
-                let chunk = min(rec.remainingTokens, config.prefillChunkSize, budget)
+                var chunk = min(rec.remainingTokens, config.prefillChunkSize, budget)
+                // Same block snapping as the running path. 0 ⇒ this step's
+                // remaining budget cannot cover the request's first block —
+                // stop admitting (FCFS: younger waiters must not jump a
+                // block-bearing elder).
+                chunk = rec.snappedChunkTokens(
+                    start: rec.numComputedTokens, proposed: chunk, budget: budget)
                 guard chunk > 0 else { break }
                 if let capacity {
                     do { try capacity.reserve(id: rec.id, additionalTokens: chunk) } catch {

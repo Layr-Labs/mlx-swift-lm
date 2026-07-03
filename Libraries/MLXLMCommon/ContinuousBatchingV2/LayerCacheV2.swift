@@ -53,6 +53,16 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// the same parameter); never part of the per-call contract surface.
     public let attentionSoftcap: Float?
 
+    /// Vision span context for the CURRENT span-containing prefill chunk,
+    /// bound by the engine immediately before that chunk's graph build and
+    /// unbound immediately after (`CBv2SpanMaskBinding`). ALWAYS nil outside
+    /// that window, so decode, text chunks, and other requests' chunks take
+    /// the untouched pinned paths. The engine only ever binds it while the
+    /// cache's rows are exactly the one vision request's row (prefill is
+    /// per-request [1, chunk]), so the span mask can never leak onto a
+    /// batchmate's computation.
+    private(set) var boundSpanContext: CBv2SpanChunkContext?
+
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
         attentionSoftcap: Float? = nil
@@ -104,7 +114,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+            scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            spanContext: boundSpanContext)
         // Advance offsets ON-DEVICE (uniform: decode is [B,1], prefill is
         // [1,chunk] — L is the same for every row in the call).
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -124,7 +135,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         )
         return CBv2AttentionV1.attendBorrowing(
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
-            queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap)
+            queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            spanContext: boundSpanContext)
     }
 
     // MARK: - Private
@@ -137,6 +149,14 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     private static func buildPositionOffsets(_ rows: [CBv2SequenceKV]) -> MLXArray {
         MLXArray(rows.map { Int32($0.absoluteOffset) })
+    }
+}
+
+// MARK: - Vision span-mask binding
+
+extension CBv2LayerCache: CBv2SpanMaskBinding {
+    public func bindSpanContext(_ context: CBv2SpanChunkContext?) {
+        boundSpanContext = context
     }
 }
 

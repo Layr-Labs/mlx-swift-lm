@@ -104,6 +104,15 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         return .some(first)
     }
 
+    /// Vision prefill eligibility: every cache in the bank must honor
+    /// span-mask contexts (`CBv2SpanMaskBinding` — the contiguous
+    /// `CBv2LayerCache` does; the paged `PagedLayerCache` does not), or a
+    /// vision chunk's bidirectional-span mask could silently not apply on
+    /// some layer. All-or-nothing, checked at submit.
+    public var supportsMultimodalSpans: Bool {
+        caches.allSatisfy { $0 is CBv2SpanMaskBinding }
+    }
+
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {

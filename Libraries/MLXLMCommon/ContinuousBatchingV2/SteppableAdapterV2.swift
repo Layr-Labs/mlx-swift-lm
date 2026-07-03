@@ -30,7 +30,11 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2CompiledSteppableModel
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
-        let kvCaches = caches.map { cache -> KVCache in
+        return model(tokens, cache: asKVCaches(caches))
+    }
+
+    private func asKVCaches(_ caches: [CBv2AttendingLayerCache]) -> [KVCache] {
+        caches.map { cache -> KVCache in
             guard let kv = cache as? KVCache else {
                 fatalError(
                     "CBv2 layer cache \(type(of: cache)) must conform to KVCache to drive "
@@ -38,6 +42,39 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2CompiledSteppableModel
             }
             return kv
         }
-        return model(tokens, cache: kvCaches)
+    }
+}
+
+// MARK: - Multimodal (vision prefill)
+
+/// The adapter answers the multimodal capability at RUNTIME: it can wrap any
+/// `LanguageModel`, and only models conforming to `CBv2EmbeddingForwardable`
+/// (Gemma4TextModel) can prefill from spliced embeddings. Requests against
+/// non-conforming models are rejected at submit
+/// (`CBv2MultimodalError.unsupportedModel`), so the trapping guards below
+/// are unreachable in a correctly gated engine.
+extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
+
+    public var supportsMultimodalPrefill: Bool { model is CBv2EmbeddingForwardable }
+
+    public func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
+        guard let embeddable = model as? CBv2EmbeddingForwardable else {
+            preconditionFailure(
+                "CBv2 multimodal: \(type(of: model)) is not CBv2EmbeddingForwardable — submit gating failed"
+            )
+        }
+        return embeddable.scaledInputEmbeddings(tokens)
+    }
+
+    public func forward(
+        tokens: MLXArray, inputEmbeddings: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let embeddable = model as? CBv2EmbeddingForwardable else {
+            preconditionFailure(
+                "CBv2 multimodal: \(type(of: model)) is not CBv2EmbeddingForwardable — submit gating failed"
+            )
+        }
+        return embeddable.embeddingForward(
+            tokens, inputEmbedding: inputEmbeddings, cache: asKVCaches(caches))
     }
 }
