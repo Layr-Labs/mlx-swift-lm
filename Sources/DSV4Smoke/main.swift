@@ -9,6 +9,10 @@
 //        --raw skips the chat template (plain completion of the prompt)
 //        --logits "id1,id2,..." forwards exact token ids and prints the
 //        last-position top-10 logits (for cross-implementation parity checks)
+//        --stream-experts streams routed-expert (switch_mlp) weights from
+//        <model-directory> per forward pass instead of loading them
+//        resident -- see DeepseekV4ExpertStreaming. Cache size is
+//        controlled by the DSV4_EXPERT_CACHE_GB env var (default 8 GiB).
 
 import Foundation
 import MLX
@@ -130,6 +134,7 @@ struct DSV4Smoke {
         var maxTokens = 64
         var raw = false
         var logitTokens: [Int]? = nil
+        var streamExperts = false
         var i = 0
         while i < args.count {
             switch args[i] {
@@ -145,10 +150,19 @@ struct DSV4Smoke {
             case "--logits" where i + 1 < args.count:
                 logitTokens = args[i + 1].split(separator: ",").compactMap { Int($0) }
                 i += 2
+            case "--stream-experts":
+                streamExperts = true
+                i += 1
             default:
                 print("unknown arg: \(args[i])")
                 exit(64)
             }
+        }
+
+        if streamExperts {
+            DeepseekV4ExpertStreaming.modelDirectory = directory
+            DeepseekV4ExpertStreaming.enabled = true
+            print("[stream-experts] enabled, cache budget=\(ExpertCache.budgetFromEnv() / 1_073_741_824) GiB")
         }
 
         do {
@@ -206,7 +220,8 @@ struct DSV4Smoke {
                 return
             }
 
-            let (promptCopy, maxTokensCopy, rawCopy) = (prompt, maxTokens, raw)
+            let (promptCopy, maxTokensCopy, rawCopy, streamExpertsCopy) =
+                (prompt, maxTokens, raw, streamExperts)
             try await container.perform { (context: ModelContext) async throws in
                 print("[model] class=\(type(of: context.model))")
 
@@ -254,6 +269,15 @@ struct DSV4Smoke {
                 print(String(format: "[memory] active=%.1f GiB peak=%.1f GiB",
                     Double(Memory.activeMemory) / 1073741824,
                     Double(Memory.peakMemory) / 1073741824))
+                if streamExpertsCopy {
+                    let s = DeepseekV4ExpertStreaming.cache.stats
+                    let total = s.hits + s.misses
+                    let hitRate = total > 0 ? Double(s.hits) / Double(total) * 100 : 0
+                    print(String(
+                        format: "[expert-cache] hits=%d misses=%d hitRate=%.1f%% resident=%.1f GiB entries=%d",
+                        s.hits, s.misses, hitRate,
+                        Double(s.residentBytes) / 1073741824, s.residentCount))
+                }
 
                 let text = pieces.joined()
                 guard !text.isEmpty else {

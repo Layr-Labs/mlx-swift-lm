@@ -1085,6 +1085,87 @@ class DeepseekV4MLP: Module, UnaryLayer {
     }
 }
 
+// MARK: - MoE expert SSD streaming (module-level opt-in)
+
+/// Controls whether DeepSeek-V4's routed-expert (`switch_mlp`) weights are
+/// streamed from disk per-forward-pass instead of loaded resident at model
+/// load time. Mirrors the `_deepseekV4MTPEnabled` flag pattern: set
+/// `modelDirectory` (and, unless relying on the env var, `enabled`) BEFORE
+/// calling `LLMModelFactory.shared.loadContainer(...)` — `DeepseekV4Model`
+/// reads `enabled` while building each `DeepseekV4MoE` layer and again while
+/// sanitizing the loaded weight dict (to drop `switch_mlp` keys so the
+/// ~125 GB of routed-expert tensors are never even read off disk into the
+/// resident weight path).
+///
+/// Routed experts are ~125 GB of a 141 GB DeepSeek-V4-Flash checkpoint; this
+/// is what makes the model fit in 128 GB of unified memory at all — the
+/// resident model without routed experts is only ~16 GB, plus a
+/// byte-budgeted expert cache (`DSV4_EXPERT_CACHE_GB`, default 8 GiB).
+public enum DeepseekV4ExpertStreaming {
+    /// Checkpoint directory routed-expert weights are streamed from. Must be
+    /// the SAME directory being loaded — the safetensors headers parsed here
+    /// must exactly match the loaded checkpoint's tensor layout. The smoke
+    /// harness sets this from its `<model-directory>` CLI argument.
+    public nonisolated(unsafe) static var modelDirectory: URL?
+
+    /// Master enable switch. Defaults from `DSV4_STREAM_EXPERTS=1` so a
+    /// harness only needs to set `modelDirectory`; settable directly too.
+    public nonisolated(unsafe) static var enabled: Bool =
+        ProcessInfo.processInfo.environment["DSV4_STREAM_EXPERTS"] == "1"
+
+    /// Process-wide expert cache shared by every streamed MoE layer in the
+    /// loaded model (only one model is ever loaded per process today).
+    /// Sized from `DSV4_EXPERT_CACHE_GB` (default 8 GiB).
+    public static let cache = ExpertCache(byteBudget: ExpertCache.budgetFromEnv())
+
+    private nonisolated(unsafe) static var cachedStore: ExpertShardStore?
+    private nonisolated(unsafe) static var cachedBaseConfiguration: BaseConfiguration?
+
+    /// Lazily parses `modelDirectory`'s safetensors headers into a
+    /// `SafetensorsLayout` on first use (shared across all layers). Parsing
+    /// scans every shard's header once — ~33 small JSON parses for the full
+    /// checkpoint, cheap next to the multi-minute resident weight load it
+    /// sits alongside.
+    static func store(numExperts: Int) -> ExpertShardStore {
+        if let cachedStore { return cachedStore }
+        guard let modelDirectory else {
+            fatalError("DeepseekV4ExpertStreaming.enabled is true but modelDirectory was never set")
+        }
+        do {
+            let layout = try SafetensorsLayout.load(modelDirectory: modelDirectory)
+            let store = ExpertShardStore(layout: layout, numExperts: numExperts)
+            cachedStore = store
+            return store
+        } catch {
+            fatalError("DeepseekV4ExpertStreaming: failed to parse safetensors layout: \(error)")
+        }
+    }
+
+    /// Reads `config.json`'s `quantization` dict for a given module path
+    /// (e.g. `"model.layers.3.ffn.switch_mlp.gate_proj"`), matching the same
+    /// per-layer resolution `quantize(model:)` uses for the resident load
+    /// path (`BaseConfiguration.PerLayerQuantization.quantization(layer:)`).
+    /// Falls back to mxfp4 group_size=32 bits=4 — the recipe every routed-
+    /// expert-streaming checkpoint produced so far uses — if `config.json`
+    /// can't be read or has no entry for this path.
+    static func quantizationParams(forLayerPath path: String) -> (
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        let fallback = (groupSize: 32, bits: 4, mode: QuantizationMode.mxfp4)
+        guard let modelDirectory else { return fallback }
+        if cachedBaseConfiguration == nil {
+            let configURL = modelDirectory.appendingPathComponent("config.json")
+            guard let data = try? Data(contentsOf: configURL),
+                let base = try? JSONDecoder().decode(BaseConfiguration.self, from: data)
+            else { return fallback }
+            cachedBaseConfiguration = base
+        }
+        guard let quant = cachedBaseConfiguration?.perLayerQuantization?.quantization(layer: path)
+        else { return fallback }
+        return (quant.groupSize, quant.bits, quant.mode)
+    }
+}
+
 // MARK: - DeepseekV4MoE
 
 class DeepseekV4MoE: Module {
@@ -1092,7 +1173,16 @@ class DeepseekV4MoE: Module {
     let swiguLimit: Float
 
     var gate: DeepseekV4Gate
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    // Resident path. Nil (and unregistered) when streaming is active for
+    // this layer -- see `streamingSwitchMLP` below.
+    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU?
+    // Streaming path. Deliberately NOT an MLXNN `Module` and NOT wrapped in
+    // `@ModuleInfo`: it holds its (large, disk-backed) expert weights inside
+    // `ExpertCache`/`ExpertShardStore`, never as a direct MLXArray stored
+    // property, so `Module.parameters()` / `update(parameters:)` /
+    // `quantize(model:)` never see or touch it. See ExpertStreaming/
+    // StreamingQuantizedSwitchGLU.swift for why this is required (and safe).
+    private let streamingSwitchMLP: StreamingQuantizedSwitchGLU?
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
@@ -1106,16 +1196,39 @@ class DeepseekV4MoE: Module {
         // is unexpressible, and SwitchGLU's single-point silu probe would
         // mis-detect a clamped variant and drop the clamps entirely (NaN on
         // real weights, which are trained against the clamped form).
-        self._switchMLP.wrappedValue = SwitchGLU(
-            inputDims: config.hiddenSize,
-            hiddenDims: config.moeIntermediateSize,
-            numExperts: config.nRoutedExperts,
-            activationProduct: { gate, up in
-                guard limit > 0 else { return silu(gate) * up }
-                let g = MLX.minimum(gate, MLXArray(limit))
-                let u = clip(up, min: MLXArray(-limit), max: MLXArray(limit))
-                return silu(g) * u
-            })
+        let clampedSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = { gate, up in
+            guard limit > 0 else { return silu(gate) * up }
+            let g = MLX.minimum(gate, MLXArray(limit))
+            let u = clip(up, min: MLXArray(-limit), max: MLXArray(limit))
+            return silu(g) * u
+        }
+
+        // MTP layers (layerIdx >= numHiddenLayers) always use the resident
+        // path: they're keyed under `mtp.N.block...` in the checkpoint, not
+        // `model.layers.N...`, so the streaming store's fixed
+        // `model.layers.<n>.ffn.switch_mlp` prefix wouldn't resolve, and MTP
+        // is off by default anyway (`_deepseekV4MTPEnabled`).
+        if DeepseekV4ExpertStreaming.enabled && layerIdx < config.numHiddenLayers {
+            let path = "model.layers.\(layerIdx).ffn.switch_mlp.gate_proj"
+            let (groupSize, bits, mode) = DeepseekV4ExpertStreaming.quantizationParams(
+                forLayerPath: path)
+            self.streamingSwitchMLP = StreamingQuantizedSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts,
+                layerIndex: layerIdx,
+                groupSize: groupSize, bits: bits, mode: mode,
+                cache: DeepseekV4ExpertStreaming.cache,
+                store: DeepseekV4ExpertStreaming.store(numExperts: config.nRoutedExperts),
+                activationProduct: clampedSwiGLU)
+        } else {
+            self.streamingSwitchMLP = nil
+            self._switchMLP.wrappedValue = SwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts,
+                activationProduct: clampedSwiGLU)
+        }
         // Reference (mlx-lm #1192): shared experts use an *unclamped* SwiGLU —
         // swiglu_limit applies to routed experts only.
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
@@ -1127,7 +1240,14 @@ class DeepseekV4MoE: Module {
 
     func callAsFunction(_ x: MLXArray, inputIds: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x, inputIds: inputIds)
-        var y = switchMLP(x, indices)
+        var y: MLXArray
+        if let streamingSwitchMLP {
+            y = streamingSwitchMLP(x, indices)
+        } else if let switchMLP {
+            y = switchMLP(x, indices)
+        } else {
+            fatalError("DeepseekV4MoE: neither streaming nor resident switch_mlp is configured")
+        }
         y = (y * scores[.ellipsis, .newAxis].asType(y.dtype)).sum(axis: -2)
         return y + sharedExperts(x)
     }
@@ -1916,6 +2036,19 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             if key.contains("rotary_emb.inv_freq") { return false }
             // Consumed by the FP8 block-dequant above; not a module parameter.
             if key.contains("weight_scale_inv") { return false }
+            // Streaming mode: drop the ~125 GB of routed-expert tensors so
+            // they're never applied to (or held resident by) the model --
+            // DeepseekV4MoE built a StreamingQuantizedSwitchGLU instead of a
+            // resident SwitchGLU for these layers, which registers no
+            // parameters and reads these tensors straight off disk per
+            // forward pass instead. Scoped to `model.layers.` (not `mtp.`)
+            // because MTP layers always keep the resident path -- see the
+            // comment in DeepseekV4MoE.init.
+            if DeepseekV4ExpertStreaming.enabled, key.hasPrefix("model.layers."),
+                key.contains(".ffn.switch_mlp.")
+            {
+                return false
+            }
             return true
         }
     }
