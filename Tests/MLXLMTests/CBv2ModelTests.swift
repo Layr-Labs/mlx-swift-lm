@@ -627,6 +627,41 @@ struct CBv2ModelGemma4ForwardTests {
         eval(logits)
         #expect(logits.shape == [1, 3, 64])
     }
+
+    /// Multimodal plumbing (Gemma4-specific): splicing the model's OWN scaled
+    /// embeddings back in must reproduce the token forward bit-for-bit — this
+    /// exercises the real embedScale + per-layer-input (token-PLE) handling
+    /// on the CBv2 embedding-forward path, which TinyTestModel (no scale, no
+    /// PLE) cannot cover. `use_bidirectional_attention` off ⇒ no overlay.
+    @Test func embeddingForwardMatchesTokenForwardOnV2Branch() throws {
+        let config = try tinyConfig()
+        let model = Gemma4TextModel(config)
+        eval(model)
+        #expect(model is CBv2EmbeddingForwardable)
+
+        func freshCaches() -> [CBv2ModelMockLayerCache] {
+            var mocks = [CBv2ModelMockLayerCache]()
+            _ = model.newCacheV2 { index, kind in
+                let mock = CBv2ModelMockLayerCache(layerIndex: index, kind: kind, rowCount: 1)
+                mocks.append(mock)
+                return mock
+            }
+            return mocks
+        }
+
+        let prompt = MLXArray([Int32(1), 2, 3, 4, 5])[.newAxis, .ellipsis]
+
+        let tokenLogits = model(prompt, cache: freshCaches() as [KVCache])
+        let spliced = (model as CBv2EmbeddingForwardable).scaledInputEmbeddings(prompt)
+        let embeddingLogits = (model as CBv2EmbeddingForwardable).embeddingForward(
+            prompt, inputEmbedding: spliced, cache: freshCaches() as [KVCache])
+        eval(tokenLogits, embeddingLogits)
+
+        #expect(tokenLogits.shape == embeddingLogits.shape)
+        #expect(
+            allClose(tokenLogits, embeddingLogits, atol: 1e-5).item(Bool.self),
+            "splicing the model's own embeddings must reproduce the token forward")
+    }
 }
 
 // MARK: - GPT-OSS forward smoke tests (v2 branch)
