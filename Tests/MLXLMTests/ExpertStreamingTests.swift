@@ -171,6 +171,102 @@ final class ExpertStreamingTests: XCTestCase {
         }
     }
 
+    // MARK: - fd cache: one fd per shard file, reused across reads
+
+    /// Regression for the fd-churn fix: before caching, every tensor read
+    /// did its own `open()`/`close()` -- a single expert fetch (6 tensors:
+    /// gate/up/down weight+scales) would have opened the shard file 6
+    /// times, and fetching multiple experts across multiple layers sharing
+    /// one shard file would open it once per tensor per expert per layer.
+    /// After caching, the fd count must stay pinned at 1 for the whole
+    /// store's lifetime, no matter how many tensors/experts/layers are
+    /// read from that single file.
+    func testExpertShardStoreReusesFileDescriptorAcrossReads() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let numExperts = 6
+        MLXRandom.seed(7)
+        func mkStack(_ rows: Int, _ cols: Int) -> MLXArray {
+            MLXRandom.randInt(low: 0, high: 1000, [numExperts, rows, cols], type: UInt32.self)
+        }
+        // Two layers sharing the SAME shard file (single-file checkpoint),
+        // so the test exercises fd reuse across layers too, not just
+        // within one layer's fetch.
+        var arrays: [String: MLXArray] = [:]
+        for layer in [0, 1] {
+            let prefix = "model.layers.\(layer).ffn.switch_mlp"
+            arrays["\(prefix).gate_proj.weight"] = mkStack(4, 4)
+            arrays["\(prefix).gate_proj.scales"] = mkStack(4, 1)
+            arrays["\(prefix).up_proj.weight"] = mkStack(4, 4)
+            arrays["\(prefix).up_proj.scales"] = mkStack(4, 1)
+            arrays["\(prefix).down_proj.weight"] = mkStack(4, 4)
+            arrays["\(prefix).down_proj.scales"] = mkStack(4, 1)
+        }
+        eval(Array(arrays.values))
+        try MLX.save(arrays: arrays, url: dir.appendingPathComponent("model.safetensors"))
+
+        let layout = try SafetensorsLayout.load(modelDirectory: dir)
+        let store = ExpertShardStore(layout: layout, numExperts: numExperts)
+
+        XCTAssertEqual(store.openFileDescriptorCountForTesting, 0, "no fd opened before first read")
+
+        _ = try store.fetch(layerIndex: 0, experts: [0, 1, 2])
+        XCTAssertEqual(
+            store.openFileDescriptorCountForTesting, 1,
+            "first fetch (3 experts x 6 tensors = 18 reads) must open exactly one fd")
+
+        _ = try store.fetch(layerIndex: 0, experts: [3, 4, 5])
+        _ = try store.fetch(layerIndex: 1, experts: [0, 1, 2, 3, 4, 5])
+        XCTAssertEqual(
+            store.openFileDescriptorCountForTesting, 1,
+            "further fetches (including a different layer's tensors, same shard file) "
+                + "must reuse the same cached fd, not open new ones")
+    }
+
+    /// Two DIFFERENT shard files must each get their own cached fd -- the
+    /// cache is keyed by path, not a single global fd.
+    func testExpertShardStoreCachesOneFileDescriptorPerDistinctShardFile() throws {
+        let dir = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let numExperts = 2
+        MLXRandom.seed(11)
+        func mkStack() -> MLXArray {
+            MLXRandom.randInt(low: 0, high: 1000, [numExperts, 4, 2], type: UInt32.self)
+        }
+        let shard0: [String: MLXArray] = [
+            "model.layers.0.ffn.switch_mlp.gate_proj.weight": mkStack(),
+            "model.layers.0.ffn.switch_mlp.gate_proj.scales": mkStack(),
+            "model.layers.0.ffn.switch_mlp.up_proj.weight": mkStack(),
+            "model.layers.0.ffn.switch_mlp.up_proj.scales": mkStack(),
+            "model.layers.0.ffn.switch_mlp.down_proj.weight": mkStack(),
+            "model.layers.0.ffn.switch_mlp.down_proj.scales": mkStack(),
+        ]
+        let shard1: [String: MLXArray] = [
+            "model.layers.1.ffn.switch_mlp.gate_proj.weight": mkStack(),
+            "model.layers.1.ffn.switch_mlp.gate_proj.scales": mkStack(),
+            "model.layers.1.ffn.switch_mlp.up_proj.weight": mkStack(),
+            "model.layers.1.ffn.switch_mlp.up_proj.scales": mkStack(),
+            "model.layers.1.ffn.switch_mlp.down_proj.weight": mkStack(),
+            "model.layers.1.ffn.switch_mlp.down_proj.scales": mkStack(),
+        ]
+        eval(Array(shard0.values) + Array(shard1.values))
+        try MLX.save(arrays: shard0, url: dir.appendingPathComponent("model-00001-of-00002.safetensors"))
+        try MLX.save(arrays: shard1, url: dir.appendingPathComponent("model-00002-of-00002.safetensors"))
+
+        let layout = try SafetensorsLayout.load(modelDirectory: dir)
+        let store = ExpertShardStore(layout: layout, numExperts: numExperts)
+
+        _ = try store.fetch(layerIndex: 0, experts: [0, 1])
+        XCTAssertEqual(store.openFileDescriptorCountForTesting, 1)
+
+        _ = try store.fetch(layerIndex: 1, experts: [0, 1])
+        XCTAssertEqual(
+            store.openFileDescriptorCountForTesting, 2,
+            "a second distinct shard file must get its own cached fd")
+    }
+
     // MARK: - (c) LRU eviction respects byte budget
 
     func testExpertCacheEvictsLeastRecentlyUsedUnderByteBudget() {

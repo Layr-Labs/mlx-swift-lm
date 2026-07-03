@@ -89,6 +89,67 @@ private final class ExpertFetchState: @unchecked Sendable {
     }
 }
 
+/// Caches one read-only file descriptor per shard file, opened lazily on
+/// first access and reused for the life of the store. `pread` takes an
+/// explicit offset (see the file-level comment), so any number of threads
+/// can safely issue concurrent reads through the SAME fd with no locking
+/// around the actual I/O — the lock here only protects the dictionary that
+/// maps path -> fd, not the reads themselves.
+///
+/// WHY this matters: before this cache, every tensor read did its own
+/// `open()`/`close()` pair. A single expert fetch touches 6 tensors (mxfp4:
+/// gate/up/down weight+scales, no biases) to 9 (an affine checkpoint with
+/// biases) in the SAME shard file, so that was 6-9 syscall pairs of pure
+/// overhead per expert, on top of the actual `pread`. At decode (6 experts
+/// per token per layer x 41 layers) that's 1,000+ redundant open/close
+/// pairs PER TOKEN. Caching the fd removes all of them; the shard file
+/// stays open for the process lifetime, which is fine — checkpoints are
+/// read-only during inference and the fd count is bounded by shard count
+/// (tens, not thousands).
+final class ShardFileDescriptorCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fds: [String: Int32] = [:]
+
+    /// Returns the cached fd for `url`, opening it (read-only) on first
+    /// access. Safe to call concurrently: the lock only guards the
+    /// dictionary lookup/insert, not the fd's subsequent use.
+    func fd(for url: URL) throws -> Int32 {
+        let path = url.path
+        lock.lock()
+        if let existing = fds[path] {
+            lock.unlock()
+            return existing
+        }
+        lock.unlock()
+
+        let opened = open(path, O_RDONLY)
+        guard opened >= 0 else { throw ExpertShardStoreError.shortRead(path) }
+
+        lock.lock()
+        defer { lock.unlock() }
+        // Another thread may have opened (and cached) the same path while
+        // we raced to `open()` above -- keep theirs, close our redundant fd
+        // rather than leaking it or clobbering the cached entry.
+        if let existing = fds[path] {
+            close(opened)
+            return existing
+        }
+        fds[path] = opened
+        return opened
+    }
+
+    /// Number of distinct fds currently cached. Testing hook only.
+    var countForTesting: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return fds.count
+    }
+
+    deinit {
+        for (_, fd) in fds { close(fd) }
+    }
+}
+
 /// Given a layout and a `switch_mlp` weight prefix, resolves per-expert byte
 /// ranges and reads them with `pread`, fanning misses out across
 /// `DispatchQueue.concurrentPerform` so a chunk of N experts issues N
@@ -97,11 +158,18 @@ private final class ExpertFetchState: @unchecked Sendable {
 public final class ExpertShardStore: @unchecked Sendable {
     private let layout: SafetensorsLayout
     private let numExperts: Int
+    private let fdCache = ShardFileDescriptorCache()
 
     public init(layout: SafetensorsLayout, numExperts: Int) {
         self.layout = layout
         self.numExperts = numExperts
     }
+
+    /// Testing hook: number of distinct shard file descriptors currently
+    /// cached. Used to assert the fd-reuse optimization actually reuses one
+    /// fd across many tensor reads in the same shard file, rather than
+    /// re-opening per read.
+    var openFileDescriptorCountForTesting: Int { fdCache.countForTesting }
 
     /// Byte sub-range (within the tensor's already-absolute `byteRange`) that
     /// expert `e` occupies in a `[numExperts, ...]` stacked tensor. Exposed
@@ -157,15 +225,15 @@ public final class ExpertShardStore: @unchecked Sendable {
         DispatchQueue.concurrentPerform(iterations: n) { i in
             do {
                 let e = experts[i]
-                let gw = try Self.readExpertTensor(gateW, expert: e, numExperts: numExperts)
-                let gs = try Self.readExpertTensor(gateS, expert: e, numExperts: numExperts)
-                let gb = try gateB.map { try Self.readExpertTensor($0, expert: e, numExperts: numExperts) }
-                let uw = try Self.readExpertTensor(upW, expert: e, numExperts: numExperts)
-                let us = try Self.readExpertTensor(upS, expert: e, numExperts: numExperts)
-                let ub = try upB.map { try Self.readExpertTensor($0, expert: e, numExperts: numExperts) }
-                let dw = try Self.readExpertTensor(downW, expert: e, numExperts: numExperts)
-                let ds = try Self.readExpertTensor(downS, expert: e, numExperts: numExperts)
-                let db = try downB.map { try Self.readExpertTensor($0, expert: e, numExperts: numExperts) }
+                let gw = try self.readExpertTensor(gateW, expert: e, numExperts: numExperts)
+                let gs = try self.readExpertTensor(gateS, expert: e, numExperts: numExperts)
+                let gb = try gateB.map { try self.readExpertTensor($0, expert: e, numExperts: numExperts) }
+                let uw = try self.readExpertTensor(upW, expert: e, numExperts: numExperts)
+                let us = try self.readExpertTensor(upS, expert: e, numExperts: numExperts)
+                let ub = try upB.map { try self.readExpertTensor($0, expert: e, numExperts: numExperts) }
+                let dw = try self.readExpertTensor(downW, expert: e, numExperts: numExperts)
+                let ds = try self.readExpertTensor(downS, expert: e, numExperts: numExperts)
+                let db = try downB.map { try self.readExpertTensor($0, expert: e, numExperts: numExperts) }
 
                 let bytes =
                     gw.nbytes + gs.nbytes + (gb?.nbytes ?? 0)
@@ -196,26 +264,22 @@ public final class ExpertShardStore: @unchecked Sendable {
 
     /// pread one expert's contiguous byte range for a tensor and wrap it as
     /// an MLXArray with the per-expert shape (leading expert axis dropped).
-    static func readExpertTensor(
+    private func readExpertTensor(
         _ location: SafetensorsTensorLocation, expert e: Int, numExperts: Int
     ) throws -> MLXArray {
-        let range = try expertByteRange(of: location, expert: e, numExperts: numExperts)
+        let range = try Self.expertByteRange(of: location, expert: e, numExperts: numExperts)
         let data = try preadRange(fileURL: location.fileURL, range: range)
-        let shape = perExpertShape(location.shape)
+        let shape = Self.perExpertShape(location.shape)
         return MLXArray(data, shape, dtype: location.dtype.mlxDType)
     }
 
-    /// Raw `pread(2)` of an absolute byte range. Uses the POSIX call
-    /// directly (not `FileHandle.seek(toOffset:)` + `read`) so concurrent
-    /// reads issued from different `DispatchQueue.concurrentPerform` threads
-    /// against the same fd never race on a shared file offset — pread takes
-    /// the offset as an explicit argument, so it's safe to call from many
-    /// threads on independently-opened file descriptors (or even the same
-    /// fd) with no coordination.
-    private static func preadRange(fileURL: URL, range: Range<Int>) throws -> Data {
-        let fd = open(fileURL.path, O_RDONLY)
-        guard fd >= 0 else { throw ExpertShardStoreError.shortRead(fileURL.path) }
-        defer { close(fd) }
+    /// Raw `pread(2)` of an absolute byte range, through the store's cached
+    /// fd for `fileURL`. `pread` takes the offset as an explicit argument,
+    /// so it's safe to call from many threads against the SAME fd with no
+    /// coordination -- no per-thread/per-read `open()` needed (see
+    /// `ShardFileDescriptorCache` above for why that used to be the case).
+    private func preadRange(fileURL: URL, range: Range<Int>) throws -> Data {
+        let fd = try fdCache.fd(for: fileURL)
 
         let count = range.count
         var buffer = Data(count: count)
