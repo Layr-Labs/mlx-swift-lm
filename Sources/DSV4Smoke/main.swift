@@ -183,6 +183,13 @@ struct DSV4Smoke {
                         MLX.abs(hLast).max().item(Float.self),
                         hLast.mean().item(Float.self),
                         MLX.sqrt(hLast.square().sum()).item(Float.self)))
+                    if let dumpPath = ProcessInfo.processInfo.environment["DSV4_DUMP_HIDDEN"] {
+                        let vals = hLast.asArray(Float.self)
+                        let json = "[" + vals.map { String($0) }.joined(separator: ",") + "]"
+                        try? json.write(
+                            toFile: dumpPath, atomically: true, encoding: .utf8)
+                        print("[hidden] dumped \(vals.count) floats to \(dumpPath)")
+                    }
                     let logits = lm.lmHead(hidden)
                     let last = logits[0, -1, 0...].asType(.float32)
                     eval(last)
