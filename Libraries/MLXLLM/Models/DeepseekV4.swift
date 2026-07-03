@@ -1645,8 +1645,20 @@ public class DeepseekV4ModelInner: Module {
             windowSize: config.slidingWindow,
             returnArray: true)
 
+        // Debug probe (env DSV4_DEBUG_LAYER_NORMS=1): print per-layer hidden
+        // stats to locate the first non-finite layer on a real checkpoint.
+        // Forces a per-layer eval — smoke-test use only.
+        let debugNorms = ProcessInfo.processInfo.environment["DSV4_DEBUG_LAYER_NORMS"] == "1"
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: maskMode, cache: cache?[i], inputIds: inputIds)
+            if debugNorms {
+                let f = h.asType(.float32)
+                let absMax = MLX.abs(f).max().item(Float.self)
+                let mean = f.mean().item(Float.self)
+                print(String(format: "[dsv4-debug] layer %02d ratio=%d absMax=%.4e mean=%+.4e",
+                    i, i < config.compressRatios.count ? config.compressRatios[i] : -1,
+                    absMax, mean))
+            }
         }
 
         let rawHidden = returnRawHidden ? h : nil
