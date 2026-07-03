@@ -30,7 +30,7 @@ final class DeepseekV4Tests: XCTestCase {
             {
                 "vocab_size": 64,
                 "hidden_size": 32,
-                "moe_intermediate_size": 16,
+                "moe_intermediate_size": 32,
                 "num_hidden_layers": \(compressRatios.count),
                 "num_attention_heads": 4,
                 "head_dim": 16,
@@ -293,12 +293,12 @@ final class DeepseekV4Tests: XCTestCase {
 
         let shared = moe.sharedExperts
         MLXRandom.seed(3)
-        let big = MLXRandom.normal([16, 32]) * 4.0  // drives |gate| >> swiglu_limit
+        let big = MLXRandom.normal([32, 32]) * 4.0  // drives |gate| >> swiglu_limit
         try shared.update(
             parameters: ModuleParameters.unflattened([
                 "gate_proj.weight": big,
-                "up_proj.weight": MLXRandom.normal([16, 32]),
-                "down_proj.weight": MLXRandom.normal([32, 16]) * 0.1,
+                "up_proj.weight": MLXRandom.normal([32, 32]),
+                "down_proj.weight": MLXRandom.normal([32, 32]) * 0.1,
             ]), verify: .none)
 
         let x = MLXRandom.normal([1, 1, 32]) * 3.0
@@ -428,7 +428,7 @@ final class DeepseekV4Tests: XCTestCase {
             "layers.1.attn.wo_a.weight": zeros([2 * 8, 64]),
         ]
         for e in 0 ..< 8 {
-            weights["layers.0.ffn.experts.\(e).w1.weight"] = zeros([16, 32])
+            weights["layers.0.ffn.experts.\(e).w1.weight"] = zeros([32, 32])
         }
 
         let sanitized = model.sanitize(weights: weights)
@@ -444,7 +444,7 @@ final class DeepseekV4Tests: XCTestCase {
         XCTAssertEqual(tid2eid.dtype, .int32, "hash tables must be cast to int32")
 
         let stacked = try XCTUnwrap(sanitized["model.layers.0.ffn.switch_mlp.gate_proj.weight"])
-        XCTAssertEqual(stacked.shape, [8, 16, 32], "per-expert weights must stack")
+        XCTAssertEqual(stacked.shape, [8, 32, 32], "per-expert weights must stack")
         XCTAssertNil(sanitized["model.layers.0.ffn.experts.0.w1.weight"])
 
         let woA = try XCTUnwrap(sanitized["model.layers.1.attn.wo_a.weight"])

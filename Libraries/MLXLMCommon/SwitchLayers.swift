@@ -196,7 +196,51 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// Explicit gate×up product path — for activations that are NOT a pure
+    /// unary function of the gate (e.g. DeepSeek-V4's limited SwiGLU, which
+    /// clamps BOTH gate and up). Bypasses the single-point SiLU/GELU probe
+    /// below entirely: that probe evaluates the activation at x=1.0, where a
+    /// clamped SwiGLU is indistinguishable from plain SiLU, and would silently
+    /// route the hot path onto the UNclamped compiled kernel.
+    public init(
+        inputDims: Int,
+        hiddenDims: Int,
+        numExperts: Int,
+        activationProduct: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray,
+        bias: Bool = false,
+        fuseGateUp: Bool = false
+    ) {
+        self.inputDims = inputDims
+        self.hiddenDims = hiddenDims
+        self.numExperts = numExperts
+        // Unused on the hot path (activationProduct wins in callAsFunction);
+        // kept as a sane fallback.
+        self.activation = MLXNN.silu
+        self.activationProduct = activationProduct
+        self.isSiluActivation = false
+        self.isGeluActivation = false
+
+        if fuseGateUp {
+            self._gateUpProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims * 2, numExperts: numExperts, bias: bias)
+        } else {
+            self._gateProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+            self._upProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        }
+        self._downProj.wrappedValue = SwitchLinear(
+            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
+
+        super.init()
+    }
+
     /// Custom-activation GLU path -- runs `activation(gate) * up` uncompiled.
+    ///
+    /// WARNING: the SiLU/GELU detection below is a SINGLE-POINT probe (x=1.0).
+    /// It is only sound for activations that are exactly silu/gelu everywhere.
+    /// Activations that merely AGREE with silu at 1.0 (clamped variants) must
+    /// use the `activationProduct:` initializer above instead.
     public init(
         inputDims: Int,
         hiddenDims: Int,

@@ -1077,11 +1077,22 @@ class DeepseekV4MoE: Module {
         self.swiguLimit = config.swiguLimit
         self.gate = DeepseekV4Gate(config: config, layerIdx: layerIdx)
         let limit = config.swiguLimit
+        // Reference _limited_swiglu clamps BOTH inputs: gate one-sided
+        // (min(gate, limit)), up two-sided (clip ±limit). This must go through
+        // the explicit-product initializer — as a unary activation the up-clamp
+        // is unexpressible, and SwitchGLU's single-point silu probe would
+        // mis-detect a clamped variant and drop the clamps entirely (NaN on
+        // real weights, which are trained against the clamped form).
         self._switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            activation: { x in limit > 0 ? silu(clip(x, min: -limit, max: limit)) : silu(x) })
+            activationProduct: { gate, up in
+                guard limit > 0 else { return silu(gate) * up }
+                let g = MLX.minimum(gate, MLXArray(limit))
+                let u = clip(up, min: MLXArray(-limit), max: MLXArray(limit))
+                return silu(g) * u
+            })
         // Reference (mlx-lm #1192): shared experts use an *unclamped* SwiGLU —
         // swiglu_limit applies to routed experts only.
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
