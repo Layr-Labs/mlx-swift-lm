@@ -1893,7 +1893,23 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         lmHead(model(inputs, cache: cache))
     }
 
-    public func makeCache(parameters: GenerateParameters) -> [any KVCache] {
+    /// The `LanguageModel` protocol hook every generation path actually calls
+    /// (`TokenIterator`, `ModelContainer.generate`, the continuous-batching
+    /// scheduler's `supportsBatchedServing` probe, ...).
+    ///
+    /// This MUST be `newCache(parameters:)`, not just a differently-named
+    /// helper: `DeepseekV4Model` conforms to `KVCacheDimensionProvider`, whose
+    /// default `newCache` (LanguageModel.swift) returns one `KVCacheSimple`
+    /// per layer. The compressed/sparse attention layers downcast their cache
+    /// to `DeepseekV4LayerCache` — against a `KVCacheSimple` that downcast
+    /// quietly returns nil, so KV never accumulates, `offset` stays 0, and
+    /// decode emits garbage while prefill-only probes (`--logits`) look fine.
+    ///
+    /// `parameters` is intentionally unused: the cache layout is dictated by
+    /// `compress_ratios` (rotating window / pooled / sparse-pooled per layer),
+    /// not by caller preferences like `maxKVSize` — a caller-supplied rotating
+    /// cache cannot represent the pooled state.
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         args.compressRatios.map { ratio in
             if ratio == 0 {
                 return RotatingKVCache(maxSize: args.slidingWindow) as any KVCache
@@ -1910,6 +1926,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 ) as any KVCache
             }
         }
+    }
+
+    /// Legacy spelling kept for existing call sites (tests, DSV4Smoke's
+    /// `--logits` probe). Delegates to the protocol hook above so there is
+    /// exactly one cache-layout implementation.
+    public func makeCache(parameters: GenerateParameters) -> [any KVCache] {
+        newCache(parameters: parameters)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

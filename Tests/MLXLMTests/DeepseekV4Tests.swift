@@ -399,6 +399,48 @@ final class DeepseekV4Tests: XCTestCase {
         XCTAssertTrue(cache[3] is RotatingKVCache)
     }
 
+    /// Regression: the generation stack (`TokenIterator`, `ModelContainer`,
+    /// scheduler probes) allocates caches through the `LanguageModel`
+    /// protocol hook `newCache(parameters:)`, NOT `makeCache`. Because
+    /// `DeepseekV4Model` conforms to `KVCacheDimensionProvider`, forgetting
+    /// to override `newCache` silently inherited the default 43×
+    /// `KVCacheSimple` implementation — the attention layers' downcasts to
+    /// `DeepseekV4LayerCache` returned nil, KV never accumulated, and decode
+    /// produced garbage (prefill-only logit probes looked fine, which is why
+    /// this escaped the parity tests).
+    func testNewCacheReturnsCompressRatioLayoutNotSimple() throws {
+        let config = try makeConfig(compressRatios: [0, 4, 128, 0])
+        let model = makeModel(config)
+        let cache = model.newCache(parameters: nil)
+
+        XCTAssertEqual(cache.count, config.numHiddenLayers)
+        XCTAssertFalse(
+            cache.contains { $0 is KVCacheSimple },
+            "newCache must not fall back to KVCacheDimensionProvider's KVCacheSimple default")
+
+        XCTAssertTrue(cache[0] is RotatingKVCache)
+        let sparse = try XCTUnwrap(cache[1] as? DeepseekV4LayerCache)
+        XCTAssertEqual(sparse.pooling.count, 2, "ratio 4 → compressor + indexer pools")
+        let compressed = try XCTUnwrap(cache[2] as? DeepseekV4LayerCache)
+        XCTAssertEqual(compressed.pooling.count, 1, "ratio 128 → compressor pool only")
+        XCTAssertTrue(cache[3] is RotatingKVCache)
+    }
+
+    /// The darkbloom provider probes `Scheduler.supportsBatchedServing` with
+    /// the model's `newCache(parameters: nil)` layout to decide whether the
+    /// batched engine may serve it. With the inherited-`KVCacheSimple` bug
+    /// above, this returned true and routed DeepSeek-V4 into the batched
+    /// engine, whose `BatchKVCache` substitution breaks the model's
+    /// `DeepseekV4LayerCache` downcasts. The custom cache layout must
+    /// classify as NOT batchable.
+    func testSchedulerRejectsBatchedServingForV4CacheLayout() throws {
+        let config = try makeConfig(compressRatios: [0, 4, 128, 0])
+        let model = makeModel(config)
+        XCTAssertFalse(
+            Scheduler.supportsBatchedServing(cacheLayout: model.newCache(parameters: nil)),
+            "DeepseekV4LayerCache layers must fence the model out of the batched engine")
+    }
+
     func testLayerCacheIsNotTrimmableAndCopyIsIndependent() throws {
         let layerCache = DeepseekV4LayerCache(
             rotating: RotatingKVCache(maxSize: 8),
