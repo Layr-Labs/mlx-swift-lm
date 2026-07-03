@@ -45,6 +45,12 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
     /// Nil disables prefetch entirely (e.g. `DSV4_STREAM_PREFETCH=0`, or
     /// callers/tests that don't want the background queue at all).
     private let prefetch: PrefetchCoordinator?
+    /// Optional per-(layer, expert) usage-frequency recorder (see
+    /// ExpertUsageProfile.swift), persisted to disk and consumed by
+    /// `ExpertCacheWarmer` on a FUTURE process's load. Nil disables
+    /// collection entirely (`DSV4_STREAM_PROFILE=0`, or tests that don't
+    /// want the extra bookkeeping).
+    private let usageProfile: ExpertUsageProfile?
 
     /// Max experts fetched/stacked into one `gatherQuantizedMM` call. Bounds
     /// peak transient memory for prefill batches that touch most/all of the
@@ -73,7 +79,8 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         activationProduct: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray,
         maxExpertsPerChunk: Int? = nil,
         evalThresholdBytes: Int? = nil,
-        prefetch: PrefetchCoordinator? = nil
+        prefetch: PrefetchCoordinator? = nil,
+        usageProfile: ExpertUsageProfile? = nil
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -88,6 +95,7 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
         self.maxExpertsPerChunk = maxExpertsPerChunk ?? Self.chunkSizeFromEnv()
         self.evalThresholdBytes = evalThresholdBytes ?? Self.evalThresholdBytesFromEnv()
         self.prefetch = prefetch
+        self.usageProfile = usageProfile
     }
 
     private static func chunkSizeFromEnv() -> Int {
@@ -167,6 +175,12 @@ public final class StreamingQuantizedSwitchGLU: @unchecked Sendable {
             prefetch.recordSelection(layer: layerIndex, experts: groups.map { $0.expert })
             prefetch.prefetchAhead(fromLayer: layerIndex)
         }
+        // Cheap, host-only bookkeeping (no GPU work, no extra I/O) for the
+        // persisted usage-frequency profile that a FUTURE process's
+        // `ExpertCacheWarmer` will warm from — see ExpertUsageProfile.swift.
+        // Reuses the SAME `groups` this call already computed for its own
+        // chunk-fetch planning.
+        usageProfile?.record(layer: layerIndex, groups: groups)
 
         // Bucket consecutive groups into fetch chunks. Because groups are
         // already in ascending-expert / ascending-row order, a chunk's

@@ -1145,12 +1145,26 @@ public enum DeepseekV4ExpertStreaming {
     private nonisolated(unsafe) static var cachedStore: ExpertShardStore?
     private nonisolated(unsafe) static var cachedBaseConfiguration: BaseConfiguration?
     private nonisolated(unsafe) static var cachedPrefetchCoordinator: PrefetchCoordinator?
+    private nonisolated(unsafe) static var cachedUsageProfile: ExpertUsageProfile?
+    private nonisolated(unsafe) static var cachedCacheWarmer: ExpertCacheWarmer?
 
     /// The shared prefetch coordinator, if one has been constructed (nil
     /// before the first streamed layer is built, or if prefetch is
     /// disabled). Exposed for diagnostics/telemetry callers (e.g. DSV4Smoke)
     /// that want to report `PrefetchCoordinator.Stats` alongside cache stats.
     public static var prefetchCoordinatorForDiagnostics: PrefetchCoordinator? { cachedPrefetchCoordinator }
+
+    /// The shared usage-frequency profile, if one has been constructed.
+    /// Exposed for diagnostics (DSV4Smoke) and so a host process (the
+    /// provider's model-lifecycle path) can call `flush()` explicitly
+    /// before shutdown/unload rather than relying solely on the debounced
+    /// background save.
+    public static var usageProfileForDiagnostics: ExpertUsageProfile? { cachedUsageProfile }
+
+    /// The shared background cache warmer, if one has been constructed.
+    /// Exposed for diagnostics (DSV4Smoke reports `ExpertCacheWarmer.Stats`
+    /// alongside cache/prefetch/profile stats).
+    public static var cacheWarmerForDiagnostics: ExpertCacheWarmer? { cachedCacheWarmer }
 
     /// Lazily parses `modelDirectory`'s safetensors headers into a
     /// `SafetensorsLayout` on first use (shared across all layers). Parsing
@@ -1189,6 +1203,45 @@ public enum DeepseekV4ExpertStreaming {
             maxInFlight: PrefetchCoordinator.maxInFlightFromEnv())
         cachedPrefetchCoordinator = coordinator
         return coordinator
+    }
+
+    /// Lazily builds (and load-merges from disk) the process-wide
+    /// `ExpertUsageProfile` — same singleton-per-checkpoint pattern as
+    /// `store`/`prefetchCoordinator` above. Returns nil when profile
+    /// collection is disabled (`DSV4_STREAM_PROFILE=0`).
+    static func usageProfile(numExperts: Int, totalLayers: Int) -> ExpertUsageProfile? {
+        guard ExpertUsageProfile.enabledFromEnv() else { return nil }
+        if let cachedUsageProfile { return cachedUsageProfile }
+        guard let modelDirectory else { return nil }
+        let identity = ExpertUsageProfile.checkpointIdentity(modelDirectory: modelDirectory)
+        let url = ExpertUsageProfile.defaultProfileURL(for: identity)
+        let profile = ExpertUsageProfile.loadMerged(
+            identity: identity, profileURL: url, numExperts: numExperts, totalLayers: totalLayers)
+        cachedUsageProfile = profile
+        return profile
+    }
+
+    /// Lazily builds the process-wide `ExpertCacheWarmer` and kicks its
+    /// background warm task exactly once (`ExpertCacheWarmer.start()` is
+    /// itself idempotent, but building a second warmer instance per layer
+    /// would still redundantly recompute the candidate list, so this
+    /// follows the same cached-singleton pattern as
+    /// `store`/`prefetchCoordinator`/`usageProfile`). Returns nil when
+    /// warming is disabled (`DSV4_STREAM_WARM=0`) or there is no usage
+    /// profile to warm from (profile collection disabled, or
+    /// `modelDirectory` unset).
+    @discardableResult
+    static func cacheWarmer(numExperts: Int, totalLayers: Int) -> ExpertCacheWarmer? {
+        guard ExpertCacheWarmer.enabledFromEnv() else { return nil }
+        if let cachedCacheWarmer { return cachedCacheWarmer }
+        guard let profile = usageProfile(numExperts: numExperts, totalLayers: totalLayers) else {
+            return nil
+        }
+        let warmer = ExpertCacheWarmer(
+            cache: cache, store: store(numExperts: numExperts), profile: profile)
+        cachedCacheWarmer = warmer
+        warmer.start()
+        return warmer
     }
 
     // MARK: - Lifecycle (unload / reload)
@@ -1239,10 +1292,21 @@ public enum DeepseekV4ExpertStreaming {
     /// at the new checkpoint and flipping `enabled`, exactly as it already
     /// does today.
     public static func purgeCache() {
+        // Cancel any in-flight background warm task and flush the current
+        // in-memory usage profile to disk BEFORE dropping these statics —
+        // both hold state (pending fetches, unsaved counts) tied to the
+        // departing checkpoint that would otherwise be silently lost on
+        // unload (the debounced `record()` save cadence has no reason to
+        // have just fired at exactly this moment).
+        cachedCacheWarmer?.cancel()
+        cachedUsageProfile?.flush()
+
         cache.purgeAll()
         cachedStore = nil
         cachedBaseConfiguration = nil
         cachedPrefetchCoordinator = nil
+        cachedUsageProfile = nil
+        cachedCacheWarmer = nil
     }
 
     /// Resize the shared expert cache's byte budget, evicting immediately
@@ -1334,6 +1398,16 @@ class DeepseekV4MoE: Module {
             let path = "model.layers.\(layerIdx).ffn.switch_mlp.gate_proj"
             let (groupSize, bits, mode) = DeepseekV4ExpertStreaming.quantizationParams(
                 forLayerPath: path)
+            // Kick the background warm task (idempotent, cached
+            // singleton — see `cacheWarmer`) as a side effect of building
+            // the FIRST streamed layer, same lazy-on-first-use timing as
+            // `store`/`prefetchCoordinator` below. Not plumbed into
+            // `StreamingQuantizedSwitchGLU` itself (unlike the usage
+            // profile) because the warmer is never called FROM a forward
+            // pass — it only reads `ExpertUsageProfile.totalForwardCalls`
+            // to decide when to stop, so the two are decoupled on purpose.
+            DeepseekV4ExpertStreaming.cacheWarmer(
+                numExperts: config.nRoutedExperts, totalLayers: config.numHiddenLayers)
             self.streamingSwitchMLP = StreamingQuantizedSwitchGLU(
                 inputDims: config.hiddenSize,
                 hiddenDims: config.moeIntermediateSize,
@@ -1344,7 +1418,9 @@ class DeepseekV4MoE: Module {
                 store: DeepseekV4ExpertStreaming.store(numExperts: config.nRoutedExperts),
                 activationProduct: clampedSwiGLU,
                 prefetch: DeepseekV4ExpertStreaming.prefetchCoordinator(
-                    totalLayers: config.numHiddenLayers, numExperts: config.nRoutedExperts))
+                    totalLayers: config.numHiddenLayers, numExperts: config.nRoutedExperts),
+                usageProfile: DeepseekV4ExpertStreaming.usageProfile(
+                    numExperts: config.nRoutedExperts, totalLayers: config.numHiddenLayers))
         } else {
             self.streamingSwitchMLP = nil
             self._switchMLP.wrappedValue = SwitchGLU(

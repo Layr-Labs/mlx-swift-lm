@@ -135,6 +135,7 @@ struct DSV4Smoke {
         var raw = false
         var logitTokens: [Int]? = nil
         var streamExperts = false
+        var delayBeforeGenerateSecs: Double = 0
         var i = 0
         while i < args.count {
             switch args[i] {
@@ -153,6 +154,15 @@ struct DSV4Smoke {
             case "--stream-experts":
                 streamExperts = true
                 i += 1
+            case "--delay-before-generate" where i + 1 < args.count:
+                // Simulates the realistic "provider idle after load, request
+                // arrives later" case, giving the background warm task (see
+                // ExpertCacheWarmer) a head start BEFORE it has to compete
+                // with a real request's own foreground fetches for I/O --
+                // as opposed to this harness's default immediate-generate
+                // flow, which is closer to a worst case (zero head start).
+                delayBeforeGenerateSecs = Double(args[i + 1]) ?? 0
+                i += 2
             default:
                 print("unknown arg: \(args[i])")
                 exit(64)
@@ -170,6 +180,10 @@ struct DSV4Smoke {
             let container = try await LLMModelFactory.shared.loadContainer(
                 from: directory, using: #huggingFaceTokenizerLoader())
             let loadSecs = CFAbsoluteTimeGetCurrent() - loadStart
+            if delayBeforeGenerateSecs > 0 {
+                print(String(format: "[delay] sleeping %.1fs before first request", delayBeforeGenerateSecs))
+                try await Task.sleep(nanoseconds: UInt64(delayBeforeGenerateSecs * 1_000_000_000))
+            }
             print(String(format: "[load] %.1fs, active=%.1f GiB, peak=%.1f GiB",
                 loadSecs,
                 Double(Memory.activeMemory) / 1073741824,
@@ -297,6 +311,36 @@ struct DSV4Smoke {
                     } else {
                         print("[prefetch] disabled or not yet constructed")
                     }
+                    if let profile = DeepseekV4ExpertStreaming.usageProfileForDiagnostics {
+                        let profileSize: Int? =
+                            ((try? FileManager.default.attributesOfItem(
+                                atPath: profile.profileURL.path))?[.size] as? NSNumber)?.intValue
+                        print(String(
+                            format: "[expert-profile] entries=%d forwardCalls=%d path=%@ sizeBytes=%@",
+                            profile.snapshotCounts().count, profile.totalForwardCalls,
+                            profile.profileURL.path,
+                            profileSize.map { "\($0)" } ?? "n/a"))
+                    } else {
+                        print("[expert-profile] disabled or not yet constructed")
+                    }
+                    if let warmer = DeepseekV4ExpertStreaming.cacheWarmerForDiagnostics {
+                        let ws = warmer.stats
+                        print(String(
+                            format:
+                                "[expert-warm] enabled=%@ finished=%@ reason=%@ warmed=%d warmedBytes=%.2fGiB skipped=%d elapsedMs=%@",
+                            warmer.enabled ? "true" : "false", ws.finished ? "true" : "false",
+                            ws.stopReason, ws.warmed, Double(ws.warmedBytes) / 1_073_741_824,
+                            ws.skippedAlreadyResident,
+                            ws.elapsedMs.map { String(format: "%.0f", $0) } ?? "n/a"))
+                    } else {
+                        print("[expert-warm] disabled or not yet constructed")
+                    }
+                    // Explicit flush (not just relying on the debounced
+                    // save cadence inside `record()`) so THIS process's
+                    // profile is guaranteed durable on disk before it
+                    // exits — required for the profile-building step of
+                    // the measurement protocol, and harmless in general.
+                    DeepseekV4ExpertStreaming.usageProfileForDiagnostics?.flush()
                 }
 
                 let text = pieces.joined()
