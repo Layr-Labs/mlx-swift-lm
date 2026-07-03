@@ -90,6 +90,46 @@ public final class ExpertCache: @unchecked Sendable {
         evictLocked()
     }
 
+    /// Insert a speculatively-warmed expert (see `ExpertCacheWarmer`) at
+    /// the COLD end of the LRU order instead of the normal MRU end.
+    ///
+    /// WHY cold-end, not the normal `insert`'s MRU-end: a warm entry is a
+    /// PREDICTION (this checkpoint's historical usage profile says this
+    /// expert is likely to matter), not yet confirmed by an actual
+    /// request. Foreground traffic must never lose real, already-useful
+    /// cache residents to make room for a guess. Inserting at the cold end
+    /// means every subsequent `evictLocked()` call evicts pending warm
+    /// entries BEFORE it ever touches an organically-inserted (real)
+    /// entry, no matter how large the warm batch is relative to headroom
+    /// -- so warming can only ever compete with OTHER warm entries for
+    /// space, never with real traffic. The moment a warmed expert is
+    /// actually used by a real request, `get()`'s `touchLocked` promotes
+    /// it to the MRU end exactly like any organic hit, and from then on
+    /// it is indistinguishable from (and exactly as protected as) an
+    /// expert the foreground path fetched itself.
+    ///
+    /// Repeatedly warming (multiple calls, each prepending) naturally
+    /// preserves relative priority among the warmed set too: since
+    /// `ExpertUsageProfile.warmOrder` yields highest-frequency-first, and
+    /// each new prepend pushes earlier entries one step further from the
+    /// eviction end, the FIRST (highest-priority) warmed expert ends up
+    /// LAST to be evicted among the warm cohort -- lowest-priority warm
+    /// guesses are sacrificed first if the cache is under budget pressure
+    /// before real traffic confirms any of them.
+    ///
+    /// A no-op if the key is already resident (organically or from an
+    /// earlier warm call) -- same idempotence contract as `insert`.
+    public func insertAtColdEnd(layer: Int, expert: Int, weights: ExpertWeights) {
+        let key = Key(layer: layer, expert: expert)
+        lock.lock()
+        defer { lock.unlock() }
+        guard storage[key] == nil else { return }
+        storage[key] = weights
+        order.insert(key, at: 0)
+        currentBytes += weights.byteCount
+        evictLocked()
+    }
+
     /// Resolve a batch of experts for one layer: cache hits return
     /// immediately, misses are fetched from `store` in parallel and
     /// inserted before returning. This is the single entry point
