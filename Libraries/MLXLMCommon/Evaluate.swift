@@ -649,6 +649,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // Prefill runs on the ModelContainer actor thread; decode (next())
+        // runs on the generateLoopTask task thread. Both must pin their MLX
+        // default streams to the process-global ones or the first eval on an
+        // unpinned thread mints a thread-local Stream(gpu, N) that a later
+        // eval from the other thread cannot see ("There is no Stream(gpu, N)
+        // in current thread"). See pinThreadDefaultStreamsToGlobal.
+        pinThreadDefaultStreamsToGlobal()
+
         processor?.prompt(input.text.tokens)
 
         switch try model.prepare(input, cache: cache, windowSize: windowSize) {
@@ -702,6 +710,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
+
+        // See prepare(): the decode loop thread differs from the prefill
+        // thread and needs the same default-stream pinning. Idempotent.
+        pinThreadDefaultStreamsToGlobal()
 
         // save current value -- this will be returned
         let previousY = y
