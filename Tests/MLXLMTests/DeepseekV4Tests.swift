@@ -161,6 +161,76 @@ final class DeepseekV4Tests: XCTestCase {
             "chunked prefill must reproduce one-shot logits (pooling remainder accounting)")
     }
 
+    // MARK: - RoPE
+
+    /// Pin the rotation angle analytically. mx.fast.rope with explicit `freqs`
+    /// expects PERIODS (theta = pos / period): for base 10000 and rope dim 2i,
+    /// period_i = base^(2i/dims). The original port passed INVERSE frequencies
+    /// (base^(2i/dims) w/o the reciprocal → used as periods), which rotated
+    /// every position by reciprocal angles — self-consistent (all tests that
+    /// only compare the port against itself pass) but catastrophically wrong
+    /// against real weights. This test compares against a hand-computed
+    /// traditional-RoPE rotation, so a self-consistent-but-wrong frequency
+    /// table cannot pass.
+    func testRoPERotationMatchesAnalyticAngles() {
+        let dims = 8
+        let base: Float = 100.0
+        let rope = DeepseekV4RoPE(
+            dims: dims, base: base, scalingConfig: nil, maxPositionEmbeddings: 1024)
+
+        // One head, one position (pos=3), headDim == dims (no NOPE padding).
+        let pos = 3
+        var input = [Float](repeating: 0, count: dims)
+        for i in 0 ..< dims { input[i] = Float(i + 1) }
+        let x = MLXArray(input, [1, 1, 1, dims])
+        // Offset shifts the rotation position.
+        let out = rope.callAsFunction(zeros([1, 1, 1, dims]) + x, offset: pos)
+        eval(out)
+        let got = out.asArray(Float.self)
+
+        // Traditional RoPE: consecutive pairs (x[2i], x[2i+1]) rotate by
+        // theta_i = pos / period_i, period_i = base^(2i/dims).
+        for i in 0 ..< dims / 2 {
+            let period = pow(base, Float(2 * i) / Float(dims))
+            let theta = Float(pos) / period
+            let (a, b) = (input[2 * i], input[2 * i + 1])
+            let wantA = a * cos(theta) - b * sin(theta)
+            let wantB = a * sin(theta) + b * cos(theta)
+            XCTAssertEqual(got[2 * i], wantA, accuracy: 1e-3,
+                "pair \(i) real component: freqs must be periods, not inverse frequencies")
+            XCTAssertEqual(got[2 * i + 1], wantB, accuracy: 1e-3,
+                "pair \(i) imaginary component")
+        }
+
+        // Inverse rotation must undo the forward rotation.
+        let roundTrip = rope.callAsFunction(out, offset: pos, inverse: true)
+        eval(roundTrip)
+        let rt = roundTrip.asArray(Float.self)
+        for i in 0 ..< dims {
+            XCTAssertEqual(rt[i], input[i], accuracy: 1e-3, "inverse must round-trip")
+        }
+    }
+
+    /// NOPE prefix: when headDim > rope dims, the leading pairs get infinite
+    /// periods (zero angle) and must pass through unrotated at any offset.
+    func testRoPENopePrefixIsIdentity() {
+        let rope = DeepseekV4RoPE(
+            dims: 4, base: 10000, scalingConfig: nil, maxPositionEmbeddings: 1024)
+        let headDim = 12  // 4 NOPE pairs + 2 rope pairs
+        MLXRandom.seed(9)
+        let x = MLXRandom.normal([1, 1, 1, headDim])
+        let out = rope.callAsFunction(x, offset: 77)
+        eval(x, out)
+        let xv = x.asArray(Float.self)
+        let ov = out.asArray(Float.self)
+        for i in 0 ..< (headDim - 4) {
+            XCTAssertEqual(ov[i], xv[i], accuracy: 1e-5,
+                "NOPE dims must be identity at any offset")
+        }
+        XCTAssertNotEqual(ov[headDim - 1], xv[headDim - 1],
+            "rope dims must actually rotate")
+    }
+
     // MARK: - HyperConnection
 
     /// The fused Metal kernel and the pure-ops fallback must agree.
