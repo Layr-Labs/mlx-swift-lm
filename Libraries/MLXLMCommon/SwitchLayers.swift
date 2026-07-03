@@ -342,6 +342,50 @@ public class SwitchGLU: Module {
         self.fusedMode = g.mode
     }
 
+    /// Build this SwitchGLU's fused gate+up cache now (if eligible) and hand
+    /// the SAME fused arrays to `other`, marking `other`'s fusion as done so
+    /// it never builds its own copy.
+    ///
+    /// For weight-sharing module trees — e.g. a VLM wrapper's language model
+    /// and an MLXLLM text model extracted over the same quantized arrays.
+    /// Each SwitchGLU instance otherwise lazily concatenates its own fused
+    /// gate+up copy on first forward (~540 MB per layer on Gemma4-26B-8bit,
+    /// ~15 GiB model-wide), so two trees over the same weights retain TWO
+    /// identical multi-GiB copies in unified memory. Sharing keeps the total
+    /// at one copy, built eagerly here (deterministic at load time, where
+    /// admission checks can see it) instead of mid-request.
+    ///
+    /// Must be called before either tree serves traffic: the fused-cache
+    /// fields are unsynchronized module state, and this is the one write
+    /// point that both trees' later (read-only) forwards rely on.
+    ///
+    /// If this instance is ineligible for fusion (non-quantized projections,
+    /// mismatched quantization, cache-limit exceeded, or the
+    /// `BENCH_NO_FUSED_GATE_UP` opt-out), `other` inherits the same verdict:
+    /// neither tree will build a fused cache, and both use the unfused path.
+    public func shareFusedGateUpCache(with other: SwitchGLU) {
+        ensureFusedGateUp()
+        other.fusionAttempted = true
+        other.fusedGateUpWeight = fusedGateUpWeight
+        other.fusedGateUpScales = fusedGateUpScales
+        other.fusedGateUpBiases = fusedGateUpBiases
+        other.fusedGroupSize = fusedGroupSize
+        other.fusedBits = fusedBits
+        other.fusedMode = fusedMode
+    }
+
+    /// Whether the fused gate+up cache is populated, its total byte size, and
+    /// the identity of its weight buffer. Diagnostic/test hooks for the
+    /// cache-sharing contract (`shareFusedGateUpCache(with:)`): tests assert
+    /// the shared tree holds the SAME array instance (not a second
+    /// concatenation) and bound memory growth by the cache's real size.
+    public var hasFusedGateUpCache: Bool { fusedGateUpWeight != nil }
+    public var fusedGateUpWeightForVerification: MLXArray? { fusedGateUpWeight }
+    public var fusedGateUpCacheBytes: Int {
+        (fusedGateUpWeight?.nbytes ?? 0) + (fusedGateUpScales?.nbytes ?? 0)
+            + (fusedGateUpBiases?.nbytes ?? 0)
+    }
+
     private func fusedGateUpCacheByteLimit() -> Int {
         let env = ProcessInfo.processInfo.environment
         if let raw = env["FUSED_GATE_UP_CACHE_LIMIT_BYTES"],
