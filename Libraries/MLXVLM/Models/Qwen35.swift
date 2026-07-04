@@ -859,8 +859,27 @@ enum Qwen35Language {
                     let batchSize = inputs.dim(0)
                     let seqLength = inputs.dim(1)
 
+                    // `ropeDeltas` is module-level state written by the most
+                    // recent prefill (shape [prefillBatch]). Under continuous
+                    // batching a cold prefill of newly-admitted requests runs
+                    // BETWEEN the live batch's decode steps and overwrites it,
+                    // so at decode time its batch dim can differ from this
+                    // batch's. Those deltas belong to OTHER rows — never apply
+                    // them here. (The old `repeated(delta, count: batchSize)`
+                    // "adjustment" repeated each element batchSize times,
+                    // yielding prefillBatch×batchSize rows and killing the
+                    // provider with
+                    //   [broadcast_shapes] (B,1) vs (prefillBatch·B,1)
+                    // — d-inference issue #513. The old `>` branch silently
+                    // applied a different request's deltas instead.)
+                    //
+                    // Only a matching batch dim can be the same-rows
+                    // continuation case (media decode is B==1 via the
+                    // serialized prepare path; batched text rows always have
+                    // delta 0, so dropping a stale array is a numeric no-op
+                    // for them).
                     var delta = MLXArray(cacheOffset).asType(.int32)
-                    if let ropeDeltas {
+                    if let ropeDeltas, ropeDeltas.dim(0) == batchSize {
                         delta = delta + ropeDeltas.asType(.int32)
                     }
 
@@ -869,10 +888,6 @@ enum Qwen35Language {
 
                     if delta.ndim == 0 {
                         delta = broadcast(delta, to: [batchSize])
-                    } else if delta.dim(0) < batchSize {
-                        delta = repeated(delta, count: batchSize, axis: 0)
-                    } else if delta.dim(0) > batchSize {
-                        delta = delta[0 ..< batchSize]
                     }
 
                     base = base + delta[0..., .newAxis]
