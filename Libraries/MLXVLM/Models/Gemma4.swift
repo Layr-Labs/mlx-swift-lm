@@ -1117,6 +1117,18 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     private func encodeVisionFeatures(
         pixels: MLXArray, frames: [THW]?, dtype: DType, isVideo: Bool = false
     ) -> MLXArray {
+        let featuresList = visionFeatureList(pixels: pixels, frames: frames, isVideo: isVideo)
+        return (featuresList.count == 1 ? featuresList[0] : concatenated(featuresList))
+            .asType(dtype)
+    }
+
+    /// Shared tower + projector loop: one `[1, softTokens, textHidden]` array
+    /// per image / video frame, in the projector's native dtype (callers cast).
+    /// Split out of `encodeVisionFeatures` so the external per-image seam
+    /// (`perImageVisionFeatures`) reuses exactly the arrays `prepare` scatters.
+    private func visionFeatureList(
+        pixels: MLXArray, frames: [THW]?, isVideo: Bool
+    ) -> [MLXArray] {
         let B = pixels.dim(0)
         var featuresList = [MLXArray]()
         featuresList.reserveCapacity(B)
@@ -1143,7 +1155,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                 featuresList.append(embedVision(visionTower(single, outputLength: outLen)))
             }
         }
-        return (B == 1 ? featuresList[0] : concatenated(featuresList)).asType(dtype)
+        return featuresList
     }
 
     private func padCache(_ cache: [any KVCache]?) -> [KVCache?]? {
@@ -1197,6 +1209,35 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 }
 
 extension Gemma4: LoRAModel { public var loraLayers: [Module] { languageModel.model.layers } }
+
+// MARK: - External vision-embedding seam (CBv2 multimodal prefill)
+
+extension Gemma4 {
+    /// The token id every image soft-token position carries in the tokenized
+    /// prompt (`image_token_id`; the processor writes `imageSeqLength` of
+    /// these per image between the ordinary `boi`/`eoi` delimiter tokens).
+    /// External engines locate the per-image placeholder runs with it.
+    public var imagePlaceholderTokenId: Int { config.imageTokenId }
+
+    /// Per-image soft-token embeddings — the EXACT arrays `prepare` scatters
+    /// over the image placeholder positions (vision tower + multimodal
+    /// projector, `embedVision(visionTower(frame))`): one
+    /// `[1, softTokens, textHidden]` array per image, in the text embedding
+    /// space and the language model's token-embedding dtype (matching
+    /// `prepare`'s `emb.dtype`).
+    ///
+    /// This is the seam external continuous-batching engines (CBv2
+    /// multimodal prefill) use to precompute the embeddings they splice at
+    /// the placeholder spans; `prepare` itself is unchanged and shares the
+    /// same private loop, so the two paths cannot drift.
+    public func perImageVisionFeatures(pixels: MLXArray, frames: [THW]?) -> [MLXArray] {
+        // Same dtype resolution as `prepare`: the token-embedding output
+        // dtype (dtype/shape are lazy graph metadata — nothing evaluates).
+        let dtype = languageModel.model.emb(MLXArray([Int32(0)]).reshaped([1, 1])).dtype
+        return visionFeatureList(pixels: pixels, frames: frames, isVideo: false)
+            .map { $0.asType(dtype) }
+    }
+}
 
 // MARK: - Processor
 

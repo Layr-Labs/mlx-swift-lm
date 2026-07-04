@@ -43,6 +43,17 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     /// claims `.some(nil)` while vending softcapped caches produces silent
     /// numeric drift between eager and compiled steps.
     var uniformAttentionSoftcap: Float?? { get }
+    /// True when EVERY cache this provider vends honors span-mask contexts
+    /// (`CBv2SpanMaskBinding`), so vision prefill chunks can carry their
+    /// causal-plus-bidirectional-within-span masks. Fail-safe default is
+    /// false: providers that cannot vouch (paged backend, custom caches)
+    /// reject multimodal requests at submit rather than silently serving
+    /// them with plain causal masks.
+    var supportsMultimodalSpans: Bool { get }
+}
+
+extension CBv2LayerCacheProvider {
+    public var supportsMultimodalSpans: Bool { false }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
@@ -352,6 +363,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
+    /// Resolved vision inputs (validated spans + materialized embeddings),
+    /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
+    /// the span chunks and needs the embeddings again); dropped at finish.
+    private var multimodalByID: [CBv2RequestID: CBv2ResolvedMultimodal] = [:]
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
@@ -533,8 +548,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         return true
     }
 
+    /// Submit-side unwind: remove a stream registered by `submit` whose
+    /// request never reached `enqueue` (multimodal materialization failed
+    /// after registration — PR#63 review). Only legal BEFORE `enqueue`; a
+    /// live request's stream is removed via `takeStream` at finish.
+    func unregister(_ id: CBv2RequestID) {
+        stateLock.lock()
+        streams.removeValue(forKey: id)
+        stateLock.unlock()
+    }
+
     /// Runs on the engine queue. The stream must already be registered.
-    func enqueue(_ request: CBv2Request, adoption: CBv2PrefixAdoption? = nil) {
+    /// `multimodal` is the submit-thread resolution of the request's vision
+    /// input (nil for text requests) — mutually exclusive with `adoption`
+    /// (vision requests never do prefix-cache lookup).
+    func enqueue(
+        _ request: CBv2Request, adoption: CBv2PrefixAdoption? = nil,
+        multimodal: CBv2ResolvedMultimodal? = nil
+    ) {
         engineQueue.async { [self] in
             defer {
                 gauges.endSubmit()
@@ -568,6 +599,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                     deadline: Date().addingTimeInterval(config.requestTimeout))
                 detokenizers[request.id] =
                     detokenizerFactory.makeDetokenizer(stopStrings: request.stopStrings)
+                if let multimodal {
+                    multimodalByID[request.id] = multimodal
+                }
                 if let adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
@@ -913,7 +947,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             // (`pendingSamples == 0` here: finalize always precedes
             // executeMixed, so every planned token value is host-visible.)
             let samples = rec.numComputedTokens == rec.effectiveTokenCount
-            let isDecode = n == 1 && samples && start == rec.tokens.count - 1
+            // A length-1 image span on the FINAL prompt token produces an
+            // assignment shaped exactly like a decode row (n == 1, samples,
+            // last known token) — but its placeholder token must take the
+            // embedding-splice prefill path below, not the decode batch's
+            // plain token-embedding path (PR#63 review). Genuine decode rows
+            // never trip this: their positions are past every span.
+            let finalTokenIsImageSpan =
+                multimodalByID[id]?.containsSpan(at: rec.tokens.count - 1) ?? false
+            let isDecode =
+                n == 1 && samples && start == rec.tokens.count - 1 && !finalTokenIsImageSpan
             work.append(
                 RowWork(rec: rec, start: start, count: n, samples: samples, isDecode: isDecode))
         }
@@ -954,7 +997,20 @@ public final class EngineLoopV2: @unchecked Sendable {
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
-            let logits = model.forward(tokens: inputs, caches: caches)
+            let logits: MLXArray
+            if let multimodal = multimodalByID[rec.id],
+                let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
+            {
+                // Vision chunk (contains image spans): the NEW pinned path —
+                // spliced input embeddings + span attention masks. Chunks of
+                // the SAME request without spans fall through to the
+                // untouched text path (pure function of has-spans).
+                logits = multimodalChunkForward(
+                    tokens: inputs, start: row.start, count: row.count,
+                    multimodal: multimodal, spanContext: spanContext, caches: caches)
+            } else {
+                logits = model.forward(tokens: inputs, caches: caches)
+            }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
                 prefillSampled[rec.id] = sampler.sample(
@@ -1009,6 +1065,46 @@ public final class EngineLoopV2: @unchecked Sendable {
             evalTargets: evalTargets)
         step.logprobSegments = logprobSegments
         return step
+    }
+
+    // MARK: Vision prefill (span-containing chunks only)
+
+    /// Forward one span-containing prefill chunk: splice the request's image
+    /// embeddings over the scaled text embeddings, bind the chunk's span
+    /// mask context to every layer cache for the duration of the graph
+    /// build, and run the model's embedding forward. The context is unbound
+    /// before returning, so every other computation (decode, text chunks,
+    /// batchmates) sees nil — the mask can only ever apply to this one
+    /// request's [1, chunk] rows.
+    ///
+    /// A 1-TOKEN chunk (`count == 1`) still splices its image embedding, but
+    /// is NOT span-mask-bound: a chunk that small can only contain a
+    /// length-1 block (blocks never split across chunks), and bidirectional
+    /// attention within a single-token block is a no-op — the token attends
+    /// only itself, identical under causal. Binding would trip the
+    /// attention path's `L > 1` span precondition, so it is skipped
+    /// (PR review: reachable via a length-1 span landing in a trailing
+    /// 1-token prefill chunk).
+    private func multimodalChunkForward(
+        tokens: MLXArray, start: Int, count: Int,
+        multimodal: CBv2ResolvedMultimodal, spanContext: CBv2SpanChunkContext,
+        caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let mmModel = model as? CBv2MultimodalSteppableModel else {
+            // Unreachable: EngineV2.submit gates multimodal requests on this
+            // capability before they ever reach the scheduler.
+            preconditionFailure(
+                "CBv2 multimodal chunk reached a model without embedding-forward support")
+        }
+        let textEmbeddings = mmModel.embedPromptTokens(tokens)
+        let spliced = CBv2MultimodalPlan.spliceEmbeddings(
+            textEmbeddings: textEmbeddings,
+            chunkStart: start,
+            spans: multimodal.spansInChunk(start: start, count: count))
+        let bindables = count > 1 ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
+        for bindable in bindables { bindable.bindSpanContext(spanContext) }
+        defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
+        return mmModel.forward(tokens: tokens, inputEmbeddings: spliced, caches: caches)
     }
 
     // MARK: Finalization (deferred stop detection)
@@ -1133,6 +1229,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // attempt tally and its first transient KV-capacity trip
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
+        multimodalByID.removeValue(forKey: id)
         guard let rec = scheduler.finish(id: id, reason: reason) else {
             // Unknown to the scheduler (already finished) — make sure no
             // stream leaks regardless.
@@ -1206,6 +1303,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         for rec: CBv2ScheduledRequest, reason: CBv2FinishReason, state: [CBv2SequenceKV?]
     ) -> CBv2DonationIntent? {
         guard prefixCache != nil else { return nil }
+        // Vision requests NEVER donate (v1 policy, enforced in BOTH
+        // directions — lookup is skipped in `EngineV2.makeAdoption`): the
+        // prefix cache keys on token-id chain hashes, and an image span's
+        // placeholder ids are identical for every image — a donated vision
+        // prefix would be silently served to a request with different image
+        // content. Image-digest extra keys in the block hash (vLLM-V1
+        // `extra_keys`) are the documented follow-up.
+        guard rec.request.multimodal == nil else { return nil }
         switch reason {
         case .stop, .length: break
         case .cancelled, .error: return nil

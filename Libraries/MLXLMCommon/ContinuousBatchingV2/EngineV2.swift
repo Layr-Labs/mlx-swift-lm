@@ -275,6 +275,24 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
         }
 
+        // Vision requests, CHEAP half only: span structure, model/backend
+        // capability, block-vs-budget — no provider call, no MLX graphs.
+        // The heavy embedding materialization waits until EVERY cheap
+        // admission gate (canEverFit, maxWaiting, duplicate id) has passed,
+        // so a rejected request never runs the vision tower and heavy work
+        // is always counted in `pendingSubmits` (PR#63 review). All
+        // multimodal failures remain submit-time throws
+        // (`CBv2MultimodalError`); nothing reaches the scheduler.
+        var multimodalBlocks: [CBv2ImageSpan] = []
+        if let input = request.multimodal {
+            multimodalBlocks = try CBv2MultimodalPlan.validate(
+                input,
+                promptTokenCount: request.promptTokens.count,
+                model: loop.model,
+                cacheProvider: loop.cacheProvider,
+                maxBatchedTokensPerStep: schedulerConfig.maxBatchedTokensPerStep)
+        }
+
         // Truthful admission: reject what could NEVER fit; everything else
         // is admitted optimistically (preemption is the backstop).
         guard
@@ -305,7 +323,25 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             gauges.endSubmit()
             throw CBv2SchedulerError.duplicateRequestID(request.id)
         }
-        loop.enqueue(request, adoption: makeAdoption(for: request))
+
+        // Vision requests, HEAVY half: materialize the image embeddings ONCE,
+        // here on the submit thread (the one provider call per request —
+        // never on the engine step thread), now that every cheap gate has
+        // passed. A failure must unwind the registration + pending-submit
+        // count taken above (the stream was never handed to the caller).
+        var multimodal: CBv2ResolvedMultimodal? = nil
+        if let input = request.multimodal {
+            do {
+                multimodal = try CBv2MultimodalPlan.materialize(
+                    input, blocks: multimodalBlocks, model: loop.model)
+            } catch {
+                loop.unregister(request.id)
+                gauges.endSubmit()
+                throw error
+            }
+        }
+
+        loop.enqueue(request, adoption: makeAdoption(for: request), multimodal: multimodal)
         return stream.makeStream()
     }
 
@@ -317,6 +353,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// it in every outcome.
     private func makeAdoption(for request: CBv2Request) -> CBv2PrefixAdoption? {
         guard let prefixCache else { return nil }
+        // Vision requests NEVER look up the prefix cache (v1 policy — the
+        // donation side is excluded symmetrically in
+        // `EngineLoopV2.donationIntent`): token-id hashes cannot see image
+        // content, so an adopted "hit" over another request's image span
+        // would be silently wrong KV.
+        guard request.multimodal == nil else { return nil }
         guard
             let hit = prefixCache.lookup(
                 tokens: request.promptTokens, layerKinds: layerKinds,

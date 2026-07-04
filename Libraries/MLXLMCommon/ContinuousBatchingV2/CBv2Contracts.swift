@@ -89,11 +89,16 @@ public struct CBv2Request: Sendable {
     /// different salts can never share cached KV; nil falls back to the
     /// cache-level salt (byte-identical hashes to the pre-salt behavior).
     public var cacheSalt: String?
+    /// Vision prefill (additive): precomputed image-embedding spans spliced
+    /// at placeholder-token positions of `promptTokens`. nil = text-only —
+    /// every code path is byte-identical to the pre-multimodal engine.
+    /// See `CBv2MultimodalInput` for the full semantics.
+    public var multimodal: CBv2MultimodalInput?
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
         maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0,
-        cacheSalt: String? = nil
+        cacheSalt: String? = nil, multimodal: CBv2MultimodalInput? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -103,7 +108,72 @@ public struct CBv2Request: Sendable {
         self.stopStrings = stopStrings
         self.priority = priority
         self.cacheSalt = cacheSalt
+        self.multimodal = multimodal
     }
+}
+
+// MARK: - Multimodal input (vision prefill; additive)
+
+/// One image's soft-token span inside the prompt: `length` placeholder token
+/// ids starting at `tokenOffset` (absolute prompt position). That is how VLM
+/// chat templates render images — the vision tower's soft-token count worth
+/// of placeholder ids, wrapped by ordinary begin/end-of-image text tokens
+/// (which are NOT part of the span).
+public struct CBv2ImageSpan: Sendable, Equatable {
+    public var tokenOffset: Int
+    public var length: Int
+    public init(tokenOffset: Int, length: Int) {
+        self.tokenOffset = tokenOffset
+        self.length = length
+    }
+    var end: Int { tokenOffset + length }
+}
+
+/// Vision input for one request: ordered image spans plus an embeddings
+/// provider the engine calls EXACTLY ONCE per request, on the submit thread
+/// (never on the engine step thread, never on the decode hot path). The
+/// provider returns one array per span — `[length, hidden]` or
+/// `[1, length, hidden]` — containing the FINAL text-space values for that
+/// span (vision tower + multimodal projector output, in the model's
+/// activation dtype). The engine splices them verbatim over the scaled text
+/// embeddings at the span positions (the `maskedScatter` semantics of the
+/// MLXVLM Gemma4 wrapper); it never applies the model's embedding scale to
+/// them.
+///
+/// `@unchecked Sendable`: the closure is consumed exactly once on the submit
+/// thread; callers must make it safe to invoke there (typically it returns
+/// precomputed arrays, or lazily runs the vision tower — MLX graph building
+/// off the engine thread is the established pattern for submit-side work).
+public struct CBv2MultimodalInput: @unchecked Sendable {
+    /// Image spans in ascending `tokenOffset` order, non-overlapping, fully
+    /// inside the prompt. Validated at submit; violations throw
+    /// `CBv2MultimodalError`.
+    public var spans: [CBv2ImageSpan]
+    /// Embeddings provider — one array per span, same order as `spans`.
+    public var embeddings: () throws -> [MLXArray]
+
+    public init(spans: [CBv2ImageSpan], embeddings: @escaping () throws -> [MLXArray]) {
+        self.spans = spans
+        self.embeddings = embeddings
+    }
+}
+
+/// Submit-time multimodal rejections (thrown by `CBv2Engine.submit`).
+public enum CBv2MultimodalError: Error, Equatable {
+    /// The engine's model does not support embedding-spliced prefill.
+    case unsupportedModel(String)
+    /// The engine's layer-cache provider cannot honor span attention masks
+    /// (e.g. the paged backend).
+    case unsupportedBackend(String)
+    /// Spans empty, unsorted, overlapping, non-positive, or out of bounds.
+    case invalidSpans(String)
+    /// A contiguous placeholder run (adjacent spans coalesce — they attend
+    /// bidirectionally as ONE block, so they must ride one prefill chunk)
+    /// exceeds the per-step token budget and could never be scheduled.
+    case spanTooLong(blockTokens: Int, maxBatchedTokensPerStep: Int)
+    /// Provider returned the wrong number of arrays, a length that does not
+    /// match its span, or an inconsistent hidden dimension.
+    case embeddingMismatch(String)
 }
 
 // MARK: - Layer descriptions (model structure as data)

@@ -578,6 +578,36 @@ final class TinyAttention: Module {
         return oProj(out.swappedAxes(1, 2).reshaped(B, L, -1))
     }
 
+    /// Independent full-sequence reference attention (multimodal harness):
+    /// process the WHOLE sequence at once (offset 0) against an explicit
+    /// boolean mask, with no KV cache. Non-shared layers project + RoPE
+    /// their own K/V; shared layers project Q only and borrow the passed
+    /// (already-RoPE'd) source K/V. Returns (output, keys, values) so a
+    /// downstream shared layer can borrow. Used ONLY by the vision reference
+    /// — it never touches the engine's span-mask code.
+    func referenceForward(
+        _ x: MLXArray, maskArray: MLXArray, sharedKV: (keys: MLXArray, values: MLXArray)?
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let (B, L) = (x.dim(0), x.dim(1))
+        var q = qProj(x).reshaped(B, L, -1, config.headDim).swappedAxes(1, 2)
+        q = rope(q, offset: 0)
+        let k: MLXArray
+        let v: MLXArray
+        if let sharedKV {
+            k = sharedKV.keys
+            v = sharedKV.values
+        } else {
+            var kk = kProj(x).reshaped(B, L, -1, config.headDim).swappedAxes(1, 2)
+            kk = rope(kk, offset: 0)
+            k = kk
+            v = vProj(x).reshaped(B, L, -1, config.headDim).swappedAxes(1, 2)
+        }
+        let out = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v,
+            scale: config.scale, mask: .array(maskArray), sinks: sinks)
+        return (oProj(out.swappedAxes(1, 2).reshaped(B, L, -1)), k, v)
+    }
+
     /// v2 path for a KV-SHARED layer (Gemma-4 style): project Q only, RoPE
     /// with the SOURCE layer's PRE-update offsets (a KV-shared cache owns no
     /// rows, so its own `positionOffsets` is empty — the
@@ -642,6 +672,19 @@ final class TinyBlock: Module {
                 attnNorm(x), cache: cache, source: source, sourceOffsets: sourceOffsets)
         h = h + mlp(mlpNorm(h))
         return h
+    }
+
+    /// Full-sequence reference block (vision harness): residual + MLP around
+    /// `TinyAttention.referenceForward`. Returns the block output and this
+    /// layer's (keys, values) for a downstream shared layer to borrow.
+    func referenceForward(
+        _ x: MLXArray, maskArray: MLXArray, sharedKV: (keys: MLXArray, values: MLXArray)?
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let (out, keys, values) = attention.referenceForward(
+            attnNorm(x), maskArray: maskArray, sharedKV: sharedKV)
+        var h = x + out
+        h = h + mlp(mlpNorm(h))
+        return (h, keys, values)
     }
 }
 
@@ -796,8 +839,15 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     // MARK: v2 path (`CBv2SteppableModel`)
 
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+        forwardV2(hidden: embed(tokens), caches: caches)
+    }
+
+    /// Shared v2 trunk from a pre-layer-0 hidden state (the token path
+    /// embeds; the multimodal path passes spliced embeddings). One code
+    /// path ⇒ the text behavior cannot drift.
+    private func forwardV2(hidden: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         precondition(caches.count == blocks.count)
-        var h = embed(tokens)
+        var h = hidden
         // KV-shared layers reuse the SOURCE layer's PRE-update position
         // offsets — capture before the source layer's updateAndAttend
         // advances them (the gemma4CapturePositionOffset discipline).
@@ -815,6 +865,21 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
             }
         }
         return lmHead(finalNorm(h))
+    }
+}
+
+/// Vision-like fixture surface: TinyTestModel has no embedding scale, so the
+/// spliceable pre-layer-0 hidden state is `embed(tokens)` directly; the
+/// multimodal forward runs the SAME v2 trunk from the spliced embeddings.
+extension TinyTestModel: CBv2MultimodalSteppableModel {
+    func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
+        embed(tokens)
+    }
+
+    func forward(
+        tokens: MLXArray, inputEmbeddings: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        forwardV2(hidden: inputEmbeddings, caches: caches)
     }
 }
 

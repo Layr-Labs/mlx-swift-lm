@@ -96,6 +96,12 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     // RoPE parameters (nested dict with full_attention/sliding_attention sub-configs)
     public internal(set) var ropeParameters: [String: [String: StringOrNumber]]?
 
+    // "vision" enables Gemma4 blockwise bidirectional attention within
+    // image/video soft-token spans during prefill (mirrors the VLM twin's
+    // G4TextConfig field). nil/other => ordinary causal. Only consulted when
+    // a caller passes an `imageTokenMask`; pure-text configs omit it.
+    public internal(set) var useBidirectionalAttention: String?
+
     // Derived properties
     public internal(set) var slidingRopeTheta: Float = 10000.0
     public internal(set) var fullRopeTheta: Float = 1_000_000.0
@@ -130,6 +136,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         case numExperts = "num_experts"
         case topKExperts = "top_k_experts"
         case moeIntermediateSize = "moe_intermediate_size"
+        case useBidirectionalAttention = "use_bidirectional_attention"
     }
 
     enum QuantizationCodingKeys: String, CodingKey {
@@ -212,6 +219,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         self.topKExperts = try container.decodeIfPresent(Int.self, forKey: .topKExperts)
         self.moeIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize)
+        self.useBidirectionalAttention =
+            try container.decodeIfPresent(String.self, forKey: .useBidirectionalAttention)
 
         // Extract RoPE parameters from nested config
         if let ropeParams = ropeParameters {
@@ -1003,10 +1012,13 @@ public class Gemma4TextModelInner: Module {
     public func callAsFunction(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
-        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil,
+        inputEmbedding: MLXArray? = nil,
+        imageTokenMask: MLXArray? = nil
     ) -> MLXArray {
         forwardTrunk(
-            inputs, cache: cache, captureHook: captureHook, capturePreNorm: false
+            inputs, cache: cache, captureHook: captureHook, capturePreNorm: false,
+            inputEmbedding: inputEmbedding, imageTokenMask: imageTokenMask
         ).postNorm
     }
 
@@ -1029,10 +1041,21 @@ public class Gemma4TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache]?,
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)?,
-        capturePreNorm: Bool
+        capturePreNorm: Bool,
+        inputEmbedding: MLXArray? = nil,
+        imageTokenMask: MLXArray? = nil
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
-        let inputEmbeddings = embedTokens(inputs)
-        var h = inputEmbeddings * embedScale
+        // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
+        // `inputEmbedding` — the scaled text embeddings with image soft-token
+        // embeddings spliced at placeholder positions — replaces the trunk's
+        // own lookup; token ids still feed the per-layer embeddings (PLE)
+        // below. nil keeps the text path byte-identical.
+        var h: MLXArray
+        if let inputEmbedding {
+            h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
+        } else {
+            h = embedTokens(inputs) * embedScale
+        }
 
         // Compute per-layer inputs (PLE)
         var perLayerInputs: [MLXArray?]
@@ -1086,17 +1109,37 @@ public class Gemma4TextModelInner: Module {
         let isCBv2 = fullCache.contains { ($0 as? (any CBv2AttendingLayerCache)) != nil }
 
         // Build masks: one per attention type (legacy path only).
+        //
+        // Vision prefill (mirrors the inline VLM twin): when the config
+        // enables `use_bidirectional_attention == "vision"` and the caller
+        // passes an `imageTokenMask` ([B, L] bool, true at image soft-token
+        // positions), overlay blockwise bidirectional attention within the
+        // image spans onto BOTH mask types. The overlay needs a materialized
+        // boolean mask, so `returnArray` is forced only when active; the
+        // text-only / single-token decode hot path keeps `imageTokenMask ==
+        // nil` and stays on the symbolic `.causal` mask.
         var maskByType = [String: MLXFast.ScaledDotProductAttentionMaskMode]()
         if !isCBv2 {
+            let useBidirectionalVision =
+                imageTokenMask != nil && config.useBidirectionalAttention == "vision"
+                && h.dim(1) > 1
             for (i, layer) in layers.enumerated() {
                 let lt = layer.layerType
                 if maskByType[lt] == nil {
+                    var mask: MLXFast.ScaledDotProductAttentionMaskMode
                     if lt == "sliding_attention" {
-                        maskByType[lt] = createAttentionMask(
-                            h: h, cache: fullCache[i], windowSize: config.slidingWindow)
+                        mask = createAttentionMask(
+                            h: h, cache: fullCache[i], windowSize: config.slidingWindow,
+                            returnArray: useBidirectionalVision)
                     } else {
-                        maskByType[lt] = createAttentionMask(h: h, cache: fullCache[i])
+                        mask = createAttentionMask(
+                            h: h, cache: fullCache[i], windowSize: nil,
+                            returnArray: useBidirectionalVision)
                     }
+                    if useBidirectionalVision, let imageTokenMask {
+                        mask = gemma4TextOverlayBidirectionalVision(mask, isVision: imageTokenMask)
+                    }
+                    maskByType[lt] = mask
                 }
             }
         }
@@ -1138,6 +1181,62 @@ public class Gemma4TextModelInner: Module {
     }
 }
 
+// MARK: - Bidirectional vision attention overlay (mirror of the VLM twin)
+
+/// Per-token block id for vision spans: each contiguous run of vision tokens
+/// shares an id, non-vision tokens get -1. Exact mirror of
+/// `gemma4VisionBlockIds` in Libraries/MLXVLM/Models/Gemma4.swift (Python
+/// `_block_sequence_ids_for_mask`).
+private func gemma4TextVisionBlockIds(_ isVision: MLXArray) -> MLXArray {
+    let length = isVision.dim(1)
+    let leading = MLXArray.zeros([isVision.dim(0), 1], dtype: .bool)
+    let prev = concatenated([leading, isVision[0..., ..<(length - 1)]], axis: 1)
+    let starts = logicalAnd(isVision, logicalNot(prev))
+    let groupIds = cumsum(starts.asType(.int32), axis: 1) - 1
+    return MLX.where(isVision, groupIds, MLXArray(Int32(-1)))
+}
+
+/// Overlay blockwise bidirectional attention for vision-token spans onto a
+/// boolean causal mask (true = attend): tokens in the same image block
+/// attend each other in BOTH directions. Exact mirror of
+/// `gemma4BidirectionalVisionMask` (Python
+/// `_apply_blockwise_bidirectional_overlay`).
+private func gemma4TextBidirectionalVisionMask(
+    _ baseMask: MLXArray, isVision: MLXArray
+) -> MLXArray {
+    let blockIds = gemma4TextVisionBlockIds(isVision)
+    let qBlocks = expandedDimensions(blockIds, axis: -1)  // [B, L, 1]
+    let kBlocks = expandedDimensions(blockIds, axis: -2)  // [B, 1, L]
+    var sameBlock = logicalAnd(qBlocks .!= MLXArray(Int32(-1)), qBlocks .== kBlocks)  // [B, L, L]
+    // Cached (chunked) prefill: `baseMask` covers ALL key columns
+    // (`offset + L`) while `sameBlock` only describes the current window's
+    // L columns. Left-pad with `false` so the overlay lands on the LAST L
+    // key columns — cached keys stay causal. Callers must never split an
+    // image block across the cache boundary (the CBv2 scheduler snaps
+    // chunks to block edges; whole-prompt prefill has offset 0), or the
+    // overlay could not see the cached half of the block (PR#63 review).
+    let L = isVision.dim(1)
+    let keyColumns = baseMask.dim(-1)
+    if keyColumns > L {
+        let pad = MLXArray.zeros([sameBlock.dim(0), L, keyColumns - L], dtype: .bool)
+        sameBlock = concatenated([pad, sameBlock], axis: -1)  // [B, L, offset+L]
+    }
+    return logicalOr(baseMask, expandedDimensions(sameBlock, axis: 1))  // -> [B, 1, L, offset+L]
+}
+
+/// If `mode` carries a boolean array mask, overlay the vision bidirectional
+/// attention; pass other modes (`.causal`, `.none`) through unchanged.
+private func gemma4TextOverlayBidirectionalVision(
+    _ mode: MLXFast.ScaledDotProductAttentionMaskMode, isVision: MLXArray
+) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    switch mode {
+    case .array(let maskArray):
+        return .array(gemma4TextBidirectionalVisionMask(maskArray, isVision: isVision))
+    default:
+        return mode
+    }
+}
+
 // MARK: - Public Model
 
 public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -1167,6 +1266,23 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let hidden = model(inputs, cache: cache)
         return applyLMHead(hidden)
+    }
+
+    /// Vision forward (mirror of the VLM wrapper's
+    /// `languageModel(tokens, inputEmbedding:cache:imageTokenMask:)` call):
+    /// `inputEmbedding` replaces the trunk's own embedding lookup (spliced
+    /// image soft tokens; token ids still feed the PLE side inputs), and
+    /// `imageTokenMask` ([B, L] bool) enables the blockwise bidirectional
+    /// overlay on the LEGACY mask path (v2 layer caches own their masks and
+    /// ignore it). Both nil ⇒ byte-identical to `callAsFunction(_:cache:)`.
+    public func callAsFunction(
+        _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
+        imageTokenMask: MLXArray? = nil
+    ) -> MLXArray {
+        applyLMHead(
+            model(
+                inputs, cache: cache, inputEmbedding: inputEmbedding,
+                imageTokenMask: imageTokenMask))
     }
 
     /// Apply the LM head (tied embedding or explicit `lm_head`) plus the
@@ -1329,5 +1445,40 @@ extension Gemma4TextModel {
         try cbv2LayerKinds.enumerated().map { index, kind in
             try makeLayerCache(index, kind)
         }
+    }
+}
+
+// MARK: - ContinuousBatchingV2 multimodal (vision prefill)
+
+/// The CBv2 engine's embedding-spliced prefill surface
+/// (`CBv2SteppableLanguageModelAdapter` forwards through this). The v2
+/// attention branch is reached exactly as for token forwards — the layer
+/// caches detected in `cache` own attention AND masking (the engine binds
+/// the span-mask context on them) — only the embedding source differs.
+/// Positions, KV sharing, and dual RoPE are untouched.
+extension Gemma4TextModel: CBv2EmbeddingForwardable {
+
+    /// Only configs whose weights were trained with the bidirectional
+    /// image-span attention may serve CBv2 vision spans — the same gate the
+    /// legacy `imageTokenMask` path applies. Text-only Gemma4 configs
+    /// (nil / non-`"vision"`) reject multimodal requests at submit instead
+    /// of silently serving logits under masks the weights never saw
+    /// (PR#63 review).
+    public var supportsVisionSpanPrefill: Bool {
+        config.useBidirectionalAttention == "vision"
+    }
+
+    /// `embed(tokens) * embedScale` — exactly the trunk's pre-layer-0 hidden
+    /// state, the tensor the engine splices image embeddings into (the
+    /// VLM wrapper's `prepare` computes the same product before
+    /// `maskedScatter`).
+    public func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray {
+        model.embedTokens(inputs) * model.embedScale
+    }
+
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        applyLMHead(model(inputs, cache: cache, inputEmbedding: inputEmbedding))
     }
 }
