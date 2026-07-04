@@ -1229,6 +1229,32 @@ public final class Scheduler: @unchecked Sendable {
         cacheFactoryKind(for: layer, quantConfig: quantConfig).typeName
     }
 
+    /// Whether the continuous-batching engine can faithfully serve a model
+    /// with this cache layout.
+    ///
+    /// The batched cache factory maps every layer it does not recognize to a
+    /// plain `BatchKVCache` (the `.fp16` default). For models whose forward
+    /// pass downcasts its per-layer cache back to a custom concrete type
+    /// (e.g. DeepSeek-V4's `DeepseekV4LayerCache`, or `CacheList` composites),
+    /// that substitution does not crash — the downcast quietly returns nil and
+    /// the model generates garbage. Callers MUST route such models through a
+    /// single-sequence path (`model.makeCache()` semantics) instead of the
+    /// batched engine.
+    public static func supportsBatchedServing(cacheLayout: [any KVCache]) -> Bool {
+        for layer in cacheLayout {
+            if layer is MambaCache { continue }
+            if layer is ArraysCache { continue }
+            if let rotating = layer as? RotatingKVCache, rotating.maxSize != nil { continue }
+            // CacheList composites and custom cache classes are re-downcast by
+            // their model's attention path; a BatchKVCache substitute silently
+            // breaks them.
+            if layer is CacheList { return false }
+            if layer is KVCacheSimple { continue }
+            return false
+        }
+        return true
+    }
+
     private func doExternalPrefill(
         tokens: [Int],
         existingCache: [KVCache]?

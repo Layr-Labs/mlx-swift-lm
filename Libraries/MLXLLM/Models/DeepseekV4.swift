@@ -203,6 +203,16 @@ final class PoolingCache {
         let queryPos = MLXArray(Int32(offset + 1)..<Int32(offset + L + 1))  // [L]
         return poolIdx .< (queryPos[0..., .newAxis] / Int32(ratio))  // [L, P]
     }
+
+    /// Independent copy. MLXArrays are safe to share (state transitions replace
+    /// references, never mutate in place); only the container must be distinct.
+    func copy() -> PoolingCache {
+        let c = PoolingCache(ratio: ratio)
+        c.bufKV = bufKV
+        c.bufGate = bufGate
+        c.pooled = pooled
+        return c
+    }
 }
 
 // MARK: - DeepseekV4LayerCache
@@ -246,13 +256,18 @@ final class DeepseekV4LayerCache: KVCache {
         set { rotating.metaState = newValue }
     }
 
-    var isTrimmable: Bool { rotating.isTrimmable }
+    /// Trimming would need to roll back pooled windows and remainder buffers;
+    /// the rotating window alone cannot represent that, so report untrimmable
+    /// (mirrors the reference, where PoolingCache has no trim support).
+    var isTrimmable: Bool { false }
 
     @discardableResult
-    func trim(_ n: Int) -> Int { rotating.trim(n) }
+    func trim(_ n: Int) -> Int { 0 }
 
     func copy() -> any KVCache {
-        DeepseekV4LayerCache(rotating: rotating.copy() as! RotatingKVCache, pooling: pooling)
+        DeepseekV4LayerCache(
+            rotating: rotating.copy() as! RotatingKVCache,
+            pooling: pooling.map { $0.copy() })
     }
 
     func makeMask(
@@ -283,10 +298,14 @@ final class DeepseekV4RoPE {
         self.dims = dims
         self.freqScale = freqScale
 
-        // inv_freq[i] = base^(2i/dims)
+        // inv_freq[i] = base^(-2i/dims)  (reference: 1 / base^(2i/dims)).
+        // Getting this backwards is catastrophic-but-self-consistent: baseFreqs
+        // below then holds inverse frequencies where mx.fast.rope expects
+        // PERIODS, silently mis-rotating every position (caught by real-weight
+        // parity vs mlx-lm#1192, invisible to self-consistency tests).
         let exponents =
             MLXArray(stride(from: 0, to: dims, by: 2)).asType(.float32) / Float(dims)
-        var invFreq = MLX.pow(base, exponents)  // [dims/2]
+        var invFreq = MLXArray(1.0) / MLX.pow(base, exponents)  // [dims/2]
 
         // Yarn / DeepSeek-Yarn scaling
         let ropeType: String?
@@ -310,13 +329,13 @@ final class DeepseekV4RoPE {
                 Float(dims) * log(Float(origMaxPos) / (numRot * 2 * .pi)) / (2 * log(base))
             }
 
-            let low = max(Int(floor(correctionDim(betaFast))), 0)
-            var high = min(Int(ceil(correctionDim(betaSlow))), dims - 1)
-            if low == high { high += 1 }
+            let low = Float(max(Int(floor(correctionDim(betaFast))), 0))
+            var high = Float(min(Int(ceil(correctionDim(betaSlow))), dims - 1))
+            if low == high { high += 0.001 }  // reference uses a float epsilon, not +1
 
             let ramp =
-                (MLXArray(stride(from: 0, to: dims / 2, by: 1)).asType(.float32) - Float(low))
-                / Float(high - low)
+                (MLXArray(stride(from: 0, to: dims / 2, by: 1)).asType(.float32) - low)
+                / (high - low)
             let smooth = 1.0 - MLX.clip(ramp, min: MLXArray(Float(0)), max: MLXArray(Float(1)))
             invFreq = invFreq / factor * (1.0 - smooth) + invFreq * smooth
         }
@@ -366,7 +385,7 @@ final class DeepseekV4RoPE {
 /// Grouped linear: o_groups independent projections applied in batch.
 /// Weight shape: [groups, out_features, in_features].
 /// Used for wo_a (output gate projection before wo_b).
-final class DeepseekV4MultiLinear: Module {
+class DeepseekV4MultiLinear: Module, Quantizable {
     var weight: MLXArray  // [groups, out_features, in_features]
 
     init(inFeatures: Int, outFeatures: Int, groups: Int) {
@@ -374,10 +393,53 @@ final class DeepseekV4MultiLinear: Module {
         super.init()
     }
 
+    init(weight: MLXArray) {
+        self.weight = weight
+        super.init()
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // x: [B, groups, L, in_features]
         // weight.T (axis 1,2): [groups, in_features, out_features]
         return matmul(x, weight.transposed(0, 2, 1))
+    }
+
+    func toQuantized(groupSize: Int, bits: Int, mode: QuantizationMode) -> Module {
+        QuantizedDeepseekV4MultiLinear(self, groupSize: groupSize, bits: bits, mode: mode)
+    }
+}
+
+/// Quantized counterpart of ``DeepseekV4MultiLinear`` (mirrors the reference
+/// QuantizedMultiLinear): batched quantized matmul over the groups axis.
+final class QuantizedDeepseekV4MultiLinear: DeepseekV4MultiLinear, Quantized {
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+
+    let scales: MLXArray
+    let biases: MLXArray?
+
+    init(
+        _ other: DeepseekV4MultiLinear, groupSize: Int, bits: Int,
+        mode: QuantizationMode
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+
+        let (quantizedWeight, scales, biases) = MLX.quantized(
+            other.weight, groupSize: groupSize, bits: bits, mode: mode)
+        self.scales = scales
+        self.biases = biases
+
+        super.init(weight: quantizedWeight)
+        self.freeze()
+    }
+
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        quantizedMM(
+            x, weight, scales: scales, biases: biases, transpose: true,
+            groupSize: groupSize, bits: bits, mode: mode)
     }
 }
 
@@ -530,7 +592,7 @@ private let _hcSinkhornCollapseKernel: MLXFast.MLXFastKernel = MLXFast.metalKern
 ///   - scale: `[3]` float32 — pre / post / comb scale factors
 ///   - base:  `[(2+hc)*hc]` float32 — biases
 /// - Returns: `(collapsed [B, S, D], post [B, S, HC], comb [B, S, HC, HC])`
-private func hcKernel(
+func hcKernel(
     x: MLXArray,
     mixes: MLXArray,
     scale: MLXArray,
@@ -570,10 +632,11 @@ private func hcKernel(
 // MARK: - HyperConnection helpers
 
 /// Compute the three gating matrices (pre, post, comb) from the 4D hidden state.
-/// Corrected from Python hyper_connection.py:
-///   post = 2 * sigmoid(...)  (no eps, factor of 2)
-///   comb = softmax(...) + eps  (not sigmoid)
-private func hcSplitSinkhorn(
+/// Mirrors _hc_split_sinkhorn_ops from the reference hyper_connection.py:
+///   pre  = sigmoid(...) + eps        (NOT normalized — matches the Metal kernel)
+///   post = 2 * sigmoid(...)          (no eps, factor of 2)
+///   comb = softmax(...) + eps, then Sinkhorn row/col normalization
+func hcSplitSinkhorn(
     _ mixes: MLXArray,
     hcScale: MLXArray,
     hcBase: MLXArray,
@@ -592,9 +655,7 @@ private func hcSplitSinkhorn(
     let postBase = hcBase[hc ..< 2 * hc]
     let combBase = hcBase[(2 * hc)...]
 
-    // pre: sigmoid + eps, then row-normalize
-    var pre = sigmoid(preMix * hcScale[0] + preBase) + eps
-    pre = pre / pre.sum(axis: -1, keepDims: true)
+    let pre = sigmoid(preMix * hcScale[0] + preBase) + eps
 
     // post: 2 * sigmoid (no eps)
     let post = 2 * sigmoid(postMix * hcScale[1] + postBase)
@@ -624,17 +685,22 @@ func hcPre(
     hcBase: MLXArray,
     hcMult: Int,
     sinkhornIters: Int,
-    eps: Float
+    eps: Float,
+    normEps: Float
 ) -> (MLXArray, MLXArray, MLXArray) {
     let dtype = x.dtype
     let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
 
+    // Reference: mixes = rms_norm(x.flatten(-2), None, rms_norm_eps) @ fn.T
+    // (normalization epsilon is rms_norm_eps; hc_eps is the sinkhorn/sigmoid eps).
     let xFlat = x.reshaped([B, S, hc * D]).asType(.float32)
-    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
+    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + normEps)
     let mixes = matmul(xFlat, hcFn.T) * normScale  // [B, S, (2+hc)*hc]
 
-    // Fused Metal kernel: Sinkhorn + collapse in one dispatch
-    if Device.defaultDevice().deviceType == .gpu {
+    // Fused Metal kernel: Sinkhorn + collapse in one dispatch.
+    // DSV4_HC_OPS=1 forces the pure-ops fallback (kernel bisection).
+    let forceOps = DSV4Debug.forceHcOps
+    if !forceOps, Device.defaultDevice().deviceType == .gpu {
         return hcKernel(
             x: x,
             mixes: mixes.reshaped([B * S, mixes.dim(2)]),
@@ -643,11 +709,12 @@ func hcPre(
             hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
     }
 
-    // Pure-ops fallback (CPU / non-Metal)
+    // Pure-ops fallback (CPU / non-Metal). Reference collapses in float32 and
+    // casts the result — matching the Metal kernel's accumulation precision.
     let (pre, post, comb) = hcSplitSinkhorn(
         mixes, hcScale: hcScale, hcBase: hcBase,
         hcMult: hcMult, sinkhornIters: sinkhornIters, eps: eps)
-    let y = (pre.expandedDimensions(axis: -1).asType(dtype) * x).sum(axis: -2)
+    let y = (pre.expandedDimensions(axis: -1) * x.asType(.float32)).sum(axis: -2).asType(dtype)
     return (y, post, comb)
 }
 
@@ -660,14 +727,11 @@ func hcPost(
     post: MLXArray,
     comb: MLXArray
 ) -> MLXArray {
-    let term1 = post.expandedDimensions(axis: -1) * x.expandedDimensions(axis: -2)
-    // term2: comb.swapaxes(-1,-2) @ residual
-    // comb: [B, S, hc, hc], residual: [B, S, hc, D]
-    // Using expand trick: combExp [B,S,hc,hc,1] * residualExp [B,S,hc,1,D] → sum axis 2
-    let combExp = comb.expandedDimensions(axis: -1)
-    let residualExp = residual.expandedDimensions(axis: -2)
-    let term2 = (combExp * residualExp).sum(axis: 2)
-    return (term1.asType(.float32) + term2.asType(.float32)).asType(x.dtype)
+    // Reference: y = post[..., None] * x[:, :, None, :] + comb.swapaxes(-1,-2) @ residual
+    // (all in float32; post/comb already float32 out of the sinkhorn kernel).
+    let term1 = post.expandedDimensions(axis: -1) * x.expandedDimensions(axis: -2).asType(.float32)
+    let term2 = matmul(comb.transposed(0, 1, 3, 2), residual.asType(.float32))
+    return (term1 + term2).asType(x.dtype)
 }
 
 /// HC head: collapse 4D [B, S, hc, D] → [B, S, D] using HyperHead weights.
@@ -676,28 +740,72 @@ func hcHeadReduce(
     hcFn: MLXArray,
     hcScale: MLXArray,
     hcBase: MLXArray,
-    eps: Float
+    eps: Float,
+    normEps: Float
 ) -> MLXArray {
     let dtype = x.dtype
     let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
 
     let xFlat = x.reshaped([B, S, hc * D]).asType(.float32)
-    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
+    let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + normEps)
     let mixes = matmul(xFlat, hcFn.T) * normScale
     let pre = sigmoid(mixes * hcScale + hcBase) + eps
 
-    return (pre.expandedDimensions(axis: -1).asType(dtype) * x).sum(axis: -2).asType(dtype)
+    // Collapse in float32 (reference), then cast back.
+    return (pre.expandedDimensions(axis: -1) * x.asType(.float32)).sum(axis: -2).asType(dtype)
 }
 
 // MARK: - Helpers
+
+/// `ProcessInfo.processInfo.environment` snapshots the whole environ on
+/// EVERY access (µs-scale) — too slow to call per-token from the hot path.
+/// These debug probes are read from the environment exactly once, at
+/// process start, and cached here (mirrors `DSV4AttnDump.armed` below).
+/// Behavior when the env vars are set is unchanged; only the read is hoisted.
+private enum DSV4Debug {
+    /// `DSV4_DEBUG_LAYER_NORMS`: 0 (unset), 1, or 2.
+    static let layerNorms: Int = {
+        switch ProcessInfo.processInfo.environment["DSV4_DEBUG_LAYER_NORMS"] {
+        case "1": return 1
+        case "2": return 2
+        default: return 0
+        }
+    }()
+    /// `DSV4_DUMP_LAYER_DIR`: directory to dump per-layer hidden states into.
+    static let dumpLayerDir: String? = ProcessInfo.processInfo.environment["DSV4_DUMP_LAYER_DIR"]
+    /// `DSV4_HC_OPS=1`: force the pure-ops Sinkhorn fallback (kernel bisection).
+    static let forceHcOps: Bool = ProcessInfo.processInfo.environment["DSV4_HC_OPS"] == "1"
+}
+
+/// Debug-only (DSV4_DUMP_ATTN_DIR): dump named attention internals from the
+/// FIRST attention invocation of the process for elementwise reference diffs.
+/// Non-reentrant by design (single-threaded smoke harness only).
+enum DSV4AttnDump {
+    nonisolated(unsafe) static var armed =
+        ProcessInfo.processInfo.environment["DSV4_DUMP_ATTN_DIR"] != nil
+    static func dump(_ name: String, _ a: MLXArray) {
+        guard armed,
+            let dir = ProcessInfo.processInfo.environment["DSV4_DUMP_ATTN_DIR"]
+        else { return }
+        let f = a.flattened().asType(.float32)
+        eval(f)
+        let vals = f.asArray(Float.self)
+        let json = "[" + vals.map { String($0) }.joined(separator: ",") + "]"
+        try? json.write(toFile: "\(dir)/\(name).json", atomically: true, encoding: .utf8)
+        print("[attn-dump] \(name) \(a.shape)")
+    }
+}
 
 private func sqrtSoftplus(_ x: MLXArray) -> MLXArray {
     let sp = MLX.maximum(x, MLXArray(Float(0))) + MLX.log1p(MLX.exp(-MLX.abs(x)))
     return MLX.sqrt(sp)
 }
 
+/// Weightless RMS norm with float32 accumulation (mirrors mx.fast.rms_norm(x, None, eps);
+/// accumulating mean-of-squares in bf16 over 512 dims loses precision).
 private func headRmsNorm(_ x: MLXArray, eps: Float) -> MLXArray {
-    x * rsqrt(x.square().mean(axis: -1, keepDims: true) + eps)
+    let xf = x.asType(.float32)
+    return (xf * rsqrt(xf.square().mean(axis: -1, keepDims: true) + eps)).asType(x.dtype)
 }
 
 /// Extend an attention mask to cover pooled KV positions.
@@ -728,8 +836,8 @@ final class Compressor: Module {
     let overlap: Bool  // true when ratio=4
     let outDim: Int
 
-    var wkv: Linear
-    var wgate: Linear
+    @ModuleInfo var wkv: Linear
+    @ModuleInfo var wgate: Linear
     var ape: MLXArray   // [ratio, out_dim] – positional encoding for windows
     var norm: RMSNorm
     let rope: DeepseekV4RoPE  // non-Module: computed from hyperparams
@@ -842,8 +950,8 @@ final class Indexer: Module {
     let indexTopk: Int
     let scale: Float
 
-    var wq_b: Linear
-    var weights_proj: Linear
+    @ModuleInfo var wq_b: Linear
+    @ModuleInfo var weights_proj: Linear
     var compressor: Compressor
 
     init(config: DeepseekV4Configuration, compressRatio: Int) {
@@ -887,11 +995,13 @@ final class Indexer: Module {
         let combined = (posScores * w.transposed(0, 2, 1).expandedDimensions(axis: -1))
             .sum(axis: 1)
 
-        // Apply causal pool mask if in prefill
+        // Apply causal pool mask if in prefill. Use the finite dtype minimum as the
+        // masked sentinel (reference uses mx.finfo(...).min): -inf produces NaN
+        // downstream when a query row has zero visible pooled positions.
         var maskedScores = combined
         if let pc = poolCache, let pm = pc.makeMask(L: L, offset: offset) {
             maskedScores = MLX.where(pm[0..., 0...].expandedDimensions(axis: 0), combined,
-                MLXArray(Float(-Float.infinity)))
+                MLXArray(-Float.greatestFiniteMagnitude))
         }
 
         let k = min(indexTopk, P)
@@ -971,9 +1081,9 @@ class DeepseekV4Gate: Module {
 // MARK: - DeepseekV4MLP (for shared experts)
 
 class DeepseekV4MLP: Module, UnaryLayer {
-    var gate_proj: Linear
-    var up_proj: Linear
-    var down_proj: Linear
+    @ModuleInfo var gate_proj: Linear
+    @ModuleInfo var up_proj: Linear
+    @ModuleInfo var down_proj: Linear
     let swiguLimit: Float
 
     init(hiddenSize: Int, intermediateSize: Int, swiguLimit: Float) {
@@ -995,6 +1105,253 @@ class DeepseekV4MLP: Module, UnaryLayer {
     }
 }
 
+// MARK: - MoE expert SSD streaming (module-level opt-in)
+
+/// Controls whether DeepSeek-V4's routed-expert (`switch_mlp`) weights are
+/// streamed from disk per-forward-pass instead of loaded resident at model
+/// load time. Mirrors the `_deepseekV4MTPEnabled` flag pattern: set
+/// `modelDirectory` (and, unless relying on the env var, `enabled`) BEFORE
+/// calling `LLMModelFactory.shared.loadContainer(...)` — `DeepseekV4Model`
+/// reads `enabled` while building each `DeepseekV4MoE` layer and again while
+/// sanitizing the loaded weight dict (to drop `switch_mlp` keys so the
+/// ~125 GB of routed-expert tensors are never even read off disk into the
+/// resident weight path).
+///
+/// Routed experts are ~125 GB of a 141 GB DeepSeek-V4-Flash checkpoint; this
+/// is what makes the model fit in 128 GB of unified memory at all — the
+/// resident model without routed experts is only ~16 GB, plus a
+/// byte-budgeted expert cache (`DSV4_EXPERT_CACHE_GB`, default 8 GiB).
+public enum DeepseekV4ExpertStreaming {
+    /// Checkpoint directory routed-expert weights are streamed from. Must be
+    /// the SAME directory being loaded — the safetensors headers parsed here
+    /// must exactly match the loaded checkpoint's tensor layout. The smoke
+    /// harness sets this from its `<model-directory>` CLI argument.
+    public nonisolated(unsafe) static var modelDirectory: URL?
+
+    /// Master enable switch. Defaults from `DSV4_STREAM_EXPERTS=1` so a
+    /// harness only needs to set `modelDirectory`; settable directly too.
+    public nonisolated(unsafe) static var enabled: Bool =
+        ProcessInfo.processInfo.environment["DSV4_STREAM_EXPERTS"] == "1"
+
+    /// Process-wide expert cache shared by every streamed MoE layer in the
+    /// loaded model (only one model is ever loaded per process today).
+    /// Bootstrap-sized from `DSV4_EXPERT_CACHE_GB` (default 8 GiB) the
+    /// first time this static is touched; call `setCacheBudgetBytes(_:)`
+    /// to resize it later (e.g. on a reload with a different configured
+    /// budget) and `purgeCache()` to empty it (e.g. on model unload) — see
+    /// the lifecycle section below.
+    public static let cache = ExpertCache(byteBudget: ExpertCache.budgetFromEnv())
+
+    private nonisolated(unsafe) static var cachedStore: ExpertShardStore?
+    private nonisolated(unsafe) static var cachedBaseConfiguration: BaseConfiguration?
+    private nonisolated(unsafe) static var cachedPrefetchCoordinator: PrefetchCoordinator?
+    private nonisolated(unsafe) static var cachedUsageProfile: ExpertUsageProfile?
+    private nonisolated(unsafe) static var cachedCacheWarmer: ExpertCacheWarmer?
+
+    /// The shared prefetch coordinator, if one has been constructed (nil
+    /// before the first streamed layer is built, or if prefetch is
+    /// disabled). Exposed for diagnostics/telemetry callers (e.g. DSV4Smoke)
+    /// that want to report `PrefetchCoordinator.Stats` alongside cache stats.
+    public static var prefetchCoordinatorForDiagnostics: PrefetchCoordinator? { cachedPrefetchCoordinator }
+
+    /// The shared usage-frequency profile, if one has been constructed.
+    /// Exposed for diagnostics (DSV4Smoke) and so a host process (the
+    /// provider's model-lifecycle path) can call `flush()` explicitly
+    /// before shutdown/unload rather than relying solely on the debounced
+    /// background save.
+    public static var usageProfileForDiagnostics: ExpertUsageProfile? { cachedUsageProfile }
+
+    /// The shared background cache warmer, if one has been constructed.
+    /// Exposed for diagnostics (DSV4Smoke reports `ExpertCacheWarmer.Stats`
+    /// alongside cache/prefetch/profile stats).
+    public static var cacheWarmerForDiagnostics: ExpertCacheWarmer? { cachedCacheWarmer }
+
+    /// Lazily parses `modelDirectory`'s safetensors headers into a
+    /// `SafetensorsLayout` on first use (shared across all layers). Parsing
+    /// scans every shard's header once — ~33 small JSON parses for the full
+    /// checkpoint, cheap next to the multi-minute resident weight load it
+    /// sits alongside.
+    static func store(numExperts: Int) -> ExpertShardStore {
+        if let cachedStore { return cachedStore }
+        guard let modelDirectory else {
+            fatalError("DeepseekV4ExpertStreaming.enabled is true but modelDirectory was never set")
+        }
+        do {
+            let layout = try SafetensorsLayout.load(modelDirectory: modelDirectory)
+            let store = ExpertShardStore(layout: layout, numExperts: numExperts)
+            cachedStore = store
+            return store
+        } catch {
+            fatalError("DeepseekV4ExpertStreaming: failed to parse safetensors layout: \(error)")
+        }
+    }
+
+    /// Lazily builds the process-wide `PrefetchCoordinator` (shared across
+    /// every streamed MoE layer, same rationale as `cache`/`store` above:
+    /// only one model is ever loaded per process). Returns nil when
+    /// prefetch is disabled (`DSV4_STREAM_PREFETCH=0`) so
+    /// `StreamingQuantizedSwitchGLU` can treat "no prefetch" and "prefetch
+    /// disabled" identically (both just skip the coordinator calls).
+    static func prefetchCoordinator(totalLayers: Int, numExperts: Int) -> PrefetchCoordinator? {
+        guard PrefetchCoordinator.enabledFromEnv() else { return nil }
+        if let cachedPrefetchCoordinator { return cachedPrefetchCoordinator }
+        let coordinator = PrefetchCoordinator(
+            cache: cache,
+            store: store(numExperts: numExperts),
+            totalLayers: totalLayers,
+            lookaheadLayers: PrefetchCoordinator.lookaheadFromEnv(),
+            maxInFlight: PrefetchCoordinator.maxInFlightFromEnv())
+        cachedPrefetchCoordinator = coordinator
+        return coordinator
+    }
+
+    /// Lazily builds (and load-merges from disk) the process-wide
+    /// `ExpertUsageProfile` — same singleton-per-checkpoint pattern as
+    /// `store`/`prefetchCoordinator` above. Returns nil when profile
+    /// collection is disabled (`DSV4_STREAM_PROFILE=0`).
+    static func usageProfile(numExperts: Int, totalLayers: Int) -> ExpertUsageProfile? {
+        guard ExpertUsageProfile.enabledFromEnv() else { return nil }
+        if let cachedUsageProfile { return cachedUsageProfile }
+        guard let modelDirectory else { return nil }
+        let identity = ExpertUsageProfile.checkpointIdentity(modelDirectory: modelDirectory)
+        let url = ExpertUsageProfile.defaultProfileURL(for: identity)
+        let profile = ExpertUsageProfile.loadMerged(
+            identity: identity, profileURL: url, numExperts: numExperts, totalLayers: totalLayers)
+        cachedUsageProfile = profile
+        return profile
+    }
+
+    /// Lazily builds the process-wide `ExpertCacheWarmer` and kicks its
+    /// background warm task exactly once (`ExpertCacheWarmer.start()` is
+    /// itself idempotent, but building a second warmer instance per layer
+    /// would still redundantly recompute the candidate list, so this
+    /// follows the same cached-singleton pattern as
+    /// `store`/`prefetchCoordinator`/`usageProfile`). Returns nil when
+    /// warming is disabled (`DSV4_STREAM_WARM=0`) or there is no usage
+    /// profile to warm from (profile collection disabled, or
+    /// `modelDirectory` unset).
+    @discardableResult
+    static func cacheWarmer(numExperts: Int, totalLayers: Int) -> ExpertCacheWarmer? {
+        guard ExpertCacheWarmer.enabledFromEnv() else { return nil }
+        if let cachedCacheWarmer { return cachedCacheWarmer }
+        guard let profile = usageProfile(numExperts: numExperts, totalLayers: totalLayers) else {
+            return nil
+        }
+        let warmer = ExpertCacheWarmer(
+            cache: cache, store: store(numExperts: numExperts), profile: profile)
+        cachedCacheWarmer = warmer
+        warmer.start()
+        return warmer
+    }
+
+    // MARK: - Lifecycle (unload / reload)
+    //
+    // Concurrency contract: `modelDirectory`, `enabled`, `cachedStore`,
+    // `cachedBaseConfiguration`, and `cachedPrefetchCoordinator` are
+    // `nonisolated(unsafe)` process-wide statics. That is only sound
+    // because every mutation (including the two calls below) is made by
+    // the host process's single model-lifecycle actor (the provider's
+    // `ProviderLoop`/`BatchScheduler` load/unload path, or the CLI smoke
+    // harness's single-threaded setup) STRICTLY BETWEEN forward passes —
+    // never concurrently with one. A forward pass only ever READS
+    // `modelDirectory`/`enabled` and calls into `cache`/`store`, and the
+    // host is required to fence out in-flight generation (await any
+    // running decode/prefill tasks to completion) before calling
+    // `purgeCache()` or `setCacheBudgetBytes(_:)` and before starting the
+    // next load. We do not add a lock here on top of that contract —
+    // `ExpertCache`'s own internals stay lock-correct independently (its
+    // `get`/`insert`/`fetch` race against each other from prefetch and
+    // foreground fetch threads DURING a forward pass), but these two
+    // lifecycle entry points are load/unload-time-only and single-writer
+    // by construction, so a second lock here would just be dead weight.
+    //
+    // Callers: today that's `ProviderLoop`/`BatchScheduler.stopCurrentEngine()`
+    // (purge on unload/idle-timeout/reload) and the provider's model-load
+    // path (budget resize before building the new model's streaming
+    // layers).
+
+    /// Release every entry in the shared expert cache and forget the
+    /// checkpoint-specific layout/config state cached alongside it.
+    ///
+    /// Call this AFTER the departing model's forward passes have been
+    /// fully fenced (no in-flight decode/prefill) and BEFORE the caller
+    /// does its own `MLX.Memory.clearCache()` sweep, so the freed expert
+    /// arrays return to the OS in the same pass as the rest of the
+    /// unloaded model's resident weights.
+    ///
+    /// `cachedStore` and `cachedBaseConfiguration` are cleared here (not
+    /// just the byte cache) because both are keyed by whatever
+    /// `modelDirectory` was set at the time they were built. The model
+    /// directory CAN change between loads — a re-downloaded checkpoint at
+    /// the same path, or a different DeepSeek-V4 version entirely — and a
+    /// stale `SafetensorsLayout`/`BaseConfiguration` would silently try to
+    /// serve byte ranges computed against the OLD checkpoint's shard
+    /// layout. `modelDirectory` itself and `enabled` are intentionally
+    /// left untouched: the next load's setup path (same one that runs on
+    /// the very first load) is responsible for pointing `modelDirectory`
+    /// at the new checkpoint and flipping `enabled`, exactly as it already
+    /// does today.
+    public static func purgeCache() {
+        // Cancel any in-flight background warm task and flush the current
+        // in-memory usage profile to disk BEFORE dropping these statics —
+        // both hold state (pending fetches, unsaved counts) tied to the
+        // departing checkpoint that would otherwise be silently lost on
+        // unload (the debounced `record()` save cadence has no reason to
+        // have just fired at exactly this moment).
+        cachedCacheWarmer?.cancel()
+        cachedUsageProfile?.flush()
+
+        cache.purgeAll()
+        cachedStore = nil
+        cachedBaseConfiguration = nil
+        cachedPrefetchCoordinator = nil
+        cachedUsageProfile = nil
+        cachedCacheWarmer = nil
+    }
+
+    /// Resize the shared expert cache's byte budget, evicting immediately
+    /// if the new budget is smaller than current occupancy. Replaces the
+    /// old "static let, sized once from `DSV4_EXPERT_CACHE_GB` on first
+    /// access, can't resize" limitation — a provider reloading with a
+    /// different `expert_cache_gb` now calls this instead of relying on
+    /// the environment variable being read exactly once per process.
+    ///
+    /// `DSV4_EXPERT_CACHE_GB` / `ExpertCache.budgetFromEnv()` remains the
+    /// bootstrap value `cache` is constructed with (still needed for
+    /// out-of-process consumers like the CLI smoke harness that never call
+    /// this setter), but any in-process caller that knows the desired
+    /// budget should call this directly rather than mutating the
+    /// environment after the process has started (env vars are read once
+    /// at cache-construction time, not on every access).
+    public static func setCacheBudgetBytes(_ bytes: Int) {
+        cache.setByteBudget(bytes)
+    }
+
+    /// Reads `config.json`'s `quantization` dict for a given module path
+    /// (e.g. `"model.layers.3.ffn.switch_mlp.gate_proj"`), matching the same
+    /// per-layer resolution `quantize(model:)` uses for the resident load
+    /// path (`BaseConfiguration.PerLayerQuantization.quantization(layer:)`).
+    /// Falls back to mxfp4 group_size=32 bits=4 — the recipe every routed-
+    /// expert-streaming checkpoint produced so far uses — if `config.json`
+    /// can't be read or has no entry for this path.
+    static func quantizationParams(forLayerPath path: String) -> (
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        let fallback = (groupSize: 32, bits: 4, mode: QuantizationMode.mxfp4)
+        guard let modelDirectory else { return fallback }
+        if cachedBaseConfiguration == nil {
+            let configURL = modelDirectory.appendingPathComponent("config.json")
+            guard let data = try? Data(contentsOf: configURL),
+                let base = try? JSONDecoder().decode(BaseConfiguration.self, from: data)
+            else { return fallback }
+            cachedBaseConfiguration = base
+        }
+        guard let quant = cachedBaseConfiguration?.perLayerQuantization?.quantization(layer: path)
+        else { return fallback }
+        return (quant.groupSize, quant.bits, quant.mode)
+    }
+}
+
 // MARK: - DeepseekV4MoE
 
 class DeepseekV4MoE: Module {
@@ -1002,7 +1359,16 @@ class DeepseekV4MoE: Module {
     let swiguLimit: Float
 
     var gate: DeepseekV4Gate
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    // Resident path. Nil (and unregistered) when streaming is active for
+    // this layer -- see `streamingSwitchMLP` below.
+    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU?
+    // Streaming path. Deliberately NOT an MLXNN `Module` and NOT wrapped in
+    // `@ModuleInfo`: it holds its (large, disk-backed) expert weights inside
+    // `ExpertCache`/`ExpertShardStore`, never as a direct MLXArray stored
+    // property, so `Module.parameters()` / `update(parameters:)` /
+    // `quantize(model:)` never see or touch it. See ExpertStreaming/
+    // StreamingQuantizedSwitchGLU.swift for why this is required (and safe).
+    private let streamingSwitchMLP: StreamingQuantizedSwitchGLU?
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
@@ -1010,21 +1376,78 @@ class DeepseekV4MoE: Module {
         self.swiguLimit = config.swiguLimit
         self.gate = DeepseekV4Gate(config: config, layerIdx: layerIdx)
         let limit = config.swiguLimit
-        self._switchMLP.wrappedValue = SwitchGLU(
-            inputDims: config.hiddenSize,
-            hiddenDims: config.moeIntermediateSize,
-            numExperts: config.nRoutedExperts,
-            activation: { x in limit > 0 ? silu(clip(x, min: -limit, max: limit)) : silu(x) })
+        // Reference _limited_swiglu clamps BOTH inputs: gate one-sided
+        // (min(gate, limit)), up two-sided (clip ±limit). This must go through
+        // the explicit-product initializer — as a unary activation the up-clamp
+        // is unexpressible, and SwitchGLU's single-point silu probe would
+        // mis-detect a clamped variant and drop the clamps entirely (NaN on
+        // real weights, which are trained against the clamped form).
+        let clampedSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = { gate, up in
+            guard limit > 0 else { return silu(gate) * up }
+            let g = MLX.minimum(gate, MLXArray(limit))
+            let u = clip(up, min: MLXArray(-limit), max: MLXArray(limit))
+            return silu(g) * u
+        }
+
+        // MTP layers (layerIdx >= numHiddenLayers) always use the resident
+        // path: they're keyed under `mtp.N.block...` in the checkpoint, not
+        // `model.layers.N...`, so the streaming store's fixed
+        // `model.layers.<n>.ffn.switch_mlp` prefix wouldn't resolve, and MTP
+        // is off by default anyway (`_deepseekV4MTPEnabled`).
+        if DeepseekV4ExpertStreaming.enabled && layerIdx < config.numHiddenLayers {
+            let path = "model.layers.\(layerIdx).ffn.switch_mlp.gate_proj"
+            let (groupSize, bits, mode) = DeepseekV4ExpertStreaming.quantizationParams(
+                forLayerPath: path)
+            // Kick the background warm task (idempotent, cached
+            // singleton — see `cacheWarmer`) as a side effect of building
+            // the FIRST streamed layer, same lazy-on-first-use timing as
+            // `store`/`prefetchCoordinator` below. Not plumbed into
+            // `StreamingQuantizedSwitchGLU` itself (unlike the usage
+            // profile) because the warmer is never called FROM a forward
+            // pass — it only reads `ExpertUsageProfile.totalForwardCalls`
+            // to decide when to stop, so the two are decoupled on purpose.
+            DeepseekV4ExpertStreaming.cacheWarmer(
+                numExperts: config.nRoutedExperts, totalLayers: config.numHiddenLayers)
+            self.streamingSwitchMLP = StreamingQuantizedSwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts,
+                layerIndex: layerIdx,
+                groupSize: groupSize, bits: bits, mode: mode,
+                cache: DeepseekV4ExpertStreaming.cache,
+                store: DeepseekV4ExpertStreaming.store(numExperts: config.nRoutedExperts),
+                activationProduct: clampedSwiGLU,
+                prefetch: DeepseekV4ExpertStreaming.prefetchCoordinator(
+                    totalLayers: config.numHiddenLayers, numExperts: config.nRoutedExperts),
+                usageProfile: DeepseekV4ExpertStreaming.usageProfile(
+                    numExperts: config.nRoutedExperts, totalLayers: config.numHiddenLayers))
+        } else {
+            self.streamingSwitchMLP = nil
+            self._switchMLP.wrappedValue = SwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.nRoutedExperts,
+                activationProduct: clampedSwiGLU)
+        }
+        // Reference (mlx-lm #1192): shared experts use an *unclamped* SwiGLU —
+        // swiglu_limit applies to routed experts only.
         self._sharedExperts.wrappedValue = DeepseekV4MLP(
             hiddenSize: config.hiddenSize,
             intermediateSize: config.moeIntermediateSize * config.nSharedExperts,
-            swiguLimit: config.swiguLimit)
+            swiguLimit: 0)
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray, inputIds: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x, inputIds: inputIds)
-        var y = switchMLP(x, indices)
+        var y: MLXArray
+        if let streamingSwitchMLP {
+            y = streamingSwitchMLP(x, indices)
+        } else if let switchMLP {
+            y = switchMLP(x, indices)
+        } else {
+            fatalError("DeepseekV4MoE: neither streaming nor resident switch_mlp is configured")
+        }
         y = (y * scores[.ellipsis, .newAxis].asType(y.dtype)).sum(axis: -2)
         return y + sharedExperts(x)
     }
@@ -1071,13 +1494,13 @@ final class LocalAttention: Module {
 
     let rope: DeepseekV4RoPE  // non-Module
 
-    var wq_a: Linear
+    @ModuleInfo var wq_a: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    var wq_b: Linear
-    var wkv: Linear
+    @ModuleInfo var wq_b: Linear
+    @ModuleInfo var wkv: Linear
     @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
-    var wo_a: DeepseekV4MultiLinear
-    var wo_b: Linear
+    @ModuleInfo var wo_a: DeepseekV4MultiLinear
+    @ModuleInfo var wo_b: Linear
     var attn_sink: MLXArray
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
@@ -1118,29 +1541,39 @@ final class LocalAttention: Module {
         let B = x.dim(0), L = x.dim(1)
         let offset = cache?.offset ?? 0
 
-        var q = wq_b(qNorm(wq_a(x)))
+        let qRes = qNorm(wq_a(x))
+        DSV4AttnDump.dump("q_residual", qRes)
+        var q = wq_b(qRes)
         q = q.reshaped([B, L, numHeads, headDim])
         q = headRmsNorm(q, eps: eps)
         q = q.transposed(0, 2, 1, 3)       // [B, numHeads, L, headDim]
         q = rope.callAsFunction(q, offset: offset)
+        DSV4AttnDump.dump("q_roped", q)
 
         var kv = kvNorm(wkv(x)).reshaped([B, 1, L, headDim])
         kv = rope.callAsFunction(kv, offset: offset)
+        DSV4AttnDump.dump("kv_roped", kv)
         if let c = cache {
             let (cached, _) = c.update(keys: kv, values: kv)
             kv = cached
         }
 
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-            ? attn_sink.asType(q.dtype) : nil
+        // Reference always passes sinks (a zero sink still contributes exp(0)=1 to
+        // the softmax denominator — omitting it is not equivalent). Never gate on
+        // .item(): that forces a GPU sync per layer per step.
+        let sinks = attn_sink.asType(q.dtype)
         var out = MLXFast.scaledDotProductAttention(
             queries: q, keys: kv, values: kv,
             scale: scale, mask: mask, sinks: sinks)  // [B, numHeads, L, headDim]
+        DSV4AttnDump.dump("sdpa_out", out)
 
         out = rope.callAsFunction(out, offset: offset, inverse: true)
 
-        return applyOutputProjection(out, woA: wo_a, woB: wo_b,
+        let projected = applyOutputProjection(out, woA: wo_a, woB: wo_b,
             oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
+        DSV4AttnDump.dump("attn_projected", projected)
+        DSV4AttnDump.armed = false
+        return projected
     }
 }
 
@@ -1159,13 +1592,13 @@ final class CompressedAttention: Module {
     let rope: DeepseekV4RoPE
     var compressor: Compressor
 
-    var wq_a: Linear
+    @ModuleInfo var wq_a: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    var wq_b: Linear
-    var wkv: Linear
+    @ModuleInfo var wq_b: Linear
+    @ModuleInfo var wkv: Linear
     @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
-    var wo_a: DeepseekV4MultiLinear
-    var wo_b: Linear
+    @ModuleInfo var wo_a: DeepseekV4MultiLinear
+    @ModuleInfo var wo_b: Linear
     var attn_sink: MLXArray
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
@@ -1229,13 +1662,12 @@ final class CompressedAttention: Module {
         let pooled = compressor(x, poolCache: poolCache, offset: offset)  // [B, P, headDim]
         var effectiveMask = mask
         let P = pooled.dim(1)
+        let sinks = attn_sink.asType(q.dtype)
         if P > 0 {
             let poolMask = poolCache?.makeMask(L: L, offset: offset)
             let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
             effectiveMask = extendMask(mask, poolMask: poolMask, L: L, P: P)
 
-            let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-                ? attn_sink.asType(q.dtype) : nil
             var out = MLXFast.scaledDotProductAttention(
                 queries: q, keys: fullKV, values: fullKV,
                 scale: scale, mask: effectiveMask, sinks: sinks)
@@ -1244,8 +1676,6 @@ final class CompressedAttention: Module {
                 oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
         }
 
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-            ? attn_sink.asType(q.dtype) : nil
         var out = MLXFast.scaledDotProductAttention(
             queries: q, keys: kv, values: kv,
             scale: scale, mask: mask, sinks: sinks)
@@ -1270,13 +1700,13 @@ final class SparseCompressedAttention: Module {
     var compressor: Compressor
     var indexer: Indexer
 
-    var wq_a: Linear
+    @ModuleInfo var wq_a: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    var wq_b: Linear
-    var wkv: Linear
+    @ModuleInfo var wq_b: Linear
+    @ModuleInfo var wkv: Linear
     @ModuleInfo(key: "kv_norm") var kvNorm: RMSNorm
-    var wo_a: DeepseekV4MultiLinear
-    var wo_b: Linear
+    @ModuleInfo var wo_a: DeepseekV4MultiLinear
+    @ModuleInfo var wo_b: Linear
     var attn_sink: MLXArray
 
     init(config: DeepseekV4Configuration, layerIdx: Int) {
@@ -1339,8 +1769,7 @@ final class SparseCompressedAttention: Module {
         let pooled = compressor(x, poolCache: compCache, offset: offset)
         let pmask = compCache?.makeMask(L: L, offset: offset)
         let topk = indexer(x, qResidual: qResidual, rope: rope, poolCache: idxCache, offset: offset)
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
-            ? attn_sink.asType(q.dtype) : nil
+        let sinks = attn_sink.asType(q.dtype)
         let P = pooled.dim(1)
         let indexTopk = indexer.indexTopk
 
@@ -1397,15 +1826,15 @@ final class SparseCompressedAttention: Module {
         let qScaled = q * scale
 
         // Local scores: [B, H, L, localLen]
+        // Masked positions use the finite dtype minimum (reference:
+        // mx.finfo(...).min) — -inf turns into NaN in the split-softmax below
+        // whenever an entire row is masked.
         let localScores: MLXArray
-        switch localMask {
-        case .none, .causal:
-            localScores = qScaled.matmul(localKV.transposed(0, 1, 3, 2))
-        case .array(let arr):
+        if let arr = localMask.mask {
             let raw = qScaled.matmul(localKV.transposed(0, 1, 3, 2))
             let arrExpanded = arr.expandedDimensions(axis: 0).expandedDimensions(axis: 1)
-            localScores = MLX.where(arrExpanded, raw, MLXArray(Float(-Float.infinity)))
-        @unknown default:
+            localScores = MLX.where(arrExpanded, raw, MLXArray(-Float.greatestFiniteMagnitude))
+        } else {
             localScores = qScaled.matmul(localKV.transposed(0, 1, 3, 2))
         }
 
@@ -1426,7 +1855,7 @@ final class SparseCompressedAttention: Module {
             pooledScores = MLX.where(
                 sparsePM[0..., .newAxis, 0..., 0...],
                 pooledScores,
-                MLXArray(Float(-Float.infinity)))
+                MLXArray(-Float.greatestFiniteMagnitude))
         }
 
         let maxPooled = pooledScores.max(axis: -1, keepDims: true)
@@ -1492,11 +1921,23 @@ class DeepseekV4Block: Module {
         cache: (any KVCache)?,
         inputIds: MLXArray
     ) -> MLXArray {
+        let debug = DSV4Debug.layerNorms == 2
+        func probe(_ name: String, _ a: MLXArray) {
+            guard debug else { return }
+            let f = a.asType(.float32)
+            print(String(format: "[dsv4-block] %@ absMax=%.4e mean=%+.4e",
+                name, MLX.abs(f).max().item(Float.self), f.mean().item(Float.self)))
+        }
+
         // Attention sub-block
         var residual = x
         let (xAttn, postAttn, combAttn) = hcPre(
             x: residual, hcFn: attn_hc.fn, hcScale: attn_hc.scale, hcBase: attn_hc.base,
-            hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps)
+            hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps,
+            normEps: config.rmsNormEps)
+        probe("hcPre.x", xAttn)
+        probe("hcPre.post", postAttn)
+        probe("hcPre.comb", combAttn)
 
         let attnOut: MLXArray
         let normedAttn = attnNorm(xAttn)
@@ -1509,15 +1950,19 @@ class DeepseekV4Block: Module {
         } else {
             fatalError("Unknown attention type in DeepseekV4Block")
         }
+        probe("attnOut", attnOut)
 
-        var h = hcPost(x: attnOut, residual: residual, post: postAttn, comb: combAttn)
+        let h = hcPost(x: attnOut, residual: residual, post: postAttn, comb: combAttn)
+        probe("postAttn.h", h)
 
         // FFN sub-block
         residual = h
         let (xFfn, postFfn, combFfn) = hcPre(
             x: residual, hcFn: ffn_hc.fn, hcScale: ffn_hc.scale, hcBase: ffn_hc.base,
-            hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps)
+            hcMult: config.hcMult, sinkhornIters: config.hcSinkhornIters, eps: config.hcEps,
+            normEps: config.rmsNormEps)
         let ffnOut = ffn(ffnNorm(xFfn), inputIds: inputIds)
+        probe("ffnOut", ffnOut)
         return hcPost(x: ffnOut, residual: residual, post: postFfn, comb: combFfn)
     }
 }
@@ -1555,7 +2000,9 @@ public class DeepseekV4ModelInner: Module {
     }
 
     /// Forward with optional return of the raw 4D hidden state (for MTP).
-    func forward(
+    /// Public so out-of-module harnesses (DSV4Smoke) can probe the pre-head
+    /// hidden state for parity debugging.
+    public func forward(
         _ inputIds: MLXArray,
         cache: [any KVCache]?,
         returnRawHidden: Bool
@@ -1578,14 +2025,37 @@ public class DeepseekV4ModelInner: Module {
             windowSize: config.slidingWindow,
             returnArray: true)
 
+        // Debug probe (env DSV4_DEBUG_LAYER_NORMS=1): print per-layer hidden
+        // stats to locate the first non-finite layer on a real checkpoint.
+        // Forces a per-layer eval — smoke-test use only.
+        let debugNorms = DSV4Debug.layerNorms == 1
+        // DSV4_DUMP_LAYER_DIR: dump each layer's last-position 4D hidden
+        // ([hc*D] flattened, float32 JSON) for elementwise reference diffing.
+        let dumpDir = DSV4Debug.dumpLayerDir
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: maskMode, cache: cache?[i], inputIds: inputIds)
+            if debugNorms {
+                let f = h.asType(.float32)
+                let absMax = MLX.abs(f).max().item(Float.self)
+                let mean = f.mean().item(Float.self)
+                print(String(format: "[dsv4-debug] layer %02d ratio=%d absMax=%.4e mean=%+.4e",
+                    i, i < config.compressRatios.count ? config.compressRatios[i] : -1,
+                    absMax, mean))
+            }
+            if let dumpDir {
+                let f = h[0, -1, 0..., 0...].flattened().asType(.float32)
+                eval(f)
+                let vals = f.asArray(Float.self)
+                let json = "[" + vals.map { String($0) }.joined(separator: ",") + "]"
+                try? json.write(
+                    toFile: "\(dumpDir)/layer\(i).json", atomically: true, encoding: .utf8)
+            }
         }
 
         let rawHidden = returnRawHidden ? h : nil
         h = hcHeadReduce(
             x: h, hcFn: hc_head.fn, hcScale: hc_head.scale, hcBase: hc_head.base,
-            eps: config.hcEps)
+            eps: config.hcEps, normEps: config.rmsNormEps)
         return (norm(h), rawHidden)
     }
 }
@@ -1597,7 +2067,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     var args: DeepseekV4Configuration
     public var model: DeepseekV4ModelInner
-    @ModuleInfo(key: "lm_head") var lmHead: Linear
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear
 
     /// MTP prediction blocks. Non-nil only when `_deepseekV4MTPEnabled == true` at init time.
     var mtp: [DeepseekV4MTPBlock]?
@@ -1623,7 +2093,23 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         lmHead(model(inputs, cache: cache))
     }
 
-    public func makeCache(parameters: GenerateParameters) -> [any KVCache] {
+    /// The `LanguageModel` protocol hook every generation path actually calls
+    /// (`TokenIterator`, `ModelContainer.generate`, the continuous-batching
+    /// scheduler's `supportsBatchedServing` probe, ...).
+    ///
+    /// This MUST be `newCache(parameters:)`, not just a differently-named
+    /// helper: `DeepseekV4Model` conforms to `KVCacheDimensionProvider`, whose
+    /// default `newCache` (LanguageModel.swift) returns one `KVCacheSimple`
+    /// per layer. The compressed/sparse attention layers downcast their cache
+    /// to `DeepseekV4LayerCache` — against a `KVCacheSimple` that downcast
+    /// quietly returns nil, so KV never accumulates, `offset` stays 0, and
+    /// decode emits garbage while prefill-only probes (`--logits`) look fine.
+    ///
+    /// `parameters` is intentionally unused: the cache layout is dictated by
+    /// `compress_ratios` (rotating window / pooled / sparse-pooled per layer),
+    /// not by caller preferences like `maxKVSize` — a caller-supplied rotating
+    /// cache cannot represent the pooled state.
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         args.compressRatios.map { ratio in
             if ratio == 0 {
                 return RotatingKVCache(maxSize: args.slidingWindow) as any KVCache
@@ -1640,6 +2126,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                 ) as any KVCache
             }
         }
+    }
+
+    /// Legacy spelling kept for existing call sites (tests, DSV4Smoke's
+    /// `--logits` probe). Delegates to the protocol hook above so there is
+    /// exactly one cache-layout implementation.
+    public func makeCache(parameters: GenerateParameters) -> [any KVCache] {
+        newCache(parameters: parameters)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -1688,6 +2181,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
         var remapped: [String: MLXArray] = [:]
         for (key, value) in w {
+            var value = value
+            // Hash-routing tables must be integer indices (reference casts to int32).
+            if key.contains("tid2eid") { value = value.asType(.int32) }
             var nk = key.hasPrefix("layers.") ? "model." + key : key
             // Remap flat hc keys: .hc_attn_fn → .attn_hc.fn
             for sub in ["attn", "ffn"] {
@@ -1761,9 +2257,43 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         return w.filter { key, _ in
             if key.hasPrefix("mtp.") && !hasMTP { return false }
             if key.contains("rotary_emb.inv_freq") { return false }
+            // Consumed by the FP8 block-dequant above; not a module parameter.
+            if key.contains("weight_scale_inv") { return false }
+            // Streaming mode: drop the ~125 GB of routed-expert tensors so
+            // they're never applied to (or held resident by) the model --
+            // DeepseekV4MoE built a StreamingQuantizedSwitchGLU instead of a
+            // resident SwitchGLU for these layers, which registers no
+            // parameters and reads these tensors straight off disk per
+            // forward pass instead. Scoped to `model.layers.` (not `mtp.`)
+            // because MTP layers always keep the resident path -- see the
+            // comment in DeepseekV4MoE.init.
+            if DeepseekV4ExpertStreaming.enabled, key.hasPrefix("model.layers."),
+                key.contains(".ffn.switch_mlp.")
+            {
+                return false
+            }
             return true
         }
     }
 
     public var loraLayers: [Module] { model.layers }
+}
+
+// MARK: - StreamedWeightsModel
+
+extension DeepseekV4Model: StreamedWeightsModel {
+    /// Consulted by `loadWeights` BEFORE shard materialization: the parallel
+    /// shard reader evals every shard as it reads it, so waiting for
+    /// `sanitize` to drop switch_mlp keys would transiently materialize the
+    /// full ~141 GB checkpoint (OOM on a 128 GB box). Keys matched here stay
+    /// unevaluated lazy loads and their bytes are never read.
+    ///
+    /// Keys are pre-`sanitize` spellings: mlx-canonical checkpoints use
+    /// `model.layers.N.ffn.switch_mlp....`, older exports `layers.N....` —
+    /// both contain `.ffn.switch_mlp.`. MTP keys (`mtp.`) are excluded
+    /// because MTP layers always keep the resident path (see DeepseekV4MoE).
+    public func shouldStreamWeight(key: String) -> Bool {
+        guard DeepseekV4ExpertStreaming.enabled else { return false }
+        return !key.hasPrefix("mtp.") && key.contains(".ffn.switch_mlp.")
+    }
 }

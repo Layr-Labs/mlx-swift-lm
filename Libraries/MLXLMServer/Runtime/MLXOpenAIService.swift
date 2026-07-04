@@ -68,7 +68,9 @@ public struct MLXOpenAIService: Sendable {
         await metrics.recordChatRequest()
         do {
             let output = try await collectChatOutput(request: request)
-            let response = try chatCompletionResponse(request: request, output: output)
+            let modelDefault = await engine.defaultReasoningParser(for: request.model)
+            let response = try chatCompletionResponse(
+                request: request, output: output, modelDefaultReasoningParser: modelDefault)
             await metrics.recordUsage(response.usage)
             return response
         } catch {
@@ -83,6 +85,11 @@ public struct MLXOpenAIService: Sendable {
         await metrics.recordChatRequest()
         let generationRequest = try OpenAIResponseFormatSupport.preparedRequest(request)
         let stream = try await engine.streamChatCompletion(request: generationRequest)
+        // Resolved AFTER `streamChatCompletion` returns -- by this point the
+        // engine has already resolved (and, for atomic-acquire engines,
+        // loaded/pinned) the model for this request, so this lookup never
+        // races a concurrent load/eviction and never forces one itself.
+        let modelDefault = await engine.defaultReasoningParser(for: request.model)
         let id = idProvider("chatcmpl")
         let created = Int(Date().timeIntervalSince1970)
         let includeUsage = request.streamOptions?.includeUsage == true
@@ -92,7 +99,7 @@ public struct MLXOpenAIService: Sendable {
                 var usage: OpenAIUsage?
                 var finishReason = "stop"
                 var reasoningParser = StreamingReasoningParser(
-                    format: request.reasoningParser ?? defaultReasoningParser ?? .none
+                    format: request.reasoningParser ?? modelDefault ?? defaultReasoningParser ?? .none
                 )
                 do {
                     continuation.yield(
@@ -254,7 +261,10 @@ public struct MLXOpenAIService: Sendable {
         await metrics.recordResponseRequest()
         do {
             let output = try await collectChatOutput(request: request.chatCompletionRequest)
-            let response = responseObject(request: request, output: output)
+            let modelDefault = await engine.defaultReasoningParser(
+                for: request.chatCompletionRequest.model)
+            let response = responseObject(
+                request: request, output: output, modelDefaultReasoningParser: modelDefault)
             if request.store != false {
                 await responseStore.save(response)
             }
@@ -353,10 +363,13 @@ public struct MLXOpenAIService: Sendable {
 
     private func chatCompletionResponse(
         request: OpenAIChatCompletionRequest,
-        output: CollectedChatOutput
+        output: CollectedChatOutput,
+        modelDefaultReasoningParser: ReasoningParserFormat? = nil
     ) throws -> OpenAIChatCompletionResponse {
-        let parsed = ReasoningParser(format: request.reasoningParser ?? defaultReasoningParser ?? .none)
-            .parse(output.content)
+        let parsed = ReasoningParser(
+            format: request.reasoningParser ?? modelDefaultReasoningParser ?? defaultReasoningParser ?? .none
+        )
+        .parse(output.content)
         let content = output.toolCalls.isEmpty
             ? try OpenAIResponseFormatSupport.normalizedContent(
                 parsed.content,
@@ -382,10 +395,14 @@ public struct MLXOpenAIService: Sendable {
 
     private func responseObject(
         request: OpenAIResponseRequest,
-        output: CollectedChatOutput
+        output: CollectedChatOutput,
+        modelDefaultReasoningParser: ReasoningParserFormat? = nil
     ) -> OpenAIResponse {
-        let parsed = ReasoningParser(format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
-            .parse(output.content)
+        let parsed = ReasoningParser(
+            format: request.reasoning?.parser ?? modelDefaultReasoningParser ?? defaultReasoningParser
+                ?? .none
+        )
+        .parse(output.content)
         var outputItems: [OpenAIResponseOutputItem] = []
         if let reasoningContent = parsed.reasoningContent, !reasoningContent.isEmpty {
             outputItems.append(.reasoning(id: idProvider("rs"), text: reasoningContent))

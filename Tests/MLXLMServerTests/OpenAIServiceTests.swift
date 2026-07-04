@@ -53,6 +53,98 @@ struct OpenAIServiceTests {
         #expect(lastRequest?.tools?.first?.function.name == "get_weather")
     }
 
+    // MARK: - Engine-provided model-type default reasoning parser (DAR: deepseek_v4 auto-split)
+
+    @Test("chat completion falls back to the engine's model-type default reasoning parser when the request doesn't specify one")
+    func chatCompletionUsesEngineDefaultReasoningParserWhenRequestOmitsOne() async throws {
+        let engine = ScriptedServerEngine(
+            events: [
+                .content("<think>plan the answer</think>Hello there"),
+                .info(.init(promptTokens: 4, completionTokens: 5)),
+            ],
+            reasoningParserDefault: .deepseekR1
+        )
+        let service = MLXOpenAIService(engine: engine)
+
+        // No `reasoningParser` on the request -- must NOT leak raw
+        // `<think>...</think>` text into `content` the way it would with
+        // `format: .none`; the engine's deepseek_v4-derived default must
+        // apply.
+        let response = try await service.createChatCompletion(
+            request: .test(messages: [.init(role: .user, content: .text("hi"))])
+        )
+
+        #expect(response.choices.first?.message.content == .text("Hello there"))
+        #expect(response.choices.first?.message.reasoningContent == "plan the answer")
+    }
+
+    @Test("an explicit request reasoning_parser overrides the engine's model-type default")
+    func explicitRequestReasoningParserOverridesEngineDefault() async throws {
+        let engine = ScriptedServerEngine(
+            events: [
+                .content("<think>plan the answer</think>Hello there"),
+                .info(.init(promptTokens: 4, completionTokens: 5)),
+            ],
+            reasoningParserDefault: .deepseekR1
+        )
+        let service = MLXOpenAIService(engine: engine)
+
+        // Consumer explicitly disables reasoning parsing -- the engine's
+        // default must NOT override an explicit request value.
+        let response = try await service.createChatCompletion(
+            request: .test(
+                messages: [.init(role: .user, content: .text("hi"))],
+                reasoningParser: ReasoningParserFormat.none
+            )
+        )
+
+        #expect(response.choices.first?.message.content == .text("<think>plan the answer</think>Hello there"))
+        #expect(response.choices.first?.message.reasoningContent == nil)
+    }
+
+    @Test("streaming chat completion also applies the engine's model-type default reasoning parser")
+    func streamingChatCompletionUsesEngineDefaultReasoningParser() async throws {
+        let engine = ScriptedServerEngine(
+            events: [
+                .content("<think>plan</think>Hi"),
+                .info(.init(promptTokens: 1, completionTokens: 1)),
+            ],
+            reasoningParserDefault: .deepseekR1
+        )
+        let service = MLXOpenAIService(engine: engine)
+
+        var frames: [String] = []
+        for try await frame in try await service.streamChatCompletionFrames(
+            request: .test(messages: [.init(role: .user, content: .text("hi"))], stream: true)
+        ) {
+            frames.append(frame)
+        }
+        let joined = frames.joined()
+
+        #expect(joined.contains(#""reasoning_content":"plan""#))
+        #expect(joined.contains(#""content":"Hi""#))
+        #expect(!joined.contains("<think>"), "raw think tags must never leak into a content delta")
+    }
+
+    @Test("an engine with no model-type opinion (nil default) leaves reasoning parsing unchanged")
+    func engineWithNilReasoningDefaultLeavesContentUnparsed() async throws {
+        // No `reasoningParserDefault` supplied -- matches the protocol's
+        // documented default (nil) and every pre-existing conformer's
+        // (source-compatible) behavior.
+        let engine = ScriptedServerEngine(events: [
+            .content("<think>plan</think>Hi"),
+            .info(.init(promptTokens: 1, completionTokens: 1)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+
+        let response = try await service.createChatCompletion(
+            request: .test(messages: [.init(role: .user, content: .text("hi"))])
+        )
+
+        #expect(response.choices.first?.message.content == .text("<think>plan</think>Hi"))
+        #expect(response.choices.first?.message.reasoningContent == nil)
+    }
+
     @Test("streaming chat completion emits OpenAI SSE frames, usage, and done sentinel")
     func streamingChatCompletionEmitsSSEFramesUsageAndDone() async throws {
         let engine = ScriptedServerEngine(events: [
@@ -609,9 +701,15 @@ struct OpenAIServiceTests {
 private actor ScriptedServerEngine: MLXServerEngine {
     var lastChatRequest: OpenAIChatCompletionRequest?
     private let events: [MLXServerGenerationEvent]
+    /// Simulates a multi-model engine's model-type-derived reasoning
+    /// parser default (mirrors `MultiModelBatchSchedulerEngine` in the
+    /// darkbloom provider, which derives this from the resolved model's
+    /// `modelType`). nil ⇒ "no opinion" (the protocol's documented default).
+    private let reasoningParserDefault: ReasoningParserFormat?
 
-    init(events: [MLXServerGenerationEvent]) {
+    init(events: [MLXServerGenerationEvent], reasoningParserDefault: ReasoningParserFormat? = nil) {
         self.events = events
+        self.reasoningParserDefault = reasoningParserDefault
     }
 
     func availableModels() async throws -> [MLXServerModel] {
@@ -641,6 +739,10 @@ private actor ScriptedServerEngine: MLXServerEngine {
 
     func applyTemplate(_ request: ApplyTemplateRequest) async throws -> TokenizeResponse {
         .init(tokens: [7, 8, 9])
+    }
+
+    func defaultReasoningParser(for modelId: String) async -> ReasoningParserFormat? {
+        reasoningParserDefault
     }
 }
 

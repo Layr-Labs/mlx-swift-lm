@@ -1,0 +1,358 @@
+// DSV4Smoke — minimal end-to-end smoke harness for DeepSeek-V4 checkpoints.
+//
+// Loads a local model directory (full or truncated checkpoint), applies the
+// chat template, greedy-generates, and prints text + timing + memory. Used to
+// validate the DeepseekV4 port against real weights on a dev box before any
+// provider integration.
+//
+// usage: DSV4Smoke <model-directory> [--prompt "..."] [--max-tokens N] [--raw]
+//        --raw skips the chat template (plain completion of the prompt)
+//        --logits "id1,id2,..." forwards exact token ids and prints the
+//        last-position top-10 logits (for cross-implementation parity checks)
+//        --stream-experts streams routed-expert (switch_mlp) weights from
+//        <model-directory> per forward pass instead of loading them
+//        resident -- see DeepseekV4ExpertStreaming. Cache size is
+//        controlled by the DSV4_EXPERT_CACHE_GB env var (default 8 GiB).
+
+import Foundation
+import MLX
+import MLXHuggingFace
+import MLXLLM
+import MLXLMCommon
+import Tokenizers
+
+/// Determinism stress for the primitive ops DeepSeek-V4 leans on that other
+/// fleet models don't. Runs each op N times on identical inputs and reports
+/// any run-to-run drift (bitwise, via float32 sum + abs-diff vs first run).
+func runOpStress(iterations: Int) {
+    MLXRandom.seed(42)
+
+    func drift(_ name: String, _ make: () -> MLXArray) {
+        var reference: [Float]? = nil
+        var maxDrift: Float = 0
+        var nanRuns = 0
+        for _ in 0 ..< iterations {
+            let out = make().asType(.float32)
+            eval(out)
+            let vals = out.asArray(Float.self)
+            if vals.contains(where: { $0.isNaN }) { nanRuns += 1; continue }
+            if let ref = reference {
+                var d: Float = 0
+                for (a, b) in zip(vals, ref) { d = max(d, abs(a - b)) }
+                maxDrift = max(maxDrift, d)
+            } else {
+                reference = vals
+            }
+        }
+        let verdict = (nanRuns > 0 || maxDrift > 0) ? "DRIFT" : "ok"
+        print(String(format: "[op-stress] %-28@ maxDrift=%.3e nanRuns=%d/%d  %@",
+            name, maxDrift, nanRuns, iterations, verdict))
+    }
+
+    // Shapes mirror the real model (hidden 4096, moe 2048, experts 256, top-6).
+    let x = MLXRandom.normal([7, 4096]).asType(.bfloat16)
+    eval(x)
+
+    // 1. Plain dense matmul (control; steel gemm / nax on M5).
+    let denseW = MLXRandom.normal([4096, 1024]).asType(.bfloat16)
+    eval(denseW)
+    drift("dense matmul (control)") { matmul(x, denseW) }
+
+    // 2. Affine-quantized matmul g64 (attention projections).
+    let wq = MLXRandom.normal([1024, 4096])
+    let (qw, qs, qb) = MLX.quantized(wq, groupSize: 64, bits: 4, mode: .affine)
+    eval(qw, qs, qb ?? MLXArray(0))
+    drift("qmm affine g64") {
+        quantizedMM(x, qw, scales: qs, biases: qb, transpose: true,
+            groupSize: 64, bits: 4, mode: .affine)
+    }
+
+    // 3. Batched (3D) affine quantized matmul (wo_a MultiLinear).
+    let wq3 = MLXRandom.normal([8, 1024, 4096])
+    let (qw3, qs3, qb3) = MLX.quantized(wq3, groupSize: 64, bits: 4, mode: .affine)
+    let x4 = MLXRandom.normal([1, 8, 7, 4096]).asType(.bfloat16)
+    eval(qw3, qs3, x4)
+    drift("qmm batched 3D (wo_a)") {
+        quantizedMM(x4, qw3, scales: qs3, biases: qb3, transpose: true,
+            groupSize: 64, bits: 4, mode: .affine)
+    }
+
+    // 4. mxfp4 gather-quantized matmul (routed experts).
+    let we = MLXRandom.normal([256, 2048, 4096])
+    let (qwe, qse, qbe) = MLX.quantized(we, groupSize: 32, bits: 4, mode: .mxfp4)
+    let inds = MLXArray([Int32(3), 17, 40, 99, 200, 255], [1, 1, 6])
+    let xg = MLXRandom.normal([1, 1, 1, 4096]).asType(.bfloat16)
+    eval(qwe, qse, xg)
+    drift("gather-qmm mxfp4 g32") {
+        gatherQuantizedMM(
+            xg, qwe, scales: qse, biases: qbe, rhsIndices: inds, transpose: true,
+            groupSize: 32, bits: 4, mode: .mxfp4)
+    }
+
+    // 5. fast.rope with infinite NOPE frequencies (DeepseekV4RoPE).
+    let ropeFreqs = concatenated([
+        MLXArray(Array(repeating: Float.infinity, count: 224)),
+        MLXArray((0 ..< 32).map { Float(pow(10000.0, Double($0) / 32.0)) }),
+    ])
+    let ropeX = MLXRandom.normal([1, 64, 7, 512]).asType(.bfloat16)
+    eval(ropeFreqs, ropeX)
+    drift("fast.rope inf freqs (NOPE)") {
+        MLXFast.RoPE(
+            ropeX, dimensions: 512, traditional: true, base: nil, scale: 1.0,
+            offset: 0, freqs: ropeFreqs)
+    }
+
+    // 6. SDPA with sinks + bool array mask (1 KV head).
+    let q = MLXRandom.normal([1, 64, 7, 512]).asType(.bfloat16)
+    let kv = MLXRandom.normal([1, 1, 7, 512]).asType(.bfloat16)
+    let sinks = MLXRandom.normal([64]).asType(.bfloat16)
+    let boolMask = MLXArray((0 ..< 49).map { Int32($0 % 7 <= $0 / 7 ? 1 : 0) }, [7, 7])
+        .asType(.bool)
+    eval(q, kv, sinks, boolMask)
+    drift("sdpa sinks + bool mask") {
+        MLXFast.scaledDotProductAttention(
+            queries: q, keys: kv, values: kv, scale: 0.044,
+            mask: .array(boolMask), sinks: sinks)
+    }
+}
+
+@main
+struct DSV4Smoke {
+    static func main() async {
+        var args = Array(CommandLine.arguments.dropFirst())
+        guard !args.isEmpty else {
+            print("usage: DSV4Smoke <model-directory> [--prompt \"...\"] [--max-tokens N] [--raw]")
+            print("       DSV4Smoke --op-stress [iterations]")
+            exit(64)
+        }
+        if args[0] == "--op-stress" {
+            runOpStress(iterations: args.count > 1 ? Int(args[1]) ?? 12 : 12)
+            return
+        }
+        let directory = URL(fileURLWithPath: args.removeFirst())
+        var prompt = "Give me three facts about the Apple M5 Max."
+        var maxTokens = 64
+        var raw = false
+        var logitTokens: [Int]? = nil
+        var streamExperts = false
+        var delayBeforeGenerateSecs: Double = 0
+        var i = 0
+        while i < args.count {
+            switch args[i] {
+            case "--prompt" where i + 1 < args.count:
+                prompt = args[i + 1]
+                i += 2
+            case "--max-tokens" where i + 1 < args.count:
+                maxTokens = Int(args[i + 1]) ?? maxTokens
+                i += 2
+            case "--raw":
+                raw = true
+                i += 1
+            case "--logits" where i + 1 < args.count:
+                logitTokens = args[i + 1].split(separator: ",").compactMap { Int($0) }
+                i += 2
+            case "--stream-experts":
+                streamExperts = true
+                i += 1
+            case "--delay-before-generate" where i + 1 < args.count:
+                // Simulates the realistic "provider idle after load, request
+                // arrives later" case, giving the background warm task (see
+                // ExpertCacheWarmer) a head start BEFORE it has to compete
+                // with a real request's own foreground fetches for I/O --
+                // as opposed to this harness's default immediate-generate
+                // flow, which is closer to a worst case (zero head start).
+                delayBeforeGenerateSecs = Double(args[i + 1]) ?? 0
+                i += 2
+            default:
+                print("unknown arg: \(args[i])")
+                exit(64)
+            }
+        }
+
+        if streamExperts {
+            DeepseekV4ExpertStreaming.modelDirectory = directory
+            DeepseekV4ExpertStreaming.enabled = true
+            print("[stream-experts] enabled, cache budget=\(ExpertCache.budgetFromEnv() / 1_073_741_824) GiB")
+        }
+
+        do {
+            let loadStart = CFAbsoluteTimeGetCurrent()
+            let container = try await LLMModelFactory.shared.loadContainer(
+                from: directory, using: #huggingFaceTokenizerLoader())
+            let loadSecs = CFAbsoluteTimeGetCurrent() - loadStart
+            if delayBeforeGenerateSecs > 0 {
+                print(String(format: "[delay] sleeping %.1fs before first request", delayBeforeGenerateSecs))
+                try await Task.sleep(nanoseconds: UInt64(delayBeforeGenerateSecs * 1_000_000_000))
+            }
+            print(String(format: "[load] %.1fs, active=%.1f GiB, peak=%.1f GiB",
+                loadSecs,
+                Double(Memory.activeMemory) / 1073741824,
+                Double(Memory.peakMemory) / 1073741824))
+
+            // Logit-parity mode: forward exact ids (no cache), print
+            // per-position top-10 (token, logit) of the LAST position. The
+            // Python reference (mlx-lm PR #1192) run on the same ids must
+            // produce matching values within quantization noise.
+            if let ids = logitTokens {
+                try await container.perform { (context: ModelContext) async throws in
+                    print("[model] class=\(type(of: context.model))")
+                    let model = context.model
+                    guard let lm = model as? DeepseekV4Model else {
+                        print("not a DeepseekV4Model: \(type(of: model))")
+                        exit(64)
+                    }
+                    let cache = lm.makeCache(parameters: GenerateParameters())
+                    let (hidden, _) = lm.model.forward(
+                        MLXArray(ids.map(Int32.init), [1, ids.count]),
+                        cache: cache, returnRawHidden: false)
+                    let hLast = hidden[0, -1, 0...].asType(.float32)
+                    eval(hLast)
+                    print(String(format: "[hidden] last absMax=%.5e mean=%+.5e l2=%.4f",
+                        MLX.abs(hLast).max().item(Float.self),
+                        hLast.mean().item(Float.self),
+                        MLX.sqrt(hLast.square().sum()).item(Float.self)))
+                    if let dumpPath = ProcessInfo.processInfo.environment["DSV4_DUMP_HIDDEN"] {
+                        let vals = hLast.asArray(Float.self)
+                        let json = "[" + vals.map { String($0) }.joined(separator: ",") + "]"
+                        try? json.write(
+                            toFile: dumpPath, atomically: true, encoding: .utf8)
+                        print("[hidden] dumped \(vals.count) floats to \(dumpPath)")
+                    }
+                    let logits = lm.lmHead(hidden)
+                    let last = logits[0, -1, 0...].asType(.float32)
+                    eval(last)
+                    let vals = last.asArray(Float.self)
+                    let top = vals.enumerated().sorted { $0.element > $1.element }.prefix(10)
+                    print("[logits] last position top-10:")
+                    for (tok, v) in top {
+                        print(String(format: "  %6d  %+.4f", tok, v))
+                    }
+                    let mean = vals.reduce(0, +) / Float(vals.count)
+                    let l2 = vals.map { Double($0) * Double($0) }.reduce(0, +).squareRoot()
+                    print(String(format: "[logits] mean=%+.5f l2=%.3f vocab=%d", mean, l2, vals.count))
+                }
+                return
+            }
+
+            let (promptCopy, maxTokensCopy, rawCopy, streamExpertsCopy) =
+                (prompt, maxTokens, raw, streamExperts)
+            try await container.perform { (context: ModelContext) async throws in
+                print("[model] class=\(type(of: context.model))")
+
+                let tokens: [Int]
+                if rawCopy {
+                    tokens = context.tokenizer.encode(text: promptCopy, addSpecialTokens: true)
+                } else if let templated = try? context.tokenizer.applyChatTemplate(
+                    messages: [["role": "user", "content": promptCopy]],
+                    tools: nil, additionalContext: nil)
+                {
+                    tokens = templated
+                } else {
+                    // DeepSeek-V4 checkpoints ship without a chat_template in
+                    // tokenizer_config.json but DO carry the DeepSeek chat
+                    // marker tokens. Fall back to the DeepSeek-V3-style turn
+                    // format so instruct-tuned weights see the chat shape
+                    // they were trained on (raw completion of a question
+                    // yields much less coherent output).
+                    let chat =
+                        "<｜begin▁of▁sentence｜><｜User｜>\(promptCopy)<｜Assistant｜>"
+                    tokens = context.tokenizer.encode(text: chat, addSpecialTokens: false)
+                    print("[prompt] no chat template; using DeepSeek turn format fallback")
+                }
+                print("[prompt] \(tokens.count) tokens")
+
+                let input = LMInput(tokens: MLXArray(tokens))
+                let params = GenerateParameters(maxTokens: maxTokensCopy, temperature: 0)
+
+                let genStart = CFAbsoluteTimeGetCurrent()
+                var firstTokenAt: CFAbsoluteTime?
+                var pieces: [String] = []
+                var completionInfo: GenerateCompletionInfo?
+
+                let stream = try MLXLMCommon.generate(
+                    input: input, parameters: params, context: context)
+                for await gen in stream {
+                    switch gen {
+                    case .chunk(let text):
+                        if firstTokenAt == nil { firstTokenAt = CFAbsoluteTimeGetCurrent() }
+                        pieces.append(text)
+                        print(text, terminator: "")
+                        fflush(stdout)
+                    case .info(let info):
+                        completionInfo = info
+                    case .toolCall(let call):
+                        print("\n[toolCall] \(call.function.name)")
+                    }
+                }
+                let done = CFAbsoluteTimeGetCurrent()
+                print("\n---")
+                let ttft = (firstTokenAt ?? done) - genStart
+                print(String(format: "[timing] ttft=%.2fs total=%.2fs", ttft, done - genStart))
+                if let info = completionInfo {
+                    print(String(format: "[usage] prompt=%d completion=%d decode=%.1f tok/s",
+                        info.promptTokenCount, info.generationTokenCount, info.tokensPerSecond))
+                }
+                print(String(format: "[memory] active=%.1f GiB peak=%.1f GiB",
+                    Double(Memory.activeMemory) / 1073741824,
+                    Double(Memory.peakMemory) / 1073741824))
+                if streamExpertsCopy {
+                    let s = DeepseekV4ExpertStreaming.cache.stats
+                    let total = s.hits + s.misses
+                    let hitRate = total > 0 ? Double(s.hits) / Double(total) * 100 : 0
+                    print(String(
+                        format: "[expert-cache] hits=%d misses=%d hitRate=%.1f%% resident=%.1f GiB entries=%d",
+                        s.hits, s.misses, hitRate,
+                        Double(s.residentBytes) / 1073741824, s.residentCount))
+                    if let p = DeepseekV4ExpertStreaming.prefetchCoordinatorForDiagnostics {
+                        let ps = p.stats
+                        print(String(
+                            format: "[prefetch] scheduled=%d completed=%d alreadyWarm=%d",
+                            ps.scheduled, ps.completed, ps.alreadySkippedWarm))
+                    } else {
+                        print("[prefetch] disabled or not yet constructed")
+                    }
+                    if let profile = DeepseekV4ExpertStreaming.usageProfileForDiagnostics {
+                        let profileSize: Int? =
+                            ((try? FileManager.default.attributesOfItem(
+                                atPath: profile.profileURL.path))?[.size] as? NSNumber)?.intValue
+                        print(String(
+                            format: "[expert-profile] entries=%d forwardCalls=%d path=%@ sizeBytes=%@",
+                            profile.snapshotCounts().count, profile.totalForwardCalls,
+                            profile.profileURL.path,
+                            profileSize.map { "\($0)" } ?? "n/a"))
+                    } else {
+                        print("[expert-profile] disabled or not yet constructed")
+                    }
+                    if let warmer = DeepseekV4ExpertStreaming.cacheWarmerForDiagnostics {
+                        let ws = warmer.stats
+                        print(String(
+                            format:
+                                "[expert-warm] enabled=%@ finished=%@ reason=%@ warmed=%d warmedBytes=%.2fGiB skipped=%d elapsedMs=%@",
+                            warmer.enabled ? "true" : "false", ws.finished ? "true" : "false",
+                            ws.stopReason, ws.warmed, Double(ws.warmedBytes) / 1_073_741_824,
+                            ws.skippedAlreadyResident,
+                            ws.elapsedMs.map { String(format: "%.0f", $0) } ?? "n/a"))
+                    } else {
+                        print("[expert-warm] disabled or not yet constructed")
+                    }
+                    // Explicit flush (not just relying on the debounced
+                    // save cadence inside `record()`) so THIS process's
+                    // profile is guaranteed durable on disk before it
+                    // exits — required for the profile-building step of
+                    // the measurement protocol, and harmless in general.
+                    DeepseekV4ExpertStreaming.usageProfileForDiagnostics?.flush()
+                }
+
+                let text = pieces.joined()
+                guard !text.isEmpty else {
+                    print("[FAIL] no text generated")
+                    exit(70)
+                }
+                print("[OK] generated \(text.count) chars")
+            }
+        } catch {
+            print("error: \(error)")
+            exit(70)
+        }
+    }
+}

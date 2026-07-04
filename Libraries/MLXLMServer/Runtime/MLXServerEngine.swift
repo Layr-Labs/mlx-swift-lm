@@ -75,6 +75,33 @@ public protocol MLXServerEngine: Sendable {
     func tokenize(_ request: TokenizeRequest) async throws -> TokenizeResponse
     func detokenize(_ request: DetokenizeRequest) async throws -> DetokenizeResponse
     func applyTemplate(_ request: ApplyTemplateRequest) async throws -> TokenizeResponse
+
+    /// Model-type-derived default reasoning-parser format for `modelId`,
+    /// consulted by `MLXOpenAIService` only when a request doesn't specify
+    /// `reasoning_parser` explicitly (an explicit request value always
+    /// wins; this is a fallback, one step above the service-wide
+    /// `defaultReasoningParser` and one step below it in priority... see
+    /// `MLXOpenAIService`'s resolution order: request > this > service
+    /// default > `.none`).
+    ///
+    /// `nil` means "this engine has no per-model opinion" — the safe
+    /// default for any engine that doesn't track model types (embeddings,
+    /// single-model servers that already pass a fixed
+    /// `defaultReasoningParser` to `MLXOpenAIService`, test doubles).
+    /// Engines that DO track a `modelType` per loaded model (e.g. a
+    /// multi-model registry that also resolves `ToolCallFormat` per
+    /// request via `ServerToolParser.resolve(requested:modelType:)`) can
+    /// mirror that same model-type inference for reasoning parsers.
+    ///
+    /// Given a default (nil-returning) implementation below, this is
+    /// purely additive — existing conformers need no changes.
+    func defaultReasoningParser(for modelId: String) async -> ReasoningParserFormat?
+}
+
+extension MLXServerEngine {
+    public func defaultReasoningParser(for modelId: String) async -> ReasoningParserFormat? {
+        nil
+    }
 }
 
 extension GenerateStopReason {
