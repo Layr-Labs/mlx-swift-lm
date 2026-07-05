@@ -366,6 +366,11 @@ func runV2Cell(
                 stats.disabledReason.map { " DISABLED: \($0)" } ?? ""))
         }
     }
+    // Measurement boundary: reset the process-wide peak AFTER engine
+    // construction and the compiled-decode warm-up so the caller's per-row
+    // gpuPeak covers only the measured request group — not trace-building
+    // or an earlier cell's high-water mark.
+    MLX.Memory.peakMemory = 0
     let results = await withTaskGroup(of: (Int, RunResult).self) { group in
         for (i, length) in promptLengths.enumerated() {
             let prompt = syntheticPrompt(
@@ -409,6 +414,9 @@ func runLegacyCell(
         config: ContinuousBatchingConfig(stepInterval: 0.0005, yieldInterval: 1))
     engine.start()
     defer { engine.stop() }
+    // Same measurement boundary as runV2Cell: per-row gpuPeak covers only
+    // this cell's measured requests.
+    MLX.Memory.peakMemory = 0
     let results = await withTaskGroup(of: (Int, RunResult).self) { group in
         for (i, length) in promptLengths.enumerated() {
             let prompt = syntheticPrompt(
@@ -1038,11 +1046,6 @@ struct BenchCBv2RealModel {
                         }
 
                         for batch in batchesCopy {
-                            // peakMemory is a process-wide high-water mark; reset it
-                            // per cell so each row reports ITS peak, not an earlier
-                            // (larger) cell's. The setter discards the value and
-                            // calls mlx_reset_peak_memory.
-                            MLX.Memory.peakMemory = 0
                             let mix = promptMix(batch: batch)
                             let cell: CellResult
                             switch engineName {
