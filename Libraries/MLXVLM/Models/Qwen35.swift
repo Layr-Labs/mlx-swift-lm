@@ -878,8 +878,15 @@ enum Qwen35Language {
                     // serialized prepare path; batched text rows always have
                     // delta 0, so dropping a stale array is a numeric no-op
                     // for them).
+                    //
+                    // The guard is shape-total: anything other than a 1-D
+                    // [batchSize] array is some other batch's state and is
+                    // skipped. A mismatch is the ROUTINE continuous-batching
+                    // condition (every mid-decode admission overwrites the
+                    // module state), not an anomaly — so skipping, not
+                    // logging or trapping, is the correct handling.
                     var delta = MLXArray(cacheOffset).asType(.int32)
-                    if let ropeDeltas, ropeDeltas.dim(0) == batchSize {
+                    if let ropeDeltas, ropeDeltas.ndim == 1, ropeDeltas.dim(0) == batchSize {
                         delta = delta + ropeDeltas.asType(.int32)
                     }
 
