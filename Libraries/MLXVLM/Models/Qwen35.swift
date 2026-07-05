@@ -897,6 +897,14 @@ enum Qwen35Language {
                         delta = broadcast(delta, to: [batchSize])
                     }
 
+                    // Invariant, total by construction: delta is the scalar
+                    // cacheOffset broadcast to [batchSize], optionally plus a
+                    // ropeDeltas that the guard above proved is [batchSize].
+                    // (Debug-only; compiles out of release builds.)
+                    assert(
+                        delta.ndim == 1 && delta.dim(0) == batchSize,
+                        "position-id delta must be [batchSize] before broadcast")
+
                     base = base + delta[0..., .newAxis]
                     positionIds = broadcast(
                         base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
