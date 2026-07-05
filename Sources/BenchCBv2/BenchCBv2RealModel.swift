@@ -1065,6 +1065,11 @@ struct BenchCBv2RealModel {
                                     vocabSize: vocabSize, kvBytes: kvBytesCopy)
                             }
                             emit(cell.markdownRow)
+                            emit(String(
+                                format: "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
+                                cell.engine, batch,
+                                Double(MLX.GPU.activeMemory) / Double(1 << 30),
+                                Double(MLX.GPU.peakMemory) / Double(1 << 30)))
                             details.append(
                                 "  \(cell.engine) B=\(batch):\n"
                                     + cell.perRequest.joined(separator: "\n"))
