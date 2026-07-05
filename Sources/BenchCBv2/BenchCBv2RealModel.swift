@@ -1038,6 +1038,11 @@ struct BenchCBv2RealModel {
                         }
 
                         for batch in batchesCopy {
+                            // peakMemory is a process-wide high-water mark; reset it
+                            // per cell so each row reports ITS peak, not an earlier
+                            // (larger) cell's. The setter discards the value and
+                            // calls mlx_reset_peak_memory.
+                            MLX.Memory.peakMemory = 0
                             let mix = promptMix(batch: batch)
                             let cell: CellResult
                             switch engineName {

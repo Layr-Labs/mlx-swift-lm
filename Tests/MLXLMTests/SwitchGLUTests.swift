@@ -125,13 +125,15 @@ struct SwitchGLUTests {
     ///     old fused trigger shape leave active memory flat to well under the
     ///     bytes a fused gate+up copy of this module would occupy.
     @Test func decodeShapedForwardsRetainNoExtraWeightCopies() {
-        // Sized so a retained gate+up copy (~70 MB here) dwarfs the process-
-        // global GPU-counter noise other concurrently-running suites add
-        // (measured single-digit MB) — the assertion threshold sits an order
-        // of magnitude above the noise and an order below the signal.
+        // Sized so a retained gate+up copy (~36 MB quantized here) dwarfs the
+        // process-global GPU-counter noise other concurrently-running suites
+        // add (measured single-digit MB) — the assertion threshold sits well
+        // above the noise and an order of magnitude below the signal — while
+        // keeping the transient fp32 instantiation (~384 MB pre-quantization)
+        // inside what low-memory CI runners tolerate.
         let inputDims = 2048
         let hiddenDims = 2048
-        let numExperts = 16
+        let numExperts = 8
 
         let glu = SwitchGLU(
             inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts)
@@ -142,9 +144,17 @@ struct SwitchGLUTests {
         let x = values(inputDims, offset: 100).reshaped(1, inputDims).asType(.float32)
         let indices = MLXArray((0 ..< 8).map(Int32.init)).reshaped(1, 8)
 
-        // Warm-up: materialize lazy parameters and any one-time compiled
-        // kernel state before the snapshot.
-        eval(glu(x, indices))
+        // Warm-up: materialize lazy parameters and one-time kernel state
+        // through a shape the old lazy cache could NOT trigger on
+        // (indices.size == 16 > 8). If the cache is ever reintroduced with
+        // its first-decode-forward build, it stays unbuilt until the
+        // measured loop below and lands inside the growth check — warming up
+        // through the trigger shape would have built and retained it before
+        // the snapshot, silently passing the test.
+        let warmX = values(2 * inputDims, offset: 200)
+            .reshaped(2, inputDims).asType(.float32)
+        let warmIndices = MLXArray((0 ..< 16).map { Int32($0 % 8) }).reshaped(2, 8)
+        eval(glu(warmX, warmIndices))
         MLX.eval(glu.parameters().flattened().map(\.1))
 
         let paramsBefore = Dictionary(
