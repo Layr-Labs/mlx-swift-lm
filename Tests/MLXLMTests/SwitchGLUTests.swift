@@ -114,62 +114,50 @@ struct SwitchGLUTests {
     /// Regression for the removed runtime fused gate+up cache: SwitchGLU must
     /// retain NO weight copies beyond its parameters. The removed cache
     /// concatenated a full second copy of the quantized gate+up expert weights
-    /// on the module at the first decode-shaped forward (`indices.size <= 8`)
-    /// — ~8 GiB (qat-4bit) / ~15 GiB (8bit) model-wide on Gemma 4 26B, and the
-    /// root cause of the v0.7.3 production incident. This pins both views:
+    /// onto the module (stored OUTSIDE `parameters()`, so quantize/update never
+    /// saw it) on the first forward — ~8 GiB (qat-4bit) / ~15 GiB (8bit)
+    /// model-wide on Gemma 4 26B, and the root cause of the v0.7.3 production
+    /// incident. This pins both views:
     ///
     ///   * parameter identity — every parameter array is the SAME instance
     ///     after N decode-shaped forwards (nothing re-pointed, nothing added);
-    ///   * MLX active memory — after a warm-up forward (compiled-kernel
-    ///     constants etc. already materialized), N more forwards through the
-    ///     old fused trigger shape leave active memory flat to well under the
-    ///     bytes a fused gate+up copy of this module would occupy.
+    ///   * module-retained bytes — a reflection walk over every MLXArray
+    ///     reachable from the module (deduped by instance) measures EXACTLY
+    ///     what the module holds. The baseline is taken BEFORE any forward —
+    ///     the old cache built in `callAsFunction` ahead of its size gate, so
+    ///     any warm-up forward (whatever its shape) would hide a reintroduced
+    ///     build; and unlike the process-global `GPU.activeMemory` counter,
+    ///     the walk is immune to allocations from concurrently-running suites,
+    ///     so the assertion can be exact instead of noise-margined.
     @Test func decodeShapedForwardsRetainNoExtraWeightCopies() {
-        // Sized so a retained gate+up copy (~70 MB here) dwarfs the process-
-        // global GPU-counter noise other concurrently-running suites add
-        // (measured single-digit MB) — the assertion threshold sits an order
-        // of magnitude above the noise and an order below the signal.
         let inputDims = 2048
         let hiddenDims = 2048
-        let numExperts = 16
+        let numExperts = 8
 
         let glu = SwitchGLU(
             inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts)
         quantize(model: glu, groupSize: 64, bits: 4)
-
-        // Decode shape: B=1, top_k=8 → indices.size == 8, the exact per-call
-        // gate the removed fused dispatch keyed on.
-        let x = values(inputDims, offset: 100).reshaped(1, inputDims).asType(.float32)
-        let indices = MLXArray((0 ..< 8).map(Int32.init)).reshaped(1, 8)
-
-        // Warm-up: materialize lazy parameters and any one-time compiled
-        // kernel state before the snapshot.
-        eval(glu(x, indices))
         MLX.eval(glu.parameters().flattened().map(\.1))
 
         let paramsBefore = Dictionary(
             uniqueKeysWithValues: glu.parameters().flattened())
-        let weightBytes = paramsBefore.reduce(0) { $0 + $1.value.nbytes }
-        Memory.clearCache()
-        let activeBefore = GPU.activeMemory
+        let retainedBefore = Self.moduleRetainedBytes(glu)
 
+        // Decode shape: B=1, top_k=8 → indices.size == 8, the exact per-call
+        // shape the removed fused dispatch keyed on.
+        let x = values(inputDims, offset: 100).reshaped(1, inputDims).asType(.float32)
+        let indices = MLXArray((0 ..< 8).map(Int32.init)).reshaped(1, 8)
         for _ in 0 ..< 8 {
             eval(glu(x, indices))
         }
 
-        Memory.clearCache()
-        let growth = GPU.activeMemory - activeBefore
-        // The gate+up projections are ~2/3 of the module's parameter bytes;
-        // a retained fused copy would grow active memory by that amount.
-        // Anything transient the forwards allocate is released with the
-        // outputs, so flat-to-noise is the pass bar.
-        let fusedCopyBytes = weightBytes * 2 / 3
+        let retainedAfter = Self.moduleRetainedBytes(glu)
         #expect(
-            growth < fusedCopyBytes / 4,
+            retainedAfter == retainedBefore,
             Comment(
-                rawValue: "8 decode-shaped forwards retained \(growth) bytes of module state "
-                    + "(a fused gate+up copy would be ~\(fusedCopyBytes) bytes) — "
-                    + "SwitchGLU is caching weights again"))
+                rawValue: "8 decode-shaped forwards grew module-retained arrays from "
+                    + "\(retainedBefore) to \(retainedAfter) bytes — SwitchGLU is "
+                    + "caching weights again"))
 
         let paramsAfter = Dictionary(
             uniqueKeysWithValues: glu.parameters().flattened())
@@ -179,6 +167,34 @@ struct SwitchGLUTests {
                 paramsAfter[key] === before,
                 Comment(rawValue: "parameter \(key) was replaced during forwards"))
         }
+    }
+
+    /// Total bytes of every MLXArray reachable from `root` via reflection,
+    /// deduped by array instance. Sees arrays stored in plain (non-parameter)
+    /// properties — exactly where the removed cache lived — and only this
+    /// module's arrays, so concurrent suites cannot perturb the measurement.
+    private static func moduleRetainedBytes(_ root: Any) -> Int {
+        var seenArrays = Set<ObjectIdentifier>()
+        var seenObjects = Set<ObjectIdentifier>()
+        var total = 0
+        func walk(_ value: Any) {
+            if let array = value as? MLXArray {
+                if seenArrays.insert(ObjectIdentifier(array)).inserted {
+                    total += array.nbytes
+                }
+                return
+            }
+            let mirror = Mirror(reflecting: value)
+            if mirror.displayStyle == .class {
+                let id = ObjectIdentifier(value as AnyObject)
+                if !seenObjects.insert(id).inserted { return }
+            }
+            for child in mirror.children {
+                walk(child.value)
+            }
+        }
+        walk(root)
+        return total
     }
 
     private func values(_ count: Int, offset: Int = 0) -> MLXArray {
