@@ -238,4 +238,109 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         admission.refundExternalReserve()
         XCTAssertEqual(admission.admissibleBytesCapacity, 1600)
     }
+
+    // MARK: Runtime capacity updates (multi-model co-residency re-slicing)
+
+    /// Shrink below current usage: in-flight reservations are untouched
+    /// (nothing evicted), NEW reserves fail until the pool drains below the
+    /// new ceiling, then admission resumes under the NEW ceiling.
+    func testUpdateBytesCapacityShrinkUnderLoad() throws {
+        // 1 full layer, kv1 hd1 eb2 ⇒ 4 B/token. No watermark for exact math.
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1000, config: .init(watermarkFraction: 0))
+
+        // Fill near the ceiling: 960 of 1000 bytes.
+        try admission.reserve(id: id(1), additionalTokens: 140)  // 560 B
+        try admission.reserve(id: id(2), additionalTokens: 100)  // 400 B
+        XCTAssertEqual(admission.bytesReserved, 960)
+
+        // Shrink BELOW current usage.
+        admission.updateBytesCapacity(500)
+        XCTAssertEqual(admission.bytesCapacity, 500)
+
+        // Existing reservations are untouched — the ledger still carries
+        // them and unreserve/releaseAll stay symmetric.
+        XCTAssertEqual(admission.bytesReserved, 960)
+
+        // New reserves fail while the pool sits above the new ceiling —
+        // including zero-cost feasibility (canEverFit judges vs 500 now).
+        XCTAssertFalse(admission.canEverFit(promptTokens: 100, maxTokens: 60))
+        XCTAssertThrowsError(try admission.reserve(id: id(3), additionalTokens: 1)) { error in
+            guard case CBv2KVError.capacityExhausted(_, let available) = error else {
+                return XCTFail("expected capacityExhausted, got \(error)")
+            }
+            XCTAssertEqual(available, 0, "over-ceiling pool must report zero availability")
+        }
+        // Even the in-flight requests cannot GROW their reservations — the
+        // scheduler preempts on this signal; the ledger never over-admits.
+        XCTAssertThrowsError(try admission.reserve(id: id(1), additionalTokens: 1))
+        XCTAssertFalse(admission.hasHeadroom(additionalTokens: 1))
+
+        // Partial drain that STILL exceeds the ceiling: still exhausted
+        // (560 B remain > 500).
+        admission.releaseAll(id: id(2))
+        XCTAssertEqual(admission.bytesReserved, 560)
+        XCTAssertThrowsError(try admission.reserve(id: id(3), additionalTokens: 1))
+
+        // Drain below the new ceiling: admission resumes, and the NEW
+        // ceiling binds exactly (125 tokens == 500 B).
+        admission.releaseAll(id: id(1))
+        XCTAssertEqual(admission.bytesReserved, 0)
+        XCTAssertTrue(admission.canEverFit(promptTokens: 100, maxTokens: 25))
+        try admission.reserve(id: id(5), additionalTokens: 125)
+        XCTAssertEqual(admission.bytesReserved, 500)
+        XCTAssertThrowsError(try admission.reserve(id: id(6), additionalTokens: 1))
+    }
+
+    /// Grow takes effect immediately: a ledger at the old ceiling admits
+    /// more the moment the capacity rises.
+    func testUpdateBytesCapacityGrowAdmitsImmediately() throws {
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 400, config: .init(watermarkFraction: 0))
+        try admission.reserve(id: id(1), additionalTokens: 100)  // 400 B — at the ceiling
+        XCTAssertThrowsError(try admission.reserve(id: id(2), additionalTokens: 1))
+        XCTAssertFalse(admission.canEverFit(promptTokens: 100, maxTokens: 1))
+
+        admission.updateBytesCapacity(800)
+        XCTAssertEqual(admission.bytesCapacity, 800)
+        XCTAssertTrue(admission.canEverFit(promptTokens: 100, maxTokens: 100))
+        XCTAssertTrue(admission.hasHeadroom(additionalTokens: 100))
+        try admission.reserve(id: id(2), additionalTokens: 100)  // 800 B total
+        XCTAssertEqual(admission.bytesReserved, 800)
+        XCTAssertThrowsError(try admission.reserve(id: id(3), additionalTokens: 1))
+    }
+
+    /// The watermark is recomputed from the CONFIGURED fraction against the
+    /// new capacity — observable through `admissibleBytesCapacity`
+    /// (capacity − externalReserve − watermark) and the reserve boundary.
+    func testUpdateBytesCapacityRecomputesWatermark() throws {
+        // 4 B/token; 10% watermark. 1000 ⇒ admissible 900.
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1000, config: .init(watermarkFraction: 0.1))
+        XCTAssertEqual(admission.admissibleBytesCapacity, 900)
+
+        // Grow: watermark scales up with the new capacity (2000 ⇒ 200).
+        admission.updateBytesCapacity(2000)
+        XCTAssertEqual(admission.admissibleBytesCapacity, 1800)
+        try admission.reserve(id: id(1), additionalTokens: 450)  // exactly 1800 B
+        XCTAssertThrowsError(try admission.reserve(id: id(2), additionalTokens: 1))
+        admission.releaseAll(id: id(1))
+
+        // Shrink: watermark scales down (500 ⇒ 50).
+        admission.updateBytesCapacity(500)
+        XCTAssertEqual(admission.admissibleBytesCapacity, 450)
+        // Snapshot reports the live capacity.
+        XCTAssertEqual(
+            admission.snapshot(activeRequests: 0, waitingRequests: 0, activeTokens: 0)
+                .kvBytesCapacity,
+            500)
+
+        // Degenerate input clamps to zero — nothing is ever admissible.
+        admission.updateBytesCapacity(-5)
+        XCTAssertEqual(admission.bytesCapacity, 0)
+        XCTAssertFalse(admission.canEverFit(promptTokens: 1, maxTokens: 0))
+    }
 }

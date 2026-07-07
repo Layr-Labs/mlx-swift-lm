@@ -60,6 +60,16 @@ final class CBv2EngineGauges: @unchecked Sendable {
         pendingSubmits = max(0, pendingSubmits - 1)
         lock.unlock()
     }
+
+    /// Point update for runtime KV-capacity changes: an idle engine
+    /// publishes no step snapshots, so `capacity()` must reflect a
+    /// re-sliced ceiling without waiting for the next step. The loop's
+    /// next full-snapshot publish carries the same live value.
+    func updateKVBytesCapacity(_ bytes: Int) {
+        lock.lock()
+        snapshot.kvBytesCapacity = bytes
+        lock.unlock()
+    }
 }
 
 // MARK: - EngineV2
@@ -82,6 +92,9 @@ final class CBv2EngineGauges: @unchecked Sendable {
 public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let loop: EngineLoopV2
     private let admission: AdmissionV2
+    /// Retained for runtime KV re-slicing (`updateKVBytesCapacity`); all
+    /// step-path access goes through the loop.
+    private let backend: CBv2KVBackend
     private let schedulerConfig: CBv2SchedulerConfig
     private let loopConfig: CBv2EngineLoopConfig
     private let gauges: CBv2EngineGauges
@@ -138,6 +151,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
+        self.backend = backend
         let activePrefixCache = schedulerConfig.enablePrefixCache ? prefixCache : nil
         self.prefixCache = activePrefixCache
         if let violation = Self.prefixCachePairingViolation(
@@ -396,6 +410,30 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// published by the engine thread after every step.
     public func capacity() -> CBv2CapacitySnapshot {
         gauges.read()
+    }
+
+    /// Runtime KV-budget update (multi-model co-residency re-slicing): fans
+    /// out to the admission ledger and the KV backend. Safe from any thread
+    /// — both ledgers are lock-protected, and a step racing the update sees
+    /// either the old or the new ceiling: a shrink that lands mid-step is
+    /// absorbed by the loop's capacity-requeue path (backend admissions are
+    /// atomic; losers requeue to waiting). Ordering keeps the soft gate at
+    /// or under the hard gate throughout: on shrink the admission ledger
+    /// tightens FIRST, on grow the backend widens FIRST, so admission never
+    /// admits work the backend would still refuse at the old ceiling.
+    /// In-flight reservations above a new lower ceiling are untouched; new
+    /// admissions fail (`capacityExhausted`) until the pool drains below
+    /// the new ceiling; grow admits immediately.
+    public func updateKVBytesCapacity(_ bytes: Int) {
+        let clamped = max(0, bytes)
+        if clamped < admission.bytesCapacity {
+            admission.updateBytesCapacity(clamped)
+            backend.updateBytesCapacity(clamped)
+        } else {
+            backend.updateBytesCapacity(clamped)
+            admission.updateBytesCapacity(clamped)
+        }
+        gauges.updateKVBytesCapacity(clamped)
     }
 
     /// Graceful drain: new submissions are rejected, waiting requests are

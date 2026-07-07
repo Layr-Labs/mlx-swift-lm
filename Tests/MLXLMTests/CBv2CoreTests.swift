@@ -456,6 +456,69 @@ struct CBv2CoreContiguousBackendTests {
         }
     }
 
+    /// Runtime re-slice, shrink half: live rows above a new lower ceiling
+    /// stay registered (nothing evicted), new admissions fail until usage
+    /// drains below the new ceiling, then the NEW ceiling binds.
+    @Test func updateBytesCapacityShrinkKeepsLiveRowsAndBlocksNewAdmissions() throws {
+        // One full layer, kvHeads 1, headDim 4, fp16 ⇒ initial slots
+        // min(64, 4 + 256) = 64 ⇒ 1024 bytes reserved per admission.
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 2)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 4096))
+
+        let first = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 64)
+        let second = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 64)
+        #expect(backend.bytesReserved == 2048)
+
+        // Shrink BELOW current usage: live rows untouched, ceiling reported
+        // live, new admission refused.
+        backend.updateBytesCapacity(1500)
+        #expect(backend.bytesCapacity == 1500)
+        #expect(backend.bytesReserved == 2048, "shrink must not evict live rows")
+        #expect(throws: CBv2KVError.self) {
+            try backend.makeSequenceState(layerKinds: kinds, promptLength: 4, maxLength: 64)
+        }
+
+        // Partial drain still above the ceiling (1024 + 1024 > 1500).
+        backend.release(first)
+        #expect(backend.bytesReserved == 1024)
+        #expect(throws: CBv2KVError.self) {
+            try backend.makeSequenceState(layerKinds: kinds, promptLength: 4, maxLength: 64)
+        }
+
+        // Full drain: one admission fits under the NEW ceiling, two do not.
+        backend.release(second)
+        #expect(backend.bytesReserved == 0)
+        let third = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 64)
+        #expect(throws: CBv2KVError.self) {
+            try backend.makeSequenceState(layerKinds: kinds, promptLength: 4, maxLength: 64)
+        }
+        backend.release(third)
+    }
+
+    /// Runtime re-slice, grow half: a backend refusing at its old ceiling
+    /// admits immediately once the ceiling rises.
+    @Test func updateBytesCapacityGrowAdmitsImmediately() throws {
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 2)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1500))
+
+        let first = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 64)
+        #expect(throws: CBv2KVError.self) {
+            try backend.makeSequenceState(layerKinds: kinds, promptLength: 4, maxLength: 64)
+        }
+
+        backend.updateBytesCapacity(4096)
+        #expect(backend.bytesCapacity == 4096)
+        let second = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 64)
+        #expect(backend.bytesReserved == 2048)
+        backend.release(first)
+        backend.release(second)
+    }
+
     @Test func quantizedConfigProducesQuantizedFullLayers() throws {
         let backend = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 1 << 24, quantization: (groupSize: 64, bits: 8)))
