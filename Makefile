@@ -28,6 +28,7 @@ test-cb:
 	@types=$$(grep -hoE '(struct|class) (CBv2|Gemma4MTP)[A-Za-z0-9_]*Tests' \
 		Tests/MLXLMTests/CBv2*.swift Tests/MLXLMTests/Gemma4MTP*Tests.swift \
 		| awk '{print $$2}' | sort -u); \
+	[ -n "$$types" ] || { echo "test-cb: no CBv2 suites matched — glob/rename drift; refusing to run the full suite"; exit 1; }; \
 	flags=""; \
 	for t in $$types; do flags="$$flags -only-testing:MLXLMTests/$$t"; done; \
 	xcodebuild test \
