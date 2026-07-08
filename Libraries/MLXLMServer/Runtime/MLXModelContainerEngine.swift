@@ -7,8 +7,9 @@ import MLXLMCommon
 import Tokenizers
 
 /// Single-request server engine backed by ``ModelContainer``'s serial actor.
-/// Concurrent ``streamChatCompletion(request:)`` calls serialise; for
-/// concurrent production traffic use ``MLXBatchedEngineServerEngine``.
+/// Concurrent ``streamChatCompletion(request:)`` calls serialise; batched
+/// concurrent serving lives downstream in the Darkbloom provider's
+/// ContinuousBatchingV2 bridge, not in this CLI engine.
 public struct MLXModelContainerEngine: MLXServerEngine {
     private let modelID: String
     private let model: ModelContainer
@@ -46,10 +47,27 @@ public struct MLXModelContainerEngine: MLXServerEngine {
 
         try await configureToolParser(for: request)
 
-        let userInput = UserInput(
-            chat: request.messages.map { $0.chatMessage() },
-            tools: request.tools?.map { $0.toolSpec() }
-        )
+        // Multi-turn tool-use history (assistant `tool_calls`,
+        // `tool_call_id`, `reasoning_content`) is not representable in
+        // `Chat.Message` (role + text content only) — flattening through
+        // `chatMessage()` silently drops those fields before the chat
+        // template renders, corrupting tool-call conversations. When any
+        // message carries them, feed the template the full
+        // `templateMessage()` dictionaries instead (`UserInput(messages:)`
+        // hands them to `applyChatTemplate` verbatim). Plain chats keep
+        // the structured `.chat` path unchanged.
+        let userInput: UserInput
+        if Self.requiresTemplateMessages(request.messages) {
+            userInput = UserInput(
+                messages: request.messages.map { $0.templateMessage() },
+                tools: request.tools?.map { $0.toolSpec() }
+            )
+        } else {
+            userInput = UserInput(
+                chat: request.messages.map { $0.chatMessage() },
+                tools: request.tools?.map { $0.toolSpec() }
+            )
+        }
         let input = try await model.prepare(input: userInput)
         let stream = try await model.generate(
             input: input, parameters: request.generationParameters)
@@ -74,6 +92,17 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         }
     }
 
+    /// True when any message carries tool-use history fields that
+    /// `Chat.Message` cannot represent — the signal to render through
+    /// `templateMessage()` dictionaries instead of the structured chat.
+    /// Internal (not private) so the predicate is directly testable.
+    static func requiresTemplateMessages(_ messages: [OpenAIChatMessage]) -> Bool {
+        messages.contains {
+            ($0.toolCalls?.isEmpty == false) || $0.toolCallID != nil
+                || $0.reasoningContent != nil
+        }
+    }
+
     public func tokenize(_ request: TokenizeRequest) async throws -> TokenizeResponse {
         let tokenizer = await model.tokenizer
         return .init(
@@ -95,12 +124,11 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     }
 
     public func applyTemplate(_ request: ApplyTemplateRequest) async throws -> TokenizeResponse {
-        let messages = request.messages.map { message in
-            [
-                "role": message.role.rawValue,
-                "content": message.textContent,
-            ] as [String: any Sendable]
-        }
+        // Full wire-type translation (role/content plus name,
+        // tool_call_id, tool_calls with decoded arguments, and
+        // reasoning_content) so `/apply-template` renders tool-use history
+        // exactly like the serving path — not a role+content flattening.
+        let messages = request.messages.map { $0.templateMessage() }
         let tools = request.tools?.map { $0.toolSpec() }
         let tokens = try await model.perform { context in
             try context.tokenizer.applyChatTemplate(

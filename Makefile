@@ -21,25 +21,20 @@ test:
 		-scheme mlx-swift-lm-Package \
 		-destination 'platform=macOS'
 
-# Run only the continuous-batching tests.
+# Run only the ContinuousBatchingV2 tests (the v1 CB* suites died with the
+# v1 engine). The -only-testing list is generated from the CBv2*/Gemma4MTP*
+# test files at invocation time, so new suites are picked up automatically.
 test-cb:
+	@types=$$(grep -hoE '(struct|class) (CBv2|Gemma4MTP)[A-Za-z0-9_]*Tests' \
+		Tests/MLXLMTests/CBv2*.swift Tests/MLXLMTests/Gemma4MTP*Tests.swift \
+		| awk '{print $$2}' | sort -u); \
+	flags=""; \
+	for t in $$types; do flags="$$flags -only-testing:MLXLMTests/$$t"; done; \
 	xcodebuild test \
 		-scheme mlx-swift-lm-Package \
 		-destination 'platform=macOS' \
-		-only-testing:MLXLMTests/CBRequestStatusTests \
-		-only-testing:MLXLMTests/CBOutputCollectorTests \
-		-only-testing:MLXLMTests/CBSamplingTests \
-		-only-testing:MLXLMTests/CBRepetitionPenaltyTests \
-		-only-testing:MLXLMTests/CBBlockHashTests \
-		-only-testing:MLXLMTests/CBPrefixCacheTests \
-		-only-testing:MLXLMTests/CBSchedulerTests \
-		-only-testing:MLXLMTests/CBEngineCoreLifecycleTests \
-		-only-testing:MLXLMTests/CBEngineCoreRequestTests \
-		-only-testing:MLXLMTests/CBEngineCoreGenerationTests \
-		-only-testing:MLXLMTests/CBEngineCoreThreadSafetyTests \
-		-only-testing:MLXLMTests/CBBatchedEngineTests \
-		-only-testing:MLXLMTests/CBGenerationBatchShapeTests \
-		2>&1 | grep -E "Test Case|Test Suite|SUCCEEDED|FAILED|error:"
+		$$flags \
+		2>&1 | grep -E "Test Case|Test Suite|Suite .* (passed|failed)|SUCCEEDED|FAILED|error:"
 
 # Build the inference server (release mode for benchmarking).
 build-server:

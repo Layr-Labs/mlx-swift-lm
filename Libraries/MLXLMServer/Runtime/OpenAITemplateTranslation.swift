@@ -8,9 +8,12 @@ import Foundation
 import MLXLMCommon
 
 extension OpenAIChatMessage {
-    /// Chat-template-ready dictionary in the shape expected by
-    /// ``BatchedEngine/buildPrompt(messages:tools:additionalContext:)``.
-    /// Gemma4's renderer reads `tool_calls` from assistant history.
+    /// Chat-template-ready dictionary (the shape `applyChatTemplate`
+    /// consumes): role/content plus `name`, `tool_call_id`, `tool_calls`
+    /// (arguments decoded to a mapping), and `reasoning_content`. Gemma4's
+    /// renderer reads `tool_calls` from assistant history. Used by
+    /// `MLXModelContainerEngine` for tool-history chats and
+    /// `/apply-template`.
     func templateMessage() -> [String: any Sendable] {
         var entry: [String: any Sendable] = [
             "role": role.rawValue,
