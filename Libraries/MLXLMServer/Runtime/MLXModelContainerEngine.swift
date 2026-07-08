@@ -45,7 +45,7 @@ public struct MLXModelContainerEngine: MLXServerEngine {
             throw MLXModelContainerEngineError.mediaUnsupported
         }
 
-        try await configureToolParser(for: request)
+        try await validateToolParserOverride(for: request)
 
         // Multi-turn tool-use history (assistant `tool_calls`,
         // `tool_call_id`, `reasoning_content`) is not representable in
@@ -56,21 +56,27 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         // `templateMessage()` dictionaries instead (`UserInput(messages:)`
         // hands them to `applyChatTemplate` verbatim). Plain chats keep
         // the structured `.chat` path unchanged.
+        let toolSpecs = request.tools?.map { $0.toolSpec() }
         let userInput: UserInput
         if Self.requiresTemplateMessages(request.messages) {
             userInput = UserInput(
                 messages: request.messages.map { $0.templateMessage() },
-                tools: request.tools?.map { $0.toolSpec() }
+                tools: toolSpecs
             )
         } else {
             userInput = UserInput(
                 chat: request.messages.map { $0.chatMessage() },
-                tools: request.tools?.map { $0.toolSpec() }
+                tools: toolSpecs
             )
         }
         let input = try await model.prepare(input: userInput)
+        // Declared-tool schemas flow into the streaming ToolCallProcessor
+        // (the deleted v1 adapter did this via BatchedToolStreamHandler):
+        // with schemas present, parsers reject undeclared function names and
+        // JSON-looking non-tool output instead of surfacing them as tool
+        // calls.
         let stream = try await model.generate(
-            input: input, parameters: request.generationParameters)
+            input: input, parameters: request.generationParameters, tools: toolSpecs)
 
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -92,14 +98,19 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         }
     }
 
-    /// True when any message carries tool-use history fields that
-    /// `Chat.Message` cannot represent — the signal to render through
+    /// True when any message carries a field that `Chat.Message` (role +
+    /// text content only) cannot represent — the signal to render through
     /// `templateMessage()` dictionaries instead of the structured chat.
-    /// Internal (not private) so the predicate is directly testable.
+    /// Covers tool-use history (`tool_calls`, `tool_call_id`,
+    /// `reasoning_content`) AND the OpenAI `name` field (named participants /
+    /// functions): all are dropped on the `chatMessage()` path, so a plain
+    /// history that only sets `name` would otherwise be silently collapsed
+    /// to role/content before the template renders. Internal (not private)
+    /// so the predicate is directly testable.
     static func requiresTemplateMessages(_ messages: [OpenAIChatMessage]) -> Bool {
         messages.contains {
             ($0.toolCalls?.isEmpty == false) || $0.toolCallID != nil
-                || $0.reasoningContent != nil
+                || $0.reasoningContent != nil || $0.name != nil
         }
     }
 
@@ -140,21 +151,39 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         return .init(tokens: tokens)
     }
 
-    private func configureToolParser(for request: OpenAIChatCompletionRequest) async throws {
-        let configuration = await model.configuration
-        let format: ToolCallFormat
-        let requested = request.toolCallParser ?? defaultToolCallParser
-        if requested == nil, let existing = configuration.toolCallFormat {
-            format = existing
-        } else {
-            format = try ServerToolParser.resolve(
-                requested: requested,
-                modelType: modelType
-            )
-        }
+    /// Validate a per-request `tool_call_parser` override WITHOUT mutating
+    /// shared model state. The format was pinned once at load time
+    /// (`MLXServer.run`); `streamChatCompletion` awaits `prepare` and
+    /// `generate` separately, so a `model.update` here would let request B's
+    /// parser overwrite the shared `ModelContext.configuration` before
+    /// request A's stream snapshots it — parsing A's output with B's grammar.
+    /// Accept `nil`/`"auto"` (trust the server) and any override that
+    /// RESOLVES to the pinned format; reject a conflicting one, exactly as
+    /// the deleted v1 batched adapter did (`validateToolCallParserOverride`).
+    private func validateToolParserOverride(
+        for request: OpenAIChatCompletionRequest
+    ) async throws {
+        let pinned = try await model.configuration.toolCallFormat
+            ?? ServerToolParser.resolve(
+                requested: defaultToolCallParser, modelType: modelType)
+        try Self.validateToolParserOverride(
+            requested: request.toolCallParser, pinned: pinned, modelType: modelType)
+    }
 
-        await model.update { context in
-            context.configuration.toolCallFormat = format
+    /// Pure validator (mirrors the deleted v1 adapter's static helper, kept
+    /// testable without a loaded container): accept `nil`/`"auto"` (trust
+    /// the server) and any override that RESOLVES to `pinned`; throw on a
+    /// resolved-format mismatch. Internal (not private) so tests can drive it.
+    static func validateToolParserOverride(
+        requested: String?, pinned: ToolCallFormat, modelType: String?
+    ) throws {
+        guard let requested else { return }
+        if requested.lowercased() == "auto" { return }
+        let resolved = try ServerToolParser.resolve(
+            requested: requested, modelType: modelType)
+        if resolved != pinned {
+            throw MLXModelContainerEngineError.unsupportedToolCallParser(
+                pinned: pinned, requested: resolved)
         }
     }
 }

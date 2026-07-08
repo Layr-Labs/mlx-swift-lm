@@ -101,6 +101,47 @@ struct ContainerEngineToolHistoryTests {
         #expect(MLXModelContainerEngine.requiresTemplateMessages(messages))
     }
 
+    @Test("the OpenAI name field (no tool fields) selects the template-dict path")
+    func nameSelectsTemplateMessages() {
+        // Regression (Codex, PR #68 review): a plain history whose only
+        // non-role/content field is `name` (a named participant/function)
+        // must NOT take the `chatMessage()` path — `Chat.Message` has no
+        // `name` slot, so the template would never see it. templateMessage()
+        // carries `name`, so the predicate must route here.
+        let messages: [OpenAIChatMessage] = [
+            .init(role: .user, content: .text("hi"), name: "alice")
+        ]
+        #expect(MLXModelContainerEngine.requiresTemplateMessages(messages))
+        // And the field actually survives the translation.
+        #expect(messages[0].templateMessage()["name"] as? String == "alice")
+    }
+
+    @Test("per-request tool_call_parser: nil / auto / matching are accepted")
+    func toolParserOverrideAccepted() throws {
+        // No override, or "auto", trusts the server-pinned format.
+        try MLXModelContainerEngine.validateToolParserOverride(
+            requested: nil, pinned: .harmony, modelType: "gpt_oss")
+        try MLXModelContainerEngine.validateToolParserOverride(
+            requested: "auto", pinned: .harmony, modelType: "gpt_oss")
+        // An override that resolves to the SAME pinned format is fine.
+        try MLXModelContainerEngine.validateToolParserOverride(
+            requested: "harmony", pinned: .harmony, modelType: "gpt_oss")
+    }
+
+    @Test("per-request tool_call_parser: a conflicting override is REJECTED, not applied")
+    func toolParserOverrideConflictRejected() {
+        // Regression (Codex, PR #68 review): the CLI container engine must
+        // not honor a per-request parser by mutating shared ModelContext
+        // state (that raced across concurrent requests — request B's parser
+        // could overwrite the config before request A's stream snapshotted
+        // it). A conflicting override is rejected outright, exactly as the
+        // deleted v1 batched adapter did.
+        #expect(throws: MLXModelContainerEngineError.self) {
+            try MLXModelContainerEngine.validateToolParserOverride(
+                requested: "json", pinned: .harmony, modelType: "gpt_oss")
+        }
+    }
+
     @Test("templateMessage preserves every history field the template reads")
     func templateMessageCarriesAllHistoryFields() throws {
         let message = OpenAIChatMessage(

@@ -10,6 +10,15 @@ public enum MLXServer {
             for: configuration.model,
             revision: configuration.revision
         )
+        // Pin the tool-call format ONCE, at load time. An explicit
+        // --tool-call-parser wins here; otherwise the field stays nil so
+        // LLMModelFactory's load-time inference (model_type + config.json
+        // secondary detection, e.g. Llama 3 via vocab_size/rope_scaling)
+        // fills it. Either way the LOADED configuration is the single source
+        // of truth the container engine's streaming tool parser reads;
+        // per-request overrides are validated against it, never applied by
+        // mutating shared model state (that raced across concurrent
+        // requests — see MLXModelContainerEngine).
         if let parser = configuration.toolCallParser {
             primaryModelConfiguration.toolCallFormat = try ServerToolParser.resolve(
                 requested: parser,
