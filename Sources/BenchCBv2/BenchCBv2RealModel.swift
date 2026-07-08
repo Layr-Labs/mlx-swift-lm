@@ -244,43 +244,6 @@ func logprobDetail(_ r: RunResult, at index: Int, label: String) -> String {
     return String(format: "%@: chose %d (logprob %.4f) top=[%@]%@", label, lp.token, lp.logprob, alts, gap)
 }
 
-func runLegacyRequest(
-    engine: EngineCore, id: String, promptTokens: [Int], maxTokens: Int
-) async -> RunResult {
-    var r = RunResult()
-    r.submittedAt = CFAbsoluteTimeGetCurrent()
-    let request = Request(
-        requestId: id,
-        prompt: promptTokens as AnyHashable,
-        samplingParams: SamplingParams(maxTokens: maxTokens, temperature: 0))
-    let requestId = await engine.addRequest(request)
-    var last: Double?
-    var seen = 0
-    for await chunk in engine.streamOutputs(requestId: requestId) {
-        let now = CFAbsoluteTimeGetCurrent()
-        if chunk.outputTokenIds.count > seen {
-            if last == nil {
-                r.firstTokenAt = now
-            } else {
-                r.itlsMs.append((now - last!) * 1e3)
-            }
-            last = now
-            r.lastTokenAt = now
-            seen = chunk.outputTokenIds.count
-            r.tokens = chunk.outputTokenIds
-        }
-        if chunk.finished {
-            r.finish = chunk.finishReason ?? "finished"
-            r.finishedAt = now
-            break
-        }
-    }
-    if r.finishedAt == 0 { r.finishedAt = CFAbsoluteTimeGetCurrent() }
-    r.completionTokens = r.tokens.count
-    r.promptTokens = promptTokens.count
-    return r
-}
-
 // MARK: - Perf cells
 
 struct CellResult: Sendable {
@@ -396,43 +359,6 @@ func runV2Cell(
     return summarize(
         engine: compiledDecode ? "v2-compiled" : backend.rawValue,
         batch: batch, promptMix: promptLengths, results: results)
-}
-
-func runLegacyCell(
-    context: ModelContext, batch: Int, promptLengths: [Int], steps: Int, vocabSize: Int,
-    label: String
-) async -> CellResult {
-    let scheduler = Scheduler(
-        model: context.model,
-        tokenizer: context.tokenizer,
-        config: SchedulerConfig(
-            maxNumSeqs: batch, maxNumBatchedTokens: 4096, prefillStepSize: 512,
-            streamInterval: 1),
-        eosTokenIds: [])
-    let engine = EngineCore(
-        scheduler: scheduler,
-        config: ContinuousBatchingConfig(stepInterval: 0.0005, yieldInterval: 1))
-    engine.start()
-    defer { engine.stop() }
-    // Same measurement boundary as runV2Cell: per-row gpuPeak covers only
-    // this cell's measured requests.
-    MLX.Memory.peakMemory = 0
-    let results = await withTaskGroup(of: (Int, RunResult).self) { group in
-        for (i, length) in promptLengths.enumerated() {
-            let prompt = syntheticPrompt(
-                length: length, seed: 0xFACE &+ UInt64(i), vocabSize: vocabSize)
-            group.addTask { @Sendable in
-                let r = await runLegacyRequest(
-                    engine: engine, id: "legacy-\(batch)-\(i)", promptTokens: prompt,
-                    maxTokens: steps)
-                return (i, r)
-            }
-        }
-        var all: [(Int, RunResult)] = []
-        for await entry in group { all.append(entry) }
-        return all.sorted { $0.0 < $1.0 }.map(\.1)
-    }
-    return summarize(engine: label, batch: batch, promptMix: promptLengths, results: results)
 }
 
 // MARK: - Correctness
@@ -855,7 +781,7 @@ struct BenchCBv2RealModel {
         setvbuf(stdout, nil, _IONBF, 0)
         var modelPath: String?
         var mode = "all"
-        var engines = ["legacy", "v2", "v2-compiled", "v2-paged"]
+        var engines = ["v2", "v2-compiled", "v2-paged"]
         var batches = [1, 2, 4]
         var steps = 128
         var label = ""
@@ -885,7 +811,7 @@ struct BenchCBv2RealModel {
             case "--out": outPath = args.isEmpty ? nil : args.removeFirst()
             default:
                 print("usage: BenchCBv2 --model <dir> [--mode all|correctness|perf]")
-                print("       [--engines legacy,v2,v2-compiled,v2-paged] [--batches 1,2,4]")
+                print("       [--engines v2,v2-compiled,v2-paged] [--batches 1,2,4]")
                 print("       [--steps N] [--label tag] [--kv-gb N] [--out report.md]")
                 exit(64)
             }
@@ -900,13 +826,10 @@ struct BenchCBv2RealModel {
             exit(66)
         }
 
-        let compiled = CompiledDecode.isEnabled
-        let legacyLabel = label.isEmpty ? (compiled ? "legacy-compiled" : "legacy") : label
         let contention = hostContentionSummary()
         print("== BenchCBv2RealModel ==")
         print("model: \(modelPath)")
         print("mode: \(mode)  engines: \(engines)  batches: \(batches)  steps: \(steps)")
-        print("DARKBLOOM_COMPILED_DECODE resolved: \(compiled) (affects legacy engine only)")
         print("host: \(contention.line)")
         if contention.contended {
             print("WARNING: host is contended — eager decode is CPU-bound, results will be skewed")
@@ -921,8 +844,8 @@ struct BenchCBv2RealModel {
             print(String(
                 format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
 
-            let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy, legacyLabelCopy) =
-                (mode, engines, batches, steps, kvBytes, legacyLabel)
+            let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy) =
+                (mode, engines, batches, steps, kvBytes)
             let report: String = try await container.perform {
                 (context: ModelContext) async throws -> String in
                 var out = ""
@@ -942,14 +865,15 @@ struct BenchCBv2RealModel {
                 let vocabSize = probe.dim(-1)
                 emit("vocabSize=\(vocabSize)")
 
-                // Chat prompt builder: BatchedEngine.buildPrompt runs the full
-                // production template cascade (tokenizer template → external
-                // chat_template.jinja → per-family fallback).
-                let promptBuilder = BatchedEngine(context: context)
+                // Chat prompt builder: the tokenizer's own chat template —
+                // the same templating the production provider applies before
+                // `submitTokenized` (the legacy BatchedEngine cascade died
+                // with the v1 engine).
                 let chatTokens: (String) -> [Int] = { question in
-                    let prompt = promptBuilder.buildPrompt(
-                        messages: [["role": "user", "content": question]])
-                    return context.tokenizer.encode(text: prompt, addSpecialTokens: false)
+                    (try? context.tokenizer.applyChatTemplate(
+                        messages: [["role": "user", "content": question]],
+                        tools: nil, additionalContext: nil))
+                        ?? context.tokenizer.encode(text: question, addSpecialTokens: true)
                 }
 
                 // Correctness ------------------------------------------------
@@ -973,19 +897,6 @@ struct BenchCBv2RealModel {
                     emit("\n## Decode-step profile (B=1, maxTokens \(stepsCopy))\n")
                     for engineName in enginesCopy where engineName != "v2-paged" {
                         switch engineName {
-                        case "legacy":
-                            _ = await runLegacyCell(
-                                context: context, batch: 1, promptLengths: [100],
-                                steps: 8, vocabSize: vocabSize, label: "warmup")
-                            CBv2StepProfiler.reset()
-                            CBv2StepProfiler.enabled = true
-                            let cell = await runLegacyCell(
-                                context: context, batch: 1, promptLengths: [500],
-                                steps: stepsCopy, vocabSize: vocabSize,
-                                label: legacyLabelCopy)
-                            CBv2StepProfiler.enabled = false
-                            emit("### legacy (\(legacyLabelCopy)) B=1 — decodeTPS \(String(format: "%.1f", cell.decodeTPSPerRequest))\n")
-                            emit(CBv2StepProfiler.summaryTable())
                         case "v2":
                             _ = try? await runV2Cell(
                                 context: context, hooks: hooks, backend: .contiguous,
@@ -1015,10 +926,6 @@ struct BenchCBv2RealModel {
                         // Warmup: absorb kernel compile / cache-shape costs.
                         let warmPrompt = [100]
                         switch engineName {
-                        case "legacy":
-                            _ = await runLegacyCell(
-                                context: context, batch: 1, promptLengths: warmPrompt,
-                                steps: 8, vocabSize: vocabSize, label: "warmup")
                         case "v2":
                             _ = try? await runV2Cell(
                                 context: context, hooks: hooks, backend: .contiguous,
@@ -1049,11 +956,6 @@ struct BenchCBv2RealModel {
                             let mix = promptMix(batch: batch)
                             let cell: CellResult
                             switch engineName {
-                            case "legacy":
-                                cell = await runLegacyCell(
-                                    context: context, batch: batch, promptLengths: mix,
-                                    steps: stepsCopy, vocabSize: vocabSize,
-                                    label: legacyLabelCopy)
                             case "v2":
                                 cell = try await runV2Cell(
                                     context: context, hooks: hooks, backend: .contiguous,
@@ -1099,7 +1001,6 @@ struct BenchCBv2RealModel {
                 | Chip | \(sysctlString("machdep.cpu.brand_string")) |
                 | RAM | \(ram) GB |
                 | OS | \(os) |
-                | Compiled decode (legacy) | \(compiled) |
                 | Host at start | \(contention.line) |
                 | Date | \(ISO8601DateFormatter().string(from: Date())) |
 

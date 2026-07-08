@@ -12,10 +12,9 @@ import Testing
 ///    dequantized-matmul) reference within fp tolerance, for both single-query
 ///    decode (`n == 1`) and multi-query prefill (`n > 1`), with grouped-query
 ///    attention (GQA).
-///  * Lever B — `QuantizedBatchKVCacheBase.makeMask` returns `.none` for the
-///    single-query decode no-op-mask case. These tests pin that skipping the
-///    mask is bit-identical to applying the materialized all-`true` mask, and
-///    that the fast path is taken only under the safe conditions.
+///  (Lever B — the legacy QuantizedBatchKVCache `makeMask` fast path — died
+///   with the v1 engine; its mask-skip parity test above survives via the
+///   kernel-level `.none` vs all-`true` comparison.)
 @Suite("QuantizedSDPATests")
 struct QuantizedSDPATests {
 
@@ -227,36 +226,4 @@ struct QuantizedSDPATests {
         #expect(diff < 1e-5, ".none vs all-true mask max|Δ| = \(diff)")
     }
 
-    // MARK: - Lever B: makeMask fast-path conditions
-
-    /// `makeMask` returns `.none` only for the safe single-query decode case and
-    /// otherwise materializes the array mask.
-    @Test func makeMaskFastPathConditions() {
-        let (nKVHeads, d) = (2, Self.headDim)
-        let t = 5
-
-        func freshCache(leftPadding: [Int]) -> QuantizedBatchKVCache {
-            let cache = QuantizedBatchKVCache(
-                leftPadding: leftPadding, groupSize: Self.groupSize, bits: Self.bits)
-            let bSize = leftPadding.count
-            let k = varied([bSize, nKVHeads, t, d], phase: 1.1)
-            let v = varied([bSize, nKVHeads, t, d], phase: 2.1)
-            _ = cache.updateQuantized(keys: k, values: v)
-            return cache
-        }
-
-        // n == 1, no left padding, no window -> fast path (.none).
-        let c1 = freshCache(leftPadding: [0])
-        #expect(Self.isNone(c1.makeMask(n: 1, windowSize: nil, returnArray: false)))
-
-        // n > 1 -> materialized mask (prefill/chunked).
-        #expect(Self.isArray(c1.makeMask(n: 2, windowSize: nil, returnArray: false)))
-
-        // n == 1 but a sliding window is set -> conservative materialized mask.
-        #expect(Self.isArray(c1.makeMask(n: 1, windowSize: 4, returnArray: false)))
-
-        // n == 1 but left padding present -> materialized mask.
-        let c2 = freshCache(leftPadding: [3])
-        #expect(Self.isArray(c2.makeMask(n: 1, windowSize: nil, returnArray: false)))
-    }
 }

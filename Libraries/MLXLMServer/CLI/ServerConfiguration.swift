@@ -2,14 +2,6 @@
 
 import Foundation
 
-/// Which ``MLXServerEngine`` implementation the runner constructs.
-public enum MLXServerEngineKind: String, Sendable, Equatable, CaseIterable {
-    /// ``MLXBatchedEngineServerEngine`` (continuous batching). Default.
-    case batched
-    /// ``MLXModelContainerEngine`` (single-request serialised access).
-    case singleRequest = "single_request"
-}
-
 public struct MLXServerConfiguration: Sendable, Equatable {
     public var model: String
     public var revision: String
@@ -19,10 +11,6 @@ public struct MLXServerConfiguration: Sendable, Equatable {
     public var toolCallParser: String?
     public var reasoningParser: ReasoningParserFormat?
     public var embeddingModel: String?
-    /// Which engine to construct. Default: ``MLXServerEngineKind/batched``.
-    public var engineKind: MLXServerEngineKind
-    /// Batching knobs; ignored when ``engineKind`` is ``MLXServerEngineKind/singleRequest``.
-    public var batchedEngineConfiguration: BatchedEngineServerConfiguration
 
     public init(
         model: String,
@@ -32,9 +20,7 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         modelType: String? = nil,
         toolCallParser: String? = nil,
         reasoningParser: ReasoningParserFormat? = nil,
-        embeddingModel: String? = nil,
-        engineKind: MLXServerEngineKind = .batched,
-        batchedEngineConfiguration: BatchedEngineServerConfiguration = .init()
+        embeddingModel: String? = nil
     ) {
         self.model = model
         self.revision = revision
@@ -44,8 +30,6 @@ public struct MLXServerConfiguration: Sendable, Equatable {
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
         self.embeddingModel = embeddingModel
-        self.engineKind = engineKind
-        self.batchedEngineConfiguration = batchedEngineConfiguration
     }
 }
 
@@ -91,11 +75,6 @@ public enum MLXServerCLI {
         if let raw = environment["MLX_SERVER_REASONING_PARSER"] {
             reasoningParser = try decodeReasoningParser(raw)
         }
-        var engineKind: MLXServerEngineKind = .batched
-        if let raw = environment["MLX_SERVER_ENGINE_KIND"] {
-            engineKind = try decodeEngineKind(raw)
-        }
-
         var index = 1
         while index < arguments.count {
             let option = arguments[index]
@@ -126,10 +105,6 @@ public enum MLXServerCLI {
                 )
             case "--embedding-model":
                 embeddingModel = try value(after: option, arguments: arguments, index: &index)
-            case "--engine-kind":
-                engineKind = try decodeEngineKind(
-                    try value(after: option, arguments: arguments, index: &index)
-                )
             default:
                 if option.hasPrefix("-") {
                     throw MLXServerCLIError.unknownOption(option)
@@ -148,8 +123,7 @@ public enum MLXServerCLI {
                 modelType: modelType,
                 toolCallParser: toolCallParser,
                 reasoningParser: reasoningParser,
-                embeddingModel: embeddingModel,
-                engineKind: engineKind
+                embeddingModel: embeddingModel
             )
         )
     }
@@ -166,7 +140,6 @@ public enum MLXServerCLI {
               --tool-call-parser <parser>  auto, json, lfm2, xml_function, glm4, gemma, gemma4, kimi_k2, minimax_m2, mistral, llama3_json, harmony
               --reasoning-parser <parser>  none, deepseek_r1, qwen3, harmony
               --embedding-model <id>       Optional embedding model id for /v1/embeddings
-              --engine-kind <kind>         batched (default) or single_request
               --list-routes                Print the server route manifest
           -h, --help                       Print this help
 
@@ -194,11 +167,4 @@ public enum MLXServerCLI {
         return try JSONDecoder().decode(ReasoningParserFormat.self, from: data)
     }
 
-    private static func decodeEngineKind(_ raw: String) throws -> MLXServerEngineKind {
-        let normalized = raw.lowercased().replacingOccurrences(of: "-", with: "_")
-        guard let kind = MLXServerEngineKind(rawValue: normalized) else {
-            throw MLXServerCLIError.invalidEngineKind(raw)
-        }
-        return kind
-    }
 }

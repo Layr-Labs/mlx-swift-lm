@@ -369,116 +369,6 @@ func runTinyCell(
     )
 }
 
-// MARK: - Real-model mode (LEGACY engine baseline; v2 binding at integration)
-
-/// Minimal tokenizer for the Scheduler (prompts are pre-tokenized [Int]s;
-/// only stop-string encoding would use this, and the benchmark sets none).
-struct BenchPassthroughTokenizer: Tokenizer {
-    var bosToken: String? { nil }
-    var eosToken: String? { nil }
-    var unknownToken: String? { nil }
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
-        text.split(separator: " ").compactMap { Int($0) }
-    }
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-        tokenIds.map(String.init).joined(separator: " ")
-    }
-    func convertTokenToId(_ token: String) -> Int? { Int(token) }
-    func convertIdToToken(_ id: Int) -> String? { String(id) }
-    func applyChatTemplate(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?
-    ) throws -> [Int] { [] }
-}
-
-struct RequestTimings: Sendable {
-    var ttftMs: Double
-    var itlsMs: [Double]
-    var tokens: Int
-    var wallSeconds: Double
-}
-
-func runLegacyEngineCell(
-    model: any LanguageModel, vocabSize: Int,
-    batch: Int, promptLength: Int, decodeSteps: Int
-) async -> CellResult {
-    let scheduler = Scheduler(
-        model: model,
-        tokenizer: BenchPassthroughTokenizer(),
-        config: SchedulerConfig(
-            maxNumSeqs: batch,
-            maxNumBatchedTokens: 4096,
-            prefillStepSize: 512,
-            streamInterval: 1
-        ),
-        eosTokenIds: []  // maxTokens governs — comparable across models
-    )
-    let engine = EngineCore(
-        scheduler: scheduler,
-        config: ContinuousBatchingConfig(stepInterval: 0.0005, yieldInterval: 1)
-    )
-    engine.start()
-    defer { engine.stop() }
-
-    let timings = await withTaskGroup(of: RequestTimings.self) { group in
-        for r in 0 ..< batch {
-            let prompt = benchPrompt(
-                length: promptLength, seed: 0xFACE &+ UInt64(r), vocabSize: vocabSize)
-            group.addTask { @Sendable in
-                let submitted = CFAbsoluteTimeGetCurrent()
-                let request = Request(
-                    requestId: "bench-\(batch)x\(promptLength)-\(r)",
-                    prompt: prompt as AnyHashable,
-                    samplingParams: SamplingParams(maxTokens: decodeSteps, temperature: 0)
-                )
-                let requestId = await engine.addRequest(request)
-
-                var ttftMs = 0.0
-                var itlsMs: [Double] = []
-                var lastArrival: Double?
-                var tokenCount = 0
-                for await chunk in engine.streamOutputs(requestId: requestId) {
-                    let now = CFAbsoluteTimeGetCurrent()
-                    if chunk.outputTokenIds.count > tokenCount {
-                        if lastArrival == nil {
-                            ttftMs = (now - submitted) * 1e3
-                        } else {
-                            itlsMs.append((now - lastArrival!) * 1e3)
-                        }
-                        lastArrival = now
-                        tokenCount = chunk.outputTokenIds.count
-                    }
-                    if chunk.finished { break }
-                }
-                return RequestTimings(
-                    ttftMs: ttftMs, itlsMs: itlsMs, tokens: tokenCount,
-                    wallSeconds: CFAbsoluteTimeGetCurrent() - submitted)
-            }
-        }
-        var all: [RequestTimings] = []
-        for await t in group { all.append(t) }
-        return all
-    }
-
-    let totalTokens = timings.reduce(0) { $0 + $1.tokens }
-    let wall = timings.map(\.wallSeconds).max() ?? 1
-    let itls = timings.flatMap(\.itlsMs).sorted()
-    let ttfts = timings.map(\.ttftMs).sorted()
-    let perRequestTPS = timings.map { $0.wallSeconds > 0 ? Double($0.tokens) / $0.wallSeconds : 0 }
-
-    return CellResult(
-        mode: "legacy", batch: batch, promptLength: promptLength, decodeSteps: decodeSteps,
-        tpsPerRequest: perRequestTPS.reduce(0, +) / Double(max(1, perRequestTPS.count)),
-        aggregateTPS: Double(totalTokens) / wall,
-        ttftP50Ms: percentile(ttfts, 0.50),
-        itlP50Ms: percentile(itls, 0.50),
-        itlP99Ms: percentile(itls, 0.99),
-        stepCPUMicros: nil,
-        stepGPUMicros: nil
-    )
-}
-
 // MARK: - Report
 
 func sysctlString(_ name: String) -> String {
@@ -545,43 +435,15 @@ struct CBv2Benchmark {
         var results: [CellResult] = []
         var modelLabel = "TinyBenchModel (2-layer, full+window16, seeded — no downloads)"
 
-        if let modelPath {
-            modelLabel = modelPath
-            let directory = URL(fileURLWithPath: modelPath)
-            guard FileManager.default.fileExists(atPath: directory.path) else {
-                print("error: model directory does not exist: \(directory.path)")
-                exit(66)
-            }
-            do {
-                let container = try await loadModelContainer(
-                    from: directory, using: BenchTokenizerLoader())
-                // Immutable copies for the @Sendable perform closure.
-                let (promptLengths, batches, steps) = (promptLengths, batches, steps)
-                results = try await container.perform {
-                    (context: ModelContext) async throws -> [CellResult] in
-                    // Vocab probe: one [1, 1] cache-less forward.
-                    let probe = context.model(MLXArray([Int32(0)]).reshaped(1, 1), cache: nil)
-                    let vocabSize = probe.dim(-1)
-                    var cells: [CellResult] = []
-                    // Warmup: absorb load/compile cost before measuring.
-                    _ = await runLegacyEngineCell(
-                        model: context.model, vocabSize: vocabSize,
-                        batch: 1, promptLength: 32, decodeSteps: 8)
-                    for promptLength in promptLengths {
-                        for batch in batches {
-                            let cell = await runLegacyEngineCell(
-                                model: context.model, vocabSize: vocabSize,
-                                batch: batch, promptLength: promptLength, decodeSteps: steps)
-                            print("done: \(cell.markdownRow)")
-                            cells.append(cell)
-                        }
-                    }
-                    return cells
-                }
-            } catch {
-                print("error: \(error)")
-                exit(70)
-            }
+        if modelPath != nil {
+            // The legacy-engine real-model baseline died with the v1 engine
+            // (v0.7.5 one-engine). Real-model CBv2 measurement lives in the
+            // provider's `darkbloom benchmark --sweep` (built on the
+            // production EngineV2Factory); this tool keeps the tiny-model
+            // step-loop instrumentation mode only.
+            print("error: --model mode was removed with the legacy engine;")
+            print("       use `darkbloom benchmark --sweep` for real-model CBv2 numbers.")
+            exit(64)
         } else {
             let model = TinyBenchModel.make()
             for promptLength in promptLengths {
@@ -631,12 +493,3 @@ struct CBv2Benchmark {
     }
 }
 
-/// Tokenizer loader for real-model mode: the benchmark never tokenizes text
-/// (prompts are synthetic token ids), so any tokenizer satisfying the loader
-/// suffices. Mirrors BenchmarkHelpers.NoOpTokenizerLoader without importing
-/// the helper target.
-struct BenchTokenizerLoader: TokenizerLoader {
-    func load(from directory: URL) async throws -> any Tokenizer {
-        BenchPassthroughTokenizer()
-    }
-}

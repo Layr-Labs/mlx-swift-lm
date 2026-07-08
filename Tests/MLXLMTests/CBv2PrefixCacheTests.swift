@@ -6,6 +6,7 @@
 
 import Foundation
 import MLX
+import CryptoKit
 import XCTest
 
 @testable import MLXLMCommon
@@ -135,8 +136,23 @@ final class CBv2PrefixCacheHasherTests: XCTestCase {
     }
 
     func testEmptySaltIsByteCompatibleWithLegacyCheckpointTier() {
-        // The SSD checkpoint tier interop contract: with an empty salt the v2
-        // chain is byte-identical to legacy computeBlockHash (PrefixCache.swift).
+        // Hash-scheme stability pin: with an empty salt the v2 chain is
+        // byte-identical to the legacy checkpoint tier's computeBlockHash
+        // (SHA-256 over modelName ‖ parent-or-"omlx-root" ‖ "(t0, t1, …)").
+        // The legacy implementation died with the v1 engine, so the
+        // reference is reproduced INLINE — this pin is what keeps future
+        // hasher edits from silently invalidating any persisted chains the
+        // SSD-offload successor may interop with.
+        func legacyComputeBlockHash(
+            parentHash: Data?, tokenIds: [Int], modelName: String
+        ) -> Data {
+            var h = SHA256()
+            if !modelName.isEmpty { h.update(data: Data(modelName.utf8)) }
+            h.update(data: parentHash ?? Data("omlx-root".utf8))
+            let repr = "(\(tokenIds.map(String.init).joined(separator: ", ")))"
+            h.update(data: Data(repr.utf8))
+            return Data(h.finalize())
+        }
         let tokens = Array(0 ..< 12)
         let hasher = CBv2BlockHasher(blockSize: 4, modelName: "test_model")
         let v2Chain = hasher.chainHashes(tokens: tokens)
@@ -145,7 +161,7 @@ final class CBv2PrefixCacheHasherTests: XCTestCase {
         var legacyChain: [Data] = []
         for i in 0 ..< 3 {
             let block = Array(tokens[(i * 4) ..< (i * 4 + 4)])
-            let h = computeBlockHash(
+            let h = legacyComputeBlockHash(
                 parentHash: parent, tokenIds: block, modelName: "test_model")
             legacyChain.append(h)
             parent = h
