@@ -466,6 +466,14 @@ struct LLMUserInputProcessor: UserInputProcessor {
             // (or a template+tools render failure) is a model-packaging
             // bug, and silently degrading to the content-join would mask
             // it behind degenerate output.
+            //
+            // Contract note: a custom `Tokenizer` that relies on the
+            // protocol-extension DEFAULTS for the explicit-template
+            // overloads (which throw `missingChatTemplate`) will therefore
+            // hard-fail here when a jinja file is present, instead of
+            // degrading — by design: it cannot render the template the
+            // checkpoint ships. Production tokenizers (the HuggingFace
+            // adapter) implement the overloads and are unaffected.
             if let template = Self.externalChatTemplate(configuration: configuration) {
                 let promptTokens = try tokenizer.applyChatTemplate(
                     messages: messages, chatTemplate: template,

@@ -163,9 +163,16 @@ public struct MLXModelContainerEngine: MLXServerEngine {
     private func validateToolParserOverride(
         for request: OpenAIChatCompletionRequest
     ) async throws {
-        let pinned = try await model.configuration.toolCallFormat
-            ?? ServerToolParser.resolve(
-                requested: defaultToolCallParser, modelType: modelType)
+        // The pinned format MUST mirror what the generation loop actually
+        // parses with: `modelConfiguration.toolCallFormat ?? .json`
+        // (`generateTask`). An explicit --tool-call-parser was already
+        // resolved into the configuration at load (`MLXServer.run`), and
+        // the factory's config-data inference fills it otherwise — so a nil
+        // format here means the stream parses `.json`, and the validator
+        // must pin `.json` too. Deriving a different fallback (e.g. from
+        // --model-type) would wrongly reject a per-request override that
+        // MATCHES the stream's real behavior.
+        let pinned = await model.configuration.toolCallFormat ?? .json
         try Self.validateToolParserOverride(
             requested: request.toolCallParser, pinned: pinned, modelType: modelType)
     }
