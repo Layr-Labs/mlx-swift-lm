@@ -417,11 +417,16 @@ public final class ChatSession {
                             input: input, model: model, cache: kvCache,
                             parameters: generateParameters)
 
+                        // Declared tools flow into the streaming parser too
+                        // (not just the prompt template): with schemas
+                        // present the parsers reject undeclared function
+                        // names instead of surfacing/dispatching them.
                         let (stream, task) = MLXLMCommon.generateTask(
                             promptTokenCount: input.text.tokens.size,
                             modelConfiguration: modelConfiguration,
                             tokenizer: tokenizer,
-                            iterator: iterator
+                            iterator: iterator,
+                            tools: tools
                         )
 
                         var pendingToolCalls: [ToolCall] = []

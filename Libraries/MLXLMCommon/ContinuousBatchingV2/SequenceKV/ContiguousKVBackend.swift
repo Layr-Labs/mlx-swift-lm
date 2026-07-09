@@ -10,7 +10,9 @@ import MLX
 
 /// Configuration for `CBv2ContiguousKVBackend`.
 public struct CBv2ContiguousBackendConfig: Sendable {
-    /// Byte budget for all live sequence KV (admission ceiling).
+    /// Byte budget for all live sequence KV (admission ceiling). This is
+    /// the INITIAL budget; the backend's live ceiling can be re-sliced at
+    /// runtime via `CBv2ContiguousKVBackend.updateBytesCapacity(_:)`.
     public var bytesCapacity: Int
     /// Optional KV quantization for FULL-attention layers (group size, bits).
     /// Windowed layers stay unquantized (small ring, quantization gains
@@ -65,12 +67,32 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     /// `AdmissionV2` (which can carry per-layer element sizes) remains the
     /// primary admission gate.
     private var reservations: [ObjectIdentifier: Int] = [:]
+    /// Live byte budget, seeded from `config.bytesCapacity` and resizable
+    /// at runtime (`updateBytesCapacity`). Lock-protected: the atomic
+    /// admit-and-register check reads it inside its critical section.
+    private var liveBytesCapacity: Int
 
     public init(config: CBv2ContiguousBackendConfig) {
         self.config = config
+        self.liveBytesCapacity = config.bytesCapacity
     }
 
-    public var bytesCapacity: Int { config.bytesCapacity }
+    public var bytesCapacity: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return liveBytesCapacity
+    }
+
+    /// Runtime capacity update (multi-model co-residency re-slicing).
+    /// Shrink never evicts live rows: registrations above a new lower
+    /// ceiling stay resident and new admissions fail until usage drains
+    /// below the new ceiling; grow admits immediately
+    /// (`CBv2KVBackend.updateBytesCapacity`).
+    public func updateBytesCapacity(_ bytes: Int) {
+        lock.lock()
+        liveBytesCapacity = max(0, bytes)
+        lock.unlock()
+    }
 
     public var bytesInUse: Int {
         lock.lock()
@@ -207,7 +229,7 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         lock.lock()
         defer { lock.unlock() }
         let needed = estimates.reduce(0) { $0 + ($1 ?? 0) }
-        let available = bytesCapacity - accountedBytesLocked()
+        let available = liveBytesCapacity - accountedBytesLocked()
         guard needed <= available else {
             throw CBv2KVError.capacityExhausted(needed: needed, available: max(0, available))
         }

@@ -1369,6 +1369,7 @@ public func generate(
 /// ```
 public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
+    tools: [[String: any Sendable]]? = nil,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try TokenIterator(
@@ -1378,6 +1379,7 @@ public func generate(
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
+        tools: tools,
         wiredMemoryTicket: wiredMemoryTicket)
     return stream
 }
@@ -1435,6 +1437,7 @@ public func generate(
     draftModel: any LanguageModel,
     draftCache: [KVCache]? = nil,
     numDraftTokens: Int = 2,
+    tools: [[String: any Sendable]]? = nil,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
     let iterator = try SpeculativeTokenIterator(
@@ -1454,7 +1457,8 @@ public func generate(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: context.tokenizer,
-            format: context.configuration.toolCallFormat ?? .json
+            format: context.configuration.toolCallFormat ?? .json,
+            tools: tools
         )
     )
     return stream
@@ -1497,6 +1501,7 @@ public func generateTask(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming TokenIterator,
+    tools: [[String: any Sendable]]? = nil,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
@@ -1507,7 +1512,8 @@ public func generateTask(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
-            format: modelConfiguration.toolCallFormat ?? .json
+            format: modelConfiguration.toolCallFormat ?? .json,
+            tools: tools
         )
     )
 }
@@ -1522,6 +1528,7 @@ public func generateTask(
     modelConfiguration: ModelConfiguration,
     tokenizer: Tokenizer,
     iterator: consuming any TokenIteratorProtocol,
+    tools: [[String: any Sendable]]? = nil,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) -> (AsyncStream<Generation>, Task<Void, Never>) {
     generateLoopTask(
@@ -1532,7 +1539,8 @@ public func generateTask(
         wiredMemoryTicket: wiredMemoryTicket,
         handler: TextToolTokenLoopHandler(
             tokenizer: tokenizer,
-            format: modelConfiguration.toolCallFormat ?? .json
+            format: modelConfiguration.toolCallFormat ?? .json,
+            tools: tools
         )
     )
 }
@@ -1994,9 +2002,12 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     var detokenizer: NaiveStreamingDetokenizer
     let toolCallProcessor: ToolCallProcessor
 
-    init(tokenizer: Tokenizer, format: ToolCallFormat) {
+    init(tokenizer: Tokenizer, format: ToolCallFormat, tools: [[String: any Sendable]]? = nil) {
         detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        toolCallProcessor = ToolCallProcessor(format: format)
+        // Declared-tool schemas make the parsers reject undeclared function
+        // names (and JSON-looking non-tool output) instead of surfacing them
+        // as tool calls — see `ToolCallProcessor(format:tools:)`.
+        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
     }
 
     mutating func onToken(

@@ -80,12 +80,23 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private let layerKinds: [CBv2LayerKind]
     /// Resolved bytes-per-element per layer (aligned to `layerKinds`).
     private let perLayerElementBytes: [Int]
-    private let watermark: Int
+    /// Watermark fraction retained so `updateBytesCapacity` can recompute
+    /// `watermark` against the new capacity.
+    private let watermarkFraction: Double
+    /// Lock-protected: recomputed whenever the capacity changes.
+    private var watermark: Int
     /// Per-token bytes if every storage-owning layer retained the token
     /// (upper bound; used for the conservative headroom probe).
     private let maxPerTokenBytes: Int
 
-    public let bytesCapacity: Int
+    /// Total KV byte budget. Runtime-resizable via `updateBytesCapacity`
+    /// (multi-model co-residency re-slicing); reads take the ledger lock.
+    public var bytesCapacity: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _bytesCapacity
+    }
+    private var _bytesCapacity: Int
 
     /// Bytes carved out of the budget for an EXTERNAL worst-case obligation
     /// the ledger cannot see per-request — today the compiled decode path's
@@ -106,7 +117,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         externalReserveBytes: Int = 0
     ) {
         self.layerKinds = layerKinds
-        self.bytesCapacity = bytesCapacity
+        self._bytesCapacity = bytesCapacity
         self.externalReserveBytes = max(0, externalReserveBytes)
         if let table = config.layerElementBytes {
             precondition(
@@ -118,6 +129,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             self.perLayerElementBytes = Array(
                 repeating: config.elementBytes, count: layerKinds.count)
         }
+        self.watermarkFraction = config.watermarkFraction
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
         var perToken = 0
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
@@ -152,11 +164,28 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public var admissibleBytesCapacity: Int {
         lock.lock()
         defer { lock.unlock() }
-        return bytesCapacity - externalReserveBytes - watermark
+        return _bytesCapacity - externalReserveBytes - watermark
     }
 
     /// The ceiling every reservation is checked against. Callers hold `lock`.
-    private var reserveCeiling: Int { bytesCapacity - externalReserveBytes - watermark }
+    private var reserveCeiling: Int { _bytesCapacity - externalReserveBytes - watermark }
+
+    /// Runtime capacity update (multi-model co-residency re-slicing: the
+    /// provider shrinks resident engines to fair shares before granting a
+    /// newcomer, and grows survivors back on unload). The watermark is
+    /// recomputed from the configured fraction against the new capacity.
+    ///
+    /// Shrink semantics are safe by construction: reservations already in
+    /// the ledger are untouched (nothing is evicted here — preemption
+    /// remains the scheduler's job), while NEW `reserve` calls fail with
+    /// `capacityExhausted` until the pool drains below the new ceiling.
+    /// Grow takes effect immediately.
+    public func updateBytesCapacity(_ bytes: Int) {
+        lock.lock()
+        _bytesCapacity = max(0, bytes)
+        watermark = Int(Double(_bytesCapacity) * watermarkFraction)
+        lock.unlock()
+    }
 
     /// Release the external carve-out (idempotent). Called by the engine
     /// when the obligation it covered no longer exists — compiled decode
@@ -236,11 +265,15 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public func snapshot(
         activeRequests: Int, waitingRequests: Int, activeTokens: Int, backendBytesInUse: Int? = nil
     ) -> CBv2CapacitySnapshot {
-        CBv2CapacitySnapshot(
+        lock.lock()
+        let reserved = ledgerBytes
+        let capacity = _bytesCapacity
+        lock.unlock()
+        return CBv2CapacitySnapshot(
             activeRequests: activeRequests,
             waitingRequests: waitingRequests,
-            kvBytesInUse: backendBytesInUse ?? bytesReserved,
-            kvBytesCapacity: bytesCapacity,
+            kvBytesInUse: backendBytesInUse ?? reserved,
+            kvBytesCapacity: capacity,
             activeTokens: activeTokens)
     }
 }

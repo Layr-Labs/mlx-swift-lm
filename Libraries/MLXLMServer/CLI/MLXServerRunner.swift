@@ -10,6 +10,15 @@ public enum MLXServer {
             for: configuration.model,
             revision: configuration.revision
         )
+        // Pin the tool-call format ONCE, at load time. An explicit
+        // --tool-call-parser wins here; otherwise the field stays nil so
+        // LLMModelFactory's load-time inference (model_type + config.json
+        // secondary detection, e.g. Llama 3 via vocab_size/rope_scaling)
+        // fills it. Either way the LOADED configuration is the single source
+        // of truth the container engine's streaming tool parser reads;
+        // per-request overrides are validated against it, never applied by
+        // mutating shared model state (that raced across concurrent
+        // requests — see MLXModelContainerEngine).
         if let parser = configuration.toolCallParser {
             primaryModelConfiguration.toolCallFormat = try ServerToolParser.resolve(
                 requested: parser,
@@ -17,43 +26,19 @@ public enum MLXServer {
             )
         }
 
-        let engine: any MLXServerEngine
-        let batchedEngine: MLXBatchedEngineServerEngine?
-        switch configuration.engineKind {
-        case .batched:
-            let context = try await MLXServerModelLoader.loadContext(
-                configuration: primaryModelConfiguration
-            )
-            let batched = try MLXBatchedEngineServerEngine(
-                modelID: configuration.model,
-                modelContext: context,
-                modelType: configuration.modelType,
-                configuration: configuration.batchedEngineConfiguration,
-                defaultToolCallParser: configuration.toolCallParser
-            )
-            await batched.start()
-            engine = batched
-            batchedEngine = batched
-        case .singleRequest:
-            let model = try await MLXServerModelLoader.load(
-                configuration: primaryModelConfiguration
-            )
-            engine = MLXModelContainerEngine(
-                modelID: configuration.model,
-                model: model,
-                modelType: configuration.modelType,
-                defaultToolCallParser: configuration.toolCallParser
-            )
-            batchedEngine = nil
-        }
-
-        // Stop the engine on any exit path. Fire-and-forget is safe because
-        // EngineCore.stop is synchronous + idempotent today.
-        defer {
-            if let batchedEngine {
-                Task.detached(priority: .high) { await batchedEngine.stop() }
-            }
-        }
+        // v0.7.5 one-engine: the legacy continuous-batching adapter
+        // (`MLXBatchedEngineServerEngine`) died with the v1 engine. The CLI
+        // serves through the single-request container engine; batched
+        // serving lives in the Darkbloom provider (ContinuousBatchingV2).
+        let model = try await MLXServerModelLoader.load(
+            configuration: primaryModelConfiguration
+        )
+        let engine: any MLXServerEngine = MLXModelContainerEngine(
+            modelID: configuration.model,
+            model: model,
+            modelType: configuration.modelType,
+            defaultToolCallParser: configuration.toolCallParser
+        )
 
         let embeddingEngine: MLXEmbedderContainerEngine?
         if let embeddingModelID = configuration.embeddingModel {

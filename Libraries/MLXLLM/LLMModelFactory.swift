@@ -428,7 +428,9 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 @available(*, deprecated, renamed: "LLMRegistry", message: "Please use LLMRegistry directly.")
 public typealias ModelRegistry = LLMRegistry
 
-private struct LLMUserInputProcessor: UserInputProcessor {
+// Internal (not private) so the chat-template fallback cascade is directly
+// testable (`@testable import MLXLLM`).
+struct LLMUserInputProcessor: UserInputProcessor {
 
     let tokenizer: Tokenizer
     let configuration: ModelConfiguration
@@ -451,6 +453,33 @@ private struct LLMUserInputProcessor: UserInputProcessor {
 
             return LMInput(tokens: MLXArray(promptTokens))
         } catch TokenizerError.missingChatTemplate {
+            // Fallback cascade (kept from the deleted v1 engine's
+            // `buildPrompt`): when the tokenizer config lacks an embedded
+            // `chat_template`, try a `chat_template.jinja` file shipped next
+            // to the weights BEFORE degrading to the generic content-join —
+            // chat-tuned models get their real chat format instead of a
+            // degenerate plain-text prompt.
+            //
+            // File ABSENT → degrade to the content-join below (fine: the
+            // model genuinely ships no template). File PRESENT but failing
+            // to render → SURFACE the error: a malformed shipped template
+            // (or a template+tools render failure) is a model-packaging
+            // bug, and silently degrading to the content-join would mask
+            // it behind degenerate output.
+            //
+            // Contract note: a custom `Tokenizer` that relies on the
+            // protocol-extension DEFAULTS for the explicit-template
+            // overloads (which throw `missingChatTemplate`) will therefore
+            // hard-fail here when a jinja file is present, instead of
+            // degrading — by design: it cannot render the template the
+            // checkpoint ships. Production tokenizers (the HuggingFace
+            // adapter) implement the overloads and are unaffected.
+            if let template = Self.externalChatTemplate(configuration: configuration) {
+                let promptTokens = try tokenizer.applyChatTemplate(
+                    messages: messages, chatTemplate: template,
+                    tools: input.tools, additionalContext: input.additionalContext)
+                return LMInput(tokens: MLXArray(promptTokens))
+            }
             print(
                 "No chat template was included or provided, so converting messages to simple text format. This is not optimal for model performance, so applications should provide a chat template if none is included with the model."
             )
@@ -461,6 +490,15 @@ private struct LLMUserInputProcessor: UserInputProcessor {
             let promptTokens = tokenizer.encode(text: prompt)
             return LMInput(tokens: MLXArray(promptTokens))
         }
+    }
+
+    /// `chat_template.jinja` next to the weights, when the model was loaded
+    /// from a resolved local directory (HF cache or explicit path).
+    static func externalChatTemplate(configuration: ModelConfiguration) -> String? {
+        guard let directory = try? configuration.modelDirectory else { return nil }
+        return try? String(
+            contentsOf: directory.appendingPathComponent("chat_template.jinja"),
+            encoding: .utf8)
     }
 }
 

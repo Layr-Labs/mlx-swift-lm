@@ -1237,6 +1237,28 @@ extension Gemma4 {
         return visionFeatureList(pixels: pixels, frames: frames, isVideo: false)
             .map { $0.asType(dtype) }
     }
+
+    /// The token id every VIDEO soft-token position carries in the tokenized
+    /// prompt (`video_token_id`, default 258_884 — the processor emits one
+    /// delimited `timestamp + boi + <placeholder>×count + eoi` block of these
+    /// per sampled frame). External engines locate the per-frame placeholder
+    /// runs with it. nil mirrors a config that explicitly disables video.
+    public var videoPlaceholderTokenId: Int? { config.videoTokenId }
+
+    /// Per-FRAME soft-token embeddings for a sampled video — the EXACT
+    /// arrays `prepare` scatters over the video placeholder positions: the
+    /// mirror of `perImageVisionFeatures` with the VIDEO patch budget
+    /// (`isVideo` selects the per-frame, data-driven output length derived
+    /// from the video-budget-resized grid — ~70 soft tokens per frame vs 280
+    /// per image). One `[1, softTokens, textHidden]` array per frame, in the
+    /// language model's token-embedding dtype (matching `prepare`'s
+    /// `emb.dtype`). Shares the same private tower loop as `prepare`, so the
+    /// two paths cannot drift.
+    public func perVideoFrameVisionFeatures(pixels: MLXArray, frames: [THW]?) -> [MLXArray] {
+        let dtype = languageModel.model.emb(MLXArray([Int32(0)]).reshaped([1, 1])).dtype
+        return visionFeatureList(pixels: pixels, frames: frames, isVideo: true)
+            .map { $0.asType(dtype) }
+    }
 }
 
 // MARK: - Processor

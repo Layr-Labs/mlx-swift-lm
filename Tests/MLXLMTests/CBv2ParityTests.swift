@@ -48,18 +48,20 @@ final class CBv2ParityTests: XCTestCase {
 
     // MARK: - Legacy EAGER reference (numerically pinned ground truth)
 
-    /// Drive TinyTestModel exactly as the legacy engine's eager path does at
-    /// B=1: the Scheduler's fp16 cold cache substitution (KVCacheSimple →
-    /// BatchKVCache, RotatingKVCache → BatchRotatingKVCache — see
-    /// `Scheduler.makeCacheFactory`), model-built masks, prefill over
-    /// prompt[0..<n-1] in `prefillStepSize` chunks, then greedy 1-token
-    /// decode steps seeded with the last prompt token.
+    /// Drive TinyTestModel through the plain eager reference at B=1: the
+    /// model-built single-request caches (`KVCacheSimple` for the full
+    /// layer, `RotatingKVCache` for the windowed layer — the legacy
+    /// engine's batched fp16 substitutes died with the v1 engine, and at
+    /// B=1 with no left padding they were semantically identical to
+    /// these), model-built masks, prefill over prompt[0..<n-1] in
+    /// `prefillStepSize` chunks, then greedy 1-token decode steps seeded
+    /// with the last prompt token.
     private func runLegacyEagerReference(
         model: TinyTestModel, prompt: [Int], maxTokens: Int
     ) -> [Int] {
         let caches: [KVCache] = [
-            BatchKVCache(leftPadding: [0]),
-            BatchRotatingKVCache(maxSize: model.config.windowSize, leftPadding: [0]),
+            KVCacheSimple(),
+            RotatingKVCache(maxSize: model.config.windowSize),
         ]
 
         let prefillTokens = Array(prompt.dropLast())
@@ -83,50 +85,6 @@ final class CBv2ParityTests: XCTestCase {
         return output
     }
 
-    // MARK: - Legacy B=1 ENGINE driver
-
-    /// Run one greedy request through the OLD engine (Scheduler/EngineCore,
-    /// which substitutes BatchKVCache / BatchRotatingKVCache) and return its
-    /// generated token ids.
-    private func runLegacyGreedy(
-        model: TinyTestModel, prompt: [Int], maxTokens: Int
-    ) async throws -> [Int] {
-        let scheduler = Scheduler(
-            model: model,
-            tokenizer: IdentityTokenizer(),
-            config: SchedulerConfig(
-                maxNumSeqs: 1,
-                maxNumBatchedTokens: 512,
-                prefillStepSize: Self.prefillStepSize,
-                streamInterval: 1
-            ),
-            eosTokenIds: []  // no EOS — finish on maxTokens only
-        )
-        let engine = EngineCore(
-            scheduler: scheduler,
-            config: ContinuousBatchingConfig(stepInterval: 0.0005, yieldInterval: 1)
-        )
-        engine.start()
-        defer { engine.stop() }
-
-        let request = Request(
-            requestId: UUID().uuidString,
-            prompt: prompt as AnyHashable,
-            samplingParams: SamplingParams(maxTokens: maxTokens, temperature: 0)
-        )
-        let requestId = await engine.addRequest(request)
-
-        var output: [Int] = []
-        for await chunk in engine.streamOutputs(requestId: requestId) {
-            output = chunk.outputTokenIds
-            if chunk.finished {
-                XCTAssertNil(chunk.error, "legacy engine errored: \(chunk.error ?? "")")
-                break
-            }
-        }
-        return output
-    }
-
     private func assertParity(
         prompt: [Int], maxTokens: Int, withSinks: Bool = false,
         file: StaticString = #filePath, line: UInt = #line
@@ -142,29 +100,7 @@ final class CBv2ParityTests: XCTestCase {
             prefillChunkSize: Self.prefillStepSize)
         XCTAssertEqual(
             v2, eager,
-            "v2 B=1 diverged from the legacy EAGER reference "
-                + "(prompt \(prompt.count) tokens, sinks=\(withSinks))",
-            file: file, line: line)
-
-        // 2. v2 vs the full legacy engine. Token-exact whenever the engine is
-        //    on its eager path; the one known legacy compiled-decode
-        //    discrepancy downgrades to a documented skip (header comment).
-        let legacy = try await runLegacyGreedy(
-            model: model, prompt: prompt, maxTokens: maxTokens)
-        XCTAssertEqual(
-            legacy.count, maxTokens, "legacy run did not complete", file: file, line: line)
-        if CompiledDecode.isEnabled && legacy != eager {
-            throw XCTSkip(
-                "legacy engine took its compiled B=1 decode path and diverged from its OWN "
-                    + "eager path on this fixture (pre-existing legacy compiled-decode "
-                    + "discrepancy for prompts already past the sliding window at compile "
-                    + "time; v2 matches eager token-exactly — see "
-                    + "docs/engine-v2/CONTRACT-ISSUES-G-harness.md item 2). "
-                    + "Run with DARKBLOOM_COMPILED_DECODE=0 for strict engine-level parity.")
-        }
-        XCTAssertEqual(
-            v2, legacy,
-            "v2 B=1 diverged from legacy engine B=1 "
+            "v2 B=1 diverged from the eager reference "
                 + "(prompt \(prompt.count) tokens, sinks=\(withSinks))",
             file: file, line: line)
     }

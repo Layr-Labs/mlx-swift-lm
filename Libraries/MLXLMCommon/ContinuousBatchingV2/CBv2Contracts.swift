@@ -306,6 +306,17 @@ public protocol CBv2KVBackend: AnyObject {
     /// Bytes currently in use / capacity, for truthful admission.
     var bytesInUse: Int { get }
     var bytesCapacity: Int { get }
+    /// Update `bytesCapacity` at runtime (multi-model co-residency
+    /// re-slicing: the provider shrinks resident engines to fair shares
+    /// before granting a newcomer, and grows survivors back on unload).
+    /// Shrink never evicts live rows — registrations above a new lower
+    /// ceiling stay resident; new admissions fail with `capacityExhausted`
+    /// until usage drains below the new ceiling. Grow admits immediately.
+    /// Default no-op: backends with a construction-fixed budget (the paged
+    /// slabs are physically preallocated) ignore the call, and `AdmissionV2`
+    /// — which the engine resizes in the same breath — remains the primary
+    /// admission gate.
+    func updateBytesCapacity(_ bytes: Int)
     /// Admission-relevant bytes: worst-case reservations of live requests
     /// (paged backend reserves pages up front so `update` can never fail).
     /// Defaults to `bytesInUse` for backends that do not reserve.
@@ -335,6 +346,7 @@ extension CBv2KVBackend {
     public var bytesReserved: Int { bytesInUse }
     public var requiresMaterializedSnapshots: Bool { false }
     public var producesCompiledDecodeEligibleRows: Bool { false }
+    public func updateBytesCapacity(_ bytes: Int) {}
 }
 
 public enum CBv2KVError: Error {
@@ -684,6 +696,17 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
+    /// Update the engine's KV byte budget at runtime (multi-model
+    /// co-residency re-slicing). Fans out to the admission ledger and the
+    /// KV backend; safe from any thread. Shrink leaves in-flight
+    /// reservations untouched — new admissions fail until the pool drains
+    /// below the new ceiling; grow admits immediately. Default no-op for
+    /// engines without a resizable KV budget.
+    func updateKVBytesCapacity(_ bytes: Int)
     /// Graceful drain: finish running requests, reject new submissions.
     func shutdown() async
+}
+
+extension CBv2Engine {
+    public func updateKVBytesCapacity(_ bytes: Int) {}
 }
