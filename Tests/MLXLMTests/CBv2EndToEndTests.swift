@@ -646,4 +646,47 @@ final class CBv2EndToEndTests: XCTestCase {
         XCTAssertEqual(winnerFinish, .length)
         await engine.shutdown()
     }
+
+    // MARK: (vii) Zero re-slice survives step publishes (paged)
+
+    /// A ledger re-slice to ZERO on the paged backend must hold through
+    /// step publishes: the INSTALLED admission ledger is authoritative
+    /// even at 0, while the unchanged physical pool rides
+    /// `kvBytesBackendCapacity`. The gauge must never overwrite a zeroed
+    /// ceiling with pool truth and re-advertise capacity that submit-time
+    /// admission rejects.
+    func testPagedZeroResliceSurvivesStepPublish() async throws {
+        let model = makeModel(.paged)
+        let stack = try makeStack(.paged, model: model, enablePrefixCache: false)
+        let requestID: UInt64 = 8801
+        let stream = try stack.engine.submit(
+            greedyRequest(
+                id: requestID, prompt: makePromptTokens(length: 8, seed: 81), maxTokens: 120))
+        var iterator = stream.makeAsyncIterator()
+        var started = false
+        while let event = await iterator.next() {
+            if case .delta = event {
+                started = true
+                break
+            }
+            if case .finished = event { break }
+        }
+        XCTAssertTrue(started, "the in-flight request must be decoding (steps publishing)")
+
+        stack.engine.updateKVBytesCapacity(0)
+        // The in-flight request keeps decoding (reservations untouched),
+        // so steps keep publishing — the settled snapshot must carry the
+        // ledger's zero next to the pool's physical truth.
+        let settled = await cbv2SchedWait {
+            let snapshot = stack.engine.capacity()
+            return snapshot.kvBytesCapacity == 0 && snapshot.kvBytesBackendCapacity > 0
+        }
+        XCTAssertTrue(settled, "a zero re-slice must not be overwritten by pool truth")
+
+        stack.engine.cancel(CBv2RequestID(requestID))
+        while let event = await iterator.next() {
+            if case .finished = event { break }
+        }
+        await stack.engine.shutdown()
+    }
 }

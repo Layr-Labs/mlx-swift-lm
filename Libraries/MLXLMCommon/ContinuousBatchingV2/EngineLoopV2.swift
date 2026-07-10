@@ -1536,17 +1536,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         // kvBytesCapacity carries the ADMISSION ceiling so a runtime
         // re-slice reads back consistently between the resize point-update
         // and per-step publishes (on the paged backend the two ledgers
-        // diverge — the pool is construction-fixed). Fall back to backend
-        // truth when no admission ledger is installed.
-        let ledgerCapacity = capacity?.bytesCapacity ?? 0
+        // diverge — the pool is construction-fixed). An INSTALLED ledger is
+        // authoritative even at 0 (a legitimate zero re-slice must not be
+        // overwritten with pool truth and re-advertise capacity that
+        // admission rejects); backend truth is the fallback only for
+        // ledger-less (bare-loop test) constructions. Reserved bytes carry
+        // the backend's admission-truth promises PLUS the compiled path's
+        // LIVE padding carve (0 after a warmup refund), so
+        // "capacity − reserved" stays truthful for capacity planners.
+        let compiledPaddingReserve = (capacity as? AdmissionV2)?.bytesExternallyReserved ?? 0
         gauges.update(
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
                 waitingRequests: scheduler.waitingCount,
                 kvBytesInUse: backend.bytesInUse,
-                kvBytesCapacity: ledgerCapacity > 0 ? ledgerCapacity : backend.bytesCapacity,
+                kvBytesCapacity: capacity?.bytesCapacity ?? backend.bytesCapacity,
                 kvBytesBackendCapacity: backend.bytesCapacity,
-                kvBytesReserved: backend.bytesReserved,
+                kvBytesReserved: backend.bytesReserved + compiledPaddingReserve,
                 activeTokens: scheduler.activeTokens,
                 stepsExecuted: stepCount))
     }

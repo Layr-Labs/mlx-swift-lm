@@ -520,16 +520,22 @@ public struct CBv2CapacitySnapshot: Sendable {
     public var kvBytesCapacity: Int
     /// The backend's PHYSICAL byte capacity (paged: pageCount × pageBytes
     /// over all groups, construction-fixed; contiguous: == the admission
-    /// ceiling). 0 ⇒ unknown (older snapshots / idle point-updates).
-    /// Capacity planning must bind to min(kvBytesCapacity, this) — after a
-    /// ledger GROW past pool truth the pool is what actually admits.
+    /// ceiling). Capacity planning binds to min(kvBytesCapacity, this)
+    /// ONLY WHEN THIS IS NONZERO — after a ledger GROW past pool truth the
+    /// pool is what actually admits. 0 means UNKNOWN (snapshots built
+    /// through the backwards-compatible initializer, e.g. test stubs) and
+    /// must never be read as zero capacity.
     public var kvBytesBackendCapacity: Int
-    /// Backend admission truth: bytes PROMISED to admitted sequences (the
-    /// paged pool's atomic worst-case page charges; the contiguous backend's
-    /// per-row `max(allocated, reservation)`). `kvBytesInUse` lags this —
-    /// storage materializes lazily as tokens are written — so capacity
-    /// planning (provider heartbeats) must subtract RESERVED, not in-use,
-    /// or several admitted-but-cold requests look like free headroom.
+    /// Bytes NOT available for new admissions: the backend's admission
+    /// truth — bytes PROMISED to admitted sequences (the paged pool's
+    /// atomic worst-case page charges; the contiguous backend's per-row
+    /// `max(allocated, reservation)`) — PLUS the compiled decode path's
+    /// live padding carve (`AdmissionV2.bytesExternallyReserved`, 0 after
+    /// a warmup refund and always 0 on paged backends, where compiled
+    /// decode is vetoed). `kvBytesInUse` lags this — storage materializes
+    /// lazily as tokens are written — so capacity planning (provider
+    /// heartbeats) must subtract RESERVED, not in-use, or several
+    /// admitted-but-cold requests look like free headroom.
     public var kvBytesReserved: Int
     public var activeTokens: Int
     /// Monotonic count of engine steps executed. Providers use this as a

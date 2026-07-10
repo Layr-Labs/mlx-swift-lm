@@ -65,7 +65,11 @@ final class CBv2KVResizeTests: XCTestCase {
         XCTAssertEqual(stack.engine.capacity().kvBytesCapacity, initial)
 
         // Grow, on an IDLE engine: no step has run, so the gauge update must
-        // come from the resize itself, not a step snapshot.
+        // come from the resize itself, not a step snapshot — and it must
+        // refresh the BACKEND capacity too (the contiguous backend really
+        // resized): min(kvBytesCapacity, kvBytesBackendCapacity) consumers
+        // (provider heartbeats) must not under-advertise off a stale
+        // backend value until the next step publish.
         let grown = 1 << 22
         stack.engine.updateKVBytesCapacity(grown)
         XCTAssertEqual(stack.admission.bytesCapacity, grown, "admission ledger must resize")
@@ -73,6 +77,9 @@ final class CBv2KVResizeTests: XCTestCase {
         XCTAssertEqual(
             stack.engine.capacity().kvBytesCapacity, grown,
             "capacity() must reflect the resize while idle")
+        XCTAssertEqual(
+            stack.engine.capacity().kvBytesBackendCapacity, grown,
+            "idle resize must refresh the snapshot's backend capacity")
 
         // Shrink.
         let shrunk = 1 << 16
@@ -80,6 +87,7 @@ final class CBv2KVResizeTests: XCTestCase {
         XCTAssertEqual(stack.admission.bytesCapacity, shrunk)
         XCTAssertEqual(stack.backend.bytesCapacity, shrunk)
         XCTAssertEqual(stack.engine.capacity().kvBytesCapacity, shrunk)
+        XCTAssertEqual(stack.engine.capacity().kvBytesBackendCapacity, shrunk)
 
         // Degenerate input clamps to zero on both ledgers.
         stack.engine.updateKVBytesCapacity(-1)

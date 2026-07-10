@@ -200,6 +200,17 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// when the obligation it covered no longer exists — compiled decode
     /// disabled itself at warmup, so its padding can never materialize and
     /// the bytes belong to regular admission again (PR#62 review).
+    /// Live external (compiled padding) reserve — the construction value
+    /// until `refundExternalReserve()`, then 0. Read by the engine loop's
+    /// gauge publish so the snapshot's `kvBytesReserved` carries the FULL
+    /// not-available-for-new-admissions figure (backend promises + this
+    /// carve), keeping "capacity − reserved" truthful for planners.
+    public var bytesExternallyReserved: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return externalReserveBytes
+    }
+
     public func refundExternalReserve() {
         lock.lock()
         externalReserveBytes = 0
