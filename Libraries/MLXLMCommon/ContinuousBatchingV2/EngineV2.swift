@@ -25,10 +25,15 @@ final class CBv2EngineGauges: @unchecked Sendable {
     private var snapshot: CBv2CapacitySnapshot
     private var pendingSubmits = 0
 
-    init(kvBytesCapacity: Int) {
+    init(kvBytesCapacity: Int, kvBytesBackendCapacity: Int = 0) {
+        // Seed backend truth at construction: heartbeats read `capacity()`
+        // on IDLE engines (zero steps published), and a paged slot must
+        // report its pool ceiling from the first beat — not after the
+        // first request.
         self.snapshot = CBv2CapacitySnapshot(
             activeRequests: 0, waitingRequests: 0, kvBytesInUse: 0,
-            kvBytesCapacity: kvBytesCapacity, activeTokens: 0)
+            kvBytesCapacity: kvBytesCapacity,
+            kvBytesBackendCapacity: kvBytesBackendCapacity, activeTokens: 0)
     }
 
     func update(_ newValue: CBv2CapacitySnapshot) {
@@ -215,7 +220,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             config: admissionConfig,
             externalReserveBytes: compiledDecode?.admissionPaddingReserve ?? 0)
         self.admission = admission
-        let gauges = CBv2EngineGauges(kvBytesCapacity: backend.bytesCapacity)
+        let gauges = CBv2EngineGauges(
+            kvBytesCapacity: backend.bytesCapacity,
+            kvBytesBackendCapacity: backend.bytesCapacity)
         self.gauges = gauges
         self.loop = EngineLoopV2(
             model: model,

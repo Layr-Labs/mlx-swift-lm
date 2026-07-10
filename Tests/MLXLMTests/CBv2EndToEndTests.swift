@@ -547,4 +547,103 @@ final class CBv2EndToEndTests: XCTestCase {
         }
         wait(for: [drained], timeout: 10)
     }
+
+    // MARK: (vi) Terminal pool exhaustion — canonical capacity finish
+
+    /// Two same-step-admissible requests race for a pool sized to hold one:
+    /// both pass `AdmissionV2.canEverFit` (each fits alone; the ledger
+    /// reserves chunk-wise, never the worst case), the winner's
+    /// `makeSequenceState` charges its worst-case pages atomically, and the
+    /// loser bounces `requeueOnCapacity` until `maxCapacityRequeues` trips.
+    /// The terminal finish must carry
+    /// `CBv2KVError.capacityExhaustedFinishPrefix` — bridges key their
+    /// retryable capacity error (429-class, never a 5xx) off that prefix.
+    func testPagedPoolExhaustionFinishesWithCanonicalCapacityError() async throws {
+        let model = makeModel(.paged)
+        // One shared page group (both layers are (kvHeads 2, headDim 64)).
+        // Per-request worst case at maxLength 308: ceil(308/16)=20 full
+        // pages + ring ceil((16+64)/16)+1=6 pages = 26 pages × 8 KiB
+        // ≈ 208 KiB. 256 KiB holds one request, not two; the byte ledger
+        // (~162 KiB estimate) admits each individually.
+        let paged: PagedKVBackend
+        do {
+            paged = try PagedKVBackend(
+                layerKinds: model.layerKinds,
+                config: PagedKVPoolConfig(
+                    capacityBytes: 256 << 10,
+                    maxPrefillChunk: 64,
+                    nominalMaxSequenceLength: 512))
+        } catch let error as CBv2KVError {
+            throw XCTSkip("paged backend unavailable on this hardware: \(error)")
+        }
+        let engine = EngineV2(
+            model: model,
+            layerKinds: model.layerKinds,
+            backend: paged,
+            cacheProvider: CBv2LayerCacheBank(caches: paged.makeLayerCaches()),
+            sampler: CBv2DefaultSampler(fallbackSeed: 11),
+            detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: CBv2E2ETokenizer()),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
+                prefillChunkSize: 16, maxWaiting: 16,
+                enablePrefixCache: false),
+            prefixCache: nil)
+
+        // Winner: decode long enough (300 steps) to outlive the loser's
+        // 64 requeue attempts (~1 per step). Wait for its first delta so
+        // its worst-case pages are charged before the loser submits.
+        let winnerStream = try engine.submit(
+            greedyRequest(id: 7001, prompt: makePromptTokens(length: 8, seed: 71), maxTokens: 300))
+        var winnerIter = winnerStream.makeAsyncIterator()
+        var winnerFinish: CBv2FinishReason?
+        var winnerStarted = false
+        while let event = await winnerIter.next() {
+            if case .delta = event {
+                winnerStarted = true
+                break
+            }
+            if case .finished(let reason, _) = event {
+                winnerFinish = reason
+                break
+            }
+        }
+        XCTAssertTrue(winnerStarted, "winner must decode, got \(String(describing: winnerFinish))")
+
+        // Pool-truth surfaces through the engine's capacity snapshot: the
+        // winner's atomic worst-case page charge is RESERVED (not yet all
+        // in-use — pages materialize lazily as tokens are written), and
+        // the backend's physical capacity rides next to the admission
+        // ceiling (they diverge on paged re-slices).
+        let snapshot = engine.capacity()
+        XCTAssertEqual(snapshot.kvBytesReserved, paged.bytesReserved)
+        XCTAssertGreaterThan(snapshot.kvBytesReserved, 0)
+        XCTAssertEqual(snapshot.kvBytesBackendCapacity, paged.bytesCapacity)
+        XCTAssertLessThanOrEqual(
+            snapshot.kvBytesReserved, snapshot.kvBytesBackendCapacity)
+
+        let loser = await cbv2SchedCollect(
+            try engine.submit(
+                greedyRequest(
+                    id: 7002, prompt: makePromptTokens(length: 8, seed: 72), maxTokens: 300)),
+            timeoutSeconds: 120)
+        guard case .error(let message) = loser.finishReason else {
+            await engine.shutdown()
+            return XCTFail(
+                "expected terminal capacity error, got \(String(describing: loser.finishReason))")
+        }
+        XCTAssertTrue(
+            message.hasPrefix(CBv2KVError.capacityExhaustedFinishPrefix),
+            "terminal capacity finish must carry the canonical prefix, got: \(message)")
+
+        // The winner is unaffected by the loser's rejection: it finishes
+        // by length with its pages intact.
+        while let event = await winnerIter.next() {
+            if case .finished(let reason, _) = event {
+                winnerFinish = reason
+                break
+            }
+        }
+        XCTAssertEqual(winnerFinish, .length)
+        await engine.shutdown()
+    }
 }

@@ -1491,6 +1491,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                     capacityRequeueCount += 1
                     return nil
                 }
+                // Terminal capacity exhaustion is retryable (the backend is
+                // full, not broken): finish with the canonical prefix so
+                // bridges surface a capacity error, never a server error.
+                finishRequest(
+                    rec.id,
+                    reason: .error(
+                        CBv2KVError.capacityExhaustedFinishPrefix + "\(kvError)"))
+                return nil
             }
             finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
             return nil
@@ -1525,12 +1533,20 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Gauges
 
     private func publishGauges() {
+        // kvBytesCapacity carries the ADMISSION ceiling so a runtime
+        // re-slice reads back consistently between the resize point-update
+        // and per-step publishes (on the paged backend the two ledgers
+        // diverge — the pool is construction-fixed). Fall back to backend
+        // truth when no admission ledger is installed.
+        let ledgerCapacity = capacity?.bytesCapacity ?? 0
         gauges.update(
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
                 waitingRequests: scheduler.waitingCount,
                 kvBytesInUse: backend.bytesInUse,
-                kvBytesCapacity: backend.bytesCapacity,
+                kvBytesCapacity: ledgerCapacity > 0 ? ledgerCapacity : backend.bytesCapacity,
+                kvBytesBackendCapacity: backend.bytesCapacity,
+                kvBytesReserved: backend.bytesReserved,
                 activeTokens: scheduler.activeTokens,
                 stepsExecuted: stepCount))
     }

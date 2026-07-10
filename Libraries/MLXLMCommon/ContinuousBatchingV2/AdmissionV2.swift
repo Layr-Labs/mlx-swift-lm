@@ -27,6 +27,15 @@ public protocol CBv2StepCapacity: AnyObject {
     func releaseAll(id: CBv2RequestID)
     /// Non-throwing conservative probe used by the chained-decode fast path.
     func hasHeadroom(additionalTokens: Int) -> Bool
+    /// The ledger's current byte ceiling (runtime-resizable). Feeds the
+    /// engine's capacity snapshot so re-slices read back consistently.
+    /// Defaulted to 0 (= unknown) so simple test capacities need not
+    /// implement it.
+    var bytesCapacity: Int { get }
+}
+
+extension CBv2StepCapacity {
+    public var bytesCapacity: Int { 0 }
 }
 
 // MARK: - AdmissionV2
@@ -274,6 +283,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             waitingRequests: waitingRequests,
             kvBytesInUse: backendBytesInUse ?? reserved,
             kvBytesCapacity: capacity,
+            kvBytesReserved: reserved,
             activeTokens: activeTokens)
     }
 }
