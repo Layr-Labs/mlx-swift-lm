@@ -83,7 +83,11 @@ final class CBv2SchedulerLoopTests: XCTestCase {
             )
             return
         }
-        XCTAssertTrue(message.contains("KV allocation failed"), "unexpected error: \(message)")
+        // Terminal requeue exhaustion carries the CANONICAL capacity prefix
+        // (bridges map it to their retryable capacity error, never a 5xx).
+        XCTAssertTrue(
+            message.hasPrefix(CBv2KVError.capacityExhaustedFinishPrefix),
+            "unexpected error: \(message)")
         let hog = await cbv2SchedCollect(hogStream)
         XCTAssertEqual(hog.finishReason, .length)
         let drained = await cbv2SchedWait { harness.backend.liveStates == 0 }

@@ -343,4 +343,44 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertEqual(admission.bytesCapacity, 0)
         XCTAssertFalse(admission.canEverFit(promptTokens: 1, maxTokens: 0))
     }
+
+    /// `snapshot().kvBytesReserved` honors the field's contract: it carries
+    /// the live external (compiled padding) carve on top of the per-request
+    /// ledger — so "capacity − reserved" matches what `reserve` actually
+    /// admits, the same figure the engine loop's gauge publish reports —
+    /// and drops it after the warmup refund. The carve is a reservation,
+    /// not storage: the in-use fallback stays ledger-only.
+    /// (Fixture shape = 4 bytes/token: one full layer, kvHeads 1, headDim 1,
+    /// elementBytes 2, K+V.)
+    func testSnapshotReservedIncludesLiveExternalReserve() throws {
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1000,
+            config: .init(watermarkFraction: 0),
+            externalReserveBytes: 300)
+
+        // Idle: reserved = the standing carve alone; in-use stays 0.
+        let idle = admission.snapshot(activeRequests: 0, waitingRequests: 0, activeTokens: 0)
+        XCTAssertEqual(idle.kvBytesReserved, 300)
+        XCTAssertEqual(idle.kvBytesInUse, 0)
+        XCTAssertEqual(admission.bytesExternallyReserved, 300)
+
+        // With a live reservation (100 tokens = 400 B): reserved = ledger +
+        // carve, and "capacity − reserved" IS the remaining admit ceiling —
+        // exactly 75 more tokens fit, one more byte-worth throws.
+        try admission.reserve(id: id(9), additionalTokens: 100)
+        let busy = admission.snapshot(activeRequests: 1, waitingRequests: 0, activeTokens: 100)
+        XCTAssertEqual(busy.kvBytesReserved, 700)
+        XCTAssertEqual(busy.kvBytesInUse, 400, "the carve is not storage")
+        XCTAssertEqual(busy.kvBytesCapacity - busy.kvBytesReserved, 300)
+        try admission.reserve(id: id(9), additionalTokens: 75)
+        XCTAssertThrowsError(try admission.reserve(id: id(9), additionalTokens: 1))
+
+        // Refund (compiled decode disabled at warmup): the carve leaves
+        // reserved; the ledger remains.
+        admission.refundExternalReserve()
+        XCTAssertEqual(admission.bytesExternallyReserved, 0)
+        let refunded = admission.snapshot(activeRequests: 1, waitingRequests: 0, activeTokens: 175)
+        XCTAssertEqual(refunded.kvBytesReserved, 700)
+    }
 }

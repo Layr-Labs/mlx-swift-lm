@@ -1491,6 +1491,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                     capacityRequeueCount += 1
                     return nil
                 }
+                // Terminal capacity exhaustion is retryable (the backend is
+                // full, not broken): finish with the canonical prefix so
+                // bridges surface a capacity error, never a server error.
+                finishRequest(
+                    rec.id,
+                    reason: .error(
+                        CBv2KVError.capacityExhaustedFinishPrefix + "\(kvError)"))
+                return nil
             }
             finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
             return nil
@@ -1525,12 +1533,26 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Gauges
 
     private func publishGauges() {
+        // kvBytesCapacity carries the ADMISSION ceiling so a runtime
+        // re-slice reads back consistently between the resize point-update
+        // and per-step publishes (on the paged backend the two ledgers
+        // diverge — the pool is construction-fixed). An INSTALLED ledger is
+        // authoritative even at 0 (a legitimate zero re-slice must not be
+        // overwritten with pool truth and re-advertise capacity that
+        // admission rejects); backend truth is the fallback only for
+        // ledger-less (bare-loop test) constructions. Reserved bytes carry
+        // the backend's admission-truth promises PLUS the compiled path's
+        // LIVE padding carve (0 after a warmup refund), so
+        // "capacity − reserved" stays truthful for capacity planners.
+        let compiledPaddingReserve = (capacity as? AdmissionV2)?.bytesExternallyReserved ?? 0
         gauges.update(
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
                 waitingRequests: scheduler.waitingCount,
                 kvBytesInUse: backend.bytesInUse,
-                kvBytesCapacity: backend.bytesCapacity,
+                kvBytesCapacity: capacity?.bytesCapacity ?? backend.bytesCapacity,
+                kvBytesBackendCapacity: backend.bytesCapacity,
+                kvBytesReserved: backend.bytesReserved + compiledPaddingReserve,
                 activeTokens: scheduler.activeTokens,
                 stepsExecuted: stepCount))
     }

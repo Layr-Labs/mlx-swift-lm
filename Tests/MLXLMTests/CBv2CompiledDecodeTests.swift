@@ -863,4 +863,39 @@ final class CBv2CompiledDecodeTests: XCTestCase {
             row.compiledStorage(keysDType: .float16, valuesDType: .float16),
             "V-dtype mismatch must fall back")
     }
+
+    // MARK: - Padding reserve in the capacity snapshot
+
+    /// `capacity().kvBytesReserved` must carry the compiled path's LIVE
+    /// padding carve: seeded while IDLE (heartbeats fire before any step
+    /// publishes) and back to exactly the standing carve after traffic
+    /// drains (row promises released, the carve remains) — so a planner's
+    /// "capacity − reserved" matches what the admission ledger will
+    /// actually accept. A compiled-disabled engine reserves nothing.
+    func testReservedBytesCarryCompiledPaddingReserve() async throws {
+        let model = TinyTestModel.make(seed: 0xC0FFEE)
+
+        let eager = makeEngine(model: model, compiled: false)
+        XCTAssertEqual(
+            eager.capacity().kvBytesReserved, 0,
+            "no compiled path ⇒ no standing carve")
+        await eager.shutdown()
+
+        let compiled = makeEngine(model: model, compiled: true)
+        let idleReserve = compiled.capacity().kvBytesReserved
+        XCTAssertGreaterThan(
+            idleReserve, 0, "idle compiled engine must seed the padding carve")
+
+        let collected = await cbv2SchedCollect(
+            try compiled.submit(request(id: 9901, prompt: [3, 5, 7], maxTokens: 8)))
+        XCTAssertEqual(collected.finishReason, .length)
+        let settled = await cbv2SchedWait {
+            compiled.capacity().kvBytesReserved == idleReserve
+        }
+        XCTAssertTrue(
+            settled,
+            "after traffic drains, reserved must return to exactly the standing carve "
+                + "(got \(compiled.capacity().kvBytesReserved), want \(idleReserve))")
+        await compiled.shutdown()
+    }
 }

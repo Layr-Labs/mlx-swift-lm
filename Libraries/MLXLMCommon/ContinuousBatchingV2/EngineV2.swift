@@ -25,10 +25,16 @@ final class CBv2EngineGauges: @unchecked Sendable {
     private var snapshot: CBv2CapacitySnapshot
     private var pendingSubmits = 0
 
-    init(kvBytesCapacity: Int) {
+    init(kvBytesCapacity: Int, kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0) {
+        // Seed backend truth at construction: heartbeats read `capacity()`
+        // on IDLE engines (zero steps published), and a paged slot must
+        // report its pool ceiling — and a compiled engine its padding
+        // carve — from the first beat, not after the first request.
         self.snapshot = CBv2CapacitySnapshot(
             activeRequests: 0, waitingRequests: 0, kvBytesInUse: 0,
-            kvBytesCapacity: kvBytesCapacity, activeTokens: 0)
+            kvBytesCapacity: kvBytesCapacity,
+            kvBytesBackendCapacity: kvBytesBackendCapacity,
+            kvBytesReserved: kvBytesReserved, activeTokens: 0)
     }
 
     func update(_ newValue: CBv2CapacitySnapshot) {
@@ -63,11 +69,17 @@ final class CBv2EngineGauges: @unchecked Sendable {
 
     /// Point update for runtime KV-capacity changes: an idle engine
     /// publishes no step snapshots, so `capacity()` must reflect a
-    /// re-sliced ceiling without waiting for the next step. The loop's
-    /// next full-snapshot publish carries the same live value.
-    func updateKVBytesCapacity(_ bytes: Int) {
+    /// re-sliced ceiling — AND the backend's post-resize truth (the
+    /// contiguous backend really resizes; the paged pool stays fixed) —
+    /// without waiting for the next step. Refreshing only the ledger here
+    /// would leave `kvBytesBackendCapacity` stale-small after an idle
+    /// grow-back, and min-binding consumers (provider heartbeats) would
+    /// under-advertise exactly the slots that just freed capacity. The
+    /// loop's next full-snapshot publish carries the same live values.
+    func updateKVBytesCapacity(_ bytes: Int, backendCapacity: Int) {
         lock.lock()
         snapshot.kvBytesCapacity = bytes
+        snapshot.kvBytesBackendCapacity = backendCapacity
         lock.unlock()
     }
 }
@@ -215,7 +227,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             config: admissionConfig,
             externalReserveBytes: compiledDecode?.admissionPaddingReserve ?? 0)
         self.admission = admission
-        let gauges = CBv2EngineGauges(kvBytesCapacity: backend.bytesCapacity)
+        let gauges = CBv2EngineGauges(
+            kvBytesCapacity: backend.bytesCapacity,
+            kvBytesBackendCapacity: backend.bytesCapacity,
+            kvBytesReserved: compiledDecode?.admissionPaddingReserve ?? 0)
         self.gauges = gauges
         self.loop = EngineLoopV2(
             model: model,
@@ -433,7 +448,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             backend.updateBytesCapacity(clamped)
             admission.updateBytesCapacity(clamped)
         }
-        gauges.updateKVBytesCapacity(clamped)
+        // Read the backend AFTER its own resize ran: contiguous reflects
+        // the new ceiling; the construction-fixed paged pool reports its
+        // unchanged physical truth.
+        gauges.updateKVBytesCapacity(clamped, backendCapacity: backend.bytesCapacity)
     }
 
     /// Graceful drain: new submissions are rejected, waiting requests are

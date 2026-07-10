@@ -354,6 +354,15 @@ public enum CBv2KVError: Error {
     case backendIneligible(reason: String)
 }
 
+extension CBv2KVError {
+    /// Stable machine prefix on the terminal `.error` finish when a request
+    /// exhausts its capacity requeues (`EngineLoopV2.ensureKVState`). This is
+    /// a RETRYABLE capacity condition — the backend is full of other tenants'
+    /// KV, not broken — so bridges must map finishes carrying this prefix to
+    /// their retryable capacity error (429-class), never a server error.
+    public static let capacityExhaustedFinishPrefix = "kv_capacity_exhausted: "
+}
+
 // MARK: - Attention dispatch (owned by the layer cache object)
 
 /// The per-layer batch-facing cache object the model interacts with.
@@ -503,7 +512,31 @@ public struct CBv2CapacitySnapshot: Sendable {
     public var activeRequests: Int
     public var waitingRequests: Int
     public var kvBytesInUse: Int
+    /// The ADMISSION ceiling (runtime-resizable soft ledger). On the
+    /// contiguous backend this equals the backend's capacity (resize fans
+    /// out to both); on the paged backend a re-slice moves only this
+    /// ledger — the physically preallocated slabs stay at
+    /// `kvBytesBackendCapacity`.
     public var kvBytesCapacity: Int
+    /// The backend's PHYSICAL byte capacity (paged: pageCount × pageBytes
+    /// over all groups, construction-fixed; contiguous: == the admission
+    /// ceiling). Capacity planning binds to min(kvBytesCapacity, this)
+    /// ONLY WHEN THIS IS NONZERO — after a ledger GROW past pool truth the
+    /// pool is what actually admits. 0 means UNKNOWN (snapshots built
+    /// through the backwards-compatible initializer, e.g. test stubs) and
+    /// must never be read as zero capacity.
+    public var kvBytesBackendCapacity: Int
+    /// Bytes NOT available for new admissions: the backend's admission
+    /// truth — bytes PROMISED to admitted sequences (the paged pool's
+    /// atomic worst-case page charges; the contiguous backend's per-row
+    /// `max(allocated, reservation)`) — PLUS the compiled decode path's
+    /// live padding carve (`AdmissionV2.bytesExternallyReserved`, 0 after
+    /// a warmup refund and always 0 on paged backends, where compiled
+    /// decode is vetoed). `kvBytesInUse` lags this — storage materializes
+    /// lazily as tokens are written — so capacity planning (provider
+    /// heartbeats) must subtract RESERVED, not in-use, or several
+    /// admitted-but-cold requests look like free headroom.
+    public var kvBytesReserved: Int
     public var activeTokens: Int
     /// Monotonic count of engine steps executed. Providers use this as a
     /// direct liveness/wedge signal (a stalled engine stops incrementing)
@@ -511,12 +544,15 @@ public struct CBv2CapacitySnapshot: Sendable {
     public var stepsExecuted: Int
     public init(
         activeRequests: Int, waitingRequests: Int, kvBytesInUse: Int, kvBytesCapacity: Int,
-        activeTokens: Int, stepsExecuted: Int = 0
+        kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0, activeTokens: Int,
+        stepsExecuted: Int = 0
     ) {
         self.activeRequests = activeRequests
         self.waitingRequests = waitingRequests
         self.kvBytesInUse = kvBytesInUse
         self.kvBytesCapacity = kvBytesCapacity
+        self.kvBytesBackendCapacity = kvBytesBackendCapacity
+        self.kvBytesReserved = kvBytesReserved
         self.activeTokens = activeTokens
         self.stepsExecuted = stepsExecuted
     }

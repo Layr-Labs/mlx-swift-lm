@@ -27,6 +27,15 @@ public protocol CBv2StepCapacity: AnyObject {
     func releaseAll(id: CBv2RequestID)
     /// Non-throwing conservative probe used by the chained-decode fast path.
     func hasHeadroom(additionalTokens: Int) -> Bool
+    /// The ledger's current byte ceiling (runtime-resizable). Feeds the
+    /// engine's capacity snapshot so re-slices read back consistently.
+    /// Defaulted to 0 (= unknown) so simple test capacities need not
+    /// implement it.
+    var bytesCapacity: Int { get }
+}
+
+extension CBv2StepCapacity {
+    public var bytesCapacity: Int { 0 }
 }
 
 // MARK: - AdmissionV2
@@ -191,6 +200,17 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// when the obligation it covered no longer exists — compiled decode
     /// disabled itself at warmup, so its padding can never materialize and
     /// the bytes belong to regular admission again (PR#62 review).
+    /// Live external (compiled padding) reserve — the construction value
+    /// until `refundExternalReserve()`, then 0. Read by the engine loop's
+    /// gauge publish so the snapshot's `kvBytesReserved` carries the FULL
+    /// not-available-for-new-admissions figure (backend promises + this
+    /// carve), keeping "capacity − reserved" truthful for planners.
+    public var bytesExternallyReserved: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return externalReserveBytes
+    }
+
     public func refundExternalReserve() {
         lock.lock()
         externalReserveBytes = 0
@@ -266,14 +286,22 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         activeRequests: Int, waitingRequests: Int, activeTokens: Int, backendBytesInUse: Int? = nil
     ) -> CBv2CapacitySnapshot {
         lock.lock()
-        let reserved = ledgerBytes
+        let ledger = ledgerBytes
+        // Honor the field's contract (see `CBv2CapacitySnapshot
+        // .kvBytesReserved`): reserved carries the live external (compiled
+        // padding) carve too, so "capacity − reserved" matches what
+        // `canEverFit`/`reserve` will actually admit — the same figure the
+        // engine loop's gauge publish reports. The carve is NOT storage,
+        // so the in-use fallback stays ledger-only.
+        let reserved = ledger + externalReserveBytes
         let capacity = _bytesCapacity
         lock.unlock()
         return CBv2CapacitySnapshot(
             activeRequests: activeRequests,
             waitingRequests: waitingRequests,
-            kvBytesInUse: backendBytesInUse ?? reserved,
+            kvBytesInUse: backendBytesInUse ?? ledger,
             kvBytesCapacity: capacity,
+            kvBytesReserved: reserved,
             activeTokens: activeTokens)
     }
 }
