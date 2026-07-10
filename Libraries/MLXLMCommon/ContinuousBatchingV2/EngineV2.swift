@@ -141,6 +141,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// NOTE: counters are engine-thread owned; read at quiescent points
     /// (after streams finish) for exact values.
     public var compiledDecodeStats: CBv2CompiledDecodeStats? { loop.compiledDecode?.stats }
+
+    /// Cumulative MTP (speculative decoding) counters, or nil when MTP is
+    /// inactive (no drafter, config/kill-switch off, or a model that cannot
+    /// drive rounds). Lock-protected snapshot — safe to poll from any
+    /// thread (provider heartbeats/telemetry).
+    public func mtpMetricsSnapshot() -> CBv2MTPMetrics? { loop.mtp?.metricsSnapshot() }
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
     /// Internal test hook: the admission ledger, for asserting the compiled
@@ -158,7 +164,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
         admissionConfig: AdmissionV2.Config = AdmissionV2.Config(),
         prefixCache: CBv2PrefixCache? = nil,
-        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig()
+        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig(),
+        mtpDrafter: (any CBv2MTPDrafter)? = nil,
+        mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
@@ -232,6 +240,18 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             kvBytesBackendCapacity: backend.bytesCapacity,
             kvBytesReserved: compiledDecode?.admissionPaddingReserve ?? 0)
         self.gauges = gauges
+        // MTP (speculative decoding): active only when a drafter is bound,
+        // the config (and the DARKBLOOM_CBV2_MTP kill switch) allow it, and
+        // the model can drive rounds (CBv2MTPSteppableModel with capture
+        // layers). nil ⇒ byte-identical plain-decode behavior. The loop
+        // wires `SchedulerV2.speculationPlanner` when the driver exists.
+        let mtpDriver = CBv2MTPRoundDriver.build(
+            model: model, drafter: mtpDrafter, config: mtpConfig)
+        if mtpDrafter != nil, mtpConfig.enabled, mtpDriver == nil {
+            log.info(
+                "CBv2 MTP inactive despite a bound drafter: \(CBv2MTPConfig.envEnabled ? "model \(type(of: model)) cannot drive MTP rounds (no capture layers)" : "DARKBLOOM_CBV2_MTP kill switch", privacy: .public) — plain decode"
+            )
+        }
         self.loop = EngineLoopV2(
             model: model,
             layerKinds: layerKinds,
@@ -243,6 +263,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             capacity: admission,
             prefixCache: activePrefixCache,
             compiledDecode: compiledDecode,
+            mtp: mtpDriver,
             config: loopConfig,
             gauges: gauges)
         loop.start()

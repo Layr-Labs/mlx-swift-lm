@@ -242,6 +242,12 @@ final class CBv2InFlightStep {
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
             donation: CBv2DonationIntent?, earlyDonation: CBv2EarlyDonationJob?
         )] = []
+    /// Non-nil marks this step as an MTP round (verify and/or seed work,
+    /// finalized by `finalizeMTPRound`). MTP rounds NEVER chain: the
+    /// chained path's finalize loop and `deferredReleases` assume exactly
+    /// one sample per row, so `engineStep` guards on this before offering
+    /// the step as a chain base.
+    var mtpRound: CBv2MTPRoundInFlight?
 
     init(
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
@@ -392,6 +398,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// engine queue before the first step; every pure-decode step tries it
     /// first and falls back to the eager path when it declines.
     let compiledDecode: CBv2CompiledDecode?
+    /// MTP (speculative decoding) driver state, or nil (byte-identical
+    /// plain-decode behavior). Round logic lives in EngineLoopV2+MTP.swift.
+    let mtp: CBv2MTPRoundDriver?
     let config: CBv2EngineLoopConfig
     let gauges: CBv2EngineGauges
 
@@ -420,7 +429,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// path: their holdback scan gates the deterministic one-step-late
     /// stop-string finish, which cannot be deferred without generating text
     /// past the stop (contract) or breaking the parity suites.
-    private let detokQueue = DispatchQueue(
+    let detokQueue = DispatchQueue(
         label: "com.eigen.cbv2.detok", qos: .userInitiated)
 
     // Cross-thread state (stateLock).
@@ -431,9 +440,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var wedgeReported = false
     private var _healthy = true
 
-    // Engine-thread-confined state.
-    private var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
-    private var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
+    // Engine-thread-confined state (internal, not private: the MTP round
+    // driver in EngineLoopV2+MTP.swift is part of the loop).
+    var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
+    var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
@@ -447,15 +457,16 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Resolved vision inputs (validated spans + materialized embeddings),
     /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
     /// the span chunks and needs the embeddings again); dropped at finish.
-    private var multimodalByID: [CBv2RequestID: CBv2ResolvedMultimodal] = [:]
+    var multimodalByID: [CBv2RequestID: CBv2ResolvedMultimodal] = [:]
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
     private var drainWaiters: [CBv2DrainWaiter] = []
-    /// True after a compiled decode step advanced rows OUTSIDE the eager
-    /// provider's caches: the next eager bind must be forced to rebuild
-    /// `positionOffsets` from host truth (see `eagerCaches`).
-    private var eagerCompositionStale = false
+    /// True after a compiled decode step (or a rejecting MTP round)
+    /// advanced rows OUTSIDE the eager provider's caches' host truth: the
+    /// next eager bind must be forced to rebuild `positionOffsets` from
+    /// host truth (see `eagerCaches`).
+    var eagerCompositionStale = false
 
     /// Telemetry / test hooks.
     public private(set) var stepCount = 0
@@ -471,8 +482,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// evaluating the offset chain every eager step keeps its lazy `+ L`
     /// advance from accumulating O(steps) of graph. Zero for the compiled
     /// path (its counters advance in-graph) and for caches that vend no
-    /// inner state (mocks). Test hook.
-    public private(set) var offsetChainEvalSteps = 0
+    /// inner state (mocks). Test hook. (internal(set): MTP round steps in
+    /// EngineLoopV2+MTP.swift count here too.)
+    public internal(set) var offsetChainEvalSteps = 0
     /// Fired (from the watchdog thread) when a step exceeds `stepTimeout`.
     public var onStepWedge: (@Sendable (TimeInterval) -> Void)?
     /// Test hook: artificial delay at the START of the enqueue engine block,
@@ -499,6 +511,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         capacity: CBv2StepCapacity?,
         prefixCache: CBv2PrefixCache? = nil,
         compiledDecode: CBv2CompiledDecode? = nil,
+        mtp: CBv2MTPRoundDriver? = nil,
         config: CBv2EngineLoopConfig,
         gauges: CBv2EngineGauges
     ) {
@@ -512,8 +525,17 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.capacity = capacity
         self.prefixCache = prefixCache
         self.compiledDecode = compiledDecode
+        self.mtp = mtp
         self.config = config
         self.gauges = gauges
+        // MTP: the scheduler consults the loop for 1+k decode assignments.
+        // `unowned` is safe (and cycle-free): the loop owns the scheduler
+        // and both live exactly as long as the engine.
+        if mtp != nil {
+            scheduler.speculationPlanner = { [unowned self] rec in
+                self.mtpPlanSpeculation(for: rec)
+            }
+        }
     }
 
     // MARK: Lifecycle
@@ -833,13 +855,22 @@ public final class EngineLoopV2: @unchecked Sendable {
         processDeadlines()
 
         // Chained decode fast path: build step N+1 on step N's lazy tokens.
+        // MTP guards: an MTP round step is never a chain base (its finalize
+        // confirms 1+k samples per row — the chained machinery assumes
+        // exactly one), and the chain must BREAK whenever the MTP driver
+        // wants the next step (seed or round) for any candidate row —
+        // chained launches bypass hidden capture, so seeding could
+        // otherwise never start.
         if let previous = inFlight,
+            previous.mtpRound == nil,
             previous.sampledTokens != nil,
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
             ids.allSatisfy({ kvStates[$0] != nil }),
+            !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
         {
+            mtp?.beginPlan()
             let plan = scheduler.plan()
             if isPureDecodePlan(plan, matching: ids) {
                 if CBv2StepProfiler.enabled {
@@ -872,6 +903,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // A preempted request recomputes from scratch — any adopted
                 // prefix credit no longer describes work that was skipped.
                 invalidateAdoptedPrefix(id)
+                mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
                 compiledDecode?.forgetRows(state)
                 if previous.participants.contains(id) {
@@ -912,6 +944,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
 
+        mtp?.beginPlan()
         let plan = scheduler.plan()
         handlePreemptions(plan.preemptions)
         guard !plan.assignments.isEmpty else {
@@ -919,7 +952,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduleIdleRecheck()
             return
         }
-        inFlight = executeMixed(plan)
+        // MTP round steps (1+k verify assignments and/or seed decodes)
+        // branch BEFORE executeMixed — its rec.tokens slicing and samples
+        // predicate are structurally wrong for speculative tokens.
+        inFlight = mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan)
         stepCount += 1
         publishGauges()
         scheduleNextStep()
@@ -947,7 +983,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// Eager layer caches, with the provider's composition fingerprint
     /// force-invalidated when compiled steps advanced rows behind its back.
-    private func eagerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+    func eagerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         if eagerCompositionStale {
             (cacheProvider as? CBv2CompositionInvalidating)?.invalidateBoundComposition()
             eagerCompositionStale = false
@@ -962,7 +998,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// of unevaluated graph — the DAR-325 bug class (legacy `BatchKVCache`
     /// had exactly this). Empty for the compiled path (its counters advance
     /// in-graph) and for caches that vend no inner state (mocks).
-    private func eagerCacheInnerState(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
+    func eagerCacheInnerState(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
@@ -1052,7 +1088,10 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// General step: decode batch [B, 1] + per-request [1, chunk] prefills,
     /// interleaved per the plan, ONE `asyncEval` for the whole step.
-    private func executeMixed(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
+    /// NEVER extended for MTP speculation — 1+k assignments take
+    /// `executeMTPRound` (this function's `rec.tokens` slicing and
+    /// `samples` predicate are structurally wrong for speculative tokens).
+    func executeMixed(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         struct RowWork {
             let rec: CBv2ScheduledRequest
             let start: Int
@@ -1209,7 +1248,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// attention path's `L > 1` span precondition, so it is skipped
     /// (PR review: reachable via a length-1 span landing in a trailing
     /// 1-token prefill chunk).
-    private func multimodalChunkForward(
+    func multimodalChunkForward(
         tokens: MLXArray, start: Int, count: Int,
         multimodal: CBv2ResolvedMultimodal, spanContext: CBv2SpanChunkContext,
         caches: [CBv2AttendingLayerCache]
@@ -1335,6 +1374,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
+        // MTP round steps: seed-carry capture + the verify accept-walk run
+        // at this same host-sync boundary (their arrays rode the step's
+        // asyncEval), AFTER the plain loop above (seed bonus tokens are
+        // confirmed there) and BEFORE the fenced frees below.
+        if step.mtpRound != nil {
+            finalizeMTPRound(step)
+        }
+
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
@@ -1350,7 +1397,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Request completion
 
-    private func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+    func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
         // that exhausted it), or a reused id inherits the previous
@@ -1359,6 +1406,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         capacityRequeues.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
         let earlyDonation = earlyDonationsScheduled.removeValue(forKey: id)
+        // MTP: ids are reusable, so every per-id trace (carry, marks) must
+        // go on every finish path.
+        mtp?.requestDidFinish(id)
         guard let rec = scheduler.finish(id: id, reason: reason) else {
             // Unknown to the scheduler (already finished) — make sure no
             // stream leaks regardless.
@@ -1665,7 +1715,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// Full per-row sampler context (confirmed history only; in-flight
     /// chained samples travel separately as `pendingSampledTokens`).
-    private static func samplerRow(_ rec: CBv2ScheduledRequest) -> CBv2SamplerRow {
+    static func samplerRow(_ rec: CBv2ScheduledRequest) -> CBv2SamplerRow {
         CBv2SamplerRow(
             id: rec.id,
             params: rec.request.sampling,
@@ -1745,6 +1795,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             // prefix credit no longer describes work that was skipped, so
             // usage.prefixCacheHitTokens must not over-credit at finish.
             invalidateAdoptedPrefix(id)
+            // A preempted row's drafter carry no longer describes its KV
+            // (the structural fingerprint would catch it; drop eagerly).
+            mtp?.invalidateCarry(id)
             if let state = kvStates.removeValue(forKey: id) {
                 compiledDecode?.forgetRows(state)
                 releaseState(state, pendingEarlyDonation: earlyDonationsScheduled[id])
@@ -1758,7 +1811,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// requeued to waiting instead of error-finished: accepted requests wait
     /// for room. Bounded by `maxCapacityRequeues` (then error-finish) and by
     /// the request deadline. Other failures error-finish as before.
-    private func ensureKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
+    func ensureKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
         if let state = kvStates[rec.id] { return state }
         do {
             let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
@@ -1773,6 +1826,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(rec.id) {
                     capacityRequeues[rec.id] = attempts + 1
                     capacityRequeueCount += 1
+                    mtp?.invalidateCarry(rec.id)  // preempted-style restart
                     return nil
                 }
                 // Terminal capacity exhaustion is retryable (the backend is
@@ -1794,7 +1848,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Streams
 
-    private func stream(for id: CBv2RequestID) -> CBv2OutputStream? {
+    func stream(for id: CBv2RequestID) -> CBv2OutputStream? {
         stateLock.lock()
         defer { stateLock.unlock() }
         return streams[id]
