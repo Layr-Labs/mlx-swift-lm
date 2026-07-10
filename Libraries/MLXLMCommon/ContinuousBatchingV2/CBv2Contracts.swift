@@ -263,6 +263,38 @@ public protocol CBv2SequenceKV: AnyObject {
     /// Rollback the last `n` tokens (speculative rejection). Must scrub
     /// un-confirmed tail state so it can never be attended to.
     func rollback(_ n: Int)
+
+    // MARK: Speculative (MTP) writes
+
+    /// True when this row can take a multi-token `update()` under
+    /// `beginSpeculativeWrite()` such that the sequence
+    /// `beginSpeculativeWrite(); update(n tokens); rollback(m);
+    /// commitSpeculativeWrite()` (m ≤ n) leaves state VALUE-EXACTLY equal to
+    /// a plain `update()` of only the first `n - m` tokens. This is the
+    /// eligibility gate for speculative (MTP) decoding: a row whose storage
+    /// cannot guarantee exact rollback (e.g. a paged windowed ring, whose
+    /// in-place writes destroy the oldest in-window entries — see
+    /// `CBv2WindowedSequenceKV`'s rollback discussion) MUST return false so
+    /// the engine falls back to plain decode for that row. Default: false
+    /// (fail-safe — unknown row classes never speculate), mirroring
+    /// `CBv2KVBackend.producesCompiledDecodeEligibleRows`.
+    var supportsSpeculativeWrites: Bool { get }
+    /// Arm speculative-write mode for the NEXT `update()` call. Storage
+    /// whose plain rollback is already value-exact (full, quantized,
+    /// paged-full) may make this a no-op. Ring storage (contiguous windowed)
+    /// must STAGE the next update — return the exact views a plain
+    /// multi-token update would return and advance counters, but defer the
+    /// destructive ring writes until `commitSpeculativeWrite()` so a
+    /// `rollback(m)` in between is a pure counter move (nothing was
+    /// destroyed). At most one speculative update may be in flight per row.
+    func beginSpeculativeWrite()
+    /// Commit the staged speculative update (if any): persist storage for
+    /// the still-confirmed positions `[stagedBase, absoluteOffset)` and
+    /// disarm. Called at step finalization AFTER `rollback` of rejected
+    /// tokens. No-op when nothing is staged. The engine guarantees no
+    /// attention runs against this row between the speculative `update()`
+    /// and this commit except through the views that update returned.
+    func commitSpeculativeWrite()
     /// Advance the absolute position counter WITHOUT writing storage.
     /// Only valid on a FRESH windowed state during prefix-cache adoption:
     /// the engine recomputes the trailing window tokens for windowed layers,
@@ -283,6 +315,13 @@ extension CBv2SequenceKV {
 
     /// Default: full-precision snapshots are value-exact.
     public var snapshotIsLossless: Bool { true }
+
+    /// Default: fail-safe — unknown row classes never speculate.
+    public var supportsSpeculativeWrites: Bool { false }
+    /// Default: no-op (rows whose plain rollback is already value-exact).
+    public func beginSpeculativeWrite() {}
+    /// Default: no-op.
+    public func commitSpeculativeWrite() {}
 }
 
 /// Factory for per-sequence KV state; implemented by the v1 contiguous

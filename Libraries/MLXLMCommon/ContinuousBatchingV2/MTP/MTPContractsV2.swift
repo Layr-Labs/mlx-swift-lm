@@ -1,0 +1,208 @@
+// MTPContractsV2.swift
+//
+// ContinuousBatchingV2 — Gemma-4-style MTP (multi-token prediction /
+// speculative decoding) integration contracts.
+//
+// Design (mirrors the KV-less frozen-KV drafter that vLLM and SGLang
+// independently converged on for Gemma 4, and our own v1 engine shipped):
+//
+//   - The DRAFTER writes no KV. Each round it attends a snapshot of the
+//     target's KV at exactly TWO layers (the last non-shared full-attention
+//     layer and the last non-shared sliding-attention layer), with a
+//     CONSTANT query RoPE position per round (the anchor = the absolute
+//     position of the row's newest confirmed-but-unfed token).
+//   - Per round, for each speculating row: chain k drafter forwards
+//     (greedy argmax, seed = newest confirmed token + the target's pre-norm
+//     hidden at the position before it), then verify [seed, d_1..d_k] in ONE
+//     rectangular [B, 1+k] target forward. The accept-walk
+//     (`Gemma4SpeculativeWalk` semantics: accept while target argmax ==
+//     draft, always emit target argmax at the first divergence / bonus
+//     position) emits a+1 tokens; the k−a rejected tokens are rolled back
+//     per row (exact — see `CBv2SequenceKV.supportsSpeculativeWrites`).
+//   - GREEDY-ONLY losslessness is the parity invariant: MTP-on output is
+//     token-exact vs MTP-off for temperature-0 requests. Non-greedy rows
+//     never speculate.
+//
+// Layering: everything here is model-family-agnostic. The Gemma-4 drafter
+// module, its masks, and the accept-walk live in MLXLLM; they reach the
+// engine through `CBv2MTPDrafter` / `CBv2MTPForwardable` (same pattern as
+// `CBv2EmbeddingForwardable` for multimodal).
+
+import Foundation
+import MLX
+
+// MARK: - Model seam (verify forward + capture geometry)
+
+/// Which layer indices the engine snapshots for the drafter's frozen KV.
+/// Indices are MODEL layer indices (== positions in the engine's per-layer
+/// caches array). Both referenced layers must OWN storage (non-KV-shared).
+public struct CBv2MTPCaptureLayers: Sendable, Equatable {
+    /// Last non-shared full-attention layer.
+    public var full: Int
+    /// Last non-shared sliding-attention layer.
+    public var sliding: Int
+    public init(full: Int, sliding: Int) {
+        self.full = full
+        self.sliding = sliding
+    }
+}
+
+/// Model-level surface for `LanguageModel` conformers reached through
+/// `CBv2SteppableLanguageModelAdapter` (Gemma4TextModel conforms): the
+/// KVCache-shaped twin of the `CBv2MTPSteppableModel` requirements.
+public protocol CBv2MTPForwardable: AnyObject {
+    /// nil when this model cannot drive MTP (no capture layers).
+    var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? { get }
+    /// Forward returning (softcapped) logits [B, L, vocab] AND the pre-norm
+    /// last-decoder-layer hidden [B, L, hidden] — the tensor the Gemma-4
+    /// drafter was trained against. Must be numerically identical to the
+    /// plain forward on the logits side.
+    func cbv2ForwardWithHidden(_ tokens: MLXArray, caches: [KVCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+/// Steppable models that can drive MTP rounds. Additive refinement of
+/// `CBv2SteppableModel`; the engine speculates only when the bound model
+/// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
+public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
+    /// nil when the underlying model cannot drive MTP (adapters over
+    /// arbitrary models answer at runtime).
+    var mtpCaptureLayers: CBv2MTPCaptureLayers? { get }
+    /// Forward returning logits [B, L, vocab] and pre-norm last hidden
+    /// [B, L, hidden]. Same cache/attention semantics as `forward`.
+    func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+// MARK: - Drafter seam
+
+/// One speculating row's frozen-KV capture for a round: snapshot views of
+/// the target's retained KV at the two capture layers, plus the row's
+/// anchor geometry. Views are per-row (no padding — the drafter pads and
+/// masks internally, so mixed retained lengths across rows are fine).
+public struct CBv2MTPRowCapture {
+    /// Full-attention capture layer: [1, kvHeads, Tfull, headDim], temporal
+    /// order, post-RoPE (captured from storage the target attended).
+    public var fullKeys: MLXArray
+    public var fullValues: MLXArray
+    /// Sliding-attention capture layer: [1, kvHeads, Tslide, headDim],
+    /// temporal order. Window-limited by storage eviction.
+    public var slidingKeys: MLXArray
+    public var slidingValues: MLXArray
+    /// Absolute position of the FIRST retained sliding entry (the sliding
+    /// KV covers positions [slidingStart, anchor)). The full capture always
+    /// starts at 0.
+    public var slidingStart: Int
+    /// The round's frozen query position: absolute position of the row's
+    /// newest confirmed-but-unfed token (== the row's absoluteOffset).
+    public var anchor: Int
+
+    public init(
+        fullKeys: MLXArray, fullValues: MLXArray,
+        slidingKeys: MLXArray, slidingValues: MLXArray,
+        slidingStart: Int, anchor: Int
+    ) {
+        self.fullKeys = fullKeys
+        self.fullValues = fullValues
+        self.slidingKeys = slidingKeys
+        self.slidingValues = slidingValues
+        self.slidingStart = slidingStart
+        self.anchor = anchor
+    }
+}
+
+/// Opaque round-scoped state a drafter builds once per round from the
+/// per-row captures (padded/stacked batch KV, per-row masks, positions).
+public protocol CBv2MTPPreparedCapture: AnyObject {}
+
+/// The engine's view of a drafter. Implemented in MLXLLM by an adapter over
+/// `Gemma4AssistantDraftModel` bound to the engine's target model (the
+/// adapter owns target-embedding lookup, mask construction, and greedy
+/// argmax). All methods are called on the engine thread while building the
+/// step graph; they MUST NOT force evaluation (no host syncs).
+public protocol CBv2MTPDrafter: AnyObject {
+    /// Build round-scoped batch state from per-row captures. `rows` order
+    /// == the round's speculating-row order.
+    func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
+    /// One draft-chain step over all speculating rows.
+    ///  - tokens: [B, 1] int32 (lazy) — seed tokens (round start: each
+    ///    row's newest confirmed token; later steps: previous draft).
+    ///  - hidden: [B, 1, H] — round start: the target's pre-norm hidden at
+    ///    the position BEFORE the seed token; later steps: the drafter's
+    ///    own previous output hidden.
+    ///  - Returns greedy next-token ids [B] int32 (lazy) and the drafter's
+    ///    output hidden [B, 1, H] for chaining.
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
+    ) -> (tokens: MLXArray, hidden: MLXArray)
+}
+
+// MARK: - Config
+
+/// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
+public struct CBv2MTPConfig: Sendable {
+    /// Master switch. The engine also requires a drafter instance and a
+    /// conforming model; `enabled == true` without both is inert.
+    public var enabled: Bool
+    /// Max draft tokens per round (k). Rounds verify 1+k and emit 1..k+1.
+    /// Clamped to `1...15` (Gemma-4 block-size validation is 2...16 on
+    /// 1+k).
+    public var maxDraftTokens: Int
+    /// Speculate only while the number of RUNNING requests is ≤ this
+    /// (static gate; above it every row takes plain decode — the batched
+    /// forward already amortizes weight streaming, so speculation stops
+    /// paying for itself; seeded from the v1 engine's maxBatch=2 finding
+    /// and the vLLM/SGLang batch gates).
+    public var maxSpeculativeBatch: Int
+
+    /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
+    /// disables MTP even when the provider enables it (same convention as
+    /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
+    public static let envEnabled: Bool = {
+        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP"] {
+            return !["0", "false", "no", "off"].contains(raw.lowercased())
+        }
+        return true
+    }()
+
+    public init(enabled: Bool = false, maxDraftTokens: Int = 2, maxSpeculativeBatch: Int = 2) {
+        self.enabled = enabled
+        self.maxDraftTokens = min(max(maxDraftTokens, 1), 15)
+        self.maxSpeculativeBatch = max(maxSpeculativeBatch, 1)
+    }
+
+    /// The effective on/off state (config AND env kill switch).
+    public var effectiveEnabled: Bool { enabled && Self.envEnabled }
+}
+
+// MARK: - Metrics
+
+/// Cumulative MTP counters (engine-thread mutated, snapshot under the
+/// engine's stats lock). Per-position acceptance is the tuning signal for
+/// `maxDraftTokens`.
+public struct CBv2MTPMetrics: Sendable {
+    /// Rounds that drafted (k ≥ 1) and verified.
+    public var rounds: Int = 0
+    /// Seed steps (eligible rows that decoded eagerly with hidden capture
+    /// to establish the drafter carry — no drafts yet).
+    public var seedSteps: Int = 0
+    /// Total draft tokens proposed across all rounds.
+    public var draftedTokens: Int = 0
+    /// Total draft tokens accepted across all rounds.
+    public var acceptedTokens: Int = 0
+    /// Total tokens emitted by MTP rounds (accepted + bonus/correction).
+    public var emittedTokens: Int = 0
+    /// perPositionAccepted[i] = rounds in which draft position i (0-based)
+    /// was accepted. Monotonically non-increasing over i within a run.
+    public var perPositionAccepted: [Int] = []
+    /// Rows that were round-eligible but clamped to plain decode, keyed by
+    /// reason ("batch_gate", "kv_headroom", "carry_invalid", ...).
+    public var skippedRows: [String: Int] = [:]
+
+    public init() {}
+
+    /// Mean accepted drafts per round (nil before any round).
+    public var meanAcceptedPerRound: Double? {
+        rounds > 0 ? Double(acceptedTokens) / Double(rounds) : nil
+    }
+}

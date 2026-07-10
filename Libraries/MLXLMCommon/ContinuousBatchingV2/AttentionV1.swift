@@ -52,7 +52,9 @@ enum CBv2AttentionV1 {
     /// Update each row with this step's K/V and attend.
     ///
     /// - queries/keys/values: `[B, heads, L, headDim]` with `L == 1` for
-    ///   decode (B == rows.count) or `B == 1` for a prefill chunk.
+    ///   decode (B == rows.count), `B == 1` for a prefill chunk, or a
+    ///   RECTANGULAR `[B > 1, L > 1]` MTP verify batch (every row processes
+    ///   the same 1+k tokens; per row this is exactly the [1, L] chunk path).
     /// - softcap: construction-time attention-logit soft cap
     ///   (`cap * tanh(qk / cap)` before softmax, Gemma-2 style). When set,
     ///   BOTH phases take the composed reference path (SDPA cannot express
@@ -75,47 +77,80 @@ enum CBv2AttentionV1 {
             "CBv2AttentionV1: batch \(B) != rows \(rows.count) — prefill must run per-request [1, chunk]"
         )
         precondition(
-            B == 1 || L == 1,
-            "CBv2AttentionV1: ragged shapes are impossible in v2 — decode is [B, 1], prefill is [1, chunk]"
-        )
-        precondition(
             spanContext == nil || (B == 1 && L > 1),
             "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
         )
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if B == 1 {
-            let (cachedKeys, cachedValues) = rows[0].update(keys: keys, values: values)
-            if let spanContext, L > 1 {
-                return attendSpanChunk(
-                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                    L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-                    context: spanContext, sinks: effectiveSinks, softcap: softcap)
-            }
-            return attend(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-                sinks: effectiveSinks, softcap: softcap)
+            return updateAndAttendRow(
+                row: rows[0], kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: effectiveSinks, softcap: softcap,
+                spanContext: spanContext)
         }
 
-        // Batched decode: split queries per row, per-row update + SDPA
-        // against that row's own KV, then concatenate. No masks — each row
-        // sees exactly its own KV, so batch-composition invariance holds by
-        // construction and fully-masked rows cannot exist.
+        if L == 1 {
+            // Batched decode: split queries per row, per-row update + SDPA
+            // against that row's own KV, then concatenate. No masks — each row
+            // sees exactly its own KV, so batch-composition invariance holds by
+            // construction and fully-masked rows cannot exist.
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(B)
+            for (index, row) in rows.enumerated() {
+                let (cachedKeys, cachedValues) = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                outputs.append(
+                    attend(
+                        queries: queries[index ..< (index + 1)],
+                        keys: cachedKeys, values: cachedValues, scale: scale,
+                        L: 1, kL: cachedKeys.dim(2), window: nil,
+                        sinks: effectiveSinks, softcap: softcap))
+            }
+            return concatenated(outputs, axis: 0)
+        }
+
+        // Rectangular [B > 1, L > 1] verify batch (MTP rounds): every row
+        // takes the SAME per-row path a [1, L] prefill chunk takes today —
+        // one pinned attention path per (model, phase); the loop reuses it,
+        // it does not invent a new one. Each row attends exactly its own KV.
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
         for (index, row) in rows.enumerated() {
-            let (cachedKeys, cachedValues) = row.update(
-                keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)])
             outputs.append(
-                attend(
+                updateAndAttendRow(
+                    row: row, kind: kind,
                     queries: queries[index ..< (index + 1)],
-                    keys: cachedKeys, values: cachedValues, scale: scale,
-                    L: 1, kL: cachedKeys.dim(2), window: nil,
-                    sinks: effectiveSinks, softcap: softcap))
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)],
+                    scale: scale, sinks: effectiveSinks, softcap: softcap,
+                    spanContext: nil))
         }
         return concatenated(outputs, axis: 0)
+    }
+
+    /// One row's update + attention — verbatim the single-request ([1, L])
+    /// logic, shared by the B == 1 path and the rectangular [B > 1, L > 1]
+    /// verify loop so a batched row is bit-identical to running alone.
+    private static func updateAndAttendRow(
+        row: CBv2SequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContext: CBv2SpanChunkContext?
+    ) -> MLXArray {
+        let L = queries.dim(2)
+        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        if let spanContext, L > 1 {
+            return attendSpanChunk(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                L: L, kL: cachedKeys.dim(2), window: window(of: kind),
+                context: spanContext, sinks: sinks, softcap: softcap)
+        }
+        return attend(
+            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+            L: L, kL: cachedKeys.dim(2), window: window(of: kind),
+            sinks: sinks, softcap: softcap)
     }
 
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer
@@ -147,31 +182,31 @@ enum CBv2AttentionV1 {
             B == sourceRows.count,
             "CBv2AttentionV1: batch \(B) != source rows \(sourceRows.count)")
         precondition(
-            B == 1 || L == 1,
-            "CBv2AttentionV1: ragged shapes are impossible in v2 — decode is [B, 1], prefill is [1, chunk]"
-        )
-        precondition(
             spanContext == nil || (B == 1 && L > 1),
             "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
         )
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
-        if B == 1, L > 1 {
-            let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRows[0])
-            if let spanContext {
-                // Same overlay as the storage-owning path: the MLXVLM
-                // reference applies the bidirectional-span overlay to the
-                // masks KV-shared layers reuse (they share their source's
-                // layer type, hence its window).
-                return attendSpanChunk(
-                    queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                    L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
-                    context: spanContext, sinks: effectiveSinks, softcap: softcap)
+        if L > 1 {
+            if B == 1 {
+                return borrowAndAttendRow(
+                    sourceRow: sourceRows[0], sourceKind: sourceKind,
+                    queries: queries, scale: scale, sinks: effectiveSinks, softcap: softcap,
+                    spanContext: spanContext)
             }
-            return attend(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
-                sinks: effectiveSinks, softcap: softcap)
+            // Rectangular [B > 1, L > 1] verify batch: per-row chunk borrow,
+            // same pinned path as [1, chunk] (see updateAndAttend).
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(B)
+            for (index, row) in sourceRows.enumerated() {
+                outputs.append(
+                    borrowAndAttendRow(
+                        sourceRow: row, sourceKind: sourceKind,
+                        queries: queries[index ..< (index + 1)],
+                        scale: scale, sinks: effectiveSinks, softcap: softcap,
+                        spanContext: nil))
+            }
+            return concatenated(outputs, axis: 0)
         }
 
         var outputs: [MLXArray] = []
@@ -186,6 +221,32 @@ enum CBv2AttentionV1 {
                     sinks: effectiveSinks, softcap: softcap))
         }
         return B == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+    }
+
+    /// One row's chunk borrow + attention — verbatim the single-request
+    /// ([1, chunk]) borrow logic, shared by the B == 1 path and the
+    /// rectangular [B > 1, L > 1] verify loop.
+    private static func borrowAndAttendRow(
+        sourceRow: CBv2SequenceKV, sourceKind: CBv2LayerKind,
+        queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContext: CBv2SpanChunkContext?
+    ) -> MLXArray {
+        let L = queries.dim(2)
+        let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
+        if let spanContext {
+            // Same overlay as the storage-owning path: the MLXVLM
+            // reference applies the bidirectional-span overlay to the
+            // masks KV-shared layers reuse (they share their source's
+            // layer type, hence its window).
+            return attendSpanChunk(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
+                context: spanContext, sinks: sinks, softcap: softcap)
+        }
+        return attend(
+            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+            L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
+            sinks: sinks, softcap: softcap)
     }
 
     /// The views a borrowing layer must attend for the current PREFILL-CHUNK

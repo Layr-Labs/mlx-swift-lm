@@ -85,3 +85,27 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
             tokens, inputEmbedding: inputEmbeddings, cache: asKVCaches(caches))
     }
 }
+
+// MARK: - MTP (speculative decoding)
+
+/// Answered at RUNTIME like the multimodal capability: the adapter wraps any
+/// `LanguageModel`, and only `CBv2MTPForwardable` conformers (Gemma4TextModel)
+/// can drive MTP rounds. The engine gates speculation on
+/// `mtpCaptureLayers != nil` before ever calling `forwardWithHidden`, so the
+/// trapping guard below is unreachable in a correctly gated engine.
+extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
+
+    public var mtpCaptureLayers: CBv2MTPCaptureLayers? {
+        (model as? CBv2MTPForwardable)?.cbv2MTPCaptureLayers
+    }
+
+    public func forwardWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        guard let forwardable = model as? CBv2MTPForwardable else {
+            preconditionFailure(
+                "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — engine gating failed")
+        }
+        return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
+    }
+}
