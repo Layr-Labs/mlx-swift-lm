@@ -286,13 +286,20 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         activeRequests: Int, waitingRequests: Int, activeTokens: Int, backendBytesInUse: Int? = nil
     ) -> CBv2CapacitySnapshot {
         lock.lock()
-        let reserved = ledgerBytes
+        let ledger = ledgerBytes
+        // Honor the field's contract (see `CBv2CapacitySnapshot
+        // .kvBytesReserved`): reserved carries the live external (compiled
+        // padding) carve too, so "capacity − reserved" matches what
+        // `canEverFit`/`reserve` will actually admit — the same figure the
+        // engine loop's gauge publish reports. The carve is NOT storage,
+        // so the in-use fallback stays ledger-only.
+        let reserved = ledger + externalReserveBytes
         let capacity = _bytesCapacity
         lock.unlock()
         return CBv2CapacitySnapshot(
             activeRequests: activeRequests,
             waitingRequests: waitingRequests,
-            kvBytesInUse: backendBytesInUse ?? reserved,
+            kvBytesInUse: backendBytesInUse ?? ledger,
             kvBytesCapacity: capacity,
             kvBytesReserved: reserved,
             activeTokens: activeTokens)
