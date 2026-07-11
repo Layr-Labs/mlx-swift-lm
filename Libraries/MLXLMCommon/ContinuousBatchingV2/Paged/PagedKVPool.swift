@@ -102,6 +102,13 @@ public struct PagedKVPoolConfig: Sendable {
     public var nominalMaxSequenceLength: Int
     /// KV storage scheme. Only `.fp16` is accepted (see file header).
     public var quantScheme: CBv2KVQuantScheme
+    /// Metal's maximum length for one buffer. Every K and V slab is
+    /// validated against this before any MLXArray is created; exceeding it
+    /// would otherwise surface as an uncatchable allocator/Metal failure.
+    public var maxBufferLength: Int
+    /// Optional resource-search roots. nil uses the installed runtime
+    /// layout; explicit roots are a package-layout test seam.
+    public var resourceSearchRoots: [URL]?
 
     public init(
         pageSize: Int = CBv2PagedDefaults.pageSize,
@@ -109,7 +116,9 @@ public struct PagedKVPoolConfig: Sendable {
         dtype: DType = .float16,
         maxPrefillChunk: Int = 512,
         nominalMaxSequenceLength: Int = 8192,
-        quantScheme: CBv2KVQuantScheme = .fp16
+        quantScheme: CBv2KVQuantScheme = .fp16,
+        maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize,
+        resourceSearchRoots: [URL]? = nil
     ) {
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
@@ -117,6 +126,8 @@ public struct PagedKVPoolConfig: Sendable {
         self.maxPrefillChunk = maxPrefillChunk
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
         self.quantScheme = quantScheme
+        self.maxBufferLength = maxBufferLength
+        self.resourceSearchRoots = resourceSearchRoots
     }
 }
 
@@ -212,6 +223,10 @@ final class PagedKVGroup {
 /// performs no internal locking.
 public final class PagedKVPool {
     public let config: PagedKVPoolConfig
+    /// Validated Metal source retained for the pool's lifetime. Kernel
+    /// dispatch never touches Bundle.module and therefore has no
+    /// request-time resource-failure path.
+    let kernelSource: String
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
 
     /// Monotonic identity for every `PagedSequenceKV` minted against this
@@ -247,8 +262,14 @@ public final class PagedKVPool {
             throw CBv2KVError.backendIneligible(
                 reason: "PagedKVPool: unsupported page dtype \(config.dtype)")
         }
-        guard config.pageSize > 0, config.capacityBytes > 0 else {
+        guard config.pageSize > 0, config.capacityBytes > 0,
+            config.maxPrefillChunk > 0, config.nominalMaxSequenceLength > 0
+        else {
             throw CBv2KVError.backendIneligible(reason: "PagedKVPool: invalid config")
+        }
+        guard config.maxBufferLength > 0 else {
+            throw CBv2KVError.backendIneligible(
+                reason: "PagedKVPool: Metal maxBufferLength is unavailable")
         }
         // The decode kernel partitions attention into fixed
         // `PagedAttentionKernel.partitionTokens`-token slices and requires
@@ -264,38 +285,130 @@ public final class PagedKVPool {
                     + "(\(PagedAttentionKernel.partitionTokens)) — use a power-of-two "
                     + "divisor such as \(CBv2PagedDefaults.pageSize)")
         }
-        self.config = config
-
         // Demand-proportional capacity split.
         let owning = layerKinds.filter { $0.sharesKVWithLayer == nil }
         guard !owning.isEmpty else {
             throw CBv2KVError.backendIneligible(reason: "PagedKVPool: no storage-owning layers")
         }
+        for kind in owning {
+            guard kind.kvHeads > 0, kind.headDim > 0 else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "PagedKVPool: non-positive KV shape "
+                        + "\(kind.kvHeads)x\(kind.headDim)")
+            }
+            if case .slidingWindow(let window) = kind.attention {
+                guard window > 0 else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "PagedKVPool: invalid sliding window \(window)")
+                }
+                _ = try Self.checkedRingPageCount(window: window, config: config)
+            }
+        }
+
+        let source: String
+        do {
+            source = try PagedAttentionResources.loadSource(
+                roots: config.resourceSearchRoots ?? PagedAttentionResources.runtimeRoots())
+        } catch {
+            throw CBv2KVError.backendIneligible(
+                reason: "PagedKVPool: paged-attention runtime resource unavailable: \(error)")
+        }
+        self.config = config
+        self.kernelSource = source
+
         var demandTokens: [PagedKVGroupKey: Int] = [:]
         for kind in owning {
             let key = PagedKVGroupKey(kind)
             let tokens = Self.perSequenceTokenDemand(kind: kind, config: config)
-            demandTokens[key, default: 0] += tokens
+            demandTokens[key] = try Self.checkedAdd(
+                demandTokens[key, default: 0],
+                tokens,
+                context: "group token demand")
         }
         var demandBytes: [PagedKVGroupKey: Int] = [:]
         var totalDemand = 0
         for (key, tokens) in demandTokens {
-            let bytesPerToken = 2 * key.kvHeads * key.headDim * config.dtype.size
-            let bytes = tokens * bytesPerToken
+            let bytesPerToken = try Self.checkedMultiply(
+                [2, key.kvHeads, key.headDim, config.dtype.size],
+                context: "bytes per token")
+            let bytes = try Self.checkedMultiply(
+                [tokens, bytesPerToken],
+                context: "group byte demand")
             demandBytes[key] = bytes
-            totalDemand += bytes
+            totalDemand = try Self.checkedAdd(
+                totalDemand, bytes, context: "total byte demand")
+        }
+        guard totalDemand > 0 else {
+            throw CBv2KVError.backendIneligible(
+                reason: "PagedKVPool: zero byte demand")
         }
         for (key, bytes) in demandBytes {
             let share = Double(bytes) / Double(totalDemand)
             let groupBytes = Int(share * Double(config.capacityBytes))
-            let pageBytes = 2 * key.kvHeads * config.pageSize * key.headDim * config.dtype.size
+            let pageBytes = try Self.checkedMultiply(
+                [2, key.kvHeads, config.pageSize, key.headDim, config.dtype.size],
+                context: "page bytes")
             let pageCount = groupBytes / pageBytes
             guard pageCount > 0 else {
                 throw CBv2KVError.capacityExhausted(needed: pageBytes, available: groupBytes)
             }
+            guard pageCount <= Int(Int32.max) else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "PagedKVPool: group \(key) needs \(pageCount) pages, "
+                        + "over the Int32 page-table limit")
+            }
+            let slabBytes = try Self.checkedMultiply(
+                [pageCount, key.kvHeads, config.pageSize, key.headDim, config.dtype.size],
+                context: "slab bytes")
+            guard slabBytes <= config.maxBufferLength else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "PagedKVPool: group \(key) slab requires \(slabBytes) B, "
+                        + "over Metal maxBufferLength \(config.maxBufferLength) B")
+            }
             groups[key] = PagedKVGroup(
                 key: key, pageCount: pageCount, pageSize: config.pageSize, dtype: config.dtype)
         }
+    }
+
+    private static func checkedAdd(
+        _ lhs: Int,
+        _ rhs: Int,
+        context: String
+    ) throws -> Int {
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        guard !overflow else {
+            throw CBv2KVError.backendIneligible(
+                reason: "PagedKVPool: integer overflow computing \(context)")
+        }
+        return sum
+    }
+
+    private static func checkedMultiply(
+        _ values: [Int],
+        context: String
+    ) throws -> Int {
+        var product = 1
+        for value in values {
+            let (next, overflow) = product.multipliedReportingOverflow(by: value)
+            guard !overflow else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "PagedKVPool: integer overflow computing \(context)")
+            }
+            product = next
+        }
+        return product
+    }
+
+    private static func checkedRingPageCount(
+        window: Int,
+        config: PagedKVPoolConfig
+    ) throws -> Int {
+        let tokens = try checkedAdd(
+            window, config.maxPrefillChunk, context: "window ring tokens")
+        let rounded = try checkedAdd(
+            tokens, config.pageSize - 1, context: "window ring rounding")
+        return try checkedAdd(
+            rounded / config.pageSize, 1, context: "window ring slack")
     }
 
     /// Worst-case tokens a single sequence can pin in one layer of `kind`.
@@ -402,7 +515,8 @@ public final class PagedKVPool {
             keys: k, values: v,
             slots: MLXArray(padded),
             prevFence: g.writeFence,
-            pageSize: g.pageSize)
+            pageSize: g.pageSize,
+            kernelSource: kernelSource)
     }
 
     // MARK: - Reads

@@ -209,7 +209,8 @@ public struct PagedDecodeProfiler {
                         params: MLXArray([Float(1), scale, 0, 0, 0, 0, 0, 0]),
                         softcap: false,
                         pageSize: backend.pool.config.pageSize,
-                        writeFence: group.writeFence)
+                        writeFence: group.writeFence,
+                        kernelSource: backend.pool.kernelSource)
                     carry = out[0, 0, 0] * zero
                 }
             }
