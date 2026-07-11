@@ -39,13 +39,14 @@ struct CBv2PagedSafetyTests {
         }
     }
 
-    @Test("app-root SwiftPM bundle layout is discovered without a bundle-name special case")
-    func appRootBundleLayout() throws {
-        let root = FileManager.default.temporaryDirectory
+    @Test("signed-app Resources bundle layout is discovered without a bundle-name special case")
+    func signedAppResourceLayout() throws {
+        let app = FileManager.default.temporaryDirectory
             .appendingPathComponent("paged-resource-layout-\(UUID().uuidString)", isDirectory: true)
+        let root = app.appendingPathComponent("Contents/Resources", isDirectory: true)
         let bundle = root.appendingPathComponent("any-package_Target.bundle", isDirectory: true)
         try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer { try? FileManager.default.removeItem(at: app) }
         let source = """
             namespace cbv2 {
             inline void paged_attention_part_impl() {}
