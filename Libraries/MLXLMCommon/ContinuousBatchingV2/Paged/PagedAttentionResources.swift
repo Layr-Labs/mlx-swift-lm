@@ -35,10 +35,20 @@ enum PagedAttentionResources {
 
     /// Canonical sealed resource root when the current executable is inside
     /// a macOS app. No caller may add fallback roots in this context.
+    ///
+    /// The installer exposes the app executable through `bin/` symlinks
+    /// (and operators add their own in /usr/local/bin), so the invocation
+    /// path may not sit inside the .app at all. Resolve symlinks first —
+    /// mirroring SelfUpdater's install-root resolution — otherwise a
+    /// symlinked launch would silently miss the sealed resources.
     static func packagedAppResourcesURL(
         executableURL: URL? = Bundle.main.executableURL
     ) -> URL? {
-        guard let executableURL = executableURL?.standardizedFileURL else {
+        guard
+            let executableURL = executableURL?
+                .resolvingSymlinksInPath()
+                .standardizedFileURL
+        else {
             return nil
         }
         let macOS = executableURL.deletingLastPathComponent()

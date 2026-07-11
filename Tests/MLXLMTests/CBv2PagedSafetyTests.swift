@@ -94,6 +94,44 @@ struct CBv2PagedSafetyTests {
                 developmentSearchRoots: [external]) == validSource)
     }
 
+    @Test("symlinked invocation still resolves the sealed app resources")
+    func symlinkedInvocationFindsSealedResource() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paged-resource-symlink-\(UUID().uuidString)", isDirectory: true)
+        let app = base.appendingPathComponent("Darkbloom.app", isDirectory: true)
+        let executable = app.appendingPathComponent("Contents/MacOS/darkbloom")
+        let sealed = app.appendingPathComponent("Contents/Resources", isDirectory: true)
+        let binDir = base.appendingPathComponent("bin", isDirectory: true)
+        let symlink = binDir.appendingPathComponent("darkbloom")
+        try FileManager.default.createDirectory(
+            at: executable.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        // The target must exist on disk for symlink resolution to apply.
+        try Data().write(to: executable)
+        // Same literal relative destination the installer writes with
+        // `ln -sfn` into ~/.darkbloom/bin.
+        try FileManager.default.createSymbolicLink(
+            atPath: symlink.path,
+            withDestinationPath: "../Darkbloom.app/Contents/MacOS/darkbloom")
+        try writeResource(root: sealed, bundleName: "mlx-swift-lm_MLXLMCommon.bundle")
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        let sealedRoot = PagedAttentionResources.packagedAppResourcesURL(
+            executableURL: symlink)
+        #expect(
+            sealedRoot?.resolvingSymlinksInPath().standardizedFileURL.path
+                == sealed.resolvingSymlinksInPath().standardizedFileURL.path)
+        // End-to-end: the sealed resource is found and an unsigned external
+        // bundle cannot hijack a symlinked launch either.
+        let external = base.appendingPathComponent("unsigned-external", isDirectory: true)
+        try writeResource(root: external)
+        #expect(
+            try PagedAttentionResources.loadSourceForCurrentProcess(
+                executableURL: symlink,
+                developmentSearchRoots: [external]) == validSource)
+    }
+
     @Test("model-specific smoke covers fused, borrowing, sink, and large-head variants")
     func modelSpecificKernelVariants() throws {
         try PagedAttentionKernel.runtimeSmoke(shapes: [
