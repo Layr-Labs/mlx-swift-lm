@@ -130,7 +130,9 @@ struct CBv2PagedEligibilityTests {
             !PagedAttentionMSL.writeBody.contains("threadgroup"),
             "bulk-write body must allocate no threadgroup memory")
         // RSTRIDE in the .metal impl mirrors mergeRecordMetaFloats.
-        #expect(try PagedAttentionResources.loadSource().contains("RSTRIDE = D + 2"))
+        #expect(
+            try PagedAttentionResources.loadSourceForCurrentProcess()
+                .contains("RSTRIDE = D + 2"))
     }
 
     @Test func simdgroupSelectionRespectsBudget() {

@@ -33,7 +33,29 @@ public enum PagedAttentionResourceError: Error, Equatable, CustomStringConvertib
 enum PagedAttentionResources {
     static let resourceName = "pagedattention.metal"
 
-    static func runtimeRoots(
+    /// Canonical sealed resource root when the current executable is inside
+    /// a macOS app. No caller may add fallback roots in this context.
+    static func packagedAppResourcesURL(
+        executableURL: URL? = Bundle.main.executableURL
+    ) -> URL? {
+        guard let executableURL = executableURL?.standardizedFileURL else {
+            return nil
+        }
+        let macOS = executableURL.deletingLastPathComponent()
+        let contents = macOS.deletingLastPathComponent()
+        let app = contents.deletingLastPathComponent()
+        guard macOS.lastPathComponent == "MacOS",
+            contents.lastPathComponent == "Contents",
+            app.pathExtension == "app"
+        else { return nil }
+        return app.appendingPathComponent(
+            "Contents/Resources",
+            isDirectory: true)
+    }
+
+    /// Development/test lookup roots. This path is used only when the
+    /// executable is not packaged inside an app.
+    static func developmentRoots(
         mainBundleURL: URL = Bundle.main.bundleURL,
         mainResourceURL: URL? = Bundle.main.resourceURL,
         executableURL: URL? = Bundle.main.executableURL
@@ -99,6 +121,25 @@ enum PagedAttentionResources {
         }
     }
 
+    /// Production-safe process lookup. A packaged executable is restricted
+    /// to its sealed Contents/Resources tree; cwd and compile-time build
+    /// roots are considered only for an unbundled development/test process.
+    static func loadSourceForCurrentProcess(
+        executableURL: URL? = Bundle.main.executableURL,
+        developmentSearchRoots: [URL]? = nil,
+        fileManager: FileManager = .default
+    ) throws -> String {
+        if let sealedRoot = packagedAppResourcesURL(executableURL: executableURL) {
+            return try loadSource(
+                roots: [sealedRoot],
+                fileManager: fileManager)
+        }
+        return try loadSource(
+            roots: developmentSearchRoots ?? developmentRoots(
+                executableURL: executableURL),
+            fileManager: fileManager)
+    }
+
     static func locate(
         roots: [URL],
         fileManager: FileManager = .default
@@ -142,7 +183,7 @@ enum PagedAttentionResources {
     }
 
     static func loadSource(
-        roots: [URL] = runtimeRoots(),
+        roots: [URL],
         fileManager: FileManager = .default
     ) throws -> String {
         let url = try locate(roots: roots, fileManager: fileManager)

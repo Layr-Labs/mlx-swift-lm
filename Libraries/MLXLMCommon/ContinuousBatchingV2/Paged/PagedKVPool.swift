@@ -106,10 +106,6 @@ public struct PagedKVPoolConfig: Sendable {
     /// validated against this before any MLXArray is created; exceeding it
     /// would otherwise surface as an uncatchable allocator/Metal failure.
     public var maxBufferLength: Int
-    /// Optional resource-search roots. nil uses the installed runtime
-    /// layout; explicit roots are a package-layout test seam.
-    public var resourceSearchRoots: [URL]?
-
     public init(
         pageSize: Int = CBv2PagedDefaults.pageSize,
         capacityBytes: Int,
@@ -117,8 +113,7 @@ public struct PagedKVPoolConfig: Sendable {
         maxPrefillChunk: Int = 512,
         nominalMaxSequenceLength: Int = 8192,
         quantScheme: CBv2KVQuantScheme = .fp16,
-        maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize,
-        resourceSearchRoots: [URL]? = nil
+        maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize
     ) {
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
@@ -127,7 +122,6 @@ public struct PagedKVPoolConfig: Sendable {
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
         self.quantScheme = quantScheme
         self.maxBufferLength = maxBufferLength
-        self.resourceSearchRoots = resourceSearchRoots
     }
 }
 
@@ -307,8 +301,7 @@ public final class PagedKVPool {
 
         let source: String
         do {
-            source = try PagedAttentionResources.loadSource(
-                roots: config.resourceSearchRoots ?? PagedAttentionResources.runtimeRoots())
+            source = try PagedAttentionResources.loadSourceForCurrentProcess()
         } catch {
             throw CBv2KVError.backendIneligible(
                 reason: "PagedKVPool: paged-attention runtime resource unavailable: \(error)")

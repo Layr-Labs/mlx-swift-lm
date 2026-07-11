@@ -328,43 +328,6 @@ public enum PagedAttentionKernel {
         cache.kernel(for: key, source: source)
     }
 
-    /// Catchable resource preflight used by backend construction and
-    /// packaged-artifact verification. This deliberately bypasses
-    /// SwiftPM's generated `Bundle.module` accessor because that accessor
-    /// traps instead of throwing when a release omits the resource bundle.
-    public static func validateRuntimeResources(
-        searchRoots: [URL]? = nil
-    ) throws {
-        _ = try PagedAttentionResources.loadSource(
-            roots: searchRoots ?? PagedAttentionResources.runtimeRoots())
-    }
-
-    /// Minimal installed-layout smoke: resolve and validate the packaged
-    /// Metal source, compile the bulk-write kernel, and execute one tiny
-    /// dispatch. Release CI runs this from the staged/extracted app before
-    /// upload, so a missing bundle or unusable kernel fails the artifact.
-    public static func runtimeSmoke(
-        searchRoots: [URL]? = nil
-    ) throws {
-        let source = try PagedAttentionResources.loadSource(
-            roots: searchRoots ?? PagedAttentionResources.runtimeRoots())
-        let kSlab = MLXArray.zeros([1, 1, CBv2PagedDefaults.pageSize, 64], dtype: .float16)
-        let vSlab = MLXArray.zeros([1, 1, CBv2PagedDefaults.pageSize, 64], dtype: .float16)
-        let tile = MLXArray.zeros([1, 1, 64], dtype: .float16)
-        let slots = MLXArray([Int32](repeating: 0, count: 8))
-        let fence = MLXArray.zeros([1], dtype: .int32)
-        let next = bulkWrite(
-            kSlab: kSlab,
-            vSlab: vSlab,
-            keys: tile,
-            values: tile,
-            slots: slots,
-            prevFence: fence,
-            pageSize: CBv2PagedDefaults.pageSize,
-            kernelSource: source)
-        eval(next)
-    }
-
     /// Shared dummy sinks (the generated signature keeps a `device` input
     /// even when HAS_SINKS is false). Read-only after creation; MLXArray is
     /// not Sendable but this one is never mutated (engine-thread discipline).

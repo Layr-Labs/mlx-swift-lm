@@ -21,7 +21,23 @@ struct CBv2PagedSafetyTests {
             queryHeads: 4)
     }
 
-    @Test("package resource is readable and its minimal Metal kernel executes")
+    private let validSource = """
+        namespace cbv2 {
+        inline void paged_attention_part_impl() {}
+        inline void paged_kv_write_impl() {}
+        }
+        """
+
+    private func writeResource(root: URL, bundleName: String = "any-package_Target.bundle") throws {
+        let bundle = root.appendingPathComponent(bundleName, isDirectory: true)
+        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
+        try validSource.write(
+            to: bundle.appendingPathComponent("pagedattention.metal"),
+            atomically: true,
+            encoding: .utf8)
+    }
+
+    @Test("package resource pre-JITs GPT part, merge, and write kernels")
     func packagedResourceKernelSmoke() throws {
         try PagedAttentionKernel.validateRuntimeResources()
         try PagedAttentionKernel.runtimeSmoke()
@@ -35,7 +51,7 @@ struct CBv2PagedSafetyTests {
         defer { try? FileManager.default.removeItem(at: root) }
 
         #expect(throws: PagedAttentionResourceError.self) {
-            _ = try PagedAttentionResources.loadSource(roots: [root])
+            try PagedAttentionKernel.runtimeSmokeForTesting(searchRoots: [root])
         }
     }
 
@@ -44,21 +60,53 @@ struct CBv2PagedSafetyTests {
         let app = FileManager.default.temporaryDirectory
             .appendingPathComponent("paged-resource-layout-\(UUID().uuidString)", isDirectory: true)
         let root = app.appendingPathComponent("Contents/Resources", isDirectory: true)
-        let bundle = root.appendingPathComponent("any-package_Target.bundle", isDirectory: true)
-        try FileManager.default.createDirectory(at: bundle, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: app) }
-        let source = """
-            namespace cbv2 {
-            inline void paged_attention_part_impl() {}
-            inline void paged_kv_write_impl() {}
-            }
-            """
-        try source.write(
-            to: bundle.appendingPathComponent("pagedattention.metal"),
-            atomically: true,
-            encoding: .utf8)
+        try writeResource(root: root)
 
-        #expect(try PagedAttentionResources.loadSource(roots: [root]) == source)
+        #expect(try PagedAttentionResources.loadSource(roots: [root]) == validSource)
+    }
+
+    @Test("packaged lookup ignores an unsigned external bundle")
+    func packagedLookupCannotEscapeApp() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("paged-resource-adversarial-\(UUID().uuidString)", isDirectory: true)
+        let app = base.appendingPathComponent("Darkbloom.app", isDirectory: true)
+        let executable = app.appendingPathComponent("Contents/MacOS/darkbloom")
+        let sealed = app.appendingPathComponent("Contents/Resources", isDirectory: true)
+        let external = base.appendingPathComponent("unsigned-external", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: executable.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sealed, withIntermediateDirectories: true)
+        try writeResource(root: external)
+        defer { try? FileManager.default.removeItem(at: base) }
+
+        #expect(throws: PagedAttentionResourceError.self) {
+            _ = try PagedAttentionResources.loadSourceForCurrentProcess(
+                executableURL: executable,
+                developmentSearchRoots: [external])
+        }
+
+        try writeResource(root: sealed, bundleName: "mlx-swift-lm_MLXLMCommon.bundle")
+        #expect(
+            try PagedAttentionResources.loadSourceForCurrentProcess(
+                executableURL: executable,
+                developmentSearchRoots: [external]) == validSource)
+    }
+
+    @Test("model-specific smoke covers fused, borrowing, sink, and large-head variants")
+    func modelSpecificKernelVariants() throws {
+        try PagedAttentionKernel.runtimeSmoke(shapes: [
+            .init(
+                headDim: 64, kvHeads: 8, queryHeads: 64,
+                hasSinks: true, hasWrite: true),
+            .init(
+                headDim: 512, kvHeads: 2, queryHeads: 16,
+                hasSinks: false, hasWrite: true),
+            .init(
+                headDim: 512, kvHeads: 2, queryHeads: 16,
+                hasSinks: false, hasWrite: false),
+        ])
     }
 
     @Test("each slab is rejected before allocation when it exceeds Metal maxBufferLength")
