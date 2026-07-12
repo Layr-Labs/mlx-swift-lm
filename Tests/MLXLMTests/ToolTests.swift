@@ -539,6 +539,41 @@ struct ToolTests {
         #expect(parser.parse(content: content, tools: tools) == nil)
     }
 
+    @Test("Test Gemma 4 Tool Call Parser - rejects unrelated short tool names")
+    func testGemma4ToolCallParserRejectsShortNameFuzzyMatch() {
+        let parser = GemmaFunctionParser()
+        let tools: [[String: any Sendable]] = [[
+            "type": "function",
+            "function": ["name": "sum"] as [String: any Sendable],
+        ]]
+
+        let content = "<|tool_call>call:run{value:1}<tool_call|>"
+        #expect(parser.parse(content: content, tools: tools) == nil)
+    }
+
+    @Test("Test Gemma 4 Tool Call Parser - preserves allowed additional arguments")
+    func testGemma4ToolCallParserPreservesAdditionalArguments() throws {
+        let parser = GemmaFunctionParser()
+        let tools: [[String: any Sendable]] = [[
+            "type": "function",
+            "function": [
+                "name": "search",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string"] as [String: any Sendable]
+                    ] as [String: any Sendable],
+                    "additionalProperties": true,
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]]
+
+        let content = "<|tool_call>call:search{query:swift,sort:recent}<tool_call|>"
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+        #expect(toolCall.function.arguments["query"] == .string("swift"))
+        #expect(toolCall.function.arguments["sort"] == .string("recent"))
+    }
+
     @Test("Test Gemma Format via ToolCallProcessor")
     func testGemmaFormatProcessor() throws {
         let processor = ToolCallProcessor(format: .gemma)
