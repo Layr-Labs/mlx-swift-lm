@@ -109,6 +109,37 @@ struct ToolCallParserIntegrationTests {
         #expect(toolCalls[0].function.arguments["location"] == .string("San Francisco"))
     }
 
+    @Test("BatchedToolStreamHandler preserves comma-bearing Gemma string arguments")
+    func batchedHandlerGemmaCommaBearingString() throws {
+        let tools: [[String: any Sendable]] = [[
+            "type": "function",
+            "function": [
+                "name": "get_current_weather",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "location": ["type": "string"] as [String: any Sendable],
+                        "unit": ["type": "string"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]]
+        let handler = BatchedToolStreamHandler(format: .gemma, tools: tools)
+
+        for chunk in [
+            "<|tool_call>",
+            "call:get_current_weather{location:Boston,",
+            " MA,unit:fahrenheit}",
+            "<tool_call|>",
+        ] {
+            _ = handler.processChunk(chunk)
+        }
+
+        let toolCall = try #require(handler.finish().first)
+        #expect(toolCall.function.arguments["location"] == .string("Boston, MA"))
+        #expect(toolCall.function.arguments["unit"] == .string("fahrenheit"))
+    }
+
     // MARK: - BatchedToolStreamHandler: Harmony Format
 
     @Test("BatchedToolStreamHandler extracts Harmony tool call from single chunk")

@@ -36,23 +36,72 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
         // Extract function name (word characters until {)
         guard let braceStart = remaining.firstIndex(of: "{") else { return nil }
-        let funcName = String(remaining[..<braceStart])
-
-        guard !funcName.isEmpty else { return nil }
+        let rawFuncName = String(remaining[..<braceStart])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let funcName = resolveFunctionName(rawFuncName, tools: tools) else { return nil }
 
         // Extract arguments string (everything between { and })
         guard let braceEnd = remaining.lastIndex(of: "}") else { return nil }
         let argsStr = String(remaining[remaining.index(after: braceStart) ..< braceEnd])
-        let arguments = parseArguments(argsStr)
+        let arguments = parseArguments(argsStr, funcName: funcName, tools: tools)
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
 
-    private func parseArguments(_ text: String) -> [String: any Sendable] {
+    private func resolveFunctionName(
+        _ rawName: String,
+        tools: [[String: any Sendable]]?
+    ) -> String? {
+        guard !rawName.isEmpty else { return nil }
+        guard let tools, !tools.isEmpty else { return rawName }
+
+        let declaredNames = tools.compactMap { tool in
+            (tool["function"] as? [String: any Sendable])?["name"] as? String
+        }
+        guard !declaredNames.isEmpty else { return rawName }
+        if declaredNames.contains(rawName) { return rawName }
+
+        // Repair only a unique, nearby declared name. This covers observed
+        // Gemma token glitches without turning arbitrary text into a tool call.
+        let likelyMatches = declaredNames.filter { declaredName in
+            rawName.hasPrefix(declaredName + " ")
+                || editDistance(rawName, declaredName) <= max(2, declaredName.count / 4)
+        }
+        return likelyMatches.count == 1 ? likelyMatches[0] : nil
+    }
+
+    private func editDistance(_ lhs: String, _ rhs: String) -> Int {
+        let left = Array(lhs)
+        let right = Array(rhs)
+        var previous = Array(0...right.count)
+
+        for (leftIndex, leftCharacter) in left.enumerated() {
+            var current = [leftIndex + 1]
+            current.reserveCapacity(right.count + 1)
+            for (rightIndex, rightCharacter) in right.enumerated() {
+                current.append(min(
+                    current[rightIndex] + 1,
+                    previous[rightIndex + 1] + 1,
+                    previous[rightIndex] + (leftCharacter == rightCharacter ? 0 : 1)
+                ))
+            }
+            previous = current
+        }
+        return previous[right.count]
+    }
+
+    private func parseArguments(
+        _ text: String,
+        funcName: String,
+        tools: [[String: any Sendable]]?
+    ) -> [String: any Sendable] {
         var arguments: [String: any Sendable] = [:]
-        for pair in splitTopLevel(text, separator: ",") {
+        // Gemma occasionally omits its string markers. The schema lets us keep
+        // a comma in `Boston, MA` while still splitting before `unit:`.
+        let argumentNames = Set(getParameterConfig(funcName: funcName, tools: tools).keys)
+        for pair in splitTopLevel(text, separator: ",", argumentNames: argumentNames) {
             guard let colon = pair.firstIndex(of: ":") else { continue }
-            let key = pair[..<colon].trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = parseArgumentKey(pair[..<colon])
             let rawValue = pair[pair.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
             arguments[key] = parseValue(rawValue)
@@ -60,11 +109,19 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         return arguments
     }
 
+    private func parseArgumentKey(_ rawKey: Substring) -> String {
+        let key = rawKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return decodeJSONString(key) ?? key
+    }
+
     private func parseValue(_ rawValue: String) -> any Sendable {
         for marker in quoteMarkers where rawValue.hasPrefix(marker) && rawValue.hasSuffix(marker) {
             let start = rawValue.index(rawValue.startIndex, offsetBy: marker.count)
             let end = rawValue.index(rawValue.endIndex, offsetBy: -marker.count)
             return String(rawValue[start..<end])
+        }
+        if let string = decodeJSONString(rawValue) {
+            return string
         }
         if let data = rawValue.data(using: .utf8),
            let json = deserializeJSON(data)
@@ -74,19 +131,52 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         return rawValue
     }
 
-    private func splitTopLevel(_ text: String, separator: Character) -> [String] {
+    private func decodeJSONString(_ rawValue: String) -> String? {
+        guard rawValue.first == "\"", rawValue.last == "\"",
+              let data = rawValue.data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(String.self, from: data)
+    }
+
+    private func splitTopLevel(
+        _ text: String,
+        separator: Character,
+        argumentNames: Set<String>
+    ) -> [String] {
         var result: [String] = []
         var start = text.startIndex
         var index = text.startIndex
         var depth = 0
+        var inJSONString = false
+        var isEscaped = false
 
         while index < text.endIndex {
-            if let marker = quoteMarkers.first(where: { text[index...].hasPrefix($0) }) {
+            if !inJSONString,
+               let marker = quoteMarkers.first(where: { text[index...].hasPrefix($0) })
+            {
                 let afterStart = text.index(index, offsetBy: marker.count)
                 if let end = text.range(of: marker, range: afterStart..<text.endIndex) {
                     index = end.upperBound
                     continue
                 }
+            }
+
+            if inJSONString {
+                if isEscaped {
+                    isEscaped = false
+                } else if text[index] == "\\" {
+                    isEscaped = true
+                } else if text[index] == "\"" {
+                    inJSONString = false
+                }
+                index = text.index(after: index)
+                continue
+            }
+
+            if text[index] == "\"" {
+                inJSONString = true
+                index = text.index(after: index)
+                continue
             }
 
             switch text[index] {
@@ -95,8 +185,13 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             case "}", "]":
                 depth = max(0, depth - 1)
             case separator where depth == 0:
-                result.append(String(text[start..<index]))
-                start = text.index(after: index)
+                let next = text.index(after: index)
+                if argumentNames.isEmpty
+                    || startsArgument(in: text, at: next, argumentNames: argumentNames)
+                {
+                    result.append(String(text[start..<index]))
+                    start = next
+                }
             default:
                 break
             }
@@ -105,5 +200,40 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
         result.append(String(text[start..<text.endIndex]))
         return result
+    }
+
+    private func startsArgument(
+        in text: String,
+        at start: String.Index,
+        argumentNames: Set<String>
+    ) -> Bool {
+        var keyStart = start
+        while keyStart < text.endIndex, text[keyStart].isWhitespace {
+            keyStart = text.index(after: keyStart)
+        }
+
+        var index = keyStart
+        var inJSONString = false
+        var isEscaped = false
+        while index < text.endIndex {
+            let character = text[index]
+            if inJSONString {
+                if isEscaped {
+                    isEscaped = false
+                } else if character == "\\" {
+                    isEscaped = true
+                } else if character == "\"" {
+                    inJSONString = false
+                }
+            } else if character == "\"" {
+                inJSONString = true
+            } else if character == ":" {
+                return argumentNames.contains(parseArgumentKey(text[keyStart..<index]))
+            } else if character == "," || character == "{" || character == "}" {
+                return false
+            }
+            index = text.index(after: index)
+        }
+        return false
     }
 }
