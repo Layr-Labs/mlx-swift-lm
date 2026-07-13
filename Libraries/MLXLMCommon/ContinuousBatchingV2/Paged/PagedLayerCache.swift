@@ -232,7 +232,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             params: params(scale: scale),
             softcap: attentionSoftcap != nil,
             pageSize: pool.config.pageSize,
-            writeFence: group.writeFence
+            writeFence: group.writeFence,
+            kernelSource: pool.kernelSource
         )
         // The fused write advanced the group's write-fence chain: later
         // slab readers (KV-borrowing layers, next steps' dispatches,

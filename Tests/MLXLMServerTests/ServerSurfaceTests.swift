@@ -54,6 +54,7 @@ struct ServerSurfaceTests {
               "tool_choice": "auto",
               "tool_call_parser": "mistral",
               "reasoning_parser": "deepseek_r1",
+              "reasoning": {"enabled": true},
               "response_format": {"type": "json_object"},
               "stream": true,
               "temperature": 0.2,
@@ -74,6 +75,7 @@ struct ServerSurfaceTests {
         #expect(request.toolChoice == .mode(.auto))
         #expect(request.toolCallParser == "mistral")
         #expect(request.reasoningParser == .deepseekR1)
+        #expect(request.reasoning?.enabled == true)
         #expect(request.responseFormat?.type == .jsonObject)
         #expect(request.stream == true)
         #expect(request.generationParameters.maxTokens == 128)

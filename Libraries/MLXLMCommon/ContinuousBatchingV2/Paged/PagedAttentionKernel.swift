@@ -67,24 +67,7 @@ struct PagedAttentionKernelKey: Hashable {
     }
 }
 
-/// Loads the MSL source for the paged-attention kernels from the package
-/// bundle exactly once.
 enum PagedAttentionMSL {
-    static let header: String = {
-        guard
-            let url = Bundle.module.url(
-                forResource: "pagedattention", withExtension: "metal")
-        else {
-            fatalError(
-                "[PagedAttentionKernel] missing bundle resource pagedattention.metal "
-                    + "— check Package.swift resources for MLXLMCommon")
-        }
-        guard let source = try? String(contentsOf: url, encoding: .utf8) else {
-            fatalError("[PagedAttentionKernel] unable to read pagedattention.metal")
-        }
-        return source
-    }()
-
     /// Bodies of the auto-generated kernel functions. They reference the
     /// thread attributes and `_shape` helpers by name so MLX includes them
     /// in the generated signature (MLX scans the body source for tokens).
@@ -276,7 +259,10 @@ public enum PagedAttentionKernel {
         private var kernels: [PagedAttentionKernelKey: MLXFast.MLXFastKernel] = [:]
         private let lock = NSLock()
 
-        func kernel(for key: PagedAttentionKernelKey) -> MLXFast.MLXFastKernel {
+        func kernel(
+            for key: PagedAttentionKernelKey,
+            source: String
+        ) -> MLXFast.MLXFastKernel {
             lock.lock()
             defer { lock.unlock() }
             if let k = kernels[key] { return k }
@@ -295,7 +281,7 @@ public enum PagedAttentionKernel {
                     ],
                     outputNames: ["partials", "meta", "fence"],
                     source: PagedAttentionMSL.partBody,
-                    header: PagedAttentionMSL.header,
+                    header: source,
                     ensureRowContiguous: true
                 )
             case .part:
@@ -306,7 +292,7 @@ public enum PagedAttentionKernel {
                     ],
                     outputNames: ["partials", "meta"],
                     source: PagedAttentionMSL.partBodyNoWrite,
-                    header: PagedAttentionMSL.header,
+                    header: source,
                     ensureRowContiguous: true
                 )
             case .merge:
@@ -315,7 +301,7 @@ public enum PagedAttentionKernel {
                     inputNames: ["partials", "meta", "seqinfo", "sinks"],
                     outputNames: ["out"],
                     source: PagedAttentionMSL.mergeBody,
-                    header: PagedAttentionMSL.header,
+                    header: source,
                     ensureRowContiguous: true
                 )
             case .write:
@@ -324,7 +310,7 @@ public enum PagedAttentionKernel {
                     inputNames: ["ktile", "vtile", "slots", "prev", "kcache", "vcache"],
                     outputNames: ["fence"],
                     source: PagedAttentionMSL.writeBody,
-                    header: PagedAttentionMSL.header,
+                    header: source,
                     ensureRowContiguous: true
                 )
             }
@@ -335,8 +321,11 @@ public enum PagedAttentionKernel {
 
     private static let cache = KernelCache()
 
-    static func kernel(for key: PagedAttentionKernelKey) -> MLXFast.MLXFastKernel {
-        cache.kernel(for: key)
+    static func kernel(
+        for key: PagedAttentionKernelKey,
+        source: String
+    ) -> MLXFast.MLXFastKernel {
+        cache.kernel(for: key, source: source)
     }
 
     /// Shared dummy sinks (the generated signature keeps a `device` input
@@ -391,6 +380,7 @@ public enum PagedAttentionKernel {
         softcap: Bool,
         pageSize: Int,
         writeFence: MLXArray,
+        kernelSource: String,
         stream: StreamOrDevice = .default
     ) -> (out: MLXArray, nextWriteFence: MLXArray?) {
         var q = queries
@@ -447,7 +437,7 @@ public enum PagedAttentionKernel {
             pass: .part, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap, hasWrite: hasWrite)
         let tg = 32 * nsg
-        let partOut = kernel(for: partKey)(
+        let partOut = kernel(for: partKey, source: kernelSource)(
             partInputs,
             template: [
                 ("T", dtype),
@@ -471,7 +461,7 @@ public enum PagedAttentionKernel {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false)
-        let outputs = kernel(for: mergeKey)(
+        let outputs = kernel(for: mergeKey, source: kernelSource)(
             [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks],
             template: [
                 ("T", dtype),
@@ -503,6 +493,7 @@ public enum PagedAttentionKernel {
         slots: MLXArray,
         prevFence: MLXArray,
         pageSize: Int,
+        kernelSource: String,
         stream: StreamOrDevice = .default
     ) -> MLXArray {
         let dtype = kSlab.dtype
@@ -518,7 +509,7 @@ public enum PagedAttentionKernel {
         let key = PagedAttentionKernelKey(
             pass: .write, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: 0,
             simdgroups: 0, hasSinks: false, hasSoftcap: false)
-        let outputs = kernel(for: key)(
+        let outputs = kernel(for: key, source: kernelSource)(
             [keys, values, slots, prevFence, kSlab, vSlab],
             template: [
                 ("T", dtype),

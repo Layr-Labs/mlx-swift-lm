@@ -115,7 +115,7 @@ struct CBv2PagedEligibilityTests {
     /// the buffers the Swift budget models — two float threadgroup buffers
     /// in each pass-A variant (q_smem, red_smem with RSTRIDE = D + 2), none
     /// in pass B or the bulk-write kernel.
-    @Test func shaderSourceStillMatchesBudgetModel() {
+    @Test func shaderSourceStillMatchesBudgetModel() throws {
         for part in [PagedAttentionMSL.partBody, PagedAttentionMSL.partBodyNoWrite] {
             #expect(part.contains("threadgroup float q_smem[HPT * D];"))
             #expect(part.contains("threadgroup float red_smem[NSG * HPT * (D + 2)];"))
@@ -130,7 +130,9 @@ struct CBv2PagedEligibilityTests {
             !PagedAttentionMSL.writeBody.contains("threadgroup"),
             "bulk-write body must allocate no threadgroup memory")
         // RSTRIDE in the .metal impl mirrors mergeRecordMetaFloats.
-        #expect(PagedAttentionMSL.header.contains("RSTRIDE = D + 2"))
+        #expect(
+            try PagedAttentionResources.loadSourceForCurrentProcess()
+                .contains("RSTRIDE = D + 2"))
     }
 
     @Test func simdgroupSelectionRespectsBudget() {
