@@ -549,6 +549,8 @@ struct ToolTests {
 
         let content = "<|tool_call>call:run{value:1}<tool_call|>"
         #expect(parser.parse(content: content, tools: tools) == nil)
+        let suffixed = "<|tool_call>call:sum total{value:1}<tool_call|>"
+        #expect(parser.parse(content: suffixed, tools: tools) == nil)
     }
 
     @Test("Test Gemma 4 Tool Call Parser - preserves allowed additional arguments")
@@ -572,6 +574,29 @@ struct ToolTests {
         let toolCall = try #require(parser.parse(content: content, tools: tools))
         #expect(toolCall.function.arguments["query"] == .string("swift"))
         #expect(toolCall.function.arguments["sort"] == .string("recent"))
+    }
+
+    @Test("Test Gemma 4 Tool Call Parser - rejects unknown strict-schema arguments")
+    func testGemma4ToolCallParserRejectsUnknownStrictArgument() {
+        let parser = GemmaFunctionParser()
+        let tools: [[String: any Sendable]] = [[
+            "type": "function",
+            "function": [
+                "name": "weather",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "location": ["type": "string"] as [String: any Sendable],
+                        "unit": ["type": "string"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                    "additionalProperties": false,
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]]
+
+        let content =
+            "<|tool_call>call:weather{location:Paris,country:FR,unit:celsius}<tool_call|>"
+        #expect(parser.parse(content: content, tools: tools) == nil)
     }
 
     @Test("Test Gemma Format via ToolCallProcessor")

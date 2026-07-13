@@ -48,7 +48,8 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         // Extract arguments string (everything between { and })
         guard let braceEnd = remaining.lastIndex(of: "}") else { return nil }
         let argsStr = String(remaining[remaining.index(after: braceStart) ..< braceEnd])
-        let arguments = parseArguments(argsStr, funcName: funcName, tools: tools)
+        guard let arguments = parseArguments(argsStr, funcName: funcName, tools: tools)
+        else { return nil }
 
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
@@ -70,7 +71,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         // Gemma token glitches without turning arbitrary text into a tool call.
         let likelyMatches = declaredNames.filter { declaredName in
             let maxDistance = declaredName.count < 5 ? 0 : max(1, declaredName.count / 4)
-            return rawName.hasPrefix(declaredName + " ")
+            return (declaredName.count >= 5 && rawName.hasPrefix(declaredName + " "))
                 || editDistance(rawName, declaredName) <= maxDistance
         }
         return likelyMatches.count == 1 ? likelyMatches[0] : nil
@@ -100,16 +101,17 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         _ text: String,
         funcName: String,
         tools: [[String: any Sendable]]?
-    ) -> [String: any Sendable] {
+    ) -> [String: any Sendable]? {
         var arguments: [String: any Sendable] = [:]
         // Gemma occasionally omits its string markers. The schema lets us keep
         // a comma in `Boston, MA` while still splitting before `unit:`.
         let schema = argumentSchema(funcName: funcName, tools: tools)
-        for pair in splitTopLevel(text, separator: ",", schema: schema) {
+        for pair in splitTopLevel(text, separator: ",") {
             guard let colon = pair.firstIndex(of: ":") else { continue }
             let key = parseArgumentKey(pair[..<colon])
             let rawValue = pair[pair.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
+            guard schema.allowsAdditional || schema.names.contains(key) else { return nil }
             arguments[key] = parseValue(rawValue)
         }
         return arguments
@@ -163,8 +165,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
     private func splitTopLevel(
         _ text: String,
-        separator: Character,
-        schema: ArgumentSchema
+        separator: Character
     ) -> [String] {
         var result: [String] = []
         var start = text.startIndex
@@ -209,7 +210,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
                 depth = max(0, depth - 1)
             case separator where depth == 0:
                 let next = text.index(after: index)
-                if startsArgument(in: text, at: next, schema: schema) {
+                if startsArgument(in: text, at: next) {
                     result.append(String(text[start..<index]))
                     start = next
                 }
@@ -225,8 +226,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
     private func startsArgument(
         in text: String,
-        at start: String.Index,
-        schema: ArgumentSchema
+        at start: String.Index
     ) -> Bool {
         var keyStart = start
         while keyStart < text.endIndex, text[keyStart].isWhitespace {
@@ -250,7 +250,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
                 inJSONString = true
             } else if character == ":" {
                 let key = parseArgumentKey(text[keyStart..<index])
-                return !key.isEmpty && (schema.allowsAdditional || schema.names.contains(key))
+                return !key.isEmpty
             } else if character == "," || character == "{" || character == "}" {
                 return false
             }
