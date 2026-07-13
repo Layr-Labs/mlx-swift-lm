@@ -347,6 +347,14 @@ public enum OpenAIToolChoice: Codable, Sendable, Equatable {
     }
 }
 
+public struct OpenAIReasoningConfig: Codable, Sendable, Equatable {
+    public var enabled: Bool?
+
+    public init(enabled: Bool? = nil) {
+        self.enabled = enabled
+    }
+}
+
 public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var model: String
     public var messages: [OpenAIChatMessage]
@@ -354,6 +362,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var toolChoice: OpenAIToolChoice?
     public var toolCallParser: String?
     public var reasoningParser: ReasoningParserFormat?
+    public var reasoning: OpenAIReasoningConfig?
     public var responseFormat: OpenAIResponseFormat?
     public var stream: Bool?
     public var temperature: Float?
@@ -374,6 +383,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         case toolChoice = "tool_choice"
         case toolCallParser = "tool_call_parser"
         case reasoningParser = "reasoning_parser"
+        case reasoning
         case responseFormat = "response_format"
         case stream
         case temperature
@@ -395,6 +405,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         toolChoice: OpenAIToolChoice? = nil,
         toolCallParser: String? = nil,
         reasoningParser: ReasoningParserFormat? = nil,
+        reasoning: OpenAIReasoningConfig? = nil,
         responseFormat: OpenAIResponseFormat? = nil,
         stream: Bool? = nil,
         temperature: Float? = nil,
@@ -414,6 +425,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         self.toolChoice = toolChoice
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
+        self.reasoning = reasoning
         self.responseFormat = responseFormat
         self.stream = stream
         self.temperature = temperature
