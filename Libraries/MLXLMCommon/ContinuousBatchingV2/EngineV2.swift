@@ -370,7 +370,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             }
         }
 
-        loop.enqueue(request, adoption: makeAdoption(for: request), multimodal: multimodal)
+        loop.enqueue(
+            request, prefixLookup: makePrefixLookup(for: request), multimodal: multimodal)
         return stream.makeStream()
     }
 
@@ -380,26 +381,36 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// offset every row adopts before the engine replays the trailing
     /// tokens. The lookup pin travels with the adoption; the loop balances
     /// it in every outcome.
-    private func makeAdoption(for request: CBv2Request) -> CBv2PrefixAdoption? {
-        guard let prefixCache else { return nil }
+    private func makePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
+        guard let prefixCache else {
+            return CBv2PrefixLookup(adoption: nil, outcome: .disabled, matchedTokens: 0)
+        }
+        guard request.prefixCacheEnabled else {
+            return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
+        }
         // Vision requests NEVER look up the prefix cache (v1 policy — the
         // donation side is excluded symmetrically in
         // `EngineLoopV2.donationIntent`): token-id hashes cannot see image
         // content, so an adopted "hit" over another request's image span
         // would be silently wrong KV.
-        guard request.multimodal == nil else { return nil }
+        guard request.multimodal == nil else {
+            return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
+        }
         guard
             let hit = prefixCache.lookup(
                 tokens: request.promptTokens, layerKinds: layerKinds,
                 cacheSalt: request.cacheSalt)
-        else { return nil }
+        else {
+            return CBv2PrefixLookup(adoption: nil, outcome: .miss, matchedTokens: 0)
+        }
         let recompute = cbv2RequiredRecompute(layerKinds: layerKinds, matched: hit.matched)
         let effective = hit.matched - recompute
         guard effective > 0 else {
             prefixCache.endAdoption(
                 tokens: request.promptTokens, matched: hit.matched,
                 cacheSalt: request.cacheSalt)
-            return nil
+            return CBv2PrefixLookup(
+                adoption: nil, outcome: .skippedPolicy, matchedTokens: hit.matched)
         }
         let prefix = hit.prefix.map { entry -> (keys: MLXArray, values: MLXArray, offset: Int)? in
             guard let entry else { return nil }
@@ -410,9 +421,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 offset: effective
             )
         }
-        return CBv2PrefixAdoption(
-            tokens: request.promptTokens, matched: hit.matched,
-            effective: effective, prefix: prefix, cacheSalt: request.cacheSalt)
+        return CBv2PrefixLookup(
+            adoption: CBv2PrefixAdoption(
+                tokens: request.promptTokens, matched: hit.matched,
+                effective: effective, prefix: prefix, cacheSalt: request.cacheSalt),
+            outcome: .adoptionFailed, matchedTokens: hit.matched)
     }
 
     /// Cancel promptly: the in-flight step completes, the row is dropped

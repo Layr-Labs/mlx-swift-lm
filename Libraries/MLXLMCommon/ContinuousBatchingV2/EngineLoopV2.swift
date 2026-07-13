@@ -178,11 +178,23 @@ public struct CBv2EngineLoopConfig: Sendable {
     /// executing in the background; the process-level owner decides
     /// whether to exit.
     public var shutdownTimeout: TimeInterval
+    /// Donate a prompt-only snapshot after the first sampled token confirms
+    /// that prefill completed. Off by default. The loop only enables this on
+    /// backends whose snapshot storage is not recyclable; terminal donation
+    /// remains available to every safely paired backend.
+    public var enableEarlyPrefixDonation: Bool
+    /// Maximum prompt-only donations that may be queued or materializing at
+    /// once. Each job retains its donor state until the donation queue has
+    /// passed it, so this bound also caps retained-state backlog. Terminal
+    /// donations are not subject to this limit.
+    public var maxPendingEarlyPrefixDonations: Int
 
     public init(
         requestTimeout: TimeInterval = 120, stepTimeout: TimeInterval = 30,
         watchdogInterval: TimeInterval = 0.25, idleRecheckInterval: TimeInterval = 0.001,
-        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10
+        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10,
+        enableEarlyPrefixDonation: Bool = false,
+        maxPendingEarlyPrefixDonations: Int = 2
     ) {
         self.requestTimeout = requestTimeout
         self.stepTimeout = stepTimeout
@@ -190,6 +202,8 @@ public struct CBv2EngineLoopConfig: Sendable {
         self.idleRecheckInterval = idleRecheckInterval
         self.eventBufferCapacity = eventBufferCapacity
         self.shutdownTimeout = shutdownTimeout
+        self.enableEarlyPrefixDonation = enableEarlyPrefixDonation
+        self.maxPendingEarlyPrefixDonations = max(0, maxPendingEarlyPrefixDonations)
     }
 }
 
@@ -220,10 +234,13 @@ final class CBv2InFlightStep {
     /// `rollbackOne` scrubs the wasted-token KV tail before release;
     /// `donation` (non-nil for natural finishes with prefix caching on)
     /// routes the retired state through the donation queue.
-    var deferredReleases:
+    /// `earlyDonation` preserves the exact per-request job after the request
+    /// id becomes reusable. Only that job's pending materialization may defer
+    /// an otherwise-immediate release.
+    fileprivate var deferredReleases:
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
-            donation: CBv2DonationIntent?
+            donation: CBv2DonationIntent?, earlyDonation: CBv2EarlyDonationJob?
         )] = []
 
     init(
@@ -258,10 +275,29 @@ struct CBv2PrefixAdoption: @unchecked Sendable {
     let cacheSalt: String?
 }
 
-/// A finished request's donation intent: which tokens to donate and under
+/// Submit-thread lookup result handed to the engine queue. `outcome` is
+/// provisional when `adoption != nil`; `applyAdoption` resolves it to a real
+/// hit or a precise adoption failure before usage is emitted.
+struct CBv2PrefixLookup: @unchecked Sendable {
+    let adoption: CBv2PrefixAdoption?
+    let outcome: CBv2PrefixCacheOutcome
+    let matchedTokens: Int
+}
+
+struct CBv2PrefixUsage {
+    var outcome: CBv2PrefixCacheOutcome
+    var matchedTokens: Int
+    var prefillTokensSaved: Int
+
+    static let disabled = CBv2PrefixUsage(
+        outcome: .disabled, matchedTokens: 0, prefillTokensSaved: 0)
+}
+
+/// A request's donation intent: which exact token prefix to donate and under
 /// which salt scope (TB-007 — the entry must be indexed with the same salt
 /// its donor request carried, or a differently-salted request could hit it).
 struct CBv2DonationIntent {
+    let requestID: CBv2RequestID
     let tokens: [Int]
     let cacheSalt: String?
 }
@@ -271,6 +307,43 @@ struct CBv2DonationIntent {
 /// touches the value after enqueueing.
 private struct CBv2Handoff<Value>: @unchecked Sendable {
     let value: Value
+}
+
+/// Unique lifetime token for one early donation. Completion and retirement
+/// run on different serial queues, so the lock linearizes "still pending?"
+/// with attaching retired states. The job identity, not the reusable request
+/// id, prevents an old completion from affecting a newer request.
+fileprivate final class CBv2EarlyDonationJob: @unchecked Sendable {
+    let requestID: CBv2RequestID
+
+    private let lock = NSLock()
+    private var completed = false
+    private var deferredReleases: [[CBv2SequenceKV?]] = []
+
+    init(requestID: CBv2RequestID) {
+        self.requestID = requestID
+    }
+
+    /// Returns true when the job took ownership of `state` until completion.
+    func deferRelease(_ state: [CBv2SequenceKV?]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !completed else { return false }
+        deferredReleases.append(state)
+        return true
+    }
+
+    /// Mark materialization complete and transfer any waiting states back to
+    /// the engine. Called exactly once by this job's donation-queue block.
+    func complete() -> [[CBv2SequenceKV?]] {
+        lock.lock()
+        defer { lock.unlock() }
+        assert(!completed, "early donation completed more than once")
+        completed = true
+        let releases = deferredReleases
+        deferredReleases.removeAll(keepingCapacity: false)
+        return releases
+    }
 }
 
 /// Resume-exactly-once wrapper for a drain continuation: the engine queue
@@ -363,6 +436,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
+    /// Lookup/adoption outcome carried to terminal usage.
+    private var prefixUsageByID: [CBv2RequestID: CBv2PrefixUsage] = [:]
+    /// Exact prompt-only donation job for each live request. Entries clear on
+    /// completion or terminal retirement; identity checks make that cleanup
+    /// safe when a request id is reused before an old job completes.
+    private var earlyDonationsScheduled: [CBv2RequestID: CBv2EarlyDonationJob] = [:]
+    /// Global job accounting remains independent of reusable request ids.
+    private var pendingEarlyDonationCount = 0
     /// Resolved vision inputs (validated spans + materialized embeddings),
     /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
     /// the span chunks and needs the embeddings again); dropped at finish.
@@ -563,7 +644,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// input (nil for text requests) — mutually exclusive with `adoption`
     /// (vision requests never do prefix-cache lookup).
     func enqueue(
-        _ request: CBv2Request, adoption: CBv2PrefixAdoption? = nil,
+        _ request: CBv2Request,
+        prefixLookup: CBv2PrefixLookup = CBv2PrefixLookup(
+            adoption: nil, outcome: .disabled, matchedTokens: 0),
         multimodal: CBv2ResolvedMultimodal? = nil
     ) {
         engineQueue.async { [self] in
@@ -574,11 +657,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             if enqueueStartDelayForTesting > 0 {
                 Thread.sleep(forTimeInterval: enqueueStartDelayForTesting)
             }
+            prefixUsageByID[request.id] = CBv2PrefixUsage(
+                outcome: prefixLookup.outcome,
+                matchedTokens: prefixLookup.matchedTokens,
+                prefillTokensSaved: 0)
             guard running, !draining else {
-                releaseAbandonedAdoption(adoption)
+                releaseAbandonedAdoption(prefixLookup.adoption)
                 takeStream(request.id)?.finish(
                     reason: .error("engine is shutting down"),
-                    usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+                    usage: takePrefixUsage(
+                        requestID: request.id, promptTokens: request.promptTokens.count,
+                        completionTokens: 0))
                 return
             }
             // Early-cancel race: a cancel can arrive after `submit` registered
@@ -587,10 +676,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             // act. A pending cancel is remembered until this point and
             // consumed here so the request is never started (PR#62 review).
             if consumeEarlyCancel(request.id) {
-                releaseAbandonedAdoption(adoption)
+                releaseAbandonedAdoption(prefixLookup.adoption)
                 takeStream(request.id)?.finish(
                     reason: .cancelled,
-                    usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+                    usage: takePrefixUsage(
+                        requestID: request.id, promptTokens: request.promptTokens.count,
+                        completionTokens: 0))
                 return
             }
             do {
@@ -602,18 +693,20 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if let multimodal {
                     multimodalByID[request.id] = multimodal
                 }
-                if let adoption {
+                if let adoption = prefixLookup.adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
             } catch let error as CBv2SchedulerError {
-                releaseAbandonedAdoption(adoption)
+                releaseAbandonedAdoption(prefixLookup.adoption)
                 // Contract violation (duplicate live request id) — surfaced
                 // distinctly from capacity backpressure.
                 takeStream(request.id)?.finish(
                     reason: .error("scheduler rejected request: \(error)"),
-                    usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+                    usage: takePrefixUsage(
+                        requestID: request.id, promptTokens: request.promptTokens.count,
+                        completionTokens: 0))
             } catch {
-                releaseAbandonedAdoption(adoption)
+                releaseAbandonedAdoption(prefixLookup.adoption)
                 // Precise maxWaiting enforcement (the submit-side gauge check
                 // is the fast path; this is the authoritative one). The
                 // MESSAGE IS A CONTRACT: it must classify exactly like
@@ -626,7 +719,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // (PR#62 review).
                 takeStream(request.id)?.finish(
                     reason: .error("token_budget_exhausted: request queue full"),
-                    usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+                    usage: takePrefixUsage(
+                        requestID: request.id, promptTokens: request.promptTokens.count,
+                        completionTokens: 0))
             }
         }
     }
@@ -644,12 +739,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                 cacheSalt: adoption.cacheSalt)
         }
         guard let rec = scheduler.record(for: requestID), kvStates[requestID] == nil else {
+            markPrefixAdoptionFailed(requestID, outcome: .adoptionFailed)
             return
         }
         if let capacity {
             do {
                 try capacity.reserve(id: requestID, additionalTokens: adoption.effective)
             } catch {
+                markPrefixAdoptionFailed(requestID, outcome: .skippedCapacity)
                 return  // capacity tight — full prefill with the usual backstops
             }
         }
@@ -660,9 +757,33 @@ public final class EngineLoopV2: @unchecked Sendable {
             kvStates[requestID] = state
             rec.numComputedTokens = adoption.effective
             prefixHitTokens[requestID] = adoption.effective
+            prefixUsageByID[requestID]?.outcome = .hit
+            prefixUsageByID[requestID]?.prefillTokensSaved = adoption.effective
         } catch {
             capacity?.unreserve(id: requestID, tokens: adoption.effective)
+            let outcome: CBv2PrefixCacheOutcome
+            if let kvError = error as? CBv2KVError, case .capacityExhausted = kvError {
+                outcome = .skippedCapacity
+            } else {
+                outcome = .adoptionFailed
+            }
+            markPrefixAdoptionFailed(requestID, outcome: outcome)
         }
+    }
+
+    private func markPrefixAdoptionFailed(
+        _ requestID: CBv2RequestID, outcome: CBv2PrefixCacheOutcome
+    ) {
+        prefixHitTokens.removeValue(forKey: requestID)
+        prefixUsageByID[requestID]?.outcome = outcome
+        prefixUsageByID[requestID]?.prefillTokensSaved = 0
+    }
+
+    /// Preemption discards adopted KV and forces a full recompute. Preserve
+    /// genuine miss/policy outcomes; only an actual hit loses its credit.
+    private func invalidateAdoptedPrefix(_ requestID: CBv2RequestID) {
+        guard prefixUsageByID[requestID]?.outcome == .hit else { return }
+        markPrefixAdoptionFailed(requestID, outcome: .adoptionFailed)
     }
 
     /// Balance a lookup pin for an adoption that never reached
@@ -750,14 +871,17 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preemptionCount += 1
                 // A preempted request recomputes from scratch — any adopted
                 // prefix credit no longer describes work that was skipped.
-                prefixHitTokens.removeValue(forKey: id)
+                invalidateAdoptedPrefix(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
                 compiledDecode?.forgetRows(state)
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
-                        (id: id, state: state, rollbackOne: false, donation: nil))
+                        (
+                            id: id, state: state, rollbackOne: false, donation: nil,
+                            earlyDonation: earlyDonationsScheduled[id]
+                        ))
                 } else {
-                    backend.release(state)
+                    releaseState(state, pendingEarlyDonation: earlyDonationsScheduled[id])
                 }
             }
         }
@@ -1196,6 +1320,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 matchedStopString = detokenizer?.matchedStopString ?? false
             }
 
+            scheduleEarlyDonationIfEligible(for: rec)
+
             // Stop detection — one step late by construction.
             if isStopToken {
                 finishRequest(id, reason: .stop)
@@ -1212,11 +1338,13 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
-        for (_, state, rollbackOne, donation) in step.deferredReleases {
+        for (_, state, rollbackOne, donation, earlyDonation) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
-            retire(state: state, donating: donation)
+            retire(
+                state: state, donating: donation,
+                pendingEarlyDonation: earlyDonation)
         }
     }
 
@@ -1230,12 +1358,13 @@ public final class EngineLoopV2: @unchecked Sendable {
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
+        let earlyDonation = earlyDonationsScheduled.removeValue(forKey: id)
         guard let rec = scheduler.finish(id: id, reason: reason) else {
             // Unknown to the scheduler (already finished) — make sure no
             // stream leaks regardless.
-            prefixHitTokens.removeValue(forKey: id)
+            let usage = takePrefixUsage(requestID: id, promptTokens: 0, completionTokens: 0)
             takeStream(id)?.finish(
-                reason: reason, usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+                reason: reason, usage: usage)
             return
         }
         capacity?.releaseAll(id: id)
@@ -1257,19 +1386,21 @@ public final class EngineLoopV2: @unchecked Sendable {
                     (
                         id: id, state: state,
                         rollbackOne: inFlight.sampledRows.contains(id),
-                        donation: donation
+                        donation: donation,
+                        earlyDonation: earlyDonation
                     ))
             } else {
-                retire(state: state, donating: donation)
+                retire(
+                    state: state, donating: donation,
+                    pendingEarlyDonation: earlyDonation)
             }
         }
 
         let detokenizer = detokenizers.removeValue(forKey: id)
         let stream = takeStream(id)
-        let usage = CBv2Usage(
-            promptTokens: rec.request.promptTokens.count,
-            completionTokens: rec.generatedTokenCount,
-            prefixCacheHitTokens: prefixHitTokens.removeValue(forKey: id) ?? 0)
+        let usage = takePrefixUsage(
+            requestID: id, promptTokens: rec.request.promptTokens.count,
+            completionTokens: rec.generatedTokenCount)
 
         // Passthrough requests emit deltas on the detok queue; the trailing
         // flush + terminal MUST ride the same queue so they land AFTER those
@@ -1303,8 +1434,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         for rec: CBv2ScheduledRequest, reason: CBv2FinishReason, state: [CBv2SequenceKV?]
     ) -> CBv2DonationIntent? {
         guard prefixCache != nil else { return nil }
+        guard rec.request.prefixCacheEnabled else { return nil }
         // Vision requests NEVER donate (v1 policy, enforced in BOTH
-        // directions — lookup is skipped in `EngineV2.makeAdoption`): the
+        // directions — lookup is skipped in `EngineV2.makePrefixLookup`): the
         // prefix cache keys on token-id chain hashes, and an image span's
         // placeholder ids are identical for every image — a donated vision
         // prefix would be silently served to a request with different image
@@ -1330,7 +1462,51 @@ public final class EngineLoopV2: @unchecked Sendable {
             guard cacheable, let sequence = state[i] else { continue }
             guard sequence.snapshotIsLossless else { return nil }
         }
-        return CBv2DonationIntent(tokens: rec.tokens, cacheSalt: rec.request.cacheSalt)
+        return CBv2DonationIntent(
+            requestID: rec.request.prefixCacheReceiptID ?? rec.id,
+            tokens: Array(rec.tokens.dropLast()),
+            cacheSalt: rec.request.cacheSalt)
+    }
+
+    /// Enqueue a prompt-only donation after the first sampled token. The
+    /// snapshot is graph-built on the engine queue, but hashing and device
+    /// materialization remain on `donationQueue`, so streaming never waits.
+    ///
+    /// Paged backends are deliberately excluded: their snapshots are lazy
+    /// gathers from in-place slabs. Terminal donation is safe because page
+    /// release is fenced behind donation materialization; an early donor
+    /// stays live and could be cancelled/released while that asynchronous
+    /// gather is pending. Without a page-lease API, disabling early donation
+    /// is the only race-free policy.
+    private func scheduleEarlyDonationIfEligible(for rec: CBv2ScheduledRequest) {
+        guard config.enableEarlyPrefixDonation, prefixCache != nil else { return }
+        guard rec.request.prefixCacheEnabled else { return }
+        guard !backend.requiresMaterializedSnapshots else { return }
+        guard rec.generatedTokenCount == 1 else { return }
+        guard earlyDonationsScheduled[rec.id] == nil else { return }
+        guard pendingEarlyDonationCount < config.maxPendingEarlyPrefixDonations else { return }
+        guard rec.request.multimodal == nil, rec.request.promptTokens.count > 1 else { return }
+        guard let state = kvStates[rec.id], donationStateIsLossless(state) else { return }
+        let promptCount = rec.request.promptTokens.count
+        guard stateCoversDonation(state, tokenCount: promptCount) else { return }
+
+        let earlyDonation = CBv2EarlyDonationJob(requestID: rec.id)
+        earlyDonationsScheduled[rec.id] = earlyDonation
+        pendingEarlyDonationCount += 1
+        let queued = enqueueDonation(
+            state: state,
+            intent: CBv2DonationIntent(
+                requestID: rec.request.prefixCacheReceiptID ?? rec.id,
+                tokens: rec.request.promptTokens,
+                cacheSalt: rec.request.cacheSalt),
+            releaseAfterDonation: false,
+            earlyDonation: earlyDonation)
+        if !queued {
+            pendingEarlyDonationCount -= 1
+            if earlyDonationsScheduled[rec.id] === earlyDonation {
+                earlyDonationsScheduled.removeValue(forKey: rec.id)
+            }
+        }
     }
 
     /// Retire a finished request's KV state: donate to the prefix cache
@@ -1339,13 +1515,49 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// indexing + optional materialization run on the donation queue), then
     /// release the storage back on the engine queue (the paged pool is
     /// engine-thread-affine).
-    private func retire(state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?) {
-        guard let prefixCache, let donation else {
+    private func retire(
+        state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?,
+        pendingEarlyDonation: CBv2EarlyDonationJob? = nil
+    ) {
+        guard prefixCache != nil, let donation else {
+            releaseState(state, pendingEarlyDonation: pendingEarlyDonation)
+            return
+        }
+        let queued = enqueueDonation(
+            state: state, intent: donation, releaseAfterDonation: true)
+        if !queued {
+            releaseState(state, pendingEarlyDonation: pendingEarlyDonation)
+        }
+    }
+
+    /// Release immediately unless this request's exact early donation is
+    /// still materializing. A pending job takes ownership of the state and
+    /// releases it on its own completion; unrelated later donation work does
+    /// not extend the backend charge. Job identity makes id reuse harmless.
+    private func releaseState(
+        _ state: [CBv2SequenceKV?], pendingEarlyDonation: CBv2EarlyDonationJob?
+    ) {
+        guard let pendingEarlyDonation,
+            pendingEarlyDonation.deferRelease(state)
+        else {
             backend.release(state)
             return
         }
-        let donated = Array(donation.tokens.dropLast())
-        let cacheSalt = donation.cacheSalt
+    }
+
+    /// Build immutable-by-contract snapshot handles on the engine queue and
+    /// hand all expensive work to the serial donation queue. `tokenCount`
+    /// may be shorter than live state (early donation can race one chained
+    /// decode graph), so every cacheable layer is sliced to the exact donated
+    /// prompt boundary before handoff.
+    private func enqueueDonation(
+        state: [CBv2SequenceKV?], intent: CBv2DonationIntent,
+        releaseAfterDonation: Bool,
+        earlyDonation: CBv2EarlyDonationJob? = nil
+    ) -> Bool {
+        guard let prefixCache else { return false }
+        let tokenCount = intent.tokens.count
+        guard stateCoversDonation(state, tokenCount: tokenCount) else { return false }
         var built: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
         built.reserveCapacity(layerKinds.count)
         for (i, kind) in layerKinds.enumerated() {
@@ -1355,10 +1567,20 @@ public final class EngineLoopV2: @unchecked Sendable {
                 built.append(nil)
                 continue
             }
-            built.append(seq.snapshot())
+            let snap = seq.snapshot()
+            if snap.offset == tokenCount {
+                built.append(snap)
+            } else {
+                built.append(
+                    (
+                        keys: snap.keys[.ellipsis, 0 ..< tokenCount, 0...],
+                        values: snap.values[.ellipsis, 0 ..< tokenCount, 0...],
+                        offset: tokenCount
+                    ))
+            }
         }
         let layerKinds = self.layerKinds
-        let handoff = CBv2Handoff(value: (state: state, snapshots: built))
+        let handoff = CBv2Handoff(value: (state: state, snapshots: built, intent: intent))
         // Strong self on purpose: the deferred release is a pending
         // obligation of this loop — it must survive until the donation
         // lands, or the retired state leaks its pages (the paged pool is
@@ -1366,15 +1588,77 @@ public final class EngineLoopV2: @unchecked Sendable {
         // No cycle: the block releases its captures once it runs.
         donationQueue.async {
             prefixCache.donate(
-                tokens: donated, snapshots: handoff.value.snapshots, layerKinds: layerKinds,
-                cacheSalt: cacheSalt)
-            self.releaseOnEngineQueue(handoff.value.state)
+                requestID: handoff.value.intent.requestID,
+                tokens: handoff.value.intent.tokens,
+                snapshots: handoff.value.snapshots, layerKinds: layerKinds,
+                cacheSalt: handoff.value.intent.cacheSalt)
+            if releaseAfterDonation {
+                self.releaseOnEngineQueue(handoff.value.state)
+            }
+            if let earlyDonation {
+                self.earlyDonationDidComplete(earlyDonation)
+            }
         }
+        return true
+    }
+
+    private func earlyDonationDidComplete(_ donation: CBv2EarlyDonationJob) {
+        for state in donation.complete() {
+            releaseOnEngineQueue(state)
+        }
+        engineQueue.async { [self] in
+            assert(pendingEarlyDonationCount > 0, "unbalanced early donation completion")
+            pendingEarlyDonationCount = max(0, pendingEarlyDonationCount - 1)
+            if earlyDonationsScheduled[donation.requestID] === donation {
+                earlyDonationsScheduled.removeValue(forKey: donation.requestID)
+            }
+        }
+    }
+
+    private func donationStateIsLossless(_ state: [CBv2SequenceKV?]) -> Bool {
+        for (i, kind) in layerKinds.enumerated() {
+            var cacheable = kind.sharesKVWithLayer == nil
+            if case .slidingWindow = kind.attention { cacheable = false }
+            guard cacheable, let sequence = state[i] else { continue }
+            guard sequence.snapshotIsLossless else { return false }
+        }
+        return true
+    }
+
+    private func stateCoversDonation(
+        _ state: [CBv2SequenceKV?], tokenCount: Int
+    ) -> Bool {
+        guard tokenCount > 1 else { return false }
+        var cacheableLayers = 0
+        for (i, kind) in layerKinds.enumerated() {
+            var cacheable = kind.sharesKVWithLayer == nil
+            if case .slidingWindow = kind.attention { cacheable = false }
+            guard cacheable else { continue }
+            guard let sequence = state[i], sequence.absoluteOffset >= tokenCount else { return false }
+            cacheableLayers += 1
+        }
+        return cacheableLayers > 0
+    }
+
+    private func takePrefixUsage(
+        requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
+    ) -> CBv2Usage {
+        let prefix = prefixUsageByID.removeValue(forKey: requestID) ?? .disabled
+        let saved = prefixHitTokens.removeValue(forKey: requestID) ?? prefix.prefillTokensSaved
+        return CBv2Usage(
+            promptTokens: promptTokens, completionTokens: completionTokens,
+            prefixCacheHitTokens: saved,
+            prefixCacheOutcome: prefix.outcome,
+            prefixCacheMatchedTokens: prefix.matchedTokens,
+            prefixCachePrefillTokensSaved: saved)
     }
 
     private func releaseOnEngineQueue(_ state: [CBv2SequenceKV?]) {
         let handoff = CBv2Handoff(value: state)
-        engineQueue.async { [self] in backend.release(handoff.value) }
+        engineQueue.async { [self] in
+            backend.release(handoff.value)
+            publishGauges()
+        }
     }
 
     // MARK: Sampler row context
@@ -1460,10 +1744,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             // A preempted request recomputes from scratch — any adopted
             // prefix credit no longer describes work that was skipped, so
             // usage.prefixCacheHitTokens must not over-credit at finish.
-            prefixHitTokens.removeValue(forKey: id)
+            invalidateAdoptedPrefix(id)
             if let state = kvStates.removeValue(forKey: id) {
                 compiledDecode?.forgetRows(state)
-                backend.release(state)
+                releaseState(state, pendingEarlyDonation: earlyDonationsScheduled[id])
             }
         }
     }

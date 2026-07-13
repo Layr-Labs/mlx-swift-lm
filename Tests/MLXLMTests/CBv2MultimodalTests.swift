@@ -565,6 +565,7 @@ final class CBv2MultimodalTests: XCTestCase {
             schedulerConfig: CBv2SchedulerConfig(
                 maxBatchedTokensPerStep: 256, prefillChunkSize: 8, maxWaiting: 16,
                 enablePrefixCache: true),
+            loopConfig: CBv2EngineLoopConfig(enableEarlyPrefixDonation: true),
             prefixCache: cache)
         return (engine, cache)
     }

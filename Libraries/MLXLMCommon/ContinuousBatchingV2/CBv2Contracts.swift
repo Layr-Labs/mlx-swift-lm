@@ -89,6 +89,17 @@ public struct CBv2Request: Sendable {
     /// different salts can never share cached KV; nil falls back to the
     /// cache-level salt (byte-identical hashes to the pre-salt behavior).
     public var cacheSalt: String?
+    /// Per-request cache participation gate. Remote bridges set this false
+    /// when no authenticated cache scope was supplied, preventing nil salt
+    /// from silently becoming an unscoped shared cache. Defaults true for
+    /// local and backwards-compatible direct engine callers.
+    public var prefixCacheEnabled: Bool
+    /// Correlation identity for prefix-cache donation receipts. This is
+    /// deliberately separate from `id`, which remains the sampler and
+    /// scheduler identity and may be reused after a request finishes. nil
+    /// preserves the direct-caller behavior by correlating donations with
+    /// `id`.
+    public var prefixCacheReceiptID: CBv2RequestID?
     /// Vision prefill (additive): precomputed image-embedding spans spliced
     /// at placeholder-token positions of `promptTokens`. nil = text-only —
     /// every code path is byte-identical to the pre-multimodal engine.
@@ -98,7 +109,9 @@ public struct CBv2Request: Sendable {
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
         maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0,
-        cacheSalt: String? = nil, multimodal: CBv2MultimodalInput? = nil
+        cacheSalt: String? = nil, prefixCacheEnabled: Bool = true,
+        multimodal: CBv2MultimodalInput? = nil,
+        prefixCacheReceiptID: CBv2RequestID? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -108,7 +121,9 @@ public struct CBv2Request: Sendable {
         self.stopStrings = stopStrings
         self.priority = priority
         self.cacheSalt = cacheSalt
+        self.prefixCacheEnabled = prefixCacheEnabled
         self.multimodal = multimodal
+        self.prefixCacheReceiptID = prefixCacheReceiptID
     }
 }
 
@@ -498,12 +513,49 @@ public enum CBv2Event: Sendable {
 public struct CBv2Usage: Sendable {
     public var promptTokens: Int
     public var completionTokens: Int
+    /// Final per-request prefix lookup/adoption result. This describes the
+    /// in-memory engine tier only; SSD staging remains a provider concern.
+    public var prefixCacheOutcome: CBv2PrefixCacheOutcome
+    /// Whole-block tokens matched by lookup before the model-specific
+    /// recompute bound and backend adoption are applied.
+    public var prefixCacheMatchedTokens: Int
+    /// Tokens the engine actually skipped after successful adoption. This is
+    /// the routing-relevant prefill saving, not the raw lookup match.
+    public var prefixCachePrefillTokensSaved: Int
+    /// Backwards-compatible alias retained for existing provider bridges.
+    /// New integrations should read `prefixCachePrefillTokensSaved`.
     public var prefixCacheHitTokens: Int
-    public init(promptTokens: Int, completionTokens: Int, prefixCacheHitTokens: Int = 0) {
+    public init(
+        promptTokens: Int, completionTokens: Int, prefixCacheHitTokens: Int = 0,
+        prefixCacheOutcome: CBv2PrefixCacheOutcome = .disabled,
+        prefixCacheMatchedTokens: Int = 0,
+        prefixCachePrefillTokensSaved: Int = 0
+    ) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
+        self.prefixCacheOutcome = prefixCacheOutcome
+        self.prefixCacheMatchedTokens = prefixCacheMatchedTokens
+        self.prefixCachePrefillTokensSaved = prefixCachePrefillTokensSaved
         self.prefixCacheHitTokens = prefixCacheHitTokens
     }
+}
+
+/// Engine-local prefix-cache result. The provider maps this to its wire
+/// receipt vocabulary after combining it with SSD staging policy/outcomes.
+public enum CBv2PrefixCacheOutcome: Sendable, Equatable {
+    /// Prefix caching was not configured for this engine/request.
+    case disabled
+    /// Lookup/adoption was intentionally excluded (for example multimodal,
+    /// or a match whose mandatory recompute bound leaves no tokens to save).
+    case skippedPolicy
+    /// Lookup ran and no in-memory entry matched.
+    case miss
+    /// A matched prefix was successfully adopted and skipped real prefill.
+    case hit
+    /// A match existed but the capacity ledger could not admit adoption.
+    case skippedCapacity
+    /// A match existed but backend adoption failed for another reason.
+    case adoptionFailed
 }
 
 /// Capacity snapshot for provider heartbeats (same field semantics as today,
@@ -619,6 +671,15 @@ public protocol CBv2PrefixCache: AnyObject, Sendable {
         tokens: [Int],
         snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         layerKinds: [CBv2LayerKind], cacheSalt: String?)
+    /// Request-correlated salted donation. Engine integrations use this for
+    /// both early and terminal donations so asynchronous durable-cache
+    /// settlement can be bound to the exact originating request. The
+    /// default delegates to the legacy salted overload, preserving existing
+    /// conformers that do not need correlation.
+    func donate(
+        requestID: CBv2RequestID, tokens: [Int],
+        snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind], cacheSalt: String?)
     /// Salted pin release; must carry the salt the balancing `lookup` used.
     func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?)
 }
@@ -638,6 +699,16 @@ extension CBv2PrefixCache {
         layerKinds: [CBv2LayerKind], cacheSalt: String?
     ) {
         donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds)
+    }
+
+    public func donate(
+        requestID: CBv2RequestID, tokens: [Int],
+        snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind], cacheSalt: String?
+    ) {
+        donate(
+            tokens: tokens, snapshots: snapshots, layerKinds: layerKinds,
+            cacheSalt: cacheSalt)
     }
 
     public func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?) {
