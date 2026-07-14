@@ -61,11 +61,10 @@ final class CBv2MTPRoundInFlight {
         let k: Int
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
-        /// Lazy [B, k] int32 — the drafter's proposed ids.
-        let draftIds: MLXArray
-        /// Lazy [B, 1+k] int32 — argmax of the target's verify logits.
-        /// Emitted tokens come ONLY from this array (greedy losslessness).
-        let targetArgmax: MLXArray
+        /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
+        /// [B, 1+k] target argmaxes. One `asArray` at finalize reads both,
+        /// preserving the single host-sync boundary.
+        let acceptancePacket: MLXArray
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
@@ -80,6 +79,11 @@ final class CBv2MTPRoundInFlight {
     /// Lazy [B_decode, 1, H] pre-norm hidden of the step's decode batch
     /// (non-nil iff `seedRows` is non-empty).
     let seedHidden: MLXArray?
+    /// Finalization outcomes used by host-only controller attribution. These
+    /// are populated at the existing host-sync boundary.
+    var finalizedSeedIDs: Set<CBv2RequestID> = []
+    var finalizedVerifyIDs: Set<CBv2RequestID> = []
+    var claimedSeedCostNanos: UInt64 = 0
 
     init(
         verify: Verify?,
@@ -90,6 +94,63 @@ final class CBv2MTPRoundInFlight {
         self.seedRows = seedRows
         self.seedHidden = seedHidden
     }
+}
+
+/// A seed step belongs to the row cohort it prepared, not to the depth that
+/// happened to be selected on that plan. A later verification may run at a
+/// different depth; exact-cohort matching prevents cancelled or invalidated
+/// seed work from leaking into an unrelated probe.
+struct CBv2MTPSeedCostLedger {
+    private struct Pending {
+        var nanos: UInt64
+        let requestIDs: Set<CBv2RequestID>
+    }
+
+    private var byBucket: [Int: Pending] = [:]
+
+    mutating func record(
+        decodeRowBucket: Int, requestIDs: Set<CBv2RequestID>, nanos: UInt64
+    ) {
+        guard decodeRowBucket > 0, !requestIDs.isEmpty, nanos > 0 else { return }
+        if var pending = byBucket[decodeRowBucket], pending.requestIDs == requestIDs {
+            pending.nanos &+= nanos
+            byBucket[decodeRowBucket] = pending
+        } else {
+            byBucket[decodeRowBucket] = Pending(nanos: nanos, requestIDs: requestIDs)
+        }
+    }
+
+    /// Claim seed cost before verify-row completion can retire request ids.
+    /// An overlapping but non-identical cohort is discarded rather than
+    /// partially charging work whose rectangular batch shape changed.
+    mutating func take(
+        decodeRowBucket: Int, requestIDs: Set<CBv2RequestID>
+    ) -> UInt64 {
+        guard let pending = byBucket[decodeRowBucket], !requestIDs.isEmpty else { return 0 }
+        if pending.requestIDs == requestIDs {
+            byBucket.removeValue(forKey: decodeRowBucket)
+            return pending.nanos
+        }
+        if !pending.requestIDs.isDisjoint(with: requestIDs) {
+            byBucket.removeValue(forKey: decodeRowBucket)
+        }
+        return 0
+    }
+
+    mutating func invalidate(_ id: CBv2RequestID) {
+        let matching = byBucket.compactMap { bucket, pending in
+            pending.requestIDs.contains(id) ? bucket : nil
+        }
+        for bucket in matching {
+            byBucket.removeValue(forKey: bucket)
+        }
+    }
+
+    mutating func removeAll() {
+        byBucket.removeAll(keepingCapacity: false)
+    }
+
+    var count: Int { byBucket.count }
 }
 
 // MARK: - Driver
@@ -103,11 +164,7 @@ final class CBv2MTPRoundDriver {
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
     let captureLayers: CBv2MTPCaptureLayers
-
-    /// Draft tokens per round. Static (no adaptive k): default 2, aligned
-    /// with `Gemma4MTPAutomaticPolicy` moeA4B (singleStreamBlockSize 3 ⇒
-    /// a 1+k verify block of 3).
-    var k: Int { config.maxDraftTokens }
+    private let depthController: CBv2MTPDepthController
 
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
@@ -116,9 +173,18 @@ final class CBv2MTPRoundDriver {
     /// Plan-scoped: eligible rows without a valid carry — their decode step
     /// this plan is a SEED step (eager forwardWithHidden, hidden captured).
     private(set) var seedMarks: Set<CBv2RequestID> = []
+    /// One selection for the whole scheduler plan. Every speculating row in
+    /// that plan uses this depth, so target verification stays rectangular.
+    private(set) var controllerDecision = CBv2MTPDepthDecision(
+        depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
+    private(set) var planDecision = CBv2MTPDepthDecision(
+        depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
+    private(set) var controllerMeasurementEligible = false
 
     private let metricsLock = NSLock()
     private var metrics = CBv2MTPMetrics()
+
+    private var pendingSeedCosts = CBv2MTPSeedCostLedger()
 
     private init(
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
@@ -128,6 +194,8 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
+        self.depthController = CBv2MTPDepthController(
+            maxDepth: config.maxDraftTokens, fixedDepth: config.fixedDraftTokens)
     }
 
     /// Build the driver, or nil when MTP cannot activate: config off (or the
@@ -149,9 +217,61 @@ final class CBv2MTPRoundDriver {
     /// Reset speculation marks. Called immediately before every
     /// `scheduler.plan()` so marks can never leak across plans (a rolled-
     /// back plan's marks must not classify the next plan's rows).
-    func beginPlan() {
+    func beginPlan(plannedDecodeRows: Int, canSpeculate: Bool) {
         if !roundMarks.isEmpty { roundMarks = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
+        controllerMeasurementEligible = canSpeculate
+        controllerDecision = depthController.select(
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
+        planDecision = controllerDecision
+        guard plannedDecodeRows > 0 else { return }
+        metricsLock.lock()
+        metrics.selectedDepth = planDecision.depth
+        metrics.decodeRowBucket = planDecision.decodeRowBucket
+        metrics.depthSelections[planDecision.depth, default: 0] += 1
+        metrics.controllerFallbacks[planDecision.reason, default: 0] += 1
+        refreshControllerMetricsLocked()
+        metricsLock.unlock()
+    }
+
+    func previewDecision(
+        plannedDecodeRows: Int, canSpeculate: Bool
+    ) -> CBv2MTPDepthDecision {
+        depthController.preview(
+            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
+    }
+
+    func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
+        depthController.requiresNonChainedDepthZeroProbe(decision)
+    }
+
+    var planDepth: Int { planDecision.depth }
+    var planDecodeRowBucket: Int { planDecision.decodeRowBucket }
+
+    /// A plan boundary can discover that one otherwise eligible row cannot
+    /// complete the selected full round (typically a max-token tail). Mixing
+    /// that row's L=1 target decode with neighbors' L=1+k verify changes the
+    /// target batch shape. Clamp the whole plan to depth zero so target-only
+    /// and MTP execute the same rectangular tail batch.
+    func clampPlanDepth(to requestedDepth: Int, reason: String) {
+        let newDepth = min(max(requestedDepth, 0), planDecision.depth)
+        guard newDepth != planDecision.depth else { return }
+        let oldDepth = planDecision.depth
+        planDecision = CBv2MTPDepthDecision(
+            depth: newDepth, decodeRowBucket: planDecision.decodeRowBucket,
+            reason: reason, isExploration: false)
+        metricsLock.lock()
+        metrics.selectedDepth = newDepth
+        if let count = metrics.depthSelections[oldDepth], count > 0 {
+            if count == 1 {
+                metrics.depthSelections.removeValue(forKey: oldDepth)
+            } else {
+                metrics.depthSelections[oldDepth] = count - 1
+            }
+        }
+        metrics.depthSelections[newDepth, default: 0] += 1
+        metrics.controllerFallbacks[reason, default: 0] += 1
+        metricsLock.unlock()
     }
 
     func markRound(_ id: CBv2RequestID, k: Int) { roundMarks[id] = k }
@@ -214,6 +334,7 @@ final class CBv2MTPRoundDriver {
     /// arrays alive.
     func invalidateCarry(_ id: CBv2RequestID) {
         carries.removeValue(forKey: id)
+        pendingSeedCosts.invalidate(id)
     }
 
     /// The request left the engine for good — ids are legally reusable, so
@@ -222,6 +343,20 @@ final class CBv2MTPRoundDriver {
         carries.removeValue(forKey: id)
         roundMarks.removeValue(forKey: id)
         seedMarks.remove(id)
+        pendingSeedCosts.invalidate(id)
+    }
+
+    /// Drain/shutdown drops every device-resident request trace while
+    /// retaining cumulative metrics/controller estimates for a final poll.
+    func removeAllRequestState() {
+        carries.removeAll(keepingCapacity: false)
+        roundMarks.removeAll(keepingCapacity: false)
+        seedMarks.removeAll(keepingCapacity: false)
+        pendingSeedCosts.removeAll()
+    }
+
+    var requestStateCountForTesting: Int {
+        carries.count + roundMarks.count + seedMarks.count + pendingSeedCosts.count
     }
 
     // MARK: Metrics (lock-protected; polled cross-thread)
@@ -229,6 +364,13 @@ final class CBv2MTPRoundDriver {
     func recordSkip(_ reason: String) {
         metricsLock.lock()
         metrics.skippedRows[reason, default: 0] += 1
+        metrics.controllerFallbacks[reason, default: 0] += 1
+        metricsLock.unlock()
+    }
+
+    func recordControllerFallback(_ reason: String) {
+        metricsLock.lock()
+        metrics.controllerFallbacks[reason, default: 0] += 1
         metricsLock.unlock()
     }
 
@@ -239,7 +381,9 @@ final class CBv2MTPRoundDriver {
         metricsLock.unlock()
     }
 
-    func recordRound(drafted: Int, accepted: Int, emitted: Int) {
+    func recordRound(
+        drafted: Int, accepted: Int, emitted: Int
+    ) {
         metricsLock.lock()
         metrics.rounds += 1
         metrics.draftedTokens += drafted
@@ -253,12 +397,99 @@ final class CBv2MTPRoundDriver {
         for position in 0 ..< accepted {
             metrics.perPositionAccepted[position] += 1
         }
+        refreshControllerMetricsLocked()
         metricsLock.unlock()
+    }
+
+    /// The controller optimizes the synchronized rectangular step, so it
+    /// learns the minimum accepted prefix that every participating verify
+    /// row can commit together, once per step (not once per row).
+    func recordStepAcceptance(
+        drafted: Int, accepted: Int, observedDrafts: Int,
+        decodeRowBucket: Int
+    ) {
+        depthController.observeAcceptance(
+            decodeRowBucket: decodeRowBucket,
+            drafted: observedDrafts,
+            accepted: accepted)
+        metricsLock.lock()
+        refreshControllerMetricsLocked()
+        metricsLock.unlock()
+    }
+
+    func claimPendingSeedCost(
+        decodeRowBucket: Int, finalizedVerifyIDs: Set<CBv2RequestID>
+    ) -> UInt64 {
+        pendingSeedCosts.take(
+            decodeRowBucket: decodeRowBucket, requestIDs: finalizedVerifyIDs)
+    }
+
+    func recordStepCost(
+        _ measurement: CBv2MTPStepMeasurement,
+        wallTimeNanos: UInt64,
+        finalizedPlainWork: Bool,
+        finalizedSeedIDs: Set<CBv2RequestID>,
+        finalizedVerification: Bool,
+        claimedSeedCostNanos: UInt64
+    ) {
+        guard wallTimeNanos > 0 else { return }
+        let decision = measurement.decision
+        if measurement.seedOnly, decision.depth > 0 {
+            guard measurement.costEligible, !finalizedSeedIDs.isEmpty else { return }
+            pendingSeedCosts.record(
+                decodeRowBucket: decision.decodeRowBucket,
+                requestIDs: finalizedSeedIDs,
+                nanos: wallTimeNanos)
+            return
+        }
+        let attributed = wallTimeNanos &+ claimedSeedCostNanos
+        let recorded = depthController.recordFinalizedStep(
+            decision: decision,
+            actualDepth: measurement.actualDepth,
+            wallTimeNanos: attributed,
+            costEligible: measurement.costEligible,
+            chained: measurement.chained,
+            finalizedPlainWork: finalizedPlainWork,
+            finalizedVerification: finalizedVerification)
+        guard recorded else { return }
+        metricsLock.lock()
+        if measurement.actualDepth > 0 {
+            metrics.totalRoundWallTimeNanos &+= attributed
+        }
+        refreshControllerMetricsLocked()
+        metricsLock.unlock()
+    }
+
+    var pendingSeedCostCountForTesting: Int { pendingSeedCosts.count }
+
+    func activeDepthForTesting(decodeRowBucket: Int) -> Int {
+        depthController.activeDepthForTesting(decodeRowBucket: decodeRowBucket)
+    }
+
+    func probeIntervalForTesting(decodeRowBucket: Int) -> Int {
+        depthController.probeIntervalForTesting(decodeRowBucket: decodeRowBucket)
     }
 
     func metricsSnapshot() -> CBv2MTPMetrics {
         metricsLock.lock()
         defer { metricsLock.unlock() }
         return metrics
+    }
+
+    private func refreshControllerMetricsLocked() {
+        let snapshot = depthController.snapshot()
+        metrics.conditionalAcceptance = snapshot.conditionalAcceptance
+        metrics.costInputs = snapshot.costInputs
+    }
+}
+
+/// Official Gemma candidate generation carries the target hidden state that
+/// predicted the newest accepted/unfed token. In a verify tensor whose input
+/// columns are `[seed, d1, ...]`, that is exactly column `acceptedDrafts`.
+/// Kept as a pure seam so indexing is deterministic and fixture-independent.
+enum CBv2MTPHiddenIndex {
+    static func carryColumn(targetOutputIndex: Int, draftDepth: Int) -> Int {
+        precondition(targetOutputIndex >= 0 && targetOutputIndex <= draftDepth)
+        return targetOutputIndex
     }
 }

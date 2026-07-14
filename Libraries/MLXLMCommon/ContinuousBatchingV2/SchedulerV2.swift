@@ -236,6 +236,7 @@ public final class SchedulerV2 {
         var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
         var assignmentIndex: [CBv2RequestID: Int] = [:]
         var preemptions: [CBv2RequestID] = []
+        var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback] = [:]
         var stopScheduling = false
 
         // 0. Starved block-sized chunk from the previous step: first claim on
@@ -277,6 +278,8 @@ public final class SchedulerV2 {
                 if k > 0, 1 + k <= budget {
                     n = 1 + k
                     speculated = true
+                } else if k > 0 {
+                    speculationFallbacks[rec.id] = .tokenBudget
                 }
             }
             n = min(n, budget)
@@ -305,6 +308,7 @@ public final class SchedulerV2 {
                     if speculated {
                         n = 1
                         speculated = false
+                        speculationFallbacks[rec.id] = .kvHeadroom
                         continue
                     }
                     guard let victim = preemptionVictim() else {
@@ -393,7 +397,8 @@ public final class SchedulerV2 {
 
         return CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
-            preemptions: preemptions)
+            preemptions: preemptions,
+            speculationFallbacks: speculationFallbacks)
     }
 
     /// One-off admission of a starved block-bearing WAITING row ahead of the

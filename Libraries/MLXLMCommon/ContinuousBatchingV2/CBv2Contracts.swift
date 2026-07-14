@@ -486,13 +486,24 @@ public enum CBv2FinishReason: Sendable, Equatable {
 public struct CBv2StepPlan: Sendable {
     public var assignments: [(id: CBv2RequestID, numTokens: Int)]
     public var preemptions: [CBv2RequestID]
+    /// Rows whose requested speculative width was demoted to plain decode,
+    /// with the exact reason. This is execution metadata only; it never
+    /// changes scheduling or preemption behavior.
+    public var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback]
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
-        preemptions: [CBv2RequestID] = []
+        preemptions: [CBv2RequestID] = [],
+        speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback] = [:]
     ) {
         self.assignments = assignments
         self.preemptions = preemptions
+        self.speculationFallbacks = speculationFallbacks
     }
+}
+
+public enum CBv2SpeculationFallback: Sendable, Equatable {
+    case tokenBudget
+    case kvHeadroom
 }
 
 public struct CBv2SchedulerConfig: Sendable {
@@ -788,7 +799,14 @@ extension CBv2PrefixCache {
 ///     far enough that NO windowed layer's polluted band overlaps the
 ///     retained region — i.e. essentially the whole prompt.
 ///
-/// The safe, model-shape-only bound that captures this is
+/// A storage-owning full-attention layer downstream of a windowed layer
+/// permanently caches K/V for the replay positions whose upstream window was
+/// incomplete. Replaying more trailing windows cannot remove those polluted
+/// full-attention entries: later decode continues to attend them. Such a
+/// layout must therefore recompute the entire matched prefix.
+///
+/// When no storage-owning full layer follows a windowed layer, the safe,
+/// model-shape-only bound is
 ///   recompute = (number of windowed layers) × (largest window),
 /// clamped to `matched`. Rationale for each factor:
 ///   - `largest window` is the per-layer receptive-field step (a layer with
@@ -805,19 +823,23 @@ extension CBv2PrefixCache {
 ///     layer): recompute == window, unchanged from the old bound — the
 ///     single windowed layer is last, so its polluted early outputs feed
 ///     nothing downstream.
-///   - Deep hybrids on long prompts (Gemma-4: dozens of windowed layers ×
-///     512): the product exceeds the prompt, so the clamp collapses it to
-///     `matched` and adoption degrades to near-full recompute. That is the
-///     CORRECT outcome — those models simply cannot reuse a windowed prefix
-///     exactly, and the safe fallback is to recompute.
+///   - Interleaved hybrids (Gemma-4 / GPT-OSS): a storage-owning full layer
+///     follows a windowed layer, so adoption degrades to full recompute.
 public func cbv2RequiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
     guard matched > 0 else { return 0 }
     var maxWindow = 0
     var windowCount = 0
+    var sawWindowedLayer = false
     for kind in layerKinds {
         if case .slidingWindow(let window) = kind.attention {
             maxWindow = max(maxWindow, window)
             windowCount += 1
+            sawWindowedLayer = true
+        } else if sawWindowedLayer, kind.sharesKVWithLayer == nil {
+            // This layer owns full-attention K/V derived from an activation
+            // whose upstream sliding context was incomplete at the replay
+            // boundary. Those cached entries remain visible forever.
+            return matched
         }
     }
     guard windowCount > 0 else { return 0 }

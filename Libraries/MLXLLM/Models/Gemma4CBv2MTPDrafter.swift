@@ -9,13 +9,13 @@
 // Round invariants (must match the v1 `runGemma4MTPGreedyRound` semantics):
 //  - The query RoPE position is CONSTANT for every draft step of a round
 //    (each row's anchor), carried as a `.batch` offset.
-//  - B == 1 attends the row's snapshot views directly with NO masks (v1
-//    semantics: full attention is bidirectional over the whole snapshot;
-//    the sliding snapshot is storage-evicted to ≤ window entries, all
-//    within window distance of the anchor, so only padding would ever need
-//    masking — and there is none).
-//  - B > 1 right-pads each row's capture to the batch max length and masks
-//    ONLY the padded tail with per-row additive masks [B, 1, 1, Tmax].
+//  - Full attention is bidirectional over the whole retained snapshot.
+//  - Sliding attention uses ABSOLUTE retained positions and the target's
+//    strict `(anchor - window, anchor + window)` rule. A full rotating ring
+//    retains the boundary key at `anchor-window`; it must be masked even for
+//    B == 1.
+//  - B > 1 right-pads each row's capture to the batch max length and combines
+//    the absolute sliding-window rule with the padding mask.
 //    v1's `makeMasks` is NOT reused here: it reads row 0 of a `.batch`
 //    offset (a shared-frontier assumption that is wrong for CBv2 rows at
 //    genuinely different positions) and it keys the sliding mask to
@@ -68,13 +68,19 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let positionOffset = Gemma4.PositionOffset.batch(
             MLXArray(rows.map { Int32($0.anchor) }))
 
+        let slidingWindow = drafter.config.textConfig.slidingWindow
         if rows.count == 1 {
             let row = rows[0]
+            let slidingMask = Self.slidingMask(
+                rows: rows, tMax: row.slidingKeys.dim(2), window: slidingWindow,
+                dtype: row.slidingKeys.dtype)
             return Prepared(
                 sharedKV: Gemma4SharedKV(
                     fullAttention: (row.fullKeys, row.fullValues),
                     slidingAttention: (row.slidingKeys, row.slidingValues)),
-                masks: Gemma4DrafterMasks(full: .none, sliding: .none),
+                masks: Gemma4DrafterMasks(
+                    full: .none,
+                    sliding: slidingMask.map { .array($0) } ?? .none),
                 positionOffset: positionOffset)
         }
 
@@ -82,9 +88,14 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             keys: rows.map(\.fullKeys), values: rows.map(\.fullValues))
         let (slidingKV, slidingMask) = Self.padAndMask(
             keys: rows.map(\.slidingKeys), values: rows.map(\.slidingValues))
+        let absoluteSlidingMask = Self.slidingMask(
+            rows: rows, tMax: slidingKV.0.dim(2), window: slidingWindow,
+            dtype: slidingKV.0.dtype)
         return Prepared(
             sharedKV: Gemma4SharedKV(fullAttention: fullKV, slidingAttention: slidingKV),
-            masks: Gemma4DrafterMasks(full: .array(fullMask), sliding: .array(slidingMask)),
+            masks: Gemma4DrafterMasks(
+                full: .array(fullMask),
+                sliding: .array(absoluteSlidingMask ?? slidingMask)),
             positionOffset: positionOffset)
     }
 
@@ -133,11 +144,37 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         return (padded, MLX.where(valid, zero, negInf))
     }
 
+    /// Additive `[B, 1, 1, Tmax]` mask for CBv2 sliding captures. Returns nil
+    /// only when every retained position is strictly inside its row's window
+    /// and no padding exists. Internal so the absolute boundary is pinned by
+    /// weight-free tests without exposing it as product API.
+    static func slidingMask(
+        rows: [CBv2MTPRowCapture], tMax: Int, window: Int, dtype: DType
+    ) -> MLXArray? {
+        let lengths = rows.map { $0.slidingKeys.dim(2) }
+        let needsMask = rows.enumerated().contains { index, row in
+            lengths[index] < tMax || row.slidingStart <= row.anchor - window
+        }
+        guard needsMask else { return nil }
+
+        let positions = MLXArray(Int32(0) ..< Int32(tMax)).reshaped([1, 1, 1, tMax])
+        let lengthsArray = MLXArray(lengths.map(Int32.init)).reshaped([-1, 1, 1, 1])
+        let starts = MLXArray(rows.map { Int32($0.slidingStart) }).reshaped([-1, 1, 1, 1])
+        let lowerBounds = MLXArray(rows.map { Int32($0.anchor - window) })
+            .reshaped([-1, 1, 1, 1])
+        let insideLength = positions .< lengthsArray
+        let insideWindow = (positions + starts) .> lowerBounds
+        let valid = MLX.logicalAnd(insideLength, insideWindow)
+        let zero = MLXArray(0.0).asType(dtype)
+        let negInf = MLXArray(-Float.infinity).asType(dtype)
+        return MLX.where(valid, zero, negInf)
+    }
+
     private static func padStack(_ rows: [MLXArray], to tMax: Int) -> MLXArray {
         if rows.allSatisfy({ $0.dim(2) == tMax }) {
             return concatenated(rows, axis: 0)
         }
-        var out = MLXArray.zeros(
+        let out = MLXArray.zeros(
             [rows.count, rows[0].dim(1), tMax, rows[0].dim(3)], dtype: rows[0].dtype)
         for (i, row) in rows.enumerated() {
             out[i ..< (i + 1), 0..., 0 ..< row.dim(2), 0...] = row

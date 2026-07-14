@@ -230,6 +230,10 @@ final class CBv2InFlightStep {
     /// exist in the batch). Graph-only until finalization, where they are
     /// materialized at the SAME boundary as the sampled tokens.
     var logprobSegments: [CBv2StepLogprobs] = []
+    /// Host wall clock captured before graph construction for controller
+    /// attribution at the existing finalize boundary.
+    let wallStartedNanos: UInt64
+    var mtpMeasurement: CBv2MTPStepMeasurement?
     /// KV states whose release is fenced behind this step's completion.
     /// `rollbackOne` scrubs the wasted-token KV tail before release;
     /// `donation` (non-nil for natural finishes with prefix caching on)
@@ -251,12 +255,14 @@ final class CBv2InFlightStep {
 
     init(
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
-        sampledTokens: MLXArray?, evalTargets: [MLXArray]
+        sampledTokens: MLXArray?, evalTargets: [MLXArray],
+        wallStartedNanos: UInt64
     ) {
         self.participants = participants
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
         self.evalTargets = evalTargets
+        self.wallStartedNanos = wallStartedNanos
     }
 }
 
@@ -628,6 +634,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func completeStop() {
+        mtp?.removeAllRequestState()
         running = false
         draining = false
         stopWatchdog()
@@ -870,14 +877,23 @@ public final class EngineLoopV2: @unchecked Sendable {
             !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
         {
-            mtp?.beginPlan()
+            beginMTPPlan()
             let plan = scheduler.plan()
             if isPureDecodePlan(plan, matching: ids) {
                 if CBv2StepProfiler.enabled {
                     CBv2StepProfiler.record(
                         "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
                 }
+                let measurement = mtpMeasurement(for: plan)
                 let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                attachMTPMeasurement(measurement, to: next, chained: true)
+                if var previousMeasurement = previous.mtpMeasurement {
+                    // The previous step's finalize-to-launch interval now
+                    // includes construction of this successor. It is no
+                    // longer an isolated depth-zero cost sample either.
+                    previousMeasurement.chained = true
+                    previous.mtpMeasurement = previousMeasurement
+                }
                 inFlight = next
                 chainedStepCount += 1
                 stepCount += 1
@@ -944,7 +960,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
 
-        mtp?.beginPlan()
+        beginMTPPlan()
         let plan = scheduler.plan()
         handlePreemptions(plan.preemptions)
         guard !plan.assignments.isEmpty else {
@@ -955,7 +971,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // MTP round steps (1+k verify assignments and/or seed decodes)
         // branch BEFORE executeMixed — its rec.tokens slicing and samples
         // predicate are structurally wrong for speculative tokens.
+        let measurement = mtpMeasurement(for: plan)
         inFlight = mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan)
+        attachMTPMeasurement(measurement, to: inFlight, chained: false)
         stepCount += 1
         publishGauges()
         scheduleNextStep()
@@ -1037,6 +1055,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
     ) -> CBv2InFlightStep {
+        let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
@@ -1081,7 +1100,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
         let step = CBv2InFlightStep(
-            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [])
+            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
         return step
     }
@@ -1092,6 +1112,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `executeMTPRound` (this function's `rec.tokens` slicing and
     /// `samples` predicate are structurally wrong for speculative tokens).
     func executeMixed(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
+        let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         struct RowWork {
             let rec: CBv2ScheduledRequest
             let start: Int
@@ -1225,7 +1246,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             participants: Set(work.map(\.rec.id)),
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
-            evalTargets: evalTargets)
+            evalTargets: evalTargets,
+            wallStartedNanos: wallStartedNanos)
         step.logprobSegments = logprobSegments
         return step
     }
@@ -1306,9 +1328,11 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
+        var finalizedPlainWork = false
         for (i, id) in step.sampledRows.enumerated() {
             if step.discard.contains(id) { continue }
             guard let rec = scheduler.record(for: id) else { continue }
+            finalizedPlainWork = true
             let token = Int(host[i])
             scheduler.recordSampled(id: id, token: token)
 
@@ -1392,6 +1416,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             retire(
                 state: state, donating: donation,
                 pendingEarlyDonation: earlyDonation)
+        }
+        if let measurement = step.mtpMeasurement {
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
+            mtp?.recordStepCost(
+                measurement,
+                wallTimeNanos: elapsed,
+                finalizedPlainWork: finalizedPlainWork,
+                finalizedSeedIDs: step.mtpRound?.finalizedSeedIDs ?? [],
+                finalizedVerification: !(step.mtpRound?.finalizedVerifyIDs.isEmpty ?? true),
+                claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
         }
     }
 

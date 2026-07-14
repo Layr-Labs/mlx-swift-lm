@@ -13,7 +13,7 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
@@ -27,6 +27,41 @@ struct CBv2MTPModelSeamTests {
     private let vocabSize = 256
     private let hiddenSize = 64
     private let slidingWindow = 64
+
+    @Test func slidingMaskUsesStrictAbsoluteWindowBoundary() {
+        func row(start: Int, anchor: Int, count: Int) -> CBv2MTPRowCapture {
+            let kv = MLXArray.zeros([1, 1, count, 4], dtype: .float32)
+            return CBv2MTPRowCapture(
+                fullKeys: kv, fullValues: kv,
+                slidingKeys: kv, slidingValues: kv,
+                slidingStart: start, anchor: anchor)
+        }
+
+        // At anchor == window, absolute key 0 lies exactly on the excluded
+        // lower boundary while key 1 is visible.
+        let boundary = Gemma4CBv2MTPDrafter.slidingMask(
+            rows: [row(start: 0, anchor: slidingWindow, count: slidingWindow)],
+            tMax: slidingWindow, window: slidingWindow, dtype: .float32)
+        let boundaryMask = boundary?.reshaped([-1]).asArray(Float.self)
+        #expect(boundaryMask?.first == -Float.infinity)
+        #expect(boundaryMask?[1] == 0)
+
+        // The same rule holds after the rotating window advances: the oldest
+        // retained absolute key remains exactly `anchor-window`.
+        let advanced = Gemma4CBv2MTPDrafter.slidingMask(
+            rows: [row(start: 1, anchor: slidingWindow + 1, count: slidingWindow)],
+            tMax: slidingWindow, window: slidingWindow, dtype: .float32)
+        let advancedMask = advanced?.reshaped([-1]).asArray(Float.self)
+        #expect(advancedMask?.first == -Float.infinity)
+        #expect(advancedMask?[1] == 0)
+
+        // Before the first wrap every retained key is strictly in range, so
+        // the allocation-free no-mask path remains available.
+        #expect(
+            Gemma4CBv2MTPDrafter.slidingMask(
+                rows: [row(start: 0, anchor: slidingWindow - 1, count: slidingWindow - 1)],
+                tMax: slidingWindow - 1, window: slidingWindow, dtype: .float32) == nil)
+    }
 
     /// 6-layer target, last 2 KV-shared. Non-shared prefix layer types
     /// [sliding, full, full, sliding] ⇒ capture layers full=2, sliding=3.
@@ -294,7 +329,7 @@ struct CBv2MTPModelSeamTests {
         MLXRandom.seed(0xD0D0)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
-        let drafter = Gemma4AssistantDraftModel(config: try drafterConfig())
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
         eval(target, drafter)
 
         // Prompt < both windows so legacy RotatingKVCache and CBv2 windowed
@@ -361,7 +396,7 @@ struct CBv2MTPModelSeamTests {
         MLXRandom.seed(0xFACE)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
-        let drafter = Gemma4AssistantDraftModel(config: try drafterConfig())
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
         eval(target, drafter)
 
         let rig = CBv2Rig(config: config)
@@ -409,5 +444,49 @@ struct CBv2MTPModelSeamTests {
                 batchDrafts[row] == soloDrafts[row],
                 "row \(row) batch drafts \(batchDrafts[row]) != solo \(soloDrafts[row])")
         }
+    }
+
+    // MARK: - (e) Official target-hidden and accepted-index semantics
+
+    @Test func targetConditioningHiddenIsPreFinalNorm() throws {
+        MLXRandom.seed(0xA55157)
+        let config = try targetConfig()
+        let target = Gemma4TextModel(config)
+        eval(target)
+        let rig = CBv2Rig(config: config)
+        let prompt = makePromptTokens(length: 11, seed: 77, vocabSize: vocabSize)
+        let tokens = tokens2d(prompt)
+
+        let referenceRow = try rig.newRow(promptLength: prompt.count)
+        let (postNorm, preNorm) = target.model.callCapturingPreNorm(
+            tokens, cache: rig.kvCaches([referenceRow]))
+        let seamRow = try rig.newRow(promptLength: prompt.count)
+        let (_, conditioningHidden) = target.cbv2ForwardWithHidden(
+            tokens, caches: rig.kvCaches([seamRow]))
+        eval(postNorm, preNorm, conditioningHidden)
+
+        #expect(
+            allClose(conditioningHidden, preNorm, rtol: 0, atol: 0).item(Bool.self),
+            "the assistant conditioning slot must be the decoder output before model.norm")
+        #expect(
+            !allClose(conditioningHidden, postNorm, rtol: 0, atol: 0).item(Bool.self),
+            "a post-final-norm hidden would silently change official assistant inputs")
+    }
+
+    @Test func lastAcceptedTokenUsesAcceptedDraftHiddenColumn() {
+        let depth = 3
+        let hidden = MLXArray((0 ..< 8).map(Int32.init)).reshaped([2, 4, 1])
+        for accepted in 0 ... depth {
+            let column = CBv2MTPHiddenIndex.carryColumn(
+                targetOutputIndex: accepted, draftDepth: depth)
+            #expect(column == accepted)
+            let selected = hidden[0, column, 0].item(Int32.self)
+            #expect(selected == Int32(accepted))
+        }
+        // The second row proves the same column is selected per row rather
+        // than flattening across the rectangular batch.
+        let column = CBv2MTPHiddenIndex.carryColumn(
+            targetOutputIndex: 2, draftDepth: depth)
+        #expect(hidden[1, column, 0].item(Int32.self) == 6)
     }
 }

@@ -141,18 +141,27 @@ public protocol CBv2MTPDrafter: AnyObject {
 
 /// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
 public struct CBv2MTPConfig: Sendable {
+    /// The largest draft depth covered by the production rectangular-shape
+    /// validation matrix (`verify width = 1 + k`, widths 1...8).
+    public static let testedMaxDraftTokens = 7
+    /// CBv2's production rectangular batch ceiling.
+    public static let testedMaxSpeculativeBatch = 8
+
     /// Master switch. The engine also requires a drafter instance and a
     /// conforming model; `enabled == true` without both is inert.
     public var enabled: Bool
-    /// Max draft tokens per round (k). Rounds verify 1+k and emit 1..k+1.
-    /// Clamped to `1...15` (Gemma-4 block-size validation is 2...16 on
-    /// 1+k).
+    /// Max draft tokens per round (k). Rounds verify 1+k and emit 1...k+1.
+    /// Clamped to the production-tested `0...7` range.
     public var maxDraftTokens: Int
-    /// Speculate only while the number of RUNNING requests is ≤ this
-    /// (static gate; above it every row takes plain decode — the batched
-    /// forward already amortizes weight streaming, so speculation stops
-    /// paying for itself; seeded from the v1 engine's maxBatch=2 finding
-    /// and the vLLM/SGLang batch gates).
+    /// Optional deterministic override. nil selects the adaptive controller;
+    /// a value selects a fixed step-global depth, clamped to
+    /// `0...maxDraftTokens`. Fixed zero is an explicit target-only mode that
+    /// keeps MTP construction and metrics active for bring-up.
+    public var fixedDraftTokens: Int?
+    /// Hard operational gate on decode rows in one plan, clamped to 1...8.
+    /// Together with the k<=7 bound this caps staged window-KV to 64 token
+    /// rows per storage-owning layer and one in-flight step. The adaptive
+    /// controller is separately keyed by a planned-decode-row bucket.
     public var maxSpeculativeBatch: Int
 
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
@@ -165,10 +174,20 @@ public struct CBv2MTPConfig: Sendable {
         return true
     }()
 
-    public init(enabled: Bool = false, maxDraftTokens: Int = 2, maxSpeculativeBatch: Int = 2) {
+    public init(
+        enabled: Bool = false,
+        maxDraftTokens: Int = Self.testedMaxDraftTokens,
+        maxSpeculativeBatch: Int = 8,
+        fixedDraftTokens: Int? = nil
+    ) {
         self.enabled = enabled
-        self.maxDraftTokens = min(max(maxDraftTokens, 1), 15)
-        self.maxSpeculativeBatch = max(maxSpeculativeBatch, 1)
+        let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
+        self.maxDraftTokens = resolvedMax
+        self.maxSpeculativeBatch = min(
+            max(maxSpeculativeBatch, 1), Self.testedMaxSpeculativeBatch)
+        self.fixedDraftTokens = fixedDraftTokens.map {
+            min(max($0, 0), resolvedMax)
+        }
     }
 
     /// The effective on/off state (config AND env kill switch).
@@ -177,10 +196,39 @@ public struct CBv2MTPConfig: Sendable {
 
 // MARK: - Metrics
 
+/// One controller wall-cost input exposed in a lock-safe metrics snapshot.
+/// Cost is measured at the existing finalize boundary; collecting it adds no
+/// MLX evaluation or tensor readback.
+public struct CBv2MTPCostInput: Sendable, Equatable {
+    public var decodeRowBucket: Int
+    public var depth: Int
+    public var samples: Int
+    public var ewmaWallTimeNanos: UInt64
+    public var totalWallTimeNanos: UInt64
+
+    public init(
+        decodeRowBucket: Int, depth: Int, samples: Int,
+        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64
+    ) {
+        self.decodeRowBucket = decodeRowBucket
+        self.depth = depth
+        self.samples = samples
+        self.ewmaWallTimeNanos = ewmaWallTimeNanos
+        self.totalWallTimeNanos = totalWallTimeNanos
+    }
+}
+
 /// Cumulative MTP counters (engine-thread mutated, snapshot under the
 /// engine's stats lock). Per-position acceptance is the tuning signal for
 /// `maxDraftTokens`.
 public struct CBv2MTPMetrics: Sendable {
+    /// True for every non-nil `EngineV2.mtpMetricsSnapshot()`. Kept explicit
+    /// so provider telemetry can serialize one stable shape.
+    public var active: Bool = true
+    /// Most recently selected step-global depth (zero means target-only).
+    public var selectedDepth: Int = 0
+    /// Planned decode-row bucket used for the most recent selection.
+    public var decodeRowBucket: Int = 0
     /// Rounds that drafted (k ≥ 1) and verified.
     public var rounds: Int = 0
     /// Seed steps (eligible rows that decoded eagerly with hidden capture
@@ -198,8 +246,25 @@ public struct CBv2MTPMetrics: Sendable {
     /// Rows that were round-eligible but clamped to plain decode, keyed by
     /// reason ("batch_gate", "kv_headroom", "carry_invalid", ...).
     public var skippedRows: [String: Int] = [:]
+    /// Step selections by depth, including depth zero.
+    public var depthSelections: [Int: Int] = [:]
+    /// Stable controller/fallback reasons (warmup, exploration, hysteresis,
+    /// unprofitable depth zero, batch gate, token/KV headroom, and so on).
+    public var controllerFallbacks: [String: Int] = [:]
+    /// Conditional acceptance rate at each draft position: P(position i is
+    /// accepted | every earlier draft position was accepted).
+    public var conditionalAcceptance: [Double] = []
+    /// Outlier-clamped wall-cost EWMAs and raw cumulative inputs, sorted by
+    /// decode-row bucket then depth in snapshots.
+    public var costInputs: [CBv2MTPCostInput] = []
+    /// Sum of measured wall time for cost-eligible speculative rounds.
+    public var totalRoundWallTimeNanos: UInt64 = 0
 
     public init() {}
+
+    /// Preferred proposal-count spelling. `draftedTokens` remains stored for
+    /// compatibility with the first engine/provider seam.
+    public var proposedTokens: Int { draftedTokens }
 
     /// Mean accepted drafts per round (nil before any round).
     public var meanAcceptedPerRound: Double? {

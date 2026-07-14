@@ -17,7 +17,7 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
@@ -106,7 +106,7 @@ struct CBv2MTPRoundSmokeTests {
     private func makeFixture(seed: UInt64 = 0x5EED) throws -> Fixture {
         MLXRandom.seed(seed)
         let target = Gemma4TextModel(try targetConfig())
-        let drafter = Gemma4AssistantDraftModel(config: try drafterConfig())
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
         eval(target, drafter)
         return Fixture(target: target, drafter: drafter)
     }
@@ -136,17 +136,19 @@ struct CBv2MTPRoundSmokeTests {
             mtpDrafter: mtpDrafter,
             mtpConfig: CBv2MTPConfig(
                 enabled: mtp, maxDraftTokens: maxDraftTokens,
-                maxSpeculativeBatch: maxSpeculativeBatch))
+                maxSpeculativeBatch: maxSpeculativeBatch,
+                fixedDraftTokens: maxDraftTokens))
     }
 
     private func greedyRequest(
         id: UInt64, prompt: [Int], maxTokens: Int, stopTokens: Set<Int> = [],
-        temperature: Float = 0
+        stopStrings: [String] = [], temperature: Float = 0
     ) -> CBv2Request {
         CBv2Request(
             id: CBv2RequestID(id), promptTokens: prompt,
             sampling: CBv2SamplingParams(temperature: temperature),
-            maxTokens: maxTokens, stopTokens: stopTokens)
+            maxTokens: maxTokens, stopTokens: stopTokens,
+            stopStrings: stopStrings)
     }
 
     private func run(
@@ -184,7 +186,11 @@ struct CBv2MTPRoundSmokeTests {
         // then rounds emitting 1..1+k tokens each.
         #expect(metrics.seedSteps >= 1)
         #expect(metrics.rounds >= 1)
-        #expect(metrics.draftedTokens == metrics.rounds * 2)
+        // Terminal-depth clamping may run the final rounds at k=1 even though
+        // the configured ceiling is k=2.
+        #expect(metrics.draftedTokens >= metrics.rounds)
+        #expect(metrics.draftedTokens <= metrics.rounds * 2)
+        #expect(metrics.controllerFallbacks["tail_depth", default: 0] > 0)
         #expect(metrics.emittedTokens >= metrics.rounds)
         #expect(metrics.emittedTokens <= metrics.rounds * 3)
         #expect(metrics.acceptedTokens <= metrics.draftedTokens)
@@ -338,6 +344,22 @@ struct CBv2MTPRoundSmokeTests {
         #expect(metrics.seedSteps == 0, "temperature>0 row must never seed")
     }
 
+    @Test func stopStringRowsFailOpenToPlainDecode() async throws {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 16, seed: 62, vocabSize: vocabSize)
+        let engine = try makeEngine(fixture, mtp: true)
+        let collected = try await run(
+            engine,
+            greedyRequest(
+                id: 1, prompt: prompt, maxTokens: 8,
+                stopStrings: ["never-matched-by-null-detokenizer"]))
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(collected.finishReason == .length)
+        #expect(metrics.rounds == 0)
+        #expect(metrics.seedSteps == 0)
+    }
+
     // MARK: - (7) Cancel mid-generation leaks nothing (admission liveness)
 
     @Test func cancelMidRoundDoesNotBlockAdmission() async throws {
@@ -367,5 +389,58 @@ struct CBv2MTPRoundSmokeTests {
         await on.shutdown()
         #expect(follower.finishReason == .length)
         #expect(follower.tokens.count == 8)
+    }
+
+    @Test func requestIDReuseAndShutdownClearMTPState() async throws {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 20, seed: 72, vocabSize: vocabSize)
+        let engine = try makeEngine(fixture, mtp: true)
+        let reusedID = CBv2RequestID(44)
+
+        let first = try engine.submit(
+            CBv2Request(
+                id: reusedID, promptTokens: prompt,
+                sampling: .init(temperature: 0), maxTokens: 256))
+        var iterator = first.makeAsyncIterator()
+        var seen = 0
+        while let event = await iterator.next() {
+            switch event {
+            case .delta(_, let tokens, _):
+                seen += tokens.count
+                if seen >= 8 { engine.cancel(reusedID) }
+            case .finished(let reason, _):
+                #expect(reason == .cancelled)
+                break
+            }
+            if seen >= 8, engine.capacity().activeRequests == 0 { break }
+        }
+
+        let reused = try await run(
+            engine,
+            CBv2Request(
+                id: reusedID, promptTokens: prompt,
+                sampling: .init(temperature: 0), maxTokens: 8))
+        #expect(reused.finishReason == .length)
+        await engine.shutdown()
+        #expect(engine.loopForTesting.mtp?.requestStateCountForTesting == 0)
+    }
+
+    @Test func fixedDepthZeroProbesOnceThenKeepsNormalChaining() async throws {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 16, seed: 73, vocabSize: vocabSize)
+        let engine = try makeEngine(fixture, mtp: true, maxDraftTokens: 0)
+        let result = try await run(
+            engine, greedyRequest(id: 1, prompt: prompt, maxTokens: 20))
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        let baseline = try #require(
+            metrics.costInputs.first {
+                $0.decodeRowBucket == 1 && $0.depth == 0
+            })
+        await engine.shutdown()
+
+        #expect(result.finishReason == .length)
+        #expect(engine.chainedStepCount > 0)
+        #expect(baseline.samples == 1)
+        #expect(metrics.rounds == 0)
     }
 }

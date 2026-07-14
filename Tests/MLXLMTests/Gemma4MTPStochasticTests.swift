@@ -79,7 +79,7 @@ struct Gemma4MTPStochasticTests {
             }
         }
         """
-        return Gemma4AssistantDraftModel(
+        return try Gemma4AssistantDraftModel(
             config: try JSONDecoder.json5().decode(
                 Gemma4AssistantConfiguration.self, from: Data(json.utf8)))
     }

@@ -13,6 +13,10 @@ import MLXRandom
 
 /// Errors thrown by the Gemma 4 MTP drafter pipeline.
 public enum Gemma4MTPError: LocalizedError, Sendable, Equatable {
+    /// An assistant config is malformed or outside the supported, bounded
+    /// geometry. `field` and `reason` are stable diagnostics for callers.
+    case invalidConfiguration(field: String, reason: String)
+
     /// The target passed to `generateGemma4MTP` wasn't a `Gemma4TextModel`.
     /// Associated value is the actual type name.
     case unsupportedTarget(String)
@@ -36,6 +40,8 @@ public enum Gemma4MTPError: LocalizedError, Sendable, Equatable {
 
     public var errorDescription: String? {
         switch self {
+        case .invalidConfiguration(let field, let reason):
+            return "Invalid Gemma4 assistant configuration at \(field): \(reason)."
         case .unsupportedTarget(let typeName):
             return "Gemma4 MTP requires a Gemma4TextModel target; got \(typeName)."
         case .rebindForbidden:
@@ -559,15 +565,15 @@ public final class Gemma4MaskedEmbedder: Module, @unchecked Sendable {
             selectedEmb.swappedAxes(-1, -2)
         ).squeezed(axis: -2)  // [B, L, topK * vsc]
 
-        // Scalar fill is faster than an explicit on-device broadcast on
-        // M3 for this shape; the only CPU sync in the sparse head is this
-        // scalar sentinel extraction.
-        let sentinelValue = selectedLogits.min().item(Float.self) - 1.0
+        // Keep the sentinel device-resident. A host scalar extraction here
+        // would add one synchronization per draft token and violate CBv2's
+        // single finalize boundary.
+        let sentinelValue = selectedLogits.min() - 1.0
 
         // Full-vocab output tensor filled with the sentinel.
         let out = MLX.full(
             [B, L, vocabSize],
-            values: MLXArray(sentinelValue),
+            values: sentinelValue,
             dtype: hiddenStates.dtype)
 
         // Scatter selected logits into their canonical positions.
@@ -901,37 +907,49 @@ public struct Gemma4AssistantConfiguration: Codable, Sendable {
     }
 
     public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.modelType =
-            try container.decodeIfPresent(String.self, forKey: .modelType)
-            ?? "gemma4_assistant"
-        self.backboneHiddenSize = try container.decode(Int.self, forKey: .backboneHiddenSize)
-        self.useOrderedEmbeddings =
-            try container.decodeIfPresent(Bool.self, forKey: .useOrderedEmbeddings) ?? false
-        self.numCentroids =
-            try container.decodeIfPresent(Int.self, forKey: .numCentroids) ?? 2048
-        self.centroidIntermediateTopK =
-            try container.decodeIfPresent(Int.self, forKey: .centroidIntermediateTopK) ?? 32
-        // block_size isn't in the HF config file - it's a runtime hyperparam
-        // passed into the round loop. Default 4 matches Google's published
-        // recommendation.
-        self.blockSize =
-            try container.decodeIfPresent(Int.self, forKey: .blockSize) ?? 4
+        do {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.modelType = try container.decode(String.self, forKey: .modelType)
+            self.backboneHiddenSize = try container.decode(
+                Int.self, forKey: .backboneHiddenSize)
+            self.useOrderedEmbeddings =
+                try container.decodeIfPresent(Bool.self, forKey: .useOrderedEmbeddings) ?? false
+            self.numCentroids =
+                try container.decodeIfPresent(Int.self, forKey: .numCentroids) ?? 2048
+            self.centroidIntermediateTopK =
+                try container.decodeIfPresent(Int.self, forKey: .centroidIntermediateTopK) ?? 32
+            // block_size isn't in the HF config file - it's a runtime hyperparam
+            // passed into the round loop. Default 4 matches Google's published
+            // recommendation.
+            self.blockSize =
+                try container.decodeIfPresent(Int.self, forKey: .blockSize) ?? 4
 
-        var textConfig =
-            try container.decode(Gemma4TextConfiguration.self, forKey: .textConfig)
+            let preflight = try container.decode(
+                Gemma4AssistantTextConfigurationPreflight.self,
+                forKey: .textConfig)
+            try Gemma4AssistantConfigurationValidator.validatePreflight(preflight)
+            var textConfig = try container.decode(
+                Gemma4TextConfiguration.self, forKey: .textConfig)
 
-        // HF post-init: drafter checkpoints require every layer to consume
-        // the target's shared K/V. If the checkpoint omits num_kv_shared_layers
-        // (decoder default 20, typically > num_hidden_layers=4 for drafters)
-        // or sets it to 0, clamp it to num_hidden_layers so every drafter
-        // layer is KV-shared.
-        if textConfig.numKvSharedLayers == 0
-            || textConfig.numKvSharedLayers > textConfig.numHiddenLayers
-        {
-            textConfig.numKvSharedLayers = textConfig.numHiddenLayers
+            // HF post-init: drafter checkpoints require every layer to consume
+            // the target's shared K/V. If the checkpoint omits num_kv_shared_layers
+            // (decoder default 20, typically > num_hidden_layers=4 for drafters)
+            // or sets it to 0, clamp it to num_hidden_layers so every drafter
+            // layer is KV-shared.
+            if textConfig.numKvSharedLayers == 0
+                || textConfig.numKvSharedLayers > textConfig.numHiddenLayers
+            {
+                textConfig.numKvSharedLayers = textConfig.numHiddenLayers
+            }
+            self.textConfig = textConfig
+            try Gemma4AssistantConfigurationValidator.validate(self)
+        } catch let error as Gemma4MTPError {
+            throw error
+        } catch {
+            throw Gemma4MTPError.invalidConfiguration(
+                field: "config.json",
+                reason: "could not be decoded")
         }
-        self.textConfig = textConfig
     }
 }
 
@@ -955,7 +973,8 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     internal var targetEmbed: ((MLXArray) -> MLXArray)?
     internal var boundTargetID: ObjectIdentifier?
 
-    public init(config: Gemma4AssistantConfiguration) {
+    public init(config: Gemma4AssistantConfiguration) throws {
+        let geometry = try Gemma4AssistantConfigurationValidator.validate(config)
         self.config = config
 
         let textCfg = config.textConfig
@@ -964,7 +983,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
 
         // pre: [2 * backbone -> drafter_hidden]
         self._preProjection.wrappedValue = Linear(
-            2 * config.backboneHiddenSize, textCfg.hiddenSize, bias: false)
+            geometry.preProjectionInputSize, textCfg.hiddenSize, bias: false)
         // post: [drafter_hidden -> backbone]
         self._postProjection.wrappedValue = Linear(
             textCfg.hiddenSize, config.backboneHiddenSize, bias: false)
@@ -1208,70 +1227,9 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     /// Fail-fast on every drafter/target mismatch with the field name in
     /// the error. Called once at bind time.
     private func validateCompatibility(with target: any Gemma4MTPTarget) throws {
-        let drafterT = config.textConfig
-        let targetCfg = target.mtpConfiguration
-
-        // 1. Backbone hidden size must match target hidden size (pre/post
-        //    projection shapes depend on this).
-        guard config.backboneHiddenSize == targetCfg.hiddenSize else {
-            throw Gemma4MTPError.incompatibleDrafter(
-                field: "backboneHiddenSize",
-                drafter: "\(config.backboneHiddenSize)",
-                target: "\(targetCfg.hiddenSize)"
-            )
-        }
-
-        // 2. Vocab sizes must match (drafter's LM head produces logits over
-        //    the target's vocab).
-        guard drafterT.vocabSize == targetCfg.vocabSize else {
-            throw Gemma4MTPError.incompatibleDrafter(
-                field: "vocabSize",
-                drafter: "\(drafterT.vocabSize)",
-                target: "\(targetCfg.vocabSize)"
-            )
-        }
-
-        // 3. Every drafter layer_type must be one of the two known types.
-        for (i, lt) in drafterT.layerTypes.enumerated() {
-            guard lt == "full_attention" || lt == "sliding_attention" else {
-                throw Gemma4MTPError.incompatibleDrafter(
-                    field: "layerTypes[\(i)]",
-                    drafter: lt,
-                    target: "full_attention|sliding_attention"
-                )
-            }
-        }
-
-        // 4. K=V compatibility: applies only when the drafter has at least
-        //    one full-attention layer AND attention_k_eq_v is true.
-        let drafterHasFullAttn =
-            drafterT.layerTypes.contains("full_attention")
-        if drafterHasFullAttn && drafterT.attentionKeqV {
-            guard targetCfg.attentionKeqV else {
-                throw Gemma4MTPError.incompatibleDrafter(
-                    field: "attentionKeqV",
-                    drafter: "true",
-                    target: "false"
-                )
-            }
-            guard drafterT.numGlobalKeyValueHeads == targetCfg.numGlobalKeyValueHeads
-            else {
-                throw Gemma4MTPError.incompatibleDrafter(
-                    field: "numGlobalKeyValueHeads",
-                    drafter: "\(drafterT.numGlobalKeyValueHeads.map(String.init) ?? "nil")",
-                    target: "\(targetCfg.numGlobalKeyValueHeads.map(String.init) ?? "nil")"
-                )
-            }
-        }
-
-        // 5. Drafter must be fully KV-shared by construction.
-        guard drafterT.numKvSharedLayers == drafterT.numHiddenLayers else {
-            throw Gemma4MTPError.incompatibleDrafter(
-                field: "numKvSharedLayers",
-                drafter: "\(drafterT.numKvSharedLayers)",
-                target: "\(drafterT.numHiddenLayers)"
-            )
-        }
+        try Gemma4MTPCompatibilityValidator.validate(
+            drafter: config,
+            target: target.mtpConfiguration)
     }
 
     // MARK: - Loading
@@ -1285,19 +1243,12 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
     /// - Throws: file I/O errors, JSON decoding errors, or
     ///   `Gemma4MTPError.incompatibleDrafter` from `sanitize`.
     public static func load(from directory: URL) async throws -> Gemma4AssistantDraftModel {
-        // Decode the drafter config.
         let configURL = directory.appending(component: "config.json")
-        let configData = try Data(contentsOf: configURL)
-        let config = try JSONDecoder.json5().decode(
-            Gemma4AssistantConfiguration.self, from: configData)
-        // Optional quantization block: 4-bit QAT (and other quantized)
-        // drafters ship a `quantization` section in config.json. nil for
-        // plain bf16 drafters, in which case no quantization is applied.
-        let baseConfig = try? JSONDecoder.json5().decode(
-            BaseConfiguration.self, from: configData)
+        let document = try Gemma4AssistantConfigurationDocument.read(from: configURL)
+        let config = document.config
 
         // Construct the drafter (random init).
-        let drafter = Gemma4AssistantDraftModel(config: config)
+        let drafter = try Gemma4AssistantDraftModel(config: config)
 
         // Collect all safetensors files in the directory. `resolvingSymlinksInPath`
         // ensures a symlinked directory (e.g. pointing into the HF cache) is
@@ -1320,7 +1271,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         // Quantize matching modules before applying weights when the checkpoint
         // is quantized (4-bit QAT drafter). A module is quantized iff its
         // `.scales` tensor is present. Mirrors `loadWeights` in MLXLMCommon.
-        if let plq = baseConfig?.perLayerQuantization {
+        if let plq = document.baseConfiguration.perLayerQuantization {
             quantize(model: drafter) { path, _ in
                 sanitized["\(path).scales"] != nil
                     ? plq.quantization(layer: path)?.asTuple : nil

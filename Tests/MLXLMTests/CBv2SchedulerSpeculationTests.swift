@@ -178,6 +178,7 @@ final class CBv2SchedulerSpeculationTests: XCTestCase {
         scheduler.speculationPlanner = { _ in 3 }  // 1+3 = 4 > budget 2 ⇒ 1
         let plan = scheduler.plan()
         XCTAssertEqual(plan.assignments.map(\.numTokens), [1])
+        XCTAssertEqual(plan.speculationFallbacks[request.id], .tokenBudget)
         XCTAssertEqual(scheduler.record(for: request.id)?.numComputedTokens, 3)
     }
 
@@ -207,6 +208,7 @@ final class CBv2SchedulerSpeculationTests: XCTestCase {
         let plan = scheduler.plan()
         XCTAssertEqual(plan.assignments.map(\.numTokens), [1])
         XCTAssertTrue(plan.preemptions.isEmpty, "speculative slack must never preempt")
+        XCTAssertEqual(plan.speculationFallbacks[request.id], .kvHeadroom)
         XCTAssertEqual(capacity.reserveCalls.map(\.tokens), [10, 4, 1])
         XCTAssertTrue(capacity.releaseAllCalls.isEmpty)
         XCTAssertEqual(scheduler.record(for: request.id)?.numComputedTokens, 11)
