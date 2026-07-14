@@ -665,6 +665,16 @@ public protocol CBv2PrefixCache: AnyObject, Sendable {
     /// unsalted method), so pre-salt implementations stay conformant.
     func lookup(tokens: [Int], layerKinds: [CBv2LayerKind], cacheSalt: String?)
         -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
+    /// Request-correlated salted lookup. Engine integrations use one stable
+    /// correlation identity for both this lookup and its balancing
+    /// `endAdoption`, allowing durable-cache bridges to bind any staging pin
+    /// or ticket to the exact request even when multiple requests carry an
+    /// identical token prefix. The default delegates to the legacy salted
+    /// overload, preserving existing conformers.
+    func lookup(
+        requestID: CBv2RequestID, tokens: [Int], layerKinds: [CBv2LayerKind],
+        cacheSalt: String?
+    ) -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
     /// Salted pre-snapshotted donation; same semantics as the unsalted
     /// overload with the entry indexed under the request's salt scope.
     func donate(
@@ -682,6 +692,11 @@ public protocol CBv2PrefixCache: AnyObject, Sendable {
         layerKinds: [CBv2LayerKind], cacheSalt: String?)
     /// Salted pin release; must carry the salt the balancing `lookup` used.
     func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?)
+    /// Request-correlated salted pin release. `requestID` must equal the
+    /// identity passed to the lookup that created this pin. The default
+    /// delegates to the legacy salted overload.
+    func endAdoption(
+        requestID: CBv2RequestID, tokens: [Int], matched: Int, cacheSalt: String?)
 }
 
 extension CBv2PrefixCache {
@@ -691,6 +706,13 @@ extension CBv2PrefixCache {
         -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
     {
         lookup(tokens: tokens, layerKinds: layerKinds)
+    }
+
+    public func lookup(
+        requestID: CBv2RequestID, tokens: [Int], layerKinds: [CBv2LayerKind],
+        cacheSalt: String?
+    ) -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])? {
+        lookup(tokens: tokens, layerKinds: layerKinds, cacheSalt: cacheSalt)
     }
 
     public func donate(
@@ -713,6 +735,12 @@ extension CBv2PrefixCache {
 
     public func endAdoption(tokens: [Int], matched: Int, cacheSalt: String?) {
         endAdoption(tokens: tokens, matched: matched)
+    }
+
+    public func endAdoption(
+        requestID: CBv2RequestID, tokens: [Int], matched: Int, cacheSalt: String?
+    ) {
+        endAdoption(tokens: tokens, matched: matched, cacheSalt: cacheSalt)
     }
 }
 

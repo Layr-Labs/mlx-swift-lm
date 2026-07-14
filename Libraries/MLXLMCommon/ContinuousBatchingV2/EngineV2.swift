@@ -396,9 +396,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         guard request.multimodal == nil else {
             return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
         }
+        let cacheRequestID = request.prefixCacheReceiptID ?? request.id
         guard
             let hit = prefixCache.lookup(
-                tokens: request.promptTokens, layerKinds: layerKinds,
+                requestID: cacheRequestID, tokens: request.promptTokens, layerKinds: layerKinds,
                 cacheSalt: request.cacheSalt)
         else {
             return CBv2PrefixLookup(adoption: nil, outcome: .miss, matchedTokens: 0)
@@ -407,7 +408,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         let effective = hit.matched - recompute
         guard effective > 0 else {
             prefixCache.endAdoption(
-                tokens: request.promptTokens, matched: hit.matched,
+                requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,
                 cacheSalt: request.cacheSalt)
             return CBv2PrefixLookup(
                 adoption: nil, outcome: .skippedPolicy, matchedTokens: hit.matched)
@@ -423,7 +424,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         }
         return CBv2PrefixLookup(
             adoption: CBv2PrefixAdoption(
-                tokens: request.promptTokens, matched: hit.matched,
+                requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,
                 effective: effective, prefix: prefix, cacheSalt: request.cacheSalt),
             outcome: .adoptionFailed, matchedTokens: hit.matched)
     }
