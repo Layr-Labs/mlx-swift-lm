@@ -25,12 +25,17 @@ private final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
     private let promptLength: Int
     private let offset: Int
     private let vocabSize: Int
+    let mtpTargetIdentity: ObjectIdentifier?
 
-    init(script: [Int], promptLength: Int, offset: Int, vocabSize: Int) {
+    init(
+        script: [Int], promptLength: Int, offset: Int, vocabSize: Int,
+        target: Gemma4TextModel
+    ) {
         self.script = script
         self.promptLength = promptLength
         self.offset = offset
         self.vocabSize = vocabSize
+        self.mtpTargetIdentity = ObjectIdentifier(target)
     }
 
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
@@ -49,6 +54,16 @@ private final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
             return Int32((value + offset) % vocabSize)
         }
         return (MLXArray(ids), hidden)
+    }
+}
+
+private final class CBv2ParityConstantSampler: CBv2StepSampler {
+    func sample(
+        logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
+        stepIndex: Int, pendingSampledTokens: MLXArray?,
+        rowContext: () -> [CBv2SamplerRow]
+    ) -> MLXArray {
+        MLXArray.zeros([params.count], dtype: .int32)
     }
 }
 
@@ -138,7 +153,8 @@ struct CBv2MTPEngineParityTests {
     private func makeEngine(
         target: Gemma4TextModel, drafter: (any CBv2MTPDrafter)?,
         maxSpeculativeBatch: Int = 4, maxConcurrent: Int = 4,
-        fixedDepth: Int? = nil
+        fixedDepth: Int? = nil,
+        sampler: CBv2StepSampler = CBv2DefaultSampler()
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
         let depth = fixedDepth ?? k
@@ -147,6 +163,7 @@ struct CBv2MTPEngineParityTests {
             layerKinds: kinds,
             backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28)),
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            sampler: sampler,
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: maxConcurrent, maxBatchedTokensPerStep: 256,
                 prefillChunkSize: 16, maxWaiting: 16),
@@ -263,7 +280,7 @@ struct CBv2MTPEngineParityTests {
             target: fixture.target,
             drafter: CBv2ParityScriptedDrafter(
                 script: probe.tokens, promptLength: prompt.count, offset: 0,
-                vocabSize: vocabSize))
+                vocabSize: vocabSize, target: fixture.target))
         let on = try await run(engine, request(id: 1, prompt: prompt, maxTokens: maxTokens))
         let metrics = try #require(engine.mtpMetricsSnapshot())
         await engine.shutdown()
@@ -286,7 +303,7 @@ struct CBv2MTPEngineParityTests {
             target: fixture.target,
             drafter: CBv2ParityScriptedDrafter(
                 script: probe.tokens, promptLength: prompt.count, offset: 1,
-                vocabSize: vocabSize))
+                vocabSize: vocabSize, target: fixture.target))
         let on = try await run(engine, request(id: 1, prompt: prompt, maxTokens: maxTokens))
         let metrics = try #require(engine.mtpMetricsSnapshot())
         await engine.shutdown()
@@ -315,7 +332,7 @@ struct CBv2MTPEngineParityTests {
             target: fixture.target,
             drafter: CBv2ParityScriptedDrafter(
                 script: script, promptLength: prompt.count, offset: 0,
-                vocabSize: vocabSize),
+                vocabSize: vocabSize, target: fixture.target),
             fixedDepth: 4)
 
         async let a = run(engine, request(id: 1, prompt: prompt, maxTokens: 8))
@@ -331,5 +348,27 @@ struct CBv2MTPEngineParityTests {
         #expect(values.2.tokens == Array(targetValues.2.tokens.prefix(8)))
         #expect(values.3.tokens == Array(targetValues.3.tokens.prefix(8)))
         #expect(metrics.controllerFallbacks["tail_depth", default: 0] > 0)
+    }
+
+    @Test func customSamplerKeepsTokenAuthorityByDisablingMTP() async throws {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 14, seed: 491, vocabSize: vocabSize)
+        let item = request(id: 1, prompt: prompt, maxTokens: 8)
+
+        let targetOnly = makeEngine(
+            target: fixture.target, drafter: nil,
+            sampler: CBv2ParityConstantSampler())
+        let expected = try await run(targetOnly, item)
+        await targetOnly.shutdown()
+
+        let requestedMTP = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture),
+            sampler: CBv2ParityConstantSampler())
+        #expect(requestedMTP.mtpMetricsSnapshot() == nil)
+        let actual = try await run(requestedMTP, item)
+        await requestedMTP.shutdown()
+
+        #expect(expected.tokens == Array(repeating: 0, count: item.maxTokens))
+        #expect(actual.tokens == expected.tokens)
     }
 }

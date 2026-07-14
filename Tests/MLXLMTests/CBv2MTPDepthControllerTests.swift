@@ -270,10 +270,11 @@ struct CBv2MTPDepthControllerTests {
     }
 
     private func makeDriver(maxDepth: Int) throws -> CBv2MTPRoundDriver {
-        try #require(
+        let model = MTPControllerTestModel()
+        return try #require(
             CBv2MTPRoundDriver.build(
-                model: MTPControllerTestModel(),
-                drafter: MTPControllerTestDrafter(),
+                model: model,
+                drafter: MTPControllerTestDrafter(target: model),
                 config: CBv2MTPConfig(
                     enabled: true, maxDraftTokens: maxDepth,
                     maxSpeculativeBatch: 1, fixedDraftTokens: nil)))
@@ -313,6 +314,12 @@ struct CBv2MTPDepthControllerTests {
 private final class MTPControllerTestPrepared: CBv2MTPPreparedCapture {}
 
 private final class MTPControllerTestDrafter: CBv2MTPDrafter {
+    let mtpTargetIdentity: ObjectIdentifier?
+
+    init(target: MTPControllerTestModel) {
+        self.mtpTargetIdentity = ObjectIdentifier(target)
+    }
+
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         MTPControllerTestPrepared()
     }
@@ -326,6 +333,7 @@ private final class MTPControllerTestDrafter: CBv2MTPDrafter {
 
 private final class MTPControllerTestModel: CBv2MTPSteppableModel {
     let mtpCaptureLayers: CBv2MTPCaptureLayers? = .init(full: 0, sliding: 0)
+    var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(self) }
 
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         fatalError("controller tests do not execute model graphs")

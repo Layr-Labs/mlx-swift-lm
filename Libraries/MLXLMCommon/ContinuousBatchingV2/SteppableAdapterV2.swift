@@ -99,6 +99,11 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
         (model as? CBv2MTPForwardable)?.cbv2MTPCaptureLayers
     }
 
+    public var mtpTargetIdentity: ObjectIdentifier? {
+        guard let target = model as? any CBv2MTPForwardable else { return nil }
+        return ObjectIdentifier(target)
+    }
+
     public func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {

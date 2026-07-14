@@ -208,6 +208,10 @@ final class CBv2MTPRoundDriver {
         guard let mtpModel = model as? (any CBv2MTPSteppableModel),
             let captureLayers = mtpModel.mtpCaptureLayers
         else { return nil }
+        guard let modelTarget = mtpModel.mtpTargetIdentity,
+            let drafterTarget = drafter.mtpTargetIdentity,
+            modelTarget == drafterTarget
+        else { return nil }
         return CBv2MTPRoundDriver(
             config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers)
     }

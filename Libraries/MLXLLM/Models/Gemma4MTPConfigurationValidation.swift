@@ -584,10 +584,12 @@ enum Gemma4MTPCompatibilityValidator {
                     drafterText.attentionKeqV,
                     target.attentionKeqV,
                     field: "fullAttention.attentionKeqV")
-                try equalOptional(
-                    drafterText.numGlobalKeyValueHeads,
-                    target.numGlobalKeyValueHeads,
-                    field: "fullAttention.numGlobalKeyValueHeads")
+                if drafterText.attentionKeqV {
+                    try equalOptional(
+                        drafterText.numGlobalKeyValueHeads,
+                        target.numGlobalKeyValueHeads,
+                        field: "fullAttention.numGlobalKeyValueHeads")
+                }
                 try equal(
                     effectiveFullKVHeads(drafterText),
                     effectiveFullKVHeads(target),

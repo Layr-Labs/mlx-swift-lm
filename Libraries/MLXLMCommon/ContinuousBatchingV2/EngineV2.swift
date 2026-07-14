@@ -240,16 +240,27 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             kvBytesBackendCapacity: backend.bytesCapacity,
             kvBytesReserved: compiledDecode?.admissionPaddingReserve ?? 0)
         self.gauges = gauges
-        // MTP (speculative decoding): active only when a drafter is bound,
-        // the config (and the DARKBLOOM_CBV2_MTP kill switch) allow it, and
-        // the model can drive rounds (CBv2MTPSteppableModel with capture
-        // layers). nil ⇒ byte-identical plain-decode behavior. The loop
-        // wires `SchedulerV2.speculationPlanner` when the driver exists.
-        let mtpDriver = CBv2MTPRoundDriver.build(
-            model: model, drafter: mtpDrafter, config: mtpConfig)
+        // MTP verification bypasses the sampler and emits raw target
+        // argmaxes. Only the two known argmax-equivalent implementations may
+        // activate it; custom samplers fail safe to ordinary target decode.
+        let samplerSupportsMTP =
+            sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler
+        let mtpDriver = samplerSupportsMTP
+            ? CBv2MTPRoundDriver.build(
+                model: model, drafter: mtpDrafter, config: mtpConfig)
+            : nil
         if mtpDrafter != nil, mtpConfig.enabled, mtpDriver == nil {
+            let reason: String
+            if !CBv2MTPConfig.envEnabled {
+                reason = "DARKBLOOM_CBV2_MTP kill switch"
+            } else if !samplerSupportsMTP {
+                reason = "sampler \(type(of: sampler)) is not proven argmax-equivalent"
+            } else {
+                reason =
+                    "model/drafter pair cannot prove matching MTP target identity or capture layers"
+            }
             log.info(
-                "CBv2 MTP inactive despite a bound drafter: \(CBv2MTPConfig.envEnabled ? "model \(type(of: model)) cannot drive MTP rounds (no capture layers)" : "DARKBLOOM_CBV2_MTP kill switch", privacy: .public) — plain decode"
+                "CBv2 MTP inactive despite a bound drafter: \(reason, privacy: .public) — plain decode"
             )
         }
         self.loop = EngineLoopV2(

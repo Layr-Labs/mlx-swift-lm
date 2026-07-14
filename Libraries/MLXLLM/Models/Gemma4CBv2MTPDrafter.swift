@@ -63,6 +63,8 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     // MARK: - CBv2MTPDrafter
 
+    public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
+
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepare: rows must be non-empty")
         let positionOffset = Gemma4.PositionOffset.batch(

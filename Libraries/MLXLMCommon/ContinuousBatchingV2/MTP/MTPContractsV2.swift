@@ -68,10 +68,18 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// nil when the underlying model cannot drive MTP (adapters over
     /// arbitrary models answer at runtime).
     var mtpCaptureLayers: CBv2MTPCaptureLayers? { get }
+    /// Identity of the exact target instance that owns verification logits,
+    /// hidden states, and KV. nil means compatibility cannot be proven and
+    /// must fail safe to plain decode.
+    var mtpTargetIdentity: ObjectIdentifier? { get }
     /// Forward returning logits [B, L, vocab] and pre-norm last hidden
     /// [B, L, hidden]. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2MTPSteppableModel {
+    public var mtpTargetIdentity: ObjectIdentifier? { nil }
 }
 
 // MARK: - Drafter seam
@@ -121,6 +129,10 @@ public protocol CBv2MTPPreparedCapture: AnyObject {}
 /// argmax). All methods are called on the engine thread while building the
 /// step graph; they MUST NOT force evaluation (no host syncs).
 public protocol CBv2MTPDrafter: AnyObject {
+    /// Identity of the exact target instance whose embeddings and geometry
+    /// this drafter consumes. nil means compatibility cannot be proven and
+    /// must fail safe to plain decode.
+    var mtpTargetIdentity: ObjectIdentifier? { get }
     /// Build round-scoped batch state from per-row captures. `rows` order
     /// == the round's speculating-row order.
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
@@ -135,6 +147,10 @@ public protocol CBv2MTPDrafter: AnyObject {
     func draftStep(
         tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
     ) -> (tokens: MLXArray, hidden: MLXArray)
+}
+
+extension CBv2MTPDrafter {
+    public var mtpTargetIdentity: ObjectIdentifier? { nil }
 }
 
 // MARK: - Config

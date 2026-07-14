@@ -265,10 +265,28 @@ struct CBv2MTPModelSeamTests {
         let gemmaAdapter = CBv2SteppableLanguageModelAdapter(gemma)
         #expect(gemmaAdapter.mtpCaptureLayers == gemma.cbv2MTPCaptureLayers)
         #expect(gemmaAdapter.mtpCaptureLayers != nil)
+        #expect(gemmaAdapter.mtpTargetIdentity == ObjectIdentifier(gemma))
 
         // Non-CBv2MTPForwardable models answer nil (no trap).
         let tinyAdapter = CBv2SteppableLanguageModelAdapter(TinyTestModel.make())
         #expect(tinyAdapter.mtpCaptureLayers == nil)
+        #expect(tinyAdapter.mtpTargetIdentity == nil)
+    }
+
+    @Test func driverRejectsDrafterBoundToDifferentTargetInstance() throws {
+        MLXRandom.seed(0x518)
+        let boundTarget = Gemma4TextModel(try targetConfig())
+        let engineTarget = Gemma4TextModel(try targetConfig())
+        let assistant = try Gemma4AssistantDraftModel(config: drafterConfig())
+        let drafter = try Gemma4CBv2MTPDrafter(
+            drafter: assistant, target: boundTarget)
+
+        let driver = CBv2MTPRoundDriver.build(
+            model: CBv2SteppableLanguageModelAdapter(engineTarget),
+            drafter: drafter,
+            config: CBv2MTPConfig(enabled: true, fixedDraftTokens: 2))
+
+        #expect(driver == nil)
     }
 
     // MARK: - (b) Logits parity: cbv2ForwardWithHidden vs plain forward

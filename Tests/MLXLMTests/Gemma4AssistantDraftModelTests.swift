@@ -184,6 +184,15 @@ struct Gemma4AssistantDraftModelTests {
         }
     }
 
+    @Test func bindIgnoresUnusedGlobalKVHeadsWhenKeqVDisabled() throws {
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        let target = Gemma4TextModel(
+            try targetConfig(attentionKeqV: false, numGlobalKVHeads: 2))
+        eval(drafter, target)
+
+        try drafter.bind(target: target)
+    }
+
     @Test func captureGeometryMismatchesThrowBeforeDrafting() throws {
         typealias DrafterMutation = (inout Gemma4AssistantConfiguration) -> Void
         typealias TargetMutation = (inout Gemma4TextConfiguration) -> Void
