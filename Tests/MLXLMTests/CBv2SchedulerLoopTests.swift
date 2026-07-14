@@ -439,6 +439,114 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         // Every lookup pin was balanced by exactly one endAdoption.
         XCTAssertEqual(prefixCache.lookups, 2)
         XCTAssertEqual(prefixCache.endAdoptions, prefixCache.lookups)
+        XCTAssertEqual(
+            Set(prefixCache.lookupRequestIDs), Set([older.id, younger.id]),
+            "requests without receipt ids must correlate cache pins by scheduler id")
+        XCTAssertEqual(
+            Set(prefixCache.endAdoptionRequestIDs), Set([older.id, younger.id]))
+    }
+
+    func testConcurrentIdenticalPrefixesReleaseTheirExactReceiptIDs() async throws {
+        let cache = CBv2SchedScriptedPrefixCache(matched: 2)
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(enablePrefixCache: true),
+            prefixCache: cache)
+        let receiptA = CBv2RequestID(50_001)
+        let receiptB = CBv2RequestID(50_002)
+        let prompt = [1, 2, 3, 4]
+        let requestA = CBv2Request(
+            id: CBv2RequestID(501), promptTokens: prompt, maxTokens: 4,
+            prefixCacheReceiptID: receiptA)
+        let requestB = CBv2Request(
+            id: CBv2RequestID(502), promptTokens: prompt, maxTokens: 4,
+            prefixCacheReceiptID: receiptB)
+
+        let streamA = try harness.engine.submit(requestA)
+        let streamB = try harness.engine.submit(requestB)
+        async let outputA = cbv2SchedCollect(streamA)
+        async let outputB = cbv2SchedCollect(streamB)
+        let (resultA, resultB) = await (outputA, outputB)
+        XCTAssertEqual(resultA.finishReason, .length)
+        XCTAssertEqual(resultB.finishReason, .length)
+        XCTAssertEqual(Set(cache.lookupRequestIDs), Set([receiptA, receiptB]))
+        XCTAssertEqual(Set(cache.endAdoptionRequestIDs), Set([receiptA, receiptB]))
+        XCTAssertEqual(cache.lookups, 2)
+        XCTAssertEqual(cache.endAdoptions, 2)
+        await harness.engine.shutdown()
+    }
+
+    func testAbandonedAdoptionReleasesItsExactReceiptID() async throws {
+        let cache = CBv2SchedScriptedPrefixCache(matched: 2)
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(enablePrefixCache: true),
+            prefixCache: cache)
+        harness.engine.loopForTesting.enqueueStartDelayForTesting = 0.1
+        let schedulerID = CBv2RequestID(510)
+        let receiptID = CBv2RequestID(51_001)
+        let request = CBv2Request(
+            id: schedulerID, promptTokens: [1, 2, 3, 4], maxTokens: 4,
+            prefixCacheReceiptID: receiptID)
+
+        let stream = try harness.engine.submit(request)
+        harness.engine.cancel(schedulerID)
+        let result = await cbv2SchedCollect(stream)
+        XCTAssertEqual(result.finishReason, .cancelled)
+        XCTAssertEqual(cache.lookupRequestIDs, [receiptID])
+        XCTAssertEqual(cache.endAdoptionRequestIDs, [receiptID])
+        XCTAssertEqual(cache.endAdoptions, cache.lookups)
+        await harness.engine.shutdown()
+    }
+
+    func testReusedSchedulerIDDoesNotReusePrefixReceiptIdentity() async throws {
+        let cache = CBv2SchedScriptedPrefixCache(matched: 2)
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(enablePrefixCache: true),
+            prefixCache: cache)
+        let schedulerID = CBv2RequestID(520)
+        let firstReceipt = CBv2RequestID(52_001)
+        let secondReceipt = CBv2RequestID(52_002)
+        let prompt = [1, 2, 3, 4]
+
+        let first = await cbv2SchedCollect(
+            try harness.engine.submit(
+                CBv2Request(
+                    id: schedulerID, promptTokens: prompt, maxTokens: 2,
+                    prefixCacheReceiptID: firstReceipt)))
+        let second = await cbv2SchedCollect(
+            try harness.engine.submit(
+                CBv2Request(
+                    id: schedulerID, promptTokens: prompt, maxTokens: 2,
+                    prefixCacheReceiptID: secondReceipt)))
+
+        XCTAssertEqual(first.finishReason, .length)
+        XCTAssertEqual(second.finishReason, .length)
+        XCTAssertEqual(cache.lookupRequestIDs, [firstReceipt, secondReceipt])
+        XCTAssertEqual(cache.endAdoptionRequestIDs, [firstReceipt, secondReceipt])
+        XCTAssertEqual(cache.endAdoptions, cache.lookups)
+        await harness.engine.shutdown()
+    }
+
+    func testPolicySkippedAdoptionReleasesItsExactReceiptID() async throws {
+        let cache = CBv2SchedScriptedPrefixCache(matched: 2)
+        let windowed = CBv2LayerKind(
+            attention: .slidingWindow(4), headDim: 4, kvHeads: 1, queryHeads: 2)
+        let harness = CBv2SchedHarness(
+            layerKinds: [windowed],
+            schedulerConfig: CBv2SchedulerConfig(enablePrefixCache: true),
+            prefixCache: cache)
+        let receiptID = CBv2RequestID(53_001)
+        let request = CBv2Request(
+            id: CBv2RequestID(530), promptTokens: [1, 2, 3, 4], maxTokens: 2,
+            prefixCacheReceiptID: receiptID)
+
+        let result = await cbv2SchedCollect(try harness.engine.submit(request))
+        XCTAssertEqual(result.finishReason, .length)
+        XCTAssertEqual(result.usage?.prefixCacheOutcome, .skippedPolicy)
+        XCTAssertEqual(result.usage?.prefixCacheMatchedTokens, 2)
+        XCTAssertEqual(cache.lookupRequestIDs, [receiptID])
+        XCTAssertEqual(cache.endAdoptionRequestIDs, [receiptID])
+        XCTAssertEqual(cache.endAdoptions, cache.lookups)
+        await harness.engine.shutdown()
     }
 
     // MARK: Deadlines & watchdog

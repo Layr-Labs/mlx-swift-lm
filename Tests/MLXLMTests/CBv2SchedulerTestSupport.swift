@@ -281,6 +281,8 @@ final class CBv2SchedScriptedPrefixCache: CBv2PrefixCache, @unchecked Sendable {
     private let lock = NSLock()
     private var _lookups = 0
     private var _endAdoptions = 0
+    private var _lookupRequestIDs: [CBv2RequestID] = []
+    private var _endAdoptionRequestIDs: [CBv2RequestID] = []
 
     init(matched: Int) { self.matched = matched }
 
@@ -294,13 +296,37 @@ final class CBv2SchedScriptedPrefixCache: CBv2PrefixCache, @unchecked Sendable {
         defer { lock.unlock() }
         return _endAdoptions
     }
+    var lookupRequestIDs: [CBv2RequestID] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _lookupRequestIDs
+    }
+    var endAdoptionRequestIDs: [CBv2RequestID] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _endAdoptionRequestIDs
+    }
 
     func lookup(tokens: [Int], layerKinds: [CBv2LayerKind])
         -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])?
     {
+        lookup(tokens: tokens, layerKinds: layerKinds, requestID: nil)
+    }
+
+    func lookup(
+        requestID: CBv2RequestID, tokens: [Int], layerKinds: [CBv2LayerKind],
+        cacheSalt: String?
+    ) -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])? {
+        lookup(tokens: tokens, layerKinds: layerKinds, requestID: requestID)
+    }
+
+    private func lookup(
+        tokens: [Int], layerKinds: [CBv2LayerKind], requestID: CBv2RequestID?
+    ) -> (matched: Int, prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?])? {
         guard tokens.count > matched, matched > 0 else { return nil }
         lock.lock()
         _lookups += 1
+        if let requestID { _lookupRequestIDs.append(requestID) }
         lock.unlock()
         return (
             matched,
@@ -325,6 +351,15 @@ final class CBv2SchedScriptedPrefixCache: CBv2PrefixCache, @unchecked Sendable {
     func endAdoption(tokens: [Int], matched: Int) {
         lock.lock()
         _endAdoptions += 1
+        lock.unlock()
+    }
+
+    func endAdoption(
+        requestID: CBv2RequestID, tokens: [Int], matched: Int, cacheSalt: String?
+    ) {
+        lock.lock()
+        _endAdoptions += 1
+        _endAdoptionRequestIDs.append(requestID)
         lock.unlock()
     }
 

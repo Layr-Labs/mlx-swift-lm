@@ -5,6 +5,23 @@ import XCTest
 @testable import MLXLMCommon
 
 final class CBv2EarlyPrefixDonationTests: XCTestCase {
+    private final class CompletionFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        func markComplete() {
+            lock.lock()
+            value = true
+            lock.unlock()
+        }
+
+        var isComplete: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     private final class RecordingCache: CBv2PrefixCache, @unchecked Sendable {
         struct Donation {
             let requestID: CBv2RequestID
@@ -124,6 +141,7 @@ final class CBv2EarlyPrefixDonationTests: XCTestCase {
         model: TinyTestModel, cache: RecordingCache,
         backend: CBv2KVBackend? = nil,
         early: Bool, requestTimeout: TimeInterval = 120,
+        shutdownTimeout: TimeInterval = 10,
         maxConcurrentRequests: Int = 2,
         maxPendingEarlyPrefixDonations: Int = 2,
         modelOverride: CBv2SteppableModel? = nil
@@ -146,7 +164,8 @@ final class CBv2EarlyPrefixDonationTests: XCTestCase {
                 maxConcurrentRequests: maxConcurrentRequests, maxBatchedTokensPerStep: 128,
                 prefillChunkSize: 8, maxWaiting: 8, enablePrefixCache: true),
             loopConfig: CBv2EngineLoopConfig(
-                requestTimeout: requestTimeout, enableEarlyPrefixDonation: early,
+                requestTimeout: requestTimeout, shutdownTimeout: shutdownTimeout,
+                enableEarlyPrefixDonation: early,
                 maxPendingEarlyPrefixDonations: maxPendingEarlyPrefixDonations),
             prefixCache: cache)
     }
@@ -482,6 +501,143 @@ final class CBv2EarlyPrefixDonationTests: XCTestCase {
         await engine.shutdown()
     }
 
+    func testRepeatedPreemptionReleasesReplacementStatesBehindOneEarlyJob() throws {
+        let backend = CBv2SchedMockBackend()
+        let kinds = CBv2SchedFixtures.tinyLayerKinds(layers: 2)
+        let source = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 8, maxLength: 64)
+        let job = CBv2EarlyDonationJob(
+            requestID: CBv2RequestID(94), sourceState: source)
+
+        XCTAssertTrue(job.deferRelease(source), "the exact snapshot source must be retained")
+        for _ in 0 ..< 32 {
+            let replacement = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: 8, maxLength: 64)
+            if !job.deferRelease(replacement) {
+                backend.release(replacement)
+            }
+            XCTAssertEqual(
+                backend.liveStates, 1,
+                "replacement states from repeated preemption must release immediately")
+        }
+
+        guard let release = job.complete() else {
+            return XCTFail("the source release obligation must survive until completion")
+        }
+        XCTAssertEqual(ObjectIdentifier(release[0]!), ObjectIdentifier(source[0]!))
+        XCTAssertEqual(ObjectIdentifier(release[1]!), ObjectIdentifier(source[1]!))
+        backend.release(release)
+        XCTAssertEqual(backend.liveStates, 0)
+
+        let laterReplacement = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 8, maxLength: 64)
+        XCTAssertFalse(job.deferRelease(laterReplacement))
+        backend.release(laterReplacement)
+        XCTAssertEqual(backend.liveStates, 0)
+    }
+
+    func testShutdownWaitsForBlockedEarlyDonationToReleaseBackendState() async throws {
+        let model = TinyTestModel.make(seed: 0xE423, fullAttentionOnly: true)
+        let prompt = makePromptTokens(length: 41, seed: 13)
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28))
+        let cache = RecordingCache(blockFirstDonation: true)
+        let engine = try makeEngine(
+            model: model, cache: cache, backend: backend, early: true,
+            shutdownTimeout: 2)
+        let id = CBv2RequestID(130)
+
+        let stream = try engine.submit(request(id.raw, prompt: prompt, maxTokens: 1_000))
+        var iterator = stream.makeAsyncIterator()
+        guard case .delta? = await iterator.next() else {
+            return XCTFail("request must reach the early-donation boundary")
+        }
+        let donationStarted = await cbv2SchedWait { cache.startedDonationIDs == [id] }
+        XCTAssertTrue(donationStarted)
+        engine.cancel(id)
+        let reason = await finishReason(from: &iterator)
+        XCTAssertEqual(reason, .cancelled)
+        XCTAssertGreaterThan(backend.bytesReserved, 0)
+
+        let completed = CompletionFlag()
+        let shutdown = Task {
+            await engine.shutdown()
+            completed.markComplete()
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(completed.isComplete, "shutdown crossed a live early-donation obligation")
+        XCTAssertGreaterThan(backend.bytesReserved, 0)
+
+        cache.unblockDonations()
+        await shutdown.value
+        XCTAssertTrue(completed.isComplete)
+        XCTAssertEqual(backend.bytesReserved, 0)
+    }
+
+    func testShutdownWaitsForBlockedTerminalDonationToReleaseBackendState() async throws {
+        let model = TinyTestModel.make(seed: 0xE424, fullAttentionOnly: true)
+        let prompt = makePromptTokens(length: 41, seed: 14)
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28))
+        let cache = RecordingCache(blockFirstDonation: true)
+        let engine = try makeEngine(
+            model: model, cache: cache, backend: backend, early: false,
+            shutdownTimeout: 2)
+        let id = CBv2RequestID(140)
+
+        let result = await cbv2SchedCollect(
+            try engine.submit(request(id.raw, prompt: prompt, maxTokens: 2)))
+        XCTAssertEqual(result.finishReason, .length)
+        let donationStarted = await cbv2SchedWait { cache.startedDonationIDs == [id] }
+        XCTAssertTrue(donationStarted)
+        XCTAssertGreaterThan(backend.bytesReserved, 0)
+
+        let completed = CompletionFlag()
+        let shutdown = Task {
+            await engine.shutdown()
+            completed.markComplete()
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(completed.isComplete, "shutdown crossed a live terminal-donation obligation")
+        XCTAssertGreaterThan(backend.bytesReserved, 0)
+
+        cache.unblockDonations()
+        await shutdown.value
+        XCTAssertTrue(completed.isComplete)
+        XCTAssertEqual(backend.bytesReserved, 0)
+    }
+
+    func testBlockedDonationShutdownTimeoutKeepsStateOwnedUntilCompletion() async throws {
+        let model = TinyTestModel.make(seed: 0xE425, fullAttentionOnly: true)
+        let prompt = makePromptTokens(length: 41, seed: 15)
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 28))
+        let cache = RecordingCache(blockFirstDonation: true)
+        let engine = try makeEngine(
+            model: model, cache: cache, backend: backend, early: true,
+            shutdownTimeout: 0.1)
+        let id = CBv2RequestID(150)
+
+        let stream = try engine.submit(request(id.raw, prompt: prompt, maxTokens: 1_000))
+        var iterator = stream.makeAsyncIterator()
+        guard case .delta? = await iterator.next() else {
+            return XCTFail("request must reach the early-donation boundary")
+        }
+        let donationStarted = await cbv2SchedWait { cache.startedDonationIDs == [id] }
+        XCTAssertTrue(donationStarted)
+        engine.cancel(id)
+        let reason = await finishReason(from: &iterator)
+        XCTAssertEqual(reason, .cancelled)
+
+        let started = Date()
+        await engine.shutdown()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1)
+        XCTAssertGreaterThan(
+            backend.bytesReserved, 0,
+            "timeout must not release state while blocked snapshots still depend on it")
+
+        cache.unblockDonations()
+        let released = await cbv2SchedWait { backend.bytesReserved == 0 }
+        XCTAssertTrue(released)
+    }
+
     func testEarlySnapshotSurvivesContinuedMutationAndCancellation() async throws {
         let model = TinyTestModel.make(seed: 0xE417, fullAttentionOnly: true)
         let delayed = DelayedModel(base: model, delay: 0.005)
@@ -615,7 +771,7 @@ final class CBv2EarlyPrefixDonationTests: XCTestCase {
         let engine = try makeEngine(model: model, cache: cache, early: false)
 
         _ = await cbv2SchedCollect(try engine.submit(request(40, prompt: prompt, maxTokens: 4)))
-        let firstDonated = await cbv2SchedWait { cache.donations.count == 1 }
+        let firstDonated = await cbv2SchedWait { cache.inner.stats().entryCount == 1 }
         XCTAssertTrue(firstDonated)
         let hit = await cbv2SchedCollect(
             try engine.submit(request(41, prompt: prompt, maxTokens: 4)))

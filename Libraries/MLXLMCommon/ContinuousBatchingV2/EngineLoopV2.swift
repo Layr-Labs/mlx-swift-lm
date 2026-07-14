@@ -266,6 +266,9 @@ final class CBv2InFlightStep {
 /// `@unchecked Sendable`: immutable value handed off exactly once, submit
 /// thread → engine queue; the MLXArray views are graph-only until adopted.
 struct CBv2PrefixAdoption: @unchecked Sendable {
+    /// Correlation identity used by the lookup that owns this pin. This is
+    /// the request's receipt id when supplied, otherwise its scheduler id.
+    let requestID: CBv2RequestID
     let tokens: [Int]
     let matched: Int
     let effective: Int
@@ -313,36 +316,49 @@ private struct CBv2Handoff<Value>: @unchecked Sendable {
 /// run on different serial queues, so the lock linearizes "still pending?"
 /// with attaching retired states. The job identity, not the reusable request
 /// id, prevents an old completion from affecting a newer request.
-fileprivate final class CBv2EarlyDonationJob: @unchecked Sendable {
+final class CBv2EarlyDonationJob: @unchecked Sendable {
     let requestID: CBv2RequestID
+    /// Exact sequence rows from which this job's snapshot was built. A
+    /// preempted request may allocate replacement rows under the same reusable
+    /// request id; those rows are unrelated and must never wait behind this
+    /// donation.
+    private let sourceStateIDs: [ObjectIdentifier?]
 
     private let lock = NSLock()
     private var completed = false
-    private var deferredReleases: [[CBv2SequenceKV?]] = []
+    private var deferredRelease: [CBv2SequenceKV?]?
 
-    init(requestID: CBv2RequestID) {
+    init(requestID: CBv2RequestID, sourceState: [CBv2SequenceKV?]) {
         self.requestID = requestID
+        self.sourceStateIDs = Self.identities(of: sourceState)
     }
 
-    /// Returns true when the job took ownership of `state` until completion.
+    private static func identities(of state: [CBv2SequenceKV?]) -> [ObjectIdentifier?] {
+        state.map { sequence in sequence.map { ObjectIdentifier($0) } }
+    }
+
+    /// Returns true only when the job took ownership of its exact source
+    /// state until completion. At most one release can be attached.
     func deferRelease(_ state: [CBv2SequenceKV?]) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard !completed else { return false }
-        deferredReleases.append(state)
+        guard !completed, deferredRelease == nil,
+            Self.identities(of: state) == sourceStateIDs
+        else { return false }
+        deferredRelease = state
         return true
     }
 
     /// Mark materialization complete and transfer any waiting states back to
     /// the engine. Called exactly once by this job's donation-queue block.
-    func complete() -> [[CBv2SequenceKV?]] {
+    func complete() -> [CBv2SequenceKV?]? {
         lock.lock()
         defer { lock.unlock() }
         assert(!completed, "early donation completed more than once")
         completed = true
-        let releases = deferredReleases
-        deferredReleases.removeAll(keepingCapacity: false)
-        return releases
+        let release = deferredRelease
+        deferredRelease = nil
+        return release
     }
 }
 
@@ -444,6 +460,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var earlyDonationsScheduled: [CBv2RequestID: CBv2EarlyDonationJob] = [:]
     /// Global job accounting remains independent of reusable request ids.
     private var pendingEarlyDonationCount = 0
+    /// Donation work that currently owns a retired backend state. Natural
+    /// drain cannot complete until each obligation releases its state back on
+    /// the engine queue. Early jobs are counted only after their exact source
+    /// state retires; terminal donations are counted when queued.
+    private var pendingDonationReleaseCount = 0
     /// Resolved vision inputs (validated spans + materialized embeddings),
     /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
     /// the span chunks and needs the embeddings again); dropped at finish.
@@ -577,12 +598,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                     finishRequest(rec.id, reason: .cancelled)
                 }
                 publishGauges()
-                if !scheduler.hasWork, inFlight == nil {
-                    completeStop()
-                    waiter.resume()
-                } else {
-                    drainWaiters.append(waiter)
-                }
+                drainWaiters.append(waiter)
+                completeDrainIfReady()
             }
         }
     }
@@ -609,6 +626,19 @@ public final class EngineLoopV2: @unchecked Sendable {
         running = false
         draining = false
         stopWatchdog()
+    }
+
+    /// Natural shutdown barrier. Donation completion hops back to the engine
+    /// queue and calls this, so a drain with no scheduler work wakes promptly
+    /// instead of waiting for another polling step.
+    private func completeDrainIfReady() {
+        guard draining, !scheduler.hasWork, inFlight == nil,
+            pendingDonationReleaseCount == 0
+        else { return }
+        completeStop()
+        let waiters = drainWaiters
+        drainWaiters = []
+        for waiter in waiters { waiter.resume() }
     }
 
     // MARK: Submission (from EngineV2)
@@ -735,7 +765,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func applyAdoption(_ adoption: CBv2PrefixAdoption, requestID: CBv2RequestID) {
         defer {
             prefixCache?.endAdoption(
-                tokens: adoption.tokens, matched: adoption.matched,
+                requestID: adoption.requestID, tokens: adoption.tokens, matched: adoption.matched,
                 cacheSalt: adoption.cacheSalt)
         }
         guard let rec = scheduler.record(for: requestID), kvStates[requestID] == nil else {
@@ -791,7 +821,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func releaseAbandonedAdoption(_ adoption: CBv2PrefixAdoption?) {
         guard let adoption else { return }
         prefixCache?.endAdoption(
-            tokens: adoption.tokens, matched: adoption.matched, cacheSalt: adoption.cacheSalt)
+            requestID: adoption.requestID, tokens: adoption.tokens, matched: adoption.matched,
+            cacheSalt: adoption.cacheSalt)
     }
 
     // MARK: Cancellation & backpressure (any thread)
@@ -902,11 +933,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             publishGauges()
             if draining {
-                completeStop()
-                let waiters = drainWaiters
-                drainWaiters = []
-                for waiter in waiters { waiter.resume() }
-                return
+                completeDrainIfReady()
+                if !running { return }
             }
             scheduleIdleRecheck()
             return
@@ -1490,7 +1518,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         let promptCount = rec.request.promptTokens.count
         guard stateCoversDonation(state, tokenCount: promptCount) else { return }
 
-        let earlyDonation = CBv2EarlyDonationJob(requestID: rec.id)
+        let earlyDonation = CBv2EarlyDonationJob(requestID: rec.id, sourceState: state)
         earlyDonationsScheduled[rec.id] = earlyDonation
         pendingEarlyDonationCount += 1
         let queued = enqueueDonation(
@@ -1543,6 +1571,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             backend.release(state)
             return
         }
+        pendingDonationReleaseCount += 1
     }
 
     /// Build immutable-by-contract snapshot handles on the engine queue and
@@ -1581,6 +1610,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let layerKinds = self.layerKinds
         let handoff = CBv2Handoff(value: (state: state, snapshots: built, intent: intent))
+        if releaseAfterDonation {
+            pendingDonationReleaseCount += 1
+        }
         // Strong self on purpose: the deferred release is a pending
         // obligation of this loop — it must survive until the donation
         // lands, or the retired state leaks its pages (the paged pool is
@@ -1593,7 +1625,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 snapshots: handoff.value.snapshots, layerKinds: layerKinds,
                 cacheSalt: handoff.value.intent.cacheSalt)
             if releaseAfterDonation {
-                self.releaseOnEngineQueue(handoff.value.state)
+                self.releaseDonationStateOnEngineQueue(handoff.value.state)
             }
             if let earlyDonation {
                 self.earlyDonationDidComplete(earlyDonation)
@@ -1603,8 +1635,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func earlyDonationDidComplete(_ donation: CBv2EarlyDonationJob) {
-        for state in donation.complete() {
-            releaseOnEngineQueue(state)
+        if let state = donation.complete() {
+            releaseDonationStateOnEngineQueue(state)
         }
         engineQueue.async { [self] in
             assert(pendingEarlyDonationCount > 0, "unbalanced early donation completion")
@@ -1653,11 +1685,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             prefixCachePrefillTokensSaved: saved)
     }
 
-    private func releaseOnEngineQueue(_ state: [CBv2SequenceKV?]) {
+    private func releaseDonationStateOnEngineQueue(_ state: [CBv2SequenceKV?]) {
         let handoff = CBv2Handoff(value: state)
         engineQueue.async { [self] in
             backend.release(handoff.value)
+            assert(pendingDonationReleaseCount > 0, "unbalanced donation release completion")
+            pendingDonationReleaseCount = max(0, pendingDonationReleaseCount - 1)
             publishGauges()
+            completeDrainIfReady()
         }
     }
 
