@@ -131,6 +131,8 @@ struct CBv2MTPEngineMixedTests {
         let drafter = mtp
             ? try Gemma4CBv2MTPDrafter(drafter: fixture.drafter, target: fixture.target)
             : nil
+        let mtpConfig = makeMTPConfig(
+            enabled: mtp, maxSpeculativeBatch: maxSpeculativeBatch)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(fixture.target),
             layerKinds: kinds, backend: backend, cacheProvider: provider,
@@ -146,10 +148,18 @@ struct CBv2MTPEngineMixedTests {
             compiledDecodeConfig: CBv2CompiledDecodeConfig(
                 enabled: compiledEnabled, buckets: [1, 2], kvCapacity: 256),
             mtpDrafter: drafter,
-            mtpConfig: CBv2MTPConfig(
-                enabled: mtp, maxDraftTokens: fixedDepth,
-                maxSpeculativeBatch: maxSpeculativeBatch,
-                fixedDraftTokens: fixedDepth))
+            mtpConfig: mtpConfig)
+    }
+
+    private func makeMTPConfig(
+        enabled: Bool, maxSpeculativeBatch: Int
+    ) -> CBv2MTPConfig {
+        var config = CBv2MTPConfig(
+            enabled: enabled, maxDraftTokens: fixedDepth,
+            maxSpeculativeBatch: maxSpeculativeBatch,
+            fixedDraftTokens: fixedDepth)
+        config.runtimeChipNameOverrideForTesting = "Apple M4 Max"
+        return config
     }
 
     private func request(
@@ -264,9 +274,7 @@ struct CBv2MTPEngineMixedTests {
                 prefillChunkSize: 2, maxWaiting: 4),
             compiledDecodeConfig: .init(enabled: false),
             mtpDrafter: drafter,
-            mtpConfig: .init(
-                enabled: true, maxDraftTokens: fixedDepth,
-                maxSpeculativeBatch: 1, fixedDraftTokens: fixedDepth))
+            mtpConfig: makeMTPConfig(enabled: true, maxSpeculativeBatch: 1))
         let value = try await run(
             engine, request(id: 1, prompt: prompt, maxTokens: 8))
         let metrics = try #require(engine.mtpMetricsSnapshot())

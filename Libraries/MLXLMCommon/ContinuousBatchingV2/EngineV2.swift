@@ -147,6 +147,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// drive rounds). Lock-protected snapshot — safe to poll from any
     /// thread (provider heartbeats/telemetry).
     public func mtpMetricsSnapshot() -> CBv2MTPMetrics? { loop.mtp?.metricsSnapshot() }
+    /// Construction-time reason MTP is inactive. nil means the driver is
+    /// active. Providers can surface this alongside the nil metrics snapshot;
+    /// no request has to run before a hardware safety veto is observable.
+    public let mtpInactiveReason: String?
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
     /// Internal test hook: the admission ledger, for asserting the compiled
@@ -245,22 +249,41 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // activate it; custom samplers fail safe to ordinary target decode.
         let samplerSupportsMTP =
             sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler
-        let mtpDriver = samplerSupportsMTP
-            ? CBv2MTPRoundDriver.build(
+        let runtimeChipName =
+            mtpConfig.runtimeChipNameOverrideForTesting ?? MLXHardwareInfo.chipName
+        let hardwareSupportsMTP = MLXHardwareInfo.supportsMTPRectangularVerification(
+            chipName: runtimeChipName)
+        let mtpDriver: CBv2MTPRoundDriver?
+        if samplerSupportsMTP && hardwareSupportsMTP {
+            mtpDriver = CBv2MTPRoundDriver.build(
                 model: model, drafter: mtpDrafter, config: mtpConfig)
-            : nil
-        if mtpDrafter != nil, mtpConfig.enabled, mtpDriver == nil {
-            let reason: String
-            if !CBv2MTPConfig.envEnabled {
-                reason = "DARKBLOOM_CBV2_MTP kill switch"
-            } else if !samplerSupportsMTP {
-                reason = "sampler \(type(of: sampler)) is not proven argmax-equivalent"
-            } else {
-                reason =
-                    "model/drafter pair cannot prove matching MTP target identity or capture layers"
-            }
+        } else {
+            mtpDriver = nil
+        }
+        let mtpInactiveReason: String?
+        if mtpDriver != nil {
+            mtpInactiveReason = nil
+        } else if mtpDrafter == nil {
+            mtpInactiveReason = "no drafter supplied"
+        } else if !mtpConfig.enabled {
+            mtpInactiveReason = "configuration disabled"
+        } else if !CBv2MTPConfig.envEnabled {
+            mtpInactiveReason = "DARKBLOOM_CBV2_MTP kill switch"
+        } else if !hardwareSupportsMTP {
+            mtpInactiveReason =
+                "rectangular MTP verification is disabled on \(runtimeChipName): "
+                + "target-only and [B, 1+k] target argmax parity is not certified"
+        } else if !samplerSupportsMTP {
+            mtpInactiveReason =
+                "sampler \(type(of: sampler)) is not proven argmax-equivalent"
+        } else {
+            mtpInactiveReason =
+                "model/drafter pair cannot prove matching MTP target identity or capture layers"
+        }
+        self.mtpInactiveReason = mtpInactiveReason
+        if mtpDrafter != nil, mtpConfig.enabled, let mtpInactiveReason {
             log.info(
-                "CBv2 MTP inactive despite a bound drafter: \(reason, privacy: .public) — plain decode"
+                "CBv2 MTP inactive despite a bound drafter: \(mtpInactiveReason, privacy: .public) — plain decode"
             )
         }
         self.loop = EngineLoopV2(

@@ -34,7 +34,9 @@ struct CBv2MTPRoundSmokeTests {
     // MARK: - Fixtures (mirrors CBv2MTPModelSeamTests)
 
     /// 6-layer target, last 2 KV-shared; capture layers full=2, sliding=3.
-    private func targetConfig() throws -> Gemma4TextConfiguration {
+    private func targetConfig(
+        tieWordEmbeddings: Bool = true
+    ) throws -> Gemma4TextConfiguration {
         let json = """
             {
                 "model_type": "gemma4_text",
@@ -51,7 +53,7 @@ struct CBv2MTPRoundSmokeTests {
                                 "sliding_attention", "full_attention"],
                 "sliding_window": \(slidingWindow),
                 "final_logit_softcapping": 30.0,
-                "tie_word_embeddings": true,
+                "tie_word_embeddings": \(tieWordEmbeddings),
                 "vocab_size": \(vocabSize),
                 "vocab_size_per_layer_input": \(vocabSize),
                 "rms_norm_eps": 1e-6,
@@ -103,10 +105,14 @@ struct CBv2MTPRoundSmokeTests {
         let drafter: Gemma4AssistantDraftModel
     }
 
-    private func makeFixture(seed: UInt64 = 0x5EED) throws -> Fixture {
+    private func makeFixture(
+        seed: UInt64 = 0x5EED, deterministicTarget: Bool = false
+    ) throws -> Fixture {
         MLXRandom.seed(seed)
-        let target = Gemma4TextModel(try targetConfig())
+        let target = Gemma4TextModel(
+            try targetConfig(tieWordEmbeddings: !deterministicTarget))
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        if deterministicTarget { stabilizeCBv2MTPGreedyCycleTarget(target) }
         eval(target, drafter)
         return Fixture(target: target, drafter: drafter)
     }
@@ -124,6 +130,11 @@ struct CBv2MTPRoundSmokeTests {
             mtp
             ? try Gemma4CBv2MTPDrafter(drafter: fixture.drafter, target: fixture.target)
             : nil
+        var mtpConfig = CBv2MTPConfig(
+            enabled: mtp, maxDraftTokens: maxDraftTokens,
+            maxSpeculativeBatch: maxSpeculativeBatch,
+            fixedDraftTokens: maxDraftTokens)
+        mtpConfig.runtimeChipNameOverrideForTesting = "Apple M4 Max"
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(fixture.target),
             layerKinds: kinds,
@@ -134,10 +145,7 @@ struct CBv2MTPRoundSmokeTests {
                 prefillChunkSize: 16, maxWaiting: 16),
             compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: false),
             mtpDrafter: mtpDrafter,
-            mtpConfig: CBv2MTPConfig(
-                enabled: mtp, maxDraftTokens: maxDraftTokens,
-                maxSpeculativeBatch: maxSpeculativeBatch,
-                fixedDraftTokens: maxDraftTokens))
+            mtpConfig: mtpConfig)
     }
 
     private func greedyRequest(
@@ -239,7 +247,7 @@ struct CBv2MTPRoundSmokeTests {
     // MARK: - (3) Two verify rows in one rectangular round
 
     @Test func twoSpeculatingRowsStayTokenExact() async throws {
-        let fixture = try makeFixture()
+        let fixture = try makeFixture(deterministicTarget: true)
         let promptA = makePromptTokens(length: 12, seed: 31, vocabSize: vocabSize)
         let promptB = makePromptTokens(length: 18, seed: 32, vocabSize: vocabSize)
 
@@ -250,6 +258,12 @@ struct CBv2MTPRoundSmokeTests {
                 try await run(off, greedyRequest(id: UInt64(index + 1), prompt: prompt, maxTokens: 24)))
             await off.shutdown()
         }
+        let expectedA = cbv2MTPExpectedGreedyCycle(
+            after: promptA.last!, count: 24, vocabularySize: vocabSize)
+        let expectedB = cbv2MTPExpectedGreedyCycle(
+            after: promptB.last!, count: 24, vocabularySize: vocabSize)
+        #expect(baselines[0].tokens == expectedA)
+        #expect(baselines[1].tokens == expectedB)
 
         // Both rows greedy and running (batch gate 2): rounds batch to a
         // rectangular [2, 1+k] verify once both are decode-ready.

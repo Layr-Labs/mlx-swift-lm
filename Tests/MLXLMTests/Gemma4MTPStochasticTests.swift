@@ -66,7 +66,7 @@ struct Gemma4MTPStochasticTests {
                 "global_head_dim": 32,
                 "num_key_value_heads": 1,
                 "num_kv_shared_layers": 4,
-                "sliding_window": 64,
+                "sliding_window": 128,
                 "final_logit_softcapping": null,
                 "tie_word_embeddings": true,
                 "vocab_size": 1024,

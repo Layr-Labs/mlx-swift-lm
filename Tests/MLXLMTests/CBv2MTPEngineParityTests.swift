@@ -5,7 +5,7 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
+@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
@@ -74,7 +74,9 @@ struct CBv2MTPEngineParityTests {
     private let slidingWindow = 16
     private let k = 2
 
-    private func targetConfig() throws -> Gemma4TextConfiguration {
+    private func targetConfig(
+        tieWordEmbeddings: Bool = true
+    ) throws -> Gemma4TextConfiguration {
         let json = """
             {
                 "model_type": "gemma4_text",
@@ -91,7 +93,7 @@ struct CBv2MTPEngineParityTests {
                                 "sliding_attention", "full_attention"],
                 "sliding_window": \(slidingWindow),
                 "final_logit_softcapping": 30.0,
-                "tie_word_embeddings": true,
+                "tie_word_embeddings": \(tieWordEmbeddings),
                 "vocab_size": \(vocabSize),
                 "vocab_size_per_layer_input": \(vocabSize),
                 "rms_norm_eps": 1e-6,
@@ -142,10 +144,14 @@ struct CBv2MTPEngineParityTests {
         let drafter: Gemma4AssistantDraftModel
     }
 
-    private func makeFixture(seed: UInt64 = 0x9A7E) throws -> Fixture {
+    private func makeFixture(
+        seed: UInt64 = 0x9A7E, deterministicTarget: Bool = false
+    ) throws -> Fixture {
         MLXRandom.seed(seed)
-        let target = Gemma4TextModel(try targetConfig())
+        let target = Gemma4TextModel(
+            try targetConfig(tieWordEmbeddings: !deterministicTarget))
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        if deterministicTarget { stabilizeCBv2MTPGreedyCycleTarget(target) }
         eval(target, drafter)
         return Fixture(target: target, drafter: drafter)
     }
@@ -154,10 +160,16 @@ struct CBv2MTPEngineParityTests {
         target: Gemma4TextModel, drafter: (any CBv2MTPDrafter)?,
         maxSpeculativeBatch: Int = 4, maxConcurrent: Int = 4,
         fixedDepth: Int? = nil,
-        sampler: CBv2StepSampler = CBv2DefaultSampler()
+        sampler: CBv2StepSampler = CBv2DefaultSampler(),
+        runtimeChipNameForTesting: String? = "Apple M4 Max"
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
         let depth = fixedDepth ?? k
+        var mtpConfig = CBv2MTPConfig(
+            enabled: drafter != nil, maxDraftTokens: depth,
+            maxSpeculativeBatch: maxSpeculativeBatch,
+            fixedDraftTokens: depth)
+        mtpConfig.runtimeChipNameOverrideForTesting = runtimeChipNameForTesting
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(target),
             layerKinds: kinds,
@@ -169,10 +181,7 @@ struct CBv2MTPEngineParityTests {
                 prefillChunkSize: 16, maxWaiting: 16),
             compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: false),
             mtpDrafter: drafter,
-            mtpConfig: CBv2MTPConfig(
-                enabled: drafter != nil, maxDraftTokens: depth,
-                maxSpeculativeBatch: maxSpeculativeBatch,
-                fixedDraftTokens: depth))
+            mtpConfig: mtpConfig)
     }
 
     private func realDrafter(_ fixture: Fixture) throws -> Gemma4CBv2MTPDrafter {
@@ -220,7 +229,7 @@ struct CBv2MTPEngineParityTests {
     }
 
     @Test func b1ParityAcrossRaggedPromptLengths() async throws {
-        let fixture = try makeFixture()
+        let fixture = try makeFixture(deterministicTarget: true)
         for (index, length) in [5, 13, 24, 41].enumerated() {
             let prompt = makePromptTokens(
                 length: length, seed: UInt64(100 + index), vocabSize: vocabSize)
@@ -231,6 +240,9 @@ struct CBv2MTPEngineParityTests {
             let metrics = try #require(engine.mtpMetricsSnapshot())
             await engine.shutdown()
 
+            let expected = cbv2MTPExpectedGreedyCycle(
+                after: prompt.last!, count: 24, vocabularySize: vocabSize)
+            #expect(off.tokens == expected)
             #expect(on.tokens == off.tokens, "prompt length \(length)")
             #expect(metrics.rounds > 0)
             expectAccounting(metrics)
@@ -370,5 +382,37 @@ struct CBv2MTPEngineParityTests {
 
         #expect(expected.tokens == Array(repeating: 0, count: item.maxTokens))
         #expect(actual.tokens == expected.tokens)
+    }
+
+    @Test func m5HardwareGateFailsOpenToTargetOnlyBeforeRequests() async throws {
+        #expect(!MLXHardwareInfo.supportsMTPRectangularVerification(chipName: "Apple M5"))
+        #expect(!MLXHardwareInfo.supportsMTPRectangularVerification(chipName: "Apple M5 Max"))
+        #expect(MLXHardwareInfo.supportsMTPRectangularVerification(chipName: "Apple M4 Max"))
+        let runtimeChipName = MLXHardwareInfo.chipName
+        let simulatedChipName =
+            MLXHardwareInfo.supportsMTPRectangularVerification(chipName: runtimeChipName)
+            ? "Apple M5 Max" : nil
+        let gatedChipName = simulatedChipName ?? runtimeChipName
+
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 19, seed: 0xA55, vocabSize: vocabSize)
+        let item = request(id: 1, prompt: prompt, maxTokens: 12)
+        let targetOnly = makeEngine(target: fixture.target, drafter: nil)
+        let expected = try await run(targetOnly, item)
+        await targetOnly.shutdown()
+
+        let gated = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture),
+            runtimeChipNameForTesting: simulatedChipName)
+        #expect(gated.mtpMetricsSnapshot() == nil)
+        #expect(
+            gated.mtpInactiveReason
+                == "rectangular MTP verification is disabled on \(gatedChipName): "
+                + "target-only and [B, 1+k] target argmax parity is not certified")
+        let actual = try await run(gated, item)
+        await gated.shutdown()
+
+        #expect(actual.tokens == expected.tokens)
+        #expect(actual.finishReason == expected.finishReason)
     }
 }

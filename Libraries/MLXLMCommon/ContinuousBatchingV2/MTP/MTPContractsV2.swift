@@ -179,6 +179,9 @@ public struct CBv2MTPConfig: Sendable {
     /// rows per storage-owning layer and one in-flight step. The adaptive
     /// controller is separately keyed by a planned-decode-row bucket.
     public var maxSpeculativeBatch: Int
+    /// Test-only chip injection for construction-time hardware gating. Product
+    /// callers always use `MLXHardwareInfo.chipName`.
+    var runtimeChipNameOverrideForTesting: String?
 
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as

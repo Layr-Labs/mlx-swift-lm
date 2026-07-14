@@ -193,15 +193,27 @@ struct Gemma4AssistantDraftModelTests {
         try drafter.bind(target: target)
     }
 
+    @Test func slidingWindowMismatchReportsExactGeometry() throws {
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        var targetConfiguration = try targetConfig()
+        targetConfiguration.slidingWindow = 128
+        let target = Gemma4TextModel(targetConfiguration)
+        eval(drafter, target)
+
+        #expect(
+            throws: Gemma4MTPError.incompatibleDrafter(
+                field: "slidingAttention.slidingWindow", drafter: "64", target: "128")
+        ) {
+            try drafter.bind(target: target)
+        }
+    }
+
     @Test func captureGeometryMismatchesThrowBeforeDrafting() throws {
         typealias DrafterMutation = (inout Gemma4AssistantConfiguration) -> Void
         typealias TargetMutation = (inout Gemma4TextConfiguration) -> Void
         let noDrafterChange: DrafterMutation = { _ in }
         let noTargetChange: TargetMutation = { _ in }
         let cases: [(String, String, DrafterMutation, TargetMutation)] = [
-            (
-                "sliding window", "slidingAttention.slidingWindow",
-                noDrafterChange, { $0.slidingWindow = 32 }),
             (
                 "sliding head dimension", "slidingAttention.headDimension",
                 noDrafterChange, { $0.headDim = 16 }),
