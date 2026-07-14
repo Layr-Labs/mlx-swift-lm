@@ -148,6 +148,12 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         )
     }
 
+    /// Plain rollback is already value-exact (see `rollback`: the offset
+    /// decrement makes the un-confirmed tail structurally unreachable and
+    /// the confirmed prefix is untouched), so speculative begin/commit are
+    /// the contract's default no-ops.
+    public var supportsSpeculativeWrites: Bool { true }
+
     /// Rollback the last `n` tokens (speculative rejection). The un-confirmed
     /// tail is structurally unreachable afterwards: every view this class
     /// hands out is sliced to `..<absoluteOffset`, and the tail slots are

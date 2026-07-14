@@ -104,6 +104,16 @@ public final class PagedSequenceKV: CBv2SequenceKV {
         return (k, v, absoluteOffset)
     }
 
+    /// FULL rows: rollback frees pages past the frontier and every read is
+    /// bounded by `absoluteOffset` (see `rollback`) — value-exact, so the
+    /// contract's default no-op begin/commit suffice. WINDOWED rows: the
+    /// page ring aliases slots at distance `ringPages * pageSize`, so a
+    /// multi-token write destroys the oldest in-window entries before a
+    /// rollback could save them — the same lossy-wrap problem as the
+    /// contiguous ring, and staging is NOT implemented for the paged
+    /// backend in this phase. Windowed rows are speculation-ineligible.
+    public var supportsSpeculativeWrites: Bool { windowSize == nil }
+
     public func rollback(_ n: Int) {
         precondition(n >= 0 && n <= absoluteOffset - baseOffset, "rollback past written tokens")
         guard n > 0 else { return }

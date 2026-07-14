@@ -600,11 +600,12 @@ final class CBv2PrefixCacheWindowedPolicyTests: XCTestCase {
             PrefixCacheV2.requiredRecompute(layerKinds: gemma4Like, matched: 1024), 1024)
     }
 
-    func testGPTOSSLikeRecomputeScalesWithWindowedDepth() {
-        // gptossLike has 2 windowed(128) layers: 2 × 128 = 256 trailing
-        // tokens replayed (was 128 under the single-window bound).
+    func testGPTOSSLikeDownstreamFullLayerRequiresFullReplay() {
+        // The first full-attention layer caches K/V for replay positions whose
+        // upstream sliding context is incomplete. Those entries never age out,
+        // so a trailing-window bound cannot make partial adoption exact.
         XCTAssertEqual(
-            PrefixCacheV2.requiredRecompute(layerKinds: gptossLike, matched: 1024), 256)
+            PrefixCacheV2.requiredRecompute(layerKinds: gptossLike, matched: 1024), 1024)
     }
 
     func testAllFullModelRequiresNoRecompute() {
@@ -618,6 +619,11 @@ final class CBv2PrefixCacheWindowedPolicyTests: XCTestCase {
         // polluted early outputs feed nothing downstream.
         let kinds = [fullLayer(), windowedLayer(16)]
         XCTAssertEqual(PrefixCacheV2.requiredRecompute(layerKinds: kinds, matched: 1024), 16)
+    }
+
+    func testTrailingWindowStackUsesBoundedReplay() {
+        let kinds = [fullLayer(), windowedLayer(64), windowedLayer(128)]
+        XCTAssertEqual(PrefixCacheV2.requiredRecompute(layerKinds: kinds, matched: 1024), 256)
     }
 
     func testRecomputeClampedToMatchedPrefix() {

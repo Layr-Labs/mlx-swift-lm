@@ -1482,3 +1482,27 @@ extension Gemma4TextModel: CBv2EmbeddingForwardable {
         applyLMHead(model(inputs, cache: cache, inputEmbedding: inputEmbedding))
     }
 }
+
+// MARK: - ContinuousBatchingV2 MTP (speculative decoding)
+
+/// The CBv2 engine's MTP verify surface (`CBv2MTPForwardable`): the plain
+/// forward plus the PRE-norm last-decoder-layer hidden the Gemma-4 drafter
+/// chains from, and the layer indices the engine snapshots for the drafter's
+/// frozen KV. The logits side is numerically identical to
+/// `callAsFunction(_:cache:)` — same trunk, same LM head, same softcap.
+extension Gemma4TextModel: CBv2MTPForwardable {
+
+    public var cbv2MTPCaptureLayers: CBv2MTPCaptureLayers? {
+        let full = model.lastFullAttentionNonSharedIdx
+        let sliding = model.lastSlidingAttentionNonSharedIdx
+        guard full >= 0, sliding >= 0 else { return nil }
+        return CBv2MTPCaptureLayers(full: full, sliding: sliding)
+    }
+
+    public func cbv2ForwardWithHidden(
+        _ tokens: MLXArray, caches: [KVCache]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
+        return (applyLMHead(postNorm), preNorm)
+    }
+}

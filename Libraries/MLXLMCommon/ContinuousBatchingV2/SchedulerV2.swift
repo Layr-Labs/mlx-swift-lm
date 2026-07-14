@@ -137,6 +137,14 @@ public final class SchedulerV2 {
     /// can run without any capacity model.
     let capacity: CBv2StepCapacity?
 
+    /// MTP speculation hook (set by the engine loop): returns the number of
+    /// EXTRA speculative draft tokens (k ≥ 0) to plan for a decode-ready
+    /// RUNNING row this step, making its assignment 1 + k. Consulted ONLY
+    /// when `remainingTokens == 1` — never for paused/cancelled rows,
+    /// prefill chunks, or waiting admission. nil ⇒ planning is byte-identical
+    /// to plain decode.
+    public var speculationPlanner: ((CBv2ScheduledRequest) -> Int)?
+
     /// RUNNING requests, in admission order (plan preserves this order,
     /// with ONE exception: a row starved by the block-chunk guard is moved
     /// to the front — see `deferredBlockRequestID`).
@@ -170,6 +178,9 @@ public final class SchedulerV2 {
     public var runningCount: Int { running.count }
     public var hasWork: Bool { !running.isEmpty || !waiting.isEmpty }
     /// Tokens known + in flight across running requests (capacity snapshot).
+    /// Includes `pendingSamples` — an in-flight MTP row counts its 1+k
+    /// unconfirmed drafts — an intentionally optimistic capacity signal
+    /// (finalize discards trim it right back).
     public var activeTokens: Int { running.reduce(0) { $0 + $1.effectiveTokenCount } }
 
     public func record(for id: CBv2RequestID) -> CBv2ScheduledRequest? { byID[id] }
@@ -225,6 +236,7 @@ public final class SchedulerV2 {
         var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
         var assignmentIndex: [CBv2RequestID: Int] = [:]
         var preemptions: [CBv2RequestID] = []
+        var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback] = [:]
         var stopScheduling = false
 
         // 0. Starved block-sized chunk from the previous step: first claim on
@@ -256,7 +268,20 @@ public final class SchedulerV2 {
                 continue
             }
             var n = rec.remainingTokens
-            if n > 1 { n = min(n, config.prefillChunkSize) }  // chunk prefill only
+            var speculated = false
+            if n > 1 {
+                n = min(n, config.prefillChunkSize)  // chunk prefill only
+            } else if let planner = speculationPlanner {
+                // MTP: 1 known token + k speculative draft slots. Speculation
+                // never eats into a smaller budget — fall back to plain decode.
+                let k = max(0, planner(rec))
+                if k > 0, 1 + k <= budget {
+                    n = 1 + k
+                    speculated = true
+                } else if k > 0 {
+                    speculationFallbacks[rec.id] = .tokenBudget
+                }
+            }
             n = min(n, budget)
             // Vision requests: never split a multimodal block across chunks
             // (snap to block edges; extend over prefillChunkSize when the
@@ -278,6 +303,14 @@ public final class SchedulerV2 {
                     try capacity?.reserve(id: rec.id, additionalTokens: n)
                     reserved = true
                 } catch {
+                    // Speculative slack must never trigger the preemption
+                    // backstop: retry once as plain decode before preempting.
+                    if speculated {
+                        n = 1
+                        speculated = false
+                        speculationFallbacks[rec.id] = .kvHeadroom
+                        continue
+                    }
                     guard let victim = preemptionVictim() else {
                         stopScheduling = true
                         break
@@ -327,8 +360,11 @@ public final class SchedulerV2 {
                     continue
                 }
                 if rec.cancelRequested { break }  // engine cleans at the boundary
-                // A preempted request whose in-flight sample is unconfirmed
-                // cannot re-prefill yet (its token values are not host-visible).
+                // A preempted request whose in-flight samples are unconfirmed
+                // cannot re-prefill yet (its token values are not
+                // host-visible). MTP rows may hold up to 1+k pendings; they
+                // stay blocked here until the finalize-side correction
+                // (recordSampled + discardPendingSamples) zeroes them.
                 guard rec.pendingSamples == 0 else { break }
                 var chunk = min(rec.remainingTokens, config.prefillChunkSize, budget)
                 // Same block snapping as the running path. 0 ⇒ this step's
@@ -361,7 +397,8 @@ public final class SchedulerV2 {
 
         return CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
-            preemptions: preemptions)
+            preemptions: preemptions,
+            speculationFallbacks: speculationFallbacks)
     }
 
     /// One-off admission of a starved block-bearing WAITING row ahead of the
@@ -404,6 +441,8 @@ public final class SchedulerV2 {
     /// path). Requests admitted from waiting by this plan stay in `running`
     /// with zero progress — the next `plan()` reassigns them (vLLM never
     /// un-admits except via preemption). Preemptions are NOT undone.
+    /// Speculative 1+k assignments roll back unchanged (full n subtracted
+    /// and unreserved — nothing was marked pending yet).
     public func rollback(_ plan: CBv2StepPlan) {
         for (id, n) in plan.assignments {
             guard let rec = byID[id] else { continue }
@@ -418,6 +457,36 @@ public final class SchedulerV2 {
     /// `ids` (deferred confirmation — the values are still lazy).
     public func markPendingSamples(ids: [CBv2RequestID]) {
         for id in ids { byID[id]?.pendingSamples += 1 }
+    }
+
+    /// Multi-count variant for MTP speculation: the launched step samples
+    /// `count` tokens (1 known + k drafts) for each row.
+    public func markPendingSamples(counts: [(id: CBv2RequestID, count: Int)]) {
+        for (id, count) in counts { byID[id]?.pendingSamples += count }
+    }
+
+    /// Finalize-side correction for speculative samples that were rejected
+    /// or truncated: drop `count` launched-but-unconfirmed samples without
+    /// confirming tokens (the accepted prefix is confirmed via
+    /// `recordSampled`, one call per token).
+    public func discardPendingSamples(id: CBv2RequestID, count: Int) {
+        guard let rec = byID[id] else { return }
+        rec.pendingSamples = max(0, rec.pendingSamples - count)
+    }
+
+    /// Finalize-side rejection of speculative writes: roll back the
+    /// optimistic `numComputedTokens` advance for an executed-but-rejected
+    /// suffix and return its reservation (mirrors `rollback(_:)`).
+    /// No-op for unknown ids: a request that finished mid-flight already
+    /// dropped ALL its reservations via the finish path's `releaseAll`
+    /// (`AdmissionV2.unreserve`/`releaseAll` clamp at zero, so even a late
+    /// double release could not underflow the ledger). Preempted rows are
+    /// safe too: `numComputedTokens` clamps at 0 and unreserving a released
+    /// id is a no-op.
+    public func rollbackComputed(id: CBv2RequestID, tokens n: Int) {
+        guard let rec = byID[id] else { return }
+        rec.numComputedTokens = max(0, rec.numComputedTokens - n)
+        capacity?.unreserve(id: id, tokens: n)
     }
 
     /// Confirm one sampled token (called at step finalization, one step
@@ -461,6 +530,12 @@ public final class SchedulerV2 {
     /// The engine compares this against the in-flight step's sampled rows to
     /// decide whether to build step N+1 on top of step N's lazy tokens
     /// (SGLang-MLX chained overlap; chain breaks on ANY membership change).
+    ///
+    /// NOTE (MTP): an in-flight MTP row keeps `remainingTokens == 1` by the
+    /// plan-time invariant (`numComputedTokens` +1+k, `pendingSamples` +1+k),
+    /// so it reads decode-ready here exactly like a plain decode row. That
+    /// is intended — the engine guards chaining off MTP steps itself; this
+    /// eligibility check stays agnostic.
     public func chainCandidateIDs() -> [CBv2RequestID]? {
         guard !running.isEmpty else { return nil }
         var ids: [CBv2RequestID] = []

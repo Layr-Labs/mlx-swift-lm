@@ -139,6 +139,18 @@ public final class CBv2QuantizedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvid
     /// (see `snapshot()`), so the engine must not donate this row's state.
     public var snapshotIsLossless: Bool { false }
 
+    /// Value-exact under multi-token write + rollback, so speculative
+    /// begin/commit are the contract's default no-ops. VERDICT: MLX
+    /// quantization groups span the LAST axis only (headDim — `groupSize`
+    /// must divide it, see `resolvedGroupSize`), never the token axis, so
+    /// each token position's (weights, scales, biases) rows are computed
+    /// independently of every other token in the same `quantized()` call.
+    /// Writing `n` tokens then decrementing `absoluteOffset` therefore
+    /// leaves the confirmed prefix's quantized content bit-identical to
+    /// having written only that prefix (`dequantizedView` slices the token
+    /// axis at `..<offset`).
+    public var supportsSpeculativeWrites: Bool { true }
+
     /// See `CBv2FullSequenceKV.rollback` — the stale tail is structurally
     /// unreachable (views sliced to `..<absoluteOffset`, overwritten before
     /// re-exposure).

@@ -141,6 +141,16 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// NOTE: counters are engine-thread owned; read at quiescent points
     /// (after streams finish) for exact values.
     public var compiledDecodeStats: CBv2CompiledDecodeStats? { loop.compiledDecode?.stats }
+
+    /// Cumulative MTP (speculative decoding) counters, or nil when MTP is
+    /// inactive (no drafter, config/kill-switch off, or a model that cannot
+    /// drive rounds). Lock-protected snapshot — safe to poll from any
+    /// thread (provider heartbeats/telemetry).
+    public func mtpMetricsSnapshot() -> CBv2MTPMetrics? { loop.mtp?.metricsSnapshot() }
+    /// Construction-time reason MTP is inactive. nil means the driver is
+    /// active. Providers can surface this alongside the nil metrics snapshot;
+    /// no request has to run before a hardware safety veto is observable.
+    public let mtpInactiveReason: String?
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
     /// Internal test hook: the admission ledger, for asserting the compiled
@@ -158,7 +168,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
         admissionConfig: AdmissionV2.Config = AdmissionV2.Config(),
         prefixCache: CBv2PrefixCache? = nil,
-        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig()
+        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig(),
+        mtpDrafter: (any CBv2MTPDrafter)? = nil,
+        mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
@@ -232,6 +244,48 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             kvBytesBackendCapacity: backend.bytesCapacity,
             kvBytesReserved: compiledDecode?.admissionPaddingReserve ?? 0)
         self.gauges = gauges
+        // MTP verification bypasses the sampler and emits raw target
+        // argmaxes. Only the two known argmax-equivalent implementations may
+        // activate it; custom samplers fail safe to ordinary target decode.
+        let samplerSupportsMTP =
+            sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler
+        let runtimeChipName =
+            mtpConfig.runtimeChipNameOverrideForTesting ?? MLXHardwareInfo.chipName
+        let hardwareSupportsMTP = MLXHardwareInfo.supportsMTPRectangularVerification(
+            chipName: runtimeChipName)
+        let mtpDriver: CBv2MTPRoundDriver?
+        if samplerSupportsMTP && hardwareSupportsMTP {
+            mtpDriver = CBv2MTPRoundDriver.build(
+                model: model, drafter: mtpDrafter, config: mtpConfig)
+        } else {
+            mtpDriver = nil
+        }
+        let mtpInactiveReason: String?
+        if mtpDriver != nil {
+            mtpInactiveReason = nil
+        } else if mtpDrafter == nil {
+            mtpInactiveReason = "no drafter supplied"
+        } else if !mtpConfig.enabled {
+            mtpInactiveReason = "configuration disabled"
+        } else if !CBv2MTPConfig.envEnabled {
+            mtpInactiveReason = "DARKBLOOM_CBV2_MTP kill switch"
+        } else if !hardwareSupportsMTP {
+            mtpInactiveReason =
+                "rectangular MTP verification is disabled on \(runtimeChipName): "
+                + "target-only and [B, 1+k] target argmax parity is not certified"
+        } else if !samplerSupportsMTP {
+            mtpInactiveReason =
+                "sampler \(type(of: sampler)) is not proven argmax-equivalent"
+        } else {
+            mtpInactiveReason =
+                "model/drafter pair cannot prove matching MTP target identity or capture layers"
+        }
+        self.mtpInactiveReason = mtpInactiveReason
+        if mtpDrafter != nil, mtpConfig.enabled, let mtpInactiveReason {
+            log.info(
+                "CBv2 MTP inactive despite a bound drafter: \(mtpInactiveReason, privacy: .public) — plain decode"
+            )
+        }
         self.loop = EngineLoopV2(
             model: model,
             layerKinds: layerKinds,
@@ -243,6 +297,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             capacity: admission,
             prefixCache: activePrefixCache,
             compiledDecode: compiledDecode,
+            mtp: mtpDriver,
             config: loopConfig,
             gauges: gauges)
         loop.start()
