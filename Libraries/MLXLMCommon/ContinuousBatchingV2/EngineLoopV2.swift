@@ -473,6 +473,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// next eager bind must be forced to rebuild `positionOffsets` from
     /// host truth (see `eagerCaches`).
     var eagerCompositionStale = false
+    /// True when the eager provider no longer retains its most recently
+    /// bound rows. Kept separate from offset staleness: a rejecting MTP
+    /// round makes offsets stale without releasing the eager bindings.
+    var eagerBindingsReleased = true
 
     /// Telemetry / test hooks.
     public private(set) var stepCount = 0
@@ -948,6 +952,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // rebind, pinning dead KV on an idle engine (PR#62 review).
             // No-op after the first call while idle.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            eagerBindingsReleased = true
             publishGauges()
             if draining {
                 completeStop()
@@ -1006,7 +1011,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             (cacheProvider as? CBv2CompositionInvalidating)?.invalidateBoundComposition()
             eagerCompositionStale = false
         }
-        return cacheProvider.layerCaches(rowStates: rowStates)
+        let caches = cacheProvider.layerCaches(rowStates: rowStates)
+        eagerBindingsReleased = false
+        return caches
     }
 
     /// Inner-state arrays (lazily-mutated KV buffers + the on-device
@@ -1034,16 +1041,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             let compiled = compiledDecode.decodeStep(rowStates: rowStates, tokens: tokens)
         {
             // First compiled step after an eager bind: release the eager
-            // caches' row bindings alongside marking them stale. Compiled
-            // steps never rebind the eager caches, so a compiled-only
-            // stretch would otherwise pin the last eager batch's rows —
-            // retired ones included — indefinitely (PR#62 review). Guarded
-            // by the stale flag so the chained compiled hot path pays this
-            // exactly once per eager→compiled transition.
-            if !eagerCompositionStale {
-                eagerCompositionStale = true
+            // caches' row bindings. Offset staleness is not sufficient as
+            // the guard: a rejecting MTP round already marks offsets stale
+            // while leaving its eager rows bound. Compiled-only work must
+            // still release those rows exactly once.
+            if !eagerBindingsReleased {
                 (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+                eagerBindingsReleased = true
             }
+            eagerCompositionStale = true
             return (compiled, [])
         }
         let caches = eagerCaches(rowStates: rowStates)

@@ -30,6 +30,86 @@ private final class MTPTestSequenceKV: CBv2SequenceKV {
     func rollback(_ n: Int) { absoluteOffset -= n }
 }
 
+private final class MTPRejectingPrepared: CBv2MTPPreparedCapture {}
+
+/// Returns the input token as every draft. The deterministic cycle target
+/// predicts input+1, so every verify round rejects at position zero.
+private final class MTPRejectingDrafter: CBv2MTPDrafter {
+    let mtpTargetIdentity: ObjectIdentifier?
+
+    init(target: Gemma4TextModel) {
+        self.mtpTargetIdentity = ObjectIdentifier(target)
+    }
+
+    func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
+        MTPRejectingPrepared()
+    }
+
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        (tokens.squeezed(axis: 1), hidden)
+    }
+}
+
+private final class MTPReleaseTrackingCacheProvider: CBv2LayerCacheProvider,
+    CBv2CompositionInvalidating, @unchecked Sendable
+{
+    private let bank: CBv2LayerCacheBank
+    private let lock = NSLock()
+    private var retainsBoundRows = false
+    private var staleObserver: (() -> Bool)?
+    private var _releasesWhileBoundAndStale = 0
+
+    init(layerKinds: [CBv2LayerKind]) {
+        self.bank = CBv2LayerCacheBank(layerKinds: layerKinds)
+    }
+
+    var uniformAttentionSoftcap: Float?? { bank.uniformAttentionSoftcap }
+    var supportsMultimodalSpans: Bool { bank.supportsMultimodalSpans }
+
+    var releasesWhileBoundAndStale: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _releasesWhileBoundAndStale
+    }
+
+    func observeStaleness(_ observer: @escaping () -> Bool) {
+        lock.lock()
+        staleObserver = observer
+        lock.unlock()
+    }
+
+    func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+        let caches = bank.layerCaches(rowStates: rowStates)
+        lock.lock()
+        retainsBoundRows = true
+        lock.unlock()
+        return caches
+    }
+
+    func invalidateBoundComposition() {
+        // Invalidation alone does not clear the caches' strong row arrays.
+        bank.invalidateBoundComposition()
+    }
+
+    func releaseBoundRows() {
+        lock.lock()
+        let wasRetaining = retainsBoundRows
+        let observer = staleObserver
+        lock.unlock()
+        let wasAlreadyStale = observer?() ?? false
+
+        bank.releaseBoundRows()
+        lock.lock()
+        if wasRetaining && wasAlreadyStale {
+            _releasesWhileBoundAndStale += 1
+        }
+        retainsBoundRows = false
+        lock.unlock()
+    }
+}
+
 @Suite("CBv2MTPEngineMixed", .serialized)
 struct CBv2MTPEngineMixedTests {
     private let vocabSize = 256
@@ -37,7 +117,9 @@ struct CBv2MTPEngineMixedTests {
     private let slidingWindow = 16
     private let fixedDepth = 2
 
-    private func targetConfig() throws -> Gemma4TextConfiguration {
+    private func targetConfig(
+        tieWordEmbeddings: Bool = true
+    ) throws -> Gemma4TextConfiguration {
         let json = """
             {
                 "model_type": "gemma4_text",
@@ -54,7 +136,7 @@ struct CBv2MTPEngineMixedTests {
                                 "sliding_attention", "full_attention"],
                 "sliding_window": \(slidingWindow),
                 "final_logit_softcapping": 30.0,
-                "tie_word_embeddings": true,
+                "tie_word_embeddings": \(tieWordEmbeddings),
                 "vocab_size": \(vocabSize),
                 "vocab_size_per_layer_input": \(vocabSize),
                 "rms_norm_eps": 1e-6,
@@ -105,10 +187,14 @@ struct CBv2MTPEngineMixedTests {
         let drafter: Gemma4AssistantDraftModel
     }
 
-    private func makeFixture(seed: UInt64 = 0x5EED) throws -> Fixture {
+    private func makeFixture(
+        seed: UInt64 = 0x5EED, deterministicTarget: Bool = false
+    ) throws -> Fixture {
         MLXRandom.seed(seed)
-        let target = Gemma4TextModel(try targetConfig())
+        let target = Gemma4TextModel(
+            try targetConfig(tieWordEmbeddings: !deterministicTarget))
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        if deterministicTarget { stabilizeCBv2MTPGreedyCycleTarget(target) }
         eval(target, drafter)
         return Fixture(target: target, drafter: drafter)
     }
@@ -122,15 +208,23 @@ struct CBv2MTPEngineMixedTests {
         backend: CBv2KVBackend? = nil,
         cacheProvider: CBv2LayerCacheProvider? = nil,
         prefixCache: CBv2PrefixCache? = nil,
-        earlyPrefixDonation: Bool = false
+        earlyPrefixDonation: Bool = false,
+        eventBufferCapacity: Int = 256,
+        mtpDrafter: (any CBv2MTPDrafter)? = nil
     ) throws -> EngineV2 {
         let kinds = fixture.target.cbv2LayerKinds
         let backend = backend
             ?? CBv2ContiguousKVBackend(config: .init(bytesCapacity: bytesCapacity))
         let provider = cacheProvider ?? CBv2LayerCacheBank(layerKinds: kinds)
-        let drafter = mtp
-            ? try Gemma4CBv2MTPDrafter(drafter: fixture.drafter, target: fixture.target)
-            : nil
+        let drafter: (any CBv2MTPDrafter)?
+        if mtp, let mtpDrafter {
+            drafter = mtpDrafter
+        } else if mtp {
+            drafter = try Gemma4CBv2MTPDrafter(
+                drafter: fixture.drafter, target: fixture.target)
+        } else {
+            drafter = nil
+        }
         let mtpConfig = makeMTPConfig(
             enabled: mtp, maxSpeculativeBatch: maxSpeculativeBatch)
         return EngineV2(
@@ -142,6 +236,7 @@ struct CBv2MTPEngineMixedTests {
                 prefillChunkSize: prefillChunkSize, maxWaiting: 16,
                 enablePrefixCache: prefixCache != nil),
             loopConfig: CBv2EngineLoopConfig(
+                eventBufferCapacity: eventBufferCapacity,
                 enableEarlyPrefixDonation: earlyPrefixDonation),
             admissionConfig: admissionConfig,
             prefixCache: prefixCache,
@@ -406,6 +501,48 @@ struct CBv2MTPEngineMixedTests {
         await engine.shutdown()
         #expect(value.tokens == expected.tokens)
         #expect(metrics.rounds > 0)
+    }
+
+    @Test func rejectedMTPBindingsReleaseBeforeCompiledOnlyStretch() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let provider = MTPReleaseTrackingCacheProvider(
+            layerKinds: fixture.target.cbv2LayerKinds)
+        let engine = try makeEngine(
+            fixture, mtp: true, prefillChunkSize: 8, compiledEnabled: true,
+            cacheProvider: provider, eventBufferCapacity: 16,
+            mtpDrafter: MTPRejectingDrafter(target: fixture.target))
+        provider.observeStaleness { [weak engine] in
+            engine?.loopForTesting.eagerCompositionStale ?? false
+        }
+        let greedy = request(
+            id: 1,
+            prompt: makePromptTokens(length: 16, seed: 0xB01, vocabSize: vocabSize),
+            maxTokens: 64)
+        let ineligible = request(
+            id: 2,
+            prompt: makePromptTokens(length: 64, seed: 0xB02, vocabSize: vocabSize),
+            maxTokens: 64, temperature: 0.7, seed: 9)
+        let greedyStream = try engine.submit(greedy)
+        let ineligibleStream = try engine.submit(ineligible)
+
+        let released = await cbv2SchedWait(timeoutSeconds: 3) {
+            let metrics = engine.mtpMetricsSnapshot()
+            return (metrics?.rounds ?? 0) > 0
+                && metrics?.acceptedTokens == 0
+                && (engine.compiledDecodeStats?.compiledSteps ?? 0) > 0
+                && provider.releasesWhileBoundAndStale > 0
+        }
+
+        engine.cancel(greedy.id)
+        engine.cancel(ineligible.id)
+        async let greedyResult = cbv2SchedCollect(greedyStream)
+        async let ineligibleResult = cbv2SchedCollect(ineligibleStream)
+        _ = await (greedyResult, ineligibleResult)
+        await engine.shutdown()
+
+        #expect(
+            released,
+            "compiled decode must release eager rows retained by a rejected MTP round")
     }
 
     @Test func earlyDonationOnUnsafeHybridFallsBackToFullReplay() async throws {
