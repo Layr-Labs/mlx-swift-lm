@@ -196,6 +196,7 @@ final class CBv2MTPRoundDriver {
         self.captureLayers = captureLayers
         self.depthController = CBv2MTPDepthController(
             maxDepth: config.maxDraftTokens, fixedDepth: config.fixedDraftTokens)
+        self.metrics.verificationMode = config.verificationMode
     }
 
     /// Build the driver, or nil when MTP cannot activate: config off (or the

@@ -24,16 +24,18 @@ private final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
     private let script: [Int]
     private let promptLength: Int
     private let offset: Int
+    private let offsetsByStep: [Int]?
     private let vocabSize: Int
     let mtpTargetIdentity: ObjectIdentifier?
 
     init(
         script: [Int], promptLength: Int, offset: Int, vocabSize: Int,
-        target: Gemma4TextModel
+        target: Gemma4TextModel, offsetsByStep: [Int]? = nil
     ) {
         self.script = script
         self.promptLength = promptLength
         self.offset = offset
+        self.offsetsByStep = offsetsByStep
         self.vocabSize = vocabSize
         self.mtpTargetIdentity = ObjectIdentifier(target)
     }
@@ -51,7 +53,10 @@ private final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
         let ids = cursor.baseIndices.map { base -> Int32 in
             let index = base + cursor.step
             let value = index < script.count ? script[index] : 0
-            return Int32((value + offset) % vocabSize)
+            let stepOffset = offsetsByStep.flatMap {
+                cursor.step < $0.count ? $0[cursor.step] : nil
+            } ?? offset
+            return Int32((value + stepOffset) % vocabSize)
         }
         return (MLXArray(ids), hidden)
     }
@@ -161,15 +166,15 @@ struct CBv2MTPEngineParityTests {
         maxSpeculativeBatch: Int = 4, maxConcurrent: Int = 4,
         fixedDepth: Int? = nil,
         sampler: CBv2StepSampler = CBv2DefaultSampler(),
-        runtimeChipNameForTesting: String? = "Apple M4 Max"
+        verificationMode: CBv2MTPVerificationMode = .serialTarget
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
         let depth = fixedDepth ?? k
-        var mtpConfig = CBv2MTPConfig(
+        let mtpConfig = CBv2MTPConfig(
             enabled: drafter != nil, maxDraftTokens: depth,
             maxSpeculativeBatch: maxSpeculativeBatch,
-            fixedDraftTokens: depth)
-        mtpConfig.runtimeChipNameOverrideForTesting = runtimeChipNameForTesting
+            fixedDraftTokens: depth,
+            verificationMode: verificationMode)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(target),
             layerKinds: kinds,
@@ -329,6 +334,30 @@ struct CBv2MTPEngineParityTests {
         expectAccounting(metrics)
     }
 
+    @Test func repeatedPartialRejectionCommitsOnlyCanonicalTargetKV() async throws {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 21, seed: 403, vocabSize: vocabSize)
+        let probe = try await baseline(fixture, prompt: prompt, maxTokens: 32)
+        let maxTokens = 24
+        let engine = makeEngine(
+            target: fixture.target,
+            drafter: CBv2ParityScriptedDrafter(
+                script: probe.tokens, promptLength: prompt.count, offset: 0,
+                vocabSize: vocabSize, target: fixture.target,
+                offsetsByStep: [0, 1]))
+        let on = try await run(engine, request(id: 1, prompt: prompt, maxTokens: maxTokens))
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+
+        #expect(on.tokens == Array(probe.tokens.prefix(maxTokens)))
+        #expect(metrics.rounds > 2)
+        #expect(metrics.acceptedTokens > 0)
+        #expect(metrics.acceptedTokens < metrics.draftedTokens)
+        #expect(metrics.perPositionAccepted.first == metrics.acceptedTokens)
+        #expect(metrics.perPositionAccepted.dropFirst().allSatisfy { $0 == 0 })
+        expectAccounting(metrics)
+    }
+
     @Test func fullAcceptanceTailKeepsWholeB4TargetBatchPlain() async throws {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 18, seed: 490, vocabSize: vocabSize)
@@ -384,16 +413,14 @@ struct CBv2MTPEngineParityTests {
         #expect(actual.tokens == expected.tokens)
     }
 
-    @Test func m5HardwareGateFailsOpenToTargetOnlyBeforeRequests() async throws {
-        #expect(!MLXHardwareInfo.supportsMTPRectangularVerification(chipName: "Apple M5"))
-        #expect(!MLXHardwareInfo.supportsMTPRectangularVerification(chipName: "Apple M5 Max"))
-        #expect(MLXHardwareInfo.supportsMTPRectangularVerification(chipName: "Apple M4 Max"))
-        let runtimeChipName = MLXHardwareInfo.chipName
-        let simulatedChipName =
-            MLXHardwareInfo.supportsMTPRectangularVerification(chipName: runtimeChipName)
-            ? "Apple M5 Max" : nil
-        let gatedChipName = simulatedChipName ?? runtimeChipName
-
+    @Test func serialTargetVerificationIsActiveWithoutHardwareGating() async throws {
+        #expect(CBv2MTPConfig().verificationMode == .serialTarget)
+        for chip in ["M1", "M2", "M3", "M4", "M5", "M5 Pro", "M5 Max"] {
+            // Hardware identity is intentionally not an input to the default
+            // verification strategy. This message keeps every supported
+            // generation explicit if the default ever regresses.
+            #expect(CBv2MTPConfig().verificationMode == .serialTarget, "chip \(chip)")
+        }
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 19, seed: 0xA55, vocabSize: vocabSize)
         let item = request(id: 1, prompt: prompt, maxTokens: 12)
@@ -401,18 +428,39 @@ struct CBv2MTPEngineParityTests {
         let expected = try await run(targetOnly, item)
         await targetOnly.shutdown()
 
-        let gated = makeEngine(
-            target: fixture.target, drafter: try realDrafter(fixture),
-            runtimeChipNameForTesting: simulatedChipName)
-        #expect(gated.mtpMetricsSnapshot() == nil)
-        #expect(
-            gated.mtpInactiveReason
-                == "rectangular MTP verification is disabled on \(gatedChipName): "
-                + "target-only and [B, 1+k] target argmax parity is not certified")
-        let actual = try await run(gated, item)
-        await gated.shutdown()
+        let active = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture))
+        #expect(active.mtpInactiveReason == nil)
+        #expect(active.loopForTesting.mtp?.config.verificationMode == .serialTarget)
+        let actual = try await run(active, item)
+        let metrics = try #require(active.mtpMetricsSnapshot())
+        await active.shutdown()
 
         #expect(actual.tokens == expected.tokens)
         #expect(actual.finishReason == expected.finishReason)
+        #expect(metrics.rounds > 0)
+    }
+
+    @Test func rectangularVerificationRemainsAnExplicitOptimization() async throws {
+        // Rectangular target tests use a deterministic wide-margin cycle.
+        // Random near-tie logits are intentionally not a cross-kernel parity
+        // oracle on Apple GPUs.
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompt = makePromptTokens(length: 19, seed: 0xA56, vocabSize: vocabSize)
+        let item = request(id: 1, prompt: prompt, maxTokens: 12)
+        let targetOnly = makeEngine(target: fixture.target, drafter: nil)
+        let expected = try await run(targetOnly, item)
+        await targetOnly.shutdown()
+
+        let optimized = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture),
+            verificationMode: .rectangular)
+        #expect(optimized.loopForTesting.mtp?.config.verificationMode == .rectangular)
+        let actual = try await run(optimized, item)
+        let metrics = try #require(optimized.mtpMetricsSnapshot())
+        await optimized.shutdown()
+
+        #expect(actual.tokens == expected.tokens)
+        #expect(metrics.rounds > 0)
     }
 }

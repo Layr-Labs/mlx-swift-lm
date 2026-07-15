@@ -209,7 +209,7 @@ extension EngineLoopV2 {
         guard !verifyRows.isEmpty else { return nil }
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
-        precondition(depths.count == 1, "CBv2 MTP: one plan must use one rectangular depth")
+        precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
         let k = depths.first!
         let batch = verifyRows.count
         var captures: [CBv2MTPRowCapture] = []
@@ -225,7 +225,7 @@ extension EngineLoopV2 {
             // MLX versioning freezes the assistant's pre-round KV reads.
             let fullRow = state[mtp.captureLayers.full]!
             let slidingRow = state[mtp.captureLayers.sliding]!
-            assert(
+            precondition(
                 fullRow.absoluteOffset == carry.kvOffset,
                 "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
             )
@@ -271,23 +271,21 @@ extension EngineLoopV2 {
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
-        let verifyTokens = concatenated(
-            [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }, axis: 1)
-        let caches = eagerCaches(rowStates: verifyRows.map { kvStates[$0.rec.id]! })
-        let (verifyLogits, verifyHidden) = mtp.model.forwardWithHidden(
-            tokens: verifyTokens, caches: caches)
-        cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
-        let targetArgmax = argMax(verifyLogits, axis: -1).asType(.int32)
+        let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
+        let target = mtpBuildTargetVerification(
+            columns: targetColumns, rows: verifyRows, driver: mtp)
+        cacheInnerState.append(contentsOf: target.cacheInnerState)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
         let acceptancePacket = concatenated(
-            [draftIDs.reshaped([-1]), targetArgmax.reshaped([-1])], axis: 0)
+            [draftIDs.reshaped([-1]), target.argmax.reshaped([-1])], axis: 0)
         return CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
-            lastHidden: verifyHidden)
+            lastHidden: target.hidden)
     }
+
 }

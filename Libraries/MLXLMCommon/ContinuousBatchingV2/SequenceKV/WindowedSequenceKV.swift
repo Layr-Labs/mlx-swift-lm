@@ -44,13 +44,13 @@ import MLX
 /// The post-wrap window shrink above is CORRECT but numerically divergent
 /// from a non-speculative run, which breaks the MTP acceptance gate (MTP-on
 /// must be token-exact vs MTP-off for greedy). `beginSpeculativeWrite()`
-/// therefore arms a STAGED mode for the next `update()`: the update returns
-/// exactly the views a plain update would return and advances
-/// `absoluteOffset`, but the destructive ring writes (and the
-/// `oldestValidPosition` advance) are deferred to
-/// `commitSpeculativeWrite()`. A `rollback(m)` in between is a pure counter
-/// move — nothing was destroyed — so after commit the state is value-exactly
-/// what a plain `update()` of only the confirmed tokens would have produced.
+/// therefore opens a STAGED transaction: one multi-token update or several
+/// serial one-token updates return exactly the views their plain equivalents
+/// would return and advance `absoluteOffset`, while destructive ring writes
+/// (and the `oldestValidPosition` advance) are deferred to
+/// `commitSpeculativeWrite()`. A final `rollback(m)` is a pure counter move —
+/// nothing was destroyed — so after commit the state is value-exactly what
+/// plain updates of only the confirmed tokens would have produced.
 public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
     /// Window size in tokens == number of physical ring slots.
@@ -83,14 +83,14 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// and the following update).
     private var borrowableChunkViews: (keys: MLXArray, values: MLXArray)?
 
-    /// Armed by `beginSpeculativeWrite()`; consumed (disarmed) by the next
-    /// `update()`, which stages instead of writing the ring.
+    /// Transaction opened by `beginSpeculativeWrite()` and closed by commit.
+    /// Every intervening update stages instead of writing the ring.
     private var speculativeWriteArmed = false
 
-    /// The staged speculative update: the K/V tensors the armed `update()`
-    /// received, plus the absolute position it started at. The ring writes
+    /// The accumulated speculative updates plus the absolute position the
+    /// transaction started at. The ring writes
     /// for the still-confirmed range `[basePosition, absoluteOffset)` happen
-    /// at `commitSpeculativeWrite()`. At most one staged update per row.
+    /// at `commitSpeculativeWrite()`. At most one transaction per row.
     private var staged: (keys: MLXArray, values: MLXArray, basePosition: Int)?
 
     /// - Parameters:
@@ -196,8 +196,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         speculativeWriteArmed = true
     }
 
-    /// The armed `update()`: return EXACTLY the views a plain update would
-    /// return and advance `absoluteOffset`, but touch NEITHER the ring
+    /// One update in the active transaction: return EXACTLY the views the
+    /// corresponding plain update would return and advance `absoluteOffset`,
+    /// but touch NEITHER the ring
     /// buffers NOR `oldestValidPosition` — the destructive writes are
     /// deferred to `commitSpeculativeWrite()` so a `rollback` in between is
     /// a pure counter move.
@@ -212,21 +213,31 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     private func stageSpeculativeUpdate(
         newKeys: MLXArray, newValues: MLXArray, count n: Int
     ) -> (MLXArray, MLXArray) {
-        speculativeWriteArmed = false
-        let historyCount = min(retainedCount, window - 1)
-        let historyFrom = absoluteOffset - historyCount
+        let logical = snapshot()
+        let historyCount = min(logical.keys.dim(2), window - 1)
+        let historyFrom = logical.keys.dim(2) - historyCount
         var kParts: [MLXArray] = []
         var vParts: [MLXArray] = []
         if historyCount > 0 {
-            kParts = ringSlices(keys!, from: historyFrom, to: absoluteOffset)
-            vParts = ringSlices(values!, from: historyFrom, to: absoluteOffset)
+            kParts.append(logical.keys[.ellipsis, historyFrom..., 0...])
+            vParts.append(logical.values[.ellipsis, historyFrom..., 0...])
         }
         kParts.append(newKeys)
         vParts.append(newValues)
         let returnedKeys = kParts.count == 1 ? kParts[0] : concatenated(kParts, axis: 2)
         let returnedValues = vParts.count == 1 ? vParts[0] : concatenated(vParts, axis: 2)
 
-        staged = (newKeys, newValues, absoluteOffset)
+        if let existing = staged {
+            let confirmed = absoluteOffset - existing.basePosition
+            let existingKeys = existing.keys[.ellipsis, ..<confirmed, 0...]
+            let existingValues = existing.values[.ellipsis, ..<confirmed, 0...]
+            staged = (
+                concatenated([existingKeys, newKeys], axis: 2),
+                concatenated([existingValues, newValues], axis: 2),
+                existing.basePosition)
+        } else {
+            staged = (newKeys, newValues, absoluteOffset)
+        }
         absoluteOffset += n
         // KV-borrowing layers attend the SAME views this step (the ring does
         // not hold the staged tokens yet) — set for n == 1 too, unlike the
@@ -283,6 +294,24 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// layer's `update()` and the next mutation; never retain across steps.
     public func borrowableViews() -> (keys: MLXArray, values: MLXArray) {
         if let views = borrowableChunkViews { return views }
+        let snap = snapshot()
+        return (snap.keys, snap.values)
+    }
+
+    /// Decode normally borrows the retained ring snapshot. During a staged
+    /// serial MTP transaction the ring deliberately has not been written, so
+    /// the source layer's current logical post-update view is authoritative.
+    func decodeBorrowableViews() -> (keys: MLXArray, values: MLXArray) {
+        if staged != nil {
+            precondition(
+                borrowableChunkViews != nil,
+                "CBv2WindowedSequenceKV: staged decode borrow after rollback — commit first")
+            let views = borrowableChunkViews!
+            precondition(
+                views.keys.dim(2) <= window && views.values.dim(2) <= window,
+                "CBv2WindowedSequenceKV: staged decode borrow exceeds window \(window)")
+            return views
+        }
         let snap = snapshot()
         return (snap.keys, snap.values)
     }

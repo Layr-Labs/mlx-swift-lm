@@ -191,6 +191,57 @@ struct CBv2MTPKVStagingEquivalenceTests {
             runCase(window: window, baseFill: baseFill, n: 1, m: 1)
         }
     }
+
+    /// Serial target verification performs several ordinary `[B, 1]`
+    /// forwards inside one speculative transaction. Every intermediate view
+    /// and the final committed prefix must match plain decode exactly.
+    @Test func serialUpdatesEqualPlainDecodeAcrossGeometries() {
+        for window in [4, 8, 16] {
+            for baseFill in [0, window - 1, window, 3 * window + 1] {
+                for n in [2, 4] {
+                    for m in 0 ... n {
+                        let label = "serial w=\(window) base=\(baseFill) n=\(n) m=\(m)"
+                        let stagedRow = CBv2WindowedSequenceKV(
+                            window: window, kvHeads: 2, headDim: 4)
+                        let viewReference = CBv2WindowedSequenceKV(
+                            window: window, kvHeads: 2, headDim: 4)
+                        fillWindowed(stagedRow, count: baseFill)
+                        fillWindowed(viewReference, count: baseFill)
+
+                        stagedRow.beginSpeculativeWrite()
+                        for index in 0 ..< n {
+                            let keys = positionCoded(from: baseFill + index, count: 1)
+                            let values = positionCoded(from: 5000 + baseFill + index, count: 1)
+                            let staged = stagedRow.update(keys: keys, values: values)
+                            let plain = viewReference.update(keys: keys, values: values)
+                            expectExact(staged.0, plain.0, "intermediate keys \(label) i=\(index)")
+                            expectExact(staged.1, plain.1, "intermediate values \(label) i=\(index)")
+                        }
+                        stagedRow.rollback(m)
+                        stagedRow.commitSpeculativeWrite()
+
+                        let confirmed = n - m
+                        let plainRow = CBv2WindowedSequenceKV(
+                            window: window, kvHeads: 2, headDim: 4)
+                        fillWindowed(plainRow, count: baseFill)
+                        for index in 0 ..< confirmed {
+                            _ = plainRow.update(
+                                keys: positionCoded(from: baseFill + index, count: 1),
+                                values: positionCoded(from: 5000 + baseFill + index, count: 1))
+                        }
+                        #expect(stagedRow.absoluteOffset == plainRow.absoluteOffset, "offset \(label)")
+                        #expect(stagedRow.retainedCount == plainRow.retainedCount, "retained \(label)")
+                        expectExact(
+                            stagedRow.snapshot().keys, plainRow.snapshot().keys,
+                            "committed keys \(label)")
+                        expectExact(
+                            stagedRow.snapshot().values, plainRow.snapshot().values,
+                            "committed values \(label)")
+                    }
+                }
+            }
+        }
+    }
 }
 
 // MARK: - (b) Mid-flight staged views
@@ -269,6 +320,31 @@ struct CBv2MTPKVStagingFullQuantizedTests {
             expectedPositions([0, 1, 2, 3, 4, 5, 60, 61]), "full content")
     }
 
+    @Test func fullSequenceSerialRoundEqualsPlain() {
+        let speculated = CBv2FullSequenceKV(
+            promptLength: 5, maxLength: 64, kvHeads: 2, headDim: 4)
+        _ = speculated.update(
+            keys: positionCoded(from: 0, count: 5), values: positionCoded(from: 5000, count: 5))
+        speculated.beginSpeculativeWrite()
+        for index in 0 ..< 3 {
+            _ = speculated.update(
+                keys: positionCoded(from: 5 + index, count: 1),
+                values: positionCoded(from: 5005 + index, count: 1))
+        }
+        speculated.rollback(2)
+        speculated.commitSpeculativeWrite()
+
+        let plain = CBv2FullSequenceKV(
+            promptLength: 5, maxLength: 64, kvHeads: 2, headDim: 4)
+        _ = plain.update(
+            keys: positionCoded(from: 0, count: 5), values: positionCoded(from: 5000, count: 5))
+        _ = plain.update(
+            keys: positionCoded(from: 5, count: 1), values: positionCoded(from: 5005, count: 1))
+
+        expectExact(speculated.snapshot().keys, plain.snapshot().keys, "serial full keys")
+        expectExact(speculated.snapshot().values, plain.snapshot().values, "serial full values")
+    }
+
     /// The QuantizedSequenceKV verdict: quantization groups span the headDim
     /// axis only, so writing n tokens then rolling back m leaves the
     /// confirmed prefix's quantized content BIT-identical to never having
@@ -304,6 +380,36 @@ struct CBv2MTPKVStagingFullQuantizedTests {
         // Dequantized snapshots must match BITWISE — same quantization grid.
         expectExact(speculated.snapshot().keys, plain.snapshot().keys, "quantized keys")
         expectExact(speculated.snapshot().values, plain.snapshot().values, "quantized values")
+    }
+
+    @Test func quantizedSerialRoundEqualsPlainBitExactly() {
+        MLXRandom.seed(0xBEEF)
+        let base = MLXRandom.normal([1, 2, 5, 64]).asType(.float16)
+        let chunk = MLXRandom.normal([1, 2, 3, 64]).asType(.float16)
+
+        func makeRow() -> CBv2QuantizedSequenceKV {
+            CBv2QuantizedSequenceKV(
+                promptLength: 5, maxLength: 64, kvHeads: 2, headDim: 64,
+                groupSize: 64, bits: 4)
+        }
+
+        let speculated = makeRow()
+        _ = speculated.update(keys: base, values: base)
+        speculated.beginSpeculativeWrite()
+        for index in 0 ..< 3 {
+            let token = chunk[.ellipsis, index ..< (index + 1), 0...]
+            _ = speculated.update(keys: token, values: token)
+        }
+        speculated.rollback(2)
+        speculated.commitSpeculativeWrite()
+
+        let plain = makeRow()
+        _ = plain.update(keys: base, values: base)
+        let first = chunk[.ellipsis, ..<1, 0...]
+        _ = plain.update(keys: first, values: first)
+
+        expectExact(speculated.snapshot().keys, plain.snapshot().keys, "serial quantized keys")
+        expectExact(speculated.snapshot().values, plain.snapshot().values, "serial quantized values")
     }
 }
 
@@ -494,6 +600,52 @@ struct CBv2MTPKVStagingAttentionParityTests {
                 source: soloSource, queries: borrowQ[index ..< (index + 1)],
                 scale: scale, sinks: nil)
             expectExact(out[index ..< (index + 1)], soloOut, "borrowed row \(index)")
+        }
+    }
+
+    @Test func kvSharedBorrowSerialStagingMatchesPlainDecode() {
+        let sourceKind = CBv2LayerKind(
+            attention: .slidingWindow(8), headDim: headDim, kvHeads: kvHeads,
+            queryHeads: queryHeads)
+        let sharedKind = CBv2LayerKind(
+            attention: .slidingWindow(8), sharesKVWithLayer: 0, headDim: headDim,
+            kvHeads: kvHeads, queryHeads: queryHeads)
+        let stagedRow = CBv2WindowedSequenceKV(
+            window: 8, kvHeads: kvHeads, headDim: headDim)
+        let plainRow = CBv2WindowedSequenceKV(
+            window: 8, kvHeads: kvHeads, headDim: headDim)
+        for position in 0 ..< 13 {
+            let keys = positionCoded(
+                from: position, count: 1, kvHeads: kvHeads, headDim: headDim)
+            let values = positionCoded(
+                from: 5000 + position, count: 1, kvHeads: kvHeads, headDim: headDim)
+            _ = stagedRow.update(keys: keys, values: values)
+            _ = plainRow.update(keys: keys, values: values)
+        }
+        stagedRow.beginSpeculativeWrite()
+
+        let stagedSource = CBv2LayerCache(layerIndex: 0, kind: sourceKind, rows: [stagedRow])
+        let plainSource = CBv2LayerCache(layerIndex: 0, kind: sourceKind, rows: [plainRow])
+        let stagedShared = CBv2LayerCache(layerIndex: 5, kind: sharedKind)
+        let plainShared = CBv2LayerCache(layerIndex: 5, kind: sharedKind)
+
+        for index in 0 ..< 2 {
+            MLXRandom.seed(UInt64(8100 + index))
+            let q = MLXRandom.normal([1, queryHeads, 1, headDim]).asType(.float16)
+            let k = MLXRandom.normal([1, kvHeads, 1, headDim]).asType(.float16)
+            let v = MLXRandom.normal([1, kvHeads, 1, headDim]).asType(.float16)
+            _ = stagedSource.updateAndAttend(
+                queries: q, keys: k, values: v, scale: scale, sinks: nil)
+            _ = plainSource.updateAndAttend(
+                queries: q, keys: k, values: v, scale: scale, sinks: nil)
+
+            MLXRandom.seed(UInt64(8200 + index))
+            let borrowQ = MLXRandom.normal([1, queryHeads, 1, headDim]).asType(.float16)
+            let stagedOutput = stagedShared.attendBorrowing(
+                source: stagedSource, queries: borrowQ, scale: scale, sinks: nil)
+            let plainOutput = plainShared.attendBorrowing(
+                source: plainSource, queries: borrowQ, scale: scale, sinks: nil)
+            expectExact(stagedOutput, plainOutput, "serial borrowed output \(index)")
         }
     }
 

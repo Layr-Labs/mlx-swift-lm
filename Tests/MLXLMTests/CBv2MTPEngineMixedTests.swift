@@ -249,12 +249,10 @@ struct CBv2MTPEngineMixedTests {
     private func makeMTPConfig(
         enabled: Bool, maxSpeculativeBatch: Int
     ) -> CBv2MTPConfig {
-        var config = CBv2MTPConfig(
+        CBv2MTPConfig(
             enabled: enabled, maxDraftTokens: fixedDepth,
             maxSpeculativeBatch: maxSpeculativeBatch,
             fixedDraftTokens: fixedDepth)
-        config.runtimeChipNameOverrideForTesting = "Apple M4 Max"
-        return config
     }
 
     private func request(

@@ -10,7 +10,7 @@ import MLX
 extension EngineLoopV2 {
 
     /// Execute a plan containing MTP work. Graph construction includes seed
-    /// decodes, frozen-KV drafting, one rectangular target verify, ordinary
+    /// decodes, frozen-KV drafting, target-authoritative verification, ordinary
     /// decode neighbors, and per-request prefill chunks.
     func executeMTPRound(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         guard let mtp else { return executeMixed(plan) }

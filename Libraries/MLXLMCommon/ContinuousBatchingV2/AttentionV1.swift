@@ -212,7 +212,16 @@ enum CBv2AttentionV1 {
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
         for (index, row) in sourceRows.enumerated() {
-            let (cachedKeys, cachedValues, _) = row.snapshot()
+            let cachedKeys: MLXArray
+            let cachedValues: MLXArray
+            if let windowed = row as? CBv2WindowedSequenceKV {
+                // Ordinary decode borrows the retained ring. A staged serial
+                // MTP transaction has not written that ring yet, so borrow
+                // the source layer's logical post-update view instead.
+                (cachedKeys, cachedValues) = windowed.decodeBorrowableViews()
+            } else {
+                (cachedKeys, cachedValues, _) = row.snapshot()
+            }
             outputs.append(
                 attend(
                     queries: B == 1 ? queries : queries[index ..< (index + 1)],
