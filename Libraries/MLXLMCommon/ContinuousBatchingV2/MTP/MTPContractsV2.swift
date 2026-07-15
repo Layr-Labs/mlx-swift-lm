@@ -165,6 +165,7 @@ extension CBv2MTPDrafter {
 public enum CBv2MTPVerificationMode: String, Sendable, Equatable {
     case serialTarget = "serial_target"
     case rectangular
+    case automatic
 }
 
 /// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
@@ -191,9 +192,16 @@ public struct CBv2MTPConfig: Sendable {
     /// rows per storage-owning layer and one in-flight step. The adaptive
     /// controller is separately keyed by a planned-decode-row bucket.
     public var maxSpeculativeBatch: Int
-    /// Target scoring strategy. The chip-independent serial target path is
-    /// the safe default; rectangular scoring is an explicit optimization.
+    /// Target scoring strategy. Automatic verification is the safe default:
+    /// it uses rectangular scoring only within the configured work envelope
+    /// and otherwise clamps depth before draft work. Serial target scoring
+    /// remains an explicit correctness fallback.
     public var verificationMode: CBv2MTPVerificationMode
+    /// Maximum `batch * (1+k)` target rows eligible for automatic
+    /// rectangular verification. The planner clamps larger work to a safe
+    /// depth, including ordinary target-only decode when no positive depth
+    /// fits. Ignored by explicit serial/rectangular modes.
+    public var maxAutomaticRectangularTokens: Int
 
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
@@ -210,7 +218,8 @@ public struct CBv2MTPConfig: Sendable {
         maxDraftTokens: Int = Self.testedMaxDraftTokens,
         maxSpeculativeBatch: Int = 8,
         fixedDraftTokens: Int? = nil,
-        verificationMode: CBv2MTPVerificationMode = .serialTarget
+        verificationMode: CBv2MTPVerificationMode = .automatic,
+        maxAutomaticRectangularTokens: Int = 4
     ) {
         self.enabled = enabled
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
@@ -221,6 +230,7 @@ public struct CBv2MTPConfig: Sendable {
             min(max($0, 0), resolvedMax)
         }
         self.verificationMode = verificationMode
+        self.maxAutomaticRectangularTokens = max(0, maxAutomaticRectangularTokens)
     }
 
     /// The effective on/off state (config AND env kill switch).
@@ -259,7 +269,15 @@ public struct CBv2MTPMetrics: Sendable {
     /// so provider telemetry can serialize one stable shape.
     public var active: Bool = true
     /// Target scoring strategy used by every round in this engine.
-    public var verificationMode: CBv2MTPVerificationMode = .serialTarget
+    public var verificationMode: CBv2MTPVerificationMode = .automatic
+    /// Configured automatic rectangular work cap, exposed so benchmark
+    /// validators can distinguish intentional target-only fallback from a
+    /// failure to run the requested fixed depth.
+    public var maxAutomaticRectangularTokens: Int = 0
+    /// Actual target-verification rounds by strategy. Automatic mode can use
+    /// both across batch/depth regimes.
+    public var rectangularVerificationRounds: Int = 0
+    public var serialVerificationRounds: Int = 0
     /// Most recently selected step-global depth (zero means target-only).
     public var selectedDepth: Int = 0
     /// Planned decode-row bucket used for the most recent selection.

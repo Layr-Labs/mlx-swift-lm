@@ -43,6 +43,11 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     private var cachedPositionOffsets: MLXArray
 
+    /// MTP-only verification policy. When true, an L>1 update still projects
+    /// and stores the whole rectangle once, but attention evaluates each
+    /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
+    var mtpSerializesRectangularAttention = false
+
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.
     public private(set) var positionOffsetsHostRebuilds = 0
@@ -115,7 +120,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
-            spanContext: boundSpanContext)
+            spanContext: boundSpanContext,
+            serializeQueries: mtpSerializesRectangularAttention)
         // Advance offsets ON-DEVICE (uniform: decode is [B,1], prefill is
         // [1,chunk] — L is the same for every row in the call).
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -136,7 +142,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return CBv2AttentionV1.attendBorrowing(
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
             queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,
-            spanContext: boundSpanContext)
+            spanContext: boundSpanContext,
+            serializeQueries: mtpSerializesRectangularAttention)
     }
 
     // MARK: - Private

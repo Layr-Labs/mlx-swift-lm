@@ -181,7 +181,7 @@ struct CBv2MTPRoundSmokeTests {
         #expect(baseline.tokens.count == 40)
         #expect(off.mtpMetricsSnapshot() == nil, "MTP-off engine must report no MTP state")
 
-        let on = try makeEngine(fixture, mtp: true)
+        let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
         let speculative = try await run(on, greedyRequest(id: 1, prompt: prompt, maxTokens: 40))
         let metrics = try #require(on.mtpMetricsSnapshot())
         await on.shutdown()
@@ -387,7 +387,7 @@ struct CBv2MTPRoundSmokeTests {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 20, seed: 71, vocabSize: vocabSize)
 
-        let on = try makeEngine(fixture, mtp: true)
+        let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
         let victim = greedyRequest(id: 1, prompt: prompt, maxTokens: 512)
         let stream = try on.submit(victim)
         // Let it get well into MTP rounds, then cancel mid-flight.

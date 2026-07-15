@@ -18,8 +18,15 @@ extension EngineLoopV2 {
         let argmax: MLXArray
         let hidden: MLXArray
 
-        switch mtp.config.verificationMode {
-        case .serialTarget:
+        let useRectangular = switch mtp.config.verificationMode {
+        case .serialTarget: false
+        case .rectangular: true
+        case .automatic:
+            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+        }
+        mtp.recordVerificationStrategy(rectangular: useRectangular)
+
+        if !useRectangular {
             var argmaxColumns: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
             argmaxColumns.reserveCapacity(columns.count)
@@ -38,7 +45,17 @@ extension EngineLoopV2 {
             argmax = concatenated(argmaxColumns, axis: 1)
             hidden = concatenated(hiddenColumns, axis: 1)
 
-        case .rectangular:
+        } else {
+            let rectangularCaches: [CBv2LayerCache] = caches.map { cache in
+                guard let cache = cache as? CBv2LayerCache else {
+                    preconditionFailure("MTP rectangular verification requires CBv2 layer caches")
+                }
+                return cache
+            }
+            for cache in rectangularCaches { cache.mtpSerializesRectangularAttention = true }
+            defer {
+                for cache in rectangularCaches { cache.mtpSerializesRectangularAttention = false }
+            }
             let tokens = concatenated(columns, axis: 1)
             let output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
             argmax = argMax(output.logits, axis: -1).asType(.int32)

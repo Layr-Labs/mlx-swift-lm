@@ -96,6 +96,11 @@ extension EngineLoopV2 {
         }
         guard !eligible.isEmpty else { return false }
         if decision.depth == 0 {
+            if mtp.config.verificationMode == .automatic,
+                mtp.maximumAutomaticDepth(plannedDecodeRows: ids.count) == 0
+            {
+                return false
+            }
             return canSpeculate && mtp.requiresNonChainedDepthZeroProbe(decision)
         }
         guard canSpeculate else { return false }

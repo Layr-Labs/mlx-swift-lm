@@ -166,7 +166,8 @@ struct CBv2MTPEngineParityTests {
         maxSpeculativeBatch: Int = 4, maxConcurrent: Int = 4,
         fixedDepth: Int? = nil,
         sampler: CBv2StepSampler = CBv2DefaultSampler(),
-        verificationMode: CBv2MTPVerificationMode = .serialTarget
+        verificationMode: CBv2MTPVerificationMode = .serialTarget,
+        maxAutomaticRectangularTokens: Int = 8
     ) -> EngineV2 {
         let kinds = target.cbv2LayerKinds
         let depth = fixedDepth ?? k
@@ -174,7 +175,8 @@ struct CBv2MTPEngineParityTests {
             enabled: drafter != nil, maxDraftTokens: depth,
             maxSpeculativeBatch: maxSpeculativeBatch,
             fixedDraftTokens: depth,
-            verificationMode: verificationMode)
+            verificationMode: verificationMode,
+            maxAutomaticRectangularTokens: maxAutomaticRectangularTokens)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(target),
             layerKinds: kinds,
@@ -413,14 +415,10 @@ struct CBv2MTPEngineParityTests {
         #expect(actual.tokens == expected.tokens)
     }
 
-    @Test func serialTargetVerificationIsActiveWithoutHardwareGating() async throws {
-        #expect(CBv2MTPConfig().verificationMode == .serialTarget)
-        for chip in ["M1", "M2", "M3", "M4", "M5", "M5 Pro", "M5 Max"] {
-            // Hardware identity is intentionally not an input to the default
-            // verification strategy. This message keeps every supported
-            // generation explicit if the default ever regresses.
-            #expect(CBv2MTPConfig().verificationMode == .serialTarget, "chip \(chip)")
-        }
+    @Test func automaticVerificationIsSafeDefault() async throws {
+        let defaultConfig = CBv2MTPConfig()
+        #expect(defaultConfig.verificationMode == .automatic)
+        #expect(defaultConfig.maxAutomaticRectangularTokens == 4)
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 19, seed: 0xA55, vocabSize: vocabSize)
         let item = request(id: 1, prompt: prompt, maxTokens: 12)
@@ -429,9 +427,11 @@ struct CBv2MTPEngineParityTests {
         await targetOnly.shutdown()
 
         let active = makeEngine(
-            target: fixture.target, drafter: try realDrafter(fixture))
+            target: fixture.target, drafter: try realDrafter(fixture),
+            verificationMode: defaultConfig.verificationMode,
+            maxAutomaticRectangularTokens: defaultConfig.maxAutomaticRectangularTokens)
         #expect(active.mtpInactiveReason == nil)
-        #expect(active.loopForTesting.mtp?.config.verificationMode == .serialTarget)
+        #expect(active.loopForTesting.mtp?.config.verificationMode == .automatic)
         let actual = try await run(active, item)
         let metrics = try #require(active.mtpMetricsSnapshot())
         await active.shutdown()
@@ -439,6 +439,8 @@ struct CBv2MTPEngineParityTests {
         #expect(actual.tokens == expected.tokens)
         #expect(actual.finishReason == expected.finishReason)
         #expect(metrics.rounds > 0)
+        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(metrics.serialVerificationRounds == 0)
     }
 
     @Test func rectangularVerificationRemainsAnExplicitOptimization() async throws {
@@ -462,5 +464,80 @@ struct CBv2MTPEngineParityTests {
 
         #expect(actual.tokens == expected.tokens)
         #expect(metrics.rounds > 0)
+    }
+
+    @Test func automaticB4L2UsesExactRectangularVerification() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompts = (0 ..< 4).map {
+            makePromptTokens(length: 16, seed: UInt64(0xB40 + $0), vocabSize: vocabSize)
+        }
+
+        func collect(_ engine: EngineV2) async throws -> [CBv2SchedCollected] {
+            let streams = try prompts.enumerated().map { index, prompt in
+                try engine.submit(request(id: UInt64(index + 1), prompt: prompt, maxTokens: 16))
+            }
+            var results: [CBv2SchedCollected] = []
+            for stream in streams { results.append(await cbv2SchedCollect(stream)) }
+            return results
+        }
+
+        let targetOnly = makeEngine(
+            target: fixture.target, drafter: nil,
+            maxSpeculativeBatch: 4, maxConcurrent: 4, fixedDepth: 1)
+        let expected = try await collect(targetOnly)
+        await targetOnly.shutdown()
+
+        let automatic = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture),
+            maxSpeculativeBatch: 4, maxConcurrent: 4, fixedDepth: 1,
+            verificationMode: .automatic)
+        let actual = try await collect(automatic)
+        let metrics = try #require(automatic.mtpMetricsSnapshot())
+        await automatic.shutdown()
+
+        #expect(actual.map(\.tokens) == expected.map(\.tokens))
+        #expect(metrics.rounds > 0)
+        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(metrics.serialVerificationRounds == 0)
+    }
+
+    @Test func automaticB8ClampsToCanonicalChainedTargetOnly() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompts = (0 ..< 8).map {
+            makePromptTokens(length: 16, seed: UInt64(0xB80 + $0), vocabSize: vocabSize)
+        }
+
+        func collect(_ engine: EngineV2) async throws -> [CBv2SchedCollected] {
+            let streams = try prompts.enumerated().map { index, prompt in
+                try engine.submit(request(id: UInt64(index + 1), prompt: prompt, maxTokens: 16))
+            }
+            var results: [CBv2SchedCollected] = []
+            for stream in streams { results.append(await cbv2SchedCollect(stream)) }
+            return results
+        }
+
+        let targetOnly = makeEngine(
+            target: fixture.target, drafter: nil,
+            maxSpeculativeBatch: 8, maxConcurrent: 8, fixedDepth: 1)
+        let expected = try await collect(targetOnly)
+        await targetOnly.shutdown()
+
+        let automatic = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture),
+            maxSpeculativeBatch: 8, maxConcurrent: 8, fixedDepth: 1,
+            verificationMode: .automatic, maxAutomaticRectangularTokens: 0)
+        let actual = try await collect(automatic)
+        let metrics = try #require(automatic.mtpMetricsSnapshot())
+        await automatic.shutdown()
+
+        #expect(actual.map(\.tokens) == expected.map(\.tokens))
+        #expect(metrics.rounds == 0)
+        #expect(metrics.seedSteps == 0)
+        #expect(metrics.proposedTokens == 0)
+        #expect(metrics.maxAutomaticRectangularTokens == 0)
+        #expect(metrics.rectangularVerificationRounds == 0)
+        #expect(metrics.serialVerificationRounds == 0)
+        #expect(metrics.controllerFallbacks["automatic_rectangular_limit", default: 0] > 0)
+        #expect(automatic.chainedStepCount > 0)
     }
 }
