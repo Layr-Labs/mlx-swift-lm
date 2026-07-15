@@ -268,9 +268,10 @@ public protocol CBv2SequenceKV: AnyObject {
 
     /// True when this row can take a multi-token `update()` under
     /// `beginSpeculativeWrite()` such that the sequence
-    /// `beginSpeculativeWrite(); update(n tokens); rollback(m);
-    /// commitSpeculativeWrite()` (m ≤ n) leaves state VALUE-EXACTLY equal to
-    /// a plain `update()` of only the first `n - m` tokens. This is the
+    /// `beginSpeculativeWrite(); update(...); ...; rollback(m);
+    /// commitSpeculativeWrite()` leaves state VALUE-EXACTLY equal to plain
+    /// updates of only the confirmed prefix. The transaction may contain one
+    /// multi-token update or multiple serial one-token updates. This is the
     /// eligibility gate for speculative (MTP) decoding: a row whose storage
     /// cannot guarantee exact rollback (e.g. a paged windowed ring, whose
     /// in-place writes destroy the oldest in-window entries — see
@@ -279,14 +280,14 @@ public protocol CBv2SequenceKV: AnyObject {
     /// (fail-safe — unknown row classes never speculate), mirroring
     /// `CBv2KVBackend.producesCompiledDecodeEligibleRows`.
     var supportsSpeculativeWrites: Bool { get }
-    /// Arm speculative-write mode for the NEXT `update()` call. Storage
+    /// Begin one speculative-write transaction. Storage
     /// whose plain rollback is already value-exact (full, quantized,
     /// paged-full) may make this a no-op. Ring storage (contiguous windowed)
-    /// must STAGE the next update — return the exact views a plain
-    /// multi-token update would return and advance counters, but defer the
-    /// destructive ring writes until `commitSpeculativeWrite()` so a
-    /// `rollback(m)` in between is a pure counter move (nothing was
-    /// destroyed). At most one speculative update may be in flight per row.
+    /// must STAGE every update until commit — each call returns the exact
+    /// views its corresponding plain update would return and advances
+    /// counters, but destructive ring writes are deferred so a final
+    /// `rollback(m)` is a pure counter move. At most one speculative
+    /// transaction may be in flight per row.
     func beginSpeculativeWrite()
     /// Commit the staged speculative update (if any): persist storage for
     /// the still-confirmed positions `[stagedBase, absoluteOffset)` and

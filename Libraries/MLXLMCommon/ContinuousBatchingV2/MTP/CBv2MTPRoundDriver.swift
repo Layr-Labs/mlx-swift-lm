@@ -196,6 +196,8 @@ final class CBv2MTPRoundDriver {
         self.captureLayers = captureLayers
         self.depthController = CBv2MTPDepthController(
             maxDepth: config.maxDraftTokens, fixedDepth: config.fixedDraftTokens)
+        self.metrics.verificationMode = config.verificationMode
+        self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
     }
 
     /// Build the driver, or nil when MTP cannot activate: config off (or the
@@ -227,7 +229,8 @@ final class CBv2MTPRoundDriver {
         controllerMeasurementEligible = canSpeculate
         controllerDecision = depthController.select(
             plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
-        planDecision = controllerDecision
+        planDecision = verificationLimitedDecision(
+            controllerDecision, plannedDecodeRows: plannedDecodeRows)
         guard plannedDecodeRows > 0 else { return }
         metricsLock.lock()
         metrics.selectedDepth = planDecision.depth
@@ -241,8 +244,28 @@ final class CBv2MTPRoundDriver {
     func previewDecision(
         plannedDecodeRows: Int, canSpeculate: Bool
     ) -> CBv2MTPDepthDecision {
-        depthController.preview(
-            plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate)
+        verificationLimitedDecision(
+            depthController.preview(
+                plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate),
+            plannedDecodeRows: plannedDecodeRows)
+    }
+
+    func maximumAutomaticDepth(plannedDecodeRows: Int) -> Int {
+        guard config.verificationMode == .automatic, plannedDecodeRows > 0 else {
+            return config.maxDraftTokens
+        }
+        let maxWidth = config.maxAutomaticRectangularTokens / plannedDecodeRows
+        return min(config.maxDraftTokens, max(0, maxWidth - 1))
+    }
+
+    private func verificationLimitedDecision(
+        _ decision: CBv2MTPDepthDecision, plannedDecodeRows: Int
+    ) -> CBv2MTPDepthDecision {
+        let limit = maximumAutomaticDepth(plannedDecodeRows: plannedDecodeRows)
+        guard decision.depth > limit else { return decision }
+        return CBv2MTPDepthDecision(
+            depth: limit, decodeRowBucket: decision.decodeRowBucket,
+            reason: "automatic_rectangular_limit", isExploration: false)
     }
 
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
@@ -478,6 +501,16 @@ final class CBv2MTPRoundDriver {
         metricsLock.lock()
         defer { metricsLock.unlock() }
         return metrics
+    }
+
+    func recordVerificationStrategy(rectangular: Bool) {
+        metricsLock.lock()
+        if rectangular {
+            metrics.rectangularVerificationRounds += 1
+        } else {
+            metrics.serialVerificationRounds += 1
+        }
+        metricsLock.unlock()
     }
 
     private func refreshControllerMetricsLocked() {

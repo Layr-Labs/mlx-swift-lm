@@ -155,6 +155,19 @@ extension CBv2MTPDrafter {
 
 // MARK: - Config
 
+/// How the target scores one MTP draft chain.
+///
+/// `serialTarget` is the correctness baseline: every column uses the same
+/// `[B, 1]` eager target forward as ordinary decode. It works independently
+/// of chip-specific multi-position kernel numerics. `rectangular` is an
+/// explicit optimization that scores all `1+k` columns in one `[B, 1+k]`
+/// forward and therefore requires separate numerical certification.
+public enum CBv2MTPVerificationMode: String, Sendable, Equatable {
+    case serialTarget = "serial_target"
+    case rectangular
+    case automatic
+}
+
 /// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
 public struct CBv2MTPConfig: Sendable {
     /// The largest draft depth covered by the production rectangular-shape
@@ -179,9 +192,20 @@ public struct CBv2MTPConfig: Sendable {
     /// rows per storage-owning layer and one in-flight step. The adaptive
     /// controller is separately keyed by a planned-decode-row bucket.
     public var maxSpeculativeBatch: Int
-    /// Test-only chip injection for construction-time hardware gating. Product
-    /// callers always use `MLXHardwareInfo.chipName`.
-    var runtimeChipNameOverrideForTesting: String?
+    /// Target scoring strategy. Automatic verification is the safe default:
+    /// it uses rectangular scoring only within the configured work envelope
+    /// and otherwise clamps depth before draft work. Serial target scoring
+    /// remains an explicit correctness fallback.
+    public var verificationMode: CBv2MTPVerificationMode
+    /// Maximum `batch * (1+k)` target rows eligible for automatic
+    /// rectangular verification. The planner clamps larger work to a safe
+    /// depth, including ordinary target-only decode when no positive depth
+    /// fits. Defaults to ZERO: a positive envelope is the integrator's
+    /// explicit claim that rectangular target evaluation is argmax-exact for
+    /// the deployed chip/OS/MLX/model tuple at every shape inside it. With
+    /// no envelope, automatic mode performs no speculative work. Ignored by
+    /// explicit serial/rectangular modes.
+    public var maxAutomaticRectangularTokens: Int
 
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
@@ -197,7 +221,9 @@ public struct CBv2MTPConfig: Sendable {
         enabled: Bool = false,
         maxDraftTokens: Int = Self.testedMaxDraftTokens,
         maxSpeculativeBatch: Int = 8,
-        fixedDraftTokens: Int? = nil
+        fixedDraftTokens: Int? = nil,
+        verificationMode: CBv2MTPVerificationMode = .automatic,
+        maxAutomaticRectangularTokens: Int = 0
     ) {
         self.enabled = enabled
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
@@ -207,6 +233,8 @@ public struct CBv2MTPConfig: Sendable {
         self.fixedDraftTokens = fixedDraftTokens.map {
             min(max($0, 0), resolvedMax)
         }
+        self.verificationMode = verificationMode
+        self.maxAutomaticRectangularTokens = max(0, maxAutomaticRectangularTokens)
     }
 
     /// The effective on/off state (config AND env kill switch).
@@ -244,6 +272,16 @@ public struct CBv2MTPMetrics: Sendable {
     /// True for every non-nil `EngineV2.mtpMetricsSnapshot()`. Kept explicit
     /// so provider telemetry can serialize one stable shape.
     public var active: Bool = true
+    /// Target scoring strategy used by every round in this engine.
+    public var verificationMode: CBv2MTPVerificationMode = .automatic
+    /// Configured automatic rectangular work cap, exposed so benchmark
+    /// validators can distinguish intentional target-only fallback from a
+    /// failure to run the requested fixed depth.
+    public var maxAutomaticRectangularTokens: Int = 0
+    /// Actual target-verification rounds by strategy. Automatic mode can use
+    /// both across batch/depth regimes.
+    public var rectangularVerificationRounds: Int = 0
+    public var serialVerificationRounds: Int = 0
     /// Most recently selected step-global depth (zero means target-only).
     public var selectedDepth: Int = 0
     /// Planned decode-row bucket used for the most recent selection.

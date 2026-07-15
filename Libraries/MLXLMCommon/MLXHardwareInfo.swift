@@ -1,9 +1,5 @@
 import Foundation
 
-#if canImport(Darwin)
-    import Darwin
-#endif
-
 /// Runtime gate for `compile(shapeless: true)` activation micro-fusions
 /// (SwiGLU / GeGLU / GELU / softcap).
 ///
@@ -29,36 +25,6 @@ import Foundation
 /// decode helpers (`MLXVLM/Models/Gemma4.swift`) so those file-private fusions can
 /// later be collapsed onto this single shared symbol with no behavior change.
 public enum MLXHardwareInfo {
-    /// Apple marketing name reported by the kernel (for example,
-    /// `Apple M4 Max`). Kept here so correctness gates and diagnostics use
-    /// one process-stable value.
-    public static let chipName: String = {
-        #if canImport(Darwin)
-            var size = 0
-            guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0,
-                size > 0
-            else { return "unknown" }
-            var buffer = [UInt8](repeating: 0, count: size)
-            guard sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0) == 0 else {
-                return "unknown"
-            }
-            return String(decoding: buffer.prefix(while: { $0 != 0 }), as: UTF8.self)
-        #else
-            return "unknown"
-        #endif
-    }()
-
-    /// MTP verifies drafts with `[B, 1+k]` target forwards, while ordinary
-    /// greedy decode uses `[B, 1]`. The M5 Metal path has produced repeatable
-    /// target-argmax drift between those shapes, including on the production
-    /// Gemma 4 QAT pair. Fail closed to target-only until that chip family has
-    /// a certified rectangular verification path.
-    public static func supportsMTPRectangularVerification(chipName: String) -> Bool {
-        let tokens = chipName.uppercased().components(
-            separatedBy: CharacterSet.alphanumerics.inverted)
-        return !tokens.contains("M5")
-    }
-
     /// `true` when `compile(shapeless: true)` activation fusions are enabled.
     ///
     /// Defaults to `true`. Set `MLX_COMPILED_DECODE` to `0`/`false`/`no`/`off`

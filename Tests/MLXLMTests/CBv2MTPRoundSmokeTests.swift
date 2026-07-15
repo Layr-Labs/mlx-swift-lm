@@ -123,18 +123,20 @@ struct CBv2MTPRoundSmokeTests {
     /// same eager paths.
     private func makeEngine(
         _ fixture: Fixture, mtp: Bool, maxDraftTokens: Int = 2, maxSpeculativeBatch: Int = 2,
-        maxConcurrent: Int = 4
+        maxConcurrent: Int = 4,
+        verificationMode: CBv2MTPVerificationMode = .serialTarget
     ) throws -> EngineV2 {
         let kinds = fixture.target.cbv2LayerKinds
         let mtpDrafter: Gemma4CBv2MTPDrafter? =
             mtp
             ? try Gemma4CBv2MTPDrafter(drafter: fixture.drafter, target: fixture.target)
             : nil
-        var mtpConfig = CBv2MTPConfig(
+        let mtpConfig = CBv2MTPConfig(
             enabled: mtp, maxDraftTokens: maxDraftTokens,
             maxSpeculativeBatch: maxSpeculativeBatch,
-            fixedDraftTokens: maxDraftTokens)
-        mtpConfig.runtimeChipNameOverrideForTesting = "Apple M4 Max"
+            fixedDraftTokens: maxDraftTokens,
+            verificationMode: verificationMode,
+            maxAutomaticRectangularTokens: 8)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(fixture.target),
             layerKinds: kinds,
@@ -180,7 +182,7 @@ struct CBv2MTPRoundSmokeTests {
         #expect(baseline.tokens.count == 40)
         #expect(off.mtpMetricsSnapshot() == nil, "MTP-off engine must report no MTP state")
 
-        let on = try makeEngine(fixture, mtp: true)
+        let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
         let speculative = try await run(on, greedyRequest(id: 1, prompt: prompt, maxTokens: 40))
         let metrics = try #require(on.mtpMetricsSnapshot())
         await on.shutdown()
@@ -265,18 +267,24 @@ struct CBv2MTPRoundSmokeTests {
         #expect(baselines[0].tokens == expectedA)
         #expect(baselines[1].tokens == expectedB)
 
-        // Both rows greedy and running (batch gate 2): rounds batch to a
-        // rectangular [2, 1+k] verify once both are decode-ready.
-        let on = try makeEngine(fixture, mtp: true)
-        async let a = run(on, greedyRequest(id: 1, prompt: promptA, maxTokens: 24))
-        async let b = run(on, greedyRequest(id: 2, prompt: promptB, maxTokens: 24))
-        let (collectedA, collectedB) = try await (a, b)
-        let metrics = try #require(on.mtpMetricsSnapshot())
-        await on.shutdown()
+        // Both rows greedy and running (batch gate 2): exercise the universal
+        // serial target verifier and the explicit rectangular optimization.
+        for mode in [CBv2MTPVerificationMode.serialTarget, .rectangular] {
+            let on = try makeEngine(fixture, mtp: true, verificationMode: mode)
+            async let a = run(on, greedyRequest(id: 1, prompt: promptA, maxTokens: 24))
+            async let b = run(on, greedyRequest(id: 2, prompt: promptB, maxTokens: 24))
+            let (collectedA, collectedB) = try await (a, b)
+            let metrics = try #require(on.mtpMetricsSnapshot())
+            await on.shutdown()
 
-        #expect(collectedA.tokens == baselines[0].tokens, "row A diverged when batched")
-        #expect(collectedB.tokens == baselines[1].tokens, "row B diverged when batched")
-        #expect(metrics.rounds >= 1)
+            #expect(
+                collectedA.tokens == baselines[0].tokens,
+                "row A diverged in \(mode.rawValue) mode")
+            #expect(
+                collectedB.tokens == baselines[1].tokens,
+                "row B diverged in \(mode.rawValue) mode")
+            #expect(metrics.rounds >= 1)
+        }
     }
 
     // MARK: - (4) Mid-round stop-token truncation
@@ -380,7 +388,7 @@ struct CBv2MTPRoundSmokeTests {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 20, seed: 71, vocabSize: vocabSize)
 
-        let on = try makeEngine(fixture, mtp: true)
+        let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
         let victim = greedyRequest(id: 1, prompt: prompt, maxTokens: 512)
         let stream = try on.submit(victim)
         // Let it get well into MTP rounds, then cancel mid-flight.

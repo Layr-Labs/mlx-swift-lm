@@ -6,9 +6,15 @@ extension EngineLoopV2 {
 
     /// Mixed prefill work is excluded from the controller's cost curve so it
     /// learns only comparable decode-shaped steps.
+    /// Measurements carry the plan's FINAL decision (`planDecision`), not the
+    /// controller's raw choice: the automatic rectangular cap and the
+    /// tail/token-budget clamps can lower the executed depth, and
+    /// `recordFinalizedStep` commits a sample only when the finalized depth
+    /// matches the decision it was measured against. Carrying the uncapped
+    /// decision silently discarded every capped round's cost sample.
     func mtpMeasurement(for plan: CBv2StepPlan) -> CBv2MTPStepMeasurement? {
         guard let mtp, mtp.controllerMeasurementEligible,
-            mtp.controllerDecision.decodeRowBucket > 0
+            mtp.planDecision.decodeRowBucket > 0
         else { return nil }
         let pureDecode = plan.assignments.allSatisfy { assignment in
             guard let rec = scheduler.record(for: assignment.id) else { return false }
@@ -18,7 +24,7 @@ extension EngineLoopV2 {
             return !finalTokenIsImageSpan && rec.effectiveTokenCount - before == 1
         }
         return CBv2MTPStepMeasurement(
-            decision: mtp.controllerDecision,
+            decision: mtp.planDecision,
             actualDepth: 0,
             costEligible: pureDecode,
             chained: false,

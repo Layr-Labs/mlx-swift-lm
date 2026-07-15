@@ -5,6 +5,26 @@ import Testing
 
 @Suite("CBv2MTPDepthController")
 struct CBv2MTPDepthControllerTests {
+    @Test func automaticVerificationCapsDepthByRectangularWork() throws {
+        let model = MTPControllerTestModel()
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model, drafter: MTPControllerTestDrafter(target: model),
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 7, maxSpeculativeBatch: 8,
+                    fixedDraftTokens: 7, verificationMode: .automatic,
+                    maxAutomaticRectangularTokens: 8)))
+
+        #expect(driver.maximumAutomaticDepth(plannedDecodeRows: 1) == 7)
+        #expect(driver.maximumAutomaticDepth(plannedDecodeRows: 2) == 3)
+        #expect(driver.maximumAutomaticDepth(plannedDecodeRows: 4) == 1)
+        #expect(driver.maximumAutomaticDepth(plannedDecodeRows: 8) == 0)
+        #expect(driver.previewDecision(plannedDecodeRows: 4, canSpeculate: true).depth == 1)
+        let blocked = driver.previewDecision(plannedDecodeRows: 8, canSpeculate: true)
+        #expect(blocked.depth == 0)
+        #expect(blocked.reason == "automatic_rectangular_limit")
+    }
+
     @Test func fixedOverrideIncludesZeroAndClampsToTestedMaximum() {
         let zero = CBv2MTPDepthController(maxDepth: 7, fixedDepth: 0)
         #expect(zero.select(plannedDecodeRows: 1, canSpeculate: true).depth == 0)

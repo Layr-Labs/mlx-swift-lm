@@ -67,7 +67,8 @@ enum CBv2AttentionV1 {
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
-        spanContext: CBv2SpanChunkContext? = nil
+        spanContext: CBv2SpanChunkContext? = nil,
+        serializeQueries: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -83,6 +84,12 @@ enum CBv2AttentionV1 {
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if B == 1 {
+            if serializeQueries, L > 1 {
+                return updateAndAttendRowSerialQueries(
+                    row: rows[0], kind: kind,
+                    queries: queries, keys: keys, values: values,
+                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+            }
             return updateAndAttendRow(
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
@@ -118,14 +125,24 @@ enum CBv2AttentionV1 {
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
         for (index, row) in rows.enumerated() {
-            outputs.append(
-                updateAndAttendRow(
+            if serializeQueries {
+                outputs.append(
+                    updateAndAttendRowSerialQueries(
+                        row: row, kind: kind,
+                        queries: queries[index ..< (index + 1)],
+                        keys: keys[index ..< (index + 1)],
+                        values: values[index ..< (index + 1)],
+                        scale: scale, sinks: effectiveSinks, softcap: softcap))
+            } else {
+                outputs.append(
+                    updateAndAttendRow(
                     row: row, kind: kind,
                     queries: queries[index ..< (index + 1)],
                     keys: keys[index ..< (index + 1)],
                     values: values[index ..< (index + 1)],
                     scale: scale, sinks: effectiveSinks, softcap: softcap,
                     spanContext: nil))
+            }
         }
         return concatenated(outputs, axis: 0)
     }
@@ -153,6 +170,19 @@ enum CBv2AttentionV1 {
             sinks: sinks, softcap: softcap)
     }
 
+    private static func updateAndAttendRowSerialQueries(
+        row: CBv2SequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray {
+        let L = queries.dim(2)
+        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        return attendSerialQueries(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: L, window: window(of: kind), scale: scale,
+            sinks: sinks, softcap: softcap)
+    }
+
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer
     /// KV sharing: shared layers project Q only and borrow the source
     /// layer's K/V — the source layer already appended this step's tokens
@@ -173,7 +203,8 @@ enum CBv2AttentionV1 {
     static func attendBorrowing(
         sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind, kind: CBv2LayerKind,
         queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil,
-        spanContext: CBv2SpanChunkContext? = nil
+        spanContext: CBv2SpanChunkContext? = nil,
+        serializeQueries: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -189,6 +220,13 @@ enum CBv2AttentionV1 {
 
         if L > 1 {
             if B == 1 {
+                if serializeQueries {
+                    let (keys, values) = chunkBorrowViews(of: sourceRows[0])
+                    return attendSerialQueries(
+                        queries: queries, keys: keys, values: values,
+                        newTokenCount: L, window: window(of: sourceKind), scale: scale,
+                        sinks: effectiveSinks, softcap: softcap)
+                }
                 return borrowAndAttendRow(
                     sourceRow: sourceRows[0], sourceKind: sourceKind,
                     queries: queries, scale: scale, sinks: effectiveSinks, softcap: softcap,
@@ -199,12 +237,22 @@ enum CBv2AttentionV1 {
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in sourceRows.enumerated() {
-                outputs.append(
-                    borrowAndAttendRow(
+                if serializeQueries {
+                    let (keys, values) = chunkBorrowViews(of: row)
+                    outputs.append(
+                        attendSerialQueries(
+                            queries: queries[index ..< (index + 1)],
+                            keys: keys, values: values, newTokenCount: L,
+                            window: window(of: sourceKind), scale: scale,
+                            sinks: effectiveSinks, softcap: softcap))
+                } else {
+                    outputs.append(
+                        borrowAndAttendRow(
                         sourceRow: row, sourceKind: sourceKind,
                         queries: queries[index ..< (index + 1)],
                         scale: scale, sinks: effectiveSinks, softcap: softcap,
                         spanContext: nil))
+                }
             }
             return concatenated(outputs, axis: 0)
         }
@@ -212,7 +260,16 @@ enum CBv2AttentionV1 {
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
         for (index, row) in sourceRows.enumerated() {
-            let (cachedKeys, cachedValues, _) = row.snapshot()
+            let cachedKeys: MLXArray
+            let cachedValues: MLXArray
+            if let windowed = row as? CBv2WindowedSequenceKV {
+                // Ordinary decode borrows the retained ring. A staged serial
+                // MTP transaction has not written that ring yet, so borrow
+                // the source layer's logical post-update view instead.
+                (cachedKeys, cachedValues) = windowed.decodeBorrowableViews()
+            } else {
+                (cachedKeys, cachedValues, _) = row.snapshot()
+            }
             outputs.append(
                 attend(
                     queries: B == 1 ? queries : queries[index ..< (index + 1)],
@@ -268,6 +325,30 @@ enum CBv2AttentionV1 {
         case .full: return nil
         case .slidingWindow(let window): return window
         }
+    }
+
+    private static func attendSerialQueries(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        newTokenCount: Int, window: Int?, scale: Float,
+        sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray {
+        let keyCount = keys.dim(2)
+        let historyCount = keyCount - newTokenCount
+        precondition(historyCount >= 0)
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(newTokenCount)
+        for column in 0 ..< newTokenCount {
+            let visibleEnd = historyCount + column + 1
+            let visibleStart = window.map { max(0, visibleEnd - $0) } ?? 0
+            outputs.append(
+                attend(
+                    queries: queries[0..., 0..., column ..< (column + 1), 0...],
+                    keys: keys[0..., 0..., visibleStart ..< visibleEnd, 0...],
+                    values: values[0..., 0..., visibleStart ..< visibleEnd, 0...],
+                    scale: scale, L: 1, kL: visibleEnd - visibleStart,
+                    window: nil, sinks: sinks, softcap: softcap))
+        }
+        return concatenated(outputs, axis: 2)
     }
 
     /// Single-request attention dispatch. Without a softcap this is MLXFast
