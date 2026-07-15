@@ -135,7 +135,8 @@ struct CBv2MTPRoundSmokeTests {
             enabled: mtp, maxDraftTokens: maxDraftTokens,
             maxSpeculativeBatch: maxSpeculativeBatch,
             fixedDraftTokens: maxDraftTokens,
-            verificationMode: verificationMode)
+            verificationMode: verificationMode,
+            maxAutomaticRectangularTokens: 8)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(fixture.target),
             layerKinds: kinds,

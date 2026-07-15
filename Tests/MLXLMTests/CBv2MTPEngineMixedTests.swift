@@ -252,7 +252,8 @@ struct CBv2MTPEngineMixedTests {
         CBv2MTPConfig(
             enabled: enabled, maxDraftTokens: fixedDepth,
             maxSpeculativeBatch: maxSpeculativeBatch,
-            fixedDraftTokens: fixedDepth)
+            fixedDraftTokens: fixedDepth,
+            maxAutomaticRectangularTokens: 64)
     }
 
     private func request(

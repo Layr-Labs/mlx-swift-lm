@@ -200,7 +200,11 @@ public struct CBv2MTPConfig: Sendable {
     /// Maximum `batch * (1+k)` target rows eligible for automatic
     /// rectangular verification. The planner clamps larger work to a safe
     /// depth, including ordinary target-only decode when no positive depth
-    /// fits. Ignored by explicit serial/rectangular modes.
+    /// fits. Defaults to ZERO: a positive envelope is the integrator's
+    /// explicit claim that rectangular target evaluation is argmax-exact for
+    /// the deployed chip/OS/MLX/model tuple at every shape inside it. With
+    /// no envelope, automatic mode performs no speculative work. Ignored by
+    /// explicit serial/rectangular modes.
     public var maxAutomaticRectangularTokens: Int
 
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
@@ -219,7 +223,7 @@ public struct CBv2MTPConfig: Sendable {
         maxSpeculativeBatch: Int = 8,
         fixedDraftTokens: Int? = nil,
         verificationMode: CBv2MTPVerificationMode = .automatic,
-        maxAutomaticRectangularTokens: Int = 4
+        maxAutomaticRectangularTokens: Int = 0
     ) {
         self.enabled = enabled
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)

@@ -416,9 +416,12 @@ struct CBv2MTPEngineParityTests {
     }
 
     @Test func automaticVerificationIsSafeDefault() async throws {
+        // The default envelope is ZERO: enabling automatic MTP without a
+        // certified cap yields canonical target-only decode, never
+        // uncertified rectangular work.
         let defaultConfig = CBv2MTPConfig()
         #expect(defaultConfig.verificationMode == .automatic)
-        #expect(defaultConfig.maxAutomaticRectangularTokens == 4)
+        #expect(defaultConfig.maxAutomaticRectangularTokens == 0)
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 19, seed: 0xA55, vocabSize: vocabSize)
         let item = request(id: 1, prompt: prompt, maxTokens: 12)
@@ -426,21 +429,59 @@ struct CBv2MTPEngineParityTests {
         let expected = try await run(targetOnly, item)
         await targetOnly.shutdown()
 
-        let active = makeEngine(
+        let inert = makeEngine(
             target: fixture.target, drafter: try realDrafter(fixture),
             verificationMode: defaultConfig.verificationMode,
             maxAutomaticRectangularTokens: defaultConfig.maxAutomaticRectangularTokens)
-        #expect(active.mtpInactiveReason == nil)
-        #expect(active.loopForTesting.mtp?.config.verificationMode == .automatic)
-        let actual = try await run(active, item)
-        let metrics = try #require(active.mtpMetricsSnapshot())
-        await active.shutdown()
+        #expect(inert.mtpInactiveReason == nil)
+        #expect(inert.loopForTesting.mtp?.config.verificationMode == .automatic)
+        let actual = try await run(inert, item)
+        let metrics = try #require(inert.mtpMetricsSnapshot())
+        await inert.shutdown()
 
         #expect(actual.tokens == expected.tokens)
         #expect(actual.finishReason == expected.finishReason)
-        #expect(metrics.rounds > 0)
-        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(metrics.rounds == 0)
+        #expect(metrics.seedSteps == 0)
+        #expect(metrics.proposedTokens == 0)
+        #expect(metrics.rectangularVerificationRounds == 0)
         #expect(metrics.serialVerificationRounds == 0)
+        #expect(metrics.controllerFallbacks["automatic_rectangular_limit", default: 0] > 0)
+        // Activation with a positive certified envelope is proven by
+        // automaticB4L2UsesExactRectangularVerification on the deterministic
+        // wide-margin fixture.
+    }
+
+    @Test func cappedAutomaticRoundsStillContributeCostSamples() async throws {
+        // Regression for the measurement-keying bug: when the automatic cap
+        // lowers a fixed depth (here 7 -> 3 at B=2 under cap 8), the round
+        // must still commit a controller cost sample at the EXECUTED depth.
+        // Carrying the uncapped controller decision made recordFinalizedStep
+        // drop every capped sample as depth-mismatched.
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompts = (0 ..< 2).map {
+            makePromptTokens(length: 16, seed: UInt64(0xC20 + $0), vocabSize: vocabSize)
+        }
+        let engine = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture),
+            maxSpeculativeBatch: 2, maxConcurrent: 2, fixedDepth: 7,
+            verificationMode: .automatic, maxAutomaticRectangularTokens: 8)
+        let streams = try prompts.enumerated().map { index, prompt in
+            try engine.submit(request(id: UInt64(index + 1), prompt: prompt, maxTokens: 16))
+        }
+        for stream in streams { _ = await cbv2SchedCollect(stream) }
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+
+        #expect(metrics.rounds > 0)
+        #expect(metrics.controllerFallbacks["automatic_rectangular_limit", default: 0] > 0)
+        #expect(metrics.depthSelections[3, default: 0] > 0)
+        #expect(
+            metrics.costInputs.contains {
+                $0.decodeRowBucket == 2 && $0.depth == 3 && $0.samples > 0
+            },
+            "capped rounds must contribute cost samples at the executed depth")
+        #expect(metrics.totalRoundWallTimeNanos > 0)
     }
 
     @Test func rectangularVerificationRemainsAnExplicitOptimization() async throws {
