@@ -50,7 +50,7 @@ final class CBv2QuantizedKVDonationTests: XCTestCase {
                 bytesCapacity: 1 << 28,
                 quantization: quantizedBits.map { (groupSize: 64, bits: $0) }))
         let prefixCache = PrefixCacheV2(
-            config: .init(blockSize: blockSize, modelName: "cbv2-qkv"))
+            config: .init(blockSize: blockSize, promptContractID: "cbv2-qkv"))
         let engine = EngineV2(
             model: model,
             layerKinds: model.layerKinds,

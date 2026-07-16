@@ -120,7 +120,7 @@ final class CBv2EndToEndTests: XCTestCase {
         }
         let prefixCache = PrefixCacheV2(
             config: .init(
-                blockSize: blockSize, modelName: "cbv2-e2e",
+                blockSize: blockSize, promptContractID: "cbv2-e2e",
                 materializeOnDonate: materializeOnDonate))
         let engine = EngineV2(
             model: model,

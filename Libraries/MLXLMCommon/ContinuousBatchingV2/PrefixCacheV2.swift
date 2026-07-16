@@ -7,7 +7,7 @@
 // report 10 invariant 6):
 //
 //  - Keys are SHA-256 chain hashes at fixed block granularity
-//    (`CBv2BlockHasher`, byte-compatible with the legacy checkpoint tier).
+//    (`CBv2BlockHasher`, shared versioned binary format across engine and coordinator).
 //    Fixed blocks, deliberately NOT a radix tree — at provider-scale queue
 //    depths hash-chained blocks capture ~all the win (plan §7 Phase 4).
 //  - `donate` is a zero-copy move: the finished request's per-layer
@@ -43,11 +43,10 @@ import MLX
 public struct CBv2PrefixCacheConfig: Sendable, Equatable {
     /// Tokens per hash block. Must stay consistent for the cache lifetime.
     public var blockSize: Int
-    /// Model namespace folded into every block hash (cross-model isolation).
-    public var modelName: String
-    /// Tenant-scope namespace folded into the first block hash (TB-007).
-    /// Empty ⇒ unscoped, byte-identical to the legacy chain scheme.
-    public var cacheSalt: String
+    /// Prompt-contract identity folded into every block hash.
+    public var promptContractID: String
+    /// Authenticated cache scope folded into every block hash.
+    public var scopeID: String
     /// Byte budget enforced automatically after each donation.
     /// nil ⇒ unbounded; the owner calls `evict(toFit:)` explicitly.
     public var maxBytes: Int?
@@ -62,14 +61,14 @@ public struct CBv2PrefixCacheConfig: Sendable, Equatable {
 
     public init(
         blockSize: Int = CBv2BlockHasher.defaultBlockSize,
-        modelName: String = "",
-        cacheSalt: String = "",
+        promptContractID: String = "",
+        scopeID: String = "",
         maxBytes: Int? = nil,
         materializeOnDonate: Bool = true
     ) {
         self.blockSize = blockSize
-        self.modelName = modelName
-        self.cacheSalt = cacheSalt
+        self.promptContractID = promptContractID
+        self.scopeID = scopeID
         self.maxBytes = maxBytes
         self.materializeOnDonate = materializeOnDonate
     }
@@ -146,8 +145,8 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         self.config = config
         self.hasher = CBv2BlockHasher(
             blockSize: config.blockSize,
-            modelName: config.modelName,
-            cacheSalt: config.cacheSalt
+            promptContractID: config.promptContractID,
+            scopeID: config.scopeID
         )
     }
 
@@ -160,7 +159,9 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
     func hasher(cacheSalt: String?) -> CBv2BlockHasher {
         guard let cacheSalt else { return hasher }
         return CBv2BlockHasher(
-            blockSize: config.blockSize, modelName: config.modelName, cacheSalt: cacheSalt)
+            blockSize: config.blockSize,
+            promptContractID: config.promptContractID,
+            scopeID: cacheSalt)
     }
 
     // MARK: - CBv2PrefixCache: lookup
