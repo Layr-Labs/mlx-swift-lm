@@ -57,10 +57,19 @@ public struct CBv2BlockHasher: Sendable, Equatable {
         blockIndex: Int
     ) -> Data {
         precondition(blockIndex >= 0 && blockIndex <= Int(UInt32.max))
+        let contractID = Data(promptContractID.utf8)
+        let scope = Data(scopeID.utf8)
         var input = Data()
+        input.reserveCapacity(
+            Self.domain.count
+                + MemoryLayout<UInt32>.size + contractID.count
+                + MemoryLayout<UInt32>.size + scope.count
+                + SHA256.Digest.byteCount
+                + MemoryLayout<UInt32>.size
+                + blockTokens.count * MemoryLayout<UInt32>.size)
         input.append(Self.domain)
-        appendLengthPrefixed(Data(promptContractID.utf8), to: &input)
-        appendLengthPrefixed(Data(scopeID.utf8), to: &input)
+        appendLengthPrefixed(contractID, to: &input)
+        appendLengthPrefixed(scope, to: &input)
         if let parent {
             precondition(parent.count == 32)
             input.append(parent)

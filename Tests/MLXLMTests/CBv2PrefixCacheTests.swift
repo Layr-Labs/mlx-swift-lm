@@ -187,10 +187,10 @@ final class CBv2PrefixCacheHasherTests: XCTestCase {
             }
         }
 
-        var root = URL(fileURLWithPath: #filePath)
-        for _ in 0 ..< 5 { root.deleteLastPathComponent() }
-        let fixture = root.appendingPathComponent(
-            "fixtures/prompt-contract/v1/block_hash_vectors.json")
+        let fixture = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "block_hash_vectors",
+                withExtension: "json"))
         let corpus = try JSONDecoder().decode(Corpus.self, from: Data(contentsOf: fixture))
         XCTAssertEqual(corpus.blockHashVersion, CBv2BlockHasher.version)
         for vector in corpus.vectors {
