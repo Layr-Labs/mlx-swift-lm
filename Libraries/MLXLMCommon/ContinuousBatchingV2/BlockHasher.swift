@@ -42,7 +42,9 @@ public struct CBv2BlockHasher: Sendable, Equatable {
         promptContractID: String = "",
         scopeID: String = ""
     ) {
-        precondition(blockSize > 0, "blockSize must be positive")
+        precondition(
+            blockSize > 0 && UInt64(blockSize) <= UInt64(UInt32.max),
+            "blockSize must fit UInt32")
         self.blockSize = blockSize
         self.promptContractID = promptContractID
         self.scopeID = scopeID
@@ -57,8 +59,11 @@ public struct CBv2BlockHasher: Sendable, Equatable {
         blockIndex: Int
     ) -> Data {
         precondition(blockIndex >= 0 && blockIndex <= Int(UInt32.max))
+        precondition(blockTokens.count == blockSize, "blockTokens must contain one full block")
         let contractID = Data(promptContractID.utf8)
         let scope = Data(scopeID.utf8)
+        precondition(contractID.count <= Int(UInt32.max))
+        precondition(scope.count <= Int(UInt32.max))
         var input = Data()
         input.reserveCapacity(
             Self.domain.count
