@@ -555,7 +555,8 @@ final class CBv2MultimodalTests: XCTestCase {
     /// vision-specific skip. Returns the cache so tests can synchronize on the
     /// ASYNC donation queue (donation lands after the stream finishes).
     private func makeMultimodalEngine(_ model: TinyTestModel) -> (EngineV2, PrefixCacheV2) {
-        let cache = PrefixCacheV2(config: .init(blockSize: 8, modelName: "cbv2-mm"))
+        let cache = PrefixCacheV2(
+            config: .init(blockSize: 8, promptContractID: "cbv2-mm"))
         let engine = EngineV2(
             model: model,
             layerKinds: model.layerKinds,
@@ -565,7 +566,6 @@ final class CBv2MultimodalTests: XCTestCase {
             schedulerConfig: CBv2SchedulerConfig(
                 maxBatchedTokensPerStep: 256, prefillChunkSize: 8, maxWaiting: 16,
                 enablePrefixCache: true),
-            loopConfig: CBv2EngineLoopConfig(enableEarlyPrefixDonation: true),
             prefixCache: cache)
         return (engine, cache)
     }

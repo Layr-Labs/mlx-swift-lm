@@ -178,23 +178,11 @@ public struct CBv2EngineLoopConfig: Sendable {
     /// executing in the background; the process-level owner decides
     /// whether to exit.
     public var shutdownTimeout: TimeInterval
-    /// Donate a prompt-only snapshot after the first sampled token confirms
-    /// that prefill completed. Off by default. The loop only enables this on
-    /// backends whose snapshot storage is not recyclable; terminal donation
-    /// remains available to every safely paired backend.
-    public var enableEarlyPrefixDonation: Bool
-    /// Maximum prompt-only donations that may be queued or materializing at
-    /// once. Each job retains its donor state until the donation queue has
-    /// passed it, so this bound also caps retained-state backlog. Terminal
-    /// donations are not subject to this limit.
-    public var maxPendingEarlyPrefixDonations: Int
 
     public init(
         requestTimeout: TimeInterval = 120, stepTimeout: TimeInterval = 30,
         watchdogInterval: TimeInterval = 0.25, idleRecheckInterval: TimeInterval = 0.001,
-        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10,
-        enableEarlyPrefixDonation: Bool = false,
-        maxPendingEarlyPrefixDonations: Int = 2
+        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10
     ) {
         self.requestTimeout = requestTimeout
         self.stepTimeout = stepTimeout
@@ -202,8 +190,6 @@ public struct CBv2EngineLoopConfig: Sendable {
         self.idleRecheckInterval = idleRecheckInterval
         self.eventBufferCapacity = eventBufferCapacity
         self.shutdownTimeout = shutdownTimeout
-        self.enableEarlyPrefixDonation = enableEarlyPrefixDonation
-        self.maxPendingEarlyPrefixDonations = max(0, maxPendingEarlyPrefixDonations)
     }
 }
 
@@ -238,13 +224,10 @@ final class CBv2InFlightStep {
     /// `rollbackOne` scrubs the wasted-token KV tail before release;
     /// `donation` (non-nil for natural finishes with prefix caching on)
     /// routes the retired state through the donation queue.
-    /// `earlyDonation` preserves the exact per-request job after the request
-    /// id becomes reusable. Only that job's pending materialization may defer
-    /// an otherwise-immediate release.
     fileprivate var deferredReleases:
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
-            donation: CBv2DonationIntent?, earlyDonation: CBv2EarlyDonationJob?
+            donation: CBv2DonationIntent?
         )] = []
     /// Non-nil marks this step as an MTP round (verify and/or seed work,
     /// finalized by `finalizeMTPRound`). MTP rounds NEVER chain: the
@@ -322,56 +305,6 @@ struct CBv2DonationIntent {
 /// touches the value after enqueueing.
 private struct CBv2Handoff<Value>: @unchecked Sendable {
     let value: Value
-}
-
-/// Unique lifetime token for one early donation. Completion and retirement
-/// run on different serial queues, so the lock linearizes "still pending?"
-/// with attaching retired states. The job identity, not the reusable request
-/// id, prevents an old completion from affecting a newer request.
-final class CBv2EarlyDonationJob: @unchecked Sendable {
-    let requestID: CBv2RequestID
-    /// Exact sequence rows from which this job's snapshot was built. A
-    /// preempted request may allocate replacement rows under the same reusable
-    /// request id; those rows are unrelated and must never wait behind this
-    /// donation.
-    private let sourceStateIDs: [ObjectIdentifier?]
-
-    private let lock = NSLock()
-    private var completed = false
-    private var deferredRelease: [CBv2SequenceKV?]?
-
-    init(requestID: CBv2RequestID, sourceState: [CBv2SequenceKV?]) {
-        self.requestID = requestID
-        self.sourceStateIDs = Self.identities(of: sourceState)
-    }
-
-    private static func identities(of state: [CBv2SequenceKV?]) -> [ObjectIdentifier?] {
-        state.map { sequence in sequence.map { ObjectIdentifier($0) } }
-    }
-
-    /// Returns true only when the job took ownership of its exact source
-    /// state until completion. At most one release can be attached.
-    func deferRelease(_ state: [CBv2SequenceKV?]) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !completed, deferredRelease == nil,
-            Self.identities(of: state) == sourceStateIDs
-        else { return false }
-        deferredRelease = state
-        return true
-    }
-
-    /// Mark materialization complete and transfer any waiting states back to
-    /// the engine. Called exactly once by this job's donation-queue block.
-    func complete() -> [CBv2SequenceKV?]? {
-        lock.lock()
-        defer { lock.unlock() }
-        assert(!completed, "early donation completed more than once")
-        completed = true
-        let release = deferredRelease
-        deferredRelease = nil
-        return release
-    }
 }
 
 /// Resume-exactly-once wrapper for a drain continuation: the engine queue
@@ -470,16 +403,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
     private var prefixUsageByID: [CBv2RequestID: CBv2PrefixUsage] = [:]
-    /// Exact prompt-only donation job for each live request. Entries clear on
-    /// completion or terminal retirement; identity checks make that cleanup
-    /// safe when a request id is reused before an old job completes.
-    private var earlyDonationsScheduled: [CBv2RequestID: CBv2EarlyDonationJob] = [:]
-    /// Global job accounting remains independent of reusable request ids.
-    private var pendingEarlyDonationCount = 0
     /// Donation work that currently owns a retired backend state. Natural
-    /// drain cannot complete until each obligation releases its state back on
-    /// the engine queue. Early jobs are counted only after their exact source
-    /// state retires; terminal donations are counted when queued.
+    /// drain cannot complete until each terminal donation releases its state
+    /// back on the engine queue.
     private var pendingDonationReleaseCount = 0
     /// Resolved vision inputs (validated spans + materialized embeddings),
     /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
@@ -960,11 +886,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
                         (
-                            id: id, state: state, rollbackOne: false, donation: nil,
-                            earlyDonation: earlyDonationsScheduled[id]
+                            id: id, state: state, rollbackOne: false, donation: nil
                         ))
                 } else {
-                    releaseState(state, pendingEarlyDonation: earlyDonationsScheduled[id])
+                    backend.release(state)
                 }
             }
         }
@@ -1417,8 +1342,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 matchedStopString = detokenizer?.matchedStopString ?? false
             }
 
-            scheduleEarlyDonationIfEligible(for: rec)
-
             // Stop detection — one step late by construction.
             if isStopToken {
                 finishRequest(id, reason: .stop)
@@ -1443,13 +1366,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
-        for (_, state, rollbackOne, donation, earlyDonation) in step.deferredReleases {
+        for (_, state, rollbackOne, donation) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
-            retire(
-                state: state, donating: donation,
-                pendingEarlyDonation: earlyDonation)
+            retire(state: state, donating: donation)
         }
         if let measurement = step.mtpMeasurement {
             let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
@@ -1473,7 +1394,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
-        let earlyDonation = earlyDonationsScheduled.removeValue(forKey: id)
         // MTP: ids are reusable, so every per-id trace (carry, marks) must
         // go on every finish path.
         mtp?.requestDidFinish(id)
@@ -1504,13 +1424,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                     (
                         id: id, state: state,
                         rollbackOne: inFlight.sampledRows.contains(id),
-                        donation: donation,
-                        earlyDonation: earlyDonation
+                        donation: donation
                     ))
             } else {
-                retire(
-                    state: state, donating: donation,
-                    pendingEarlyDonation: earlyDonation)
+                retire(state: state, donating: donation)
             }
         }
 
@@ -1586,47 +1503,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             cacheSalt: rec.request.cacheSalt)
     }
 
-    /// Enqueue a prompt-only donation after the first sampled token. The
-    /// snapshot is graph-built on the engine queue, but hashing and device
-    /// materialization remain on `donationQueue`, so streaming never waits.
-    ///
-    /// Paged backends are deliberately excluded: their snapshots are lazy
-    /// gathers from in-place slabs. Terminal donation is safe because page
-    /// release is fenced behind donation materialization; an early donor
-    /// stays live and could be cancelled/released while that asynchronous
-    /// gather is pending. Without a page-lease API, disabling early donation
-    /// is the only race-free policy.
-    private func scheduleEarlyDonationIfEligible(for rec: CBv2ScheduledRequest) {
-        guard config.enableEarlyPrefixDonation, prefixCache != nil else { return }
-        guard rec.request.prefixCacheEnabled else { return }
-        guard !backend.requiresMaterializedSnapshots else { return }
-        guard rec.generatedTokenCount == 1 else { return }
-        guard earlyDonationsScheduled[rec.id] == nil else { return }
-        guard pendingEarlyDonationCount < config.maxPendingEarlyPrefixDonations else { return }
-        guard rec.request.multimodal == nil, rec.request.promptTokens.count > 1 else { return }
-        guard let state = kvStates[rec.id], donationStateIsLossless(state) else { return }
-        let promptCount = rec.request.promptTokens.count
-        guard stateCoversDonation(state, tokenCount: promptCount) else { return }
-
-        let earlyDonation = CBv2EarlyDonationJob(requestID: rec.id, sourceState: state)
-        earlyDonationsScheduled[rec.id] = earlyDonation
-        pendingEarlyDonationCount += 1
-        let queued = enqueueDonation(
-            state: state,
-            intent: CBv2DonationIntent(
-                requestID: rec.request.prefixCacheReceiptID ?? rec.id,
-                tokens: rec.request.promptTokens,
-                cacheSalt: rec.request.cacheSalt),
-            releaseAfterDonation: false,
-            earlyDonation: earlyDonation)
-        if !queued {
-            pendingEarlyDonationCount -= 1
-            if earlyDonationsScheduled[rec.id] === earlyDonation {
-                earlyDonationsScheduled.removeValue(forKey: rec.id)
-            }
-        }
-    }
-
     /// Retire a finished request's KV state: donate to the prefix cache
     /// (snapshots graph-built HERE on the engine thread, so views over
     /// shared paged slabs are consistent with in-flight writes; hashing +
@@ -1634,45 +1510,22 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// release the storage back on the engine queue (the paged pool is
     /// engine-thread-affine).
     private func retire(
-        state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?,
-        pendingEarlyDonation: CBv2EarlyDonationJob? = nil
+        state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?
     ) {
         guard prefixCache != nil, let donation else {
-            releaseState(state, pendingEarlyDonation: pendingEarlyDonation)
-            return
-        }
-        let queued = enqueueDonation(
-            state: state, intent: donation, releaseAfterDonation: true)
-        if !queued {
-            releaseState(state, pendingEarlyDonation: pendingEarlyDonation)
-        }
-    }
-
-    /// Release immediately unless this request's exact early donation is
-    /// still materializing. A pending job takes ownership of the state and
-    /// releases it on its own completion; unrelated later donation work does
-    /// not extend the backend charge. Job identity makes id reuse harmless.
-    private func releaseState(
-        _ state: [CBv2SequenceKV?], pendingEarlyDonation: CBv2EarlyDonationJob?
-    ) {
-        guard let pendingEarlyDonation,
-            pendingEarlyDonation.deferRelease(state)
-        else {
             backend.release(state)
             return
         }
-        pendingDonationReleaseCount += 1
+        let queued = enqueueDonation(state: state, intent: donation)
+        if !queued {
+            backend.release(state)
+        }
     }
 
     /// Build immutable-by-contract snapshot handles on the engine queue and
-    /// hand all expensive work to the serial donation queue. `tokenCount`
-    /// may be shorter than live state (early donation can race one chained
-    /// decode graph), so every cacheable layer is sliced to the exact donated
-    /// prompt boundary before handoff.
+    /// hand all expensive work to the serial donation queue.
     private func enqueueDonation(
-        state: [CBv2SequenceKV?], intent: CBv2DonationIntent,
-        releaseAfterDonation: Bool,
-        earlyDonation: CBv2EarlyDonationJob? = nil
+        state: [CBv2SequenceKV?], intent: CBv2DonationIntent
     ) -> Bool {
         guard let prefixCache else { return false }
         let tokenCount = intent.tokens.count
@@ -1700,9 +1553,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let layerKinds = self.layerKinds
         let handoff = CBv2Handoff(value: (state: state, snapshots: built, intent: intent))
-        if releaseAfterDonation {
-            pendingDonationReleaseCount += 1
-        }
+        pendingDonationReleaseCount += 1
         // Strong self on purpose: the deferred release is a pending
         // obligation of this loop — it must survive until the donation
         // lands, or the retired state leaks its pages (the paged pool is
@@ -1714,35 +1565,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 tokens: handoff.value.intent.tokens,
                 snapshots: handoff.value.snapshots, layerKinds: layerKinds,
                 cacheSalt: handoff.value.intent.cacheSalt)
-            if releaseAfterDonation {
-                self.releaseDonationStateOnEngineQueue(handoff.value.state)
-            }
-            if let earlyDonation {
-                self.earlyDonationDidComplete(earlyDonation)
-            }
-        }
-        return true
-    }
-
-    private func earlyDonationDidComplete(_ donation: CBv2EarlyDonationJob) {
-        if let state = donation.complete() {
-            releaseDonationStateOnEngineQueue(state)
-        }
-        engineQueue.async { [self] in
-            assert(pendingEarlyDonationCount > 0, "unbalanced early donation completion")
-            pendingEarlyDonationCount = max(0, pendingEarlyDonationCount - 1)
-            if earlyDonationsScheduled[donation.requestID] === donation {
-                earlyDonationsScheduled.removeValue(forKey: donation.requestID)
-            }
-        }
-    }
-
-    private func donationStateIsLossless(_ state: [CBv2SequenceKV?]) -> Bool {
-        for (i, kind) in layerKinds.enumerated() {
-            var cacheable = kind.sharesKVWithLayer == nil
-            if case .slidingWindow = kind.attention { cacheable = false }
-            guard cacheable, let sequence = state[i] else { continue }
-            guard sequence.snapshotIsLossless else { return false }
+            self.releaseDonationStateOnEngineQueue(handoff.value.state)
         }
         return true
     }
@@ -1875,7 +1698,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             mtp?.invalidateCarry(id)
             if let state = kvStates.removeValue(forKey: id) {
                 compiledDecode?.forgetRows(state)
-                releaseState(state, pendingEarlyDonation: earlyDonationsScheduled[id])
+                backend.release(state)
             }
         }
     }

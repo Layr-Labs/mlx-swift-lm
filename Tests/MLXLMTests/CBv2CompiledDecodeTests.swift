@@ -393,7 +393,8 @@ final class CBv2CompiledDecodeTests: XCTestCase {
         var perModeHits: [Bool: [Int]] = [:]
         for compiled in [false, true] {
             let prefixCache = PrefixCacheV2(
-                config: .init(blockSize: 8, modelName: "cbv2-compiled-adopt"))
+                config: .init(
+                    blockSize: 8, promptContractID: "cbv2-compiled-adopt"))
             let engine = EngineV2(
                 model: model,
                 layerKinds: model.layerKinds,

@@ -208,7 +208,6 @@ struct CBv2MTPEngineMixedTests {
         backend: CBv2KVBackend? = nil,
         cacheProvider: CBv2LayerCacheProvider? = nil,
         prefixCache: CBv2PrefixCache? = nil,
-        earlyPrefixDonation: Bool = false,
         eventBufferCapacity: Int = 256,
         mtpDrafter: (any CBv2MTPDrafter)? = nil
     ) throws -> EngineV2 {
@@ -235,9 +234,7 @@ struct CBv2MTPEngineMixedTests {
                 maxBatchedTokensPerStep: 256,
                 prefillChunkSize: prefillChunkSize, maxWaiting: 16,
                 enablePrefixCache: prefixCache != nil),
-            loopConfig: CBv2EngineLoopConfig(
-                eventBufferCapacity: eventBufferCapacity,
-                enableEarlyPrefixDonation: earlyPrefixDonation),
+            loopConfig: CBv2EngineLoopConfig(eventBufferCapacity: eventBufferCapacity),
             admissionConfig: admissionConfig,
             prefixCache: prefixCache,
             compiledDecodeConfig: CBv2CompiledDecodeConfig(
@@ -544,51 +541,11 @@ struct CBv2MTPEngineMixedTests {
             "compiled decode must release eager rows retained by a rejected MTP round")
     }
 
-    @Test func earlyDonationOnUnsafeHybridFallsBackToFullReplay() async throws {
-        let fixture = try makeFixture()
-        // The donated prompt matches, but this interleaved hybrid has a
-        // storage-owning full layer downstream of sliding attention. Partial
-        // adoption would permanently cache replay-boundary pollution, so the
-        // safe policy recomputes the whole matched prefix.
-        let prompt = makePromptTokens(length: 129, seed: 660, vocabSize: vocabSize)
-        let cache = PrefixCacheV2(
-            config: .init(blockSize: 8, modelName: "mtp-prefix-confirmed"))
-        let engine = try makeEngine(
-            fixture, mtp: true, prefillChunkSize: 16,
-            prefixCache: cache, earlyPrefixDonation: true)
-
-        let donor = request(id: 1, prompt: prompt, maxTokens: 128)
-        let stream = try engine.submit(donor)
-        var iterator = stream.makeAsyncIterator()
-        guard case .delta? = await iterator.next() else {
-            await engine.shutdown()
-            Issue.record("MTP donor must reach its first confirmed token")
-            return
-        }
-        let donated = await cbv2SchedWait { cache.stats().entryCount > 0 }
-        #expect(donated, "early donation must materialize confirmed prompt KV")
-        engine.cancel(donor.id)
-        while let event = await iterator.next() {
-            if case .finished = event { break }
-        }
-
-        let adopted = try await run(
-            engine, request(id: 2, prompt: prompt, maxTokens: 8))
-        let metrics = try #require(engine.mtpMetricsSnapshot())
-        await engine.shutdown()
-        #expect(adopted.finishReason == .length)
-        #expect(adopted.usage?.prefixCacheOutcome == .skippedPolicy)
-        #expect(adopted.usage?.prefixCacheMatchedTokens == 128)
-        #expect(adopted.usage?.prefixCachePrefillTokensSaved == 0)
-        #expect(adopted.usage?.prefixCacheHitTokens == 0)
-        #expect(metrics.rounds > 0)
-    }
-
     @Test func terminalDonationAfterSynchronizedRollbackReplaysExactly() async throws {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 129, seed: 662, vocabSize: vocabSize)
         let cache = PrefixCacheV2(
-            config: .init(blockSize: 8, modelName: "mtp-terminal-confirmed"))
+            config: .init(blockSize: 8, promptContractID: "mtp-terminal-confirmed"))
         let engine = try makeEngine(
             fixture, mtp: true, prefillChunkSize: 16, prefixCache: cache)
 

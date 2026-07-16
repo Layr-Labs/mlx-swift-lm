@@ -6,7 +6,6 @@
 
 import Foundation
 import MLX
-import CryptoKit
 import XCTest
 
 @testable import MLXLMCommon
@@ -15,6 +14,19 @@ import XCTest
 
 private func hex(_ data: Data) -> String {
     data.map { String(format: "%02x", $0) }.joined()
+}
+
+private func hexData(_ value: String) -> Data? {
+    guard value.count.isMultiple(of: 2) else { return nil }
+    var data = Data()
+    var index = value.startIndex
+    while index < value.endIndex {
+        let next = value.index(index, offsetBy: 2)
+        guard let byte = UInt8(String(value[index ..< next]), radix: 16) else { return nil }
+        data.append(byte)
+        index = next
+    }
+    return data
 }
 
 private func fullLayer() -> CBv2LayerKind {
@@ -69,34 +81,34 @@ private func makeCache(
 ) -> PrefixCacheV2 {
     PrefixCacheV2(
         config: CBv2PrefixCacheConfig(
-            blockSize: blockSize, modelName: "test", cacheSalt: salt, maxBytes: maxBytes))
+            blockSize: blockSize,
+            promptContractID: "test",
+            scopeID: salt,
+            maxBytes: maxBytes))
 }
 
 // MARK: - §1 Chain-hash vectors
 
 final class CBv2PrefixCacheHasherTests: XCTestCase {
 
-    // Fixed vectors computed independently (Python hashlib) against the
-    // documented format:
-    //   h_i = SHA256(model ‖ (parent ?? "omlx-root")
-    //                ‖ [first block: "cbv2-salt-v1" ‖ u64le(len) ‖ salt]
-    //                ‖ "(t0, t1, …)")
+    // Fixed vectors computed independently with Python hashlib/struct against
+    // the versioned binary format documented in BlockHasher.swift.
 
     func testFixedVectorNoModelNoSalt() {
         let hasher = CBv2BlockHasher(blockSize: 3)
-        let h = hasher.blockHash(parent: nil, blockTokens: [1, 2, 3])
+        let h = hasher.blockHash(parent: nil, blockTokens: [1, 2, 3], blockIndex: 0)
         XCTAssertEqual(
-            hex(h), "bbae1d7b58b0342987ac2fc87c5c3a190f737d0357d739d9c3fb1f65b2df8d4f")
+            hex(h), "f55d264cf55e50a1e376d23c9621b96663dd90401587a6ca107bcc9e6cbdf475")
     }
 
     func testFixedVectorModelAndChain() {
-        let hasher = CBv2BlockHasher(blockSize: 3, modelName: "m")
-        let h1 = hasher.blockHash(parent: nil, blockTokens: [1, 2, 3])
+        let hasher = CBv2BlockHasher(blockSize: 3, promptContractID: "m")
+        let h1 = hasher.blockHash(parent: nil, blockTokens: [1, 2, 3], blockIndex: 0)
         XCTAssertEqual(
-            hex(h1), "87540c796cfe1ad7f636e1429ee7e96b9df90ac1ea8b3c79c844ecdc64cf1eef")
-        let h2 = hasher.blockHash(parent: h1, blockTokens: [4, 5, 6])
+            hex(h1), "2d297cdc058f6ada3ba21260bdd49104a57a70ff76d535256a3862f48eeb555f")
+        let h2 = hasher.blockHash(parent: h1, blockTokens: [4, 5, 6], blockIndex: 1)
         XCTAssertEqual(
-            hex(h2), "d03e1c265f8b6b657b243049714a11629d4d6f18c270895077656ba8d56ac3da")
+            hex(h2), "0c0fc3d92932754aba387be45c074aa7a3d3f9300ba4a88eb44483ca3817c6d0")
         // chainHashes must produce exactly [h1, h2] for two whole blocks.
         XCTAssertEqual(hasher.chainHashes(tokens: [1, 2, 3, 4, 5, 6]), [h1, h2])
         // Partial third block is not hashed.
@@ -104,69 +116,96 @@ final class CBv2PrefixCacheHasherTests: XCTestCase {
     }
 
     func testSaltSeparationVectors() {
-        let unsalted = CBv2BlockHasher(blockSize: 3, modelName: "m")
-        let tenantA = CBv2BlockHasher(blockSize: 3, modelName: "m", cacheSalt: "tenantA")
-        let tenantB = CBv2BlockHasher(blockSize: 3, modelName: "m", cacheSalt: "tenantB")
+        let unsalted = CBv2BlockHasher(blockSize: 3, promptContractID: "m")
+        let tenantA = CBv2BlockHasher(
+            blockSize: 3, promptContractID: "m", scopeID: "tenantA")
+        let tenantB = CBv2BlockHasher(
+            blockSize: 3, promptContractID: "m", scopeID: "tenantB")
 
-        let hA = tenantA.blockHash(parent: nil, blockTokens: [1, 2, 3])
-        let hB = tenantB.blockHash(parent: nil, blockTokens: [1, 2, 3])
-        let h0 = unsalted.blockHash(parent: nil, blockTokens: [1, 2, 3])
+        let hA = tenantA.blockHash(parent: nil, blockTokens: [1, 2, 3], blockIndex: 0)
+        let hB = tenantB.blockHash(parent: nil, blockTokens: [1, 2, 3], blockIndex: 0)
+        let h0 = unsalted.blockHash(parent: nil, blockTokens: [1, 2, 3], blockIndex: 0)
 
         XCTAssertEqual(
-            hex(hA), "3d85d37a09c31f646b3e3c4f7634c73eece1c87ae3911292fd8f8c6f932cee83")
+            hex(hA), "3561a06666af2c57b2cb399fa88dbf29d0f837f239653866dac46e08775fd511")
         XCTAssertEqual(
-            hex(hB), "a5e78ee5a02603c59c7bf70eabd87e7b0e42bda81567c86bc4673eabcf0a66a3")
+            hex(hB), "3f70a1b42f37810db151bf461a46a4879b5916ec83138944534ff296392d866f")
         // Three distinct namespaces for identical tokens.
         XCTAssertNotEqual(hA, hB)
         XCTAssertNotEqual(hA, h0)
         XCTAssertNotEqual(hB, h0)
     }
 
-    func testSaltAppliesToFirstBlockOnlyAndPropagatesViaChain() {
-        let unsalted = CBv2BlockHasher(blockSize: 3, modelName: "m")
-        let tenantA = CBv2BlockHasher(blockSize: 3, modelName: "m", cacheSalt: "tenantA")
+    func testScopeIdentityIsBoundIntoEveryBlock() {
+        let tenantA = CBv2BlockHasher(
+            blockSize: 3, promptContractID: "m", scopeID: "tenantA")
 
-        let h1 = tenantA.blockHash(parent: nil, blockTokens: [1, 2, 3])
-        let h2 = tenantA.blockHash(parent: h1, blockTokens: [4, 5, 6])
+        let h1 = tenantA.blockHash(
+            parent: nil, blockTokens: [1, 2, 3], blockIndex: 0)
+        let h2 = tenantA.blockHash(
+            parent: h1, blockTokens: [4, 5, 6], blockIndex: 1)
         XCTAssertEqual(
-            hex(h2), "15fa28e9dd45684845d5e2a178c586f6b00db04e5bce956f1a6515818b8fe939")
-        // Non-first blocks mix no salt bytes: the salted and unsalted hashers
-        // agree given the same parent (the tenant scope rides the chain).
-        XCTAssertEqual(h2, unsalted.blockHash(parent: h1, blockTokens: [4, 5, 6]))
+            hex(h2), "76cb22b1a5f55ed9ef8f461b2592ee6e89021a443f2dc3cb47ea00c6f485eb09")
     }
 
-    func testEmptySaltIsByteCompatibleWithLegacyCheckpointTier() {
-        // Hash-scheme stability pin: with an empty salt the v2 chain is
-        // byte-identical to the legacy checkpoint tier's computeBlockHash
-        // (SHA-256 over modelName ‖ parent-or-"omlx-root" ‖ "(t0, t1, …)").
-        // The legacy implementation died with the v1 engine, so the
-        // reference is reproduced INLINE — this pin is what keeps future
-        // hasher edits from silently invalidating any persisted chains the
-        // SSD-offload successor may interop with.
-        func legacyComputeBlockHash(
-            parentHash: Data?, tokenIds: [Int], modelName: String
-        ) -> Data {
-            var h = SHA256()
-            if !modelName.isEmpty { h.update(data: Data(modelName.utf8)) }
-            h.update(data: parentHash ?? Data("omlx-root".utf8))
-            let repr = "(\(tokenIds.map(String.init).joined(separator: ", ")))"
-            h.update(data: Data(repr.utf8))
-            return Data(h.finalize())
-        }
-        let tokens = Array(0 ..< 12)
-        let hasher = CBv2BlockHasher(blockSize: 4, modelName: "test_model")
-        let v2Chain = hasher.chainHashes(tokens: tokens)
+    func testBlockIndexIsBound() {
+        let hasher = CBv2BlockHasher(blockSize: 3, promptContractID: "m")
+        let first = hasher.blockHash(
+            parent: nil, blockTokens: [1, 2, 3], blockIndex: 0)
+        let shifted = hasher.blockHash(
+            parent: nil, blockTokens: [1, 2, 3], blockIndex: 1)
+        XCTAssertNotEqual(first, shifted)
+    }
 
-        var parent: Data?
-        var legacyChain: [Data] = []
-        for i in 0 ..< 3 {
-            let block = Array(tokens[(i * 4) ..< (i * 4 + 4)])
-            let h = legacyComputeBlockHash(
-                parentHash: parent, tokenIds: block, modelName: "test_model")
-            legacyChain.append(h)
-            parent = h
+    func testSharedBinaryHashVectors() throws {
+        struct Corpus: Decodable {
+            let blockHashVersion: String
+            let vectors: [Vector]
+
+            enum CodingKeys: String, CodingKey {
+                case blockHashVersion = "block_hash_version"
+                case vectors
+            }
         }
-        XCTAssertEqual(v2Chain, legacyChain)
+        struct Vector: Decodable {
+            let contractId: String
+            let scopeId: String
+            let blockIndex: Int
+            let parentHash: String
+            let tokenStart: Int
+            let tokenCount: Int
+            let expectedHash: String
+
+            enum CodingKeys: String, CodingKey {
+                case contractId = "contract_id"
+                case scopeId = "scope_id"
+                case blockIndex = "block_index"
+                case parentHash = "parent_hash"
+                case tokenStart = "token_start"
+                case tokenCount = "token_count"
+                case expectedHash = "expected_hash"
+            }
+        }
+
+        let fixture = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "block_hash_vectors",
+                withExtension: "json"))
+        let corpus = try JSONDecoder().decode(Corpus.self, from: Data(contentsOf: fixture))
+        XCTAssertEqual(corpus.blockHashVersion, CBv2BlockHasher.version)
+        for vector in corpus.vectors {
+            let parent = try XCTUnwrap(hexData(vector.parentHash))
+            let tokens = Array(vector.tokenStart ..< vector.tokenStart + vector.tokenCount)
+            let hasher = CBv2BlockHasher(
+                blockSize: vector.tokenCount,
+                promptContractID: vector.contractId,
+                scopeID: vector.scopeId)
+            let actual = hasher.blockHash(
+                parent: parent,
+                blockTokens: tokens,
+                blockIndex: vector.blockIndex)
+            XCTAssertEqual(hex(actual), vector.expectedHash)
+        }
     }
 
     func testFullBlockCountAndLookupCap() {
@@ -187,7 +226,7 @@ final class CBv2PrefixCacheHasherTests: XCTestCase {
     }
 
     func testChainHashesMaxBlocksCap() {
-        let hasher = CBv2BlockHasher(blockSize: 4, modelName: "m")
+        let hasher = CBv2BlockHasher(blockSize: 4, promptContractID: "m")
         let tokens = Array(0 ..< 12)
         let full = hasher.chainHashes(tokens: tokens)
         XCTAssertEqual(full.count, 3)
