@@ -639,12 +639,11 @@ final class CBv2PrefixCacheWindowedPolicyTests: XCTestCase {
             PrefixCacheV2.requiredRecompute(layerKinds: gemma4Like, matched: 1024), 1024)
     }
 
-    func testGPTOSSLikeDownstreamFullLayerRequiresFullReplay() {
-        // The first full-attention layer caches K/V for replay positions whose
-        // upstream sliding context is incomplete. Those entries never age out,
-        // so a trailing-window bound cannot make partial adoption exact.
+    func testGPTOSSLikeUsesConservativeFrozenReplayTail() {
+        // Two sliding layers × 128 tokens. Owning full rows stay immutable
+        // through M, so only finite-window state needs this replay tail.
         XCTAssertEqual(
-            PrefixCacheV2.requiredRecompute(layerKinds: gptossLike, matched: 1024), 1024)
+            PrefixCacheV2.requiredRecompute(layerKinds: gptossLike, matched: 1024), 256)
     }
 
     func testAllFullModelRequiresNoRecompute() {

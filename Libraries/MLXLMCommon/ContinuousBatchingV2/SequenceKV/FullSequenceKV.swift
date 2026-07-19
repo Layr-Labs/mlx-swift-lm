@@ -59,6 +59,15 @@ protocol CBv2InnerStateProviding {
     func cbv2InnerState() -> [MLXArray]
 }
 
+/// Internal compiled-decode storage seam shared by ordinary and
+/// frozen-replay full rows after the latter crosses its immutable high-water.
+protocol CBv2CompiledFullSequenceKV: CBv2SequenceKV {
+    func compiledStorage(
+        capacity: Int, keysDType: DType, valuesDType: DType
+    ) -> (keys: MLXArray, values: MLXArray)?
+    func noteCompiledAdvance()
+}
+
 /// `CBv2SequenceKV` for full (non-windowed) attention.
 ///
 /// Storage is one contiguous `[1, kvHeads, capacity, headDim]` buffer per
@@ -259,3 +268,5 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         capacity = newCapacity
     }
 }
+
+extension CBv2FullSequenceKV: CBv2CompiledFullSequenceKV {}

@@ -96,10 +96,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// - Parameters:
     ///   - window: sliding window in tokens (> 0).
     ///   - initialOffset: absolute position this sequence starts at. Non-zero
-    ///     when a prefix-cache hit adopts full-attention KV at offset `m` and
-    ///     the scheduler recomputes the trailing `window` tokens for windowed
-    ///     layers: those rows start at `max(0, m - window)` so that absolute
-    ///     RoPE positions line up across layers.
+    ///     when a prefix-cache hit starts finite-window replay at C. The row
+    ///     starts empty at C while owning full rows may retain immutable K/V
+    ///     through M; absolute RoPE positions therefore remain aligned.
     public init(window: Int, kvHeads: Int, headDim: Int, initialOffset: Int = 0) {
         precondition(window > 0, "CBv2WindowedSequenceKV: window must be > 0")
         precondition(initialOffset >= 0, "CBv2WindowedSequenceKV: negative initialOffset")

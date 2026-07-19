@@ -50,6 +50,10 @@ public struct CBv2ContiguousBackendConfig: Sendable {
 public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     public let config: CBv2ContiguousBackendConfig
+    public var prefixReuseBackend: CBv2PrefixReuseBackend {
+        if config.quantization != nil { return .contiguousQuantized }
+        return .contiguousUnquantized
+    }
 
     /// Compiled [B, 1] decode can bind the fp16 rows this backend mints
     /// (`CBv2FullSequenceKV` / `CBv2WindowedSequenceKV`) — but NOT the
@@ -129,6 +133,7 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
         try validate(layerKinds: layerKinds)
@@ -137,12 +142,49 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 reason: "prefix count \(prefix.count) != layer count \(layerKinds.count)")
         }
 
-        // The matched prefix length: uniform across all donated full-attention
-        // layers by construction of the prefix cache.
-        var matched = 0
+        guard plan.backend == prefixReuseBackend else {
+            throw CBv2KVError.backendIneligible(
+                reason:
+                    "prefix plan backend \(plan.backend.rawValue) != \(prefixReuseBackend.rawValue)")
+        }
+        if plan.strategy == .frozenFullReplay, config.quantization != nil {
+            throw CBv2KVError.backendIneligible(
+                reason: "frozen-full replay requires contiguous unquantized rows")
+        }
+        guard plan.matchedBoundary <= maxLength,
+            plan.replayStart >= 0,
+            plan.replayStart <= plan.matchedBoundary,
+            plan.replayTokens == plan.matchedBoundary - plan.replayStart
+        else {
+            throw CBv2KVError.backendIneligible(reason: "invalid prefix replay plan")
+        }
+
+        // Full snapshots use either C (ordinary safe-layout replay) or M
+        // (frozen-full replay). Every owning full row must agree.
+        let expectedSnapshotOffset = plan.restoredFullTokens
+        var sawOwningFull = false
         for (index, entry) in prefix.enumerated() {
-            guard let entry else { continue }
             let kind = layerKinds[index]
+            if kind.sharesKVWithLayer != nil {
+                guard entry == nil else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "layer \(index) is KV-shared but received a prefix snapshot")
+                }
+                continue
+            }
+            if case .slidingWindow = kind.attention {
+                guard entry == nil else {
+                    throw CBv2KVError.backendIneligible(
+                        reason:
+                            "layer \(index) is windowed but received a prefix snapshot")
+                }
+                continue
+            }
+            sawOwningFull = true
+            guard let entry else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "owning full layer \(index) is missing its prefix snapshot")
+            }
             guard kind.sharesKVWithLayer == nil else {
                 throw CBv2KVError.backendIneligible(
                     reason: "layer \(index) is KV-shared but received a prefix snapshot")
@@ -153,46 +195,54 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                         "layer \(index) is windowed but received a prefix snapshot (windowed layers are recomputed)"
                 )
             }
-            if matched == 0 { matched = entry.offset }
-            guard entry.offset == matched else {
+            guard entry.offset == expectedSnapshotOffset else {
                 throw CBv2KVError.backendIneligible(
                     reason:
-                        "non-uniform prefix offsets (\(entry.offset) vs \(matched)) at layer \(index)"
+                        "prefix offset \(entry.offset) != planned \(expectedSnapshotOffset) at layer \(index)"
                 )
             }
+            guard entry.keys.dim(2) == entry.offset, entry.values.dim(2) == entry.offset else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "full prefix snapshot at layer \(index) does not exactly cover its offset")
+            }
         }
-        guard matched <= maxLength else {
+        guard sawOwningFull else {
             throw CBv2KVError.backendIneligible(
-                reason: "prefix offset \(matched) exceeds maxLength \(maxLength)")
+                reason: "prefix replay requires at least one storage-owning full layer")
         }
 
         let state = layerKinds.enumerated().map { index, kind -> CBv2SequenceKV? in
             guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
             case .slidingWindow(let window):
-                // Windowed layers never receive a snapshot. Reconciled
-                // adoption semantics (contract `makeSequenceState(adopting:)`):
-                // the engine already sliced the prefix down by
-                // `cbv2RequiredRecompute`, so EVERY row starts at the uniform
-                // adopted offset and the engine replays [matched, prompt)
-                // through all layers.
+                // Sliding rows always start empty at C and rebuild through R.
                 return CBv2WindowedSequenceKV(
                     window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
-                    initialOffset: matched)
+                    initialOffset: plan.replayStart)
             case .full:
-                let row = makeRow(kind: kind, promptLength: matched, maxLength: maxLength)!
-                if let entry = prefix[index], entry.offset > 0 {
-                    // Bounded one-time copy of the donated arrays into fresh
-                    // sequence state (the paged backend makes this free).
-                    _ = row.update(keys: entry.keys, values: entry.values)
+                let entry = prefix[index]!
+                if plan.strategy == .frozenFullReplay {
+                    return CBv2FrozenReplayFullSequenceKV(
+                        snapshot: entry,
+                        replayStart: plan.replayStart,
+                        maxLength: maxLength,
+                        kvHeads: kind.kvHeads,
+                        headDim: kind.headDim)
                 }
+                let row = makeRow(
+                    kind: kind,
+                    promptLength: expectedSnapshotOffset,
+                    maxLength: maxLength)!
+                _ = row.update(keys: entry.keys, values: entry.values)
                 return row
             }
         }
         try registerReserving(
             state,
-            estimates: rowEstimates(
-                layerKinds: layerKinds, promptLength: matched, maxLength: maxLength))
+            estimates: adoptionRowEstimates(
+                prefix: prefix,
+                layerKinds: layerKinds,
+                maxLength: maxLength))
         return state
     }
 
@@ -228,7 +278,10 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         precondition(state.count == estimates.count, "estimate/state count mismatch")
         lock.lock()
         defer { lock.unlock() }
-        let needed = estimates.reduce(0) { $0 + ($1 ?? 0) }
+        let needed = zip(state, estimates).reduce(0) { total, pair in
+            guard let row = pair.0 else { return total }
+            return total + max(row.byteCount, pair.1 ?? 0)
+        }
         let available = liveBytesCapacity - accountedBytesLocked()
         guard needed <= available else {
             throw CBv2KVError.capacityExhausted(needed: needed, available: max(0, available))
@@ -310,6 +363,28 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                     return slots * kind.kvHeads * perToken * 2
                 }
                 return slots * kind.kvHeads * kind.headDim * itemSize * 2
+            }
+        }
+    }
+
+    /// Adoption transfers native-dtype full rows from staging. Reserve their
+    /// full request span before publication so later capacity growth cannot
+    /// outrun the backend hard ceiling. Sliding rows retain their fixed ring
+    /// estimate.
+    private func adoptionRowEstimates(
+        prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind],
+        maxLength: Int
+    ) -> [Int?] {
+        layerKinds.enumerated().map { index, kind in
+            guard kind.sharesKVWithLayer == nil else { return nil }
+            switch kind.attention {
+            case .slidingWindow(let window):
+                return window * kind.kvHeads * kind.headDim * config.kvDType.size * 2
+            case .full:
+                guard let entry = prefix[index] else { return 0 }
+                return maxLength * kind.kvHeads * kind.headDim
+                    * (entry.keys.dtype.size + entry.values.dtype.size)
             }
         }
     }

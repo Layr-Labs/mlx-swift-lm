@@ -328,6 +328,8 @@ extension CBv2SequenceKV {
 /// Factory for per-sequence KV state; implemented by the v1 contiguous
 /// backend and the v2 paged backend.
 public protocol CBv2KVBackend: AnyObject {
+    /// Exact prefix-reuse identity. Unknown backends fail cold.
+    var prefixReuseBackend: CBv2PrefixReuseBackend { get }
     /// Create per-layer sequence state for a new request. `layerKinds` has
     /// one entry per model layer; entries with `sharesKVWithLayer != nil`
     /// receive NO storage (return nil at that index).
@@ -337,16 +339,14 @@ public protocol CBv2KVBackend: AnyObject {
     /// per-layer snapshots for the ADOPTED token range (full-attention
     /// layers only; windowed and KV-shared layers are nil).
     ///
-    /// Reconciled adoption semantics (one policy for BOTH backends): the
-    /// engine slices the matched prefix down by
-    /// `cbv2RequiredRecompute(layerKinds:matched:)` BEFORE calling this, so
-    /// every non-nil entry carries the same uniform `offset`. The backend
-    /// positions EVERY storage-owning row at that uniform offset — full
-    /// layers by writing the snapshot, windowed layers via
-    /// `CBv2SequenceKV.fastForward(to:)` (counter only, no storage) — and
-    /// the engine then replays tokens `[offset, prompt)` through ALL layers.
+    /// `plan` is authoritative for M/C/R and backend support. Ordinary safe
+    /// layouts receive full snapshots through C. Frozen-full hybrid replay
+    /// receives exact full snapshots through M while every windowed row starts
+    /// empty at C. Unsupported backend/layout pairs must throw before state is
+    /// published.
     func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?]
     /// Free all storage for a sequence (cancellation, finish, preemption).
@@ -398,10 +398,44 @@ public protocol CBv2KVBackend: AnyObject {
 }
 
 extension CBv2KVBackend {
+    public var prefixReuseBackend: CBv2PrefixReuseBackend { .unknown }
     public var bytesReserved: Int { bytesInUse }
     public var requiresMaterializedSnapshots: Bool { false }
     public var producesCompiledDecodeEligibleRows: Bool { false }
     public func updateBytesCapacity(_ bytes: Int) {}
+    public func makeSequenceState(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
+        layerKinds: [CBv2LayerKind],
+        maxLength: Int
+    ) throws -> [CBv2SequenceKV?] {
+        throw CBv2KVError.backendIneligible(
+            reason: "backend \(type(of: self)) has no proven prefix-reuse implementation")
+    }
+
+    /// Source-compatibility convenience for direct backend tests. Production
+    /// engine adoption always supplies the explicit typed plan.
+    public func makeSequenceState(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind],
+        maxLength: Int
+    ) throws -> [CBv2SequenceKV?] {
+        guard let matched = prefix.compactMap({ $0?.offset }).first else {
+            throw CBv2KVError.backendIneligible(reason: "prefix contains no owning full snapshot")
+        }
+        let capability = CBv2PrefixReuseCapability.derive(
+            layerKinds: layerKinds,
+            backend: prefixReuseBackend)
+        guard let plan = capability.plan(matchedBoundary: matched) else {
+            throw CBv2KVError.backendIneligible(
+                reason: capability.unsupportedReason?.rawValue ?? "prefix plan saves no tokens")
+        }
+        return try makeSequenceState(
+            adopting: prefix,
+            plan: plan,
+            layerKinds: layerKinds,
+            maxLength: maxLength)
+    }
 }
 
 public enum CBv2KVError: Error {
@@ -573,6 +607,11 @@ public struct CBv2Usage: Sendable {
     /// Tokens the engine actually skipped after successful adoption. This is
     /// the routing-relevant prefill saving, not the raw lookup match.
     public var prefixCachePrefillTokensSaved: Int
+    /// Exact replay strategy, replay work, and scheduler boundary splits for
+    /// low-cardinality provider telemetry. Nil/zero on non-hits.
+    public var prefixCacheStrategy: CBv2PrefixReuseStrategy?
+    public var prefixCacheReplayTokens: Int
+    public var prefixCacheBoundarySplits: Int
     /// Backwards-compatible alias retained for existing provider bridges.
     /// New integrations should read `prefixCachePrefillTokensSaved`.
     public var prefixCacheHitTokens: Int
@@ -580,13 +619,19 @@ public struct CBv2Usage: Sendable {
         promptTokens: Int, completionTokens: Int, prefixCacheHitTokens: Int = 0,
         prefixCacheOutcome: CBv2PrefixCacheOutcome = .disabled,
         prefixCacheMatchedTokens: Int = 0,
-        prefixCachePrefillTokensSaved: Int = 0
+        prefixCachePrefillTokensSaved: Int = 0,
+        prefixCacheStrategy: CBv2PrefixReuseStrategy? = nil,
+        prefixCacheReplayTokens: Int = 0,
+        prefixCacheBoundarySplits: Int = 0
     ) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.prefixCacheOutcome = prefixCacheOutcome
         self.prefixCacheMatchedTokens = prefixCacheMatchedTokens
         self.prefixCachePrefillTokensSaved = prefixCachePrefillTokensSaved
+        self.prefixCacheStrategy = prefixCacheStrategy
+        self.prefixCacheReplayTokens = prefixCacheReplayTokens
+        self.prefixCacheBoundarySplits = prefixCacheBoundarySplits
         self.prefixCacheHitTokens = prefixCacheHitTokens
     }
 }
@@ -795,86 +840,26 @@ extension CBv2PrefixCache {
     }
 }
 
-/// Tokens the engine must re-prefill through ALL layers after adopting a
-/// `matched`-token prefix, so WINDOWED layers (whose KV is never cached —
-/// report 10 invariant 6) are rebuilt at true absolute positions, clamped
-/// to the matched prefix. 0 for all-full-attention models. Pure model-shape
-/// logic, shared by every backend and the engine.
+/// Conservative replay length R for rebuilding finite-window rows.
 ///
-/// DERIVATION (why a single window is NOT enough — Codex P1).
-///
-/// Adoption replays `[effective, prompt)` through ALL layers, where
-/// `effective = matched - recompute`. Full-attention layers restore
-/// `[0, effective)` from the cached snapshot; windowed layers own no cached
-/// KV and are rebuilt only from the replay. A windowed layer's stored K/V
-/// PROJECTIONS are a pure function of that layer's INPUT (the previous
-/// layer's output), so they are exact wherever the input is exact. Its
-/// windowed-attention OUTPUT, however, is only exact once the replay has
-/// filled a full window BEHIND the query: the first `window-1` replayed
-/// positions attend an incomplete window (their true window reaches below
-/// `effective`, where no windowed KV was replayed) and therefore DEVIATE.
-///
-/// That deviation is not contained to the windowed layer. The polluted
-/// output feeds the next layer's input, so:
-///   - each additional windowed layer in DEPTH ORDER pushes the
-///     "first exact position" forward by another ~window (its own window
-///     must clear the upstream layer's polluted band before its output is
-///     exact) — the receptive field grows LINEARLY with the number of
-///     stacked windowed layers, and
-///   - any downstream FULL-attention layer caches K/V for the polluted
-///     positions and attends them during decode, so a hybrid that
-///     interleaves windowed and full layers (real Gemma-4 / GPT-OSS) can
-///     only be made exact for the retained tail by pushing `effective` back
-///     far enough that NO windowed layer's polluted band overlaps the
-///     retained region — i.e. essentially the whole prompt.
-///
-/// A storage-owning full-attention layer downstream of a windowed layer
-/// permanently caches K/V for the replay positions whose upstream window was
-/// incomplete. Replaying more trailing windows cannot remove those polluted
-/// full-attention entries: later decode continues to attend them. Such a
-/// layout must therefore recompute the entire matched prefix.
-///
-/// When no storage-owning full layer follows a windowed layer, the safe,
-/// model-shape-only bound is
-///   recompute = (number of windowed layers) × (largest window),
-/// clamped to `matched`. Rationale for each factor:
-///   - `largest window` is the per-layer receptive-field step (a layer with
-///     a smaller window still needs at most the largest window cleared once
-///     the compounding is folded into a single uniform bound);
-///   - `number of windowed layers` is the depth of compounding — every
-///     windowed layer (including KV-SHARED windowed layers, whose borrowed
-///     attention output still pollutes downstream) contributes one step.
-///
-/// Consequences that are CORRECT and intended:
-///   - Full-attention-only models: 0 windowed layers ⇒ recompute 0 ⇒ full
-///     prefix-cache benefit, unchanged.
-///   - Windowed-LAST single-window models (e.g. TinyTestModel: 1 windowed
-///     layer): recompute == window, unchanged from the old bound — the
-///     single windowed layer is last, so its polluted early outputs feed
-///     nothing downstream.
-///   - Interleaved hybrids (Gemma-4 / GPT-OSS): a storage-owning full layer
-///     follows a windowed layer, so adoption degrades to full recompute.
+/// Each windowed layer can extend the inexact replay frontier by at most the
+/// largest configured window, so `windowed-layer count × largest window` is a
+/// model-shape-only upper bound, clamped to M. Interleaved hybrids use the same
+/// R, but their storage-owning full rows must remain frozen through M; replayed
+/// projections must never overwrite the exact cached full K/V.
 public func cbv2RequiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> Int {
     guard matched > 0 else { return 0 }
     var maxWindow = 0
     var windowCount = 0
-    var sawWindowedLayer = false
     for kind in layerKinds {
         if case .slidingWindow(let window) = kind.attention {
             maxWindow = max(maxWindow, window)
             windowCount += 1
-            sawWindowedLayer = true
-        } else if sawWindowedLayer, kind.sharesKVWithLayer == nil {
-            // This layer owns full-attention K/V derived from an activation
-            // whose upstream sliding context was incomplete at the replay
-            // boundary. Those cached entries remain visible forever.
-            return matched
         }
     }
     guard windowCount > 0 else { return 0 }
-    // windowCount × maxWindow can overflow only at absurd model shapes; the
-    // clamp to `matched` (a real token count) makes the product harmless.
-    let bound = windowCount * maxWindow
+    let (product, overflow) = windowCount.multipliedReportingOverflow(by: maxWindow)
+    let bound = overflow ? Int.max : product
     return min(bound, matched)
 }
 

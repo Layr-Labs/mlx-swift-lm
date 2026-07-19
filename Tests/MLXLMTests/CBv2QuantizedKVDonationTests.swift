@@ -73,61 +73,53 @@ final class CBv2QuantizedKVDonationTests: XCTestCase {
 
     // MARK: (i) Re-quantization drift canary
 
-    /// Donate/adopt round trip on the raw storage: adopting a quantized
-    /// row's DEQUANTIZED snapshot re-quantizes it onto a different grid, so
-    /// the adopted values measurably drift. This is the defect that makes
-    /// quantized donation unsound with the current snapshot format. CANARY:
-    /// if this assertion ever fails (drift gone), MLX affine quantization
-    /// has become idempotent and `snapshotIsLossless` for
-    /// `CBv2QuantizedSequenceKV` can be revisited.
-    private func requantizationDrift(bits: Int) throws -> Float {
+    func testQuantizedBackendCapabilityFailsCold() throws {
         let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)
         let backend = CBv2ContiguousKVBackend(
-            config: .init(bytesCapacity: 1 << 24, quantization: (groupSize: 64, bits: bits)))
-
-        let donorState = try backend.makeSequenceState(
-            layerKinds: [kind], promptLength: 16, maxLength: 64)
-        let donor = try XCTUnwrap(donorState[0] as? CBv2QuantizedSequenceKV)
-        XCTAssertFalse(
-            donor.snapshotIsLossless,
-            "quantized rows must report lossy snapshots — that is what gates donation")
-
-        MLXRandom.seed(0xD0_0D)
-        let keys = MLXRandom.normal([1, 2, 16, 64]).asType(.float16)
-        let values = MLXRandom.normal([1, 2, 16, 64]).asType(.float16)
-        _ = donor.update(keys: keys, values: values)
-
-        let snap = donor.snapshot()
-        XCTAssertEqual(snap.offset, 16)
-
-        let adoptedState = try backend.makeSequenceState(
-            adopting: [snap], layerKinds: [kind], maxLength: 64)
-        let adopted = try XCTUnwrap(adoptedState[0] as? CBv2QuantizedSequenceKV)
-        XCTAssertEqual(adopted.absoluteOffset, 16)
-
-        let snap2 = adopted.snapshot()
-        let drift = max(
-            abs(snap2.keys - snap.keys).max().item(Float.self),
-            abs(snap2.values - snap.values).max().item(Float.self))
-        backend.release(donorState)
-        backend.release(adoptedState)
-        return drift
+            config: .init(
+                bytesCapacity: 1 << 24,
+                quantization: (groupSize: 64, bits: 4)))
+        XCTAssertEqual(backend.prefixReuseBackend, .contiguousQuantized)
+        let capability = CBv2PrefixReuseCapability.derive(
+            layerKinds: [kind],
+            backend: backend.prefixReuseBackend)
+        XCTAssertFalse(capability.isSupported)
+        XCTAssertEqual(capability.unsupportedReason, .quantizedRowsUnsupported)
+        XCTAssertNil(capability.plan(matchedBoundary: 16))
     }
 
-    func testRequantizationDriftIsReal_4bit() throws {
-        let drift = try requantizationDrift(bits: 4)
-        XCTAssertGreaterThan(
-            drift, 1e-6,
-            "canary: 4-bit re-quantization became value-exact — quantized donation "
-                + "(snapshotIsLossless) can be reconsidered")
-    }
+    func testQuantizedSnapshotsRemainLossyAcrossRequantization() {
+        for bits in [4, 8] {
+            let donor = CBv2QuantizedSequenceKV(
+                promptLength: 16,
+                maxLength: 64,
+                kvHeads: 2,
+                headDim: 64,
+                groupSize: 64,
+                bits: bits)
+            MLXRandom.seed(UInt64(0xD0_0D + bits))
+            let keys = MLXRandom.normal([1, 2, 16, 64]).asType(.float16)
+            let values = MLXRandom.normal([1, 2, 16, 64]).asType(.float16)
+            _ = donor.update(keys: keys, values: values)
+            let snapshot = donor.snapshot()
 
-    func testRequantizationDriftIsReal_8bit() throws {
-        let drift = try requantizationDrift(bits: 8)
-        XCTAssertGreaterThan(
-            drift, 1e-6,
-            "canary: 8-bit re-quantization became value-exact — quantized donation "
-                + "(snapshotIsLossless) can be reconsidered")
+            let resumed = CBv2QuantizedSequenceKV(
+                promptLength: 16,
+                maxLength: 64,
+                kvHeads: 2,
+                headDim: 64,
+                groupSize: 64,
+                bits: bits)
+            _ = resumed.update(keys: snapshot.keys, values: snapshot.values)
+            let requantized = resumed.snapshot()
+            let drift = max(
+                abs(requantized.keys - snapshot.keys).max().item(Float.self),
+                abs(requantized.values - snapshot.values).max().item(Float.self))
+            XCTAssertGreaterThan(
+                drift,
+                1e-6,
+                "\(bits)-bit snapshots must remain fail-cold until adoption is lossless")
+        }
     }
 
     // MARK: (ii) Quantized engines skip donation, stay token-exact

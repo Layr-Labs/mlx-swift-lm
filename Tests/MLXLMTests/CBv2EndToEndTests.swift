@@ -91,7 +91,10 @@ final class CBv2EndToEndTests: XCTestCase {
     }
 
     private func makeStack(
-        _ kind: BackendKind, model: TinyTestModel, enablePrefixCache: Bool = true
+        _ kind: BackendKind,
+        model: TinyTestModel,
+        enablePrefixCache: Bool = true,
+        prefillChunkSize: Int = 16
     ) throws -> Stack {
         let backend: CBv2KVBackend
         let bank: CBv2LayerCacheBank
@@ -131,7 +134,7 @@ final class CBv2EndToEndTests: XCTestCase {
             detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: CBv2E2ETokenizer()),
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
-                prefillChunkSize: 16, maxWaiting: 16,
+                prefillChunkSize: prefillChunkSize, maxWaiting: 16,
                 enablePrefixCache: enablePrefixCache),
             prefixCache: prefixCache)
         return Stack(engine: engine, model: model, prefixCache: prefixCache)
@@ -402,29 +405,22 @@ final class CBv2EndToEndTests: XCTestCase {
         try await runPrefixCacheRoundTrip(.paged)
     }
 
-    // MARK: (iv-c) Stacked-sliding + downstream-full drift (Codex P1)
+    // MARK: (iv-c) Frozen-full hybrid replay
 
-    /// Regression for the under-replayed sliding-window adoption bound.
-    ///
-    /// Model shape [full, sliding(16), sliding(16), full]: two STACKED
-    /// windowed layers whose first `window-1` replayed outputs are polluted
-    /// (their true window reaches below `effective`, where no windowed KV was
-    /// replayed), and a DOWNSTREAM full layer that CACHES those polluted
-    /// outputs as K/V inside the retained region. The old single-window bound
-    /// (`recompute = window`) adopts `effective = matched - 16`, so the full
-    /// layer decodes against corrupted KV and drifts. The revised bound
-    /// (`windowedCount × window = 32 ≥ matched = 24`) clamps to the whole
-    /// match, degrading adoption to full recompute — which is exact. Under
-    /// the OLD bound this assertion FAILS; under the fix it holds.
-    func testStackedSlidingRecomputeIsTokenExact() async throws {
-        // blockSize 8, window 16, prompt 25 ⇒ matched = 3×8 = 24 (capped at
-        // prompt-1). windowedCount 2 × window 16 = 32 ≥ 24 ⇒ full recompute.
+    /// End-to-end production-engine regression for
+    /// [full, sliding(16), sliding(16), full]. M=72, R=32, C=40: sliding rows
+    /// rebuild from C while both owning full rows retain exact K/V through M.
+    func testStackedSlidingFrozenFullReplayIsTokenExact() async throws {
         let model = TinyTestModel.make(seed: 0xD00D_F00D, stackedSlidingFull: true)
         XCTAssertEqual(model.layerKinds.count, 4, "shape must be [full, sliding, sliding, full]")
-        let prompt = makePromptTokens(length: 25, seed: 0x5EED)
+        let prompt = makePromptTokens(length: 73, seed: 0x5EED)
         let budget = 16
 
-        let stack = try makeStack(.contiguous, model: model, enablePrefixCache: true)
+        let stack = try makeStack(
+            .contiguous,
+            model: model,
+            enablePrefixCache: true,
+            prefillChunkSize: 64)
 
         let first = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: budget)))
@@ -440,11 +436,38 @@ final class CBv2EndToEndTests: XCTestCase {
         await stack.engine.shutdown()
 
         XCTAssertEqual(second.finishReason, .length)
+        XCTAssertEqual(second.usage?.prefixCacheMatchedTokens, 72)
+        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 40)
+        XCTAssertEqual(second.usage?.prefixCacheStrategy, .frozenFullReplay)
+        XCTAssertEqual(second.usage?.prefixCacheReplayTokens, 32)
+        XCTAssertEqual(second.usage?.prefixCacheBoundarySplits, 1)
         XCTAssertEqual(
             second.tokens, first.tokens,
-            "stacked-sliding adoption must be token-exact vs the cold run "
-                + "(the windowed-layer-count recompute bound guarantees it)")
+            "frozen-full hybrid replay must remain target-token exact")
         XCTAssertEqual(second.text, first.text)
+    }
+
+    func testStackedSlidingPagedBackendFailsCold() async throws {
+        let model = TinyTestModel.make(
+            seed: 0xD00D_F00D,
+            headDim: 64,
+            stackedSlidingFull: true)
+        let prompt = makePromptTokens(length: 73, seed: 0x5EED)
+        let stack = try makeStack(.paged, model: model, enablePrefixCache: true)
+        XCTAssertFalse(stack.engine.prefixReuseCapability.isSupported)
+        XCTAssertEqual(
+            stack.engine.prefixReuseCapability.unsupportedReason,
+            .pagedHybridRequiresDualCursor)
+
+        let first = await cbv2SchedCollect(
+            try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: 8)))
+        let second = await cbv2SchedCollect(
+            try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: 8)))
+        await stack.engine.shutdown()
+
+        XCTAssertEqual(first.tokens, second.tokens)
+        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 0)
+        XCTAssertEqual(stack.prefixCache.stats().entryCount, 0)
     }
 
     // MARK: (iv-b) Per-request cache salt isolation (TB-007)

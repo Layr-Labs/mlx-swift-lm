@@ -21,8 +21,14 @@ public protocol CBv2StepCapacity: AnyObject {
     /// `id`. Throws `CBv2KVError.capacityExhausted` when the soft ledger
     /// would cross the watermark — the scheduler preempts in response.
     func reserve(id: CBv2RequestID, additionalTokens: Int) throws
+    /// Reserve token-derived bytes plus an exact native-dtype adjustment in
+    /// one admission operation.
+    func reserve(
+        id: CBv2RequestID, additionalTokens: Int, additionalBytes: Int
+    ) throws
     /// Partially undo a reservation (optimistic-advance rollback).
     func unreserve(id: CBv2RequestID, tokens: Int)
+    func unreserve(id: CBv2RequestID, tokens: Int, bytes: Int)
     /// Drop every reservation held by `id` (finish/cancel/preempt).
     func releaseAll(id: CBv2RequestID)
     /// Non-throwing conservative probe used by the chained-decode fast path.
@@ -36,6 +42,19 @@ public protocol CBv2StepCapacity: AnyObject {
 
 extension CBv2StepCapacity {
     public var bytesCapacity: Int { 0 }
+    public func reserve(
+        id: CBv2RequestID, additionalTokens: Int, additionalBytes: Int
+    ) throws {
+        guard additionalBytes == 0 else {
+            throw CBv2KVError.backendIneligible(
+                reason: "capacity oracle cannot reserve exact native KV bytes")
+        }
+        try reserve(id: id, additionalTokens: additionalTokens)
+    }
+    public func unreserve(id: CBv2RequestID, tokens: Int, bytes: Int) {
+        precondition(bytes == 0, "capacity oracle cannot unreserve exact native KV bytes")
+        unreserve(id: id, tokens: tokens)
+    }
 }
 
 // MARK: - AdmissionV2
@@ -119,6 +138,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// converting to bytes, so decode reservations past a layer's window add
     /// zero bytes for that layer).
     private var reservedTokens: [CBv2RequestID: Int] = [:]
+    private var reservedExactBytes: [CBv2RequestID: Int] = [:]
     private var ledgerBytes = 0
 
     public init(
@@ -229,31 +249,67 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     // MARK: CBv2StepCapacity
 
     public func reserve(id: CBv2RequestID, additionalTokens: Int) throws {
+        try reserve(id: id, additionalTokens: additionalTokens, additionalBytes: 0)
+    }
+
+    public func reserve(
+        id: CBv2RequestID, additionalTokens: Int, additionalBytes: Int
+    ) throws {
+        guard additionalTokens >= 0, additionalBytes >= 0 else {
+            throw CBv2KVError.backendIneligible(reason: "negative KV reservation")
+        }
         lock.lock()
         defer { lock.unlock() }
         let old = reservedTokens[id] ?? 0
         let new = old + additionalTokens
-        let delta = estimatedBytes(forTokens: new) - estimatedBytes(forTokens: old)
-        let after = ledgerBytes + delta
+        let oldExact = reservedExactBytes[id] ?? 0
+        let (newExact, exactOverflow) = oldExact.addingReportingOverflow(additionalBytes)
+        guard !exactOverflow else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
+        let (tokenDelta, tokenOverflow) = estimatedBytes(forTokens: new)
+            .subtractingReportingOverflow(estimatedBytes(forTokens: old))
+        let (delta, deltaOverflow) = tokenDelta.addingReportingOverflow(additionalBytes)
+        guard !tokenOverflow, !deltaOverflow else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
+        let (after, afterOverflow) = ledgerBytes.addingReportingOverflow(delta)
+        guard !afterOverflow else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
         guard after <= reserveCeiling else {
             throw CBv2KVError.capacityExhausted(
                 needed: delta,
                 available: max(0, reserveCeiling - ledgerBytes))
         }
         reservedTokens[id] = new
+        reservedExactBytes[id] = newExact
         ledgerBytes = after
     }
 
     public func unreserve(id: CBv2RequestID, tokens: Int) {
+        unreserve(id: id, tokens: tokens, bytes: 0)
+    }
+
+    public func unreserve(id: CBv2RequestID, tokens: Int, bytes: Int) {
+        precondition(tokens >= 0 && bytes >= 0)
         lock.lock()
         defer { lock.unlock() }
         let old = reservedTokens[id] ?? 0
         let new = max(0, old - tokens)
+        let oldExact = reservedExactBytes[id] ?? 0
+        let newExact = max(0, oldExact - bytes)
         ledgerBytes += estimatedBytes(forTokens: new) - estimatedBytes(forTokens: old)
+            + newExact - oldExact
         if new == 0 {
             reservedTokens.removeValue(forKey: id)
         } else {
             reservedTokens[id] = new
+        }
+        if newExact == 0 {
+            reservedExactBytes.removeValue(forKey: id)
+        } else {
+            reservedExactBytes[id] = newExact
         }
     }
 
@@ -261,7 +317,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let old = reservedTokens.removeValue(forKey: id) else { return }
-        ledgerBytes -= estimatedBytes(forTokens: old)
+        let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
+        ledgerBytes -= estimatedBytes(forTokens: old) + exact
     }
 
     /// Conservative (window caps ignored): may under-report headroom, which

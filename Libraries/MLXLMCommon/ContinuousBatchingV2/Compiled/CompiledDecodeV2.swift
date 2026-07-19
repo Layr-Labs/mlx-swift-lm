@@ -428,7 +428,8 @@ public final class CBv2CompiledDecode {
         for info in infos {
             for sequence in info.row {
                 switch sequence {
-                case let full as CBv2FullSequenceKV: full.noteCompiledAdvance()
+                case let full as any CBv2CompiledFullSequenceKV:
+                    full.noteCompiledAdvance()
                 case let windowed as CBv2WindowedSequenceKV: windowed.noteCompiledAdvance()
                 default: break
                 }
@@ -465,7 +466,7 @@ public final class CBv2CompiledDecode {
             let offset: Int
             switch kind.attention {
             case .full:
-                guard let full = sequence as? CBv2FullSequenceKV,
+                guard let full = sequence as? any CBv2CompiledFullSequenceKV,
                     full.absoluteOffset < config.kvCapacity
                 else { return nil }
                 offset = full.absoluteOffset
@@ -506,7 +507,7 @@ public final class CBv2CompiledDecode {
             let storage: (keys: MLXArray, values: MLXArray)?
             switch kind.attention {
             case .full:
-                storage = (info.row[index] as? CBv2FullSequenceKV)?
+                storage = (info.row[index] as? any CBv2CompiledFullSequenceKV)?
                     .compiledStorage(
                         capacity: config.kvCapacity,
                         keysDType: dtypes.keys, valuesDType: dtypes.values)
@@ -600,7 +601,7 @@ public final class CBv2CompiledDecode {
         guard let row else { return "layer\(layer)_missing" }
         let shape: String
         switch row {
-        case let full as CBv2FullSequenceKV:
+        case let full as any CBv2CompiledFullSequenceKV:
             let snap = full.snapshot()
             shape = "full k=\(snap.keys.dtype) v=\(snap.values.dtype)"
         case let windowed as CBv2WindowedSequenceKV:
