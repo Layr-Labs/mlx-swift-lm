@@ -142,6 +142,24 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertFalse(admission.hasHeadroom(additionalTokens: 1))
     }
 
+    func testOverflowingCapacityInputsFailWithoutMutatingLedger() throws {
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
+        ]
+        let admission = AdmissionV2(
+            layerKinds: kinds,
+            bytesCapacity: Int.max,
+            config: .init(watermarkFraction: 0))
+        try admission.reserve(id: id(1), additionalTokens: 1)
+        XCTAssertThrowsError(
+            try admission.reserve(id: id(1), additionalTokens: Int.max))
+        XCTAssertEqual(admission.bytesReserved, 4)
+        XCTAssertFalse(admission.canEverFit(promptTokens: Int.max, maxTokens: 1))
+        XCTAssertFalse(admission.hasHeadroom(additionalTokens: Int.max))
+        admission.releaseAll(id: id(1))
+        XCTAssertEqual(admission.bytesReserved, 0)
+    }
+
     func testUnreserveAndReleaseRestoreHeadroom() throws {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
         let admission = AdmissionV2(

@@ -165,21 +165,38 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
         var perToken = 0
         var fullPerToken = 0
+        var accountingOverflow = false
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
-            let bytes = 2 * kind.kvHeads * kind.headDim * self.perLayerElementBytes[index]
-            perToken += bytes
+            guard
+                let bytes = Self.storageBytesPerToken(
+                    kind: kind,
+                    elementBytes: self.perLayerElementBytes[index]),
+                let newPerToken = Self.add(perToken, bytes)
+            else {
+                accountingOverflow = true
+                break
+            }
+            perToken = newPerToken
             if case .full = kind.attention {
-                fullPerToken += bytes
+                guard let newFullPerToken = Self.add(fullPerToken, bytes) else {
+                    accountingOverflow = true
+                    break
+                }
+                fullPerToken = newFullPerToken
             }
         }
-        self.maxPerTokenBytes = perToken
-        self.fullKVBytesPerToken = fullPerToken
+        self.maxPerTokenBytes = accountingOverflow ? Int.max : perToken
+        self.fullKVBytesPerToken = accountingOverflow ? Int.max : fullPerToken
     }
 
     // MARK: Estimation
 
     /// KV bytes retained after processing `tokens` tokens of one sequence.
     public func estimatedBytes(forTokens tokens: Int) -> Int {
+        estimatedBytesChecked(forTokens: tokens) ?? Int.max
+    }
+
+    private func estimatedBytesChecked(forTokens tokens: Int) -> Int? {
         guard tokens > 0 else { return 0 }
         var total = 0
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
@@ -188,7 +205,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             case .full: retained = tokens
             case .slidingWindow(let window): retained = min(tokens, window)
             }
-            total += retained * 2 * kind.kvHeads * kind.headDim * perLayerElementBytes[index]
+            guard retained >= 0,
+                let perTokenBytes = Self.storageBytesPerToken(
+                    kind: kind,
+                    elementBytes: perLayerElementBytes[index]),
+                let retainedBytes = Self.multiply(retained, perTokenBytes),
+                let newTotal = Self.add(total, retainedBytes)
+            else { return nil }
+            total = newTotal
         }
         return total
     }
@@ -201,18 +225,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
             guard case .slidingWindow(let window) = kind.attention else { continue }
             let missing = max(0, window - max(0, tokens))
-            let (elements, elementsOverflow) = kind.kvHeads.multipliedReportingOverflow(
-                by: kind.headDim)
-            let (kvElements, kvOverflow) = elements.multipliedReportingOverflow(by: 2)
-            let (perTokenBytes, byteOverflow) = kvElements.multipliedReportingOverflow(
-                by: perLayerElementBytes[index])
-            let (missingBytes, missingOverflow) = missing.multipliedReportingOverflow(
-                by: perTokenBytes)
-            let (sum, sumOverflow) = total.addingReportingOverflow(missingBytes)
-            guard !elementsOverflow, !kvOverflow, !byteOverflow,
-                !missingOverflow, !sumOverflow
+            guard
+                let perTokenBytes = Self.storageBytesPerToken(
+                    kind: kind,
+                    elementBytes: perLayerElementBytes[index]),
+                let missingBytes = Self.multiply(missing, perTokenBytes),
+                let newTotal = Self.add(total, missingBytes)
             else { return nil }
-            total = sum
+            total = newTotal
         }
         return total
     }
@@ -276,7 +296,11 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// rejected up front; requests that fit only sometimes are admitted
     /// optimistically and preempted if optimism loses.
     public func canEverFit(promptTokens: Int, maxTokens: Int) -> Bool {
-        estimatedBytes(forTokens: promptTokens + max(maxTokens, 0)) <= admissibleBytesCapacity
+        let (tokens, overflow) = promptTokens.addingReportingOverflow(max(maxTokens, 0))
+        guard !overflow, let bytes = estimatedBytesChecked(forTokens: tokens) else {
+            return false
+        }
+        return bytes <= admissibleBytesCapacity
     }
 
     // MARK: CBv2StepCapacity
@@ -294,14 +318,16 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         let old = reservedTokens[id] ?? 0
-        let new = old + additionalTokens
+        let (new, tokenCountOverflow) = old.addingReportingOverflow(additionalTokens)
         let oldExact = reservedExactBytes[id] ?? 0
         let (newExact, exactOverflow) = oldExact.addingReportingOverflow(additionalBytes)
-        guard !exactOverflow else {
+        guard !tokenCountOverflow, !exactOverflow,
+            let oldTokenBytes = estimatedBytesChecked(forTokens: old),
+            let newTokenBytes = estimatedBytesChecked(forTokens: new)
+        else {
             throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
         }
-        let (tokenDelta, tokenOverflow) = estimatedBytes(forTokens: new)
-            .subtractingReportingOverflow(estimatedBytes(forTokens: old))
+        let (tokenDelta, tokenOverflow) = newTokenBytes.subtractingReportingOverflow(oldTokenBytes)
         let (delta, deltaOverflow) = tokenDelta.addingReportingOverflow(additionalBytes)
         guard !tokenOverflow, !deltaOverflow else {
             throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
@@ -359,7 +385,32 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public func hasHeadroom(additionalTokens: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return ledgerBytes + additionalTokens * maxPerTokenBytes <= reserveCeiling
+        guard additionalTokens >= 0,
+            let additionalBytes = Self.multiply(additionalTokens, maxPerTokenBytes),
+            let after = Self.add(ledgerBytes, additionalBytes)
+        else { return false }
+        return after <= reserveCeiling
+    }
+
+    private static func storageBytesPerToken(
+        kind: CBv2LayerKind,
+        elementBytes: Int
+    ) -> Int? {
+        guard kind.kvHeads >= 0, kind.headDim >= 0, elementBytes >= 0,
+            let elements = multiply(kind.kvHeads, kind.headDim),
+            let kvElements = multiply(elements, 2)
+        else { return nil }
+        return multiply(kvElements, elementBytes)
+    }
+
+    private static func multiply(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+        return overflow ? nil : value
+    }
+
+    private static func add(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : value
     }
 
     // MARK: Telemetry
