@@ -576,6 +576,52 @@ struct CBv2CoreContiguousBackendTests {
         #expect(state[2] == nil)
         backend.release(state)
     }
+
+    @Test func compatibilityAdoptionPreservesAlreadySlicedTailOffset() throws {
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(
+                attention: .slidingWindow(16),
+                headDim: 4,
+                kvHeads: 2,
+                queryHeads: 4),
+        ]
+        let adoptedOffset = 24
+        let keys = positionCoded(from: 0, count: adoptedOffset).asType(.float16)
+        let values = positionCoded(from: 200, count: adoptedOffset).asType(.float16)
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 1 << 24, kvDType: .float16))
+        let state = try backend.makeSequenceState(
+            adopting: [(keys, values, adoptedOffset), nil],
+            layerKinds: kinds,
+            maxLength: 64)
+        let full = try #require(state[0] as? CBv2FullSequenceKV)
+        let window = try #require(state[1] as? CBv2WindowedSequenceKV)
+        #expect(full.absoluteOffset == adoptedOffset)
+        #expect(window.absoluteOffset == adoptedOffset)
+        expectClose(full.snapshot().keys, keys, "compatibility full-layer keys")
+        backend.release(state)
+    }
+
+    @Test func compatibilityAdoptionRejectsHybridThatNeedsExplicitMatchedBoundary() {
+        let adoptedOffset = 24
+        let keys = positionCoded(from: 0, count: adoptedOffset).asType(.float16)
+        let values = positionCoded(from: 200, count: adoptedOffset).asType(.float16)
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 1 << 24, kvDType: .float16))
+        #expect(throws: CBv2KVError.self) {
+            _ = try backend.makeSequenceState(
+                adopting: [
+                    (keys, values, adoptedOffset),
+                    nil,
+                    nil,
+                    (keys, values, adoptedOffset),
+                ],
+                layerKinds: layerKinds,
+                maxLength: 64)
+        }
+        #expect(backend.bytesReserved == 0)
+    }
 }
 
 // MARK: - AttentionV1 parity (solo vs batched)

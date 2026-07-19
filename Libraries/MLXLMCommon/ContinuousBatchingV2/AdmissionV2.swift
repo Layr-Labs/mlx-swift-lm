@@ -116,6 +116,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// Per-token bytes if every storage-owning layer retained the token
     /// (upper bound; used for the conservative headroom probe).
     private let maxPerTokenBytes: Int
+    /// Nominal bytes per token for storage-owning full-attention rows under
+    /// this ledger's actual per-layer dtype assumptions.
+    public let fullKVBytesPerToken: Int
 
     /// Total KV byte budget. Runtime-resizable via `updateBytesCapacity`
     /// (multi-model co-residency re-slicing); reads take the ledger lock.
@@ -161,10 +164,16 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         self.watermarkFraction = config.watermarkFraction
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
         var perToken = 0
+        var fullPerToken = 0
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
-            perToken += 2 * kind.kvHeads * kind.headDim * self.perLayerElementBytes[index]
+            let bytes = 2 * kind.kvHeads * kind.headDim * self.perLayerElementBytes[index]
+            perToken += bytes
+            if case .full = kind.attention {
+                fullPerToken += bytes
+            }
         }
         self.maxPerTokenBytes = perToken
+        self.fullKVBytesPerToken = fullPerToken
     }
 
     // MARK: Estimation
@@ -180,6 +189,30 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             case .slidingWindow(let window): retained = min(tokens, window)
             }
             total += retained * 2 * kind.kvHeads * kind.headDim * perLayerElementBytes[index]
+        }
+        return total
+    }
+
+    /// Bytes needed to materialize every fixed sliding ring beyond what a
+    /// token reservation at `tokens` already charges. Adoption allocates full
+    /// rings immediately even when replay starts before the window fills.
+    public func fixedWindowBytesShortfall(afterReservingTokens tokens: Int) -> Int? {
+        var total = 0
+        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
+            guard case .slidingWindow(let window) = kind.attention else { continue }
+            let missing = max(0, window - max(0, tokens))
+            let (elements, elementsOverflow) = kind.kvHeads.multipliedReportingOverflow(
+                by: kind.headDim)
+            let (kvElements, kvOverflow) = elements.multipliedReportingOverflow(by: 2)
+            let (perTokenBytes, byteOverflow) = kvElements.multipliedReportingOverflow(
+                by: perLayerElementBytes[index])
+            let (missingBytes, missingOverflow) = missing.multipliedReportingOverflow(
+                by: perTokenBytes)
+            let (sum, sumOverflow) = total.addingReportingOverflow(missingBytes)
+            guard !elementsOverflow, !kvOverflow, !byteOverflow,
+                !missingOverflow, !sumOverflow
+            else { return nil }
+            total = sum
         }
         return total
     }

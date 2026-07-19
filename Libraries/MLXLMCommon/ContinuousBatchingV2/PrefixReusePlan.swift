@@ -174,9 +174,16 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
     public func plan(
         matchedBoundary: Int,
         exactStagedFullKVBytes: Int? = nil,
-        maximumSequenceLength: Int? = nil
+        maximumSequenceLength: Int? = nil,
+        nominalFullKVBytesPerToken: Int? = nil,
+        fixedWindowCapacityBytes: Int = 0
     ) -> CBv2PrefixReusePlan? {
         guard let strategy, unsupportedReason == nil, matchedBoundary > 0 else {
+            return nil
+        }
+        let nominalBytesPerToken =
+            nominalFullKVBytesPerToken ?? fullKVBytesPerToken
+        guard nominalBytesPerToken >= 0, fixedWindowCapacityBytes >= 0 else {
             return nil
         }
         let replayTokens = min(matchedBoundary, conservativeReplayBoundTokens)
@@ -205,7 +212,8 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         guard let residentBytes = Self.multiply(restoredFullTokens, exactBytesPerToken) else {
             return nil
         }
-        let additionalFullBytesPerToken = max(0, exactBytesPerToken - fullKVBytesPerToken)
+        let additionalFullBytesPerToken = max(
+            0, exactBytesPerToken - nominalBytesPerToken)
         let fullCapacityTokens = max(
             restoredFullTokens,
             maximumSequenceLength ?? restoredFullTokens)
@@ -213,10 +221,13 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
             let exactFullCapacityBytes = Self.multiply(
                 fullCapacityTokens, exactBytesPerToken),
             let nominalInitiallyReserved = Self.multiply(
-                capacityReservationTokens, fullKVBytesPerToken)
+                capacityReservationTokens, nominalBytesPerToken)
         else { return nil }
-        let initialAdditionalCapacityBytes = max(
+        let fullCapacityAdjustment = max(
             0, exactFullCapacityBytes - nominalInitiallyReserved)
+        let (initialAdditionalCapacityBytes, capacityOverflow) =
+            fullCapacityAdjustment.addingReportingOverflow(fixedWindowCapacityBytes)
+        guard !capacityOverflow else { return nil }
         return CBv2PrefixReusePlan(
             backend: backend,
             strategy: strategy,
@@ -226,13 +237,57 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
             prefillTokensSaved: replayStart,
             restoredFullTokens: restoredFullTokens,
             capacityReservationTokens: capacityReservationTokens,
-            nominalFullKVBytesPerToken: fullKVBytesPerToken,
+            nominalFullKVBytesPerToken: nominalBytesPerToken,
             fullKVBytesPerToken: exactBytesPerToken,
             additionalFullKVBytesPerToken: additionalFullBytesPerToken,
             initialAdditionalCapacityBytes: initialAdditionalCapacityBytes,
             fullCapacityTokensReserved: fullCapacityTokens,
             stagedFullKVBytes: stagedBytes,
             residentFullKVBytes: residentBytes)
+    }
+
+    /// Preserve the historical backend-only contract: callers already hand
+    /// this overload snapshots sliced to the adopted offset C and perform any
+    /// required replay themselves. Interleaved hybrids require the explicit
+    /// M/C dual-cursor plan and therefore fail cold here.
+    public func compatibilityPlan(
+        adoptedOffset: Int,
+        exactStagedFullKVBytes: Int,
+        maximumSequenceLength: Int
+    ) -> CBv2PrefixReusePlan? {
+        guard let strategy,
+            strategy != .frozenFullReplay,
+            unsupportedReason == nil,
+            adoptedOffset > 0,
+            maximumSequenceLength >= adoptedOffset,
+            exactStagedFullKVBytes >= 0,
+            exactStagedFullKVBytes % adoptedOffset == 0
+        else { return nil }
+        let exactBytesPerToken = exactStagedFullKVBytes / adoptedOffset
+        guard
+            let exactFullCapacityBytes = Self.multiply(
+                maximumSequenceLength, exactBytesPerToken),
+            let nominalInitiallyReserved = Self.multiply(
+                adoptedOffset, fullKVBytesPerToken)
+        else { return nil }
+        return CBv2PrefixReusePlan(
+            backend: backend,
+            strategy: strategy,
+            matchedBoundary: adoptedOffset,
+            replayStart: adoptedOffset,
+            replayTokens: 0,
+            prefillTokensSaved: adoptedOffset,
+            restoredFullTokens: adoptedOffset,
+            capacityReservationTokens: adoptedOffset,
+            nominalFullKVBytesPerToken: fullKVBytesPerToken,
+            fullKVBytesPerToken: exactBytesPerToken,
+            additionalFullKVBytesPerToken: max(
+                0, exactBytesPerToken - fullKVBytesPerToken),
+            initialAdditionalCapacityBytes: max(
+                0, exactFullCapacityBytes - nominalInitiallyReserved),
+            fullCapacityTokensReserved: maximumSequenceLength,
+            stagedFullKVBytes: exactStagedFullKVBytes,
+            residentFullKVBytes: exactStagedFullKVBytes)
     }
 
     private static func unsupported(

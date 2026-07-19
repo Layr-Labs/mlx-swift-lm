@@ -431,7 +431,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// Prefix-cache lookup on the SUBMIT thread (SHA-256 hashing is host
     /// work; slicing is graph-only). The capability derives the exact
     /// match-specific M/C/R plan. Safe layouts slice full rows to C; hybrid
-    /// contiguous-fp16 layouts retain full rows through M for frozen replay.
+    /// contiguous native-float layouts retain full rows through M for frozen replay.
     /// The lookup pin travels with the adoption; the loop balances it in
     /// every outcome.
     private func makePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
@@ -470,12 +470,23 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             }
             exactStagedFullKVBytes = sum
         }
+        let replayTokens = min(
+            hit.matched,
+            prefixReuseCapability.conservativeReplayBoundTokens)
+        let replayStart = hit.matched - replayTokens
+        let initialReservationTokens =
+            prefixReuseCapability.strategy == .frozenFullReplay
+            ? hit.matched : replayStart
         guard !byteOverflow,
+            let fixedWindowCapacityBytes = admission.fixedWindowBytesShortfall(
+                afterReservingTokens: initialReservationTokens),
             let plan = prefixReuseCapability.plan(
                 matchedBoundary: hit.matched,
                 exactStagedFullKVBytes: exactStagedFullKVBytes,
                 maximumSequenceLength:
-                    request.promptTokens.count + max(request.maxTokens, 1))
+                    request.promptTokens.count + max(request.maxTokens, 1),
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
+                fixedWindowCapacityBytes: fixedWindowCapacityBytes)
         else {
             prefixCache.endAdoption(
                 requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,

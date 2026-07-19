@@ -43,18 +43,29 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
         XCTAssertEqual(plan.clampedChunk(start: 40, proposed: 40), 32)
         XCTAssertEqual(plan.clampedChunk(start: 72, proposed: 16), 16)
 
+        let fp32Admission = AdmissionV2(
+            layerKinds: kinds,
+            bytesCapacity: 1 << 28,
+            config: .init(
+                watermarkFraction: 0,
+                layerElementBytes: [4, 2, 2, 4]))
+        XCTAssertEqual(fp32Admission.fullKVBytesPerToken, 256)
+        let fp32WindowShortfall = try XCTUnwrap(
+            fp32Admission.fixedWindowBytesShortfall(afterReservingTokens: 72))
         let nativeFP32 = try XCTUnwrap(
             capability.plan(
                 matchedBoundary: 72,
                 exactStagedFullKVBytes: 72 * 256,
-                maximumSequenceLength: 200))
+                maximumSequenceLength: 200,
+                nominalFullKVBytesPerToken: fp32Admission.fullKVBytesPerToken,
+                fixedWindowCapacityBytes: fp32WindowShortfall))
         XCTAssertEqual(nativeFP32.fullKVBytesPerToken, 256)
-        XCTAssertEqual(nativeFP32.nominalFullKVBytesPerToken, 128)
-        XCTAssertEqual(nativeFP32.additionalFullKVBytesPerToken, 128)
+        XCTAssertEqual(nativeFP32.nominalFullKVBytesPerToken, 256)
+        XCTAssertEqual(nativeFP32.additionalFullKVBytesPerToken, 0)
         XCTAssertEqual(nativeFP32.fullCapacityTokensReserved, 200)
         XCTAssertEqual(
             nativeFP32.initialAdditionalCapacityBytes,
-            200 * 256 - 72 * 128)
+            (200 - 72) * 256)
         XCTAssertEqual(nativeFP32.stagedFullKVBytes, 72 * 256)
         XCTAssertEqual(nativeFP32.residentFullKVBytes, 72 * 256)
     }
@@ -203,5 +214,83 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
         XCTAssertNil(rec.prefixReusePlan)
         XCTAssertEqual(rec.numComputedTokens, 0)
         XCTAssertEqual(admission.bytesReserved, 0)
+    }
+
+    func testTailReplayPrepaysFullSlidingRingAndNativeFullSpan() throws {
+        let kinds = [full(), sliding(16)]
+        let admission = AdmissionV2(
+            layerKinds: kinds,
+            bytesCapacity: 1 << 20,
+            config: .init(watermarkFraction: 0))
+        let capability = CBv2PrefixReuseCapability.derive(
+            layerKinds: kinds,
+            backend: .contiguousUnquantized)
+        let matched = 24
+        let replayStart = 8
+        let fixedWindowBytes = try XCTUnwrap(
+            admission.fixedWindowBytesShortfall(
+                afterReservingTokens: replayStart))
+        let exactFullBytesPerToken = 64
+        let plan = try XCTUnwrap(capability.plan(
+            matchedBoundary: matched,
+            exactStagedFullKVBytes: matched * exactFullBytesPerToken,
+            maximumSequenceLength: 40,
+            nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
+            fixedWindowCapacityBytes: fixedWindowBytes))
+        XCTAssertEqual(plan.strategy, .tailReplay)
+        XCTAssertEqual(plan.replayStart, replayStart)
+        XCTAssertEqual(fixedWindowBytes, 8 * 64)
+        XCTAssertEqual(
+            plan.initialAdditionalCapacityBytes,
+            (40 - replayStart) * exactFullBytesPerToken + fixedWindowBytes)
+
+        try admission.reserve(
+            id: CBv2RequestID(777),
+            additionalTokens: plan.capacityReservationTokens,
+            additionalBytes: plan.initialAdditionalCapacityBytes)
+        let exactBackendBytes =
+            40 * exactFullBytesPerToken
+            + 16 * 64
+        XCTAssertEqual(admission.bytesReserved, exactBackendBytes)
+        let scheduler = SchedulerV2(
+            config: .init(
+                maxConcurrentRequests: 1,
+                maxBatchedTokensPerStep: 32,
+                prefillChunkSize: 16),
+            capacity: admission)
+        let rec = try scheduler.enqueue(CBv2Request(
+            id: CBv2RequestID(777),
+            promptTokens: makePromptTokens(length: 25, seed: 777),
+            sampling: .init(temperature: 0),
+            maxTokens: 4))
+        rec.prefixReusePlan = plan
+        rec.numComputedTokens = replayStart
+        let replay = scheduler.plan()
+        XCTAssertEqual(replay.assignments.map(\.numTokens), [16])
+        XCTAssertEqual(admission.bytesReserved, exactBackendBytes)
+        let postBoundary = scheduler.plan()
+        XCTAssertEqual(postBoundary.assignments.map(\.numTokens), [1])
+        XCTAssertEqual(
+            admission.bytesReserved,
+            exactBackendBytes,
+            "prepaid full span and fixed ring must not be charged again")
+        scheduler.rollback(postBoundary)
+        scheduler.rollback(replay)
+        admission.releaseAll(id: CBv2RequestID(777))
+        XCTAssertEqual(admission.bytesReserved, 0)
+    }
+
+    func testFixedWindowShortfallOverflowFailsCold() {
+        let admission = AdmissionV2(
+            layerKinds: [
+                CBv2LayerKind(
+                    attention: .slidingWindow(Int.max),
+                    headDim: 1,
+                    kvHeads: 1,
+                    queryHeads: 1)
+            ],
+            bytesCapacity: Int.max,
+            config: .init(watermarkFraction: 0))
+        XCTAssertNil(admission.fixedWindowBytesShortfall(afterReservingTokens: 0))
     }
 }

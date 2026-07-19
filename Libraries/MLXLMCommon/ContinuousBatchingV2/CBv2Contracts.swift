@@ -420,15 +420,35 @@ extension CBv2KVBackend {
         layerKinds: [CBv2LayerKind],
         maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
-        guard let matched = prefix.compactMap({ $0?.offset }).first else {
+        guard let adoptedOffset = prefix.compactMap({ $0?.offset }).first else {
             throw CBv2KVError.backendIneligible(reason: "prefix contains no owning full snapshot")
+        }
+        var exactBytes = 0
+        for entry in prefix {
+            guard let entry else { continue }
+            guard entry.offset == adoptedOffset else {
+                throw CBv2KVError.backendIneligible(reason: "non-uniform adopted prefix offsets")
+            }
+            let (entryBytes, entryOverflow) = entry.keys.nbytes.addingReportingOverflow(
+                entry.values.nbytes)
+            let (total, totalOverflow) = exactBytes.addingReportingOverflow(entryBytes)
+            guard !entryOverflow, !totalOverflow else {
+                throw CBv2KVError.backendIneligible(reason: "adopted prefix byte overflow")
+            }
+            exactBytes = total
         }
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
             backend: prefixReuseBackend)
-        guard let plan = capability.plan(matchedBoundary: matched) else {
+        guard let plan = capability.compatibilityPlan(
+            adoptedOffset: adoptedOffset,
+            exactStagedFullKVBytes: exactBytes,
+            maximumSequenceLength: maxLength)
+        else {
             throw CBv2KVError.backendIneligible(
-                reason: capability.unsupportedReason?.rawValue ?? "prefix plan saves no tokens")
+                reason:
+                    capability.unsupportedReason?.rawValue
+                    ?? "layout requires an explicit matched-boundary replay plan")
         }
         return try makeSequenceState(
             adopting: prefix,
