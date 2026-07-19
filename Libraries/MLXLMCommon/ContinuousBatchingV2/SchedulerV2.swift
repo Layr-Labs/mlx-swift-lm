@@ -63,6 +63,10 @@ public final class CBv2ScheduledRequest {
     public internal(set) var cancelRequested: Bool = false
     /// Times this request was preempted (telemetry).
     public internal(set) var preemptionCount: Int = 0
+    /// Active exact-prefix replay contract. Set only after atomic adoption;
+    /// cleared on preemption because the adopted state is discarded.
+    internal var prefixReusePlan: CBv2PrefixReusePlan?
+    internal var prefixReplayBoundarySplits = 0
 
     public var id: CBv2RequestID { request.id }
     public var numTokens: Int { tokens.count }
@@ -102,6 +106,11 @@ public final class CBv2ScheduledRequest {
     ///    validation guarantees every block fits a FULL step budget).
     /// Text requests (no blocks) return `proposed` unchanged.
     func snappedChunkTokens(start: Int, proposed: Int, budget: Int) -> Int {
+        let unclamped = proposed
+        let proposed = prefixReusePlan?.clampedChunk(start: start, proposed: proposed) ?? proposed
+        if proposed < unclamped {
+            prefixReplayBoundarySplits += 1
+        }
         guard proposed > 0, !multimodalBlocks.isEmpty else { return proposed }
         // Chunks never split blocks, so a chunk can never START strictly
         // inside one (preemption restarts at 0; adoption is excluded for
@@ -297,10 +306,20 @@ public final class SchedulerV2 {
             }
 
             // Reserve KV headroom; preemption is the backstop.
-            var reserved = capacity == nil
+            var reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                start: rec.numComputedTokens,
+                count: n) ?? n
+            var reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                start: rec.numComputedTokens,
+                count: n) ?? 0
+            var reserved =
+                capacity == nil || (reservationTokens == 0 && reservationBytes == 0)
             while !reserved {
                 do {
-                    try capacity?.reserve(id: rec.id, additionalTokens: n)
+                    try capacity?.reserve(
+                        id: rec.id,
+                        additionalTokens: reservationTokens,
+                        additionalBytes: reservationBytes)
                     reserved = true
                 } catch {
                     // Speculative slack must never trigger the preemption
@@ -308,6 +327,12 @@ public final class SchedulerV2 {
                     if speculated {
                         n = 1
                         speculated = false
+                        reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                            start: rec.numComputedTokens,
+                            count: n) ?? n
+                        reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                            start: rec.numComputedTokens,
+                            count: n) ?? 0
                         speculationFallbacks[rec.id] = .kvHeadroom
                         continue
                     }
@@ -381,7 +406,20 @@ public final class SchedulerV2 {
                     break
                 }
                 if let capacity {
-                    do { try capacity.reserve(id: rec.id, additionalTokens: chunk) } catch {
+                    let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                        start: rec.numComputedTokens,
+                        count: chunk) ?? chunk
+                    let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                        start: rec.numComputedTokens,
+                        count: chunk) ?? 0
+                    do {
+                        if reservationTokens > 0 || reservationBytes > 0 {
+                            try capacity.reserve(
+                                id: rec.id,
+                                additionalTokens: reservationTokens,
+                                additionalBytes: reservationBytes)
+                        }
+                    } catch {
                         break  // no preemption on behalf of WAITING requests
                     }
                 }
@@ -423,7 +461,20 @@ public final class SchedulerV2 {
             start: rec.numComputedTokens, proposed: chunk, budget: budget)
         guard chunk > 0 else { return nil }
         if let capacity {
-            do { try capacity.reserve(id: rec.id, additionalTokens: chunk) } catch {
+            let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                start: rec.numComputedTokens,
+                count: chunk) ?? chunk
+            let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                start: rec.numComputedTokens,
+                count: chunk) ?? 0
+            do {
+                if reservationTokens > 0 || reservationBytes > 0 {
+                    try capacity.reserve(
+                        id: rec.id,
+                        additionalTokens: reservationTokens,
+                        additionalBytes: reservationBytes)
+                }
+            } catch {
                 return nil  // no preemption on behalf of WAITING requests
             }
         }
@@ -446,8 +497,16 @@ public final class SchedulerV2 {
     public func rollback(_ plan: CBv2StepPlan) {
         for (id, n) in plan.assignments {
             guard let rec = byID[id] else { continue }
-            rec.numComputedTokens = max(0, rec.numComputedTokens - n)
-            capacity?.unreserve(id: id, tokens: n)
+            let start = max(0, rec.numComputedTokens - n)
+            let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                start: start,
+                count: n) ?? n
+            let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                start: start,
+                count: n) ?? 0
+            rec.numComputedTokens = start
+            capacity?.unreserve(
+                id: id, tokens: reservationTokens, bytes: reservationBytes)
         }
     }
 
@@ -485,8 +544,16 @@ public final class SchedulerV2 {
     /// id is a no-op.
     public func rollbackComputed(id: CBv2RequestID, tokens n: Int) {
         guard let rec = byID[id] else { return }
-        rec.numComputedTokens = max(0, rec.numComputedTokens - n)
-        capacity?.unreserve(id: id, tokens: n)
+        let start = max(0, rec.numComputedTokens - n)
+        let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+            start: start,
+            count: n) ?? n
+        let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+            start: start,
+            count: n) ?? 0
+        rec.numComputedTokens = start
+        capacity?.unreserve(
+            id: id, tokens: reservationTokens, bytes: reservationBytes)
     }
 
     /// Confirm one sampled token (called at step finalization, one step
@@ -582,6 +649,8 @@ public final class SchedulerV2 {
         // Full restart: keep generated tokens, recompute everything (the
         // prefix cache makes re-prefill cheap once WS-D lands).
         victim.numComputedTokens = 0
+        victim.prefixReusePlan = nil
+        victim.prefixReplayBoundarySplits = 0
         victim.status = .preempted
         victim.preemptionCount += 1
         insertWaiting(victim, preemptedRequeue: true)
@@ -599,6 +668,8 @@ public final class SchedulerV2 {
         capacity?.releaseAll(id: rec.id)
         running.removeAll { $0 === rec }
         rec.numComputedTokens = 0
+        rec.prefixReusePlan = nil
+        rec.prefixReplayBoundarySplits = 0
         rec.status = .preempted
         rec.preemptionCount += 1
         insertWaiting(rec, preemptedRequeue: true)

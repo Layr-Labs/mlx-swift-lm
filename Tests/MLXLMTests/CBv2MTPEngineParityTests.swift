@@ -11,7 +11,7 @@ import Testing
 
 @testable import MLXLLM
 
-private final class CBv2ParityScriptCursor: CBv2MTPPreparedCapture {
+final class CBv2ParityScriptCursor: CBv2MTPPreparedCapture {
     let baseIndices: [Int]
     var step = 0
 
@@ -20,7 +20,7 @@ private final class CBv2ParityScriptCursor: CBv2MTPPreparedCapture {
 
 /// Position-keyed deterministic drafter. offset 0 is an oracle; offset 1 is
 /// guaranteed to disagree with the probed target continuation.
-private final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
+final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
     private let script: [Int]
     private let promptLength: Int
     private let offset: Int

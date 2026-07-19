@@ -285,6 +285,74 @@ struct CBv2MTPEngineMixedTests {
             config: .init(watermarkFraction: 0))
     }
 
+    @Test func frozenReplayStaysTargetAuthoritativeAcrossAcceptedAndRejectedDrafts() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompt = makePromptTokens(
+            length: 81,
+            seed: 0xCA_55,
+            vocabSize: vocabSize)
+        let cache = PrefixCacheV2(
+            config: .init(
+                blockSize: 4,
+                promptContractID: "mtp-frozen-replay",
+                materializeOnDonate: true))
+
+        let targetOnly = try makeEngine(
+            fixture,
+            mtp: false,
+            prefixCache: cache)
+        let baseline = try await run(
+            targetOnly,
+            request(id: 1, prompt: prompt, maxTokens: 24))
+        let donated = await cbv2SchedWait {
+            cache.stats().entryCount > 0
+        }
+        #expect(donated)
+        await targetOnly.shutdown()
+
+        let accepted = try makeEngine(
+            fixture,
+            mtp: true,
+            prefixCache: cache,
+            mtpDrafter: CBv2ParityScriptedDrafter(
+                script: baseline.tokens,
+                promptLength: prompt.count,
+                offset: 0,
+                vocabSize: vocabSize,
+                target: fixture.target))
+        let acceptedResult = try await run(
+            accepted,
+            request(id: 2, prompt: prompt, maxTokens: 24))
+        let acceptedMetrics = try #require(accepted.mtpMetricsSnapshot())
+        await accepted.shutdown()
+        #expect(acceptedResult.tokens == baseline.tokens)
+        #expect(acceptedResult.usage?.prefixCacheStrategy == .frozenFullReplay)
+        #expect((acceptedResult.usage?.prefixCachePrefillTokensSaved ?? 0) > 0)
+        #expect(acceptedMetrics.acceptedTokens > 0)
+        #expect(acceptedMetrics.acceptedTokens == acceptedMetrics.draftedTokens)
+
+        let rejected = try makeEngine(
+            fixture,
+            mtp: true,
+            prefixCache: cache,
+            mtpDrafter: CBv2ParityScriptedDrafter(
+                script: baseline.tokens,
+                promptLength: prompt.count,
+                offset: 1,
+                vocabSize: vocabSize,
+                target: fixture.target))
+        let rejectedResult = try await run(
+            rejected,
+            request(id: 3, prompt: prompt, maxTokens: 24))
+        let rejectedMetrics = try #require(rejected.mtpMetricsSnapshot())
+        await rejected.shutdown()
+        #expect(rejectedResult.tokens == baseline.tokens)
+        #expect(rejectedResult.usage?.prefixCacheStrategy == .frozenFullReplay)
+        #expect(rejectedMetrics.acceptedTokens == 0)
+        #expect(rejectedMetrics.emittedTokens == rejectedMetrics.rounds)
+        #expect(cache.stats().entryCount > 0, "terminal MTP donation remains reusable")
+    }
+
     @Test func verifyRowsWithChunkedPrefillNeighborStayExact() async throws {
         let fixture = try makeFixture()
         let requests = [

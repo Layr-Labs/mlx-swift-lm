@@ -138,10 +138,18 @@ extension EngineLoopV2 {
             }
         }
         if mtp.planDepth > 0 {
-            let requiredTokens = rows.count + eligibleRows.count * mtp.planDepth
-            if requiredTokens > scheduler.config.maxBatchedTokensPerStep {
+            let eligibleIDs = Set(eligibleRows.map(\.id))
+            let stepTokens = rows.count + eligibleRows.count * mtp.planDepth
+            let capacityTokens = rows.reduce(0) { total, rec in
+                let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
+                return total
+                    + (rec.prefixReusePlan?.capacityTokensForChunk(
+                        start: rec.numComputedTokens,
+                        count: count) ?? count)
+            }
+            if stepTokens > scheduler.config.maxBatchedTokensPerStep {
                 mtp.clampPlanDepth(to: 0, reason: "step_token_budget")
-            } else if !(capacity?.hasHeadroom(additionalTokens: requiredTokens) ?? true) {
+            } else if !(capacity?.hasHeadroom(additionalTokens: capacityTokens) ?? true) {
                 mtp.clampPlanDepth(to: 0, reason: "step_kv_headroom")
             }
         }

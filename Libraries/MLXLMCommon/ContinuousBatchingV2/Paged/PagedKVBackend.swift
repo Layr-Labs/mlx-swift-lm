@@ -29,6 +29,7 @@ import Foundation
 import MLX
 
 public final class PagedKVBackend: CBv2KVBackend {
+    public var prefixReuseBackend: CBv2PrefixReuseBackend { .pagedFP16 }
     public let pool: PagedKVPool
     /// The model's per-layer structure this backend was built for.
     public let layerKinds: [CBv2LayerKind]
@@ -138,19 +139,24 @@ public final class PagedKVBackend: CBv2KVBackend {
         return states
     }
 
-    /// Adopt a donated prefix. Snapshots are written into fresh pages via
-    /// the in-place bulk-write kernel (off the hot decode path; the writes
-    /// ride the group's fence chain and evaluate with the row's first
-    /// consuming step). Reconciled
-    /// adoption semantics (contract `makeSequenceState(adopting:)`): the
-    /// engine already sliced the prefix down by `cbv2RequiredRecompute`, so
-    /// every non-nil entry carries the same uniform offset; windowed layers
-    /// are fast-forwarded to that offset (counter only, no storage) and the
-    /// engine replays the trailing tokens through all layers.
+    /// Adopt a donated prefix for direct or ordinary tail replay. Snapshots
+    /// are written into fresh pages via the in-place bulk-write kernel.
+    /// Frozen-full hybrid replay is explicitly rejected: paged rows currently
+    /// expose one mutable cursor and do not yet implement immutable M plus a
+    /// logical replay cursor C.
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
+        guard plan.backend == .pagedFP16 else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged adoption received \(plan.backend.rawValue) prefix plan")
+        }
+        guard plan.strategy != .frozenFullReplay else {
+            throw CBv2KVError.backendIneligible(
+                reason: CBv2PrefixReuseUnsupportedReason.pagedHybridRequiresDualCursor.rawValue)
+        }
         precondition(prefix.count == layerKinds.count, "prefix/layer count mismatch")
         var matched = 0
         for (index, entry) in prefix.enumerated() {
@@ -162,6 +168,10 @@ public final class PagedKVBackend: CBv2KVBackend {
                 matched == 0 || matched == entry.offset,
                 "non-uniform prefix offsets (\(entry.offset) vs \(matched))")
             matched = entry.offset
+        }
+        guard matched == plan.restoredFullTokens, matched == plan.replayStart else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged prefix offset does not match ordinary replay plan")
         }
         let states = try makeSequenceState(
             layerKinds: layerKinds, promptLength: 0, maxLength: maxLength)

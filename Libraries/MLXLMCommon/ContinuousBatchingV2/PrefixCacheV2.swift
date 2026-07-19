@@ -22,12 +22,11 @@
 //  - Windowed-layer policy (report 10 invariant 6): sliding-window layers
 //    NEVER enter full-history prefix reuse. Donation stores snapshots for
 //    full-attention layers that own storage; windowed and KV-sharing layers
-//    are nil. The engine re-prefills the trailing `requiredRecompute(...)`
-//    tokens through ALL layers after adopting a prefix. That span is
-//    (windowed-layer count × largest window), clamped to the match, because
-//    each stacked windowed layer compounds the receptive field and any
-//    downstream full layer caches its polluted early outputs — see the
-//    derivation on `cbv2RequiredRecompute`.
+//    are nil. The typed backend plan replays
+//    (windowed-layer count × largest window), clamped to M, to rebuild finite
+//    window state. Interleaved contiguous-fp16 hybrids keep donated full K/V
+//    frozen through M during that replay, so polluted early replay activations
+//    can never overwrite persistent full-attention state.
 //  - Eviction is LRU by last access; entries currently being adopted
 //    (in-use refcount > 0) are never evicted, and key repointing skips
 //    pinned entries so an in-flight adoption always stays resolvable.
@@ -492,9 +491,9 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
 
     // MARK: - Windowed-layer policy
 
-    /// Tokens the engine must re-prefill through ALL layers after adopting
-    /// a `matched`-token prefix so windowed layers are exact for the
-    /// retained tail. Delegates to the contract-level free function
+    /// Conservative finite-window replay length R after matching M. Frozen
+    /// hybrid plans retain owning full K/V through M while this replay runs.
+    /// Delegates to the contract-level free function
     /// `cbv2RequiredRecompute` (pure model-shape logic, shared by all
     /// backends); see its derivation for why the span scales with the
     /// number of stacked windowed layers.

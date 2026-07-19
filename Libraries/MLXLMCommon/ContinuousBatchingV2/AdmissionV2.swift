@@ -21,8 +21,14 @@ public protocol CBv2StepCapacity: AnyObject {
     /// `id`. Throws `CBv2KVError.capacityExhausted` when the soft ledger
     /// would cross the watermark — the scheduler preempts in response.
     func reserve(id: CBv2RequestID, additionalTokens: Int) throws
+    /// Reserve token-derived bytes plus an exact native-dtype adjustment in
+    /// one admission operation.
+    func reserve(
+        id: CBv2RequestID, additionalTokens: Int, additionalBytes: Int
+    ) throws
     /// Partially undo a reservation (optimistic-advance rollback).
     func unreserve(id: CBv2RequestID, tokens: Int)
+    func unreserve(id: CBv2RequestID, tokens: Int, bytes: Int)
     /// Drop every reservation held by `id` (finish/cancel/preempt).
     func releaseAll(id: CBv2RequestID)
     /// Non-throwing conservative probe used by the chained-decode fast path.
@@ -36,6 +42,19 @@ public protocol CBv2StepCapacity: AnyObject {
 
 extension CBv2StepCapacity {
     public var bytesCapacity: Int { 0 }
+    public func reserve(
+        id: CBv2RequestID, additionalTokens: Int, additionalBytes: Int
+    ) throws {
+        guard additionalBytes == 0 else {
+            throw CBv2KVError.backendIneligible(
+                reason: "capacity oracle cannot reserve exact native KV bytes")
+        }
+        try reserve(id: id, additionalTokens: additionalTokens)
+    }
+    public func unreserve(id: CBv2RequestID, tokens: Int, bytes: Int) {
+        precondition(bytes == 0, "capacity oracle cannot unreserve exact native KV bytes")
+        unreserve(id: id, tokens: tokens)
+    }
 }
 
 // MARK: - AdmissionV2
@@ -97,6 +116,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// Per-token bytes if every storage-owning layer retained the token
     /// (upper bound; used for the conservative headroom probe).
     private let maxPerTokenBytes: Int
+    /// Nominal bytes per token for storage-owning full-attention rows under
+    /// this ledger's actual per-layer dtype assumptions.
+    public let fullKVBytesPerToken: Int
 
     /// Total KV byte budget. Runtime-resizable via `updateBytesCapacity`
     /// (multi-model co-residency re-slicing); reads take the ledger lock.
@@ -119,6 +141,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// converting to bytes, so decode reservations past a layer's window add
     /// zero bytes for that layer).
     private var reservedTokens: [CBv2RequestID: Int] = [:]
+    private var reservedExactBytes: [CBv2RequestID: Int] = [:]
     private var ledgerBytes = 0
 
     public init(
@@ -141,16 +164,39 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         self.watermarkFraction = config.watermarkFraction
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
         var perToken = 0
+        var fullPerToken = 0
+        var accountingOverflow = false
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
-            perToken += 2 * kind.kvHeads * kind.headDim * self.perLayerElementBytes[index]
+            guard
+                let bytes = Self.storageBytesPerToken(
+                    kind: kind,
+                    elementBytes: self.perLayerElementBytes[index]),
+                let newPerToken = Self.add(perToken, bytes)
+            else {
+                accountingOverflow = true
+                break
+            }
+            perToken = newPerToken
+            if case .full = kind.attention {
+                guard let newFullPerToken = Self.add(fullPerToken, bytes) else {
+                    accountingOverflow = true
+                    break
+                }
+                fullPerToken = newFullPerToken
+            }
         }
-        self.maxPerTokenBytes = perToken
+        self.maxPerTokenBytes = accountingOverflow ? Int.max : perToken
+        self.fullKVBytesPerToken = accountingOverflow ? Int.max : fullPerToken
     }
 
     // MARK: Estimation
 
     /// KV bytes retained after processing `tokens` tokens of one sequence.
     public func estimatedBytes(forTokens tokens: Int) -> Int {
+        estimatedBytesChecked(forTokens: tokens) ?? Int.max
+    }
+
+    private func estimatedBytesChecked(forTokens tokens: Int) -> Int? {
         guard tokens > 0 else { return 0 }
         var total = 0
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
@@ -159,7 +205,34 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             case .full: retained = tokens
             case .slidingWindow(let window): retained = min(tokens, window)
             }
-            total += retained * 2 * kind.kvHeads * kind.headDim * perLayerElementBytes[index]
+            guard retained >= 0,
+                let perTokenBytes = Self.storageBytesPerToken(
+                    kind: kind,
+                    elementBytes: perLayerElementBytes[index]),
+                let retainedBytes = Self.multiply(retained, perTokenBytes),
+                let newTotal = Self.add(total, retainedBytes)
+            else { return nil }
+            total = newTotal
+        }
+        return total
+    }
+
+    /// Bytes needed to materialize every fixed sliding ring beyond what a
+    /// token reservation at `tokens` already charges. Adoption allocates full
+    /// rings immediately even when replay starts before the window fills.
+    public func fixedWindowBytesShortfall(afterReservingTokens tokens: Int) -> Int? {
+        var total = 0
+        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
+            guard case .slidingWindow(let window) = kind.attention else { continue }
+            let missing = max(0, window - max(0, tokens))
+            guard
+                let perTokenBytes = Self.storageBytesPerToken(
+                    kind: kind,
+                    elementBytes: perLayerElementBytes[index]),
+                let missingBytes = Self.multiply(missing, perTokenBytes),
+                let newTotal = Self.add(total, missingBytes)
+            else { return nil }
+            total = newTotal
         }
         return total
     }
@@ -223,37 +296,79 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// rejected up front; requests that fit only sometimes are admitted
     /// optimistically and preempted if optimism loses.
     public func canEverFit(promptTokens: Int, maxTokens: Int) -> Bool {
-        estimatedBytes(forTokens: promptTokens + max(maxTokens, 0)) <= admissibleBytesCapacity
+        let (tokens, overflow) = promptTokens.addingReportingOverflow(max(maxTokens, 0))
+        guard !overflow, let bytes = estimatedBytesChecked(forTokens: tokens) else {
+            return false
+        }
+        return bytes <= admissibleBytesCapacity
     }
 
     // MARK: CBv2StepCapacity
 
     public func reserve(id: CBv2RequestID, additionalTokens: Int) throws {
+        try reserve(id: id, additionalTokens: additionalTokens, additionalBytes: 0)
+    }
+
+    public func reserve(
+        id: CBv2RequestID, additionalTokens: Int, additionalBytes: Int
+    ) throws {
+        guard additionalTokens >= 0, additionalBytes >= 0 else {
+            throw CBv2KVError.backendIneligible(reason: "negative KV reservation")
+        }
         lock.lock()
         defer { lock.unlock() }
         let old = reservedTokens[id] ?? 0
-        let new = old + additionalTokens
-        let delta = estimatedBytes(forTokens: new) - estimatedBytes(forTokens: old)
-        let after = ledgerBytes + delta
+        let (new, tokenCountOverflow) = old.addingReportingOverflow(additionalTokens)
+        let oldExact = reservedExactBytes[id] ?? 0
+        let (newExact, exactOverflow) = oldExact.addingReportingOverflow(additionalBytes)
+        guard !tokenCountOverflow, !exactOverflow,
+            let oldTokenBytes = estimatedBytesChecked(forTokens: old),
+            let newTokenBytes = estimatedBytesChecked(forTokens: new)
+        else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
+        let (tokenDelta, tokenOverflow) = newTokenBytes.subtractingReportingOverflow(oldTokenBytes)
+        let (delta, deltaOverflow) = tokenDelta.addingReportingOverflow(additionalBytes)
+        guard !tokenOverflow, !deltaOverflow else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
+        let (after, afterOverflow) = ledgerBytes.addingReportingOverflow(delta)
+        guard !afterOverflow else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
         guard after <= reserveCeiling else {
             throw CBv2KVError.capacityExhausted(
                 needed: delta,
                 available: max(0, reserveCeiling - ledgerBytes))
         }
         reservedTokens[id] = new
+        reservedExactBytes[id] = newExact
         ledgerBytes = after
     }
 
     public func unreserve(id: CBv2RequestID, tokens: Int) {
+        unreserve(id: id, tokens: tokens, bytes: 0)
+    }
+
+    public func unreserve(id: CBv2RequestID, tokens: Int, bytes: Int) {
+        precondition(tokens >= 0 && bytes >= 0)
         lock.lock()
         defer { lock.unlock() }
         let old = reservedTokens[id] ?? 0
         let new = max(0, old - tokens)
+        let oldExact = reservedExactBytes[id] ?? 0
+        let newExact = max(0, oldExact - bytes)
         ledgerBytes += estimatedBytes(forTokens: new) - estimatedBytes(forTokens: old)
+            + newExact - oldExact
         if new == 0 {
             reservedTokens.removeValue(forKey: id)
         } else {
             reservedTokens[id] = new
+        }
+        if newExact == 0 {
+            reservedExactBytes.removeValue(forKey: id)
+        } else {
+            reservedExactBytes[id] = newExact
         }
     }
 
@@ -261,7 +376,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let old = reservedTokens.removeValue(forKey: id) else { return }
-        ledgerBytes -= estimatedBytes(forTokens: old)
+        let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
+        ledgerBytes -= estimatedBytes(forTokens: old) + exact
     }
 
     /// Conservative (window caps ignored): may under-report headroom, which
@@ -269,7 +385,32 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public func hasHeadroom(additionalTokens: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return ledgerBytes + additionalTokens * maxPerTokenBytes <= reserveCeiling
+        guard additionalTokens >= 0,
+            let additionalBytes = Self.multiply(additionalTokens, maxPerTokenBytes),
+            let after = Self.add(ledgerBytes, additionalBytes)
+        else { return false }
+        return after <= reserveCeiling
+    }
+
+    private static func storageBytesPerToken(
+        kind: CBv2LayerKind,
+        elementBytes: Int
+    ) -> Int? {
+        guard kind.kvHeads >= 0, kind.headDim >= 0, elementBytes >= 0,
+            let elements = multiply(kind.kvHeads, kind.headDim),
+            let kvElements = multiply(elements, 2)
+        else { return nil }
+        return multiply(kvElements, elementBytes)
+    }
+
+    private static func multiply(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+        return overflow ? nil : value
+    }
+
+    private static func add(_ lhs: Int, _ rhs: Int) -> Int? {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : value
     }
 
     // MARK: Telemetry

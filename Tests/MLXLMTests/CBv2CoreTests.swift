@@ -532,15 +532,21 @@ struct CBv2CoreContiguousBackendTests {
         backend.release(state)
     }
 
-    @Test func adoptingPrefixCopiesFullLayersAndOffsetsWindowedRows() throws {
+    @Test func adoptingPrefixFreezesFullLayersAndOffsetsWindowedRows() throws {
         let backend = CBv2ContiguousKVBackend(
-            config: .init(bytesCapacity: 1 << 24, kvDType: .float32))
+            config: .init(bytesCapacity: 1 << 24, kvDType: .float16))
 
         // Donor prefix of 12 tokens on the full-attention layers.
         let donor = CBv2FullSequenceKV(promptLength: 12, maxLength: 64, kvHeads: 2, headDim: 4)
         _ = donor.update(
-            keys: positionCoded(from: 0, count: 12), values: positionCoded(from: 200, count: 12))
+            keys: positionCoded(from: 0, count: 12).asType(.float16),
+            values: positionCoded(from: 200, count: 12).asType(.float16))
         let donated = donor.snapshot()
+        let plan = try #require(
+            CBv2PrefixReuseCapability.derive(
+                layerKinds: layerKinds,
+                backend: backend.prefixReuseBackend
+            ).plan(matchedBoundary: donated.offset))
 
         let prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?] = [
             (donated.keys, donated.values, donated.offset),
@@ -549,20 +555,72 @@ struct CBv2CoreContiguousBackendTests {
             (donated.keys, donated.values, donated.offset),
         ]
         let state = try backend.makeSequenceState(
-            adopting: prefix, layerKinds: layerKinds, maxLength: 64)
+            adopting: prefix,
+            plan: plan,
+            layerKinds: layerKinds,
+            maxLength: 64)
 
-        let adopted = state[0] as! CBv2FullSequenceKV
+        let adopted = try #require(state[0] as? CBv2FrozenReplayFullSequenceKV)
+        #expect(adopted.absoluteOffset == 4)
+        #expect(adopted.frozenHighWater == 12)
+        _ = adopted.update(
+            keys: positionCoded(from: 900, count: 8).asType(.float16),
+            values: positionCoded(from: 1900, count: 8).asType(.float16))
         #expect(adopted.absoluteOffset == 12)
-        expectClose(adopted.snapshot().keys, donated.keys, "adopted full-layer keys")
+        expectClose(adopted.snapshot().keys, donated.keys, "frozen full-layer keys")
 
-        // Windowed rows start at the UNIFORM adopted offset (the engine
-        // slices the matched prefix by cbv2RequiredRecompute before
-        // adopting, then replays [offset, prompt) through all layers).
+        // Windowed rows start empty at C while owning full rows retain M.
         let windowed = state[1] as! CBv2WindowedSequenceKV
-        #expect(windowed.absoluteOffset == 12)
+        #expect(windowed.absoluteOffset == 4)
         #expect(windowed.retainedCount == 0)
         #expect(state[2] == nil)
         backend.release(state)
+    }
+
+    @Test func compatibilityAdoptionPreservesAlreadySlicedTailOffset() throws {
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(
+                attention: .slidingWindow(16),
+                headDim: 4,
+                kvHeads: 2,
+                queryHeads: 4),
+        ]
+        let adoptedOffset = 24
+        let keys = positionCoded(from: 0, count: adoptedOffset).asType(.float16)
+        let values = positionCoded(from: 200, count: adoptedOffset).asType(.float16)
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 1 << 24, kvDType: .float16))
+        let state = try backend.makeSequenceState(
+            adopting: [(keys, values, adoptedOffset), nil],
+            layerKinds: kinds,
+            maxLength: 64)
+        let full = try #require(state[0] as? CBv2FullSequenceKV)
+        let window = try #require(state[1] as? CBv2WindowedSequenceKV)
+        #expect(full.absoluteOffset == adoptedOffset)
+        #expect(window.absoluteOffset == adoptedOffset)
+        expectClose(full.snapshot().keys, keys, "compatibility full-layer keys")
+        backend.release(state)
+    }
+
+    @Test func compatibilityAdoptionRejectsHybridThatNeedsExplicitMatchedBoundary() {
+        let adoptedOffset = 24
+        let keys = positionCoded(from: 0, count: adoptedOffset).asType(.float16)
+        let values = positionCoded(from: 200, count: adoptedOffset).asType(.float16)
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 1 << 24, kvDType: .float16))
+        #expect(throws: CBv2KVError.self) {
+            _ = try backend.makeSequenceState(
+                adopting: [
+                    (keys, values, adoptedOffset),
+                    nil,
+                    nil,
+                    (keys, values, adoptedOffset),
+                ],
+                layerKinds: layerKinds,
+                maxLength: 64)
+        }
+        #expect(backend.bytesReserved == 0)
     }
 }
 

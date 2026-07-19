@@ -116,6 +116,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// the submit thread (hashing is host work — never on the engine step
     /// thread); adoption and donation are handled by the loop.
     private let prefixCache: CBv2PrefixCache?
+    public let prefixReuseCapability: CBv2PrefixReuseCapability
 
     private let stateLock = NSLock()
     private var rejectingSubmissions = false
@@ -175,7 +176,13 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
         self.backend = backend
-        let activePrefixCache = schedulerConfig.enablePrefixCache ? prefixCache : nil
+        let prefixReuseCapability = CBv2PrefixReuseCapability.derive(
+            layerKinds: layerKinds,
+            backend: backend.prefixReuseBackend)
+        self.prefixReuseCapability = prefixReuseCapability
+        let activePrefixCache =
+            schedulerConfig.enablePrefixCache && prefixReuseCapability.isSupported
+            ? prefixCache : nil
         self.prefixCache = activePrefixCache
         if let violation = Self.prefixCachePairingViolation(
             backend: backend, prefixCache: activePrefixCache)
@@ -422,11 +429,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     }
 
     /// Prefix-cache lookup on the SUBMIT thread (SHA-256 hashing is host
-    /// work; slicing is graph-only). Returns a prepared adoption sliced to
-    /// `effective = matched - cbv2RequiredRecompute(...)` — the uniform
-    /// offset every row adopts before the engine replays the trailing
-    /// tokens. The lookup pin travels with the adoption; the loop balances
-    /// it in every outcome.
+    /// work; slicing is graph-only). The capability derives the exact
+    /// match-specific M/C/R plan. Safe layouts slice full rows to C; hybrid
+    /// contiguous native-float layouts retain full rows through M for frozen replay.
+    /// The lookup pin travels with the adoption; the loop balances it in
+    /// every outcome.
     private func makePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
         guard let prefixCache else {
             return CBv2PrefixLookup(adoption: nil, outcome: .disabled, matchedTokens: 0)
@@ -450,9 +457,37 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         else {
             return CBv2PrefixLookup(adoption: nil, outcome: .miss, matchedTokens: 0)
         }
-        let recompute = cbv2RequiredRecompute(layerKinds: layerKinds, matched: hit.matched)
-        let effective = hit.matched - recompute
-        guard effective > 0 else {
+        var exactStagedFullKVBytes = 0
+        var byteOverflow = false
+        for entry in hit.prefix {
+            guard let entry else { continue }
+            let (entryBytes, entryOverflow) = entry.keys.nbytes.addingReportingOverflow(
+                entry.values.nbytes)
+            let (sum, sumOverflow) = exactStagedFullKVBytes.addingReportingOverflow(entryBytes)
+            if entryOverflow || sumOverflow {
+                byteOverflow = true
+                break
+            }
+            exactStagedFullKVBytes = sum
+        }
+        let replayTokens = min(
+            hit.matched,
+            prefixReuseCapability.conservativeReplayBoundTokens)
+        let replayStart = hit.matched - replayTokens
+        let initialReservationTokens =
+            prefixReuseCapability.strategy == .frozenFullReplay
+            ? hit.matched : replayStart
+        guard !byteOverflow,
+            let fixedWindowCapacityBytes = admission.fixedWindowBytesShortfall(
+                afterReservingTokens: initialReservationTokens),
+            let plan = prefixReuseCapability.plan(
+                matchedBoundary: hit.matched,
+                exactStagedFullKVBytes: exactStagedFullKVBytes,
+                maximumSequenceLength:
+                    request.promptTokens.count + max(request.maxTokens, 1),
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
+                fixedWindowCapacityBytes: fixedWindowCapacityBytes)
+        else {
             prefixCache.endAdoption(
                 requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,
                 cacheSalt: request.cacheSalt)
@@ -461,17 +496,34 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         }
         let prefix = hit.prefix.map { entry -> (keys: MLXArray, values: MLXArray, offset: Int)? in
             guard let entry else { return nil }
-            guard entry.offset != effective else { return entry }
+            let restored = plan.restoredFullTokens
+            guard entry.offset >= restored else { return nil }
+            guard entry.offset != restored else { return entry }
             return (
-                keys: entry.keys[.ellipsis, 0 ..< effective, 0...],
-                values: entry.values[.ellipsis, 0 ..< effective, 0...],
-                offset: effective
+                keys: entry.keys[.ellipsis, 0 ..< restored, 0...],
+                values: entry.values[.ellipsis, 0 ..< restored, 0...],
+                offset: restored
             )
+        }
+        // Every storage-owning full row must survive the graph-only slice.
+        for (index, kind) in layerKinds.enumerated()
+        where kind.sharesKVWithLayer == nil {
+            if case .full = kind.attention, prefix[index] == nil {
+                prefixCache.endAdoption(
+                    requestID: cacheRequestID,
+                    tokens: request.promptTokens,
+                    matched: hit.matched,
+                    cacheSalt: request.cacheSalt)
+                return CBv2PrefixLookup(
+                    adoption: nil,
+                    outcome: .adoptionFailed,
+                    matchedTokens: hit.matched)
+            }
         }
         return CBv2PrefixLookup(
             adoption: CBv2PrefixAdoption(
                 requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,
-                effective: effective, prefix: prefix, cacheSalt: request.cacheSalt),
+                plan: plan, prefix: prefix, cacheSalt: request.cacheSalt),
             outcome: .adoptionFailed, matchedTokens: hit.matched)
     }
 

@@ -252,10 +252,10 @@ final class CBv2InFlightStep {
 // MARK: - Prefix adoption handoff
 
 /// A prefix-cache hit prepared on the submit thread (lookup + graph-only
-/// slicing) and applied on the engine thread at enqueue. `prefix` is already
-/// sliced to `effective = matched - cbv2RequiredRecompute(...)`, the uniform
-/// offset every storage-owning row adopts; the engine replays
-/// `[effective, prompt)` through all layers. The lookup's in-use pin is
+/// slicing) and applied on the engine thread at enqueue. The typed plan owns
+/// M/C/R, backend support, and accounting facts. Ordinary safe layouts carry
+/// full snapshots through C; frozen-full layouts carry them through M while
+/// sliding rows begin empty at C. The lookup's in-use pin is
 /// balanced by exactly one `endAdoption(tokens:matched:)` when the adoption
 /// is consumed or abandoned.
 /// `@unchecked Sendable`: immutable value handed off exactly once, submit
@@ -266,7 +266,7 @@ struct CBv2PrefixAdoption: @unchecked Sendable {
     let requestID: CBv2RequestID
     let tokens: [Int]
     let matched: Int
-    let effective: Int
+    let plan: CBv2PrefixReusePlan
     let prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?]
     /// Request-scoped salt the lookup used (TB-007); the pin release and any
     /// fallback paths must carry the SAME salt or the pin leaks.
@@ -286,9 +286,17 @@ struct CBv2PrefixUsage {
     var outcome: CBv2PrefixCacheOutcome
     var matchedTokens: Int
     var prefillTokensSaved: Int
+    var strategy: CBv2PrefixReuseStrategy?
+    var replayTokens: Int
+    var boundarySplits: Int
 
     static let disabled = CBv2PrefixUsage(
-        outcome: .disabled, matchedTokens: 0, prefillTokensSaved: 0)
+        outcome: .disabled,
+        matchedTokens: 0,
+        prefillTokensSaved: 0,
+        strategy: nil,
+        replayTokens: 0,
+        boundarySplits: 0)
 }
 
 /// A request's donation intent: which exact token prefix to donate and under
@@ -649,7 +657,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             prefixUsageByID[request.id] = CBv2PrefixUsage(
                 outcome: prefixLookup.outcome,
                 matchedTokens: prefixLookup.matchedTokens,
-                prefillTokensSaved: 0)
+                prefillTokensSaved: 0,
+                strategy: nil,
+                replayTokens: 0,
+                boundarySplits: 0)
             guard running, !draining else {
                 releaseAbandonedAdoption(prefixLookup.adoption)
                 takeStream(request.id)?.finish(
@@ -733,7 +744,13 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         if let capacity {
             do {
-                try capacity.reserve(id: requestID, additionalTokens: adoption.effective)
+                // Frozen replay physically owns full K/V through M from the
+                // instant adoption publishes, even though its logical cursor
+                // starts at C. Reserving only C would understate residency.
+                try capacity.reserve(
+                    id: requestID,
+                    additionalTokens: adoption.plan.capacityReservationTokens,
+                    additionalBytes: adoption.plan.initialAdditionalCapacityBytes)
             } catch {
                 markPrefixAdoptionFailed(requestID, outcome: .skippedCapacity)
                 return  // capacity tight — full prefill with the usual backstops
@@ -742,14 +759,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         do {
             let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
             let state = try backend.makeSequenceState(
-                adopting: adoption.prefix, layerKinds: layerKinds, maxLength: maxLength)
+                adopting: adoption.prefix,
+                plan: adoption.plan,
+                layerKinds: layerKinds,
+                maxLength: maxLength)
             kvStates[requestID] = state
-            rec.numComputedTokens = adoption.effective
-            prefixHitTokens[requestID] = adoption.effective
+            rec.numComputedTokens = adoption.plan.replayStart
+            rec.prefixReusePlan = adoption.plan
+            prefixHitTokens[requestID] = adoption.plan.prefillTokensSaved
             prefixUsageByID[requestID]?.outcome = .hit
-            prefixUsageByID[requestID]?.prefillTokensSaved = adoption.effective
+            prefixUsageByID[requestID]?.prefillTokensSaved = adoption.plan.prefillTokensSaved
+            prefixUsageByID[requestID]?.strategy = adoption.plan.strategy
+            prefixUsageByID[requestID]?.replayTokens = adoption.plan.replayTokens
         } catch {
-            capacity?.unreserve(id: requestID, tokens: adoption.effective)
+            capacity?.unreserve(
+                id: requestID,
+                tokens: adoption.plan.capacityReservationTokens,
+                bytes: adoption.plan.initialAdditionalCapacityBytes)
             let outcome: CBv2PrefixCacheOutcome
             if let kvError = error as? CBv2KVError, case .capacityExhausted = kvError {
                 outcome = .skippedCapacity
@@ -766,6 +792,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         prefixHitTokens.removeValue(forKey: requestID)
         prefixUsageByID[requestID]?.outcome = outcome
         prefixUsageByID[requestID]?.prefillTokensSaved = 0
+        prefixUsageByID[requestID]?.strategy = nil
+        prefixUsageByID[requestID]?.replayTokens = 0
+        prefixUsageByID[requestID]?.boundarySplits = 0
     }
 
     /// Preemption discards adopted KV and forces a full recompute. Preserve
@@ -1433,6 +1462,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let detokenizer = detokenizers.removeValue(forKey: id)
         let stream = takeStream(id)
+        prefixUsageByID[id]?.boundarySplits = rec.prefixReplayBoundarySplits
         let usage = takePrefixUsage(
             requestID: id, promptTokens: rec.request.promptTokens.count,
             completionTokens: rec.generatedTokenCount)
@@ -1595,7 +1625,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             prefixCacheHitTokens: saved,
             prefixCacheOutcome: prefix.outcome,
             prefixCacheMatchedTokens: prefix.matchedTokens,
-            prefixCachePrefillTokensSaved: saved)
+            prefixCachePrefillTokensSaved: saved,
+            prefixCacheStrategy: prefix.strategy,
+            prefixCacheReplayTokens: prefix.replayTokens,
+            prefixCacheBoundarySplits: prefix.boundarySplits)
     }
 
     private func releaseDonationStateOnEngineQueue(_ state: [CBv2SequenceKV?]) {
