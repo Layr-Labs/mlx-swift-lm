@@ -86,6 +86,35 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         await harness.engine.shutdown()
     }
 
+    func testDegenerateConstrainedRequestsPreserveImmediateEvents() async throws {
+        let layerKinds = CBv2SchedFixtures.tinyLayerKinds()
+        let engine = EngineV2(
+            model: CBv2SchedScriptedModel(),
+            layerKinds: layerKinds,
+            backend: CBv2SchedMockBackend(),
+            cacheProvider: CBv2SchedMockCacheProvider(layerKinds: layerKinds),
+            sampler: CBv2ConstraintUnawareSampler(),
+            admissionConfig: .init(watermarkFraction: 0))
+
+        let zeroBudget = await cbv2SchedCollect(
+            try engine.submit(CBv2Request(
+                id: CBv2RequestID(9003),
+                promptTokens: [1],
+                maxTokens: 0,
+                tokenConstraint: CBv2SchedulerPassthroughConstraint(maxTokens: 7))))
+        XCTAssertEqual(zeroBudget.finishReason, .length)
+        XCTAssertEqual(zeroBudget.usage?.completionTokens, 0)
+
+        let emptyPrompt = await cbv2SchedCollect(
+            try engine.submit(CBv2Request(
+                id: CBv2RequestID(9004),
+                promptTokens: [],
+                maxTokens: 2,
+                tokenConstraint: CBv2SchedulerPassthroughConstraint(maxTokens: 3))))
+        XCTAssertEqual(emptyPrompt.finishReason, .error("empty prompt"))
+        await engine.shutdown()
+    }
+
     /// PR#62 review (paged admission alignment): when several same-step
     /// admissions race for the last capacity, the loser of the backend's
     /// atomic charge must be REQUEUED to waiting — an accepted request waits

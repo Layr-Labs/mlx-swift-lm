@@ -8,8 +8,8 @@ import MLXLMCommon
 import Testing
 
 struct OpenAIServiceTests {
-    @Test("responses API forwards parallel_tool_calls into chat execution")
-    func responsesAPIForwardsParallelToolCalls() throws {
+    @Test("responses API enforces parallel_tool_calls false")
+    func responsesAPIEnforcesParallelToolCalls() async throws {
         let request = try JSONDecoder().decode(
             OpenAIResponseRequest.self,
             from: Data(
@@ -23,6 +23,23 @@ struct OpenAIServiceTests {
 
         #expect(request.parallelToolCalls == false)
         #expect(request.chatCompletionRequest.parallelToolCalls == false)
+
+        let events: [MLXServerGenerationEvent] = [
+            .toolCall(.init(function: .init(name: "first", arguments: [:]))),
+            .toolCall(.init(function: .init(name: "second", arguments: [:]))),
+        ]
+        let service = MLXOpenAIService(engine: ScriptedServerEngine(events: events))
+        await #expect(throws: MLXOpenAIServiceError.multipleToolCallsNotAllowed) {
+            _ = try await service.createResponse(request: request)
+        }
+
+        let streaming = MLXOpenAIService(
+            engine: ScriptedServerEngine(events: events))
+        let frames = try await streaming.streamChatCompletionFrames(
+            request: request.chatCompletionRequest)
+        await #expect(throws: MLXOpenAIServiceError.multipleToolCallsNotAllowed) {
+            for try await _ in frames {}
+        }
     }
 
     @Test("named tool_choice rejects non-function type")

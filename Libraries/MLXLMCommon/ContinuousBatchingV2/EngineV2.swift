@@ -346,17 +346,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         guard !rejecting else {
             throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
         }
-        if let constraint = request.tokenConstraint {
-            guard samplerSupportsTokenConstraints else {
-                throw CBv2SchedulerError.tokenConstraintUnsupportedBySampler
-            }
-            guard constraint.maxTokens == request.maxTokens else {
-                throw CBv2SchedulerError.tokenConstraintBudgetMismatch(
-                    request: request.maxTokens,
-                    constraint: constraint.maxTokens)
-            }
-        }
-
         // Degenerate requests: uniform event surface, no engine round-trip.
         if request.maxTokens <= 0 {
             return Self.immediateStream(
@@ -367,6 +356,17 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             return Self.immediateStream(
                 reason: .error("empty prompt"),
                 usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+        }
+
+        if let constraint = request.tokenConstraint {
+            guard samplerSupportsTokenConstraints else {
+                throw CBv2SchedulerError.tokenConstraintUnsupportedBySampler
+            }
+            guard constraint.maxTokens == request.maxTokens else {
+                throw CBv2SchedulerError.tokenConstraintBudgetMismatch(
+                    request: request.maxTokens,
+                    constraint: constraint.maxTokens)
+            }
         }
 
         // Vision requests, CHEAP half only: span structure, model/backend
