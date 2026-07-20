@@ -325,12 +325,27 @@ public enum OpenAIToolChoice: Codable, Sendable, Equatable {
             self = .mode(mode)
             return
         }
-        if let name = try? object.decode(String.self, forKey: .name) {
-            self = .function(name: name)
-            return
+        let topLevelName = try object.decodeIfPresent(String.self, forKey: .name)
+        var nestedName: String?
+        if object.contains(.function) {
+            let function = try object.nestedContainer(
+                keyedBy: CodingKeys.self, forKey: .function)
+            nestedName = try function.decodeIfPresent(String.self, forKey: .name)
         }
-        let function = try object.nestedContainer(keyedBy: CodingKeys.self, forKey: .function)
-        self = .function(name: try function.decode(String.self, forKey: .name))
+        if let topLevelName, let nestedName, topLevelName != nestedName {
+            throw DecodingError.dataCorruptedError(
+                forKey: .name,
+                in: object,
+                debugDescription: "tool_choice contains conflicting function names")
+        }
+        guard let name = topLevelName ?? nestedName else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.name,
+                .init(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "named tool_choice requires a function name"))
+        }
+        self = .function(name: name)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -360,6 +375,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var messages: [OpenAIChatMessage]
     public var tools: [OpenAITool]?
     public var toolChoice: OpenAIToolChoice?
+    public var parallelToolCalls: Bool?
     public var toolCallParser: String?
     public var reasoningParser: ReasoningParserFormat?
     public var reasoning: OpenAIReasoningConfig?
@@ -381,6 +397,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         case messages
         case tools
         case toolChoice = "tool_choice"
+        case parallelToolCalls = "parallel_tool_calls"
         case toolCallParser = "tool_call_parser"
         case reasoningParser = "reasoning_parser"
         case reasoning
@@ -403,6 +420,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         messages: [OpenAIChatMessage],
         tools: [OpenAITool]? = nil,
         toolChoice: OpenAIToolChoice? = nil,
+        parallelToolCalls: Bool? = nil,
         toolCallParser: String? = nil,
         reasoningParser: ReasoningParserFormat? = nil,
         reasoning: OpenAIReasoningConfig? = nil,
@@ -423,6 +441,7 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         self.messages = messages
         self.tools = tools
         self.toolChoice = toolChoice
+        self.parallelToolCalls = parallelToolCalls
         self.toolCallParser = toolCallParser
         self.reasoningParser = reasoningParser
         self.reasoning = reasoning

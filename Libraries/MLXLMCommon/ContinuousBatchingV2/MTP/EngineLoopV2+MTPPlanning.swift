@@ -8,7 +8,8 @@ extension EngineLoopV2 {
     /// not contribute MTP skip metrics.
     private func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         let sampling = rec.request.sampling
-        guard sampling.temperature == 0,
+        guard rec.request.tokenConstraint == nil,
+            sampling.temperature == 0,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
             sampling.repetitionPenalty == 1,

@@ -101,11 +101,21 @@ public protocol CBv2StepSampler: AnyObject {
     /// and its sampler state remains a pure function of its history.
     /// Default: no-op (stateless samplers).
     func requestDidFinish(_ id: CBv2RequestID)
+
+    /// Confirm host-materialized samples at the existing finalization
+    /// boundary. Stateful token constraints advance here; unconstrained
+    /// samplers use the no-op default.
+    func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID])
+
+    /// Typed constraint failure latched while masking or advancing a row.
+    func tokenConstraintFailure(for id: CBv2RequestID) -> String?
 }
 
 extension CBv2StepSampler {
     public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
     public func requestDidFinish(_ id: CBv2RequestID) {}
+    public func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID]) {}
+    public func tokenConstraintFailure(for id: CBv2RequestID) -> String? { nil }
 }
 
 /// Greedy stub — vectorized argmax, batch-composition invariant by
@@ -864,6 +874,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
             ids.allSatisfy({ kvStates[$0] != nil }),
+            // Constraint state advances from the host-confirmed token. Do
+            // not launch N+1 from N's lazy token before that transition.
+            ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
             !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
         {
@@ -1297,6 +1310,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record(
                 "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)
         }
+        if !step.sampledRows.isEmpty {
+            sampler.confirmSampledTokens(
+                host.map(Int.init), requestIDs: step.sampledRows)
+        }
 
         // Materialize any lazy logprob gathers at this same boundary (they
         // rode the step's asyncEval, so this reads back finished results —
@@ -1323,6 +1340,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             finalizedPlainWork = true
             let token = Int(host[i])
             scheduler.recordSampled(id: id, token: token)
+            if let constraintFailure = sampler.tokenConstraintFailure(for: id) {
+                finishRequest(id, reason: .error(constraintFailure))
+                continue
+            }
 
             // A stop TOKEN's text is never emitted (OpenAI behavior: the
             // stop token terminates the stream and its rendering is
@@ -1651,7 +1672,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             id: rec.id,
             params: rec.request.sampling,
             promptTokens: rec.request.promptTokens,
-            outputTokens: Array(rec.tokens.dropFirst(rec.request.promptTokens.count)))
+            outputTokens: Array(rec.tokens.dropFirst(rec.request.promptTokens.count)),
+            tokenConstraint: rec.request.tokenConstraint,
+            maxTokens: rec.request.maxTokens)
     }
 
     // MARK: Boundary housekeeping

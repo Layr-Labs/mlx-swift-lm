@@ -33,6 +33,9 @@ public class ToolCallProcessor {
 
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
+    /// Number of tool-shaped buffers that failed parser validation and were
+    /// returned as visible text. Content is never included in telemetry.
+    public private(set) var parseFailureCount = 0
 
     // MARK: - State Enum
 
@@ -112,6 +115,7 @@ public class ToolCallProcessor {
 
         let parsed = parser.parseEOS(toolCallBuffer, tools: tools)
         toolCalls.append(contentsOf: parsed)
+        if parsed.isEmpty { parseFailureCount += 1 }
 
         let buffered = toolCallBuffer
         toolCallBuffer = ""
@@ -150,6 +154,7 @@ public class ToolCallProcessor {
                 // Still collecting — check if braces are balanced (would mean parse
                 // failed on complete JSON, so it's not a tool call)
                 if jsonBracesBalanced(toolCallBuffer) {
+                    parseFailureCount += 1
                     state = .normal
                     let buffer = toolCallBuffer
                     toolCallBuffer = ""
@@ -174,6 +179,7 @@ public class ToolCallProcessor {
 
             // If braces are balanced but parse failed, this isn't a tool call — flush
             if jsonBracesBalanced(toolCallBuffer) {
+                parseFailureCount += 1
                 state = .normal
                 let buffer = toolCallBuffer
                 toolCallBuffer = ""
@@ -274,8 +280,15 @@ public class ToolCallProcessor {
                     from: &toolCallBuffer, separators: endTags, returnLeading: false)
 
                 // Parse the tool call using the parser
-                if let toolCall = parser.parse(content: toolCallBuffer, tools: tools) {
+                let failedBuffer = toolCallBuffer
+                let parsedCall = parser.parse(content: toolCallBuffer, tools: tools)
+                if let toolCall = parsedCall {
                     toolCalls.append(toolCall)
+                } else {
+                    // Historical auto output may be malformed. Returning the
+                    // exact withheld buffer as text is a visible, typed-safe
+                    // degradation; silently dropping it produced empty 200s.
+                    parseFailureCount += 1
                 }
 
                 state = .normal
@@ -285,10 +298,19 @@ public class ToolCallProcessor {
                 if let trailingToken,
                     startTagFirstChars.contains(where: { trailingToken.contains($0) })
                 {
-                    return processChunk(trailingToken)
+                    let trailingVisible = processChunk(trailingToken) ?? ""
+                    let visible =
+                        (leadingToken ?? "")
+                        + (parsedCall == nil ? failedBuffer : "")
+                        + trailingVisible
+                    return visible.isEmpty ? nil : visible
                 } else {
                     // Otherwise, return the collected token, or nil if it's empty
-                    return trailingToken?.isEmpty ?? true ? nil : trailingToken
+                    if parsedCall == nil {
+                        return (leadingToken ?? "") + failedBuffer + (trailingToken ?? "")
+                    }
+                    let visible = (leadingToken ?? "") + (trailingToken ?? "")
+                    return visible.isEmpty ? nil : visible
                 }
             } else {
                 return nil

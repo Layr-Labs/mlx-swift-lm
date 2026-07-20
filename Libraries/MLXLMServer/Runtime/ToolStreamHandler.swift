@@ -14,6 +14,7 @@ import MLXLMCommon
 /// ContinuousBatchingV2 generation events.
 public final class BatchedToolStreamHandler: @unchecked Sendable {
     private let processor: ToolCallProcessor
+    private var residualText: String?
 
     public init(format: ToolCallFormat, tools: [[String: any Sendable]]?) {
         self.processor = ToolCallProcessor(format: format, tools: tools)
@@ -24,7 +25,16 @@ public final class BatchedToolStreamHandler: @unchecked Sendable {
     }
 
     public func finish() -> [ToolCall] {
-        processor.processEOS()
+        residualText = processor.processEOS(returnBufferedText: true)
         return processor.toolCalls
+    }
+
+    public func takeResidualText() -> String? {
+        defer { residualText = nil }
+        return residualText
+    }
+
+    public var parseFailureCount: Int {
+        processor.parseFailureCount
     }
 }

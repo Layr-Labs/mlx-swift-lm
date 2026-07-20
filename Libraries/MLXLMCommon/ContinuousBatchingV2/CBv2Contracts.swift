@@ -105,13 +105,18 @@ public struct CBv2Request: Sendable {
     /// every code path is byte-identical to the pre-multimodal engine.
     /// See `CBv2MultimodalInput` for the full semantics.
     public var multimodal: CBv2MultimodalInput?
+    /// Optional inference-time token automaton. nil preserves the ordinary
+    /// sampler byte-for-byte. Required/named/none tool choices install a
+    /// row-local machine compiled before submission.
+    public var tokenConstraint: (any CBv2TokenConstraint)?
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
         maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0,
         cacheSalt: String? = nil, prefixCacheEnabled: Bool = true,
         multimodal: CBv2MultimodalInput? = nil,
-        prefixCacheReceiptID: CBv2RequestID? = nil
+        prefixCacheReceiptID: CBv2RequestID? = nil,
+        tokenConstraint: (any CBv2TokenConstraint)? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -124,6 +129,7 @@ public struct CBv2Request: Sendable {
         self.prefixCacheEnabled = prefixCacheEnabled
         self.multimodal = multimodal
         self.prefixCacheReceiptID = prefixCacheReceiptID
+        self.tokenConstraint = tokenConstraint
     }
 }
 
