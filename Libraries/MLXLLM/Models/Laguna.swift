@@ -315,13 +315,20 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         super.init()
 
-        // Checkpoints quantize only switch_mlp/shared_expert; attention, router,
-        // embeddings, lm_head and the dense layer-0 MLP stay full precision. Pre-
-        // quantize per layer so the loader quantize(model:) pass finds nothing to
-        // convert and never descends a decoder layer with no quantized submodule.
+        // The checkpoint stores NVFP4 only on the MoE expert and shared-expert
+        // projections; attention, the router gate, embeddings, the LM head and the
+        // dense layer-0 MLP stay full precision. Quantize those modules here, once
+        // per sparse decoder layer. This is a bounded pass (at most num_hidden_layers
+        // iterations) and allocates nothing eagerly: MLX is lazy, so the freshly
+        // initialized expert weights are never materialized -- `loadWeights`
+        // overwrites these parameters with the checkpoint tensors before the first
+        // `eval`, so peak memory is just the model loaded once. Doing it per sparse
+        // layer also keeps the loader's own whole-model `quantize(model:)` pass from
+        // descending a decoder layer that contributes no quantized submodule (the
+        // dense layer 0), which the module updater rejects.
         if let groupSize = config.quantGroupSize, let bits = config.quantBits {
             let mode = config.quantMode ?? .affine
-            for layer in model.layers {
+            for layer in model.layers where layer.mlp is LagunaSparseMoeBlock {
                 quantize(model: layer) { path, _ in
                     if path.contains("switch_mlp") || path.contains("shared_expert") {
                         return (groupSize: groupSize, bits: bits, mode: mode)
