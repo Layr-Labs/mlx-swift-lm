@@ -8,6 +8,33 @@ import MLXLMCommon
 import Testing
 
 struct OpenAIServiceTests {
+    @Test("responses API forwards parallel_tool_calls into chat execution")
+    func responsesAPIForwardsParallelToolCalls() throws {
+        let request = try JSONDecoder().decode(
+            OpenAIResponseRequest.self,
+            from: Data(
+                #"""
+                {
+                  "model": "local-model",
+                  "input": "call both tools",
+                  "parallel_tool_calls": false
+                }
+                """#.utf8))
+
+        #expect(request.parallelToolCalls == false)
+        #expect(request.chatCompletionRequest.parallelToolCalls == false)
+    }
+
+    @Test("named tool_choice rejects non-function type")
+    func namedToolChoiceRejectsNonFunctionType() {
+        #expect(throws: (any Error).self) {
+            _ = try JSONDecoder().decode(
+                OpenAIToolChoice.self,
+                from: Data(
+                    #"{"type":"bogus","name":"weather"}"#.utf8))
+        }
+    }
+
     @Test("chat completion collects generated content, reasoning, tool calls, usage, and metrics")
     func chatCompletionCollectsContentReasoningToolCallsUsageAndMetrics() async throws {
         let engine = ScriptedServerEngine(events: [

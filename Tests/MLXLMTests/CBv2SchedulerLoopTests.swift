@@ -26,15 +26,65 @@ private final class CBv2SchedulerPassthroughConstraint:
     init(maxTokens: Int) { self.maxTokens = maxTokens }
 
     func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
-        remainingTokens > 0 ? Array(0 ..< 256) : []
+        remainingTokens > 0 ? Array(0 ..< 64) : []
     }
 
     func nextState(state: Int, tokenID: Int) -> Int? {
-        (0 ..< 256).contains(tokenID) ? 0 : nil
+        (0 ..< 64).contains(tokenID) ? 0 : nil
+    }
+}
+
+private final class CBv2ConstraintUnawareSampler: CBv2StepSampler {
+    func sample(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepIndex: Int,
+        pendingSampledTokens: MLXArray?,
+        rowContext: () -> [CBv2SamplerRow]
+    ) -> MLXArray {
+        argMax(logits, axis: -1).asType(.int32)
     }
 }
 
 final class CBv2SchedulerLoopTests: XCTestCase {
+
+    func testConstrainedSubmitRejectsConstraintUnawareSampler() async throws {
+        let layerKinds = CBv2SchedFixtures.tinyLayerKinds()
+        let engine = EngineV2(
+            model: CBv2SchedScriptedModel(),
+            layerKinds: layerKinds,
+            backend: CBv2SchedMockBackend(),
+            cacheProvider: CBv2SchedMockCacheProvider(layerKinds: layerKinds),
+            sampler: CBv2ConstraintUnawareSampler(),
+            admissionConfig: .init(watermarkFraction: 0))
+        let request = CBv2Request(
+            id: CBv2RequestID(9001),
+            promptTokens: [1],
+            maxTokens: 2,
+            tokenConstraint: CBv2SchedulerPassthroughConstraint(maxTokens: 2))
+
+        XCTAssertThrowsError(try engine.submit(request)) { error in
+            XCTAssertEqual(
+                error as? CBv2SchedulerError,
+                .tokenConstraintUnsupportedBySampler)
+        }
+        await engine.shutdown()
+    }
+
+    func testConstrainedSubmitRejectsDivergentOutputBudget() async throws {
+        let harness = CBv2SchedHarness()
+        let request = CBv2Request(
+            id: CBv2RequestID(9002),
+            promptTokens: [1],
+            maxTokens: 2,
+            tokenConstraint: CBv2SchedulerPassthroughConstraint(maxTokens: 3))
+
+        XCTAssertThrowsError(try harness.engine.submit(request)) { error in
+            XCTAssertEqual(
+                error as? CBv2SchedulerError,
+                .tokenConstraintBudgetMismatch(request: 2, constraint: 3))
+        }
+        await harness.engine.shutdown()
+    }
 
     /// PR#62 review (paged admission alignment): when several same-step
     /// admissions race for the last capacity, the loser of the backend's
@@ -425,7 +475,8 @@ final class CBv2SchedulerLoopTests: XCTestCase {
     /// was preempted. Preemption discards the adopted KV and recomputes the
     /// full prompt from scratch, so a stale entry over-credited
     /// usage.prefixCacheHitTokens at finish. Both preemption paths now drop
-    /// the entry; a non-preempted adopted batchmate keeps its true credit.
+    /// the entry; a non-preempted control proves the fixture really adopts
+    /// and preserves its true credit.
     func testPreemptedAdoptedRequestReportsZeroPrefixHitTokens() async throws {
         // Same capacity shape as the preemption test above (12-token soft
         // ledger), plus a scripted prefix cache that claims a 2-token hit
@@ -462,6 +513,22 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         XCTAssertTrue(
             hitTokens.contains(0),
             "a preempted adopted request must clear stale prefix-hit credit")
+
+        // Prove this is not a vacuous all-zero fixture: a solitary control on
+        // an unconstrained-capacity engine adopts the same prefix and retains
+        // the exact cache credit.
+        let controlCache = CBv2SchedScriptedPrefixCache(matched: matched)
+        let controlHarness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(enablePrefixCache: true),
+            prefixCache: controlCache)
+        let retained = CBv2SchedFixtures.request(
+            prompt: [80, 81, 82, 83], maxTokens: 2)
+        let retainedCollected = await cbv2SchedCollect(
+            try controlHarness.engine.submit(retained))
+        XCTAssertEqual(retainedCollected.usage?.prefixCacheHitTokens, matched)
+        XCTAssertEqual(controlCache.lookups, 1)
+        XCTAssertEqual(controlCache.endAdoptions, 1)
+        await controlHarness.engine.shutdown()
 
         // Every lookup pin was balanced by exactly one endAdoption.
         XCTAssertEqual(prefixCache.lookups, 2)

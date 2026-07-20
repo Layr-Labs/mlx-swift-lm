@@ -111,6 +111,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let loopConfig: CBv2EngineLoopConfig
     private let gauges: CBv2EngineGauges
     private let layerKinds: [CBv2LayerKind]
+    private let samplerSupportsTokenConstraints: Bool
     /// Non-nil only when active (instance supplied AND
     /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
     /// the submit thread (hashing is host work — never on the engine step
@@ -176,6 +177,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
         self.backend = backend
+        self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints
         let prefixReuseCapability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
             backend: backend.prefixReuseBackend)
@@ -343,6 +345,16 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         stateLock.unlock()
         guard !rejecting else {
             throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
+        }
+        if let constraint = request.tokenConstraint {
+            guard samplerSupportsTokenConstraints else {
+                throw CBv2SchedulerError.tokenConstraintUnsupportedBySampler
+            }
+            guard constraint.maxTokens == request.maxTokens else {
+                throw CBv2SchedulerError.tokenConstraintBudgetMismatch(
+                    request: request.maxTokens,
+                    constraint: constraint.maxTokens)
+            }
         }
 
         // Degenerate requests: uniform event surface, no engine round-trip.

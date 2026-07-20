@@ -39,6 +39,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     public private(set) var logprobGatherCount = 0
     /// Test hook: the composed pipeline's logprob-capture counter.
     var pipelineLogprobBuildCount: Int { pipeline?.logprobBuildCount ?? 0 }
+    public var supportsTokenConstraints: Bool { true }
 
     /// - Parameter fallbackSeed: engine-level seed for rows without a
     ///   per-request seed (fixed at init so nil-seed rows stay
@@ -75,18 +76,18 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         // Same IDs ⇒ the incremental commits below already covered every
         // token sampled since configuration (including any pending ones).
 
-        // Grammar masking precedes top-k/top-p/min-p so filtering is computed
-        // over the valid language, never over an unconstrained shortlist that
-        // might contain zero legal tokens. Raw logprobs still come from the
-        // original unmasked distribution by contract.
-        let constrained = constraintSampler.mask(logits, requestIDs: requestIDs)
+        // Apply the grammar exactly once, after arithmetic transforms and
+        // before top-k/top-p/min-p. This preserves the valid language even
+        // for malformed-but-decodable penalties that can resurrect
+        // -infinity, without rebuilding the dense mask twice. Raw logprobs
+        // still come from the original unmasked distribution by contract.
         let output = pipeline.process(
-            constrained,
+            logits,
             rawLogprobsFrom: logits,
-            hardMask: { [constraintSampler] transformed in
+            hardMask: constraintSampler.hasRows ? { [constraintSampler] transformed in
                 constraintSampler.mask(
                     transformed, requestIDs: requestIDs)
-            })
+            } : nil)
         let tokens = sampler.sample(from: output.sampling)
         pipeline.commit(sampledTokens: tokens)
         sampler.commit()
