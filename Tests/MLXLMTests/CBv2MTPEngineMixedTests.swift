@@ -625,10 +625,10 @@ struct CBv2MTPEngineMixedTests {
             engine, request(id: 2, prompt: prompt, maxTokens: 12))
         await engine.shutdown()
 
-        #expect(warm.usage?.prefixCacheOutcome == .skippedPolicy)
+        #expect(warm.usage?.prefixCacheOutcome == .hit)
         #expect(warm.usage?.prefixCacheMatchedTokens ?? 0 >= 128)
-        #expect(warm.usage?.prefixCachePrefillTokensSaved == 0)
-        #expect(warm.usage?.prefixCacheHitTokens == 0)
+        #expect(warm.usage?.prefixCachePrefillTokensSaved == 80)
+        #expect(warm.usage?.prefixCacheHitTokens == 80)
         #expect(warm.tokens == cold.tokens)
     }
 
