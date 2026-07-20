@@ -91,6 +91,7 @@ public struct MLXOpenAIService: Sendable {
             let task = Task {
                 var usage: OpenAIUsage?
                 var finishReason = "stop"
+                var nextToolCallIndex = 0
                 var reasoningParser = StreamingReasoningParser(
                     format: request.reasoningParser ?? defaultReasoningParser ?? .none
                 )
@@ -152,8 +153,9 @@ public struct MLXOpenAIService: Sendable {
                             let openAIToolCall = try OpenAIToolCall(
                                 toolCall: toolCall,
                                 id: idProvider("call"),
-                                index: 0
+                                index: nextToolCallIndex
                             )
+                            nextToolCallIndex += 1
                             continuation.yield(
                                 try ServerSentEventEncoder.encode(
                                     OpenAIChatCompletionChunk(

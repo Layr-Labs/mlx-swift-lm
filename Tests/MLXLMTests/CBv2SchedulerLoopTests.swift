@@ -15,6 +15,25 @@ import XCTest
 
 @testable import MLXLMCommon
 
+private final class CBv2SchedulerPassthroughConstraint:
+    CBv2TokenConstraint, @unchecked Sendable
+{
+    let mode: CBv2TokenConstraintMode = .required
+    let maxTokens: Int
+    let fallbackTokenID = 0
+    let initialState = 0
+
+    init(maxTokens: Int) { self.maxTokens = maxTokens }
+
+    func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
+        remainingTokens > 0 ? Array(0 ..< 256) : []
+    }
+
+    func nextState(state: Int, tokenID: Int) -> Int? {
+        (0 ..< 256).contains(tokenID) ? 0 : nil
+    }
+}
+
 final class CBv2SchedulerLoopTests: XCTestCase {
 
     /// PR#62 review (paged admission alignment): when several same-step
@@ -299,7 +318,9 @@ final class CBv2SchedulerLoopTests: XCTestCase {
 
     func testCancelRunningRequestFinishesPromptlyAndFreesKV() async throws {
         let harness = CBv2SchedHarness()
-        let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 1_000_000)
+        var request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 1_000_000)
+        request.tokenConstraint = CBv2SchedulerPassthroughConstraint(
+            maxTokens: request.maxTokens)
         let stream = try harness.engine.submit(request)
 
         let collector = Task { await cbv2SchedCollect(stream) }
@@ -382,7 +403,9 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         // with a seamless token stream.
         let harness = CBv2SchedHarness(backendCapacity: 200)
         let older = CBv2SchedFixtures.request(prompt: [1, 2, 3, 4], maxTokens: 6)
-        let younger = CBv2SchedFixtures.request(prompt: [40, 41, 42, 43], maxTokens: 6)
+        var younger = CBv2SchedFixtures.request(prompt: [40, 41, 42, 43], maxTokens: 6)
+        younger.tokenConstraint = CBv2SchedulerPassthroughConstraint(
+            maxTokens: younger.maxTokens)
         let olderStream = try harness.engine.submit(older)
         let youngerStream = try harness.engine.submit(younger)
         async let olderOut = cbv2SchedCollect(olderStream)

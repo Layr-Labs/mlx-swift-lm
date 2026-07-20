@@ -44,15 +44,24 @@ public struct CBv2SamplerRow {
     /// Tokens generated so far (non-empty when a mid-flight request is
     /// re-vectorized after a membership change or preemption resume).
     public var outputTokens: [Int]
+    /// Optional row-local inference constraint. The ordinary path is nil.
+    public var tokenConstraint: (any CBv2TokenConstraint)?
+    /// Request output ceiling, used by the constraint runtime to reserve
+    /// enough tokens to close the grammar before the engine length stop.
+    public var maxTokens: Int
 
     public init(
         id: CBv2RequestID, params: CBv2SamplingParams,
-        promptTokens: [Int], outputTokens: [Int] = []
+        promptTokens: [Int], outputTokens: [Int] = [],
+        tokenConstraint: (any CBv2TokenConstraint)? = nil,
+        maxTokens: Int = .max
     ) {
         self.id = id
         self.params = params
         self.promptTokens = promptTokens
         self.outputTokens = outputTokens
+        self.tokenConstraint = tokenConstraint
+        self.maxTokens = maxTokens
     }
 }
 
@@ -264,7 +273,11 @@ public final class LogitsPipelineV2 {
 
     /// Apply the ordered transform pipeline to raw logits [B, vocab].
     /// Pure: does not mutate pipeline state.
-    public func process(_ logits: MLXArray) -> Output {
+    public func process(
+        _ logits: MLXArray,
+        rawLogprobsFrom rawLogits: MLXArray? = nil,
+        hardMask: ((MLXArray) -> MLXArray)? = nil
+    ) -> Output {
         precondition(
             logits.dim(0) == rowCount,
             "logits rows (\(logits.dim(0))) != configured rows (\(rowCount)) — call setRows")
@@ -278,7 +291,8 @@ public final class LogitsPipelineV2 {
         let rawLogprobs: MLXArray?
         if wantsLogprobs {
             logprobBuildCount += 1
-            rawLogprobs = x - logSumExp(x, axis: -1, keepDims: true)
+            let raw = (rawLogits ?? logits).asType(.float32)
+            rawLogprobs = raw - logSumExp(raw, axis: -1, keepDims: true)
         } else {
             rawLogprobs = nil
         }
@@ -302,6 +316,15 @@ public final class LogitsPipelineV2 {
         // (3) Temperature (greedy rows pinned to 1.0 in the tensor).
         if let temperature {
             x = x / temperature
+        }
+
+        // Arithmetic transforms above can turn a forbidden -infinity into a
+        // finite/+infinity value for malformed-but-decodable parameters
+        // (for example a negative repetition penalty or temperature). Restore
+        // hard language constraints before probability filtering so top-k/p
+        // never discard every legal token in favor of a resurrected one.
+        if let hardMask {
+            x = hardMask(x)
         }
 
         // (4) top-k / top-p / min-p via one descending sort + cumsum.

@@ -105,6 +105,25 @@ struct OpenAIServiceTests {
         #expect(frames.contains { $0.contains("\"finish_reason\":\"tool_calls\"") })
     }
 
+    @Test("parallel streaming tool calls receive distinct indices")
+    func parallelToolCallIndices() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .toolCall(.init(function: .init(name: "first", arguments: [:]))),
+            .toolCall(.init(function: .init(name: "second", arguments: [:]))),
+            .info(.init(promptTokens: 2, completionTokens: 2)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+        let stream = try await service.streamChatCompletionFrames(
+            request: .test(stream: true))
+        var toolFrames: [String] = []
+        for try await frame in stream where frame.contains("\"tool_calls\":[") {
+            toolFrames.append(frame)
+        }
+        #expect(toolFrames.count == 2)
+        #expect(toolFrames[0].contains("\"index\":0"))
+        #expect(toolFrames[1].contains("\"index\":1"))
+    }
+
     @Test("streaming tool calls preserve reasoning emitted before the tool call")
     func streamingToolCallsPreservePriorReasoning() async throws {
         let engine = ScriptedServerEngine(events: [

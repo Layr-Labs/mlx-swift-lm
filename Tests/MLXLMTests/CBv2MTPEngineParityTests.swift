@@ -72,6 +72,27 @@ private final class CBv2ParityConstantSampler: CBv2StepSampler {
     }
 }
 
+private final class CBv2MTPNoopConstraint: CBv2TokenConstraint, @unchecked Sendable {
+    let mode: CBv2TokenConstraintMode = .required
+    let maxTokens: Int
+    let fallbackTokenID = 0
+    let initialState = 0
+    private let vocabSize: Int
+
+    init(maxTokens: Int, vocabSize: Int) {
+        self.maxTokens = maxTokens
+        self.vocabSize = vocabSize
+    }
+
+    func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
+        remainingTokens > 0 ? Array(0 ..< vocabSize) : []
+    }
+
+    func nextState(state: Int, tokenID: Int) -> Int? {
+        tokenID >= 0 && tokenID < vocabSize ? 0 : nil
+    }
+}
+
 @Suite("CBv2MTPEngineParity", .serialized)
 struct CBv2MTPEngineParityTests {
     private let vocabSize = 256
@@ -233,6 +254,28 @@ struct CBv2MTPEngineParityTests {
                 metrics.perPositionAccepted[position]
                     <= metrics.perPositionAccepted[position - 1])
         }
+    }
+
+    @Test func constrainedRowsStayTargetOnlyWhenMTPIsEnabled() async throws {
+        let fixture = try makeFixture(deterministicTarget: true)
+        let prompt = [3, 7, 11, 19, 23]
+        let maxTokens = 8
+        var constrained = request(id: 991, prompt: prompt, maxTokens: maxTokens)
+        constrained.tokenConstraint = CBv2MTPNoopConstraint(
+            maxTokens: maxTokens, vocabSize: vocabSize)
+
+        let expected = try await baseline(
+            fixture, prompt: prompt, maxTokens: maxTokens, id: 991)
+        let engine = makeEngine(
+            target: fixture.target, drafter: try realDrafter(fixture))
+        let actual = try await run(engine, constrained)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+
+        #expect(actual.tokens == expected.tokens)
+        #expect(metrics.rounds == 0)
+        #expect(metrics.seedSteps == 0)
+        #expect(metrics.proposedTokens == 0)
     }
 
     @Test func b1ParityAcrossRaggedPromptLengths() async throws {

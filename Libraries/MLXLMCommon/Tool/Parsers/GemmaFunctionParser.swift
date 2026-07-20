@@ -101,18 +101,30 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         _ text: String,
         funcName: String,
         tools: [[String: any Sendable]]?
-    ) -> [String: any Sendable]? {
-        var arguments: [String: any Sendable] = [:]
+    ) -> [String: JSONValue]? {
+        let schema = argumentSchema(funcName: funcName, tools: tools)
+        var strict = GemmaArgumentValueParser(text)
+        if let parsed = strict.parseTopLevelArguments(),
+            strict.isAtEnd,
+            schema.allowsAdditional || parsed.keys.allSatisfy(schema.names.contains)
+        {
+            return parsed
+        }
+
+        // Historical unconstrained auto output is intentionally accepted by
+        // the bounded compatibility parser below (missing markers, comma-
+        // bearing bare strings). Required/named output never needs this path:
+        // its sampler emits only the strict template language above.
+        var arguments: [String: JSONValue] = [:]
         // Gemma occasionally omits its string markers. The schema lets us keep
         // a comma in `Boston, MA` while still splitting before `unit:`.
-        let schema = argumentSchema(funcName: funcName, tools: tools)
         for pair in splitTopLevel(text, separator: ",") {
             guard let colon = pair.firstIndex(of: ":") else { continue }
             let key = parseArgumentKey(pair[..<colon])
             let rawValue = pair[pair.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
             guard schema.allowsAdditional || schema.names.contains(key) else { return nil }
-            arguments[key] = parseValue(rawValue)
+            arguments[key] = JSONValue.from(parseValue(rawValue))
         }
         return arguments
     }
@@ -257,5 +269,152 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             index = text.index(after: index)
         }
         return false
+    }
+}
+
+/// Strict recursive parser for the exact value syntax produced by Gemma's
+/// `format_argument(..., escape_keys=False)` macro. The older permissive
+/// parser remains as a fallback only for historical unconstrained auto output.
+private struct GemmaArgumentValueParser {
+    private let text: String
+    private var index: String.Index
+
+    init(_ text: String) {
+        self.text = text
+        self.index = text.startIndex
+    }
+
+    var isAtEnd: Bool {
+        var copy = self
+        copy.skipWhitespace()
+        return copy.index == text.endIndex
+    }
+
+    mutating func parseTopLevelArguments() -> [String: JSONValue]? {
+        skipWhitespace()
+        if index == text.endIndex { return [:] }
+        var output: [String: JSONValue] = [:]
+        while index < text.endIndex {
+            guard let key = parseKey(), consume(":"),
+                let value = parseValue()
+            else { return nil }
+            output[key] = value
+            skipWhitespace()
+            if index == text.endIndex { return output }
+            guard consume(",") else { return nil }
+        }
+        return output
+    }
+
+    private mutating func parseValue() -> JSONValue? {
+        skipWhitespace()
+        for marker in ["<|\"|>", "<escape>"] where text[index...].hasPrefix(marker) {
+            advance(marker.count)
+            guard let range = text.range(of: marker, range: index ..< text.endIndex) else {
+                return nil
+            }
+            let value = String(text[index ..< range.lowerBound])
+            index = range.upperBound
+            return .string(value)
+        }
+        if consume("{") {
+            var object: [String: JSONValue] = [:]
+            skipWhitespace()
+            if consume("}") { return .object(object) }
+            while true {
+                guard let key = parseKey(), consume(":"),
+                    let value = parseValue()
+                else { return nil }
+                object[key] = value
+                if consume("}") { return .object(object) }
+                guard consume(",") else { return nil }
+            }
+        }
+        if consume("[") {
+            var array: [JSONValue] = []
+            skipWhitespace()
+            if consume("]") { return .array(array) }
+            while true {
+                guard let value = parseValue() else { return nil }
+                array.append(value)
+                if consume("]") { return .array(array) }
+                guard consume(",") else { return nil }
+            }
+        }
+        if consume("true") { return .bool(true) }
+        if consume("false") { return .bool(false) }
+        if consume("null") { return .null }
+        if text[index...].hasPrefix("\""), let string = parseJSONString() {
+            return .string(string)
+        }
+        return parseNumber()
+    }
+
+    private mutating func parseKey() -> String? {
+        skipWhitespace()
+        if text[index...].hasPrefix("\"") { return parseJSONString() }
+        let start = index
+        while index < text.endIndex {
+            let character = text[index]
+            if character == ":" { break }
+            if character == "," || character == "{" || character == "}" || character == "[" || character == "]" {
+                return nil
+            }
+            index = text.index(after: index)
+        }
+        let key = text[start ..< index].trimmingCharacters(in: .whitespacesAndNewlines)
+        return key.isEmpty ? nil : key
+    }
+
+    private mutating func parseJSONString() -> String? {
+        let start = index
+        guard consume("\"") else { return nil }
+        var escaped = false
+        while index < text.endIndex {
+            let character = text[index]
+            index = text.index(after: index)
+            if escaped {
+                escaped = false
+            } else if character == "\\" {
+                escaped = true
+            } else if character == "\"" {
+                let raw = String(text[start ..< index])
+                return try? JSONDecoder().decode(String.self, from: Data(raw.utf8))
+            }
+        }
+        return nil
+    }
+
+    private mutating func parseNumber() -> JSONValue? {
+        let start = index
+        while index < text.endIndex {
+            let character = text[index]
+            guard character.isNumber || character == "-" || character == "+"
+                || character == "." || character == "e" || character == "E"
+            else { break }
+            index = text.index(after: index)
+        }
+        guard start != index else { return nil }
+        let raw = String(text[start ..< index])
+        if let integer = Int(raw) { return .int(integer) }
+        if let number = Double(raw), number.isFinite { return .double(number) }
+        return nil
+    }
+
+    private mutating func consume(_ literal: String) -> Bool {
+        skipWhitespace()
+        guard text[index...].hasPrefix(literal) else { return false }
+        advance(literal.count)
+        return true
+    }
+
+    private mutating func skipWhitespace() {
+        while index < text.endIndex, text[index].isWhitespace {
+            index = text.index(after: index)
+        }
+    }
+
+    private mutating func advance(_ count: Int) {
+        index = text.index(index, offsetBy: count)
     }
 }

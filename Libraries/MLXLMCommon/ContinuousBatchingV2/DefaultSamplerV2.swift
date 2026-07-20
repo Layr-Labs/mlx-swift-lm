@@ -29,6 +29,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
 
     private var pipeline: LogitsPipelineV2?
     private let sampler: SamplerV2
+    private let constraintSampler = CBv2TokenConstraintSampler()
     private var configuredIDs: [CBv2RequestID] = []
     /// The lazy logprob gather built by the most recent `sample` call, until
     /// the loop consumes it via `takeStepLogprobs` (take semantics).
@@ -62,6 +63,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             let rows = rowContext()
             pipeline.setRows(rows)
             sampler.setRows(rows)
+            constraintSampler.configure(rows)
             configuredIDs = requestIDs
             if let pendingSampledTokens {
                 // Fold the chained in-flight tokens into the fresh state so
@@ -73,7 +75,18 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         // Same IDs ⇒ the incremental commits below already covered every
         // token sampled since configuration (including any pending ones).
 
-        let output = pipeline.process(logits)
+        // Grammar masking precedes top-k/top-p/min-p so filtering is computed
+        // over the valid language, never over an unconstrained shortlist that
+        // might contain zero legal tokens. Raw logprobs still come from the
+        // original unmasked distribution by contract.
+        let constrained = constraintSampler.mask(logits, requestIDs: requestIDs)
+        let output = pipeline.process(
+            constrained,
+            rawLogprobsFrom: logits,
+            hardMask: { [constraintSampler] transformed in
+                constraintSampler.mask(
+                    transformed, requestIDs: requestIDs)
+            })
         let tokens = sampler.sample(from: output.sampling)
         pipeline.commit(sampledTokens: tokens)
         sampler.commit()
@@ -108,8 +121,19 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     /// (PR#62 review). Forcing a full `setRows` on the next `sample` is
     /// exact — reconfiguration is a pure function of `rowContext()`.
     public func requestDidFinish(_ id: CBv2RequestID) {
+        constraintSampler.requestDidFinish(id)
         if configuredIDs.contains(id) {
             configuredIDs = []
         }
+    }
+
+    public func confirmSampledTokens(
+        _ tokens: [Int], requestIDs: [CBv2RequestID]
+    ) {
+        constraintSampler.confirm(tokens: tokens, requestIDs: requestIDs)
+    }
+
+    public func tokenConstraintFailure(for id: CBv2RequestID) -> String? {
+        constraintSampler.failure(for: id)
     }
 }
