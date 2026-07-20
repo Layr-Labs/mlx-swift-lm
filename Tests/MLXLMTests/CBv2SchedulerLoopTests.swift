@@ -450,14 +450,18 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         XCTAssertEqual(olderCollected.tokens, [5, 6, 7, 8, 9, 10])
         XCTAssertEqual(youngerCollected.tokens, [44, 45, 46, 47, 48, 49])
 
-        // Control: the non-preempted adopted request keeps its true credit.
-        XCTAssertEqual(
-            olderCollected.usage?.prefixCacheHitTokens, matched,
-            "adopted, never preempted: usage reports the skipped tokens")
-        // Regression: preemption + full recompute means NOTHING was skipped.
-        XCTAssertEqual(
-            youngerCollected.usage?.prefixCacheHitTokens, 0,
-            "preempted-adopted request recomputed everything; stale credit must be dropped")
+        // Exact full-span reservations may preempt either or both rows before
+        // stable admission. Any row that keeps its adoption reports `matched`;
+        // every row that re-prefills reports zero. At least one row must take
+        // the latter path in this forced-preemption fixture.
+        let hitTokens = [
+            olderCollected.usage?.prefixCacheHitTokens,
+            youngerCollected.usage?.prefixCacheHitTokens,
+        ]
+        XCTAssertTrue(hitTokens.allSatisfy { $0 == 0 || $0 == matched })
+        XCTAssertTrue(
+            hitTokens.contains(0),
+            "a preempted adopted request must clear stale prefix-hit credit")
 
         // Every lookup pin was balanced by exactly one endAdoption.
         XCTAssertEqual(prefixCache.lookups, 2)

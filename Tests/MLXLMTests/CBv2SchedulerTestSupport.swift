@@ -91,6 +91,7 @@ final class CBv2SchedMockSequenceKV: CBv2SequenceKV {
 final class CBv2SchedMockBackend: CBv2KVBackend, @unchecked Sendable {
     private let lock = NSLock()
     var capacity: Int
+    var prefixReuseBackend: CBv2PrefixReuseBackend { .contiguousUnquantized }
 
     private var _liveStates = 0
     private var _makeCalls = 0
