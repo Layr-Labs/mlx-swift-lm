@@ -64,10 +64,15 @@ final class CBv2SchedMockCapacity: CBv2StepCapacity {
 // MARK: - Mock per-sequence KV + backend
 
 final class CBv2SchedMockSequenceKV: CBv2SequenceKV {
-    private(set) var absoluteOffset = 0
-    private(set) var retainedCount = 0
+    private(set) var absoluteOffset: Int
+    private(set) var retainedCount: Int
     private(set) var rollbackCalls: [Int] = []
     var byteCount: Int { retainedCount * 2 }
+
+    init(adoptedOffset: Int = 0) {
+        self.absoluteOffset = adoptedOffset
+        self.retainedCount = adoptedOffset
+    }
 
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let n = keys.dim(2)
@@ -136,9 +141,22 @@ final class CBv2SchedMockBackend: CBv2KVBackend, @unchecked Sendable {
 
     func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
-        try makeSequenceState(layerKinds: layerKinds, promptLength: 0, maxLength: maxLength)
+        lock.lock()
+        _makeCalls += 1
+        if let cap = maxLiveStates, _liveStates >= cap {
+            lock.unlock()
+            throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
+        }
+        _liveStates += 1
+        lock.unlock()
+        return layerKinds.enumerated().map { index, kind in
+            guard kind.sharesKVWithLayer == nil else { return nil }
+            let offset = prefix[index]?.offset ?? plan.replayStart
+            return CBv2SchedMockSequenceKV(adoptedOffset: offset)
+        }
     }
 
     func release(_ state: [CBv2SequenceKV?]) {

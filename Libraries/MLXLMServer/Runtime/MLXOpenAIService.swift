@@ -7,6 +7,7 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
     case responseNotFound(String)
     case embeddingsNotConfigured
     case invalidResponseFormatOutput(String)
+    case multipleToolCallsNotAllowed
 
     public var errorDescription: String? {
         switch self {
@@ -16,6 +17,8 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
             return "Embeddings require an embedding model engine; this server instance was started without one."
         case .invalidResponseFormatOutput(let message):
             return "Generated output did not satisfy response_format: \(message)"
+        case .multipleToolCallsNotAllowed:
+            return "Generated output contained multiple tool calls while parallel_tool_calls was false"
         }
     }
 }
@@ -149,6 +152,11 @@ public struct MLXOpenAIService: Sendable {
                                 )
                             }
                         case .toolCall(let toolCall):
+                            if request.parallelToolCalls == false,
+                                nextToolCallIndex > 0
+                            {
+                                throw MLXOpenAIServiceError.multipleToolCallsNotAllowed
+                            }
                             finishReason = "tool_calls"
                             let openAIToolCall = try OpenAIToolCall(
                                 toolCall: toolCall,
@@ -335,6 +343,11 @@ public struct MLXOpenAIService: Sendable {
             case .content(let text):
                 output.content += text
             case .toolCall(let toolCall):
+                if request.parallelToolCalls == false,
+                    !output.toolCalls.isEmpty
+                {
+                    throw MLXOpenAIServiceError.multipleToolCallsNotAllowed
+                }
                 output.toolCalls.append(
                     try OpenAIToolCall(toolCall: toolCall, id: idProvider("call"))
                 )

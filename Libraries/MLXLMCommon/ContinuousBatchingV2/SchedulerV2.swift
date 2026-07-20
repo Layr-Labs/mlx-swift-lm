@@ -28,6 +28,14 @@ public enum CBv2SchedulerError: Error, Equatable {
     /// bookkeeping. The provider already guards against duplicate ids; the
     /// engine now enforces it (PR#62 review).
     case duplicateRequestID(CBv2RequestID)
+    /// The engine was constructed with a sampler that did not opt into the
+    /// complete token-constraint lifecycle. Reject at submit instead of
+    /// silently decoding an unconstrained row.
+    case tokenConstraintUnsupportedBySampler
+    /// The constraint and request must consume the same output budget.
+    /// Divergence would make viability pruning disagree with engine length
+    /// termination.
+    case tokenConstraintBudgetMismatch(request: Int, constraint: Int)
 }
 
 // MARK: - Per-request scheduling record

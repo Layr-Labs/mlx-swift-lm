@@ -57,6 +57,7 @@ public struct OpenAIResponseRequest: Codable, Sendable, Equatable {
     public var instructions: String?
     public var tools: [OpenAITool]?
     public var toolChoice: OpenAIToolChoice?
+    public var parallelToolCalls: Bool?
     public var reasoning: OpenAIResponseReasoningOptions?
     public var stream: Bool?
     public var store: Bool?
@@ -71,6 +72,7 @@ public struct OpenAIResponseRequest: Codable, Sendable, Equatable {
         case instructions
         case tools
         case toolChoice = "tool_choice"
+        case parallelToolCalls = "parallel_tool_calls"
         case reasoning
         case stream
         case store
@@ -86,6 +88,7 @@ public struct OpenAIResponseRequest: Codable, Sendable, Equatable {
         instructions: String? = nil,
         tools: [OpenAITool]? = nil,
         toolChoice: OpenAIToolChoice? = nil,
+        parallelToolCalls: Bool? = nil,
         reasoning: OpenAIResponseReasoningOptions? = nil,
         stream: Bool? = nil,
         store: Bool? = nil,
@@ -99,6 +102,7 @@ public struct OpenAIResponseRequest: Codable, Sendable, Equatable {
         self.instructions = instructions
         self.tools = tools
         self.toolChoice = toolChoice
+        self.parallelToolCalls = parallelToolCalls
         self.reasoning = reasoning
         self.stream = stream
         self.store = store
@@ -114,6 +118,7 @@ public struct OpenAIResponseRequest: Codable, Sendable, Equatable {
             messages: input.messages(instructions: instructions),
             tools: tools,
             toolChoice: toolChoice,
+            parallelToolCalls: parallelToolCalls,
             reasoningParser: reasoning?.parser,
             stream: stream,
             temperature: temperature,

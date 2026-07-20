@@ -8,6 +8,50 @@ import MLXLMCommon
 import Testing
 
 struct OpenAIServiceTests {
+    @Test("responses API enforces parallel_tool_calls false")
+    func responsesAPIEnforcesParallelToolCalls() async throws {
+        let request = try JSONDecoder().decode(
+            OpenAIResponseRequest.self,
+            from: Data(
+                #"""
+                {
+                  "model": "local-model",
+                  "input": "call both tools",
+                  "parallel_tool_calls": false
+                }
+                """#.utf8))
+
+        #expect(request.parallelToolCalls == false)
+        #expect(request.chatCompletionRequest.parallelToolCalls == false)
+
+        let events: [MLXServerGenerationEvent] = [
+            .toolCall(.init(function: .init(name: "first", arguments: [:]))),
+            .toolCall(.init(function: .init(name: "second", arguments: [:]))),
+        ]
+        let service = MLXOpenAIService(engine: ScriptedServerEngine(events: events))
+        await #expect(throws: MLXOpenAIServiceError.multipleToolCallsNotAllowed) {
+            _ = try await service.createResponse(request: request)
+        }
+
+        let streaming = MLXOpenAIService(
+            engine: ScriptedServerEngine(events: events))
+        let frames = try await streaming.streamChatCompletionFrames(
+            request: request.chatCompletionRequest)
+        await #expect(throws: MLXOpenAIServiceError.multipleToolCallsNotAllowed) {
+            for try await _ in frames {}
+        }
+    }
+
+    @Test("named tool_choice rejects non-function type")
+    func namedToolChoiceRejectsNonFunctionType() {
+        #expect(throws: (any Error).self) {
+            _ = try JSONDecoder().decode(
+                OpenAIToolChoice.self,
+                from: Data(
+                    #"{"type":"bogus","name":"weather"}"#.utf8))
+        }
+    }
+
     @Test("chat completion collects generated content, reasoning, tool calls, usage, and metrics")
     func chatCompletionCollectsContentReasoningToolCallsUsageAndMetrics() async throws {
         let engine = ScriptedServerEngine(events: [

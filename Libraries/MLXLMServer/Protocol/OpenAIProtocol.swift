@@ -325,6 +325,14 @@ public enum OpenAIToolChoice: Codable, Sendable, Equatable {
             self = .mode(mode)
             return
         }
+        let type = try object.decode(String.self, forKey: .type)
+        guard type == "function" else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .type,
+                in: object,
+                debugDescription:
+                    "named tool_choice type must be 'function'")
+        }
         let topLevelName = try object.decodeIfPresent(String.self, forKey: .name)
         var nestedName: String?
         if object.contains(.function) {

@@ -76,6 +76,12 @@ extension CBv2LayerCacheProvider {
 ///    CONFIRMED output tokens). Copies token arrays — only call it on
 ///    membership change, never on the chained fast path.
 public protocol CBv2StepSampler: AnyObject {
+    /// True only when this sampler implements the full token-constraint
+    /// lifecycle: configure, hard-mask, confirm, failure reporting, and
+    /// request-id retirement. EngineV2 rejects constrained requests unless
+    /// the installed sampler opts in.
+    var supportsTokenConstraints: Bool { get }
+
     func sample(
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
         stepIndex: Int, pendingSampledTokens: MLXArray?,
@@ -112,6 +118,7 @@ public protocol CBv2StepSampler: AnyObject {
 }
 
 extension CBv2StepSampler {
+    public var supportsTokenConstraints: Bool { false }
     public func takeStepLogprobs() -> CBv2StepLogprobs? { nil }
     public func requestDidFinish(_ id: CBv2RequestID) {}
     public func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID]) {}
@@ -123,13 +130,42 @@ extension CBv2StepSampler {
 /// deterministic fallback for scheduler/loop tests; production uses
 /// `CBv2DefaultSampler`.
 public final class CBv2GreedySampler: CBv2StepSampler {
+    private let constraintSampler = CBv2TokenConstraintSampler()
+    private var configuredIDs: [CBv2RequestID] = []
+
+    public var supportsTokenConstraints: Bool { true }
+
     public init() {}
     public func sample(
         logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
         stepIndex: Int, pendingSampledTokens: MLXArray?,
         rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray {
-        argMax(logits, axis: -1).asType(.int32)
+        if requestIDs != configuredIDs {
+            constraintSampler.configure(rowContext())
+            configuredIDs = requestIDs
+        }
+        return argMax(
+            constraintSampler.mask(logits, requestIDs: requestIDs),
+            axis: -1
+        ).asType(.int32)
+    }
+
+    public func requestDidFinish(_ id: CBv2RequestID) {
+        constraintSampler.requestDidFinish(id)
+        if configuredIDs.contains(id) {
+            configuredIDs = []
+        }
+    }
+
+    public func confirmSampledTokens(
+        _ tokens: [Int], requestIDs: [CBv2RequestID]
+    ) {
+        constraintSampler.confirm(tokens: tokens, requestIDs: requestIDs)
+    }
+
+    public func tokenConstraintFailure(for id: CBv2RequestID) -> String? {
+        constraintSampler.failure(for: id)
     }
 }
 

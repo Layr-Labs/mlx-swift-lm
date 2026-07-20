@@ -37,6 +37,28 @@ private final class ImpossibleTokenConstraint: CBv2TokenConstraint, @unchecked S
     func nextState(state: Int, tokenID: Int) -> Int? { nil }
 }
 
+private final class DenseTokenConstraint: CBv2TokenConstraint, @unchecked Sendable {
+    let mode: CBv2TokenConstraintMode = .required
+    let maxTokens = 1
+    let fallbackTokenID = 0
+    let initialState = 0
+    private let allowed: [Int]
+    private let excluded: Int
+
+    init(vocab: Int, excluding token: Int) {
+        self.allowed = (0 ..< vocab).filter { $0 != token }
+        self.excluded = token
+    }
+
+    func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] {
+        remainingTokens > 0 ? allowed : []
+    }
+
+    func nextState(state: Int, tokenID: Int) -> Int? {
+        tokenID == excluded ? nil : 1
+    }
+}
+
 private final class ConstraintBundleSentinel {}
 
 private func ensureConstraintTestMetallib() throws {
@@ -55,6 +77,56 @@ private func ensureConstraintTestMetallib() throws {
 
 @Suite("CBv2 row-local token constraints")
 struct CBv2TokenConstraintSamplingTests {
+    @Test("greedy sampler enforces token constraints")
+    func greedySamplerEnforcesConstraint() throws {
+        try ensureConstraintTestMetallib()
+        let sampler = CBv2GreedySampler()
+        let id = CBv2RequestID(700)
+        let constraint = FixedTokenConstraint([1])
+        let params = [CBv2SamplingParams(temperature: 0)]
+        let row = CBv2SamplerRow(
+            id: id, params: params[0], promptTokens: [0],
+            tokenConstraint: constraint, maxTokens: 1)
+
+        let token = sampler.sample(
+            logits: MLXArray([Float(0), 1, 2, 100], [1, 4]),
+            params: params,
+            requestIDs: [id],
+            stepIndex: 0,
+            pendingSampledTokens: nil,
+            rowContext: { [row] })
+            .asArray(Int32.self)
+
+        #expect(token == [1])
+    }
+
+    @Test("dense allowlists mask their excluded token")
+    func denseAllowlistMask() throws {
+        try ensureConstraintTestMetallib()
+        let vocab = 32
+        let sampler = CBv2DefaultSampler(fallbackSeed: 1)
+        let id = CBv2RequestID(701)
+        let params = [CBv2SamplingParams(temperature: 0)]
+        let row = CBv2SamplerRow(
+            id: id, params: params[0], promptTokens: [0],
+            tokenConstraint: DenseTokenConstraint(vocab: vocab, excluding: 31),
+            maxTokens: 1)
+        var logits = [Float](repeating: 0, count: vocab)
+        logits[30] = 10
+        logits[31] = 100
+
+        let token = sampler.sample(
+            logits: MLXArray(logits, [1, vocab]),
+            params: params,
+            requestIDs: [id],
+            stepIndex: 0,
+            pendingSampledTokens: nil,
+            rowContext: { [row] })
+            .asArray(Int32.self)
+
+        #expect(token == [30])
+    }
+
     @Test("mixed constrained and ordinary rows never share grammar state")
     func mixedRows() throws {
         try ensureConstraintTestMetallib()
