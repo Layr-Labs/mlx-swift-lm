@@ -131,6 +131,14 @@ public enum CBv2SafetyCeiling {
     static let prefillFloorTPS: Double = 200
     /// Bounded slack for one full post-preemption re-prefill plus margin.
     static let preemptionSlackSeconds: Double = 60
+    /// Saturation bound for the computed ceiling (~31.7 years). `Duration`
+    /// construction traps on values beyond its representable range, and an
+    /// extreme accepted `maxTokens` (fixed-window backends cap retained KV by
+    /// the window, not the request allowance) over a tiny decode floor can
+    /// otherwise produce seconds past Int64 range — a remotely reachable
+    /// process crash. Any request hitting this clamp is already bounded far
+    /// beyond every real workload; the ceiling stays an absolute bound.
+    static let maxCeilingSeconds: Double = 1e9
 
     /// Absolute ceiling duration, measured from enqueue.
     ///
@@ -155,7 +163,10 @@ public enum CBv2SafetyCeiling {
             + decodeBound
             + prefillBound  // one conservative re-prefill after a late preemption
             + preemptionSlackSeconds
-        return .seconds(seconds)
+        // Saturate before constructing: .seconds(_:) traps past Duration's
+        // range, and `seconds` is attacker-influenceable through an accepted
+        // extreme maxTokens (see maxCeilingSeconds).
+        return .seconds(min(seconds, maxCeilingSeconds))
     }
 }
 

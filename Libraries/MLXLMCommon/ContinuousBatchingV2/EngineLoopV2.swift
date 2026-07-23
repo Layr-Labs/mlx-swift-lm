@@ -2039,6 +2039,21 @@ public final class EngineLoopV2: @unchecked Sendable {
                     capacityRequeues[rec.id] = attempts + 1
                     capacityRequeueCount += 1
                     mtp?.invalidateCarry(rec.id)  // preempted-style restart
+                    // Preempted-style lease reset too: requeueOnCapacity
+                    // rewound numComputedTokens to zero, so rewind the
+                    // progress watermark and grant a fresh prefill window
+                    // (admission stays permanently cleared). Without this a
+                    // capacity wait longer than the prefill lease leaves the
+                    // stale progress deadline expired and the newly
+                    // re-admitted row is killed as .prefillStall before its
+                    // first healthy chunk finalizes (PR#82 review). No
+                    // pending finalize can include this row's sample here —
+                    // it was being admitted this step, not running — so the
+                    // rollback-path deferral does not apply.
+                    if var lease = leasesByID[rec.id] {
+                        lease.markPreempted(now: config.clock.now())
+                        leasesByID[rec.id] = lease
+                    }
                     return nil
                 }
                 // Terminal capacity exhaustion is retryable (the backend is

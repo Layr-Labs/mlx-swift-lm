@@ -55,6 +55,22 @@ final class CBv2DeadlineLeaseTests: XCTestCase {
             200, accuracy: 1e-6)
     }
 
+    func testSafetyCeilingSaturatesInsteadOfTrapping() {
+        // An extreme accepted maxTokens over the minimum decode floor would
+        // otherwise compute seconds past Duration's representable range and
+        // TRAP in .seconds(_:) — a remotely reachable process crash. The
+        // ceiling must saturate at the clamp and remain a real bound.
+        let ceiling = CBv2SafetyCeiling.duration(
+            promptTokens: Int.max, maxTokens: Int.max,
+            admissionLease: 120, decodeFloorTPS: 0.000001)
+        XCTAssertEqual(
+            seconds(ceiling), CBv2SafetyCeiling.maxCeilingSeconds, accuracy: 1)
+        // Ordinary requests are far below the clamp (formula unchanged).
+        let ordinary = CBv2SafetyCeiling.duration(
+            promptTokens: 2000, maxTokens: 16000, admissionLease: 120, decodeFloorTPS: 5)
+        XCTAssertLessThan(seconds(ordinary), CBv2SafetyCeiling.maxCeilingSeconds / 1000)
+    }
+
     func testSafetyCeilingIsGenerousVersusRealThroughput() {
         // A 16k-token generation at a REAL 55 tok/s finishes in ~291s; the
         // ceiling for the same request must be far larger (pathology only).
