@@ -1031,6 +1031,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // prefix credit no longer describes work that was skipped.
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
+                // Rewind the lease's computed watermark alongside the
+                // scheduler's numComputedTokens reset (see handlePreemptions).
+                if var lease = leasesByID[id] {
+                    lease.markPreempted(now: stepNow)
+                    leasesByID[id] = lease
+                }
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
                 compiledDecode?.forgetRows(state)
                 if previous.participants.contains(id) {
@@ -1966,6 +1972,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // scheduler already released the capacity reservations and requeued
         // the victims (generated tokens kept).
         assert(inFlight == nil, "preemption with a step in flight")
+        let now = config.clock.now()
         for id in ids {
             preemptionCount += 1
             // A preempted request recomputes from scratch — any adopted
@@ -1975,6 +1982,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             // A preempted row's drafter carry no longer describes its KV
             // (the structural fingerprint would catch it; drop eagerly).
             mtp?.invalidateCarry(id)
+            // The scheduler rewound numComputedTokens to zero; reset the
+            // lease's computed watermark and grant a fresh prefill window so
+            // the re-prefill's confirmed chunks refresh the progress lease
+            // (otherwise a long re-prefill is falsely killed as a stall).
+            if var lease = leasesByID[id] {
+                lease.markPreempted(now: now)
+                leasesByID[id] = lease
+            }
             if let state = kvStates.removeValue(forKey: id) {
                 compiledDecode?.forgetRows(state)
                 backend.release(state)

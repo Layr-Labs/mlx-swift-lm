@@ -287,6 +287,24 @@ struct CBv2RequestLeaseState {
         progressDeadline = now.advanced(by: phase == .prefill ? prefillLease : decodeLease)
     }
 
+    /// Preemption rewound computation: the scheduler reset the record's
+    /// computed-token count to zero and the request must re-prefill from
+    /// scratch (generated tokens are kept). Reset the computed watermark and
+    /// grant a fresh PREFILL progress window so the re-prefill's confirmed
+    /// chunks refresh the lease — without this, every re-prefill chunk at or
+    /// below the old watermark fails the `computedTokens >` test while the
+    /// stale (possibly decode-phase) progress deadline keeps running, and a
+    /// sufficiently long re-prefill is falsely killed as a stall. Never
+    /// re-arms admission (a preempted row stays admitted); backpressure state
+    /// is untouched (output-stream pause bookkeeping is orthogonal and its
+    /// pause/resume events keep driving markPaused/markResumed).
+    mutating func markPreempted(now: ContinuousClock.Instant) {
+        guard legacyWall == nil else { return }
+        lastComputedTokens = 0
+        phase = .prefill
+        progressDeadline = now.advanced(by: prefillLease)
+    }
+
     // MARK: Expiry
 
     /// The typed cause if any lease has expired, else nil.
@@ -310,12 +328,23 @@ struct CBv2RequestLeaseState {
             if now > safetyDeadline { return .safetyDeadline }
             return nil
         }
-        // Admitted. The absolute ceiling is the backstop for everything.
-        if now > safetyDeadline { return .safetyDeadline }
-        if isPaused {
+        // Admitted. While genuinely paused on backpressure, the backpressure
+        // lease governs and takes precedence over the safety ceiling: the
+        // ceiling's formula includes no backpressure allowance, so a request
+        // paused by a slow consumer late in its budget must be terminated as
+        // health-neutral `.backpressureTimeout` (at the full lease), never
+        // misclassified as engine pathology. This cannot unbound a request's
+        // lifetime: each pause is bounded by one backpressure lease, and the
+        // ceiling applies at the first running check between pauses. A paused
+        // row with no armed lease (defensive: bookkeeping drift) still falls
+        // back to the ceiling.
+        if isPaused, backpressureDeadline != nil {
             if let bp = backpressureDeadline, now > bp { return .backpressureTimeout }
             return nil
         }
+        // The absolute ceiling is the backstop for everything else.
+        if now > safetyDeadline { return .safetyDeadline }
+        if isPaused { return nil }
         if isRunning, now > progressDeadline {
             return phase == .prefill ? .prefillStall : .decodeStall
         }

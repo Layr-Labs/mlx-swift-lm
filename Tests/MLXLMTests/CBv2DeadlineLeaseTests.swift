@@ -193,6 +193,83 @@ final class CBv2DeadlineLeaseTests: XCTestCase {
             .decodeStall)
     }
 
+    // MARK: Preemption rewind (PR#82 review P1)
+
+    func testPreemptionRewindGrantsFreshPrefillWindowAndResetsWatermark() {
+        // A decode-phase request is preempted: the scheduler rewinds
+        // numComputedTokens to 0 and the request must re-prefill from scratch
+        // (generated tokens kept). Without markPreempted, the stale computed
+        // watermark (1000) makes every re-prefill chunk at or below 1000 fail
+        // the progress test while the old decode-phase deadline keeps running
+        // — a healthy re-prefill would be killed as .decodeStall.
+        var lease = makeLease(prefill: 120, decode: 120, safety: 100_000)
+        lease.markAdmitted(now: at(0))
+        lease.recordProgress(now: at(10), computedTokens: 1000, generatedTokens: 8)
+        lease.markPreempted(now: at(50))
+        // Fresh PREFILL window from the preemption instant, not the stale
+        // decode deadline armed at t=10.
+        XCTAssertNil(lease.expiredCause(now: at(169), isRunning: true, isPaused: false))
+        // Re-prefill chunks BELOW the old watermark refresh the lease again.
+        lease.recordProgress(now: at(169), computedTokens: 256, generatedTokens: 8)
+        XCTAssertNil(lease.expiredCause(now: at(288), isRunning: true, isPaused: false))
+        lease.recordProgress(now: at(288), computedTokens: 700, generatedTokens: 8)
+        XCTAssertNil(lease.expiredCause(now: at(407), isRunning: true, isPaused: false))
+        // A genuinely stalled re-prefill still dies, as .prefillStall.
+        XCTAssertEqual(
+            lease.expiredCause(now: at(409), isRunning: true, isPaused: false),
+            .prefillStall)
+        // Admission was NOT re-armed by the preemption.
+        XCTAssertTrue(lease.isAdmitted)
+    }
+
+    func testPreemptionRewindThenNewTokenReturnsToDecodePhase() {
+        var lease = makeLease(prefill: 120, decode: 120, safety: 100_000)
+        lease.markAdmitted(now: at(0))
+        lease.recordProgress(now: at(10), computedTokens: 1000, generatedTokens: 8)
+        lease.markPreempted(now: at(50))
+        // Re-prefill completes and the FIRST NEW generated token flips the
+        // lease back to the decode phase with a fresh decode window.
+        lease.recordProgress(now: at(100), computedTokens: 1009, generatedTokens: 9)
+        XCTAssertNil(lease.expiredCause(now: at(219), isRunning: true, isPaused: false))
+        XCTAssertEqual(
+            lease.expiredCause(now: at(221), isRunning: true, isPaused: false),
+            .decodeStall)
+    }
+
+    // MARK: Backpressure precedence over the ceiling (PR#82 review P2)
+
+    func testPausedRequestPastCeilingIsBackpressureNotSafety() {
+        // The ceiling's formula has no backpressure allowance, so a request
+        // paused by a slow consumer late in its budget must get the FULL
+        // backpressure lease and terminate as health-neutral
+        // .backpressureTimeout — never be misclassified as .safetyDeadline.
+        var lease = makeLease(decode: 120, backpressure: 120, safety: 100)
+        lease.markAdmitted(now: at(0))
+        lease.recordProgress(now: at(10), computedTokens: 5, generatedTokens: 1)
+        lease.markPaused(now: at(90))
+        // Past the 100s ceiling but inside the pause's backpressure lease:
+        // still alive, and NOT a safety death.
+        XCTAssertNil(lease.expiredCause(now: at(150), isRunning: true, isPaused: true))
+        // The backpressure lease (90+120) governs the paused terminal.
+        XCTAssertEqual(
+            lease.expiredCause(now: at(211), isRunning: true, isPaused: true),
+            .backpressureTimeout)
+        // The ceiling still applies at the first RUNNING check after resume —
+        // pauses cannot unbound a request's lifetime.
+        var resumed = lease
+        resumed.markResumed(now: at(150))
+        XCTAssertEqual(
+            resumed.expiredCause(now: at(151), isRunning: true, isPaused: false),
+            .safetyDeadline)
+        // Defensive: paused with NO armed backpressure lease (bookkeeping
+        // drift) still falls back to the ceiling backstop.
+        var drifted = makeLease(safety: 100)
+        drifted.markAdmitted(now: at(0))
+        XCTAssertEqual(
+            drifted.expiredCause(now: at(101), isRunning: true, isPaused: true),
+            .safetyDeadline)
+    }
+
     // MARK: Legacy kill-switch wall
 
     func testLegacyWallIsSingleLifetimeIgnoringProgress() {
