@@ -1944,8 +1944,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     /// The wire finish reason for a lease cause. The legacy kill-switch keeps
-    /// the exact original `.error` string for a bit-compatible rollback; every
-    /// new-lease cause surfaces as a typed `.terminal`.
+    /// the exact original `.error` string for a behavior-compatible rollback
+    /// (same single total-lifetime wall and wire terminal; timing now runs on
+    /// the monotonic clock rather than `Date`, and expiry is observed at the
+    /// central lease scan rather than the old inline checks — not literally
+    /// bit-identical timing); every new-lease cause surfaces as a typed
+    /// `.terminal`.
     private func leaseFinishReason(for cause: CBv2TerminalCause) -> CBv2FinishReason {
         switch cause {
         case .legacyRequestTimeout:
