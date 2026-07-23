@@ -521,6 +521,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// backpressure / safety, or the legacy single wall under the kill-switch).
     /// Engine-thread-confined. See `CBv2DeadlineLeases.swift`.
     var leasesByID: [CBv2RequestID: CBv2RequestLeaseState] = [:]
+    /// Rollback-path preemption victims whose lease rewind (`markPreempted`)
+    /// is deferred until after the pending finalize confirms their in-flight
+    /// sample — finalization's progress refresh would otherwise flip the lease
+    /// back to `.decode` and undo the rewind (PR#82 review). Engine-thread-
+    /// confined; drained at the finalize site every step.
+    var leasePreemptionsPendingFinalize: [CBv2RequestID] = []
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
@@ -1025,18 +1031,19 @@ public final class EngineLoopV2: @unchecked Sendable {
             // generated tokens, and an unconfirmed `pendingSamples` would
             // block their re-admission forever).
             scheduler.rollback(plan)
+            // Lease rewind is DEFERRED past the finalize below: the victims'
+            // in-flight sample is confirmed there (refreshProgressLeases would
+            // see generated > watermark and flip the lease back to .decode,
+            // undoing an earlier markPreempted — PR#82 review). The general
+            // path already has the correct order because it finalizes before
+            // planning; this defers the rollback path to match.
+            leasePreemptionsPendingFinalize.append(contentsOf: plan.preemptions)
             for id in plan.preemptions {
                 preemptionCount += 1
                 // A preempted request recomputes from scratch — any adopted
                 // prefix credit no longer describes work that was skipped.
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
-                // Rewind the lease's computed watermark alongside the
-                // scheduler's numComputedTokens reset (see handlePreemptions).
-                if var lease = leasesByID[id] {
-                    lease.markPreempted(now: stepNow)
-                    leasesByID[id] = lease
-                }
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
                 compiledDecode?.forgetRows(state)
                 if previous.participants.contains(id) {
@@ -1055,6 +1062,19 @@ public final class EngineLoopV2: @unchecked Sendable {
         if let previous = inFlight {
             inFlight = nil
             finalize(previous, now: stepNow)
+        }
+        // Apply the rollback path's deferred lease rewinds now that the
+        // victims' in-flight samples are confirmed: markPreempted must be the
+        // LAST lease transition of the preemption instant so the fresh
+        // prefill window and zeroed watermark survive into the re-prefill.
+        if !leasePreemptionsPendingFinalize.isEmpty {
+            for id in leasePreemptionsPendingFinalize {
+                if var lease = leasesByID[id] {
+                    lease.markPreempted(now: stepNow)
+                    leasesByID[id] = lease
+                }
+            }
+            leasePreemptionsPendingFinalize.removeAll(keepingCapacity: true)
         }
 
         guard scheduler.hasWork else {
