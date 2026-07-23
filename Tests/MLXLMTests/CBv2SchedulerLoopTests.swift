@@ -672,21 +672,149 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         await harness.engine.shutdown()
     }
 
-    // MARK: Deadlines & watchdog
+    // MARK: Deadlines & leases
 
-    func testRequestDeadlineErrorFinishes() async throws {
+    /// HEADLINE REGRESSION: an admitted request making slow but CONTINUOUS
+    /// decode progress must survive far past the legacy 120s wall. The old
+    /// single wall killed it at 120s; the decode progress lease refreshes on
+    /// every confirmed token, so it completes naturally. Simulated time is
+    /// driven by an auto-advancing monotonic clock (one step per clock read),
+    /// so no real sleeps are needed. This test FAILS on the pre-lease engine.
+    func testSlowDecodeSurvivesFarPastLegacyWall() async throws {
+        let clock = CBv2SchedFakeClock(autoAdvanceSeconds: 20)  // 20s per step
         let harness = CBv2SchedHarness(
-            loopConfig: CBv2EngineLoopConfig(requestTimeout: 0.05))
-        harness.model.forwardDelay = 0.02  // a few slow steps blow the deadline
+            loopConfig: CBv2EngineLoopConfig(
+                decodeProgressLease: 120,       // 20s/step gap ≪ 120 ⇒ never stalls
+                safetyCeilingDecodeFloorTPS: 0.01,  // huge ceiling: irrelevant here
+                clock: clock.clock))
+        let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 12)
+        let collected = await cbv2SchedCollect(try harness.engine.submit(request))
+
+        XCTAssertEqual(
+            collected.finishReason, .length,
+            "a continuously-progressing request must complete naturally, not deadline")
+        XCTAssertEqual(collected.tokens, expectedTokens(prompt: [1], count: 12))
+        XCTAssertGreaterThan(
+            clock.elapsedSeconds, 120,
+            "the request survived well past the legacy 120s wall")
+        let released = await cbv2SchedWait { harness.backend.liveStates == 0 }
+        XCTAssertTrue(released)
+    }
+
+    /// Kill-switch: the legacy single total-lifetime wall is restored and
+    /// expires with the ORIGINAL `.error("...deadline")` string (bit-compatible
+    /// rollback). Formerly `testRequestDeadlineErrorFinishes`.
+    func testLegacyKillSwitchRestoresSingleWall() async throws {
+        let harness = CBv2SchedHarness(
+            loopConfig: CBv2EngineLoopConfig(
+                requestTimeout: 0.05, useLegacyRequestTimeout: true))
+        harness.model.forwardDelay = 0.02  // a few slow steps blow the wall
         let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 1_000_000)
         let collected = await cbv2SchedCollect(try harness.engine.submit(request))
 
         guard case .error(let message)? = collected.finishReason else {
-            return XCTFail("expected deadline error, got \(String(describing: collected.finishReason))")
+            return XCTFail(
+                "expected legacy deadline error, got \(String(describing: collected.finishReason))")
         }
         XCTAssertTrue(message.contains("deadline"), message)
         let released = await cbv2SchedWait { harness.backend.liveStates == 0 }
         XCTAssertTrue(released)
+    }
+
+    /// A legacy deadline terminal must carry the RECONCILED usage generated
+    /// before it fired — not zero. (The bug discarded usage at the deadline.)
+    func testLegacyDeadlineTerminalCarriesReconciledUsage() async throws {
+        let harness = CBv2SchedHarness(
+            loopConfig: CBv2EngineLoopConfig(
+                requestTimeout: 0.25, useLegacyRequestTimeout: true))
+        harness.model.forwardDelay = 0.01  // generate many tokens before 0.25s
+        let request = CBv2SchedFixtures.request(prompt: [1, 2], maxTokens: 1_000_000)
+        let collected = await cbv2SchedCollect(try harness.engine.submit(request))
+
+        guard case .error? = collected.finishReason else {
+            return XCTFail("expected legacy deadline error")
+        }
+        let usage = try XCTUnwrap(collected.usage)
+        XCTAssertEqual(usage.promptTokens, 2)
+        XCTAssertGreaterThan(
+            usage.completionTokens, 0,
+            "the deadline terminal must reconcile the tokens generated before it fired")
+    }
+
+    /// A never-admitted request expires with the typed `.admissionTimeout`
+    /// cause while a progressing admitted peer is untouched. Uses a single
+    /// engine slot so the second request never begins engine work.
+    func testNeverAdmittedRequestExpiresWithAdmissionTimeout() async throws {
+        let clock = CBv2SchedFakeClock()  // manual
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 2048,
+                prefillChunkSize: 512, maxWaiting: 8),
+            loopConfig: CBv2EngineLoopConfig(
+                admissionLease: 1,             // tiny admission window
+                decodeProgressLease: 3600,     // running peer stays healthy
+                safetyCeilingDecodeFloorTPS: 0.0001,
+                clock: clock.clock))
+        harness.model.forwardDelay = 0.005
+
+        // Occupy the single slot with a long-running request.
+        let hog = CBv2SchedFixtures.request(prompt: [1], maxTokens: 1_000_000)
+        let hogStream = try harness.engine.submit(hog)
+        _ = await cbv2SchedWait { harness.engine.capacity().activeRequests == 1 }
+
+        // Queue a second request that can never be admitted.
+        let queued = CBv2SchedFixtures.request(prompt: [2], maxTokens: 5)
+        let queuedStream = try harness.engine.submit(queued)
+        _ = await cbv2SchedWait { harness.engine.capacity().waitingRequests == 1 }
+        // Barrier: the enqueue + lease-arm runs async on the engine queue, so
+        // sync on that queue to guarantee the queued request's admission
+        // deadline is stamped at the pre-advance time before we time-travel.
+        _ = harness.engine.loopForTesting.pausedIDsSnapshot()
+
+        async let hogOut = cbv2SchedCollect(hogStream)
+        async let queuedOut = cbv2SchedCollect(queuedStream, timeoutSeconds: 5)
+
+        // Cross the admission lease (but stay far under the healthy decode lease).
+        clock.advance(seconds: 5)
+
+        let queuedCollected = await queuedOut
+        guard case .terminal(let cause, _)? = queuedCollected.finishReason else {
+            return XCTFail(
+                "a request that never began engine work must admission-timeout, got "
+                    + "\(String(describing: queuedCollected.finishReason))")
+        }
+        XCTAssertEqual(cause, .admissionTimeout)
+
+        await harness.engine.shutdown()
+        _ = await hogOut
+    }
+
+    /// The absolute safety ceiling fires with `.safetyDeadline` even though the
+    /// request keeps producing tokens (so the decode progress lease never
+    /// trips). Constructs the pathology: an auto-advancing clock makes each
+    /// token "cost" far more wall time than the conservative floor allows.
+    func testSafetyCeilingFiresDespiteProgress() async throws {
+        // Pathology: a request that keeps producing tokens, but whose per-token
+        // wall cost (40s/step auto-advance) is far below the conservative
+        // decode floor — so the absolute ceiling fires while the decode
+        // progress lease stays healthy.
+        let clock = CBv2SchedFakeClock(autoAdvanceSeconds: 40)  // 40s per step
+        let harness = CBv2SchedHarness(
+            loopConfig: CBv2EngineLoopConfig(
+                admissionLease: 120,             // 40s/step ⇒ admits before timeout
+                decodeProgressLease: 120,        // 40s/step gap ≪ 120 ⇒ never stalls
+                safetyCeilingDecodeFloorTPS: 1_000_000,  // tiny decode bound ⇒ ~180s ceiling
+                clock: clock.clock))
+        // Large maxTokens so the request keeps generating until the ceiling.
+        let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 100_000)
+        let collected = await cbv2SchedCollect(try harness.engine.submit(request))
+
+        guard case .terminal(let cause, _)? = collected.finishReason else {
+            return XCTFail(
+                "the absolute ceiling must fire, got "
+                    + "\(String(describing: collected.finishReason))")
+        }
+        XCTAssertEqual(cause, .safetyDeadline)
     }
 
     func testWatchdogFiresOnWedgedStepAndErrorsStreams() async throws {
@@ -714,15 +842,56 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 100)
         let collected = await cbv2SchedCollect(try harness.engine.submit(request))
 
-        guard case .error(let message)? = collected.finishReason else {
-            return XCTFail("expected watchdog error, got \(String(describing: collected.finishReason))")
+        guard case .terminal(let cause, let message)? = collected.finishReason else {
+            return XCTFail(
+                "expected watchdog terminal, got \(String(describing: collected.finishReason))")
         }
+        XCTAssertEqual(cause, .watchdog)
         XCTAssertTrue(message.contains("watchdog"), message)
         XCTAssertGreaterThanOrEqual(flag.count, 1, "wedge signal must fire")
         // The loop resumes after the wedge and cleans up the row.
         let cleaned = await cbv2SchedWait { harness.backend.liveStates == 0 }
         XCTAssertTrue(cleaned)
         XCTAssertTrue(harness.engine.isHealthy, "health recovers once the step completes")
+    }
+
+    /// The watchdog terminal must carry the RECONCILED usage observed before
+    /// the wedge (previously it injected raw zero usage). Generate a few tokens
+    /// fast, then wedge a later step and assert non-zero completion tokens.
+    func testWatchdogTerminalCarriesReconciledUsage() async throws {
+        let harness = CBv2SchedHarness(
+            loopConfig: CBv2EngineLoopConfig(
+                stepTimeout: 0.05, watchdogInterval: 0.01))
+        harness.model.forwardDelay = 0  // fast steps first: generate tokens
+        let request = CBv2SchedFixtures.request(prompt: [1], maxTokens: 1_000_000)
+
+        var tokens: [Int] = []
+        var finish: CBv2FinishReason?
+        var usage: CBv2Usage?
+        var wedged = false
+        for await event in try harness.engine.submit(request) {
+            switch event {
+            case .delta(_, let toks, _):
+                tokens.append(contentsOf: toks)
+                // After a couple confirmed tokens, wedge the next step.
+                if tokens.count >= 2, !wedged {
+                    wedged = true
+                    harness.model.forwardDelay = 0.5
+                }
+            case .finished(let reason, let u):
+                finish = reason
+                usage = u
+            }
+        }
+
+        guard case .terminal(let cause, _)? = finish else {
+            return XCTFail("expected watchdog terminal, got \(String(describing: finish))")
+        }
+        XCTAssertEqual(cause, .watchdog)
+        let reconciled = try XCTUnwrap(usage)
+        XCTAssertGreaterThan(
+            reconciled.completionTokens, 0,
+            "watchdog terminal must carry the tokens generated before the wedge")
     }
 
     // MARK: Degenerate submissions

@@ -28,6 +28,54 @@ struct CBv2SchedSplitMix64: RandomNumberGenerator {
     }
 }
 
+// MARK: - Injectable monotonic clock (deadline-lease tests)
+
+/// A controllable monotonic clock for exercising deadline leases with NO real
+/// sleeps. Built on `ContinuousClock` (never `Date`), so tests also demonstrate
+/// wall-clock-jump immunity by construction.
+///
+/// Two modes, composable:
+///   * `advance(seconds:)` — manual, explicit time travel.
+///   * `autoAdvance` — every `now()` read advances the clock by a fixed
+///     duration. The engine reads the clock exactly once per step, so an
+///     auto-advancing clock advances simulated time one fixed step at a time —
+///     enough to sail past any absolute wall while every per-step progress gap
+///     stays below the progress lease.
+final class CBv2SchedFakeClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private let base = ContinuousClock.now
+    private var offset: Duration = .zero
+    private let autoAdvance: Duration
+
+    init(autoAdvanceSeconds: Double = 0) {
+        self.autoAdvance = .seconds(autoAdvanceSeconds)
+    }
+
+    private var instant: ContinuousClock.Instant {
+        lock.lock()
+        defer { lock.unlock() }
+        let now = base.advanced(by: offset)
+        offset += autoAdvance
+        return now
+    }
+
+    func advance(seconds: Double) {
+        lock.lock()
+        offset += .seconds(seconds)
+        lock.unlock()
+    }
+
+    /// Simulated seconds elapsed since construction (monotonic).
+    var elapsedSeconds: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return Double(offset.components.seconds)
+            + Double(offset.components.attoseconds) / 1e18
+    }
+
+    var clock: CBv2Clock { CBv2Clock { [self] in self.instant } }
+}
+
 // MARK: - Scripted capacity oracle
 
 final class CBv2SchedMockCapacity: CBv2StepCapacity {

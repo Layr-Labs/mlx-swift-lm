@@ -539,6 +539,16 @@ public enum CBv2FinishReason: Sendable, Equatable {
     case length         // maxTokens or context limit
     case cancelled
     case error(String)
+    /// A typed platform/engine terminal: a monotonic deadline lease
+    /// (admission / prefill / decode / backpressure / safety) or the step
+    /// watchdog. Unlike `.error(String)`, this preserves the MACHINE-READABLE
+    /// cause so the provider bridge and coordinator can classify health,
+    /// retry, and billing without parsing a string. The reconciled usage
+    /// (prompt/completion token counts) rides the same
+    /// `CBv2Event.finished(reason:usage:)` envelope — a typed terminal always
+    /// carries the tokens generated before it fired. `message` is diagnostic
+    /// only (never a wire contract). See `CBv2DeadlineLeases.swift`.
+    case terminal(cause: CBv2TerminalCause, message: String)
 }
 
 /// One step's work assignment: token counts per request under a single

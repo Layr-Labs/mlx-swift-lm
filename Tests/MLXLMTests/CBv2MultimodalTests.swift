@@ -209,7 +209,7 @@ final class CBv2VisionDriver {
             request.multimodal = CBv2MultimodalInput(spans: multimodal.spans) { [] }
         }
         let record = CBv2ScheduledRequest(
-            request: request, arrivalSeq: nextID, submittedAt: Date(), deadline: nil)
+            request: request, arrivalSeq: nextID, submittedAt: Date())
 
         let kv = try backend.makeSequenceState(
             layerKinds: layerKinds, promptLength: prompt.count,
@@ -814,7 +814,7 @@ final class CBv2MultimodalTests: XCTestCase {
             request.multimodal = CBv2MultimodalInput(spans: spans) { [] }
         }
         return CBv2ScheduledRequest(
-            request: request, arrivalSeq: 0, submittedAt: Date(), deadline: nil)
+            request: request, arrivalSeq: 0, submittedAt: Date())
     }
 
     // MARK: - (e) Submit-time rejections
