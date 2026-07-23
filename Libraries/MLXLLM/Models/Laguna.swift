@@ -95,9 +95,11 @@ private class LagunaAttention: Module {
         keys = kNorm(keys.reshaped(B, L, nKVHeads, headDim)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, nKVHeads, headDim).transposed(0, 2, 1, 3)
 
-        let offset = cache?.ropeOffset
-        queries = applyRotaryPosition(rope, to: queries, offset: offset)
-        keys = applyRotaryPosition(rope, to: keys, offset: offset)
+        // Same idiom as every other model in this tree (Apertus, AfMoE,
+        // BailingMoe): applyRotaryPosition(_:to:cache:) resolves the offset
+        // internally (graph offset array when available, else cache offset).
+        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         var output = attentionWithCacheUpdate(
             queries: queries,
