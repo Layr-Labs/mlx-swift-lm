@@ -1584,7 +1584,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         // (MTP rows are `participants` and were confirmed above via
         // `finalizeMTPRound`). This is the single point where confirmed
         // finalized progress refreshes a lease, never optimistic planning.
-        refreshProgressLeases(step, now: now)
+        //
+        // Read the clock FRESH here rather than reusing the caller's `now`:
+        // that instant was captured before this function's blocking host
+        // readback, so stamping progress with it backdates confirmation by
+        // the sync duration — with a stepTimeout configured above a progress
+        // lease, a healthy long readback could leave the just-refreshed lease
+        // already expired at the next boundary (PR#82 review). Progress is
+        // confirmed NOW, after the sync.
+        refreshProgressLeases(step, now: config.clock.now())
     }
 
     /// Refresh each live participant's progress lease and its reconciled usage
