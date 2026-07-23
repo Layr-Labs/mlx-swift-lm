@@ -203,12 +203,44 @@ public final class CBv2NullDetokenizerFactory: CBv2DetokenizerFactory {
 // MARK: - Loop configuration
 
 public struct CBv2EngineLoopConfig: Sendable {
-    /// Per-request wall-clock deadline; overdue requests are error-finished
-    /// at the next step boundary.
+    /// LEGACY single total-lifetime wall (seconds), used ONLY when
+    /// `useLegacyRequestTimeout` is true (the rollback kill-switch). In the
+    /// default new-lease behavior this value is inert — the monotonic
+    /// admission/prefill/decode/backpressure leases and the safety ceiling
+    /// below govern request lifetime instead. See `CBv2DeadlineLeases.swift`.
     public var requestTimeout: TimeInterval
+    /// Kill-switch: when true, restore the legacy behavior — one
+    /// `requestTimeout`-second wall over the entire engine lifetime, expiring
+    /// with the original `.error("request exceeded Ns deadline")` string.
+    /// Default false = the new independent monotonic leases.
+    public var useLegacyRequestTimeout: Bool
+    /// Admission-only lease (seconds): bounds time before the request begins
+    /// engine work. Ends permanently at first admission; never re-arms after
+    /// preemption. Expiry cause `.admissionTimeout`.
+    public var admissionLease: TimeInterval
+    /// Prefill progress lease (seconds): expires a prompt prefill that stops
+    /// making confirmed finalized progress. Cause `.prefillStall`.
+    public var prefillProgressLease: TimeInterval
+    /// Decode progress lease (seconds): expires decode that stops producing
+    /// confirmed token progress. A generation that keeps producing tokens
+    /// NEVER expires. Cause `.decodeStall`.
+    public var decodeProgressLease: TimeInterval
+    /// Backpressure lease (seconds): bounds how long a request may sit paused
+    /// on downstream buffer pressure. Health-neutral. Cause
+    /// `.backpressureTimeout`.
+    public var backpressureLease: TimeInterval
+    /// Conservative decode throughput floor (tokens/second) for the absolute
+    /// request-derived safety ceiling. Deliberately far below any real model
+    /// (~30–120 tok/s) so the ceiling only catches pathology, never a healthy
+    /// long generation. Cause `.safetyDeadline`.
+    public var safetyCeilingDecodeFloorTPS: Double
+    /// Injectable monotonic clock. Production uses `ContinuousClock`; tests
+    /// inject a fake to drive lease expiry with no real sleeps. Never `Date`.
+    public var clock: CBv2Clock
     /// Single-step watchdog: a step (graph build + blocking eval) exceeding
-    /// this marks the engine unhealthy, error-finishes all live streams, and
-    /// fires `onStepWedge`.
+    /// this marks the engine unhealthy, terminal-finishes all live streams
+    /// with cause `.watchdog` (carrying the reconciled usage observed before
+    /// the wedge), and fires `onStepWedge`.
     public var stepTimeout: TimeInterval
     /// Watchdog polling interval.
     public var watchdogInterval: TimeInterval
@@ -228,7 +260,14 @@ public struct CBv2EngineLoopConfig: Sendable {
     public init(
         requestTimeout: TimeInterval = 120, stepTimeout: TimeInterval = 30,
         watchdogInterval: TimeInterval = 0.25, idleRecheckInterval: TimeInterval = 0.001,
-        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10
+        eventBufferCapacity: Int = 256, shutdownTimeout: TimeInterval = 10,
+        useLegacyRequestTimeout: Bool = false,
+        admissionLease: TimeInterval = 120,
+        prefillProgressLease: TimeInterval = 120,
+        decodeProgressLease: TimeInterval = 120,
+        backpressureLease: TimeInterval = 120,
+        safetyCeilingDecodeFloorTPS: Double = 5,
+        clock: CBv2Clock = .continuous
     ) {
         self.requestTimeout = requestTimeout
         self.stepTimeout = stepTimeout
@@ -236,6 +275,13 @@ public struct CBv2EngineLoopConfig: Sendable {
         self.idleRecheckInterval = idleRecheckInterval
         self.eventBufferCapacity = eventBufferCapacity
         self.shutdownTimeout = shutdownTimeout
+        self.useLegacyRequestTimeout = useLegacyRequestTimeout
+        self.admissionLease = admissionLease
+        self.prefillProgressLease = prefillProgressLease
+        self.decodeProgressLease = decodeProgressLease
+        self.backpressureLease = backpressureLease
+        self.safetyCeilingDecodeFloorTPS = safetyCeilingDecodeFloorTPS
+        self.clock = clock
     }
 }
 
@@ -448,6 +494,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var stepStartedNanos: UInt64 = 0
     private var wedgeReported = false
     private var _healthy = true
+    /// Reconciled per-request usage (prompt/completion counts) snapshotted at
+    /// enqueue and refreshed at each finalize. Lock-protected so the watchdog
+    /// thread — which fires while the engine thread is wedged inside a blocking
+    /// eval and therefore cannot read engine-confined state — can attach the
+    /// usage observed before the wedge instead of injecting raw zero usage.
+    private var usageSnapshots: [CBv2RequestID: CBv2Usage] = [:]
 
     // Engine-thread-confined state (internal, not private: the MTP round
     // driver in EngineLoopV2+MTP.swift is part of the loop).
@@ -465,6 +517,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
     /// the span chunks and needs the embeddings again); dropped at finish.
     var multimodalByID: [CBv2RequestID: CBv2ResolvedMultimodal] = [:]
+    /// Monotonic per-request deadline leases (admission / prefill / decode /
+    /// backpressure / safety, or the legacy single wall under the kill-switch).
+    /// Engine-thread-confined. See `CBv2DeadlineLeases.swift`.
+    var leasesByID: [CBv2RequestID: CBv2RequestLeaseState] = [:]
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
@@ -731,9 +787,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 return
             }
             do {
-                try scheduler.enqueue(
-                    request,
-                    deadline: Date().addingTimeInterval(config.requestTimeout))
+                try scheduler.enqueue(request)
+                armLease(for: request)
                 detokenizers[request.id] =
                     detokenizerFactory.makeDetokenizer(stopStrings: request.stopStrings)
                 if let multimodal {
@@ -872,10 +927,23 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     func setPaused(_ id: CBv2RequestID, _ paused: Bool) {
         engineQueue.async { [self] in
+            let now = config.clock.now()
             if paused {
                 scheduler.pause(id)
+                // Arm the backpressure lease and suspend the progress lease:
+                // a request blocked on a slow consumer is not an engine stall.
+                if var lease = leasesByID[id] {
+                    lease.markPaused(now: now)
+                    leasesByID[id] = lease
+                }
             } else {
                 scheduler.resume(id)
+                // Clear the backpressure lease and grant a fresh progress
+                // window — the paused interval was not the engine's fault.
+                if var lease = leasesByID[id] {
+                    lease.markResumed(now: now)
+                    leasesByID[id] = lease
+                }
             }
         }
     }
@@ -894,8 +962,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
+        // One monotonic clock read per step, reused for lease expiry, admission
+        // stamping, and the finalize-time progress refresh — so lease gaps are
+        // exactly one step apart (never widened by extra clock reads).
+        let stepNow = config.clock.now()
         processCancellations()
-        processDeadlines()
+        processLeaseExpiry(now: stepNow)
 
         // Chained decode fast path: build step N+1 on step N's lazy tokens.
         // MTP guards: an MTP round step is never a chain base (its finalize
@@ -936,7 +1008,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 inFlight = next
                 chainedStepCount += 1
                 stepCount += 1
-                finalize(previous)
+                finalize(previous, now: stepNow)
                 publishGauges()
                 scheduleNextStep()
                 return
@@ -976,7 +1048,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // the plan sees confirmed tokens and post-stop membership.
         if let previous = inFlight {
             inFlight = nil
-            finalize(previous)
+            finalize(previous, now: stepNow)
         }
 
         guard scheduler.hasWork else {
@@ -1004,6 +1076,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduleIdleRecheck()
             return
         }
+        // First engine work for any newly-admitted row ends its admission lease
+        // permanently and arms the prefill progress lease. Idempotent for rows
+        // already running (a preempted requeue never re-arms admission).
+        markAdmitted(plan, now: stepNow)
         // MTP round steps (1+k verify assignments and/or seed decodes)
         // branch BEFORE executeMixed — its rec.tokens slicing and samples
         // predicate are structurally wrong for speculative tokens.
@@ -1331,7 +1407,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Finalization (deferred stop detection)
 
-    private func finalize(_ step: CBv2InFlightStep) {
+    private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
         // graph pipelining stays bounded at two steps.
@@ -1428,16 +1504,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                 matchedStopString = detokenizer?.matchedStopString ?? false
             }
 
-            // Stop detection — one step late by construction.
+            // Stop detection — one step late by construction. Deadlines are NO
+            // LONGER checked here: a request that just produced a token is
+            // making progress and must never be killed mid-generation. Lease
+            // expiry is evaluated centrally in `processLeaseExpiry` at the top
+            // of each step, and this confirmed token refreshes the decode lease
+            // in `refreshProgressLeases` below.
             if isStopToken {
                 finishRequest(id, reason: .stop)
             } else if matchedStopString {
                 finishRequest(id, reason: .stop)
             } else if rec.generatedTokenCount >= rec.request.maxTokens {
                 finishRequest(id, reason: .length)
-            } else if let deadline = rec.deadline, Date() > deadline {
-                finishRequest(
-                    id, reason: .error("request exceeded \(Int(config.requestTimeout))s deadline"))
             }
         }
 
@@ -1468,6 +1546,40 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finalizedVerification: !(step.mtpRound?.finalizedVerifyIDs.isEmpty ?? true),
                 claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
         }
+
+        // Refresh progress leases from CONFIRMED work this step — covers plain
+        // decode, chained decode, prefill chunks, and MTP rounds uniformly
+        // (MTP rows are `participants` and were confirmed above via
+        // `finalizeMTPRound`). This is the single point where confirmed
+        // finalized progress refreshes a lease, never optimistic planning.
+        refreshProgressLeases(step, now: now)
+    }
+
+    /// Refresh each live participant's progress lease and its reconciled usage
+    /// snapshot from CONFIRMED finalized state. A confirmed sampled/generated
+    /// token refreshes the decode lease; a confirmed prefill-chunk advance
+    /// refreshes the prefill lease.
+    private func refreshProgressLeases(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
+        for id in step.participants {
+            guard let rec = scheduler.record(for: id) else { continue }
+            if var lease = leasesByID[id] {
+                lease.recordProgress(
+                    now: now,
+                    computedTokens: rec.numComputedTokens,
+                    generatedTokens: rec.generatedTokenCount)
+                leasesByID[id] = lease
+            }
+            // Publish the reconciled usage once tokens start flowing (prompt
+            // count with zero completion was already seeded at enqueue, so a
+            // still-prefilling row needs no lock traffic here).
+            if rec.generatedTokenCount > 0 {
+                setUsageSnapshot(
+                    id,
+                    CBv2Usage(
+                        promptTokens: rec.request.promptTokens.count,
+                        completionTokens: rec.generatedTokenCount))
+            }
+        }
     }
 
     // MARK: Request completion
@@ -1480,6 +1592,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
+        // Ids are reusable after finish: drop the per-id lease and usage
+        // snapshot so a reused id starts fresh (a stale lease would otherwise
+        // expire the new request early).
+        leasesByID.removeValue(forKey: id)
+        clearUsageSnapshot(id)
         // MTP: ids are reusable, so every per-id trace (carry, marks) must
         // go on every finish path.
         mtp?.requestDidFinish(id)
@@ -1567,7 +1684,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         guard rec.request.multimodal == nil else { return nil }
         switch reason {
         case .stop, .length: break
-        case .cancelled, .error: return nil
+        // A deadline/watchdog terminal aborts an incomplete request — its KV is
+        // not a confirmed, complete prefix, so it never donates.
+        case .cancelled, .error, .terminal: return nil
         }
         // Donation requires the full prompt to have been processed (at
         // least one sampled token) — mid-prefill finishes carry partial KV.
@@ -1757,18 +1876,82 @@ public final class EngineLoopV2: @unchecked Sendable {
         return pendingCancels.remove(id) != nil
     }
 
-    private func processDeadlines() {
-        let now = Date()
-        var overdue: [CBv2RequestID] = []
-        for rec in scheduler.running where rec.deadline.map({ now > $0 }) == true {
-            overdue.append(rec.id)
+    // MARK: Deadline leases
+
+    /// Arm the monotonic lease set for a freshly enqueued request and seed its
+    /// reconciled-usage snapshot (prompt tokens known, zero completion). Under
+    /// the kill-switch this is the legacy single total-lifetime wall.
+    private func armLease(for request: CBv2Request) {
+        let now = config.clock.now()
+        let lease: CBv2RequestLeaseState
+        if config.useLegacyRequestTimeout {
+            lease = .legacy(now: now, wall: config.requestTimeout)
+        } else {
+            lease = CBv2RequestLeaseState(
+                now: now,
+                admissionLease: config.admissionLease,
+                prefillLease: config.prefillProgressLease,
+                decodeLease: config.decodeProgressLease,
+                backpressureLease: config.backpressureLease,
+                safety: CBv2SafetyCeiling.duration(
+                    promptTokens: request.promptTokens.count,
+                    maxTokens: request.maxTokens,
+                    admissionLease: config.admissionLease,
+                    decodeFloorTPS: config.safetyCeilingDecodeFloorTPS),
+                computedTokens: 0,
+                generatedTokens: 0)
         }
-        for rec in scheduler.waiting where rec.deadline.map({ now > $0 }) == true {
-            overdue.append(rec.id)
+        leasesByID[request.id] = lease
+        setUsageSnapshot(
+            request.id,
+            CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+    }
+
+    /// End the admission lease for every row that began engine work this step.
+    /// Idempotent; a preempted requeue never re-arms admission.
+    private func markAdmitted(_ plan: CBv2StepPlan, now: ContinuousClock.Instant) {
+        for (id, _) in plan.assignments {
+            guard var lease = leasesByID[id], !lease.isAdmitted else { continue }
+            lease.markAdmitted(now: now)
+            leasesByID[id] = lease
         }
-        for id in overdue {
-            finishRequest(
-                id, reason: .error("request exceeded \(Int(config.requestTimeout))s deadline"))
+    }
+
+    /// Central lease-expiry scan at the top of each step. Each expired request
+    /// finishes with its TYPED cause (or, under the kill-switch, the legacy
+    /// error string). Progress leases apply only to actively-RUNNING rows; a
+    /// preempted row awaiting re-admission is bounded only by the absolute
+    /// safety ceiling, never faulted as a stall.
+    private func processLeaseExpiry(now: ContinuousClock.Instant) {
+        var expired: [(CBv2RequestID, CBv2TerminalCause)] = []
+        for rec in scheduler.running {
+            if let cause = leasesByID[rec.id]?.expiredCause(
+                now: now, isRunning: true, isPaused: rec.isPaused)
+            {
+                expired.append((rec.id, cause))
+            }
+        }
+        for rec in scheduler.waiting {
+            if let cause = leasesByID[rec.id]?.expiredCause(
+                now: now, isRunning: false, isPaused: rec.isPaused)
+            {
+                expired.append((rec.id, cause))
+            }
+        }
+        for (id, cause) in expired {
+            finishRequest(id, reason: leaseFinishReason(for: cause))
+        }
+    }
+
+    /// The wire finish reason for a lease cause. The legacy kill-switch keeps
+    /// the exact original `.error` string for a bit-compatible rollback; every
+    /// new-lease cause surfaces as a typed `.terminal`.
+    private func leaseFinishReason(for cause: CBv2TerminalCause) -> CBv2FinishReason {
+        switch cause {
+        case .legacyRequestTimeout:
+            return .error("request exceeded \(Int(config.requestTimeout))s deadline")
+        default:
+            return .terminal(cause: cause, message: cause.diagnostic)
         }
     }
 
@@ -1848,6 +2031,22 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return streams.removeValue(forKey: id)
+    }
+
+    // MARK: Reconciled-usage snapshots (watchdog-readable)
+
+    /// Publish the reconciled usage for `id` under `stateLock` so the watchdog
+    /// thread can read it while the engine thread is wedged.
+    private func setUsageSnapshot(_ id: CBv2RequestID, _ usage: CBv2Usage) {
+        stateLock.lock()
+        usageSnapshots[id] = usage
+        stateLock.unlock()
+    }
+
+    private func clearUsageSnapshot(_ id: CBv2RequestID) {
+        stateLock.lock()
+        usageSnapshots.removeValue(forKey: id)
+        stateLock.unlock()
     }
 
     // MARK: Test/telemetry introspection
@@ -1941,6 +2140,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         wedgeReported = true
         _healthy = false
         let liveStreams = streams
+        // Snapshot the reconciled usage observed before the wedge under the
+        // SAME lock, so each terminal carries the tokens generated so far
+        // instead of raw zero usage (the engine thread is wedged and cannot
+        // reconcile now).
+        let usageByID = usageSnapshots
         pendingCancels.formUnion(liveStreams.keys)
         stateLock.unlock()
 
@@ -1948,11 +2152,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         // terminal event must be able to observe the wedge side effects
         // (health metric, telemetry) immediately.
         onStepWedge?(elapsed)
-        for (_, stream) in liveStreams {
+        let message = "engine step exceeded \(Int(config.stepTimeout))s watchdog"
+        for (id, stream) in liveStreams {
             stream.finish(
-                reason: .error(
-                    "engine step exceeded \(Int(config.stepTimeout))s watchdog"),
-                usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+                reason: .terminal(cause: .watchdog, message: message),
+                usage: usageByID[id]
+                    ?? CBv2Usage(promptTokens: 0, completionTokens: 0))
         }
     }
 }

@@ -172,11 +172,13 @@ extension EngineLoopV2 {
 
             if let finishReason {
                 finishRequest(id, reason: finishReason)
-            } else if let deadline = rec.deadline, Date() > deadline {
-                finishRequest(
-                    id,
-                    reason: .error("request exceeded \(Int(config.requestTimeout))s deadline"))
             } else {
+                // No inline deadline check: an MTP row that just confirmed
+                // tokens is making progress and its decode lease is refreshed
+                // in `refreshProgressLeases` (run at the end of the enclosing
+                // `finalize`, after this round). Lease expiry is evaluated
+                // centrally in `processLeaseExpiry` — identical typed-terminal
+                // semantics to the ordinary decode path.
                 let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
                     targetOutputIndex: confirmed - 1, draftDepth: k)
                 mtp.storeCarry(

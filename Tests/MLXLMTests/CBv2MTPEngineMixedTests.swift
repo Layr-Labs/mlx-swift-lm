@@ -209,7 +209,8 @@ struct CBv2MTPEngineMixedTests {
         cacheProvider: CBv2LayerCacheProvider? = nil,
         prefixCache: CBv2PrefixCache? = nil,
         eventBufferCapacity: Int = 256,
-        mtpDrafter: (any CBv2MTPDrafter)? = nil
+        mtpDrafter: (any CBv2MTPDrafter)? = nil,
+        loopConfig: CBv2EngineLoopConfig? = nil
     ) throws -> EngineV2 {
         let kinds = fixture.target.cbv2LayerKinds
         let backend = backend
@@ -234,7 +235,8 @@ struct CBv2MTPEngineMixedTests {
                 maxBatchedTokensPerStep: 256,
                 prefillChunkSize: prefillChunkSize, maxWaiting: 16,
                 enablePrefixCache: prefixCache != nil),
-            loopConfig: CBv2EngineLoopConfig(eventBufferCapacity: eventBufferCapacity),
+            loopConfig: loopConfig
+                ?? CBv2EngineLoopConfig(eventBufferCapacity: eventBufferCapacity),
             admissionConfig: admissionConfig,
             prefixCache: prefixCache,
             compiledDecodeConfig: CBv2CompiledDecodeConfig(
@@ -661,5 +663,43 @@ struct CBv2MTPEngineMixedTests {
         let unsupported = MTPTestSequenceKV(supportsSpeculativeWrites: false)
         #expect(EngineLoopV2.mtpStorageEligible([supported, nil]))
         #expect(!EngineLoopV2.mtpStorageEligible([supported, unsupported]))
+    }
+
+    /// MTP PARITY: the MTP finalize path and the ordinary decode path must
+    /// produce the IDENTICAL typed terminal for the same condition. Both are
+    /// driven past the absolute safety ceiling (via an auto-advancing monotonic
+    /// clock) while still producing tokens, and both must terminate with
+    /// `.terminal(cause: .safetyDeadline)`. This guards the removal of the
+    /// MTP-specific inline deadline branch — MTP rows now flow through the same
+    /// central `processLeaseExpiry` as plain decode.
+    @Test func mtpAndPlainDecodeShareTypedDeadlineTerminal() async throws {
+        let fixture = try makeFixture()
+        let prompt = [1, 2, 3]
+
+        func terminalCause(mtp: Bool, id: UInt64) async throws -> CBv2TerminalCause? {
+            let clock = CBv2SchedFakeClock(autoAdvanceSeconds: 40)  // 40s per step
+            let engine = try makeEngine(
+                fixture, mtp: mtp,
+                loopConfig: CBv2EngineLoopConfig(
+                    admissionLease: 120,               // 40s/step ⇒ admits first
+                    decodeProgressLease: 120,          // 40s gap ≪ 120 ⇒ never stalls
+                    safetyCeilingDecodeFloorTPS: 1_000_000,  // ~180s absolute ceiling
+                    clock: clock.clock))
+            let collected = await cbv2SchedCollect(
+                try engine.submit(request(id: id, prompt: prompt, maxTokens: 100_000)))
+            await engine.shutdown()
+            guard case .terminal(let cause, _)? = collected.finishReason else {
+                let got = String(describing: collected.finishReason)
+                Issue.record("expected a typed terminal (mtp=\(mtp)), got \(got)")
+                return nil
+            }
+            return cause
+        }
+
+        let plainCause = try await terminalCause(mtp: false, id: 1)
+        let mtpCause = try await terminalCause(mtp: true, id: 2)
+        #expect(plainCause == .safetyDeadline)
+        #expect(mtpCause == .safetyDeadline)
+        #expect(plainCause == mtpCause)
     }
 }

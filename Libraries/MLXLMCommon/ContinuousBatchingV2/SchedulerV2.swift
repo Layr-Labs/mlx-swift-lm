@@ -53,8 +53,6 @@ public final class CBv2ScheduledRequest {
     /// Monotonic admission sequence — FCFS tie-break within a priority class.
     public let arrivalSeq: UInt64
     public let submittedAt: Date
-    /// Absolute wall-clock deadline; the engine error-finishes past this.
-    public let deadline: Date?
 
     /// Prompt + confirmed generated tokens.
     public internal(set) var tokens: [Int]
@@ -92,11 +90,10 @@ public final class CBv2ScheduledRequest {
     /// bidirectional attention needs all of its keys in one forward.
     public let multimodalBlocks: [CBv2ImageSpan]
 
-    init(request: CBv2Request, arrivalSeq: UInt64, submittedAt: Date, deadline: Date?) {
+    init(request: CBv2Request, arrivalSeq: UInt64, submittedAt: Date) {
         self.request = request
         self.arrivalSeq = arrivalSeq
         self.submittedAt = submittedAt
-        self.deadline = deadline
         self.tokens = request.promptTokens
         self.multimodalBlocks = CBv2MultimodalPlan.coalescedBlocks(
             spans: request.multimodal?.spans ?? [])
@@ -216,7 +213,7 @@ public final class SchedulerV2 {
     /// never orphan the original request's stream either (PR#62 review).
     @discardableResult
     public func enqueue(
-        _ request: CBv2Request, now: Date = Date(), deadline: Date? = nil
+        _ request: CBv2Request, now: Date = Date()
     ) throws -> CBv2ScheduledRequest {
         guard byID[request.id] == nil else {
             throw CBv2SchedulerError.duplicateRequestID(request.id)
@@ -225,7 +222,7 @@ public final class SchedulerV2 {
             throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
         }
         let record = CBv2ScheduledRequest(
-            request: request, arrivalSeq: nextArrivalSeq, submittedAt: now, deadline: deadline)
+            request: request, arrivalSeq: nextArrivalSeq, submittedAt: now)
         nextArrivalSeq += 1
         byID[request.id] = record
         insertWaiting(record, preemptedRequeue: false)
