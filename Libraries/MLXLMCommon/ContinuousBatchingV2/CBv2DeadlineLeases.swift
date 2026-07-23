@@ -316,6 +316,21 @@ struct CBv2RequestLeaseState {
         progressDeadline = now.advanced(by: prefillLease)
     }
 
+    /// Re-admission from waiting (a preempted or capacity-requeued row
+    /// entering engine work again): the fresh window granted at demotion has
+    /// been ticking through the stall-exempt queue wait — progress checks are
+    /// correctly suspended for waiting rows, but the deadline itself is not —
+    /// so a wait longer than the lease leaves it pre-expired and the row
+    /// would be killed as a stall before its first re-prefill chunk
+    /// finalizes. Grant a fresh progress window for the current phase WITHOUT
+    /// touching the (permanently ended) admission lease or backpressure
+    /// state. No-op for a never-admitted row (first admission owns that
+    /// transition).
+    mutating func markReadmitted(now: ContinuousClock.Instant) {
+        guard legacyWall == nil, admissionDeadline == nil else { return }
+        progressDeadline = now.advanced(by: phase == .prefill ? prefillLease : decodeLease)
+    }
+
     // MARK: Expiry
 
     /// The typed cause if any lease has expired, else nil.

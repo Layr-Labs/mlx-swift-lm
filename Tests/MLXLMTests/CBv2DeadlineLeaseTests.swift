@@ -252,6 +252,40 @@ final class CBv2DeadlineLeaseTests: XCTestCase {
             .decodeStall)
     }
 
+    func testReadmissionAfterLongQueueWaitGrantsFreshWindow() {
+        // Preempted at t=50 (fresh prefill window 50+120=170), then the row
+        // waits behind higher-priority work for LONGER than the prefill lease.
+        // Waiting rows are correctly stall-exempt (isRunning:false → only the
+        // ceiling applies), but the window itself kept ticking — so without a
+        // re-admission refresh the row returns to RUNNING pre-expired and is
+        // killed as .prefillStall before its first re-prefill chunk.
+        var lease = makeLease(prefill: 120, decode: 120, safety: 100_000)
+        lease.markAdmitted(now: at(0))
+        lease.recordProgress(now: at(10), computedTokens: 1000, generatedTokens: 8)
+        lease.markPreempted(now: at(50))
+        // Long stall-exempt wait: alive at t=400 only because isRunning:false.
+        XCTAssertNil(lease.expiredCause(now: at(400), isRunning: false, isPaused: false))
+        // WITHOUT the refresh it would die instantly on re-admission:
+        XCTAssertEqual(
+            lease.expiredCause(now: at(400), isRunning: true, isPaused: false),
+            .prefillStall)
+        // Re-admission grants a fresh window without re-arming admission.
+        lease.markReadmitted(now: at(400))
+        XCTAssertTrue(lease.isAdmitted)
+        XCTAssertNil(lease.expiredCause(now: at(519), isRunning: true, isPaused: false))
+        // A genuinely stalled re-prefill still dies at the fresh window's end.
+        XCTAssertEqual(
+            lease.expiredCause(now: at(521), isRunning: true, isPaused: false),
+            .prefillStall)
+        // No-op on a never-admitted row: first admission owns that transition.
+        var fresh = makeLease(admission: 120)
+        fresh.markReadmitted(now: at(60))
+        XCTAssertFalse(fresh.isAdmitted)
+        XCTAssertEqual(
+            fresh.expiredCause(now: at(121), isRunning: false, isPaused: false),
+            .admissionTimeout)
+    }
+
     // MARK: Backpressure precedence over the ceiling (PR#82 review P2)
 
     func testPausedRequestPastCeilingIsBackpressureNotSafety() {

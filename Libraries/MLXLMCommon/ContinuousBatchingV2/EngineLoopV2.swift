@@ -1095,6 +1095,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         beginMTPPlan()
+        // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
+        // plan moves waiting→running) are distinguishable from continuing
+        // running rows in markAdmitted below.
+        let waitingBeforePlan = Set(scheduler.waiting.map(\.id))
         let plan = scheduler.plan()
         handlePreemptions(plan.preemptions)
         guard !plan.assignments.isEmpty else {
@@ -1103,9 +1107,11 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
         // First engine work for any newly-admitted row ends its admission lease
-        // permanently and arms the prefill progress lease. Idempotent for rows
-        // already running (a preempted requeue never re-arms admission).
-        markAdmitted(plan, now: stepNow)
+        // permanently and arms the prefill progress lease; a RE-admitted row
+        // gets a fresh progress window (its demotion-time window may have
+        // expired during the stall-exempt queue wait). Idempotent for
+        // continuing rows (a preempted requeue never re-arms admission).
+        markAdmitted(plan, now: stepNow, readmittedFrom: waitingBeforePlan)
         // MTP round steps (1+k verify assignments and/or seed decodes)
         // branch BEFORE executeMixed — its rec.tokens slicing and samples
         // predicate are structurally wrong for speculative tokens.
@@ -1933,13 +1939,29 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
     }
 
-    /// End the admission lease for every row that began engine work this step.
-    /// Idempotent; a preempted requeue never re-arms admission.
-    private func markAdmitted(_ plan: CBv2StepPlan, now: ContinuousClock.Instant) {
+    /// End the admission lease for every row that began engine work this step,
+    /// and grant a fresh progress window to RE-admitted rows (already-admitted
+    /// rows crossing waiting→running again after preemption / capacity
+    /// requeue): their demotion-time window kept ticking through the
+    /// stall-exempt queue wait and may be pre-expired (PR#82 review).
+    /// `waitingBefore` is the waiting set snapshotted BEFORE plan() — only
+    /// rows that crossed out of it this step qualify; continuing running rows
+    /// must NOT refresh here or genuine decode stalls would be masked
+    /// (plan.assignments lists every scheduled row each step, not just
+    /// admissions). Idempotent; a preempted requeue never re-arms admission.
+    private func markAdmitted(
+        _ plan: CBv2StepPlan, now: ContinuousClock.Instant,
+        readmittedFrom waitingBefore: Set<CBv2RequestID>
+    ) {
         for (id, _) in plan.assignments {
-            guard var lease = leasesByID[id], !lease.isAdmitted else { continue }
-            lease.markAdmitted(now: now)
-            leasesByID[id] = lease
+            guard var lease = leasesByID[id] else { continue }
+            if !lease.isAdmitted {
+                lease.markAdmitted(now: now)
+                leasesByID[id] = lease
+            } else if waitingBefore.contains(id) {
+                lease.markReadmitted(now: now)
+                leasesByID[id] = lease
+            }
         }
     }
 
