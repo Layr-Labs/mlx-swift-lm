@@ -883,12 +883,6 @@ extension TinyTestModel: CBv2MultimodalSteppableModel {
     }
 }
 
-/// Opt the fixture model into compiled [B, 1] decode: its v2 forward drives
-/// the layer caches purely through the contract surface, so EngineV2 tests
-/// exercise the compiled path with the default configuration (eager
-/// fallback still covers mock backends whose rows are not contiguous).
-extension TinyTestModel: CBv2CompiledSteppableModel {}
-
 // MARK: - v2 harness engine (test-local greedy step loop)
 
 /// Minimal deterministic v2 driver: per-request chunked prefill ([1, chunk]),
