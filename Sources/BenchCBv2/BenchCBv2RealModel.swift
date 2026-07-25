@@ -18,6 +18,9 @@
 //                      no-chunking — token-exact identical.
 //   perf: B ∈ {1,2,4} with mixed prompt lengths (~100/~500/~1500),
 //     maxTokens 128, engines legacy / v2 (contiguous) / v2-paged.
+//     --prompt-lengths replaces the mix (cycled to the batch width) and
+//     resizes the paged pool's nominalMaxSequenceLength to match, so prompts
+//     far above the default 1500 cap are measurable.
 //     Compiled decode for the legacy engine is a process-wide switch
 //     (DARKBLOOM_COMPILED_DECODE, static let) — run separate processes to
 //     compare compiled vs plain legacy.
@@ -25,7 +28,8 @@
 // Usage:
 //   swift run -c release BenchCBv2 --model <dir> [--mode all|correctness|perf]
 //       [--engines legacy,v2,v2-paged] [--batches 1,2,4] [--steps 128]
-//       [--label tag] [--out report.md]
+//       [--prompt-lengths 500,10000] [--max-seq-len N] [--label tag]
+//       [--out report.md]
 
 import Foundation
 import MLX
@@ -99,6 +103,13 @@ func v2Hooks(for model: any LanguageModel) -> V2ModelHooks? {
 /// Compiled-decode KV capacity override (--kv-capacity), 0 = default 4096.
 nonisolated(unsafe) var benchCompiledKVCapacity = 4096
 
+/// Paged-pool sizing for the perf cells: `--max-seq-len`, else derived from
+/// the longest requested prompt. It only splits pool capacity across layer
+/// groups by per-sequence demand — not a hard ceiling — but sizing it below
+/// the real prompt length starves the full-attention group while the windowed
+/// groups keep their full ring. 4096 is the historical default.
+nonisolated(unsafe) var benchPagedNominalMaxSequenceLength = 4096
+
 enum V2Backend: String {
     case contiguous = "v2"
     case paged = "v2-paged"
@@ -134,7 +145,7 @@ func makeV2Engine(
             config: PagedKVPoolConfig(
                 capacityBytes: kvBytes,
                 maxPrefillChunk: schedulerConfig.prefillChunkSize,
-                nominalMaxSequenceLength: 4096))
+                nominalMaxSequenceLength: benchPagedNominalMaxSequenceLength))
         let pagedCaches = paged.makeLayerCaches()
         // Route through newCacheV2 so GPT-OSS primes its sinks probe.
         caches = try hooks.buildCaches { index, _ in pagedCaches[index] }
@@ -290,13 +301,22 @@ func summarize(engine: String, batch: Int, promptMix: [Int], results: [RunResult
         perRequest: perRequest)
 }
 
-func promptMix(batch: Int) -> [Int] {
-    switch batch {
-    case 1: return [500]
-    case 2: return [100, 1500]
-    case 4: return [100, 500, 1500, 500]
-    default: return Array(repeating: 500, count: batch)
+/// Prompt-length mix for one perf cell. The default mixes are the historical
+/// hardcoded ones — unchanged so existing reports stay reproducible.
+/// `lengths` (from `--prompt-lengths`) replaces them and is cycled to exactly
+/// `batch` entries, keeping the batch axis (concurrency) independent of the
+/// length axis.
+func promptMix(batch: Int, lengths: [Int] = []) -> [Int] {
+    guard !lengths.isEmpty else {
+        switch batch {
+        case 1: return [500]
+        case 2: return [100, 1500]
+        case 4: return [100, 500, 1500, 500]
+        default: return Array(repeating: 500, count: batch)
+        }
     }
+    guard batch > 0 else { return [] }
+    return (0 ..< batch).map { lengths[$0 % lengths.count] }
 }
 
 func runV2Cell(
@@ -734,6 +754,44 @@ func sysctlString(_ name: String) -> String {
     return String(decoding: buffer.prefix(while: { $0 != 0 }), as: UTF8.self)
 }
 
+/// Best-effort `git` capture in `directory`. Returns nil when git is missing,
+/// the command fails, or the output is empty — a bench report must never fail
+/// over provenance.
+func gitOutput(_ arguments: [String], in directory: String) -> String? {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    process.arguments = ["git", "-C", directory] + arguments
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else { return nil }
+    let text = String(decoding: data, as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return text.isEmpty ? nil : text
+}
+
+/// Short git SHA of the mlx-swift-lm checkout this binary was built from,
+/// suffixed `-dirty` when tracked files are modified. Stamped into the report
+/// header so a number traces back to an exact tree. `#filePath` is
+/// `<root>/Sources/BenchCBv2/BenchCBv2RealModel.swift`, so three parent hops
+/// reach the repository root. A clean tree makes `status --porcelain` empty,
+/// which `gitOutput` reports as nil.
+func submoduleGitSHA(sourceFile: String = #filePath) -> String {
+    let root = URL(fileURLWithPath: sourceFile)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .path
+    guard let sha = gitOutput(["rev-parse", "--short", "HEAD"], in: root) else {
+        return "unknown"
+    }
+    return gitOutput(["status", "--porcelain", "-uno"], in: root) == nil
+        ? sha : "\(sha)-dirty"
+}
+
 /// 1-minute load average — stamped into the report header so a benchmark
 /// taken on a contended host is visibly suspect. A busy host (parallel
 /// swift build, a serving provider) halves eager decode TPS and skews
@@ -787,6 +845,8 @@ struct BenchCBv2RealModel {
         var label = ""
         var outPath: String?
         var kvBytes = 16 << 30
+        var promptLengths: [Int] = []
+        var maxSeqLen: Int?
 
         var args = Array(CommandLine.arguments.dropFirst())
         while !args.isEmpty {
@@ -800,6 +860,14 @@ struct BenchCBv2RealModel {
             case "--batches":
                 batches = args.isEmpty
                     ? batches : args.removeFirst().split(separator: ",").compactMap { Int($0) }
+            case "--prompt-lengths":
+                promptLengths = args.isEmpty
+                    ? promptLengths
+                    : args.removeFirst().split(separator: ",")
+                        .compactMap { Int($0) }.filter { $0 > 0 }
+            case "--max-seq-len":
+                maxSeqLen = args.isEmpty
+                    ? maxSeqLen : Int(args.removeFirst()).flatMap { $0 > 0 ? $0 : nil }
             case "--steps": steps = args.isEmpty ? steps : Int(args.removeFirst()) ?? steps
             case "--label": label = args.isEmpty ? label : args.removeFirst()
             case "--kv-gb":
@@ -813,6 +881,7 @@ struct BenchCBv2RealModel {
                 print("usage: BenchCBv2 --model <dir> [--mode all|correctness|perf]")
                 print("       [--engines v2,v2-compiled,v2-paged] [--batches 1,2,4]")
                 print("       [--steps N] [--label tag] [--kv-gb N] [--out report.md]")
+                print("       [--prompt-lengths 500,10000] [--max-seq-len N]")
                 exit(64)
             }
         }
@@ -826,10 +895,23 @@ struct BenchCBv2RealModel {
             exit(66)
         }
 
+        // Paged pool sizing: `nominalMaxSequenceLength` splits pool capacity
+        // across layer groups by per-sequence demand, so a 10k prompt against a
+        // 4096 nominal starves the full-attention group. Derive it from the
+        // longest cell (prompt + generated tokens) and never dip below the
+        // historical 4096, so a run with no new flags sizes the pool as before.
+        let longestPrompt = batches
+            .map { promptMix(batch: $0, lengths: promptLengths).max() ?? 0 }
+            .max() ?? 0
+        benchPagedNominalMaxSequenceLength = maxSeqLen ?? max(4096, longestPrompt + steps)
+
         let contention = hostContentionSummary()
         print("== BenchCBv2RealModel ==")
         print("model: \(modelPath)")
         print("mode: \(mode)  engines: \(engines)  batches: \(batches)  steps: \(steps)")
+        print("prompt lengths: "
+            + (promptLengths.isEmpty ? "default mix" : promptLengths.description)
+            + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
         print("host: \(contention.line)")
         if contention.contended {
             print("WARNING: host is contended — eager decode is CPU-bound, results will be skewed")
@@ -846,6 +928,7 @@ struct BenchCBv2RealModel {
 
             let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy) =
                 (mode, engines, batches, steps, kvBytes)
+            let promptLengthsCopy = promptLengths
             let report: String = try await container.perform {
                 (context: ModelContext) async throws -> String in
                 var out = ""
@@ -953,7 +1036,7 @@ struct BenchCBv2RealModel {
                         }
 
                         for batch in batchesCopy {
-                            let mix = promptMix(batch: batch)
+                            let mix = promptMix(batch: batch, lengths: promptLengthsCopy)
                             let cell: CellResult
                             switch engineName {
                             case "v2":
@@ -992,6 +1075,14 @@ struct BenchCBv2RealModel {
 
             let ram = ProcessInfo.processInfo.physicalMemory / (1 << 30)
             let os = ProcessInfo.processInfo.operatingSystemVersionString
+            // Provenance: the exact argv and submodule tree behind these
+            // numbers. A literal `|` would break the markdown table.
+            let invocation = CommandLine.arguments
+                .joined(separator: " ")
+                .replacingOccurrences(of: "|", with: "\\|")
+            let promptAxis = promptLengths.isEmpty
+                ? "default mix (B=1 500; B=2 100,1500; B=4 100,500,1500,500; else 500 x B)"
+                : promptLengths.map(String.init).joined(separator: ",")
             let header = """
                 # BenchCBv2RealModel report
 
@@ -1002,6 +1093,10 @@ struct BenchCBv2RealModel {
                 | RAM | \(ram) GB |
                 | OS | \(os) |
                 | Host at start | \(contention.line) |
+                | Invocation | `\(invocation)` |
+                | Prompt lengths | \(promptAxis) |
+                | Paged nominalMaxSeqLen | \(benchPagedNominalMaxSequenceLength) |
+                | mlx-swift-lm | \(submoduleGitSHA()) |
                 | Date | \(ISO8601DateFormatter().string(from: Date())) |
 
 
