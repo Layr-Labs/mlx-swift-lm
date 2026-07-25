@@ -197,7 +197,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // writes the tiles IN PLACE before attending (fused write —
             // the slabs are never versioned through MLX ops).
             let targets = pagedRows.map { $0.prepareDecodeWrite() }
-            retainedPrefillKV = nil
+            retainedPrefillKV = []
             output = dispatchDecode(
                 queries: queries,
                 newKeys: keys.squeezed(axis: 2),
@@ -209,17 +209,27 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // weight-bound model body across the `1 + k` columns, but
             // attention is serialised per column. Each column reserves its
             // own destination and the kernel fuses the write, exactly as a
-            // standalone decode step would, so `b > 1` is fine here — the
-            // `b == 1` precondition below is about PREFILL chunks, which
-            // this is not.
-            retainedPrefillKV = nil
+            // standalone decode step would. This branch is checked BEFORE
+            // the prompt-chunk branch: an MTP round's `[B, 1 + k]` call is
+            // rectangular VERIFICATION, never a packed prompt chunk.
+            retainedPrefillKV = []
             output = attendRectangularColumns(
                 queries: queries, keys: keys, values: values,
                 rows: pagedRows, scale: scale, sinks: effectiveSinks)
         } else {
-            precondition(b == 1, "prefill chunks are per-request [1, chunk]")
-            let row = pagedRows[0]
-            // WS-1.2: assemble the chunk's KV BEFORE writing it, so this
+            precondition(
+                boundSpanContext == nil || b == 1,
+                "[PagedLayerCache] span-bearing chunks are never packed")
+            // Prompt chunk. `b == 1` is the ordinary per-request shape;
+            // `b > 1` is WS-2.1 PACKED prefill, which is the SAME work run
+            // once per row. Nothing here reads a batchmate: the gather
+            // walks THIS row's page table, the write lands in THIS row's
+            // pages, and the mask is built from THIS row's absolute
+            // positions. That is why a packed row is bit-identical to the
+            // row run alone, and why cross-row contamination is not a
+            // property the mask has to establish.
+            //
+            // WS-1.2: assemble each chunk's KV BEFORE writing it, so this
             // path only ever asks the ring for `window - 1` tokens. The
             // chunk's own K/V need no gather at all — they are the
             // arguments.
@@ -235,17 +245,35 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // post-write gather is not merely wasteful, it aborts the
             // process on `gatherRange`'s eviction precondition for any
             // windowed chunk past `pageSize + 1` tokens.
-            let kv = prefillKV(
-                row: row, chunkKeys: keys, chunkValues: values, dtype: queries.dtype)
-            row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
-            retainedPrefillKV = retainsChunkForBorrowers ? kv : nil
-            output = prefillAttend(
-                queries: queries, kv: kv, scale: scale, sinks: effectiveSinks)
+            //
+            // The batch-axis decomposition is `CBv2AttentionV1.packedPerRow`,
+            // shared with the contiguous backend so "packed" cannot mean two
+            // different things depending on storage. Only the per-row BODY
+            // is paged's own, and it has to be: contiguous updates the row
+            // and masks in relative coordinates, this gathers pages before
+            // writing and masks in absolute ones.
+            var views: [PrefillKV] = []
+            views.reserveCapacity(b)
+            output = CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
+                let row = pagedRows[index]
+                let rowKeys = slice(keys)
+                let rowValues = slice(values)
+                let kv = prefillKV(
+                    row: row, chunkKeys: rowKeys, chunkValues: rowValues,
+                    dtype: queries.dtype)
+                row.write(
+                    keys: rowKeys.squeezed(axis: 0), values: rowValues.squeezed(axis: 0))
+                views.append(kv)
+                return prefillAttend(
+                    queries: slice(queries), kv: kv, scale: scale, sinks: effectiveSinks)
+            }
+            retainedPrefillKV = retainsChunkForBorrowers ? views : []
         }
         // Advance offsets ON-DEVICE (uniform L for every row in the call:
-        // decode is [B,1], prefill is [1,chunk]) — the rows just advanced
-        // their absolute counters by exactly L, so the cached device array
-        // tracks them without a per-step host rebuild.
+        // decode is [B,1], a prompt chunk is [1,chunk], and a packed group
+        // is [B,chunk] with one common chunk length) — the rows just
+        // advanced their absolute counters by exactly L, so the cached
+        // device array tracks them without a per-step host rebuild.
         cachedPositionOffsets = cachedPositionOffsets + Int32(l)
         return output
     }
@@ -280,25 +308,34 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 rows: src.pagedRows, scale: scale, sinks: effectiveSinks,
                 tableProvider: src)
         } else {
-            precondition(queries.dim(0) == 1 && src.pagedRows.count == 1)
+            let b = queries.dim(0)
+            precondition(
+                b == src.pagedRows.count,
+                "borrowed chunk batch \(b) != source rows \(src.pagedRows.count)")
             // The source assembled `gather(window history) ++ chunk` before
             // it wrote, and the post-write ring cannot reproduce the older
             // part of it (WS-1.2), so the borrower attends the SOURCE's
-            // retained view rather than re-gathering. `retainsChunkForBorrowers`
-            // is only ever cleared for a layer no sibling borrows from, so
-            // reaching this with an empty view means the bank wired the
-            // KV-sharing graph wrong.
-            guard let kv = src.retainedPrefillKV else {
+            // retained views rather than re-gathering — one per packed row,
+            // in row order. `retainsChunkForBorrowers` is only ever cleared
+            // for a layer no sibling borrows from, so reaching this with no
+            // retained views means the bank wired the KV-sharing graph
+            // wrong.
+            guard src.retainedPrefillKV.count == b else {
                 fatalError(
                     "[PagedLayerCache] layer \(layerIndex) borrows from layer "
-                        + "\(src.layerIndex), which retained no chunk view — the source was "
-                        + "told it has no borrowers, or it last ran a decode step")
+                        + "\(src.layerIndex), which retained \(src.retainedPrefillKV.count) "
+                        + "chunk views for \(b) rows — the source was told it has no "
+                        + "borrowers, or it last ran a decode step")
             }
-            precondition(
-                kv.queryCount == queries.dim(2),
-                "borrowed chunk is \(kv.queryCount) tokens, queries are \(queries.dim(2))")
-            return prefillAttend(
-                queries: queries, kv: kv, scale: scale, sinks: effectiveSinks)
+            // Same shared batch-axis decomposition as the owning path.
+            return CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
+                let kv = src.retainedPrefillKV[index]
+                precondition(
+                    kv.queryCount == l,
+                    "borrowed chunk is \(kv.queryCount) tokens, queries are \(l)")
+                return prefillAttend(
+                    queries: slice(queries), kv: kv, scale: scale, sinks: effectiveSinks)
+            }
         }
     }
 
@@ -623,7 +660,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let kpos = MLXArray(Int32(kStart) ..< Int32(kStart + keyCount)).expandedDimensions(
             axis: 0)
 
-        guard CBv2AttentionV1.shouldBlockQueries(l) else {
+        // Span-bearing vision chunks (WS-2.2) keep the SINGLE unblocked
+        // call. A block's key slice ends at the LATEST query's own position,
+        // which is exactly the causal bound a bidirectional span is there to
+        // escape: an image query must be able to attend keys AFTER itself
+        // inside its own block, and those columns are not in the slice.
+        // The overlay itself lives in `attendQueryBlock`, so the mask stays
+        // defined in one place either way.
+        guard boundSpanContext == nil, CBv2AttentionV1.shouldBlockQueries(l) else {
             return attendQueryBlock(
                 queries: queries, keys: k, values: v,
                 qpos: qpos, kpos: kpos, scale: scale, sinks: sinks)
@@ -678,6 +722,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// values the unblocked call would have produced for those rows and
     /// columns — the pinned `.array` representation never varies with the
     /// block size, and neither does the softcap path's.
+    ///
+    /// A bound span context (WS-2.2) OR-s a bidirectional-within-block
+    /// overlay onto that base, matching MLXVLM Gemma4's
+    /// `gemma4BidirectionalVisionMask` (`baseMask ∨ sameBlock`) and
+    /// `CBv2AttentionV1.spanChunkMask` term for term. This is where paged
+    /// composes MORE directly than contiguous: contiguous builds its base in
+    /// RELATIVE coordinates (`boolMask(L:kL:window:)`) and has to
+    /// reconstruct absolute `qAbs`/`kAbs` from `context.chunkEnd` to place
+    /// the blocks; `qpos`/`kpos` are already absolute here, so the block
+    /// bounds are compared directly against them and the two coordinate
+    /// systems cannot drift apart.
     private func attendQueryBlock(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         qpos: MLXArray, kpos: MLXArray, scale: Float, sinks: MLXArray?
@@ -685,6 +740,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var mask = kpos .<= qpos
         if case .slidingWindow(let window) = kind.attention {
             mask = mask & (kpos .> (qpos - Int32(window)))
+        }
+        if let spans = boundSpanContext {
+            for block in spans.blocks {
+                let lo = Int32(block.tokenOffset)
+                let hi = Int32(block.end)
+                let qIn = (qpos .>= lo) .&& (qpos .< hi)  // [q, 1]
+                let kIn = (kpos .>= lo) .&& (kpos .< hi)  // [1, kL]
+                mask = mask .|| (qIn .&& kIn)
+            }
         }
 
         if let softcap = attentionSoftcap {
@@ -790,6 +854,38 @@ extension PagedLayerCache: CBv2MTPRectangularSerializing {}
 extension PagedLayerCache: CBv2KVSourceChunkRetaining {
     public func setRetainsChunkForBorrowers(_ retains: Bool) {
         retainsChunkForBorrowers = retains
-        if !retains { retainedPrefillKV = nil }
+        if !retains { retainedPrefillKV = [] }
     }
+}
+
+// MARK: - Packed prefill (WS-2.1)
+
+/// The affirmative claim `CBv2LayerCacheBank.supportsPackedPrefill` reads.
+///
+/// `updateAndAttend`'s prompt-chunk branch loops over the bound rows and
+/// runs each one through the SAME `prefillKV` / `row.write` / `prefillAttend`
+/// sequence a `[1, chunk]` call runs, then concatenates on the batch axis.
+/// No tensor in that sequence spans two rows: the gather walks one row's
+/// page table, the write lands in one row's pages, and the mask is built
+/// from one row's absolute positions. A packed row is therefore
+/// bit-identical to that row run alone, which is what this claim asserts.
+extension PagedLayerCache: CBv2PackedPrefillCapableCache {
+    public var keepsRowsIndependentWhenPacked: Bool { true }
+}
+
+// MARK: - Vision span masks (WS-2.2)
+
+/// The affirmative claim `CBv2LayerCacheBank.supportsMultimodalSpans` reads,
+/// plus the binding it refines.
+///
+/// The bound context reaches the mask: `prefillAttend` forces the single
+/// unblocked call while it is set, and `attendQueryBlock` OR-s the
+/// bidirectional-within-block overlay onto the absolute-coordinate base
+/// mask. Both are exercised by `CBv2PagedPackedSpanTests`.
+extension PagedLayerCache: CBv2MultimodalSpanCapableCache {
+    public func bindSpanContext(_ context: CBv2SpanChunkContext?) {
+        boundSpanContext = context
+    }
+
+    public var honorsSpanMaskContexts: Bool { true }
 }

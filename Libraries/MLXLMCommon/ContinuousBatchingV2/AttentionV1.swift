@@ -148,27 +148,50 @@ enum CBv2AttentionV1 {
         // takes the SAME per-row path a [1, L] prefill chunk takes today —
         // one pinned attention path per (model, phase); the loop reuses it,
         // it does not invent a new one. Each row attends exactly its own KV.
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(B)
-        for (index, row) in rows.enumerated() {
+        return packedPerRow(batch: B) { index, slice in
             if serializeQueries {
-                outputs.append(
-                    updateAndAttendRowSerialQueries(
-                        row: row, kind: kind,
-                        queries: queries[index ..< (index + 1)],
-                        keys: keys[index ..< (index + 1)],
-                        values: values[index ..< (index + 1)],
-                        scale: scale, sinks: effectiveSinks, softcap: softcap))
-            } else {
-                outputs.append(
-                    updateAndAttendRow(
-                    row: row, kind: kind,
-                    queries: queries[index ..< (index + 1)],
-                    keys: keys[index ..< (index + 1)],
-                    values: values[index ..< (index + 1)],
-                    scale: scale, sinks: effectiveSinks, softcap: softcap,
-                    spanContext: nil))
+                return updateAndAttendRowSerialQueries(
+                    row: rows[index], kind: kind,
+                    queries: slice(queries), keys: slice(keys), values: slice(values),
+                    scale: scale, sinks: effectiveSinks, softcap: softcap)
             }
+            return updateAndAttendRow(
+                row: rows[index], kind: kind,
+                queries: slice(queries), keys: slice(keys), values: slice(values),
+                scale: scale, sinks: effectiveSinks, softcap: softcap,
+                spanContext: nil)
+        }
+    }
+
+    /// The batch-axis decomposition of a PACKED `[B, ...]` prompt pass —
+    /// the one definition both backends share, so "packed" cannot come to
+    /// mean two different things depending on storage.
+    ///
+    /// Row `index` sees the `index`-th batch slice of every tensor and
+    /// nothing else; the per-row results are rejoined on axis 0 in row
+    /// order. What is deliberately NOT shared is the body: the contiguous
+    /// per-row path updates the row and masks in RELATIVE coordinates
+    /// (`maskMode`, which may return symbolic `.causal`), while the paged
+    /// one gathers pages before writing and masks in ABSOLUTE ones (always
+    /// `.array` — MLX #3384). Those are genuinely different computations
+    /// over genuinely different storage; forcing one body on both would
+    /// break the paged file's pinned mask contract. The decomposition is
+    /// the part that must not drift, so the decomposition is what is
+    /// factored out.
+    ///
+    /// `batch == 1` passes the caller's tensors through UNSLICED and skips
+    /// the concatenate, so a singleton call is provably the same graph it
+    /// was before packing existed.
+    @inline(__always)
+    static func packedPerRow(
+        batch: Int, _ row: (_ index: Int, _ slice: (MLXArray) -> MLXArray) -> MLXArray
+    ) -> MLXArray {
+        precondition(batch >= 1, "CBv2AttentionV1: packed batch must be >= 1")
+        if batch == 1 { return row(0, { $0 }) }
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(batch)
+        for index in 0 ..< batch {
+            outputs.append(row(index, { $0[index ..< (index + 1)] }))
         }
         return concatenated(outputs, axis: 0)
     }

@@ -466,19 +466,87 @@ struct CBv2PagedQueryBlockingTests {
         assertIdentical(got, concatenated(wantColumns, axis: 2))
     }
 
-    /// Clearing the flag restores the ordinary prefill guard: a rectangular
-    /// prompt chunk is still refused, because packed prefill is a separate
-    /// item that lands after WS-0.2p.
-    @Test func clearedFlagKeepsPrefillPerRequest() throws {
+    /// The FLAG is the router, and clearing it must route a rectangular
+    /// `[B, L > 1]` call to the PROMPT-CHUNK path — not to the per-column
+    /// decode path, and (since WS-2.1) not to a trap either.
+    ///
+    /// History, because this test changed shape rather than meaning. It used
+    /// to assert `!bank.supportsPackedPrefill`, and its doc claimed that
+    /// pinned "a rectangular prompt chunk is still refused" — but it never
+    /// issued one, or called `updateAndAttend` at all. The closed capability
+    /// gate was a PROXY: while `PagedLayerCache` had a `precondition(b == 1)`
+    /// on the prompt branch, the only thing keeping the engine from tripping
+    /// it was the bank refusing to vouch. The invariant actually being
+    /// defended was "the cache must not claim a capability it does not
+    /// implement". That invariant is unchanged; paged now implements packed
+    /// prefill, so the claim flips WITH the implementation, and the routing
+    /// the doc always described is asserted directly here for the first
+    /// time. Bit-identity of a packed row against the same row run alone —
+    /// what makes the claim TRUE rather than merely asserted — is covered by
+    /// `CBv2PagedPackedSpanTests.packedPrefillIsBitIdenticalToUnpackedPerRow`
+    /// and `.packedPrefillHonoursPerRowOffsetsOnSlidingWindow`.
+    @Test func clearedFlagRoutesRectangularCallsToPackedPrefill() throws {
         let layer = kind(window: nil)
+        let chunk = 12
+        let batch = 2
+        let dtype = DType.float16
         let backend = try PagedKVBackend(
-            layerKinds: [layer], config: config(maxPrefillChunk: 16, dtype: .float16))
-        let cache = backend.makeLayerCaches()[0]
-        #expect(!cache.mtpSerializesRectangularAttention)
-        let bank = CBv2LayerCacheBank(caches: [cache])
+            layerKinds: [layer], config: config(maxPrefillChunk: 16, dtype: dtype))
+
+        func makeRows() throws -> ([CBv2SequenceKV?], [PagedSequenceKV]) {
+            var states: [CBv2SequenceKV?] = []
+            var rows: [PagedSequenceKV] = []
+            for _ in 0 ..< batch {
+                let state = try backend.makeSequenceState(
+                    layerKinds: [layer], promptLength: chunk, maxLength: 64)
+                states.append(state[0])
+                rows.append(try #require(state[0] as? PagedSequenceKV))
+            }
+            return (states, rows)
+        }
+        let (promptStates, promptRows) = try makeRows()
+        let (columnStates, columnRows) = try makeRows()
+        defer {
+            backend.release(promptStates)
+            backend.release(columnStates)
+        }
+
+        let queries = MLXRandom.normal([batch, queryHeads, chunk, headDim], dtype: dtype)
+        let (ck, cv) = codedKV(0 ..< chunk, dtype: dtype)
+        let keys = stacked([MLXArray](repeating: ck, count: batch), axis: 0)
+        let values = stacked([MLXArray](repeating: cv, count: batch), axis: 0)
+
+        // Flag CLEARED: the prompt-chunk path. It attends gathered pages
+        // through SDPA and never builds a device block table, because only
+        // `dispatchDecode` needs one.
+        let prompt = backend.makeLayerCaches()[0]
+        #expect(!prompt.mtpSerializesRectangularAttention, "off by default")
+        prompt.setRows(promptRows)
+        _ = prompt.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
         #expect(
-            !bank.supportsPackedPrefill,
-            "the paged cache makes no packed-prefill claim, so the bank must not vouch")
+            prompt.tablesRebuildCount == 0,
+            "the prompt-chunk path must not touch the decode kernel's block tables")
+
+        // Flag SET, same shape: the per-column decode path, which does.
+        let columns = backend.makeLayerCaches()[0]
+        columns.setRows(columnRows)
+        columns.mtpSerializesRectangularAttention = true
+        _ = columns.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        columns.mtpSerializesRectangularAttention = false
+        #expect(
+            columns.tablesRebuildCount > 0,
+            "premise: the per-column path DOES build block tables, so the check above discriminates the two routes rather than being vacuous")
+
+        // Both routes advanced every row by the full chunk.
+        #expect(promptRows.allSatisfy { $0.absoluteOffset == chunk })
+        #expect(columnRows.allSatisfy { $0.absoluteOffset == chunk })
+
+        // And the capability claim now matches the implementation.
+        #expect(
+            CBv2LayerCacheBank(caches: [prompt]).supportsPackedPrefill,
+            "paged implements packed prefill, so the bank must vouch")
     }
 }
 
