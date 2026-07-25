@@ -24,6 +24,21 @@
 // pages materialize lazily as tokens are written (`bytesInUse` stays
 // truthful); `CBv2SequenceKV.update` therefore never fails mid-decode. See
 // PagedKVPool.swift for the rationale.
+//
+// Prefix adoption (WS-4.1): paged serves `.direct`, `.tailReplay` and BOTH
+// forms of `.frozenFullReplay` — the dual-cursor replay, and the zero-replay
+// restore that arrives once a window payload exists. See
+// `makeSequenceState(adopting:plan:layerKinds:maxLength:)` for the three
+// shapes. Two properties of that path are load-bearing and easy to lose:
+//
+//   * a refusal is a THROW, never a trap. The engine's only recovery is a
+//     cold prefill, and it can only take it if the adoption reports failure
+//     instead of aborting the daemon;
+//   * validation of EVERY layer completes before the first page is reserved.
+//     A frozen-full hit whose sliding side cannot be completed must leave the
+//     pool exactly as it found it, because a half-restored hybrid does not
+//     fail loudly — the sliding rows simply attend fewer keys than they
+//     should, and nothing downstream can see it.
 
 import Foundation
 import MLX
@@ -33,8 +48,24 @@ public final class PagedKVBackend: CBv2KVBackend {
     public let pool: PagedKVPool
     /// The model's per-layer structure this backend was built for.
     public let layerKinds: [CBv2LayerKind]
+    /// WHEN this backend's slabs become MLX-resident. See
+    /// PagedKVSlabCommitment.swift — the default defers the commitment past
+    /// engine construction so an idle pool does not pre-empt a co-resident
+    /// model's post-load headroom measurement (D1).
+    public let slabCommitment: PagedKVSlabCommitment
+    /// True once the slabs have actually been evaluated. Flipped exactly
+    /// once, on the engine loop thread, by `commitSlabs()`.
+    private(set) var slabsAreWired = false
+    /// The only writer of `slabsAreWired`; `private(set)` keeps the flag out
+    /// of reach of everything except `commitSlabs()`, which lives in the
+    /// other file.
+    func markSlabsWired() { slabsAreWired = true }
 
-    public init(layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig) throws {
+    public init(
+        layerKinds: [CBv2LayerKind],
+        config: PagedKVPoolConfig,
+        slabCommitment: PagedKVSlabCommitment = .atFirstAdmission
+    ) throws {
         for (index, kind) in layerKinds.enumerated() {
             if let source = kind.sharesKVWithLayer {
                 guard source >= 0, source < layerKinds.count,
@@ -73,7 +104,11 @@ public final class PagedKVBackend: CBv2KVBackend {
             }
         }
         self.layerKinds = layerKinds
+        self.slabCommitment = slabCommitment
         self.pool = try PagedKVPool(layerKinds: layerKinds, config: config)
+        if slabCommitment == .atConstruction {
+            commitSlabs()
+        }
     }
 
     // MARK: - Admission-time reservation (Codex P2)
@@ -93,6 +128,12 @@ public final class PagedKVBackend: CBv2KVBackend {
     public func reserve(layerKinds: [CBv2LayerKind], maxLength: Int) throws {
         precondition(maxLength > 0)
         try pool.reserve(pageNeeds(layerKinds: layerKinds, maxLength: maxLength))
+        // The charge succeeded, so this pool is no longer idle. Wire the
+        // slabs NOW — before any row can reach `ensurePage` — so a deferred
+        // commitment never turns an accepted admission into an unbacked
+        // page. Deferring the ALLOCATION is the D1 fix; deferring the
+        // GUARANTEE would be a daemon abort under load.
+        commitSlabs()
     }
 
     /// Release an admission-time `reserve` that never reached
@@ -123,6 +164,10 @@ public final class PagedKVBackend: CBv2KVBackend {
         if !reserved {
             try pool.reserve(needs)
         }
+        // Same guarantee as `reserve`: every page this row may touch is
+        // backed before the row exists. Idempotent and free after the first
+        // admission.
+        commitSlabs()
         var states: [CBv2SequenceKV?] = []
         states.reserveCapacity(layerKinds.count)
         for kind in layerKinds {
@@ -139,11 +184,36 @@ public final class PagedKVBackend: CBv2KVBackend {
         return states
     }
 
-    /// Adopt a donated prefix for direct or ordinary tail replay. Snapshots
-    /// are written into fresh pages via the in-place bulk-write kernel.
-    /// Frozen-full hybrid replay is explicitly rejected: paged rows currently
-    /// expose one mutable cursor and do not yet implement immutable M plus a
-    /// logical replay cursor C.
+    /// Adopt a donated prefix. Snapshots are written into fresh pages via the
+    /// in-place bulk-write kernel.
+    ///
+    /// Three shapes, one entry point:
+    ///
+    ///  * `.direct` / `.tailReplay` — owning full rows restored to C, windowed
+    ///    rows fast-forwarded to C and left empty, engine replays `[C, M)`.
+    ///    Both cursors are C, which is why paged has always served these.
+    ///  * `.frozenFullReplay` with R == 0 (`requiresExactWindowRestore`) —
+    ///    owning full rows restored to M and EVERY owning windowed row
+    ///    restored to M from an admissible `CBv2PagedWindowSnapshot`. Both
+    ///    cursors are M and there is nothing to replay, which is the form
+    ///    `PagedSeamContract` describes as making
+    ///    `pagedHybridRequiresDualCursor` evaporate rather than solving it.
+    ///  * `.frozenFullReplay` with R > 0 — owning full rows adopted FROZEN
+    ///    through M via `PagedSequenceKV.adoptFrozen`, so their storage is
+    ///    exact and immutable while the logical cursor reports C; windowed
+    ///    rows fast-forwarded to C and left empty; engine replays `[C, M)`.
+    ///    This is the genuine dual cursor, and it is the form the engine
+    ///    actually produces today — `PrefixCacheV2` nils every windowed layer,
+    ///    so no window payload reaches the restore form yet.
+    ///
+    /// EVERY refusal is a thrown `backendIneligible`, never a trap and never a
+    /// partial install. `EngineLoopV2.applyAdoption` catches it, unreserves the
+    /// admission charge and the request cold-prefills — which is the only safe
+    /// answer, because a frozen-full hit that restores the full layers but
+    /// cannot complete the sliding side leaves windows that are SHORT rather
+    /// than absent: attention silently ignores the missing oldest entries and
+    /// no later replay can recover them. Validation therefore completes for
+    /// every layer BEFORE a single page is reserved.
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         plan: CBv2PrefixReusePlan,
@@ -153,11 +223,20 @@ public final class PagedKVBackend: CBv2KVBackend {
             throw CBv2KVError.backendIneligible(
                 reason: "paged adoption received \(plan.backend.rawValue) prefix plan")
         }
-        guard plan.strategy != .frozenFullReplay else {
+        guard prefix.count == layerKinds.count else {
             throw CBv2KVError.backendIneligible(
-                reason: CBv2PrefixReuseUnsupportedReason.pagedHybridRequiresDualCursor.rawValue)
+                reason: "prefix count \(prefix.count) != layer count \(layerKinds.count)")
         }
-        precondition(prefix.count == layerKinds.count, "prefix/layer count mismatch")
+        guard plan.matchedBoundary > 0, plan.matchedBoundary <= maxLength,
+            plan.replayStart >= 0, plan.replayStart <= plan.matchedBoundary,
+            plan.replayTokens == plan.matchedBoundary - plan.replayStart
+        else {
+            throw CBv2KVError.backendIneligible(reason: "invalid prefix replay plan")
+        }
+        if plan.strategy == .frozenFullReplay {
+            return try makeFrozenFullState(
+                adopting: prefix, plan: plan, layerKinds: layerKinds, maxLength: maxLength)
+        }
         var matched = 0
         for (index, entry) in prefix.enumerated() {
             guard let entry else { continue }
@@ -198,6 +277,238 @@ public final class PagedKVBackend: CBv2KVBackend {
         return states
     }
 
+    // MARK: - Frozen-full hybrid adoption (WS-4.1)
+
+    /// Replay length a paged frozen-full adoption needs for the sliding rows
+    /// to come back bit-exact: the model-shape bound `cbv2RequiredRecompute`
+    /// uses, plus ONE prefill chunk.
+    ///
+    /// The extra chunk is not margin. `CBv2FrozenReplayFullSequenceKV.update`
+    /// discards the replayed projections and hands attention the CACHED keys
+    /// for the whole chunk, so on contiguous the replay is exact from the
+    /// first position whose sliding dependency cone fits inside `[C, M)`.
+    /// `PagedLayerCache.prefillKV` instead assembles
+    /// `gather([baseOffset, queryStart)) ++ chunk`, and the chunk half is the
+    /// K/V the layer was just called with — so a frozen paged row contributes
+    /// exact keys for everything before the current chunk and poisoned ones
+    /// inside it. A position is exact only once the chunk it sits in STARTS
+    /// at or after the cone frontier, which costs at most one chunk.
+    ///
+    /// `CBv2PrefixReuseCapability.derive` pays `maxWindow` for this, because
+    /// it cannot see pool config. That covers every `maxPrefillChunk <=
+    /// maxWindow`, which is every shipping config (gemma-4 is 512 against
+    /// 1,024). This function is where the assumption is actually CHECKED,
+    /// with the real chunk in hand.
+    static func requiredFrozenReplayTokens(
+        layerKinds: [CBv2LayerKind], maxPrefillChunk: Int
+    ) -> Int {
+        var maxWindow = 0
+        var windowCount = 0
+        for kind in layerKinds {
+            if case .slidingWindow(let window) = kind.attention {
+                maxWindow = max(maxWindow, window)
+                windowCount += 1
+            }
+        }
+        guard windowCount > 0 else { return 0 }
+        let (bound, boundOverflow) = windowCount.multipliedReportingOverflow(by: maxWindow)
+        guard !boundOverflow else { return Int.max }
+        let (total, totalOverflow) = bound.addingReportingOverflow(max(0, maxPrefillChunk))
+        return totalOverflow ? Int.max : total
+    }
+
+    private func makeFrozenFullState(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
+        layerKinds: [CBv2LayerKind], maxLength: Int
+    ) throws -> [CBv2SequenceKV?] {
+        let matched = plan.matchedBoundary
+        guard plan.restoredFullTokens == matched else {
+            throw CBv2KVError.backendIneligible(
+                reason: "frozen-full plan restores \(plan.restoredFullTokens) tokens but "
+                    + "matched \(matched) — full rows must be exact through M")
+        }
+        let restoringWindows = plan.requiresExactWindowRestore
+        if !restoringWindows {
+            // The dual-cursor form. Two things must hold before it is safe,
+            // and neither is visible to the planner.
+            guard plan.replayStart > 0 else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "frozen replay with C == 0 saves nothing")
+            }
+            let required = Self.requiredFrozenReplayTokens(
+                layerKinds: layerKinds, maxPrefillChunk: pool.config.maxPrefillChunk)
+            guard plan.replayTokens >= required else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "frozen replay of \(plan.replayTokens) tokens is shorter than the "
+                        + "\(required) this pool needs (chunk \(pool.config.maxPrefillChunk)) — "
+                        + "the sliding rows would come back inexact")
+            }
+        }
+
+        // --- Validate every layer BEFORE reserving a single page. A frozen
+        //     full restore that cannot complete its sliding side must leave
+        //     the pool untouched so the cold prefill can have the capacity.
+        var fullKV: [Int: (keys: MLXArray, values: MLXArray)] = [:]
+        var windows: [Int: CBv2PagedWindowSnapshot] = [:]
+        var sawOwningFull = false
+        for (index, kind) in layerKinds.enumerated() {
+            let entry = prefix[index]
+            guard kind.sharesKVWithLayer == nil else {
+                guard entry == nil else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "layer \(index) is KV-shared but received a prefix snapshot")
+                }
+                continue
+            }
+            // An owning full layer always needs its snapshot. A windowed one
+            // needs a window under the restore form and must NOT have one
+            // under the replay form, which the switch below decides.
+            let needsEntry: Bool
+            if case .slidingWindow = kind.attention {
+                needsEntry = restoringWindows
+            } else {
+                needsEntry = true
+            }
+            guard let entry else {
+                guard !needsEntry else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "frozen-full adoption at boundary \(matched): owning layer "
+                            + "\(index) has no donated KV")
+                }
+                continue
+            }
+            switch kind.attention {
+            case .full:
+                guard entry.offset == matched else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "full prefix offset \(entry.offset) != matched \(matched) at "
+                            + "layer \(index)")
+                }
+                let keys = Self.rowShaped(entry.keys)
+                let values = Self.rowShaped(entry.values)
+                guard keys.ndim == 3, values.ndim == 3,
+                    keys.dim(0) == kind.kvHeads, values.dim(0) == kind.kvHeads,
+                    keys.dim(2) == kind.headDim, values.dim(2) == kind.headDim,
+                    keys.dim(1) == matched, values.dim(1) == matched
+                else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "full prefix snapshot at layer \(index) does not exactly cover "
+                            + "[0, \(matched)) at this layer's geometry")
+                }
+                fullKV[index] = (keys, values)
+                sawOwningFull = true
+            case .slidingWindow(let window):
+                guard restoringWindows else {
+                    // The replay form recomputes windowed layers from C. A
+                    // payload here means the donor and the plan disagree
+                    // about what is being adopted; installing it would put
+                    // the row at M while every other row sits at C.
+                    throw CBv2KVError.backendIneligible(
+                        reason: "layer \(index) is windowed but received a prefix snapshot "
+                            + "under a replay plan (windowed layers are recomputed)")
+                }
+                guard entry.keys.ndim == 4,
+                    let snapshot = CBv2PagedWindowSnapshot(
+                        keys: entry.keys, values: entry.values,
+                        base: entry.offset - entry.keys.dim(2))
+                else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "windowed prefix at layer \(index) is not a well-formed "
+                            + "window snapshot")
+                }
+                // The seam's rule, not a local reimplementation of it: the
+                // payload may be installed at exactly one absolute boundary,
+                // and a short window is refused rather than partially placed.
+                do {
+                    try snapshot.requireAdmissible(at: matched, window: window)
+                } catch let refusal as CBv2PagedWindowRestoreRefusal {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "layer \(index): \(refusal.description)")
+                }
+                guard snapshot.keys.dim(1) == kind.kvHeads,
+                    snapshot.keys.dim(3) == kind.headDim,
+                    snapshot.values.dim(1) == kind.kvHeads,
+                    snapshot.values.dim(3) == kind.headDim
+                else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "windowed prefix at layer \(index) has the wrong KV geometry")
+                }
+                windows[index] = snapshot
+            }
+        }
+        guard sawOwningFull else {
+            throw CBv2KVError.backendIneligible(
+                reason: "frozen-full adoption requires at least one storage-owning full layer")
+        }
+
+        // --- Install. Everything above validated, so nothing here throws and
+        //     no half-built state can escape.
+        //
+        //     Both forms leave EVERY row on the same logical cursor, which is
+        //     what keeps RoPE offsets, masks and `retainedCount` uniform
+        //     across layers: M for the restore form, C for the replay form.
+        let states = try makeSequenceState(
+            layerKinds: layerKinds, promptLength: 0, maxLength: maxLength)
+        for (index, state) in states.enumerated() {
+            guard let row = state as? PagedSequenceKV else { continue }
+            if let full = fullKV[index] {
+                if restoringWindows {
+                    row.write(keys: full.keys, values: full.values)
+                } else {
+                    // Storage [0, M) is exact and immutable; the cursor
+                    // reports C so the replay of [C, M) advances it without
+                    // overwriting a byte.
+                    row.adoptFrozen(
+                        keys: full.keys, values: full.values, replayStart: plan.replayStart)
+                }
+            } else if let window = windows[index] {
+                installWindow(window, into: row)
+            } else if plan.replayStart > 0 {
+                // Windowed row on the replay form: empty, at C, and its
+                // `baseOffset` set so no query reaches behind the replay.
+                row.fastForward(to: plan.replayStart)
+            }
+        }
+        return states
+    }
+
+    /// Place a validated window at its one admissible base.
+    ///
+    /// `fastForward` is what makes the absolute positions right: it sets both
+    /// `absoluteOffset` and `baseOffset` to `snapshot.base`, so the tokens
+    /// land in the ring slots `(p / pageSize) % ringPages` a cold row would
+    /// have used for the same absolute positions, and every later gather and
+    /// decode window resolves against the true positions rather than against
+    /// a payload that merely starts somewhere.
+    ///
+    /// The write is SPLIT: `PagedSequenceKV.write` refuses a windowed run
+    /// longer than `maxPrefillChunk` because the ring cannot hold one, and a
+    /// full window is longer than a chunk by construction (gemma-4: 1,024
+    /// against 512).
+    private func installWindow(
+        _ snapshot: CBv2PagedWindowSnapshot, into row: PagedSequenceKV
+    ) {
+        let keys = snapshot.keys.squeezed(axis: 0)
+        let values = snapshot.values.squeezed(axis: 0)
+        row.fastForward(to: snapshot.base)
+        var written = 0
+        while written < snapshot.tokens {
+            let count = min(pool.config.maxPrefillChunk, snapshot.tokens - written)
+            let range = written ..< (written + count)
+            row.write(
+                keys: keys[.ellipsis, range, 0...],
+                values: values[.ellipsis, range, 0...])
+            written += count
+        }
+    }
+
+    /// `[1, kvHeads, tokens, headDim]` (a donated snapshot) or
+    /// `[kvHeads, tokens, headDim]` (already row-shaped) -> row shape.
+    private static func rowShaped(_ array: MLXArray) -> MLXArray {
+        array.ndim == 4 && array.dim(0) == 1 ? array.squeezed(axis: 0) : array
+    }
+
     public func release(_ state: [CBv2SequenceKV?]) {
         for entry in state {
             guard let entry else { continue }
@@ -212,6 +523,12 @@ public final class PagedKVBackend: CBv2KVBackend {
     public var bytesCapacity: Int { pool.bytesCapacity }
     /// Admission-relevant bytes (worst-case reservations of live requests).
     public var bytesReserved: Int { pool.bytesReserved }
+    /// The slabs' allocation CEILING — `pageCount * pageBytes` over every
+    /// group, poison pages included. Derived from page bookkeeping fixed at
+    /// `PagedKVPool.init`, NOT from whether the slabs have been evaluated,
+    /// so it is time-INVARIANT and safe for sizing/limit consumers.
+    /// For "how much is resident right now" use `bytesWired`.
+    public var bytesPhysical: Int { pool.bytesPhysical }
     /// Paged snapshots are views over the SHARED slabs; the donor's pages
     /// are recycled once its state is released, so donated snapshots must
     /// be device-materialized before the prefix cache indexes them.
