@@ -180,9 +180,10 @@ public final class SchedulerV2 {
     ///
     /// NOT capped: decode rows (never — including their MTP speculative
     /// width), pure-prefill steps (no decode row ⇒ the quota is not armed at
-    /// all), and the one-shot deferred multimodal-block row (its tokens count
-    /// against the quota for the rest of the step, but it is never blocked by
-    /// it — otherwise the block starvation guard would be defeated).
+    /// all), and the one-shot deferred multimodal-block row — whether it is
+    /// admitted from `waiting` or already `running` (its tokens count against
+    /// the quota for the rest of the step, but it is never blocked by it —
+    /// otherwise the block starvation guard would be defeated).
     ///
     /// NO STARVATION: the quota only ever *defers* prefill work, and the set
     /// of decode rows can only be replenished by rows that finished prefill.
@@ -320,6 +321,7 @@ public final class SchedulerV2 {
         // this step's full budget (see `deferredBlockRequestID`). One-shot —
         // re-armed below if the row starves again.
         var deferredAdmittedID: CBv2RequestID? = nil
+        var deferredRunningID: CBv2RequestID? = nil
         if let deferredID = deferredBlockRequestID {
             deferredBlockRequestID = nil
             if let dIdx = running.firstIndex(where: { $0.id == deferredID }) {
@@ -327,6 +329,9 @@ public final class SchedulerV2 {
                 // chunk of leading text this step still leaves it in front
                 // for the block itself next step).
                 if dIdx > 0 { running.insert(running.remove(at: dIdx), at: 0) }
+                // Remembered for the running pass so the quota can exempt it
+                // — the marker itself is consumed here (one-shot).
+                deferredRunningID = deferredID
             } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
                 deferredAdmittedID = admitDeferredBlockRow(
                     at: wIdx, budget: &budget,
@@ -384,7 +389,23 @@ public final class SchedulerV2 {
             // returns > 0. A block chunk may therefore extend past the quota
             // — block integrity outranks the quota, and the overshoot is
             // charged below so the rest of the step stays bounded.
-            if isPrefillRow, prefillCap != nil {
+            //
+            // The row deferred by the starvation guard on the PREVIOUS step
+            // is exempt (PR#64 review). Moving it to the front of `running`
+            // is worthless on its own: a zero-headroom `continue` fires
+            // BEFORE `snappedChunkTokens`, so the row would neither be
+            // scheduled nor re-arm `deferredBlockRequestID` — at `cap == 0`
+            // it would then be skipped on every step for as long as ANY
+            // decode row lives and could hit its progress deadline. Chose
+            // exemption over re-arming the marker because (a) re-arming
+            // preserves the marker but still never schedules the block while
+            // a decoder is alive, so it does not fix the starvation, and
+            // (b) exemption is exactly what `admitDeferredBlockRow` already
+            // does for the deferred WAITING row and what this property's
+            // contract promises ("NOT capped: ... the one-shot deferred
+            // multimodal-block row"). It stays one-shot (the marker was
+            // consumed above) and its tokens are still charged below.
+            if isPrefillRow, prefillCap != nil, rec.id != deferredRunningID {
                 let headroom = prefillHeadroom()
                 if headroom <= 0 {
                     idx += 1

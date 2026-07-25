@@ -326,4 +326,198 @@ final class CBv2MixedStepPrefillQuotaTests: XCTestCase {
         XCTAssertEqual(plan.assignments.map(\.id), prefills.map(\.id))
         XCTAssertEqual(plan.assignments.map(\.numTokens), [512, 512])
     }
+
+    // MARK: 6. The deferred multimodal-block row is EXEMPT from the quota
+
+    // Fixed ids, far above `CBv2SchedFixtures`' monotonic counter.
+    private let decodeID = CBv2RequestID(1_000_001)
+    private let visionID = CBv2RequestID(1_000_002)
+
+    /// Tiny-budget fixture shared by the deferred-block regressions: budget
+    /// and chunk are both 8, so ONE block of 8 needs the entire step budget.
+    private func makeBlockStarvationScheduler() -> SchedulerV2 {
+        SchedulerV2(
+            config: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 8,
+                prefillChunkSize: 8, maxWaiting: 8))
+    }
+
+    private func tokensAssigned(_ plan: CBv2StepPlan, _ id: CBv2RequestID) -> Int? {
+        plan.assignments.first { $0.id == id }?.numTokens
+    }
+
+    /// Drive the shared fixture to the exact state the reviewer describes:
+    /// a decode row plus a RUNNING multimodal row whose next block was
+    /// deferred by the starvation guard on the previous step. The quota is
+    /// left DISARMED here (cap nil) so the setup itself is the pinned
+    /// pre-quota behavior; callers arm it right before the step under test.
+    private func armDeferredRunningBlockRow(_ scheduler: SchedulerV2) throws {
+        // Older text row, driven to decode.
+        try scheduler.enqueue(
+            CBv2Request(id: decodeID, promptTokens: [1, 2, 3], maxTokens: 32))
+        CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())
+
+        // Vision row: 2 leading text tokens, then a block of 8 (== budget).
+        var vision = CBv2Request(
+            id: visionID, promptTokens: [Int](repeating: 0, count: 12), maxTokens: 4)
+        vision.multimodal = CBv2MultimodalInput(
+            spans: [CBv2ImageSpan(tokenOffset: 2, length: 8)]) { [] }
+        try scheduler.enqueue(vision)
+
+        // Step A: decode takes 1; vision admits its 2 leading text tokens.
+        let planA = scheduler.plan()
+        XCTAssertEqual(tokensAssigned(planA, decodeID), 1)
+        XCTAssertEqual(tokensAssigned(planA, visionID), 2)
+        CBv2SchedSim.confirm(scheduler, plan: planA)
+
+        // Step B: decode takes 1 first, leaving budget 7 < block 8 — the
+        // block cannot ride this step and the starvation guard arms for the
+        // now-RUNNING vision row.
+        let planB = scheduler.plan()
+        XCTAssertEqual(tokensAssigned(planB, decodeID), 1)
+        XCTAssertNil(tokensAssigned(planB, visionID), "block cannot fit the leftover budget")
+        CBv2SchedSim.confirm(scheduler, plan: planB)
+        XCTAssertEqual(scheduler.running.map(\.id), [decodeID, visionID])
+        XCTAssertEqual(scheduler.record(for: visionID)?.numComputedTokens, 2)
+    }
+
+    /// Regression (Codex P2): at cap 0 the deferred marker was consumed (row
+    /// moved to the front of `running`) and then the zero-headroom check
+    /// skipped the row BEFORE `snappedChunkTokens` could re-arm the guard —
+    /// so the block silently lost its promised first claim and could stay
+    /// unprocessed for the decoder's entire lifetime. The deferred block row
+    /// must be exempt from the quota exactly like the deferred WAITING row.
+    func testZeroCapDoesNotStarveDeferredRunningBlockRow() throws {
+        let scheduler = makeBlockStarvationScheduler()
+        try armDeferredRunningBlockRow(scheduler)
+
+        // The degenerate cap arms only now: the block is already deferred.
+        scheduler.mixedStepPrefillTokenCap = 0
+
+        // Step C: the deferred row keeps its first claim on the FULL budget
+        // — the whole block rides this step despite cap 0.
+        let planC = scheduler.plan()
+        XCTAssertEqual(
+            tokensAssigned(planC, visionID), 8,
+            "cap 0 must not defeat the block starvation guard")
+        XCTAssertNil(tokensAssigned(planC, decodeID), "budget exhausted by the block")
+        XCTAssertEqual(scheduler.record(for: visionID)?.numComputedTokens, 10)
+        CBv2SchedSim.confirm(scheduler, plan: planC)
+
+        // The exemption is ONE-SHOT: the row is an ordinary prefill row again
+        // and the cap resumes binding on its trailing text tokens.
+        let planD = scheduler.plan()
+        XCTAssertEqual(planD.assignments.map(\.id), [decodeID])
+        XCTAssertEqual(tokensAssigned(planD, decodeID), 1)
+    }
+
+    /// The same shape with a small NON-ZERO cap below the block size: block
+    /// integrity outranks the quota, so the deferred row's whole block rides
+    /// in one chunk (an intentional, one-row, one-step overshoot) instead of
+    /// being clamped to the cap and snapped back to 0.
+    func testSmallCapBelowBlockSizeStillSchedulesDeferredBlock() throws {
+        let scheduler = makeBlockStarvationScheduler()
+        try armDeferredRunningBlockRow(scheduler)
+
+        scheduler.mixedStepPrefillTokenCap = 4  // < block size 8
+
+        let planC = scheduler.plan()
+        XCTAssertEqual(
+            tokensAssigned(planC, visionID), 8,
+            "a block must never be split to fit the quota")
+        XCTAssertNil(tokensAssigned(planC, decodeID))
+        XCTAssertEqual(scheduler.record(for: visionID)?.numComputedTokens, 10)
+    }
+
+    /// Liveness at cap 0: the block-bearing row must not be pinned for the
+    /// decoder's whole lifetime. The decode row here has 32 output tokens;
+    /// the vision row must finish its prompt long before that.
+    func testDeferredBlockRowProgressesWhileDecoderIsStillAlive() throws {
+        let scheduler = makeBlockStarvationScheduler()
+        try armDeferredRunningBlockRow(scheduler)
+        scheduler.mixedStepPrefillTokenCap = 0
+
+        var blockScheduledAtStep: Int?
+        for step in 0 ..< 12 {
+            let plan = scheduler.plan()
+            if blockScheduledAtStep == nil, tokensAssigned(plan, visionID) != nil {
+                blockScheduledAtStep = step
+            }
+            CBv2SchedSim.confirm(scheduler, plan: plan)
+            // The decode row must still be alive — otherwise this would only
+            // prove the "pure-prefill step once the decoder finishes" escape
+            // hatch, not the starvation guard.
+            XCTAssertNotNil(scheduler.record(for: decodeID))
+        }
+        XCTAssertEqual(
+            blockScheduledAtStep, 0,
+            "the deferred block must ride the very next step, not wait out the decoder")
+        XCTAssertGreaterThanOrEqual(
+            scheduler.record(for: visionID)?.numComputedTokens ?? 0, 10,
+            "the multimodal block must be computed while the decode row is still running")
+    }
+
+    /// The exemption is bounded: the deferred row's block tokens are CHARGED
+    /// to the quota, so the rest of the step stays capped. Here the block is
+    /// deferred behind two long text prefills (not decode), leaving real
+    /// budget after it rides — the trailing prefill rows must still be
+    /// skipped, with no optimistic advance and no reservation.
+    func testExemptDeferredBlockChargesQuotaForTheRestOfTheStep() throws {
+        let capacity = CBv2SchedMockCapacity(tokenLimit: 100_000)
+        let scheduler = SchedulerV2(
+            config: CBv2SchedulerConfig(
+                maxConcurrentRequests: 8, maxBatchedTokensPerStep: 20,
+                prefillChunkSize: 8, maxWaiting: 8),
+            capacity: capacity)
+
+        try scheduler.enqueue(
+            CBv2Request(id: decodeID, promptTokens: [1, 2, 3], maxTokens: 32))
+        CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())
+        let longs = try (0 ..< 2).map { i -> CBv2Request in
+            let request = CBv2SchedFixtures.request(
+                prompt: Array(repeating: i + 1, count: 40), maxTokens: 4)
+            try scheduler.enqueue(request)
+            return request
+        }
+        var vision = CBv2Request(
+            id: visionID, promptTokens: [Int](repeating: 0, count: 12), maxTokens: 4)
+        vision.multimodal = CBv2MultimodalInput(
+            spans: [CBv2ImageSpan(tokenOffset: 2, length: 8)]) { [] }
+        try scheduler.enqueue(vision)
+
+        // Step A (uncapped): 1 + 8 + 8 leaves 3 — vision admits its 2 leading
+        // text tokens only.
+        let planA = scheduler.plan()
+        XCTAssertEqual(planA.assignments.map(\.numTokens), [1, 8, 8, 2])
+        CBv2SchedSim.confirm(scheduler, plan: planA)
+
+        // Step B: the two long prefills pin the leftover below the block —
+        // the guard arms for the RUNNING vision row.
+        let planB = scheduler.plan()
+        XCTAssertNil(tokensAssigned(planB, visionID))
+        CBv2SchedSim.confirm(scheduler, plan: planB)
+
+        // Step C: cap 2, block size 8. The exempt block rides whole and
+        // charges 8, which exhausts the quota for the long prefill rows.
+        scheduler.mixedStepPrefillTokenCap = 2
+        let reservedBefore = capacity.totalReserved
+        let planC = scheduler.plan()
+        XCTAssertEqual(tokensAssigned(planC, visionID), 8, "block rides whole")
+        XCTAssertEqual(tokensAssigned(planC, decodeID), 1, "decode is never capped")
+        for long in longs {
+            XCTAssertNil(
+                tokensAssigned(planC, long.id),
+                "the block's tokens are charged to the quota — nothing else prefills")
+        }
+        // Skipped rows leave nothing behind: no advance, no new reservation.
+        XCTAssertEqual(scheduler.record(for: longs[0].id)?.numComputedTokens, 16)
+        XCTAssertEqual(scheduler.record(for: longs[1].id)?.numComputedTokens, 16)
+        XCTAssertEqual(capacity.totalReserved, reservedBefore + 8 + 1)
+        XCTAssertTrue(planC.preemptions.isEmpty)
+
+        // Rollback of the exempt plan restores the ledger exactly.
+        scheduler.rollback(planC)
+        XCTAssertEqual(capacity.totalReserved, reservedBefore)
+        XCTAssertEqual(scheduler.record(for: visionID)?.numComputedTokens, 2)
+    }
 }
