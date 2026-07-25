@@ -447,21 +447,27 @@ final class CBv2EndToEndTests: XCTestCase {
         XCTAssertEqual(second.text, first.text)
     }
 
-    /// WS-4.1. Paged now DERIVES `.frozenFullReplay` for the interleaved
-    /// hybrid instead of failing cold, so the prefix cache is armed and the
-    /// finished request donates. The adoption itself is still refused for
-    /// this plan shape — the engine's plan carries R > 0 and
-    /// `PagedSequenceKV` has one mutable cursor, so replaying `[C, M)` would
-    /// overwrite the exact cached full K/V — and the refusal degrades to a
-    /// cold prefill, which is what keeps the two runs token-identical.
+    /// WS-4.1. The paged twin of `testStackedSlidingFrozenFullReplayIsToken
+    /// Exact` above, on the same layout and prompt: paged used to fail cold on
+    /// an interleaved hybrid (`pagedHybridRequiresDualCursor`) and now serves
+    /// it end to end through the production engine, donation queue and
+    /// PrefixCacheV2 — a real hit, token-identical to the cold run.
+    ///
+    /// The numbers differ from the contiguous twin by exactly one window, and
+    /// that is structural, not noise. `PagedLayerCache.prefillKV` attends
+    /// `gather ++ chunk` with the chunk half freshly projected, where
+    /// `CBv2FrozenReplayFullSequenceKV` hands back the cached keys, so a
+    /// frozen paged row needs one extra window of replay:
+    ///   contiguous  replayBound 2 x 16 = 32, saves 72 - 32 = 40
+    ///   paged       replayBound 32 + 16 = 48, saves 72 - 48 = 24
     ///
     /// The zero-replay form (every sliding row restored EXACTLY at M from a
-    /// `CBv2PagedWindowSnapshot`) IS served, and is covered end to end at the
-    /// backend level by `CBv2PrefixReusePagedFrozenFullTests`. It cannot be
-    /// exercised from here because nothing in the engine donates a window:
-    /// `PrefixCacheV2.isCacheable` nils every sliding layer, and the payload
-    /// comes from the provider's per-block window sidecar.
-    func testStackedSlidingPagedBackendDonatesButRefusesTheReplayForm() async throws {
+    /// `CBv2PagedWindowSnapshot`) is covered at the backend level by
+    /// `CBv2PrefixReusePagedFrozenFullTests`. It cannot be exercised from here
+    /// because nothing in the engine donates a window: `PrefixCacheV2
+    /// .isCacheable` nils every sliding layer, and the payload comes from the
+    /// provider's per-block window sidecar.
+    func testStackedSlidingPagedBackendServesFrozenFullReplay() async throws {
         let model = TinyTestModel.make(
             seed: 0xD00D_F00D,
             headDim: 64,
@@ -470,18 +476,25 @@ final class CBv2EndToEndTests: XCTestCase {
         let stack = try makeStack(.paged, model: model, enablePrefixCache: true)
         XCTAssertTrue(stack.engine.prefixReuseCapability.isSupported)
         XCTAssertEqual(stack.engine.prefixReuseCapability.strategy, .frozenFullReplay)
+        XCTAssertEqual(stack.engine.prefixReuseCapability.conservativeReplayBoundTokens, 48)
 
         let first = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: 8)))
+        XCTAssertEqual(first.usage?.prefixCacheHitTokens, 0, "first run is a miss")
         let donated = await cbv2SchedWait { stack.prefixCache.stats().entryCount >= 1 }
         XCTAssertTrue(donated, "a supported capability must arm donation")
         let second = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: 8)))
         await stack.engine.shutdown()
 
-        XCTAssertEqual(first.tokens, second.tokens)
-        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 0)
-        XCTAssertNil(second.usage?.prefixCacheStrategy, "the adoption was refused, not served")
+        XCTAssertEqual(second.usage?.prefixCacheMatchedTokens, 72)
+        XCTAssertEqual(second.usage?.prefixCacheStrategy, .frozenFullReplay)
+        XCTAssertEqual(second.usage?.prefixCacheReplayTokens, 48)
+        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 24)
+        XCTAssertEqual(
+            second.tokens, first.tokens,
+            "paged frozen-full replay must be target-token exact")
+        XCTAssertEqual(second.text, first.text)
     }
 
     // MARK: (iv-b) Per-request cache salt isolation (TB-007)
