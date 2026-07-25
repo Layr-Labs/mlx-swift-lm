@@ -142,7 +142,14 @@ final class CBv2CompiledLayerCache: CBv2AttendingLayerCache {
         precondition(L == 1, "compiled path is decode-only ([B, 1])")
         precondition(B == laneKeys.count,
             "CBv2CompiledLayerCache: batch \(B) != bound lanes \(laneKeys.count)")
-        let effectiveSinks = kind.hasSinks ? sinks : nil
+        // Coerce ONCE per step (not per lane): MLX SDPA aborts the process
+        // when the sink dtype does not promote to the output dtype, and this
+        // graph is the DEFAULT decode route on supported hardware — fixing
+        // only the eager terminal would leave the abort fully reachable. See
+        // `CBv2AttentionV1.sdpaSinks`. No softcap branch exists here: the
+        // compiled path is plain SDPA, never the composed fp32 reference.
+        let effectiveSinks = kind.hasSinks
+            ? CBv2AttentionV1.sdpaSinks(sinks, queryDType: queries.dtype) : nil
 
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
@@ -191,7 +198,10 @@ final class CBv2CompiledLayerCache: CBv2AttendingLayerCache {
         precondition(L == 1, "compiled path is decode-only ([B, 1])")
         precondition(B == src.laneKeys.count,
             "CBv2CompiledLayerCache: batch \(B) != source lanes \(src.laneKeys.count)")
-        let effectiveSinks = kind.hasSinks ? sinks : nil
+        // Same sink-dtype contract as `updateAndAttend` above; the borrowing
+        // layer's own `kind` decides whether sinks apply at all.
+        let effectiveSinks = kind.hasSinks
+            ? CBv2AttentionV1.sdpaSinks(sinks, queryDType: queries.dtype) : nil
 
         // Decode borrow attends the source's POST-update state (the source
         // layer already wrote this step's token earlier in the forward);

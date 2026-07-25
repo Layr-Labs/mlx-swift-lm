@@ -20,9 +20,17 @@
 // These tests pin the contiguous path's acceptance of a WIDER sink than the
 // activations, on every route that reaches MLXFast SDPA:
 //
-//   `attend`          — decode, unblocked prefill, query-blocked prefill,
-//                       serialized (MTP) prefill;
-//   `attendSpanChunk` — vision span-bearing prefill chunks.
+//   `attend`                 — decode, unblocked prefill, query-blocked
+//                              prefill, serialized (MTP) prefill;
+//   `attendSpanChunk`        — vision span-bearing prefill chunks;
+//   `CBv2CompiledLayerCache` — the compiled `[B, 1]` decode graph, both its
+//                              storage-owning (`updateAndAttend`) and
+//                              KV-shared (`attendBorrowing`) terminals.
+//                              Compiled decode is the DEFAULT on supported
+//                              hardware and `CBv2SteppableLanguageModelAdapter`
+//                              opts GPT-OSS — the only sinks model — into
+//                              it, so coercing only the eager terminal
+//                              would leave the abort reachable by default.
 //
 // The softcap sibling of each site goes to `PagedAttentionReference
 // .composedAttention`, which runs in fp32 throughout and casts sinks itself,
@@ -33,8 +41,19 @@
 // therefore a property of the dtype path, not of rounding, which lets the
 // same-backend comparisons assert exact equality.
 //
-// No negative test. Asserting the pre-fix trap needs a subprocess harness,
-// because an in-process `fatalError` takes down the whole test bundle.
+// No in-bundle NEGATIVE test. MLX throws `std::invalid_argument` in C++,
+// mlx-c routes it to the installed error handler, and mlx-swift's handler
+// calls `fatalError` (`MLX/ErrorHandler.swift`) — SIGTRAP, uncatchable, so
+// an uncoerced terminal takes the whole bundle down instead of recording an
+// issue. Observing the pre-fix trap therefore needs a deliberately-aborting
+// child process, i.e. an extra executable target in the shared
+// Package.swift. The positive tests below DO still fail without the fix,
+// just as a bundle crash rather than a recorded failure — verified by
+// reverting each compiled coercion in turn, both of which produce
+// `Fatal error: [scaled_dot_product_attention] Type of sinks must promote
+// to output type float16` and signal 5. `sinkCoercionIsSharedContract`
+// additionally pins the coercion helper itself, which fails CLEANLY and is
+// the assertion that survives to say what went wrong.
 
 import Foundation
 import MLX
@@ -42,6 +61,13 @@ import MLXRandom
 import Testing
 
 @testable import MLXLMCommon
+
+/// Live query-block width. Read once, because `CBv2AttentionV1
+/// .queryBlockSize` is a lazily-initialized `static let` fixed for the
+/// process — every chunk length below is derived from it rather than from
+/// the 128 default, so this suite keeps testing the routes it names under
+/// `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK` (including the `0` kill switch).
+private let liveBlock = CBv2AttentionV1.queryBlockSize
 
 @Suite("CBv2AttentionSinkDtype", .serialized)
 struct CBv2AttentionSinkDtypeTests {
@@ -277,28 +303,44 @@ struct CBv2AttentionSinkDtypeTests {
 
     // MARK: - Prefill: query-blocked and serialized
 
-    /// `attendQueryBlocks` (chunk > `queryBlockSize`, default 128) and the
-    /// MTP serial path (`serializeQueries`, block size 1) both re-enter
-    /// `attend` per block, so the cast has to survive slicing. Oracle is the
-    /// dtype-agnostic fp32 composed reference rather than the paged backend,
-    /// which applies its own blocking policy at these lengths.
+    /// `attendQueryBlocks` and the MTP serial path (`serializeQueries`,
+    /// block size 1) both re-enter `attend` per block, so the coercion has
+    /// to survive slicing. Oracle is the dtype-agnostic fp32 composed
+    /// reference rather than the paged backend, which applies its own
+    /// blocking policy at these lengths.
     @Test(arguments: [false, true])
     func blockedAndSerializedPrefillAcceptWiderSinks(serialize: Bool) throws {
         MLXRandom.seed(0x51_4B_D7_03)
-        // 200 > queryBlockSize (128) so the unserialized arm blocks too.
-        let chunk = serialize ? 24 : 200
+        // Chunk widths come from the LIVE block width so each arm keeps
+        // taking the route it is named for at any knob setting:
+        //  - serialized: `serializeQueries` short-circuits the blocking gate
+        //    entirely (`updateAndAttendRowSerialQueries` pins block size 1),
+        //    so any multi-token chunk exercises it and the gate's verdict is
+        //    irrelevant — asserting it here is what broke below 24;
+        //  - unserialized: must EXCEED the live width to reach
+        //    `attendQueryBlocks`, except under the `0` kill switch, where
+        //    blocking is off for every L and the single-call terminal is
+        //    what this arm covers instead.
+        let chunk = serialize ? 24 : (liveBlock == 0 ? 200 : liveBlock + 24)
+        let rowCapacity = max(512, chunk + 8)
         let kind = CBv2LayerKind(
             attention: .full, hasSinks: true, headDim: 64, kvHeads: 2, queryHeads: 8)
         let scale: Float = 0.125
         let (narrowSinks, wideSinks) = sinkPair(queryHeads: 8)
-        #expect(CBv2AttentionV1.shouldBlockQueries(chunk) == !serialize)
+        if serialize {
+            #expect(chunk > 1, "the serial path needs more than one query to split")
+        } else {
+            #expect(
+                CBv2AttentionV1.shouldBlockQueries(chunk) == (liveBlock > 0),
+                "chunk \(chunk) must block iff blocking is enabled (queryBlockSize \(liveBlock))")
+        }
 
         let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 29))
         var states: [[CBv2SequenceKV?]] = []
         defer { states.forEach { backend.release($0) } }
         func freshRow() throws -> CBv2SequenceKV {
             let state = try backend.makeSequenceState(
-                layerKinds: [kind], promptLength: 0, maxLength: 512)
+                layerKinds: [kind], promptLength: 0, maxLength: rowCapacity)
             states.append(state)
             return state[0]!
         }
@@ -375,5 +417,216 @@ struct CBv2AttentionSinkDtypeTests {
                 boolMask: CBv2AttentionV1.spanChunkMask(
                     L: chunk, kL: chunk, window: nil, context: context),
                 sinks: wideSinks))
+    }
+
+    // MARK: - Compiled decode: the DEFAULT route on supported hardware
+
+    /// One compiled layer bucket and the EAGER twin of the same rows, fed
+    /// byte-identical history. Lane storage is fp16, the dtype real decode
+    /// caches at, so the SDPA output dtype is fp16 and a wider sink is a
+    /// promotion failure rather than a no-op.
+    private struct CompiledArm {
+        let compiled: CBv2CompiledLayerCache
+        let eager: CBv2LayerCache
+        let counters: CBv2CompiledLaneCounters
+        let statics: CBv2CompiledLaneStatics
+    }
+
+    private func makeCompiledArm(
+        kind: CBv2LayerKind, histories: [Int], kvCapacity: Int
+    ) throws -> CompiledArm {
+        let window: Int?
+        switch kind.attention {
+        case .full: window = nil
+        case .slidingWindow(let w): window = w
+        }
+        let counters = CBv2CompiledLaneCounters(lanes: histories.count)
+        let statics = CBv2CompiledLaneStatics(
+            lanes: histories.count, windows: window.map { [$0] } ?? [])
+        let compiled = CBv2CompiledLayerCache(
+            layerIndex: 0, kind: kind, kvCapacity: kvCapacity,
+            counters: counters, statics: statics)
+        var eagerRows: [CBv2SequenceKV] = []
+
+        for (lane, history) in histories.enumerated() {
+            let k = MLXRandom.normal(
+                [1, kind.kvHeads, history, kind.headDim], dtype: .float16)
+            let v = MLXRandom.normal(
+                [1, kind.kvHeads, history, kind.headDim], dtype: .float16)
+            let storage: (keys: MLXArray, values: MLXArray)
+            if let window {
+                let eagerRow = CBv2WindowedSequenceKV(
+                    window: window, kvHeads: kind.kvHeads, headDim: kind.headDim)
+                let compiledRow = CBv2WindowedSequenceKV(
+                    window: window, kvHeads: kind.kvHeads, headDim: kind.headDim)
+                _ = eagerRow.update(keys: k, values: v)
+                _ = compiledRow.update(keys: k, values: v)
+                eagerRows.append(eagerRow)
+                storage = try #require(
+                    compiledRow.compiledStorage(keysDType: .float16, valuesDType: .float16))
+                statics.bind(
+                    lane: lane, oldestByWindow: [compiledRow.compiledOldestValidPosition])
+            } else {
+                let eagerRow = CBv2FullSequenceKV(
+                    promptLength: history, maxLength: kvCapacity,
+                    kvHeads: kind.kvHeads, headDim: kind.headDim)
+                let compiledRow = CBv2FullSequenceKV(
+                    promptLength: history, maxLength: kvCapacity,
+                    kvHeads: kind.kvHeads, headDim: kind.headDim)
+                _ = eagerRow.update(keys: k, values: v)
+                _ = compiledRow.update(keys: k, values: v)
+                eagerRows.append(eagerRow)
+                storage = try #require(
+                    compiledRow.compiledStorage(
+                        capacity: kvCapacity, keysDType: .float16, valuesDType: .float16))
+                statics.bind(lane: lane, oldestByWindow: [])
+            }
+            compiled.bindLane(lane, keys: storage.keys, values: storage.values)
+            counters.bind(lane: lane, offset: history)
+        }
+        return CompiledArm(
+            compiled: compiled,
+            eager: CBv2LayerCache(layerIndex: 0, kind: kind, rows: eagerRows),
+            counters: counters, statics: statics)
+    }
+
+    /// fp32 sinks against fp16 queries through `CBv2CompiledLayerCache
+    /// .updateAndAttend` — the storage-owning terminal of the compiled
+    /// decode graph, and the one production actually runs: compiled decode
+    /// is on by default on supported hardware and the adapter opts GPT-OSS
+    /// (the only sinks model) into it.
+    ///
+    /// Without the coercion this test does not record a failure, it CRASHES
+    /// the bundle (see the file header): MLX's promotion check throws in C++
+    /// and mlx-swift's error handler turns that into `fatalError`. Both
+    /// lanes and both attention shapes are driven, and the outputs must be
+    /// bit-identical to the fp16-sink arm carrying the same values, so a
+    /// "coercion" that silently changed the result would fail cleanly.
+    @Test(arguments: [Int?.none, Int?(6)])
+    func compiledDecodeAcceptsWiderSinks(window: Int?) throws {
+        let seed: UInt64 = 0x51_4B_D7_05
+        let kind = CBv2LayerKind(
+            attention: window.map { .slidingWindow($0) } ?? .full,
+            hasSinks: true, headDim: 64, kvHeads: 2, queryHeads: 8)
+        let kvCapacity = 32
+        // Lane 1's windowed ring has wrapped (9 > 6); lane 0's has not.
+        let histories = [4, 9]
+        let b = histories.count
+        let scale: Float = 0.125
+
+        MLXRandom.seed(seed)
+        let wideArm = try makeCompiledArm(
+            kind: kind, histories: histories, kvCapacity: kvCapacity)
+        // Same seed, same draws: the narrow arm's lanes hold identical bytes.
+        MLXRandom.seed(seed)
+        let narrowArm = try makeCompiledArm(
+            kind: kind, histories: histories, kvCapacity: kvCapacity)
+        let (narrowSinks, wideSinks) = sinkPair(queryHeads: kind.queryHeads)
+
+        let q = MLXRandom.normal([b, kind.queryHeads, 1, kind.headDim], dtype: .float16)
+        let k = MLXRandom.normal([b, kind.kvHeads, 1, kind.headDim], dtype: .float16)
+        let v = MLXRandom.normal([b, kind.kvHeads, 1, kind.headDim], dtype: .float16)
+
+        let wide = wideArm.compiled.updateAndAttend(
+            queries: q, keys: k, values: v, scale: scale, sinks: wideSinks)
+        let narrow = narrowArm.compiled.updateAndAttend(
+            queries: q, keys: k, values: v, scale: scale, sinks: narrowSinks)
+        // Eager twin of the SAME rows: the compiled graph must not have
+        // bought its dtype acceptance with a different answer.
+        let eager = wideArm.eager.updateAndAttend(
+            queries: q, keys: k, values: v, scale: scale, sinks: wideSinks)
+
+        #expect(wide.shape == [b, kind.queryHeads, 1, kind.headDim])
+        #expect(wide.dtype == .float16)
+        assertIdentical(wide, narrow)
+        assertClose(wide, eager)
+    }
+
+    /// The compiled KV-shared terminal (`attendBorrowing`): Gemma-4-style
+    /// layers project Q only and attend the source layer's lanes. It is the
+    /// second uncoerced compiled SDPA call and takes the same `sinks`.
+    ///
+    /// No eager oracle here — this test pins DTYPE ACCEPTANCE, not the
+    /// compiled/eager borrow equivalence, which the compiled decode suite
+    /// owns. The fp16-sink arm carries bit-identical values, so exact
+    /// equality is the right bar.
+    @Test func compiledBorrowAcceptsWiderSinks() throws {
+        let seed: UInt64 = 0x51_4B_D7_06
+        let kvCapacity = 32
+        let histories = [4, 9]
+        let b = histories.count
+        let scale: Float = 0.125
+        let sourceKind = CBv2LayerKind(
+            attention: .full, hasSinks: true, headDim: 64, kvHeads: 2, queryHeads: 8)
+        let sharedKind = CBv2LayerKind(
+            attention: .full, sharesKVWithLayer: 0, hasSinks: true,
+            headDim: 64, kvHeads: 2, queryHeads: 8)
+
+        MLXRandom.seed(seed)
+        let wideArm = try makeCompiledArm(
+            kind: sourceKind, histories: histories, kvCapacity: kvCapacity)
+        MLXRandom.seed(seed)
+        let narrowArm = try makeCompiledArm(
+            kind: sourceKind, histories: histories, kvCapacity: kvCapacity)
+        let (narrowSinks, wideSinks) = sinkPair(queryHeads: sourceKind.queryHeads)
+
+        let wideShared = CBv2CompiledLayerCache(
+            layerIndex: 1, kind: sharedKind, kvCapacity: kvCapacity,
+            counters: wideArm.counters, statics: wideArm.statics)
+        let narrowShared = CBv2CompiledLayerCache(
+            layerIndex: 1, kind: sharedKind, kvCapacity: kvCapacity,
+            counters: narrowArm.counters, statics: narrowArm.statics)
+
+        let q = MLXRandom.normal([b, sourceKind.queryHeads, 1, sourceKind.headDim], dtype: .float16)
+        let k = MLXRandom.normal([b, sourceKind.kvHeads, 1, sourceKind.headDim], dtype: .float16)
+        let v = MLXRandom.normal([b, sourceKind.kvHeads, 1, sourceKind.headDim], dtype: .float16)
+
+        // The source layer writes this step's token first, exactly as the
+        // real forward does; the shared layer then borrows post-update.
+        _ = wideArm.compiled.updateAndAttend(
+            queries: q, keys: k, values: v, scale: scale, sinks: wideSinks)
+        _ = narrowArm.compiled.updateAndAttend(
+            queries: q, keys: k, values: v, scale: scale, sinks: narrowSinks)
+
+        let wide = wideShared.attendBorrowing(
+            source: wideArm.compiled, queries: q, scale: scale, sinks: wideSinks)
+        let narrow = narrowShared.attendBorrowing(
+            source: narrowArm.compiled, queries: q, scale: scale, sinks: narrowSinks)
+
+        #expect(wide.shape == [b, sharedKind.queryHeads, 1, sharedKind.headDim])
+        #expect(wide.dtype == .float16)
+        assertIdentical(wide, narrow)
+    }
+
+    // MARK: - The shared coercion contract
+
+    /// `CBv2AttentionV1.sdpaSinks` is the single normalization both backends'
+    /// SDPA terminals call, and the only part of this bug that can be
+    /// asserted WITHOUT risking a process abort: every behavioural test
+    /// above dies on a `fatalError` rather than a recorded issue when the
+    /// coercion is missing, so this is the check that names the fault.
+    @Test func sinkCoercionIsSharedContract() throws {
+        let (narrow, wide) = sinkPair(queryHeads: 8)
+        #expect(narrow.dtype == .float16)
+        #expect(wide.dtype == .float32)
+
+        // Wider-than-activation sinks are narrowed to the SDPA output dtype.
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float16)?.dtype == .float16)
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .bfloat16)?.dtype == .bfloat16)
+        // fp32 activations keep fp32 sinks: the cast is not unconditional.
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float32)?.dtype == .float32)
+        // A sinkless layer stays sinkless.
+        #expect(CBv2AttentionV1.sdpaSinks(nil, queryDType: .float16) == nil)
+
+        // Matching dtypes must be a true no-op, not a rebuilt array: the
+        // models shipping today load `sinks` in activation dtype and the
+        // hoist is worthless if the common case still allocates.
+        #expect(CBv2AttentionV1.sdpaSinks(narrow, queryDType: .float16) === narrow)
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float32) === wide)
+
+        // Narrowing preserves the values (the fp32 arm is an fp16 widening),
+        // so the two arms of every test above really are the same numbers.
+        assertIdentical(
+            try #require(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float16)), narrow)
     }
 }
