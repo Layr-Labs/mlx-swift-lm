@@ -128,6 +128,28 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
+    /// commit the whole chunk's K/V, attend only its newest query row.
+    /// Offsets advance by the K/V length, NOT the query length — the chunk
+    /// consumed `keys.dim(2)` positions even though one query was evaluated.
+    public func updateAndAttendLastQuery(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage to commit")
+        precondition(
+            !mtpSerializesRectangularAttention,
+            "CBv2LayerCache: last-query prefill is never part of an MTP verify round")
+        let output = CBv2AttentionV1.updateAndAttendLastQuery(
+            rows: rows, kind: kind,
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        return output
+    }
+
     public func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
@@ -158,6 +180,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         MLXArray(rows.map { Int32($0.absoluteOffset) })
     }
 }
+
+// MARK: - Final-layer last-query prefill
+
+extension CBv2LayerCache: CBv2LastQueryPrefillLayerCache {}
 
 // MARK: - Vision span-mask binding
 

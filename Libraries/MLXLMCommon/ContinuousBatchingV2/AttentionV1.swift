@@ -147,6 +147,62 @@ enum CBv2AttentionV1 {
         return concatenated(outputs, axis: 0)
     }
 
+    /// Commit a full-attention prefill chunk's K/V while evaluating only its
+    /// newest query (see LastQueryPrefillV2.swift). The newest causal query
+    /// sees every key the chunk just wrote, so this is exactly the final row
+    /// of ordinary chunk attention — mask-free by construction, which is why
+    /// a bound span overlay cannot change it either.
+    static func updateAndAttendLastQuery(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float? = nil
+    ) -> MLXArray {
+        precondition(
+            kind.attention == .full,
+            "CBv2AttentionV1: last-query prefill requires full attention")
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "CBv2AttentionV1: last-query prefill cannot own KV for a shared layer")
+        precondition(
+            queries.ndim == 4 && keys.ndim == 4 && values.ndim == 4,
+            "CBv2AttentionV1: last-query prefill tensors must be rank 4")
+        let batch = queries.dim(0)
+        precondition(
+            batch > 0 && rows.count == batch
+                && keys.dim(0) == batch && values.dim(0) == batch,
+            "CBv2AttentionV1: last-query prefill rows and tensors must share batch B")
+        precondition(
+            queries.dim(2) == 1,
+            "CBv2AttentionV1: last-query prefill requires qL=1")
+        let kvLength = keys.dim(2)
+        precondition(kvLength > 1, "CBv2AttentionV1: last-query prefill requires kvL>1")
+        precondition(
+            values.dim(2) == kvLength,
+            "CBv2AttentionV1: last-query prefill K/V lengths must match")
+        precondition(
+            queries.dim(1) == kind.queryHeads && queries.dim(3) == kind.headDim,
+            "CBv2AttentionV1: last-query prefill Q shape does not match the layer kind")
+        precondition(
+            keys.dim(1) == kind.kvHeads && values.dim(1) == kind.kvHeads
+                && keys.dim(3) == kind.headDim && values.dim(3) == kind.headDim,
+            "CBv2AttentionV1: last-query prefill K/V shape does not match the layer kind")
+
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(batch)
+        for (index, row) in rows.enumerated() {
+            let (cachedKeys, cachedValues) = row.update(
+                keys: keys[index ..< index + 1],
+                values: values[index ..< index + 1])
+            outputs.append(
+                attend(
+                    queries: queries[index ..< index + 1],
+                    keys: cachedKeys, values: cachedValues,
+                    scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
+                    sinks: kind.hasSinks ? sinks : nil, softcap: softcap))
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+    }
+
     /// One row's update + attention — verbatim the single-request ([1, L])
     /// logic, shared by the B == 1 path and the rectangular [B > 1, L > 1]
     /// verify loop so a batched row is bit-identical to running alone.

@@ -113,6 +113,15 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         caches.allSatisfy { $0 is CBv2SpanMaskBinding }
     }
 
+    /// Rectangular packed prefill eligibility: every cache must be the
+    /// contiguous `CBv2LayerCache`, whose `updateAndAttend` dispatches
+    /// per-row against each sequence's own KV (so a packed row is
+    /// bit-identical to running alone). Paged/custom caches make no such
+    /// claim and keep prompt chunks per-request.
+    public var supportsPackedPrefill: Bool {
+        caches.allSatisfy { $0 is CBv2LayerCache }
+    }
+
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {

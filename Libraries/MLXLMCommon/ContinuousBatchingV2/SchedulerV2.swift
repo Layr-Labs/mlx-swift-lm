@@ -159,6 +159,43 @@ public final class SchedulerV2 {
     /// to plain decode.
     public var speculationPlanner: ((CBv2ScheduledRequest) -> Int)?
 
+    /// OPT-IN mixed-step prefill quota (nil ⇒ disabled, byte-identical to the
+    /// unguarded vLLM-V1 behavior).
+    ///
+    /// PROBLEM: one budget of `maxBatchedTokensPerStep` covers decode AND
+    /// prefill, so a step can pair one decoding row's single token with
+    /// several full prefill chunks. All of it shares one `asyncEval` and one
+    /// readback boundary, so the decoding request's inter-token latency
+    /// tracks the whole mixed forward, not its own 1 token.
+    ///
+    /// SEMANTICS when non-nil: within a single `plan()`, IF the step carries
+    /// decode work (at least one schedulable RUNNING row with
+    /// `isDecodeReady`), the cumulative tokens assigned to PREFILL rows in
+    /// that plan are limited to this value. It is a SECOND budget layered on
+    /// top of `budget`, consumed in the same order the rows are visited, so
+    /// the earliest prefill row (running order, then waiting order) has first
+    /// claim. A row whose remaining quota is 0 is simply SKIPPED: no
+    /// optimistic advance, no capacity reservation, no preemption, no
+    /// cancellation, and it keeps its queue position.
+    ///
+    /// NOT capped: decode rows (never — including their MTP speculative
+    /// width), pure-prefill steps (no decode row ⇒ the quota is not armed at
+    /// all), and the one-shot deferred multimodal-block row (its tokens count
+    /// against the quota for the rest of the step, but it is never blocked by
+    /// it — otherwise the block starvation guard would be defeated).
+    ///
+    /// NO STARVATION: the quota only ever *defers* prefill work, and the set
+    /// of decode rows can only be replenished by rows that finished prefill.
+    /// (a) Prefill rows are visited in FIFO/priority order and the quota is
+    /// consumed in that order, so the head prefill row gets first claim every
+    /// capped step; with `cap >= 1` it advances by at least 1 token per step
+    /// until its prompt is done, then it leaves the prefill set. (b) Even
+    /// with `cap == 0`, decode rows have finite output budgets and no NEW
+    /// decode row can appear while prefill is fully blocked, so the running
+    /// set drains to zero decode rows and the next step is pure prefill —
+    /// which is uncapped. A skipped row therefore always gets a later step.
+    public var mixedStepPrefillTokenCap: Int?
+
     /// RUNNING requests, in admission order (plan preserves this order,
     /// with ONE exception: a row starved by the block-chunk guard is moved
     /// to the front — see `deferredBlockRequestID`).
@@ -253,6 +290,32 @@ public final class SchedulerV2 {
         var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback] = [:]
         var stopScheduling = false
 
+        // Mixed-step prefill quota (opt-in — see `mixedStepPrefillTokenCap`).
+        // Armed ONCE, up front, from the RUNNING set: a step is "mixed" when
+        // it carries at least one schedulable decode-ready running row. Rows
+        // cannot cross between the decode and prefill sets inside one plan
+        // (`isDecodeReady` is a function of state that only `plan()` mutates),
+        // so this pre-scan is exact for membership. It is conservative in one
+        // direction only: if that decode row later fails to be scheduled
+        // (budget exhausted by earlier rows, or `stopScheduling`), the quota
+        // stays armed for a plan with no decode assignment — capping prefill
+        // slightly harder on a step that was already degenerate. Arming it
+        // early is what lets the quota bind on prefill rows that are visited
+        // BEFORE the decode row in running order.
+        var prefillTokensAssigned = 0
+        let prefillCap: Int? = {
+            guard let cap = mixedStepPrefillTokenCap else { return nil }
+            let hasDecodeWork = running.contains { rec in
+                !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
+            }
+            return hasDecodeWork ? max(0, cap) : nil
+        }()
+        /// Tokens the quota still permits this step (`.max` when disarmed).
+        func prefillHeadroom() -> Int {
+            guard let prefillCap else { return .max }
+            return max(0, prefillCap - prefillTokensAssigned)
+        }
+
         // 0. Starved block-sized chunk from the previous step: first claim on
         // this step's full budget (see `deferredBlockRequestID`). One-shot —
         // re-armed below if the row starves again.
@@ -270,6 +333,14 @@ public final class SchedulerV2 {
                     assignments: &assignments, assignmentIndex: &assignmentIndex)
             }
         }
+        // The deferred block row is EXEMPT from the quota (it must keep its
+        // first claim on the full budget or the block starvation guard is
+        // defeated), but its tokens are prefill and are charged to the quota
+        // so the rest of the step stays bounded. This is the one path that
+        // can overshoot the cap, and only for multimodal block chunks.
+        if let admitted = deferredAdmittedID, let aIdx = assignmentIndex[admitted] {
+            prefillTokensAssigned += assignments[aIdx].numTokens
+        }
 
         // 1. RUNNING first, in order.
         var idx = 0
@@ -281,6 +352,10 @@ public final class SchedulerV2 {
                 idx += 1
                 continue
             }
+            // Captured BEFORE any mutation: the optimistic advance below can
+            // flip `isDecodeReady`, and the quota must charge what the row
+            // WAS when it was scheduled.
+            let isPrefillRow = !rec.isDecodeReady
             var n = rec.remainingTokens
             var speculated = false
             if n > 1 {
@@ -297,6 +372,26 @@ public final class SchedulerV2 {
                 }
             }
             n = min(n, budget)
+            // Mixed-step prefill quota: a second budget that binds ONLY on
+            // prefill rows. Applied BEFORE snapping/reservation so a skipped
+            // row leaves nothing behind: no optimistic advance, no capacity
+            // reservation, and no `snappedChunkTokens` side effects.
+            //
+            // The block starvation guard is untouched by the quota. Snapping
+            // still runs against the REAL `budget`, so its only 0-return
+            // (a chunk starting at a block whose whole span exceeds `budget`)
+            // is quota-independent; the shrink-to-block-start branch always
+            // returns > 0. A block chunk may therefore extend past the quota
+            // — block integrity outranks the quota, and the overshoot is
+            // charged below so the rest of the step stays bounded.
+            if isPrefillRow, prefillCap != nil {
+                let headroom = prefillHeadroom()
+                if headroom <= 0 {
+                    idx += 1
+                    continue
+                }
+                n = min(n, headroom)
+            }
             // Vision requests: never split a multimodal block across chunks
             // (snap to block edges; extend over prefillChunkSize when the
             // chunk starts at a block, bounded by the step budget). 0 ⇒ the
@@ -366,6 +461,7 @@ public final class SchedulerV2 {
 
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
+            if isPrefillRow { prefillTokensAssigned += n }
             assignmentIndex[rec.id] = assignments.count
             assignments.append((id: rec.id, numTokens: n))
             idx += 1
@@ -396,7 +492,15 @@ public final class SchedulerV2 {
                 // stay blocked here until the finalize-side correction
                 // (recordSampled + discardPendingSamples) zeroes them.
                 guard rec.pendingSamples == 0 else { break }
-                var chunk = min(rec.remainingTokens, config.prefillChunkSize, budget)
+                // Mixed-step prefill quota. Every admission is prefill work,
+                // so an exhausted quota ends the pass (like an exhausted
+                // budget): no later waiter could fit either, and stopping
+                // here preserves FCFS. Checked BEFORE chunk/snap so a
+                // quota-blocked row never arms the block starvation guard.
+                let admissionHeadroom = prefillHeadroom()
+                guard admissionHeadroom > 0 else { break }
+                var chunk = min(
+                    rec.remainingTokens, config.prefillChunkSize, budget, admissionHeadroom)
                 // Same block snapping as the running path. 0 ⇒ this step's
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
@@ -432,6 +536,7 @@ public final class SchedulerV2 {
                 rec.status = .running
                 rec.numComputedTokens += chunk
                 budget -= chunk
+                prefillTokensAssigned += chunk
                 assignmentIndex[rec.id] = assignments.count
                 assignments.append((id: rec.id, numTokens: chunk))
                 running.append(rec)

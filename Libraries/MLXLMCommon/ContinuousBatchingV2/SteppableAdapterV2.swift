@@ -45,6 +45,49 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2CompiledSteppableModel
     }
 }
 
+// MARK: - Prompt-output narrowing (prefill only)
+
+/// Answered at RUNTIME like the multimodal/MTP capabilities: only models
+/// conforming to `CBv2LanguageModelPrefillForwardable` (Gemma4TextModel) can
+/// narrow their prompt output. Everything else keeps the full-logits
+/// `forward` contract and is sliced by the engine, so this conformance can
+/// never change what a non-conforming model computes.
+extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
+
+    public var supportsPackedPrefill: Bool {
+        (model as? CBv2LanguageModelPrefillForwardable)?.cbv2SupportsPackedPrefill ?? false
+    }
+
+    public func prefill(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        guard let prefillable = model as? CBv2LanguageModelPrefillForwardable else {
+            // Fail SAFE, not fatal: reproduce `forward` + the engine's own
+            // slicing. `EngineLoopV2.prefillOutput` only routes here after a
+            // successful cast, so this is belt-and-braces for direct callers.
+            let logits: MLXArray
+            if let inputEmbeddings {
+                logits = forward(
+                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+            } else {
+                logits = forward(tokens: tokens, caches: caches)
+            }
+            switch requirement {
+            case .evaluationOnly: return logits[0..., -1, 0 ..< 1]
+            case .lastPositionLogits: return logits[0..., -1, 0...]
+            }
+        }
+        return prefillable.cbv2Prefill(
+            tokens,
+            inputEmbedding: inputEmbeddings,
+            cache: asKVCaches(caches),
+            requirement: requirement)
+    }
+}
+
 // MARK: - Multimodal (vision prefill)
 
 /// The adapter answers the multimodal capability at RUNTIME: it can wrap any

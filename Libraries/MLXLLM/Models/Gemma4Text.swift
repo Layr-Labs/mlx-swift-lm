@@ -26,6 +26,85 @@ private let gemma4CompiledDecodeSupported: Bool = {
     return true
 }()
 
+// MARK: - CBv2 prompt-path knobs (prefill only; decode never reads these)
+
+@inline(__always)
+private func gemma4TruthyFlag(_ raw: String?) -> Bool {
+    guard let raw else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+/// CBv2 consumes only the final prompt position, so the LAST decoder layer
+/// can keep full attention and every K/V write while retaining just this
+/// many trailing rows for `o_proj`, the residual, the feed-forward/MoE
+/// branches, PLE, and the final norm. One row is what the frontier needs,
+/// and it puts that work on the same small-M expert path as B=1 decode.
+///
+/// `DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS=0` restores the full final layer
+/// (the kill switch); a larger value is for comparing kernel geometries.
+private let gemma4PrefillTailRows: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS"],
+        let value = Int(raw)
+    else { return 1 }
+    return max(0, value)
+}()
+
+/// Chunks shorter than this keep the unnarrowed final layer: the saving
+/// scales with the discarded row count, and tiny chunks are dominated by
+/// fixed overhead. Overridable so tests can exercise the narrow path on
+/// small fixtures.
+private let gemma4PrefillTailMinChunk: Int = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_TAIL_MIN_CHUNK"],
+        let value = Int(raw)
+    else { return 128 }
+    return max(2, value)
+}()
+
+/// Final-layer last-query prefill: project and cache the whole chunk's K/V
+/// but compute Q and attention for the frontier row alone. Requires the tail
+/// narrowing above (exactly one retained row) and a cache that can commit
+/// full K/V for a single query. Default ON with
+/// `DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY=0` as the kill switch.
+private let gemma4PrefillLastQueryEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY"]
+    else { return true }
+    return gemma4TruthyFlag(raw)
+}()
+
+/// The final layer must own a full-attention, non-shared cache for
+/// last-query prefill to be equivalent. Sliding windows give each query a
+/// different visible span, and a KV-shared final layer writes nothing.
+func gemma4SupportsLastQueryPrefill(_ config: Gemma4TextConfiguration) -> Bool {
+    config.layerTypes.count == config.numHiddenLayers
+        && config.layerTypes.last == "full_attention"
+        && !config.layerUsesSharedKV(layerIdx: config.numHiddenLayers - 1)
+}
+
+/// Pure policy seam for the final layer's prompt specialization, so the
+/// decision is unit-testable without building a model. Cache capability is
+/// supplied by the caller: only the contiguous CBv2 cache exposes the
+/// atomic full-K/V + last-query operation.
+func gemma4UseLastQueryPrefill(
+    _ config: Gemma4TextConfiguration,
+    layerIdx: Int,
+    batchSize: Int,
+    sequenceLength: Int,
+    outputTailRows: Int?,
+    hasCapableCache: Bool,
+    enabled: Bool = gemma4PrefillLastQueryEnabled
+) -> Bool {
+    enabled
+        && hasCapableCache
+        && outputTailRows == 1
+        && layerIdx == config.numHiddenLayers - 1
+        && batchSize > 0
+        && sequenceLength > 1
+        && gemma4SupportsLastQueryPrefill(config)
+}
+
 /// Approximate (tanh) GELU written with `x * x * x` instead of the Power
 /// primitive (`x ** 3`) so it is safe under `compile(shapeless: true)` — the
 /// Power primitive returns zero results on the Tahoe Metal JIT (MLX #3329).
@@ -480,7 +559,9 @@ private class Gemma4Attention: Module {
         cache: KVCache? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
         positionOffset: Gemma4.PositionOffset? = nil,
-        v2SharedSource: (any CBv2AttendingLayerCache)? = nil
+        v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
+        outputStart: Int = 0,
+        useLastQueryPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -489,8 +570,12 @@ private class Gemma4Attention: Module {
         if let layerCacheV2 = cache as? (any CBv2AttendingLayerCache) {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
-                sharedKV: sharedKV, positionOffset: positionOffset)
+                sharedKV: sharedKV, positionOffset: positionOffset,
+                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
         }
+        precondition(
+            outputStart == 0 && !useLastQueryPrefill,
+            "Gemma4: prompt output narrowing is a CBv2-only path")
 
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -602,11 +687,34 @@ private class Gemma4Attention: Module {
         layerCache: any CBv2AttendingLayerCache,
         source: (any CBv2AttendingLayerCache)?,
         sharedKV: (MLXArray, MLXArray)?,
-        positionOffset: Gemma4.PositionOffset?
+        positionOffset: Gemma4.PositionOffset?,
+        outputStart: Int = 0,
+        useLastQueryPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
+        precondition(
+            outputStart >= 0 && outputStart < L,
+            "Gemma4: output narrowing start \(outputStart) outside chunk length \(L)")
 
-        var queries = qProj(x).reshaped(B, L, nHeads, effectiveHeadDim)
+        // Last-query prefill projects Q for the frontier row only. Every
+        // other path keeps the full query rectangle and narrows (if at all)
+        // AFTER attention.
+        let lastQueryCache: (any CBv2LastQueryPrefillLayerCache)? =
+            useLastQueryPrefill
+            ? layerCache as? (any CBv2LastQueryPrefillLayerCache) : nil
+        if useLastQueryPrefill {
+            precondition(
+                lastQueryCache != nil,
+                "Gemma4 last-query prefill requires a capable layer cache")
+            precondition(
+                B > 0 && L > 1 && outputStart == L - 1 && !isSliding && !usesSharedKV,
+                "Gemma4 last-query prefill requires a final-row, non-shared, full-attention layer")
+        }
+
+        let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
+        let queryLength = queryInput.dim(1)
+
+        var queries = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
         queries = queries.transposed(0, 2, 1, 3)
 
@@ -627,7 +735,10 @@ private class Gemma4Attention: Module {
             queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
             let attention = layerCache.attendBorrowing(
                 source: source, queries: queries, scale: scale, sinks: nil)
-            let output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            if outputStart > 0 {
+                output = output[0..., outputStart..., 0...]
+            }
             return (oProj(output), sharedKV, positionOffset)
         }
 
@@ -642,7 +753,14 @@ private class Gemma4Attention: Module {
         let capturedOffsets = layerCache.positionOffsets + 0
         let captured = Gemma4.PositionOffset.batch(capturedOffsets)
 
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: captured)
+        // The frontier query sits `outputStart` positions past the chunk's
+        // first token, so last-query prefill must shift its RoPE position.
+        // K/V keep the unshifted capture: they cover the whole chunk.
+        let queryPositionOffset: Gemma4.PositionOffset =
+            lastQueryCache == nil
+            ? captured
+            : .batch(capturedOffsets + Int32(outputStart))
+        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
 
         let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
         var k = kNorm(kRaw)
@@ -661,10 +779,19 @@ private class Gemma4Attention: Module {
         v = vNorm(v)
         v = v.transposed(0, 2, 1, 3)
 
-        let attention = layerCache.updateAndAttend(
-            queries: queries, keys: k, values: v, scale: scale, sinks: nil)
+        let attention: MLXArray
+        if let lastQueryCache {
+            attention = lastQueryCache.updateAndAttendLastQuery(
+                queries: queries, keys: k, values: v, scale: scale, sinks: nil)
+        } else {
+            attention = layerCache.updateAndAttend(
+                queries: queries, keys: k, values: v, scale: scale, sinks: nil)
+        }
 
-        let output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
+        if lastQueryCache == nil && outputStart > 0 {
+            output = output[0..., outputStart..., 0...]
+        }
         return (oProj(output), (k, v), captured)
     }
 }
@@ -861,14 +988,42 @@ public class Gemma4DecoderLayer: Module {
         perLayerInput: MLXArray? = nil,
         sharedKV: (MLXArray, MLXArray)? = nil,
         positionOffset: Gemma4.PositionOffset? = nil,
-        v2SharedSource: (any CBv2AttendingLayerCache)? = nil
+        v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
+        outputTailRows: Int? = nil,
+        useLastQueryPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
-        let residual = x
+        // Prompt-path narrowing (CBv2 only): attention and every K/V write
+        // still cover the full chunk; only the token-local work AFTER
+        // attention is restricted to the trailing rows CBv2 actually reads.
+        let outputStart: Int
+        if let outputTailRows {
+            precondition(outputTailRows > 0, "Gemma4: output tail must retain at least one row")
+            precondition(
+                (cache as? (any CBv2AttendingLayerCache)) != nil,
+                "Gemma4: output-tail narrowing is only valid for CBv2 attention")
+            outputStart = max(0, x.dim(1) - outputTailRows)
+        } else {
+            outputStart = 0
+        }
+        if useLastQueryPrefill {
+            precondition(
+                outputTailRows == 1 && outputStart == x.dim(1) - 1,
+                "Gemma4: last-query prefill retains exactly one output row")
+        }
+
+        let residual = outputStart > 0 ? x[0..., outputStart..., 0...] : x
+        let activePerLayerInput: MLXArray?
+        if let perLayerInput, outputStart > 0 {
+            activePerLayerInput = perLayerInput[0..., outputStart..., 0...]
+        } else {
+            activePerLayerInput = perLayerInput
+        }
 
         let h = inputLayernorm(x)
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
-            v2SharedSource: v2SharedSource)
+            v2SharedSource: v2SharedSource, outputStart: outputStart,
+            useLastQueryPrefill: useLastQueryPrefill)
         let postAttn = postAttentionLayernorm(attnOut)
         var out = residual + postAttn
 
@@ -904,7 +1059,7 @@ public class Gemma4DecoderLayer: Module {
         if let gate = perLayerInputGate,
             let proj = perLayerProjection,
             let norm = postPerLayerInputNorm,
-            let perLayerInput
+            let perLayerInput = activePerLayerInput
         {
             let residual3 = out
             var g = gate(out)
@@ -1022,6 +1177,20 @@ public class Gemma4TextModelInner: Module {
         ).postNorm
     }
 
+    /// CBv2 prompt-forward entry point. Keeping the scheduled-prefill
+    /// specializations behind their own entry point means legacy forwards,
+    /// compiled [B, 1] decode, and MTP verification can never reach them.
+    fileprivate func cbv2Prefill(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        inputEmbedding: MLXArray?
+    ) -> MLXArray {
+        forwardTrunk(
+            inputs, cache: cache, captureHook: nil, capturePreNorm: false,
+            inputEmbedding: inputEmbedding, schedulePrefill: true
+        ).postNorm
+    }
+
     /// Variant that ALSO returns the pre-norm last-layer hidden state.
     /// The MTP drafter's `pre_projection` was trained against the pre-norm
     /// hidden (HF captures `hidden_states` at the decoder-layer boundary,
@@ -1043,7 +1212,8 @@ public class Gemma4TextModelInner: Module {
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)?,
         capturePreNorm: Bool,
         inputEmbedding: MLXArray? = nil,
-        imageTokenMask: MLXArray? = nil
+        imageTokenMask: MLXArray? = nil,
+        schedulePrefill: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
@@ -1162,6 +1332,22 @@ public class Gemma4TextModelInner: Module {
                 ? fullCache[prevIdx] as? (any CBv2AttendingLayerCache) : nil
 
             let mask = maskByType[layer.layerType]
+            // Prompt-path specializations, final layer only. Every earlier
+            // layer runs the full chunk unchanged because later positions'
+            // K/V depend on it.
+            let isFinalPromptLayer =
+                schedulePrefill && isCBv2 && idx == layers.count - 1
+                && h.dim(0) > 0 && h.dim(1) >= gemma4PrefillTailMinChunk
+            let outputTailRows: Int? =
+                isFinalPromptLayer && gemma4PrefillTailRows > 0
+                ? min(gemma4PrefillTailRows, h.dim(1)) : nil
+            let useLastQueryPrefill = gemma4UseLastQueryPrefill(
+                config,
+                layerIdx: idx,
+                batchSize: h.dim(0),
+                sequenceLength: h.dim(1),
+                outputTailRows: outputTailRows,
+                hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
             let (out, kvPair, positionOffset) = layer(
                 h,
                 mask: mask,
@@ -1169,7 +1355,9 @@ public class Gemma4TextModelInner: Module {
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
                 positionOffset: sharedPositionOffset,
-                v2SharedSource: v2SharedSource
+                v2SharedSource: v2SharedSource,
+                outputTailRows: outputTailRows,
+                useLastQueryPrefill: useLastQueryPrefill
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
@@ -1444,6 +1632,43 @@ extension Gemma4TextModel {
     ) rethrows -> [any CBv2AttendingLayerCache] {
         try cbv2LayerKinds.enumerated().map { index, kind in
             try makeLayerCache(index, kind)
+        }
+    }
+}
+
+// MARK: - ContinuousBatchingV2 prompt-only output narrowing
+
+/// CBv2 consumes only the final prompt position, so the public
+/// `LanguageModel` forward contract stays unchanged while the engine's
+/// prompt path skips the vocabulary projection for discarded positions:
+/// intermediate chunks project nothing, and the frontier chunk projects one
+/// hidden row. Attention, multimodal span masks, positions, and every K/V
+/// write still cover the full chunk.
+extension Gemma4TextModel: CBv2LanguageModelPrefillForwardable {
+
+    /// The Gemma trunk is shape-generic over `[B, L]`, and the CBv2
+    /// attention dispatch handles a rectangular `B > 1, L > 1` prompt batch
+    /// by attending each row against its OWN KV (the same per-row path a
+    /// `[1, chunk]` call takes), so a packed row is bit-identical to running
+    /// alone. The engine still requires the cache provider to vouch for row
+    /// independence before it packs anything.
+    public var cbv2SupportsPackedPrefill: Bool { true }
+
+    public func cbv2Prefill(
+        _ inputs: MLXArray,
+        inputEmbedding: MLXArray?,
+        cache: [KVCache]?,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        let hidden = model.cbv2Prefill(
+            inputs, cache: cache, inputEmbedding: inputEmbedding)
+        switch requirement {
+        case .evaluationOnly:
+            // Small handle whose graph depends on the whole trunk — forcing
+            // it commits every layer's K/V write for this chunk.
+            return hidden[0..., -1, 0 ..< 1]
+        case .lastPositionLogits:
+            return applyLMHead(hidden[0..., -1, 0...])
         }
     }
 }
