@@ -11,14 +11,17 @@
 // in table slot `(p / pageSize) % ringPages`, slot `p % pageSize`. Eviction
 // is therefore implicit overwrite keyed to absolute positions — the recent
 // end always survives, no window masks over shared buffers exist, and the
-// ring is sized to hold a full prefill chunk plus the trailing window so
-// every query in a chunk can still see its complete window after the chunk
-// is written.
+// ring is sized (`PagedKVPool.ringPageCount`) to cover everything the row
+// can be asked for at once: the trailing window, the extra `chunk - 1`
+// positions a prefill chunk's earliest query still needs (see
+// `retainedCount`), and one speculative span (`CBv2PagedSpeculation
+// .maxSpeculativeSpan`) so an MTP round overwrites only already-evicted
+// slots.
 
 import Foundation
 import MLX
 
-public final class PagedSequenceKV: CBv2SequenceKV {
+public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     let pool: PagedKVPool
     let groupKey: PagedKVGroupKey
     /// Pool-issued monotonic identity (never reused, unlike a heap address).
@@ -50,6 +53,13 @@ public final class PagedSequenceKV: CBv2SequenceKV {
     /// `retainedCount` exposes for windowed layers (a chunk's earliest query
     /// must see its full window).
     private var lastUpdateTokens: Int = 1
+
+    /// Absolute frontier as of `beginSpeculativeWrite()`; `nil` outside a
+    /// speculative transaction. `rollback` may not cross it.
+    private(set) var speculativeBase: Int?
+    /// `lastUpdateTokens` as of `beginSpeculativeWrite()`, restored when a
+    /// round leaves no surviving write.
+    private var speculativeUpdateTokens: Int = 1
 
     private var released = false
 
@@ -104,35 +114,199 @@ public final class PagedSequenceKV: CBv2SequenceKV {
         return (k, v, absoluteOffset)
     }
 
-    /// FULL rows: rollback frees pages past the frontier and every read is
-    /// bounded by `absoluteOffset` (see `rollback`) — value-exact, so the
-    /// contract's default no-op begin/commit suffice. WINDOWED rows: the
-    /// page ring aliases slots at distance `ringPages * pageSize`, so a
-    /// multi-token write destroys the oldest in-window entries before a
-    /// rollback could save them — the same lossy-wrap problem as the
-    /// contiguous ring, and staging is NOT implemented for the paged
-    /// backend in this phase. Windowed rows are speculation-ineligible.
-    public var supportsSpeculativeWrites: Bool { windowSize == nil }
+    // MARK: - Speculative (MTP) transaction
+
+    /// Positions this row can write past its confirmed frontier before a
+    /// rollback would stop being value-exact.
+    ///
+    /// WINDOWED rows: the page ring aliases at `ringPages * pageSize`, which
+    /// is strictly GREATER than `window` — `PagedKVPool.ringPageCount`
+    /// reserves the window plus a speculative span (and must also cover a
+    /// prefill chunk; see the caveat below). A write past the frontier
+    /// therefore overwrites slots whose positions were `ringPages * pageSize`
+    /// behind it: already evicted, outside every attendable window,
+    /// unreachable by any later read. The slack between that alias distance
+    /// and the window IS the headroom. Same argument as this file's header
+    /// and as `pagedattention.metal` ("Windowed rings cannot alias: the
+    /// overwritten slot held a position >= ring*S older than the query,
+    /// outside every attendable window").
+    ///
+    /// CAVEAT — this is the STATIC headroom, measured against `window`, and
+    /// it is the formula frozen in `CBv2PagedSpeculativeRow`. The range a row
+    /// actually exposes is `retainedCount`, which is `window - 1 +
+    /// lastUpdateTokens` right after a bulk write, so the LIVE headroom can
+    /// be smaller. `guardSpeculativeSpan` checks the live figure at each
+    /// write; this property answers the planning-time question "is this row
+    /// speculation-capable at all", which is a property of the ring, not of
+    /// the row's current phase.
+    ///
+    /// FULL rows: no alias distance exists at all — every logical page owns
+    /// its own table slot, and `rollback` frees the pages past the new
+    /// frontier while every read stays bounded by `absoluteOffset`.
+    public var speculativeHeadroom: Int {
+        guard let window = windowSize, let ring = ringPages else { return .max }
+        return ring * pool.config.pageSize - window
+    }
+
+    /// Eligibility is DERIVED from `speculativeHeadroom` — never from the
+    /// attention kind.
+    ///
+    /// The gate this replaced was `windowSize == nil`, justified by a claim
+    /// that the paged ring aliases within its window and so destroys the
+    /// oldest in-window entries. That claim was false. It transplanted the
+    /// CONTIGUOUS ring's problem (`CBv2WindowedSequenceKV` holds exactly
+    /// `window` slots, so it genuinely aliases at `window` and genuinely
+    /// needs data staging) onto the paged ring, which holds
+    /// `ringPages * pageSize` slots — always at least a whole speculative
+    /// span more than the window. Nothing a round overwrites is still
+    /// readable, so the paged transaction is bookkeeping only: no staging
+    /// buffer exists or is needed.
+    ///
+    /// Comparing against `CBv2PagedSpeculation.maxSpeculativeSpan` rather
+    /// than against zero is what keeps the ring sizing and the MTP draft
+    /// bound coupled: raise the span past what the ring reserves and rows go
+    /// INELIGIBLE, instead of silently corrupting confirmed history.
+    public var supportsSpeculativeWrites: Bool {
+        speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
+    }
+
+    public func beginSpeculativeWrite() {
+        precondition(
+            speculativeBase == nil,
+            "[PagedSequenceKV] beginSpeculativeWrite while already armed")
+        speculativeBase = absoluteOffset
+        speculativeUpdateTokens = lastUpdateTokens
+    }
+
+    public func commitSpeculativeWrite() {
+        guard let base = speculativeBase else { return }
+        speculativeBase = nil
+        // Pages `rollback` took out of the table were only QUEUED: the
+        // round's gathers are lazy and still name those physical pages, so
+        // handing them back before the round closes lets another row
+        // allocate and rewrite them underneath a live capture. This is the
+        // first moment no capture can reach them.
+        pool.drainDeferredFrees()
+        settleUpdateTokens(base: base)
+    }
+
+    /// Restore the `retainedCount` input at the end of a round.
+    ///
+    /// `retainedCount` is `min(written, window - 1 + lastUpdateTokens)`. A
+    /// bulk `write()` inside a transaction legitimately raises the input to
+    /// `n` so the chunk's earliest query still sees its full window, but
+    /// leaving it there afterwards over-exposes the row by `n - 1` against
+    /// the plain run, which produced the same confirmed tokens one decode at
+    /// a time. So: `1` when any write of this round survived (decode-shaped,
+    /// exposing exactly `window`), otherwise the value the round opened with.
+    private func settleUpdateTokens(base: Int) {
+        lastUpdateTokens = absoluteOffset > base ? 1 : speculativeUpdateTokens
+    }
+
+    /// Trap before a transaction writes further past its base than the ring
+    /// can absorb.
+    ///
+    /// Two bounds, because `speculativeHeadroom` is measured against `window`
+    /// while the range the row actually exposes is `retainedCount`, which is
+    /// `window - 1 + lastUpdateTokens` immediately after a bulk write:
+    ///
+    ///  - STATIC: the span must fit the ring's slack over the window. This is
+    ///    the eligibility bound, and a round already passed it at planning
+    ///    time; it fires only for an over-long round.
+    ///  - LIVE: the span must not reach the oldest position the row can still
+    ///    be asked for. Writing position `p` destroys whatever held
+    ///    `p - ringPages * pageSize`, so the round may not extend past
+    ///    `absoluteOffset - retainedCount + ringPages * pageSize`. Under a
+    ///    ring that covers `window - 1 + maxPrefillChunk + span` this cannot
+    ///    fire; under an under-sized one it fires HERE, naming the cause,
+    ///    instead of surfacing later as a wrong-KV answer or as a bare
+    ///    "gather of evicted window range" from `gatherRange`.
+    ///
+    /// The LIVE bound is not belt-and-braces, and the residual slack is much
+    /// thinner than it looks. `ringPageCount` reserves
+    /// `ceil((window - 1 + maxPrefillChunk) / pageSize) + ceil(span / pageSize)`
+    /// pages, so for gemma-4 (window 1024, chunk 512, page 16) the ring is
+    /// 1,552 tokens and the margin over the LIVE attendable range depends
+    /// entirely on what the row last did:
+    ///
+    ///      at MTP time      retainedCount 1,024  ->  margin 528
+    ///      during a chunk   retainedCount 1,535  ->  margin  17
+    ///
+    /// The 17 is the number that matters: prefill is the path that runs
+    /// constantly, and it is where the ring is nearly exact. Neither figure
+    /// is asserted anywhere — both fall out of chunk sizing and page
+    /// rounding, so a change to `maxPrefillChunk`, `pageSize` or the window
+    /// moves them silently. The scheduled `gather(ring) ++ chunk` rework
+    /// takes the ring down to the window proper, at which point the 528
+    /// disappears too. Treat a violation here as a real defect, never as
+    /// something the slack can absorb.
+    private func guardSpeculativeSpan(adding n: Int) {
+        guard let base = speculativeBase else { return }
+        let span = absoluteOffset + n - base
+        precondition(
+            span <= speculativeHeadroom,
+            "[PagedSequenceKV] speculative span \(span) exceeds headroom "
+                + "\(speculativeHeadroom) — rollback would not be value-exact")
+        guard let ring = ringPages else { return }
+        let ringTokens = ring * pool.config.pageSize
+        let oldestAttendable = absoluteOffset - retainedCount
+        precondition(
+            absoluteOffset + n - ringTokens <= oldestAttendable,
+            "[PagedSequenceKV] speculative write to \(absoluteOffset + n - 1) would evict "
+                + "position \(absoluteOffset + n - 1 - ringTokens), still attendable from "
+                + "\(oldestAttendable) — ring \(ringTokens) does not cover retainedCount "
+                + "\(retainedCount) plus the round. The ring holds the attendable range "
+                + "plus one speculative span. Any apparent slack is an accident of chunk "
+                + "sizing that nothing asserts — on gemma-4 it is 528 tokens at MTP time "
+                + "but only 17 during a prefill chunk, and the scheduled ring rework "
+                + "removes both. Re-size the ring or shorten the round; do not assume "
+                + "there is room to spare.")
+    }
 
     public func rollback(_ n: Int) {
         precondition(n >= 0 && n <= absoluteOffset - baseOffset, "rollback past written tokens")
+        if let base = speculativeBase {
+            // Confirmed history is NOT recoverable by rewinding the counter:
+            // the round's writes already overwrote the ring slots behind the
+            // base, and a full row's pages past its frontier are queued for
+            // release. Crossing the base would re-expose those slots as if
+            // they still held their original positions.
+            precondition(
+                absoluteOffset - n >= base,
+                "[PagedSequenceKV] rollback into confirmed history "
+                    + "(\(absoluteOffset) - \(n) < speculative base \(base))")
+        }
         guard n > 0 else { return }
         absoluteOffset -= n
         if ringPages == nil {
-            // Full layer: free pages past the new frontier. Freed pages may
-            // hold stale bytes; they are only ever re-read by their NEXT
+            // Full layer: release pages past the new frontier. Freed pages
+            // may hold stale bytes; they are only ever re-read by their NEXT
             // owner after that owner writes them (all reads are bounded by
             // the owner's absoluteOffset), so no scrubbing pass is needed.
             let keepPages = (absoluteOffset + pool.config.pageSize - 1) / pool.config.pageSize
             if keepPages < table.count {
-                pool.freePages(group: groupKey, pages: table[keepPages...])
+                if speculativeBase == nil {
+                    pool.freePages(group: groupKey, pages: table[keepPages...])
+                } else {
+                    // Inside a round the release is DEFERRED to commit; see
+                    // `commitSpeculativeWrite`. The pages stay out of the
+                    // free list until then, so `ensurePage` will draw fresh
+                    // ones — which cannot breach the reservation, because a
+                    // transaction never writes after its rollback (the engine
+                    // rolls back at finalize, EngineLoopV2+MTPFinalize).
+                    pool.deferFreePages(group: groupKey, pages: table[keepPages...])
+                }
                 table.removeSubrange(keepPages...)
                 tableVersion += 1
             }
         }
         // Windowed rings keep their pages; the rolled-back slots are
         // overwritten before they can re-enter any attendable range.
-        lastUpdateTokens = 1
+        if let base = speculativeBase {
+            settleUpdateTokens(base: base)
+        } else {
+            lastUpdateTokens = 1
+        }
     }
 
     // MARK: - Writes
@@ -152,6 +326,7 @@ public final class PagedSequenceKV: CBv2SequenceKV {
                 "windowed update of \(n) tokens exceeds maxPrefillChunk "
                     + "\(pool.config.maxPrefillChunk) — the ring cannot hold it")
         }
+        guardSpeculativeSpan(adding: n)
         let s = pool.config.pageSize
 
         // Physical destination (page * pageSize + slot) per token.
@@ -176,6 +351,7 @@ public final class PagedSequenceKV: CBv2SequenceKV {
         precondition(
             absoluteOffset + 1 <= maxLength,
             "write past maxLength (\(absoluteOffset) + 1 > \(maxLength))")
+        guardSpeculativeSpan(adding: 1)
         let s = pool.config.pageSize
         let page = ensurePage(logicalPage: absoluteOffset / s)
         let slot = absoluteOffset % s
@@ -303,6 +479,16 @@ public final class PagedSequenceKV: CBv2SequenceKV {
     func releaseStorage() {
         guard !released else { return }
         released = true
+        if speculativeBase != nil {
+            // Released mid-round: the row finished in flight, so the deferred
+            // release fence tears it down and `commitSpeculativeWrite` never
+            // runs. Draining here is what keeps its queued pages from being
+            // orphaned, and it is safe under the RECYCLE INVARIANT above —
+            // releases only happen between host-synced steps, so no lazy
+            // capture can still name a queued page.
+            speculativeBase = nil
+            pool.drainDeferredFrees()
+        }
         pool.freePages(group: groupKey, pages: table)
         table.removeAll()
         tableVersion += 1
