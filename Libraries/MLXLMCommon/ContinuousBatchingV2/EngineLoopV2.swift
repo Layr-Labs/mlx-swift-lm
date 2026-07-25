@@ -50,10 +50,16 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     /// reject multimodal requests at submit rather than silently serving
     /// them with plain causal masks.
     var supportsMultimodalSpans: Bool { get }
+    /// True only when EVERY layer cache this provider vends keeps rows
+    /// independent under a rectangular `[B > 1, L > 1]` prompt pass, so
+    /// equal-length text chunks may be coalesced into one layer-major
+    /// forward. Fail-safe default false (paged/custom providers).
+    var supportsPackedPrefill: Bool { get }
 }
 
 extension CBv2LayerCacheProvider {
     public var supportsMultimodalSpans: Bool { false }
+    public var supportsPackedPrefill: Bool { false }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
@@ -1196,6 +1202,48 @@ public final class EngineLoopV2: @unchecked Sendable {
         return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
     }
 
+    /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
+    /// skip the vocabulary projection for discarded prompt positions;
+    /// everything else keeps the established full-logits forward and is
+    /// sliced HERE, so the optimization is strictly opt-in and byte-neutral
+    /// for non-conforming models.
+    ///
+    /// Returns `[B, 1]` for `.evaluationOnly` (a cheap handle that still
+    /// forces the whole chunk's graph, including its KV writes) and
+    /// `[B, vocab]` for `.lastPositionLogits`.
+    func prefillOutput(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        if let prefillModel = model as? CBv2PrefillSteppableModel {
+            return prefillModel.prefill(
+                tokens: tokens,
+                inputEmbeddings: inputEmbeddings,
+                caches: caches,
+                requirement: requirement)
+        }
+
+        let logits: MLXArray
+        if let inputEmbeddings {
+            guard let multimodalModel = model as? CBv2MultimodalSteppableModel else {
+                preconditionFailure(
+                    "CBv2 embedding prefill reached a model without embedding-forward support")
+            }
+            logits = multimodalModel.forward(
+                tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+        } else {
+            logits = model.forward(tokens: tokens, caches: caches)
+        }
+        switch requirement {
+        case .evaluationOnly:
+            return logits[0..., -1, 0 ..< 1]
+        case .lastPositionLogits:
+            return logits[0..., -1, 0...]
+        }
+    }
+
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
@@ -1318,15 +1366,93 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
 
-        // Per-request prefill chunks [1, chunk].
+        // Prompt chunks. Default shape is per-request [1, chunk]; when the
+        // model AND the cache provider both prove rectangular per-row
+        // semantics, equal-length TEXT chunks are coalesced into one
+        // layer-major [B, chunk] forward so each layer's weights are read
+        // once for the whole cohort. Span-bearing multimodal chunks always
+        // stay per-request.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var evalTargets: [MLXArray] = []
+        var packedIDs = Set<CBv2RequestID>()
+
+        if cacheProvider.supportsPackedPrefill,
+            let packedModel = model as? CBv2PackedPrefillSteppableModel,
+            packedModel.supportsPackedPrefill
+        {
+            struct PackedGroup {
+                let count: Int
+                let samples: Bool
+                var rows: [RowWork]
+            }
+            var groups: [PackedGroup] = []
+            for row in work where !row.isDecode {
+                // Pure function of has-spans, exactly like the singleton
+                // path: a multimodal REQUEST whose current chunk carries no
+                // span is still packable.
+                let hasSpan =
+                    multimodalByID[row.rec.id]?.chunkContext(
+                        start: row.start, count: row.count) != nil
+                if hasSpan { continue }
+                if let index = groups.firstIndex(where: {
+                    $0.count == row.count && $0.samples == row.samples
+                }) {
+                    groups[index].rows.append(row)
+                } else {
+                    groups.append(
+                        PackedGroup(count: row.count, samples: row.samples, rows: [row]))
+                }
+            }
+
+            for group in groups where group.rows.count > 1 {
+                var flatTokens: [Int32] = []
+                flatTokens.reserveCapacity(group.rows.count * group.count)
+                for row in group.rows {
+                    flatTokens.append(
+                        contentsOf: row.rec.tokens[row.start ..< row.start + row.count]
+                            .map(Int32.init))
+                }
+                let inputs = MLXArray(flatTokens).reshaped([group.rows.count, group.count])
+                let caches = eagerCaches(rowStates: group.rows.map { kvStates[$0.rec.id]! })
+                let requirement: CBv2PrefillRequirement =
+                    group.samples ? .lastPositionLogits : .evaluationOnly
+                let output = prefillOutput(
+                    tokens: inputs, inputEmbeddings: nil, caches: caches,
+                    requirement: requirement)
+                cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+
+                if group.samples {
+                    let sampled = sampler.sample(
+                        logits: output,
+                        params: group.rows.map(\.rec.request.sampling),
+                        requestIDs: group.rows.map(\.rec.id),
+                        stepIndex: stepCount,
+                        pendingSampledTokens: nil,
+                        rowContext: { group.rows.map { Self.samplerRow($0.rec) } })
+                    for (index, row) in group.rows.enumerated() {
+                        prefillSampled[row.rec.id] = sampled[index ..< index + 1]
+                    }
+                    if let stepLogprobs = sampler.takeStepLogprobs() {
+                        logprobSegments.append(stepLogprobs)
+                    }
+                } else {
+                    // One handle commits the whole rectangular trunk and
+                    // every participating row's KV writes.
+                    evalTargets.append(output)
+                }
+                packedIDs.formUnion(group.rows.map(\.rec.id))
+            }
+        }
+
         for row in work where !row.isDecode {
             let rec = row.rec
+            if packedIDs.contains(rec.id) { continue }
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
-            let logits: MLXArray
+            let requirement: CBv2PrefillRequirement =
+                row.samples ? .lastPositionLogits : .evaluationOnly
+            let output: MLXArray
             if let multimodal = multimodalByID[rec.id],
                 let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
             {
@@ -1334,16 +1460,19 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // spliced input embeddings + span attention masks. Chunks of
                 // the SAME request without spans fall through to the
                 // untouched text path (pure function of has-spans).
-                logits = multimodalChunkForward(
+                output = multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches)
+                    multimodal: multimodal, spanContext: spanContext, caches: caches,
+                    requirement: requirement)
             } else {
-                logits = model.forward(tokens: inputs, caches: caches)
+                output = prefillOutput(
+                    tokens: inputs, inputEmbeddings: nil, caches: caches,
+                    requirement: requirement)
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
                 prefillSampled[rec.id] = sampler.sample(
-                    logits: logits[0..., -1, 0...],
+                    logits: output,
                     params: [rec.request.sampling],
                     requestIDs: [rec.id],
                     stepIndex: stepCount,
@@ -1355,7 +1484,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             } else {
                 // Cheap handle that forces this chunk's graph (incl. KV
                 // writes) without materializing full logits on the host.
-                evalTargets.append(logits[0, row.count - 1, 0 ..< 1])
+                evalTargets.append(output)
             }
         }
 
@@ -1418,7 +1547,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     func multimodalChunkForward(
         tokens: MLXArray, start: Int, count: Int,
         multimodal: CBv2ResolvedMultimodal, spanContext: CBv2SpanChunkContext,
-        caches: [CBv2AttendingLayerCache]
+        caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
     ) -> MLXArray {
         guard let mmModel = model as? CBv2MultimodalSteppableModel else {
             // Unreachable: EngineV2.submit gates multimodal requests on this
@@ -1434,7 +1564,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         let bindables = count > 1 ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
         for bindable in bindables { bindable.bindSpanContext(spanContext) }
         defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
-        return mmModel.forward(tokens: tokens, inputEmbeddings: spliced, caches: caches)
+        return prefillOutput(
+            tokens: tokens, inputEmbeddings: spliced, caches: caches,
+            requirement: requirement)
     }
 
     // MARK: Finalization (deferred stop detection)

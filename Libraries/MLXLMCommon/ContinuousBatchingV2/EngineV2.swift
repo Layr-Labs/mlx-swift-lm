@@ -286,6 +286,20 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 "CBv2 MTP inactive despite a bound drafter: \(mtpInactiveReason, privacy: .public) — plain decode"
             )
         }
+        // Mixed-step prefill quota (opt-in, default OFF ⇒ byte-identical
+        // planning). When set, a step that also carries decode work admits
+        // at most this many PROMPT tokens, so newly arriving prompts cannot
+        // park an actively decoding request behind ~1.6s of prefill in one
+        // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
+        let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
+        if let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
+            let cap = Int(raw), cap >= 0
+        {
+            scheduler.mixedStepPrefillTokenCap = cap
+            log.info(
+                "CBv2 mixed-step prefill cap: \(cap, privacy: .public) tokens")
+        }
         self.loop = EngineLoopV2(
             model: model,
             layerKinds: layerKinds,
@@ -293,7 +307,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             cacheProvider: cacheProvider,
             sampler: sampler,
             detokenizerFactory: detokenizerFactory,
-            scheduler: SchedulerV2(config: schedulerConfig, capacity: admission),
+            scheduler: scheduler,
             capacity: admission,
             prefixCache: activePrefixCache,
             compiledDecode: compiledDecode,

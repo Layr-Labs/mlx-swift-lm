@@ -126,20 +126,25 @@ extension EngineLoopV2 {
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
-            let logits: MLXArray
+            let requirement: CBv2PrefillRequirement =
+                row.samples ? .lastPositionLogits : .evaluationOnly
+            let output: MLXArray
             if let multimodal = multimodalByID[rec.id],
                 let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
             {
-                logits = multimodalChunkForward(
+                output = multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches)
+                    multimodal: multimodal, spanContext: spanContext, caches: caches,
+                    requirement: requirement)
             } else {
-                logits = model.forward(tokens: inputs, caches: caches)
+                output = prefillOutput(
+                    tokens: inputs, inputEmbeddings: nil, caches: caches,
+                    requirement: requirement)
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
                 prefillSampled[rec.id] = sampler.sample(
-                    logits: logits[0..., -1, 0...],
+                    logits: output,
                     params: [rec.request.sampling],
                     requestIDs: [rec.id],
                     stepIndex: stepCount,
@@ -149,7 +154,7 @@ extension EngineLoopV2 {
                     logprobSegments.append(stepLogprobs)
                 }
             } else {
-                prefillEvalTargets.append(logits[0, row.count - 1, 0 ..< 1])
+                prefillEvalTargets.append(output)
             }
         }
 
