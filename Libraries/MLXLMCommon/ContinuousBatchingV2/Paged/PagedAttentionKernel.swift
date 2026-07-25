@@ -227,15 +227,57 @@ public enum PagedAttentionKernel {
     ///
     /// `DARKBLOOM_CBV2_PAGED_PTOK_TARGET=0` disables adaptation and pins
     /// PTOK to `partitionTokens` — the pre-WS-6.4 behaviour, and the kill
-    /// switch.
-    public static let partitionTargetThreadgroups: Int = {
-        guard
-            let raw = ProcessInfo.processInfo.environment[
-                "DARKBLOOM_CBV2_PAGED_PTOK_TARGET"],
-            let value = Int(raw), value >= 0
-        else { return 128 }
-        return value
-    }()
+    /// switch. Values above `partitionTargetLimit` are CLAMPED, not
+    /// rejected.
+    public static let partitionTargetThreadgroups: Int = partitionTarget(
+        environment: ProcessInfo.processInfo.environment)
+
+    /// Environment variable backing `partitionTargetThreadgroups`.
+    static let partitionTargetEnvironmentKey = "DARKBLOOM_CBV2_PAGED_PTOK_TARGET"
+
+    /// Target used when the knob is unset or unparseable.
+    static let partitionTargetDefault = 128
+
+    /// Ceiling on the operator-settable threadgroup target.
+    ///
+    /// The target is a THREADGROUP COUNT — "how much of the machine one
+    /// decode dispatch should fill". The largest Apple GPU in the fleet has
+    /// 80 cores, so 4,096 is ~50x saturation, and past it the knob stops
+    /// expressing anything new: with a target this high the sizer already
+    /// returns the ladder floor for every context a served model can hold
+    /// (the next rung up needs `128 * target / perPartition` attended
+    /// tokens — over 65,000 even at the least favourable shape). Clamping
+    /// therefore costs no reachable behaviour and buys two things:
+    ///
+    ///  - `partitionTokensForDispatch` can no longer be handed a target
+    ///    whose ceiling division overflows. This is an operator-facing kill
+    ///    switch; `DARKBLOOM_CBV2_PAGED_PTOK_TARGET=9223372036854775807`
+    ///    used to parse as a valid non-negative tuning value and then trap
+    ///    the daemon on its first paged decode.
+    ///  - `PagedAttentionKernelSmoke.smokeAttendLengths` can sweep the WHOLE
+    ///    reachable partition range instead of a prefix of it, so no rung
+    ///    the sizer can select is left to JIT on live traffic.
+    public static let partitionTargetLimit = 4096
+
+    /// `partitionTargetThreadgroups` as a function of an environment, so the
+    /// knob's own parse — including a hostile value — is testable without a
+    /// second process.
+    static func partitionTarget(environment: [String: String]) -> Int {
+        guard let raw = environment[partitionTargetEnvironmentKey] else {
+            return partitionTargetDefault
+        }
+        if let value = Int(raw), value >= 0 {
+            return min(value, partitionTargetLimit)
+        }
+        // All-digit values too large for `Int` are an over-range tuning
+        // setting, not a typo: clamp them exactly as `Int.max` clamps,
+        // rather than silently reverting to the default.
+        let digits = raw.hasPrefix("+") ? raw.dropFirst() : raw[...]
+        if !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }) {
+            return partitionTargetLimit
+        }
+        return partitionTargetDefault
+    }
 
     /// Tokens per partition for one decode dispatch: a rung of
     /// `partitionTokenLadder` that divides evenly into `pageSize` pages, so
@@ -254,13 +296,26 @@ public enum PagedAttentionKernel {
     public static func partitionTokensForDispatch(
         maxAttendLength: Int, batch: Int, kvHeads: Int, headSplits: Int, pageSize: Int
     ) -> Int {
+        partitionTokensForDispatch(
+            maxAttendLength: maxAttendLength, batch: batch, kvHeads: kvHeads,
+            headSplits: headSplits, pageSize: pageSize,
+            target: partitionTargetThreadgroups)
+    }
+
+    /// `partitionTokensForDispatch` with the threadgroup target injected —
+    /// the seam the smoke and its tests use to reason about a target other
+    /// than this process's.
+    static func partitionTokensForDispatch(
+        maxAttendLength: Int, batch: Int, kvHeads: Int, headSplits: Int, pageSize: Int,
+        target: Int
+    ) -> Int {
         // Rungs this page size can express. A page larger than a rung cannot
         // be subdivided into it; the pool refuses a page size that does not
         // divide `partitionTokens`, but `decode` is callable directly.
         let rungs = partitionTokenLadder.filter {
             $0 % pageSize == 0 && $0 <= partitionTokens
         }
-        guard let smallest = rungs.first, partitionTargetThreadgroups > 0 else {
+        guard let smallest = rungs.first, target > 0 else {
             return partitionTokens
         }
         let largest = rungs[rungs.count - 1]
@@ -268,16 +323,27 @@ public enum PagedAttentionKernel {
         // Threadgroups already launched per partition: everything except the
         // partition count is fixed by the layer and the batch.
         let perPartition = max(1, kvHeads * headSplits * batch)
-        let wantedPartitions =
-            (partitionTargetThreadgroups + perPartition - 1) / perPartition
+        let wantedPartitions = ceilingDivide(target, perPartition)
         guard wantedPartitions > 1 else { return largest }
 
         // Largest rung that still yields `wantedPartitions` partitions —
         // the smallest partial buffers that fill the machine. When even the
         // smallest rung cannot (the context is simply too short), take it:
         // that is the floor, not a target miss to correct further.
-        let idealTokens = (maxAttendLength + wantedPartitions - 1) / wantedPartitions
+        let idealTokens = ceilingDivide(maxAttendLength, wantedPartitions)
         return rungs.last { $0 <= idealTokens } ?? smallest
+    }
+
+    /// `ceil(lhs / rhs)` without the `lhs + rhs - 1` overflow. Both operands
+    /// can come from outside the process (`maxAttendLength` from a caller,
+    /// the target from an operator's environment), and an overflow trap on
+    /// this path takes the daemon down on its first paged decode.
+    private static func ceilingDivide(_ lhs: Int, _ rhs: Int) -> Int {
+        precondition(rhs > 0, "ceilingDivide by \(rhs)")
+        let quotient = lhs / rhs
+        // `quotient + 1` cannot overflow: reaching `Int.max` needs rhs == 1,
+        // and then the remainder is 0 and this returns early.
+        return lhs % rhs == 0 ? quotient : quotient + 1
     }
 
     // MARK: - Threadgroup-memory budget (single source of truth)

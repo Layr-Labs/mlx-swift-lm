@@ -359,10 +359,31 @@ struct CBv2PagedPoolGuardTests {
     /// (`[B, queryHeads, maxParts, headDim]` fp32) and merge work for
     /// occupancy that is already there. B == 8 is the target operating
     /// point, so a regression here would trade the batching win away.
+    ///
+    /// "Already saturated" is relative to `partitionTargetThreadgroups`,
+    /// which is operator-settable: raising the knob above what the fixed
+    /// partition launches is a REQUEST for the shrink, so the maximum-rung
+    /// expectation is conditioned on the fixed dispatch actually meeting
+    /// the configured target. The unconditional half — never fewer
+    /// threadgroups than the fixed partition would launch — holds at every
+    /// setting, including the kill switch, and keeps this non-vacuous when
+    /// the target is raised past saturation.
     @Test func partitionSizerKeepsTheMaximumWhenAlreadySaturated() {
+        let kvHeads = 8
+        let splits = 1
+        let batch = 8
+        func threadgroups(_ ptok: Int, _ length: Int) -> Int {
+            kvHeads * splits * batch * ((length + ptok - 1) / ptok)
+        }
         for length in [512, 1024, 8192] {
             let ptok = PagedAttentionKernel.partitionTokensForDispatch(
-                maxAttendLength: length, batch: 8, kvHeads: 8, headSplits: 1, pageSize: 16)
+                maxAttendLength: length, batch: batch, kvHeads: kvHeads,
+                headSplits: splits, pageSize: 16)
+            let fixed = threadgroups(PagedAttentionKernel.partitionTokens, length)
+            #expect(
+                threadgroups(ptok, length) >= fixed,
+                "B=8 length \(length): PTOK \(ptok) launches fewer threadgroups than the fixed partition")
+            guard fixed >= PagedAttentionKernel.partitionTargetThreadgroups else { continue }
             #expect(
                 ptok == PagedAttentionKernel.partitionTokens,
                 "B=8 length \(length) shrank PTOK to \(ptok)")

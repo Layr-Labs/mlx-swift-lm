@@ -109,11 +109,13 @@ struct CBv2PagedBackendTests {
 
     @Test func reservationExhaustionThrowsAtomically() throws {
         let kinds = [fullKind()]
-        // Tiny pool: room for a handful of pages only.
+        // Tiny pool: room for a handful of pages only. The +1 page is the
+        // group's poison page, which is carved OUT of `capacityBytes`, so a
+        // budget of N+1 pages is what buys N tenant pages.
         let pageBytes = 2 * 2 * 16 * 64 * 2
         let pool = try PagedKVPool(
             layerKinds: kinds,
-            config: config(capacityBytes: pageBytes * 8, nominalMaxLen: 128))
+            config: config(capacityBytes: pageBytes * 9, nominalMaxLen: 128))
         let key = PagedKVGroupKey(kvHeads: 2, headDim: 64)
         try pool.reserve([key: 6])
         #expect(throws: CBv2KVError.self) {
@@ -492,14 +494,16 @@ struct CBv2PagedBackendTests {
     /// request is accepted, and `bytesReserved` never exceeds capacity.
     @Test func admissionReservationCannotOvercommitPool() throws {
         let kinds = [fullKind()]  // one group, kv2 x d64
-        // Pool sized for exactly 2 requests of maxLength 128 (8 pages each).
+        // Pool sized for exactly 2 requests of maxLength 128 (8 pages each)
+        // plus the group's poison page, which comes out of `capacityBytes`.
         let perRequestPages = PagedKVPool.pageDemand(
             kind: kinds[0], maxLength: 128,
             config: config(nominalMaxLen: 128))
         let pageBytes = 2 * 2 * 16 * 64 * 2
         let backend = try PagedKVBackend(
             layerKinds: kinds,
-            config: config(capacityBytes: pageBytes * (perRequestPages * 2), nominalMaxLen: 128))
+            config: config(
+                capacityBytes: pageBytes * (perRequestPages * 2 + 1), nominalMaxLen: 128))
         #expect(backend.bytesReserved == 0)
 
         try backend.reserve(layerKinds: kinds, maxLength: 128)

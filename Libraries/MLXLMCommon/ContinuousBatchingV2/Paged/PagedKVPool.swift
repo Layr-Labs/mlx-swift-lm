@@ -345,7 +345,7 @@ public final class PagedKVPool {
         // no cross-reference, and their divisibility is what makes windowed
         // sharing a pointer swap: every matched block boundary is then also
         // a page boundary, so an adopter's post-adoption writes start at
-        // slot 0 of a fresh page and `restoreWindow(keys:values:base:)`
+        // slot 0 of a fresh page and `restoreWindow(_:at:)`
         // never has to copy a partial page (PagedSeamContract.swift, WS-4.1
         // — which explicitly defers the assertion to this guard). Violating
         // it does not fail loudly anywhere; it silently makes adoption
@@ -453,20 +453,27 @@ public final class PagedKVPool {
             let pageBytes = try Self.checkedMultiply(
                 [2, key.kvHeads, config.pageSize, key.headDim, config.dtype.size],
                 context: "page bytes")
-            let usablePages = groupBytes / pageBytes
-            guard usablePages > 0 else {
-                throw CBv2KVError.capacityExhausted(needed: pageBytes, available: groupBytes)
+            // Pages the group's two slabs may PHYSICALLY hold. `pageBytes`
+            // counts K and V together, so this is the whole allocation the
+            // group makes and it never exceeds the group's share of
+            // `capacityBytes` — deployments that treat `capacityBytes` as
+            // the total slab-memory (wired) limit are held to it.
+            let pageCount = groupBytes / pageBytes
+            // One of those physical pages backs the reserved poison page
+            // (WS-0.5): permanently zeroed, never allocatable, never
+            // written. It is carved OUT of the budget rather than on top of
+            // it, so a group needs room for two pages before it can serve
+            // anyone — one poison, one tenant. `bytesCapacity` reports the
+            // tenant figure (`usablePageCount * pageBytes`), which is now
+            // one page below the floor-divided budget instead of equal to
+            // it: a pool sized for exactly N requests must be sized for
+            // N requests PLUS one page.
+            guard pageCount >= 2 else {
+                throw CBv2KVError.capacityExhausted(
+                    needed: try Self.checkedMultiply(
+                        [2, pageBytes], context: "minimum group bytes"),
+                    available: groupBytes)
             }
-            // One extra PHYSICAL page per group backs the reserved poison
-            // page (WS-0.5). It is carved on TOP of the byte budget rather
-            // than out of it, so `capacityBytes` keeps mapping to
-            // tenant-usable pages exactly: a pool sized for N concurrent
-            // requests still admits N. The overshoot is one page per group
-            // — the same order as the floor division above already discards
-            // — and it is the only allocation in the pool that is not
-            // tenant storage. `bytesCapacity` reports the usable figure, so
-            // no accounting surface sees the extra page.
-            let pageCount = try Self.checkedAdd(usablePages, 1, context: "poison page")
             guard pageCount <= Int(Int32.max) else {
                 throw CBv2KVError.backendIneligible(
                     reason: "PagedKVPool: group \(key) needs \(pageCount) pages, "
@@ -873,9 +880,17 @@ public final class PagedKVPool {
     /// Bytes a sequence can actually be given. Counts USABLE pages: the
     /// per-group poison page is physically allocated but is not tenant
     /// storage, so reporting it here would overstate what admission can
-    /// hand out.
+    /// hand out. Strictly below `bytesPhysical` — by exactly one page per
+    /// group.
     public var bytesCapacity: Int {
         groups.values.reduce(0) { $0 + $1.usablePageCount * $1.pageBytes }
+    }
+
+    /// Bytes the slabs actually allocate (`materializeSlabs`), poison pages
+    /// INCLUDED. This is the figure a wired-memory or container limit sees,
+    /// and `PagedKVPool.init` holds it at or below `config.capacityBytes`.
+    public var bytesPhysical: Int {
+        groups.values.reduce(0) { $0 + $1.pageCount * $1.pageBytes }
     }
 
     /// Force-materialize the slabs (e.g. at engine warmup, before the wired

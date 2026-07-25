@@ -20,6 +20,23 @@
 //     of `[1, queryHeads, chunk, retained]`. The mask representation is
 //     unchanged by blocking: every block still gets an absolute-position
 //     BOOL `.array`.
+//   - PACKED prefill (`B > 1`, `L > 1`, WS-2.1): the SAME per-request chunk
+//     path, run once per row and concatenated on the batch axis — the
+//     storage-agnostic rectangular loop `CBv2AttentionV1.updateAndAttend`
+//     already uses, ported to paged storage. Each row gathers its OWN pages
+//     and masks in its OWN absolute coordinates, so a packed row is
+//     BIT-IDENTICAL to that row run alone and cross-row contamination is
+//     impossible by construction rather than by mask arithmetic. Requires
+//     WS-0.2p's query blocking to already bound the per-row score tensor,
+//     which it does.
+//   - VISION span chunk (`B == 1`, `L > 1`, spans bound through
+//     `CBv2SpanMaskBinding`, WS-2.2): the same mask, OR-ed with a
+//     bidirectional-within-block overlay. Because this file's mask is
+//     ALREADY materialized in absolute coordinates, the overlay is two
+//     comparisons against the block bounds — no chunk-end coordinate
+//     reconstruction, and no escape from a symbolic mode. Span chunks stay
+//     UNBLOCKED: a block's visible span is causal, and a bidirectional query
+//     may attend keys AFTER its own position.
 //   - MTP rectangular verification (`CBv2MTPRectangularSerializing`, `L > 1`
 //     with `B` rows): the decode kernel again, one query COLUMN at a time,
 //     so each column is bit-identical to that column run as a standalone
@@ -84,9 +101,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     var mtpSerializesRectangularAttention = false
 
     /// WS-1.2. The KV a KV-shared sibling needs in order to attend THIS
-    /// layer's most recent prompt chunk. A borrower runs AFTER the source
-    /// wrote, so it cannot reproduce the pre-write view by gathering; the
-    /// source has to keep it.
+    /// layer's most recent prompt chunk, ONE ENTRY PER ROW of that chunk
+    /// pass (packed prefill runs `B` rows through it — WS-2.1). A borrower
+    /// runs AFTER the source wrote, so it cannot reproduce the pre-write
+    /// view by gathering; the source has to keep it.
     ///
     /// DORMANT, DELIBERATELY. Under the ring sizing that shipped
     /// (`ceil((window - 1 + maxPrefillChunk) / pageSize) + span`) a
@@ -98,11 +116,19 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// overwritten by the chunk's own tail and no gather order can recover
     /// it. Do not delete it as unused: it is the mechanism, kept working,
     /// for a change already scheduled.
-    private var retainedPrefillKV: PrefillKV?
+    private var retainedPrefillKV: [PrefillKV] = []
     /// Defaults to `true` so a cache used outside a bank is correct; the
     /// bank turns it off for every layer no sibling borrows — which is all
     /// of them for both supported models, so neither pays a byte.
     private var retainsChunkForBorrowers = true
+
+    /// WS-2.2 (`CBv2SpanMaskBinding`). The bidirectional image spans of the
+    /// ONE vision prefill chunk currently being built, in ABSOLUTE token
+    /// coordinates — the same coordinates this file's masks already live in,
+    /// so the overlay needs no translation. The engine binds it immediately
+    /// before that chunk's graph build and unbinds it immediately after, so
+    /// it is ALWAYS nil for decode, text chunks, and other requests' chunks.
+    private(set) var boundSpanContext: CBv2SpanChunkContext?
 
     public init(
         layerIndex: Int, kind: CBv2LayerKind, pool: PagedKVPool,
@@ -135,7 +161,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             return paged
         }
         rebuildPositionOffsets()
-        retainedPrefillKV = nil
+        retainedPrefillKV = []
     }
 
     /// Per-row absolute RoPE offsets `[B]` (device int32). Read BEFORE
