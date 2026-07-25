@@ -31,11 +31,37 @@ enum CBv2MTPCaptureFence {
     /// collapses, and greedy token-exactness can break SILENTLY, with no
     /// crash to point at.
     ///
-    /// It does not corrupt today only because a windowed ring is sized
-    /// `window + maxPrefillChunk`, and the resulting ~528-token alias margin
-    /// puts the round's writes outside the gathered range. That margin is an
-    /// accident, and it is exactly what WS-1.2/3.1's ring shrink deletes —
-    /// which is why the shrink is held out of this wave and this is not.
+    /// It does not corrupt in practice today because the windowed ring is
+    /// sized `ceil((window - 1 + maxPrefillChunk) / pageSize) +
+    /// ceil(maxSpeculativeSpan / pageSize)`, which leaves slack between the
+    /// ring and the gathered range. For gemma-4 (window 1024, chunk 512,
+    /// pageSize 16, span 8) that is 97 pages == 1,552 tokens, and the two
+    /// paths sit very differently inside it:
+    ///
+    ///     MTP round      attendable 1,024   ->  margin 528
+    ///     prefill chunk  attendable 1,535   ->  margin  17
+    ///
+    /// Read the SECOND row before concluding there is room to spare. 528 is
+    /// the number this hazard happens to hide behind; 17 is the number the
+    /// path that runs on every request lives on. Neither is a guarantee —
+    /// both are by-products of chunk sizing, and nothing asserts either.
+    /// WS-1.2/3.1 proposed shrinking the ring to `ceil(window / pageSize) +
+    /// span pages`, deleting the 528 outright. That shrink was tried and
+    /// REVERTED this wave — it aborted ordinary windowed prefill, which
+    /// needs the chunk term — so the margin still stands. The next attempt
+    /// will not have that bug, and then only this edge is left.
+    ///
+    /// **This is why the edge is unconditional.** There IS a chain that ties
+    /// ring sizing to speculation — `PagedKVPool.checkedRingPageCount` sizes
+    /// against `CBv2PagedSpeculation.maxSpeculativeSpan`, and
+    /// `assertSpanCoversMTPBound()` ties that span to the MTP draft bound —
+    /// and this fence deliberately joins none of it. Gating the edge on ring
+    /// geometry would make its correctness a function of three constants
+    /// maintained in two other files, and would silently exempt the case
+    /// with no ring at all. Publishing it unconditionally costs one reduction
+    /// per capture and is correct for any ring size, any span, any chunk, and
+    /// for full-attention rows. It is a mechanism, not a check, so it cannot
+    /// go stale when someone re-lands the shrink.
     ///
     /// **The fix: a fence BACK-edge.** `PagedKVPool.gather` already folds the
     /// group's write fence into its page index (`MLXArray(pages) +
