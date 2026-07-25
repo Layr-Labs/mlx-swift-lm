@@ -20,16 +20,15 @@ struct CBv2PagedKernelTests {
     /// A paged config whose `maxPrefillChunk` the pool will actually accept
     /// for `kind`.
     ///
-    /// WS-1.2 shrank the windowed ring from `ceil((window + maxPrefillChunk) /
-    /// pageSize) + 1` pages to `ceil(window / pageSize) + ceil(
-    /// maxSpeculativeSpan / pageSize)`, and `PagedKVPool` now REFUSES a config
+    /// The windowed ring is `ceil(max(window + maxSpeculativeSpan,
+    /// maxPrefillChunk) / pageSize)` pages, and `PagedKVPool` REFUSES a config
     /// whose `maxPrefillChunk` exceeds the whole ring — a chunk that laps the
-    /// ring would overwrite the tokens it just wrote. Before the shrink the
-    /// ring was sized as `window + maxPrefillChunk`, so any chunk fitted by
-    /// construction and these fixtures could hard-code 64.
+    /// ring would put two of its own tokens in one physical slot inside a
+    /// single dispatch. In practice the `max` means the ring always covers the
+    /// chunk, so this clamp is belt-and-braces; it stays because the shape
+    /// matrix is declarative and a future sizing change should not silently
+    /// turn a fixture into a `backendIneligible` throw.
     ///
-    /// Clamping here rather than hard-coding per shape keeps the shape matrix
-    /// declarative: each case asks for the largest chunk its window admits.
     /// Full-attention layers have no ring and are unclamped.
     static func pagedConfig(
         for kind: CBv2LayerKind, capacityBytes: Int, desiredPrefillChunk: Int = 64,
@@ -51,23 +50,27 @@ struct CBv2PagedKernelTests {
     /// i.e. bypassing `PagedLayerCache`, as the fixtures do when they seed a
     /// row's history.
     ///
-    /// Distinct from `config.maxPrefillChunk`, and the difference is the whole
-    /// of WS-1.2's trade. After a write of `n` tokens a windowed row reports
-    /// `retainedCount == min(written, window - 1 + n)` and `attendableViews()`
-    /// gathers exactly that span, which `gatherRange` refuses (process abort)
-    /// once it exceeds the ring. `PagedLayerCache` is allowed a chunk as large
-    /// as the whole ring because it gathers BEFORE it writes and concatenates
-    /// the chunk it already holds (see PagedLayerCache.updateAndAttend,
-    /// WS-1.2 comment) — it never asks the ring for more than `window - 1`.
-    /// A direct writer has no such trick, so it is bounded by
-    /// `ringTokens - window + 1`.
+    /// `config.maxPrefillChunk`, same as any other writer. It was NOT always:
+    /// a direct write used to leave `retainedCount == min(written, window - 1
+    /// + n)`, so the following `attendableViews()` asked the ring for
+    /// `window - 1 + n` and `gatherRange` aborted the process once that span
+    /// exceeded the ring — bounding a direct writer at `ringTokens - window +
+    /// 1`, which is 17 tokens at gemma-4's geometry against a 512-token chunk.
+    ///
+    /// WS-1.2's row half removed that. `PagedSequenceKV.update` now gathers a
+    /// chunk's window history BEFORE writing the chunk, exactly as
+    /// `PagedLayerCache.prefillKV` does, so `retainedCount` is
+    /// `min(written, window)` in every phase and the ring only has to cover
+    /// one whole chunk — which `PagedKVPool.ringPageCount`'s ROW bound
+    /// guarantees by construction.
+    ///
+    /// Kept as a named function rather than inlined so the distinction stays
+    /// greppable: it is the thing that used to be true, and the two callers it
+    /// stands for (this harness and `PagedDecodeProfiler`) are the paged
+    /// backend's only direct writers.
     static func rowSafeWriteChunk(for kind: CBv2LayerKind, desired: Int = 64) -> Int {
-        guard case .slidingWindow(let window) = kind.attention else { return desired }
-        let config = pagedConfig(
-            for: kind, capacityBytes: 1 << 20, desiredPrefillChunk: desired)
-        let ringTokens =
-            PagedKVPool.ringPageCount(window: window, config: config) * config.pageSize
-        return max(1, min(config.maxPrefillChunk, ringTokens - window + 1))
+        pagedConfig(for: kind, capacityBytes: 1 << 20, desiredPrefillChunk: desired)
+            .maxPrefillChunk
     }
 
     // MARK: - Fixtures

@@ -689,19 +689,34 @@ public final class PagedKVPool {
     ///
     /// CONSEQUENCE: there is no safe reduction available HERE. WS-1.3's
     /// "charge min(ctx, window)" reads as a change to this function, but the
-    /// charge is already the tight bound — what makes it large is the ring.
-    /// gemma-4's 1,024-token window rings at 97 pages (1,552 tokens), so
-    /// every request whose `maxLength` reaches 1,537 legitimately holds all
-    /// 97 of them, and charging less is a free-list underflow:
+    /// charge is already the tight bound — what makes it large is the ring,
+    /// and charging below the ring is a free-list underflow:
     /// `PagedKVGroup.allocatePage` traps, which is a daemon abort under
     /// load, not a rejected request.
     ///
-    /// The win therefore lives in `ringPageCount`, and — see the analysis
-    /// there — it is NOT a resizing change either. It needs the layer to
-    /// attend `gather(ring) ++ chunk` with the gather taken before the
-    /// write, which drops the ring to 65 pages; this `min` then inherits
-    /// the reduction for free with no change to the line below. Until that
-    /// lands, WS-1.3 has nothing to collect.
+    /// The win therefore lived in `ringPageCount`, and it has LANDED: the
+    /// ring is now `ceil(max(maxWindowExposure(window) + maxSpeculativeSpan,
+    /// maxPrefillChunk) / pageSize)`, and this `min` inherited the reduction
+    /// for free with no change to the line below. On gemma-4 (window 1,024,
+    /// pageSize 16, chunk 512) that is 65 pages / 1,040 tokens, down from
+    /// the 97 / 1,552 the earlier `window - 1 + maxPrefillChunk` ring
+    /// charged. Derive the figure from `ringPageCount` rather than trusting
+    /// either number here — this comment is the third place they have
+    /// rotted.
+    ///
+    /// The shorter ring is only legitimate because THREE things now hold
+    /// together; an earlier attempt at 65 without them aborted the daemon in
+    /// ordinary prefill. (1) The pre-write gather is on both the layer and
+    /// the row path, so a chunk attends `gather(ring) ++ chunk` rather than
+    /// re-reading slots it is about to overwrite. (2) `retainedCount` is
+    /// clamped to `PagedSequenceKV.maxWindowExposure`, which is also the
+    /// first term of the ring, so widening a row's exposure grows the ring
+    /// instead of silently out-running it. (3) `PagedKVPool.gather`
+    /// publishes a fence BACK-edge. That last one was a latent bug, not a
+    /// new requirement: the gather and `writeTokens` were graph SIBLINGS,
+    /// benign at 1,552 tokens because a chunk's history and the chunk never
+    /// shared a ring slot, and silently corrupting at 1,040 because they do.
+    /// Removing any of the three re-arms the abort; see `ringPageCount`.
     ///
     /// Rows adopted mid-stream (`fastForward`) are the one CONSERVATIVE
     /// case: their first write lands at ring slot `(base / pageSize) %

@@ -24,11 +24,12 @@ import Foundation
 /// * OVER-charging rejects requests the pool can serve. A one-token request
 ///   on gemma-4 needs ONE 16-token page per windowed layer, not the 1,024
 ///   rows of the window (nor the full width of the ring). Do not restate the
-///   ring's width here, and do not assume one: it is `ringPageCount`'s to
-///   define, it is actively contested (WS-1.2 proposes shrinking gemma-4's
-///   from 97 pages to 65 on the back of a pre-write gather in
-///   `PagedLayerCache`), and deriving the charge from `pageDemand` is
-///   precisely what keeps this file correct under either answer.
+///   ring's width here and do not assume one: it is `ringPageCount`'s to
+///   define and it has already moved once under this file's feet (WS-1.2
+///   took gemma-4's from 97 pages to 65 once `PagedLayerCache` gathered
+///   BEFORE writing). Deriving the charge from `pageDemand` is what kept
+///   this file correct across that change without an edit, and is why it
+///   needs none for the next one.
 public struct CBv2PagedKVResidency: CBv2KVResidencyPolicy {
     public let config: PagedKVPoolConfig
 

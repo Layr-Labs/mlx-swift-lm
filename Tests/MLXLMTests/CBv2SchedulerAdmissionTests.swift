@@ -546,10 +546,10 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
 
     /// The gemma-4 paged sizing: pageSize 16, chunk 512. The ring it implies
     /// is deliberately NOT restated here — it is `ringPageCount`'s to define
-    /// and it is contested (97 pages at the time of writing; WS-1.2 proposes
-    /// 65 on the back of a pre-write gather in `PagedLayerCache`). Every
-    /// expectation below that depends on it reads `PagedKVPool.ringPageCount`
-    /// instead of a literal, so this suite is correct under either answer.
+    /// and it has already moved once (WS-1.2 took gemma-4's from 97 pages to
+    /// 65 once `PagedLayerCache` gathered BEFORE writing). Every expectation
+    /// below that depends on it reads `PagedKVPool.ringPageCount` instead of
+    /// a literal, which is what carried this suite across that change.
     private var gemmaPagedConfig: PagedKVPoolConfig {
         PagedKVPoolConfig(
             capacityBytes: 1 << 30, maxPrefillChunk: 512, nominalMaxSequenceLength: 8192)
@@ -671,9 +671,9 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertEqual(admitted, capacity / pageBytes)
 
         // Not a relaxation: what the pool cannot serve is still refused. A
-        // 2,000-token row saturates the whole ring, and the ring is far wider
-        // than this fixture's 40 pages under every sizing on the table (97
-        // today, 65 under WS-1.2), so both the ledger and the pool say no.
+        // 2,000-token row saturates the whole ring, and the ring dwarfs this
+        // fixture's 40 pages under either sizing it has had (65 now, 97
+        // before WS-1.2), so both the ledger and the pool say no.
         XCTAssertFalse(backendAware.canEverFit(promptTokens: 2000, maxTokens: 0))
         XCTAssertThrowsError(try (backend as! PagedKVBackend).reserve(
             layerKinds: kinds, maxLength: 2000))

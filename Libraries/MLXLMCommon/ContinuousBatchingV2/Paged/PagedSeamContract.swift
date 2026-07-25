@@ -271,7 +271,7 @@ protocol CBv2MTPRectangularSerializing: AnyObject {
 extension CBv2LayerCache: CBv2MTPRectangularSerializing {}
 
 // WS-3.4 LANDED: `extension PagedLayerCache: CBv2MTPRectangularSerializing`
-// (`PagedLayerCache.swift:844`), with `updateAndAttend` honouring the flag
+// in `PagedLayerCache.swift`, with `updateAndAttend` honouring the flag
 // through `attendRectangularColumns` rather than the prompt-chunk branch —
 // which is why the branch's `b > 1` case is now packed prefill, not a
 // rectangular round. The blanket
@@ -501,26 +501,39 @@ public struct CBv2PagedWindowSnapshot {
 //
 //       HOW THE 65-PAGE RING BECAME SAFE — the whole point of this entry,
 //       because the same 65 pages were a daemon abort two revisions ago and
-//       nothing about the arithmetic says which. It is safe because the
-//       EXPOSURE shrank, not because the ring was re-argued:
+//       nothing about the arithmetic says which. THREE preconditions hold
+//       now that did not hold then. Remove any one and the abort re-arms;
+//       `PagedKVPool.ringPageCount` carries the same list.
 //
-//         `PagedSequenceKV.retainedCount` used to be
-//         `min(written, window - 1 + lastUpdateTokens)`, so a prefill chunk
-//         of `n` left the row able to demand `window - 1 + n` from the ring.
-//         Under a 1,040-token ring `gatherRange` trips
-//         `precondition(start >= absoluteOffset - ring, "gather of evicted
-//         window range")` for any windowed chunk past `pageSize + 1` tokens.
-//         That is an ordinary-prefill process abort, and it is why this
-//         entry previously recorded the window-only ring as REJECTED.
+//         1. BOTH write paths gather before they write.
+//            `PagedLayerCache.prefillKV` is the layer half (WS-1.2) and
+//            `PagedSequenceKV.update` is the row half: it gathers at most
+//            `window - 1` positions of history, writes, then concatenates
+//            the chunk tensor it already holds.
 //
-//         It stopped being reachable when BOTH write paths started gathering
-//         before they write: `PagedLayerCache.prefillKV` (the layer half,
-//         WS-1.2) and now `PagedSequenceKV.update` (the row half), which
-//         gathers at most `window - 1` positions of history and then
-//         concatenates the chunk tensor it already holds. With no consumer
-//         left inflating it, `retainedCount` collapsed to
-//         `min(written, maxWindowExposure(window))` and the chunk term left
-//         the ring with it.
+//         2. `retainedCount` is clamped to `maxWindowExposure`. It used to
+//            be `min(written, window - 1 + lastUpdateTokens)`, so a prefill
+//            chunk of `n` left the row able to demand `window - 1 + n`.
+//            Under a 1,040-token ring `gatherRange` trips
+//            `precondition(start >= absoluteOffset - ring, "gather of
+//            evicted window range")` for any windowed chunk past
+//            `pageSize + 1` tokens — an ordinary-prefill process abort, and
+//            why this entry previously recorded the ring as REJECTED. With
+//            (1) leaving no consumer to inflate it, the clamp collapsed it
+//            to `min(written, maxWindowExposure(window))` and the chunk
+//            term left the ring with it.
+//
+//         3. `PagedKVPool.gather` publishes a fence BACK-edge, so a later
+//            bulk write cannot overtake a pre-write gather that has not
+//            materialised. This one is NOT a consequence of the shrink and
+//            is the easiest to lose: it was a latent bug all along, because
+//            the gather and `writeTokens` were graph SIBLINGS. In-place
+//            slab writes are invisible to MLX's hazard tracking, so nothing
+//            ordered them. At 1,552 tokens it was benign — a chunk's
+//            history and the chunk never shared a ring slot. At 1,040 they
+//            do, and the same missing edge corrupts KV silently, with no
+//            precondition to trip. The forward edge alone is not enough;
+//            both halves are required.
 //
 //       THE LIVE CONSTRAINT, which replaces the old prohibition. Exposure
 //       and ring size are now mechanically coupled through ONE symbol:
@@ -530,7 +543,7 @@ public struct CBv2PagedWindowSnapshot {
 //       shrinks the ring" — it is "someone re-widens what a row exposes".
 //       Concretely, any change that makes a row gather AFTER it writes must
 //       either raise `maxWindowExposure` (and pay for the ring) or not land.
-//       Two ways to get this wrong that both look like tidying:
+//       Three ways to get this wrong that all look like tidying:
 //         1. Hoisting `PagedLayerCache`'s gather OUT of the per-row body of
 //            `CBv2AttentionV1.packedPerRow` so it runs once across the
 //            batch. It reads as deduplication; it reintroduces a post-write
@@ -540,6 +553,13 @@ public struct CBv2PagedWindowSnapshot {
 //            `retainedPrefillKV[index]` in `attendBorrowing`. It compiles,
 //            and it silently serves row 0's history to every KV-shared
 //            sibling of a packed prefill.
+//         3. Deleting the fence BACK-edge at the end of `PagedKVPool.gather`
+//            as a redundant no-op. It multiplies the fence by zero, so it
+//            looks like dead arithmetic and reads like a performance win;
+//            it is the only thing ordering a later bulk write after this
+//            read. Unlike (1) and (2) it does not widen exposure, so
+//            `checkedRingPageCount` cannot catch it and no precondition
+//            trips — it corrupts KV silently.
 //       Track L and track R own those bodies; this entry owns the
 //       constraint.
 //
