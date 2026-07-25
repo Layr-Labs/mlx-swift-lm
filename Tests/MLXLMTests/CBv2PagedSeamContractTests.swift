@@ -7,17 +7,23 @@
 // Two of these suites exist because the frozen contract HAD drifted (PR#86
 // review):
 //
-//  * `:158` — the contract declared a ring formula
-//    (`ceil(window / pageSize) + ceil(span / pageSize)`, 65 pages for
-//    gemma-4) that `PagedKVPool` never implemented and that makes an
-//    ordinary-prefill daemon abort reachable. Nothing failed when they
-//    disagreed. `RingFormula` below fails.
-//  * `:173` — the contract froze `restoreWindow(keys:values:base:)`, which
-//    cannot tell whether the window it is handed belongs at the boundary
-//    being adopted. `WindowSnapshotBoundary` below pins the refusal.
+//  * the contract declared a ring formula that `PagedKVPool` never
+//    implemented, and nothing failed when they disagreed. `RingFormula`
+//    below fails.
+//  * the contract froze `restoreWindow(keys:values:base:)`, which cannot
+//    tell whether the window it is handed belongs at the boundary being
+//    adopted. `WindowSnapshotBoundary` below pins the refusal.
 //
-// The third (`:50`) is the always-run copy of an invariant that used to be
-// guarded by an `assert` inside a function nothing called.
+// The third is the always-run copy of an invariant that used to be guarded
+// by an `assert` inside a function nothing called.
+//
+// NOTE ON THE RING SUITE. The formula the contract used to declare —
+// `ceil(window / pageSize) + span pages`, 65 for gemma-4 — WAS wrong when it
+// was written, and shipping it aborted the daemon in ordinary windowed
+// prefill. It is right now, and the tests below are deliberately written so
+// that they fail again if the reason it became right is undone. They pin the
+// CONDITION, not the number: `attendableTokens` may drop the prefill-chunk
+// term only while both write paths gather before they write.
 
 import Foundation
 import MLX
@@ -92,74 +98,149 @@ struct CBv2PagedSeamContractRingFormulaTests {
                         tokens >= required,
                         """
                         window \(window), pageSize \(pageSize), chunk \(chunk): ring holds \
-                        \(tokens) tokens but must cover \(required) (attendable \
-                        \(CBv2PagedRingGeometry.attendableTokens(
-                            window: window, maxPrefillChunk: chunk)) + span \
-                        \(CBv2PagedSpeculation.maxSpeculativeSpan))
+                        \(tokens) tokens but must cover \(required) (max of attendable \
+                        \(CBv2PagedRingGeometry.attendableTokens(window: window)) + span \
+                        \(CBv2PagedSpeculation.maxSpeculativeSpan), and one chunk \(chunk))
                         """)
                 }
             }
         }
     }
 
-    /// The widest range a windowed row exposes is `retainedCount` right after
-    /// a bulk write — `window - 1 + maxPrefillChunk`, not `window`. This is
-    /// the term the rejected formula dropped, so it is pinned separately from
-    /// the page arithmetic that consumes it.
-    @Test func attendableSpanCarriesTheWholePrefillChunk() {
-        #expect(CBv2PagedRingGeometry.attendableTokens(window: 1024, maxPrefillChunk: 512) == 1535)
-        #expect(CBv2PagedRingGeometry.attendableTokens(window: 1, maxPrefillChunk: 1) == 1)
-        #expect(
-            CBv2PagedRingGeometry.requiredTokens(window: 1024, maxPrefillChunk: 512)
-                == 1535 + CBv2PagedSpeculation.maxSpeculativeSpan)
+    /// The seam's `attendableTokens` must be exactly what the ROW can be
+    /// asked to gather — not a number that happens to match today.
+    ///
+    /// THIS IS THE CONDITION PIN. `attendableTokens` dropped its
+    /// `maxPrefillChunk` term because `PagedSequenceKV.update` and
+    /// `PagedLayerCache.prefillKV` gather a chunk's window history BEFORE
+    /// writing the chunk, which collapsed `retainedCount` to
+    /// `min(written, window)`. Restore a post-write gather anywhere on either
+    /// path and `retainedCount` climbs above `window` again — that is what
+    /// this measures, on a REAL row driven through a REAL `maxPrefillChunk`
+    /// write, not on the arithmetic.
+    ///
+    /// The failure it stands in front of is not hypothetical. A ring sized
+    /// from `window` while the row still gathers after writing asks
+    /// `gatherRange` for `window - 1 + chunk` out of `window + span` and
+    /// aborts the process. That shipped once.
+    @Test(arguments: [(window: 32, chunk: 16), (window: 64, chunk: 64), (window: 128, chunk: 32)])
+    func attendableSpanIsWhatARealRowActuallyExposes(_ shape: (window: Int, chunk: Int)) throws {
+        let kind = CBv2LayerKind(
+            attention: .slidingWindow(shape.window), headDim: 64, kvHeads: 2, queryHeads: 4)
+        let cfg = PagedKVPoolConfig(
+            capacityBytes: 8 << 20, maxPrefillChunk: shape.chunk,
+            nominalMaxSequenceLength: 4096)
+        let backend = try PagedKVBackend(layerKinds: [kind], config: cfg)
+        let state = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 2048)
+        defer { backend.release(state) }
+        let row = try #require(state[0] as? PagedSequenceKV)
+
+        let declared = CBv2PagedRingGeometry.attendableTokens(window: shape.window)
+        // Sweep well past the ring so wrap-around is live, ending on a
+        // FULL-SIZE chunk — the phase that used to inflate `retainedCount`.
+        var written = 0
+        while written < 4 * shape.window + 2 * shape.chunk {
+            let n = shape.chunk
+            _ = row.update(
+                keys: MLXArray.zeros([2, n, 64], dtype: .float16),
+                values: MLXArray.zeros([2, n, 64], dtype: .float16))
+            written += n
+            #expect(
+                row.retainedCount <= declared,
+                """
+                window \(shape.window) chunk \(shape.chunk): after a \(n)-token write the row \
+                exposes \(row.retainedCount) positions but the seam declares \
+                \(declared). CBv2PagedRingGeometry.attendableTokens drops the maxPrefillChunk \
+                term ONLY because PagedSequenceKV.update and PagedLayerCache.prefillKV gather \
+                the chunk's window history BEFORE writing the chunk. If a post-write gather \
+                came back, put the term back FIRST — a ring sized for the window alone aborts \
+                the daemon in gatherRange on ordinary prefill.
+                """)
+        }
+        // ...and the row must still be gatherable at that width, which is the
+        // half `retainedCount` alone cannot show.
+        let (k, _) = row.attendableViews()
+        #expect(k.dim(2) == row.retainedCount)
     }
 
-    /// gemma-4's geometry, and the arithmetic that rejected the smaller
-    /// formula the contract used to declare.
+    /// The ROW bound is independent of the window and must be pinned
+    /// independently, or a future resize re-derives the ring from the cache
+    /// bound alone and hands a long-chunk pool a ring it cannot write into.
+    ///
+    /// `maxPrefillChunk` used to be implied by the chunk term inside the
+    /// attendable span. It is not implied any more.
+    @Test func rowBoundSurvivesAChunkThatOutrunsTheWindow() {
+        let pageSize = 16
+        let span = CBv2PagedSpeculation.maxSpeculativeSpan
+        for (window, chunk) in [(128, 2048), (32, 512), (16, 4096)] {
+            let required = CBv2PagedRingGeometry.requiredTokens(
+                window: window, maxPrefillChunk: chunk)
+            let cacheOnly = window + span
+            #expect(
+                chunk > cacheOnly,
+                "fixture is wrong: window \(window) chunk \(chunk) is not row-bound")
+            #expect(
+                required >= chunk,
+                """
+                window \(window) chunk \(chunk): the ring must cover ONE maxPrefillChunk write \
+                (\(chunk) tokens) and covers \(required). The cache bound alone would give it \
+                \(cacheOnly) tokens — \((cacheOnly + pageSize - 1) / pageSize) pages for a \
+                \((chunk + pageSize - 1) / pageSize)-page write, so the chunk would lap the \
+                ring inside a single bulk-write dispatch with no ordering between the two \
+                tokens landing in the same slot.
+                """)
+            let pages = CBv2PagedRingGeometry.ringPageCount(
+                window: window, pageSize: pageSize, maxPrefillChunk: chunk)
+            #expect(pages * pageSize >= chunk)
+        }
+    }
+
+    /// gemma-4's geometry, and the history that makes 65 pages a conclusion
+    /// rather than a constant.
     ///
     /// 25 of gemma-4's 30 layers are sliding at window 1,024 with pageSize 16
-    /// and the default 512-token prefill chunk. The landed ring is 97 pages;
-    /// the rejected `ceil(window / pageSize) + ceil(span / pageSize)` is 65.
-    /// 65 pages is 1,040 tokens against an attendable range of 1,535, so a
-    /// row that writes a full chunk and then gathers `retainedCount` asks
-    /// `gatherRange` for a range the ring has already lapped — the "gather of
-    /// evicted window range" precondition, i.e. a daemon abort on ordinary
-    /// prefill.
-    @Test func gemma4RingIsNinetySevenPagesAndTheRejectedFormulaIsTooSmall() {
+    /// and the default 512-token prefill chunk. The ring is 65 pages == 1,040
+    /// tokens. It was 97 pages == 1,552 tokens, and the 528-token difference
+    /// was a measured 1.10x per-sequence KV regression against the contiguous
+    /// backend at 10k context.
+    ///
+    /// 65 was ALSO tried before and reverted, for a reproduced daemon abort.
+    /// What changed is stated in `CBv2PagedRingGeometry`'s doc comment and
+    /// measured by `attendableSpanIsWhatARealRowActuallyExposes` above; this
+    /// test only pins the arithmetic that follows from it, plus the two
+    /// things that would have to be true again for 97 to come back.
+    @Test func gemma4RingIsSixtyFivePagesBecauseTheRowNoLongerOverExposes() {
         let window = 1024
         let pageSize = 16
         let chunk = 512
+        let span = CBv2PagedSpeculation.maxSpeculativeSpan
 
+        #expect(CBv2PagedRingGeometry.attendableTokens(window: window) == 1024)
+        #expect(CBv2PagedRingGeometry.requiredTokens(window: window, maxPrefillChunk: chunk) == 1032)
         let landed = CBv2PagedRingGeometry.ringPageCount(
             window: window, pageSize: pageSize, maxPrefillChunk: chunk)
-        #expect(landed == 97, "gemma-4's windowed layers ring at 97 pages (1,552 tokens)")
-        #expect(landed * pageSize == 1552)
+        #expect(landed == 65, "gemma-4's windowed layers ring at 65 pages (1,040 tokens)")
+        #expect(landed * pageSize == 1040)
 
-        // The formula PagedSeamContract.swift:154-158 used to declare.
-        let rejected =
-            (window + pageSize - 1) / pageSize
-            + (CBv2PagedSpeculation.maxSpeculativeSpan + pageSize - 1) / pageSize
-        #expect(rejected == 65, "the rejected formula sizes gemma-4's ring at 65 pages")
+        // Cache-bound, not row-bound, at the production chunk — so the
+        // 65 has to survive the row bound being slack here, and
+        // `rowBoundSurvivesAChunkThatOutrunsTheWindow` covers the other side.
+        #expect(window + span > chunk)
+
+        // What 97 pages WAS: the post-write attendable span. Kept as live
+        // arithmetic so the size of the thing that was removed stays visible.
+        let postWriteSpan = window - 1 + chunk
+        let old = (postWriteSpan + pageSize - 1) / pageSize + (span + pageSize - 1) / pageSize
+        #expect(old == 97)
+        #expect((old - landed) * pageSize == 512)
         #expect(
-            rejected * pageSize
-                < CBv2PagedRingGeometry.attendableTokens(
-                    window: window, maxPrefillChunk: chunk),
+            postWriteSpan > landed * pageSize,
             """
-            the rejected ring (\(rejected * pageSize) tokens) must be shown SMALLER than the \
-            range a row can be asked to gather (\(CBv2PagedRingGeometry.attendableTokens(
-                window: window, maxPrefillChunk: chunk))) — that gap is why it was rejected
+            a post-write gather asks for \(postWriteSpan) tokens out of a \(landed * pageSize)-\
+            token ring. That inequality IS the reverted abort: it is why the ring may only be \
+            this small while both write paths gather BEFORE they write.
             """)
-
-        // And it is not a gemma-4 quirk: the rejected formula is too small
-        // wherever the chunk outruns one page, which is every default config.
-        for chunk in [17, 64, 512, 4096] {
-            let small = (window + pageSize - 1) / pageSize + 1
-            #expect(
-                small * pageSize
-                    < CBv2PagedRingGeometry.requiredTokens(
-                        window: window, maxPrefillChunk: chunk),
-                "chunk \(chunk): the window-only ring cannot hold the attendable range")
-        }
     }
 }
 

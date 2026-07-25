@@ -447,27 +447,41 @@ final class CBv2EndToEndTests: XCTestCase {
         XCTAssertEqual(second.text, first.text)
     }
 
-    func testStackedSlidingPagedBackendFailsCold() async throws {
+    /// WS-4.1. Paged now DERIVES `.frozenFullReplay` for the interleaved
+    /// hybrid instead of failing cold, so the prefix cache is armed and the
+    /// finished request donates. The adoption itself is still refused for
+    /// this plan shape — the engine's plan carries R > 0 and
+    /// `PagedSequenceKV` has one mutable cursor, so replaying `[C, M)` would
+    /// overwrite the exact cached full K/V — and the refusal degrades to a
+    /// cold prefill, which is what keeps the two runs token-identical.
+    ///
+    /// The zero-replay form (every sliding row restored EXACTLY at M from a
+    /// `CBv2PagedWindowSnapshot`) IS served, and is covered end to end at the
+    /// backend level by `CBv2PrefixReusePagedFrozenFullTests`. It cannot be
+    /// exercised from here because nothing in the engine donates a window:
+    /// `PrefixCacheV2.isCacheable` nils every sliding layer, and the payload
+    /// comes from the provider's per-block window sidecar.
+    func testStackedSlidingPagedBackendDonatesButRefusesTheReplayForm() async throws {
         let model = TinyTestModel.make(
             seed: 0xD00D_F00D,
             headDim: 64,
             stackedSlidingFull: true)
         let prompt = makePromptTokens(length: 73, seed: 0x5EED)
         let stack = try makeStack(.paged, model: model, enablePrefixCache: true)
-        XCTAssertFalse(stack.engine.prefixReuseCapability.isSupported)
-        XCTAssertEqual(
-            stack.engine.prefixReuseCapability.unsupportedReason,
-            .pagedHybridRequiresDualCursor)
+        XCTAssertTrue(stack.engine.prefixReuseCapability.isSupported)
+        XCTAssertEqual(stack.engine.prefixReuseCapability.strategy, .frozenFullReplay)
 
         let first = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: 8)))
+        let donated = await cbv2SchedWait { stack.prefixCache.stats().entryCount >= 1 }
+        XCTAssertTrue(donated, "a supported capability must arm donation")
         let second = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: 8)))
         await stack.engine.shutdown()
 
         XCTAssertEqual(first.tokens, second.tokens)
         XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 0)
-        XCTAssertEqual(stack.prefixCache.stats().entryCount, 0)
+        XCTAssertNil(second.usage?.prefixCacheStrategy, "the adoption was refused, not served")
     }
 
     // MARK: (iv-b) Per-request cache salt isolation (TB-007)

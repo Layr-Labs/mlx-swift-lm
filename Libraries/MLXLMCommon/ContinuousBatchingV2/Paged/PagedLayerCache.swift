@@ -870,7 +870,14 @@ extension PagedLayerCache: CBv2KVSourceChunkRetaining {
 /// from one row's absolute positions. A packed row is therefore
 /// bit-identical to that row run alone, which is what this claim asserts.
 extension PagedLayerCache: CBv2PackedPrefillCapableCache {
-    public var keepsRowsIndependentWhenPacked: Bool { true }
+    /// Type-level form of the same claim, for callers that must decide
+    /// BEFORE any pool or cache exists — see
+    /// `honorsSpanMaskContextsByConstruction` for why that matters.
+    public static let keepsRowsIndependentWhenPackedByConstruction = true
+
+    public var keepsRowsIndependentWhenPacked: Bool {
+        Self.keepsRowsIndependentWhenPackedByConstruction
+    }
 }
 
 // MARK: - Vision span masks (WS-2.2)
@@ -883,9 +890,35 @@ extension PagedLayerCache: CBv2PackedPrefillCapableCache {
 /// bidirectional-within-block overlay onto the absolute-coordinate base
 /// mask. Both are exercised by `CBv2PagedPackedSpanTests`.
 extension PagedLayerCache: CBv2MultimodalSpanCapableCache {
+    /// The SAME claim, readable without an instance.
+    ///
+    /// The provider's slot policy has to decide whether a VLM slot may
+    /// route to paged before it builds anything, so it cannot ask a live
+    /// cache. It could hardcode `true` on its side; that is precisely the
+    /// "capability ASSUMED rather than asked" defect, because the assumption
+    /// would then live in a different repository from the implementation and
+    /// would not move when this file does.
+    ///
+    /// Instead there is exactly ONE boolean. The engine's own submit-time
+    /// gate (`CBv2LayerCacheBank.supportsMultimodalSpans`) reads the instance
+    /// property below, which returns this constant; the provider's routing
+    /// gate reads this constant directly. Regress the overlay and both flip
+    /// together — production stops routing vision here in the same edit that
+    /// stops honouring it.
+    ///
+    /// The residual gap a type-level claim cannot close is that the constant
+    /// is not derived from the mask code. That is what
+    /// `CBv2PagedPackedSpanTests.typeLevelClaimsMatchARealPagedBank` and the
+    /// span-behaviour tests are for: the first pins the constant to what a
+    /// real bank of real caches answers, the rest pin the answer to the
+    /// numbers.
+    public static let honorsSpanMaskContextsByConstruction = true
+
     public func bindSpanContext(_ context: CBv2SpanChunkContext?) {
         boundSpanContext = context
     }
 
-    public var honorsSpanMaskContexts: Bool { true }
+    public var honorsSpanMaskContexts: Bool {
+        Self.honorsSpanMaskContextsByConstruction
+    }
 }

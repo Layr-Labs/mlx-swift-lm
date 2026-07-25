@@ -579,6 +579,46 @@ struct CBv2PagedPackedSpanTests {
             "the paged cache now applies bound span contexts, so the bank must vouch")
     }
 
+    /// The provider's slot policy routes VLM traffic to paged by reading the
+    /// TYPE-level constants, because it must decide before any pool exists.
+    /// That is only safe while the constants say what a real bank of real
+    /// caches says — a static that drifts from its instances would route
+    /// vision at a backend that no longer honours it, which is the exact
+    /// failure the affirmative-capability design exists to prevent.
+    ///
+    /// Cross-repo consumer: `EngineV2KVBackendPolicy.applySlotVetoes` in
+    /// provider-swift takes `pagedHonorsSpanMasks:` and
+    /// `EngineV2SlotFactory` feeds it
+    /// `PagedLayerCache.honorsSpanMaskContextsByConstruction`.
+    @Test func typeLevelClaimsMatchARealPagedBank() throws {
+        let kinds = [kind(window: nil), kind(window: 128), kind(window: 128)]
+        let backend = try PagedKVBackend(
+            layerKinds: kinds, config: config(maxPrefillChunk: 64, dtype: .float16))
+        let caches = backend.makeLayerCaches()
+        let bank = CBv2LayerCacheBank(caches: caches)
+
+        #expect(
+            bank.supportsMultimodalSpans
+                == PagedLayerCache.honorsSpanMaskContextsByConstruction,
+            "the constant the provider routes on must equal what a real paged bank answers")
+        #expect(
+            bank.supportsPackedPrefill
+                == PagedLayerCache.keepsRowsIndependentWhenPackedByConstruction,
+            "same for packed prefill")
+
+        // Every instance derives from the constant, so no single layer can
+        // disagree with the type — including a windowed one, a full one, and
+        // a second windowed one sharing the first's group.
+        for cache in caches {
+            #expect(
+                cache.honorsSpanMaskContexts
+                    == PagedLayerCache.honorsSpanMaskContextsByConstruction)
+            #expect(
+                cache.keepsRowsIndependentWhenPacked
+                    == PagedLayerCache.keepsRowsIndependentWhenPackedByConstruction)
+        }
+    }
+
     /// The gates read the CLAIM, not the concrete type. A cache that is
     /// neither `CBv2LayerCache` nor `PagedLayerCache` opens the gates by
     /// answering true, and closes them by answering false — an `is` cast on

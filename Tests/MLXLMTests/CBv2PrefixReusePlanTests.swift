@@ -70,13 +70,27 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
         XCTAssertEqual(nativeFP32.residentFullKVBytes, 72 * 256)
     }
 
-    func testBackendSupportFailsColdForPagedAndUnknownHybrid() {
+    func testBackendSupportFailsColdForUnknownHybrid() {
         let kinds = [full(), sliding(16), full()]
+        // WS-4.1: paged no longer fails cold on an interleaved hybrid. It
+        // derives `.frozenFullReplay` like contiguous, but pays one extra
+        // window of conservative replay — `PagedLayerCache.prefillKV` attends
+        // the chunk's freshly projected keys where the contiguous frozen row
+        // hands back the cached ones, so the first exact position moves by up
+        // to one prefill chunk. `PagedKVBackend.requiredFrozenReplayTokens`
+        // re-checks that against the pool's real chunk.
         let paged = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds,
             backend: .pagedFP16)
-        XCTAssertFalse(paged.isSupported)
-        XCTAssertEqual(paged.unsupportedReason, .pagedHybridRequiresDualCursor)
+        XCTAssertTrue(paged.isSupported)
+        XCTAssertNil(paged.unsupportedReason)
+        XCTAssertEqual(paged.strategy, .frozenFullReplay)
+        XCTAssertEqual(paged.conservativeReplayBoundTokens, 32)
+        XCTAssertEqual(
+            CBv2PrefixReuseCapability.derive(
+                layerKinds: kinds, backend: .contiguousUnquantized
+            ).conservativeReplayBoundTokens,
+            16)
 
         let unknown = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds,

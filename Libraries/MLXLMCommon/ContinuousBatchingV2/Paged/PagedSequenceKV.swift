@@ -10,13 +10,19 @@
 // Windowed layers use a RING of pages: token at absolute position `p` lives
 // in table slot `(p / pageSize) % ringPages`, slot `p % pageSize`. Eviction
 // is therefore implicit overwrite keyed to absolute positions — the recent
-// end always survives, no window masks over shared buffers exist, and the
-// ring is sized (`PagedKVPool.ringPageCount`) to cover everything the row
-// can be asked for at once: the trailing window, the extra `chunk - 1`
-// positions a prefill chunk's earliest query still needs (see
-// `retainedCount`), and one speculative span (`CBv2PagedSpeculation
-// .maxSpeculativeSpan`) so an MTP round overwrites only already-evicted
-// slots.
+// end always survives and no window masks over shared buffers exist.
+//
+// The ring is sized (`PagedKVPool.ringPageCount`) to cover the trailing
+// window plus one speculative span (`CBv2PagedSpeculation
+// .maxSpeculativeSpan`), so an MTP round overwrites only already-evicted
+// slots. It does NOT carry a prefill-chunk term, and that is a PROPERTY OF
+// THIS FILE, not a free choice made in the pool: `update` gathers a chunk's
+// window history BEFORE writing the chunk and concatenates the chunk tensor
+// it already holds, exactly as `CBv2WindowedSequenceKV.update` and
+// `PagedLayerCache.prefillKV` do, so the widest range this row ever asks the
+// ring for is `window - 1`. `maxWindowExposure` is where that promise is
+// written down, and `PagedKVPool.ringPageCount` reads it — widen the
+// exposure and the ring grows with it or the pool refuses to build.
 
 import Foundation
 import MLX
@@ -49,17 +55,21 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// Absolute position before which nothing was ever written here
     /// (nonzero only after `fastForward(to:)` for prefix-adopted rows).
     private(set) var baseOffset: Int = 0
-    /// Size of the most recent update — governs how much trailing context
-    /// `retainedCount` exposes for windowed layers (a chunk's earliest query
-    /// must see its full window).
-    private var lastUpdateTokens: Int = 1
+    /// Absolute position through which this row's storage was adopted EXACT
+    /// and must stay immutable: prefix reuse's `.frozenFullReplay` on an
+    /// owning FULL layer. Zero for every ordinary row, and unreachable for
+    /// windowed ones (`adoptFrozen` refuses them), so nothing about the ring
+    /// changes.
+    ///
+    /// `absoluteOffset` still starts at the replay start C and advances
+    /// through [C, M) exactly as a cold prefill would, so RoPE offsets,
+    /// masks and `retainedCount` are untouched. What changes is that a write
+    /// landing wholly below M does not touch storage.
+    private(set) var frozenHighWater: Int = 0
 
     /// Absolute frontier as of `beginSpeculativeWrite()`; `nil` outside a
     /// speculative transaction. `rollback` may not cross it.
     private(set) var speculativeBase: Int?
-    /// `lastUpdateTokens` as of `beginSpeculativeWrite()`, restored when a
-    /// round leaves no surviving write.
-    private var speculativeUpdateTokens: Int = 1
 
     private var released = false
 
@@ -87,16 +97,64 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
 
     // MARK: - CBv2SequenceKV
 
+    /// Positions this row can still be asked to GATHER, ending at
+    /// `absoluteOffset`.
+    ///
+    /// `min(written, window)` for a windowed row — the physically retained
+    /// trailing window, phase-independent, and the same figure
+    /// `CBv2WindowedSequenceKV.retainedCount` reports. It used to be
+    /// `min(written, window - 1 + lastUpdateTokens)`, inflated after a bulk
+    /// write because `update` gathered the chunk's attention view AFTER
+    /// writing the chunk; that gather is now taken BEFORE the write, so the
+    /// inflation has no remaining consumer and the ring no longer has to
+    /// carry `maxPrefillChunk` to absorb it.
+    ///
+    /// NOTE that `update` still RETURNS more columns than this — up to
+    /// `window - 1 + n` — because a chunk's earliest query must see its full
+    /// window. That view is assembled, not gathered; contiguous windowed
+    /// storage has the same relationship (`CBv2WindowedSequenceKV`'s header).
     public var retainedCount: Int {
         let written = absoluteOffset - baseOffset
         guard let window = windowSize else { return written }
-        return min(written, window - 1 + lastUpdateTokens)
+        return min(written, Self.maxWindowExposure(window: window))
     }
+
+    /// The widest range a windowed row of `window` can ask the ring for.
+    ///
+    /// THE definition, in one place, because two very different things read
+    /// it: `retainedCount` above, and `PagedKVPool.ringPageCount`, which
+    /// sizes the ring as `maxWindowExposure + maxSpeculativeSpan`. That is
+    /// the mechanical coupling that keeps the 65-page ring honest — a change
+    /// that re-widens what this row exposes cannot land without the ring
+    /// growing to match, and `PagedKVPool.checkedRingPageCount` re-checks the
+    /// relation at pool build.
+    ///
+    /// It is `window`, not `window - 1 + maxPrefillChunk`, ONLY because both
+    /// write paths gather before they write. See the file header.
+    static func maxWindowExposure(window: Int) -> Int { window }
 
     public var byteCount: Int {
         table.count * pool.group(groupKey).pageBytes
     }
 
+    /// Append `keys`/`values` and return the KV a chunk of `n` queries
+    /// attends: the pre-write window history followed by the chunk itself.
+    ///
+    /// WS-1.2, ROW HALF. The gather is taken BEFORE `write` for the same
+    /// reason `PagedLayerCache.prefillKV` takes it before `row.write`, and
+    /// for the same reason `CBv2WindowedSequenceKV.update` slices its ring
+    /// before the slice-update: after the write the older part of the
+    /// chunk's own window has been overwritten by the chunk's tail, and no
+    /// gather order can recover it. Assembling it first is what holds the
+    /// ring at `window + span` instead of `window - 1 + chunk + span`.
+    ///
+    /// Returns `[1, kvHeads, min(writtenBefore, window - 1) + n, headDim]`
+    /// for a windowed row — WIDER than `retainedCount`, deliberately, so the
+    /// chunk's earliest query still sees its whole window. The caller masks
+    /// with `causal ∧ window`, exactly as on the contiguous backend.
+    ///
+    /// FULL rows keep the simple post-write gather: they overwrite nothing,
+    /// so the read-after-write the fence already orders is exact.
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         var k = keys
         var v = values
@@ -105,8 +163,27 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             k = k.squeezed(axis: 0)
             v = v.squeezed(axis: 0)
         }
+        guard let window = windowSize, k.dim(1) > 0 else {
+            write(keys: k, values: v)
+            return attendableViews()
+        }
+        // Pre-write history: at most `window - 1` positions, which is the
+        // ONLY demand this path makes of the ring.
+        let historyStart = max(baseOffset, absoluteOffset - (window - 1))
+        let (historyKeys, historyValues) = gatherRange(
+            start: historyStart, count: absoluteOffset - historyStart)
         write(keys: k, values: v)
-        return attendableViews()
+        // The chunk lands in the slab under the POOL dtype, so hand back the
+        // values the slab will hold — otherwise this chunk is scored at a
+        // precision no later decode over the same tokens can reproduce.
+        let dtype = pool.config.dtype
+        let chunkKeys = (k.dtype == dtype ? k : k.asType(dtype)).expandedDimensions(axis: 0)
+        let chunkValues = (v.dtype == dtype ? v : v.asType(dtype)).expandedDimensions(axis: 0)
+        guard historyKeys.dim(2) > 0 else { return (chunkKeys, chunkValues) }
+        return (
+            concatenated([historyKeys, chunkKeys], axis: 2),
+            concatenated([historyValues, chunkValues], axis: 2)
+        )
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
@@ -131,14 +208,12 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// overwritten slot held a position >= ring*S older than the query,
     /// outside every attendable window").
     ///
-    /// CAVEAT — this is the STATIC headroom, measured against `window`, and
-    /// it is the formula frozen in `CBv2PagedSpeculativeRow`. The range a row
-    /// actually exposes is `retainedCount`, which is `window - 1 +
-    /// lastUpdateTokens` right after a bulk write, so the LIVE headroom can
-    /// be smaller. `guardSpeculativeSpan` checks the live figure at each
-    /// write; this property answers the planning-time question "is this row
-    /// speculation-capable at all", which is a property of the ring, not of
-    /// the row's current phase.
+    /// This is the STATIC headroom, measured against `window`, and it is the
+    /// formula frozen in `CBv2PagedSpeculativeRow`. It is now also the LIVE
+    /// one: `retainedCount` is `min(written, window)` in every phase, so
+    /// `guardSpeculativeSpan`'s two bounds coincide instead of the live one
+    /// being the tighter of the pair. They are still checked separately —
+    /// see there for why.
     ///
     /// FULL rows: no alias distance exists at all — every logical page owns
     /// its own table slot, and `rollback` frees the pages past the new
@@ -175,11 +250,10 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             speculativeBase == nil,
             "[PagedSequenceKV] beginSpeculativeWrite while already armed")
         speculativeBase = absoluteOffset
-        speculativeUpdateTokens = lastUpdateTokens
     }
 
     public func commitSpeculativeWrite() {
-        guard let base = speculativeBase else { return }
+        guard speculativeBase != nil else { return }
         speculativeBase = nil
         // Pages `rollback` took out of the table were only QUEUED: the
         // round's gathers are lazy and still name those physical pages, so
@@ -187,28 +261,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         // allocate and rewrite them underneath a live capture. This is the
         // first moment no capture can reach them.
         pool.drainDeferredFrees()
-        settleUpdateTokens(base: base)
-    }
-
-    /// Restore the `retainedCount` input at the end of a round.
-    ///
-    /// `retainedCount` is `min(written, window - 1 + lastUpdateTokens)`. A
-    /// bulk `write()` inside a transaction legitimately raises the input to
-    /// `n` so the chunk's earliest query still sees its full window, but
-    /// leaving it there afterwards over-exposes the row by `n - 1` against
-    /// the plain run, which produced the same confirmed tokens one decode at
-    /// a time. So: `1` when any write of this round survived (decode-shaped,
-    /// exposing exactly `window`), otherwise the value the round opened with.
-    private func settleUpdateTokens(base: Int) {
-        lastUpdateTokens = absoluteOffset > base ? 1 : speculativeUpdateTokens
     }
 
     /// Trap before a transaction writes further past its base than the ring
     /// can absorb.
     ///
-    /// Two bounds, because `speculativeHeadroom` is measured against `window`
-    /// while the range the row actually exposes is `retainedCount`, which is
-    /// `window - 1 + lastUpdateTokens` immediately after a bulk write:
+    /// Two bounds. They evaluate to the same number today and are still
+    /// written separately, because they answer different questions and are
+    /// invalidated by different changes:
     ///
     ///  - STATIC: the span must fit the ring's slack over the window. This is
     ///    the eligibility bound, and a round already passed it at planning
@@ -217,29 +277,19 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     ///    be asked for. Writing position `p` destroys whatever held
     ///    `p - ringPages * pageSize`, so the round may not extend past
     ///    `absoluteOffset - retainedCount + ringPages * pageSize`. Under a
-    ///    ring that covers `window - 1 + maxPrefillChunk + span` this cannot
-    ///    fire; under an under-sized one it fires HERE, naming the cause,
-    ///    instead of surfacing later as a wrong-KV answer or as a bare
-    ///    "gather of evicted window range" from `gatherRange`.
+    ///    ring sized `window + span` this cannot fire; under an under-sized
+    ///    one it fires HERE, naming the cause, instead of surfacing later as
+    ///    a wrong-KV answer or as a bare "gather of evicted window range"
+    ///    from `gatherRange`.
     ///
-    /// The LIVE bound is not belt-and-braces, and the residual slack is much
-    /// thinner than it looks. `ringPageCount` reserves
-    /// `ceil((window - 1 + maxPrefillChunk) / pageSize) + ceil(span / pageSize)`
-    /// pages, so for gemma-4 (window 1024, chunk 512, page 16) the ring is
-    /// 1,552 tokens and the margin over the LIVE attendable range depends
-    /// entirely on what the row last did:
-    ///
-    ///      at MTP time      retainedCount 1,024  ->  margin 528
-    ///      during a chunk   retainedCount 1,535  ->  margin  17
-    ///
-    /// The 17 is the number that matters: prefill is the path that runs
-    /// constantly, and it is where the ring is nearly exact. Neither figure
-    /// is asserted anywhere — both fall out of chunk sizing and page
-    /// rounding, so a change to `maxPrefillChunk`, `pageSize` or the window
-    /// moves them silently. The scheduled `gather(ring) ++ chunk` rework
-    /// takes the ring down to the window proper, at which point the 528
-    /// disappears too. Treat a violation here as a real defect, never as
-    /// something the slack can absorb.
+    /// The two coincide only because `retainedCount` is phase-independent
+    /// (`min(written, window)`). It used to inflate to `window - 1 +
+    /// lastUpdateTokens` after a bulk write, which left gemma-4 with 528
+    /// tokens of margin at MTP time and 17 during a prefill chunk — two
+    /// numbers nothing asserted, both by-products of chunk sizing. Anything
+    /// that re-introduces a phase-dependent `retainedCount` splits them
+    /// again, and this is where that shows up. Treat a violation here as a
+    /// real defect, never as something slack can absorb.
     private func guardSpeculativeSpan(adding n: Int) {
         guard let base = speculativeBase else { return }
         let span = absoluteOffset + n - base
@@ -254,17 +304,16 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             absoluteOffset + n - ringTokens <= oldestAttendable,
             "[PagedSequenceKV] speculative write to \(absoluteOffset + n - 1) would evict "
                 + "position \(absoluteOffset + n - 1 - ringTokens), still attendable from "
-                + "\(oldestAttendable) — ring \(ringTokens) does not cover retainedCount "
-                + "\(retainedCount) plus the round. The ring holds the attendable range "
-                + "plus one speculative span. Any apparent slack is an accident of chunk "
-                + "sizing that nothing asserts — on gemma-4 it is 528 tokens at MTP time "
-                + "but only 17 during a prefill chunk, and the scheduled ring rework "
-                + "removes both. Re-size the ring or shorten the round; do not assume "
-                + "there is room to spare.")
+                + "\(retainedCount) plus the round. The ring holds "
+                + "PagedSequenceKV.maxWindowExposure plus one speculative span and nothing "
+                + "more — re-size the ring (PagedKVPool.ringPageCount) or shorten the round.")
     }
 
     public func rollback(_ n: Int) {
         precondition(n >= 0 && n <= absoluteOffset - baseOffset, "rollback past written tokens")
+        precondition(
+            absoluteOffset - n >= frozenHighWater,
+            "rollback cannot cross the frozen high-water")
         if let base = speculativeBase {
             // Confirmed history is NOT recoverable by rewinding the counter:
             // the round's writes already overwrote the ring slots behind the
@@ -302,11 +351,6 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         }
         // Windowed rings keep their pages; the rolled-back slots are
         // overwritten before they can re-enter any attendable range.
-        if let base = speculativeBase {
-            settleUpdateTokens(base: base)
-        } else {
-            lastUpdateTokens = 1
-        }
     }
 
     // MARK: - Writes
@@ -314,9 +358,34 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// Append `keys`/`values` (`[kvHeads, n, headDim]`) at the current
     /// frontier via ONE in-place write-kernel dispatch. Never throws: the
     /// pool guarantees pages up to the admission-time reservation.
+    ///
+    /// CALLERS THAT BYPASS `update`/`PagedLayerCache` — today the kernel
+    /// differential harness (`CBv2PagedKernelTests.Fixture.addRow`) and
+    /// `PagedDecodeProfiler` — are bounded by `maxPrefillChunk` and nothing
+    /// else. That is the ROW half of the ring's sizing
+    /// (`PagedKVPool.ringPageCount`): a chunk longer than the ring would put
+    /// two of its own tokens in one physical slot inside a single dispatch,
+    /// with no ordering between them. They used to be bounded far more
+    /// tightly, by `ringTokens - window + 1`, because a direct write left
+    /// `retainedCount` inflated to `window - 1 + n`; it no longer does.
+    /// (Prefix ADOPTION is not in this list: `PagedKVBackend
+    /// .makeSequenceState(adopting:)` writes only FULL rows, behind
+    /// `precondition(state.windowSize == nil)`, and its windowed half goes
+    /// through `fastForward` plus engine replay.)
     func write(keys: MLXArray, values: MLXArray) {
         let n = keys.dim(1)
         guard n > 0 else { return }
+        if absoluteOffset + n <= frozenHighWater {
+            // Frozen replay (`adoptFrozen`): storage below M is the adopted
+            // prefix and must stay byte-exact, so the cursor advances and
+            // nothing is written.
+            absoluteOffset += n
+            return
+        }
+        precondition(
+            absoluteOffset >= frozenHighWater,
+            "frozen replay chunk crosses M (\(absoluteOffset) + \(n) vs \(frozenHighWater)) "
+                + "— the plan's clampedChunk must split at M")
         precondition(
             absoluteOffset + n <= maxLength,
             "write past maxLength (\(absoluteOffset) + \(n) > \(maxLength))")
@@ -340,7 +409,6 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         pool.writeTokens(group: groupKey, slots: slots, keys: keys, values: values)
 
         absoluteOffset += n
-        lastUpdateTokens = n
     }
 
     /// Reserve the destination for ONE decode token and advance the
@@ -351,12 +419,13 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         precondition(
             absoluteOffset + 1 <= maxLength,
             "write past maxLength (\(absoluteOffset) + 1 > \(maxLength))")
+        precondition(
+            absoluteOffset >= frozenHighWater, "decode write inside the frozen region")
         guardSpeculativeSpan(adding: 1)
         let s = pool.config.pageSize
         let page = ensurePage(logicalPage: absoluteOffset / s)
         let slot = absoluteOffset % s
         absoluteOffset += 1
-        lastUpdateTokens = 1
         return (page, slot)
     }
 
@@ -385,6 +454,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// are lazy reads of the live slabs — consume them within the current
     /// engine step and drop them: the slabs are mutated in place, so a
     /// stale unevaluated gather could observe recycled pages.
+    ///
+    /// PHASE-INDEPENDENT for a windowed row: `retainedCount` is
+    /// `min(written, window)` whatever the row last did, so this can never
+    /// out-run the ring and `snapshot()` is serviceable immediately after a
+    /// full-size chunk write. It could not be, before the row half of WS-1.2:
+    /// a `maxPrefillChunk` write left `retainedCount` at `window - 1 + chunk`
+    /// and this tripped `gatherRange`'s eviction precondition on any ring
+    /// sized for the window alone.
     func attendableViews() -> (keys: MLXArray, values: MLXArray) {
         let retained = retainedCount
         let start = absoluteOffset - retained
@@ -464,6 +541,31 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         precondition(offset >= 0 && offset <= maxLength)
         absoluteOffset = offset
         baseOffset = offset
+    }
+
+    /// Adopt `[0, M)` as immutable storage with the logical cursor at C.
+    /// FULL rows only; call once, on a fresh row, before anything else.
+    /// `keys`/`values` are `[kvHeads, M, headDim]`.
+    ///
+    /// Prefix reuse's `.frozenFullReplay` (WS-4.1): the matched prefix is
+    /// exact cached K/V, but the replay range `[C, M)` has to run through the
+    /// model anyway so the SLIDING layers rebuild their windows. Replaying it
+    /// through an ordinary row would overwrite the exact full-attention K/V
+    /// with projections computed from sliding rows that do not have their
+    /// windows yet. `frozenHighWater` makes those writes cursor-only.
+    ///
+    /// Windowed rows are refused outright, so nothing here interacts with the
+    /// ring: `ringPages` is nil for every row that can reach this.
+    func adoptFrozen(keys: MLXArray, values: MLXArray, replayStart: Int) {
+        precondition(windowSize == nil, "frozen adoption is only for full-attention rows")
+        precondition(
+            table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
+            "frozen adoption requires a fresh row")
+        let m = keys.dim(1)
+        precondition(replayStart >= 0 && replayStart <= m, "frozen adoption needs 0 <= C <= M")
+        write(keys: keys, values: values)
+        frozenHighWater = m
+        absoluteOffset = replayStart
     }
 
     /// Return every page to the pool and release the reservation.

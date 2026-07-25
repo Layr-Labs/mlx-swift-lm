@@ -39,13 +39,13 @@ import MLX
 ///
 ///  - `PagedKVPool.ringPageCount` must reserve space for it, so that a
 ///    windowed ring can never alias a live in-window entry during a round
-///    (WS-3.1). It does: the landed formula's second term is
-///    `ceil(maxSpeculativeSpan / pageSize)` (`PagedKVPool.swift:625-630`),
-///    and the construction guard at `PagedKVPool.swift:564-571` refuses to
-///    build a pool whose ring cannot hold the attendable span plus one round.
+///    (WS-3.1). It does: `PagedKVPool.ringPageCount` sizes the ring as
+///    `max(PagedSequenceKV.maxWindowExposure(window:) + maxSpeculativeSpan,
+///    maxPrefillChunk)` rounded up to whole pages, and
+///    `PagedKVPool.checkedRingPageCount` refuses to build a pool whose ring
+///    cannot hold the exposure plus one round.
 ///  - `PagedSequenceKV.supportsSpeculativeWrites` must test against it rather
-///    than returning a blanket `windowSize == nil` (WS-3.3). It does, at
-///    `PagedSequenceKV.swift:169-171`.
+///    than returning a blanket `windowSize == nil` (WS-3.3). It does.
 ///
 /// Derivation: a round writes the target column plus `maxDraftTokens` drafted
 /// columns, so the span is `CBv2MTPConfig.testedMaxDraftTokens + 1`. It is
@@ -121,54 +121,112 @@ public enum CBv2PagedSpeculation {
 
 /// The windowed ring formula, in code.
 ///
-/// `PagedKVPool.ringPageCount(window:config:)` (`PagedKVPool.swift:625-630`)
-/// is the shipping implementation; this is the contract's statement of the
-/// same rule. They are bound by
-/// `CBv2PagedSeamContractTests.ringFormulaMatchesPagedKVPool`, which compares
-/// them across a matrix of windows, chunks and page sizes and fails on any
-/// divergence — so the frozen contract and the shipping code cannot drift
-/// apart silently, which is exactly what they had done (PR#86 review, `:158`).
+/// `PagedKVPool.ringPageCount(window:config:)` is the shipping
+/// implementation; this is the contract's statement of the same rule. They
+/// are bound by `CBv2PagedSeamContractTests.ringFormulaMatchesPagedKVPool`,
+/// which compares them across a matrix of windows, chunks and page sizes and
+/// fails on any divergence — so the frozen contract and the shipping code
+/// cannot drift apart silently, which is exactly what they had done (PR#86
+/// review).
 ///
 /// The pool keeps its own copy rather than calling this one because its
 /// construction path (`PagedKVPool.checkedRingPageCount`) has to
 /// overflow-check every intermediate and turn a hostile operator config into
 /// `CBv2KVError.backendIneligible` instead of a trap. This copy is the plain
 /// arithmetic that the checked one must agree with.
+///
+/// ## THE RING SIZE IS A CONSEQUENCE, NOT A CONSTANT
+///
+/// gemma-4's windowed layers ring at 65 pages (1,040 tokens) for a
+/// 1,024-token window. A 65-page ring was ALSO tried in an earlier wave and
+/// REVERTED, because it aborted the daemon in ordinary windowed prefill —
+/// reproduced from the row side, not theorised. The number did not become
+/// safe; the code around it changed. Three preconditions hold it up, and 65
+/// is wrong again the moment any one of them stops being true:
+///
+///  1. **The layer gathers before it writes.** `PagedLayerCache.prefillKV`
+///     assembles `gather(pre-write window history) ++ chunk` and only then
+///     calls `row.write`. Gathering AFTER the write asks the ring for
+///     `window - 1 + chunk` (1,535 tokens out of 1,040) and trips
+///     `PagedSequenceKV.gatherRange`'s "gather of evicted window range"
+///     precondition. THAT is the abort that got the first attempt reverted.
+///  2. **The row gathers before it writes.** `PagedSequenceKV.update` does
+///     the same thing for callers that go through the row rather than the
+///     layer cache, which is what collapses `retainedCount` to
+///     `min(written, window)` and removes `maxPrefillChunk` from
+///     `attendableTokens`. `PagedSequenceKV.maxWindowExposure(window:)` is
+///     the single declaration of that promise: `retainedCount` clamps to it
+///     and `ringPageCount` sizes from it, so a change that re-widens the
+///     row's exposure grows the ring instead of out-running it.
+///  3. **Reads publish a fence back-edge.** `PagedKVPool.gather` folds the
+///     gathered arrays back into the group's `writeFence`, so a later
+///     in-place write cannot overtake a pre-write gather that has not
+///     materialised. Without it the gather and the write are graph SIBLINGS
+///     (both merely consume `writeFence`). At 1,552 tokens that was benign,
+///     because a chunk's history and the chunk itself never shared a ring
+///     slot; at 1,040 tokens they do, and the loser of the race is the
+///     chunk's own earliest queries reading their own tail as history — a
+///     silent wrong answer with no crash and no telemetry.
+///
+/// DIRECT WRITERS, for the next person who has to audit this. Callers that
+/// reach `PagedSequenceKV.write` without the layer cache are bounded by
+/// `maxPrefillChunk` and nothing else — that is `attendableTokens`' ROW half.
+/// Today they are the kernel differential harness
+/// (`CBv2PagedKernelTests.Fixture.addRow`) and `PagedDecodeProfiler`. Prefix
+/// ADOPTION is NOT one of them, despite appearances:
+/// `PagedKVBackend.makeSequenceState(adopting:)` writes only FULL rows,
+/// behind `precondition(state.windowSize == nil)`, and its windowed half
+/// goes through `fastForward` plus engine replay through the layer cache.
 public enum CBv2PagedRingGeometry {
 
-    /// The widest range a windowed row can be asked to gather at once.
+    /// The widest range a windowed row can be asked to GATHER at once.
     ///
-    /// `PagedSequenceKV.retainedCount` is
-    /// `min(written, window - 1 + lastUpdateTokens)`
-    /// (`PagedSequenceKV.swift:90-94`), and a prefill chunk of `n` tokens
-    /// leaves `lastUpdateTokens == n`. So the widest exposure is
-    /// `window - 1 + maxPrefillChunk`, NOT `window`: the chunk's earliest
-    /// query at absolute `q` still has to see `[q - window + 1, q]`, and the
-    /// range ending at the chunk's LAST position therefore spans
-    /// `window - 1 + n`.
-    public static func attendableTokens(window: Int, maxPrefillChunk: Int) -> Int {
-        window - 1 + maxPrefillChunk
+    /// `window`, not `window - 1 + maxPrefillChunk`, and the difference is
+    /// preconditions (1) and (2) above. `PagedSequenceKV.retainedCount` is
+    /// `min(written, PagedSequenceKV.maxWindowExposure(window:))` — phase
+    /// independent, and the same figure `CBv2WindowedSequenceKV` reports.
+    ///
+    /// The chunk's earliest query still sees its whole window; it just does
+    /// not come from the ring. `window - 1` positions of it are gathered
+    /// BEFORE the chunk is written, and the rest is the chunk tensor the
+    /// caller already holds. A row therefore RETURNS up to `window - 1 + n`
+    /// columns from `update` while only ever asking storage for `window`.
+    public static func attendableTokens(window: Int) -> Int {
+        PagedSequenceKV.maxWindowExposure(window: window)
     }
 
-    /// Tokens the ring MUST cover: the attendable range plus one speculative
-    /// round. `PagedKVPool.checkedRingPageCount` refuses to build a pool that
-    /// does not reach this (`PagedKVPool.swift:564-571`).
+    /// Tokens the ring MUST cover, as the larger of two INDEPENDENT bounds.
+    /// `PagedKVPool.checkedRingPageCount` refuses to build a pool that does
+    /// not reach either, and checks them separately.
+    ///
+    ///   CACHE  `attendableTokens + maxSpeculativeSpan` — the widest gather
+    ///          plus one speculative round, because writing position `p`
+    ///          destroys whatever held `p - ringTokens`.
+    ///   ROW    `maxPrefillChunk` — one `PagedSequenceKV.write` scatters a
+    ///          whole chunk in ONE dispatch, and a chunk longer than the ring
+    ///          puts two of its own tokens in one physical slot with no
+    ///          ordering between them.
+    ///
+    /// The ROW bound used to be implied by the chunk term the CACHE bound
+    /// carried. It is not implied any more. Which one binds is pure geometry:
+    /// window 1,024 / chunk 512 is cache-bound (1,032 vs 512), while window
+    /// 128 / chunk 2,048 is row-bound (2,048 vs 136) and a ring derived from
+    /// the window alone would give it 9 pages for a 128-page write.
     public static func requiredTokens(window: Int, maxPrefillChunk: Int) -> Int {
-        attendableTokens(window: window, maxPrefillChunk: maxPrefillChunk)
-            + CBv2PagedSpeculation.maxSpeculativeSpan
+        max(
+            attendableTokens(window: window) + CBv2PagedSpeculation.maxSpeculativeSpan,
+            maxPrefillChunk)
     }
 
     /// Ring length in pages:
     ///
-    ///     ceil((window - 1 + maxPrefillChunk) / pageSize)
-    ///         + ceil(maxSpeculativeSpan / pageSize)
+    ///     ceil(max(window + maxSpeculativeSpan, maxPrefillChunk) / pageSize)
     ///
     /// gemma-4 (window 1,024, chunk 512, pageSize 16, span 8):
-    /// `ceil(1535 / 16) + ceil(8 / 16) == 96 + 1 == 97` pages == 1,552 tokens.
+    /// `ceil(max(1032, 512) / 16) == 65` pages == 1,040 tokens.
     public static func ringPageCount(window: Int, pageSize: Int, maxPrefillChunk: Int) -> Int {
-        let attendable = attendableTokens(window: window, maxPrefillChunk: maxPrefillChunk)
-        let spanPages = (CBv2PagedSpeculation.maxSpeculativeSpan + pageSize - 1) / pageSize
-        return (attendable + pageSize - 1) / pageSize + spanPages
+        let required = requiredTokens(window: window, maxPrefillChunk: maxPrefillChunk)
+        return (required + pageSize - 1) / pageSize
     }
 }
 
@@ -212,13 +270,15 @@ protocol CBv2MTPRectangularSerializing: AnyObject {
 /// so conformance is declaration-only.
 extension CBv2LayerCache: CBv2MTPRectangularSerializing {}
 
-// TODO(track L, WS-3.4): conform `PagedLayerCache` once `updateAndAttend`
-// honours the flag with a per-column loop, replacing the
-// `precondition(b == 1, "prefill chunks are per-request [1, chunk]")` guard.
-// `attendBorrowing` needs the same loop plus an explicit per-column `qPos` on
-// `dispatchDecode`, because the source layer has already advanced
-// `absoluteOffset` by L and `decodeAttendRange` would otherwise resolve only
-// the final column.
+// WS-3.4 LANDED: `extension PagedLayerCache: CBv2MTPRectangularSerializing`
+// (`PagedLayerCache.swift:844`), with `updateAndAttend` honouring the flag
+// through `attendRectangularColumns` rather than the prompt-chunk branch —
+// which is why the branch's `b > 1` case is now packed prefill, not a
+// rectangular round. The blanket
+// `precondition(b == 1, "prefill chunks are per-request [1, chunk]")` this
+// TODO asked to replace no longer exists; WS-2.1 reduced it to
+// `precondition(boundSpanContext == nil || b == 1)`. `attendBorrowing`
+// carries the matching per-column path.
 
 // MARK: - Row-side speculative transaction
 
@@ -396,8 +456,8 @@ public struct CBv2PagedWindowSnapshot {
     ///    or, for a boundary shorter than one window, the whole history. The
     ///    two together pin `base == matchedBoundary - min(matchedBoundary,
     ///    window)`, so an admissible base is page-aligned whenever
-    ///    `matchedBoundary` is, which WS-0.6 guarantees for a matched block
-    ///    boundary (`PagedKVPool.swift:340-361`).
+    ///    `matchedBoundary` is, which WS-0.6 invariant 1 guarantees for a
+    ///    matched block boundary (checked in `PagedKVPool.init`).
     ///
     /// `restoreWindow` MUST call this first and propagate the refusal.
     public func requireAdmissible(at matchedBoundary: Int, window: Int?) throws {
@@ -426,46 +486,73 @@ public struct CBv2PagedWindowSnapshot {
 //   PagedKVPool                                     owner: track P
 //   -----------------------------------------------------------------
 //   static func ringPageCount(window:config:) -> Int
-//       WS-1.2 + WS-3.1. LANDED, as
-//         ceil((window - 1 + maxPrefillChunk) / pageSize)
-//             + ceil(maxSpeculativeSpan / pageSize)
-//       (`PagedKVPool.swift:625-630`), with the construction guard
-//       `ringTokens >= (window - 1 + maxPrefillChunk) + maxSpeculativeSpan`
-//       at `PagedKVPool.swift:564-571`. `CBv2PagedRingGeometry` above is this
-//       file's copy of the same arithmetic and a test binds the two.
+//       WS-1.2 + WS-3.1, BOTH HALVES LANDED. The ring is
+//         ceil(max(maxWindowExposure(window) + maxSpeculativeSpan,
+//                  maxPrefillChunk) / pageSize)
+//       where `PagedSequenceKV.maxWindowExposure(window:)` is `window`.
+//       gemma-4 (window 1,024, span 8, chunk 512, page 16):
+//       `ceil(max(1032, 512) / 16) == 65` pages. `CBv2PagedRingGeometry`
+//       above is this file's copy of that arithmetic and
+//       `ringFormulaMatchesPagedKVPool` binds the two.
 //
-//       REJECTED ALTERNATIVE. This entry used to declare
-//         ceil(window / pageSize) + ceil(maxSpeculativeSpan / pageSize)
-//       with the guard `ringPages * pageSize >= window + maxSpeculativeSpan`,
-//       and the shipping code never matched it. It is 65 pages (1,040 tokens)
-//       for gemma-4 against an attendable range of 1,535, and it makes a
-//       DAEMON ABORT reachable from ordinary prefill — not from MTP, not from
-//       an edge case. `PagedSequenceKV.update` writes the chunk and then
-//       calls `attendableViews()` (`PagedSequenceKV.swift:100-110`), which
-//       gathers `retainedCount == window - 1 + n` ending at the new frontier;
-//       `gatherRange` trips
-//       `precondition(start >= absoluteOffset - ring, "gather of evicted
-//       window range")` (`PagedSequenceKV.swift:401-407`) as soon as that
-//       range exceeds the ring, i.e. for any windowed chunk past
-//       `pageSize + 1` tokens. `snapshot()` (`:112-115`) and
-//       `guardSpeculativeSpan`'s LIVE bound (`:245-262`) read the same
-//       `retainedCount` and fail the same way. Reproduced by track R.
+//       The `max(..., maxPrefillChunk)` term is not the old chunk term
+//       returning. It only stops a single bulk write from lapping the ring
+//       and racing itself; it does not widen what a row may GATHER.
 //
-//       ONE CORRECTION to the review that raised this, recorded so it is not
-//       "fixed" back: the mechanism it named — "`PagedLayerCache
-//       .updateAndAttend` writes the entire chunk before gathering" — is no
-//       longer true. WS-1.2's other half landed: `prefillKV` assembles
-//       `gather([q - window + 1, q)) ++ chunk` BEFORE `row.write`
-//       (`PagedLayerCache.swift:196-217`, `:510-544`), so the layer's own
-//       prefill path needs only `window - 1`. The `maxPrefillChunk` term
-//       survives anyway, because the ROW-level `retainedCount` surface above
-//       is still post-write. The ring may drop to
-//       `ceil(window / pageSize) + ceil(span / pageSize)` only once every
-//       consumer of `retainedCount` is pre-write too; until then the two
-//       halves are one work item and shipping one alone is the trap.
+//       HOW THE 65-PAGE RING BECAME SAFE — the whole point of this entry,
+//       because the same 65 pages were a daemon abort two revisions ago and
+//       nothing about the arithmetic says which. It is safe because the
+//       EXPOSURE shrank, not because the ring was re-argued:
+//
+//         `PagedSequenceKV.retainedCount` used to be
+//         `min(written, window - 1 + lastUpdateTokens)`, so a prefill chunk
+//         of `n` left the row able to demand `window - 1 + n` from the ring.
+//         Under a 1,040-token ring `gatherRange` trips
+//         `precondition(start >= absoluteOffset - ring, "gather of evicted
+//         window range")` for any windowed chunk past `pageSize + 1` tokens.
+//         That is an ordinary-prefill process abort, and it is why this
+//         entry previously recorded the window-only ring as REJECTED.
+//
+//         It stopped being reachable when BOTH write paths started gathering
+//         before they write: `PagedLayerCache.prefillKV` (the layer half,
+//         WS-1.2) and now `PagedSequenceKV.update` (the row half), which
+//         gathers at most `window - 1` positions of history and then
+//         concatenates the chunk tensor it already holds. With no consumer
+//         left inflating it, `retainedCount` collapsed to
+//         `min(written, maxWindowExposure(window))` and the chunk term left
+//         the ring with it.
+//
+//       THE LIVE CONSTRAINT, which replaces the old prohibition. Exposure
+//       and ring size are now mechanically coupled through ONE symbol:
+//       `maxWindowExposure` is read by `retainedCount` and by
+//       `PagedKVPool.ringPageCount`, and `checkedRingPageCount` re-checks
+//       the relation at pool build. So the hazard is no longer "someone
+//       shrinks the ring" — it is "someone re-widens what a row exposes".
+//       Concretely, any change that makes a row gather AFTER it writes must
+//       either raise `maxWindowExposure` (and pay for the ring) or not land.
+//       Two ways to get this wrong that both look like tidying:
+//         1. Hoisting `PagedLayerCache`'s gather OUT of the per-row body of
+//            `CBv2AttentionV1.packedPerRow` so it runs once across the
+//            batch. It reads as deduplication; it reintroduces a post-write
+//            gather for every row after the first. The gather must stay
+//            hoisted PER ROW — before that row's own write.
+//         2. Reading `retainedPrefillKV[0]` instead of
+//            `retainedPrefillKV[index]` in `attendBorrowing`. It compiles,
+//            and it silently serves row 0's history to every KV-shared
+//            sibling of a packed prefill.
+//       Track L and track R own those bodies; this entry owns the
+//       constraint.
+//
+//       Citations into `PagedLayerCache.swift` are deliberately BY SYMBOL,
+//       not by line: that file is under active refactor (WS-0.2p, WS-2.1,
+//       WS-2.2, WS-3.4 all land in it) and line anchors there rot between
+//       reviews. Line anchors elsewhere in this file point at `PagedKVPool`,
+//       `PagedSequenceKV`, `PrefixCacheV2` and the provider's
+//       `SSDWindowSidecar`, which are not being churned.
+//
 //       `perSequenceTokenDemand` and `pageDemand` are both
-//       `min(..., ringPageCount(...))` and inherit any such reduction for
-//       free, so there is nothing to collect at those two sites either.
+//       `min(..., ringPageCount(...))`, so they inherited this reduction
+//       for free — which is what WS-1.3 was waiting on.
 //   func drainDeferredFrees()
 //       WS-3.2c. Releases pages queued during a speculative transaction.
 //       Called from the row's `commitSpeculativeWrite()`, never inline in
@@ -504,8 +591,7 @@ public struct CBv2PagedWindowSnapshot {
 //       whenever `matchedBoundary` is, and `blockSize 256 % pageSize 16 == 0`
 //       makes every matched block boundary a page boundary. That divisibility
 //       is no longer a coincidence across two files with no cross-reference:
-//       WS-0.6 asserts it unconditionally at pool construction
-//       (`PagedKVPool.swift:340-361`).
+//       WS-0.6 invariant 1 asserts it unconditionally in `PagedKVPool.init`.
 //   func installShared(_ pages: [Int32], upTo boundary: Int)
 //       WS-4.1. Adopts donor pages under refcount. `boundary` is the SAME
 //       value passed to `restoreWindow`; a row that restores its window at M
@@ -517,8 +603,10 @@ public struct CBv2PagedWindowSnapshot {
 //   PagedLayerCache                                 owner: track L
 //   -----------------------------------------------------------------
 //   prefillAttend                                   WS-0.2p
-//       Gains an internal query-block loop. Three constraints, each of which a
-//       naive port gets wrong:
+//       LANDED, as `PagedLayerCache.prefillAttend`, with the query-block loop
+//       gated on `CBv2AttentionV1.shouldBlockQueries` and sized by
+//       `CBv2AttentionV1.queryBlockSize`. Three constraints, each
+//       of which a naive port gets wrong, all of which the landed loop holds:
 //         1. Do NOT call `CBv2AttentionV1.attendQueryBlocks`. It is `private`,
 //            and its `maskMode` returns symbolic `.causal`, which violates the
 //            pinned-path contract in this file's header ("always `.array`").
@@ -532,12 +620,27 @@ public struct CBv2PagedWindowSnapshot {
 //       Reuse `CBv2AttentionV1.queryBlockSize` and `.shouldBlockQueries`
 //       (both already internal) so one kill switch,
 //       `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK`, covers both backends.
-//       MUST land before the `b == 1` precondition is lifted: unblocked packed
-//       prefill puts B gathers and B score tensors live simultaneously behind
-//       `concatenated(axis: 0)`, which exceeds the activation reserve on a
-//       single layer at B=8.
+//
+//       ORDERING GATE, now DISCHARGED. This entry required WS-0.2p to land
+//       before the `precondition(b == 1, ...)` guard was lifted, because
+//       unblocked packed prefill puts B gathers and B score tensors live
+//       simultaneously behind `concatenated(axis: 0)`, which exceeds the
+//       activation reserve on a single layer at B=8. Both have now landed in
+//       that order: WS-2.1 replaced the blanket guard with a per-row body
+//       under `CBv2AttentionV1.packedPerRow` whose score tensors are one
+//       block wide, and the only surviving packing restriction is the
+//       narrower `precondition(boundSpanContext == nil || b == 1)` at the
+//       head of `updateAndAttend`'s prompt-chunk branch.
+//
+//       `packedPerRow` is SHARED with the contiguous backend on purpose, so
+//       "packed" cannot decompose two different ways depending on storage.
+//       Only the per-row body is paged's own. `attendBorrowing`'s chunk
+//       branch uses the same decomposition, because `retainedPrefillKV` is
+//       now one retained view PER ROW rather than one per call.
 //   func bindSpanContext(_ context: CBv2SpanChunkContext?)
 //       WS-2.2. Paged already builds its mask in absolute coordinates, so the
 //       vision span overlay composes onto it more directly than it does onto
-//       contiguous's symbolic mode. Note the span path stays UNBLOCKED for
-//       now, so it does not inherit WS-0.2p's memory bound.
+//       contiguous's symbolic mode. The span path stays UNBLOCKED —
+//       `prefillAttend` requires `boundSpanContext == nil` before entering
+//       the query-block loop — so it does not inherit WS-0.2p's memory
+//       bound, and for the same reason a span-bearing chunk is never packed.

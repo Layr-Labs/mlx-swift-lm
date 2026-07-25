@@ -207,14 +207,14 @@ struct CBv2PagedBackendTests {
             layerKinds: kinds, promptLength: 0, maxLength: 512)
         let row = try #require(state[0] as? PagedSequenceKV)
         let ring = PagedKVPool.ringPageCount(window: window, config: cfg)
-        // What THIS test needs of the ring, stated exactly: the span it gathers
-        // below is `retainedCount == min(written, window - 1 + n)`, and
+        // What THIS test needs of the ring, stated exactly: it gathers
+        // `retainedCount == min(written, window)` after each write, and
         // `gatherRange` aborts once that span has been lapped. The page count
-        // itself is pinned by `ringSpansAttendableSpanPlusSpeculativeSpan` /
-        // `ringIsTheSmallestSizeClearingTheFloor` — not re-derived here and not
-        // hard-coded here, so a future sizing change fails the sizing tests
-        // rather than three unrelated ones.
-        #expect(window - 1 + cfg.maxPrefillChunk <= ring * cfg.pageSize)
+        // itself is pinned by `ringSpansExposedWindowPlusSpeculativeSpan` /
+        // `ringIsTheSmallestSizeClearingTheFloor` — not re-derived here and
+        // not hard-coded here, so a future sizing change fails the sizing
+        // tests rather than three unrelated ones.
+        #expect(PagedSequenceKV.maxWindowExposure(window: window) <= ring * cfg.pageSize)
 
         var mirrorK: [MLXArray] = []
         var mirrorV: [MLXArray] = []
@@ -230,7 +230,7 @@ struct CBv2PagedBackendTests {
             #expect(row.table.count <= ring)
 
             let retained = row.retainedCount
-            #expect(retained == min(written, window - 1 + n))
+            #expect(retained == min(written, window))
             let allK = concatenated(mirrorK, axis: 1)
             let allV = concatenated(mirrorV, axis: 1)
             let (gotK, gotV) = row.attendableViews()
@@ -606,6 +606,10 @@ struct CBv2PagedBackendTests {
         // the ring-sizing tests; here all that matters is that the ring is
         // longer than the two pages the trailing replay fills, so
         // `table.count < ring` below is a real condition and not an accident.
+        // The adoption offset is DERIVED from the ring for the same reason:
+        // at a hard-coded offset a resize can silently land the replay on the
+        // ring's last slot and grow the table to its full length, which makes
+        // the test vacuous rather than red.
         let backend = try PagedKVBackend(
             layerKinds: [kind],
             config: config(capacityBytes: 32 << 20, maxPrefillChunk: 16, nominalMaxLen: 4096))
@@ -634,65 +638,289 @@ struct CBv2PagedBackendTests {
             )
         }
 
-        // Adopt at position 64 (logical page 4), replay [64, 96): logical
-        // pages 4,5 → ring slots 0,1 ⇒ table.count = 2 (slot 3 never touched).
+        // Adopt on a ring-slot-0 boundary and replay two pages, so the replay
+        // fills slots 0,1 and leaves the rest of the ring untouched.
+        let adopt = 3 * ring * backend.pool.config.pageSize
         let cache = backend.makeLayerCaches()[0]
         let state = try backend.makeSequenceState(
             layerKinds: [kind], promptLength: 0, maxLength: 4096)
         defer { backend.release(state) }
         let row = state[0] as! PagedSequenceKV
-        row.fastForward(to: 64)
-        for chunkStart in stride(from: 64, to: 96, by: 16) {
+        row.fastForward(to: adopt)
+        for chunkStart in stride(from: adopt, to: adopt + 32, by: 16) {
             let (ck, cv) = coded(chunkStart ..< chunkStart + 16)
             row.write(keys: ck, values: cv)
         }
+        #expect(row.table.count == 2, "replay must leave the ring partially allocated")
         #expect(row.table.count < ring, "replay must leave the ring partially allocated")
         #expect(row.decodeTableLength == ring, "windowed decode must divide by the ring length")
         cache.setRows([row])
 
-        // Decode at position 96: window [65, 96].
+        // Decode at `adopt + 32`: window [adopt + 1, adopt + 32].
+        let qPos = adopt + 32
         let q = MLXRandom.normal([1, kind.queryHeads, 1, dim], dtype: .float16)
-        let (nk, nv) = coded(96 ..< 97)
+        let (nk, nv) = coded(qPos ..< (qPos + 1))
         let out = cache.updateAndAttend(
             queries: q,
             keys: nk.expandedDimensions(axis: 0),
             values: nv.expandedDimensions(axis: 0),
             scale: scale, sinks: nil)
 
-        // Reference: attention over the true window [65, 96].
-        let (wk, wv) = coded(65 ..< 97)
+        // Reference: attention over the true window.
+        let (wk, wv) = coded((qPos - window + 1) ..< (qPos + 1))
         let reference = PagedAttentionReference.composedAttention(
             queries: q, keys: wk.expandedDimensions(axis: 0),
             values: wv.expandedDimensions(axis: 0), scale: scale)
         assertClose(out, reference)
     }
 
-    // MARK: - Ring sizing: bounded on BOTH sides (T4)
+    // MARK: - WS-1.2: the ring shrink, exercised
+    //
+    // The ring is `max(window + span, maxPrefillChunk)` tokens instead of
+    // `window - 1 + maxPrefillChunk + span`, and it is only correct because
+    // the gather moved BEFORE the write on both write paths and because
+    // `PagedKVPool.gather` publishes a fence back-edge. The tests here run
+    // the paths rather than restating the arithmetic: an earlier attempt at
+    // this exact size passed every arithmetic test and aborted the daemon on
+    // ordinary windowed prefill.
+
+    /// Position-coded K/V. Every element is `(131p + 17h + d) mod 2039`, an
+    /// integer below 2048 and therefore EXACT in float16; 2039 is prime and
+    /// 131 is invertible modulo it, so two distinct positions can never
+    /// produce the same code for a given (head, channel). A gathered range
+    /// therefore names exactly the absolute positions it came from, and a
+    /// clobbered ring slot cannot pass as intact.
+    private func positionCoded(
+        _ positions: Range<Int>, heads: Int = 2, dim: Int = 64
+    ) -> (MLXArray, MLXArray) {
+        let n = positions.count
+        var kflat = [Float](repeating: 0, count: heads * n * dim)
+        var vflat = kflat
+        var i = 0
+        for h in 0 ..< heads {
+            for p in positions {
+                for d in 0 ..< dim {
+                    let code = (131 * p + 17 * h + d) % 2039
+                    kflat[i] = Float(code)
+                    vflat[i] = Float((code * 7) % 2039)
+                    i += 1
+                }
+            }
+        }
+        return (
+            MLXArray(kflat, [heads, n, dim]).asType(.float16),
+            MLXArray(vflat, [heads, n, dim]).asType(.float16)
+        )
+    }
+
+    /// ORDINARY WINDOWED PREFILL AT A FULL CHUNK, on the shrunk ring.
+    ///
+    /// This is the exact scenario the reverted attempt died on: a windowed
+    /// row prefilled in `maxPrefillChunk` chunks where `window - 1 + chunk`
+    /// exceeds the whole ring. Two things must hold at once, and only running
+    /// it shows either:
+    ///
+    ///  * the chunk-shaped round must still SEE `min(written, window)` of
+    ///    history — checked against an independent mirror, position by
+    ///    position, so a clobbered slot cannot pass;
+    ///  * the chunk's EARLIEST query must still see its full window — checked
+    ///    by asserting the assembled view `update` returns is
+    ///    `min(writtenBefore, window - 1) + n` wide and that its leading
+    ///    columns are the pre-write history, not the chunk's own tail.
+    ///
+    /// Run at the production geometry (window 1,024, chunk 512, pageSize 16)
+    /// and at small shapes, because the failure is a rounding-sensitive
+    /// overlap between the gathered history and the chunk's ring slots.
+    @Test(arguments: [
+        (window: 32, chunk: 32), (window: 64, chunk: 48), (window: 1024, chunk: 512),
+    ])
+    func windowedPrefillAtFullChunkSurvivesTheRing(_ shape: (window: Int, chunk: Int)) throws {
+        let (window, chunk) = shape
+        let kind = windowedKind(window)
+        let cfg = config(capacityBytes: 64 << 20, maxPrefillChunk: chunk, nominalMaxLen: 8192)
+        let ringTokens = PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
+        // The condition that makes this test meaningful: a POST-write gather
+        // of the same span would not fit. If this ever stops holding the ring
+        // grew back and the test is no longer exercising the shrink.
+        #expect(
+            window - 1 + chunk > ringTokens || chunk == 1,
+            "window \(window) chunk \(chunk): ring \(ringTokens) is not tight enough to test")
+
+        let backend = try PagedKVBackend(layerKinds: [kind], config: cfg)
+        let state = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 4 * window + 2 * chunk)
+        defer { backend.release(state) }
+        let row = try #require(state[0] as? PagedSequenceKV)
+
+        var written = 0
+        while written + chunk <= 3 * window + chunk {
+            let (k, v) = positionCoded(written ..< (written + chunk))
+            let historyBefore = min(written, window - 1)
+            let (viewK, viewV) = row.update(keys: k, values: v)
+            written += chunk
+
+            // Width: history + chunk, WIDER than retainedCount by design.
+            #expect(
+                viewK.dim(2) == historyBefore + chunk,
+                "chunk view is \(viewK.dim(2)) columns, expected \(historyBefore + chunk)")
+            #expect(row.retainedCount == min(written, window))
+
+            // Contents: exactly positions [written - chunk - historyBefore,
+            // written). The leading columns must be the PRE-write history —
+            // if the chunk's tail had lapped them, these are the wrong
+            // positions and the codes do not match.
+            let first = written - chunk - historyBefore
+            let (wantK, wantV) = positionCoded(first ..< written)
+            assertEqualArrays(viewK, wantK.expandedDimensions(axis: 0))
+            assertEqualArrays(viewV, wantV.expandedDimensions(axis: 0))
+
+            // And the ring itself still holds the trailing window.
+            let (ringK, _) = row.attendableViews()
+            let (wantRingK, _) = positionCoded((written - row.retainedCount) ..< written)
+            assertEqualArrays(ringK, wantRingK.expandedDimensions(axis: 0))
+        }
+    }
+
+    /// The DIRECT-WRITER path at the new ring size: `write` then read, with
+    /// no gather-before-write trick available, at a full `maxPrefillChunk`.
+    ///
+    /// This is what the kernel differential harness
+    /// (`CBv2PagedKernelTests.Fixture.addRow`) and `PagedDecodeProfiler` do.
+    /// Their chunk bound used to be `ringTokens - window + 1` — 17 tokens at
+    /// gemma-4's geometry — because a direct write left `retainedCount` at
+    /// `window - 1 + n` and `attendableViews` then asked the ring for a span
+    /// it had lapped. The bound is now `maxPrefillChunk`, which the ring
+    /// covers by construction (`ringRowBoundDominatesALongChunk`).
+    @Test(arguments: [(window: 32, chunk: 32), (window: 1024, chunk: 512)])
+    func directWriterUsesTheWholeChunkAtTheNewRing(_ shape: (window: Int, chunk: Int)) throws {
+        let (window, chunk) = shape
+        let kind = windowedKind(window)
+        let cfg = config(capacityBytes: 64 << 20, maxPrefillChunk: chunk, nominalMaxLen: 8192)
+        let ringTokens = PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
+        // The bound the harness used to be held to, kept as live arithmetic:
+        // at gemma-4's geometry it is 17 against a 512-token chunk.
+        let oldBound = max(1, min(chunk, ringTokens - window + 1))
+        #expect(chunk > oldBound, "fixture is wrong: the old bound was not the binding one")
+
+        let backend = try PagedKVBackend(layerKinds: [kind], config: cfg)
+        let state = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 8 * chunk + 2 * window)
+        defer { backend.release(state) }
+        let row = try #require(state[0] as? PagedSequenceKV)
+
+        var written = 0
+        for _ in 0 ..< 6 {
+            let (k, v) = positionCoded(written ..< (written + chunk))
+            row.write(keys: k, values: v)
+            written += chunk
+            #expect(row.absoluteOffset == written)
+            // The read a direct writer actually performs. Under the old
+            // semantics this asked for `window - 1 + chunk` and aborted.
+            let (gotK, gotV) = row.attendableViews()
+            #expect(row.retainedCount == min(written, window))
+            let (wantK, wantV) = positionCoded((written - row.retainedCount) ..< written)
+            assertEqualArrays(gotK, wantK.expandedDimensions(axis: 0))
+            assertEqualArrays(gotV, wantV.expandedDimensions(axis: 0))
+            // `snapshot()` is the same read and must be serviceable in the
+            // same phase — the prefix cache donates from here.
+            #expect(row.snapshot().offset == written)
+        }
+    }
+
+    /// `PagedKVPool.gather` must publish a fence BACK-edge, so an in-place
+    /// write cannot overtake a lazy gather that has not materialised.
+    ///
+    /// Without it the gather and the following `bulkWrite` are graph
+    /// SIBLINGS: both merely consume the group's `writeFence`, and MLX may
+    /// run either first. At the old 1,552-token ring that was invisible,
+    /// because a chunk's history (`window - 1`) and the chunk itself never
+    /// shared a ring slot. At 1,040 they do, so the loser of the race is the
+    /// chunk's earliest queries reading the chunk's own tail as their
+    /// history: a wrong answer with no crash and no telemetry.
+    ///
+    /// Two assertions, because either alone is weak. The mechanism: the
+    /// fence is a NEW node after a gather and keeps its value. The effect: a
+    /// gather held unevaluated across an overlapping write still reads the
+    /// pre-write bytes.
+    @Test func gatherPublishesAFenceBackEdgeSoWritesCannotOvertakeIt() throws {
+        let window = 64
+        let chunk = 64
+        let kind = windowedKind(window)
+        let cfg = config(capacityBytes: 32 << 20, maxPrefillChunk: chunk, nominalMaxLen: 4096)
+        let backend = try PagedKVBackend(layerKinds: [kind], config: cfg)
+        let state = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 1024)
+        defer { backend.release(state) }
+        let row = try #require(state[0] as? PagedSequenceKV)
+        let group = backend.pool.group(row.groupKey)
+
+        let (k0, v0) = positionCoded(0 ..< 128)
+        for start in stride(from: 0, to: 128, by: chunk) {
+            row.write(
+                keys: k0[0..., start ..< (start + chunk), 0...],
+                values: v0[0..., start ..< (start + chunk), 0...])
+        }
+
+        // MECHANISM.
+        let fenceBefore = group.writeFence
+        eval(fenceBefore)
+        let valueBefore = fenceBefore.item(Int32.self)
+        let (histK, histV) = row.gatherRange(start: 128 - (window - 1), count: window - 1)
+        #expect(group.writeFence !== fenceBefore, "gather published no back-edge")
+        eval(group.writeFence)
+        #expect(
+            group.writeFence.item(Int32.self) == valueBefore,
+            "the back-edge must not change the fence's value")
+
+        // EFFECT. `histK`/`histV` are still unevaluated. Write a chunk whose
+        // ring slots OVERLAP them — which is exactly what a prefill chunk
+        // does now that the ring is `window + span` rather than
+        // `window - 1 + chunk + span`.
+        let ringTokens = PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
+        #expect(
+            (window - 1) + chunk > ringTokens,
+            "fixture is wrong: history and chunk do not share ring slots")
+        let (k1, v1) = positionCoded(128 ..< (128 + chunk))
+        row.write(keys: k1, values: v1)
+
+        // Only NOW force the gather. It must still hold the pre-write bytes.
+        let (wantK, wantV) = positionCoded((128 - (window - 1)) ..< 128)
+        assertEqualArrays(histK, wantK.expandedDimensions(axis: 0))
+        assertEqualArrays(histV, wantV.expandedDimensions(axis: 0))
+    }
+
+    // MARK: - Ring sizing: bounded on BOTH sides, from BOTH bounds (T4)
     //
     // `windowedRingWrapKeepsRecentEnd` asserted only `table.count <= ring`.
     // That is an UNDER-provision bound: it fires if the ring is too small for
     // the pages actually allocated and is silent about everything else, so
-    // growing the ring — or failing to shrink it — fails nothing. The two
-    // tests below bracket it, and NEITHER re-derives its expectation from
-    // `ringPageCount`: both state the requirement in tokens and let the page
+    // growing the ring — or failing to shrink it — fails nothing. The tests
+    // below bracket it, and NONE re-derives its expectation from
+    // `ringPageCount`: they state the requirement in tokens and let the page
     // count fall out.
     //
     // THE REQUIREMENT, in tokens. A windowed ring aliases at
     // `ringPages * pageSize`: writing absolute position `p` overwrites
-    // `p - ringPages * pageSize`. Two things must survive that:
+    // `p - ringPages * pageSize`. TWO INDEPENDENT things must survive that,
+    // and the ring is the larger of them:
     //
-    //   window - 1 + maxPrefillChunk   the attendable span after a full chunk.
-    //     `retainedCount` is `min(written, window - 1 + lastUpdateTokens)`,
-    //     NOT `min(written, window)`, because a chunk's EARLIEST query must
-    //     still see its whole window. `attendableViews()` gathers exactly that
-    //     span and `gatherRange` aborts the process if it has been lapped.
-    //   maxSpeculativeSpan            the alias margin a speculative round
-    //     spends before it can be rolled back. Under-reserve it and a rejected
-    //     draft destroys an entry still inside a live window — wrong output,
-    //     no crash, no telemetry.
+    //   CACHE  maxWindowExposure(window) + maxSpeculativeSpan
+    //     `retainedCount` is `min(written, maxWindowExposure(window))` —
+    //     `min(written, window)` — because both write paths gather a chunk's
+    //     history BEFORE writing the chunk. `attendableViews()` gathers
+    //     exactly that span and `gatherRange` aborts the process if it has
+    //     been lapped. `maxSpeculativeSpan` on top is the alias margin a
+    //     round spends before it can be rolled back; under-reserve it and a
+    //     rejected draft destroys an entry still inside a live window —
+    //     wrong output, no crash, no telemetry.
     //
-    // Their sum is the floor. The ring must be the SMALLEST page count that
-    // clears it.
+    //   ROW    maxPrefillChunk
+    //     One `PagedSequenceKV.write` scatters a whole chunk in ONE dispatch.
+    //     Longer than the ring and two of its own tokens land in the same
+    //     physical slot with no ordering between them. This bound USED to be
+    //     implied by the chunk term the cache bound carried; it is not
+    //     implied any more, and `ringRowBoundDominatesALongChunk` below is
+    //     what stops it being dropped.
 
     private static let ringShapes = [
         (window: 32, chunk: 16),
@@ -701,21 +929,29 @@ struct CBv2PagedBackendTests {
         // gemma-4-26b-qat-4bit sliding layers under the production chunk size.
         (window: 1024, chunk: 512),
         (window: 1024, chunk: 64),
+        // Row-bound: the chunk outruns the window, so the cache bound alone
+        // would size this ring at 9 pages for a 128-page write.
+        (window: 128, chunk: 2048),
     ]
 
     /// Tokens the ring must hold — see the requirement above.
     private static func ringFloorTokens(window: Int, chunk: Int) -> Int {
-        (window - 1 + chunk) + CBv2PagedSpeculation.maxSpeculativeSpan
+        max(
+            PagedSequenceKV.maxWindowExposure(window: window)
+                + CBv2PagedSpeculation.maxSpeculativeSpan,
+            chunk)
     }
 
     /// LOWER bound — the safety floor. Under-sizing is a process abort on
     /// prefill (`gatherRange`) or silent corruption of confirmed history
-    /// (speculative rollback), depending on which term is short.
+    /// (speculative rollback or a self-lapping chunk), depending on which
+    /// term is short.
     ///
-    /// This is the same quantity `PagedSequenceKV.speculativeHeadroom` reads
-    /// from the row side, so the two cannot be allowed to disagree.
+    /// The cache term is the same quantity `PagedSequenceKV
+    /// .speculativeHeadroom` reads from the row side, so the two cannot be
+    /// allowed to disagree.
     @Test(arguments: ringShapes)
-    func ringSpansAttendableSpanPlusSpeculativeSpan(_ shape: (window: Int, chunk: Int)) {
+    func ringSpansExposedWindowPlusSpeculativeSpan(_ shape: (window: Int, chunk: Int)) {
         let cfg = config(maxPrefillChunk: shape.chunk)
         let ring = PagedKVPool.ringPageCount(window: shape.window, config: cfg)
         let floor = Self.ringFloorTokens(window: shape.window, chunk: shape.chunk)
@@ -723,10 +959,11 @@ struct CBv2PagedBackendTests {
             ring * cfg.pageSize >= floor,
             """
             ring \(ring) pages (\(ring * cfg.pageSize) tokens) is below the floor \(floor) = \
-            (window \(shape.window) - 1 + maxPrefillChunk \(shape.chunk)) + \
-            maxSpeculativeSpan \(CBv2PagedSpeculation.maxSpeculativeSpan). Short by \
-            \(floor - ring * cfg.pageSize) tokens: prefill will abort in gatherRange, or a \
-            rolled-back speculative write will alias a live in-window entry.
+            max(exposure \(PagedSequenceKV.maxWindowExposure(window: shape.window)) + \
+            maxSpeculativeSpan \(CBv2PagedSpeculation.maxSpeculativeSpan), \
+            maxPrefillChunk \(shape.chunk)). Short by \(floor - ring * cfg.pageSize) tokens: \
+            prefill will abort in gatherRange, a rolled-back speculative write will alias a \
+            live in-window entry, or one chunk will lap the ring inside a single dispatch.
             """)
     }
 
@@ -739,17 +976,22 @@ struct CBv2PagedBackendTests {
     /// than a literal page count precisely so that it keeps holding through
     /// the sizing changes that are still coming.
     ///
-    /// HISTORY, so the next reader does not re-litigate it. WS-1.2 tried
-    /// `ceil(window / pageSize) + ceil(maxSpeculativeSpan / pageSize)` — 65
-    /// pages for gemma-4 against today's 97, which is where the "~528 tokens
-    /// of accidental margin" figure comes from. It was reverted: 65 holds the
-    /// window but not `window - 1 + chunk`, so a 512-token chunk asks the ring
-    /// for 1,535 tokens against 1,040 and `gatherRange` aborts (track R
-    /// reproduced it). 65 becomes correct only once `PagedLayerCache` attends
-    /// `gather(ring) ++ chunk` with the gather taken BEFORE the write, which
-    /// is scheduled separately. When that lands, `maxPrefillChunk` leaves the
-    /// floor, `ringFloorTokens` becomes `window + maxSpeculativeSpan`, and
-    /// this test pins the smaller ring with no other edit.
+    /// HISTORY, so the next reader does not re-litigate it. The ring used to
+    /// be `ceil((window - 1 + chunk) / pageSize) + ceil(span / pageSize)` —
+    /// 97 pages for gemma-4, 1,552 tokens for a 1,024-token window, and a
+    /// measured 1.10x per-sequence KV regression against the contiguous
+    /// backend at 10k context. An earlier attempt to shrink it to 65 pages
+    /// was REVERTED because 65 holds the window but not `window - 1 + chunk`,
+    /// and a 512-token chunk asked `gatherRange` for 1,535 tokens against
+    /// 1,040: a daemon abort on ordinary prefill, reproduced from the row
+    /// side. What made 65 correct was NOT this arithmetic — it was moving the
+    /// gather BEFORE the write on both the layer path
+    /// (`PagedLayerCache.prefillKV`) and the row path
+    /// (`PagedSequenceKV.update`), and publishing a fence back-edge in
+    /// `PagedKVPool.gather` so the chunk write cannot overtake the gather now
+    /// that they share ring slots. `windowedPrefillAtFullChunkSurvivesTheRing`
+    /// and the seam suite's `attendableSpanIsWhatARealRowActuallyExposes`
+    /// are what hold that condition; this test only pins the size.
     @Test(arguments: ringShapes)
     func ringIsTheSmallestSizeClearingTheFloor(_ shape: (window: Int, chunk: Int)) {
         let cfg = config(maxPrefillChunk: shape.chunk)
@@ -763,6 +1005,42 @@ struct CBv2PagedBackendTests {
             \(floor), so at least \(cfg.pageSize) tokens per windowed layer are slack. On \
             gemma-4 that is 25 of 30 layers.
             """)
+    }
+
+    /// The ROW bound is not a corollary of the cache bound and must be able
+    /// to DOMINATE it. This is the test that fails if someone re-derives the
+    /// ring from the window alone.
+    ///
+    /// It is deliberately arithmetic-only and separate from the sweep above:
+    /// the sweep would still pass on a formula that took `max` of the wrong
+    /// two things, because five of its six shapes are cache-bound.
+    @Test func ringRowBoundDominatesALongChunk() {
+        let span = CBv2PagedSpeculation.maxSpeculativeSpan
+        for (window, chunk) in [(128, 2048), (32, 512), (16, 4096)] {
+            let cfg = config(maxPrefillChunk: chunk)
+            let cacheOnly = PagedSequenceKV.maxWindowExposure(window: window) + span
+            #expect(chunk > cacheOnly, "fixture is wrong: \(window)/\(chunk) is not row-bound")
+            let ringTokens =
+                PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
+            #expect(
+                ringTokens >= chunk,
+                """
+                window \(window) chunk \(chunk): the ring holds \(ringTokens) tokens and must \
+                hold one whole maxPrefillChunk write (\(chunk)). The cache bound alone gives \
+                \(cacheOnly) tokens — \((cacheOnly + cfg.pageSize - 1) / cfg.pageSize) pages \
+                for a \((chunk + cfg.pageSize - 1) / cfg.pageSize)-page write — so a ring \
+                derived from the window alone lets a chunk lap itself inside one bulk-write \
+                dispatch, with no ordering between the two tokens landing in the same slot.
+                """)
+            // ...and the pool must actually BUILD at that geometry, which is
+            // the half pure arithmetic cannot show: `checkedRingPageCount`
+            // guards both bounds and would refuse it if either were short.
+            #expect(throws: Never.self) {
+                _ = try PagedKVPool(
+                    layerKinds: [self.windowedKind(window)],
+                    config: self.config(capacityBytes: 64 << 20, maxPrefillChunk: chunk))
+            }
+        }
     }
 
     // MARK: - Slab canary: pad targets must never name a live tenant page (T4)
@@ -1146,15 +1424,12 @@ struct CBv2PagedSpeculativeRowTests {
 
     /// `maxPrefillChunk` is deliberately SMALL relative to the window.
     ///
-    /// A windowed row's widest attendable range is `window - 1 + chunk`, and
-    /// a round adds `maxSpeculativeSpan` on top; the ring has to cover all of
-    /// it. `PagedKVPool.ringPageCount` is being resized by track P
-    /// (WS-1.2/3.1), so these suites pick a chunk that fits under EVERY
-    /// candidate formula — window 32 / chunk 8 needs 47 tokens, and the
-    /// smallest candidate ring for a 32 window is 48. Pinning a larger chunk
-    /// here would make these tests fail for a reason that has nothing to do
-    /// with the speculative transaction. The ring's own adequacy is asserted
-    /// by `ringCoversWidestAttendableRangePlusOneRound`.
+    /// The ring must cover `max(window + maxSpeculativeSpan, chunk)`, so a
+    /// chunk under the window keeps these suites cache-bound — window 32 /
+    /// chunk 8 needs 40 tokens and rings at 48. A larger chunk would move the
+    /// ring for a reason that has nothing to do with the speculative
+    /// transaction. The ring's own adequacy is asserted by
+    /// `ringCoversTheExposedWindowPlusOneRound`.
     private func config(maxPrefillChunk: Int = 8) -> PagedKVPoolConfig {
         PagedKVPoolConfig(
             capacityBytes: 8 << 20, maxPrefillChunk: maxPrefillChunk,
@@ -1193,9 +1468,8 @@ struct CBv2PagedSpeculativeRowTests {
         row.write(keys: k, values: v)
     }
 
-    /// Prefill `positions` as back-to-back `maxPrefillChunk` writes. Leaves
-    /// `lastUpdateTokens` equal to the FINAL chunk's size, which is what the
-    /// round tests need: a row whose retained input is wider than a decode's.
+    /// Prefill `positions` as back-to-back `maxPrefillChunk` writes, so the
+    /// row reaches the round through the same shape a real prefill would.
     private func fill(_ row: PagedSequenceKV, _ positions: Range<Int>, chunk: Int) {
         var p = positions.lowerBound
         while p < positions.upperBound {
@@ -1283,30 +1557,32 @@ struct CBv2PagedSpeculativeRowTests {
             "a gemma-4-shaped hybrid bank must now reach the MTP storage gate")
     }
 
-    /// Lower bound on the ring, the complement of `ringIsNotOverProvisioned`.
+    /// Lower bound on the ring, from the row side.
     ///
     /// A windowed row can be asked for `retainedCount` positions at once, and
-    /// that is `window - 1 + lastUpdateTokens` — a prefill chunk of `n` leaves
-    /// `n`, because the chunk's EARLIEST query must still see its full window.
-    /// On top of that a speculative round writes `maxSpeculativeSpan` past the
-    /// frontier, and writing position `p` destroys whatever held
-    /// `p - ringTokens`. So the ring must cover all three at once or a
-    /// windowed row gathers positions the ring already evicted — which is a
-    /// `precondition` in `gatherRange`, i.e. a daemon abort on an ordinary
-    /// prefill, no speculation required.
+    /// that is `min(written, maxWindowExposure(window))`. On top of that a
+    /// speculative round writes `maxSpeculativeSpan` past the frontier, and
+    /// writing position `p` destroys whatever held `p - ringTokens`. So the
+    /// ring must cover both at once or a windowed row gathers positions the
+    /// ring already evicted — which is a `precondition` in `gatherRange`,
+    /// i.e. a daemon abort on an ordinary prefill, no speculation required.
     ///
-    /// Owner of the formula is track P (`PagedKVPool.ringPageCount`). This
-    /// test asserts only the property `speculativeHeadroom` depends on.
-    @Test func ringCoversWidestAttendableRangePlusOneRound() {
+    /// Owner of the formula is `PagedKVPool.ringPageCount`. This test asserts
+    /// only the property `speculativeHeadroom` depends on, which is why it
+    /// does not mention `maxPrefillChunk`: the ROW bound is pinned separately
+    /// by `ringRowBoundDominatesALongChunk`, and conflating the two is how a
+    /// resize drops one of them.
+    @Test func ringCoversTheExposedWindowPlusOneRound() {
         for (window, chunk) in [(32, 8), (512, 256), (1024, 64), (1024, 512)] {
             let cfg = PagedKVPoolConfig(
                 capacityBytes: 8 << 20, maxPrefillChunk: chunk,
                 nominalMaxSequenceLength: 1024)
             let ringTokens = PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
-            let widest = window - 1 + chunk + CBv2PagedSpeculation.maxSpeculativeSpan
+            let exposure = PagedSequenceKV.maxWindowExposure(window: window)
+            let widest = exposure + CBv2PagedSpeculation.maxSpeculativeSpan
             let why =
                 "window \(window) chunk \(chunk): ring \(ringTokens) tokens cannot hold "
-                + "retainedCount \(window - 1 + chunk) plus a "
+                + "retainedCount \(exposure) plus a "
                 + "\(CBv2PagedSpeculation.maxSpeculativeSpan)-token round"
             #expect(widest <= ringTokens, Comment(rawValue: why))
         }
@@ -1325,12 +1601,11 @@ struct CBv2PagedSpeculativeRowTests {
         let row = try #require(state[0] as? PagedSequenceKV)
 
         // Fill several times past the ring so wrap-around aliasing is LIVE,
-        // and end on a full-size chunk so `lastUpdateTokens` is 8, not 1 —
-        // that is the value the transaction has to give back.
+        // in `maxPrefillChunk` chunks — the shape a real prefill arrives in.
         let chunk = cfg.maxPrefillChunk
         fill(row, 0 ..< 104, chunk: chunk)
         #expect(row.absoluteOffset == 104)
-        #expect(row.retainedCount == window - 1 + chunk, "bulk write raises the retained input")
+        #expect(row.retainedCount == window, "exposure is the window, whatever the last write")
         let ringTokens = PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
         #expect(row.absoluteOffset > ringTokens, "the ring must have wrapped")
 
@@ -1346,22 +1621,33 @@ struct CBv2PagedSpeculativeRowTests {
         row.commitSpeculativeWrite()
         #expect(row.speculativeBase == nil)
 
-        // Row: byte-identical, including the retained-count input and the
-        // page table. The round's writes landed on slots whose prior tenants
-        // were `ringTokens` positions behind the frontier — already evicted,
-        // outside every attendable range.
+        // Row: byte-identical, including the page table. The round's writes
+        // landed on slots whose prior tenants were `ringTokens` positions
+        // behind the frontier — already evicted, outside every attendable
+        // range. That is exactly the `ringTokens - window >= span` headroom
+        // the ring reserves, and `roundBeyondTheRingHeadroomDestroysHistory`
+        // below is the control showing it is what makes this work.
         #expect(fingerprint(row) == rowBefore)
         #expect(row.tableVersion == versionBefore, "a windowed ring allocates nothing in a round")
         // Pool: a windowed ring frees no pages, so nothing may be queued.
         #expect(fingerprint(backend.pool, row.groupKey) == poolBefore)
     }
 
-    /// Control for the test above: the SAME write-then-rollback without the
-    /// transaction does NOT restore the row. Without this, that test would
-    /// pass on an implementation whose `begin`/`commit` are still the
-    /// contract's default no-ops, because it would be asserting a property
-    /// of plain rollback rather than of the transaction.
-    @Test func unarmedRollbackDoesNotRestoreTheRetainedCountInput() throws {
+    /// Control for the test above: the restoration is a property of the
+    /// ring's RESERVED HEADROOM, not of rollback being free.
+    ///
+    /// Without a control, `windowedRoundFullyRolledBackRestoresRowAndPool`
+    /// could pass on a row that simply never overwrites anything, and the
+    /// reader would learn nothing about why `ringPageCount` carries
+    /// `maxSpeculativeSpan`. So: write PAST the headroom the ring reserves
+    /// and the same rollback does NOT restore the row — the round's writes
+    /// reached into the still-attendable window and destroyed confirmed
+    /// history.
+    ///
+    /// Unarmed on purpose. `guardSpeculativeSpan` traps this inside a
+    /// transaction, which is the whole point of the guard; running it bare
+    /// is what lets the test observe the corruption the guard prevents.
+    @Test func roundBeyondTheRingHeadroomDestroysHistory() throws {
         let window = 32
         let cfg = config()
         let kind = windowedKind(window)
@@ -1371,18 +1657,35 @@ struct CBv2PagedSpeculativeRowTests {
         defer { backend.release(state) }
         let row = try #require(state[0] as? PagedSequenceKV)
 
+        let ringTokens = PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
+        let headroom = ringTokens - window
+        #expect(
+            headroom >= CBv2PagedSpeculation.maxSpeculativeSpan,
+            "the ring must reserve at least one round of headroom")
+        #expect(row.speculativeHeadroom == headroom, "the row reads the same headroom")
+
         fill(row, 0 ..< 104, chunk: cfg.maxPrefillChunk)
         let before = fingerprint(row)
-        #expect(before.retainedCount == window - 1 + cfg.maxPrefillChunk)
+        #expect(before.retainedCount == window)
 
-        write(row, 104 ..< 112)
-        row.rollback(8)
+        // One token past the headroom is enough: position `104 + headroom`
+        // destroys `104 + headroom - ringTokens == 104 - window`, which is
+        // the OLDEST still-attendable position. Written in `maxPrefillChunk`
+        // pieces because `write` refuses a longer one — the overrun is in the
+        // ROUND's length, not in any single write.
+        let overrun = headroom + 1
+        fill(row, 104 ..< (104 + overrun), chunk: cfg.maxPrefillChunk)
+        row.rollback(overrun)
 
         #expect(row.absoluteOffset == before.absoluteOffset, "the counter still rewinds")
+        #expect(row.retainedCount == before.retainedCount, "and the exposure is unchanged")
         #expect(
-            row.retainedCount == window,
-            "unarmed rollback collapses the retained input to a decode shape")
-        #expect(fingerprint(row) != before, "so the row is NOT restored without a transaction")
+            fingerprint(row) != before,
+            """
+            a \(overrun)-token round past a \(headroom)-token headroom left the row \
+            byte-identical, so this suite is not measuring the headroom at all. Either the \
+            ring grew, or the round no longer writes through to the slabs.
+            """)
     }
 
     /// A row that finishes mid-round is torn down by the deferred-release
@@ -1511,6 +1814,19 @@ struct CBv2PagedSpeculativeRowTests {
         #expect(hostCopy(sv) == hostCopy(pv), "accepted values diverge from the plain run")
     }
 
+    /// A committed round must leave the row exposing exactly what the plain
+    /// run exposes.
+    ///
+    /// This used to be a real risk and is now a structural property:
+    /// `retainedCount` was `min(written, window - 1 + lastUpdateTokens)`, so
+    /// a bulk round left it at `window - 1 + 8 == 39` unless `commit` reset
+    /// the input, and forgetting that reset over-exposed the row against a
+    /// plain decode of the same confirmed tokens. `retainedCount` is now
+    /// `min(written, window)` in every phase, so there is no input to settle.
+    /// The test stays because the OBSERVABLE it defends — a committed round
+    /// is indistinguishable from the plain run — is what actually matters,
+    /// and it would fail again the moment a phase-dependent exposure came
+    /// back.
     @Test func committedBulkRoundDoesNotOverExposeRetainedCount() throws {
         let window = 32
         let cfg = config()
@@ -1529,13 +1845,12 @@ struct CBv2PagedSpeculativeRowTests {
 
         for row in [speculated, plain] { fill(row, 0 ..< 100, chunk: cfg.maxPrefillChunk) }
 
-        // Every draft accepted: no rollback runs, so commit alone has to
-        // settle the retained-count input. Left at 8 it would keep exposing
-        // `window - 1 + 8 == 39` tokens where the plain run — the same
-        // confirmed tokens produced one decode at a time — exposes `window`.
+        // Every draft accepted: no rollback runs.
         speculated.beginSpeculativeWrite()
         write(speculated, 100 ..< 108)
-        #expect(speculated.retainedCount == window - 1 + 8, "raised for the round's own queries")
+        #expect(
+            speculated.retainedCount == window,
+            "a bulk round must not widen what the row exposes")
         speculated.commitSpeculativeWrite()
 
         for p in 100 ..< 108 { write(plain, p ..< (p + 1)) }

@@ -544,28 +544,37 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         CBv2LayerKind(attention: .slidingWindow(1024), headDim: 256, kvHeads: 8, queryHeads: 8)
     }
 
-    /// pageSize 16 / chunk 512 ⇒ `ringPageCount(1024) == 97` (1,552 tokens),
-    /// the landed gemma-4 sizing.
+    /// The gemma-4 paged sizing: pageSize 16, chunk 512. The ring it implies
+    /// is deliberately NOT restated here — it is `ringPageCount`'s to define
+    /// and it is contested (97 pages at the time of writing; WS-1.2 proposes
+    /// 65 on the back of a pre-write gather in `PagedLayerCache`). Every
+    /// expectation below that depends on it reads `PagedKVPool.ringPageCount`
+    /// instead of a literal, so this suite is correct under either answer.
     private var gemmaPagedConfig: PagedKVPoolConfig {
         PagedKVPoolConfig(
             capacityBytes: 1 << 30, maxPrefillChunk: 512, nominalMaxSequenceLength: 8192)
     }
 
     /// The whole-ring charge PR#87 introduced is right for CONTIGUOUS rows
-    /// and wrong for PAGED ones, so the two must diverge. The exact table on
-    /// one gemma-4 windowed layer (8,192 B/token, window 1,024, ring 97
-    /// pages = 1,552 tokens):
+    /// and wrong for PAGED ones, so the two must diverge. On one gemma-4
+    /// windowed layer (8,192 B/token, window 1,024):
     ///
-    /// | tokens | contiguous rows | paged rows | contiguous B | paged B    |
-    /// |--------|-----------------|------------|--------------|------------|
-    /// |      1 |           1,024 |         16 |    8,388,608 |    131,072 |
-    /// |    500 |           1,024 |        512 |    8,388,608 |  4,194,304 |
-    /// |  2,000 |           1,024 |      1,552 |    8,388,608 | 12,713,984 |
+    /// | tokens | contiguous rows | paged rows  | contiguous B | paged B     |
+    /// |--------|-----------------|-------------|--------------|-------------|
+    /// |      1 |           1,024 |          16 |    8,388,608 |     131,072 |
+    /// |    500 |           1,024 |         512 |    8,388,608 |   4,194,304 |
+    /// |  2,000 |           1,024 | whole ring  |    8,388,608 | ring × 8,192 |
     ///
-    /// Note the last row: paged is not uniformly cheaper. Past the ring the
-    /// paged charge EXCEEDS the window because the ring is 1,552 tokens
-    /// wide, and charging less there is a free-list underflow, not a
-    /// rejected request. This is a change of policy, not a relaxation.
+    /// The short-row figures are LITERAL — one page and 32 pages are the
+    /// whole point of the fix and must not drift. The 2,000-token row is
+    /// derived from `ringPageCount` on purpose: the ring's width is under
+    /// active revision, and pinning a literal there would turn a correct
+    /// engine change into a red test (it already did once, at 1,552).
+    /// What must hold regardless of the ring's width is the SHAPE: past the
+    /// ring the paged charge stops tracking tokens and plateaus at the ring,
+    /// and that plateau is at least the window — charging less is a
+    /// free-list underflow, not a rejected request. Paged is therefore not
+    /// uniformly cheaper; this is a change of policy, not a relaxation.
     func testWindowedChargeDivergesByBackendStoragePolicy() {
         let kinds = [gemmaWindowedKind]
         let bytesPerToken = 2 * 8 * 256 * 2  // 8,192
@@ -584,7 +593,15 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         }
         XCTAssertEqual(paged.allocatedBytes(forTokens: 1), 16 * bytesPerToken)
         XCTAssertEqual(paged.allocatedBytes(forTokens: 500), 512 * bytesPerToken)
-        XCTAssertEqual(paged.allocatedBytes(forTokens: 2000), 1552 * bytesPerToken)
+        let ringRows = PagedKVPool.ringPageCount(
+            window: 1024, config: gemmaPagedConfig) * gemmaPagedConfig.pageSize
+        XCTAssertEqual(paged.allocatedBytes(forTokens: 2000), ringRows * bytesPerToken)
+        XCTAssertGreaterThanOrEqual(
+            ringRows, 1024,
+            "the ring must cover the window or the paged charge under-states the pool")
+        XCTAssertEqual(
+            paged.allocatedBytes(forTokens: 100_000), ringRows * bytesPerToken,
+            "past the ring the charge plateaus instead of tracking tokens")
 
         // Retention is a property of the MODEL, not the backend — unchanged.
         for admission in [contiguous, paged] {
@@ -653,8 +670,10 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         }
         XCTAssertEqual(admitted, capacity / pageBytes)
 
-        // Not a relaxation: what the pool cannot serve is still refused.
-        // A 2,000-token row needs the whole 97-page ring, well past 40.
+        // Not a relaxation: what the pool cannot serve is still refused. A
+        // 2,000-token row saturates the whole ring, and the ring is far wider
+        // than this fixture's 40 pages under every sizing on the table (97
+        // today, 65 under WS-1.2), so both the ledger and the pool say no.
         XCTAssertFalse(backendAware.canEverFit(promptTokens: 2000, maxTokens: 0))
         XCTAssertThrowsError(try (backend as! PagedKVBackend).reserve(
             layerKinds: kinds, maxLength: 2000))
