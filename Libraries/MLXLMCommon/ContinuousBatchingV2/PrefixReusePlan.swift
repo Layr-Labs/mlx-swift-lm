@@ -12,7 +12,6 @@ public enum CBv2PrefixReuseBackend: String, Sendable, Equatable {
     /// caches fp16; GPT-OSS full-attention rows are fp32. Dynamic plans bind
     /// exact staged `nbytes`, so neither is estimated as the other.
     case contiguousUnquantized = "contiguous_unquantized"
-    case contiguousQuantized = "contiguous_quantized"
     case pagedFP16 = "paged_fp16"
     case unknown
 }
@@ -29,7 +28,6 @@ public enum CBv2PrefixReuseUnsupportedReason: String, Sendable, Equatable {
     case emptyLayout = "empty_layout"
     case invalidLayout = "invalid_layout"
     case pagedHybridRequiresDualCursor = "paged_hybrid_requires_dual_cursor"
-    case quantizedRowsUnsupported = "quantized_rows_unsupported"
     case unknownBackend = "unknown_backend"
     case accountingOverflow = "accounting_overflow"
 }
@@ -117,13 +115,6 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         let (product, overflow) = windowCount.multipliedReportingOverflow(by: maxWindow)
         let replayBound = overflow ? Int.max : product
 
-        if backend == .contiguousQuantized {
-            return unsupported(
-                backend: backend,
-                reason: .quantizedRowsUnsupported,
-                replayBound: replayBound,
-                fullKVBytesPerToken: fullKVBytesPerToken)
-        }
         if hasOwningFullAfterWindow {
             switch backend {
             case .contiguousUnquantized:
@@ -137,12 +128,6 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
                 return unsupported(
                     backend: backend,
                     reason: .pagedHybridRequiresDualCursor,
-                    replayBound: replayBound,
-                    fullKVBytesPerToken: fullKVBytesPerToken)
-            case .contiguousQuantized:
-                return unsupported(
-                    backend: backend,
-                    reason: .quantizedRowsUnsupported,
                     replayBound: replayBound,
                     fullKVBytesPerToken: fullKVBytesPerToken)
             case .unknown:

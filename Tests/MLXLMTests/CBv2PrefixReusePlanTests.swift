@@ -70,19 +70,13 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
         XCTAssertEqual(nativeFP32.residentFullKVBytes, 72 * 256)
     }
 
-    func testBackendSupportFailsColdForPagedQuantizedAndUnknownHybrid() {
+    func testBackendSupportFailsColdForPagedAndUnknownHybrid() {
         let kinds = [full(), sliding(16), full()]
         let paged = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds,
             backend: .pagedFP16)
         XCTAssertFalse(paged.isSupported)
         XCTAssertEqual(paged.unsupportedReason, .pagedHybridRequiresDualCursor)
-
-        let quantized = CBv2PrefixReuseCapability.derive(
-            layerKinds: kinds,
-            backend: .contiguousQuantized)
-        XCTAssertFalse(quantized.isSupported)
-        XCTAssertEqual(quantized.unsupportedReason, .quantizedRowsUnsupported)
 
         let unknown = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds,
