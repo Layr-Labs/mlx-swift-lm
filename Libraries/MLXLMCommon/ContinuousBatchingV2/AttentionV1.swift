@@ -22,6 +22,32 @@ import MLX
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
 
+    /// Query-block width for multi-token prompt attention (see
+    /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
+    /// work and hold a smaller score tensor, but cost one dispatch set each;
+    /// the composed path is ~4-5 Metal dispatches per call, so very small
+    /// blocks trade GPU efficiency for FLOPs already saved.
+    ///
+    /// 128 keeps >97% of the achievable work reduction at a quarter of the
+    /// launch overhead of 32. `0` disables blocking entirely (one call for the
+    /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
+    /// this is ever implicated in a numerics or latency regression.
+    static let queryBlockSize: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
+            let value = Int(raw), value >= 0
+        else { return 128 }
+        return value
+    }()
+
+    /// Whether a chunk of `L` queries should be split into blocks. Single
+    /// queries (decode) and chunks already at or below the block width take
+    /// the unchanged single-call path, so decode is provably untouched.
+    @inline(__always)
+    static func shouldBlockQueries(_ L: Int) -> Bool {
+        queryBlockSize > 0 && L > queryBlockSize
+    }
+
     /// Mask mode for a single-request attention call.
     ///
     /// - `L == 1` (decode): `.none`. The row's retained KV IS its window —
@@ -215,10 +241,19 @@ enum CBv2AttentionV1 {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         if let spanContext, L > 1 {
+            // Vision spans carry a bidirectional overlay across the WHOLE
+            // chunk, so a query block cannot be sliced to a causal-only
+            // visible span. Span chunks keep the single-call path.
             return attendSpanChunk(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
                 context: spanContext, sinks: sinks, softcap: softcap)
+        }
+        if shouldBlockQueries(L) {
+            return attendQueryBlocks(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                newTokenCount: L, window: window(of: kind), scale: scale,
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize)
         }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
@@ -356,6 +391,12 @@ enum CBv2AttentionV1 {
                 L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
                 context: spanContext, sinks: sinks, softcap: softcap)
         }
+        if shouldBlockQueries(L) {
+            return attendQueryBlocks(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                newTokenCount: L, window: window(of: sourceKind), scale: scale,
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize)
+        }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
@@ -383,28 +424,87 @@ enum CBv2AttentionV1 {
         }
     }
 
+    /// Attend a prompt chunk in QUERY BLOCKS, slicing K/V to each block's own
+    /// visible span instead of computing the whole `[L, kL]` rectangle and
+    /// masking the excess away.
+    ///
+    /// Two things this buys, both of which matter:
+    ///
+    /// 1. WORK. A sliding-window layer's chunk attention today evaluates
+    ///    `L x (window - 1 + L)` score positions to use `L x window` of them:
+    ///    a `(window - 1 + L)/window` ratio, i.e. 1.499x at L=512/window=1024
+    ///    and 2.67x at L=2048. Per block the ratio collapses to
+    ///    `(window - 1 + q)/window` — 1.062x at q=128 — because a block only
+    ///    ever reads the keys its own queries can see.
+    /// 2. MEMORY. The composed attention path (which Gemma 4 always takes:
+    ///    MLX's fused kernel supports head_dim 64/80/128 and Gemma 4 uses
+    ///    256/512) MATERIALIZES the `[B, heads, L, kL]` score tensor. Blocking
+    ///    pins that at `[B, heads, q, kL]`, making it O(1) in chunk length —
+    ///    which is what lets `prefillChunkSize` grow without the flat 3 GiB
+    ///    activation reserve in `UnifiedMemoryCap` becoming a lie. At 124k
+    ///    context a full-attention layer drops from 2.04 GB to 0.51 GB.
+    ///
+    /// Numerics: NOT bit-identical to the single-call path. The same non-zero
+    /// terms are summed (masked entries contribute `exp(-inf) = 0`), but a
+    /// different `kL` changes the reduction tiling and may select a different
+    /// kernel specialization, so results can differ in the last ulp.
+    ///
+    /// Scope: this applies to every multi-token prompt call that reaches
+    /// `updateAndAttendRow` / `borrowAndAttendRow`, which includes the
+    /// RECTANGULAR packed-prefill path (`[B > 1, L > 1]`) — packed rows are
+    /// dispatched per row, so each row blocks independently against its own
+    /// `historyCount`. It does NOT apply to decode (`L == 1`) or to
+    /// span-bearing vision chunks, which keep the single-call path.
+    ///
+    /// `blockSize == 1` reproduces the MTP serial-query path exactly.
+    private static func attendQueryBlocks(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        newTokenCount: Int, window: Int?, scale: Float,
+        sinks: MLXArray?, softcap: Float?, blockSize: Int
+    ) -> MLXArray {
+        precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
+        let keyCount = keys.dim(2)
+        let historyCount = keyCount - newTokenCount
+        precondition(historyCount >= 0)
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
+        var offset = 0
+        while offset < newTokenCount {
+            let count = min(blockSize, newTokenCount - offset)
+            // The block's queries occupy absolute columns
+            // [historyCount + offset, historyCount + offset + count). Its
+            // visible span starts at the EARLIEST query's window floor and
+            // ends at the LATEST query's own position, so the queries are
+            // exactly the trailing `count` entries of the slice — which is
+            // the invariant `maskMode` assumes.
+            let visibleEnd = historyCount + offset + count
+            let visibleStart = window.map { max(0, historyCount + offset + 1 - $0) } ?? 0
+            outputs.append(
+                attend(
+                    queries: queries[0..., 0..., offset ..< (offset + count), 0...],
+                    keys: keys[0..., 0..., visibleStart ..< visibleEnd, 0...],
+                    values: values[0..., 0..., visibleStart ..< visibleEnd, 0...],
+                    scale: scale, L: count, kL: visibleEnd - visibleStart,
+                    // `window` still applies WITHIN the slice: with count > 1
+                    // the slice is `window - 1 + count` long, so the earliest
+                    // key is outside the latest query's window and `maskMode`
+                    // correctly selects the causal-and-window array mask.
+                    window: window, sinks: sinks, softcap: softcap))
+            offset += count
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// One query at a time — the pinned MTP serial-verification path.
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
         sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
-        let keyCount = keys.dim(2)
-        let historyCount = keyCount - newTokenCount
-        precondition(historyCount >= 0)
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(newTokenCount)
-        for column in 0 ..< newTokenCount {
-            let visibleEnd = historyCount + column + 1
-            let visibleStart = window.map { max(0, visibleEnd - $0) } ?? 0
-            outputs.append(
-                attend(
-                    queries: queries[0..., 0..., column ..< (column + 1), 0...],
-                    keys: keys[0..., 0..., visibleStart ..< visibleEnd, 0...],
-                    values: values[0..., 0..., visibleStart ..< visibleEnd, 0...],
-                    scale: scale, L: 1, kL: visibleEnd - visibleStart,
-                    window: nil, sinks: sinks, softcap: softcap))
-        }
-        return concatenated(outputs, axis: 2)
+        attendQueryBlocks(
+            queries: queries, keys: keys, values: values,
+            newTokenCount: newTokenCount, window: window, scale: scale,
+            sinks: sinks, softcap: softcap, blockSize: 1)
     }
 
     /// Single-request attention dispatch. Without a softcap this is MLXFast
