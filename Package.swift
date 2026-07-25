@@ -243,9 +243,17 @@ let package = Package(
             ],
             sources: ["CBv2Benchmark.swift"]
         ),
+        // Build-time git-revision stamp for BenchCBv2. The bench report must
+        // name the revision the binary was compiled from, not whatever HEAD
+        // is when the report is written.
+        .plugin(
+            name: "BenchRevisionStamp",
+            capability: .buildTool(),
+            path: "Plugins/BenchRevisionStamp"
+        ),
         // Real-weights validation driver for the CBv2 engine: correctness
         // smoke (batch-composition + chunked-prefill invariance) and the
-        // legacy-vs-v2 perf matrix on local model directories.
+        // v2-vs-v2-paged perf matrix on local model directories.
         .executableTarget(
             name: "BenchCBv2",
             dependencies: [
@@ -255,7 +263,15 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ],
-            path: "Sources/BenchCBv2"
+            path: "Sources/BenchCBv2",
+            plugins: ["BenchRevisionStamp"]
+        ),
+        // Harness-integrity tests: option parsing, engine resolution, and
+        // report provenance. Model-free, so they run in CI.
+        .testTarget(
+            name: "BenchCBv2Tests",
+            dependencies: ["BenchCBv2"],
+            path: "Tests/BenchCBv2Tests"
         ),
     ]
 )
