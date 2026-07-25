@@ -16,12 +16,7 @@ import MLX
 
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
-///
-/// Conforms to `CBv2CompiledSteppableModel`: models reached through this
-/// adapter drive the layer caches generically through the v2 contract, so
-/// the engine may trace them for compiled [B, 1] decode (with eager
-/// fallback if the trace fails at warmup).
-public final class CBv2SteppableLanguageModelAdapter: CBv2CompiledSteppableModel {
+public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     private let model: any LanguageModel
 

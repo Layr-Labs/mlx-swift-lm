@@ -34,15 +34,6 @@ public protocol CBv2SteppableModel: AnyObject {
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.
 public protocol CBv2LayerCacheProvider: AnyObject {
     func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache]
-    /// Attention-softcap claim for the eager caches this provider vends.
-    /// `.some(nil)` = uniformly no softcap (compiled decode may build);
-    /// `.some(x)` = uniform softcap x (propagated into the compiled config
-    /// so `CBv2CompiledDecode.build` refuses — it has no softcap path);
-    /// `nil` = no claim / mixed / unknown, which FAIL-SAFE VETOES compiled
-    /// decode entirely. Conformers must answer truthfully: a provider that
-    /// claims `.some(nil)` while vending softcapped caches produces silent
-    /// numeric drift between eager and compiled steps.
-    var uniformAttentionSoftcap: Float?? { get }
     /// True when EVERY cache this provider vends honors span-mask contexts
     /// (`CBv2SpanMaskBinding`), so vision prefill chunks can carry their
     /// causal-plus-bidirectional-within-span masks. Fail-safe default is
@@ -455,10 +446,6 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Non-nil only when prefix caching is active (instance supplied AND
     /// `CBv2SchedulerConfig.enablePrefixCache`).
     let prefixCache: CBv2PrefixCache?
-    /// Compiled [B, 1] decode executor, or nil (eager only). Warmed on the
-    /// engine queue before the first step; every pure-decode step tries it
-    /// first and falls back to the eager path when it declines.
-    let compiledDecode: CBv2CompiledDecode?
     /// MTP (speculative decoding) driver state, or nil (byte-identical
     /// plain-decode behavior). Round logic lives in EngineLoopV2+MTP.swift.
     let mtp: CBv2MTPRoundDriver?
@@ -537,15 +524,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var running = false
     private var draining = false
     private var drainWaiters: [CBv2DrainWaiter] = []
-    /// True after a compiled decode step (or a rejecting MTP round)
-    /// advanced rows OUTSIDE the eager provider's caches' host truth: the
-    /// next eager bind must be forced to rebuild `positionOffsets` from
-    /// host truth (see `eagerCaches`).
+    /// True after a rejecting MTP round advanced rows OUTSIDE the eager
+    /// provider's caches' host truth: the next eager bind must be forced to
+    /// rebuild `positionOffsets` from host truth (see `eagerCaches`).
+    /// Sole writer: `mtpFinalize` in EngineLoopV2+MTPFinalize.swift.
     var eagerCompositionStale = false
-    /// True when the eager provider no longer retains its most recently
-    /// bound rows. Kept separate from offset staleness: a rejecting MTP
-    /// round makes offsets stale without releasing the eager bindings.
-    var eagerBindingsReleased = true
 
     /// Telemetry / test hooks.
     public private(set) var stepCount = 0
@@ -559,10 +542,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Steps that submitted eager layer-cache inner state (the offset chain +
     /// KV buffers) into the step's `asyncEval` set. The DAR-325 guard:
     /// evaluating the offset chain every eager step keeps its lazy `+ L`
-    /// advance from accumulating O(steps) of graph. Zero for the compiled
-    /// path (its counters advance in-graph) and for caches that vend no
-    /// inner state (mocks). Test hook. (internal(set): MTP round steps in
-    /// EngineLoopV2+MTP.swift count here too.)
+    /// advance from accumulating O(steps) of graph. Zero for caches that
+    /// vend no inner state (mocks). Test hook. (internal(set): MTP round
+    /// steps in EngineLoopV2+MTP.swift count here too.)
     public internal(set) var offsetChainEvalSteps = 0
     /// Fired (from the watchdog thread) when a step exceeds `stepTimeout`.
     public var onStepWedge: (@Sendable (TimeInterval) -> Void)?
@@ -589,7 +571,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler: SchedulerV2,
         capacity: CBv2StepCapacity?,
         prefixCache: CBv2PrefixCache? = nil,
-        compiledDecode: CBv2CompiledDecode? = nil,
         mtp: CBv2MTPRoundDriver? = nil,
         config: CBv2EngineLoopConfig,
         gauges: CBv2EngineGauges
@@ -603,7 +584,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.scheduler = scheduler
         self.capacity = capacity
         self.prefixCache = prefixCache
-        self.compiledDecode = compiledDecode
         self.mtp = mtp
         self.config = config
         self.gauges = gauges
@@ -623,28 +603,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         engineQueue.async { [self] in
             guard !running else { return }
             running = true
-            // Pre-warm compiled decode BEFORE the first step: compile must
-            // never happen on the request path (the v0.6.30 lesson).
-            // Requests submitted meanwhile queue behind this task.
-            compiledDecode?.warmupIfNeeded()
-            refundCompiledReserveIfDisabled()
             startWatchdog()
             engineQueue.async { [weak self] in self?.engineStep() }
         }
-    }
-
-    /// The compiled padding reserve was carved out of the admission ledger
-    /// at engine build, but warmup tracing can DISABLE compiled decode (a
-    /// model structure that resists tracing). The engine then serves eagerly
-    /// forever and the padded buffers can never materialize — so the reserve
-    /// must be refunded, or admission stays permanently tighter than the
-    /// hardware truth (PR#62 review). Warmup is the only pending→disabled
-    /// transition, so this runs exactly once, right after it, on the engine
-    /// queue. (`AdmissionV2` is the only capacity oracle carrying the
-    /// reserve; scripted test oracles never charge one.)
-    private func refundCompiledReserveIfDisabled() {
-        guard let compiledDecode, compiledDecode.disabledReason != nil else { return }
-        (capacity as? AdmissionV2)?.refundExternalReserve()
     }
 
     /// Graceful drain: waiting requests are cancelled, running requests
@@ -1051,7 +1012,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 invalidateAdoptedPrefix(id)
                 mtp?.invalidateCarry(id)
                 guard let state = kvStates.removeValue(forKey: id) else { continue }
-                compiledDecode?.forgetRows(state)
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
                         (
@@ -1090,7 +1050,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             // rebind, pinning dead KV on an idle engine (PR#62 review).
             // No-op after the first call while idle.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
-            eagerBindingsReleased = true
             publishGauges()
             if draining {
                 completeDrainIfReady()
@@ -1150,14 +1109,13 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     /// Eager layer caches, with the provider's composition fingerprint
-    /// force-invalidated when compiled steps advanced rows behind its back.
+    /// force-invalidated when an MTP round advanced rows behind its back.
     func eagerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         if eagerCompositionStale {
             (cacheProvider as? CBv2CompositionInvalidating)?.invalidateBoundComposition()
             eagerCompositionStale = false
         }
         let caches = cacheProvider.layerCaches(rowStates: rowStates)
-        eagerBindingsReleased = false
         return caches
     }
 
@@ -1166,37 +1124,18 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// step's `asyncEval` collapses those lazy chains every step instead of
     /// letting `updateAndAttend`'s `+ L` offset advance accumulate O(steps)
     /// of unevaluated graph — the DAR-325 bug class (legacy `BatchKVCache`
-    /// had exactly this). Empty for the compiled path (its counters advance
-    /// in-graph) and for caches that vend no inner state (mocks).
+    /// had exactly this). Empty for caches that vend no inner state (mocks).
     func eagerCacheInnerState(_ caches: [CBv2AttendingLayerCache]) -> [MLXArray] {
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
-    /// batch: the compiled step when eligible, else the eager forward. The
-    /// second tuple element is the eager caches' inner state (offset chain +
-    /// KV buffers) that must ride the step's `asyncEval` (DAR-325); it is
-    /// empty on the compiled path.
-    /// Numerics note: both paths are pinned; they may only alternate at
-    /// step boundaries, and the parity suites hold them token-exact.
+    /// batch. The second tuple element is the eager caches' inner state
+    /// (offset chain + KV buffers) that must ride the step's `asyncEval`
+    /// (DAR-325).
     private func decodeLogits(
         rowStates: [[CBv2SequenceKV?]], tokens: MLXArray
     ) -> (logits: MLXArray, cacheInnerState: [MLXArray]) {
-        if let compiledDecode,
-            let compiled = compiledDecode.decodeStep(rowStates: rowStates, tokens: tokens)
-        {
-            // First compiled step after an eager bind: release the eager
-            // caches' row bindings. Offset staleness is not sufficient as
-            // the guard: a rejecting MTP round already marks offsets stale
-            // while leaving its eager rows bound. Compiled-only work must
-            // still release those rows exactly once.
-            if !eagerBindingsReleased {
-                (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
-                eagerBindingsReleased = true
-            }
-            eagerCompositionStale = true
-            return (compiled, [])
-        }
         let caches = eagerCaches(rowStates: rowStates)
         let logits = model.forward(tokens: tokens, caches: caches)
         return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
@@ -1788,7 +1727,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         sampler.requestDidFinish(id)
 
         if let state = kvStates.removeValue(forKey: id) {
-            compiledDecode?.forgetRows(state)
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.participants.contains(id) {
                 // The in-flight step still references this state — fence the
@@ -1863,18 +1801,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Donation requires the full prompt to have been processed (at
         // least one sampled token) — mid-prefill finishes carry partial KV.
         guard rec.generatedTokenCount >= 1, rec.tokens.count > 1 else { return nil }
-        // Lossy-snapshot rows (quantized KV) never donate: their snapshot
-        // dequantizes, and MLX affine re-quantization is not idempotent —
-        // a donate→adopt round trip would drift the adopted KV off the
-        // cold-run values, compounding with each generation. Explicit,
-        // documented skip (see CBv2SequenceKV.snapshotIsLossless); adoption
-        // of full-precision donations INTO quantized backends stays legal.
-        for (i, kind) in layerKinds.enumerated() {
-            var cacheable = kind.sharesKVWithLayer == nil
-            if case .slidingWindow = kind.attention { cacheable = false }
-            guard cacheable, let sequence = state[i] else { continue }
-            guard sequence.snapshotIsLossless else { return nil }
-        }
         return CBv2DonationIntent(
             requestID: rec.request.prefixCacheReceiptID ?? rec.id,
             tokens: Array(rec.tokens.dropLast()),
@@ -2173,7 +2099,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 leasesByID[id] = lease
             }
             if let state = kvStates.removeValue(forKey: id) {
-                compiledDecode?.forgetRows(state)
                 backend.release(state)
             }
         }
@@ -2284,10 +2209,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         // overwritten with pool truth and re-advertise capacity that
         // admission rejects); backend truth is the fallback only for
         // ledger-less (bare-loop test) constructions. Reserved bytes carry
-        // the backend's admission-truth promises PLUS the compiled path's
-        // LIVE padding carve (0 after a warmup refund), so
-        // "capacity − reserved" stays truthful for capacity planners.
-        let compiledPaddingReserve = (capacity as? AdmissionV2)?.bytesExternallyReserved ?? 0
+        // the backend's admission-truth promises, so "capacity − reserved"
+        // stays truthful for capacity planners.
         gauges.update(
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
@@ -2295,7 +2218,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 kvBytesInUse: backend.bytesInUse,
                 kvBytesCapacity: capacity?.bytesCapacity ?? backend.bytesCapacity,
                 kvBytesBackendCapacity: backend.bytesCapacity,
-                kvBytesReserved: backend.bytesReserved + compiledPaddingReserve,
+                kvBytesReserved: backend.bytesReserved,
                 activeTokens: scheduler.activeTokens,
                 stepsExecuted: stepCount))
     }

@@ -172,13 +172,6 @@ class CBv2PrefillNarrowingModel: CBv2PrefillFallbackModel, CBv2PrefillSteppableM
     }
 }
 
-/// Same as the narrowing model, but ALSO eligible for compiled [B, 1]
-/// decode — used to prove the compiled decode path never reaches the
-/// prefill seam either.
-final class CBv2PrefillNarrowingCompiledModel: CBv2PrefillNarrowingModel,
-    CBv2CompiledSteppableModel
-{}
-
 // MARK: - Synchronous prefill/decode driver (harness caches, greedy)
 
 /// Drives `EngineLoopV2.prefillOutput` chunk-by-chunk over the harness layer
@@ -605,10 +598,6 @@ final class CBv2PrefillOutputTests: XCTestCase {
     func testDecodePathNeverCallsPrefill() async throws {
         let base = TinyTestModel.make(seed: hiddenSeed)
         let model = CBv2PrefillNarrowingModel(base)
-        XCTAssertFalse(
-            model is CBv2CompiledSteppableModel,
-            "test premise: this fixture stays on the eager decode path so `forward` calls "
-                + "are observable")
         let prompt = makePromptTokens(length: 24, seed: 1000)
         let budget = 6
         let engine = makeEngine(model: model, base: base, prefillChunkSize: 8)
@@ -653,35 +642,6 @@ final class CBv2PrefillOutputTests: XCTestCase {
             (budget - 1 ... budget).contains(decodeEntries.count),
             "expected \(budget - 1) or \(budget) decode forwards (chained-decode overshoot), "
                 + "got \(decodeEntries.count)")
-    }
-
-    /// Compiled-decode twin: a model eligible for the compiled [B, 1] path
-    /// must ALSO never reach the prefill seam during decode.
-    func testCompiledDecodeEligibleModelNeverCallsPrefillDuringDecode() async throws {
-        let base = TinyTestModel.make(seed: hiddenSeed)
-        let model = CBv2PrefillNarrowingCompiledModel(base)
-        let prompt = makePromptTokens(length: 24, seed: 1001)
-        let budget = 6
-        let engine = makeEngine(model: model, base: base, prefillChunkSize: 8)
-
-        let collected = await cbv2SchedCollect(
-            try engine.submit(
-                CBv2Request(
-                    id: CBv2RequestID(1), promptTokens: prompt,
-                    sampling: .init(temperature: 0), maxTokens: budget)))
-        await engine.shutdown()
-        XCTAssertEqual(collected.finishReason, .length)
-
-        let prefills = model.log.compactMap { entry -> CBv2PrefillCall? in
-            if case .prefill(let call) = entry { return call }
-            return nil
-        }
-        XCTAssertEqual(
-            prefills.count, 3,
-            "exactly the three prompt chunks — compiled decode must not add prefill calls")
-        XCTAssertTrue(
-            prefills.allSatisfy { $0.tokenShape[1] > 1 || $0.requirement == .lastPositionLogits },
-            "no [B, 1] evaluation-only prefill may appear (that would be a decode step)")
     }
 
     // MARK: 6. Multimodal chunks reach the seam with spliced embeddings

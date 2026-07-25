@@ -28,8 +28,8 @@ final class CBv2EngineGauges: @unchecked Sendable {
     init(kvBytesCapacity: Int, kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0) {
         // Seed backend truth at construction: heartbeats read `capacity()`
         // on IDLE engines (zero steps published), and a paged slot must
-        // report its pool ceiling — and a compiled engine its padding
-        // carve — from the first beat, not after the first request.
+        // report its pool ceiling from the first beat, not after the
+        // first request.
         self.snapshot = CBv2CapacitySnapshot(
             activeRequests: 0, waitingRequests: 0, kvBytesInUse: 0,
             kvBytesCapacity: kvBytesCapacity,
@@ -138,11 +138,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// Steps that evaluated the eager caches' offset/KV inner state (DAR-325
     /// guard). Test hook; engine-thread owned, read at quiescent points.
     public var offsetChainEvalSteps: Int { loop.offsetChainEvalSteps }
-    /// Compiled-decode telemetry, or nil when the compiled path was never
-    /// built (config off, ineligible model, unsupported hardware).
-    /// NOTE: counters are engine-thread owned; read at quiescent points
-    /// (after streams finish) for exact values.
-    public var compiledDecodeStats: CBv2CompiledDecodeStats? { loop.compiledDecode?.stats }
 
     /// Cumulative MTP (speculative decoding) counters, or nil when MTP is
     /// inactive (no drafter, config/kill-switch off, or a model that cannot
@@ -154,8 +149,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public let mtpInactiveReason: String?
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
-    /// Internal test hook: the admission ledger, for asserting the compiled
-    /// padding reserve is charged (or not) at construction.
+    /// Internal test hook: the admission ledger, for asserting byte
+    /// reservation accounting at construction and across resizes.
     var admissionForTesting: AdmissionV2 { admission }
 
     public init(
@@ -169,7 +164,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
         admissionConfig: AdmissionV2.Config = AdmissionV2.Config(),
         prefixCache: CBv2PrefixCache? = nil,
-        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig(),
         mtpDrafter: (any CBv2MTPDrafter)? = nil,
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) {
@@ -191,66 +185,13 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         {
             preconditionFailure(violation)
         }
-        // Compiled [B, 1] decode (Phase 1): traced per bucket at warmup on
-        // the engine queue, replayed for eligible pure-decode steps, eager
-        // fallback everywhere else. nil when statically ineligible —
-        // including when the eager layer caches carry an attention softcap
-        // the compiled path cannot reproduce (numerics guard), when the
-        // padding reserve would eat too much of the KV byte budget, or when
-        // the backend mints rows the compiled path cannot bind (quantized
-        // KV, paged slabs — see `producesCompiledDecodeEligibleRows`).
-        var effectiveCompiledConfig = compiledDecodeConfig
-        var softcapVeto = false
-        if effectiveCompiledConfig.attentionSoftcap == nil {
-            if let claim = cacheProvider.uniformAttentionSoftcap {
-                // `.some(x)`: propagate so build() refuses (compiled SDPA
-                // has no softcap path — never silently drift from eager
-                // numerics). `.some(nil)`: uniformly uncapped, safe.
-                effectiveCompiledConfig.attentionSoftcap = claim
-            } else {
-                // No claim (mixed caches, paged-only bank, or a custom
-                // provider that cannot vouch): fail-safe — compiled decode
-                // is vetoed rather than trusted to match eager numerics.
-                softcapVeto = true
-            }
-        }
-        // Backend row-type veto (PR#62 review): the compiled path can only
-        // bind CBv2FullSequenceKV/CBv2WindowedSequenceKV rows. A backend
-        // that mints anything else (contiguous with KV quantization, paged
-        // slabs) would still warm the compiled graphs against fp16 scratch
-        // and charge the admission padding reserve — then laneInfo rejects
-        // every LIVE row, every step falls back eager, and the reserve
-        // permanently tightens admission for zero benefit. Skip the build
-        // entirely: nil executor, no reserve, stay eager.
-        let backendVeto = !backend.producesCompiledDecodeEligibleRows
-        if backendVeto, effectiveCompiledConfig.enabled, CBv2CompiledDecodeConfig.envEnabled {
-            log.info(
-                "CBv2 compiled decode skipped: \(type(of: backend), privacy: .public) mints rows the compiled path cannot bind (e.g. quantized KV) — staying eager, no padding reserve"
-            )
-        }
-        let compiledDecode: CBv2CompiledDecode? =
-            (softcapVeto || backendVeto)
-            ? nil
-            : CBv2CompiledDecode.build(
-                model: model, layerKinds: layerKinds, config: effectiveCompiledConfig,
-                maxConcurrentRequests: schedulerConfig.maxConcurrentRequests,
-                kvBytesCapacity: backend.bytesCapacity)
-        // Truthful admission under compiled padding: the compiled path pads
-        // full-attention rows to its bucket capacity (more bytes than token
-        // admission would budget), so its worst-case reserve is carved out
-        // of the ledger as a REFUNDABLE external reserve — if warmup tracing
-        // later disables compiled decode, the loop refunds it so admission
-        // does not stay permanently tighter than the hardware truth (PR#62
-        // review). Heartbeat capacity stays the hardware truth.
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
-            config: admissionConfig,
-            externalReserveBytes: compiledDecode?.admissionPaddingReserve ?? 0)
+            config: admissionConfig)
         self.admission = admission
         let gauges = CBv2EngineGauges(
             kvBytesCapacity: backend.bytesCapacity,
-            kvBytesBackendCapacity: backend.bytesCapacity,
-            kvBytesReserved: compiledDecode?.admissionPaddingReserve ?? 0)
+            kvBytesBackendCapacity: backend.bytesCapacity)
         self.gauges = gauges
         // MTP verification bypasses the sampler and emits raw target
         // argmaxes. Only the two known argmax-equivalent implementations may
@@ -310,7 +251,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             scheduler: scheduler,
             capacity: admission,
             prefixCache: activePrefixCache,
-            compiledDecode: compiledDecode,
             mtp: mtpDriver,
             config: loopConfig,
             gauges: gauges)
