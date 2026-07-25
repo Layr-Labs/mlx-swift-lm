@@ -386,6 +386,17 @@ public protocol CBv2KVBackend: AnyObject {
     /// `EngineV2` skips the compiled build entirely when this is false.
     /// Defaults to false (fail-safe: unknown backends stay eager).
     var producesCompiledDecodeEligibleRows: Bool { get }
+    /// How this backend's rows OCCUPY storage, consulted by `AdmissionV2`
+    /// so the byte ledger charges what will really be allocated instead of
+    /// inferring it from `CBv2LayerKind` alone. The distinction is
+    /// load-bearing: a contiguous windowed row allocates its whole
+    /// `window`-row ring on the first write, while a paged row reserves
+    /// `min(ceil(maxLength / pageSize), ringPageCount)` pages and never
+    /// commits the ring for a short request (PR#87 review).
+    /// Defaults to `CBv2ContiguousKVResidency` — the CONSERVATIVE policy, so
+    /// a backend that forgets to declare one over-charges and under-admits
+    /// rather than over-committing the device.
+    var kvResidency: any CBv2KVResidencyPolicy { get }
 }
 
 extension CBv2KVBackend {
@@ -393,6 +404,7 @@ extension CBv2KVBackend {
     public var bytesReserved: Int { bytesInUse }
     public var requiresMaterializedSnapshots: Bool { false }
     public var producesCompiledDecodeEligibleRows: Bool { false }
+    public var kvResidency: any CBv2KVResidencyPolicy { CBv2ContiguousKVResidency() }
     public func updateBytesCapacity(_ bytes: Int) {}
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],

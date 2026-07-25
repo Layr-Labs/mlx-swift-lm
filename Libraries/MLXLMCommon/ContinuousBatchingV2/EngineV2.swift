@@ -185,9 +185,13 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         {
             preconditionFailure(violation)
         }
+        // The ledger's token→byte conversion asks the BACKEND what a row
+        // occupies (`CBv2KVResidencyPolicy`): contiguous windowed rows own
+        // their whole fixed ring from the first write, paged rows own only
+        // the pages `PagedKVPool.pageDemand` reserves.
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
-            config: admissionConfig)
+            config: admissionConfig, residency: backend.kvResidency)
         self.admission = admission
         let gauges = CBv2EngineGauges(
             kvBytesCapacity: backend.bytesCapacity,
