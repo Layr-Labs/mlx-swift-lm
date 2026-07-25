@@ -232,7 +232,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // WS-1.2: assemble each chunk's KV BEFORE writing it, so this
             // path only ever asks the ring for `window - 1` tokens. The
             // chunk's own K/V need no gather at all — they are the
-            // arguments.
+            // arguments. A row in a FROZEN REPLAY is the one exception, and
+            // it is why the write lives inside `prefillKVWritingChunk`
+            // instead of out here: that row's chunk half comes from the
+            // pages too, and it has to be read AFTER the cursor moves.
             //
             // Gathering AFTER the write instead asks for
             // `window - 1 + chunk` (`retainedCount` with
@@ -256,13 +259,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             views.reserveCapacity(b)
             output = CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
                 let row = pagedRows[index]
-                let rowKeys = slice(keys)
-                let rowValues = slice(values)
-                let kv = prefillKV(
-                    row: row, chunkKeys: rowKeys, chunkValues: rowValues,
+                let kv = prefillKVWritingChunk(
+                    row: row, chunkKeys: slice(keys), chunkValues: slice(values),
                     dtype: queries.dtype)
-                row.write(
-                    keys: rowKeys.squeezed(axis: 0), values: rowValues.squeezed(axis: 0))
                 views.append(kv)
                 return prefillAttend(
                     queries: slice(queries), kv: kv, scale: scale, sinks: effectiveSinks)
@@ -570,14 +569,71 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var queryCount: Int { keys.dim(2) - historyCount }
     }
 
-    /// Gather the chunk's window history from the ring and splice the chunk
-    /// onto it. MUST be called BEFORE `row.write`: `row.absoluteOffset` is
-    /// read as the chunk's first query position, and the gather is only
-    /// serviceable while the chunk's tail has not yet lapped the ring.
-    private func prefillKV(
+    /// Write this chunk into `row` and return exactly the KV it attends.
+    ///
+    /// The write lives in here rather than at the call site because the two
+    /// shapes below need the gather on OPPOSITE sides of it, and a caller
+    /// that has to remember which order applies gets it wrong.
+    ///
+    /// ORDINARY (`frozenHighWater <= absoluteOffset` — every windowed row,
+    /// and every row that never adopted a frozen prefix). Gather the window
+    /// history BEFORE the write and splice on the chunk tensor the layer was
+    /// handed. That order is WS-1.2: it is the only reason the ring can be
+    /// `window + span` rather than `window - 1 + chunk + span`, and gathering
+    /// after the write here aborts the process on `gatherRange`'s eviction
+    /// precondition. The chunk's own K/V need no gather at all — they are
+    /// the arguments.
+    ///
+    /// FROZEN REPLAY (`frozenHighWater > absoluteOffset`). Gather the WHOLE
+    /// view, chunk included, from the row's pages AFTER the write. During
+    /// prefix reuse's `.frozenFullReplay` the layer is handed projections
+    /// computed by SLIDING rows that do not have their windows back yet, so
+    /// the chunk tensor is POISONED — but this row's storage through M is the
+    /// adopted, exact K/V, so the chunk's own positions can simply be read.
+    /// That is what `CBv2FrozenReplayFullSequenceKV.update` does on the
+    /// contiguous backend (it discards the replayed projections and returns
+    /// the cached keys for the whole chunk, diagonal included), and matching
+    /// it is what makes a frozen paged replay exact from the same position
+    /// contiguous is — no `+ maxPrefillChunk` of extra replay.
+    ///
+    /// Four things make the post-write gather here safe, and it is safe ONLY
+    /// because all four hold:
+    ///  1. `PagedSequenceKV.adoptFrozen` refuses windowed rows, so a frozen
+    ///     row has `ringPages == nil`. There is no ring, so no page the
+    ///     chunk could have recycled and no eviction branch to trip.
+    ///  2. `PagedSequenceKV.write` is CURSOR-ONLY below M: it advances
+    ///     `absoluteOffset` and touches no storage. There is no
+    ///     read-after-write to order, and the bytes read are the adopted
+    ///     ones, written once at adoption and host-synced since.
+    ///  3. Moving the cursor first is what makes the read legal:
+    ///     `gatherRange` bounds at `absoluteOffset`, which after the write
+    ///     is exactly `queryStart + chunk`. (Same range as post-write
+    ///     `attendableViews()`, spelled out because it is the frozen region
+    ///     that is wanted, not whatever `retainedCount` currently means.)
+    ///  4. A frozen chunk never straddles M — `CBv2PrefixReusePlan
+    ///     .clampedChunk` splits there and `write` traps if it did not — so
+    ///     the range read is wholly cached.
+    private func prefillKVWritingChunk(
         row: PagedSequenceKV, chunkKeys: MLXArray, chunkValues: MLXArray, dtype: DType
     ) -> PrefillKV {
         let queryStart = row.absoluteOffset
+        let chunkLength = chunkKeys.dim(2)
+        let rowKeys = chunkKeys.squeezed(axis: 0)
+        let rowValues = chunkValues.squeezed(axis: 0)
+
+        if row.frozenHighWater > queryStart {
+            precondition(
+                row.windowSize == nil,
+                "[PagedLayerCache] layer \(layerIndex): a windowed row cannot be frozen")
+            row.write(keys: rowKeys, values: rowValues)
+            let start = row.baseOffset
+            let (frozenKeys, frozenValues) = row.gatherRange(
+                start: start, count: queryStart + chunkLength - start)
+            return PrefillKV(
+                keys: cast(frozenKeys, to: dtype), values: cast(frozenValues, to: dtype),
+                start: start, queryStart: queryStart)
+        }
+
         var start = row.baseOffset
         if let window = row.windowSize {
             start = max(start, queryStart - window + 1)
@@ -593,12 +649,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             chunkV = chunkV.asType(pool.config.dtype)
         }
         guard start < queryStart else {
+            row.write(keys: rowKeys, values: rowValues)
             return PrefillKV(
                 keys: cast(chunkK, to: dtype), values: cast(chunkV, to: dtype),
                 start: queryStart, queryStart: queryStart)
         }
         let (historyKeys, historyValues) = row.gatherRange(
             start: start, count: queryStart - start)
+        row.write(keys: rowKeys, values: rowValues)
         return PrefillKV(
             keys: concatenated([cast(historyKeys, to: dtype), cast(chunkK, to: dtype)], axis: 2),
             values: concatenated(
@@ -629,8 +687,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     ///  2. It does not gather per block. Consecutive blocks' visible spans
     ///     overlap by `window - 1` on a sliding layer and completely on a
     ///     full layer (`visibleStart == 0` for every block), so a per-block
-    ///     gather is a 3-4x pessimisation. `prefillKV` gathers ONCE and each
-    ///     block SLICES the result.
+    ///     gather is a 3-4x pessimisation. `prefillKVWritingChunk` gathers
+    ///     ONCE and each block SLICES the result.
     ///  3. It does not rebuild the position vectors per block. They are host
     ///     `arange`s that get uploaded; rebuilding them in the loop repeats
     ///     nearly the whole history once per block on a full layer.
@@ -863,7 +921,7 @@ extension PagedLayerCache: CBv2KVSourceChunkRetaining {
 /// The affirmative claim `CBv2LayerCacheBank.supportsPackedPrefill` reads.
 ///
 /// `updateAndAttend`'s prompt-chunk branch loops over the bound rows and
-/// runs each one through the SAME `prefillKV` / `row.write` / `prefillAttend`
+/// runs each one through the SAME `prefillKVWritingChunk` / `prefillAttend`
 /// sequence a `[1, chunk]` call runs, then concatenates on the batch axis.
 /// No tensor in that sequence spans two rows: the gather walks one row's
 /// page table, the write lands in one row's pages, and the mask is built
