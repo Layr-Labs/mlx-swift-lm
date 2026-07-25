@@ -517,10 +517,15 @@ enum CBv2AttentionV1 {
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
         guard let softcap else {
+            // MLX SDPA requires the sink dtype to promote to the output
+            // dtype, so fp16 queries + fp32 sinks TRAP (a fatalError inside
+            // MLX, not a throw). Match the query dtype here, exactly as the
+            // paged backend does at `PagedLayerCache.attendQueryBlock`. The
+            // composed path below needs no cast: it runs in fp32 throughout.
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale,
                 mask: maskMode(L: L, kL: kL, window: window),
-                sinks: sinks)
+                sinks: sinks?.asType(queries.dtype))
         }
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: keys, values: values, scale: scale,
@@ -585,9 +590,11 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let mask = spanChunkMask(L: L, kL: kL, window: window, context: context)
         guard let softcap else {
+            // Same sink-dtype promotion rule as `attend` — cast to the query
+            // dtype or MLX traps on fp16 queries + fp32 sinks.
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale,
-                mask: .array(mask), sinks: sinks)
+                mask: .array(mask), sinks: sinks?.asType(queries.dtype))
         }
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: keys, values: values, scale: scale,
