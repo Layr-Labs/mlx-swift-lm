@@ -16,9 +16,8 @@
 //    each row alone as [1, 3] (full, windowed with kL > window, sinks,
 //    KV-shared borrowing), at the attention layer and through a full
 //    TinyTestModel + CBv2LayerCacheBank forward.
-//  - Compiled-decode interaction guard: the violation predicate backing the
-//    compiledStorage/noteCompiledAdvance preconditions tracks the staged
-//    lifecycle exactly.
+//  - Paged speculative eligibility DERIVED from ring headroom, not asserted
+//    per attention kind.
 //
 // No model weights required — everything runs on tiny random tensors.
 
@@ -285,10 +284,10 @@ struct CBv2MTPKVStagingMidFlightTests {
     }
 }
 
-// MARK: - (c) Full / Quantized speculative rounds
+// MARK: - (c) Full-attention speculative rounds
 
-@Suite("CBv2MTPKVStaging: full & quantized rounds", .serialized)
-struct CBv2MTPKVStagingFullQuantizedTests {
+@Suite("CBv2MTPKVStaging: full rounds", .serialized)
+struct CBv2MTPKVStagingFullRoundTests {
 
     @Test func fullSequenceRoundEqualsPlain() {
         let speculated = CBv2FullSequenceKV(
@@ -345,94 +344,148 @@ struct CBv2MTPKVStagingFullQuantizedTests {
         expectExact(speculated.snapshot().values, plain.snapshot().values, "serial full values")
     }
 
-    /// The QuantizedSequenceKV verdict: quantization groups span the headDim
-    /// axis only, so writing n tokens then rolling back m leaves the
-    /// confirmed prefix's quantized content BIT-identical to never having
-    /// written the rejected suffix.
-    @Test func quantizedRoundEqualsPlainBitExactly() {
-        MLXRandom.seed(0xDEAD)
-        let base = MLXRandom.normal([1, 2, 5, 64]).asType(.float16)
-        let chunk = MLXRandom.normal([1, 2, 3, 64]).asType(.float16)
-        let next = MLXRandom.normal([1, 2, 2, 64]).asType(.float16)
-
-        func makeRow() -> CBv2QuantizedSequenceKV {
-            CBv2QuantizedSequenceKV(
-                promptLength: 5, maxLength: 64, kvHeads: 2, headDim: 64,
-                groupSize: 64, bits: 4)
-        }
-
-        let speculated = makeRow()
-        #expect(speculated.supportsSpeculativeWrites)
-        _ = speculated.update(keys: base, values: base)
-        speculated.beginSpeculativeWrite()
-        _ = speculated.update(keys: chunk, values: chunk)
-        speculated.rollback(2)
-        speculated.commitSpeculativeWrite()
-        _ = speculated.update(keys: next, values: next)
-
-        let plain = makeRow()
-        _ = plain.update(keys: base, values: base)
-        _ = plain.update(
-            keys: chunk[.ellipsis, ..<1, 0...], values: chunk[.ellipsis, ..<1, 0...])
-        _ = plain.update(keys: next, values: next)
-
-        #expect(speculated.absoluteOffset == plain.absoluteOffset)
-        // Dequantized snapshots must match BITWISE — same quantization grid.
-        expectExact(speculated.snapshot().keys, plain.snapshot().keys, "quantized keys")
-        expectExact(speculated.snapshot().values, plain.snapshot().values, "quantized values")
-    }
-
-    @Test func quantizedSerialRoundEqualsPlainBitExactly() {
-        MLXRandom.seed(0xBEEF)
-        let base = MLXRandom.normal([1, 2, 5, 64]).asType(.float16)
-        let chunk = MLXRandom.normal([1, 2, 3, 64]).asType(.float16)
-
-        func makeRow() -> CBv2QuantizedSequenceKV {
-            CBv2QuantizedSequenceKV(
-                promptLength: 5, maxLength: 64, kvHeads: 2, headDim: 64,
-                groupSize: 64, bits: 4)
-        }
-
-        let speculated = makeRow()
-        _ = speculated.update(keys: base, values: base)
-        speculated.beginSpeculativeWrite()
-        for index in 0 ..< 3 {
-            let token = chunk[.ellipsis, index ..< (index + 1), 0...]
-            _ = speculated.update(keys: token, values: token)
-        }
-        speculated.rollback(2)
-        speculated.commitSpeculativeWrite()
-
-        let plain = makeRow()
-        _ = plain.update(keys: base, values: base)
-        let first = chunk[.ellipsis, ..<1, 0...]
-        _ = plain.update(keys: first, values: first)
-
-        expectExact(speculated.snapshot().keys, plain.snapshot().keys, "serial quantized keys")
-        expectExact(speculated.snapshot().values, plain.snapshot().values, "serial quantized values")
-    }
+    // DELETED with `CBv2QuantizedSequenceKV` (KV-quant removal, this wave):
+    // `quantizedRoundEqualsPlainBitExactly` and
+    // `quantizedSerialRoundEqualsPlainBitExactly`.
+    //
+    // Recorded here because "a rollback test was deleted" is alarming out of
+    // context and a future reader must not conclude we dropped staging
+    // coverage. We did not. Both were structurally identical to
+    // `fullSequenceRoundEqualsPlain` (above) and `fullSequenceSerialRound
+    // EqualsPlain` (above) — same base/chunk/next, same
+    // begin → update → rollback(2) → commit → update shape, same `expectExact`
+    // on the resulting snapshots — differing only in the row type, headDim
+    // (64 vs 4) and ONE extra assertion.
+    //
+    // That extra assertion is the whole of what was lost, and it was a claim
+    // about the QUANTIZER, not about staging: MLX affine quantization groups
+    // span the headDim axis only, therefore writing n tokens and rolling back
+    // m leaves the confirmed prefix's DEQUANTIZED content bit-identical to
+    // never having written the rejected suffix — same values, same
+    // quantization grid. With the row type gone that claim has no subject.
+    //
+    // Surviving cover for what these tests are mistaken for:
+    //   round equivalence           `fullSequenceRoundEqualsPlain`
+    //   SERIAL round equivalence    `fullSequenceSerialRoundEqualsPlain`
+    //   serial staging, windowed    `serialUpdatesEqualPlainDecodeAcrossGeometries`
+    //                               (real ring staging, window x baseFill x n x m sweep)
+    //   serial staging, borrowed    `kvSharedBorrowSerialStagingMatchesPlainDecode`
+    //
+    // Deliberately NOT re-pointed. At `CBv2FullSequenceKV` the result is a
+    // literal duplicate of the two tests above — re-pointing that PRESERVES
+    // nothing. At `CBv2WindowedSequenceKV` it would be NEW windowed
+    // round-equality coverage (the deleted rows were never windowed, so no
+    // such coverage is being lost here); that may well be worth having after
+    // WS-3.2, but it is an additive item, not part of a compile fix.
 }
 
-// MARK: - (d) Paged eligibility flags
+// MARK: - (d) Paged speculative eligibility follows from HEADROOM
 
 @Suite("CBv2MTPKVStaging: paged flags")
 struct CBv2MTPKVStagingPagedFlagTests {
 
-    @Test func fullRowsEligibleWindowedRowsNot() throws {
+    /// This suite used to assert `state[1]?.supportsSpeculativeWrites == false`
+    /// for a windowed paged row. That PINNED THE DEFECT: `PagedSequenceKV`
+    /// returns a blanket `windowSize == nil`, whose doc comment claims the ring
+    /// "aliases within the window". It does not — it aliases at
+    /// `ringPages * pageSize`, which `PagedSeamContract`'s header, the ring
+    /// formula and `pagedattention.metal`'s "Windowed rings cannot alias"
+    /// assertion all agree on. The blanket `false` makes every gemma-4 sliding
+    /// layer permanently speculation-ineligible, which is why no MTP round is
+    /// ever built for it — and why the rectangular-verification trap stayed
+    /// unreachable rather than fixed.
+    ///
+    /// The property under test is therefore not a constant per attention kind
+    /// but a DERIVATION: a row may speculate exactly when its ring can absorb a
+    /// whole round without destroying a still-attendable entry, i.e.
+    /// `speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan`.
+    ///
+    /// Binding: `CBv2PagedSpeculativeRow` already exists in
+    /// `Paged/PagedSeamContract.swift`, so the cast below COMPILES today and
+    /// simply returns nil until track R (WS-3.2/3.3) adds the conformance —
+    /// no hard reference to an unlanded symbol, no broken build for the other
+    /// agents sharing this target.
+    @Test func speculativeEligibilityFollowsFromHeadroom() throws {
+        let window = 32
+        let maxPrefillChunk = 64
         let kinds = [
             CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4),
-            CBv2LayerKind(attention: .slidingWindow(32), headDim: 64, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(
+                attention: .slidingWindow(window), headDim: 64, kvHeads: 2, queryHeads: 4),
         ]
-        let backend = try PagedKVBackend(
-            layerKinds: kinds,
-            config: PagedKVPoolConfig(
-                capacityBytes: 8 << 20, maxPrefillChunk: 64,
-                nominalMaxSequenceLength: 1024))
+        let config = PagedKVPoolConfig(
+            capacityBytes: 8 << 20, maxPrefillChunk: maxPrefillChunk,
+            nominalMaxSequenceLength: 1024)
+        let backend = try PagedKVBackend(layerKinds: kinds, config: config)
         let state = try backend.makeSequenceState(
             layerKinds: kinds, promptLength: 0, maxLength: 256)
-        #expect(state[0]?.supportsSpeculativeWrites == true)
-        #expect(state[1]?.supportsSpeculativeWrites == false)
-        backend.release(state)
+        defer { backend.release(state) }
+
+        let full = try #require(state[0])
+        let windowed = try #require(state[1])
+
+        let fullRow = try #require(
+            full as? CBv2PagedSpeculativeRow,
+            """
+            PagedSequenceKV does not conform to CBv2PagedSpeculativeRow — track R's \
+            WS-3.2/3.3 (speculativeHeadroom + the derived eligibility gate) has not \
+            landed. Until it does, eligibility is a blanket `windowSize == nil`.
+            """)
+        let windowedRow = try #require(windowed as? CBv2PagedSpeculativeRow)
+
+        // Full rows have no aliasing distance at all: rollback frees pages past
+        // the frontier and every read is bounded by `absoluteOffset`.
+        #expect(fullRow.speculativeHeadroom == Int.max)
+
+        // Windowed rows: the ring aliases at `ringPages * pageSize`, so the
+        // room past the window is exactly `ringPages * pageSize - window`.
+        // ceil((32 + 64) / 16) + 1 = 7 pages = 112 tokens ⇒ headroom 80.
+        let ring = PagedKVPool.ringPageCount(window: window, config: config)
+        #expect(
+            windowedRow.speculativeHeadroom == ring * config.pageSize - window,
+            "windowed headroom must be the ring's aliasing distance minus the window")
+
+        // THE property, asserted on both arms rather than hard-coded per kind.
+        for (label, row, spec) in [
+            ("full", full, fullRow), ("windowed", windowed, windowedRow),
+        ] {
+            #expect(
+                row.supportsSpeculativeWrites
+                    == (spec.speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan),
+                """
+                \(label) row: supportsSpeculativeWrites \
+                (\(row.supportsSpeculativeWrites)) does not follow from headroom \
+                \(spec.speculativeHeadroom) vs maxSpeculativeSpan \
+                \(CBv2PagedSpeculation.maxSpeculativeSpan)
+                """)
+        }
+
+        // And the consequence the old assertion inverted: a windowed paged row
+        // IS speculation-eligible. No legal config can make it otherwise —
+        // `ringPageCount` reserves `maxPrefillChunk + pageSize` beyond the
+        // window and the pool requires `maxPrefillChunk > 0`, so the minimum
+        // headroom is `1 + pageSize` = 17 > 8. (After track P's WS-1.2 shrink
+        // the reserve becomes one whole page, so the minimum is 16 — still
+        // above the span.) The false arm becomes reachable only if
+        // `maxSpeculativeSpan` is ever raised past the reserved slack, which is
+        // exactly the coupling this derived gate exists to catch: it degrades
+        // to "ineligible" instead of corrupting confirmed history.
+        #expect(windowed.supportsSpeculativeWrites == true)
+        #expect(full.supportsSpeculativeWrites == true)
+    }
+
+    /// The span constant must keep covering the MTP draft bound it was sized
+    /// for; `PagedSeamContract` states the relation but only asserts it under
+    /// `-Ounchecked`-free builds via `assert`, which release tests skip.
+    @Test func speculativeSpanCoversTheMTPDraftBound() {
+        #expect(
+            CBv2PagedSpeculation.maxSpeculativeSpan
+                >= CBv2MTPConfig.testedMaxDraftTokens + 1,
+            """
+            maxSpeculativeSpan \(CBv2PagedSpeculation.maxSpeculativeSpan) no longer covers \
+            testedMaxDraftTokens + 1 (\(CBv2MTPConfig.testedMaxDraftTokens + 1)) — raise the \
+            span and re-check PagedKVPool.ringPageCount before raising the MTP bound
+            """)
     }
 }
 
@@ -711,44 +764,21 @@ struct CBv2MTPKVStagingAttentionParityTests {
     }
 }
 
-// MARK: - (f) Compiled-decode interaction guard
+// MARK: - (f) Speculative arm/disarm lifecycle
 
-@Suite("CBv2MTPKVStaging: compiled-decode guard")
-struct CBv2MTPKVStagingCompiledGuardTests {
+@Suite("CBv2MTPKVStaging: speculative lifecycle")
+struct CBv2MTPKVStagingSpeculativeLifecycleTests {
 
-    /// `compiledStorage` / `noteCompiledAdvance` preconditionFailure on
-    /// exactly this predicate (untestable in-process); pin its lifecycle:
-    /// non-nil from arm through commit, nil before and after.
-    @Test func speculativePendingViolationTracksStagedLifecycle() {
-        let row = CBv2WindowedSequenceKV(window: 8, kvHeads: 2, headDim: 4)
-        #expect(row.cbv2SpeculativePendingViolation() == nil)
-
-        row.beginSpeculativeWrite()
-        #expect(row.cbv2SpeculativePendingViolation() != nil)  // armed
-
-        _ = row.update(
-            keys: positionCoded(from: 0, count: 2), values: positionCoded(from: 5000, count: 2))
-        #expect(row.cbv2SpeculativePendingViolation() != nil)  // staged
-
-        row.rollback(1)
-        #expect(row.cbv2SpeculativePendingViolation() != nil)  // still staged
-
-        row.commitSpeculativeWrite()
-        #expect(row.cbv2SpeculativePendingViolation() == nil)
-        expectExact(row.snapshot().keys, expectedPositions([0]), "committed token survives")
-
-        // Once clear, the compiled bridge works again.
-        #expect(row.compiledStorage(keysDType: .float32, valuesDType: .float32) != nil)
-        row.noteCompiledAdvance()
-        #expect(row.absoluteOffset == 2)
-    }
-
+    /// `speculativePendingViolationTracksStagedLifecycle` lived here and
+    /// pinned `cbv2SpeculativePendingViolation()` / `compiledStorage` /
+    /// `noteCompiledAdvance()`. All three were compiled-decode-only and are
+    /// deleted with it (track G). What survives is the part that is not about
+    /// the compiled bridge: arming and disarming must leave a plain row.
     @Test func beginThenCommitWithoutUpdateIsCleanNoOp() {
         let row = CBv2WindowedSequenceKV(window: 8, kvHeads: 2, headDim: 4)
         fillWindowed(row, count: 3)
         row.beginSpeculativeWrite()
         row.commitSpeculativeWrite()  // disarms without an update
-        #expect(row.cbv2SpeculativePendingViolation() == nil)
         let (k, _) = row.update(
             keys: positionCoded(from: 3, count: 1), values: positionCoded(from: 5003, count: 1))
         expectExact(k, expectedPositions([0, 1, 2, 3]), "plain update after disarm")
