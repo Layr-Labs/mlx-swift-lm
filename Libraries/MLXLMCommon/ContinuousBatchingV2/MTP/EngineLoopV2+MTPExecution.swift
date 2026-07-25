@@ -221,13 +221,19 @@ extension EngineLoopV2 {
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
         var seedTokens: [Int32] = []
         var carryHiddens: [MLXArray] = []
+        // Each capture paired with the row it was gathered from, so
+        // `mtpFreezeCaptures` can fence it against that row's own storage.
+        var captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)] = []
         captures.reserveCapacity(batch)
+        captured.reserveCapacity(2 * batch)
 
         for row in verifyRows {
             let state = kvStates[row.rec.id]!
             let carry = row.carry!
-            // Snapshot views are graph-built before target verification, so
-            // MLX versioning freezes the assistant's pre-round KV reads.
+            // Captured BEFORE the target forward writes the round's
+            // speculative columns. On a backend whose snapshots are lazy
+            // reads of in-place-mutated storage that ordering is not free —
+            // `mtpFreezeCaptures` below is what actually enforces it.
             let fullRow = state[mtp.captureLayers.full]!
             let slidingRow = state[mtp.captureLayers.sliding]!
             precondition(
@@ -244,12 +250,16 @@ extension EngineLoopV2 {
                     slidingValues: slidingSnapshot.values,
                     slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
                     anchor: fullRow.absoluteOffset))
+            captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
+            captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
             rowMetadata.append(
                 CBv2MTPRoundInFlight.VerifyRow(
                     id: row.rec.id, storageRows: state.compactMap { $0 }))
             seedTokens.append(Int32(carry.token))
             carryHiddens.append(carry.hidden)
         }
+
+        mtpFreezeCaptures(captured)
 
         let prepared = mtp.drafter.prepare(rows: captures)
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
@@ -291,6 +301,21 @@ extension EngineLoopV2 {
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
             lastHidden: target.hidden)
+    }
+
+    /// Freeze the round's pre-write KV captures against the in-place writes
+    /// the very same graph is about to perform. See `CBv2MTPCaptureFence`
+    /// for the hazard and the mechanism.
+    private func mtpFreezeCaptures(
+        _ captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)]
+    ) {
+        // Contiguous rows are ARC-owned by their views and need nothing.
+        // `requiresMaterializedSnapshots` is the bit that already documents
+        // exactly this recyclable-storage hazard: true for `PagedKVBackend`,
+        // false everywhere else, so contiguous stays byte-identical.
+        guard backend.requiresMaterializedSnapshots else { return }
+        let unfenceable = CBv2MTPCaptureFence.publish(captured)
+        if !unfenceable.isEmpty { eval(unfenceable) }
     }
 
 }
