@@ -147,6 +147,98 @@ struct CBv2PagedSafetyTests {
         ])
     }
 
+    /// The pre-JIT exists so that no production request pays a Metal JIT on
+    /// its first decode. PTOK is a kernel TEMPLATE parameter, so every rung
+    /// of `partitionTokenLadder` the sizer can select is a SEPARATE compiled
+    /// variant with its own name and its own compile: a smoke that exercises
+    /// one rung leaves the rest to be paid by whichever live request first
+    /// lands in their context bucket — a TTFT spike, which is exactly what
+    /// the smoke is for.
+    ///
+    /// The expectation is NOT a snapshot of three integers. It is an
+    /// independent oracle: every distinct value `partitionTokensForDispatch`
+    /// returns over a dense sweep of attended lengths for the shape. Adding
+    /// a ladder rung therefore tightens this test with no edit here, and the
+    /// `DARKBLOOM_CBV2_PAGED_PTOK_TARGET=0` kill switch — which pins every
+    /// dispatch to `partitionTokens` — narrows both sides together instead
+    /// of failing.
+    @Test("runtime smoke pre-JITs every partition rung the sizer can select")
+    func runtimeSmokeCoversEveryPartitionRung() throws {
+        // The regression this guards: the smoke used to dispatch one decode
+        // at `maxAttendLength: 1`, and the sizer floors that onto the
+        // smallest rung — one compiled variant out of the ladder's three.
+        #expect(
+            PagedAttentionKernel.partitionTokensForDispatch(
+                maxAttendLength: 1, batch: 1, kvHeads: 8, headSplits: 1,
+                pageSize: CBv2PagedDefaults.pageSize)
+                == PagedAttentionKernel.minPartitionTokens)
+
+        let shapes = [
+            PagedAttentionKernelSmokeShape(
+                headDim: 64, kvHeads: 8, queryHeads: 64,
+                hasSinks: true, hasWrite: true),
+            // d512/GQA 8 splits each kv head across 4 threadgroups, so the
+            // sizer sees a different per-partition threadgroup count.
+            PagedAttentionKernelSmokeShape(
+                headDim: 512, kvHeads: 2, queryHeads: 16,
+                hasSinks: false, hasWrite: true),
+            PagedAttentionKernelSmokeShape(
+                headDim: 512, kvHeads: 2, queryHeads: 16,
+                hasSinks: false, hasWrite: false),
+        ]
+        let coverage = try PagedAttentionKernel.runtimeSmoke(shapes: shapes)
+        #expect(Set(coverage.keys) == Set(shapes))
+
+        for shape in shapes {
+            let reachable = reachablePartitionRungs(for: shape)
+            #expect(
+                reachable.count > 1
+                    || PagedAttentionKernel.partitionTargetThreadgroups == 0,
+                """
+                oracle reached only \(reachable.sorted()) for \
+                \(shape.argumentValue) — the coverage assertion is vacuous
+                """)
+            #expect(
+                coverage[shape] == reachable,
+                """
+                shape \(shape.argumentValue): the smoke compiled PTOK \
+                \((coverage[shape] ?? []).sorted()) but the sizer can dispatch \
+                \(reachable.sorted()) — every missing rung JITs on a live request
+                """)
+        }
+    }
+
+    /// Every PTOK `partitionTokensForDispatch` can return for a B == 1
+    /// decode of `shape`, found by sweeping attended lengths rather than by
+    /// reading the ladder: a rung the sizer can never select is not a hole
+    /// in the smoke's coverage, and a rung added to the ladder shows up here
+    /// on its own.
+    private func reachablePartitionRungs(
+        for shape: PagedAttentionKernelSmokeShape
+    ) -> Set<Int> {
+        let gqa = shape.queryHeads / shape.kvHeads
+        let splits =
+            gqa
+            / PagedAttentionKernel.headsPerThreadgroup(
+                headDim: shape.headDim, gqa: gqa)
+        // A partition never holds more than `partitionTokens` tokens and the
+        // sizer never wants more than `partitionTargetThreadgroups` of them,
+        // so no attended length past their product can reach a new rung. The
+        // target is operator-settable; clamp it the way the smoke's own probe
+        // sweep does so both sides bound the search identically.
+        let bound =
+            PagedAttentionKernel.partitionTokens
+            * min(max(1, PagedAttentionKernel.partitionTargetThreadgroups), 1 << 16)
+        var rungs: Set<Int> = []
+        for length in 1 ... bound {
+            rungs.insert(
+                PagedAttentionKernel.partitionTokensForDispatch(
+                    maxAttendLength: length, batch: 1, kvHeads: shape.kvHeads,
+                    headSplits: splits, pageSize: CBv2PagedDefaults.pageSize))
+        }
+        return rungs
+    }
+
     @Test("each slab is rejected before allocation when it exceeds Metal maxBufferLength")
     func maxBufferLengthPreflight() {
         let pageBytes = 2 * 2 * 16 * 64 * 2
