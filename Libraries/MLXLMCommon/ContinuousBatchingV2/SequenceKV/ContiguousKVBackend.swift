@@ -1,7 +1,7 @@
 // ContiguousKVBackend.swift
 //
 // The v1 `CBv2KVBackend`: per-sequence contiguous MLX buffers
-// (`CBv2FullSequenceKV` / `CBv2WindowedSequenceKV` / `CBv2QuantizedSequenceKV`).
+// (`CBv2FullSequenceKV` / `CBv2WindowedSequenceKV`).
 // The paged backend (workstream C) implements the same protocol behind a
 // Metal kernel; the scheduler and models never see the difference.
 
@@ -14,21 +14,15 @@ public struct CBv2ContiguousBackendConfig: Sendable {
     /// the INITIAL budget; the backend's live ceiling can be re-sliced at
     /// runtime via `CBv2ContiguousKVBackend.updateBytesCapacity(_:)`.
     public var bytesCapacity: Int
-    /// Optional KV quantization for FULL-attention layers (group size, bits).
-    /// Windowed layers stay unquantized (small ring, quantization gains
-    /// nothing and the modular writes would fight group boundaries).
-    public var quantization: (groupSize: Int, bits: Int)?
     /// dtype assumed for admission estimates (actual allocation adopts the
     /// dtype of the first appended K/V).
     public var kvDType: DType
 
     public init(
         bytesCapacity: Int,
-        quantization: (groupSize: Int, bits: Int)? = nil,
         kvDType: DType = .float16
     ) {
         self.bytesCapacity = bytesCapacity
-        self.quantization = quantization
         self.kvDType = kvDType
     }
 }
@@ -50,17 +44,7 @@ public struct CBv2ContiguousBackendConfig: Sendable {
 public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     public let config: CBv2ContiguousBackendConfig
-    public var prefixReuseBackend: CBv2PrefixReuseBackend {
-        if config.quantization != nil { return .contiguousQuantized }
-        return .contiguousUnquantized
-    }
-
-    /// Compiled [B, 1] decode can bind the fp16 rows this backend mints
-    /// (`CBv2FullSequenceKV` / `CBv2WindowedSequenceKV`) — but NOT the
-    /// `CBv2QuantizedSequenceKV` rows a quantized config produces for
-    /// full-attention layers, so a quantized backend must veto the compiled
-    /// build (no warmup, no admission padding reserve — PR#62 review).
-    public var producesCompiledDecodeEligibleRows: Bool { config.quantization == nil }
+    public var prefixReuseBackend: CBv2PrefixReuseBackend { .contiguousUnquantized }
 
     private let lock = NSLock()
     private var live: [ObjectIdentifier: CBv2SequenceKV] = [:]
@@ -146,10 +130,6 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             throw CBv2KVError.backendIneligible(
                 reason:
                     "prefix plan backend \(plan.backend.rawValue) != \(prefixReuseBackend.rawValue)")
-        }
-        if plan.strategy == .frozenFullReplay, config.quantization != nil {
-            throw CBv2KVError.backendIneligible(
-                reason: "frozen-full replay requires contiguous unquantized rows")
         }
         guard plan.matchedBoundary <= maxLength,
             plan.replayStart >= 0,
@@ -303,12 +283,6 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             return CBv2WindowedSequenceKV(
                 window: window, kvHeads: kind.kvHeads, headDim: kind.headDim)
         case .full:
-            if let quantization = config.quantization {
-                return CBv2QuantizedSequenceKV(
-                    promptLength: promptLength, maxLength: maxLength,
-                    kvHeads: kind.kvHeads, headDim: kind.headDim,
-                    groupSize: quantization.groupSize, bits: quantization.bits)
-            }
             return CBv2FullSequenceKV(
                 promptLength: promptLength, maxLength: maxLength,
                 kvHeads: kind.kvHeads, headDim: kind.headDim)
@@ -353,15 +327,6 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 return window * kind.kvHeads * kind.headDim * itemSize * 2
             case .full:
                 let slots = min(maxLength, max(1, promptLength + CBv2FullSequenceKV.initialSlack))
-                if let quantization = config.quantization {
-                    let groupSize = CBv2QuantizedSequenceKV.resolvedGroupSize(
-                        requested: quantization.groupSize, headDim: kind.headDim)
-                    // Packed weights + fp scales/biases per group.
-                    let perToken =
-                        kind.headDim * quantization.bits / 8
-                        + 2 * (kind.headDim / groupSize) * itemSize
-                    return slots * kind.kvHeads * perToken * 2
-                }
                 return slots * kind.kvHeads * kind.headDim * itemSize * 2
             }
         }

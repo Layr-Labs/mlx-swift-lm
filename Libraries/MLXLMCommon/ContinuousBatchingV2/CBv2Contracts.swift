@@ -254,18 +254,6 @@ public protocol CBv2SequenceKV: AnyObject {
     /// Zero-copy-ish snapshot for prefix-cache donation / checkpointing.
     /// Returns (keys, values, absoluteOffset) in temporal order.
     func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int)
-    /// True when `snapshot()` is VALUE-EXACT: adopting the returned arrays
-    /// reproduces this row's effective KV exactly (full-precision storage).
-    /// Quantized storage MUST return false — its snapshot dequantizes, and
-    /// MLX affine re-quantization is not idempotent (the kernel snaps the
-    /// scale to the dominant group edge, so quantize∘dequantize lands on a
-    /// different grid, drifting values by up to one quantization step per
-    /// donate→adopt generation). The engine therefore SKIPS prefix-cache
-    /// donation for states whose cacheable rows report false; adopting
-    /// full-precision donations INTO such backends remains allowed (one
-    /// quantization, same as a cold prefill of the same values). Default:
-    /// true.
-    var snapshotIsLossless: Bool { get }
     /// Rollback the last `n` tokens (speculative rejection). Must scrub
     /// un-confirmed tail state so it can never be attended to.
     func rollback(_ n: Int)
@@ -287,8 +275,8 @@ public protocol CBv2SequenceKV: AnyObject {
     /// `CBv2KVBackend.producesCompiledDecodeEligibleRows`.
     var supportsSpeculativeWrites: Bool { get }
     /// Begin one speculative-write transaction. Storage
-    /// whose plain rollback is already value-exact (full, quantized,
-    /// paged-full) may make this a no-op. Ring storage (contiguous windowed)
+    /// whose plain rollback is already value-exact (full, paged-full) may
+    /// make this a no-op. Ring storage (contiguous windowed)
     /// must STAGE every update until commit — each call returns the exact
     /// views its corresponding plain update would return and advances
     /// counters, but destructive ring writes are deferred so a final
@@ -319,9 +307,6 @@ extension CBv2SequenceKV {
         preconditionFailure(
             "fastForward(to:) is only valid on windowed sequence KV (\(type(of: self)))")
     }
-
-    /// Default: full-precision snapshots are value-exact.
-    public var snapshotIsLossless: Bool { true }
 
     /// Default: fail-safe — unknown row classes never speculate.
     public var supportsSpeculativeWrites: Bool { false }
