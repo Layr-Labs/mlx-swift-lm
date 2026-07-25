@@ -1834,11 +1834,35 @@ public final class EngineLoopV2: @unchecked Sendable {
         guard let prefixCache else { return false }
         let tokenCount = intent.tokens.count
         guard stateCoversDonation(state, tokenCount: tokenCount) else { return false }
+        // Opt-in sliding-row donation (`CBv2SlidingWindowDonating`). Asked
+        // BEFORE anything is built: a sliding snapshot is `windowCount ×
+        // window` positions of K/V — 200 MiB on gemma-4 — so a cache that
+        // does not persist windows must not pay for the graph at all.
+        let windowDonor = prefixCache as? any CBv2SlidingWindowDonating
+        let donatesWindows = windowDonor?.wantsSlidingWindowDonation ?? false
         var built: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+        var sliding: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
         built.reserveCapacity(layerKinds.count)
+        if donatesWindows { sliding.reserveCapacity(layerKinds.count) }
         for (i, kind) in layerKinds.enumerated() {
             var cacheable = kind.sharesKVWithLayer == nil
-            if case .slidingWindow = kind.attention { cacheable = false }
+            var isSliding = false
+            if case .slidingWindow = kind.attention {
+                cacheable = false
+                isSliding = true
+            }
+            if donatesWindows {
+                // Storage-owning sliding rows only, and NEVER truncated to
+                // `tokenCount`: the ring already holds exactly the last
+                // `window` positions ending at the row's absolute offset,
+                // which is the span the sidecar persists. A KV-shared row
+                // borrows its source's storage, so donating it would
+                // double-write the same bytes.
+                sliding.append(
+                    isSliding && kind.sharesKVWithLayer == nil
+                        ? state[i]?.snapshot()
+                        : nil)
+            }
             guard cacheable, let seq = state[i] else {
                 built.append(nil)
                 continue
@@ -1856,7 +1880,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
         let layerKinds = self.layerKinds
-        let handoff = CBv2Handoff(value: (state: state, snapshots: built, intent: intent))
+        let handoff = CBv2Handoff(
+            value: (state: state, snapshots: built, sliding: sliding, intent: intent))
         pendingDonationReleaseCount += 1
         // Strong self on purpose: the deferred release is a pending
         // obligation of this loop — it must survive until the donation
@@ -1864,11 +1889,21 @@ public final class EngineLoopV2: @unchecked Sendable {
         // engine-thread-affine, so the free hops back to the engine queue).
         // No cycle: the block releases its captures once it runs.
         donationQueue.async {
-            prefixCache.donate(
-                requestID: handoff.value.intent.requestID,
-                tokens: handoff.value.intent.tokens,
-                snapshots: handoff.value.snapshots, layerKinds: layerKinds,
-                cacheSalt: handoff.value.intent.cacheSalt)
+            if let windowDonor, donatesWindows {
+                windowDonor.donate(
+                    requestID: handoff.value.intent.requestID,
+                    tokens: handoff.value.intent.tokens,
+                    snapshots: handoff.value.snapshots,
+                    slidingSnapshots: handoff.value.sliding,
+                    layerKinds: layerKinds,
+                    cacheSalt: handoff.value.intent.cacheSalt)
+            } else {
+                prefixCache.donate(
+                    requestID: handoff.value.intent.requestID,
+                    tokens: handoff.value.intent.tokens,
+                    snapshots: handoff.value.snapshots, layerKinds: layerKinds,
+                    cacheSalt: handoff.value.intent.cacheSalt)
+            }
             self.releaseDonationStateOnEngineQueue(handoff.value.state)
         }
         return true
