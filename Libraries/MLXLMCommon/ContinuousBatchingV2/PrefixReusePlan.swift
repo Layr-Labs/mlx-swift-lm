@@ -442,6 +442,43 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     /// Clamp a proposed prefill chunk so it cannot cross C or M, and — for a
     /// paged frozen replay — so the replay leg cannot outrun the slack the
     /// planner bought for it (`replayChunkCeiling`).
+    ///
+    /// THIS IS THE SOLE ENFORCEMENT POINT for the ceiling, and a violation is
+    /// SILENT. `PagedKVBackend` accepts a frozen-replay adoption on the
+    /// strength of the ceiling holding, but it only ever sees the plan, never
+    /// a chunk. Nothing downstream re-checks it — all three candidates were
+    /// audited and none is a backstop:
+    ///
+    ///  * `PagedSequenceKV.write:378`, the frozen early-out, advances the
+    ///    cursor for a chunk of ANY length that lands wholly below M, writes
+    ///    nothing and returns;
+    ///  * `:385`'s `precondition` fires only on a chunk that STRADDLES M — a
+    ///    different invariant;
+    ///  * `:393`'s windowed guard tests `n <= pool.config.maxPrefillChunk`,
+    ///    the POOL's chunk, not the ceiling, so an over-ceiling windowed
+    ///    chunk clears it too.
+    ///
+    /// An over-long chunk that stays below M therefore produces sliding rows
+    /// that are full-length and inexact, with no trap and no telemetry.
+    ///
+    /// What makes it hold is that there is exactly ONE producer and it clamps
+    /// FIRST — P2 proved this exhaustively when the ceiling landed. Three
+    /// sites size a prefill chunk (`SchedulerV2:367` running, `:524`
+    /// admission, `:590` helper) and each REASSIGNS its local from
+    /// `snappedChunkTokens` (`:422`, `:529`, `:591`) before
+    /// `numComputedTokens += n` and `assignments.append(numTokens:)`;
+    /// `snappedChunkTokens` applies this clamp at `:115`. There is no fourth
+    /// producer and no path that commits an unclamped count. The one path
+    /// that can EXTEND a chunk after clamping — the multimodal snap-over — is
+    /// unreachable because adoption and vision are mutually exclusive
+    /// (`EngineLoopV2:741-743`, asserted at `SchedulerV2:121-122`). Any new
+    /// path that widens a chunk after clamping breaks exactness silently.
+    ///
+    /// EXPIRES: the ceiling exists only because a frozen paged row attends
+    /// the chunk's freshly projected keys. Once `PagedLayerCache.prefillKV`
+    /// gathers the frozen keys for the chunk instead, the paged bound equals
+    /// the contiguous one, `replayChunkCeiling` is deleted, and so is this
+    /// hazard. Do not build machinery to guard it in the meantime.
     public func clampedChunk(start: Int, proposed: Int) -> Int {
         guard proposed > 0 else { return proposed }
         var result = proposed
