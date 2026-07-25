@@ -38,6 +38,57 @@ public protocol CBv2CompositionInvalidating: AnyObject {
     func releaseBoundRows()
 }
 
+/// Affirmative capability: this cache keeps every bound row's attention
+/// independent under a rectangular `[B > 1, L > 1]` prompt pass, so a packed
+/// row is bit-identical to that row run alone.
+///
+/// This is a CLAIM a cache makes, not a type the bank recognises. The gate
+/// used to be `cache is CBv2LayerCache`, which made every backend that is
+/// not the contiguous cache second-class BY CONSTRUCTION: a new cache could
+/// satisfy the requirement perfectly and still be refused, and the only
+/// remedy was to edit the bank. Fail-safe is unchanged — a cache that does
+/// not conform makes no claim, and one silent cache closes the gate for the
+/// whole bank.
+public protocol CBv2PackedPrefillCapableCache: AnyObject {
+    var keepsRowsIndependentWhenPacked: Bool { get }
+}
+
+/// Affirmative capability: this cache's attention actually APPLIES the span
+/// context bound through `CBv2SpanMaskBinding`.
+///
+/// It REFINES the binding protocol because a cache cannot honour a context
+/// it has no way to receive — and conformance to `CBv2SpanMaskBinding` alone
+/// was too weak a gate: it proves only that the setter exists, never that
+/// the bound spans reach the mask. A cache with a no-op `bindSpanContext`
+/// passed that check and would have served vision chunks under plain causal
+/// masks.
+public protocol CBv2MultimodalSpanCapableCache: CBv2SpanMaskBinding {
+    var honorsSpanMaskContexts: Bool { get }
+}
+
+extension CBv2LayerCache: CBv2PackedPrefillCapableCache, CBv2MultimodalSpanCapableCache {
+    /// `updateAndAttend` dispatches per row against that row's own KV, so
+    /// batchmates cannot influence each other's attention.
+    public var keepsRowsIndependentWhenPacked: Bool { true }
+
+    /// The bound context feeds this cache's chunk mask builder directly
+    /// (`CBv2LayerCache.boundSpanContext`).
+    public var honorsSpanMaskContexts: Bool { true }
+}
+
+/// A KV-owning cache that must retain per-chunk attention state for the
+/// KV-shared siblings that borrow from it.
+///
+/// `CBv2LayerKind.sharesKVWithLayer` points from the BORROWER to its source,
+/// so a source cannot see its own consumers; only something holding the
+/// whole bank can. The paged cache defaults to retaining (correct standalone)
+/// and the bank switches it OFF for every layer nothing borrows — which is
+/// every layer of both supported models, so the retention costs nothing
+/// unless a model actually shares KV.
+public protocol CBv2KVSourceChunkRetaining: AnyObject {
+    func setRetainsChunkForBorrowers(_ retains: Bool)
+}
+
 public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionInvalidating {
 
     private let caches: [any CBv2AttendingLayerCache]
@@ -49,6 +100,15 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     /// `PagedKVBackend.makeLayerCaches(attentionSoftcap:)`.
     public init(caches: [any CBv2AttendingLayerCache]) {
         self.caches = caches
+        var borrowedSources = Set<Int>()
+        for cache in caches {
+            guard let source = cache.kind.sharesKVWithLayer else { continue }
+            borrowedSources.insert(source)
+        }
+        for cache in caches {
+            guard let retaining = cache as? CBv2KVSourceChunkRetaining else { continue }
+            retaining.setRetainsChunkForBorrowers(borrowedSources.contains(cache.layerIndex))
+        }
     }
 
     /// Contiguous-backend convenience: one `CBv2LayerCache` per layer kind
@@ -104,22 +164,25 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         return .some(first)
     }
 
-    /// Vision prefill eligibility: every cache in the bank must honor
-    /// span-mask contexts (`CBv2SpanMaskBinding` — the contiguous
-    /// `CBv2LayerCache` does; the paged `PagedLayerCache` does not), or a
-    /// vision chunk's bidirectional-span mask could silently not apply on
-    /// some layer. All-or-nothing, checked at submit.
+    /// Vision prefill eligibility: every cache must AFFIRM that it applies a
+    /// bound span context (`CBv2MultimodalSpanCapableCache`), or a vision
+    /// chunk's bidirectional-span mask could silently not apply on some
+    /// layer. All-or-nothing, checked at submit.
     public var supportsMultimodalSpans: Bool {
-        caches.allSatisfy { $0 is CBv2SpanMaskBinding }
+        caches.allSatisfy {
+            ($0 as? CBv2MultimodalSpanCapableCache)?.honorsSpanMaskContexts ?? false
+        }
     }
 
-    /// Rectangular packed prefill eligibility: every cache must be the
-    /// contiguous `CBv2LayerCache`, whose `updateAndAttend` dispatches
-    /// per-row against each sequence's own KV (so a packed row is
-    /// bit-identical to running alone). Paged/custom caches make no such
-    /// claim and keep prompt chunks per-request.
+    /// Rectangular packed prefill eligibility: every cache must AFFIRM that
+    /// its rows stay independent under a `[B > 1, L > 1]` pass
+    /// (`CBv2PackedPrefillCapableCache`), so a packed row is bit-identical
+    /// to running alone. A cache that makes no claim keeps prompt chunks
+    /// per-request.
     public var supportsPackedPrefill: Bool {
-        caches.allSatisfy { $0 is CBv2LayerCache }
+        caches.allSatisfy {
+            ($0 as? CBv2PackedPrefillCapableCache)?.keepsRowsIndependentWhenPacked ?? false
+        }
     }
 
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
