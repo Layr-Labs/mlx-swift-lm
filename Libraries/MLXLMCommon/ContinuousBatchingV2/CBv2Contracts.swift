@@ -898,6 +898,46 @@ public func cbv2RequiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> 
 
 // MARK: - Engine public API (what the provider binds to)
 
+/// Packed-prefill EVIDENCE: what the engine is allowed to do, and what it
+/// actually did.
+///
+/// `EngineLoopV2.executeMixed` coalesces equal-length text prompt chunks
+/// into one rectangular `[B > 1, chunk]` forward when BOTH capability gates
+/// agree (`CBv2LayerCacheProvider.supportsPackedPrefill` and
+/// `CBv2PackedPrefillSteppableModel.supportsPackedPrefill`). Those gates are
+/// CONFIGURATION: a model may claim rectangular safety and still never pack
+/// — one row per step, unequal chunk lengths, or span-bearing chunks all
+/// keep the per-request `[1, chunk]` path. `rowsExecuted` / `groupsExecuted`
+/// are the only fields that prove the path RAN; they are incremented at the
+/// packed forward itself and stay zero otherwise, whatever `isSupported`
+/// says. Callers gating a parity claim on packed prefill MUST read the
+/// counters, never `isSupported` alone.
+///
+/// MTP round steps never pack (their chunked prefills stay per-request), so
+/// the counters describe the plain-decode prefill path only.
+public struct CBv2PackedPrefillActivity: Sendable, Equatable {
+    /// Both gates answer true, so the engine MAY pack. Configuration.
+    public let isSupported: Bool
+    /// Cumulative prompt rows carried by a rectangular packed forward.
+    public let rowsExecuted: Int
+    /// Cumulative rectangular forwards issued; `rowsExecuted` counts the
+    /// rows inside them, so `rowsExecuted >= 2 * groupsExecuted`.
+    public let groupsExecuted: Int
+
+    public init(isSupported: Bool, rowsExecuted: Int, groupsExecuted: Int) {
+        self.isSupported = isSupported
+        self.rowsExecuted = rowsExecuted
+        self.groupsExecuted = groupsExecuted
+    }
+
+    /// The measured answer: at least one rectangular forward happened.
+    public var didExecute: Bool { groupsExecuted > 0 }
+
+    /// Fail-closed default for engines with no packed-prefill path.
+    public static let none = CBv2PackedPrefillActivity(
+        isSupported: false, rowsExecuted: 0, groupsExecuted: 0)
+}
+
 /// `Sendable`: engine handles cross concurrency domains by design (the
 /// provider submits from request tasks, cancels from disconnect handlers,
 /// and reads capacity from heartbeat timers). Implementations synchronize
@@ -911,6 +951,10 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
+    /// Packed-prefill capability AND cumulative execution evidence. Cheap
+    /// (plain counter reads); safe to poll from a benchmark harness or
+    /// heartbeat. Fail-closed default: `.none`.
+    func packedPrefillActivity() -> CBv2PackedPrefillActivity
     /// Update the engine's KV byte budget at runtime (multi-model
     /// co-residency re-slicing). Fans out to the admission ledger and the
     /// KV backend; safe from any thread. Shrink leaves in-flight
@@ -924,4 +968,7 @@ public protocol CBv2Engine: AnyObject, Sendable {
 
 extension CBv2Engine {
     public func updateKVBytesCapacity(_ bytes: Int) {}
+    /// An engine with no packed-prefill path reports neither capability nor
+    /// execution.
+    public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
 }

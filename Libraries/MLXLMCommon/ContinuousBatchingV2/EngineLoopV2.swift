@@ -534,6 +534,32 @@ public final class EngineLoopV2: @unchecked Sendable {
     public private(set) var stepCount = 0
     public private(set) var chainedStepCount = 0
     public private(set) var preemptionCount = 0
+    /// Packed-prefill EXECUTION evidence (`CBv2PackedPrefillActivity`).
+    /// Incremented in `executeMixed` at the rectangular forward itself, so a
+    /// capability that is claimed but never exercised leaves both at zero.
+    /// Two plain `+=` per packed group — no allocation, no locking on the
+    /// step path. Engine-thread owned, monotonic; read at quiescent points.
+    public private(set) var packedPrefillRowsExecuted = 0
+    public private(set) var packedPrefillGroupsExecuted = 0
+    /// The two capability gates `executeMixed` consults before it packs —
+    /// the caches vouch for per-row independence AND the model's prompt
+    /// forward is batch-generic. Sole reader of the gates, so the flag the
+    /// engine reports and the flag it acts on cannot drift. Configuration
+    /// only: see the counters above for whether anything packed.
+    var packedPrefillSupported: Bool {
+        cacheProvider.supportsPackedPrefill
+            && (model as? CBv2PackedPrefillSteppableModel)?.supportsPackedPrefill == true
+    }
+
+    /// Capability + cumulative execution evidence, as `EngineV2` republishes
+    /// it to out-of-module callers.
+    func packedPrefillActivity() -> CBv2PackedPrefillActivity {
+        CBv2PackedPrefillActivity(
+            isSupported: packedPrefillSupported,
+            rowsExecuted: packedPrefillRowsExecuted,
+            groupsExecuted: packedPrefillGroupsExecuted)
+    }
+
     /// Requests demoted back to waiting after a capacityExhausted at first
     /// allocation (test/telemetry hook), and the per-request attempt cap.
     private(set) var capacityRequeueCount = 0
@@ -1315,10 +1341,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         var evalTargets: [MLXArray] = []
         var packedIDs = Set<CBv2RequestID>()
 
-        if cacheProvider.supportsPackedPrefill,
-            let packedModel = model as? CBv2PackedPrefillSteppableModel,
-            packedModel.supportsPackedPrefill
-        {
+        if packedPrefillSupported {
             struct PackedGroup {
                 let count: Int
                 let samples: Bool
@@ -1380,6 +1403,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                     evalTargets.append(output)
                 }
                 packedIDs.formUnion(group.rows.map(\.rec.id))
+                // Evidence, recorded where the rectangular forward actually
+                // happened — never at the capability gate.
+                packedPrefillRowsExecuted += group.rows.count
+                packedPrefillGroupsExecuted += 1
             }
         }
 

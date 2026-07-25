@@ -139,6 +139,16 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// guard). Test hook; engine-thread owned, read at quiescent points.
     public var offsetChainEvalSteps: Int { loop.offsetChainEvalSteps }
 
+    /// Packed-prefill capability AND cumulative execution evidence. The
+    /// counters move only where `executeMixed` issues a rectangular
+    /// `[B > 1, chunk]` forward, so a model that claims packing and never
+    /// packs reads `isSupported == true, didExecute == false`. Plain counter
+    /// reads (no lock, no step-path cost); poll from a benchmark harness or
+    /// heartbeat, ideally at a quiescent point.
+    public func packedPrefillActivity() -> CBv2PackedPrefillActivity {
+        loop.packedPrefillActivity()
+    }
+
     /// Cumulative MTP (speculative decoding) counters, or nil when MTP is
     /// inactive (no drafter, config/kill-switch off, or a model that cannot
     /// drive rounds). Lock-protected snapshot — safe to poll from any
