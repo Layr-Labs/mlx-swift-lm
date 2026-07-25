@@ -43,15 +43,21 @@ public struct CBv2PagedKVResidency: CBv2KVResidencyPolicy {
 
     public func residentRows(layer kind: CBv2LayerKind, tokens: Int) -> Int? {
         guard tokens >= 0, config.pageSize > 0 else { return nil }
-        // `pageDemand` and `ringPageCount` do unchecked arithmetic on
-        // `window - 1 + maxPrefillChunk`; `PagedKVPool.init` refuses windows
-        // that overflow it, but this policy must stay total for callers that
-        // build it without a pool (probes, tests).
+        // `pageDemand` and `ringPageCount` do UNCHECKED arithmetic;
+        // `PagedKVPool.init` refuses geometries that overflow it, but this
+        // policy must stay total for callers that build it without a pool
+        // (probes, tests). Mirror exactly what `ringPageCount` computes —
+        // `max(maxWindowExposure + maxSpeculativeSpan, maxPrefillChunk)`
+        // rounded up to a page — because a guard that checks a term the
+        // formula no longer has protects nothing. It used to check
+        // `window - 1 + maxPrefillChunk`, which let `window == Int.max` with
+        // a one-token chunk through to a trap inside `window + span`.
         if case .slidingWindow(let window) = kind.attention {
             guard window > 0,
-                let attendable = Self.add(window - 1, config.maxPrefillChunk),
-                Self.add(attendable, config.pageSize - 1) != nil,
-                Self.add(CBv2PagedSpeculation.maxSpeculativeSpan, config.pageSize - 1) != nil
+                let exposed = Self.add(
+                    PagedSequenceKV.maxWindowExposure(window: window),
+                    CBv2PagedSpeculation.maxSpeculativeSpan),
+                Self.add(max(exposed, config.maxPrefillChunk), config.pageSize - 1) != nil
             else { return nil }
         }
         guard Self.add(tokens, config.pageSize - 1) != nil else { return nil }

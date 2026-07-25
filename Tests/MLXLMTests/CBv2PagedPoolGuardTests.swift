@@ -286,6 +286,117 @@ struct CBv2PagedPoolGuardTests {
         #expect(peak == charge, "peak residency \(peak) != charge \(charge)")
     }
 
+    // MARK: - Gate G1: per-sequence KV footprint vs the contiguous backend
+
+    /// Gemma-4-26b shape, as `CBv2SchedulerAdmissionTests` declares it:
+    /// 25 sliding-window(1024) layers (head_dim 256, 8 kv heads) + 5 full
+    /// layers (head_dim 512, 2 kv heads).
+    private var gemma4Kinds: [CBv2LayerKind] {
+        Array(
+            repeating: CBv2LayerKind(
+                attention: .slidingWindow(1024), headDim: 256, kvHeads: 8, queryHeads: 8),
+            count: 25)
+            + Array(
+                repeating: CBv2LayerKind(
+                    attention: .full, headDim: 512, kvHeads: 2, queryHeads: 8),
+                count: 5)
+    }
+
+    /// The shipped per-sequence KV charge, through the shipped ledger.
+    private func perSequenceKVBytes(
+        residency: any CBv2KVResidencyPolicy, tokens: Int
+    ) -> Int {
+        AdmissionV2(
+            layerKinds: gemma4Kinds, bytesCapacity: 1 << 50,
+            config: .init(watermarkFraction: 0, elementBytes: 2),
+            residency: residency
+        ).allocatedBytes(forTokens: tokens)
+    }
+
+    /// GATE G1. Paged per-sequence KV must not exceed contiguous.
+    ///
+    /// It did: the 97-page ring held 1,552 tokens for a 1,024-token window,
+    /// so every sliding layer over-committed by `ring - window == 528` tokens
+    /// once a request outgrew the window. That is 25 of gemma-4's 30 layers,
+    /// and it is why the gate failed at 10k while passing at 1k (the ring is
+    /// not yet reached) and reading much better at 100k (the five full layers
+    /// dominate the total).
+    ///
+    /// The 65-page ring holds 1,040 tokens, so the over-commit is 16 tokens —
+    /// one page — and that is a FLOOR, not slack worth chasing:
+    /// `ringPageCount` cannot go below `ceil((window + maxSpeculativeSpan) /
+    /// pageSize)`, and `chargeEqualsPeakResidency` forbids charging less than
+    /// the ring a row actually touches.
+    ///
+    /// Asserted in exact bytes rather than as a float ratio so a regression
+    /// names the layer arithmetic instead of a rounded percentage.
+    @Test(arguments: [1024, 10240, 102_400])
+    func pagedPerSequenceKVDoesNotExceedContiguous(tokens: Int) throws {
+        let cfg = PagedKVPoolConfig(
+            capacityBytes: 8 << 30, maxPrefillChunk: 512, nominalMaxSequenceLength: tokens)
+        let paged = perSequenceKVBytes(
+            residency: CBv2PagedKVResidency(config: cfg), tokens: tokens)
+        let contiguous = perSequenceKVBytes(
+            residency: CBv2ContiguousKVResidency(), tokens: tokens)
+
+        // The sliding layers are the whole story; state their two figures so
+        // a failure says WHICH side moved.
+        let ringTokens = PagedKVPool.ringPageCount(window: 1024, config: cfg) * cfg.pageSize
+        #expect(ringTokens == 1040, "gemma-4's windowed ring is 65 pages == 1,040 tokens")
+
+        // Paged may be at most one page per sliding layer over contiguous,
+        // and only once the request outgrows the window.
+        let slidingLayers = 25
+        let slidingBytesPerToken = 2 * 8 * 256 * 2
+        let allowance = tokens > 1024 ? slidingLayers * cfg.pageSize * slidingBytesPerToken : 0
+        #expect(
+            paged <= contiguous + allowance,
+            """
+            \(tokens) tokens: paged \(paged) B vs contiguous \(contiguous) B, over by \
+            \(paged - contiguous) B against an allowance of \(allowance) B (one \
+            \(cfg.pageSize)-token page on each of \(slidingLayers) sliding layers). The old \
+            97-page ring was over by \(slidingLayers * (1552 - 1024) * slidingBytesPerToken) B \
+            at this context.
+            """)
+        // ...and never UNDER, which would mean the charge stopped covering
+        // what a row can touch — a free-list underflow, not a saving.
+        #expect(
+            paged >= contiguous,
+            "\(tokens) tokens: paged \(paged) B is BELOW contiguous \(contiguous) B")
+
+        // The exact figures the gate publishes, so a regression names the
+        // arithmetic rather than a rounded percentage. Sliding layers cost
+        // 2 * 8 * 256 * 2 == 8,192 B/token, full layers 2 * 2 * 512 * 2 ==
+        // 4,096 B/token.
+        let expected: [Int: (paged: Int, contiguous: Int)] = [
+            1024: (230_686_720, 230_686_720),
+            10240: (422_707_200, 419_430_400),
+            102_400: (2_310_144_000, 2_306_867_200),
+        ]
+        let want = try #require(expected[tokens])
+        #expect(paged == want.paged, "\(tokens) tokens: paged \(paged) B != \(want.paged) B")
+        #expect(
+            contiguous == want.contiguous,
+            "\(tokens) tokens: contiguous \(contiguous) B != \(want.contiguous) B")
+
+        // The BEFORE figure, measured rather than remembered. A 1,552-token
+        // ring is what `ringPageCount` returns when the ROW bound is forced
+        // to 1,552 — the same 97 pages the old cache bound
+        // (`window - 1 + maxPrefillChunk + span`) produced at chunk 512.
+        var oldCfg = cfg
+        oldCfg.maxPrefillChunk = 1552
+        #expect(PagedKVPool.ringPageCount(window: 1024, config: oldCfg) == 97)
+        let before = perSequenceKVBytes(
+            residency: CBv2PagedKVResidency(config: oldCfg), tokens: tokens)
+        let expectedBefore: [Int: Int] = [
+            1024: 230_686_720, 10240: 527_564_800, 102_400: 2_415_001_600,
+        ]
+        #expect(
+            before == (try #require(expectedBefore[tokens])),
+            "\(tokens) tokens: pre-shrink paged \(before) B")
+        #expect(before >= paged, "the shrink must not have made the footprint larger")
+    }
+
     // MARK: - WS-6.4: adaptive partition sizing
 
     /// Every value the sizer can return must be a page multiple inside
