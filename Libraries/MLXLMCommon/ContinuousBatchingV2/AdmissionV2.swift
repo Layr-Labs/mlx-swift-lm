@@ -66,6 +66,15 @@ extension CBv2StepCapacity {
 /// (`sharesKVWithLayer != nil`) own no bytes; sliding-window layers plateau
 /// at `window` tokens — so a long-context request on Gemma-style hybrids is
 /// charged truthfully, not as if every layer were full-attention.
+///
+/// The LEDGER charges `allocatedBytes(forTokens:)`, NOT
+/// `estimatedBytes(forTokens:)`. The windowed backends allocate a fixed
+/// `window`-row ring on the FIRST write (`WindowedSequenceKV`) instead of
+/// growing with the sequence, so a 500-token request against a 1024 window
+/// occupies the whole ring the moment it is touched. Charging only the
+/// retained tokens left the gate believing it had margin it did not have
+/// (~0.9 GB of hidden overshoot at B=8 on Gemma-style hybrids), and on
+/// unified memory that surfaces as swap pressure, not a clean rejection.
 public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public struct Config: Sendable {
         /// Fraction of capacity kept free as the optimism watermark.
@@ -137,9 +146,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// tighter than the hardware truth (PR#62 review). Lock-protected.
     private var externalReserveBytes: Int
 
-    /// Cumulative reserved tokens per request (window capping is applied when
-    /// converting to bytes, so decode reservations past a layer's window add
-    /// zero bytes for that layer).
+    /// Cumulative reserved tokens per request (the token→byte conversion
+    /// charges every windowed layer its whole fixed ring once, so decode
+    /// reservations past a layer's window add zero bytes for that layer —
+    /// and so do reservations below it, the ring being already paid).
     private var reservedTokens: [CBv2RequestID: Int] = [:]
     private var reservedExactBytes: [CBv2RequestID: Int] = [:]
     private var ledgerBytes = 0
@@ -191,7 +201,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     // MARK: Estimation
 
-    /// KV bytes retained after processing `tokens` tokens of one sequence.
+    /// KV bytes whose CONTENT is retained after processing `tokens` tokens
+    /// of one sequence (windowed layers cap at their window). This is NOT
+    /// what a sequence occupies — see `allocatedBytes(forTokens:)`, the
+    /// figure the ledger charges.
     public func estimatedBytes(forTokens tokens: Int) -> Int {
         estimatedBytesChecked(forTokens: tokens) ?? Int.max
     }
@@ -217,9 +230,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         return total
     }
 
-    /// Bytes needed to materialize every fixed sliding ring beyond what a
-    /// token reservation at `tokens` already charges. Adoption allocates full
-    /// rings immediately even when replay starts before the window fills.
+    /// Bytes needed to materialize every fixed sliding ring beyond what
+    /// `estimatedBytes(forTokens:)` charges at `tokens`. The windowed
+    /// backends allocate the whole ring on first write, so this gap is real
+    /// occupancy from the first token onward; `allocatedBytesChecked` folds
+    /// it into every ledger charge, which is why no caller adds it a second
+    /// time. nil on accounting overflow.
     public func fixedWindowBytesShortfall(afterReservingTokens tokens: Int) -> Int? {
         var total = 0
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
@@ -234,6 +250,24 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             else { return nil }
             total = newTotal
         }
+        return total
+    }
+
+    /// KV bytes a sequence OCCUPIES once it has processed `tokens` tokens:
+    /// retained content plus the still-unfilled remainder of every fixed
+    /// sliding ring. This is what the ledger charges and what the windowed
+    /// backends actually allocate; for a windowed layer the two agree from
+    /// the first token (`window` rows), never `min(tokens, window)`.
+    public func allocatedBytes(forTokens tokens: Int) -> Int {
+        allocatedBytesChecked(forTokens: tokens) ?? Int.max
+    }
+
+    private func allocatedBytesChecked(forTokens tokens: Int) -> Int? {
+        guard tokens > 0 else { return 0 }
+        guard let retained = estimatedBytesChecked(forTokens: tokens),
+            let ringShortfall = fixedWindowBytesShortfall(afterReservingTokens: tokens),
+            let total = Self.add(retained, ringShortfall)
+        else { return nil }
         return total
     }
 
@@ -294,10 +328,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// watermark-adjusted capacity (`admissibleBytesCapacity` — the most
     /// `reserve` will ever grant). Requests that could never fit are
     /// rejected up front; requests that fit only sometimes are admitted
-    /// optimistically and preempted if optimism loses.
+    /// optimistically and preempted if optimism loses. Judged on OCCUPANCY
+    /// (fixed sliding rings included), so the gate agrees with both what
+    /// `reserve` charges and what the backend allocates.
     public func canEverFit(promptTokens: Int, maxTokens: Int) -> Bool {
         let (tokens, overflow) = promptTokens.addingReportingOverflow(max(maxTokens, 0))
-        guard !overflow, let bytes = estimatedBytesChecked(forTokens: tokens) else {
+        guard !overflow, let bytes = allocatedBytesChecked(forTokens: tokens) else {
             return false
         }
         return bytes <= admissibleBytesCapacity
@@ -322,8 +358,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let oldExact = reservedExactBytes[id] ?? 0
         let (newExact, exactOverflow) = oldExact.addingReportingOverflow(additionalBytes)
         guard !tokenCountOverflow, !exactOverflow,
-            let oldTokenBytes = estimatedBytesChecked(forTokens: old),
-            let newTokenBytes = estimatedBytesChecked(forTokens: new)
+            let oldTokenBytes = allocatedBytesChecked(forTokens: old),
+            let newTokenBytes = allocatedBytesChecked(forTokens: new)
         else {
             throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
         }
@@ -358,7 +394,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let new = max(0, old - tokens)
         let oldExact = reservedExactBytes[id] ?? 0
         let newExact = max(0, oldExact - bytes)
-        ledgerBytes += estimatedBytes(forTokens: new) - estimatedBytes(forTokens: old)
+        ledgerBytes += allocatedBytes(forTokens: new) - allocatedBytes(forTokens: old)
             + newExact - oldExact
         if new == 0 {
             reservedTokens.removeValue(forKey: id)
@@ -377,7 +413,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         defer { lock.unlock() }
         guard let old = reservedTokens.removeValue(forKey: id) else { return }
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
-        ledgerBytes -= estimatedBytes(forTokens: old) + exact
+        ledgerBytes -= allocatedBytes(forTokens: old) + exact
     }
 
     /// Conservative (window caps ignored): may under-report headroom, which

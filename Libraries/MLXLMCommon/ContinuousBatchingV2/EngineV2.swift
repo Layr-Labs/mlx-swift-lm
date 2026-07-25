@@ -408,7 +408,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 promptTokens: request.promptTokens.count, maxTokens: request.maxTokens)
         else {
             throw CBv2KVError.capacityExhausted(
-                needed: admission.estimatedBytes(
+                needed: admission.allocatedBytes(
                     forTokens: request.promptTokens.count + request.maxTokens),
                 available: admission.admissibleBytesCapacity)
         }
@@ -496,23 +496,24 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             }
             exactStagedFullKVBytes = sum
         }
-        let replayTokens = min(
-            hit.matched,
-            prefixReuseCapability.conservativeReplayBoundTokens)
-        let replayStart = hit.matched - replayTokens
-        let initialReservationTokens =
-            prefixReuseCapability.strategy == .frozenFullReplay
-            ? hit.matched : replayStart
+        // The fixed sliding rings are deliberately NOT added on top of the
+        // plan's capacity adjustment. Since Bug A (paged-KV plan §7 item
+        // 0.1) the ledger charges every windowed layer its WHOLE ring
+        // inside the token reservation itself
+        // (`AdmissionV2.allocatedBytes(forTokens:)`), and `applyAdoption`
+        // reserves `plan.capacityReservationTokens` — always > 0 for a
+        // non-nil plan — before it touches the backend. Routing the
+        // shortfall through `initialAdditionalCapacityBytes` as well would
+        // charge the rings twice and starve adoption on Gemma-style
+        // hybrids. Accounting overflow still fails cold: `reserve` throws
+        // `capacityExhausted` and adoption falls back to a full prefill.
         guard !byteOverflow,
-            let fixedWindowCapacityBytes = admission.fixedWindowBytesShortfall(
-                afterReservingTokens: initialReservationTokens),
             let plan = prefixReuseCapability.plan(
                 matchedBoundary: hit.matched,
                 exactStagedFullKVBytes: exactStagedFullKVBytes,
                 maximumSequenceLength:
                     request.promptTokens.count + max(request.maxTokens, 1),
-                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
-                fixedWindowCapacityBytes: fixedWindowCapacityBytes)
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken)
         else {
             prefixCache.endAdoption(
                 requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,

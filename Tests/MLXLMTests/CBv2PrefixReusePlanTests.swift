@@ -227,22 +227,20 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
             backend: .contiguousUnquantized)
         let matched = 24
         let replayStart = 8
-        let fixedWindowBytes = try XCTUnwrap(
-            admission.fixedWindowBytesShortfall(
-                afterReservingTokens: replayStart))
         let exactFullBytesPerToken = 64
         let plan = try XCTUnwrap(capability.plan(
             matchedBoundary: matched,
             exactStagedFullKVBytes: matched * exactFullBytesPerToken,
             maximumSequenceLength: 40,
-            nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
-            fixedWindowCapacityBytes: fixedWindowBytes))
+            nominalFullKVBytesPerToken: admission.fullKVBytesPerToken))
         XCTAssertEqual(plan.strategy, .tailReplay)
         XCTAssertEqual(plan.replayStart, replayStart)
-        XCTAssertEqual(fixedWindowBytes, 8 * 64)
+        // The fixed sliding ring is charged ONCE, inside the token
+        // reservation (`AdmissionV2.allocatedBytes(forTokens:)`) — do not
+        // route `fixedWindowBytesShortfall` through the plan as well.
         XCTAssertEqual(
             plan.initialAdditionalCapacityBytes,
-            (40 - replayStart) * exactFullBytesPerToken + fixedWindowBytes)
+            (40 - replayStart) * exactFullBytesPerToken)
 
         try admission.reserve(
             id: CBv2RequestID(777),

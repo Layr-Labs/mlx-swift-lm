@@ -198,6 +198,141 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertEqual(admission.bytesReserved, 32)
     }
 
+    // MARK: Fixed sliding rings (Bug A — paged-KV plan §7 item 0.1)
+
+    /// Gemma-4-26b shape: 25 sliding-window(1024) layers (head_dim 256, 8 kv
+    /// heads) + 5 full layers (head_dim 512, 2 kv heads).
+    private var gemmaKinds: [CBv2LayerKind] {
+        Array(
+            repeating: CBv2LayerKind(
+                attention: .slidingWindow(1024), headDim: 256, kvHeads: 8, queryHeads: 8),
+            count: 25)
+            + Array(
+                repeating: CBv2LayerKind(
+                    attention: .full, headDim: 512, kvHeads: 2, queryHeads: 8),
+                count: 5)
+    }
+
+    /// Regression (Bug A): the windowed backends allocate the WHOLE
+    /// `window`-row ring on the first write (`WindowedSequenceKV` —
+    /// `guard keys == nil else { return }`, then `MLXArray.zeros([1, kvHeads,
+    /// window, ...])`), so a request shorter than the window occupies the
+    /// full ring. Admission used to charge `min(tokens, window)`, leaving the
+    /// gate blind to the difference. The charge must now equal the
+    /// allocation.
+    func testWindowedLayerIsChargedItsWholeRingBelowTheWindow() throws {
+        let admission = AdmissionV2(
+            layerKinds: gemmaKinds, bytesCapacity: 1 << 40,
+            config: .init(watermarkFraction: 0, elementBytes: 2))
+        let tokens = 500  // well below the 1024 window
+
+        // Per token per storage-owning layer:
+        //   windowed 2(K+V) × 8 heads × 256 dim × 2 B = 8192 B
+        //   full     2(K+V) × 2 heads × 512 dim × 2 B = 4096 B
+        let windowedRingBytes = 25 * 1024 * 8192  // 209.7 MB — what is allocated
+        let fullBytes = 5 * tokens * 4096
+
+        // The ledger's charge now IS the allocation.
+        XCTAssertEqual(admission.allocatedBytes(forTokens: tokens), windowedRingBytes + fullBytes)
+        try admission.reserve(id: id(1), additionalTokens: tokens)
+        XCTAssertEqual(admission.bytesReserved, windowedRingBytes + fullBytes)
+
+        // Retention is unchanged and still window-capped — that estimate is
+        // simply not what a sequence occupies. The gap it used to hide is
+        // ~107 MB for ONE such request.
+        XCTAssertEqual(admission.estimatedBytes(forTokens: tokens), 25 * tokens * 8192 + fullBytes)
+        XCTAssertEqual(
+            admission.allocatedBytes(forTokens: tokens) - admission.estimatedBytes(forTokens: tokens),
+            try XCTUnwrap(admission.fixedWindowBytesShortfall(afterReservingTokens: tokens)))
+
+        // Past the window the two agree, and the ring is never charged twice:
+        // reservations below AND above the window add nothing for it.
+        try admission.reserve(id: id(1), additionalTokens: 2048 - tokens)
+        XCTAssertEqual(admission.bytesReserved, windowedRingBytes + 5 * 2048 * 4096)
+        XCTAssertEqual(
+            admission.allocatedBytes(forTokens: 2048), admission.estimatedBytes(forTokens: 2048))
+
+        admission.releaseAll(id: id(1))
+        XCTAssertEqual(admission.bytesReserved, 0, "rollback stays symmetric")
+    }
+
+    /// The overshoot this closes: eight 500-token requests looked like
+    /// 0.9 GB to the old ledger while allocating 1.76 GB. The gate must now
+    /// stop admitting before the hardware does.
+    func testWindowedOvershootIsRejectedRatherThanHidden() {
+        let capacity = 1_000_000_000
+        let admission = AdmissionV2(
+            layerKinds: gemmaKinds, bytesCapacity: capacity,
+            config: .init(watermarkFraction: 0, elementBytes: 2))
+        let tokens = 500
+
+        // What the old (retention-only) ledger believed eight rows cost —
+        // comfortably inside the budget.
+        XCTAssertLessThan(8 * admission.estimatedBytes(forTokens: tokens), capacity)
+        // What they actually allocate.
+        XCTAssertGreaterThan(8 * admission.allocatedBytes(forTokens: tokens), capacity)
+
+        var admitted = 0
+        for raw in 1 ... 8 {
+            do {
+                try admission.reserve(id: id(UInt64(raw)), additionalTokens: tokens)
+                admitted += 1
+            } catch {
+                break
+            }
+        }
+        XCTAssertEqual(admitted, 4, "the ledger stops at the real ceiling, not the imagined one")
+        XCTAssertLessThanOrEqual(admission.bytesReserved, capacity)
+    }
+
+    /// The prefix-cache adoption path reserves `capacityReservationTokens`
+    /// plus the plan's `initialAdditionalCapacityBytes`. Now that the token
+    /// charge carries the fixed rings, `EngineV2.makePrefixLookup` no longer
+    /// routes `fixedWindowBytesShortfall` through the plan — the ring must
+    /// land in the ledger exactly ONCE.
+    func testAdoptionReservationChargesFixedRingExactlyOnce() throws {
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 2),
+            CBv2LayerKind(attention: .slidingWindow(16), headDim: 8, kvHeads: 1, queryHeads: 2),
+        ]
+        // 2(K+V) × 1 head × 8 dim × 2 B = 32 B per token per layer.
+        let bytesPerToken = 32
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1 << 20, config: .init(watermarkFraction: 0))
+        let capability = CBv2PrefixReuseCapability.derive(
+            layerKinds: kinds, backend: .contiguousUnquantized)
+        let maximumSequenceLength = 40
+        let plan = try XCTUnwrap(
+            capability.plan(
+                matchedBoundary: 24,
+                exactStagedFullKVBytes: 24 * bytesPerToken,
+                maximumSequenceLength: maximumSequenceLength,
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken))
+        XCTAssertEqual(plan.strategy, .tailReplay)
+        XCTAssertEqual(plan.capacityReservationTokens, 8)
+        let ringBytes = 16 * bytesPerToken
+        XCTAssertEqual(
+            plan.initialAdditionalCapacityBytes,
+            (maximumSequenceLength - plan.capacityReservationTokens) * bytesPerToken,
+            "the plan carries the full-row span only — the ring is the token charge's job")
+
+        try admission.reserve(
+            id: id(777),
+            additionalTokens: plan.capacityReservationTokens,
+            additionalBytes: plan.initialAdditionalCapacityBytes)
+        // Backend truth: the full row is sized to the whole sequence, the
+        // sliding row to its ring. Charging the ring twice would land
+        // `ringBytes` above this.
+        let exactBackendBytes = maximumSequenceLength * bytesPerToken + ringBytes
+        XCTAssertEqual(admission.bytesReserved, exactBackendBytes)
+
+        admission.unreserve(
+            id: id(777),
+            tokens: plan.capacityReservationTokens,
+            bytes: plan.initialAdditionalCapacityBytes)
+        XCTAssertEqual(admission.bytesReserved, 0, "adoption rollback balances exactly")
+    }
+
     func testSnapshotReportsLedgerOrBackendTruth() throws {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
         let admission = AdmissionV2(
