@@ -250,6 +250,39 @@ struct DFlashConfigurationTests {
         #expect(config.ignoredConfigKeys.contains("fixture_note"))
     }
 
+    @Test func decodesLagunaXSFixture() throws {
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: try loadFixture(named: "dflash-laguna-xs-2.1-config"))
+        #expect(config.decoderLayerType == .lagunaXS)
+        #expect(config.gating == "per-head")
+        #expect(config.blockSize == 16)
+        #expect(config.numTargetLayers == 40)
+        #expect(config.targetLayerIds == [1, 13, 25, 33, 39])
+        #expect(config.maskTokenId == 12)
+        #expect(config.slidingWindow == 512)
+        #expect(config.layerTypes == Array(repeating: .slidingAttention, count: 5))
+        #expect(config.targetHiddenSize == 5 * 2048)
+        #expect(config.ropeTheta == 500000.0)
+    }
+
+    @Test func decoderLayerTypeDefaultsToQwen3() throws {
+        let config = try JSONDecoder.json5().decode(
+            DFlashConfiguration.self, from: Data(validJSON().utf8))
+        #expect(config.decoderLayerType == .qwen3)
+        #expect(config.gating == nil)
+    }
+
+    @Test func rejectsLagunaXSWithNonPerHeadGating() throws {
+        var json = try String(
+            data: loadFixture(named: "dflash-laguna-xs-2.1-config"), encoding: .utf8)!
+        json = json.replacingOccurrences(of: "\"per-head\"", with: "\"per-element\"")
+        #expect(throws: DecodingError.self) {
+            _ = try JSONDecoder.json5().decode(
+                DFlashConfiguration.self, from: Data(json.utf8))
+        }
+    }
+
     @Test func loadConfigurationFromDirectory() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)

@@ -8,6 +8,11 @@ public enum DFlashLayerType: String, Codable, Sendable, Equatable {
     case slidingAttention = "sliding_attention"
 }
 
+public enum DFlashDecoderLayerType: String, Codable, Sendable, Equatable {
+    case qwen3
+    case lagunaXS = "laguna_xs"
+}
+
 public struct DFlashConfiguration: Codable, Sendable, Equatable {
     public struct Metadata: Codable, Sendable, Equatable {
         public var targetLayerIds: [Int]
@@ -60,6 +65,8 @@ public struct DFlashConfiguration: Codable, Sendable, Equatable {
     public var slidingWindow: Int?
     public var finalLogitSoftcapping: Float?
     public var tieWordEmbeddings: Bool
+    public var decoderLayerType: DFlashDecoderLayerType
+    public var gating: String?
     public var ignoredConfigKeys: [String]
 
     public var targetLayerIds: [Int] { dflashConfig.targetLayerIds }
@@ -93,6 +100,8 @@ public struct DFlashConfiguration: Codable, Sendable, Equatable {
         case slidingWindow = "sliding_window"
         case finalLogitSoftcapping = "final_logit_softcapping"
         case tieWordEmbeddings = "tie_word_embeddings"
+        case decoderLayerType = "decoder_layer_type"
+        case gating
         case ignoredConfigKeys = "_mlx_ignored_config_keys"
     }
 
@@ -165,6 +174,16 @@ public struct DFlashConfiguration: Codable, Sendable, Equatable {
             try container.decodeIfPresent(Float.self, forKey: .finalLogitSoftcapping)
         self.tieWordEmbeddings =
             try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        self.decoderLayerType =
+            try container.decodeIfPresent(DFlashDecoderLayerType.self, forKey: .decoderLayerType)
+            ?? .qwen3
+        self.gating = try container.decodeIfPresent(String.self, forKey: .gating)
+        if decoderLayerType == .lagunaXS, let gating, gating != "per-head" {
+            throw DecodingError.dataCorruptedError(
+                forKey: .gating, in: container,
+                debugDescription:
+                    "DFlash laguna_xs drafters require per-head gating; got \(gating).")
+        }
         self.ignoredConfigKeys = try Self.unknownKeys(from: decoder)
 
         let decodedLayerTypes =
