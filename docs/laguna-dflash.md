@@ -16,9 +16,14 @@ MLP, per-layer `input_layernorm`, `aux_hidden_norms`, `fc`, `hidden_norm`,
 `norm`), not `embed_tokens`/`lm_head`.
 
 `scripts/convert_laguna_dflash.py` converts the source Poolside NVFP4
-checkpoint (safetensors, arbitrary dtype/layout) into the MLX Swift
-`DFlashDraftModel` layout: `config.json` + `model.safetensors`, bf16 tensors,
-68 keys. The converted `config.json` sets `decoder_layer_type: "laguna_xs"` —
+checkpoint (safetensors) into the MLX Swift `DFlashDraftModel` layout:
+`config.json` + `model.safetensors`, bf16 tensors, 68 keys. The converter
+validates the source against an exact BF16 manifest — every tensor's name,
+dtype, shape, and byte length are checked against the config-derived
+expectation and against its own `data_offsets` span — and fails loudly on
+any drift rather than silently reinterpreting or truncating a tensor.
+
+The converted `config.json` sets `decoder_layer_type: "laguna_xs"` —
 this is the switch, read by `DFlashConfiguration`/`DFlashDraftModel`
 (`Libraries/MLXSpeculative/DFlashConfiguration.swift`,
 `Libraries/MLXSpeculative/DFlashDraftModel.swift`), that activates the

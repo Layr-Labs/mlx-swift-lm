@@ -106,6 +106,28 @@ struct LagunaDFlashDraftModelTests {
             try draft.bind(target: target)
             eval(draft)
 
+            // MLXNN's RMSNorm initializes weights to all-ones. On freshly
+            // constructed parameters that leaves two blind spots: (a) after
+            // `hidden_norm` (ones) `ctx` is already unit-RMS, so each layer's
+            // `input_layernorm(context)` is numerically ~identity and the test
+            // cannot detect the per-layer context norm being removed or
+            // miswired; (b) every `aux_hidden_norms` weight is an identical
+            // all-ones vector, so the test cannot detect the two aux norms
+            // being permuted or norm[0] being applied to every slice.
+            // Overwrite every RMSNorm weight with distinct, non-unit, seeded
+            // values before extracting parameters for the reference below, so
+            // both bugs would actually move the numbers.
+            MLXRandom.seed(31)
+            var normOverrides = [String: MLXArray]()
+            for (key, value) in draft.parameters().flattened()
+            where key.hasSuffix("norm.weight") || key.contains("aux_hidden_norms") {
+                normOverrides[key] = MLXRandom.uniform(
+                    low: 0.5, high: 1.5, [value.dim(0)]
+                ).asType(value.dtype)
+            }
+            try draft.update(parameters: ModuleParameters.unflattened(normOverrides), verify: [])
+            eval(draft)
+
             let p = Dictionary(uniqueKeysWithValues: draft.parameters().flattened())
             func w(_ key: String) -> MLXArray { p[key]!.asType(.float32) }
             let eps: Float = 1e-6

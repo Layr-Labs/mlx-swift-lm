@@ -228,6 +228,24 @@ def convert(source_dir, output_dir, source_revision):
     q_rows = num_heads * head_dim
     kv_rows = num_kv_heads * head_dim
 
+    def _assert_exact_bf16_length(name, shape, byte_length):
+        """Every tensor in this checkpoint is a validated BF16 tensor -- its
+        source byte span must equal prod(shape) * 2 exactly. This is a
+        distinct check from `_diff_manifest` above: that function compares
+        each tensor's *declared* dtype/shape against the config-derived
+        expectation, but never cross-checks a tensor's declared shape
+        against its own `data_offsets` span. A header where those two
+        disagree (truncated/padded/corrupted data_offsets, or a shape typo)
+        would otherwise be copied silently and produce a mis-shaped or
+        truncated output tensor. Fail loudly instead."""
+        expected_length = ELEM_SIZE_BF16
+        for dim in shape:
+            expected_length *= dim
+        assert byte_length == expected_length, (
+            f"{name}: source byte length ({byte_length}) != prod(shape) * "
+            f"{ELEM_SIZE_BF16} ({expected_length}) for shape {shape}"
+        )
+
     # plan: output tensor name -> (dtype, shape, absolute_source_offset, length_bytes)
     plan = {}
 
@@ -247,22 +265,33 @@ def convert(source_dir, output_dir, source_revision):
             f"does not cover the full tensor ({qkv_end - qkv_start} bytes)"
         )
 
-        plan[p + "self_attn.q_proj.weight"] = ("BF16", [q_rows, hidden_size], data_start + q_start, q_len)
-        plan[p + "self_attn.k_proj.weight"] = ("BF16", [kv_rows, hidden_size], data_start + k_start, kv_len)
-        plan[p + "self_attn.v_proj.weight"] = ("BF16", [kv_rows, hidden_size], data_start + v_start, kv_len)
+        q_name = p + "self_attn.q_proj.weight"
+        k_name = p + "self_attn.k_proj.weight"
+        v_name = p + "self_attn.v_proj.weight"
+        _assert_exact_bf16_length(q_name, [q_rows, hidden_size], q_len)
+        _assert_exact_bf16_length(k_name, [kv_rows, hidden_size], kv_len)
+        _assert_exact_bf16_length(v_name, [kv_rows, hidden_size], kv_len)
+
+        plan[q_name] = ("BF16", [q_rows, hidden_size], data_start + q_start, q_len)
+        plan[k_name] = ("BF16", [kv_rows, hidden_size], data_start + k_start, kv_len)
+        plan[v_name] = ("BF16", [kv_rows, hidden_size], data_start + v_start, kv_len)
 
         for suffix in _PASSTHROUGH_LAYER_SUFFIXES:
             key = p + suffix
             entry = tensor_entries[key]
             start, end = entry["data_offsets"]
-            plan[key] = (entry["dtype"], list(entry["shape"]), data_start + start, end - start)
+            shape = list(entry["shape"])
+            _assert_exact_bf16_length(key, shape, end - start)
+            plan[key] = (entry["dtype"], shape, data_start + start, end - start)
 
     root_names = ["fc.weight", "hidden_norm.weight", "norm.weight"]
     root_names += [f"aux_hidden_norms.{j}.weight" for j in range(len(target_layer_ids))]
     for name in root_names:
         entry = tensor_entries[name]
         start, end = entry["data_offsets"]
-        plan[name] = (entry["dtype"], list(entry["shape"]), data_start + start, end - start)
+        shape = list(entry["shape"])
+        _assert_exact_bf16_length(name, shape, end - start)
+        plan[name] = (entry["dtype"], shape, data_start + start, end - start)
 
     sorted_names = sorted(plan.keys())
 
