@@ -198,6 +198,141 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertEqual(admission.bytesReserved, 32)
     }
 
+    // MARK: Fixed sliding rings (Bug A — paged-KV plan §7 item 0.1)
+
+    /// Gemma-4-26b shape: 25 sliding-window(1024) layers (head_dim 256, 8 kv
+    /// heads) + 5 full layers (head_dim 512, 2 kv heads).
+    private var gemmaKinds: [CBv2LayerKind] {
+        Array(
+            repeating: CBv2LayerKind(
+                attention: .slidingWindow(1024), headDim: 256, kvHeads: 8, queryHeads: 8),
+            count: 25)
+            + Array(
+                repeating: CBv2LayerKind(
+                    attention: .full, headDim: 512, kvHeads: 2, queryHeads: 8),
+                count: 5)
+    }
+
+    /// Regression (Bug A): the windowed backends allocate the WHOLE
+    /// `window`-row ring on the first write (`WindowedSequenceKV` —
+    /// `guard keys == nil else { return }`, then `MLXArray.zeros([1, kvHeads,
+    /// window, ...])`), so a request shorter than the window occupies the
+    /// full ring. Admission used to charge `min(tokens, window)`, leaving the
+    /// gate blind to the difference. The charge must now equal the
+    /// allocation.
+    func testWindowedLayerIsChargedItsWholeRingBelowTheWindow() throws {
+        let admission = AdmissionV2(
+            layerKinds: gemmaKinds, bytesCapacity: 1 << 40,
+            config: .init(watermarkFraction: 0, elementBytes: 2))
+        let tokens = 500  // well below the 1024 window
+
+        // Per token per storage-owning layer:
+        //   windowed 2(K+V) × 8 heads × 256 dim × 2 B = 8192 B
+        //   full     2(K+V) × 2 heads × 512 dim × 2 B = 4096 B
+        let windowedRingBytes = 25 * 1024 * 8192  // 209.7 MB — what is allocated
+        let fullBytes = 5 * tokens * 4096
+
+        // The ledger's charge now IS the allocation.
+        XCTAssertEqual(admission.allocatedBytes(forTokens: tokens), windowedRingBytes + fullBytes)
+        try admission.reserve(id: id(1), additionalTokens: tokens)
+        XCTAssertEqual(admission.bytesReserved, windowedRingBytes + fullBytes)
+
+        // Retention is unchanged and still window-capped — that estimate is
+        // simply not what a sequence occupies. The gap it used to hide is
+        // ~107 MB for ONE such request.
+        XCTAssertEqual(admission.estimatedBytes(forTokens: tokens), 25 * tokens * 8192 + fullBytes)
+        XCTAssertEqual(
+            admission.allocatedBytes(forTokens: tokens) - admission.estimatedBytes(forTokens: tokens),
+            try XCTUnwrap(admission.fixedWindowBytesShortfall(afterReservingTokens: tokens)))
+
+        // Past the window the two agree, and the ring is never charged twice:
+        // reservations below AND above the window add nothing for it.
+        try admission.reserve(id: id(1), additionalTokens: 2048 - tokens)
+        XCTAssertEqual(admission.bytesReserved, windowedRingBytes + 5 * 2048 * 4096)
+        XCTAssertEqual(
+            admission.allocatedBytes(forTokens: 2048), admission.estimatedBytes(forTokens: 2048))
+
+        admission.releaseAll(id: id(1))
+        XCTAssertEqual(admission.bytesReserved, 0, "rollback stays symmetric")
+    }
+
+    /// The overshoot this closes: eight 500-token requests looked like
+    /// 0.9 GB to the old ledger while allocating 1.76 GB. The gate must now
+    /// stop admitting before the hardware does.
+    func testWindowedOvershootIsRejectedRatherThanHidden() {
+        let capacity = 1_000_000_000
+        let admission = AdmissionV2(
+            layerKinds: gemmaKinds, bytesCapacity: capacity,
+            config: .init(watermarkFraction: 0, elementBytes: 2))
+        let tokens = 500
+
+        // What the old (retention-only) ledger believed eight rows cost —
+        // comfortably inside the budget.
+        XCTAssertLessThan(8 * admission.estimatedBytes(forTokens: tokens), capacity)
+        // What they actually allocate.
+        XCTAssertGreaterThan(8 * admission.allocatedBytes(forTokens: tokens), capacity)
+
+        var admitted = 0
+        for raw in 1 ... 8 {
+            do {
+                try admission.reserve(id: id(UInt64(raw)), additionalTokens: tokens)
+                admitted += 1
+            } catch {
+                break
+            }
+        }
+        XCTAssertEqual(admitted, 4, "the ledger stops at the real ceiling, not the imagined one")
+        XCTAssertLessThanOrEqual(admission.bytesReserved, capacity)
+    }
+
+    /// The prefix-cache adoption path reserves `capacityReservationTokens`
+    /// plus the plan's `initialAdditionalCapacityBytes`. Now that the token
+    /// charge carries the fixed rings, `EngineV2.makePrefixLookup` no longer
+    /// routes `fixedWindowBytesShortfall` through the plan — the ring must
+    /// land in the ledger exactly ONCE.
+    func testAdoptionReservationChargesFixedRingExactlyOnce() throws {
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 2),
+            CBv2LayerKind(attention: .slidingWindow(16), headDim: 8, kvHeads: 1, queryHeads: 2),
+        ]
+        // 2(K+V) × 1 head × 8 dim × 2 B = 32 B per token per layer.
+        let bytesPerToken = 32
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1 << 20, config: .init(watermarkFraction: 0))
+        let capability = CBv2PrefixReuseCapability.derive(
+            layerKinds: kinds, backend: .contiguousUnquantized)
+        let maximumSequenceLength = 40
+        let plan = try XCTUnwrap(
+            capability.plan(
+                matchedBoundary: 24,
+                exactStagedFullKVBytes: 24 * bytesPerToken,
+                maximumSequenceLength: maximumSequenceLength,
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken))
+        XCTAssertEqual(plan.strategy, .tailReplay)
+        XCTAssertEqual(plan.capacityReservationTokens, 8)
+        let ringBytes = 16 * bytesPerToken
+        XCTAssertEqual(
+            plan.initialAdditionalCapacityBytes,
+            (maximumSequenceLength - plan.capacityReservationTokens) * bytesPerToken,
+            "the plan carries the full-row span only — the ring is the token charge's job")
+
+        try admission.reserve(
+            id: id(777),
+            additionalTokens: plan.capacityReservationTokens,
+            additionalBytes: plan.initialAdditionalCapacityBytes)
+        // Backend truth: the full row is sized to the whole sequence, the
+        // sliding row to its ring. Charging the ring twice would land
+        // `ringBytes` above this.
+        let exactBackendBytes = maximumSequenceLength * bytesPerToken + ringBytes
+        XCTAssertEqual(admission.bytesReserved, exactBackendBytes)
+
+        admission.unreserve(
+            id: id(777),
+            tokens: plan.capacityReservationTokens,
+            bytes: plan.initialAdditionalCapacityBytes)
+        XCTAssertEqual(admission.bytesReserved, 0, "adoption rollback balances exactly")
+    }
+
     func testSnapshotReportsLedgerOrBackendTruth() throws {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
         let admission = AdmissionV2(
@@ -400,5 +535,201 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertEqual(admission.bytesExternallyReserved, 0)
         let refunded = admission.snapshot(activeRequests: 1, waitingRequests: 0, activeTokens: 175)
         XCTAssertEqual(refunded.kvBytesReserved, 700)
+    }
+
+    // MARK: Backend-aware occupancy (PR#87 review — paged over-charge)
+
+    /// gemma-4 windowed shape, 8,192 B per token per layer.
+    private var gemmaWindowedKind: CBv2LayerKind {
+        CBv2LayerKind(attention: .slidingWindow(1024), headDim: 256, kvHeads: 8, queryHeads: 8)
+    }
+
+    /// The gemma-4 paged sizing: pageSize 16, chunk 512. The ring it implies
+    /// is deliberately NOT restated here — it is `ringPageCount`'s to define
+    /// and it has already moved once (WS-1.2 took gemma-4's from 97 pages to
+    /// 65 once `PagedLayerCache` gathered BEFORE writing). Every expectation
+    /// below that depends on it reads `PagedKVPool.ringPageCount` instead of
+    /// a literal, which is what carried this suite across that change.
+    private var gemmaPagedConfig: PagedKVPoolConfig {
+        PagedKVPoolConfig(
+            capacityBytes: 1 << 30, maxPrefillChunk: 512, nominalMaxSequenceLength: 8192)
+    }
+
+    /// The whole-ring charge PR#87 introduced is right for CONTIGUOUS rows
+    /// and wrong for PAGED ones, so the two must diverge. On one gemma-4
+    /// windowed layer (8,192 B/token, window 1,024):
+    ///
+    /// | tokens | contiguous rows | paged rows  | contiguous B | paged B     |
+    /// |--------|-----------------|-------------|--------------|-------------|
+    /// |      1 |           1,024 |          16 |    8,388,608 |     131,072 |
+    /// |    500 |           1,024 |         512 |    8,388,608 |   4,194,304 |
+    /// |  2,000 |           1,024 | whole ring  |    8,388,608 | ring × 8,192 |
+    ///
+    /// The short-row figures are LITERAL — one page and 32 pages are the
+    /// whole point of the fix and must not drift. The 2,000-token row is
+    /// derived from `ringPageCount` on purpose: the ring's width is under
+    /// active revision, and pinning a literal there would turn a correct
+    /// engine change into a red test (it already did once, at 1,552).
+    /// What must hold regardless of the ring's width is the SHAPE: past the
+    /// ring the paged charge stops tracking tokens and plateaus at the ring,
+    /// and that plateau is at least the window — charging less is a
+    /// free-list underflow, not a rejected request. Paged is therefore not
+    /// uniformly cheaper; this is a change of policy, not a relaxation.
+    func testWindowedChargeDivergesByBackendStoragePolicy() {
+        let kinds = [gemmaWindowedKind]
+        let bytesPerToken = 2 * 8 * 256 * 2  // 8,192
+        let contiguous = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1 << 40,
+            config: .init(watermarkFraction: 0, elementBytes: 2))
+        let paged = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1 << 40,
+            config: .init(watermarkFraction: 0, elementBytes: 2),
+            residency: CBv2PagedKVResidency(config: gemmaPagedConfig))
+
+        for tokens in [1, 500, 2000] {
+            XCTAssertEqual(
+                contiguous.allocatedBytes(forTokens: tokens), 1024 * bytesPerToken,
+                "contiguous windowed rows own the whole ring from token one (PR#87)")
+        }
+        XCTAssertEqual(paged.allocatedBytes(forTokens: 1), 16 * bytesPerToken)
+        XCTAssertEqual(paged.allocatedBytes(forTokens: 500), 512 * bytesPerToken)
+        let ringRows = PagedKVPool.ringPageCount(
+            window: 1024, config: gemmaPagedConfig) * gemmaPagedConfig.pageSize
+        XCTAssertEqual(paged.allocatedBytes(forTokens: 2000), ringRows * bytesPerToken)
+        XCTAssertGreaterThanOrEqual(
+            ringRows, 1024,
+            "the ring must cover the window or the paged charge under-states the pool")
+        XCTAssertEqual(
+            paged.allocatedBytes(forTokens: 100_000), ringRows * bytesPerToken,
+            "past the ring the charge plateaus instead of tracking tokens")
+
+        // Retention is a property of the MODEL, not the backend — unchanged.
+        for admission in [contiguous, paged] {
+            XCTAssertEqual(admission.estimatedBytes(forTokens: 1), bytesPerToken)
+            XCTAssertEqual(admission.estimatedBytes(forTokens: 500), 500 * bytesPerToken)
+            XCTAssertEqual(admission.estimatedBytes(forTokens: 2000), 1024 * bytesPerToken)
+        }
+    }
+
+    /// The P1 itself: a short request the paged pool CAN serve was being
+    /// rejected because admission charged it a whole 1,024-row window.
+    ///
+    /// "The pool can serve it" is demonstrated, not asserted — the real
+    /// `PagedKVBackend.reserve` takes the pages first. The pool is
+    /// deliberately sized BELOW one contiguous ring, which is the regime
+    /// where the two policies disagree.
+    func testPagedShortRequestIsAdmittedWhereWholeRingChargingRejectsIt() throws {
+        // One windowed layer, 512 B/token, page = 16 tokens = 8,192 B.
+        // capacity 40 pages ⇒ 20,480 B less than the 524,288 B ring.
+        let kinds = [
+            CBv2LayerKind(attention: .slidingWindow(1024), headDim: 64, kvHeads: 2, queryHeads: 4)
+        ]
+        let pageBytes = 2 * 2 * 16 * 64 * 2  // 8,192
+        let backend: any CBv2KVBackend = try PagedKVBackend(
+            layerKinds: kinds,
+            config: PagedKVPoolConfig(
+                capacityBytes: 40 * pageBytes, maxPrefillChunk: 512,
+                nominalMaxSequenceLength: 1024))
+        let capacity = backend.bytesCapacity
+        XCTAssertLessThan(
+            capacity, 1024 * 512,
+            "fixture must be smaller than one contiguous ring or the bug cannot show")
+
+        // The whole-ring ledger PR#87 shipped, and the backend's own.
+        let wholeRing = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: capacity, config: .init(watermarkFraction: 0))
+        let backendAware = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: capacity, config: .init(watermarkFraction: 0),
+            residency: backend.kvResidency)
+
+        for tokens in [1, 64, 500] {
+            // The pool really can serve it: it hands over the pages.
+            let paged = try XCTUnwrap(backend as? PagedKVBackend)
+            XCTAssertNoThrow(
+                try paged.reserve(layerKinds: kinds, maxLength: tokens),
+                "\(tokens)-token row is within the pool's page budget")
+            paged.unreserve(layerKinds: kinds, maxLength: tokens)
+
+            XCTAssertFalse(
+                wholeRing.canEverFit(promptTokens: tokens, maxTokens: 0),
+                "the bug: \(tokens)-token request charged all 1,024 window rows")
+            XCTAssertTrue(
+                backendAware.canEverFit(promptTokens: tokens, maxTokens: 0),
+                "paged charges pages, so the gate agrees with the pool")
+            XCTAssertNoThrow(try backendAware.reserve(id: id(1), additionalTokens: tokens))
+            backendAware.releaseAll(id: id(1))
+        }
+
+        // One page per short row, so the ledger admits as many as the pool
+        // has usable pages — every one of which the old charge refused.
+        XCTAssertEqual(backendAware.allocatedBytes(forTokens: 1), pageBytes)
+        var admitted = 0
+        while (try? backendAware.reserve(id: id(UInt64(admitted + 1)), additionalTokens: 1)) != nil {
+            admitted += 1
+            if admitted > capacity / pageBytes { break }
+        }
+        XCTAssertEqual(admitted, capacity / pageBytes)
+
+        // Not a relaxation: what the pool cannot serve is still refused. A
+        // 2,000-token row saturates the whole ring, and the ring dwarfs this
+        // fixture's 40 pages under either sizing it has had (65 now, 97
+        // before WS-1.2), so both the ledger and the pool say no.
+        XCTAssertFalse(backendAware.canEverFit(promptTokens: 2000, maxTokens: 0))
+        XCTAssertThrowsError(try (backend as! PagedKVBackend).reserve(
+            layerKinds: kinds, maxLength: 2000))
+    }
+
+    /// The ledger's paged charge is DERIVED from `PagedKVPool.pageDemand`,
+    /// never restated, so admission cannot drift from the reservation the
+    /// pool actually takes. Under-charging is a free-list underflow
+    /// (`PagedKVGroup.allocatePage` traps — a daemon abort, not a rejection).
+    func testPagedResidencyTracksPoolPageDemandExactly() {
+        let config = gemmaPagedConfig
+        let policy = CBv2PagedKVResidency(config: config)
+        let kinds = [
+            gemmaWindowedKind,
+            CBv2LayerKind(attention: .slidingWindow(97), headDim: 64, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(attention: .full, headDim: 512, kvHeads: 2, queryHeads: 8),
+        ]
+        for kind in kinds {
+            for tokens in [0, 1, 15, 16, 17, 500, 1023, 1024, 1552, 1553, 2000, 8192] {
+                let expected =
+                    PagedKVPool.pageDemand(kind: kind, maxLength: tokens, config: config)
+                    * config.pageSize
+                XCTAssertEqual(
+                    policy.residentRows(layer: kind, tokens: tokens), expected,
+                    "\(kind.attention) at \(tokens) tokens")
+            }
+        }
+        XCTAssertEqual(policy.rowGranularity, config.pageSize)
+    }
+
+    /// A backend that does not declare `kvResidency` inherits the
+    /// CONSERVATIVE policy: whole-ring charging, the status quo. A future
+    /// backend that forgets must over-charge and under-admit, never
+    /// over-commit the device.
+    func testUndeclaredBackendResidencyDefaultsToWholeRingCharging() {
+        let backend: any CBv2KVBackend = HarnessKVBackend()
+        XCTAssertTrue(backend.kvResidency is CBv2ContiguousKVResidency)
+        let kind = gemmaWindowedKind
+        XCTAssertEqual(backend.kvResidency.residentRows(layer: kind, tokens: 1), 1024)
+        XCTAssertEqual(backend.kvResidency.rowGranularity, 1)
+
+        // And the paged backend answers for itself through the same seam.
+        let kinds = [
+            CBv2LayerKind(attention: .slidingWindow(1024), headDim: 64, kvHeads: 2, queryHeads: 4)
+        ]
+        guard
+            let paged = try? PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    capacityBytes: 64 * 8192, maxPrefillChunk: 512,
+                    nominalMaxSequenceLength: 1024))
+        else { return XCTFail("paged fixture must build") }
+        let asProtocol: any CBv2KVBackend = paged
+        XCTAssertTrue(
+            asProtocol.kvResidency is CBv2PagedKVResidency,
+            "the override must be a witness, not a static-dispatch shadow")
+        XCTAssertEqual(asProtocol.kvResidency.residentRows(layer: kinds[0], tokens: 1), 16)
     }
 }

@@ -744,6 +744,118 @@ struct CBv2LastQueryPrefillPolicyTests {
     }
 }
 
+// MARK: - 4b. The SHIPPING model selects this path (anti-dead-code pin)
+
+/// Last-query prefill was proposed for deletion as "dead on gemma-4-26B"
+/// on the theory that `num_kv_shared_layers` defaults to 20, so the final
+/// layer is always KV-shared and `gemma4SupportsLastQueryPrefill` is always
+/// false. That default only applies when the key is ABSENT. Every shipping
+/// gemma-4-26B-A4B checkpoint states `"num_kv_shared_layers": 0`
+/// explicitly, so the final layer owns its K/V and the specialization is
+/// SELECTED on every production prompt chunk. A Swift struct default is
+/// evidence about absent keys only, never about a shipping checkpoint.
+///
+/// This suite exists because the rest of the file could not refute that
+/// claim. `sharedFinalLayerConfigIsRejected` above looks like it pins the
+/// production model and does not: `TinyGemma.sharedFinalConfig()`
+/// DELIBERATELY passes `numKvSharedLayers: 2` to construct the rejected
+/// geometry, so it pins the NEGATIVE case only. Nothing here asserted
+/// anything about the shape actually shipped — which is exactly what made
+/// the wrong conclusion look tested. Do not delete this suite to make a
+/// removal easier; it is the removal's counter-evidence.
+///
+/// The fixture below is the verbatim `text_config` shape of
+/// `mlx-community/gemma-4-26B-A4B-it-qat-4bit` (30 layers, 5-periodic
+/// sliding/full pattern ending in `full_attention`). It is a literal, not
+/// a checkpoint read, so it needs no download and cannot go vacuous.
+@Suite("CBv2LastQueryPrefill shipping-model shape")
+struct CBv2LastQueryPrefillProductionShapeTests {
+
+    /// gemma-4-26B-A4B-it-qat-4bit `text_config`, scalars verbatim.
+    static func shippingConfig() throws -> Gemma4TextConfiguration {
+        let pattern = (0 ..< 5).flatMap { _ in
+            Array(repeating: "sliding_attention", count: 5) + ["full_attention"]
+        }
+        let types = pattern.map { "\"\($0)\"" }.joined(separator: ", ")
+        let json = """
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 2816,
+                "num_hidden_layers": 30,
+                "intermediate_size": 2112,
+                "num_attention_heads": 16,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "num_key_value_heads": 8,
+                "num_global_key_value_heads": 2,
+                "num_kv_shared_layers": 0,
+                "layer_types": [\(types)],
+                "sliding_window": 1024,
+                "attention_k_eq_v": true,
+                "enable_moe_block": true,
+                "final_logit_softcapping": 30.0,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "use_bidirectional_attention": "vision",
+                "tie_word_embeddings": true,
+                "vocab_size": 262144,
+                "vocab_size_per_layer_input": 262144,
+                "rms_norm_eps": 1e-6
+            }
+            """
+        return try JSONDecoder.json5().decode(
+            Gemma4TextConfiguration.self, from: Data(json.utf8))
+    }
+
+    /// The premise of the "dead code" claim, refuted at its root: the
+    /// shipping checkpoint states 0 shared layers, so the decoder default
+    /// of 20 never applies and the FINAL layer owns its K/V.
+    @Test func shippingConfigHasNoSharedFinalLayer() throws {
+        let config = try Self.shippingConfig()
+        #expect(config.numHiddenLayers == 30)
+        #expect(config.layerTypes.count == 30)
+        #expect(config.layerTypes.last == "full_attention")
+        #expect(config.numKvSharedLayers == 0)
+        #expect(config.layerUsesSharedKV(layerIdx: config.numHiddenLayers - 1) == false)
+    }
+
+    @Test func shippingConfigSupportsLastQueryPrefill() throws {
+        #expect(gemma4SupportsLastQueryPrefill(try Self.shippingConfig()))
+    }
+
+    /// The real `CBv2LayerCache` is what the engine binds, and it conforms
+    /// — so the trunk's `hasCapableCache` probe (Gemma4Text.swift, the
+    /// `fullCache[idx] is any CBv2LastQueryPrefillLayerCache` argument) is
+    /// true for every layer in production.
+    @Test func engineLayerCacheIsCapable() throws {
+        let config = try Self.shippingConfig()
+        let kinds = config.cbv2LayerKinds
+        let final = CBv2LayerCache(layerIndex: kinds.count - 1, kind: kinds[kinds.count - 1])
+        #expect(final is any CBv2LastQueryPrefillLayerCache)
+    }
+
+    /// End of the chain: with the shipping config, a capable cache, and the
+    /// trunk's own knob values, the policy seam SELECTS last-query prefill
+    /// for the final layer of any prompt chunk the trunk narrows. Deleting
+    /// the feature would change production behaviour.
+    @Test func shippingConfigSelectsLastQueryPrefillOnFinalLayer() throws {
+        let config = try Self.shippingConfig()
+        let chunk = PrefillKnobs.narrowingChunk
+        let selected = gemma4UseLastQueryPrefill(
+            config,
+            layerIdx: config.numHiddenLayers - 1,
+            batchSize: 1,
+            sequenceLength: chunk,
+            outputTailRows: PrefillKnobs.tailRows > 0 ? min(PrefillKnobs.tailRows, chunk) : nil,
+            hasCapableCache: true,
+            enabled: PrefillKnobs.lastQueryEnabled)
+        let expected = PrefillKnobs.lastQueryEnabled && PrefillKnobs.tailRows == 1
+        #expect(
+            selected == expected,
+            "shipping gemma-4-26B selects last-query prefill under default knobs")
+    }
+}
+
 // MARK: - 5/6. Decoder-layer parity (deterministic, env-independent)
 
 @Suite("CBv2LastQueryPrefill decoder-layer parity")

@@ -291,57 +291,6 @@ struct CBv2CoreWindowedSequenceKVTests {
     }
 }
 
-// MARK: - QuantizedSequenceKV
-
-@Suite("CBv2Core: QuantizedSequenceKV")
-struct CBv2CoreQuantizedSequenceKVTests {
-
-    @Test func roundTripReturnsDequantizedViews() {
-        MLXRandom.seed(7)
-        let row = CBv2QuantizedSequenceKV(
-            promptLength: 8, maxLength: 128, kvHeads: 2, headDim: 64, groupSize: 64, bits: 8)
-        let keys = MLXRandom.normal([1, 2, 8, 64]).asType(.float16)
-        let values = MLXRandom.normal([1, 2, 8, 64]).asType(.float16)
-        let (k, v) = row.update(keys: keys, values: values)
-        #expect(k.shape == [1, 2, 8, 64])
-        #expect(k.dtype == .float16)
-        // 8-bit affine quantization error is small.
-        expectClose(k, keys, rtol: 0.05, atol: 0.05, "dequantized keys")
-        expectClose(v, values, rtol: 0.05, atol: 0.05, "dequantized values")
-        #expect(row.byteCount > 0)
-        // Quantized storage is smaller than fp16 storage for the same capacity.
-        let fp16Row = CBv2FullSequenceKV(promptLength: 8, maxLength: 128, kvHeads: 2, headDim: 64)
-        _ = fp16Row.update(keys: keys, values: values)
-        #expect(row.byteCount < fp16Row.byteCount)
-    }
-
-    @Test func appendRollbackSnapshotBookkeeping() {
-        MLXRandom.seed(8)
-        let row = CBv2QuantizedSequenceKV(
-            promptLength: 4, maxLength: 512, kvHeads: 2, headDim: 64, groupSize: 64, bits: 8)
-        let first = MLXRandom.normal([1, 2, 4, 64]).asType(.float16)
-        _ = row.update(keys: first, values: first)
-        // Growth past initial capacity (4 + 256) in a second big chunk.
-        let second = MLXRandom.normal([1, 2, 300, 64]).asType(.float16)
-        let (k2, _) = row.update(keys: second, values: second)
-        #expect(k2.dim(2) == 304)
-        #expect(row.absoluteOffset == 304)
-
-        row.rollback(300)
-        #expect(row.absoluteOffset == 4)
-        let snap = row.snapshot()
-        #expect(snap.offset == 4)
-        expectClose(snap.keys, first, rtol: 0.05, atol: 0.05, "snapshot after rollback")
-    }
-
-    @Test func groupSizeResolvesToHeadDimCompatible() {
-        // headDim 96 is not divisible by 64 → nearest compatible is 32.
-        let row = CBv2QuantizedSequenceKV(
-            promptLength: 2, maxLength: 16, kvHeads: 1, headDim: 96, groupSize: 64, bits: 8)
-        #expect(row.groupSize == 32)
-    }
-}
-
 // MARK: - ContiguousKVBackend
 
 @Suite("CBv2Core: ContiguousKVBackend")
@@ -517,19 +466,6 @@ struct CBv2CoreContiguousBackendTests {
         #expect(backend.bytesReserved == 2048)
         backend.release(first)
         backend.release(second)
-    }
-
-    @Test func quantizedConfigProducesQuantizedFullLayers() throws {
-        let backend = CBv2ContiguousKVBackend(
-            config: .init(bytesCapacity: 1 << 24, quantization: (groupSize: 64, bits: 8)))
-        let kinds = [
-            CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4),
-            CBv2LayerKind(attention: .slidingWindow(8), headDim: 64, kvHeads: 2, queryHeads: 4),
-        ]
-        let state = try backend.makeSequenceState(layerKinds: kinds, promptLength: 4, maxLength: 64)
-        #expect(state[0] is CBv2QuantizedSequenceKV)
-        #expect(state[1] is CBv2WindowedSequenceKV)  // windowed stays unquantized
-        backend.release(state)
     }
 
     @Test func adoptingPrefixFreezesFullLayersAndOffsetsWindowedRows() throws {

@@ -14,9 +14,7 @@ import MLX
 /// This prevents incomplete sliding-window replay activations from poisoning
 /// persistent downstream full-attention state. Chunks must not cross M; the
 /// scheduler enforces that boundary from the same `CBv2PrefixReusePlan`.
-public final class CBv2FrozenReplayFullSequenceKV:
-    CBv2SequenceKV, CBv2InnerStateProviding, CBv2CompiledFullSequenceKV
-{
+public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     public private(set) var absoluteOffset: Int
     public var retainedCount: Int { absoluteOffset }
     public let frozenHighWater: Int
@@ -67,7 +65,6 @@ public final class CBv2FrozenReplayFullSequenceKV:
         keys.nbytes + values.nbytes
     }
 
-    public var snapshotIsLossless: Bool { true }
     public var supportsSpeculativeWrites: Bool { true }
 
     public func update(
@@ -123,39 +120,6 @@ public final class CBv2FrozenReplayFullSequenceKV:
 
     func cbv2InnerState() -> [MLXArray] {
         [keys, values]
-    }
-
-    func compiledStorage(
-        capacity requestedCapacity: Int,
-        keysDType: DType,
-        valuesDType: DType
-    ) -> (keys: MLXArray, values: MLXArray)? {
-        guard appendMode, absoluteOffset < requestedCapacity else { return nil }
-        guard keys.dtype == keysDType, values.dtype == valuesDType else { return nil }
-        guard capacity <= requestedCapacity else { return nil }
-        if capacity < requestedCapacity {
-            let growth = requestedCapacity - capacity
-            keys = concatenated(
-                [
-                    keys,
-                    MLXArray.zeros([1, kvHeads, growth, headDim], dtype: keys.dtype),
-                ],
-                axis: 2)
-            values = concatenated(
-                [
-                    values,
-                    MLXArray.zeros([1, kvHeads, growth, headDim], dtype: values.dtype),
-                ],
-                axis: 2)
-            capacity = requestedCapacity
-        }
-        return (keys, values)
-    }
-
-    func noteCompiledAdvance() {
-        precondition(appendMode, "compiled decode cannot run during frozen replay")
-        precondition(absoluteOffset < capacity, "compiled advance past frozen-row capacity")
-        absoluteOffset += 1
     }
 
     var didTransitionToAppendForTesting: Bool { appendMode }

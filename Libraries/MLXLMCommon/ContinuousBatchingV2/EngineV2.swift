@@ -7,6 +7,7 @@
 // ids per the contract); the engine thread only ever does graph-build +
 // asyncEval. Cancellation drops the row at the next step boundary, O(1).
 
+import CryptoKit
 import Foundation
 import MLX
 import os
@@ -28,8 +29,8 @@ final class CBv2EngineGauges: @unchecked Sendable {
     init(kvBytesCapacity: Int, kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0) {
         // Seed backend truth at construction: heartbeats read `capacity()`
         // on IDLE engines (zero steps published), and a paged slot must
-        // report its pool ceiling — and a compiled engine its padding
-        // carve — from the first beat, not after the first request.
+        // report its pool ceiling from the first beat, not after the
+        // first request.
         self.snapshot = CBv2CapacitySnapshot(
             activeRequests: 0, waitingRequests: 0, kvBytesInUse: 0,
             kvBytesCapacity: kvBytesCapacity,
@@ -138,11 +139,16 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// Steps that evaluated the eager caches' offset/KV inner state (DAR-325
     /// guard). Test hook; engine-thread owned, read at quiescent points.
     public var offsetChainEvalSteps: Int { loop.offsetChainEvalSteps }
-    /// Compiled-decode telemetry, or nil when the compiled path was never
-    /// built (config off, ineligible model, unsupported hardware).
-    /// NOTE: counters are engine-thread owned; read at quiescent points
-    /// (after streams finish) for exact values.
-    public var compiledDecodeStats: CBv2CompiledDecodeStats? { loop.compiledDecode?.stats }
+
+    /// Packed-prefill capability AND cumulative execution evidence. The
+    /// counters move only where `executeMixed` issues a rectangular
+    /// `[B > 1, chunk]` forward, so a model that claims packing and never
+    /// packs reads `isSupported == true, didExecute == false`. Plain counter
+    /// reads (no lock, no step-path cost); poll from a benchmark harness or
+    /// heartbeat, ideally at a quiescent point.
+    public func packedPrefillActivity() -> CBv2PackedPrefillActivity {
+        loop.packedPrefillActivity()
+    }
 
     /// Cumulative MTP (speculative decoding) counters, or nil when MTP is
     /// inactive (no drafter, config/kill-switch off, or a model that cannot
@@ -154,8 +160,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public let mtpInactiveReason: String?
     /// Internal test hook (engine-queue synchronized).
     var loopForTesting: EngineLoopV2 { loop }
-    /// Internal test hook: the admission ledger, for asserting the compiled
-    /// padding reserve is charged (or not) at construction.
+    /// Internal test hook: the admission ledger, for asserting byte
+    /// reservation accounting at construction and across resizes.
     var admissionForTesting: AdmissionV2 { admission }
 
     public init(
@@ -169,7 +175,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         loopConfig: CBv2EngineLoopConfig = CBv2EngineLoopConfig(),
         admissionConfig: AdmissionV2.Config = AdmissionV2.Config(),
         prefixCache: CBv2PrefixCache? = nil,
-        compiledDecodeConfig: CBv2CompiledDecodeConfig = CBv2CompiledDecodeConfig(),
         mtpDrafter: (any CBv2MTPDrafter)? = nil,
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) {
@@ -191,66 +196,17 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         {
             preconditionFailure(violation)
         }
-        // Compiled [B, 1] decode (Phase 1): traced per bucket at warmup on
-        // the engine queue, replayed for eligible pure-decode steps, eager
-        // fallback everywhere else. nil when statically ineligible —
-        // including when the eager layer caches carry an attention softcap
-        // the compiled path cannot reproduce (numerics guard), when the
-        // padding reserve would eat too much of the KV byte budget, or when
-        // the backend mints rows the compiled path cannot bind (quantized
-        // KV, paged slabs — see `producesCompiledDecodeEligibleRows`).
-        var effectiveCompiledConfig = compiledDecodeConfig
-        var softcapVeto = false
-        if effectiveCompiledConfig.attentionSoftcap == nil {
-            if let claim = cacheProvider.uniformAttentionSoftcap {
-                // `.some(x)`: propagate so build() refuses (compiled SDPA
-                // has no softcap path — never silently drift from eager
-                // numerics). `.some(nil)`: uniformly uncapped, safe.
-                effectiveCompiledConfig.attentionSoftcap = claim
-            } else {
-                // No claim (mixed caches, paged-only bank, or a custom
-                // provider that cannot vouch): fail-safe — compiled decode
-                // is vetoed rather than trusted to match eager numerics.
-                softcapVeto = true
-            }
-        }
-        // Backend row-type veto (PR#62 review): the compiled path can only
-        // bind CBv2FullSequenceKV/CBv2WindowedSequenceKV rows. A backend
-        // that mints anything else (contiguous with KV quantization, paged
-        // slabs) would still warm the compiled graphs against fp16 scratch
-        // and charge the admission padding reserve — then laneInfo rejects
-        // every LIVE row, every step falls back eager, and the reserve
-        // permanently tightens admission for zero benefit. Skip the build
-        // entirely: nil executor, no reserve, stay eager.
-        let backendVeto = !backend.producesCompiledDecodeEligibleRows
-        if backendVeto, effectiveCompiledConfig.enabled, CBv2CompiledDecodeConfig.envEnabled {
-            log.info(
-                "CBv2 compiled decode skipped: \(type(of: backend), privacy: .public) mints rows the compiled path cannot bind (e.g. quantized KV) — staying eager, no padding reserve"
-            )
-        }
-        let compiledDecode: CBv2CompiledDecode? =
-            (softcapVeto || backendVeto)
-            ? nil
-            : CBv2CompiledDecode.build(
-                model: model, layerKinds: layerKinds, config: effectiveCompiledConfig,
-                maxConcurrentRequests: schedulerConfig.maxConcurrentRequests,
-                kvBytesCapacity: backend.bytesCapacity)
-        // Truthful admission under compiled padding: the compiled path pads
-        // full-attention rows to its bucket capacity (more bytes than token
-        // admission would budget), so its worst-case reserve is carved out
-        // of the ledger as a REFUNDABLE external reserve — if warmup tracing
-        // later disables compiled decode, the loop refunds it so admission
-        // does not stay permanently tighter than the hardware truth (PR#62
-        // review). Heartbeat capacity stays the hardware truth.
+        // The ledger's token→byte conversion asks the BACKEND what a row
+        // occupies (`CBv2KVResidencyPolicy`): contiguous windowed rows own
+        // their whole fixed ring from the first write, paged rows own only
+        // the pages `PagedKVPool.pageDemand` reserves.
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
-            config: admissionConfig,
-            externalReserveBytes: compiledDecode?.admissionPaddingReserve ?? 0)
+            config: admissionConfig, residency: backend.kvResidency)
         self.admission = admission
         let gauges = CBv2EngineGauges(
             kvBytesCapacity: backend.bytesCapacity,
-            kvBytesBackendCapacity: backend.bytesCapacity,
-            kvBytesReserved: compiledDecode?.admissionPaddingReserve ?? 0)
+            kvBytesBackendCapacity: backend.bytesCapacity)
         self.gauges = gauges
         // MTP verification bypasses the sampler and emits raw target
         // argmaxes. Only the two known argmax-equivalent implementations may
@@ -310,7 +266,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             scheduler: scheduler,
             capacity: admission,
             prefixCache: activePrefixCache,
-            compiledDecode: compiledDecode,
             mtp: mtpDriver,
             config: loopConfig,
             gauges: gauges)
@@ -408,7 +363,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 promptTokens: request.promptTokens.count, maxTokens: request.maxTokens)
         else {
             throw CBv2KVError.capacityExhausted(
-                needed: admission.estimatedBytes(
+                needed: admission.allocatedBytes(
                     forTokens: request.promptTokens.count + request.maxTokens),
                 available: admission.admissibleBytesCapacity)
         }
@@ -496,23 +451,24 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             }
             exactStagedFullKVBytes = sum
         }
-        let replayTokens = min(
-            hit.matched,
-            prefixReuseCapability.conservativeReplayBoundTokens)
-        let replayStart = hit.matched - replayTokens
-        let initialReservationTokens =
-            prefixReuseCapability.strategy == .frozenFullReplay
-            ? hit.matched : replayStart
+        // The fixed sliding rings are deliberately NOT added on top of the
+        // plan's capacity adjustment. Since Bug A (paged-KV plan §7 item
+        // 0.1) the ledger charges every windowed layer its WHOLE ring
+        // inside the token reservation itself
+        // (`AdmissionV2.allocatedBytes(forTokens:)`), and `applyAdoption`
+        // reserves `plan.capacityReservationTokens` — always > 0 for a
+        // non-nil plan — before it touches the backend. Routing the
+        // shortfall through `initialAdditionalCapacityBytes` as well would
+        // charge the rings twice and starve adoption on Gemma-style
+        // hybrids. Accounting overflow still fails cold: `reserve` throws
+        // `capacityExhausted` and adoption falls back to a full prefill.
         guard !byteOverflow,
-            let fixedWindowCapacityBytes = admission.fixedWindowBytesShortfall(
-                afterReservingTokens: initialReservationTokens),
             let plan = prefixReuseCapability.plan(
                 matchedBoundary: hit.matched,
                 exactStagedFullKVBytes: exactStagedFullKVBytes,
                 maximumSequenceLength:
                     request.promptTokens.count + max(request.maxTokens, 1),
-                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
-                fixedWindowCapacityBytes: fixedWindowCapacityBytes)
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken)
         else {
             prefixCache.endAdoption(
                 requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,
@@ -618,6 +574,204 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         AsyncStream { continuation in
             continuation.yield(.finished(reason: reason, usage: usage))
             continuation.finish()
+        }
+    }
+}
+
+// MARK: - Teacher-forced top-1 scoring (backend parity measurement)
+
+extension EngineV2 {
+    /// Force `continuation` through THIS engine and return the argmax at
+    /// each continuation position (`CBv2Engine.teacherForcedTop1`).
+    ///
+    /// Runs on the engine queue against a private KV row allocated from the
+    /// same backend as any request: the prompt through the loop's own
+    /// `prefillOutput` in the chunks `SchedulerV2` would cut, then one
+    /// `[1, 1]` forward per forced token through the same eager caches the
+    /// decode step uses. Backend, cache provider, chunking and masks are
+    /// the engine's, which is the entire point — scoring outside the engine
+    /// would measure the model, and the two backends share the model.
+    ///
+    /// Never enters the scheduler, the decode chain or the step watchdog,
+    /// and never samples: no sampler is consulted, so `CBv2SamplingParams`,
+    /// temperature, seeds and token constraints cannot reach it. Repeated
+    /// calls with the same arguments return the same ids.
+    ///
+    /// Throws `CBv2TeacherForcingError.engineBusy` rather than scoring
+    /// beside an in-flight step, `.engineNotRunning` after `shutdown()`,
+    /// `.nothingToScore` for an empty prompt or continuation, and
+    /// `CBv2KVError.capacityExhausted` when the pool cannot seat the row.
+    public func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int] {
+        try loop.teacherForcedTop1(promptTokens: promptTokens, continuation: continuation)
+    }
+
+    /// Cumulative evidence that the scoring above drove real engine
+    /// forwards. Counters move at the forwards themselves, so a harness can
+    /// assert `decodeForwardsExecuted` grew by exactly
+    /// `continuation.count - 1` across a call instead of trusting that the
+    /// witness exists.
+    public func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity {
+        loop.teacherForcedScoringActivity()
+    }
+}
+
+// MARK: - Prefill logit digest (backend parity measurement)
+
+/// One-shot delivery box for the captured frontier logits. The capture runs
+/// on the engine queue; the digest caller blocks on the semaphore. Only the
+/// FIRST delivery is kept — a probe has exactly one prompt frontier, and a
+/// second one would mean the row was re-prefilled after preemption, in
+/// which case the first (uninterrupted) vector is the one that matches a
+/// quiescent arm.
+private final class CBv2FrontierLogitBox: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var captured: MLXArray?
+
+    func deliver(_ logits: MLXArray) {
+        lock.lock()
+        let isFirst = captured == nil
+        if isFirst { captured = logits }
+        lock.unlock()
+        if isFirst { semaphore.signal() }
+    }
+
+    /// nil means the frontier never fired inside the window — the caller
+    /// MUST throw rather than digest anything.
+    func wait(seconds: TimeInterval) -> MLXArray? {
+        guard semaphore.wait(timeout: .now() + seconds) == .success else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
+    }
+}
+
+extension EngineV2 {
+    /// Ceiling on how long a probe prefill may take before the digest call
+    /// refuses. Generous: this is a once-per-arm measurement over a whole
+    /// prompt on a cold engine, not a step-path budget.
+    private static let digestProbeTimeout: TimeInterval = 120
+
+    /// Serializes probes: the loop holds ONE capture hook, so two concurrent
+    /// digests would fight over it.
+    private static let digestProbeLock = NSLock()
+    private nonisolated(unsafe) static var digestProbeCounter: UInt64 = .max
+
+    private static func nextDigestProbeID() -> CBv2RequestID {
+        digestProbeCounter &-= 1
+        return CBv2RequestID(digestProbeCounter)
+    }
+
+    /// SHA-256 of the final-position prefill logit vector this engine
+    /// produces for `promptTokens`, taken on the engine's OWN prefill path.
+    ///
+    /// A probe request (`maxTokens: 1`, greedy, prefix cache off) is
+    /// submitted through the ordinary `submit` surface, so the vector is
+    /// computed by the real scheduler, the real chunking, the real layer
+    /// caches and the real KV backend. The capture sits at the prompt
+    /// frontier BEFORE the sampler, so nothing downstream of the logits can
+    /// launder a backend difference away. There is no second prefill
+    /// implementation here to drift from the first.
+    ///
+    /// The prefix cache is disabled FOR THE PROBE ONLY (both directions):
+    /// an adopted prefix would make the digest a function of some other
+    /// request's donated KV, and a donation would make later traffic a
+    /// function of the measurement. Neither is a property of the arm under
+    /// test.
+    ///
+    /// Blocking and synchronous by design — the harness calls it once per
+    /// arm at a quiescent point. Never call it from the engine queue.
+    ///
+    /// Throws `CBv2PrefillLogitDigestError.emptyPrompt`,
+    /// `.prefillProducedNoLogits` when no frontier fired inside the window
+    /// (wedged step, cancelled row), `.unexpectedLogitShape` when the
+    /// frontier is not a single vector, and whatever `submit` throws
+    /// (`CBv2KVError.capacityExhausted` when the probe cannot be admitted,
+    /// including after `shutdown()`). It never returns a fabricated digest.
+    public func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest {
+        guard !promptTokens.isEmpty else {
+            throw CBv2PrefillLogitDigestError.emptyPrompt
+        }
+        Self.digestProbeLock.lock()
+        defer { Self.digestProbeLock.unlock() }
+
+        let probeID = Self.nextDigestProbeID()
+        let box = CBv2FrontierLogitBox()
+        loop.setPrefillFrontierCapture { id, logits in
+            guard id == probeID else { return }
+            box.deliver(logits)
+        }
+        defer { loop.setPrefillFrontierCapture(nil) }
+
+        // The stream must outlive the wait: dropping it trips
+        // `CBv2OutputStream.onAbandoned`, which cancels the row — possibly
+        // before it ever prefills.
+        let stream = try submit(
+            CBv2Request(
+                id: probeID,
+                promptTokens: promptTokens,
+                sampling: CBv2SamplingParams(temperature: 0),
+                maxTokens: 1,
+                prefixCacheEnabled: false))
+        let captured = box.wait(seconds: Self.digestProbeTimeout)
+        cancel(probeID)
+        withExtendedLifetime(stream) {}
+
+        guard let captured else {
+            throw CBv2PrefillLogitDigestError.prefillProducedNoLogits(
+                seconds: Self.digestProbeTimeout)
+        }
+        // Evaluate on the engine queue: the captured handle is a lazy graph
+        // node over the same slabs a live step may still be writing, and MLX
+        // graph work is not safe to run beside the step thread.
+        return try loop.onEngineQueueSync {
+            try Self.digest(frontierLogits: captured)
+        }
+    }
+
+    /// Hash the RAW bytes of the frontier vector in the dtype the model
+    /// produced. No `asType`: an upcast here would make a bf16 arm and an
+    /// fp32 arm hash identically for values that differ below fp16
+    /// precision, which is exactly the drift this seam has to see.
+    static func digest(frontierLogits: MLXArray) throws -> CBv2PrefillLogitDigest {
+        let vector: MLXArray
+        switch frontierLogits.ndim {
+        case 1: vector = frontierLogits
+        case 2 where frontierLogits.dim(0) == 1: vector = frontierLogits[0]
+        default: throw CBv2PrefillLogitDigestError.unexpectedLogitShape(frontierLogits.shape)
+        }
+        let maxAbs = MLX.abs(vector).max().item(Float.self)
+        let raw = vector.asData(access: .copy)
+        var hasher = SHA256()
+        hasher.update(data: raw.data)
+        let hex = hasher.finalize().reduce(into: "") { $0 += String(format: "%02x", $1) }
+        return CBv2PrefillLogitDigest(
+            dtype: Self.dtypeName(raw.dType),
+            count: vector.dim(0),
+            sha256: hex,
+            maxAbs: maxAbs)
+    }
+
+    /// Stable, MLX-canonical dtype spelling. A `String(describing:)` on
+    /// `DType` would be a Swift enum case name and would silently change
+    /// shape if mlx-swift renames one; the harness compares these across
+    /// arms and across builds.
+    static func dtypeName(_ dtype: DType) -> String {
+        switch dtype {
+        case .bool: return "bool"
+        case .uint8: return "uint8"
+        case .uint16: return "uint16"
+        case .uint32: return "uint32"
+        case .uint64: return "uint64"
+        case .int8: return "int8"
+        case .int16: return "int16"
+        case .int32: return "int32"
+        case .int64: return "int64"
+        case .float16: return "float16"
+        case .float32: return "float32"
+        case .bfloat16: return "bfloat16"
+        case .complex64: return "complex64"
+        case .float64: return "float64"
         }
     }
 }

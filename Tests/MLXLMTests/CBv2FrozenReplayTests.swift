@@ -382,8 +382,7 @@ final class CBv2FrozenReplayCounterexampleTests: XCTestCase {
                 prefillChunkSize: 16,
                 maxWaiting: 4,
                 enablePrefixCache: true),
-            prefixCache: cache,
-            compiledDecodeConfig: .init(enabled: false))
+            prefixCache: cache)
         let prompt = makePromptTokens(length: 73, seed: 0xCACE)
         let donor = await cbv2SchedCollect(
             try engine.submit(

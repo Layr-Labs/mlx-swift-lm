@@ -12,7 +12,6 @@ public enum CBv2PrefixReuseBackend: String, Sendable, Equatable {
     /// caches fp16; GPT-OSS full-attention rows are fp32. Dynamic plans bind
     /// exact staged `nbytes`, so neither is estimated as the other.
     case contiguousUnquantized = "contiguous_unquantized"
-    case contiguousQuantized = "contiguous_quantized"
     case pagedFP16 = "paged_fp16"
     case unknown
 }
@@ -29,7 +28,6 @@ public enum CBv2PrefixReuseUnsupportedReason: String, Sendable, Equatable {
     case emptyLayout = "empty_layout"
     case invalidLayout = "invalid_layout"
     case pagedHybridRequiresDualCursor = "paged_hybrid_requires_dual_cursor"
-    case quantizedRowsUnsupported = "quantized_rows_unsupported"
     case unknownBackend = "unknown_backend"
     case accountingOverflow = "accounting_overflow"
 }
@@ -117,34 +115,47 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         let (product, overflow) = windowCount.multipliedReportingOverflow(by: maxWindow)
         let replayBound = overflow ? Int.max : product
 
-        if backend == .contiguousQuantized {
-            return unsupported(
-                backend: backend,
-                reason: .quantizedRowsUnsupported,
-                replayBound: replayBound,
-                fullKVBytesPerToken: fullKVBytesPerToken)
-        }
         if hasOwningFullAfterWindow {
             switch backend {
-            case .contiguousUnquantized:
+            case .contiguousUnquantized, .pagedFP16:
+                // Both backends now pay the SAME conservative replay, and
+                // that is a recent and hard-won equality — do not let the two
+                // cases drift apart again without reading this.
+                //
+                // Paged used to pay `+ maxWindow`, because
+                // `CBv2FrozenReplayFullSequenceKV.update` hands attention the
+                // CACHED keys for a whole replay chunk while the paged layer
+                // handed it `gather ++ freshly-projected chunk`. A frozen
+                // paged row therefore emitted exact keys before the current
+                // chunk and poisoned ones inside it, so exactness began one
+                // chunk later than contiguous's `windowCount * maxWindow`.
+                //
+                // That is gone: `PagedLayerCache.prefillKVWritingChunk` takes
+                // the frozen branch's gather AFTER the (cursor-only) write and
+                // reads `[baseOffset, queryStart + chunk)` straight out of the
+                // frozen pages, cached diagonal included. "Exact once the
+                // CHUNK starts at or after the cone frontier" collapses back
+                // to "exact once the POSITION is at or after it", which is
+                // this bound. Verified rather than argued: a frozen row handed
+                // arbitrary poison for its chunk is array-equal to a cold twin
+                // at the first replayed chunk, and the fixture model is
+                // token-exact AND window-exact at exactly R == this bound
+                // (`CBv2PagedFrozenChunkGather`).
+                //
+                // The extra window also brought `replayChunkCeiling`,
+                // `maxWindowTokens` and `PagedKVBackend.requiredFrozenReplay
+                // Tokens` with it; all three are deleted. If a future change
+                // makes a frozen paged row attend freshly projected keys
+                // again, the term comes back and so does that machinery —
+                // re-read `PagedKVBackend`'s adoption guard first, because it
+                // now checks `cbv2RequiredRecompute` and would silently accept
+                // a replay that is one chunk short.
                 return Self(
                     backend: backend,
                     strategy: .frozenFullReplay,
                     conservativeReplayBoundTokens: replayBound,
                     fullKVBytesPerToken: fullKVBytesPerToken,
                     unsupportedReason: nil)
-            case .pagedFP16:
-                return unsupported(
-                    backend: backend,
-                    reason: .pagedHybridRequiresDualCursor,
-                    replayBound: replayBound,
-                    fullKVBytesPerToken: fullKVBytesPerToken)
-            case .contiguousQuantized:
-                return unsupported(
-                    backend: backend,
-                    reason: .quantizedRowsUnsupported,
-                    replayBound: replayBound,
-                    fullKVBytesPerToken: fullKVBytesPerToken)
             case .unknown:
                 return unsupported(
                     backend: backend,
@@ -171,12 +182,23 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
 
     /// Produce one immutable match-specific contract. Exact staged bytes come
     /// from the hit arrays, so native fp16/fp32 layouts are accounted as held.
+    ///
+    /// `restoringWindowsAtBoundary` is the adopter's promise that it holds an
+    /// EXACT sliding window ending at `matchedBoundary` for every windowed
+    /// layer — the paged seam's `CBv2PagedWindowSnapshot`, sourced from the
+    /// provider's per-block window sidecars. It collapses R to zero and puts
+    /// both cursors at M, which is the form
+    /// `PagedSeamContract` calls "no second cursor". The promise is CHECKED,
+    /// not trusted: `PagedKVBackend.makeSequenceState(adopting:)` refuses a
+    /// zero-replay plan whose prefix does not carry an admissible window for
+    /// every owning windowed layer, and the engine then cold-prefills.
     public func plan(
         matchedBoundary: Int,
         exactStagedFullKVBytes: Int? = nil,
         maximumSequenceLength: Int? = nil,
         nominalFullKVBytesPerToken: Int? = nil,
-        fixedWindowCapacityBytes: Int = 0
+        fixedWindowCapacityBytes: Int = 0,
+        restoringWindowsAtBoundary: Bool = false
     ) -> CBv2PrefixReusePlan? {
         guard let strategy, unsupportedReason == nil, matchedBoundary > 0 else {
             return nil
@@ -186,14 +208,18 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         guard nominalBytesPerToken >= 0, fixedWindowCapacityBytes >= 0 else {
             return nil
         }
-        let replayTokens = min(matchedBoundary, conservativeReplayBoundTokens)
+        // A restored window makes the replay unnecessary, but only for the
+        // strategy that keeps the full rows at M. Tail replay restores its
+        // full rows to C, so its windowed rows have to march from C too.
+        let restoresWindows = restoringWindowsAtBoundary && strategy == .frozenFullReplay
+        let replayTokens =
+            restoresWindows ? 0 : min(matchedBoundary, conservativeReplayBoundTokens)
         let replayStart = matchedBoundary - replayTokens
         guard replayStart > 0 || replayTokens == 0 else { return nil }
         let restoredFullTokens =
             strategy == .frozenFullReplay ? matchedBoundary : replayStart
         let capacityReservationTokens =
             strategy == .frozenFullReplay ? matchedBoundary : replayStart
-
         let exactBytesPerToken: Int
         let stagedBytes: Int
         if let exactStagedFullKVBytes {
@@ -330,7 +356,27 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     public let stagedFullKVBytes: Int
     public let residentFullKVBytes: Int
 
+    /// A frozen-full plan with nothing to replay: the adopter promised an
+    /// EXACT sliding window ending at M for every windowed layer, so both
+    /// cursors sit at M and the request resumes with an ordinary prefill of
+    /// `[M, promptLength)`.
+    ///
+    /// The two frozen-full forms are mutually exclusive and a backend must
+    /// branch on this rather than on `replayTokens > 0` ad hoc: the restore
+    /// form REQUIRES a window payload for every owning windowed layer and
+    /// must refuse without one, while the replay form REQUIRES the opposite
+    /// (windowed layers are recomputed, so a payload for one means the
+    /// donor and the plan disagree about what is being adopted).
+    public var requiresExactWindowRestore: Bool {
+        strategy == .frozenFullReplay && replayTokens == 0
+    }
+
     /// Clamp a proposed prefill chunk so it cannot cross C or M.
+    ///
+    /// The split at M is not bookkeeping. A frozen paged full row has
+    /// immutable storage below M and appends above it, and one `write` call
+    /// cannot do both — `PagedSequenceKV.write` traps rather than guess. This
+    /// clamp is what keeps a chunk off that boundary.
     public func clampedChunk(start: Int, proposed: Int) -> Int {
         guard proposed > 0 else { return proposed }
         var result = proposed
