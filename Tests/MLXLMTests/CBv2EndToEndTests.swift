@@ -447,27 +447,60 @@ final class CBv2EndToEndTests: XCTestCase {
         XCTAssertEqual(second.text, first.text)
     }
 
-    func testStackedSlidingPagedBackendFailsCold() async throws {
+    /// WS-4.1. The paged twin of `testStackedSlidingFrozenFullReplayIsToken
+    /// Exact` above, on the same layout and prompt: paged used to fail cold on
+    /// an interleaved hybrid (`pagedHybridRequiresDualCursor`) and now serves
+    /// it end to end through the production engine, donation queue and
+    /// PrefixCacheV2 — a real hit, token-identical to the cold run.
+    ///
+    /// The numbers are now IDENTICAL to the contiguous twin's, and that is
+    /// what this test is for. They used to differ by exactly one window:
+    /// `PagedLayerCache.prefillKV` attended `gather ++ chunk` with the chunk
+    /// half freshly projected, where `CBv2FrozenReplayFullSequenceKV` hands
+    /// back the cached keys, so a frozen paged row needed an extra window of
+    /// replay — replayBound 48, saving 72 - 48 = 24, against contiguous's 32
+    /// and 40. `prefillKVWritingChunk` reads the cached diagonal out of the
+    /// frozen pages now, so both arms run M = 72, R = 32, C = 40 and save 40:
+    ///   contiguous  replayBound 2 x 16 = 32, saves 72 - 32 = 40
+    ///   paged       replayBound 2 x 16 = 32, saves 72 - 32 = 40
+    /// This is the end-to-end statement of paged/contiguous parity on prefix
+    /// reuse. If these numbers ever diverge from the twin above again, a
+    /// paged-specific replay term has come back.
+    ///
+    /// The zero-replay form (every sliding row restored EXACTLY at M from a
+    /// `CBv2PagedWindowSnapshot`) is covered at the backend level by
+    /// `CBv2PrefixReusePagedFrozenFullTests`. It cannot be exercised from here
+    /// because nothing in the engine donates a window: `PrefixCacheV2
+    /// .isCacheable` nils every sliding layer, and the payload comes from the
+    /// provider's per-block window sidecar.
+    func testStackedSlidingPagedBackendServesFrozenFullReplay() async throws {
         let model = TinyTestModel.make(
             seed: 0xD00D_F00D,
             headDim: 64,
             stackedSlidingFull: true)
         let prompt = makePromptTokens(length: 73, seed: 0x5EED)
         let stack = try makeStack(.paged, model: model, enablePrefixCache: true)
-        XCTAssertFalse(stack.engine.prefixReuseCapability.isSupported)
-        XCTAssertEqual(
-            stack.engine.prefixReuseCapability.unsupportedReason,
-            .pagedHybridRequiresDualCursor)
+        XCTAssertTrue(stack.engine.prefixReuseCapability.isSupported)
+        XCTAssertEqual(stack.engine.prefixReuseCapability.strategy, .frozenFullReplay)
+        XCTAssertEqual(stack.engine.prefixReuseCapability.conservativeReplayBoundTokens, 32)
 
         let first = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: 8)))
+        XCTAssertEqual(first.usage?.prefixCacheHitTokens, 0, "first run is a miss")
+        let donated = await cbv2SchedWait { stack.prefixCache.stats().entryCount >= 1 }
+        XCTAssertTrue(donated, "a supported capability must arm donation")
         let second = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: 8)))
         await stack.engine.shutdown()
 
-        XCTAssertEqual(first.tokens, second.tokens)
-        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 0)
-        XCTAssertEqual(stack.prefixCache.stats().entryCount, 0)
+        XCTAssertEqual(second.usage?.prefixCacheMatchedTokens, 72)
+        XCTAssertEqual(second.usage?.prefixCacheStrategy, .frozenFullReplay)
+        XCTAssertEqual(second.usage?.prefixCacheReplayTokens, 32)
+        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 40)
+        XCTAssertEqual(
+            second.tokens, first.tokens,
+            "paged frozen-full replay must be target-token exact")
+        XCTAssertEqual(second.text, first.text)
     }
 
     // MARK: (iv-b) Per-request cache salt isolation (TB-007)

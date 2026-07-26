@@ -52,26 +52,29 @@ private final class MTPRejectingDrafter: CBv2MTPDrafter {
     }
 }
 
-private final class MTPReleaseTrackingCacheProvider: CBv2LayerCacheProvider,
+private final class MTPStalenessTrackingCacheProvider: CBv2LayerCacheProvider,
     CBv2CompositionInvalidating, @unchecked Sendable
 {
     private let bank: CBv2LayerCacheBank
     private let lock = NSLock()
-    private var retainsBoundRows = false
+    private var hasBoundRows = false
     private var staleObserver: (() -> Bool)?
-    private var _releasesWhileBoundAndStale = 0
+    private var _invalidationsWhileStale = 0
 
     init(layerKinds: [CBv2LayerKind]) {
         self.bank = CBv2LayerCacheBank(layerKinds: layerKinds)
     }
 
-    var uniformAttentionSoftcap: Float?? { bank.uniformAttentionSoftcap }
     var supportsMultimodalSpans: Bool { bank.supportsMultimodalSpans }
 
-    var releasesWhileBoundAndStale: Int {
+    /// Times the loop forced a composition rebuild while its own
+    /// `eagerCompositionStale` flag was still set — i.e. a rejecting MTP
+    /// round advanced rows past the caches' host truth and the next eager
+    /// bind repaired it.
+    var invalidationsWhileStale: Int {
         lock.lock()
         defer { lock.unlock() }
-        return _releasesWhileBoundAndStale
+        return _invalidationsWhileStale
     }
 
     func observeStaleness(_ observer: @escaping () -> Bool) {
@@ -83,29 +86,30 @@ private final class MTPReleaseTrackingCacheProvider: CBv2LayerCacheProvider,
     func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let caches = bank.layerCaches(rowStates: rowStates)
         lock.lock()
-        retainsBoundRows = true
+        hasBoundRows = true
         lock.unlock()
         return caches
     }
 
     func invalidateBoundComposition() {
-        // Invalidation alone does not clear the caches' strong row arrays.
+        lock.lock()
+        let wasBound = hasBoundRows
+        let observer = staleObserver
+        lock.unlock()
+        // `eagerCaches` clears `eagerCompositionStale` only AFTER this
+        // call, so the observer still reads the flag that caused it.
+        let stale = observer?() ?? false
         bank.invalidateBoundComposition()
+        guard wasBound, stale else { return }
+        lock.lock()
+        _invalidationsWhileStale += 1
+        lock.unlock()
     }
 
     func releaseBoundRows() {
-        lock.lock()
-        let wasRetaining = retainsBoundRows
-        let observer = staleObserver
-        lock.unlock()
-        let wasAlreadyStale = observer?() ?? false
-
         bank.releaseBoundRows()
         lock.lock()
-        if wasRetaining && wasAlreadyStale {
-            _releasesWhileBoundAndStale += 1
-        }
-        retainsBoundRows = false
+        hasBoundRows = false
         lock.unlock()
     }
 }
@@ -204,7 +208,6 @@ struct CBv2MTPEngineMixedTests {
         maxSpeculativeBatch: Int = 4, maxConcurrent: Int = 4,
         prefillChunkSize: Int = 16, bytesCapacity: Int = 1 << 28,
         admissionConfig: AdmissionV2.Config = .init(),
-        compiledEnabled: Bool = false,
         backend: CBv2KVBackend? = nil,
         cacheProvider: CBv2LayerCacheProvider? = nil,
         prefixCache: CBv2PrefixCache? = nil,
@@ -239,8 +242,6 @@ struct CBv2MTPEngineMixedTests {
                 ?? CBv2EngineLoopConfig(eventBufferCapacity: eventBufferCapacity),
             admissionConfig: admissionConfig,
             prefixCache: prefixCache,
-            compiledDecodeConfig: CBv2CompiledDecodeConfig(
-                enabled: compiledEnabled, buckets: [1, 2], kvCapacity: 256),
             mtpDrafter: drafter,
             mtpConfig: mtpConfig)
     }
@@ -433,7 +434,6 @@ struct CBv2MTPEngineMixedTests {
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: 1, maxBatchedTokensPerStep: 2,
                 prefillChunkSize: 2, maxWaiting: 4),
-            compiledDecodeConfig: .init(enabled: false),
             mtpDrafter: drafter,
             mtpConfig: makeMTPConfig(enabled: true, maxSpeculativeBatch: 1))
         let value = try await run(
@@ -548,20 +548,19 @@ struct CBv2MTPEngineMixedTests {
         #expect(metrics.controllerFallbacks["ineligible", default: 0] > 0)
     }
 
-    @Test func compiledPlainDecodeCoexistsWithEagerMTPRounds() async throws {
+    @Test func plainDecodeCoexistsWithEagerMTPRounds() async throws {
         let fixture = try makeFixture()
         let plainPrompt = makePromptTokens(length: 16, seed: 551, vocabSize: vocabSize)
         let mtpPrompt = makePromptTokens(length: 20, seed: 552, vocabSize: vocabSize)
         let mtpRequest = request(id: 2, prompt: mtpPrompt, maxTokens: 24)
         let expected = try await baseline(fixture, mtpRequest)
-        let engine = try makeEngine(fixture, mtp: true, compiledEnabled: true)
+        let engine = try makeEngine(fixture, mtp: true)
 
         _ = try await run(
             engine,
             request(
                 id: 1, prompt: plainPrompt, maxTokens: 16,
                 temperature: 0.7, seed: 7))
-        #expect(engine.compiledDecodeStats?.compiledSteps ?? 0 > 0)
         let value = try await run(engine, mtpRequest)
         let metrics = try #require(engine.mtpMetricsSnapshot())
         await engine.shutdown()
@@ -569,12 +568,17 @@ struct CBv2MTPEngineMixedTests {
         #expect(metrics.rounds > 0)
     }
 
-    @Test func rejectedMTPBindingsReleaseBeforeCompiledOnlyStretch() async throws {
+    /// A rejecting MTP round advances rows past the eager caches' host truth
+    /// and sets `eagerCompositionStale`; the next eager bind must force the
+    /// provider to rebuild its composition from host truth. Sole regression
+    /// guard on that flag — writer in EngineLoopV2+MTPFinalize.swift, reader
+    /// in `EngineLoopV2.eagerCaches`.
+    @Test func rejectedMTPRoundForcesEagerCompositionRebuild() async throws {
         let fixture = try makeFixture(deterministicTarget: true)
-        let provider = MTPReleaseTrackingCacheProvider(
+        let provider = MTPStalenessTrackingCacheProvider(
             layerKinds: fixture.target.cbv2LayerKinds)
         let engine = try makeEngine(
-            fixture, mtp: true, prefillChunkSize: 8, compiledEnabled: true,
+            fixture, mtp: true, prefillChunkSize: 8,
             cacheProvider: provider, eventBufferCapacity: 16,
             mtpDrafter: MTPRejectingDrafter(target: fixture.target))
         provider.observeStaleness { [weak engine] in
@@ -591,12 +595,11 @@ struct CBv2MTPEngineMixedTests {
         let greedyStream = try engine.submit(greedy)
         let ineligibleStream = try engine.submit(ineligible)
 
-        let released = await cbv2SchedWait(timeoutSeconds: 3) {
+        let repaired = await cbv2SchedWait(timeoutSeconds: 3) {
             let metrics = engine.mtpMetricsSnapshot()
             return (metrics?.rounds ?? 0) > 0
                 && metrics?.acceptedTokens == 0
-                && (engine.compiledDecodeStats?.compiledSteps ?? 0) > 0
-                && provider.releasesWhileBoundAndStale > 0
+                && provider.invalidationsWhileStale > 0
         }
 
         engine.cancel(greedy.id)
@@ -607,8 +610,8 @@ struct CBv2MTPEngineMixedTests {
         await engine.shutdown()
 
         #expect(
-            released,
-            "compiled decode must release eager rows retained by a rejected MTP round")
+            repaired,
+            "a rejected MTP round must mark the eager composition stale, and the next eager bind must rebuild it")
     }
 
     @Test func terminalDonationAfterSynchronizedRollbackReplaysExactly() async throws {
@@ -632,30 +635,6 @@ struct CBv2MTPEngineMixedTests {
         #expect(warm.usage?.prefixCachePrefillTokensSaved == 80)
         #expect(warm.usage?.prefixCacheHitTokens == 80)
         #expect(warm.tokens == cold.tokens)
-    }
-
-    @Test func quantizedFullKVRollbackMatchesQuantizedTargetOnly() async throws {
-        let fixture = try makeFixture()
-        let prompt = makePromptTokens(length: 24, seed: 665, vocabSize: vocabSize)
-        let item = request(id: 1, prompt: prompt, maxTokens: 20)
-
-        func backend() -> CBv2ContiguousKVBackend {
-            CBv2ContiguousKVBackend(
-                config: .init(
-                    bytesCapacity: 1 << 28,
-                    quantization: (groupSize: 32, bits: 8)))
-        }
-
-        let off = try makeEngine(fixture, mtp: false, backend: backend())
-        let expected = try await run(off, item)
-        await off.shutdown()
-
-        let on = try makeEngine(fixture, mtp: true, backend: backend())
-        let value = try await run(on, item)
-        let metrics = try #require(on.mtpMetricsSnapshot())
-        await on.shutdown()
-        #expect(value.tokens == expected.tokens)
-        #expect(metrics.rounds > 0)
     }
 
     @Test func unsupportedKVRowsFailOpenAtTheEngineStorageGate() {

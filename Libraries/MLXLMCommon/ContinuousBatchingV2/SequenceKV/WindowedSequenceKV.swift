@@ -272,17 +272,6 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         borrowableChunkViews = nil
     }
 
-    /// Non-nil when compiled decode would observe staged-but-uncommitted
-    /// speculative state — compiled decode never runs during an MTP round.
-    /// Testable twin of the preconditions in `compiledStorage` /
-    /// `noteCompiledAdvance`.
-    func cbv2SpeculativePendingViolation() -> String? {
-        guard speculativeWriteArmed || staged != nil else { return nil }
-        return "CBv2WindowedSequenceKV: compiled decode with a speculative write pending "
-            + "(armed=\(speculativeWriteArmed), staged=\(staged != nil)) — "
-            + "MTP rounds and compiled decode are mutually exclusive"
-    }
-
     /// Views a KV-BORROWING layer must attend against in the CURRENT step:
     /// exactly what the most recent `update()` returned. After a multi-token
     /// (prefill-chunk) update this is the PRE-eviction history + chunk — the
@@ -418,53 +407,6 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     func cbv2InnerState() -> [MLXArray] {
         [keys, values].compactMap { $0 }
-    }
-
-    // MARK: - Compiled-decode bridge (CBv2CompiledDecode)
-
-    /// The ring buffers for the compiled [B, 1] decode step. The ring is
-    /// already fixed-shape (`[1, kvHeads, window, headDim]`, slot = absolute
-    /// position mod window), so the compiled path shares this storage
-    /// directly — the SAME `MLXArray` objects, mutated via `_updateInternal`
-    /// by the compiled graph and by slice-assignment on the eager path.
-    /// Allocates zeros when the row has never been written (single-token
-    /// prompt joins decode straight away). K and V dtypes are checked
-    /// INDEPENDENTLY against their traced dtypes (PR#62 review).
-    ///
-    /// Bind-time only (membership changes) — never on the per-step path.
-    func compiledStorage(
-        keysDType: DType, valuesDType: DType
-    ) -> (keys: MLXArray, values: MLXArray)? {
-        if let violation = cbv2SpeculativePendingViolation() {
-            preconditionFailure(violation)
-        }
-        if keys == nil {
-            keys = MLXArray.zeros([1, kvHeads, window, headDim], dtype: keysDType)
-            values = MLXArray.zeros([1, kvHeads, window, headDim], dtype: valuesDType)
-        }
-        guard let keys, let values, keys.dtype == keysDType, values.dtype == valuesDType else {
-            return nil
-        }
-        return (keys, values)
-    }
-
-    /// Oldest absolute position still physically valid — the compiled mask's
-    /// static per-session lower bound (`validFrom = max(entry, offset+1-w)`).
-    var compiledOldestValidPosition: Int { oldestValidPosition }
-
-    /// Host-side bookkeeping for one compiled decode step: the compiled
-    /// graph wrote one token at slot `absoluteOffset % window` and advanced
-    /// the device-side offset state. Mirrors the eager decode update's
-    /// counter math exactly (append then evict to `window`, RECENT end
-    /// kept). Any captured pre-eviction chunk views are step-scoped and are
-    /// invalidated, same as an eager decode write.
-    func noteCompiledAdvance() {
-        if let violation = cbv2SpeculativePendingViolation() {
-            preconditionFailure(violation)
-        }
-        borrowableChunkViews = nil
-        absoluteOffset += 1
-        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
     // MARK: - Ring geometry

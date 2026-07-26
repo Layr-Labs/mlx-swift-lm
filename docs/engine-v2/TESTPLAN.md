@@ -28,6 +28,61 @@ swift run -c release CBv2Benchmark --model /path/to/model --batch 1,2,4 --prompt
 # .build/<config>/mlx-swift-lmPackageTests.xctest/Contents/MacOS/).
 ```
 
+## Two ways the suite lies to you
+
+Both of these were live in this package. Both present as success.
+
+### A test target must never depend on an executable target
+
+`Tests/BenchCBv2Tests` used to declare `dependencies: ["BenchCBv2"]`, an
+`.executableTarget`. SwiftPM then treats that binary as the swift-testing host
+and launches it with `--test-bundle-path`; `BenchOptions.parse` rejects the
+unknown flag and exits 64, which aborts the swift-testing pass for the ENTIRE
+package before a single case is discovered. Every `@Test` in mlx-swift-lm —
+728 cases across 87 suites, including the four paged-KV CI gates — executed
+nothing, XCTest classes kept running, and `swift test` still reported success.
+
+The tell is a `Test run with 0 tests` (or a bare `Executed 0 tests`) next to
+`error: unknown option --test-bundle-path`. Fixed by splitting the driver into
+the `BenchCBv2Core` library and reducing `BenchCBv2` to a `@main` shim; the
+tests import the library. Keep it that way: put shared code in a library, never
+let a test target reach an executable.
+
+Because the failure is silent, `.github/workflows/ci.yml` asserts a NON-ZERO
+executed count per gate rather than trusting the exit code. Do not remove those
+guards — an exit code cannot distinguish a passing suite from a dark one.
+
+### The package can fail to build on target ORDER alone
+
+Symptom: `swift build -c release` dies with
+`<unknown>:0: error: missing required module '_NumericsShims'` while compiling
+`EventSource` — a module with no connection to numerics. Debug and release can
+disagree about this on the *same tree*, and so can two runs.
+
+Cause: upstream `EventSource` guards its AsyncHTTPClient backend behind
+`#if canImport(AsyncHTTPClient)`. SwiftPM gives every target the one shared
+`-I .build/<triple>/<config>/Modules` directory, so that predicate flips to
+true the moment AsyncHTTPClient has been built by anything in the graph.
+`EventSource` then loads AsyncHTTPClient -> Algorithms -> RealModule, and
+`RealModule` declares a required Clang-module dependency on `_NumericsShims`
+whose modulemap SwiftPM never passed to `EventSource` (it is not in
+EventSource's *declared* dependency graph). Whether the build succeeds is
+therefore decided by which target finished first.
+
+Workaround — make `canImport` false again for one build, so `EventSource`
+compiles before AsyncHTTPClient is regenerated late in the graph:
+
+```bash
+M=.build/arm64-apple-macosx/release/Modules
+mv $M/AsyncHTTPClient.swiftmodule $M/AsyncHTTPClient.swiftdoc \
+   $M/AsyncHTTPClient.abi.json $M/AsyncHTTPClient.swiftsourceinfo /tmp/
+swift build -c release --build-tests   # regenerates them on its own
+```
+
+Upstream, not ours, and unrelated to paged-KV. Clearing `ModuleCache` does not
+help; retrying does not converge, because the failure kills the wave before the
+missing modules get built.
+
 ## Batch-composition invariance (report 12 item 5 — THE core contract)
 
 A request's greedy output is token-exact identical regardless of batchmates.
@@ -42,9 +97,20 @@ A request's greedy output is token-exact identical regardless of batchmates.
 | Attention sinks (GPT-OSS shape) under batching | `CBv2InvarianceTests.testInvarianceWithAttentionSinks` |
 | Per-request seeds on stochastic sampling | `CBv2InvarianceTests.testPerRequestSeedInvarianceUnderBatching` — `XCTSkip` pending integration: WS-E SamplerV2 |
 | 50-event join/leave churn storm, every request vs its solo run | `CBv2InvarianceTests.testChurnStormEveryRequestMatchesSolo` |
+| PAGED backend: row's partition length must not track its batchmates' attended lengths | `CBv2InvarianceTests.testPagedRowInvariantToBatchmateAttendedLength` |
 
 All comparisons are token-exact over ≥64 decode steps (churn storm: over
 however many tokens each request generated before finish/cancel).
+
+Every row above the paged one runs on `TinyTestModel`, whose head dim (16) the
+paged kernel cannot accept, so the paged arm carries its own minimal fixture —
+one `PagedAttentionKernel.decode` layer on the GPT-OSS decode shape driven as a
+recurrent greedy decoder. It is a REGRESSION gate for the WS-6.4 adaptive
+partition sizer and must fail when the pre-v0.8.0 adaptation is restored:
+
+```bash
+DARKBLOOM_CBV2_PAGED_PTOK_TARGET=128 swift test --filter CBv2Invariance
+```
 
 ## Report 10 §4 invariants 1–11
 

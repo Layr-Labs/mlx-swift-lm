@@ -3,6 +3,33 @@
 // Content-addressed, zero-copy prefix cache for the ContinuousBatchingV2
 // engine (workstream D). Implements `CBv2PrefixCache`.
 //
+// ┌───────────────────────────────────────────────────────────────────────┐
+// │ THIS TYPE DOES NOT SERVE PRODUCTION TRAFFIC, AND IS KEPT ON PURPOSE.  │
+// └───────────────────────────────────────────────────────────────────────┘
+//
+// Production installs `SSDPrefixCache` (provider-swift,
+// `KVCacheSSD/SSDPrefixCache.swift`), wired at
+// `Inference/EngineV2SlotFactory.swift:379` — `PrefixCacheV2` has ZERO
+// production construction sites and every `PrefixCacheV2(` in the tree is
+// in `Tests/MLXLMTests`. That is deliberate, not rot.
+//
+// It is retained as the engine-side REFERENCE IMPLEMENTATION and contract
+// fixture for `CBv2PrefixCache`. `SSDPrefixCache` lives in a downstream
+// package and cannot be reached from `MLXLMTests`, so this type is the only
+// in-engine exercise of the protocol's semantics: donate / lookup /
+// endAdoption / LRU eviction with in-use pinning / `requiredRecompute` /
+// the windowed-layer exclusion rule. It is also the only concrete type
+// `EngineV2.prefixCachePairingViolation` can structurally inspect, which
+// makes it the only way to test the `requiresMaterializedSnapshots` pairing
+// guard that the paged backend depends on
+// (`CBv2EndToEndTests.testPagedBackendRejectsNonMaterializingPrefixCache`).
+//
+// Deleting it therefore does not remove dead code; it removes the coverage
+// that keeps `SSDPrefixCache` honest. This was proposed and rejected during
+// the v0.8.0 paged-KV migration for exactly that reason. If the line count
+// must come back, RELOCATE the type into the test target — do not delete
+// the contract exercise. See the v0.8.0 migration JOURNAL, track DEL.
+//
 // Design (docs/engine-v2/specs/D-prefix-cache.md; report 08 §2, report 09 §2,
 // report 10 invariant 6):
 //
@@ -251,12 +278,6 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
                 snapshots.append(nil)
                 continue
             }
-            // Lossy snapshots (quantized rows) never enter the cache — a
-            // donate→adopt round trip would re-quantize onto a different
-            // grid (see CBv2SequenceKV.snapshotIsLossless). The donation as
-            // a whole is dropped: an entry missing a cacheable layer is
-            // unusable anyway.
-            guard seq.snapshotIsLossless else { return }
             snapshots.append(seq.snapshot())
         }
         donate(tokens: tokens, snapshots: snapshots, layerKinds: layerKinds, cacheSalt: cacheSalt)
@@ -480,6 +501,14 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         return _bytesInUse
     }
 
+    /// NOT a `CBv2PrefixCache` requirement, and live despite appearances:
+    /// five test files read this through `cache.stats().<field>`, so the
+    /// return type is obtained by INFERENCE and the name
+    /// `CBv2PrefixCacheStats` appears at no use site. Grepping either the
+    /// type name or the protocol surface reports it dead; it is not.
+    /// Readers: CBv2PrefixCacheTests (all five fields), CBv2EndToEndTests,
+    /// CBv2FrozenReplayTests, CBv2MTPEngineMixedTests, CBv2MultimodalTests.
+    /// Grep `.stats()`, not the type.
     public func stats() -> CBv2PrefixCacheStats {
         lock.lock()
         defer { lock.unlock() }

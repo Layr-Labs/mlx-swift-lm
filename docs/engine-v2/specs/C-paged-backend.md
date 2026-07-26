@@ -25,8 +25,8 @@ do not block on other workstreams.
    GQA, per-request KV lengths, block tables, sliding window, softcap
    optional, per-head sinks (denominator-only), head_dim ∈ {64, 128, 256,
    512} (Gemma-4 global layers are 512 — verify shared-memory budget; fall
-   back to composed path per head-dim if needed), fp16 KV first (quantized
-   pages later).
+   back to composed path per head-dim if needed), fp16 KV only — see item
+   6.
 4. `PagedLayerCache.swift` — `CBv2AttendingLayerCache` calling the kernel
    for B>1 decode; per-request SDPA fallback for prefill chunks (same as
    v1) until a varlen extend kernel exists (stretch goal, not required).
@@ -35,9 +35,17 @@ do not block on other workstreams.
    context ∈ {512, 4k, 16k}, report achieved GB/s and tokens/s. Print a
    markdown table. THIS IS THE GATE: paged decode must beat v1 per-row
    dispatch at B≥2 and be within 15% of single-request SDPA at B=1.
-6. `CBv2KVQuantScheme` hook: leave quantized pages as a TODO with the
-   design documented in the file header (fp16 pages are the v2.0 fallback
-   for KV-quant configs).
+6. `CBv2KVQuantScheme` hook: **removed in v0.8.0**, not deferred. KV
+   quantization is retired from the engine, the provider, and the operator
+   surface, so the hook and its refusal guard are gone and a quantized
+   paged config is unrepresentable rather than rejected at runtime — paged
+   pages are fp16 by design, not as a v2.0 fallback. `PagedKVPool.swift`'s
+   header keeps the notes for bringing quantized pages back should that
+   ever be revisited (a `CACHE_T` template parameter plus an inline
+   dequantize in `load_row`, and a third slab per group for affine
+   scales/biases). Rollback is at the BACKEND, not the dtype:
+   `DARKBLOOM_CBV2_PAGED_KV=0` selects the contiguous backend, which is
+   retained until 0.8.0 is stable.
 
 ## Correctness bar
 Kernel parity vs a composed reference (matmul+softmax over gathered pages):
