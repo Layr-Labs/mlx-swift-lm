@@ -15,10 +15,18 @@
 // the chunk half being those poisoned projections, so a paged frozen row
 // contributed exact keys BEFORE the current chunk and poisoned ones INSIDE
 // it. A position was therefore exact only once the chunk it sits in STARTED
-// at or after the cone frontier — which is exactly the `+ maxPrefillChunk`
-// (capped to `+ maxWindow`) that `PagedKVBackend.requiredFrozenReplayTokens`
-// demands on top of the model-shape bound `cbv2RequiredRecompute`, and which
-// costs gemma-4 36% of its measured prefix-reuse saving.
+// at or after the cone frontier — which WAS the `+ maxPrefillChunk` (capped
+// to `+ maxWindow`) that `PagedKVBackend.requiredFrozenReplayTokens` demanded
+// on top of the model-shape bound `cbv2RequiredRecompute`, and which cost
+// gemma-4 36% of its measured prefix-reuse saving.
+//
+// That term is GONE. `derive` grants `windowCount * maxWindow` for paged and
+// contiguous alike, `requiredFrozenReplayTokens` and `replayChunkCeiling` are
+// deleted, and the adoption guard calls the shared `cbv2RequiredRecompute`.
+// This suite is what made that safe to remove, and it is what keeps it safe:
+// the frozen branch pinned here is now load-bearing FOR THE BOUND, so pulling
+// the branch fails every frozen test below rather than quietly costing
+// exactness one chunk at a time.
 //
 // The bytes were always there; the layer was simply not reading them.
 //
@@ -531,14 +539,18 @@ struct CBv2PagedFrozenChunkGatherTests {
     /// `+ maxPrefillChunk`/`+ maxWindow` slack on top — is token-exact
     /// against a cold twin.
     ///
-    /// This is the evidence for the follow-up, and the order matters: a bound
-    /// narrowed before the layer can honour it is a silent wrong answer, so
-    /// the narrowing in `CBv2PrefixReuseCapability.derive` /
-    /// `PagedKVBackend.requiredFrozenReplayTokens` must land AFTER this
-    /// passes, not before. The state is therefore built by hand rather than
-    /// through `plan(matchedBoundary:)`: today's capability still demands the
-    /// extra window and `makeFrozenFullState`'s guard would refuse the plan
-    /// this test is here to justify.
+    /// This was the evidence for the narrowing, and the order mattered: a
+    /// bound narrowed before the layer can honour it is a silent wrong
+    /// answer, so `CBv2PrefixReuseCapability.derive` was equalized AFTER this
+    /// passed, not before. It has since landed — paged grants exactly
+    /// `cbv2RequiredRecompute` — so this is now the regression guard rather
+    /// than the justification for one.
+    ///
+    /// The state is still built by hand rather than through
+    /// `plan(matchedBoundary:)`, and deliberately so: R is pinned to the
+    /// model-shape cone bound, never to whatever the capability happens to
+    /// grant. Reading the grant here would make the test pass by construction
+    /// the moment anyone re-widens it.
     ///
     /// It does NOT carry the mechanism proof — `[full, sliding, sliding,
     /// full]` has no frozen full layer with an INEXACT input (layer 0 reads
@@ -558,14 +570,24 @@ struct CBv2PagedFrozenChunkGatherTests {
         #expect(kinds.count == 4, "shape must be [full, sliding, sliding, full]")
         let prompt = makePromptTokens(length: 73, seed: 0x5EED)
 
-        // The bound contiguous uses, and the one paged still asks for.
+        // The model-shape cone bound. Paged now grants exactly this, same as
+        // contiguous; R is pinned to the bound itself, never to the grant.
         let bound = cbv2RequiredRecompute(layerKinds: kinds, matched: matched)
         #expect(bound == 2 * window)
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds, backend: .pagedFP16)
         #expect(
-            capability.conservativeReplayBoundTokens == bound + window,
-            "premise: paged still grants one extra window — this test is what lets it stop")
+            capability.conservativeReplayBoundTokens == bound,
+            "paged grants the contiguous bound — no extra window")
+        #expect(
+            capability.conservativeReplayBoundTokens
+                == CBv2PrefixReuseCapability.derive(
+                    layerKinds: kinds, backend: .contiguousUnquantized
+                ).conservativeReplayBoundTokens,
+            """
+            the two backends' replay bounds are ONE number — a paged-specific slack \
+            term is a regression, not a tuning knob
+            """)
         let replayStart = matched - bound
 
         func makeBackend() throws -> PagedKVBackend {

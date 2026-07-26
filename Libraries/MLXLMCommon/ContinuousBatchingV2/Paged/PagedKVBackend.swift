@@ -279,59 +279,6 @@ public final class PagedKVBackend: CBv2KVBackend {
 
     // MARK: - Frozen-full hybrid adoption (WS-4.1)
 
-    /// Replay length a paged frozen-full adoption needs for the sliding rows
-    /// to come back bit-exact: the model-shape bound `cbv2RequiredRecompute`
-    /// uses, plus ONE prefill chunk.
-    ///
-    /// The extra chunk is not margin. `CBv2FrozenReplayFullSequenceKV.update`
-    /// discards the replayed projections and hands attention the CACHED keys
-    /// for the whole chunk, so on contiguous the replay is exact from the
-    /// first position whose sliding dependency cone fits inside `[C, M)`.
-    /// `PagedLayerCache.prefillKV` instead assembles
-    /// `gather([baseOffset, queryStart)) ++ chunk`, and the chunk half is the
-    /// K/V the layer was just called with — so a frozen paged row contributes
-    /// exact keys for everything before the current chunk and poisoned ones
-    /// inside it. A position is exact only once the chunk it sits in STARTS
-    /// at or after the cone frontier, which costs at most one chunk.
-    ///
-    /// `replayChunkTokens` is the chunk the REPLAY will actually use, which
-    /// is `min(pool.config.maxPrefillChunk, plan.replayChunkCeiling)` — not
-    /// the pool's chunk. The distinction is the whole fix for gpt-oss-20b:
-    /// `CBv2PrefixReuseCapability.derive` cannot see pool config, so it
-    /// grants `windowCount*maxWindow + maxWindow` and caps the replay chunk
-    /// at `maxWindow` in the plan. With the cap, granted >= required for
-    /// EVERY layout. Without it the relation held only where the window
-    /// exceeded the chunk: gemma-4 (1,024 vs 512) passed, gpt-oss-20b
-    /// (128 vs 512) demanded 2,048 against a granted 1,664 and refused every
-    /// adoption after a 28,416-token match, throwing away 26.7k tokens of
-    /// saving. This function is still where the relation is CHECKED rather
-    /// than assumed, because a plan reaches it from outside this type.
-    static func requiredFrozenReplayTokens(
-        layerKinds: [CBv2LayerKind], replayChunkTokens: Int
-    ) -> Int {
-        var maxWindow = 0
-        var windowCount = 0
-        for kind in layerKinds {
-            if case .slidingWindow(let window) = kind.attention {
-                maxWindow = max(maxWindow, window)
-                windowCount += 1
-            }
-        }
-        guard windowCount > 0 else { return 0 }
-        let (bound, boundOverflow) = windowCount.multipliedReportingOverflow(by: maxWindow)
-        guard !boundOverflow else { return Int.max }
-        let (total, totalOverflow) = bound.addingReportingOverflow(max(0, replayChunkTokens))
-        return totalOverflow ? Int.max : total
-    }
-
-    /// The chunk a frozen replay under `plan` will actually be given, which
-    /// is the pool's chunk clamped by the plan's ceiling. Mirrors what
-    /// `CBv2PrefixReusePlan.clampedChunk` hands `SchedulerV2` below M.
-    func replayChunkTokens(for plan: CBv2PrefixReusePlan) -> Int {
-        guard plan.replayChunkCeiling > 0 else { return pool.config.maxPrefillChunk }
-        return min(pool.config.maxPrefillChunk, plan.replayChunkCeiling)
-    }
-
     private func makeFrozenFullState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         plan: CBv2PrefixReusePlan,
@@ -345,21 +292,30 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
         let restoringWindows = plan.requiresExactWindowRestore
         if !restoringWindows {
-            // The dual-cursor form. Two things must hold before it is safe,
-            // and neither is visible to the planner.
+            // The dual-cursor form. Neither condition is visible to the
+            // planner, and both are cheap, so they are checked here.
             guard plan.replayStart > 0 else {
                 throw CBv2KVError.backendIneligible(
                     reason: "frozen replay with C == 0 saves nothing")
             }
-            let chunk = replayChunkTokens(for: plan)
-            let required = Self.requiredFrozenReplayTokens(
-                layerKinds: layerKinds, replayChunkTokens: chunk)
+            // The SAME bound contiguous uses, from the SAME function — paged
+            // briefly kept its own edition (`requiredFrozenReplayTokens`,
+            // `cbv2RequiredRecompute` plus one prefill chunk) because a
+            // frozen paged row attended its chunk's freshly projected keys.
+            // `PagedLayerCache.prefillKVWritingChunk` reads the cached
+            // diagonal out of the frozen pages now, so the extra term is gone
+            // and two copies of one bound would only drift. Still CHECKED
+            // rather than assumed: a plan reaches this function from outside
+            // the type. If a frozen paged row is ever made to attend fresh
+            // projections again, this bound is short by one chunk and it will
+            // accept a replay that leaves the sliding rows silently inexact.
+            let required = cbv2RequiredRecompute(
+                layerKinds: layerKinds, matched: plan.matchedBoundary)
             guard plan.replayTokens >= required else {
                 throw CBv2KVError.backendIneligible(
                     reason: "frozen replay of \(plan.replayTokens) tokens is shorter than the "
-                        + "\(required) this pool needs (replay chunk \(chunk), pool chunk "
-                        + "\(pool.config.maxPrefillChunk), ceiling \(plan.replayChunkCeiling)) "
-                        + "— the sliding rows would come back inexact")
+                        + "\(required) this layout needs — the sliding rows would come back "
+                        + "inexact")
             }
         }
 

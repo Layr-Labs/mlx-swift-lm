@@ -38,10 +38,6 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
     public let backend: CBv2PrefixReuseBackend
     public let strategy: CBv2PrefixReuseStrategy?
     public let conservativeReplayBoundTokens: Int
-    /// Largest sliding window in the layout, 0 when there is none. Kept
-    /// because the paged frozen replay has to CAP its chunk at one window
-    /// (`CBv2PrefixReusePlan.replayChunkCeiling`), and the plan is built here.
-    public let maxWindowTokens: Int
     public let fullKVBytesPerToken: Int
     public let unsupportedReason: CBv2PrefixReuseUnsupportedReason?
 
@@ -53,14 +49,12 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         backend: CBv2PrefixReuseBackend,
         strategy: CBv2PrefixReuseStrategy?,
         conservativeReplayBoundTokens: Int,
-        maxWindowTokens: Int,
         fullKVBytesPerToken: Int,
         unsupportedReason: CBv2PrefixReuseUnsupportedReason?
     ) {
         self.backend = backend
         self.strategy = strategy
         self.conservativeReplayBoundTokens = conservativeReplayBoundTokens
-        self.maxWindowTokens = maxWindowTokens
         self.fullKVBytesPerToken = fullKVBytesPerToken
         self.unsupportedReason = unsupportedReason
     }
@@ -123,73 +117,43 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
 
         if hasOwningFullAfterWindow {
             switch backend {
-            case .contiguousUnquantized:
+            case .contiguousUnquantized, .pagedFP16:
+                // Both backends now pay the SAME conservative replay, and
+                // that is a recent and hard-won equality — do not let the two
+                // cases drift apart again without reading this.
+                //
+                // Paged used to pay `+ maxWindow`, because
+                // `CBv2FrozenReplayFullSequenceKV.update` hands attention the
+                // CACHED keys for a whole replay chunk while the paged layer
+                // handed it `gather ++ freshly-projected chunk`. A frozen
+                // paged row therefore emitted exact keys before the current
+                // chunk and poisoned ones inside it, so exactness began one
+                // chunk later than contiguous's `windowCount * maxWindow`.
+                //
+                // That is gone: `PagedLayerCache.prefillKVWritingChunk` takes
+                // the frozen branch's gather AFTER the (cursor-only) write and
+                // reads `[baseOffset, queryStart + chunk)` straight out of the
+                // frozen pages, cached diagonal included. "Exact once the
+                // CHUNK starts at or after the cone frontier" collapses back
+                // to "exact once the POSITION is at or after it", which is
+                // this bound. Verified rather than argued: a frozen row handed
+                // arbitrary poison for its chunk is array-equal to a cold twin
+                // at the first replayed chunk, and the fixture model is
+                // token-exact AND window-exact at exactly R == this bound
+                // (`CBv2PagedFrozenChunkGather`).
+                //
+                // The extra window also brought `replayChunkCeiling`,
+                // `maxWindowTokens` and `PagedKVBackend.requiredFrozenReplay
+                // Tokens` with it; all three are deleted. If a future change
+                // makes a frozen paged row attend freshly projected keys
+                // again, the term comes back and so does that machinery —
+                // re-read `PagedKVBackend`'s adoption guard first, because it
+                // now checks `cbv2RequiredRecompute` and would silently accept
+                // a replay that is one chunk short.
                 return Self(
                     backend: backend,
                     strategy: .frozenFullReplay,
                     conservativeReplayBoundTokens: replayBound,
-                    maxWindowTokens: maxWindow,
-                    fullKVBytesPerToken: fullKVBytesPerToken,
-                    unsupportedReason: nil)
-            case .pagedFP16:
-                // WS-4.1. Paged pays ONE EXTRA WINDOW of replay over
-                // contiguous, and the reason is a difference between the two
-                // prefill paths, not a safety margin.
-                //
-                // `CBv2FrozenReplayFullSequenceKV.update` discards the
-                // replayed projections and returns the CACHED keys for the
-                // whole chunk, diagonal included, so a contiguous frozen
-                // replay is exact from the first position whose sliding cone
-                // fits inside [C, M) — the `windowCount * maxWindow` bound.
-                // `PagedLayerCache.prefillKV` cannot: it assembles
-                // `gather([baseOffset, queryStart)) ++ chunk`, and the chunk
-                // half is the freshly projected K/V the layer was called
-                // with. A frozen paged row therefore contributes exact keys
-                // for everything BEFORE the current chunk and poisoned ones
-                // inside it, which pushes the first exact position back by at
-                // most one `maxPrefillChunk`.
-                // The capability cannot see `maxPrefillChunk` (it is pool
-                // config, and `derive` is model shape plus backend identity).
-                // Rather than ASSUME a relation between the chunk and the
-                // window, it buys `maxWindow` of slack here and CAPS the
-                // replay chunk at `maxWindow` in the plan
-                // (`replayChunkCeiling`). Those two moves together make the
-                // grant sufficient for every layout instead of for the ones
-                // whose window happens to exceed their chunk:
-                //
-                //     needed   = windowCount*maxWindow + min(chunk, maxWindow)
-                //     granted  = windowCount*maxWindow + maxWindow
-                //
-                // so `needed <= granted` unconditionally, and
-                // `PagedKVBackend.requiredFrozenReplayTokens` re-checks it
-                // against the pool's real chunk.
-                //
-                // THIS PARAGRAPH USED TO SAY the grant "covers every
-                // maxPrefillChunk <= maxWindow, which is every shipping
-                // config". That was false and it cost a whole model's prefix
-                // reuse: gpt-oss-20b is 12 sliding layers of window 128
-                // against a 512-token chunk, so the backend demanded
-                // 1536 + 512 = 2048 against a granted 1664 and refused every
-                // adoption after a 28,416-token match — 26.7k tokens of
-                // saving thrown away, measured by the G2 parity gate.
-                // gemma-4 (512 against 1,024) hid it. The cap is what makes
-                // the relation hold by construction rather than by luck; it
-                // binds only where chunk > window, so gemma-4's replay chunk
-                // is unchanged at 512 and gpt-oss's becomes 128.
-                let (padded, padOverflow) = replayBound.addingReportingOverflow(maxWindow)
-                guard !padOverflow else {
-                    return unsupported(
-                        backend: backend,
-                        reason: .accountingOverflow,
-                        replayBound: replayBound,
-                        maxWindow: maxWindow,
-                        fullKVBytesPerToken: fullKVBytesPerToken)
-                }
-                return Self(
-                    backend: backend,
-                    strategy: .frozenFullReplay,
-                    conservativeReplayBoundTokens: padded,
-                    maxWindowTokens: maxWindow,
                     fullKVBytesPerToken: fullKVBytesPerToken,
                     unsupportedReason: nil)
             case .unknown:
@@ -197,7 +161,6 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
                     backend: backend,
                     reason: .unknownBackend,
                     replayBound: replayBound,
-                    maxWindow: maxWindow,
                     fullKVBytesPerToken: fullKVBytesPerToken)
             }
         }
@@ -207,14 +170,12 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
                 backend: backend,
                 reason: .unknownBackend,
                 replayBound: replayBound,
-                maxWindow: maxWindow,
                 fullKVBytesPerToken: fullKVBytesPerToken)
         }
         return Self(
             backend: backend,
             strategy: replayBound == 0 ? .direct : .tailReplay,
             conservativeReplayBoundTokens: replayBound,
-            maxWindowTokens: maxWindow,
             fullKVBytesPerToken: fullKVBytesPerToken,
             unsupportedReason: nil)
     }
@@ -259,15 +220,6 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
             strategy == .frozenFullReplay ? matchedBoundary : replayStart
         let capacityReservationTokens =
             strategy == .frozenFullReplay ? matchedBoundary : replayStart
-        // Paged's frozen replay needs its chunk capped at one window, so the
-        // slack `derive` bought (`+ maxWindow`) is always enough. It binds
-        // only where the pool's chunk exceeds the window, and it applies
-        // BELOW M only — the ordinary prefill of [M, promptLength) keeps the
-        // full chunk, which is where the tokens actually are.
-        let replayChunkCeiling =
-            backend == .pagedFP16 && strategy == .frozenFullReplay && replayTokens > 0
-            ? maxWindowTokens : 0
-
         let exactBytesPerToken: Int
         let stagedBytes: Int
         if let exactStagedFullKVBytes {
@@ -317,8 +269,7 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
             initialAdditionalCapacityBytes: initialAdditionalCapacityBytes,
             fullCapacityTokensReserved: fullCapacityTokens,
             stagedFullKVBytes: stagedBytes,
-            residentFullKVBytes: residentBytes,
-            replayChunkCeiling: replayChunkCeiling)
+            residentFullKVBytes: residentBytes)
     }
 
     /// Preserve the historical backend-only contract: callers already hand
@@ -362,22 +313,19 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
                 0, exactFullCapacityBytes - nominalInitiallyReserved),
             fullCapacityTokensReserved: maximumSequenceLength,
             stagedFullKVBytes: exactStagedFullKVBytes,
-            residentFullKVBytes: exactStagedFullKVBytes,
-            replayChunkCeiling: 0)
+            residentFullKVBytes: exactStagedFullKVBytes)
     }
 
     private static func unsupported(
         backend: CBv2PrefixReuseBackend,
         reason: CBv2PrefixReuseUnsupportedReason,
         replayBound: Int = 0,
-        maxWindow: Int = 0,
         fullKVBytesPerToken: Int = 0
     ) -> Self {
         Self(
             backend: backend,
             strategy: nil,
             conservativeReplayBoundTokens: replayBound,
-            maxWindowTokens: maxWindow,
             fullKVBytesPerToken: fullKVBytesPerToken,
             unsupportedReason: reason)
     }
@@ -407,22 +355,6 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     public let fullCapacityTokensReserved: Int
     public let stagedFullKVBytes: Int
     public let residentFullKVBytes: Int
-    /// Largest prefill chunk the replay of `[C, M)` may use, or 0 for no
-    /// cap. Nonzero only for a paged frozen replay, where it is one window.
-    ///
-    /// This is not a tuning knob, it is what makes the planner's grant
-    /// sufficient. `PagedKVBackend.requiredFrozenReplayTokens` needs
-    /// `windowCount*maxWindow + replayChunk`, and `derive` can only afford to
-    /// grant `windowCount*maxWindow + maxWindow` because it cannot see pool
-    /// config. Capping the replay chunk at `maxWindow` closes that gap for
-    /// EVERY layout rather than for the ones whose window happens to exceed
-    /// their chunk — gpt-oss-20b (12 x window 128, chunk 512) is the layout
-    /// that proved the difference, by refusing every adoption after a
-    /// 28,416-token match until this existed.
-    ///
-    /// It applies BELOW M only. The prefill of `[M, promptLength)` is where
-    /// the bulk of a long prompt is and keeps the pool's full chunk.
-    public let replayChunkCeiling: Int
 
     /// A frozen-full plan with nothing to replay: the adopter promised an
     /// EXACT sliding window ending at M for every windowed layer, so both
@@ -439,55 +371,18 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
         strategy == .frozenFullReplay && replayTokens == 0
     }
 
-    /// Clamp a proposed prefill chunk so it cannot cross C or M, and — for a
-    /// paged frozen replay — so the replay leg cannot outrun the slack the
-    /// planner bought for it (`replayChunkCeiling`).
+    /// Clamp a proposed prefill chunk so it cannot cross C or M.
     ///
-    /// THIS IS THE SOLE ENFORCEMENT POINT for the ceiling, and a violation is
-    /// SILENT. `PagedKVBackend` accepts a frozen-replay adoption on the
-    /// strength of the ceiling holding, but it only ever sees the plan, never
-    /// a chunk. Nothing downstream re-checks it — all three candidates were
-    /// audited and none is a backstop:
-    ///
-    ///  * `PagedSequenceKV.write:378`, the frozen early-out, advances the
-    ///    cursor for a chunk of ANY length that lands wholly below M, writes
-    ///    nothing and returns;
-    ///  * `:385`'s `precondition` fires only on a chunk that STRADDLES M — a
-    ///    different invariant;
-    ///  * `:393`'s windowed guard tests `n <= pool.config.maxPrefillChunk`,
-    ///    the POOL's chunk, not the ceiling, so an over-ceiling windowed
-    ///    chunk clears it too.
-    ///
-    /// An over-long chunk that stays below M therefore produces sliding rows
-    /// that are full-length and inexact, with no trap and no telemetry.
-    ///
-    /// What makes it hold is that there is exactly ONE producer and it clamps
-    /// FIRST — P2 proved this exhaustively when the ceiling landed. Three
-    /// sites size a prefill chunk (`SchedulerV2:367` running, `:524`
-    /// admission, `:590` helper) and each REASSIGNS its local from
-    /// `snappedChunkTokens` (`:422`, `:529`, `:591`) before
-    /// `numComputedTokens += n` and `assignments.append(numTokens:)`;
-    /// `snappedChunkTokens` applies this clamp at `:115`. There is no fourth
-    /// producer and no path that commits an unclamped count. The one path
-    /// that can EXTEND a chunk after clamping — the multimodal snap-over — is
-    /// unreachable because adoption and vision are mutually exclusive
-    /// (`EngineLoopV2:741-743`, asserted at `SchedulerV2:121-122`). Any new
-    /// path that widens a chunk after clamping breaks exactness silently.
-    ///
-    /// EXPIRES: the ceiling exists only because a frozen paged row attends
-    /// the chunk's freshly projected keys. Once `PagedLayerCache.prefillKV`
-    /// gathers the frozen keys for the chunk instead, the paged bound equals
-    /// the contiguous one, `replayChunkCeiling` is deleted, and so is this
-    /// hazard. Do not build machinery to guard it in the meantime.
+    /// The split at M is not bookkeeping. A frozen paged full row has
+    /// immutable storage below M and appends above it, and one `write` call
+    /// cannot do both — `PagedSequenceKV.write` traps rather than guess. This
+    /// clamp is what keeps a chunk off that boundary.
     public func clampedChunk(start: Int, proposed: Int) -> Int {
         guard proposed > 0 else { return proposed }
         var result = proposed
         for boundary in [replayStart, matchedBoundary]
         where start < boundary && result > boundary - start {
             result = boundary - start
-        }
-        if replayChunkCeiling > 0, start < matchedBoundary {
-            result = min(result, replayChunkCeiling)
         }
         return result
     }

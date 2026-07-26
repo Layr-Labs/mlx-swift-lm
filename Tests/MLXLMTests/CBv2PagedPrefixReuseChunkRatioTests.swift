@@ -8,38 +8,44 @@
 // so the chunk > window regime had no coverage at all. It is not a corner:
 // gpt-oss-20b is 12 sliding layers of window 128 against the default
 // 512-token chunk, and it is the model where prefix reuse matters most,
-// because its frozen-replay bound is 1,536 tokens rather than gemma-4's
-// 25,600 — reuse fires at a prompt length an operator actually sends.
+// because its replay bound is 1,536 tokens rather than gemma-4's 25,600 —
+// reuse fires at a prompt length an operator actually sends.
 //
-// What the gap cost, measured by the Gate G2 parity harness on real weights:
+// WHAT THE GAP COST, measured by the Gate G2 parity harness on real weights:
 // paged returned `adoption_failed` with saved = 0 on a 28,672-token prompt
 // where contiguous saved 26,880, after BOTH arms matched 28,416 tokens. The
 // lookup hit and the plan was derived; only the adoption refused.
 //
-// The refusal itself was CORRECT. `CBv2PrefixReuseCapability.derive` cannot
-// see pool config, so it padded its grant by `maxWindow` as a proxy for the
-// chunk, and `PagedKVBackend.requiredFrozenReplayTokens` re-checked the plan
-// against the pool's REAL chunk and demanded
-// `windowCount * maxWindow + maxPrefillChunk`. On gemma-4 the proxy is
-// generous (1,024 against 512) and the check passes; on gpt-oss it is short
-// (128 against 512), so the backend was handed 1,664 tokens of replay where
-// it needed 2,048 and refused rather than serve sliding rows that would come
-// back inexact. Short windows do not fail loudly — they attend fewer keys and
-// return a plausible wrong answer — so refusing was the only safe response to
-// an under-provisioned plan.
+// The refusal was CORRECT — it was refusing an under-provisioned plan.
+// `PagedLayerCache.prefillKV` used to assemble
+// `gather([baseOffset, queryStart)) ++ chunk` with the chunk half being the
+// freshly projected K/V, so a frozen paged row contributed exact keys before
+// the current chunk and poisoned ones inside it. That cost paged one extra
+// `maxPrefillChunk` of replay over contiguous, the planner could not see pool
+// config so it paid `maxWindow` as a proxy, and the proxy is only sufficient
+// when `maxPrefillChunk <= maxWindow`. gemma-4 satisfied that (512 against
+// 1,024) and gpt-oss did not (512 against 128), so the backend was handed
+// 1,664 tokens of replay where it demanded 2,048 and refused.
 //
-// The defect was that the plan was under-provisioned at all. These tests
-// therefore pin BOTH halves, because either one alone can be satisfied by a
-// wrong fix:
+// The chunk term is now GONE rather than capped: the gather is hoisted, so
+// paged's bound EQUALS contiguous's `windowCount * maxWindow` and
+// `cbv2RequiredRecompute(layerKinds:matched:)` is the single shared
+// definition, reading layer shapes and nothing else. gpt-oss went from
+// saved = 0 to saved = 26,880 — full parity with contiguous, not a shortfall.
 //
-//   1. adoption must be ACCEPTED in this ratio — a `saved = 0` on a hit is a
-//      capability regression against contiguous;
-//   2. the adopted row must be TOKEN-EXACT against a cold twin — relaxing the
-//      bound to buy (1) would trade the original frozen-full defect back for
-//      a throughput number, and nothing downstream could see it.
+// This suite pins the two things that can silently come back:
 //
-// (2) is the one with teeth. A test that only asserts (1) passes for a fix
-// that simply lowers the bound, which is precisely the unsafe change.
+//   1. the bound must stay INDEPENDENT of `maxPrefillChunk` and identical
+//      across backends. Any reintroduced chunk term or paged-specific pad
+//      re-creates the gpt-oss refusal, and it re-creates it as a
+//      configuration-dependent bug that a gemma-4-shaped fixture cannot see;
+//   2. adoption in the chunk > window ratio must be accepted AND token-exact.
+//      Widening acceptance without exactness trades the frozen-full defect
+//      back for a throughput number — the windows come back full-length but
+//      built from too few keys, which nothing downstream can detect.
+//
+// (2) is the one with teeth. A test that only asserts acceptance passes for
+// a "fix" that merely lowers the bound, which is precisely the unsafe change.
 
 import Foundation
 import MLX
@@ -64,8 +70,8 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
     private static let matched = 64
     private static let slidingLayers = 2
 
-    /// What the planner grants: `windowCount * maxWindow + maxWindow`.
-    private static let grantedReplay = slidingLayers * window + window  // 24
+    /// `windowCount * maxWindow`, with no chunk term and no paged pad.
+    private static let expectedReplay = slidingLayers * window  // 16
 
     private func makeModel() -> TinyTestModel {
         TinyTestModel.make(
@@ -83,8 +89,9 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
     }
 
     /// Prefill `prompt[from ..< upTo]`, honouring the plan's chunk clamp
-    /// exactly as `SchedulerV2` does. The clamp is load-bearing here: it is
-    /// what keeps the replay leg inside the slack the planner bought.
+    /// exactly as `SchedulerV2` does — it still splits at C and M, which a
+    /// frozen row requires because storage below M is immutable and above it
+    /// is appendable, and one write cannot do both.
     @discardableResult
     private func prefill(
         model: TinyTestModel, backend: PagedKVBackend, state: [CBv2SequenceKV?],
@@ -159,8 +166,6 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
         abs(lhs.asType(.float32) - rhs.asType(.float32)).max().item(Float.self)
     }
 
-    // MARK: - 1. The planner's grant, at real gpt-oss-20b geometry
-
     /// gpt-oss-20b as `config.json` declares it: 24 layers alternating
     /// `sliding_attention` (window 128) and `full_attention`, head_dim 64,
     /// 8 KV heads.
@@ -174,98 +179,165 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
         }
     }
 
-    /// The arithmetic that produced `saved = 0`, pinned at the real geometry.
+    /// gemma-4-26B: 25 sliding layers of window 1,024, then 5 full.
+    private func gemma4LayerKinds() -> [CBv2LayerKind] {
+        (0 ..< 30).map { index in
+            CBv2LayerKind(
+                attention: index < 25 ? .slidingWindow(1024) : .full,
+                headDim: index < 25 ? 256 : 512,
+                kvHeads: 4,
+                queryHeads: 8)
+        }
+    }
+
+    // MARK: - 1. The bound, at real production geometry
+
+    /// The arithmetic that produced `saved = 0`, pinned at the real geometry
+    /// it produced it on — and now pinned at parity.
     ///
-    /// The planner must grant at least what a 512-token-chunk pool will
-    /// demand. It buys that by capping the replay chunk rather than by
-    /// assuming a relation between the chunk and the window — the assumption
-    /// that gemma-4 satisfied and gpt-oss did not.
-    @Test func gptOssGeometryGrantsEnoughReplayForTheDefaultChunk() throws {
+    /// 26,880 is the number the G2 harness measures on contiguous. Paged
+    /// reporting anything less than that is the regression this test exists
+    /// to catch; paged reporting 0 is the bug it was written for.
+    @Test func gptOssGeometryReusesAsMuchAsContiguous() throws {
         let kinds = gptOssLayerKinds()
         #expect(kinds.filter { $0.attention == .slidingWindow(128) }.count == 12)
 
         let contiguous = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds, backend: .contiguousUnquantized)
-        #expect(contiguous.strategy == .frozenFullReplay)
-        #expect(contiguous.conservativeReplayBoundTokens == 1536, "12 sliding layers x 128")
-
         let paged = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds, backend: .pagedFP16)
+        #expect(contiguous.strategy == .frozenFullReplay)
         #expect(paged.strategy == .frozenFullReplay)
-        #expect(paged.conservativeReplayBoundTokens == 1664, "1536 + one window of slack")
+        #expect(contiguous.conservativeReplayBoundTokens == 1536, "12 sliding layers x 128")
+        #expect(
+            paged.conservativeReplayBoundTokens == 1536,
+            "paged pays no pad over contiguous once the chunk term is gone")
 
         // The boundary the G2 parity harness actually matched on both arms.
         let plan = try #require(
             paged.plan(matchedBoundary: 28416, maximumSequenceLength: 28672))
-        #expect(plan.replayTokens == 1664)
-        #expect(plan.replayStart == 26752)
-        #expect(plan.prefillTokensSaved == 26752, "a hit must save, not return zero")
-
-        // The defect, in one line of arithmetic. Left uncapped, a 512-token
-        // pool chunk demands more replay than the planner ever grants, so
-        // EVERY gpt-oss adoption was refused after a confirmed hit.
-        let uncapped = PagedKVBackend.requiredFrozenReplayTokens(
-            layerKinds: kinds, replayChunkTokens: 512)
-        #expect(uncapped == 2048, "12 x 128 + one 512-token chunk")
+        #expect(plan.replayTokens == 1536)
+        #expect(plan.replayStart == 26880)
         #expect(
-            uncapped > plan.replayTokens,
-            "regression guard: this inequality is what returned saved = 0")
-
-        // The fix caps the REPLAY chunk at one window, so the grant covers
-        // the demand by construction rather than by luck of configuration.
-        #expect(plan.replayChunkCeiling == 128)
-        let demanded = PagedKVBackend.requiredFrozenReplayTokens(
-            layerKinds: kinds,
-            replayChunkTokens: min(512, plan.replayChunkCeiling))
-        #expect(
-            demanded <= plan.replayTokens,
+            plan.prefillTokensSaved == 26880,
             """
-            planner granted \(plan.replayTokens) replay tokens but the pool \
-            demands \(demanded) — PagedKVBackend.makeSequenceState(adopting:) refuses \
-            this plan and the request cold-prefills, throwing away \
-            \(plan.prefillTokensSaved) tokens of a confirmed cache hit
+            the harness measures 26880 on contiguous; paged must match it, and it \
+            returned 0 while the bound carried a maxPrefillChunk term
             """)
-    }
 
-    /// The clamp must bind BELOW M and release above it.
-    ///
-    /// Below M it is what makes the grant sufficient. Above M the request is
-    /// doing an ordinary prefill of `[M, promptLength)` — 26k+ tokens on the
-    /// harness prompt — and holding that to one window would trade a prefill
-    /// throughput regression for the reuse win.
-    @Test func theReplayChunkClampBindsOnlyBelowTheMatchedBoundary() throws {
-        let paged = CBv2PrefixReuseCapability.derive(
-            layerKinds: gptOssLayerKinds(), backend: .pagedFP16)
-        let plan = try #require(
-            paged.plan(matchedBoundary: 28416, maximumSequenceLength: 28672))
-
-        #expect(plan.clampedChunk(start: plan.replayStart, proposed: 512) == 128)
-        #expect(plan.clampedChunk(start: plan.matchedBoundary - 1, proposed: 512) == 1)
+        // The backend's own demand, which is what refuses an adoption. It
+        // reads layer shapes only — no pool config reaches it.
         #expect(
-            plan.clampedChunk(start: plan.matchedBoundary, proposed: 512) == 512,
-            "the prefill above M keeps the pool's full chunk")
-
-        // gemma-4's ratio is the other way round (window 1,024 against a 512
-        // chunk), so the clamp must be inert there — its replay chunk is
-        // unchanged and this fix cannot regress the model that worked.
-        let gemma = CBv2PrefixReuseCapability.derive(
-            layerKinds: (0 ..< 30).map { index in
-                CBv2LayerKind(
-                    attention: index < 25 ? .slidingWindow(1024) : .full,
-                    headDim: index < 25 ? 256 : 512,
-                    kvHeads: 4,
-                    queryHeads: 8)
-            },
-            backend: .pagedFP16)
-        let gemmaPlan = try #require(
-            gemma.plan(matchedBoundary: 28416, maximumSequenceLength: 28672))
-        #expect(gemmaPlan.replayTokens == 26624, "25 x 1024 + 1024")
-        #expect(gemmaPlan.clampedChunk(start: 0, proposed: 512) == 512)
+            cbv2RequiredRecompute(layerKinds: kinds, matched: plan.matchedBoundary)
+                <= plan.replayTokens,
+            "a plan the backend will refuse must never be emitted")
     }
 
-    // MARK: - 2. Adoption is accepted in this ratio
+    // MARK: - 2. The bound is independent of the pool chunk
 
-    /// The regression. Before the chunk cap, `derive` granted
+    /// The invariant that now carries the gpt-oss defect.
+    ///
+    /// The refusal was configuration-dependent: identical model, identical
+    /// match, and the adoption succeeded or failed purely on the pool's
+    /// `maxPrefillChunk` relative to the window. So the property worth
+    /// pinning is not a numeric bound but an INDEPENDENCE — the bound must
+    /// not be a function of the chunk, and paged must not carry a pad that
+    /// contiguous does not.
+    ///
+    /// `chunk` is swept as a deliberately inert dimension. The day it stops
+    /// being inert, this fails for every shape whose window is under it,
+    /// which is exactly the population that shipped broken last time.
+    @Test func theReplayBoundIsIndependentOfThePoolChunk() throws {
+        for windowCount in [1, 2, 5, 12, 25] {
+            for window in [8, 16, 128, 512, 1024] {
+                var kinds = (0 ..< windowCount).map { _ in
+                    CBv2LayerKind(
+                        attention: .slidingWindow(window),
+                        headDim: 64, kvHeads: 2, queryHeads: 4)
+                }
+                // One owning full layer downstream: what selects
+                // `.frozenFullReplay` over `.tailReplay`.
+                kinds.append(
+                    CBv2LayerKind(
+                        attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4))
+
+                let expected = windowCount * window
+                let contiguous = CBv2PrefixReuseCapability.derive(
+                    layerKinds: kinds, backend: .contiguousUnquantized)
+                let paged = CBv2PrefixReuseCapability.derive(
+                    layerKinds: kinds, backend: .pagedFP16)
+                #expect(paged.strategy == .frozenFullReplay)
+                #expect(
+                    paged.conservativeReplayBoundTokens == expected,
+                    """
+                    \(windowCount) x window \(window): paged bound must be \
+                    windowCount x maxWindow with no pad
+                    """)
+                #expect(
+                    paged.conservativeReplayBoundTokens
+                        == contiguous.conservativeReplayBoundTokens,
+                    """
+                    \(windowCount) x window \(window): paged must not cost more \
+                    replay than contiguous
+                    """)
+
+                let plan = try #require(
+                    paged.plan(
+                        matchedBoundary: 2 * expected,
+                        maximumSequenceLength: 4 * expected))
+                #expect(plan.replayTokens == expected)
+
+                // A pool of ANY chunk must be servable by this one plan.
+                // `cbv2RequiredRecompute` takes no chunk, so the loop proves
+                // the demand cannot move with one.
+                let demanded = cbv2RequiredRecompute(
+                    layerKinds: kinds, matched: plan.matchedBoundary)
+                for chunk in [8, 16, 128, 512, 1024, 2048] {
+                    #expect(
+                        plan.replayTokens >= demanded,
+                        """
+                        \(windowCount) sliding layers x window \(window), pool chunk \
+                        \(chunk): granted \(plan.replayTokens) but the backend demands \
+                        \(demanded) — adoption refuses and the hit saves nothing
+                        """)
+                }
+            }
+        }
+    }
+
+    /// Both shipping models, at the boundary the harness matches, with the
+    /// saved-token counts the gate reports.
+    @Test func shippingModelsSaveWhatContiguousSaves() throws {
+        for (name, kinds, bound, saved) in [
+            ("gpt-oss-20b", gptOssLayerKinds(), 1536, 26880),
+            ("gemma-4-26B", gemma4LayerKinds(), 25600, 2816),
+        ] {
+            let paged = CBv2PrefixReuseCapability.derive(
+                layerKinds: kinds, backend: .pagedFP16)
+            let contiguous = CBv2PrefixReuseCapability.derive(
+                layerKinds: kinds, backend: .contiguousUnquantized)
+            #expect(paged.conservativeReplayBoundTokens == bound, "\(name)")
+            #expect(contiguous.conservativeReplayBoundTokens == bound, "\(name)")
+
+            let plan = try #require(
+                paged.plan(matchedBoundary: 28416, maximumSequenceLength: 28672))
+            #expect(plan.prefillTokensSaved == saved, "\(name)")
+
+            // `clampedChunk` no longer caps — it only splits at C and M, and
+            // that split is still mandatory: a frozen row's storage is
+            // immutable below M and appendable above it, so one write can
+            // never straddle.
+            #expect(plan.clampedChunk(start: plan.replayStart, proposed: 512) == 512)
+            #expect(
+                plan.clampedChunk(start: plan.matchedBoundary - 1, proposed: 512) == 1,
+                "\(name): a chunk must not cross M")
+            #expect(plan.clampedChunk(start: plan.matchedBoundary, proposed: 512) == 512)
+        }
+    }
+
+    // MARK: - 3. Adoption is accepted in this ratio
+
+    /// The regression. While the bound carried a chunk term, `derive` granted
     /// `2 * 8 + 8 == 24` replay tokens and the backend demanded
     /// `2 * 8 + 32 == 48`, so this threw `backendIneligible` and the engine
     /// cold-prefilled — the unit-scope shape of gpt-oss's `adoption_failed`.
@@ -279,8 +351,8 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
         let plan = try #require(
             capability.plan(
                 matchedBoundary: Self.matched, maximumSequenceLength: Self.maxLength))
-        #expect(plan.replayTokens == Self.grantedReplay)
-        #expect(plan.replayStart == Self.matched - Self.grantedReplay)
+        #expect(plan.replayTokens == Self.expectedReplay)
+        #expect(plan.replayStart == Self.matched - Self.expectedReplay)
 
         let backend = try makeBackend(kinds)
         let prefix = try donateFullRows(
@@ -304,12 +376,13 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
         backend.release(state)
     }
 
-    // MARK: - 3. And it is exact
+    // MARK: - 4. And it is exact
 
-    /// The safety half. Accepting the adoption is only correct if the sliding
-    /// rows come back bit-exact; a fix that widens acceptance by lowering the
-    /// bound reintroduces the frozen-full defect, where the windows are
-    /// full-length but built from too few keys.
+    /// The safety half, and the reason the narrowed bound needs coverage in
+    /// THIS ratio specifically. Accepting the adoption is only correct if the
+    /// sliding rows come back bit-exact; a bound that is too short reproduces
+    /// the frozen-full defect, where the windows are full-length but built
+    /// from too few keys and nothing downstream can see it.
     ///
     /// Decoded over three full window turnovers so a single missing key
     /// cannot hide inside the prompt.
@@ -365,70 +438,5 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
             the replay bound is too short for this ratio and the sliding rows came back \
             inexact
             """)
-    }
-
-    // MARK: - 4. The grant and the demand, across every ratio
-
-    /// The invariant the gpt-oss defect violated, swept over the whole
-    /// (windowCount, window, chunk) space rather than the two shapes that
-    /// happen to ship.
-    ///
-    /// `CBv2PrefixReuseCapability.derive` grants
-    /// `windowCount * maxWindow + maxWindow`; the pool demands
-    /// `windowCount * maxWindow + replayChunkTokens`. The grant covers the
-    /// demand iff the replay chunk never exceeds one window — which is what
-    /// `replayChunkCeiling` guarantees, and what the old `maxPrefillChunk <=
-    /// maxWindow` assumption merely hoped for.
-    ///
-    /// Written against the CAPPED chunk on purpose. Asserted against the raw
-    /// pool chunk this reproduces the defect instead of the invariant, so a
-    /// failure here means the grant and the cap have drifted apart — the two
-    /// live in different files and nothing else couples them.
-    @Test func theGrantCoversThePoolDemandForEveryWindowChunkRatio() throws {
-        for windowCount in [1, 2, 5, 12, 25] {
-            for window in [8, 16, 128, 512, 1024] {
-                for chunk in [8, 16, 128, 512, 1024, 2048] {
-                    var kinds = (0 ..< windowCount).map { _ in
-                        CBv2LayerKind(
-                            attention: .slidingWindow(window),
-                            headDim: 64, kvHeads: 2, queryHeads: 4)
-                    }
-                    // One owning full layer downstream: what selects
-                    // `.frozenFullReplay` over `.tailReplay`.
-                    kinds.append(
-                        CBv2LayerKind(
-                            attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4))
-
-                    let capability = CBv2PrefixReuseCapability.derive(
-                        layerKinds: kinds, backend: .pagedFP16)
-                    #expect(capability.strategy == .frozenFullReplay)
-
-                    let granted = window * (windowCount + 1)
-                    #expect(capability.conservativeReplayBoundTokens == granted)
-
-                    // A boundary comfortably past the bound, so `replayTokens`
-                    // is the full grant rather than a clamp against M.
-                    let plan = try #require(
-                        capability.plan(
-                            matchedBoundary: 2 * granted,
-                            maximumSequenceLength: 4 * granted))
-                    #expect(plan.replayTokens == granted)
-
-                    let replayChunk =
-                        plan.replayChunkCeiling > 0
-                        ? min(chunk, plan.replayChunkCeiling) : chunk
-                    let demanded = PagedKVBackend.requiredFrozenReplayTokens(
-                        layerKinds: kinds, replayChunkTokens: replayChunk)
-                    #expect(
-                        plan.replayTokens >= demanded,
-                        """
-                        \(windowCount) sliding layers x window \(window), pool chunk \
-                        \(chunk): granted \(plan.replayTokens) but the pool demands \
-                        \(demanded) (replay chunk \(replayChunk)) — adoption refuses \
-                        and the hit saves nothing
-                        """)
-                }
-            }
-        }
     }
 }

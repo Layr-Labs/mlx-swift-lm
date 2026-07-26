@@ -218,13 +218,18 @@ struct CBv2PrefixReusePagedFrozenFullTests {
         let contiguous = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds, backend: .contiguousUnquantized)
         #expect(contiguous.strategy == .frozenFullReplay)
-        // Two windowed layers x window 16.
+        // Two windowed layers x window 16. Paged pays the SAME bound as
+        // contiguous. It briefly paid one window more, because a frozen paged
+        // row attended its chunk's freshly projected keys where the
+        // contiguous frozen row hands back the cached ones;
+        // `PagedLayerCache.prefillKVWritingChunk` reads the cached diagonal
+        // out of the frozen pages now, so the two bounds are equal and this
+        // assertion is what keeps them that way.
         #expect(contiguous.conservativeReplayBoundTokens == 2 * Self.window)
-        // Paged pays one more window, because `PagedLayerCache.prefillKV`
-        // attends the chunk's freshly projected keys where the contiguous
-        // frozen row hands back the cached ones. See
-        // `PagedKVBackend.requiredFrozenReplayTokens`.
-        #expect(paged.conservativeReplayBoundTokens == 3 * Self.window)
+        #expect(paged.conservativeReplayBoundTokens == 2 * Self.window)
+        #expect(
+            paged.conservativeReplayBoundTokens
+                == contiguous.conservativeReplayBoundTokens)
     }
 
     /// The two frozen-full forms, and the reach difference between them.
@@ -243,7 +248,7 @@ struct CBv2PrefixReusePagedFrozenFullTests {
             layerKinds: kinds, backend: .contiguousUnquantized)
 
         // At or below the replay bound the replay form has nothing to save.
-        for boundary in [8, 16, 32, 48] {
+        for boundary in [8, 16, 32] {
             #expect(
                 paged.plan(matchedBoundary: boundary, maximumSequenceLength: Self.maxLength)
                     == nil,
@@ -260,8 +265,8 @@ struct CBv2PrefixReusePagedFrozenFullTests {
         let replay = try #require(
             paged.plan(matchedBoundary: 64, maximumSequenceLength: Self.maxLength))
         #expect(replay.strategy == .frozenFullReplay)
-        #expect(replay.replayTokens == 3 * Self.window)
-        #expect(replay.replayStart == 64 - 3 * Self.window)
+        #expect(replay.replayTokens == 2 * Self.window)
+        #expect(replay.replayStart == 64 - 2 * Self.window)
         #expect(replay.restoredFullTokens == 64, "full rows are exact through M in both forms")
         #expect(!replay.requiresExactWindowRestore)
 
@@ -528,12 +533,21 @@ struct CBv2PrefixReusePagedFrozenFullTests {
     /// IMMUTABLE through M with the logical cursor at C, sliding rows empty at
     /// C, `[C, M)` replayed.
     ///
-    /// The property that matters is that the frozen rows stay frozen. If
-    /// `PagedSequenceKV.write` appended during the replay, the exact cached
-    /// full K/V for `[C, M)` would be overwritten with projections taken from
-    /// sliding rows that do not have their windows yet, and the damage is
-    /// PERMANENT — full attention keeps every key forever, so a later decode
-    /// reads the poisoned ones and no replay length can recover.
+    /// Two properties, and the SECOND is the one with teeth.
+    ///
+    ///  1. The frozen rows stay frozen. If `PagedSequenceKV.write` appended
+    ///     during the replay, the exact cached full K/V for `[C, M)` would be
+    ///     overwritten with projections taken from sliding rows that do not
+    ///     have their windows yet, and the damage is PERMANENT — full
+    ///     attention keeps every key forever.
+    ///  2. The REBUILT SLIDING WINDOWS are bit-equal to a cold twin's at the
+    ///     same absolute positions. Token equality alone does NOT discriminate
+    ///     on this fixture: P4_FrozenChunkGather measured that halving R to 16
+    ///     still yields identical tokens here, because layer 0 reads the exact
+    ///     embedding (so its fresh projections already equal the cached ones)
+    ///     and layer 3 feeds only discarded pre-M logits. A test that asserted
+    ///     tokens alone would pass on a replay that is half as long as the
+    ///     cone arithmetic requires. The window comparison is what fails.
     @Test func frozenReplayFormIsTokenExactAgainstAColdTwin() throws {
         let model = makeModel()
         let kinds = model.layerKinds
@@ -565,17 +579,12 @@ struct CBv2PrefixReusePagedFrozenFullTests {
         let plan = try #require(
             capability.plan(matchedBoundary: matched, maximumSequenceLength: Self.maxLength))
         #expect(!plan.requiresExactWindowRestore)
-        #expect(plan.replayTokens == 3 * Self.window)
-        #expect(plan.replayStart == matched - 3 * Self.window)
+        #expect(plan.replayTokens == 2 * Self.window)
+        #expect(plan.replayStart == matched - 2 * Self.window)
         #expect(
             plan.replayTokens
-                >= PagedKVBackend.requiredFrozenReplayTokens(
-                    layerKinds: kinds, replayChunkTokens: Self.chunkSize))
-        // chunk 8 < window 16, so the cap does not bind and the replay is
-        // chunked exactly as an unadopted prefill would be.
-        #expect(plan.replayChunkCeiling == Self.window)
-        #expect(plan.clampedChunk(start: plan.replayStart, proposed: Self.chunkSize)
-            == Self.chunkSize)
+                >= cbv2RequiredRecompute(layerKinds: kinds, matched: matched),
+            "paged's grant must clear the shared bound, same as contiguous")
 
         let state = try backend.makeSequenceState(
             adopting: prefix, plan: plan, layerKinds: kinds, maxLength: Self.maxLength)
@@ -596,9 +605,38 @@ struct CBv2PrefixReusePagedFrozenFullTests {
             }
         }
 
+        // (2) Replay [C, M) ONLY, and compare the rebuilt sliding windows
+        //     against a cold row prefilled straight through to M. This is the
+        //     assertion that measures the replay; the tokens below do not.
+        prefill(
+            model: model, backend: backend, state: state, prompt: prompt,
+            from: plan.replayStart, upTo: matched, plan: plan)
+
+        let windowBackend = try makeBackend(kinds)
+        let windowState = try windowBackend.makeSequenceState(
+            layerKinds: kinds, promptLength: matched, maxLength: Self.maxLength)
+        prefill(
+            model: model, backend: windowBackend, state: windowState, prompt: prompt,
+            from: 0, upTo: matched)
+        for (index, kind) in kinds.enumerated() {
+            guard case .slidingWindow = kind.attention else { continue }
+            let rebuilt = try #require(state[index] as? PagedSequenceKV)
+            let reference = try #require(windowState[index] as? PagedSequenceKV)
+            #expect(rebuilt.absoluteOffset == matched && reference.absoluteOffset == matched)
+            let span = min(matched, Self.window)
+            let got = rebuilt.gatherRange(start: matched - span, count: span)
+            let want = reference.gatherRange(start: matched - span, count: span)
+            #expect(
+                maxAbsDiff(got.keys, want.keys) == 0,
+                "layer \(index) rebuilt its window inexactly — the replay is too short")
+            #expect(maxAbsDiff(got.values, want.values) == 0, "layer \(index) values")
+        }
+        windowBackend.release(windowState)
+
+        // (3) Finish the prompt and decode; tokens are the end-to-end check.
         let adopted = run(
             model: model, backend: backend, state: state, prompt: prompt,
-            from: plan.replayStart, steps: steps, plan: plan)
+            from: matched, steps: steps, plan: plan)
 
         // The frozen rows must still hold the donated bytes at [0, M) after
         // the replay wrote straight through them.
@@ -623,31 +661,23 @@ struct CBv2PrefixReusePagedFrozenFullTests {
             """)
     }
 
-    /// A replay shorter than this pool needs is refused, not attempted.
+    /// A replay shorter than the layout's cone bound is refused, not
+    /// attempted.
     ///
-    /// `derive` grants `windowCount * maxWindow + maxWindow` because it cannot
-    /// see `maxPrefillChunk`; the backend is where that is reconciled against
-    /// the chunk the replay will actually get. A plan that clears the
-    /// planner's bound but not the pool's would leave the sliding rows inexact
-    /// by up to one chunk, which is invisible: the rows are full-length, just
-    /// wrong.
-    @Test func aReplayShorterThanThePoolNeedsIsRefused() throws {
+    /// A plan reaches the backend from outside the type, so the relation is
+    /// checked rather than assumed even though `derive` now grants exactly
+    /// this. A too-short replay leaves the sliding rows inexact, which is
+    /// invisible: the rows are full-length, just wrong.
+    @Test func aReplayShorterThanTheConeBoundIsRefused() throws {
         let model = makeModel()
         let kinds = model.layerKinds
         let prompt = makePromptTokens(length: 96, seed: 0xC0FF_EE11)
         let matched = 64
 
-        // 2 sliding layers x window 16, plus the replay chunk.
+        // 2 sliding layers x window 16 — the SHARED bound, no paged extra.
+        #expect(cbv2RequiredRecompute(layerKinds: kinds, matched: matched) == 2 * Self.window)
         #expect(
-            PagedKVBackend.requiredFrozenReplayTokens(
-                layerKinds: kinds, replayChunkTokens: Self.chunkSize) == 2 * Self.window
-                + Self.chunkSize)
-        #expect(
-            PagedKVBackend.requiredFrozenReplayTokens(layerKinds: kinds, replayChunkTokens: 0)
-                == 2 * Self.window)
-        #expect(
-            PagedKVBackend.requiredFrozenReplayTokens(
-                layerKinds: [kinds[0]], replayChunkTokens: Self.chunkSize) == 0,
+            cbv2RequiredRecompute(layerKinds: [kinds[0]], matched: matched) == 0,
             "no windowed layer, no replay")
 
         let backend = try makeBackend(kinds)
@@ -673,8 +703,7 @@ struct CBv2PrefixReusePagedFrozenFullTests {
             initialAdditionalCapacityBytes: 0,
             fullCapacityTokensReserved: matched,
             stagedFullKVBytes: 0,
-            residentFullKVBytes: 0,
-            replayChunkCeiling: Self.window)
+            residentFullKVBytes: 0)
         try expectRefusal(backend: backend, prefix: prefix, plan: short, kinds: kinds)
 
         // And a replay plan that ALSO carries windows is a contradiction: one
@@ -687,24 +716,27 @@ struct CBv2PrefixReusePagedFrozenFullTests {
     }
 
     /// REGRESSION, gpt-oss-20b (G2 parity gate, 2026-07-25). A layout whose
-    /// window is SMALLER than the pool's prefill chunk used to lose prefix
-    /// reuse entirely: the planner granted `windowCount*maxWindow + maxWindow`
-    /// while the backend demanded `windowCount*maxWindow + maxPrefillChunk`,
-    /// so adoption refused after a perfectly good match. Measured on the real
+    /// window is SMALLER than the pool's prefill chunk lost prefix reuse
+    /// entirely: the planner granted `windowCount*maxWindow + maxWindow` while
+    /// the backend demanded `windowCount*maxWindow + maxPrefillChunk`, so
+    /// adoption refused after a perfectly good match. Measured on the real
     /// model: 12 sliding layers of window 128 against a 512-token chunk,
-    /// granted 1,664 against a demanded 2,048, match of 28,416 tokens, and
-    /// 26,752 tokens of available saving thrown away — while contiguous
-    /// served the same match.
+    /// granted 1,664 against a demanded 2,048, a match of 28,416 tokens, and
+    /// 26,752 tokens of saving thrown away — while contiguous served the same
+    /// match. The falsified comment read "every shipping config".
     ///
-    /// The fix is `replayChunkCeiling`: the replay is capped at one window, so
-    /// granted >= required holds for EVERY layout instead of only for the ones
-    /// whose window happens to exceed their chunk. The comment this test
-    /// defends used to read "every shipping config".
-    @Test func aWindowSmallerThanTheChunkStillAdopts() throws {
-        // window 16 with a 32-token pool chunk — the gpt-oss relation.
-        let chunk = 2 * Self.window
+    /// The chunk term is now gone entirely (`PagedLayerCache
+    /// .prefillKVWritingChunk` reads the frozen diagonal out of the pages),
+    /// so the invariant this test defends is stronger than the original fix:
+    /// THE BOUND DOES NOT DEPEND ON `maxPrefillChunk` AT ALL. Any future
+    /// change that reintroduces a chunk term brings the gpt-oss refusal back
+    /// with it, and fails here.
+    @Test func theReplayBoundIsIndependentOfThePoolChunk() throws {
         let model = makeModel()
         let kinds = model.layerKinds
+        let matched = 64
+        // window 16 against a 32-token pool chunk — the gpt-oss relation.
+        let chunk = 2 * Self.window
         let backend = try PagedKVBackend(
             layerKinds: kinds,
             config: PagedKVPoolConfig(
@@ -714,31 +746,21 @@ struct CBv2PrefixReusePagedFrozenFullTests {
 
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds, backend: .pagedFP16)
-        let matched = 64
         let plan = try #require(
             capability.plan(matchedBoundary: matched, maximumSequenceLength: Self.maxLength))
-        #expect(plan.replayTokens == 3 * Self.window)
+        // Granted, demanded, and the shared bound are ONE number, whatever the
+        // pool's chunk is.
+        #expect(plan.replayTokens == 2 * Self.window)
+        #expect(cbv2RequiredRecompute(layerKinds: kinds, matched: matched) == plan.replayTokens)
 
-        // Uncapped, the backend would demand more than the planner granted —
-        // this is the arithmetic of the production failure, asserted directly.
-        #expect(
-            PagedKVBackend.requiredFrozenReplayTokens(layerKinds: kinds, replayChunkTokens: chunk)
-                > plan.replayTokens,
-            "without the cap the grant is short — this is the gpt-oss refusal")
-        // Capped, it is satisfied, and the cap is what the replay will get.
-        #expect(plan.replayChunkCeiling == Self.window)
-        #expect(backend.replayChunkTokens(for: plan) == Self.window)
-        #expect(
-            PagedKVBackend.requiredFrozenReplayTokens(
-                layerKinds: kinds, replayChunkTokens: backend.replayChunkTokens(for: plan))
-                <= plan.replayTokens)
-
-        // The cap binds BELOW M only: the bulk prefill of [M, promptLength)
-        // keeps the pool's full chunk, which is where a long prompt's tokens
-        // actually are.
-        #expect(plan.clampedChunk(start: plan.replayStart, proposed: chunk) == Self.window)
+        // The replay leg is no longer capped: the chunk that reaches a frozen
+        // row below M is the pool's, exactly as above M. If a cap ever comes
+        // back it must come back WITH a bound that pays for it.
+        #expect(plan.clampedChunk(start: plan.replayStart, proposed: chunk) == chunk)
         #expect(plan.clampedChunk(start: matched, proposed: chunk) == chunk)
-        #expect(plan.clampedChunk(start: matched + chunk, proposed: chunk) == chunk)
+        #expect(
+            plan.clampedChunk(start: matched - Self.window, proposed: chunk) == Self.window,
+            "still split at M")
 
         // And it adopts rather than refusing.
         let prompt = makePromptTokens(length: 96, seed: 0x5EE_D5)

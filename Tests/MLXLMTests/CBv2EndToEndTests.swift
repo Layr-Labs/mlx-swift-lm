@@ -453,13 +453,19 @@ final class CBv2EndToEndTests: XCTestCase {
     /// it end to end through the production engine, donation queue and
     /// PrefixCacheV2 — a real hit, token-identical to the cold run.
     ///
-    /// The numbers differ from the contiguous twin by exactly one window, and
-    /// that is structural, not noise. `PagedLayerCache.prefillKV` attends
-    /// `gather ++ chunk` with the chunk half freshly projected, where
-    /// `CBv2FrozenReplayFullSequenceKV` hands back the cached keys, so a
-    /// frozen paged row needs one extra window of replay:
+    /// The numbers are now IDENTICAL to the contiguous twin's, and that is
+    /// what this test is for. They used to differ by exactly one window:
+    /// `PagedLayerCache.prefillKV` attended `gather ++ chunk` with the chunk
+    /// half freshly projected, where `CBv2FrozenReplayFullSequenceKV` hands
+    /// back the cached keys, so a frozen paged row needed an extra window of
+    /// replay — replayBound 48, saving 72 - 48 = 24, against contiguous's 32
+    /// and 40. `prefillKVWritingChunk` reads the cached diagonal out of the
+    /// frozen pages now, so both arms run M = 72, R = 32, C = 40 and save 40:
     ///   contiguous  replayBound 2 x 16 = 32, saves 72 - 32 = 40
-    ///   paged       replayBound 32 + 16 = 48, saves 72 - 48 = 24
+    ///   paged       replayBound 2 x 16 = 32, saves 72 - 32 = 40
+    /// This is the end-to-end statement of paged/contiguous parity on prefix
+    /// reuse. If these numbers ever diverge from the twin above again, a
+    /// paged-specific replay term has come back.
     ///
     /// The zero-replay form (every sliding row restored EXACTLY at M from a
     /// `CBv2PagedWindowSnapshot`) is covered at the backend level by
@@ -476,7 +482,7 @@ final class CBv2EndToEndTests: XCTestCase {
         let stack = try makeStack(.paged, model: model, enablePrefixCache: true)
         XCTAssertTrue(stack.engine.prefixReuseCapability.isSupported)
         XCTAssertEqual(stack.engine.prefixReuseCapability.strategy, .frozenFullReplay)
-        XCTAssertEqual(stack.engine.prefixReuseCapability.conservativeReplayBoundTokens, 48)
+        XCTAssertEqual(stack.engine.prefixReuseCapability.conservativeReplayBoundTokens, 32)
 
         let first = await cbv2SchedCollect(
             try stack.engine.submit(greedyRequest(id: 1, prompt: prompt, maxTokens: 8)))
@@ -489,8 +495,8 @@ final class CBv2EndToEndTests: XCTestCase {
 
         XCTAssertEqual(second.usage?.prefixCacheMatchedTokens, 72)
         XCTAssertEqual(second.usage?.prefixCacheStrategy, .frozenFullReplay)
-        XCTAssertEqual(second.usage?.prefixCacheReplayTokens, 48)
-        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 24)
+        XCTAssertEqual(second.usage?.prefixCacheReplayTokens, 32)
+        XCTAssertEqual(second.usage?.prefixCachePrefillTokensSaved, 40)
         XCTAssertEqual(
             second.tokens, first.tokens,
             "paged frozen-full replay must be target-token exact")

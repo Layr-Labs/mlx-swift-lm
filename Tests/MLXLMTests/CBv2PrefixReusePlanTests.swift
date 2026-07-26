@@ -73,24 +73,26 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
     func testBackendSupportFailsColdForUnknownHybrid() {
         let kinds = [full(), sliding(16), full()]
         // WS-4.1: paged no longer fails cold on an interleaved hybrid. It
-        // derives `.frozenFullReplay` like contiguous, but pays one extra
-        // window of conservative replay — `PagedLayerCache.prefillKV` attends
-        // the chunk's freshly projected keys where the contiguous frozen row
-        // hands back the cached ones, so the first exact position moves by up
-        // to one prefill chunk. `PagedKVBackend.requiredFrozenReplayTokens`
-        // re-checks that against the pool's real chunk.
+        // derives `.frozenFullReplay` like contiguous, and pays the SAME
+        // conservative replay. It briefly paid one extra window, because
+        // `PagedLayerCache.prefillKV` attended the chunk's freshly projected
+        // keys where the contiguous frozen row hands back the cached ones, so
+        // the first exact position moved by up to one prefill chunk.
+        // `prefillKVWritingChunk` reads the cached diagonal out of the frozen
+        // pages now, so the two bounds are one number — and this assertion is
+        // what keeps them that way.
         let paged = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds,
             backend: .pagedFP16)
         XCTAssertTrue(paged.isSupported)
         XCTAssertNil(paged.unsupportedReason)
         XCTAssertEqual(paged.strategy, .frozenFullReplay)
-        XCTAssertEqual(paged.conservativeReplayBoundTokens, 32)
+        XCTAssertEqual(paged.conservativeReplayBoundTokens, 16)
         XCTAssertEqual(
             CBv2PrefixReuseCapability.derive(
                 layerKinds: kinds, backend: .contiguousUnquantized
             ).conservativeReplayBoundTokens,
-            16)
+            paged.conservativeReplayBoundTokens)
 
         let unknown = CBv2PrefixReuseCapability.derive(
             layerKinds: kinds,
@@ -134,6 +136,137 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
         XCTAssertEqual(above?.clampedChunk(start: 1, proposed: 31), 31)
         XCTAssertEqual(above?.clampedChunk(start: 1, proposed: 33), 32)
         XCTAssertEqual(above?.clampedChunk(start: 33, proposed: 1), 1)
+    }
+
+    /// The two shapes Gate G2 measures, and where frozen-full reuse first
+    /// fires on each.
+    ///
+    /// Paged used to grant `windowCount * maxWindow + maxWindow`, and that
+    /// extra window cost twice: every adopted request replayed a window it
+    /// did not need, AND the first boundary that could adopt at all moved out
+    /// by the same amount. `plan` refuses at or below its own bound —
+    /// `replayStart` would be 0 and the hit would save nothing — so the bound
+    /// IS the floor, and narrowing it lowers the floor.
+    ///
+    /// `firstBoundary` is the first boundary `PrefixCacheV2` can actually
+    /// return that clears the bound: lookups match whole hash blocks, so M is
+    /// always a multiple of `CBv2BlockHasher.defaultBlockSize`.
+    func testRealModelShapesShareTheContiguousReplayBoundAndItsFloor() throws {
+        struct Shape {
+            let name: String
+            let kinds: [CBv2LayerKind]
+            /// `windowCount * maxWindow` — what both backends grant now.
+            let bound: Int
+            /// `bound + maxWindow` — what paged granted before the narrowing.
+            let previousBound: Int
+            let firstBoundary: Int
+            let savedNow: Int
+            /// What that same boundary saved under `previousBound`; 0 means
+            /// the adoption was REFUSED outright and the request cold-filled.
+            let savedBefore: Int
+        }
+        let shapes = [
+            // gemma-4-26B: 25 sliding layers of window 1,024 plus 5 full.
+            Shape(
+                name: "gemma-4-26B",
+                kinds: (0 ..< 30).map { $0 < 25 ? sliding(1024) : full() },
+                bound: 25600, previousBound: 26624,
+                firstBoundary: 25856, savedNow: 256, savedBefore: 0),
+            // gpt-oss-20b: 24 layers alternating sliding(128) / full.
+            Shape(
+                name: "gpt-oss-20b",
+                kinds: (0 ..< 24).map { $0.isMultiple(of: 2) ? sliding(128) : full() },
+                bound: 1536, previousBound: 1664,
+                firstBoundary: 1792, savedNow: 256, savedBefore: 128),
+        ]
+
+        let block = CBv2BlockHasher.defaultBlockSize
+        for shape in shapes {
+            let paged = CBv2PrefixReuseCapability.derive(
+                layerKinds: shape.kinds, backend: .pagedFP16)
+            let contiguous = CBv2PrefixReuseCapability.derive(
+                layerKinds: shape.kinds, backend: .contiguousUnquantized)
+            XCTAssertEqual(paged.strategy, .frozenFullReplay, shape.name)
+            XCTAssertEqual(
+                paged.conservativeReplayBoundTokens, shape.bound, shape.name)
+            XCTAssertEqual(
+                paged.conservativeReplayBoundTokens,
+                contiguous.conservativeReplayBoundTokens,
+                "\(shape.name): both backends must pay ONE bound")
+
+            // The floor, exactly: nothing at the bound, a plan one past it.
+            XCTAssertNil(paged.plan(matchedBoundary: shape.bound), shape.name)
+            let atFloor = try XCTUnwrap(
+                paged.plan(matchedBoundary: shape.bound + 1), shape.name)
+            XCTAssertEqual(atFloor.replayTokens, shape.bound, shape.name)
+            XCTAssertEqual(atFloor.replayStart, 1, shape.name)
+
+            // `firstBoundary` is the least block-aligned boundary above it.
+            XCTAssertEqual(
+                shape.firstBoundary, (shape.bound / block + 1) * block, shape.name)
+            let first = try XCTUnwrap(
+                paged.plan(matchedBoundary: shape.firstBoundary), shape.name)
+            XCTAssertEqual(first.replayTokens, shape.bound, shape.name)
+            XCTAssertEqual(first.prefillTokensSaved, shape.savedNow, shape.name)
+
+            // And what that same boundary was worth before the narrowing,
+            // derived from the old grant rather than asserted as a constant.
+            XCTAssertEqual(
+                shape.savedBefore,
+                max(0, shape.firstBoundary - shape.previousBound),
+                "\(shape.name): the recorded before/after saving must follow from the "
+                    + "two bounds, not from a number typed into a test")
+            XCTAssertEqual(
+                shape.previousBound - shape.bound,
+                shape.kinds.compactMap {
+                    if case .slidingWindow(let w) = $0.attention { return w }
+                    return nil
+                }.max(),
+                "\(shape.name): the term removed was exactly one maxWindow")
+        }
+    }
+
+    /// The relation `PagedKVBackend.makeFrozenFullState` checks on every
+    /// frozen adoption: the planner's grant must cover `cbv2RequiredRecompute`.
+    ///
+    /// It used to be able to FAIL. The backend added the pool's prefill chunk
+    /// to its requirement, and the planner — which cannot see pool config —
+    /// guessed `maxWindow` as a proxy, so any layout with `window < chunk`
+    /// demanded more than it was granted and refused every adoption
+    /// (gpt-oss-20b: 2,048 demanded against 1,664 granted). The requirement
+    /// now reads layer shapes only, so grant and requirement are the same
+    /// expression and the relation is EQUALITY, not slack. Pinned as equality
+    /// on purpose: `>=` would silently tolerate a bound that grew back.
+    ///
+    /// Pool-chunk independence is checked where a pool exists, in
+    /// `CBv2PrefixReusePagedFrozenFullTests.theReplayBoundIsIndependentOf
+    /// ThePoolChunk`; here the point is that no chunk can enter at all.
+    func testGrantEqualsTheAdoptionRequirementForEveryLayout() throws {
+        for windowCount in [1, 2, 5, 12, 25] {
+            for window in [8, 16, 128, 512, 1024] {
+                // One owning full layer downstream is what selects
+                // `.frozenFullReplay` over `.tailReplay`.
+                let kinds = (0 ..< windowCount).map { _ in sliding(window) } + [full()]
+                let bound = windowCount * window
+                for backend in [CBv2PrefixReuseBackend.pagedFP16, .contiguousUnquantized] {
+                    let label = "\(backend.rawValue) \(windowCount)x\(window)"
+                    let capability = CBv2PrefixReuseCapability.derive(
+                        layerKinds: kinds, backend: backend)
+                    XCTAssertEqual(capability.strategy, .frozenFullReplay, label)
+                    XCTAssertEqual(capability.conservativeReplayBoundTokens, bound, label)
+                    for matched in [bound + 1, 2 * bound, 4 * bound] {
+                        let plan = try XCTUnwrap(
+                            capability.plan(matchedBoundary: matched), "\(label) M=\(matched)")
+                        XCTAssertEqual(
+                            plan.replayTokens,
+                            cbv2RequiredRecompute(layerKinds: kinds, matched: matched),
+                            "\(label) M=\(matched): granted and required must be one number — "
+                                + "a shortfall refuses the adoption, a surplus is replay the "
+                                + "request pays for and does not need")
+                    }
+                }
+            }
+        }
     }
 
     func testSafeLayoutsPreserveDirectAndTailReplay() throws {
