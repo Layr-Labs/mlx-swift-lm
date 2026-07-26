@@ -106,16 +106,24 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// runs AFTER the source wrote, so it cannot reproduce the pre-write
     /// view by gathering; the source has to keep it.
     ///
-    /// DORMANT, DELIBERATELY. Under the ring sizing that shipped
-    /// (`ceil((window - 1 + maxPrefillChunk) / pageSize) + span`) a
-    /// post-write gather of `window - 1 + chunk` still fits, so a borrower
-    /// could re-derive the view and this retention changes nothing. It
-    /// becomes load-bearing the moment the ring drops to `window + span`
-    /// — the shrink this file's pre-write gather exists to unblock — at
-    /// which point the older part of the chunk's window is physically
-    /// overwritten by the chunk's own tail and no gather order can recover
-    /// it. Do not delete it as unused: it is the mechanism, kept working,
-    /// for a change already scheduled.
+    /// LOAD-BEARING UNDER THE RING THAT SHIPPED, and free today only by
+    /// model accident. Do not quote a formula here; read
+    /// `PagedKVPool.ringPageCount`. Its CACHE bound no longer carries a
+    /// `maxPrefillChunk` term — it sizes to `maxWindowExposure(window) +
+    /// maxSpeculativeSpan` — precisely BECAUSE this file gathers a chunk
+    /// before writing it. Under that ring a borrower can no longer
+    /// re-derive the view by gathering after the fact: the older part of
+    /// the chunk's window has already been overwritten by the chunk's own
+    /// tail, and no gather order recovers it. This array is where the
+    /// source keeps it.
+    ///
+    /// It costs nothing today only because neither supported model has a
+    /// borrower: gemma-4 and gpt-oss both run `num_kv_shared_layers: 0`, so
+    /// `LayerCacheBankV2` clears `retainsChunkForBorrowers` on every layer
+    /// (see this file's `CBv2KVSourceChunkRetaining` conformance). That is a
+    /// MODEL FACT, not a property of this design — a checkpoint with a
+    /// non-zero shared-KV tail switches the retention on and then depends on
+    /// it for correctness. Do not delete it as unused.
     private var retainedPrefillKV: [PrefillKV] = []
     /// Defaults to `true` so a cache used outside a bank is correct; the
     /// bank turns it off for every layer no sibling borrows — which is all
@@ -240,11 +248,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // Gathering AFTER the write instead asks for
             // `window - 1 + chunk` (`retainedCount` with
             // `lastUpdateTokens == chunk`), which is exactly the term that
-            // forces `ringPageCount` to carry `maxPrefillChunk` and holds
-            // gemma-4's windowed layers at 97 pages for a 1,024-token
-            // window. With the gather hoisted the ring only has to satisfy
-            // `ringPages * pageSize >= window - 1`, which is what lets it
-            // drop to `window + maxSpeculativeSpan`. Under that sizing a
+            // would force `ringPageCount` to carry `maxPrefillChunk` again
+            // and put gemma-4's windowed layers back at the 97 pages a
+            // 1,024-token window used to cost. With the gather hoisted the
+            // ring only has to satisfy `ringPages * pageSize >= window - 1`,
+            // which is what let it drop to `window + maxSpeculativeSpan`
+            // (65 pages; derive it from `ringPageCount`). Under that sizing a
             // post-write gather is not merely wasteful, it aborts the
             // process on `gatherRange`'s eviction precondition for any
             // windowed chunk past `pageSize + 1` tokens.

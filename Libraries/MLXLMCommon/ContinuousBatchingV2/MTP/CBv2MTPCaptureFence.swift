@@ -31,25 +31,31 @@ enum CBv2MTPCaptureFence {
     /// collapses, and greedy token-exactness can break SILENTLY, with no
     /// crash to point at.
     ///
-    /// It does not corrupt in practice today because the windowed ring is
-    /// sized `ceil((window - 1 + maxPrefillChunk) / pageSize) +
-    /// ceil(maxSpeculativeSpan / pageSize)`, which leaves slack between the
-    /// ring and the gathered range. For gemma-4 (window 1024, chunk 512,
-    /// pageSize 16, span 8) that is 97 pages == 1,552 tokens, and the two
-    /// paths sit very differently inside it:
+    /// It does not corrupt in practice today only because the windowed ring
+    /// is still slightly wider than the widest range a row can gather. Do
+    /// NOT read a token count out of this paragraph — this geometry has
+    /// rotted three times. DERIVE it: `PagedKVPool.ringPageCount` sizes the
+    /// ring as `ceil(max(PagedSequenceKV.maxWindowExposure(window) +
+    /// CBv2PagedSpeculation.maxSpeculativeSpan, maxPrefillChunk) /
+    /// pageSize)` pages, and the widest range an MTP round can ask the ring
+    /// for is `maxWindowExposure(window)`. The margin is the difference
+    /// between those two, in tokens.
     ///
-    ///     MTP round      attendable 1,024   ->  margin 528
-    ///     prefill chunk  attendable 1,535   ->  margin  17
+    /// The WS-1.2/3.1 shrink HAS LANDED. Its first attempt aborted ordinary
+    /// windowed prefill because the CACHE bound still carried a
+    /// `maxPrefillChunk` term that a post-write gather needed;
+    /// `PagedLayerCache` now assembles each chunk's KV BEFORE writing the
+    /// chunk, the chunk term dropped out of that bound, and the ring shrank
+    /// with it. At gemma-4's geometry (window 1,024, chunk 512, pageSize 16,
+    /// span 8) the ring is 65 pages == 1,040 tokens against an attendable
+    /// 1,024 — a margin of SIXTEEN tokens, where the pre-shrink 97-page ring
+    /// left 528. Eight of those sixteen are the speculative span the formula
+    /// reserves on purpose; the other eight are page rounding and would be
+    /// gone at `window == 1,040`.
     ///
-    /// Read the SECOND row before concluding there is room to spare. 528 is
-    /// the number this hazard happens to hide behind; 17 is the number the
-    /// path that runs on every request lives on. Neither is a guarantee —
-    /// both are by-products of chunk sizing, and nothing asserts either.
-    /// WS-1.2/3.1 proposed shrinking the ring to `ceil(window / pageSize) +
-    /// span pages`, deleting the 528 outright. That shrink was tried and
-    /// REVERTED this wave — it aborted ordinary windowed prefill, which
-    /// needs the chunk term — so the margin still stands. The next attempt
-    /// will not have that bug, and then only this edge is left.
+    /// So the slack this hazard used to hide behind is spent, and nothing
+    /// asserts what remains. Read that as the fence being MORE load-bearing
+    /// than the pre-shrink note claimed, not less.
     ///
     /// **This is why the edge is unconditional.** There IS a chain that ties
     /// ring sizing to speculation — `PagedKVPool.checkedRingPageCount` sizes
@@ -61,7 +67,7 @@ enum CBv2MTPCaptureFence {
     /// with no ring at all. Publishing it unconditionally costs one reduction
     /// per capture and is correct for any ring size, any span, any chunk, and
     /// for full-attention rows. It is a mechanism, not a check, so it cannot
-    /// go stale when someone re-lands the shrink.
+    /// go stale when the ring geometry moves again — as it just did.
     ///
     /// **The fix: a fence BACK-edge.** `PagedKVPool.gather` already folds the
     /// group's write fence into its page index (`MLXArray(pages) +

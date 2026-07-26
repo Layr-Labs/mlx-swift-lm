@@ -8,9 +8,15 @@
 // batchmate does can move this sequence's positions or evict its pages.
 //
 // Windowed layers use a RING of pages: token at absolute position `p` lives
-// in table slot `(p / pageSize) % ringPages`, slot `p % pageSize`. Eviction
-// is therefore implicit overwrite keyed to absolute positions — the recent
-// end always survives and no window masks over shared buffers exist.
+// in table slot `(p / pageSize) % ringPages`, slot `p % pageSize`. That is a
+// bijection onto `p % (ringPages * pageSize)`, i.e. the ring is a flat
+// circular buffer of `ringPages * pageSize` TOKEN slots that happens to be
+// paged. Eviction is therefore implicit overwrite keyed to absolute
+// positions — the recent end always survives and no window masks over
+// shared buffers exist. How far back that end reaches is
+// `oldestValidPosition`, measured from the highest position ever WRITTEN
+// rather than from the cursor: a rollback retreats the cursor, it does not
+// un-write a slot.
 //
 // The ring is sized (`PagedKVPool.ringPageCount`) to cover the trailing
 // window plus one speculative span (`CBv2PagedSpeculation
@@ -52,6 +58,12 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     private(set) var tableVersion: Int = 0
 
     public private(set) var absoluteOffset: Int = 0
+    /// Highest absolute position this row has ever WRITTEN. Equal to
+    /// `absoluteOffset` for every row that never rolled back, and strictly
+    /// greater afterwards: `rollback` retreats the cursor, it does not
+    /// un-write the ring slots the rolled-back tokens landed in. Eviction is
+    /// measured from here — see `oldestValidPosition`.
+    private(set) var writtenHighWater: Int = 0
     /// Absolute position before which nothing was ever written here
     /// (nonzero only after `fastForward(to:)` for prefix-adopted rows).
     private(set) var baseOffset: Int = 0
@@ -380,6 +392,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             // prefix and must stay byte-exact, so the cursor advances and
             // nothing is written.
             absoluteOffset += n
+            writtenHighWater = max(writtenHighWater, absoluteOffset)
             return
         }
         precondition(
@@ -409,6 +422,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         pool.writeTokens(group: groupKey, slots: slots, keys: keys, values: values)
 
         absoluteOffset += n
+        writtenHighWater = max(writtenHighWater, absoluteOffset)
     }
 
     /// Reserve the destination for ONE decode token and advance the
@@ -426,6 +440,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         let page = ensurePage(logicalPage: absoluteOffset / s)
         let slot = absoluteOffset % s
         absoluteOffset += 1
+        writtenHighWater = max(writtenHighWater, absoluteOffset)
         return (page, slot)
     }
 
@@ -468,20 +483,76 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         return gatherRange(start: start, count: retained)
     }
 
+    /// Oldest absolute position this row still physically holds.
+    ///
+    /// Same concept, same name, as `CBv2WindowedSequenceKV
+    /// .oldestValidPosition` on the contiguous backend, and monotonically
+    /// non-decreasing for the same reason: destroyed history can never be
+    /// re-exposed. The paged ring holds exactly `ringPages * pageSize`
+    /// tokens behind the highest position ever WRITTEN, so this is measured
+    /// from `writtenHighWater`, never from `absoluteOffset`.
+    ///
+    /// THAT DISTINCTION IS THE WHOLE POINT. A rolled-back speculative round
+    /// put real bytes in the slots of `[writtenHighWater - ringTokens,
+    /// writtenHighWater)` before the cursor retreated; measuring from the
+    /// retreated cursor calls the oldest `maxSpeculativeSpan` of those
+    /// tokens live when they in fact hold the REJECTED draft's K/V, and a
+    /// gather that reaches them returns it with no trap and no telemetry.
+    /// No shipping caller reaches that band — the widest ask is
+    /// `maxWindowExposure`, which the ring clears by a whole speculative
+    /// span by construction (`PagedKVPool.ringPageCount`) — so this was
+    /// never a wrong answer in the field. It is the difference between a
+    /// guard that is exact and one that merely happens to be unreached, and
+    /// the margin it was leaning on is 8 tokens.
+    ///
+    /// NOT the inverse of `retainedCount`, unlike on the contiguous row.
+    /// `retainedCount` is the POLICY exposure (`min(written, window)`); this
+    /// is PHYSICAL residency, which is `maxSpeculativeSpan` wider. Reads are
+    /// bounded by the first and checked against the second.
+    ///
+    /// FULL rows evict nothing (every logical page owns a table slot), so
+    /// the only floor is `baseOffset` — which also floors windowed rows that
+    /// have not yet written a whole ring.
+    var oldestValidPosition: Int {
+        guard let ring = ringPages else { return baseOffset }
+        return max(baseOffset, writtenHighWater - ring * pool.config.pageSize)
+    }
+
     /// Gather an arbitrary written range (used by prefill fallback and
     /// snapshots). `start` is an absolute position.
+    ///
+    /// THE EVICTION GUARD IS A TOKEN TEST AND THAT IS CORRECT. Do not
+    /// "harden" it into the page-span test `lpLast - lpFirst + 1 <=
+    /// ringPages` that the loop below appears to want: the ring is a flat
+    /// circular buffer of `ringPages * pageSize` TOKEN slots — position `p`
+    /// lives at `(table[(p / pageSize) % ringPages], p % pageSize)`, a
+    /// bijection onto `p % (ringPages * pageSize)` — so the page list built
+    /// below always names the CANONICAL slot of every requested position.
+    /// Nothing is ever mis-addressed; a read is exact iff every position in
+    /// it is still resident, and the oldest one bounds the rest. That is
+    /// this precondition, exactly: neither loose nor conservative.
+    ///
+    /// A legal range MAY therefore span `ringPages + 1` logical pages and
+    /// repeat one physical page. That is the buffer WRAPPING, not aliasing.
+    /// The two occurrences take disjoint slot ranges — `[start % pageSize,
+    /// pageSize)` from the first, `[0, (start + count - 1) % pageSize]` from
+    /// the last — and the guard is what forces them disjoint, by capping
+    /// `count` at `ringPages * pageSize` (with `start + count <=
+    /// absoluteOffset`, that puts the last slot strictly below the first).
+    /// Refusing a `ringPages + 1` span would abort the daemon on reads that
+    /// are byte-exact. `CBv2PagedGatherRangeGuardTests` pins both halves,
+    /// including the 66-page / 1,026-token case at gemma-4 geometry.
     func gatherRange(start: Int, count: Int) -> (keys: MLXArray, values: MLXArray) {
         guard count > 0 else {
             return pool.gather(group: groupKey, pages: [], firstSlot: 0, count: 0)
         }
         precondition(start >= baseOffset && start + count <= absoluteOffset)
-        if let window = windowSize {
-            // The ring only holds the recent end; older positions are gone.
-            let ring = ringPages! * pool.config.pageSize
-            precondition(
-                start >= absoluteOffset - ring,
-                "gather of evicted window range (window \(window))")
-        }
+        precondition(
+            start >= oldestValidPosition,
+            "gather of evicted range: \(start) is older than this row's oldest resident "
+                + "position \(oldestValidPosition) (window \(windowSize ?? 0), ring "
+                + "\(ringPages ?? 0) pages, written high water \(writtenHighWater), frontier "
+                + "\(absoluteOffset))")
         let s = pool.config.pageSize
         let lpFirst = start / s
         let lpLast = (start + count - 1) / s
@@ -541,6 +612,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         precondition(offset >= 0 && offset <= maxLength)
         absoluteOffset = offset
         baseOffset = offset
+        writtenHighWater = offset
     }
 
     /// Adopt `[0, M)` as immutable storage with the logical cursor at C.

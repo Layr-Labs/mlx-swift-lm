@@ -1647,6 +1647,16 @@ struct CBv2PagedSpeculativeRowTests {
     /// Unarmed on purpose. `guardSpeculativeSpan` traps this inside a
     /// transaction, which is the whole point of the guard; running it bare
     /// is what lets the test observe the corruption the guard prevents.
+    ///
+    /// THE DAMAGE IS OBSERVED IN TWO PLACES because a gather can no longer
+    /// see it. `PagedSequenceKV.oldestValidPosition` is measured from the
+    /// highest position ever WRITTEN, so after the rollback the destroyed
+    /// positions are outside the row's read guard and `attendableViews()`
+    /// TRAPS rather than handing back substituted KV — which is the guard
+    /// doing its job, and why this control cannot be a fingerprint diff any
+    /// more. So: the row's own report of the damage, pinned to exactly the
+    /// one position a one-token overrun reaches, plus the slab byte behind
+    /// it read straight from the pool.
     @Test func roundBeyondTheRingHeadroomDestroysHistory() throws {
         let window = 32
         let cfg = config()
@@ -1657,7 +1667,8 @@ struct CBv2PagedSpeculativeRowTests {
         defer { backend.release(state) }
         let row = try #require(state[0] as? PagedSequenceKV)
 
-        let ringTokens = PagedKVPool.ringPageCount(window: window, config: cfg) * cfg.pageSize
+        let ringPageCount = PagedKVPool.ringPageCount(window: window, config: cfg)
+        let ringTokens = ringPageCount * cfg.pageSize
         let headroom = ringTokens - window
         #expect(
             headroom >= CBv2PagedSpeculation.maxSpeculativeSpan,
@@ -1679,12 +1690,31 @@ struct CBv2PagedSpeculativeRowTests {
 
         #expect(row.absoluteOffset == before.absoluteOffset, "the counter still rewinds")
         #expect(row.retainedCount == before.retainedCount, "and the exposure is unchanged")
+
+        let destroyed = before.absoluteOffset - window
         #expect(
-            fingerprint(row) != before,
+            row.oldestValidPosition == destroyed + 1,
             """
-            a \(overrun)-token round past a \(headroom)-token headroom left the row \
-            byte-identical, so this suite is not measuring the headroom at all. Either the \
-            ring grew, or the round no longer writes through to the slabs.
+            a \(overrun)-token round past a \(headroom)-token headroom left the row holding \
+            everything from \(row.oldestValidPosition); position \(destroyed) should be gone. \
+            Either the ring grew, or the round no longer writes through to the slabs.
+            """)
+        #expect(
+            row.oldestValidPosition > row.absoluteOffset - row.retainedCount,
+            "the row still exposes a window it no longer physically holds")
+
+        // The slab byte behind that report: the destroyed slot holds the
+        // round's token, not the pre-round one.
+        let usurper = destroyed + ringTokens
+        let (slotKeys, _) = backend.pool.gather(
+            group: row.groupKey,
+            pages: [row.table[(destroyed / cfg.pageSize) % ringPageCount]],
+            firstSlot: destroyed % cfg.pageSize, count: 1)
+        #expect(
+            hostCopy(slotKeys) == hostCopy(coded(usurper ..< (usurper + 1)).0),
+            """
+            the slot of position \(destroyed) does not hold position \(usurper) — the round \
+            did not write through to the slabs.
             """)
     }
 
