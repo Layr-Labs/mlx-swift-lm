@@ -663,6 +663,28 @@ public final class PagedKVPool {
     /// than the number. The speculative term binds to
     /// `CBv2PagedSpeculation.maxSpeculativeSpan` rather than a literal so
     /// this sizing and `PagedSequenceKV.speculativeHeadroom` cannot disagree.
+    ///
+    /// So the live hazard is no longer "someone shrinks the ring" — that is
+    /// arithmetic, and `checkedRingPageCount` catches it. It is "someone
+    /// re-widens what a row exposes, or removes the ordering (3) supplies".
+    /// Three ways to do that which all read as tidying:
+    ///
+    ///  1. Hoisting `PagedLayerCache`'s gather OUT of the per-row body of
+    ///     `CBv2AttentionV1.packedPerRow` so it runs once across the batch.
+    ///     It reads as deduplication; it reintroduces a post-write gather
+    ///     for every row after the first. The gather must stay hoisted PER
+    ///     ROW — before that row's own write.
+    ///  2. Reading `retainedPrefillKV[0]` instead of
+    ///     `retainedPrefillKV[index]` in `PagedLayerCache.attendBorrowing`.
+    ///     It compiles, and it silently serves row 0's history to every
+    ///     KV-shared sibling of a packed prefill.
+    ///  3. Deleting the fence BACK-edge at the end of `PagedKVPool.gather`
+    ///     as a redundant no-op. It multiplies the fence by zero, so it
+    ///     looks like dead arithmetic and reads like a performance win; it
+    ///     is the only thing ordering a later bulk write after this read.
+    ///
+    /// (1) and (2) widen exposure, so `checkedRingPageCount` can catch them.
+    /// (3) does not: no precondition trips and the KV corrupts silently.
     static func ringPageCount(window: Int, config: PagedKVPoolConfig) -> Int {
         let tokens = max(
             PagedSequenceKV.maxWindowExposure(window: window)
