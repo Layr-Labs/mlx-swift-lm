@@ -48,6 +48,52 @@ enum CBv2AttentionV1 {
         queryBlockSize > 0 && L > queryBlockSize
     }
 
+    /// The sink logits an `MLXFast.scaledDotProductAttention` call may be
+    /// handed for `queryDType` activations.
+    ///
+    /// MLX requires the sink dtype to PROMOTE to the SDPA output dtype. fp16
+    /// queries with fp32 sinks are therefore not a rounding wart but a
+    /// process abort: MLX throws `[scaled_dot_product_attention] Type of
+    /// sinks must promote to output type float16` in C++, mlx-c routes it to
+    /// the installed error handler, and mlx-swift's handler calls
+    /// `fatalError` (`MLX/ErrorHandler.swift`) — SIGTRAP, not a Swift error
+    /// anything upstream can catch. A daemon hosting several models loses
+    /// every in-flight request and emits nothing.
+    ///
+    /// Every SDPA terminal in this module funnels through here.
+    ///
+    /// NOT for `PagedAttentionReference.composedAttention`: it runs in fp32
+    /// throughout and widens the sinks itself, so narrowing them first would
+    /// be a real precision loss.
+    @inline(__always)
+    static func sdpaSinks(_ sinks: MLXArray?, queryDType: DType) -> MLXArray? {
+        // `asType` returns `self` when the dtypes already match, so the
+        // models shipping today (gpt-oss loads `sinks` in checkpoint dtype,
+        // matching the activations) add no operation at all.
+        sinks?.asType(queryDType)
+    }
+
+    /// The sinks every terminal reached by ONE top-level dispatch receives.
+    ///
+    /// Computed once per `updateAndAttend` / `attendBorrowing` /
+    /// `updateAndAttendLastQuery` call rather than at the terminal: eager
+    /// decode enters `attend` once per row, query-blocked prefill once per
+    /// block and the MTP serial path once per query, so casting at the
+    /// terminal rebuilds the same one-element conversion for every row,
+    /// block, layer and generated token on latency-sensitive paths.
+    ///
+    /// Slicing preserves dtype, so the top-level `queries.dtype` is exactly
+    /// the dtype every per-row / per-block slice below presents.
+    @inline(__always)
+    private static func dispatchSinks(
+        _ sinks: MLXArray?, kind: CBv2LayerKind, queries: MLXArray, softcap: Float?
+    ) -> MLXArray? {
+        guard kind.hasSinks, let sinks else { return nil }
+        // A softcap sends BOTH phases to the composed fp32 reference, which
+        // wants the model's own (possibly wider) sinks — see `sdpaSinks`.
+        return softcap == nil ? sdpaSinks(sinks, queryDType: queries.dtype) : sinks
+    }
+
     /// Mask mode for a single-request attention call.
     ///
     /// - `L == 1` (decode): `.none`. The row's retained KV IS its window —
@@ -107,7 +153,8 @@ enum CBv2AttentionV1 {
             spanContext == nil || (B == 1 && L > 1),
             "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
         )
-        let effectiveSinks = kind.hasSinks ? sinks : nil
+        let effectiveSinks = dispatchSinks(
+            sinks, kind: kind, queries: queries, softcap: softcap)
 
         if B == 1 {
             if serializeQueries, L > 1 {
@@ -236,6 +283,8 @@ enum CBv2AttentionV1 {
                 && keys.dim(3) == kind.headDim && values.dim(3) == kind.headDim,
             "CBv2AttentionV1: last-query prefill K/V shape does not match the layer kind")
 
+        let effectiveSinks = dispatchSinks(
+            sinks, kind: kind, queries: queries, softcap: softcap)
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(batch)
         for (index, row) in rows.enumerated() {
@@ -247,7 +296,7 @@ enum CBv2AttentionV1 {
                     queries: queries[index ..< index + 1],
                     keys: cachedKeys, values: cachedValues,
                     scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
-                    sinks: kind.hasSinks ? sinks : nil, softcap: softcap))
+                    sinks: effectiveSinks, softcap: softcap))
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
     }
@@ -330,7 +379,8 @@ enum CBv2AttentionV1 {
             spanContext == nil || (B == 1 && L > 1),
             "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
         )
-        let effectiveSinks = kind.hasSinks ? sinks : nil
+        let effectiveSinks = dispatchSinks(
+            sinks, kind: kind, queries: queries, softcap: softcap)
 
         if L > 1 {
             if B == 1 {
@@ -540,15 +590,17 @@ enum CBv2AttentionV1 {
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
         guard let softcap else {
-            // MLX SDPA requires the sink dtype to promote to the output
-            // dtype, so fp16 queries + fp32 sinks TRAP (a fatalError inside
-            // MLX, not a throw). Match the query dtype here, exactly as the
-            // paged backend does at `PagedLayerCache.attendQueryBlock`. The
-            // composed path below needs no cast: it runs in fp32 throughout.
+            // Sinks arrive ALREADY normalized to the query dtype: see
+            // `sdpaSinks` (MLX aborts the process on a wider sink) and
+            // `dispatchSinks` (the conversion is hoisted to the top-level
+            // call, so this terminal never rebuilds it per row or block).
+            assert(
+                sinks == nil || sinks!.dtype == queries.dtype,
+                "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale,
                 mask: maskMode(L: L, kL: kL, window: window),
-                sinks: sinks?.asType(queries.dtype))
+                sinks: sinks)
         }
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: keys, values: values, scale: scale,
@@ -613,11 +665,14 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let mask = spanChunkMask(L: L, kL: kL, window: window, context: context)
         guard let softcap else {
-            // Same sink-dtype promotion rule as `attend` — cast to the query
-            // dtype or MLX traps on fp16 queries + fp32 sinks.
+            // Same contract as `attend`: normalized upstream by
+            // `dispatchSinks`, because MLX traps on fp16 queries + fp32 sinks.
+            assert(
+                sinks == nil || sinks!.dtype == queries.dtype,
+                "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale,
-                mask: .array(mask), sinks: sinks?.asType(queries.dtype))
+                mask: .array(mask), sinks: sinks)
         }
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: keys, values: values, scale: scale,

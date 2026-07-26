@@ -33,8 +33,17 @@
 // therefore a property of the dtype path, not of rounding, which lets the
 // same-backend comparisons assert exact equality.
 //
-// No negative test. Asserting the pre-fix trap needs a subprocess harness,
-// because an in-process `fatalError` takes down the whole test bundle.
+// No in-bundle NEGATIVE test. MLX throws `std::invalid_argument` in C++,
+// mlx-c routes it to the installed error handler, and mlx-swift's handler
+// calls `fatalError` (`MLX/ErrorHandler.swift`) — SIGTRAP, uncatchable, so
+// an uncoerced terminal takes the whole bundle down instead of recording an
+// issue. Observing the pre-fix trap therefore needs a deliberately-aborting
+// child process, i.e. an extra executable target in the shared
+// Package.swift. The positive tests below DO still fail without the fix,
+// just as a bundle crash rather than a recorded failure.
+// `sinkCoercionIsSharedContract` additionally pins the coercion helper
+// itself, which fails CLEANLY and is the assertion that survives to say
+// what went wrong.
 
 import Foundation
 import MLX
@@ -42,6 +51,13 @@ import MLXRandom
 import Testing
 
 @testable import MLXLMCommon
+
+/// Live query-block width. Read once, because `CBv2AttentionV1
+/// .queryBlockSize` is a lazily-initialized `static let` fixed for the
+/// process — every chunk length below is derived from it rather than from
+/// the 128 default, so this suite keeps testing the routes it names under
+/// `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK` (including the `0` kill switch).
+private let liveBlock = CBv2AttentionV1.queryBlockSize
 
 @Suite("CBv2AttentionSinkDtype", .serialized)
 struct CBv2AttentionSinkDtypeTests {
@@ -277,28 +293,44 @@ struct CBv2AttentionSinkDtypeTests {
 
     // MARK: - Prefill: query-blocked and serialized
 
-    /// `attendQueryBlocks` (chunk > `queryBlockSize`, default 128) and the
-    /// MTP serial path (`serializeQueries`, block size 1) both re-enter
-    /// `attend` per block, so the cast has to survive slicing. Oracle is the
-    /// dtype-agnostic fp32 composed reference rather than the paged backend,
-    /// which applies its own blocking policy at these lengths.
+    /// `attendQueryBlocks` and the MTP serial path (`serializeQueries`,
+    /// block size 1) both re-enter `attend` per block, so the coercion has
+    /// to survive slicing. Oracle is the dtype-agnostic fp32 composed
+    /// reference rather than the paged backend, which applies its own
+    /// blocking policy at these lengths.
     @Test(arguments: [false, true])
     func blockedAndSerializedPrefillAcceptWiderSinks(serialize: Bool) throws {
         MLXRandom.seed(0x51_4B_D7_03)
-        // 200 > queryBlockSize (128) so the unserialized arm blocks too.
-        let chunk = serialize ? 24 : 200
+        // Chunk widths come from the LIVE block width so each arm keeps
+        // taking the route it is named for at any knob setting:
+        //  - serialized: `serializeQueries` short-circuits the blocking gate
+        //    entirely (`updateAndAttendRowSerialQueries` pins block size 1),
+        //    so any multi-token chunk exercises it and the gate's verdict is
+        //    irrelevant — asserting it here is what broke below 24;
+        //  - unserialized: must EXCEED the live width to reach
+        //    `attendQueryBlocks`, except under the `0` kill switch, where
+        //    blocking is off for every L and the single-call terminal is
+        //    what this arm covers instead.
+        let chunk = serialize ? 24 : (liveBlock == 0 ? 200 : liveBlock + 24)
+        let rowCapacity = max(512, chunk + 8)
         let kind = CBv2LayerKind(
             attention: .full, hasSinks: true, headDim: 64, kvHeads: 2, queryHeads: 8)
         let scale: Float = 0.125
         let (narrowSinks, wideSinks) = sinkPair(queryHeads: 8)
-        #expect(CBv2AttentionV1.shouldBlockQueries(chunk) == !serialize)
+        if serialize {
+            #expect(chunk > 1, "the serial path needs more than one query to split")
+        } else {
+            #expect(
+                CBv2AttentionV1.shouldBlockQueries(chunk) == (liveBlock > 0),
+                "chunk \(chunk) must block iff blocking is enabled (queryBlockSize \(liveBlock))")
+        }
 
         let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 29))
         var states: [[CBv2SequenceKV?]] = []
         defer { states.forEach { backend.release($0) } }
         func freshRow() throws -> CBv2SequenceKV {
             let state = try backend.makeSequenceState(
-                layerKinds: [kind], promptLength: 0, maxLength: 512)
+                layerKinds: [kind], promptLength: 0, maxLength: rowCapacity)
             states.append(state)
             return state[0]!
         }
@@ -375,5 +407,37 @@ struct CBv2AttentionSinkDtypeTests {
                 boolMask: CBv2AttentionV1.spanChunkMask(
                     L: chunk, kL: chunk, window: nil, context: context),
                 sinks: wideSinks))
+    }
+
+    // MARK: - The shared coercion contract
+
+    /// `CBv2AttentionV1.sdpaSinks` is the single normalization every SDPA
+    /// terminal calls, and the only part of this bug that can be asserted
+    /// WITHOUT risking a process abort: every behavioural test above dies on
+    /// a `fatalError` rather than a recorded issue when the coercion is
+    /// missing, so this is the check that names the fault.
+    @Test func sinkCoercionIsSharedContract() throws {
+        let (narrow, wide) = sinkPair(queryHeads: 8)
+        #expect(narrow.dtype == .float16)
+        #expect(wide.dtype == .float32)
+
+        // Wider-than-activation sinks are narrowed to the SDPA output dtype.
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float16)?.dtype == .float16)
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .bfloat16)?.dtype == .bfloat16)
+        // fp32 activations keep fp32 sinks: the cast is not unconditional.
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float32)?.dtype == .float32)
+        // A sinkless layer stays sinkless.
+        #expect(CBv2AttentionV1.sdpaSinks(nil, queryDType: .float16) == nil)
+
+        // Matching dtypes must be a true no-op, not a rebuilt array: the
+        // models shipping today load `sinks` in activation dtype and the
+        // hoist is worthless if the common case still allocates.
+        #expect(CBv2AttentionV1.sdpaSinks(narrow, queryDType: .float16) === narrow)
+        #expect(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float32) === wide)
+
+        // Narrowing preserves the values (the fp32 arm is an fp16 widening),
+        // so the two arms of every test above really are the same numbers.
+        assertIdentical(
+            try #require(CBv2AttentionV1.sdpaSinks(wide, queryDType: .float16)), narrow)
     }
 }
