@@ -245,7 +245,8 @@ let package = Package(
         ),
         // Build-time git-revision stamp for BenchCBv2. The bench report must
         // name the revision the binary was compiled from, not whatever HEAD
-        // is when the report is written.
+        // is when the report is written. Attached to BenchCBv2Core, which is
+        // where `buildRevision()` reads the generated constant.
         .plugin(
             name: "BenchRevisionStamp",
             capability: .buildTool(),
@@ -254,8 +255,17 @@ let package = Package(
         // Real-weights validation driver for the CBv2 engine: correctness
         // smoke (batch-composition + chunked-prefill invariance) and the
         // v2-vs-v2-paged perf matrix on local model directories.
-        .executableTarget(
-            name: "BenchCBv2",
+        //
+        // A LIBRARY, with `BenchCBv2` below reduced to a `@main` shim over
+        // `BenchCBv2Driver.run()`. The split is load-bearing: when a test
+        // target depends on an executable target, SwiftPM runs that binary as
+        // the swift-testing host and hands it `--test-bundle-path`, which this
+        // driver's strict option parser rejects — aborting the swift-testing
+        // pass for the whole package. Every `@Test` in mlx-swift-lm, including
+        // the paged-KV CI gates, executed nothing while BenchCBv2Tests
+        // depended on the executable. Nothing may depend on `BenchCBv2`.
+        .target(
+            name: "BenchCBv2Core",
             dependencies: [
                 "MLXLMCommon",
                 "MLXLLM",
@@ -263,14 +273,19 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ],
-            path: "Sources/BenchCBv2",
+            path: "Sources/BenchCBv2Core",
             plugins: ["BenchRevisionStamp"]
+        ),
+        .executableTarget(
+            name: "BenchCBv2",
+            dependencies: ["BenchCBv2Core"],
+            path: "Sources/BenchCBv2"
         ),
         // Harness-integrity tests: option parsing, engine resolution, and
         // report provenance. Model-free, so they run in CI.
         .testTarget(
             name: "BenchCBv2Tests",
-            dependencies: ["BenchCBv2"],
+            dependencies: ["BenchCBv2Core"],
             path: "Tests/BenchCBv2Tests"
         ),
     ]

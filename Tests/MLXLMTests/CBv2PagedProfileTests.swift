@@ -82,12 +82,14 @@ struct CBv2PagedProfileTests {
 /// and knobs `DARKBLOOM_MTP_K` (default 3), `DARKBLOOM_MTP_CTX` (default
 /// 1,024), `DARKBLOOM_MTP_STEPS` (default 20).
 ///
-/// XCTest, not `@Test`, DELIBERATELY. Every swift-testing case in this
-/// package — including the four `CBv2PagedProfileTests` entries above — is
-/// currently unreachable: `BenchCBv2Tests` depends on the `BenchCBv2`
-/// EXECUTABLE target, so SwiftPM points the swift-testing pass at that
-/// binary, which exits on `--test-bundle-path`. Only XCTest classes run.
-/// Move this into the suite above once that is fixed.
+/// XCTest, not `@Test`, for historical reasons only. Every swift-testing case
+/// in this package — including the four `CBv2PagedProfileTests` entries above
+/// — used to be unreachable: `BenchCBv2Tests` depended on the `BenchCBv2`
+/// EXECUTABLE target, so SwiftPM pointed the swift-testing pass at that
+/// binary, which exits on `--test-bundle-path`; only XCTest classes ran. The
+/// bench driver now lives in the `BenchCBv2Core` library and the tests import
+/// that, so the swift-testing pass runs again and this can fold into the suite
+/// above as one more `@Test(.enabled(if: enabled))`.
 ///
 /// The bundle also needs `mlx.metallib` beside the xctest runner
 /// (`.build/<config>/*PackageTests.xctest/Contents/MacOS/`) or every MLX op

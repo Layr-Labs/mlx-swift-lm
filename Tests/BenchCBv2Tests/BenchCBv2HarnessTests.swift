@@ -15,7 +15,7 @@
 import Foundation
 import Testing
 
-@testable import BenchCBv2
+@testable import BenchCBv2Core
 
 // `.serialized`: one case chdirs to prove the build stamp is not derived from
 // the process's working directory.

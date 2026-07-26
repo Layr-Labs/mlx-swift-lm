@@ -37,6 +37,15 @@
 //       [--engines v2,v2-paged] [--batches 1,2,4] [--steps 128]
 //       [--prompt-lengths 500,10000] [--max-seq-len N] [--label tag]
 //       [--kv-gb 16] [--out report.md] [--print-revision]
+//
+// Target layout: everything below lives in the LIBRARY target BenchCBv2Core;
+// the `BenchCBv2` executable is a three-line `@main` shim over
+// `BenchCBv2Driver.run()`. That boundary is load-bearing, not cosmetic. A test
+// target that depends on an executable target makes SwiftPM run *that binary*
+// as the swift-testing host, handing it `--test-bundle-path` — which this
+// strict parser rejects, aborting the swift-testing pass for the whole
+// package. Every `@Test` in mlx-swift-lm went dark that way. Tests
+// `@testable import BenchCBv2Core`; nothing may depend on the executable.
 
 import Foundation
 import MLX
@@ -948,9 +957,14 @@ func reportHeader(
         """
 }
 
-@main
-struct BenchCBv2RealModel {
-    static func main() async {
+/// Program body for the `BenchCBv2` executable.
+///
+/// Lives in the library so the harness-integrity tests can reach it (and its
+/// neighbours) without putting an executable in the test target's dependency
+/// graph — see the file header. The executable's `@main` does nothing but
+/// `await BenchCBv2Driver.run()`, so the CLI surface is defined here.
+public enum BenchCBv2Driver {
+    public static func run() async {
         // Unbuffered stdout: a Metal trap must not eat buffered results.
         setvbuf(stdout, nil, _IONBF, 0)
 
