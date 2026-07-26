@@ -21,9 +21,11 @@ if [ -z "$rev" ]; then
     rev="unknown"
 elif [ -n "$(git -C "$root" status --porcelain -uall 2>/dev/null)" ]; then
     # Tracked OR untracked changes: the build does not correspond to any
-    # commit. -uall rather than -uno because BenchCBv2 declares `path:`
+    # commit. -uall rather than -uno because BenchCBv2Core declares `path:`
     # without `sources:`, so SwiftPM auto-discovers files -- an UNTRACKED
     # .swift under that path is compiled in and would otherwise stamp clean.
+    # (Was BenchCBv2 before v0.8.0 split the target into a library plus a
+    # thin executable shim; the stamp plugin follows the library.)
     rev="$rev-dirty"
 fi
 
