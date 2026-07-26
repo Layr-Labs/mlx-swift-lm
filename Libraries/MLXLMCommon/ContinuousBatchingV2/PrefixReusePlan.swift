@@ -23,11 +23,11 @@ public enum CBv2PrefixReuseStrategy: String, Sendable, Equatable {
     case frozenFullReplay = "frozen_full_replay"
 }
 
-/// Stable, low-cardinality construction refusal reasons.
+/// Stable, low-cardinality construction refusal reasons. Every case here is
+/// one `derive` can actually produce; there is no reserved-for-later case.
 public enum CBv2PrefixReuseUnsupportedReason: String, Sendable, Equatable {
     case emptyLayout = "empty_layout"
     case invalidLayout = "invalid_layout"
-    case pagedHybridRequiresDualCursor = "paged_hybrid_requires_dual_cursor"
     case unknownBackend = "unknown_backend"
     case accountingOverflow = "accounting_overflow"
 }

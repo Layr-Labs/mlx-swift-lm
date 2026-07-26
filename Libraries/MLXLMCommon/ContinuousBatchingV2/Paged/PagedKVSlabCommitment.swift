@@ -48,9 +48,10 @@
 // identity is stable for the pool's lifetime — which is the only property the
 // in-place write design actually requires (see pagedattention.metal,
 // "In-place slab writes"). The one hazard, a `Full` surviving inside a
-// `compile` tracer and re-zeroing on a later eval, cannot arise here:
-// `producesCompiledDecodeEligibleRows` is false for paged, so no slab is ever
-// traced.
+// `compile` tracer and re-zeroing on a later eval, cannot arise here: there
+// is no tracing path at all. The compiled [B, 1] decode graph was deleted
+// with the v0.8.0 migration, so nothing in the engine puts a slab — or any
+// other array — inside a `compile` tracer.
 //
 // Byte accounting
 // ---------------

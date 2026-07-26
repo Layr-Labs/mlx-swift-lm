@@ -196,8 +196,9 @@ public final class PagedKVBackend: CBv2KVBackend {
     ///    owning full rows restored to M and EVERY owning windowed row
     ///    restored to M from an admissible `CBv2PagedWindowSnapshot`. Both
     ///    cursors are M and there is nothing to replay, which is the form
-    ///    `PagedSeamContract` describes as making
-    ///    `pagedHybridRequiresDualCursor` evaporate rather than solving it.
+    ///    that makes the paged-hybrid dual-cursor problem evaporate rather
+    ///    than solving it. (The capability refusal that named that problem
+    ///    is gone: `derive` no longer refuses paged hybrids.)
     ///  * `.frozenFullReplay` with R > 0 — owning full rows adopted FROZEN
     ///    through M via `PagedSequenceKV.adoptFrozen`, so their storage is
     ///    exact and immutable while the logical cursor reports C; windowed

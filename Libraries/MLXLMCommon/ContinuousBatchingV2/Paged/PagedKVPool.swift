@@ -15,8 +15,10 @@
 // - Page size is 16 tokens (`CBv2PagedDefaults.pageSize`), matching
 //   vLLM/mistral.rs block sizes. Revisit after kernel benchmarks.
 // - The free list is a plain stack of page indices: O(1) allocate/free.
-//   Pages carry refcounts so that copy-free prefix sharing can land later
-//   (refcount > 1 == shared page); today every page has refcount 0 or 1.
+//   Pages carry refcounts, but every count is 0 or 1 — nothing retains a
+//   page twice. Copy-free prefix sharing would be what pushes a count
+//   above 1, and it does not exist: window adoption COPIES bytes
+//   (`PagedKVBackend.installWindow`), it does not adopt pages.
 // - Admission is RESERVATION based: the CBv2 contract's
 //   `CBv2SequenceKV.update` cannot throw, so capacity failures mid-decode
 //   would be unrecoverable. Instead, `reserve` claims the worst-case page
@@ -152,7 +154,11 @@ final class PagedKVGroup {
     var writeFence: MLXArray
     /// Stack of free page ids — O(1) alloc/free.
     var freeList: [Int32]
-    /// Per-page refcount (>1 reserved for future prefix sharing).
+    /// Per-page refcount. Effectively a 0/1 owned flag: `allocatePage` sets
+    /// 1, `freePage` clears to 0, and the poison page is pinned at 1. No
+    /// code path raises a count above 1 — page sharing would need a retain
+    /// operation and a sharing-aware `installWindow` (which copies bytes, it
+    /// does not adopt pages), neither of which exists.
     var refCounts: [Int]
     /// Pages currently held by sequences (refCount > 0).
     private(set) var pagesInUse: Int = 0
@@ -238,12 +244,6 @@ final class PagedKVGroup {
         refCounts[Int(page)] = 1
         pagesInUse += 1
         return page
-    }
-
-    func retainPage(_ page: Int32) {
-        precondition(page != Self.poisonPage, "retain of the reserved poison page")
-        precondition(refCounts[Int(page)] > 0, "retain of free page")
-        refCounts[Int(page)] += 1
     }
 
     func freePage(_ page: Int32) {
