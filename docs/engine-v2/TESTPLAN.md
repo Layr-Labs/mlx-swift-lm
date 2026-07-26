@@ -42,9 +42,20 @@ A request's greedy output is token-exact identical regardless of batchmates.
 | Attention sinks (GPT-OSS shape) under batching | `CBv2InvarianceTests.testInvarianceWithAttentionSinks` |
 | Per-request seeds on stochastic sampling | `CBv2InvarianceTests.testPerRequestSeedInvarianceUnderBatching` — `XCTSkip` pending integration: WS-E SamplerV2 |
 | 50-event join/leave churn storm, every request vs its solo run | `CBv2InvarianceTests.testChurnStormEveryRequestMatchesSolo` |
+| PAGED backend: row's partition length must not track its batchmates' attended lengths | `CBv2InvarianceTests.testPagedRowInvariantToBatchmateAttendedLength` |
 
 All comparisons are token-exact over ≥64 decode steps (churn storm: over
 however many tokens each request generated before finish/cancel).
+
+Every row above the paged one runs on `TinyTestModel`, whose head dim (16) the
+paged kernel cannot accept, so the paged arm carries its own minimal fixture —
+one `PagedAttentionKernel.decode` layer on the GPT-OSS decode shape driven as a
+recurrent greedy decoder. It is a REGRESSION gate for the WS-6.4 adaptive
+partition sizer and must fail when the pre-v0.8.0 adaptation is restored:
+
+```bash
+DARKBLOOM_CBV2_PAGED_PTOK_TARGET=128 swift test --filter CBv2Invariance
+```
 
 ## Report 10 §4 invariants 1–11
 
