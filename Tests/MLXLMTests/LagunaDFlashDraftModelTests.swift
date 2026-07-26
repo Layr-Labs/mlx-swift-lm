@@ -268,3 +268,27 @@ final class LagunaDraftStubTarget: Module, DFlashTargetModel {
         matmul(hidden, headWeight.T)
     }
 }
+
+/// Structural load check against the real converted Laguna DFlash artifact.
+/// Env-gated: set `MLX_SWIFT_LM_LAGUNA_DFLASH_DIR` to the converted artifact
+/// directory (config.json + model.safetensors) to enable.
+@Suite("Laguna DFlash converted artifact", .serialized)
+struct LagunaDFlashConvertedArtifactTests {
+    @Test(.enabled(if: ProcessInfo.processInfo.environment[
+        "MLX_SWIFT_LM_LAGUNA_DFLASH_DIR"] != nil))
+    func convertedArtifactLoadsWithFullVerification() async throws {
+        let dir = URL(fileURLWithPath: ProcessInfo.processInfo.environment[
+            "MLX_SWIFT_LM_LAGUNA_DFLASH_DIR"]!)
+        let draft = try await DFlashDraftModel.load(from: dir)
+        #expect(draft.config.decoderLayerType == .lagunaXS)
+        #expect(draft.config.blockSize == 16)
+        #expect(draft.config.targetLayerIds == [1, 13, 25, 33, 39])
+        let params = Dictionary(
+            uniqueKeysWithValues: draft.parameters().flattened())
+        #expect(params.count == 68)
+        #expect(params["layers.4.self_attn.g_proj.weight"]?.shape == [64, 2048])
+        #expect(params["aux_hidden_norms.4.weight"]?.shape == [2048])
+        #expect(params["fc.weight"]?.shape == [2048, 10240])
+        #expect(params["layers.0.self_attn.q_proj.weight"]?.dtype == .bfloat16)
+    }
+}
