@@ -60,11 +60,21 @@ enum CBv2AttentionV1 {
     /// anything upstream can catch. A daemon hosting several models loses
     /// every in-flight request and emits nothing.
     ///
-    /// Every SDPA terminal in this module funnels through here.
+    /// Every SDPA terminal on a SERVING path funnels through here: the two
+    /// in this file via `dispatchSinks`, and the paged prefill terminal
+    /// (`PagedLayerCache.attendQueryBlock`) via that file's `prefillSinks`.
+    /// Both callers hoist the cast to their top-level dispatch, so the
+    /// per-row / per-block / per-token loops below them re-use one array.
+    ///
+    /// The remaining SDPA calls in the module are in `PagedDecodeProfiler`
+    /// and `PagedBackendBenchmark`, which mint their own fixtures in the
+    /// dtype they then query with; they are measurement rigs, not a path any
+    /// request reaches.
     ///
     /// NOT for `PagedAttentionReference.composedAttention`: it runs in fp32
     /// throughout and widens the sinks itself, so narrowing them first would
-    /// be a real precision loss.
+    /// be a real precision loss. Both callers carve that case out on
+    /// `softcap != nil`, which is what selects the composed path.
     @inline(__always)
     static func sdpaSinks(_ sinks: MLXArray?, queryDType: DType) -> MLXArray? {
         // `asType` returns `self` when the dtypes already match, so the

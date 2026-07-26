@@ -266,6 +266,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // writing and masks in absolute ones.
             var views: [PrefillKV] = []
             views.reserveCapacity(b)
+            let chunkSinks = prefillSinks(effectiveSinks, queryDType: queries.dtype)
             output = CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
                 let row = pagedRows[index]
                 let kv = prefillKVWritingChunk(
@@ -273,7 +274,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                     dtype: queries.dtype)
                 views.append(kv)
                 return prefillAttend(
-                    queries: slice(queries), kv: kv, scale: scale, sinks: effectiveSinks)
+                    queries: slice(queries), kv: kv, scale: scale, sinks: chunkSinks)
             }
             retainedPrefillKV = retainsChunkForBorrowers ? views : []
         }
@@ -336,13 +337,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                         + "borrowers, or it last ran a decode step")
             }
             // Same shared batch-axis decomposition as the owning path.
+            let chunkSinks = prefillSinks(effectiveSinks, queryDType: queries.dtype)
             return CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
                 let kv = src.retainedPrefillKV[index]
                 precondition(
                     kv.queryCount == l,
                     "borrowed chunk is \(kv.queryCount) tokens, queries are \(l)")
                 return prefillAttend(
-                    queries: slice(queries), kv: kv, scale: scale, sinks: effectiveSinks)
+                    queries: slice(queries), kv: kv, scale: scale, sinks: chunkSinks)
             }
         }
     }
@@ -517,6 +519,33 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         cachedSinks = s
         cachedSinksSource = ObjectIdentifier(sinks)
         return s
+    }
+
+    /// Sinks prepared for the PREFILL SDPA terminal (`attendQueryBlock`),
+    /// computed ONCE per `updateAndAttend` / `attendBorrowing` call.
+    ///
+    /// The narrowing itself is `CBv2AttentionV1.sdpaSinks` — the shared
+    /// primitive that documents why fp16 queries with fp32 sinks are a
+    /// SIGTRAP rather than a rounding wart. Only the hoisting is paged's
+    /// own, and it has to be: `attendQueryBlock` runs once per query BLOCK
+    /// per packed ROW, so casting at the terminal rebuilds the same
+    /// one-element conversion for every row, block and layer of a chunk.
+    /// Slicing preserves dtype, so the top-level `queries.dtype` is exactly
+    /// the dtype every per-row / per-block slice presents.
+    ///
+    /// This is the SDPA terminal's contract only. The decode leg's
+    /// `preparedSinks` (fp32, padded to 8) is the KERNEL's, and the two must
+    /// not be merged: narrowing before `preparedSinks` widens back to fp32
+    /// would round-trip fp32 sinks through fp16, and a fresh array per step
+    /// would also miss that function's identity cache.
+    private func prefillSinks(_ sinks: MLXArray?, queryDType: DType) -> MLXArray? {
+        guard let sinks else { return nil }
+        // A softcap routes `attendQueryBlock` to the composed fp32
+        // reference, which widens the sinks itself — narrowing first would
+        // be a real precision loss. Same carve-out as
+        // `CBv2AttentionV1.dispatchSinks`.
+        guard attentionSoftcap == nil else { return sinks }
+        return CBv2AttentionV1.sdpaSinks(sinks, queryDType: queryDType)
     }
 
     /// Device `[B, maxPages]` int32 block tables, rebuilt only when some
@@ -705,6 +734,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// The kill switch is `CBv2AttentionV1`'s, shared with the contiguous
     /// backend: `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK=0` restores the single
     /// unblocked call on BOTH backends. There is no paged-only knob.
+    ///
+    /// `sinks` arrives already prepared for the SDPA terminal (see
+    /// `prefillSinks`) — this function and `attendQueryBlock` forward it
+    /// unchanged rather than casting inside the block loop.
     private func prefillAttend(
         queries: MLXArray, kv: PrefillKV, scale: Float, sinks: MLXArray?
     ) -> MLXArray {
@@ -827,12 +860,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 boolMask: mask, sinks: sinks, softcap: softcap)
         }
 
-        // MLX SDPA requires the sink dtype to promote to the output dtype
-        // (fp16 queries + fp32 sinks trap), so match the query dtype here.
-        // The decode kernel is unaffected: it consumes sinks in fp32.
+        // `sinks` already promotes to the output dtype: the caller narrowed
+        // it once per dispatch through `prefillSinks`. Do not re-cast here —
+        // that is the per-block, per-row rebuild the hoist exists to remove.
         return MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: scale,
-            mask: .array(mask), sinks: sinks?.asType(queries.dtype))
+            mask: .array(mask), sinks: sinks)
     }
 }
 
