@@ -293,6 +293,28 @@ private class LagunaModelInner: Module {
 
         return norm(h)
     }
+
+    func callCapturingDFlashHiddenStates(
+        _ inputs: MLXArray, cache: [KVCache]?, targetLayerIds: [Int]
+    ) throws -> (postNorm: MLXArray, hiddenStates: [MLXArray]) {
+        try DFlashTargetValidation.validateTargetLayerIds(
+            targetLayerIds, layerCount: layers.count)
+        let targetLayerSet = Set(targetLayerIds)
+        var captured = [Int: MLXArray]()
+
+        var h = embedTokens(inputs)
+        let fullMask = createAttentionMask(h: h, cache: cache?[fullAttentionIdx])
+        let slidingMask = createAttentionMask(
+            h: h, cache: cache?[slidingAttentionIdx], windowSize: slidingWindow)
+        for (i, layer) in layers.enumerated() {
+            let mask = layerTypes[i] == "full_attention" ? fullMask : slidingMask
+            h = layer(h, mask: mask, cache: cache?[i])
+            if targetLayerSet.contains(i) {
+                captured[i] = h
+            }
+        }
+        return (norm(h), targetLayerIds.map { captured[$0]! })
+    }
 }
 
 public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -347,6 +369,34 @@ public class LagunaModel: Module, LLMModel, KVCacheDimensionProvider {
 extension LagunaModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - DFlash
+
+extension LagunaModel: DFlashTargetModel {
+    public var dFlashVocabularySize: Int { vocabularySize }
+    public var dFlashHiddenSize: Int { config.hiddenSize }
+    public var dFlashLayerCount: Int { config.numHiddenLayers }
+
+    public func forwardForDFlash(
+        _ inputs: MLXArray, cache: [KVCache]?, targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let (postNorm, hiddenStates) = try model.callCapturingDFlashHiddenStates(
+            inputs, cache: cache, targetLayerIds: targetLayerIds)
+        return DFlashTargetForward(
+            logits: logitsForDFlashHidden(postNorm), hiddenStates: hiddenStates)
+    }
+
+    public func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    public func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        return model.embedTokens.asLinear(hidden)
     }
 }
 
