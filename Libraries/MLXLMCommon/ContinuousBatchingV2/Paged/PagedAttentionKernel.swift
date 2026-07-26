@@ -236,7 +236,24 @@ public enum PagedAttentionKernel {
     static let partitionTargetEnvironmentKey = "DARKBLOOM_CBV2_PAGED_PTOK_TARGET"
 
     /// Target used when the knob is unset or unparseable.
-    static let partitionTargetDefault = 128
+    ///
+    /// DEFAULT 0 (adaptation OFF) as of v0.8.0. The sizer derives PTOK from
+    /// `batch` and the batch-wide `maxAttendLength`, so a row's partition
+    /// count — and therefore its online-softmax summation order — moved with
+    /// its BATCHMATES. That contradicts design goal 1 in
+    /// `pagedattention.metal`, which promises a row is "bit-identical
+    /// regardless of batchmates" and predicates that proof on a FIXED PTOK.
+    /// Measured: a 1024-token row on the GPT-OSS shape takes PTOK 64 alone,
+    /// 128 at B=2, 256 at B=4 — and one 2048-token batchmate moves it 64->256
+    /// on its own. Summation-order changes flip tokens at argmax near-ties
+    /// (the same effect the query-block knob demonstrated at the v0.8.0
+    /// gate), so this was observable nondeterminism under concurrent load.
+    ///
+    /// Set the env knob to restore adaptation; recovering the WS-6.4 B=1
+    /// occupancy win invariantly needs per-row sizing (`batch: 1`, each row's
+    /// OWN attended length) plus dispatch bucketed by rung, because PTOK is a
+    /// kernel template parameter and one dispatch carries one value.
+    static let partitionTargetDefault = 0
 
     /// Ceiling on the operator-settable threadgroup target.
     ///

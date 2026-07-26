@@ -562,10 +562,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Capability + cumulative execution evidence, as `EngineV2` republishes
     /// it to out-of-module callers.
     func packedPrefillActivity() -> CBv2PackedPrefillActivity {
-        CBv2PackedPrefillActivity(
-            isSupported: packedPrefillSupported,
-            rowsExecuted: packedPrefillRowsExecuted,
-            groupsExecuted: packedPrefillGroupsExecuted)
+        engineQueue.sync {
+            CBv2PackedPrefillActivity(
+                isSupported: packedPrefillSupported,
+                rowsExecuted: packedPrefillRowsExecuted,
+                groupsExecuted: packedPrefillGroupsExecuted)
+        }
     }
 
     /// Teacher-forced scoring EXECUTION evidence (`teacherForcedTop1`).

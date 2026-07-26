@@ -19,8 +19,11 @@ if [ -z "$rev" ]; then
     # No git, no repository, or a source archive: `unknown` is honest. Never
     # substitute a plausible-looking value here.
     rev="unknown"
-elif [ -n "$(git -C "$root" status --porcelain -uno 2>/dev/null)" ]; then
-    # Tracked modifications: the build does not correspond to any commit.
+elif [ -n "$(git -C "$root" status --porcelain -uall 2>/dev/null)" ]; then
+    # Tracked OR untracked changes: the build does not correspond to any
+    # commit. -uall rather than -uno because BenchCBv2 declares `path:`
+    # without `sources:`, so SwiftPM auto-discovers files -- an UNTRACKED
+    # .swift under that path is compiled in and would otherwise stamp clean.
     rev="$rev-dirty"
 fi
 
