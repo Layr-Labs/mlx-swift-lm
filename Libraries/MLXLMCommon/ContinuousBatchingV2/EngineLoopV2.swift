@@ -493,6 +493,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// eval and therefore cannot read engine-confined state — can attach the
     /// usage observed before the wedge instead of injecting raw zero usage.
     private var usageSnapshots: [CBv2RequestID: CBv2Usage] = [:]
+    /// Prompt-frontier logit capture (`CBv2Engine.prefillLogitDigest`).
+    /// Installed around ONE probe request and cleared immediately after, so
+    /// every ordinary step pays a single uncontended lock read at the two
+    /// sites where a prompt chunk actually samples. It is deliberately NOT
+    /// a "digest is supported" flag: nothing reads it except the frontier
+    /// itself, and when it never fires the digest call throws rather than
+    /// reporting a capability.
+    private var prefillFrontierCaptureHook: (@Sendable (CBv2RequestID, MLXArray) -> Void)?
 
     // Engine-thread-confined state (internal, not private: the MTP round
     // driver in EngineLoopV2+MTP.swift is part of the loop).
@@ -558,6 +566,27 @@ public final class EngineLoopV2: @unchecked Sendable {
             isSupported: packedPrefillSupported,
             rowsExecuted: packedPrefillRowsExecuted,
             groupsExecuted: packedPrefillGroupsExecuted)
+    }
+
+    /// Teacher-forced scoring EXECUTION evidence (`teacherForcedTop1`).
+    /// Incremented at the forwards themselves — the prompt's chunked
+    /// prefill and the continuation's one-token decodes — so a witness that
+    /// scored positions OUTSIDE the engine (batched offline logits, a
+    /// reference implementation) leaves them at zero while still returning
+    /// plausible argmaxes. The counters are the only proof the continuation
+    /// really travelled the engine's own caches, chunking, and masks.
+    /// Engine-thread owned, monotonic; read at quiescent points.
+    private(set) var teacherForcedPrefillChunks = 0
+    private(set) var teacherForcedDecodeForwards = 0
+
+    /// Cumulative teacher-forced execution evidence, as `EngineV2`
+    /// republishes it to out-of-module callers.
+    func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity {
+        engineQueue.sync {
+            CBv2TeacherForcedScoringActivity(
+                prefillChunksExecuted: teacherForcedPrefillChunks,
+                decodeForwardsExecuted: teacherForcedDecodeForwards)
+        }
     }
 
     /// Requests demoted back to waiting after a capacityExhausted at first
@@ -735,6 +764,33 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.lock()
         streams.removeValue(forKey: id)
         stateLock.unlock()
+    }
+
+    /// Install (nil clears) the prompt-frontier logit capture. Cross-thread
+    /// safe; the loop reads it on the engine queue at the two prefill
+    /// sampling sites.
+    func setPrefillFrontierCapture(
+        _ capture: (@Sendable (CBv2RequestID, MLXArray) -> Void)?
+    ) {
+        stateLock.lock()
+        prefillFrontierCaptureHook = capture
+        stateLock.unlock()
+    }
+
+    /// Engine-queue read of the installed capture. nil on every ordinary
+    /// step.
+    func prefillFrontierCapture() -> (@Sendable (CBv2RequestID, MLXArray) -> Void)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return prefillFrontierCaptureHook
+    }
+
+    /// Run `body` on the engine queue, serialized against steps. Callers
+    /// holding a captured MLX handle use this so their `eval` never races a
+    /// live step's graph build on another thread. MUST NOT be called from
+    /// the engine queue itself.
+    func onEngineQueueSync<T>(_ body: () throws -> T) rethrows -> T {
+        try engineQueue.sync(execute: body)
     }
 
     /// Runs on the engine queue. The stream must already be registered.
@@ -1209,6 +1265,131 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    // MARK: - Teacher-forced top-1 scoring (backend parity measurement)
+
+    /// Drive `continuation` through the engine on a private KV row and
+    /// return the ARGMAX at each continuation position.
+    ///
+    /// Free-running comparison between two engine arms is only valid up to
+    /// the FIRST disagreement: past it the arms carry different contexts and
+    /// every later position compares two unrelated conversations, so a
+    /// harness can report a first-flip index but never an agreement RATE.
+    /// Teacher forcing removes that: position `i` is always scored against
+    /// `promptTokens + continuation[0..<i]`, identically in both arms,
+    /// whatever either arm would have preferred. Agreement becomes a rate.
+    ///
+    /// The scoring row travels the ENGINE's own path, not a shortcut: the
+    /// prompt goes through `prefillOutput` in the same chunks
+    /// `SchedulerV2.plan()` would cut (`min(prefillChunkSize,
+    /// maxBatchedTokensPerStep)`), and each forced token enters as its own
+    /// `[1, 1]` forward through `eagerCaches` — byte-for-byte the decode
+    /// seam. Scoring positions outside the engine would measure the MODEL,
+    /// and the model is the one thing the two backends share.
+    ///
+    /// Deterministic by construction: `argMax` over the last-position
+    /// logits. No sampler, no temperature, no top-k, no RNG.
+    ///
+    /// Result length == `continuation.count`. `result[0]` is the argmax
+    /// after the prompt alone; `result[i]` the argmax after
+    /// `continuation[i - 1]` is forced in. Forcing the model's own greedy
+    /// continuation therefore returns that continuation unchanged.
+    ///
+    /// Runs on the engine queue, but NOT as a step: it never enters the
+    /// scheduler, the chain, or the step watchdog. It refuses while OTHER
+    /// requests are live — not for safety (the row is bound alone, so batch
+    /// composition cannot reach its arithmetic) but for comparability: a
+    /// contended pool hands the row different pages, and page order is
+    /// precisely the drift a parity harness is trying to measure. A
+    /// trailing in-flight step from a request that already finished is not
+    /// contention and does not block scoring; its rows are re-derived and
+    /// dropped around this call.
+    func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int] {
+        guard !promptTokens.isEmpty, !continuation.isEmpty else {
+            throw CBv2TeacherForcingError.nothingToScore(
+                promptTokens: promptTokens.count, continuation: continuation.count)
+        }
+        return try engineQueue.sync {
+            try scoreTeacherForced(promptTokens: promptTokens, continuation: continuation)
+        }
+    }
+
+    /// Engine-queue body of `teacherForcedTop1`.
+    private func scoreTeacherForced(
+        promptTokens: [Int], continuation: [Int]
+    ) throws -> [Int] {
+        guard running, !draining else { throw CBv2TeacherForcingError.engineNotRunning }
+        guard !scheduler.hasWork else {
+            throw CBv2TeacherForcingError.engineBusy(
+                scheduledRequests: scheduler.running.count + scheduler.waiting.count)
+        }
+
+        // Same allocation the loop makes for a real request of this shape.
+        let state = try backend.makeSequenceState(
+            layerKinds: layerKinds,
+            promptLength: promptTokens.count,
+            maxLength: promptTokens.count + continuation.count)
+        defer {
+            // Drop the caches' strong binding to this retired row BEFORE the
+            // backend recycles its pages (PR#62), and force the next real
+            // step to rebind its own rows.
+            (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            backend.release(state)
+        }
+
+        // One lazy [1] argmax per continuation position; the forwards never
+        // read them back (the next input is the FORCED token, already on the
+        // host), so the whole run needs exactly one readback at the end.
+        var top1: [MLXArray] = []
+        top1.reserveCapacity(continuation.count)
+
+        // Prompt: chunked prefill, cut exactly as the scheduler would for a
+        // solo row (`min(remaining, prefillChunkSize, budget)`).
+        let chunkSize = max(
+            1, min(scheduler.config.prefillChunkSize, scheduler.config.maxBatchedTokensPerStep))
+        var index = 0
+        while index < promptTokens.count {
+            let count = min(chunkSize, promptTokens.count - index)
+            let isFinalChunk = index + count == promptTokens.count
+            let inputs = MLXArray(promptTokens[index ..< index + count].map(Int32.init))
+                .reshaped([1, count])
+            let caches = eagerCaches(rowStates: [state])
+            let output = prefillOutput(
+                tokens: inputs, inputEmbeddings: nil, caches: caches,
+                requirement: isFinalChunk ? .lastPositionLogits : .evaluationOnly)
+            teacherForcedPrefillChunks += 1
+            var toEval = eagerCacheInnerState(caches)
+            if isFinalChunk {
+                let argmax = argMax(output, axis: -1)  // [1]
+                top1.append(argmax)
+                toEval.append(argmax)
+            } else {
+                // `.evaluationOnly` hands back a [1, 1] handle that still
+                // forces the chunk's whole graph, KV writes included.
+                toEval.append(output)
+            }
+            asyncEval(toEval)
+            index += count
+        }
+
+        // Continuation: one [1, 1] decode forward per FORCED token. The last
+        // continuation token is never fed — its logits would score a
+        // position past the end of the range being measured.
+        for forced in continuation.dropLast() {
+            let inputs = MLXArray([Int32(forced)]).reshaped([1, 1])
+            let caches = eagerCaches(rowStates: [state])
+            let logits = model.forward(tokens: inputs, caches: caches)[0..., -1, 0...]
+            teacherForcedDecodeForwards += 1
+            let argmax = argMax(logits, axis: -1)  // [1]
+            top1.append(argmax)
+            var toEval = eagerCacheInnerState(caches)
+            toEval.append(argmax)
+            asyncEval(toEval)
+        }
+
+        let scored = top1.count == 1 ? top1[0] : concatenated(top1, axis: 0)
+        return scored.asArray(Int32.self).map(Int.init)
+    }
+
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
@@ -1384,6 +1565,13 @@ public final class EngineLoopV2: @unchecked Sendable {
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
 
                 if group.samples {
+                    // Parity seam: the frontier logits, as this backend
+                    // computed them, BEFORE the sampler touches them.
+                    if let capture = prefillFrontierCapture() {
+                        for (index, row) in group.rows.enumerated() {
+                            capture(row.rec.id, output[index])
+                        }
+                    }
                     let sampled = sampler.sample(
                         logits: output,
                         params: group.rows.map(\.rec.request.sampling),
@@ -1437,6 +1625,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
+                if let capture = prefillFrontierCapture() {
+                    capture(rec.id, output[0])
+                }
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
                     params: [rec.request.sampling],

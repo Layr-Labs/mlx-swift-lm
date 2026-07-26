@@ -964,6 +964,54 @@ public protocol CBv2Engine: AnyObject, Sendable {
     func updateKVBytesCapacity(_ bytes: Int)
     /// Graceful drain: finish running requests, reject new submissions.
     func shutdown() async
+    /// Teacher-forced top-1 scoring: force `continuation` through the
+    /// engine and return the ARGMAX at each continuation position.
+    ///
+    /// Backend parity is what this exists for. Comparing two arms by FREE
+    /// RUNNING is only valid up to their first disagreement — past it each
+    /// arm is reading its own context and every later position compares two
+    /// unrelated conversations, so a harness can report a first-flip index
+    /// but must refuse to compute an agreement RATE. Under teacher forcing
+    /// both arms score position `i` against the IDENTICAL context
+    /// `promptTokens + continuation[0..<i]`, so agreement is a real rate
+    /// over `continuation.count` comparable positions, and the threshold
+    /// can come from a control arm instead of a chosen number.
+    ///
+    /// Contract: the engine MUST consume `continuation` through its normal
+    /// path — same caches, same chunking, same masks. Scoring positions
+    /// outside the engine measures the MODEL, and the model is the one
+    /// thing the two backends share. Argmax only (returning logits would
+    /// make this the logit-digest seam with extra steps), and deterministic
+    /// by construction: no sampler, no temperature, no top-k.
+    ///
+    /// Returns exactly `continuation.count` ids. `result[0]` is the argmax
+    /// after the prompt alone; `result[i]` the argmax once
+    /// `continuation[i - 1]` has been forced in. Forcing a continuation the
+    /// engine would itself have produced therefore returns it unchanged.
+    ///
+    /// Fail-closed default: throws `CBv2TeacherForcingError.unsupported`.
+    func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int]
+    /// Fingerprint of the FINAL-POSITION prefill logit vector for
+    /// `promptTokens`, taken on this engine's own prefill path.
+    ///
+    /// Backend parity is what this exists for. `submit` yields tokens, text
+    /// and top-k logprobs; a top-k slice cannot reconstruct a full vector,
+    /// and calling the model directly bypasses the engine — which is the
+    /// thing under test. So the digest is taken where the engine's prompt
+    /// frontier actually produces logits: same caches, same chunking, same
+    /// masks, same backend.
+    ///
+    /// A digest rather than the vector, because this keeps tensors out of
+    /// the protocol and is cheap enough to call once per arm: gemma-4's
+    /// vocabulary is 262,144, so returning the vector would be 512 KB per
+    /// call at fp16.
+    ///
+    /// Fail-closed default: throws `CBv2PrefillLogitDigestError.unsupported`.
+    func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest
+    /// Cumulative EVIDENCE that teacher-forced scoring drove real engine
+    /// forwards, not a shortcut that produced the same shape of answer.
+    /// Cheap (plain counter reads). Fail-closed default: `.none`.
+    func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity
 }
 
 extension CBv2Engine {
@@ -971,4 +1019,158 @@ extension CBv2Engine {
     /// An engine with no packed-prefill path reports neither capability nor
     /// execution.
     public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
+}
+
+// MARK: - Teacher-forced top-1 scoring (backend parity measurement)
+
+/// Rejections from `CBv2Engine.teacherForcedTop1(promptTokens:continuation:)`.
+///
+/// Every case is a REFUSAL to produce a number. A parity harness divides
+/// agreements by positions scored; a seam that answered `[]`, or scored a
+/// truncated range, or silently fell back to free running would hand it a
+/// rate that reads like a measurement and is not one. Scoring either ran
+/// end to end on the engine or it throws.
+public enum CBv2TeacherForcingError: Error, Equatable {
+    /// This engine has no teacher-forced scoring path. Thrown by the
+    /// fail-closed protocol default: an unimplemented seam must never be
+    /// mistaken for a measured 100% agreement.
+    case unsupported(engine: String)
+    /// Empty prompt or empty continuation — there are no positions to score.
+    case nothingToScore(promptTokens: Int, continuation: Int)
+    /// Other requests are live. Scoring is refused not because it would be
+    /// unsafe — the row is bound alone, so batch composition cannot reach
+    /// its arithmetic — but because it would not be COMPARABLE: a contended
+    /// pool seats the row on different pages, and storage order is exactly
+    /// the drift a parity harness is measuring. Score on a quiet engine or
+    /// do not score.
+    case engineBusy(scheduledRequests: Int)
+    /// The engine is shut down or draining: no forward will run.
+    case engineNotRunning
+}
+
+/// Teacher-forced scoring EXECUTION evidence — what the engine RAN, never
+/// what a caller asked for.
+///
+/// `teacherForcedTop1` returns `continuation.count` ids whatever produced
+/// them: the engine's own chunked prefill plus one forward per forced
+/// token, an offline batched scoring pass, or a reference implementation
+/// that never touched a KV page. Only the first measures the ENGINE, which
+/// is the one thing the two backends do not share. These counters move at
+/// the forwards themselves, so the identity a harness should assert across
+/// one call is exact:
+///
+/// ```
+/// after.decodeForwardsExecuted - before.decodeForwardsExecuted
+///     == continuation.count - 1
+/// ```
+///
+/// A shortcut leaves them flat while still returning a plausible rate.
+public struct CBv2TeacherForcedScoringActivity: Sendable, Equatable {
+    /// Cumulative prompt chunks driven through the engine's prefill seam.
+    public let prefillChunksExecuted: Int
+    /// Cumulative `[1, 1]` decode forwards issued for FORCED tokens. One
+    /// per continuation position except the last, whose logits would score
+    /// past the measured range.
+    public let decodeForwardsExecuted: Int
+
+    public init(prefillChunksExecuted: Int, decodeForwardsExecuted: Int) {
+        self.prefillChunksExecuted = prefillChunksExecuted
+        self.decodeForwardsExecuted = decodeForwardsExecuted
+    }
+
+    /// The measured answer: at least one prompt chunk really ran.
+    public var didExecute: Bool { prefillChunksExecuted > 0 }
+
+    /// Fail-closed default for engines with no teacher-forced path.
+    public static let none = CBv2TeacherForcedScoringActivity(
+        prefillChunksExecuted: 0, decodeForwardsExecuted: 0)
+}
+
+extension CBv2Engine {
+    /// Fail-closed: an engine with no teacher-forced scoring path REFUSES.
+    /// The alternative defaults are all worse than an error — `[]` divides
+    /// to a vacuous 100%, echoing `continuation` back reports perfect
+    /// agreement for two arms that were never run, and free running
+    /// reintroduces exactly the post-flip incomparability this seam exists
+    /// to remove. A capability that never executed must not be readable as
+    /// a measurement.
+    public func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int] {
+        throw CBv2TeacherForcingError.unsupported(engine: String(describing: type(of: self)))
+    }
+}
+
+extension CBv2Engine {
+    /// An engine with no teacher-forced scoring path reports no execution.
+    public func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity { .none }
+}
+
+// MARK: - Prefill logit digest (backend parity measurement)
+
+/// Fingerprint of ONE engine's final-position prefill logit vector.
+///
+/// `sha256` is over the RAW BYTES of that vector in the MODEL's dtype — no
+/// upcast, no rounding, no host-side renormalization. Two arms that agree
+/// here agreed bit-for-bit at the prompt frontier; two that disagree
+/// disagreed somewhere upstream of sampling, which is the half of a
+/// divergence a token stream cannot separate.
+///
+/// `dtype` is the RESOLVED dtype the digest was taken in, never a requested
+/// one: a bf16 model reporting `"float32"` would mean the seam upcast
+/// behind the caller's back and the hash describes something the engine
+/// never computed. `count` and `maxAbs` exist so a mismatch can be SIZED
+/// rather than merely flagged — a differing `count` is a vocabulary or
+/// shape defect, an order-of-magnitude `maxAbs` gap is a scale defect, and
+/// equal `count`/`maxAbs` with differing `sha256` is the numerical-drift
+/// case this whole gate was built to distinguish.
+public struct CBv2PrefillLogitDigest: Sendable, Equatable {
+    /// Resolved MLX dtype name of the digested vector ("bfloat16",
+    /// "float16", "float32", …). Reported, never requested.
+    public let dtype: String
+    /// Elements in the digested vector — the model's vocabulary size.
+    public let count: Int
+    /// Lowercase hex SHA-256 over `count * itemSize` raw bytes.
+    public let sha256: String
+    /// max(|logit|) over the vector, read in fp32 (a widening conversion
+    /// from every supported dtype, so this loses nothing).
+    public let maxAbs: Float
+
+    public init(dtype: String, count: Int, sha256: String, maxAbs: Float) {
+        self.dtype = dtype
+        self.count = count
+        self.sha256 = sha256
+        self.maxAbs = maxAbs
+    }
+}
+
+/// Rejections from `CBv2Engine.prefillLogitDigest(_:)`.
+///
+/// Every case is a REFUSAL to produce a digest. A fabricated one — the hash
+/// of an empty buffer, of a zero vector, of a re-run outside the engine —
+/// would compare EQUAL across two arms and read as parity. The digest was
+/// taken on the engine's prefill path or this throws.
+public enum CBv2PrefillLogitDigestError: Error, Equatable {
+    /// This engine has no prefill-digest path. Thrown by the fail-closed
+    /// protocol default.
+    case unsupported(engine: String)
+    /// No prompt, so no frontier position exists to digest.
+    case emptyPrompt
+    /// The probe prefill never reached a sampled prompt frontier within
+    /// `seconds` — a wedged step, a rejected admission, or a cancelled row.
+    /// No digest is invented for it.
+    case prefillProducedNoLogits(seconds: Double)
+    /// The frontier handed back something that is not a single logit
+    /// vector. Hashing it anyway would produce a stable, comparable, wrong
+    /// answer.
+    case unexpectedLogitShape([Int])
+}
+
+extension CBv2Engine {
+    /// Fail-closed: an engine with no prefill-digest path REFUSES. Every
+    /// alternative default is worse than an error — a digest of nothing is
+    /// still a digest, and two engines that both fabricated one compare
+    /// EQUAL, which is precisely the false PASS this seam replaces.
+    public func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest {
+        throw CBv2PrefillLogitDigestError.unsupported(
+            engine: String(describing: type(of: self)))
+    }
 }
