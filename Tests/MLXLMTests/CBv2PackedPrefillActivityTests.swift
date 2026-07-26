@@ -96,7 +96,13 @@ final class CBv2PackedPrefillActivityTests: XCTestCase {
 
     /// 4-layer Gemma 4 text model: the shipping conformer that claims
     /// rectangular-prompt safety (`cbv2SupportsPackedPrefill == true`).
-    private func makeGemma4() throws -> (Gemma4TextModel, [CBv2LayerKind]) {
+    ///
+    /// `headDim` is a parameter because the paged kernel only accepts
+    /// 64/128/256/512 — the paged arm needs a head dim it can serve, the
+    /// contiguous arms stay on the cheap tiny one.
+    private func makeGemma4(headDim: Int = 8, globalHeadDim: Int = 16) throws -> (
+        Gemma4TextModel, [CBv2LayerKind]
+    ) {
         let json = """
             {
                 "model_type": "gemma4_text",
@@ -104,8 +110,8 @@ final class CBv2PackedPrefillActivityTests: XCTestCase {
                 "num_hidden_layers": 4,
                 "intermediate_size": 64,
                 "num_attention_heads": 2,
-                "head_dim": 8,
-                "global_head_dim": 16,
+                "head_dim": \(headDim),
+                "global_head_dim": \(globalHeadDim),
                 "num_key_value_heads": 1,
                 "num_kv_shared_layers": 2,
                 "layer_types": ["sliding_attention", "full_attention",
@@ -154,20 +160,23 @@ final class CBv2PackedPrefillActivityTests: XCTestCase {
         return (model, config.cbv2LayerKinds)
     }
 
-    /// Production stack: contiguous backend + the real `CBv2LayerCacheBank`
-    /// (which vouches for packing), the model behind the shipping steppable
-    /// adapter. The engine is typed as the PUBLIC protocol so every
-    /// assertion below goes through the surface an out-of-module harness has.
+    /// Production stack: the given KV backend + cache provider (defaulting
+    /// to contiguous, which vouches for packing), the model behind the
+    /// shipping steppable adapter. The engine is typed as the PUBLIC
+    /// protocol so every assertion below goes through the surface an
+    /// out-of-module harness has.
     private func makeEngine(
-        model: any LanguageModel, layerKinds: [CBv2LayerKind], prefillChunkSize: Int
+        model: any LanguageModel, layerKinds: [CBv2LayerKind], prefillChunkSize: Int,
+        backend: CBv2KVBackend? = nil, cacheProvider: CBv2LayerCacheProvider? = nil
     ) -> (engine: any CBv2Engine, recorder: CBv2ActivityRecordingModel) {
         let recorder = CBv2ActivityRecordingModel(
             CBv2SteppableLanguageModelAdapter(model))
         let engine = EngineV2(
             model: recorder,
             layerKinds: layerKinds,
-            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 27)),
-            cacheProvider: CBv2LayerCacheBank(layerKinds: layerKinds),
+            backend: backend
+                ?? CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 27)),
+            cacheProvider: cacheProvider ?? CBv2LayerCacheBank(layerKinds: layerKinds),
             sampler: CBv2GreedySampler(),
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: 8, maxBatchedTokensPerStep: 256,
@@ -280,6 +289,58 @@ final class CBv2PackedPrefillActivityTests: XCTestCase {
             subject.recorder.packedShapes.reduce(0) { $0 + $1[0] },
             "counted rows must be the batch dimensions of those forwards, saw "
                 + "\(subject.recorder.packedShapes)")
+    }
+
+    // MARK: - 1b. Backend independence
+
+    /// The counter is incremented in the backend-agnostic step path, so a
+    /// PAGED gemma-4 stack must report packing exactly like the contiguous
+    /// one (`PagedLayerCache.keepsRowsIndependentWhenPackedByConstruction`
+    /// is true, so the bank vouches). A harness differencing the counters
+    /// per backend arm would otherwise read a false "claimed but never
+    /// packed" on paged.
+    func testPagedBackendCountsPackedPrefillLikeContiguous() async throws {
+        // The paged kernel serves head dims 64/128/256/512 only (production
+        // gemma-4 is 256 sliding / 512 full).
+        let (gemma, kinds) = try makeGemma4(headDim: 64, globalHeadDim: 64)
+        let paged: PagedKVBackend
+        do {
+            paged = try PagedKVBackend(
+                layerKinds: kinds,
+                config: PagedKVPoolConfig(
+                    capacityBytes: 64 << 20, maxPrefillChunk: 64,
+                    nominalMaxSequenceLength: 512))
+        } catch let error as CBv2KVError {
+            throw XCTSkip("paged backend unavailable on this hardware: \(error)")
+        }
+        let bank = CBv2LayerCacheBank(caches: paged.makeLayerCaches())
+        XCTAssertTrue(
+            bank.supportsPackedPrefill,
+            "test premise: the paged caches vouch for per-row independence")
+
+        let (engine, recorder) = makeEngine(
+            model: gemma, layerKinds: kinds, prefillChunkSize: 16,
+            backend: paged, cacheProvider: bank)
+        XCTAssertTrue(
+            engine.packedPrefillActivity().isSupported,
+            "both gates agree on the paged stack too")
+
+        let prompts = (0 ..< 4).map { promptTokens(length: 128, seed: UInt64(4300 + $0)) }
+        let runs = try await runConcurrently(engine, prompts: prompts, maxTokens: 4)
+        await engine.shutdown()
+        for (index, run) in runs.enumerated() {
+            XCTAssertEqual(run.finishReason, .length, "paged row \(index) must complete")
+        }
+
+        let activity = engine.packedPrefillActivity()
+        XCTAssertTrue(
+            activity.didExecute,
+            "the paged arm must count packed groups, saw \(recorder.prefillShapes)")
+        XCTAssertEqual(
+            activity.groupsExecuted, recorder.packedShapes.count,
+            "one counted group per rectangular prompt forward, on paged as on contiguous")
+        XCTAssertEqual(
+            activity.rowsExecuted, recorder.packedShapes.reduce(0) { $0 + $1[0] })
     }
 
     // MARK: - 2. Claimed but unexercised
