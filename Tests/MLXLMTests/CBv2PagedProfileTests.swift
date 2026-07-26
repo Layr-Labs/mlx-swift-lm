@@ -10,6 +10,7 @@
 
 import Foundation
 import Testing
+import XCTest
 
 @testable import MLXLMCommon
 
@@ -72,5 +73,42 @@ struct CBv2PagedProfileTests {
         let sdpa = profiler.measureContiguousSDPA(
             label: "smoke", layerCount: 2, batch: 2, context: 32)
         #expect(sdpa.msPerStep > 0)
+    }
+}
+
+/// MTP verify-round attribution at gemma-4 26B geometry: paged vs contiguous,
+/// per round phase. Run with
+///   DARKBLOOM_CBV2_PAGED_PROFILE=1 swift test --filter CBv2PagedMTPRoundProfile
+/// and knobs `DARKBLOOM_MTP_K` (default 3), `DARKBLOOM_MTP_CTX` (default
+/// 1,024), `DARKBLOOM_MTP_STEPS` (default 20).
+///
+/// XCTest, not `@Test`, DELIBERATELY. Every swift-testing case in this
+/// package — including the four `CBv2PagedProfileTests` entries above — is
+/// currently unreachable: `BenchCBv2Tests` depends on the `BenchCBv2`
+/// EXECUTABLE target, so SwiftPM points the swift-testing pass at that
+/// binary, which exits on `--test-bundle-path`. Only XCTest classes run.
+/// Move this into the suite above once that is fixed.
+///
+/// The bundle also needs `mlx.metallib` beside the xctest runner
+/// (`.build/<config>/*PackageTests.xctest/Contents/MacOS/`) or every MLX op
+/// traps on "Failed to load the default metallib" — CI does this
+/// (.github/workflows/ci.yml, "Extract mlx.metallib"), a local checkout
+/// does not.
+final class CBv2PagedMTPRoundProfile: XCTestCase {
+
+    private func knob(_ key: String, _ fallback: Int) -> Int {
+        Int(ProcessInfo.processInfo.environment[key] ?? "") ?? fallback
+    }
+
+    func testMTPRoundAttribution() throws {
+        try XCTSkipUnless(CBv2PagedProfileTests.enabled, "set DARKBLOOM_CBV2_PAGED_PROFILE=1")
+        let k = knob("DARKBLOOM_MTP_K", 3)
+        let context = knob("DARKBLOOM_MTP_CTX", 1024)
+        let profiler = PagedDecodeProfiler(timedSteps: knob("DARKBLOOM_MTP_STEPS", 20))
+        let results = try profiler.mtpRoundSuite(k: k, context: context)
+        print("\n## MTP verify-round attribution (gemma4-30L, B=1, k=\(k), ctx=\(context))\n")
+        print(PagedDecodeProfiler.markdownHeader)
+        for r in results { print(r.markdownRow) }
+        print("")
     }
 }

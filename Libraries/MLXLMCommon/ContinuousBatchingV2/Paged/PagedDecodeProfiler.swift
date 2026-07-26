@@ -421,4 +421,294 @@ public struct PagedDecodeProfiler {
         }
         return results
     }
+
+    // MARK: - MTP verify-round attribution (gemma-4 26B geometry)
+    //
+    // Root-causes the paged-specific MTP penalty: a paged verify round costs
+    // ~16.4 ms against contiguous ~14.2 ms (+15.5%) at identical step counts
+    // and acceptance. The model body is backend-independent, so the whole
+    // delta has to live in the KV layer. These ablations run ONLY the KV
+    // layer, at the real layer geometry, on both backends.
+
+    /// gemma-4-26B-A4B text stack: 30 layers, `layer_types` alternating five
+    /// `sliding_attention` then one `full_attention`, sliding layers at
+    /// `head_dim` 256 / 8 KV heads, full layers at `global_head_dim` 512 /
+    /// 2 KV heads, 16 query heads throughout, window 1,024, no sinks, no
+    /// KV sharing (`num_kv_shared_layers: 0`).
+    public static func gemma4LayerKinds() -> [CBv2LayerKind] {
+        (0 ..< 30).map { i in
+            i % 6 == 5
+                ? CBv2LayerKind(
+                    attention: .full, headDim: 512, kvHeads: 2, queryHeads: 16)
+                : CBv2LayerKind(
+                    attention: .slidingWindow(1024), headDim: 256, kvHeads: 8,
+                    queryHeads: 16)
+        }
+    }
+
+    /// The two layers `Gemma4TextModel.cbv2MTPCaptureLayers` hands the
+    /// drafter: the last non-shared full layer and the last non-shared
+    /// sliding layer.
+    static func gemma4CaptureLayers(_ kinds: [CBv2LayerKind]) -> (full: Int, sliding: Int) {
+        let full = kinds.lastIndex { $0.attention == .full && $0.sharesKVWithLayer == nil }!
+        let sliding = kinds.lastIndex {
+            if case .slidingWindow = $0.attention, $0.sharesKVWithLayer == nil { return true }
+            return false
+        }!
+        return (full, sliding)
+    }
+
+    /// What one MTP round's KV-layer work is made of.
+    public enum MTPRoundPhase: String, CaseIterable, Sendable {
+        /// `1 + k` verify columns through the production rectangular path
+        /// (`mtpSerializesRectangularAttention`), wrapped in the row-level
+        /// speculative transaction the engine opens.
+        case verify = "verify-1+k"
+        /// The MTP-OFF equivalent: `1 + k` ordinary `L == 1` decode calls,
+        /// which emit the same `1 + k` tokens at 100% acceptance.
+        case decodeSerial = "decode-x(1+k)"
+        /// The round's drafter captures: `snapshot()` on the two capture
+        /// layers, plus whatever fence the backend publishes.
+        case capture = "capture+fence"
+        /// `capture` with the paged fence reduced from a full-tensor
+        /// `sum()` to the one-element probe `PagedKVPool.gather` already
+        /// publishes. Identical on contiguous (nothing to reduce).
+        case captureProbeFence = "capture+probe"
+    }
+
+    /// One MTP-round phase on the paged bank.
+    func measurePagedMTPRound(
+        label: String, k: Int, context: Int, phase: MTPRoundPhase,
+        capacityBytes: Int = 8 << 30
+    ) throws -> Result {
+        let kinds = Self.gemma4LayerKinds()
+        let columns = 1 + k
+        let maxLength = context + (warmupSteps + timedSteps + 2) * columns
+        let config = PagedKVPoolConfig(
+            capacityBytes: capacityBytes,
+            maxPrefillChunk: 512,
+            nominalMaxSequenceLength: maxLength)
+        let backend = try PagedKVBackend(layerKinds: kinds, config: config)
+        backend.pool.materializeSlabs()
+        let caches = backend.makeLayerCaches()
+        let state = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: context, maxLength: maxLength)
+        defer { backend.release(state) }
+
+        var rows: [PagedSequenceKV] = []
+        for (layer, kind) in kinds.enumerated() {
+            let row = state[layer]! as! PagedSequenceKV
+            var remaining = context
+            while remaining > 0 {
+                let n = min(config.maxPrefillChunk, remaining)
+                row.write(
+                    keys: MLXRandom.normal([kind.kvHeads, n, kind.headDim], dtype: .float16),
+                    values: MLXRandom.normal([kind.kvHeads, n, kind.headDim], dtype: .float16))
+                remaining -= n
+            }
+            caches[layer].setRows([row])
+            rows.append(row)
+        }
+        for key in backend.pool.groupKeys { eval([backend.pool.group(key).writeFence]) }
+
+        let capture = Self.gemma4CaptureLayers(kinds)
+        let scale = Float(1.0 / Double(kinds[0].headDim).squareRoot())
+        let qkv = Self.roundTiles(kinds: kinds, columns: columns)
+        let zero = MLXArray(Float16(0))
+
+        let step: () -> Void = {
+            switch phase {
+            case .capture, .captureProbeFence:
+                var edges: [MLXArray] = []
+                for layer in [capture.full, capture.sliding] {
+                    let row = rows[layer]
+                    let snap = row.snapshot()
+                    let group = row.pool.group(row.groupKey)
+                    let edge =
+                        phase == .capture
+                        ? (snap.keys.sum() + snap.values.sum())
+                        : (snap.keys[0, 0, 0, 0] + snap.values[0, 0, 0, 0])
+                    group.writeFence = group.writeFence + edge.asType(group.writeFence.dtype) * 0
+                    edges.append(group.writeFence)
+                }
+                eval(edges)
+            case .verify:
+                for row in rows { row.beginSpeculativeWrite() }
+                var carry = zero
+                for layer in 0 ..< kinds.count {
+                    caches[layer].mtpSerializesRectangularAttention = true
+                    let out = caches[layer].updateAndAttend(
+                        queries: qkv.q[layer] + carry, keys: qkv.k[layer] + carry,
+                        values: qkv.v[layer] + carry, scale: scale, sinks: nil)
+                    caches[layer].mtpSerializesRectangularAttention = false
+                    carry = out[0, 0, 0, 0] * zero
+                }
+                eval(carry)
+                for row in rows { row.commitSpeculativeWrite() }
+            case .decodeSerial:
+                var carry = zero
+                for t in 0 ..< columns {
+                    for layer in 0 ..< kinds.count {
+                        let out = caches[layer].updateAndAttend(
+                            queries: qkv.q[layer][0..., 0..., t ..< (t + 1), 0...] + carry,
+                            keys: qkv.k[layer][0..., 0..., t ..< (t + 1), 0...] + carry,
+                            values: qkv.v[layer][0..., 0..., t ..< (t + 1), 0...] + carry,
+                            scale: scale, sinks: nil)
+                        carry = out[0, 0, 0, 0] * zero
+                    }
+                }
+                eval(carry)
+            }
+        }
+
+        let (ms, peak, stepTimes) = time(step)
+        let slabGiB = Double(backend.pool.bytesPhysical) / Double(1 << 30)
+        return Result(
+            label: label, mode: "paged " + phase.rawValue, batch: 1, context: context,
+            layers: kinds.count, slabGiB: slabGiB, msPerStep: ms,
+            stepPeakGiB: peak, stepTimesMs: stepTimes)
+    }
+
+    /// The same phase on the contiguous bank — the reference the paged round
+    /// competes with. Same layer geometry, same transaction discipline.
+    func measureContiguousMTPRound(
+        label: String, k: Int, context: Int, phase: MTPRoundPhase
+    ) throws -> Result {
+        let kinds = Self.gemma4LayerKinds()
+        let columns = 1 + k
+        let maxLength = context + (warmupSteps + timedSteps + 2) * columns
+        let backend = CBv2ContiguousKVBackend(
+            config: CBv2ContiguousBackendConfig(bytesCapacity: 8 << 30, kvDType: .float16))
+        let state = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: context, maxLength: maxLength)
+        defer { backend.release(state) }
+        let caches = kinds.enumerated().map { index, kind in
+            CBv2LayerCache(layerIndex: index, kind: kind, rows: [state[index]!])
+        }
+        var rows: [CBv2SequenceKV] = []
+        for (layer, kind) in kinds.enumerated() {
+            let row = state[layer]!
+            _ = row.update(
+                keys: MLXRandom.normal([1, kind.kvHeads, context, kind.headDim], dtype: .float16),
+                values: MLXRandom.normal([1, kind.kvHeads, context, kind.headDim], dtype: .float16)
+            )
+            caches[layer].setRows([row])
+            rows.append(row)
+        }
+        eval(rows.flatMap { [$0.snapshot().keys, $0.snapshot().values] })
+
+        let capture = Self.gemma4CaptureLayers(kinds)
+        let scale = Float(1.0 / Double(kinds[0].headDim).squareRoot())
+        let qkv = Self.roundTiles(kinds: kinds, columns: columns)
+        let zero = MLXArray(Float16(0))
+
+        let step: () -> Void = {
+            switch phase {
+            case .capture, .captureProbeFence:
+                // Contiguous captures are slice views and the fence is a
+                // no-op (`requiresMaterializedSnapshots == false`), so both
+                // capture phases are the same work: what the drafter reads.
+                var probes: [MLXArray] = []
+                for layer in [capture.full, capture.sliding] {
+                    let snap = rows[layer].snapshot()
+                    probes.append(snap.keys[0, 0, 0, 0] + snap.values[0, 0, 0, 0])
+                }
+                eval(probes)
+            case .verify:
+                for row in rows { row.beginSpeculativeWrite() }
+                var carry = zero
+                for layer in 0 ..< kinds.count {
+                    caches[layer].mtpSerializesRectangularAttention = true
+                    let out = caches[layer].updateAndAttend(
+                        queries: qkv.q[layer] + carry, keys: qkv.k[layer] + carry,
+                        values: qkv.v[layer] + carry, scale: scale, sinks: nil)
+                    caches[layer].mtpSerializesRectangularAttention = false
+                    carry = out[0, 0, 0, 0] * zero
+                }
+                eval(carry)
+                for row in rows { row.commitSpeculativeWrite() }
+            case .decodeSerial:
+                var carry = zero
+                for t in 0 ..< columns {
+                    for layer in 0 ..< kinds.count {
+                        let out = caches[layer].updateAndAttend(
+                            queries: qkv.q[layer][0..., 0..., t ..< (t + 1), 0...] + carry,
+                            keys: qkv.k[layer][0..., 0..., t ..< (t + 1), 0...] + carry,
+                            values: qkv.v[layer][0..., 0..., t ..< (t + 1), 0...] + carry,
+                            scale: scale, sinks: nil)
+                        carry = out[0, 0, 0, 0] * zero
+                    }
+                }
+                eval(carry)
+            }
+        }
+
+        let (ms, peak, stepTimes) = time(step)
+        return Result(
+            label: label, mode: "contig " + phase.rawValue, batch: 1, context: context,
+            layers: kinds.count, slabGiB: 0, msPerStep: ms,
+            stepPeakGiB: peak, stepTimesMs: stepTimes)
+    }
+
+    /// Per-layer `[1, *, columns, *]` Q/K/V tiles, pre-generated so the
+    /// timed step measures the KV layer and not RNG.
+    private static func roundTiles(
+        kinds: [CBv2LayerKind], columns: Int
+    ) -> (q: [MLXArray], k: [MLXArray], v: [MLXArray]) {
+        var q: [MLXArray] = []
+        var k: [MLXArray] = []
+        var v: [MLXArray] = []
+        for kind in kinds {
+            q.append(
+                MLXRandom.normal([1, kind.queryHeads, columns, kind.headDim], dtype: .float16))
+            k.append(MLXRandom.normal([1, kind.kvHeads, columns, kind.headDim], dtype: .float16))
+            v.append(MLXRandom.normal([1, kind.kvHeads, columns, kind.headDim], dtype: .float16))
+        }
+        eval(q + k + v)
+        return (q, k, v)
+    }
+
+    /// Host cost of the per-column `seqinfo` upload `PagedLayerCache
+    /// .dispatchDecode` performs: one fresh `[B, 8]` int32 device array per
+    /// column per layer, `(1 + k) * layers` of them per round, against the
+    /// `layers` a plain decode step needs.
+    public func mtpSeqinfoUploadCost(k: Int, layers: Int = 30) -> [Result] {
+        func measure(_ label: String, uploads: Int) -> Result {
+            let step: () -> Void = {
+                var arrays: [MLXArray] = []
+                arrays.reserveCapacity(uploads)
+                for i in 0 ..< uploads {
+                    arrays.append(MLXArray([Int32(i), 1, 1, 0, 0, 0, 0, 0], [1, 8]))
+                }
+                eval(arrays)
+            }
+            let (ms, peak, times) = time(step)
+            return Result(
+                label: label, mode: "seqinfo x\(uploads)", batch: 1, context: 0,
+                layers: layers, slabGiB: 0, msPerStep: ms, stepPeakGiB: peak,
+                stepTimesMs: times)
+        }
+        return [
+            measure("seqinfo-decode", uploads: layers),
+            measure("seqinfo-round", uploads: (1 + k) * layers),
+        ]
+    }
+
+    /// The full attribution table: both backends, every phase, at gemma-4
+    /// geometry.
+    public func mtpRoundSuite(k: Int = 3, context: Int = 1024) throws -> [Result] {
+        var results: [Result] = []
+        for phase in MTPRoundPhase.allCases {
+            results.append(
+                try measurePagedMTPRound(
+                    label: "gemma4-30L", k: k, context: context, phase: phase))
+            Memory.clearCache()
+            results.append(
+                try measureContiguousMTPRound(
+                    label: "gemma4-30L", k: k, context: context, phase: phase))
+            Memory.clearCache()
+        }
+        results.append(contentsOf: mtpSeqinfoUploadCost(k: k))
+        return results
+    }
 }
