@@ -270,16 +270,6 @@ protocol CBv2MTPRectangularSerializing: AnyObject {
 /// so conformance is declaration-only.
 extension CBv2LayerCache: CBv2MTPRectangularSerializing {}
 
-// WS-3.4 LANDED: `extension PagedLayerCache: CBv2MTPRectangularSerializing`
-// in `PagedLayerCache.swift`, with `updateAndAttend` honouring the flag
-// through `attendRectangularColumns` rather than the prompt-chunk branch —
-// which is why the branch's `b > 1` case is now packed prefill, not a
-// rectangular round. The blanket
-// `precondition(b == 1, "prefill chunks are per-request [1, chunk]")` this
-// TODO asked to replace no longer exists; WS-2.1 reduced it to
-// `precondition(boundSpanContext == nil || b == 1)`. `attendBorrowing`
-// carries the matching per-column path.
-
 // MARK: - Row-side speculative transaction
 
 /// A sequence row that can stage and roll back speculative writes.
@@ -307,14 +297,6 @@ protocol CBv2PagedSpeculativeRow: AnyObject {
     /// is `>= CBv2PagedSpeculation.maxSpeculativeSpan`.
     var speculativeHeadroom: Int { get }
 }
-
-// TODO(track R, WS-3.2/3.3): conform `PagedSequenceKV`, then redefine
-// `supportsSpeculativeWrites` as
-// `speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan`
-// and delete the comment above it claiming the ring aliases within the window.
-// That comment is false, contradicts this file's own header, and contradicts
-// `pagedattention.metal`'s "Windowed rings cannot alias" assertion — the
-// shader is the correct one.
 
 // MARK: - Windowed prefix adoption (WS-4.1)
 

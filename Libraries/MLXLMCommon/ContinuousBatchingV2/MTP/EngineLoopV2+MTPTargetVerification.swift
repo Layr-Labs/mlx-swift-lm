@@ -57,7 +57,6 @@ extension EngineLoopV2 {
             serializingCaches = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
             if serializingCaches.count != caches.count {
                 mtp.recordControllerFallback("rectangular_cache_unsupported")
-                serializingCaches = []
                 useRectangular = false
             }
         }
