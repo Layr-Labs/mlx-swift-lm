@@ -1,0 +1,145 @@
+// Copyright © 2026 Apple Inc.
+
+import Foundation
+import MLX
+import MLXLLM
+import MLXLMCommon
+import MLXNN
+import MLXRandom
+import Testing
+
+@testable import MLXSpeculative
+
+@Suite("Laguna DFlash draft model")
+struct LagunaDFlashDraftModelTests {
+
+    private func lagunaConfigJSON(decoderLayerType: String = "laguna_xs") -> String {
+        """
+        {
+          "architectures": ["DFlashDraftModel"],
+          "model_type": "laguna",
+          "decoder_layer_type": "\(decoderLayerType)",
+          "gating": "per-head",
+          "hidden_size": 8,
+          "num_hidden_layers": 2,
+          "intermediate_size": 16,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "head_dim": 4,
+          "vocab_size": 32,
+          "rms_norm_eps": 1e-6,
+          "rope_theta": 500000.0,
+          "max_position_embeddings": 4096,
+          "block_size": 4,
+          "num_target_layers": 4,
+          "sliding_window": 8,
+          "layer_types": ["sliding_attention", "sliding_attention"],
+          "dflash_config": {"target_layer_ids": [0, 2], "mask_token_id": 3}
+        }
+        """
+    }
+
+    private func makeConfig(decoderLayerType: String = "laguna_xs") throws -> DFlashConfiguration {
+        try JSONDecoder.json5().decode(
+            DFlashConfiguration.self,
+            from: Data(lagunaConfigJSON(decoderLayerType: decoderLayerType).utf8))
+    }
+
+    @Test func lagunaXSBuildsGatingAndAuxNormParameters() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let draft = DFlashDraftModel(config: try makeConfig())
+            let params = Dictionary(
+                uniqueKeysWithValues: draft.parameters().flattened())
+            #expect(params["aux_hidden_norms.0.weight"]?.shape == [8])
+            #expect(params["aux_hidden_norms.1.weight"]?.shape == [8])
+            #expect(params["layers.0.self_attn.g_proj.weight"]?.shape == [2, 8])
+            #expect(params["layers.1.self_attn.g_proj.weight"]?.shape == [2, 8])
+        }
+    }
+
+    @Test func qwen3ConfigBuildsNoLagunaParameters() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let draft = DFlashDraftModel(config: try makeConfig(decoderLayerType: "qwen3"))
+            let keys = Set(draft.parameters().flattened().map(\.0))
+            #expect(!keys.contains { $0.hasPrefix("aux_hidden_norms") })
+            #expect(!keys.contains { $0.contains("g_proj") })
+        }
+    }
+
+    @Test func lagunaXSForwardDiffersFromQwen3WithSharedWeights() throws {
+        try Device.withDefaultDevice(.cpu) {
+            MLXRandom.seed(7)
+            let laguna = DFlashDraftModel(config: try makeConfig())
+            MLXRandom.seed(7)
+            let qwen = DFlashDraftModel(config: try makeConfig(decoderLayerType: "qwen3"))
+            // Copy the shared subset of weights laguna->qwen so the only
+            // differences are the laguna_xs behaviors themselves.
+            let lagunaParams = Dictionary(
+                uniqueKeysWithValues: laguna.parameters().flattened())
+            let qwenKeys = Set(qwen.parameters().flattened().map(\.0))
+            let shared = lagunaParams.filter { qwenKeys.contains($0.key) }
+            try qwen.update(
+                parameters: ModuleParameters.unflattened(shared), verify: [.noUnusedKeys])
+
+            let target = LagunaDraftStubTarget(hiddenSize: 8, vocabularySize: 32, layerCount: 4)
+            try laguna.bind(target: target)
+            try qwen.bind(target: target)
+            eval(laguna, qwen)
+
+            let hidden = MLXRandom.normal([1, 3, 16]).asType(.bfloat16)
+            let block = MLXArray([Int32(5), 3, 3, 3])[.newAxis, .ellipsis]
+            let a = try laguna(
+                block, targetHidden: hidden, cache: try laguna.makeCache(), logitsStart: 1)
+            let b = try qwen(
+                block, targetHidden: hidden, cache: try qwen.makeCache(), logitsStart: 1)
+            eval(a, b)
+            #expect(!allClose(a, b, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+        }
+    }
+}
+
+/// Minimal deterministic target: embedding table + linear head, seeded.
+final class LagunaDraftStubTarget: Module, DFlashTargetModel {
+    let vocabularySize: Int
+    let kvHeads: [Int] = []
+    let dFlashVocabularySize: Int
+    let dFlashHiddenSize: Int
+    let dFlashLayerCount: Int
+    let embedWeight: MLXArray
+    let headWeight: MLXArray
+    var loraLayers: [Module] { [] }
+
+    init(hiddenSize: Int, vocabularySize: Int, layerCount: Int) {
+        self.vocabularySize = vocabularySize
+        self.dFlashVocabularySize = vocabularySize
+        self.dFlashHiddenSize = hiddenSize
+        self.dFlashLayerCount = layerCount
+        MLXRandom.seed(99)
+        self.embedWeight = MLXRandom.normal([vocabularySize, hiddenSize]).asType(.bfloat16)
+        self.headWeight = MLXRandom.normal([vocabularySize, hiddenSize]).asType(.bfloat16)
+        super.init()
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        logitsForDFlashHidden(embedTokensForDFlash(inputs))
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+
+    func forwardForDFlash(
+        _ inputs: MLXArray, cache: [KVCache]?, targetLayerIds: [Int]
+    ) throws -> DFlashTargetForward {
+        let h = embedTokensForDFlash(inputs)
+        return DFlashTargetForward(
+            logits: logitsForDFlashHidden(h),
+            hiddenStates: targetLayerIds.map { _ in h })
+    }
+
+    func embedTokensForDFlash(_ tokens: MLXArray) -> MLXArray {
+        embedWeight[tokens]
+    }
+
+    func logitsForDFlashHidden(_ hidden: MLXArray) -> MLXArray {
+        matmul(hidden, headWeight.T)
+    }
+}
