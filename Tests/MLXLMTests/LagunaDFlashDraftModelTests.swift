@@ -193,6 +193,34 @@ struct LagunaDFlashDraftModelTests {
                 "laguna_xs draft forward diverged from reference")
         }
     }
+
+    @Test func draftBlockRunsAgainstTinyLagunaTarget() throws {
+        try Device.withDefaultDevice(.cpu) {
+            // Draft with num_target_layers = 4 matching the tiny target's 4 layers.
+            let draft = DFlashDraftModel(config: try makeConfig())
+            let target = LagunaModel(
+                try JSONDecoder.json5().decode(
+                    LagunaConfiguration.self,
+                    from: Data(LagunaModelTests.tinyConfigJSON.utf8)))
+            try draft.bind(target: target)
+            eval(draft, target)
+
+            let prompt = MLXArray([Int32(1), 2, 3])[.newAxis, .ellipsis]
+            let targetOut = try target.forwardForDFlash(
+                prompt,
+                cache: target.newCache(parameters: nil),
+                targetLayerIds: draft.config.targetLayerIds)
+            let drafted = try draft.draftBlock(
+                bonus: 4,
+                targetHidden: targetOut.targetHidden,
+                cache: try draft.makeCache(),
+                blockSize: draft.config.recommendedBlockSize)
+            eval(drafted)
+            #expect(drafted.dim(-1) == draft.config.recommendedBlockSize - 1)
+            let tokens = drafted.asArray(Int32.self)
+            #expect(tokens.allSatisfy { $0 >= 0 && $0 < 32 })
+        }
+    }
 }
 
 /// Minimal deterministic target: embedding table + linear head, seeded.
