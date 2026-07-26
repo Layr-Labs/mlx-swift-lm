@@ -96,6 +96,103 @@ struct LagunaDFlashDraftModelTests {
             #expect(!allClose(a, b, rtol: 1e-3, atol: 1e-3).item(Bool.self))
         }
     }
+
+    @Test func lagunaXSForwardMatchesReferenceImplementation() throws {
+        try Device.withDefaultDevice(.cpu) {
+            MLXRandom.seed(11)
+            let config = try makeConfig()
+            let draft = DFlashDraftModel(config: config)
+            let target = LagunaDraftStubTarget(hiddenSize: 8, vocabularySize: 32, layerCount: 4)
+            try draft.bind(target: target)
+            eval(draft)
+
+            let p = Dictionary(uniqueKeysWithValues: draft.parameters().flattened())
+            func w(_ key: String) -> MLXArray { p[key]!.asType(.float32) }
+            let eps: Float = 1e-6
+            func rms(_ x: MLXArray, _ weight: MLXArray) -> MLXArray {
+                MLXFast.rmsNorm(x, weight: weight, eps: eps)
+            }
+
+            let contextLength = 3
+            MLXRandom.seed(21)
+            let targetHidden = MLXRandom.normal([1, contextLength, 16]).asType(.float32)
+            let block: [Int32] = [5, 3, 3, 3]
+            let blockArray = MLXArray(block)[.newAxis, .ellipsis]
+
+            // --- Reference forward (float32, mirrors vLLM DFlashLagunaForCausalLM) ---
+            let slices = (0 ..< 2).map { j in
+                rms(targetHidden[.ellipsis, (j * 8) ..< ((j + 1) * 8)],
+                    w("aux_hidden_norms.\(j).weight"))
+            }
+            var ctx = concatenated(slices, axis: -1)
+            ctx = matmul(ctx, w("fc.weight").T)
+            ctx = rms(ctx, w("hidden_norm.weight"))
+
+            var h = target.embedTokensForDFlash(blockArray).asType(.float32)
+            let rope = initializeRope(
+                dims: 4, base: 500000.0, traditional: false,
+                scalingConfig: nil, maxPositionEmbeddings: 4096)
+
+            for layer in 0 ..< 2 {
+                let prefix = "layers.\(layer)"
+                let xin = rms(h, w("\(prefix).input_layernorm.weight"))
+                let ctxin = rms(ctx, w("\(prefix).input_layernorm.weight"))
+
+                func heads(_ x: MLXArray, _ n: Int) -> MLXArray {
+                    x.reshaped(1, x.dim(1), n, 4).transposed(0, 2, 1, 3)
+                }
+                var q = heads(matmul(xin, w("\(prefix).self_attn.q_proj.weight").T), 2)
+                q = rms(q, w("\(prefix).self_attn.q_norm.weight"))
+                var pk = heads(matmul(xin, w("\(prefix).self_attn.k_proj.weight").T), 1)
+                pk = rms(pk, w("\(prefix).self_attn.k_norm.weight"))
+                let pv = heads(matmul(xin, w("\(prefix).self_attn.v_proj.weight").T), 1)
+                var ck = heads(matmul(ctxin, w("\(prefix).self_attn.k_proj.weight").T), 1)
+                ck = rms(ck, w("\(prefix).self_attn.k_norm.weight"))
+                let cv = heads(matmul(ctxin, w("\(prefix).self_attn.v_proj.weight").T), 1)
+
+                q = rope(q, offset: contextLength)
+                pk = rope(pk, offset: contextLength)
+                ck = rope(ck, offset: 0)
+
+                let keys = concatenated([ck, pk], axis: 2)
+                let values = concatenated([cv, pv], axis: 2)
+                let mask = createCausalMask(
+                    n: 4, offset: contextLength, windowSize: 8)
+                let attn = MLXFast.scaledDotProductAttention(
+                    queries: q, keys: keys, values: values,
+                    scale: pow(4.0, -0.5), mask: .array(mask))
+                var out = attn.transposed(0, 2, 1, 3).reshaped(1, 4, 8)
+
+                let gate = softplus(
+                    matmul(xin, w("\(prefix).self_attn.g_proj.weight").T))
+                out = (out.reshaped(1, 4, 2, 4) * gate[.ellipsis, .newAxis])
+                    .reshaped(1, 4, 8)
+                let attnOut = matmul(out, w("\(prefix).self_attn.o_proj.weight").T)
+                h = h + attnOut
+
+                let hin = rms(h, w("\(prefix).post_attention_layernorm.weight"))
+                let mlpOut = matmul(
+                    silu(matmul(hin, w("\(prefix).mlp.gate_proj.weight").T))
+                        * matmul(hin, w("\(prefix).mlp.up_proj.weight").T),
+                    w("\(prefix).mlp.down_proj.weight").T)
+                h = h + mlpOut
+            }
+            let expected = target.logitsForDFlashHidden(
+                rms(h, w("norm.weight")).asType(.bfloat16))[0..., 1..., 0...]
+
+            // --- Model forward ---
+            let actual = try draft(
+                blockArray,
+                targetHidden: targetHidden.asType(.bfloat16),
+                cache: try draft.makeCache(),
+                logitsStart: 1)
+            eval(expected, actual)
+            #expect(
+                allClose(actual.asType(.float32), expected.asType(.float32),
+                    rtol: 2e-2, atol: 2e-2).item(Bool.self),
+                "laguna_xs draft forward diverged from reference")
+        }
+    }
 }
 
 /// Minimal deterministic target: embedding table + linear head, seeded.
