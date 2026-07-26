@@ -395,8 +395,16 @@ def selftest():
         manifest = expected_source_manifest(cfg)
         ordered_names = sorted(manifest.keys())
 
-        # Fill each tensor with distinct deterministic bytes (tensor index repeated)
-        # so a bad offset calculation would surface as cross-tensor contamination.
+        # Fill each tensor with distinct deterministic bytes that vary BOTH
+        # between tensors (via idx) and within a tensor (via the byte
+        # position b). A single repeated fill byte per tensor would make
+        # every byte inside a fused qkv_proj tensor identical, which cannot
+        # distinguish a correct q/k/v row split from a bug that swaps the k
+        # and v regions (both regions would just be the same repeated byte
+        # either way). Varying by byte position means the q/k/v regions
+        # each carry distinct, position-dependent content, so a swapped
+        # k_start/v_start (or any other row-accounting bug) produces bytes
+        # that don't match the expected slice of the source tensor.
         tensor_bytes = {}
         for idx, name in enumerate(ordered_names):
             _, shape = manifest[name]
@@ -404,8 +412,7 @@ def selftest():
             for d in shape:
                 n_elems *= d
             n_bytes = n_elems * elem_size
-            fill_byte = idx % 256
-            tensor_bytes[name] = bytes([fill_byte]) * n_bytes
+            tensor_bytes[name] = bytes(((idx * 31 + b) % 256) for b in range(n_bytes))
 
         src_header = {}
         cursor = 0
