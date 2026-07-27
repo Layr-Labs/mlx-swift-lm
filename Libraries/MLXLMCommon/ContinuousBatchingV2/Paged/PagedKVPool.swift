@@ -169,6 +169,23 @@ final class PagedKVGroup {
     /// they cannot be recycled to another row while a round's captures
     /// still name them.
     var deferredFrees: [Int32] = []
+    /// Which of this group's slabs `materializeSlabs` has ACTUALLY made
+    /// resident. Tracked explicitly — set only after the slab's blocking
+    /// eval returned — because MLX exposes no public "is this array
+    /// evaluated" API (mlx-c's `_mlx_array_is_available` is documented
+    /// internal and mlx-swift does not surface it). A partially-committed
+    /// pool needs this to know how many bytes a retry still has to
+    /// allocate: the resident slabs already live inside MLX's
+    /// `activeMemory` and must not be demanded a second time.
+    var kSlabMaterialized = false
+    var vSlabMaterialized = false
+
+    /// Bytes of ONE slab (K or V alone), poison page included — the unit
+    /// `materializeSlabs` allocates and the unit the commit headroom
+    /// re-check charges for.
+    var slabBytes: Int {
+        pageCount * key.kvHeads * pageSize * key.headDim * dtype.size
+    }
 
     /// The reserved POISON page: physical page 0 of every group, permanently
     /// zeroed, never allocatable, never writable, `refCount` pinned at 1.
@@ -1000,30 +1017,69 @@ public final class PagedKVPool {
         groups.values.reduce(0) { $0 + $1.pageCount * $1.pageBytes }
     }
 
+    /// Bytes the slabs still need to ALLOCATE before the pool is fully
+    /// resident: `bytesPhysical` before the first materialization, shrinking
+    /// slab-by-slab as evals complete, zero once wired. This — not
+    /// `bytesPhysical` — is what the commit headroom re-check must demand:
+    /// after a partial materialization the resident slabs already sit
+    /// inside MLX's `activeMemory`, so demanding the full pool would count
+    /// them on both sides of the inequality and permanently refuse an
+    /// exactly-fitting retry.
+    public var bytesUnmaterialized: Int {
+        groups.values.reduce(0) {
+            $0 + ($1.kSlabMaterialized ? 0 : $1.slabBytes)
+                + ($1.vSlabMaterialized ? 0 : $1.slabBytes)
+        }
+    }
+
+    /// Bytes the slabs have actually made resident so far. Complement of
+    /// `bytesUnmaterialized`; equals `bytesPhysical` once wired.
+    public var bytesMaterialized: Int { bytesPhysical - bytesUnmaterialized }
+
+    /// How one slab is evaluated into residency. Internal seam so tests can
+    /// inject a deterministic allocation failure mid-materialization;
+    /// production is the scoped-handler eval below and nothing else.
+    var slabEval: (MLXArray) throws -> Void = { slab in
+        // `withError` binds MLX's task-local SCOPED error handler for
+        // exactly this eval: a Metal allocation failure inside the C++
+        // layer is caught at the mlx-c boundary (after a clean C++ unwind —
+        // no error ever throws across C++ frames) and surfaces as a thrown
+        // `MLXError` rather than reaching the process-fatal default
+        // handler. Never a process-global handler swap.
+        try withError { eval(slab) }
+    }
+
     /// Force-materialize the slabs (e.g. at engine warmup, before the wired
     /// limit is measured) so first-token latency never pays the allocation.
     /// Wire-down itself is owned by the existing WiredMemory policy plumbing
     /// (`WiredSumPolicy` et al.) — slabs participate like any other resident
     /// allocation once evaluated.
     ///
-    /// THROWS on allocation failure instead of aborting the process:
-    /// `withError` binds MLX's task-local SCOPED error handler for exactly
-    /// this eval, so a Metal allocation failure inside the C++ layer is
-    /// caught at the mlx-c boundary (after a clean C++ unwind — no error
-    /// ever throws across C++ frames) and surfaces here as a thrown
-    /// `MLXError` rather than reaching the process-fatal default handler.
-    /// A slab whose allocation failed keeps its `Full` primitive — MLX
-    /// marks arrays evaluated only AFTER their primitive ran — so calling
-    /// this again retries exactly the slabs that are still unscheduled and
-    /// skips the ones already resident. `PagedKVBackend.commitSlabs()` is
-    /// the admission-path wrapper that maps the failure to the engine's
-    /// retryable `capacityExhausted` class.
+    /// THROWS on allocation failure instead of aborting the process, and
+    /// evaluates SLAB-BY-SLAB (deterministic group order) rather than one
+    /// batched eval: each slab's residency is recorded the moment its
+    /// blocking eval returns, so a mid-materialization failure leaves the
+    /// exact boundary knowable — everything before the failing slab is
+    /// resident and flagged, the failing slab and everything after are not.
+    /// A retry re-evaluates only the missing slabs and skips the resident
+    /// ones (their flags short-circuit; re-evaling an already-evaluated
+    /// array would be a no-op anyway). The per-slab evals carry no
+    /// batching benefit to give up: every slab is an independent `Full`
+    /// zero-fill leaf, materialized once per pool lifetime.
+    /// `PagedKVBackend.commitSlabs()` is the admission-path wrapper that
+    /// maps the failure to the engine's retryable `capacityExhausted`
+    /// class.
     public func materializeSlabs() throws {
-        var arrays: [MLXArray] = []
-        for g in groups.values {
-            arrays.append(g.kSlab)
-            arrays.append(g.vSlab)
+        for key in groups.keys.sorted(by: { $0.description < $1.description }) {
+            let g = groups[key]!
+            if !g.kSlabMaterialized {
+                try slabEval(g.kSlab)
+                g.kSlabMaterialized = true
+            }
+            if !g.vSlabMaterialized {
+                try slabEval(g.vSlab)
+                g.vSlabMaterialized = true
+            }
         }
-        try withError { eval(arrays) }
     }
 }

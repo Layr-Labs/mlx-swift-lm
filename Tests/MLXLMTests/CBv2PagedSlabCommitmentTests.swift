@@ -316,6 +316,116 @@ struct CBv2PagedSlabCommitmentTests {
         backend.release(states)
     }
 
+    /// The PR #100 review defect, pinned: after a PARTIAL materialization
+    /// (first slab resident, a later one failed), the resident slab sits
+    /// inside `activeBytes` — demanding the full `bytesPhysical` on retry
+    /// would count it on both sides of the shortfall inequality and refuse
+    /// an exactly-fitting retry forever. The re-check must demand only the
+    /// remainder, so a box whose headroom fits EXACTLY the unmaterialized
+    /// bytes admits the retry.
+    @Test("a partially-materialized pool retries only the remainder")
+    func partialCommitRetriesOnlyTheRemainder() throws {
+        struct InjectedAllocationFailure: Error {}
+        // Two groups (distinct headDims) → four slabs, so the failure can
+        // land strictly inside the materialization walk.
+        let kinds = [fullKind(headDim: 64), fullKind(headDim: 128)]
+        let backend = try PagedKVBackend(layerKinds: kinds, config: config())
+        let full = backend.bytesPhysical
+
+        // First attempt: the first slab's eval lands, the second one hits
+        // the mid-materialization allocation race.
+        var evalCalls = 0
+        backend.pool.slabEval = { slab in
+            evalCalls += 1
+            if evalCalls == 2 { throw InjectedAllocationFailure() }
+            try withError { eval(slab) }
+        }
+        // Layer 1 sees room for the whole pool, so the evals actually run.
+        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
+            activeBytes: { 0 }, limitBytes: { full })
+
+        do {
+            _ = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: 0, maxLength: 128)
+            Issue.record("the injected allocation failure must surface")
+        } catch let error as CBv2KVError {
+            guard case .capacityExhausted(let needed, _) = error else {
+                Issue.record("expected capacityExhausted, got \(error)")
+                return
+            }
+            #expect(
+                needed == backend.pool.bytesUnmaterialized,
+                "the failure names the remainder, not the full pool")
+        }
+        let remainder = backend.pool.bytesUnmaterialized
+        let resident = full - remainder
+        #expect(resident > 0 && remainder > 0, "the commit made real partial progress")
+        #expect(backend.bytesWired == resident, "the resident slab is reported honestly")
+        #expect(!backend.slabsAreWired)
+        #expect(backend.bytesReserved == 0)
+
+        // The wedge scenario: the resident slab now shows up in active
+        // bytes and the headroom left fits ONLY the remainder.
+        backend.pool.slabEval = { slab in try withError { eval(slab) } }
+        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
+            activeBytes: { resident }, limitBytes: { resident + remainder })
+
+        let states = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 0, maxLength: 128)
+        #expect(backend.slabsAreWired)
+        #expect(backend.bytesWired == full)
+        #expect(backend.pool.bytesUnmaterialized == 0)
+        #expect(states.contains { $0 != nil }, "the retried pool mints real rows")
+        backend.release(states)
+    }
+
+    /// The conservative side of the same fix: a retry whose remaining
+    /// headroom is genuinely one byte short of the REMAINDER still refuses
+    /// — shrinking the demand must never turn into over-commit.
+    @Test("a retry with insufficient remaining headroom still refuses")
+    func partialCommitRetryStillRefusesWithoutHeadroom() throws {
+        struct InjectedAllocationFailure: Error {}
+        let kinds = [fullKind(headDim: 64), fullKind(headDim: 128)]
+        let backend = try PagedKVBackend(layerKinds: kinds, config: config())
+        let full = backend.bytesPhysical
+
+        var evalCalls = 0
+        backend.pool.slabEval = { slab in
+            evalCalls += 1
+            if evalCalls == 2 { throw InjectedAllocationFailure() }
+            try withError { eval(slab) }
+        }
+        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
+            activeBytes: { 0 }, limitBytes: { full })
+        #expect(throws: CBv2KVError.self) {
+            try backend.makeSequenceState(layerKinds: kinds, promptLength: 0, maxLength: 128)
+        }
+        let remainder = backend.pool.bytesUnmaterialized
+        let resident = full - remainder
+
+        // One byte short of the remainder: refused, naming the remainder.
+        backend.pool.slabEval = { slab in try withError { eval(slab) } }
+        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
+            activeBytes: { resident }, limitBytes: { resident + remainder - 1 })
+        do {
+            _ = try backend.makeSequenceState(
+                layerKinds: kinds, promptLength: 0, maxLength: 128)
+            Issue.record("a short-by-one retry must refuse")
+        } catch let error as CBv2KVError {
+            guard case .capacityExhausted(let needed, let available) = error else {
+                Issue.record("expected capacityExhausted, got \(error)")
+                return
+            }
+            #expect(needed == remainder)
+            #expect(available == remainder - 1)
+        }
+        #expect(!backend.slabsAreWired)
+        #expect(backend.bytesReserved == 0)
+        #expect(
+            backend.pool.bytesUnmaterialized == remainder,
+            "a layer-1 refusal runs no evals — the remainder is untouched")
+    }
+
     /// The headroom re-check arithmetic, pinned at the boundary. "Fits
     /// exactly" must admit — the re-check exists to stop genuine
     /// overshoots, not to shave usable headroom — and one byte short must
