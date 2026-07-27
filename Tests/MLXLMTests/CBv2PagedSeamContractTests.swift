@@ -59,6 +59,20 @@ struct CBv2PagedSeamContractRingFormulaTests {
     /// contract's statement of the ring formula and
     /// `PagedKVPool.ringPageCount` is the shipping one; if either moves
     /// without the other, this fails.
+    ///
+    /// ONE TERM IS SHARED, SO THIS TEST IS BLIND TO IT. Both sides reach
+    /// `PagedSequenceKV.maxWindowExposure(window:)` for the exposure term —
+    /// the contract through `CBv2PagedRingGeometry.attendableTokens`, the
+    /// pool directly — so a change there moves both derivations together and
+    /// this comparison still passes. That is deliberate: the coupling is the
+    /// safety property (widen what a row exposes and the ring grows with it,
+    /// rather than the row out-running a ring sized from a stale literal),
+    /// so breaking it here to make the derivations independent would trade a
+    /// real invariant for test coverage.
+    ///
+    /// The exposure term is instead pinned separately, immediately below.
+    /// It is the term the whole 65-page argument rests on, so it gets its
+    /// own assertion rather than riding on this one.
     @Test func ringFormulaMatchesPagedKVPool() {
         for window in Self.windows {
             for pageSize in Self.pageSizes {
@@ -77,6 +91,32 @@ struct CBv2PagedSeamContractRingFormulaTests {
                         """)
                 }
             }
+        }
+    }
+
+    /// The exposure term, pinned on its own because
+    /// `ringFormulaMatchesPagedKVPool` cannot see it.
+    ///
+    /// `maxWindowExposure(window:) == window` is the load-bearing claim of
+    /// the whole 65-page argument: it is `window` rather than
+    /// `window - 1 + maxPrefillChunk` ONLY because both write paths gather
+    /// BEFORE they write. Re-introduce a post-write gather anywhere and this
+    /// number has to grow — at which point gemma-4's windowed layers go back
+    /// from 65 pages to something near the pre-shrink 97, on 25 of 30
+    /// layers. That is a memory decision, so it must fail a test and be
+    /// looked at, not ride silently through both derivations at once.
+    @Test func windowExposureIsExactlyTheWindow() {
+        for window in Self.windows {
+            #expect(
+                PagedSequenceKV.maxWindowExposure(window: window) == window,
+                """
+                maxWindowExposure(\(window)) is \
+                \(PagedSequenceKV.maxWindowExposure(window: window)), not \(window). Both the \
+                contract's CBv2PagedRingGeometry.attendableTokens and the shipping \
+                PagedKVPool.ringPageCount read this one function, so they moved TOGETHER and \
+                ringFormulaMatchesPagedKVPool still passed. Widening the exposure grows every \
+                windowed ring: re-derive the page counts before changing this.
+                """)
         }
     }
 

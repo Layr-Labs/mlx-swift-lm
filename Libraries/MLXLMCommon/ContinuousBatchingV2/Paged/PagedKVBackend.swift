@@ -196,8 +196,9 @@ public final class PagedKVBackend: CBv2KVBackend {
     ///    owning full rows restored to M and EVERY owning windowed row
     ///    restored to M from an admissible `CBv2PagedWindowSnapshot`. Both
     ///    cursors are M and there is nothing to replay, which is the form
-    ///    `PagedSeamContract` describes as making
-    ///    `pagedHybridRequiresDualCursor` evaporate rather than solving it.
+    ///    that makes the paged-hybrid dual-cursor problem evaporate rather
+    ///    than solving it. (The capability refusal that named that problem
+    ///    is gone: `derive` no longer refuses paged hybrids.)
     ///  * `.frozenFullReplay` with R > 0 — owning full rows adopted FROZEN
     ///    through M via `PagedSequenceKV.adoptFrozen`, so their storage is
     ///    exact and immutable while the logical cursor reports C; windowed
@@ -436,7 +437,7 @@ public final class PagedKVBackend: CBv2KVBackend {
                         keys: full.keys, values: full.values, replayStart: plan.replayStart)
                 }
             } else if let window = windows[index] {
-                installWindow(window, into: row)
+                installWindow(window, into: row, at: matched)
             } else if plan.replayStart > 0 {
                 // Windowed row on the replay form: empty, at C, and its
                 // `baseOffset` set so no query reaches behind the replay.
@@ -446,7 +447,9 @@ public final class PagedKVBackend: CBv2KVBackend {
         return states
     }
 
-    /// Place a validated window at its one admissible base.
+    /// Place a validated window at its one admissible base. A BYTE WRITE:
+    /// the payload is copied into the row's own pages. Nothing is shared and
+    /// no page refcount is adopted.
     ///
     /// `fastForward` is what makes the absolute positions right: it sets both
     /// `absoluteOffset` and `baseOffset` to `snapshot.base`, so the tokens
@@ -459,9 +462,28 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// longer than `maxPrefillChunk` because the ring cannot hold one, and a
     /// full window is longer than a chunk by construction (gemma-4: 1,024
     /// against 512).
+    ///
+    /// Admissibility is re-asserted here rather than trusted from the
+    /// caller. `CBv2PagedWindowSnapshot.requireAdmissible` is what stops a
+    /// donation taken at position 4,096 being written into an adopter's
+    /// `[0, 1024)` — silent wrong answers, no trap, no telemetry — and the
+    /// validating call is in `makeFrozenFullState`, twenty lines away and
+    /// separated by an install loop. A `precondition` rather than a throw:
+    /// the install phase is deliberately non-throwing so no half-built state
+    /// can escape, and by this point the refusal path has already run, so
+    /// this can only fire on a programming error.
     private func installWindow(
-        _ snapshot: CBv2PagedWindowSnapshot, into row: PagedSequenceKV
+        _ snapshot: CBv2PagedWindowSnapshot, into row: PagedSequenceKV,
+        at matchedBoundary: Int
     ) {
+        do {
+            try snapshot.requireAdmissible(at: matchedBoundary, window: row.windowSize)
+        } catch {
+            preconditionFailure(
+                "[PagedKVBackend] installWindow reached with an inadmissible snapshot "
+                    + "at boundary \(matchedBoundary): \(error) — validation must run in "
+                    + "makeFrozenFullState before the install phase")
+        }
         let keys = snapshot.keys.squeezed(axis: 0)
         let values = snapshot.values.squeezed(axis: 0)
         row.fastForward(to: snapshot.base)

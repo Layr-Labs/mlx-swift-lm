@@ -15,8 +15,10 @@
 // - Page size is 16 tokens (`CBv2PagedDefaults.pageSize`), matching
 //   vLLM/mistral.rs block sizes. Revisit after kernel benchmarks.
 // - The free list is a plain stack of page indices: O(1) allocate/free.
-//   Pages carry refcounts so that copy-free prefix sharing can land later
-//   (refcount > 1 == shared page); today every page has refcount 0 or 1.
+//   Pages carry refcounts, but every count is 0 or 1 — nothing retains a
+//   page twice. Copy-free prefix sharing would be what pushes a count
+//   above 1, and it does not exist: window adoption COPIES bytes
+//   (`PagedKVBackend.installWindow`), it does not adopt pages.
 // - Admission is RESERVATION based: the CBv2 contract's
 //   `CBv2SequenceKV.update` cannot throw, so capacity failures mid-decode
 //   would be unrecoverable. Instead, `reserve` claims the worst-case page
@@ -152,7 +154,11 @@ final class PagedKVGroup {
     var writeFence: MLXArray
     /// Stack of free page ids — O(1) alloc/free.
     var freeList: [Int32]
-    /// Per-page refcount (>1 reserved for future prefix sharing).
+    /// Per-page refcount. Effectively a 0/1 owned flag: `allocatePage` sets
+    /// 1, `freePage` clears to 0, and the poison page is pinned at 1. No
+    /// code path raises a count above 1 — page sharing would need a retain
+    /// operation and a sharing-aware `installWindow` (which copies bytes, it
+    /// does not adopt pages), neither of which exists.
     var refCounts: [Int]
     /// Pages currently held by sequences (refCount > 0).
     private(set) var pagesInUse: Int = 0
@@ -238,12 +244,6 @@ final class PagedKVGroup {
         refCounts[Int(page)] = 1
         pagesInUse += 1
         return page
-    }
-
-    func retainPage(_ page: Int32) {
-        precondition(page != Self.poisonPage, "retain of the reserved poison page")
-        precondition(refCounts[Int(page)] > 0, "retain of free page")
-        refCounts[Int(page)] += 1
     }
 
     func freePage(_ page: Int32) {
@@ -648,8 +648,9 @@ public final class PagedKVPool {
     ///     the write asks for `window - 1 + chunk` — 1,535 tokens out of
     ///     1,040 — and trips `gatherRange`'s eviction precondition. That is
     ///     the abort.
-    ///  2. `PagedSequenceKV.update` does the same on the row path, which is
-    ///     what collapses `retainedCount` to `min(written, window)` and
+    ///  2. `PagedSequenceKV.update` does the same on the protocol path
+    ///     (tests and `PagedDecodeProfiler`; the serving path is (1)), which
+    ///     is what collapses `retainedCount` to `min(written, window)` and
     ///     removes the chunk term from the cache bound. `maxWindowExposure`
     ///     is the coupling: this formula reads it, so widening the row's
     ///     exposure grows the ring rather than out-running it.
@@ -663,6 +664,28 @@ public final class PagedKVPool {
     /// than the number. The speculative term binds to
     /// `CBv2PagedSpeculation.maxSpeculativeSpan` rather than a literal so
     /// this sizing and `PagedSequenceKV.speculativeHeadroom` cannot disagree.
+    ///
+    /// So the live hazard is no longer "someone shrinks the ring" — that is
+    /// arithmetic, and `checkedRingPageCount` catches it. It is "someone
+    /// re-widens what a row exposes, or removes the ordering (3) supplies".
+    /// Three ways to do that which all read as tidying:
+    ///
+    ///  1. Hoisting `PagedLayerCache`'s gather OUT of the per-row body of
+    ///     `CBv2AttentionV1.packedPerRow` so it runs once across the batch.
+    ///     It reads as deduplication; it reintroduces a post-write gather
+    ///     for every row after the first. The gather must stay hoisted PER
+    ///     ROW — before that row's own write.
+    ///  2. Reading `retainedPrefillKV[0]` instead of
+    ///     `retainedPrefillKV[index]` in `PagedLayerCache.attendBorrowing`.
+    ///     It compiles, and it silently serves row 0's history to every
+    ///     KV-shared sibling of a packed prefill.
+    ///  3. Deleting the fence BACK-edge at the end of `PagedKVPool.gather`
+    ///     as a redundant no-op. It multiplies the fence by zero, so it
+    ///     looks like dead arithmetic and reads like a performance win; it
+    ///     is the only thing ordering a later bulk write after this read.
+    ///
+    /// (1) and (2) widen exposure, so `checkedRingPageCount` can catch them.
+    /// (3) does not: no precondition trips and the KV corrupts silently.
     static func ringPageCount(window: Int, config: PagedKVPoolConfig) -> Int {
         let tokens = max(
             PagedSequenceKV.maxWindowExposure(window: window)
@@ -939,12 +962,11 @@ public final class PagedKVPool {
         let values = assemble(g.vSlab)
         // The back-edge. ONE element of each is enough: MLX schedules whole
         // primitives, so a dependency on any slice of the gather forces the
-        // gather itself. (`CBv2MTPCaptureFence` uses `.sum()`, which
-        // publishes the identical edge and reads the whole range to do it —
-        // ~4 MiB per sliding layer per prefill chunk on gemma-4.) `* 0` in
-        // int32 is exactly zero for EVERY input, including whatever an
-        // out-of-range or NaN float->int conversion produces, so the fence
-        // keeps its VALUE and gains only the edge.
+        // gather itself. (`CBv2MTPCaptureFence` publishes the identical edge
+        // the same way, for the same reason.) `* 0` in int32 is exactly zero
+        // for EVERY input, including whatever an out-of-range or NaN
+        // float->int conversion produces, so the fence keeps its VALUE and
+        // gains only the edge.
         let probe = keys[0, 0, 0, 0] + values[0, 0, 0, 0]
         g.writeFence = g.writeFence + probe.asType(g.writeFence.dtype) * 0
         return (keys, values)

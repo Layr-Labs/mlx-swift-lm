@@ -543,6 +543,57 @@ public enum PagedAttentionKernel {
         return z
     }()
 
+    /// One row of the `[B, 8]` int32 `seqinfo` argument `decode` takes.
+    ///
+    /// The layout — `{attendStart, attendLen, tableLen, writePage,
+    /// writeSlot, 0, 0, 0}` — used to exist only as prose in `decode`'s
+    /// parameter list while five call sites hand-packed it, and it had
+    /// already diverged: `PagedDecodeProfiler` fed `row.table.count` as
+    /// `tableLen` where the production path feeds
+    /// `PagedSequenceKV.decodeTableLength`. Those are the same number only
+    /// while a row's physical table happens to be as long as its ring, which
+    /// the profiler's gpt-oss shapes make true and a partially-allocated
+    /// ring (a prefix-adopted windowed row) makes false — and then the
+    /// shader's `table[logicalPage % tableLen]` wraps at the wrong length and
+    /// aliases the wrong physical pages.
+    ///
+    /// So the layout is a type, next to its only consumer.
+    struct SeqInfoRow: Equatable {
+        /// First absolute position this row may attend.
+        var attendStart: Int
+        /// Positions attended, INCLUDING the newly written one.
+        var attendLength: Int
+        /// Divisor for `table[logicalPage % tableLen]`. For a row, this is
+        /// `PagedSequenceKV.decodeTableLength` — never `table.count`.
+        var tableLength: Int
+        /// Fused-write destination. Both zero for a dispatch that does not
+        /// write (KV-borrowing layers, attention-only probes).
+        var writePage: Int32 = 0
+        var writeSlot: Int = 0
+
+        var packed: [Int32] {
+            [
+                Int32(attendStart), Int32(attendLength), Int32(tableLength),
+                writePage, Int32(writeSlot), 0, 0, 0,
+            ]
+        }
+    }
+
+    /// Pack rows into the `[B, 8]` int32 array `decode` takes, and report the
+    /// `maxAttendLength` that must accompany it — the two always travel
+    /// together, and computing the max separately is its own drift risk.
+    static func seqinfo(_ rows: [SeqInfoRow]) -> (array: MLXArray, maxAttendLength: Int) {
+        precondition(!rows.isEmpty, "[PagedAttentionKernel] seqinfo needs at least one row")
+        var flat = [Int32]()
+        flat.reserveCapacity(rows.count * 8)
+        var maxAttendLength = 1
+        for row in rows {
+            flat.append(contentsOf: row.packed)
+            maxAttendLength = max(maxAttendLength, row.attendLength)
+        }
+        return (MLXArray(flat, [rows.count, 8]), maxAttendLength)
+    }
+
     /// Dispatch decode attention for `B` rows.
     ///
     /// - Parameters:
@@ -556,9 +607,9 @@ public enum PagedAttentionKernel {
     ///     owning layer).
     ///   - kSlab/vSlab: pool slabs `[P, kvHeads, pageSize, headDim]`.
     ///   - tables: `[B, maxPages]` int32, `maxPages >= 8`.
-    ///   - seqinfo: `[B, 8]` int32 rows `{attendStart, attendLen, tableLen,
-    ///     writePage, writeSlot, 0…}` — attend fields describe the range
-    ///     INCLUDING the newly written position.
+    ///   - seqinfo: `[B, 8]` int32 rows — build it with `SeqInfoRow` and
+    ///     `PagedAttentionKernel.seqinfo(_:)` rather than packing the layout
+    ///     by hand.
     ///   - maxAttendLength: max over rows of the attended length (host-side
     ///     Swift Int — sizes the partial buffers, never a device sync).
     ///   - sinks: optional per-query-head sink logits `[queryHeads]`.
@@ -645,7 +696,9 @@ public enum PagedAttentionKernel {
             maxAttendLength: maxAttendLength, batch: b, kvHeads: kvHeads,
             headSplits: splits, pageSize: pageSize)
         precondition(ptok % pageSize == 0, "PTOK must be a page multiple")
-        let maxParts = (maxAttendLength + ptok - 1) / ptok
+        // `ceilingDivide`, not `(a + b - 1) / b`: `maxAttendLength` is
+        // caller-supplied, and this is the site that motivated the helper.
+        let maxParts = ceilingDivide(maxAttendLength, ptok)
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,

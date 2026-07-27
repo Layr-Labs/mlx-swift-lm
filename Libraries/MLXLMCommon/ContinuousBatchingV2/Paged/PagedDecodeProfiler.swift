@@ -189,21 +189,18 @@ public struct PagedDecodeProfiler {
                     }
                     carry = k[0, 0, 0, 0] * zero
                 case .dispatchOnly:
-                    var info = [Int32]()
-                    var maxAttend = 1
-                    for row in rows {
-                        let (start, length) = row.decodeAttendRange
-                        info.append(contentsOf: [
-                            Int32(start), Int32(length), Int32(row.table.count), 0, 0, 0, 0, 0,
-                        ])
-                        maxAttend = max(maxAttend, length)
-                    }
+                    // `decodeTableLength`, via the row's own builder — this
+                    // site used to pass `table.count`, which is the same
+                    // number only while a row's physical table is as long
+                    // as its ring.
+                    let (seqinfo, maxAttend) = PagedAttentionKernel.seqinfo(
+                        rows.map { $0.seqInfoRow(attending: $0.decodeAttendRange) })
                     let (out, _) = PagedAttentionKernel.decode(
                         queries: q,
                         kSlab: group.kSlab,
                         vSlab: group.vSlab,
                         tables: cache.deviceTables(rows: rows),
-                        seqinfo: MLXArray(info, [rows.count, 8]),
+                        seqinfo: seqinfo,
                         maxAttendLength: maxAttend,
                         sinks: sinks,
                         params: MLXArray([Float(1), scale, 0, 0, 0, 0, 0, 0]),

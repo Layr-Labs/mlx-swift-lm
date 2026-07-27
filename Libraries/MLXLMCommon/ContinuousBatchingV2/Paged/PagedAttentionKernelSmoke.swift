@@ -250,10 +250,10 @@ extension PagedAttentionKernel {
         let columns = max(tableLength, 8)
         return SmokeProbe(
             table: [Int32](repeating: smokeHistoryPage, count: columns),
-            seqinfo: [
-                Int32(0), Int32(attendLength), Int32(tableLength),
-                smokeWritePage, 0, 0, 0, 0,
-            ])
+            seqinfo: PagedAttentionKernel.SeqInfoRow(
+                attendStart: 0, attendLength: attendLength, tableLength: tableLength,
+                writePage: smokeWritePage
+            ).packed)
     }
 
     private static func runtimeSmoke(

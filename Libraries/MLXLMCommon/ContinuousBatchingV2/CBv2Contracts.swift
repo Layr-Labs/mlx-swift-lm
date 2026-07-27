@@ -271,8 +271,7 @@ public protocol CBv2SequenceKV: AnyObject {
     /// in-place writes destroy the oldest in-window entries — see
     /// `CBv2WindowedSequenceKV`'s rollback discussion) MUST return false so
     /// the engine falls back to plain decode for that row. Default: false
-    /// (fail-safe — unknown row classes never speculate), mirroring
-    /// `CBv2KVBackend.producesCompiledDecodeEligibleRows`.
+    /// (fail-safe — unknown row classes never speculate).
     var supportsSpeculativeWrites: Bool { get }
     /// Begin one speculative-write transaction. Storage
     /// whose plain rollback is already value-exact (full, paged-full) may
@@ -376,16 +375,6 @@ public protocol CBv2KVBackend: AnyObject {
     /// `EngineV2` enforces this pairing at construction. Defaults to false
     /// (contiguous per-sequence buffers are ARC-owned by their views).
     var requiresMaterializedSnapshots: Bool { get }
-    /// True when this backend mints request rows the compiled [B, 1] decode
-    /// path can bind (`CBv2FullSequenceKV` / `CBv2WindowedSequenceKV`).
-    /// `CBv2CompiledDecode.laneInfo` rejects every other row class
-    /// (quantized, paged) at bind time, so an ineligible backend would warm
-    /// the compiled graphs against fp16 scratch, carve the padding reserve
-    /// out of admission, and then fall back eager on EVERY live step — a
-    /// permanently tighter ceiling for zero benefit (PR#62 review).
-    /// `EngineV2` skips the compiled build entirely when this is false.
-    /// Defaults to false (fail-safe: unknown backends stay eager).
-    var producesCompiledDecodeEligibleRows: Bool { get }
     /// How this backend's rows OCCUPY storage, consulted by `AdmissionV2`
     /// so the byte ledger charges what will really be allocated instead of
     /// inferring it from `CBv2LayerKind` alone. The distinction is
@@ -403,7 +392,6 @@ extension CBv2KVBackend {
     public var prefixReuseBackend: CBv2PrefixReuseBackend { .unknown }
     public var bytesReserved: Int { bytesInUse }
     public var requiresMaterializedSnapshots: Bool { false }
-    public var producesCompiledDecodeEligibleRows: Bool { false }
     public var kvResidency: any CBv2KVResidencyPolicy { CBv2ContiguousKVResidency() }
     public func updateBytesCapacity(_ bytes: Int) {}
     public func makeSequenceState(

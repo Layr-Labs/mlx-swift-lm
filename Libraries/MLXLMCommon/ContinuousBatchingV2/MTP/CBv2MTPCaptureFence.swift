@@ -64,10 +64,11 @@ enum CBv2MTPCaptureFence {
     /// and this fence deliberately joins none of it. Gating the edge on ring
     /// geometry would make its correctness a function of three constants
     /// maintained in two other files, and would silently exempt the case
-    /// with no ring at all. Publishing it unconditionally costs one reduction
-    /// per capture and is correct for any ring size, any span, any chunk, and
-    /// for full-attention rows. It is a mechanism, not a check, so it cannot
-    /// go stale when the ring geometry moves again — as it just did.
+    /// with no ring at all. Publishing it unconditionally costs one element
+    /// read per capture and is correct for any ring size, any span, any
+    /// chunk, and for full-attention rows. It is a mechanism, not a check, so
+    /// it cannot go stale when the ring geometry moves again — as it just
+    /// did.
     ///
     /// **The fix: a fence BACK-edge.** `PagedKVPool.gather` already folds the
     /// group's write fence into its page index (`MLXArray(pages) +
@@ -81,7 +82,8 @@ enum CBv2MTPCaptureFence {
     /// zero for every input, including whatever an out-of-range float→int
     /// conversion produces, so the fence keeps its VALUE and gains only the
     /// graph edge. No host sync, so the round keeps its pipelining; the cost
-    /// is one reduction pass over tensors the drafter forces anyway.
+    /// is ONE element of each capture, because MLX schedules whole
+    /// primitives and a dependency on any slice forces the whole gather.
     ///
     /// A `.copy()` or a `stopGradient` would NOT do. The hazard is invisible
     /// to MLX, so the remedy has to be a real graph edge or a real
@@ -105,11 +107,23 @@ enum CBv2MTPCaptureFence {
                 unfenceable.append(capture.values)
                 continue
             }
+            // A zero-token capture (`PagedKVPool.gather` returns
+            // `[1, H, 0, D]` for `count == 0`) has no element to probe. It
+            // also has nothing to protect: that path never built a page
+            // index, so it read no slab bytes and no later write can
+            // clobber what it did not take. `.sum()` used to return 0 here
+            // and publish an edge over nothing.
+            guard capture.keys.dim(2) > 0, capture.values.dim(2) > 0 else { continue }
             let group = paged.pool.group(paged.groupKey)
-            let edge =
-                (capture.keys.sum() + capture.values.sum())
-                .asType(group.writeFence.dtype) * 0
-            group.writeFence = group.writeFence + edge
+            // ONE element of each is enough: MLX schedules whole
+            // primitives, so a dependency on any slice of the gather forces
+            // the gather itself. This used to be
+            // `capture.keys.sum() + capture.values.sum()`, which publishes
+            // the identical edge and reads the whole captured range to do
+            // it — `PagedKVPool.gather` runs the opposite-direction edge
+            // this way and names this site as the counterexample.
+            let probe = capture.keys[0, 0, 0, 0] + capture.values[0, 0, 0, 0]
+            group.writeFence = group.writeFence + probe.asType(group.writeFence.dtype) * 0
         }
         return unfenceable
     }

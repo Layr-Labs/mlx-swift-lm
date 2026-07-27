@@ -60,11 +60,21 @@ enum CBv2AttentionV1 {
     /// anything upstream can catch. A daemon hosting several models loses
     /// every in-flight request and emits nothing.
     ///
-    /// Every SDPA terminal in this module funnels through here.
+    /// Every SDPA terminal on a SERVING path funnels through here: the two
+    /// in this file via `dispatchSinks`, and the paged prefill terminal
+    /// (`PagedLayerCache.attendQueryBlock`) via that file's `prefillSinks`.
+    /// Both callers hoist the cast to their top-level dispatch, so the
+    /// per-row / per-block / per-token loops below them re-use one array.
+    ///
+    /// The remaining SDPA calls in the module are in `PagedDecodeProfiler`
+    /// and `PagedBackendBenchmark`, which mint their own fixtures in the
+    /// dtype they then query with; they are measurement rigs, not a path any
+    /// request reaches.
     ///
     /// NOT for `PagedAttentionReference.composedAttention`: it runs in fp32
     /// throughout and widens the sinks itself, so narrowing them first would
-    /// be a real precision loss.
+    /// be a real precision loss. Both callers carve that case out on
+    /// `softcap != nil`, which is what selects the composed path.
     @inline(__always)
     static func sdpaSinks(_ sinks: MLXArray?, queryDType: DType) -> MLXArray? {
         // `asType` returns `self` when the dtypes already match, so the
@@ -92,6 +102,39 @@ enum CBv2AttentionV1 {
         // A softcap sends BOTH phases to the composed fp32 reference, which
         // wants the model's own (possibly wider) sinks — see `sdpaSinks`.
         return softcap == nil ? sdpaSinks(sinks, queryDType: queries.dtype) : sinks
+    }
+
+    /// Gathered-key columns ONE query block may see: from the EARLIEST
+    /// query's window floor to the LATEST query's own position, so the
+    /// block's queries are exactly the trailing `count` entries of the span
+    /// — the invariant `maskMode` assumes.
+    ///
+    /// `historyCount` is the number of keys that predate the block's chunk;
+    /// it means the same thing on both backends. Contiguous derives it as
+    /// `keys.dim(2) - newTokenCount`, paged reads it off the assembled
+    /// `PrefillKV`.
+    ///
+    /// **This arithmetic IS the activation-reserve bound.** Blocking is what
+    /// pins the materialized score tensor at `[B, heads, count, kL]` instead
+    /// of `[B, heads, L, kL]`, which is what lets `prefillChunkSize` grow
+    /// without the flat 3 GiB reserve in the provider's `UnifiedMemoryCap`
+    /// becoming a lie. On a sliding layer the span saturates at
+    /// `window - 1 + blockSize` however long the chunk is; on a full layer
+    /// only the query extent is capped. Both backends therefore have to
+    /// compute the SAME span — if the two copies drift, one of them silently
+    /// attends a different set of keys, and the memory bound stops holding
+    /// on whichever side widened.
+    ///
+    /// It is shared rather than copied for exactly that reason. The paged
+    /// track originally copied it because `attendQueryBlocks` is `private`
+    /// and returns a symbolic mask mode — true, but a reason that applies to
+    /// the attention CALL, not to the bounds.
+    static func queryBlockBounds(
+        historyCount: Int, offset: Int, count: Int, window: Int?
+    ) -> (visibleStart: Int, visibleEnd: Int) {
+        let visibleEnd = historyCount + offset + count
+        let visibleStart = window.map { max(0, historyCount + offset + 1 - $0) } ?? 0
+        return (visibleStart, visibleEnd)
     }
 
     /// Mask mode for a single-request attention call.
@@ -544,14 +587,8 @@ enum CBv2AttentionV1 {
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)
-            // The block's queries occupy absolute columns
-            // [historyCount + offset, historyCount + offset + count). Its
-            // visible span starts at the EARLIEST query's window floor and
-            // ends at the LATEST query's own position, so the queries are
-            // exactly the trailing `count` entries of the slice — which is
-            // the invariant `maskMode` assumes.
-            let visibleEnd = historyCount + offset + count
-            let visibleStart = window.map { max(0, historyCount + offset + 1 - $0) } ?? 0
+            let (visibleStart, visibleEnd) = queryBlockBounds(
+                historyCount: historyCount, offset: offset, count: count, window: window)
             outputs.append(
                 attend(
                     queries: queries[0..., 0..., offset ..< (offset + count), 0...],

@@ -449,7 +449,8 @@ final class CBv2EndToEndTests: XCTestCase {
 
     /// WS-4.1. The paged twin of `testStackedSlidingFrozenFullReplayIsToken
     /// Exact` above, on the same layout and prompt: paged used to fail cold on
-    /// an interleaved hybrid (`pagedHybridRequiresDualCursor`) and now serves
+    /// an interleaved hybrid (a since-deleted "requires a dual cursor"
+    /// capability refusal) and now serves
     /// it end to end through the production engine, donation queue and
     /// PrefixCacheV2 — a real hit, token-identical to the cold run.
     ///

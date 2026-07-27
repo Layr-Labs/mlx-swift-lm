@@ -5,10 +5,10 @@
 // gemma-4's shape (25 sliding + 5 full, `num_kv_shared_layers: 0`).
 //
 // The capability used to refuse this outright:
-// `CBv2PrefixReuseCapability.derive` answered
-// `unsupported(.pagedHybridRequiresDualCursor)` for `.pagedFP16`, so a paged
-// gemma-4 never got a plan at all and `PagedKVBackend`'s own guard was dead
-// code behind it. That is a straight capability regression against the
+// `CBv2PrefixReuseCapability.derive` answered a "paged hybrid requires a dual
+// cursor" refusal for `.pagedFP16`, so a paged gemma-4 never got a plan at
+// all and `PagedKVBackend`'s own guard was dead code behind it. (That refusal
+// case has since been deleted — `derive` cannot produce it.) That is a straight capability regression against the
 // contiguous backend, which serves the same layout.
 //
 // What actually blocks paged is NOT the sliding rows. `fastForward(to:)`

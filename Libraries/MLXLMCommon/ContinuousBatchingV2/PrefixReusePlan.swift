@@ -23,11 +23,11 @@ public enum CBv2PrefixReuseStrategy: String, Sendable, Equatable {
     case frozenFullReplay = "frozen_full_replay"
 }
 
-/// Stable, low-cardinality construction refusal reasons.
+/// Stable, low-cardinality construction refusal reasons. Every case here is
+/// one `derive` can actually produce; there is no reserved-for-later case.
 public enum CBv2PrefixReuseUnsupportedReason: String, Sendable, Equatable {
     case emptyLayout = "empty_layout"
     case invalidLayout = "invalid_layout"
-    case pagedHybridRequiresDualCursor = "paged_hybrid_requires_dual_cursor"
     case unknownBackend = "unknown_backend"
     case accountingOverflow = "accounting_overflow"
 }
@@ -192,6 +192,18 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
     /// not trusted: `PagedKVBackend.makeSequenceState(adopting:)` refuses a
     /// zero-replay plan whose prefix does not carry an admissible window for
     /// every owning windowed layer, and the engine then cold-prefills.
+    ///
+    /// **No production caller passes it.** The only production plan site is
+    /// `EngineV2`'s prefix lookup, which omits the argument, so it defaults
+    /// to `false`, `requiresExactWindowRestore` is never `true`, and the
+    /// zero-replay restore form is unreachable outside tests. Read the
+    /// half-built feature honestly: the provider's sidecar WRITE path is
+    /// live — windows are captured and persisted per block — and the
+    /// engine-side READ path is not, because `PrefixCacheV2` nils every
+    /// windowed layer before the prefix reaches
+    /// `makeSequenceState(adopting:)`. What ships today is
+    /// `.frozenFullReplay` with R > 0: full rows adopted frozen through M,
+    /// windowed rows fast-forwarded to C and replayed.
     public func plan(
         matchedBoundary: Int,
         exactStagedFullKVBytes: Int? = nil,

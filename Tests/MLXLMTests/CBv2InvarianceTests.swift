@@ -308,20 +308,20 @@ final class CBv2InvarianceTests: XCTestCase {
 
             let maxPages = max(8, pages.max() ?? 8)
             var table = [Int32](repeating: 0, count: batch * maxPages)
-            var info = [Int32](repeating: 0, count: batch * 8)
             var physical = 0
             for row in contexts.indices {
                 for page in 0 ..< pages[row] {
                     table[row * maxPages + page] = Int32(physical)
                     physical += 1
                 }
-                info[row * 8 + 1] = Int32(contexts[row])  // attendLen
-                info[row * 8 + 2] = Int32(pages[row])  // tableLen
             }
             let tables = MLXArray(table, [batch, maxPages])
-            let seqinfo = MLXArray(info, [batch, 8])
+            let (seqinfo, maxAttendLength) = PagedAttentionKernel.seqinfo(
+                contexts.indices.map { row in
+                    PagedAttentionKernel.SeqInfoRow(
+                        attendStart: 0, attendLength: contexts[row], tableLength: pages[row])
+                })
             let fence = MLXArray.zeros([1], dtype: .int32)
-            let maxAttendLength = contexts.max() ?? 1
 
             var queries = concatenated(
                 contexts.indices.map { row in
