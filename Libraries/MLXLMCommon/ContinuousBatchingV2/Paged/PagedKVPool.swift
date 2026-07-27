@@ -961,12 +961,11 @@ public final class PagedKVPool {
         let values = assemble(g.vSlab)
         // The back-edge. ONE element of each is enough: MLX schedules whole
         // primitives, so a dependency on any slice of the gather forces the
-        // gather itself. (`CBv2MTPCaptureFence` uses `.sum()`, which
-        // publishes the identical edge and reads the whole range to do it —
-        // ~4 MiB per sliding layer per prefill chunk on gemma-4.) `* 0` in
-        // int32 is exactly zero for EVERY input, including whatever an
-        // out-of-range or NaN float->int conversion produces, so the fence
-        // keeps its VALUE and gains only the edge.
+        // gather itself. (`CBv2MTPCaptureFence` publishes the identical edge
+        // the same way, for the same reason.) `* 0` in int32 is exactly zero
+        // for EVERY input, including whatever an out-of-range or NaN
+        // float->int conversion produces, so the fence keeps its VALUE and
+        // gains only the edge.
         let probe = keys[0, 0, 0, 0] + values[0, 0, 0, 0]
         g.writeFence = g.writeFence + probe.asType(g.writeFence.dtype) * 0
         return (keys, values)

@@ -405,6 +405,39 @@ struct CBv2MTPRectangularDegradeTests {
             "the back-edge must not change the fence's value")
     }
 
+    /// A capture with no tokens is a no-op, not a trap and not an eval.
+    ///
+    /// `PagedKVPool.gather` returns `[1, H, 0, D]` for `count == 0` and never
+    /// builds a page index, so an empty capture read no slab bytes and has
+    /// nothing for a later write to clobber. It also has no element for the
+    /// fence probe to index — the reason the probe is guarded rather than
+    /// unconditional. The row must NOT be reported unfenceable: that would
+    /// send the caller off to `eval` an empty array.
+    @Test func publishSkipsAZeroTokenCaptureWithoutTrappingOrEvaluating() throws {
+        let (heads, dim) = (2, 64)
+        let fixture = try pagedFixture(heads: heads, dim: dim)
+        defer { fixture.backend.release(fixture.state) }
+        let row = fixture.row
+        // Never written: `retainedCount` is 0, so the snapshot is empty.
+        let snapshot = row.snapshot()
+        #expect(snapshot.keys.dim(2) == 0, "an unwritten row must snapshot to zero tokens")
+
+        let group = fixture.backend.pool.group(row.groupKey)
+        let fenceBefore = group.writeFence
+        eval(fenceBefore)
+        let valueBefore = fenceBefore.item(Int32.self)
+
+        let unfenceable = CBv2MTPCaptureFence.publish(
+            [(row: row as CBv2SequenceKV, keys: snapshot.keys, values: snapshot.values)])
+
+        #expect(unfenceable.isEmpty, "an empty capture needs no eval fallback")
+        #expect(
+            group.writeFence === fenceBefore,
+            "an empty capture read nothing, so it must not publish an edge")
+        eval(group.writeFence)
+        #expect(group.writeFence.item(Int32.self) == valueBefore)
+    }
+
     /// The invariant the edge buys: a write that lands on the captured slots
     /// after `publish` cannot be observed by the capture, even when both are
     /// forced in one `eval`. Rollback-then-rewrite is the strongest possible
