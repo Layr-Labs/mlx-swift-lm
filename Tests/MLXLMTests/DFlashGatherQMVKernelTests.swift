@@ -4,7 +4,6 @@ import Darwin
 import MLX
 import MLXRandom
 import Testing
-@testable import MLXLLM
 
 @Suite("DFlash gather qmv kernel")
 struct DFlashGatherQMVKernelTests {

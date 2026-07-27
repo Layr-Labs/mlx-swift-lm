@@ -2,9 +2,10 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
+import MLXSpeculative
 import Testing
-@testable import MLXLLM
 
 @Suite("DFlashDraftModel")
 struct DFlashDraftModelTests {

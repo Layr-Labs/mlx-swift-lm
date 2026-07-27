@@ -2,9 +2,10 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXRandom
-import MLXLLM
+import MLXSpeculative
 import Testing
 
 /// Swift-internal MTP parity. The invariant:
@@ -219,7 +220,7 @@ struct Gemma4MTPParityTests {
     func centroid_drafter_parity(
         config: (blockSize: Int, promptLen: Int, maxTokens: Int)
     ) async throws {
-        // Same invariant, but exercising the Gemma4MaskedEmbedder path.
+        // Same invariant, but exercising the MaskedEmbedder path.
         let targetCfg = try e2bStyleTargetConfig()
         let target = Gemma4TextModel(targetCfg)
         let drafterCfg = try e2bStyleDrafterConfig(useOrderedEmbeddings: true)

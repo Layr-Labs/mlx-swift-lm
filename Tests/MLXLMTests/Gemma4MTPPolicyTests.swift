@@ -2,6 +2,7 @@
 
 import Foundation
 import MLXLLM
+import MLXSpeculative
 import Testing
 
 @Suite("Gemma4 MTP automatic policy")

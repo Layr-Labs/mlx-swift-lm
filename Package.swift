@@ -34,6 +34,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXSpeculative",
+            targets: ["MLXSpeculative"]),
         .executable(
             name: "mlx-bench",
             targets: ["mlx-bench"]),
@@ -103,6 +106,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXSpeculative",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Libraries/BenchmarkHelpers"
@@ -119,6 +123,19 @@ let package = Package(
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
         ),
+        .target(
+            name: "MLXSpeculative",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXSpeculative",
+            exclude: [
+                "README.md"
+            ]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -129,6 +146,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXSpeculative",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
@@ -139,11 +157,11 @@ let package = Package(
                 .process("Resources/1080p_30.mov"),
                 .process("Resources/audio_only.mov"),
                 .process("Resources/Gemma4MTPPrompts.json"),
-                .process("Resources/gemma4-26B-A4B-assistant-config.json"),
                 .process("Resources/gemma4-E4B-assistant-config.json"),
-                .process("Resources/dflash-gemma4-gated-schema-config.json"),
+                .process("Resources/gemma4-26B-A4B-assistant-config.json"),
                 .process("Resources/dflash-gpt-oss-120b-config.json"),
                 .process("Resources/dflash-qwen35-27b-config.json"),
+                .process("Resources/dflash-gemma4-gated-schema-config.json"),
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
             ]
         ),
@@ -169,6 +187,7 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXHuggingFace",
+                "MLXSpeculative",
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Transformers", package: "swift-transformers"),
                 .product(name: "MLX", package: "mlx-swift"),
@@ -181,6 +200,7 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXHuggingFace",
+                "MLXSpeculative",
                 .product(name: "Transformers", package: "swift-transformers"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),

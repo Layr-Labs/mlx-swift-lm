@@ -2,7 +2,7 @@
 
 import Foundation
 import MLXLMCommon
-import MLXLLM
+import MLXSpeculative
 import Testing
 
 @Suite("Gemma4AssistantConfiguration decoding")

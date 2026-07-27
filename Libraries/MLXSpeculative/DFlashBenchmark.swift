@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 
 /// One DFlash benchmark measurement. Prefill is reported separately so

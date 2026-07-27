@@ -1,10 +1,10 @@
 // Copyright © 2026 Apple Inc.
 
 import MLX
+import MLXLLM
 import MLXNN
 import MLXRandom
 import Testing
-@testable import MLXLLM
 
 @Suite("DFlash verify linear")
 struct DFlashVerifyLinearTests {

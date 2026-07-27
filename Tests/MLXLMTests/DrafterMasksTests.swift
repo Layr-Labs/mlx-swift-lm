@@ -2,15 +2,15 @@
 
 import Foundation
 import MLX
-import MLXLLM
+import MLXSpeculative
 import Testing
 
-@Suite("Gemma4DrafterMaskBuilder")
+@Suite("DrafterMasks")
 struct DrafterMasksTests {
 
     @Test func fullAttentionAlwaysReturnsNone() {
         // Full attention is always bidirectional; SDPA handles it directly.
-        let mask = Gemma4DrafterMaskBuilder.bidirectionalFull(
+        let mask = DrafterMasks.bidirectionalFull(
             queryLen: 3, kvLen: 100, dtype: .float32)
         switch mask {
         case .causal:
@@ -25,7 +25,7 @@ struct DrafterMasksTests {
     @Test func swaShortCircuitsWhenKVFitsInWindow() {
         // kvLen=32, window=512: every query already sees the whole KV.
         // queryOffset=32, queryLen=1 (bonus + k-1 drafts land at position 32+).
-        let mask = Gemma4DrafterMaskBuilder.bidirectionalSWA(
+        let mask = DrafterMasks.bidirectionalSWA(
             queryLen: 1, queryOffset: 32, kvLen: 32,
             window: 512, dtype: .float32)
         switch mask {
@@ -42,7 +42,7 @@ struct DrafterMasksTests {
         // kvLen=1024, window=512, queryOffset=1024, queryLen=3.
         // Query position 1024 should attend to KV positions (512, 1536) ⇒
         // first 513 KV slots are blocked for query 0.
-        let mask = Gemma4DrafterMaskBuilder.bidirectionalSWA(
+        let mask = DrafterMasks.bidirectionalSWA(
             queryLen: 3, queryOffset: 1024, kvLen: 1024,
             window: 512, dtype: .float32)
         switch mask {
@@ -70,8 +70,8 @@ struct DrafterMasksTests {
         let slidingV = MLXArray.zeros([1, 1, 10, 4], dtype: .float32)
         // Actually we don't have Gemma4SharedKV in scope without MLXLLM import;
         // use the free-function form with explicit kvLen.
-        let full = Gemma4DrafterMaskBuilder.bidirectionalFull(queryLen: 1, kvLen: 10, dtype: .float32)
-        let sliding = Gemma4DrafterMaskBuilder.bidirectionalSWA(
+        let full = DrafterMasks.bidirectionalFull(queryLen: 1, kvLen: 10, dtype: .float32)
+        let sliding = DrafterMasks.bidirectionalSWA(
             queryLen: 1, queryOffset: 10, kvLen: 10, window: 64, dtype: .float32)
         _ = (fullK, fullV, slidingK, slidingV)
         switch full {

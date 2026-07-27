@@ -2,21 +2,21 @@
 
 import Foundation
 import MLX
-@testable import MLXLLM
+@testable import MLXSpeculative
 import Testing
 
-@Suite("Gemma4MaskedEmbedder")
+@Suite("MaskedEmbedder")
 struct MaskedEmbedderTests {
 
-    /// Build a small Gemma4MaskedEmbedder with known weights.
+    /// Build a small MaskedEmbedder with known weights.
     /// hiddenSize=4, numCentroids=8, topK=2, vocabSize=16 → 2 tokens per centroid.
-    private func buildEmbedder() -> (Gemma4MaskedEmbedder, MLXArray) {
+    private func buildEmbedder() -> (MaskedEmbedder, MLXArray) {
         let hiddenSize = 4
         let numCentroids = 8
         let topK = 2
         let vocabSize = 16
 
-        let embedder = Gemma4MaskedEmbedder(
+        let embedder = MaskedEmbedder(
             hiddenSize: hiddenSize,
             numCentroids: numCentroids,
             topK: topK,

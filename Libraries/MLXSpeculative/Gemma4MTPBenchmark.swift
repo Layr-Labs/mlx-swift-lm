@@ -3,14 +3,14 @@
 // Benchmark primitives for Gemma 4 Multi-Token Prediction (MTP)
 // speculative decoding. Provides four measurement helpers:
 //
-//   - measureGemma4MTPBaselineThroughput: B=1 no-drafter target-only greedy
+//   - measureBaselineThroughput: B=1 no-drafter target-only greedy
 //     generation tokens/sec, from prefill-end through generation-end.
-//   - measureGemma4MTPThroughput: B=1 drafter-driven MTP generation tokens/sec
+//   - measureMTPThroughput: B=1 drafter-driven MTP generation tokens/sec
 //     + per-round accept histogram (rounds driven inline so round
 //     boundaries are visible).
-//   - measureGemma4MTPBatchedBaselineThroughput: B>1 target-only greedy, using
+//   - measureBatchedBaselineThroughput: B>1 target-only greedy, using
 //     the same BatchKVCache / BatchRotatingKVCache used by MTP B>1.
-//   - measureGemma4MTPBatchedThroughput: B>1 MTP via runGemma4MTPRoundsBatched.
+//   - measureBatchedMTPThroughput: B>1 MTP via runGemma4MTPRoundsBatched.
 //
 // These are intentionally minimal — no model loading, no CLI, no
 // harness. Callers supply a loaded target + bound drafter + prompt(s)
@@ -20,6 +20,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 
 /// Batched benchmark result: per-row token counts + shared timing.
@@ -84,7 +85,7 @@ public struct Gemma4MTPBenchmarkResult: Sendable {
 /// steps. Returns timing + token count. This is the denominator for the
 /// MTP speedup calculation — matches the semantics of the parity-test
 /// `runBaselineGreedy` helper.
-public func measureGemma4MTPBaselineThroughput(
+public func measureBaselineThroughput(
     target: Gemma4TextModel,
     promptTokens: MLXArray,
     maxTokens: Int
@@ -126,7 +127,7 @@ public func measureGemma4MTPBaselineThroughput(
 ///
 /// The drafter must already be bound to the target (or will be bound on
 /// first call — `bind(target:)` is idempotent when the binding matches).
-public func measureGemma4MTPThroughput(
+public func measureMTPThroughput(
     target: Gemma4TextModel,
     drafter: Gemma4AssistantDraftModel,
     promptTokens: MLXArray,
@@ -198,7 +199,7 @@ public func measureGemma4MTPThroughput(
 /// Run target-only greedy generation over B padded prompts, each for
 /// `maxTokens` steps. Uses `BatchKVCache` / `BatchRotatingKVCache` so the
 /// cache semantics match the MTP batched path.
-public func measureGemma4MTPBatchedBaselineThroughput(
+public func measureBatchedBaselineThroughput(
     target: Gemma4TextModel,
     promptTokens: [[Int32]],
     maxTokens: Int
@@ -257,7 +258,7 @@ public func measureGemma4MTPBatchedBaselineThroughput(
 /// continuous-batching compaction: rows with smaller budgets finish
 /// early, get removed from the active batch, and the remaining rows
 /// run at a smaller B until they finish.
-public func measureGemma4MTPBatchedThroughputStaggered(
+public func measureBatchedMTPThroughputStaggered(
     target: Gemma4TextModel,
     drafter: Gemma4AssistantDraftModel,
     promptTokens: [[Int32]],
@@ -329,7 +330,7 @@ public func measureGemma4MTPBatchedThroughputStaggered(
 
 /// Run MTP over B padded prompts via `runGemma4MTPRoundsBatched`. Returns
 /// aggregate timing — sum of emitted tokens / wall seconds.
-public func measureGemma4MTPBatchedThroughput(
+public func measureBatchedMTPThroughput(
     target: Gemma4TextModel,
     drafter: Gemma4AssistantDraftModel,
     promptTokens: [[Int32]],

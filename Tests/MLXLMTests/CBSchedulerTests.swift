@@ -89,7 +89,8 @@ final class CBSchedulerTests: XCTestCase {
         s.addRequest(makeIntRequest(tokens: [1], maxTokens: 10))
         s.addRequest(makeIntRequest(tokens: [6], maxTokens: 10))
 
-        _ = s.step()   // admits both, runs first decode step
+        _ = s.step()   // admits both into pending prefill
+        _ = s.step()   // promotes the prefilled batch into decode state
 
         XCTAssertEqual(s.getNumRunning(), 2)
     }
@@ -105,7 +106,7 @@ final class CBSchedulerTests: XCTestCase {
 
         _ = s.step()  // both admitted and running
 
-        s.abortRequest("r1")
+        _ = s.abortRequest("r1")
 
         // Drain remaining steps; r1 must not appear in any output.
         var seenR1 = false

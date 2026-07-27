@@ -2,10 +2,11 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 import Testing
-@testable import MLXLLM
+@testable import MLXSpeculative
 
 @Suite("DFlashTokenIterator")
 struct DFlashTokenIteratorTests {

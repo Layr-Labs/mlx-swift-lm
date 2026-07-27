@@ -492,7 +492,8 @@ public struct PenaltyProcessor: LogitProcessor {
 
 /// Common properties shared by token-generating iterators.
 ///
-/// Public so model-specific iterators outside `MLXLMCommon` can plug into
+/// Public so that packages outside `MLXLMCommon` (such as `MLXSpeculative`
+/// for Gemma 4 MTP) can implement their own iterators and plug them into
 /// the shared `generate(iterator:...)` entry point.
 public protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
@@ -1504,7 +1505,7 @@ public func generateTask(
 }
 
 /// Low-level token generation accepting any `TokenIteratorProtocol`
-/// conformer.
+/// conformer (including `MLXSpeculative.Gemma4MTPTokenIterator`).
 ///
 /// Mirrors `generateTask(...)` but takes the protocol type so packages
 /// outside `MLXLMCommon` can plug in their own iterators. The existing

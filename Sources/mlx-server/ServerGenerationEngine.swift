@@ -1,6 +1,5 @@
-import Foundation
-import MLXLLM
 import MLXLMCommon
+import MLXSpeculative
 
 protocol ServerGenerationEngine: Sendable {
     var defaultTemperature: Float { get }

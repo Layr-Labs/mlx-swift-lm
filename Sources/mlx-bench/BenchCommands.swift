@@ -8,6 +8,7 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 import MLXRandom
+import MLXSpeculative
 import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
 enum BenchMode: String {
@@ -385,12 +386,12 @@ extension MLXBench {
         print("K  base tok/s  mtp tok/s  speedup  accept_avg")
 
         let warmupPrompt = MLXArray(prompts[0])
-        _ = measureGemma4MTPBaselineThroughput(
+        _ = measureBaselineThroughput(
             target: target,
             promptTokens: warmupPrompt,
             maxTokens: warmupTokens)
         for blockSize in orderedUnique(blockSizes) {
-            _ = try measureGemma4MTPThroughput(
+            _ = try measureMTPThroughput(
                 target: target,
                 drafter: drafter,
                 promptTokens: warmupPrompt,
@@ -401,7 +402,7 @@ extension MLXBench {
 
         var baselineRates = [Double]()
         for prompt in prompts {
-            let result = measureGemma4MTPBaselineThroughput(
+            let result = measureBaselineThroughput(
                 target: target,
                 promptTokens: MLXArray(prompt),
                 maxTokens: maxTokens)
@@ -414,7 +415,7 @@ extension MLXBench {
             var mtpRates = [Double]()
             var accepts = [Int]()
             for prompt in prompts {
-                let result = try measureGemma4MTPThroughput(
+                let result = try measureMTPThroughput(
                     target: target,
                     drafter: drafter,
                     promptTokens: MLXArray(prompt),

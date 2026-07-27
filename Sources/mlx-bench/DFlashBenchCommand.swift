@@ -7,6 +7,7 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 import MLXRandom
+import MLXSpeculative
 import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
 extension MLXBench {
@@ -1701,3 +1702,4 @@ private struct DFlashPhaseTotals {
         return String(format: "%.1f%%", seconds * 100 / totalSeconds)
     }
 }
+

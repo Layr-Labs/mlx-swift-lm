@@ -31,6 +31,10 @@ private func assertArraysClose(_ lhs: [MLXArray], _ rhs: [MLXArray], label: Stri
     }
 }
 
+private func singleHeadKV(_ values: [Float]) -> MLXArray {
+    MLXArray(values).reshaped(1, 1, values.count, 1)
+}
+
 // MARK: - Original parameterized test (updated with value assertions)
 
 @Test(
@@ -193,6 +197,84 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     let (loaded, _) = try loadPromptCache(url: url)
     #expect(loaded.count == 1)
     assertArraysClose(loaded[0].state, cache.state)
+}
+
+@Test func testRotatingCacheTrimsTemporaryVerifySuffix() throws {
+    let cache = RotatingKVCache(maxSize: 3)
+    let initial = singleHeadKV([1, 2, 3])
+    _ = cache.update(keys: initial, values: initial)
+    #expect(cache.offset == 3)
+    #expect(cache.isTrimmable)
+
+    let verifyBlock = singleHeadKV([4, 5])
+    _ = cache.update(keys: verifyBlock, values: verifyBlock)
+    #expect(cache.offset == 5)
+    #expect(cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 4)
+
+    #expect(cache.trim(1) == 1)
+    #expect(cache.offset == 4)
+    #expect(cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 3)
+}
+
+@Test func testRotatingCacheTrimsExactSaturationTail() throws {
+    let cache = RotatingKVCache(maxSize: 6)
+    let initial = singleHeadKV([1, 2, 3, 4])
+    _ = cache.update(keys: initial, values: initial)
+    #expect(cache.offset == 4)
+    #expect(cache.isTrimmable)
+
+    let verifyBlock = singleHeadKV([5, 6])
+    _ = cache.update(keys: verifyBlock, values: verifyBlock)
+    #expect(cache.offset == 6)
+    #expect(cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 6)
+
+    #expect(cache.trim(1) == 1)
+    #expect(cache.offset == 5)
+    #expect(cache.isTrimmable)
+    #expect(cache.state[0].dim(2) == 5)
+}
+
+@Test func testRotatingCacheCanAppendAfterSaturatedRollbackTrim() throws {
+    let cache = RotatingKVCache(maxSize: 6)
+    let initial = singleHeadKV([1, 2, 3, 4, 5, 6])
+    _ = cache.update(keys: initial, values: initial)
+
+    let verifyBlock = singleHeadKV([7, 8])
+    _ = cache.update(keys: verifyBlock, values: verifyBlock)
+    #expect(cache.offset == 8)
+    #expect(cache.isTrimmable)
+
+    #expect(cache.trim(2) == 2)
+    #expect(cache.offset == 6)
+    #expect(cache.state[0].dim(2) == 5)
+
+    let next = singleHeadKV([9])
+    _ = cache.update(keys: next, values: next)
+    #expect(cache.offset == 7)
+    #expect(cache.state[0].dim(2) == 6)
+}
+
+@Test func testFullRotatingCacheUsesSlidingArrayMaskForMultiTokenWindow() throws {
+    let cache = RotatingKVCache(maxSize: 3)
+    let initial = singleHeadKV([1, 2, 3])
+    _ = cache.update(keys: initial, values: initial)
+
+    let mask = cache.makeMask(n: 2, windowSize: 3, returnArray: false)
+    if case .array(let maskArray) = mask {
+        #expect(maskArray.shape == [2, 4])
+    } else {
+        Issue.record("Expected explicit sliding-window mask for full rotating multi-token window")
+    }
+
+    let forcedMask = cache.makeMask(n: 2, windowSize: 3, returnArray: true)
+    if case .array(let maskArray) = forcedMask {
+        #expect(maskArray.shape == [2, 4])
+    } else {
+        Issue.record("Expected explicit array mask when returnArray is true")
+    }
 }
 
 // MARK: - ArraysCache fully populated round-trip

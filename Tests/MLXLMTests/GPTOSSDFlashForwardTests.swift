@@ -2,9 +2,9 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import Testing
-@testable import MLXLLM
 
 @Suite("GPTOSSModel forwardForDFlash")
 struct GPTOSSDFlashForwardTests {

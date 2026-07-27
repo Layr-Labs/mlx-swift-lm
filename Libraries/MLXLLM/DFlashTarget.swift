@@ -177,7 +177,7 @@ public struct DFlashCopiedTargetRollbackState: DFlashTargetRollbackState {
 
 /// Minimal target surface a DFlash drafter needs from a loaded target model.
 ///
-/// Keep this in MLXLLM so model implementations
+/// Keep this in MLXLLM rather than MLXSpeculative so model implementations
 /// can conform without reversing the package dependency direction.
 public protocol DFlashTargetModel: LLMModel {
     var dFlashVocabularySize: Int { get }

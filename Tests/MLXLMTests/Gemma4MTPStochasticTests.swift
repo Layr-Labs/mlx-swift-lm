@@ -12,9 +12,10 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXRandom
-import MLXLLM
+import MLXSpeculative
 import Testing
 
 @Suite("Gemma4 MTP stochastic sampling", .serialized)

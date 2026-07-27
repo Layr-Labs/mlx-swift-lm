@@ -2,8 +2,9 @@
 
 import Foundation
 import MLX
-import MLXLMCommon
 import MLXLLM
+import MLXLMCommon
+import MLXSpeculative
 import Testing
 
 @Suite("Gemma4MTPRoundLoop B=1")

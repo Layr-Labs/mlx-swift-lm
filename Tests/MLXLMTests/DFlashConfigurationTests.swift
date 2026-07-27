@@ -1,8 +1,8 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
+import MLXSpeculative
 import Testing
-@testable import MLXLLM
 
 @Suite("DFlashConfiguration decoding")
 struct DFlashConfigurationTests {

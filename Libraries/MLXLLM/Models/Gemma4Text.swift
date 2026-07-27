@@ -478,6 +478,126 @@ private class ScaledLinear: Module {
     }
 }
 
+/// Public namespace for Gemma 4 types that need cross-module visibility
+/// (e.g. the MTP drafter in `MLXSpeculative`).
+public enum Gemma4 {
+
+    /// Position offset for RoPE, either a single scalar (standard decode)
+    /// or a per-row `MLXArray` (continuous-batching / drafter paths).
+    ///
+    /// `@unchecked Sendable` because `MLXArray` is not `Sendable`; callers must
+    /// treat these values as immutable snapshots (they are only ever read, never
+    /// mutated in place).
+    public enum PositionOffset: @unchecked Sendable {
+        case scalar(Int)
+        case batch(MLXArray)
+    }
+}
+
+/// Immutable snapshot of per-layer-type K/V captured from a target
+/// `Gemma4TextModel` during `forwardForMTP`. Consumed by the Gemma 4 MTP
+/// drafter; every drafter layer reads from one of these two slots rather
+/// than projecting its own K/V.
+public struct Gemma4SharedKV: @unchecked Sendable {
+    /// K/V from the target's last non-shared full-attention layer.
+    /// Shape: `[B, nGlobalKVHeads, T, globalHeadDim]`.
+    public let fullAttention: (MLXArray, MLXArray)
+    /// K/V from the target's last non-shared sliding-attention layer.
+    /// Shape: `[B, nKVHeads, T, headDim]`.
+    public let slidingAttention: (MLXArray, MLXArray)
+
+    public init(
+        fullAttention: (MLXArray, MLXArray),
+        slidingAttention: (MLXArray, MLXArray)
+    ) {
+        self.fullAttention = fullAttention
+        self.slidingAttention = slidingAttention
+    }
+
+    /// Trim the tail of both K/V tensors by `rejected` time positions. Used
+    /// by the MTP round-loop to match the post-rollback target cache length.
+    /// If `rejected >= T`, clamps to a 1-slot tail so the drafter always has
+    /// at least one K/V position to attend to.
+    public static func sliceTail(
+        from shared: Gemma4SharedKV, rejected: Int
+    ) -> Gemma4SharedKV {
+        func slice(_ kv: (MLXArray, MLXArray)) -> (MLXArray, MLXArray) {
+            let T = kv.0.dim(2)
+            let valid = max(1, T - max(0, rejected))
+            if valid >= T { return kv }
+            let k = kv.0[.ellipsis, ..<valid, 0...]
+            let v = kv.1[.ellipsis, ..<valid, 0...]
+            return (k, v)
+        }
+        return Gemma4SharedKV(
+            fullAttention: slice(shared.fullAttention),
+            slidingAttention: slice(shared.slidingAttention)
+        )
+    }
+
+    /// Zero per-row tail positions of the shared K/V. For each row `b`,
+    /// slots `[keepLengths[b], T)` in both K and V tensors (for both
+    /// layer types) are set to 0.
+    ///
+    /// Used by the B>1 MTP round loop to match the per-row target cache
+    /// zeroing performed by `rollbackSpeculativeCache(.perRow:)`. Rows
+    /// that accepted less than max have their tail K/V zeroed so the
+    /// drafter doesn't attend to post-rollback "stale" positions.
+    ///
+    /// This differs from `sliceTail` which uniformly trims the T axis.
+    /// `zeroTailPerRow` preserves the T axis length (so all rows share
+    /// the same tensor shape) but zeros the invalid slots — the
+    /// SDPA/attention computation sees zeros, which contribute nothing
+    /// to the softmax when multiplied by queries.
+    ///
+    /// - Parameter keepLengths: int array of shape `[B]`. For row `b`,
+    ///   slots `[0, keepLengths[b])` are preserved; slots
+    ///   `[keepLengths[b], T)` are zeroed.
+    public static func zeroTailPerRow(
+        from shared: Gemma4SharedKV, keepLengths: MLXArray
+    ) -> Gemma4SharedKV {
+        func zero(_ kv: (MLXArray, MLXArray)) -> (MLXArray, MLXArray) {
+            let T = kv.0.dim(2)
+            let positions = MLXArray(Int32(0) ..< Int32(T))
+                .reshaped([1, 1, T, 1])                        // [1, 1, T, 1]
+            let keep = keepLengths.asType(.int32)
+                .reshaped([-1, 1, 1, 1])                       // [B, 1, 1, 1]
+            let keepMask = positions .< keep                   // [B, 1, T, 1]
+            let maskK = keepMask.asType(kv.0.dtype)
+            let maskV = keepMask.asType(kv.1.dtype)
+            return (kv.0 * maskK, kv.1 * maskV)
+        }
+        return Gemma4SharedKV(
+            fullAttention: zero(shared.fullAttention),
+            slidingAttention: zero(shared.slidingAttention)
+        )
+    }
+}
+
+/// Mutable sink for the shared-KV capture hook in
+/// `Gemma4TextModelInner.callAsFunction`. A reference type so the trunk can
+/// write into it without a return-value contortion; cleared by the caller
+/// between forwards.
+public final class Gemma4SharedKVCapture: @unchecked Sendable {
+    public var fullAttention: (MLXArray, MLXArray)? = nil
+    public var slidingAttention: (MLXArray, MLXArray)? = nil
+
+    public init() {}
+
+    /// Snapshot into an immutable `Gemma4SharedKV`. Throws via
+    /// `fatalError` if either slot is missing — the capture hook is
+    /// expected to populate both.
+    public func snapshot() -> Gemma4SharedKV {
+        guard let full = fullAttention else {
+            fatalError("Gemma4SharedKVCapture: fullAttention was not populated")
+        }
+        guard let sliding = slidingAttention else {
+            fatalError("Gemma4SharedKVCapture: slidingAttention was not populated")
+        }
+        return Gemma4SharedKV(fullAttention: full, slidingAttention: sliding)
+    }
+}
+
 private final class Gemma4DFlashHiddenCapture {
     private let positionsByLayer: [Int?]
     private var hiddenStates: [MLXArray?]
@@ -557,6 +677,43 @@ private func gemma4Record(
 ) {
     guard let start, let timings = Gemma4DFlashTimingContext.current else { return }
     update(timings, Date().timeIntervalSince(start))
+}
+
+/// Result of `Gemma4TextModel.forwardForMTP`. Carries both the LM head
+/// output and the pre-head trunk hidden, plus the shared-KV snapshot the
+/// drafter needs for its next round.
+public struct Gemma4MTPForward: @unchecked Sendable {
+    /// `[B, L, vocab]` — softcap applied.
+    public let logits: MLXArray
+    /// `[B, L, hidden_size]` — last decoder-layer output BEFORE the final
+    /// `model.norm`. This matches HF's `hidden_states` capture point and is
+    /// what the MTP drafter's `pre_projection` was trained against.
+    public let lastHidden: MLXArray
+    /// Per-layer-type K/V from the last non-shared layers of the target.
+    public let capturedSharedKV: Gemma4SharedKV
+
+    public init(
+        logits: MLXArray, lastHidden: MLXArray, capturedSharedKV: Gemma4SharedKV
+    ) {
+        self.logits = logits
+        self.lastHidden = lastHidden
+        self.capturedSharedKV = capturedSharedKV
+    }
+}
+
+/// Count of accepted speculative tokens per round, either scalar (B=1)
+/// or per-row (`[B]` int32 array, B>1).
+public enum Gemma4AcceptCount: @unchecked Sendable {
+    case scalar(Int)
+    case perRow(MLXArray)
+
+    /// Max accepted across all rows (== the scalar value in the scalar case).
+    func maxAccepted() -> Int {
+        switch self {
+        case .scalar(let n): return n
+        case .perRow(let arr): return Int(arr.max().item(Int32.self))
+        }
+    }
 }
 
 @inline(__always)
@@ -1403,7 +1560,8 @@ private class Gemma4MLP: Module {
 /// Gemma 4 decoder layer. Combines `Gemma4Attention` with an MLP (or MoE)
 /// block, the per-layer-input (PLE) path, and residual / layer-scalar
 /// plumbing. Consumed by `Gemma4TextModelInner` and by the Gemma 4 MTP
-/// drafter trunk; not intended as a user-facing composable layer.
+/// drafter's trunk in `MLXSpeculative`; not intended as a user-facing
+/// composable layer.
 public class Gemma4DecoderLayer: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -1601,9 +1759,10 @@ public class Gemma4DecoderLayer: Module {
 // MARK: - Text Model
 
 /// Inner Gemma 4 trunk: embeddings + per-layer-input (PLE) + 35 decoder
-/// layers + final norm. Public so the Gemma 4 MTP drafter can build its
-/// own 4-layer kv-shared trunk; not intended as a user-facing model —
-/// use `Gemma4TextModel` for standalone inference.
+/// layers + final norm. Public so the Gemma 4 MTP drafter in
+/// `MLXSpeculative` can build its own 4-layer kv-shared trunk; not
+/// intended as a user-facing model — use `Gemma4TextModel` for
+/// standalone inference.
 public class Gemma4TextModelInner: Module {
     let config: Gemma4TextConfiguration
     let embedScale: Float
@@ -1688,20 +1847,13 @@ public class Gemma4TextModelInner: Module {
     public func callAsFunction(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
+        capture: Gemma4SharedKVCapture? = nil,
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> MLXArray {
         forwardTrunk(
-            inputs, cache: cache, capture: nil, captureHook: captureHook,
+            inputs, cache: cache, capture: capture, captureHook: captureHook,
             capturePreNorm: false
         ).postNorm
-    }
-
-    public func callAsFunction(
-        _ inputs: MLXArray,
-        cache: [KVCache]? = nil,
-        capture: Gemma4SharedKVCapture?
-    ) -> MLXArray {
-        forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: false).postNorm
     }
 
     /// Variant that ALSO returns the pre-norm last-layer hidden state.
@@ -1712,20 +1864,12 @@ public class Gemma4TextModelInner: Module {
     public func callCapturingPreNorm(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
+        capture: Gemma4SharedKVCapture? = nil,
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> (postNorm: MLXArray, preNorm: MLXArray) {
         let r = forwardTrunk(
-            inputs, cache: cache, capture: nil, captureHook: captureHook,
+            inputs, cache: cache, capture: capture, captureHook: captureHook,
             capturePreNorm: true)
-        return (r.postNorm, r.preNorm!)
-    }
-
-    public func callCapturingPreNorm(
-        _ inputs: MLXArray,
-        cache: [KVCache]? = nil,
-        capture: Gemma4SharedKVCapture?
-    ) -> (postNorm: MLXArray, preNorm: MLXArray) {
-        let r = forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: true)
         return (r.postNorm, r.preNorm!)
     }
 
@@ -2157,7 +2301,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
     public let kvHeads: [Int]
 
     fileprivate let config: Gemma4TextConfiguration
-    let model: Gemma4TextModelInner
+    fileprivate let model: Gemma4TextModelInner
 
     /// Read-only accessor for the underlying text configuration. Needed by
     /// `Gemma4AssistantDraftModel` for its bind-time compatibility checks.
@@ -2723,12 +2867,45 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
 
     /// Apply the LM head plus the configured final-logit softcap. Pure
     /// function of the post-norm hidden.
-    func applyLMHead(_ hidden: MLXArray) -> MLXArray {
+    private func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         finalLogitTransform(applyRawLMHead(hidden))
     }
 
     private func finalLogitTransform(_ rawLogits: MLXArray) -> MLXArray {
         tanh(rawLogits / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
+    }
+
+    /// Forward pass tailored for MTP speculative decoding.
+    ///
+    /// Returns both the LM head output (logits) AND the pre-head trunk
+    /// hidden AND a snapshot of the shared-KV tensors that the drafter
+    /// will consume in its next round.
+    ///
+    /// The capture hook is always engaged on this path; both slots of the
+    /// returned `capturedSharedKV` are expected to be populated. For the
+    /// Gemma 4 target architecture this holds because `numHiddenLayers >
+    /// numKvSharedLayers` and the non-shared prefix always contains at
+    /// least one layer of each type. If a caller constructs a model with
+    /// an atypical config where one layer type is absent from the
+    /// non-shared prefix, `Gemma4SharedKVCapture.snapshot()` will fatal.
+    ///
+    /// - Parameters:
+    ///   - tokens: `[B, L]` int token array.
+    ///   - cache: pre-constructed KV caches for each non-shared layer.
+    /// - Returns: `Gemma4MTPForward` with logits, pre-head hidden, and
+    ///   captured shared-KV.
+    public func forwardForMTP(
+        _ tokens: MLXArray, cache: [KVCache]
+    ) -> Gemma4MTPForward {
+        let capture = Gemma4SharedKVCapture()
+        let (postNorm, preNorm) = model.callCapturingPreNorm(
+            tokens, cache: cache, capture: capture)
+        let logits = applyLMHead(postNorm)
+        return Gemma4MTPForward(
+            logits: logits,
+            lastHidden: preNorm,
+            capturedSharedKV: capture.snapshot()
+        )
     }
 
     /// Compute the scaled input embedding for `tokens`, matching what the
@@ -2739,13 +2916,67 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
         model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
     }
 
+    /// Rewind the target KV caches after a speculative-decoding round.
+    ///
+    /// Uniformly trims every trimmable cache by `blockSize - max(accepted) - 1`
+    /// (all rows discard their rejected-suffix). In the `.perRow` case,
+    /// additionally calls `BatchKVCache.zeroTailPerRow` on every batched cache
+    /// to clear the per-row divergence where rows accepted fewer tokens than
+    /// the max.
+    ///
+    /// Non-trimmable caches (e.g. a saturated `RotatingKVCache`) are skipped.
+    ///
+    /// - Parameters:
+    ///   - caches: the target's KV caches, typically obtained from `newCache`
+    ///     and then advanced by `forwardForMTP`.
+    ///   - accepted: per-round accept count.
+    ///   - blockSize: the full block size of this speculative round (bonus +
+    ///     k drafts; draft step count k = blockSize - 1).
+    public func rollbackSpeculativeCache(
+        _ caches: [KVCache],
+        accepted: Gemma4AcceptCount,
+        blockSize: Int
+    ) {
+        let maxAccepted = accepted.maxAccepted()
+        let trim = Swift.max(0, blockSize - maxAccepted - 1)
+
+        for cache in caches {
+            guard cache.isTrimmable else { continue }
+            if trim > 0 {
+                _ = cache.trim(trim)
+            }
+        }
+
+        if case .perRow(let perRowAccepted) = accepted, maxAccepted > 0 {
+            // After uniform trim, each batched cache is at length
+            //   postTrimLen = preTrimLen - trim.
+            // Verify-start within that post-trim cache is at
+            //   postTrimLen - (maxAccepted + 1).
+            // Row i keeps tokens through index
+            //   postTrimLen - (maxAccepted + 1) + accepted[i] + 1
+            //   = postTrimLen - (maxAccepted - accepted[i])
+            // We encode this as:
+            //   keepLengths[i] = postTrimLen - (maxAccepted - accepted[i])
+            //                  = postTrimLen - maxAccepted + accepted[i]
+            for cache in caches {
+                guard let batched = cache as? BatchKVCache else { continue }
+                let postTrimLen = batched.offset
+                let keepLengths =
+                    perRowAccepted.asType(.int32)
+                        + Int32(postTrimLen - maxAccepted)
+                batched.zeroTailPerRow(keepLengths: keepLengths)
+            }
+        }
+    }
+
     /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
     internal func _testCallInner(
         _ inputs: MLXArray,
         cache: [KVCache],
+        capture: Gemma4SharedKVCapture? = nil,
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> MLXArray {
-        model(inputs, cache: cache, captureHook: captureHook)
+        model(inputs, cache: cache, capture: capture, captureHook: captureHook)
     }
 
     /// Parse the layer index out of a weight key like

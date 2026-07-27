@@ -21,7 +21,10 @@ final class CBBatchedEngineTests: XCTestCase {
 
         // "3" encodes to [3] via IdentityTokenizer → model generates 4, then 5 (EOS)
         // outputTokenIds = [4], decoded = "4" (non-empty)
-        let result = try await engine.generate(prompt: "3", maxTokens: 10)
+        let result = try await engine.generate(
+            prompt: "3",
+            samplingParams: SamplingParams(maxTokens: 10)
+        )
 
         XCTAssertFalse(result.isEmpty, "generate must return a non-empty string")
         await engine.stop()
@@ -32,7 +35,10 @@ final class CBBatchedEngineTests: XCTestCase {
         await engine.start()
 
         var chunks: [String] = []
-        for await chunk in engine.streamGenerate(prompt: "3", maxTokens: 10) {
+        for await chunk in engine.streamGenerate(
+            prompt: "3",
+            samplingParams: SamplingParams(maxTokens: 10)
+        ) {
             chunks.append(chunk)
         }
 
@@ -49,7 +55,10 @@ final class CBBatchedEngineTests: XCTestCase {
         let messages: [[String: String]] = [
             ["role": "user", "content": "hi"],
         ]
-        let result = try await engine.chat(messages: messages, maxTokens: 5)
+        let result = try await engine.chat(
+            messages: messages,
+            samplingParams: SamplingParams(maxTokens: 5)
+        )
 
         // Just verify it completes without throwing.
         XCTAssertNotNil(result)

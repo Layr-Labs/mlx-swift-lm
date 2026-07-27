@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 
 /// Generate text from a DFlash-capable target using a DFlash drafter.

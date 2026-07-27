@@ -29,6 +29,7 @@ Developers can use these examples in their own programs -- just import the swift
 - [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm): Large language model example implementations
 - [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm): Vision language model example implementations
 - [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders): Popular encoders and embedding models example implementations
+- [MLXSpeculative](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXSpeculative/README.md): Speculative-decoding drafters (Gemma 4 MTP)
 
 ## Usage
 

@@ -2,10 +2,11 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
+import MLXSpeculative
 import Testing
-@testable import MLXLLM
 
 @Suite("generateDFlash")
 struct DFlashGenerateTests {

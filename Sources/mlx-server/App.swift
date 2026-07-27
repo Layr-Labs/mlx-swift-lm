@@ -12,6 +12,7 @@ import Hummingbird
 import MLXLLM
 import MLXHuggingFace
 import MLXLMCommon
+import MLXSpeculative
 import Tokenizers  // required for #huggingFaceTokenizerLoader() macro expansion
 
 // MARK: - CLI args
@@ -23,12 +24,12 @@ struct ServerArgs: Sendable {
     var maxTokens: Int = 4096
     var prefixCache: Bool = true
     var maxKVCacheTokens: Int = 0
+    /// Path to a DFlash drafter model directory.
+    var drafter: String?
     /// Enable internal MTP head (Qwen3.5/3.6, DeepSeek-V4). Set before model load.
     var mtp: Bool = false
     /// Path to an external Gemma 4 assistant/drafter model directory.
     var draftModel: String = ""
-    /// Path to a D-Flash drafter model directory.
-    var dflashDraftModel: String = ""
     var dflashBlockSize: Int?
 
     static func parse() throws -> ServerArgs {
@@ -65,18 +66,16 @@ struct ServerArgs: Sendable {
                     throw CLIError("--max-kv-tokens requires an integer")
                 }
                 args.maxKVCacheTokens = t
+            case "--drafter", "-d":
+                i += 1
+                guard i < argv.count else { throw CLIError("--drafter requires a value") }
+                args.drafter = argv[i]
             case "--mtp":
                 args.mtp = true
             case "--draft-model":
                 i += 1
                 guard i < argv.count else { throw CLIError("--draft-model requires a value") }
                 args.draftModel = argv[i]
-            case "--dflash-draft-model":
-                i += 1
-                guard i < argv.count else {
-                    throw CLIError("--dflash-draft-model requires a value")
-                }
-                args.dflashDraftModel = argv[i]
             case "--dflash-block-size":
                 i += 1
                 guard i < argv.count, let t = Int(argv[i]), t >= 2 else {
@@ -115,12 +114,11 @@ struct ServerArgs: Sendable {
           --max-tokens <int>    Default max tokens per request (default: 4096)
           --no-prefix-cache     Disable KV prefix caching
           --max-kv-tokens <int> Max total KV-cache tokens across running requests (0=unlimited)
+          --drafter, -d <path>  DFlash drafter directory. Enables greedy DFlash serving.
           --mtp                 Enable internal MTP speculative decoding (Qwen3.5/3.6, DeepSeek-V4)
           --draft-model <path>  Path to an external Gemma 4 assistant/drafter model directory
-          --dflash-draft-model <path>
-                                Path to a D-Flash drafter model directory
           --dflash-block-size <int>
-                                Override D-Flash block size (default: drafter config)
+                                Override DFlash block size (default: drafter config)
           --help, -h            Show this help
 
         DOWNLOAD MODELS:
@@ -184,9 +182,9 @@ func loadEngine(args: ServerArgs) async throws -> ServerSetup {
 
     // Enable internal MTP heads before loading (Qwen3.5/3.6, DeepSeek-V4).
     let hasGemma4MTPDrafter = !args.draftModel.isEmpty
-    let hasDFlashDrafter = !args.dflashDraftModel.isEmpty
+    let hasDFlashDrafter = args.drafter != nil
     if hasGemma4MTPDrafter && hasDFlashDrafter {
-        throw CLIError("--draft-model and --dflash-draft-model are mutually exclusive.")
+        throw CLIError("--draft-model and --drafter are mutually exclusive.")
     }
 
     if args.mtp && !hasGemma4MTPDrafter && !hasDFlashDrafter {
@@ -208,28 +206,44 @@ func loadEngine(args: ServerArgs) async throws -> ServerSetup {
     let modelName = url.deletingLastPathComponent().lastPathComponent + "/" + url.lastPathComponent
     print("Model loaded: \(modelName)")
 
-    if hasDFlashDrafter {
-        let draftExpanded = (args.dflashDraftModel as NSString).expandingTildeInPath
-        let draftURL = URL(fileURLWithPath: draftExpanded)
-        guard FileManager.default.fileExists(atPath: draftURL.path) else {
-            throw CLIError("D-Flash drafter directory not found: \(draftURL.path)")
+    if let drafterPath = args.drafter {
+        let expandedDrafter = (drafterPath as NSString).expandingTildeInPath
+        let drafterURL = URL(fileURLWithPath: expandedDrafter)
+        guard FileManager.default.fileExists(atPath: drafterURL.path) else {
+            throw CLIError("DFlash drafter directory not found: \(drafterURL.path)")
         }
         guard let target = context.model as? any DFlashTargetModel else {
-            throw CLIError("Model does not support D-Flash target hooks: \(type(of: context.model))")
+            throw CLIError("Model does not support DFlash target hooks: \(type(of: context.model))")
         }
-        print("Loading D-Flash drafter from: \(draftURL.path)")
-        let drafter = try await DFlashDraftModel.load(from: draftURL, bindTo: target)
+        let verifyQMMEnabled =
+            serverEnvBoolOverride("MLX_DFLASH_VERIFY_QMM") ?? false
+        if verifyQMMEnabled {
+            let include = ProcessInfo.processInfo.environment["MLX_DFLASH_VERIFY_QMM_INCLUDE"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let verifyQMMInclude = if let include, !include.isEmpty {
+                include
+            } else {
+                "router"
+            }
+            let replaced = DFlashVerifyLinear.install(
+                on: context.model,
+                enableQMM: true,
+                include: verifyQMMInclude)
+            print("DFlash verify QMM enabled: include=\(verifyQMMInclude) linears=\(replaced)")
+        }
+        print("Loading DFlash drafter from: \(drafterURL.path)")
+        let drafter = try await DFlashDraftModel.load(from: drafterURL, bindTo: target)
         let engine = try DFlashBatchedEngine(
             context: context,
             drafter: drafter,
             blockSize: args.dflashBlockSize)
         await engine.start()
-        print("D-Flash serving enabled for greedy requests")
+        print("DFlash serving enabled (greedy requests only)")
         return ServerSetup(
             engine: engine,
             modelName: modelName,
             gemma4Context: nil,
-            modeLabel: "D-Flash")
+            modeLabel: "DFlash")
     }
 
     let cbConfig = ContinuousBatchingConfig(
@@ -267,6 +281,17 @@ func loadEngine(args: ServerArgs) async throws -> ServerSetup {
         modelName: modelName,
         gemma4Context: gemma4Context,
         modeLabel: modeLabel)
+}
+
+private func serverEnvBoolOverride(_ key: String) -> Bool? {
+    switch ProcessInfo.processInfo.environment[key]?.lowercased() {
+    case "1", "true", "yes", "on":
+        return true
+    case "0", "false", "no", "off":
+        return false
+    default:
+        return nil
+    }
 }
 
 // MARK: - Entry point

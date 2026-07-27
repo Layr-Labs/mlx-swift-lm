@@ -5,6 +5,7 @@ import Hummingbird
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXSpeculative
 
 // MARK: - JSON helpers
 

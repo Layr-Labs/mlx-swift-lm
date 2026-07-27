@@ -115,7 +115,7 @@ final class CBEngineCoreRequestTests: XCTestCase {
         let req = makeIntRequest()
         await engine.addRequest(req)
 
-        engine.abortRequest(req.requestId)
+        _ = engine.abortRequest(req.requestId)
 
         // Wait for the deferred engineQueue dispatch to process.
         try await Task.sleep(nanoseconds: 80_000_000)
@@ -162,7 +162,10 @@ final class CBEngineCoreRequestTests: XCTestCase {
         XCTAssertTrue(engine.isRunning)
 
         // New request should complete successfully.
-        let output = try await engine.generate(prompt: "3", maxTokens: 5)
+        let output = try await engine.generate(
+            prompt: "3",
+            samplingParams: SamplingParams(maxTokens: 5)
+        )
         XCTAssertTrue(output.finished)
 
         engine.stop()
@@ -176,7 +179,10 @@ final class CBEngineCoreGenerationTests: XCTestCase {
     func testEngineCoreGenerateReturnsCompleteOutput() async throws {
         let engine = makeTestEngine()  // EOS = 5, prompt "3" → [1,2] via tokenizer → tokens 2,3,4,5(EOS)
         engine.start()
-        let output = try await engine.generate(prompt: "3", maxTokens: 10)
+        let output = try await engine.generate(
+            prompt: "3",
+            samplingParams: SamplingParams(maxTokens: 10)
+        )
         XCTAssertTrue(output.finished)
         XCTAssertNotNil(output.finishReason)
         engine.stop()
@@ -243,7 +249,7 @@ final class CBEngineCoreGenerationTests: XCTestCase {
         }
 
         try await Task.sleep(nanoseconds: 20_000_000)
-        engine.abortRequest(rid)
+        _ = engine.abortRequest(rid)
 
         let output = await streamTask.value
         XCTAssertNotNil(output?.error)
@@ -271,7 +277,7 @@ final class CBEngineCoreGenerationTests: XCTestCase {
         }
 
         try await Task.sleep(nanoseconds: 20_000_000)
-        engine.abortRequest(req.requestId)
+        _ = engine.abortRequest(req.requestId)
 
         do {
             _ = try await generateTask.value
@@ -288,7 +294,10 @@ final class CBEngineCoreGenerationTests: XCTestCase {
         engine.start()
 
         let generateTask = Task {
-            let _ = try? await engine.generate(prompt: "1 2 3", maxTokens: 10000)
+            let _ = try? await engine.generate(
+                prompt: "1 2 3",
+                samplingParams: SamplingParams(maxTokens: 10000)
+            )
         }
 
         // Let the request enter the scheduler.
@@ -310,8 +319,18 @@ final class CBEngineCoreGenerationTests: XCTestCase {
         engine.start()
 
         // Launch both concurrently; task2 is cancelled while task1 finishes naturally.
-        async let output1: RequestOutput? = { try? await engine.generate(prompt: "3", maxTokens: 10) }()
-        let task2 = Task { try? await engine.generate(prompt: "3", maxTokens: 10000) }
+        async let output1: RequestOutput? = {
+            try? await engine.generate(
+                prompt: "3",
+                samplingParams: SamplingParams(maxTokens: 10)
+            )
+        }()
+        let task2 = Task {
+            try? await engine.generate(
+                prompt: "3",
+                samplingParams: SamplingParams(maxTokens: 10000)
+            )
+        }
 
         // Give both tasks time to register, then cancel task2.
         try await Task.sleep(nanoseconds: 30_000_000)
@@ -330,7 +349,14 @@ final class CBEngineCoreGenerationTests: XCTestCase {
         let engine = makeTestEngine()
         engine.start()
         let output = try await engine.generate(
-            prompt: "3", maxTokens: 5, temperature: 0.5, topK: 1, minP: 0.0)
+            prompt: "3",
+            samplingParams: SamplingParams(
+                maxTokens: 5,
+                temperature: 0.5,
+                topK: 1,
+                minP: 0.0
+            )
+        )
         XCTAssertTrue(output.finished)
         engine.stop()
     }
@@ -384,7 +410,7 @@ final class CBEngineCoreThreadSafetyTests: XCTestCase {
         engine.start()
 
         await withTaskGroup(of: Void.self) { group in
-            for i in 0 ..< 20 {
+            for _ in 0 ..< 20 {
                 group.addTask {
                     await engine.addRequest(makeIntRequest(tokens: [3], maxTokens: 5))
                 }

@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
+import MLXLLM
 import MLXLMCommon
 
 /// Single-instance DFlash engine for local serving.

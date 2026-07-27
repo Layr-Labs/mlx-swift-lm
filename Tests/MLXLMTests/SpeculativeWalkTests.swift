@@ -1,14 +1,14 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
-import MLXLLM
+import MLXSpeculative
 import Testing
 
-@Suite("Gemma4SpeculativeWalk.single")
+@Suite("SpeculativeWalk.single")
 struct SpeculativeWalkSingleTests {
 
     @Test func emptyDraftReturnsJustMain() {
-        let (accepted, emitted) = Gemma4SpeculativeWalk.single(
+        let (accepted, emitted) = SpeculativeWalk.single(
             draft: [], main: [7]
         )
         #expect(accepted == 0)
@@ -16,7 +16,7 @@ struct SpeculativeWalkSingleTests {
     }
 
     @Test func allDraftsMatch() {
-        let (accepted, emitted) = Gemma4SpeculativeWalk.single(
+        let (accepted, emitted) = SpeculativeWalk.single(
             draft: [1, 2, 3], main: [1, 2, 3, 4]
         )
         #expect(accepted == 3)
@@ -24,7 +24,7 @@ struct SpeculativeWalkSingleTests {
     }
 
     @Test func firstMismatchAtZero() {
-        let (accepted, emitted) = Gemma4SpeculativeWalk.single(
+        let (accepted, emitted) = SpeculativeWalk.single(
             draft: [9, 2, 3], main: [1, 2, 3, 4]
         )
         #expect(accepted == 0)
@@ -32,7 +32,7 @@ struct SpeculativeWalkSingleTests {
     }
 
     @Test func firstMismatchInMiddle() {
-        let (accepted, emitted) = Gemma4SpeculativeWalk.single(
+        let (accepted, emitted) = SpeculativeWalk.single(
             draft: [1, 2, 99], main: [1, 2, 3, 4]
         )
         #expect(accepted == 2)
@@ -43,12 +43,12 @@ struct SpeculativeWalkSingleTests {
         // Invariant: emitted.count == accepted + 1 for any non-trivial input.
         let draft = [1, 2, 3, 4, 5]
         let main = [1, 2, 99, 4, 5, 6]
-        let (accepted, emitted) = Gemma4SpeculativeWalk.single(draft: draft, main: main)
+        let (accepted, emitted) = SpeculativeWalk.single(draft: draft, main: main)
         #expect(emitted.count == accepted + 1)
     }
 }
 
-@Suite("Gemma4SpeculativeWalk.batched")
+@Suite("SpeculativeWalk.batched")
 struct SpeculativeWalkBatchedTests {
 
     @Test func perRowEquivalenceToSingle() {
@@ -64,13 +64,13 @@ struct SpeculativeWalkBatchedTests {
         let budgets = [Int.max, Int.max]
 
         let (batchedAccepted, batchedNew) =
-            Gemma4SpeculativeWalk.batched(draft: draft, main: main, budgets: budgets)
+            SpeculativeWalk.batched(draft: draft, main: main, budgets: budgets)
 
         // Expected per-row via single(...)
         var expectedAccepted: [Int] = []
         var expectedNew: [[Int]] = []
         for i in 0 ..< draft.count {
-            let (a, n) = Gemma4SpeculativeWalk.single(draft: draft[i], main: main[i])
+            let (a, n) = SpeculativeWalk.single(draft: draft[i], main: main[i])
             expectedAccepted.append(a)
             expectedNew.append(n)
         }
@@ -83,7 +83,7 @@ struct SpeculativeWalkBatchedTests {
         let draft: [[Int]] = [[1, 2, 3]]
         let main: [[Int]] = [[1, 2, 3, 42]]
         let (accepted, emitted) =
-            Gemma4SpeculativeWalk.batched(draft: draft, main: main, budgets: [2])
+            SpeculativeWalk.batched(draft: draft, main: main, budgets: [2])
         // Emission is capped to 2 tokens; accepted is also capped so
         // the invariant emitted.count == accepted + 1 still holds.
         #expect(emitted[0].count == 2)

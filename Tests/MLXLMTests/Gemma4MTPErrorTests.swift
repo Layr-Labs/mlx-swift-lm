@@ -1,7 +1,7 @@
 // Copyright © 2026 Apple Inc.
 
 import Foundation
-import MLXLLM
+import MLXSpeculative
 import Testing
 
 @Suite("Gemma4MTPError")
