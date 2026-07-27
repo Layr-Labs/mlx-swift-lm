@@ -843,7 +843,15 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, DFlash
 // MARK: - Qwen35TextModel + MTPCapable
 
 extension Qwen35TextModel: MTPCapable {
+    public var hasMTPHead: Bool { mtp != nil }
+
     /// Run a backbone forward that also returns pre-norm hidden states.
+    ///
+    /// Returns `(logits, preNormHidden)` where `preNormHidden` is the raw backbone output
+    /// BEFORE `model.norm`. The MTP head applies its own `pre_fc_norm_hidden` normalization,
+    /// so it expects un-normalized input. Passing post-norm would double-normalize.
+    ///
+    /// PR #990: `return out, hidden  # pre-norm hidden for MTP head`
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
@@ -857,6 +865,8 @@ extension Qwen35TextModel: MTPCapable {
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
+        // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
+        // is the normalization step — it expects the raw backbone output as input.
         return (logits, hidden)
     }
 
@@ -971,6 +981,8 @@ extension Qwen35Model: LoRAModel {
 /// Forwards all MTP calls to the inner `languageModel` (a Qwen35TextModel).
 /// omlx: patches/mlx_lm_mtp/qwen35_model.py `_patch_outer_model`
 extension Qwen35Model: MTPCapable {
+    public var hasMTPHead: Bool { languageModel.hasMTPHead }
+
     public func callWithHidden(
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {

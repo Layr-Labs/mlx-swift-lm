@@ -1847,9 +1847,13 @@ public class Gemma4TextModelInner: Module {
     public func callAsFunction(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
-        capture: Gemma4SharedKVCapture? = nil
+        capture: Gemma4SharedKVCapture? = nil,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> MLXArray {
-        forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: false).postNorm
+        forwardTrunk(
+            inputs, cache: cache, capture: capture, captureHook: captureHook,
+            capturePreNorm: false
+        ).postNorm
     }
 
     /// Variant that ALSO returns the pre-norm last-layer hidden state.
@@ -1860,9 +1864,12 @@ public class Gemma4TextModelInner: Module {
     public func callCapturingPreNorm(
         _ inputs: MLXArray,
         cache: [KVCache]? = nil,
-        capture: Gemma4SharedKVCapture? = nil
+        capture: Gemma4SharedKVCapture? = nil,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> (postNorm: MLXArray, preNorm: MLXArray) {
-        let r = forwardTrunk(inputs, cache: cache, capture: capture, capturePreNorm: true)
+        let r = forwardTrunk(
+            inputs, cache: cache, capture: capture, captureHook: captureHook,
+            capturePreNorm: true)
         return (r.postNorm, r.preNorm!)
     }
 
@@ -2056,6 +2063,7 @@ public class Gemma4TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache]?,
         capture: Gemma4SharedKVCapture?,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil,
         capturePreNorm: Bool,
         dFlashHiddenCapture: Gemma4DFlashHiddenCapture? = nil,
         forceArrayMask: Bool = false
@@ -2194,6 +2202,7 @@ public class Gemma4TextModelInner: Module {
                     capture.slidingAttention = kvPair
                 }
             }
+            captureHook?(idx, kvPair)
 
             dFlashHiddenCapture?.capture(h, layer: idx)
         }
@@ -2962,9 +2971,12 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider,
 
     /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
     internal func _testCallInner(
-        _ inputs: MLXArray, cache: [KVCache], capture: Gemma4SharedKVCapture?
+        _ inputs: MLXArray,
+        cache: [KVCache],
+        capture: Gemma4SharedKVCapture? = nil,
+        captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> MLXArray {
-        model(inputs, cache: cache, capture: capture)
+        model(inputs, cache: cache, capture: capture, captureHook: captureHook)
     }
 
     /// Parse the layer index out of a weight key like

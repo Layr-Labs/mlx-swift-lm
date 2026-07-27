@@ -46,9 +46,11 @@ struct Gemma4MTPPolicyTests {
         #expect(policy.supportsBatchedMTP)
         #expect(policy.strategy(forBatchSize: 1) == .singleStream(blockSize: 5))
         #expect(policy.strategy(forBatchSize: 4) == .batched(blockSize: 3))
+        #expect(policy.singleStreamAction(
+            generatedTokens: 32, maxTokens: nil) == .mtp(blockSize: 5))
     }
 
-    @Test func quantizedE2BUsesSmallerSingleStreamBlockSize() throws {
+    @Test func quantizedE2BUsesTokenRangeAwareSingleStreamPolicy() throws {
         let policy = Gemma4MTPAutomaticPolicy.automatic(
             for: try config(hiddenSize: 1536, layers: 35, quantizationBits: 4))
 
@@ -56,16 +58,33 @@ struct Gemma4MTPPolicyTests {
         #expect(!policy.supportsBatchedMTP)
         #expect(policy.strategy(forBatchSize: 1) == .singleStream(blockSize: 3))
         #expect(policy.strategy(forBatchSize: 4) == .singleStream(blockSize: 3))
+        #expect(policy.singleStreamAction(
+            generatedTokens: 0, maxTokens: 12) == .mtp(blockSize: 4))
+        #expect(policy.singleStreamAction(
+            generatedTokens: 15, maxTokens: 12) == .mtp(blockSize: 4))
+        #expect(policy.singleStreamAction(
+            generatedTokens: 0, maxTokens: 64) == .targetOnly)
+        #expect(policy.singleStreamAction(
+            generatedTokens: 64, maxTokens: 1024) == .targetOnly)
+        #expect(policy.singleStreamAction(
+            generatedTokens: 255, maxTokens: 1024) == .targetOnly)
+        #expect(policy.singleStreamAction(
+            generatedTokens: 256, maxTokens: 1024) == .mtp(blockSize: 4))
+        #expect(policy.singleStreamAction(
+            generatedTokens: 0, maxTokens: nil) == .targetOnly)
     }
 
-    @Test func e4bUsesSmallerBatchedBlockSize() throws {
+    @Test func e4bDisablesAutomaticMTPUntilCorrectPathBeatsBaseline() throws {
         let policy = Gemma4MTPAutomaticPolicy.automatic(
             for: try config(hiddenSize: 2560, layers: 42))
 
         #expect(policy.family == .e4b)
-        #expect(policy.supportsBatchedMTP)
-        #expect(policy.strategy(forBatchSize: 1) == .singleStream(blockSize: 5))
-        #expect(policy.strategy(forBatchSize: 4) == .batched(blockSize: 2))
+        #expect(!policy.enablesAutomaticMTP)
+        #expect(!policy.supportsBatchedMTP)
+        #expect(policy.strategy(forBatchSize: 1) == .singleStream(blockSize: 3))
+        #expect(policy.strategy(forBatchSize: 4) == .singleStream(blockSize: 3))
+        #expect(policy.singleStreamAction(
+            generatedTokens: 64, maxTokens: nil) == .targetOnly)
     }
 
     @Test func moeA4BFallsBackToSingleStreamForBatchedRequests() throws {

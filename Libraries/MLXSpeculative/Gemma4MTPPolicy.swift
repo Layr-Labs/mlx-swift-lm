@@ -34,6 +34,21 @@ public enum Gemma4MTPBatchStrategy: Sendable, Equatable {
     }
 }
 
+/// Single-stream runtime action selected by the automatic MTP policy.
+public enum Gemma4MTPSingleStreamAction: Sendable, Equatable {
+    /// Run an MTP round with this block size.
+    case mtp(blockSize: Int)
+    /// Emit the next token from the target model only.
+    case targetOnly
+
+    public var blockSize: Int? {
+        switch self {
+        case .mtp(let blockSize): blockSize
+        case .targetOnly: nil
+        }
+    }
+}
+
 /// Model-aware defaults for Gemma 4 MTP on Apple Silicon.
 ///
 /// The policy is intentionally conservative: only model families with
@@ -48,6 +63,12 @@ public struct Gemma4MTPAutomaticPolicy: Sendable, Equatable {
         batchedBlockSize != nil
     }
 
+    /// Whether the public automatic generation entry point should use MTP
+    /// for this family when the caller does not force a block size.
+    public var enablesAutomaticMTP: Bool {
+        family != .e4b
+    }
+
     public func strategy(forBatchSize batchSize: Int) -> Gemma4MTPBatchStrategy {
         precondition(batchSize >= 1, "batchSize must be at least 1")
         if batchSize == 1 {
@@ -57,6 +78,34 @@ public struct Gemma4MTPAutomaticPolicy: Sendable, Equatable {
             return .batched(blockSize: batchedBlockSize)
         }
         return .singleStream(blockSize: singleStreamBlockSize)
+    }
+
+    /// Single-stream (`B=1`) runtime decision for a request that has
+    /// generated `generatedTokens` tokens so far out of `maxTokens` (if
+    /// bounded). Kept separate from `strategy(forBatchSize:)`, which only
+    /// picks a block size and does not know about progress through a
+    /// specific request.
+    public func singleStreamAction(
+        generatedTokens: Int,
+        maxTokens: Int?
+    ) -> Gemma4MTPSingleStreamAction {
+        precondition(generatedTokens >= 0, "generatedTokens must be non-negative")
+
+        if !enablesAutomaticMTP {
+            return .targetOnly
+        }
+
+        if family == .e2b && singleStreamBlockSize == 3 && batchedBlockSize == nil {
+            if let maxTokens, maxTokens <= 16 {
+                return .mtp(blockSize: 4)
+            }
+            if generatedTokens < 256 {
+                return .targetOnly
+            }
+            return .mtp(blockSize: 4)
+        }
+
+        return .mtp(blockSize: singleStreamBlockSize)
     }
 
     public static func automatic(for target: Gemma4TextModel) -> Self {
@@ -93,8 +142,8 @@ public struct Gemma4MTPAutomaticPolicy: Sendable, Equatable {
         if config.hiddenSize == 2560 && config.numHiddenLayers == 42 {
             return Self(
                 family: .e4b,
-                singleStreamBlockSize: 5,
-                batchedBlockSize: 2)
+                singleStreamBlockSize: 3,
+                batchedBlockSize: nil)
         }
 
         return Self(

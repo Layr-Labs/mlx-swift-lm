@@ -18,6 +18,13 @@ public protocol Tokenizer: Sendable {
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int]
+
+    /// Apply a specific Jinja2 chat template string to messages.
+    /// Used as a fallback when the tokenizer config lacks an embedded `chat_template`.
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        chatTemplate: String
+    ) throws -> [Int]
 }
 
 extension Tokenizer {
@@ -50,6 +57,13 @@ extension Tokenizer {
         tools: [[String: any Sendable]]?
     ) throws -> [Int] {
         try applyChatTemplate(messages: messages, tools: tools, additionalContext: nil)
+    }
+
+    public func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        chatTemplate: String
+    ) throws -> [Int] {
+        throw TokenizerError.missingChatTemplate
     }
 }
 

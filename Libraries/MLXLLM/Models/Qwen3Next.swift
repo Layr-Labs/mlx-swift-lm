@@ -29,9 +29,11 @@ final class Qwen3NextRMSNormGated: Module {
     }
 
     func callAsFunction(_ hiddenStates: MLXArray, gate: MLXArray? = nil) -> MLXArray {
-        var x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
+        let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
         if let gate {
-            x = x * silu(gate)
+            // Upcast to float32 for numerical precision — mirrors Python _precise_swiglu.
+            let g = silu(gate.asType(.float32))
+            return (g * x.asType(.float32)).asType(hiddenStates.dtype)
         }
         return x
     }
@@ -129,7 +131,7 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        return downProj(silu(gateProj(x)) * upProj(x))
     }
 }
 

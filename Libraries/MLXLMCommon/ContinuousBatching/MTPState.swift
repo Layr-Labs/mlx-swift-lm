@@ -51,9 +51,6 @@ final class MTPState {
     /// Max 2 items at any time (one draft + one bonus on accept).
     var queue: [MTPQueueItem] = []
 
-    /// Separate KV cache for the MTP head layers (allocated via model.makeMTPCache()).
-    var mtpCache: [any KVCache] = []
-
     /// First input token for the next verify forward. Shape: (1,) uint32.
     /// omlx: state.next_main
     var nextMain: MLXArray?
@@ -71,6 +68,13 @@ final class MTPState {
     /// Avoids a GPU→CPU sync on every verify cycle's accept/reject check.
     /// omlx: state.draft_id
     var draftId: Int = -1
+
+    /// KV caches for the MTP transformer layer(s). Created once at init and
+    /// accumulated across cycles — the MTP head is auto-regressive and was
+    /// trained with a growing KV context, matching the backbone's behaviour.
+    /// PR #990: `mtp_cache = model.make_mtp_cache()` (created once, reused).
+    /// omlx uses fresh-per-cycle; we now match PR #990 for correctness.
+    var mtpCache: [any KVCache]?
 
     /// Stats to be logged on sequence finish.
     var stats: MTPStats = MTPStats()

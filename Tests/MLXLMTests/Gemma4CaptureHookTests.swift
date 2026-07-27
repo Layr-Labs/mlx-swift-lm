@@ -57,6 +57,33 @@ struct Gemma4CaptureHookTests {
         #expect(capture.slidingAttention?.0.dim(2) == 4)
     }
 
+    /// Same as `innerCaptureDirectlyPopulatesBothSlots`, but via the
+    /// closure-based `captureHook` parameter instead of the
+    /// `Gemma4SharedKVCapture` object — the two capture mechanisms on
+    /// `_testCallInner` (and the underlying `forwardTrunk`) are independent
+    /// and must both work.
+    @Test func innerCaptureHookPopulatesBothSlots() throws {
+        let config = try smallTargetConfig()
+        let model = Gemma4TextModel(config)
+        eval(model)
+        let tokens = MLXArray([Int32(1), 2, 3, 4])[.newAxis, .ellipsis]
+        let cache = model.newCache(parameters: nil)
+        let capture = Gemma4SharedKVCapture()
+        _ = model._testCallInner(tokens, cache: cache) { idx, kv in
+            if idx == 4 {
+                capture.fullAttention = kv
+            } else if idx == 3 {
+                capture.slidingAttention = kv
+            }
+        }
+        #expect(capture.fullAttention != nil)
+        #expect(capture.slidingAttention != nil)
+        // Expected shapes for this config: nKVHeads = 1, head_dim = 32,
+        // global_head_dim = 32, T = 4.
+        #expect(capture.fullAttention?.0.dim(2) == 4)
+        #expect(capture.slidingAttention?.0.dim(2) == 4)
+    }
+
     @Test func defaultCaptureIsNil() throws {
         // Regression: confirm existing callers unaffected when no capture is passed.
         let config = try smallTargetConfig()

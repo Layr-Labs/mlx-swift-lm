@@ -24,7 +24,12 @@ struct ServerArgs: Sendable {
     var maxTokens: Int = 4096
     var prefixCache: Bool = true
     var maxKVCacheTokens: Int = 0
+    /// Path to a DFlash drafter model directory.
     var drafter: String?
+    /// Enable internal MTP head (Qwen3.5/3.6, DeepSeek-V4). Set before model load.
+    var mtp: Bool = false
+    /// Path to an external Gemma 4 assistant/drafter model directory.
+    var draftModel: String = ""
     var dflashBlockSize: Int?
 
     static func parse() throws -> ServerArgs {
@@ -65,6 +70,12 @@ struct ServerArgs: Sendable {
                 i += 1
                 guard i < argv.count else { throw CLIError("--drafter requires a value") }
                 args.drafter = argv[i]
+            case "--mtp":
+                args.mtp = true
+            case "--draft-model":
+                i += 1
+                guard i < argv.count else { throw CLIError("--draft-model requires a value") }
+                args.draftModel = argv[i]
             case "--dflash-block-size":
                 i += 1
                 guard i < argv.count, let t = Int(argv[i]), t >= 2 else {
@@ -104,6 +115,8 @@ struct ServerArgs: Sendable {
           --no-prefix-cache     Disable KV prefix caching
           --max-kv-tokens <int> Max total KV-cache tokens across running requests (0=unlimited)
           --drafter, -d <path>  DFlash drafter directory. Enables greedy DFlash serving.
+          --mtp                 Enable internal MTP speculative decoding (Qwen3.5/3.6, DeepSeek-V4)
+          --draft-model <path>  Path to an external Gemma 4 assistant/drafter model directory
           --dflash-block-size <int>
                                 Override DFlash block size (default: drafter config)
           --help, -h            Show this help
@@ -124,9 +137,36 @@ struct CLIError: Error, CustomStringConvertible {
     init(_ msg: String) { description = msg }
 }
 
+// MARK: - Gemma 4 MTP server context
+
+/// Holds the target model context and loaded Gemma 4 assistant drafter for MTP generation.
+/// Non-nil only when `--draft-model` is supplied.
+struct Gemma4ServerContext: @unchecked Sendable {
+    let target: ModelContext
+    let drafter: Gemma4AssistantDraftModel
+}
+
 // MARK: - Model loading
 
-func loadEngine(args: ServerArgs) async throws -> (any ServerGenerationEngine, String) {
+/// Returns true if the model directory contains any weight keys with "mtp" in their name.
+/// Checks the safetensors index file (fast), falling back to false on any error.
+func checkModelHasMTPWeights(at url: URL) -> Bool {
+    let indexURL = url.appendingPathComponent("model.safetensors.index.json")
+    guard let data = try? Data(contentsOf: indexURL),
+          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let weightMap = json["weight_map"] as? [String: String]
+    else { return false }
+    return weightMap.keys.contains { $0.contains("mtp") }
+}
+
+struct ServerSetup: @unchecked Sendable {
+    let engine: any ServerGenerationEngine
+    let modelName: String
+    let gemma4Context: Gemma4ServerContext?
+    let modeLabel: String
+}
+
+func loadEngine(args: ServerArgs) async throws -> ServerSetup {
     let tokenizerLoader = #huggingFaceTokenizerLoader()
 
     // Expand ~ and resolve to an absolute URL.
@@ -136,8 +176,29 @@ func loadEngine(args: ServerArgs) async throws -> (any ServerGenerationEngine, S
     guard FileManager.default.fileExists(atPath: url.path) else {
         throw CLIError("""
         Model directory not found: \(url.path)
-        Download models with: python -m mlx_lm.convert --hf-path <id> --mlx-path <dir>
+        Download models with: hf download <model-id>
         """)
+    }
+
+    // Enable internal MTP heads before loading (Qwen3.5/3.6, DeepSeek-V4).
+    let hasGemma4MTPDrafter = !args.draftModel.isEmpty
+    let hasDFlashDrafter = args.drafter != nil
+    if hasGemma4MTPDrafter && hasDFlashDrafter {
+        throw CLIError("--draft-model and --drafter are mutually exclusive.")
+    }
+
+    if args.mtp && !hasGemma4MTPDrafter && !hasDFlashDrafter {
+        // Pre-check: ensure the checkpoint actually contains mtp.* weights before
+        // enabling the flag (which causes the model init to allocate the MTP module).
+        // Without weights the MLXNN parameter update crashes with keyNotFound.
+        let hasMTPWeights = checkModelHasMTPWeights(at: url)
+        if !hasMTPWeights {
+            throw CLIError(
+                "--mtp was requested but the model at \(url.path) contains no MTP weights. "
+                + "Re-convert the checkpoint with a converter that preserves MTP weights.")
+        }
+        _qwen35MTPEnabled = true
+        _deepseekV4MTPEnabled = true
     }
 
     print("Loading model from: \(url.path)")
@@ -178,16 +239,48 @@ func loadEngine(args: ServerArgs) async throws -> (any ServerGenerationEngine, S
             blockSize: args.dflashBlockSize)
         await engine.start()
         print("DFlash serving enabled (greedy requests only)")
-        return (engine, modelName)
+        return ServerSetup(
+            engine: engine,
+            modelName: modelName,
+            gemma4Context: nil,
+            modeLabel: "DFlash")
     }
 
     let cbConfig = ContinuousBatchingConfig(
         schedulerConfig: SchedulerConfig(maxKVCacheTokens: args.maxKVCacheTokens),
-        prefixCacheConfig: args.prefixCache ? PrefixCacheConfig() : nil
+        prefixCacheConfig: args.prefixCache ? PrefixCacheConfig() : nil,
+        mtpEnabled: args.mtp && !hasGemma4MTPDrafter
     )
     let engine = BatchedEngine(context: context, config: cbConfig)
     await engine.start()
-    return (engine, modelName)
+
+    var gemma4Context: Gemma4ServerContext? = nil
+    if hasGemma4MTPDrafter {
+        let draftExpanded = (args.draftModel as NSString).expandingTildeInPath
+        let draftURL = URL(fileURLWithPath: draftExpanded)
+        guard FileManager.default.fileExists(atPath: draftURL.path) else {
+            throw CLIError("Draft model directory not found: \(draftURL.path)")
+        }
+        print("Loading Gemma 4 drafter from: \(draftURL.path)")
+        let drafter = try await Gemma4AssistantDraftModel.load(from: draftURL)
+        print("Drafter loaded")
+        gemma4Context = Gemma4ServerContext(target: context, drafter: drafter)
+    }
+
+    let modeLabel: String
+    if gemma4Context != nil {
+        modeLabel = "Gemma4 MTP"
+    } else if args.mtp {
+        modeLabel = "internal MTP"
+    } else {
+        modeLabel = "standard"
+    }
+
+    return ServerSetup(
+        engine: engine,
+        modelName: modelName,
+        gemma4Context: gemma4Context,
+        modeLabel: modeLabel)
 }
 
 private func serverEnvBoolOverride(_ key: String) -> Bool? {
@@ -207,11 +300,12 @@ private func serverEnvBoolOverride(_ key: String) -> Bool? {
 struct MLXServer {
     static func main() async throws {
         let args = try ServerArgs.parse()
-        let (engine, modelName) = try await loadEngine(args: args)
+        let setup = try await loadEngine(args: args)
 
         let router = buildRouter(
-            engine: engine,
-            modelName: modelName,
+            engine: setup.engine,
+            gemma4Context: setup.gemma4Context,
+            modelName: setup.modelName,
             defaultMaxTokens: args.maxTokens
         )
 
@@ -220,7 +314,7 @@ struct MLXServer {
             configuration: .init(address: .hostname(args.host, port: args.port))
         )
 
-        print("Server listening at http://\(args.host):\(args.port)")
+        print("Server listening at http://\(args.host):\(args.port) [\(setup.modeLabel)]")
         print("  POST /v1/chat/completions")
         print("  POST /v1/completions")
         print("  GET  /v1/models")
