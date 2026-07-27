@@ -236,6 +236,37 @@ struct CBv2PagedSlabCommitmentTests {
         #expect(backend.bytesReserved == 0, "no row was minted, so no hold may survive")
     }
 
+    /// The other half of the unwind contract: a `reserved: true` caller
+    /// already owns its page hold (charged by `reserve` at admission), and
+    /// a refused commit inside `makeSequenceState` must NOT unwind it —
+    /// the caller balances its own hold exactly once via `unreserve`. In
+    /// production `reserve` wires the slabs itself, so this branch is
+    /// defensive; the ledger contract still deserves pinning.
+    @Test("a reserved-true refusal preserves the caller's hold")
+    func reservedTrueRefusalPreservesCallersHold() throws {
+        let kind = fullKind()
+        let backend = try PagedKVBackend(layerKinds: [kind], config: config())
+        // Charge the pages the way `reserve` does, but leave the slabs
+        // unwired so the refusal fires inside makeSequenceState itself.
+        try backend.pool.reserve(backend.pageNeeds(layerKinds: [kind], maxLength: 128))
+        let held = backend.bytesReserved
+        #expect(held > 0)
+        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
+            activeBytes: { 1 << 30 }, limitBytes: { 1 << 30 })
+
+        #expect(throws: CBv2KVError.self) {
+            try backend.makeSequenceState(
+                layerKinds: [kind], promptLength: 0, maxLength: 128, reserved: true)
+        }
+        #expect(!backend.slabsAreWired)
+        #expect(
+            backend.bytesReserved == held,
+            "the hold belongs to the caller — makeSequenceState must not unwind it")
+        // The caller balances its own hold, exactly once.
+        backend.unreserve(layerKinds: [kind], maxLength: 128)
+        #expect(backend.bytesReserved == 0)
+    }
+
     /// A refused commit is a DELAY, not a verdict: when the pressure
     /// clears, the next admission retries the commit, wires the slabs
     /// exactly once, and the pool serves real writes. Once wired, the
