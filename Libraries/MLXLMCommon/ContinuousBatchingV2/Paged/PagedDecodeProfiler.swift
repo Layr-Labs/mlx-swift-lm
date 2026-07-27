@@ -120,7 +120,7 @@ public struct PagedDecodeProfiler {
             maxPrefillChunk: 512,
             nominalMaxSequenceLength: maxLength)
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
-        backend.pool.materializeSlabs()
+        try backend.pool.materializeSlabs()
         let caches = backend.makeLayerCaches()
 
         var states: [[CBv2SequenceKV?]] = []
@@ -486,7 +486,7 @@ public struct PagedDecodeProfiler {
             maxPrefillChunk: 512,
             nominalMaxSequenceLength: maxLength)
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
-        backend.pool.materializeSlabs()
+        try backend.pool.materializeSlabs()
         let caches = backend.makeLayerCaches()
         let state = try backend.makeSequenceState(
             layerKinds: kinds, promptLength: context, maxLength: maxLength)
