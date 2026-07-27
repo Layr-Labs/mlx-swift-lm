@@ -21,10 +21,16 @@
 import Foundation
 
 /// A layer-cache provider whose composition fingerprint can be forced
-/// stale. The engine loop invalidates after compiled decode steps advanced
-/// rows OUTSIDE the provider's caches, so the next eager bind rebuilds
-/// `positionOffsets` from host truth instead of trusting its own stale
-/// on-device advance chain.
+/// stale. The engine loop invalidates when rows advanced OUTSIDE the
+/// provider's caches, so the next eager bind rebuilds `positionOffsets`
+/// from host truth instead of trusting its own stale on-device advance
+/// chain.
+///
+/// The invalidating caller used to be compiled decode. That path is gone;
+/// the sole writer of `EngineLoopV2.eagerCompositionStale` is now the MTP
+/// round finalizer (`MTP/EngineLoopV2+MTPFinalize.swift`), which rolls the
+/// on-device offsets back after a rejecting round — the same hazard, a
+/// different producer.
 public protocol CBv2CompositionInvalidating: AnyObject {
     func invalidateBoundComposition()
 

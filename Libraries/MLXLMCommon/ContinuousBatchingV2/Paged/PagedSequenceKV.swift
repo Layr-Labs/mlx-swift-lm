@@ -22,11 +22,12 @@
 // window plus one speculative span (`CBv2PagedSpeculation
 // .maxSpeculativeSpan`), so an MTP round overwrites only already-evicted
 // slots. It does NOT carry a prefill-chunk term, and that is a PROPERTY OF
-// THIS FILE, not a free choice made in the pool: `update` gathers a chunk's
-// window history BEFORE writing the chunk and concatenates the chunk tensor
-// it already holds, exactly as `CBv2WindowedSequenceKV.update` and
-// `PagedLayerCache.prefillKV` do, so the widest range this row ever asks the
-// ring for is `window - 1`. `maxWindowExposure` is where that promise is
+// THIS FILE, not a free choice made in the pool: both routes into the ring
+// gather a chunk's window history BEFORE writing the chunk and concatenate
+// the chunk tensor the caller already holds, so the widest range this row is
+// ever asked for is `window - 1`. The serving route is
+// `PagedLayerCache.prefillKV` calling `write` / `gatherRange` directly; the
+// protocol route is this file's `update` (see there for who calls it). `maxWindowExposure` is where that promise is
 // written down, and `PagedKVPool.ringPageCount` reads it — widen the
 // exposure and the ring grows with it or the pool refuses to build.
 
@@ -167,6 +168,20 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     ///
     /// FULL rows keep the simple post-write gather: they overwrite nothing,
     /// so the read-after-write the fence already orders is exact.
+    ///
+    /// ## WHO CALLS THIS
+    ///
+    /// Not the serving path. `PagedLayerCache` never calls `row.update` — it
+    /// calls `write` and `gatherRange` itself, because a frozen-replay row
+    /// has to read its chunk half back out of the pages AFTER the cursor
+    /// moves. This is the `CBv2SequenceKV` protocol-conformance path, and
+    /// its callers are the tests and `PagedDecodeProfiler`.
+    ///
+    /// It is nonetheless the ROW HALF of the ring-sizing argument in this
+    /// file's header and in `PagedKVPool.ringPageCount`, and it stays: a
+    /// `CBv2SequenceKV` whose `update` gathered after writing would not be
+    /// substitutable for the contiguous row, and the heavy row-level test
+    /// coverage of ring behaviour runs through here.
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         var k = keys
         var v = values

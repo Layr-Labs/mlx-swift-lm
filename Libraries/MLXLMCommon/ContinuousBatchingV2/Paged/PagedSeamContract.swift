@@ -154,8 +154,9 @@ public enum CBv2PagedSpeculation {
 ///     `PagedSequenceKV.gatherRange`'s "gather of evicted window range"
 ///     precondition. THAT is the abort that got the first attempt reverted.
 ///  2. **The row gathers before it writes.** `PagedSequenceKV.update` does
-///     the same thing for callers that go through the row rather than the
-///     layer cache, which is what collapses `retainedCount` to
+///     the same thing on the `CBv2SequenceKV` protocol path — tests and
+///     `PagedDecodeProfiler`, not the serving path, which is (1) — and that
+///     is what collapses `retainedCount` to
 ///     `min(written, window)` and removes `maxPrefillChunk` from
 ///     `attendableTokens`. `PagedSequenceKV.maxWindowExposure(window:)` is
 ///     the single declaration of that promise: `retainedCount` clamps to it

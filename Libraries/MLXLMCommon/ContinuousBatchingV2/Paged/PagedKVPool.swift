@@ -648,8 +648,9 @@ public final class PagedKVPool {
     ///     the write asks for `window - 1 + chunk` — 1,535 tokens out of
     ///     1,040 — and trips `gatherRange`'s eviction precondition. That is
     ///     the abort.
-    ///  2. `PagedSequenceKV.update` does the same on the row path, which is
-    ///     what collapses `retainedCount` to `min(written, window)` and
+    ///  2. `PagedSequenceKV.update` does the same on the protocol path
+    ///     (tests and `PagedDecodeProfiler`; the serving path is (1)), which
+    ///     is what collapses `retainedCount` to `min(written, window)` and
     ///     removes the chunk term from the cache bound. `maxWindowExposure`
     ///     is the coupling: this formula reads it, so widening the row's
     ///     exposure grows the ring rather than out-running it.
