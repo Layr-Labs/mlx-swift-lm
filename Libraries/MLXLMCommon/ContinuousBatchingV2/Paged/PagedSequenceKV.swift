@@ -585,6 +585,25 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// exceeds every logical page a full row can reach).
     var decodeTableLength: Int { ringPages ?? table.count }
 
+    /// This row's `seqinfo` entry for a decode dispatch attending `range`.
+    ///
+    /// The only supported way to build one from a row: it is what stops a
+    /// caller reaching for `table.count`, which is the divergence that
+    /// motivated `decodeTableLength` and which the profiler had.
+    /// `attendRange` is a parameter rather than `decodeAttendRange` because
+    /// MTP rectangular verification attends a column BEHIND the frontier.
+    func seqInfoRow(
+        attending range: (start: Int, length: Int),
+        writeTarget: (page: Int32, slot: Int)? = nil
+    ) -> PagedAttentionKernel.SeqInfoRow {
+        PagedAttentionKernel.SeqInfoRow(
+            attendStart: range.start,
+            attendLength: range.length,
+            tableLength: decodeTableLength,
+            writePage: writeTarget?.page ?? 0,
+            writeSlot: writeTarget?.slot ?? 0)
+    }
+
     /// Kernel-facing row descriptor for decode: the absolute range the
     /// current query may attend to, plus the (modular) table length.
     /// All plain Swift Int math — never a device sync.

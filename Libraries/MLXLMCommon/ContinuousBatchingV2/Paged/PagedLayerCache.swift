@@ -374,27 +374,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let group = pool.group(rows[0].groupKey)
         let tables = provider.deviceTables(rows: rows)
 
-        var info = [Int32]()
-        info.reserveCapacity(rows.count * 8)
-        var maxAttendLength = 1
-        for (i, row) in rows.enumerated() {
-            let (start, length) = attendRange(row: row, qPosFromEnd: qPosFromEnd)
-            info.append(Int32(start))
-            info.append(Int32(length))
-            // Windowed rows report the FULL ring length, not table.count —
-            // a partially-allocated ring (prefix-adopted row) would else
-            // wrap at the wrong divisor and alias wrong pages (Codex P2).
-            info.append(Int32(row.decodeTableLength))
-            if let targets = writeTargets {
-                info.append(targets[i].page)
-                info.append(Int32(targets[i].slot))
-            } else {
-                info.append(contentsOf: [0, 0])
-            }
-            info.append(contentsOf: [0, 0, 0])
-            maxAttendLength = max(maxAttendLength, length)
-        }
-        let seqinfo = MLXArray(info, [rows.count, 8])
+        let (seqinfo, maxAttendLength) = PagedAttentionKernel.seqinfo(
+            rows.enumerated().map { i, row in
+                row.seqInfoRow(
+                    attending: attendRange(row: row, qPosFromEnd: qPosFromEnd),
+                    writeTarget: writeTargets?[i])
+            })
 
         let (out, nextFence) = PagedAttentionKernel.decode(
             queries: queries,
@@ -773,8 +758,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 qpos: qpos, kpos: kpos, scale: scale, sinks: sinks)
         }
 
-        // Block bounds are `CBv2AttentionV1.attendQueryBlocks`', with the
-        // chunk's own `historyCount`.
+        // Block bounds are SHARED with the contiguous backend
+        // (`CBv2AttentionV1.queryBlockBounds`), with this chunk's own
+        // `historyCount`. That arithmetic is the activation-reserve bound;
+        // two copies of it can drift into attending different spans.
         var window: Int?
         if case .slidingWindow(let w) = kind.attention { window = w }
         let blockSize = CBv2AttentionV1.queryBlockSize
@@ -783,7 +770,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var offset = 0
         while offset < l {
             let count = min(blockSize, l - offset)
-            let (visibleStart, visibleEnd) = Self.queryBlockBounds(
+            let (visibleStart, visibleEnd) = CBv2AttentionV1.queryBlockBounds(
                 historyCount: historyCount, offset: offset, count: count, window: window)
             outputs.append(
                 attendQueryBlock(
@@ -796,25 +783,6 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             offset += count
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
-    }
-
-    /// Gathered-key columns one query block may see: from the EARLIEST
-    /// query's window floor to the LATEST query's own position, so the
-    /// block's queries are exactly the trailing `count` entries of the
-    /// span. Same bounds as `CBv2AttentionV1.attendQueryBlocks`, with
-    /// `historyCount` counting the keys that predate the chunk.
-    ///
-    /// Internal and static because this arithmetic IS the memory bound
-    /// WS-0.2p buys: on a sliding layer the span saturates at
-    /// `window - 1 + blockSize` no matter how long the chunk is, and on a
-    /// full layer only the query extent is capped. Nothing else in the
-    /// file can be asserted against without materializing a score tensor.
-    static func queryBlockBounds(
-        historyCount: Int, offset: Int, count: Int, window: Int?
-    ) -> (visibleStart: Int, visibleEnd: Int) {
-        let visibleEnd = historyCount + offset + count
-        let visibleStart = window.map { max(0, historyCount + offset + 1 - $0) } ?? 0
-        return (visibleStart, visibleEnd)
     }
 
     /// One query block. `qpos` (`[q, 1]`) and `kpos` (`[1, kL]`) are

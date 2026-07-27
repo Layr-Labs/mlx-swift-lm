@@ -573,7 +573,7 @@ struct CBv2PagedQueryBlockBoundsTests {
         var offset = 0
         while offset < chunk {
             let count = min(blockSize, chunk - offset)
-            let bounds = PagedLayerCache.queryBlockBounds(
+            let bounds = CBv2AttentionV1.queryBlockBounds(
                 historyCount: historyCount, offset: offset, count: count, window: window)
             result.append((queries: count, keys: bounds.visibleEnd - bounds.visibleStart))
             offset += count
@@ -633,7 +633,7 @@ struct CBv2PagedQueryBlockBoundsTests {
             for historyCount in [0, 1, 63, 1023, 8192] {
                 for offset in [0, 1, 128, 384] where offset < 512 {
                     let count = min(128, 512 - offset)
-                    let bounds = PagedLayerCache.queryBlockBounds(
+                    let bounds = CBv2AttentionV1.queryBlockBounds(
                         historyCount: historyCount, offset: offset, count: count, window: window)
                     #expect(bounds.visibleEnd == historyCount + offset + count)
                     #expect(bounds.visibleStart >= 0)

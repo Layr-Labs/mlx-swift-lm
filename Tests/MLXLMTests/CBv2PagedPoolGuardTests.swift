@@ -558,12 +558,11 @@ struct CBv2PagedPoolGuardTests {
                 }
             }
             let tables = MLXArray(flat, [batch, maxPages])
-            var info = [Int32](repeating: 0, count: batch * 8)
-            for row in 0 ..< batch {
-                info[row * 8 + 1] = Int32(context)  // attendLen
-                info[row * 8 + 2] = Int32(pagesPerRow)  // tableLen
-            }
-            let seqinfo = MLXArray(info, [batch, 8])
+            let (seqinfo, _) = PagedAttentionKernel.seqinfo(
+                (0 ..< batch).map { _ in
+                    PagedAttentionKernel.SeqInfoRow(
+                        attendStart: 0, attendLength: context, tableLength: pagesPerRow)
+                })
             let params = MLXArray([Float](repeating: 0, count: 8))
             let queries = MLXArray.zeros([batch, queryHeads, headDim], dtype: dtype)
             eval(kSlab, vSlab, tables, seqinfo, params, queries, fence)
