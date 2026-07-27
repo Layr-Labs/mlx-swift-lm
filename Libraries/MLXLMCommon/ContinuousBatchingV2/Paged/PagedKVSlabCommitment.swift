@@ -1,6 +1,7 @@
 // PagedKVSlabCommitment.swift
 //
-// WHEN a paged pool's slabs become MLX-resident (D1).
+// WHEN a paged pool's slabs become MLX-resident (D1) — and what happens
+// when the commitment no longer fits the box.
 //
 // The problem
 // -----------
@@ -30,14 +31,16 @@
 // `makeSequenceState` therefore commit the WHOLE pool — every group, both
 // slabs — immediately after the admission charge succeeds and before any
 // `PagedSequenceKV` is minted. An admission that throws `capacityExhausted`
-// commits nothing.
+// commits nothing, and an admission whose COMMIT throws is unwound — the
+// page charge is released, the pool is left idle and unwired, and the next
+// admission retries the commit from a clean ledger.
 //
 // Nothing else changes: `pageCount` is still fixed at `PagedKVPool.init`, the
 // slabs are still `let`, and there is still no resize primitive. Lazy FIRST
 // commitment is not a resize — it is the same buffer, allocated later.
 //
-// Why this is correctness-neutral
-// -------------------------------
+// Why the ORDERING is correctness-neutral
+// ---------------------------------------
 // The slabs are passed to the write/decode Metal kernels as INPUTS, never as
 // declared outputs. MLX's `eval_impl` walks the tape leaf-first, so a slab's
 // `Full` primitive runs (allocating and zero-filling the buffer) BEFORE the
@@ -53,6 +56,54 @@
 // with the v0.8.0 migration, so nothing in the engine puts a slab — or any
 // other array — inside a `compile` tracer.
 //
+// Ordering, however, is only HALF of what the old eager commit provided.
+// The other half was TIMING: an eager commit ran while the just-measured
+// load headroom was still true. A deferred commit runs at first admission —
+// possibly minutes later, after a co-resident model has consumed the very
+// headroom this pool was deferred to yield (the provider's physical-capacity
+// policy deliberately reports an uncommitted pool as ZERO bytes, so nothing
+// holds the pool's bytes in escrow between load and first admission). The
+// deferred eval can therefore genuinely fail, and MLX's answer to a Metal
+// allocation failure is the installed error handler — which is `fatalError`
+// when nobody bound one: a daemon abort, on a machine whose watchdog
+// restarts it into the same state.
+//
+// Why a failed commitment is a REFUSAL, not an abort
+// --------------------------------------------------
+// `commitSlabs()` protects the eval in two layers:
+//
+//  1. PROACTIVE. Before the eval, the pool's full physical byte demand
+//     (`bytesPhysical`) is re-checked against MLX's OWN memory accounting —
+//     active bytes vs the allocator's configured limit (`commitShortfall`).
+//     A pool that no longer fits throws `CBv2KVError.capacityExhausted`
+//     naming needed and available bytes, without touching MLX state. This
+//     closes the co-residency window: a neighbor that ate the headroom
+//     since construction turns the admission into a retryable rejection.
+//  2. DEFENSIVE. The eval itself runs under MLX's SCOPED error handler
+//     (`withError`, task-local — never a process-global handler swap): an
+//     allocation failure inside the C++ layer is caught at the mlx-c
+//     boundary after a clean C++ unwind and surfaces as a thrown Swift
+//     error. Nothing throws across C++ frames, and the failed slab keeps
+//     its `Full` primitive (MLX only marks arrays evaluated AFTER their
+//     primitive ran), so a retry re-evaluates exactly the missing slabs.
+//     See `PagedKVPool.materializeSlabs`.
+//
+// Either refusal surfaces as `capacityExhausted` — the engine's RETRYABLE
+// capacity class: `EngineLoopV2.ensureKVState` requeues the request while
+// the pool waits for room, then finish-errors with
+// `capacityExhaustedFinishPrefix`, which bridges map to a retryable
+// capacity rejection (429-class), never a server error and never an abort.
+// The pool itself stays UNWIRED and IDLE (`slabsAreWired` remains false),
+// the admission charge is unwound by the caller, and the next admission
+// retries the whole commit — `guard !slabsAreWired` is the idempotence
+// that makes the call free once it finally succeeds.
+//
+// A PARTIAL commit (some groups' slabs evaluated, a later one failed) is
+// retried conservatively: slabs that did evaluate stay resident and are
+// skipped by the retry eval, but the headroom re-check still demands the
+// FULL `bytesPhysical` — over-refusal, never over-commit. The refusal
+// clears as co-resident pressure drains.
+//
 // Byte accounting
 // ---------------
 // Lazy commitment does NOT make any existing figure time-varying.
@@ -65,6 +116,7 @@
 // and it is deliberately diagnostic: nothing admits or refuses on it.
 
 import Foundation
+import MLX
 
 /// When a paged pool's slabs are evaluated into real Metal residency.
 public enum PagedKVSlabCommitment: String, Sendable, Equatable, CaseIterable {
@@ -83,6 +135,26 @@ public enum PagedKVSlabCommitment: String, Sendable, Equatable, CaseIterable {
     case atFirstAdmission
 }
 
+/// Memory accounting consulted by `commitSlabs()` before the slabs are
+/// wired. Production reads MLX's own counters (`live`); tests inject
+/// deterministic values to drive the refusal and retry paths without
+/// mutating process-global MLX limits.
+struct PagedKVCommitMemoryProbe {
+    /// Bytes held by live MLXArrays right now (`Memory.activeMemory`).
+    var activeBytes: () -> Int
+    /// The allocator's configured ceiling (`Memory.memoryLimit` — MLX's
+    /// `block_limit_`, min(1.5 × recommended working set, 0.95 × RAM)
+    /// unless the embedding process lowered it).
+    var limitBytes: () -> Int
+
+    /// MLX's real accounting.
+    static var live: PagedKVCommitMemoryProbe {
+        PagedKVCommitMemoryProbe(
+            activeBytes: { Memory.activeMemory },
+            limitBytes: { Memory.memoryLimit })
+    }
+}
+
 extension PagedKVBackend {
     /// Bytes the slabs have ACTUALLY committed to MLX right now: zero until
     /// the pool's first admission under `.atFirstAdmission`, `bytesPhysical`
@@ -96,14 +168,56 @@ extension PagedKVBackend {
     /// pool construction.
     public var bytesWired: Int { slabsAreWired ? pool.bytesPhysical : 0 }
 
+    /// Bytes of headroom MISSING for a slab commitment of `required` bytes,
+    /// or nil when the commitment fits.
+    ///
+    /// MLX's own accounting, not a restatement of provider policy: headroom
+    /// is `limitBytes - activeBytes`. Cache memory is deliberately NOT
+    /// subtracted — the Metal allocator reclaims cached buffers before it
+    /// fails an allocation, so cache is available to the slabs by
+    /// construction. An over-committed box (`activeBytes > limitBytes`)
+    /// reports the full deficit.
+    static func commitShortfall(required: Int, activeBytes: Int, limitBytes: Int) -> Int? {
+        let available = limitBytes - activeBytes
+        return required <= available ? nil : required - available
+    }
+
     /// Evaluate every group's slabs, making the pool's pages physically
-    /// resident. Idempotent: after the first call this is a bool test, so the
-    /// admission path can call it unconditionally.
+    /// resident. Idempotent after success: once wired this is a bool test,
+    /// so the admission path can call it unconditionally.
+    ///
+    /// REFUSES rather than traps when the box can no longer take the pool:
+    /// throws `CBv2KVError.capacityExhausted` — the engine's retryable
+    /// capacity class — and leaves the pool unwired so a later admission
+    /// retries the commit. See the file header for the two layers.
     ///
     /// Thread-affinity is the pool's: the engine loop thread, no locking.
-    public func commitSlabs() {
+    public func commitSlabs() throws {
         guard !slabsAreWired else { return }
-        pool.materializeSlabs()
+        let required = pool.bytesPhysical
+
+        // Layer 1 — proactive: the headroom measured at model load is stale
+        // by first admission; re-check against what MLX says is left NOW.
+        let active = commitMemoryProbe.activeBytes()
+        let limit = commitMemoryProbe.limitBytes()
+        if Self.commitShortfall(required: required, activeBytes: active, limitBytes: limit)
+            != nil
+        {
+            throw CBv2KVError.capacityExhausted(
+                needed: required, available: max(0, limit - active))
+        }
+
+        // Layer 2 — defensive: the eval can still lose a race with a
+        // co-resident allocator (or hit the Metal resource-count limit);
+        // a failure here is a thrown error, never the process-fatal
+        // default handler.
+        do {
+            try pool.materializeSlabs()
+        } catch {
+            throw CBv2KVError.capacityExhausted(
+                needed: required,
+                available: max(0, commitMemoryProbe.limitBytes() - commitMemoryProbe.activeBytes()))
+        }
         markSlabsWired()
     }
 }

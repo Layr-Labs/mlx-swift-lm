@@ -60,6 +60,10 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// of reach of everything except `commitSlabs()`, which lives in the
     /// other file.
     func markSlabsWired() { slabsAreWired = true }
+    /// Memory accounting consulted by `commitSlabs()`'s pre-commit headroom
+    /// re-check. Production is MLX's own counters; tests inject
+    /// deterministic values. See PagedKVSlabCommitment.swift.
+    var commitMemoryProbe = PagedKVCommitMemoryProbe.live
 
     public init(
         layerKinds: [CBv2LayerKind],
@@ -107,7 +111,10 @@ public final class PagedKVBackend: CBv2KVBackend {
         self.slabCommitment = slabCommitment
         self.pool = try PagedKVPool(layerKinds: layerKinds, config: config)
         if slabCommitment == .atConstruction {
-            commitSlabs()
+            // An eager commit that cannot fit fails the BUILD (throwing
+            // `capacityExhausted`), which is the honest posture for the
+            // profiler/single-slot deployments that opt into it.
+            try commitSlabs()
         }
     }
 
@@ -127,13 +134,22 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// admission that never materializes with `unreserve(layerKinds:maxLength:)`.
     public func reserve(layerKinds: [CBv2LayerKind], maxLength: Int) throws {
         precondition(maxLength > 0)
-        try pool.reserve(pageNeeds(layerKinds: layerKinds, maxLength: maxLength))
+        let needs = pageNeeds(layerKinds: layerKinds, maxLength: maxLength)
+        try pool.reserve(needs)
         // The charge succeeded, so this pool is no longer idle. Wire the
         // slabs NOW — before any row can reach `ensurePage` — so a deferred
         // commitment never turns an accepted admission into an unbacked
         // page. Deferring the ALLOCATION is the D1 fix; deferring the
         // GUARANTEE would be a daemon abort under load.
-        commitSlabs()
+        do {
+            try commitSlabs()
+        } catch {
+            // A refused commit must leave the pool exactly as it found it:
+            // unwind the page charge so the rejected admission leaves no
+            // residue and the retry re-charges from a clean ledger.
+            pool.unreserve(needs)
+            throw error
+        }
     }
 
     /// Release an admission-time `reserve` that never reached
@@ -166,8 +182,15 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
         // Same guarantee as `reserve`: every page this row may touch is
         // backed before the row exists. Idempotent and free after the first
-        // admission.
-        commitSlabs()
+        // admission. On a refused commit, unwind exactly the charge THIS
+        // call took — a `reserved: true` caller still owns its own hold and
+        // balances it with `unreserve` per the admission contract above.
+        do {
+            try commitSlabs()
+        } catch {
+            if !reserved { pool.unreserve(needs) }
+            throw error
+        }
         var states: [CBv2SequenceKV?] = []
         states.reserveCapacity(layerKinds.count)
         for kind in layerKinds {

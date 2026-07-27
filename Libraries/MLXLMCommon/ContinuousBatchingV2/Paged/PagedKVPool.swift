@@ -1005,12 +1005,25 @@ public final class PagedKVPool {
     /// Wire-down itself is owned by the existing WiredMemory policy plumbing
     /// (`WiredSumPolicy` et al.) — slabs participate like any other resident
     /// allocation once evaluated.
-    public func materializeSlabs() {
+    ///
+    /// THROWS on allocation failure instead of aborting the process:
+    /// `withError` binds MLX's task-local SCOPED error handler for exactly
+    /// this eval, so a Metal allocation failure inside the C++ layer is
+    /// caught at the mlx-c boundary (after a clean C++ unwind — no error
+    /// ever throws across C++ frames) and surfaces here as a thrown
+    /// `MLXError` rather than reaching the process-fatal default handler.
+    /// A slab whose allocation failed keeps its `Full` primitive — MLX
+    /// marks arrays evaluated only AFTER their primitive ran — so calling
+    /// this again retries exactly the slabs that are still unscheduled and
+    /// skips the ones already resident. `PagedKVBackend.commitSlabs()` is
+    /// the admission-path wrapper that maps the failure to the engine's
+    /// retryable `capacityExhausted` class.
+    public func materializeSlabs() throws {
         var arrays: [MLXArray] = []
         for g in groups.values {
             arrays.append(g.kSlab)
             arrays.append(g.vSlab)
         }
-        eval(arrays)
+        try withError { eval(arrays) }
     }
 }
