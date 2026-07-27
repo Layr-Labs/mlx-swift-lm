@@ -189,29 +189,27 @@ struct CBv2PagedSlabCommitmentTests {
     /// The daemon-killer, pinned as a refusal. A pool that fit at
     /// construction can stop fitting by first admission (a co-resident
     /// model consumed the headroom — nothing holds an uncommitted pool's
-    /// bytes in escrow). The commit must THROW the engine's retryable
-    /// capacity error, never trap, and the failed admission must leave no
-    /// residue: pool unwired, page charge unwound.
-    @Test("a commit that no longer fits refuses instead of aborting")
+    /// bytes in escrow). When the slab allocation actually fails, the
+    /// commit must THROW the engine's retryable capacity error, never
+    /// trap, and the failed admission must leave no residue: pool
+    /// unwired, page charge unwound.
+    @Test("a commit whose allocation fails refuses instead of aborting")
     func commitRefusalThrowsInsteadOfAborting() throws {
+        struct InjectedAllocationFailure: Error {}
         let kind = fullKind()
         let backend = try PagedKVBackend(layerKinds: [kind], config: config())
-        // A neighbor ate the box since construction: MLX reports zero
-        // bytes of headroom left under its configured limit.
-        let limit = 1 << 30
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { limit }, limitBytes: { limit })
+        // The neighbor ate the box: the very first slab allocation fails.
+        backend.pool.slabEval = { _ in throw InjectedAllocationFailure() }
 
         do {
             try backend.reserve(layerKinds: [kind], maxLength: 128)
-            Issue.record("reserve must refuse when the commit cannot fit")
+            Issue.record("reserve must refuse when the allocation fails")
         } catch let error as CBv2KVError {
-            guard case .capacityExhausted(let needed, let available) = error else {
+            guard case .capacityExhausted(let needed, _) = error else {
                 Issue.record("expected capacityExhausted, got \(error)")
                 return
             }
             #expect(needed == backend.bytesPhysical, "names the pool's full byte demand")
-            #expect(available == 0, "names what the box actually has left")
         }
         #expect(!backend.slabsAreWired)
         #expect(backend.bytesWired == 0)
@@ -224,10 +222,10 @@ struct CBv2PagedSlabCommitmentTests {
     /// path consumes.
     @Test("makeSequenceState unwinds its charge on a refused commit")
     func makeSequenceStateUnwindsOnRefusedCommit() throws {
+        struct InjectedAllocationFailure: Error {}
         let kind = fullKind()
         let backend = try PagedKVBackend(layerKinds: [kind], config: config())
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { 1 << 30 }, limitBytes: { 1 << 30 })
+        backend.pool.slabEval = { _ in throw InjectedAllocationFailure() }
 
         #expect(throws: CBv2KVError.self) {
             try backend.makeSequenceState(layerKinds: [kind], promptLength: 0, maxLength: 128)
@@ -244,6 +242,7 @@ struct CBv2PagedSlabCommitmentTests {
     /// defensive; the ledger contract still deserves pinning.
     @Test("a reserved-true refusal preserves the caller's hold")
     func reservedTrueRefusalPreservesCallersHold() throws {
+        struct InjectedAllocationFailure: Error {}
         let kind = fullKind()
         let backend = try PagedKVBackend(layerKinds: [kind], config: config())
         // Charge the pages the way `reserve` does, but leave the slabs
@@ -251,8 +250,7 @@ struct CBv2PagedSlabCommitmentTests {
         try backend.pool.reserve(backend.pageNeeds(layerKinds: [kind], maxLength: 128))
         let held = backend.bytesReserved
         #expect(held > 0)
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { 1 << 30 }, limitBytes: { 1 << 30 })
+        backend.pool.slabEval = { _ in throw InjectedAllocationFailure() }
 
         #expect(throws: CBv2KVError.self) {
             try backend.makeSequenceState(
@@ -269,24 +267,22 @@ struct CBv2PagedSlabCommitmentTests {
 
     /// A refused commit is a DELAY, not a verdict: when the pressure
     /// clears, the next admission retries the commit, wires the slabs
-    /// exactly once, and the pool serves real writes. Once wired, the
-    /// probe is never consulted again (the `!slabsAreWired` guard is the
-    /// idempotence that makes the admission-path call free).
+    /// exactly once, and the pool serves real writes. Once wired, no slab
+    /// is ever evaluated again (the `!slabsAreWired` guard plus the
+    /// per-slab flags are the idempotence that makes the admission-path
+    /// call free).
     @Test("a refused commit leaves the slot retryable and wires exactly once")
     func refusedCommitIsRetryable() throws {
+        struct InjectedAllocationFailure: Error {}
         let kind = fullKind()
         let backend = try PagedKVBackend(layerKinds: [kind], config: config())
-        let required = backend.bytesPhysical
         var neighborResident = true
-        var probeConsults = 0
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: {
-                probeConsults += 1
-                return neighborResident ? required : 0
-            },
-            // Exactly the pool's demand: the cleared retry is also an
-            // exact-fit admission, the tightest headroom that must pass.
-            limitBytes: { required })
+        var evalCalls = 0
+        backend.pool.slabEval = { slab in
+            evalCalls += 1
+            if neighborResident { throw InjectedAllocationFailure() }
+            try withError { eval(slab) }
+        }
 
         #expect(throws: CBv2KVError.self) {
             try backend.makeSequenceState(layerKinds: [kind], promptLength: 0, maxLength: 128)
@@ -301,10 +297,10 @@ struct CBv2PagedSlabCommitmentTests {
         #expect(backend.slabsAreWired)
         #expect(backend.bytesWired == backend.bytesPhysical)
 
-        // Wired is terminal: later commits are a bool test, no re-probe.
-        let consultsAtWire = probeConsults
+        // Wired is terminal: later commits are a bool test, no re-eval.
+        let callsAtWire = evalCalls
         try backend.commitSlabs()
-        #expect(probeConsults == consultsAtWire, "the probe is dead once the pool is wired")
+        #expect(evalCalls == callsAtWire, "no slab is re-evaluated once the pool is wired")
 
         // And the retried pool genuinely serves: a real kernel write lands.
         let row = try #require(states[0] as? PagedSequenceKV)
@@ -335,14 +331,12 @@ struct CBv2PagedSlabCommitmentTests {
         // First attempt: the first slab's eval lands, the second one hits
         // the mid-materialization allocation race.
         var evalCalls = 0
+        var failing = true
         backend.pool.slabEval = { slab in
             evalCalls += 1
-            if evalCalls == 2 { throw InjectedAllocationFailure() }
+            if failing && evalCalls == 2 { throw InjectedAllocationFailure() }
             try withError { eval(slab) }
         }
-        // Layer 1 sees room for the whole pool, so the evals actually run.
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { 0 }, limitBytes: { full })
 
         do {
             _ = try backend.makeSequenceState(
@@ -357,6 +351,7 @@ struct CBv2PagedSlabCommitmentTests {
                 needed == backend.pool.bytesUnmaterialized,
                 "the failure names the remainder, not the full pool")
         }
+        #expect(evalCalls == 2, "the walk stops at the failing slab")
         let remainder = backend.pool.bytesUnmaterialized
         let resident = full - remainder
         #expect(resident > 0 && remainder > 0, "the commit made real partial progress")
@@ -364,14 +359,12 @@ struct CBv2PagedSlabCommitmentTests {
         #expect(!backend.slabsAreWired)
         #expect(backend.bytesReserved == 0)
 
-        // The wedge scenario: the resident slab now shows up in active
-        // bytes and the headroom left fits ONLY the remainder.
-        backend.pool.slabEval = { slab in try withError { eval(slab) } }
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { resident }, limitBytes: { resident + remainder })
-
+        // The pressure cleared; the retry must re-attempt ONLY the three
+        // missing slabs — never the resident one.
+        failing = false
         let states = try backend.makeSequenceState(
             layerKinds: kinds, promptLength: 0, maxLength: 128)
+        #expect(evalCalls == 5, "retry evals exactly the 3 missing slabs (2 + 3)")
         #expect(backend.slabsAreWired)
         #expect(backend.bytesWired == full)
         #expect(backend.pool.bytesUnmaterialized == 0)
@@ -380,9 +373,9 @@ struct CBv2PagedSlabCommitmentTests {
     }
 
     /// The conservative side of the same fix: a retry whose remaining
-    /// headroom is genuinely one byte short of the REMAINDER still refuses
-    /// — shrinking the demand must never turn into over-commit.
-    @Test("a retry with insufficient remaining headroom still refuses")
+    /// slabs STILL cannot allocate refuses again, naming the remainder —
+    /// shrinking the retry's demand must never turn into over-commit.
+    @Test("a retry that still cannot allocate refuses again")
     func partialCommitRetryStillRefusesWithoutHeadroom() throws {
         struct InjectedAllocationFailure: Error {}
         let kinds = [fullKind(headDim: 64), fullKind(headDim: 128)]
@@ -392,80 +385,68 @@ struct CBv2PagedSlabCommitmentTests {
         var evalCalls = 0
         backend.pool.slabEval = { slab in
             evalCalls += 1
-            if evalCalls == 2 { throw InjectedAllocationFailure() }
+            if evalCalls >= 2 { throw InjectedAllocationFailure() }
             try withError { eval(slab) }
         }
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { 0 }, limitBytes: { full })
         #expect(throws: CBv2KVError.self) {
             try backend.makeSequenceState(layerKinds: kinds, promptLength: 0, maxLength: 128)
         }
         let remainder = backend.pool.bytesUnmaterialized
-        let resident = full - remainder
+        #expect(remainder > 0 && remainder < full)
 
-        // One byte short of the remainder: refused, naming the remainder.
-        backend.pool.slabEval = { slab in try withError { eval(slab) } }
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { resident }, limitBytes: { resident + remainder - 1 })
+        // The box is still out of memory: the retry refuses again, and the
+        // failure names the remainder, not the full pool.
         do {
             _ = try backend.makeSequenceState(
                 layerKinds: kinds, promptLength: 0, maxLength: 128)
-            Issue.record("a short-by-one retry must refuse")
+            Issue.record("a retry that still cannot allocate must refuse")
         } catch let error as CBv2KVError {
-            guard case .capacityExhausted(let needed, let available) = error else {
+            guard case .capacityExhausted(let needed, _) = error else {
                 Issue.record("expected capacityExhausted, got \(error)")
                 return
             }
             #expect(needed == remainder)
-            #expect(available == remainder - 1)
         }
         #expect(!backend.slabsAreWired)
         #expect(backend.bytesReserved == 0)
         #expect(
             backend.pool.bytesUnmaterialized == remainder,
-            "a layer-1 refusal runs no evals — the remainder is untouched")
+            "a failed retry makes no false progress — the remainder is untouched")
     }
 
-    /// The headroom re-check arithmetic, pinned at the boundary. "Fits
-    /// exactly" must admit — the re-check exists to stop genuine
-    /// overshoots, not to shave usable headroom — and one byte short must
-    /// refuse with the exact deficit.
-    @Test("the headroom re-check is exact at the boundary")
-    func headroomArithmeticIsExactAtTheBoundary() {
-        // Fits exactly: zero slack is still a fit.
-        #expect(
-            PagedKVBackend.commitShortfall(required: 1024, activeBytes: 0, limitBytes: 1024)
-                == nil)
-        #expect(
-            PagedKVBackend.commitShortfall(required: 1024, activeBytes: 512, limitBytes: 1536)
-                == nil)
-        // Short by one byte: refused, and the shortfall says one byte.
-        #expect(
-            PagedKVBackend.commitShortfall(required: 1024, activeBytes: 1, limitBytes: 1024)
-                == 1)
-        // Nothing required always fits, even on a saturated box.
-        #expect(
-            PagedKVBackend.commitShortfall(required: 0, activeBytes: 4096, limitBytes: 4096)
-                == nil)
-        // Over-committed box (active beyond the limit): the deficit compounds.
-        #expect(
-            PagedKVBackend.commitShortfall(required: 8, activeBytes: 4100, limitBytes: 4096)
-                == 12)
-    }
+    /// The profiler shape (PR #100 review, P2): both `PagedDecodeProfiler`
+    /// paths call the public `pool.materializeSlabs()` directly before
+    /// minting rows, so `commitSlabs()` arrives with ZERO bytes left to
+    /// allocate. That commit must succeed UNCONDITIONALLY — no memory
+    /// condition may refuse an admission that has nothing to allocate —
+    /// and must not re-evaluate a single slab.
+    @Test("an already-materialized pool wires for free")
+    func alreadyMaterializedPoolWiresForFree() throws {
+        let kind = fullKind()
+        let backend = try PagedKVBackend(layerKinds: [kind], config: config())
+        var evalCalls = 0
+        backend.pool.slabEval = { slab in
+            evalCalls += 1
+            try withError { eval(slab) }
+        }
 
-    /// An exact fit admits IN VIVO too, through the real commit path.
-    @Test("a commit that fits exactly is admitted")
-    func exactFitCommits() throws {
-        let backend = try PagedKVBackend(layerKinds: [fullKind()], config: config())
-        let required = backend.bytesPhysical
-        backend.commitMemoryProbe = PagedKVCommitMemoryProbe(
-            activeBytes: { 0 }, limitBytes: { required })
-        try backend.commitSlabs()
+        // The profiler's warmup path: materialize outside the commit.
+        try backend.pool.materializeSlabs()
+        let callsAfterWarmup = evalCalls
+        #expect(callsAfterWarmup == 2, "one K and one V slab")
+        #expect(!backend.slabsAreWired, "warmup does not wire — only commitSlabs does")
+
+        // Admission with nothing left to allocate: succeeds, wires, and
+        // runs zero evals — there is no arithmetic left to refuse it.
+        let states = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 0, maxLength: 128)
+        #expect(evalCalls == callsAfterWarmup, "a zero-byte commit evaluates nothing")
         #expect(backend.slabsAreWired)
-        #expect(backend.bytesWired == required)
+        #expect(backend.bytesWired == backend.bytesPhysical)
+        backend.release(states)
     }
 
-    /// Layer 2's seam contract, pinned against the vendored MLX: an error
+    /// The commit's seam contract, pinned against the vendored MLX: an error
     /// raised inside MLX's C++ layer during a `withError` scope surfaces as
     /// a thrown Swift error — the process-fatal default handler is NOT
     /// engaged. `PagedKVPool.materializeSlabs` relies on exactly this to

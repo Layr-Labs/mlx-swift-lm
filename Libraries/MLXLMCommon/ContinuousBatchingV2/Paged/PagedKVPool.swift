@@ -173,16 +173,14 @@ final class PagedKVGroup {
     /// resident. Tracked explicitly — set only after the slab's blocking
     /// eval returned — because MLX exposes no public "is this array
     /// evaluated" API (mlx-c's `_mlx_array_is_available` is documented
-    /// internal and mlx-swift does not surface it). A partially-committed
-    /// pool needs this to know how many bytes a retry still has to
-    /// allocate: the resident slabs already live inside MLX's
-    /// `activeMemory` and must not be demanded a second time.
+    /// internal and mlx-swift does not surface it). A retry after a
+    /// partial commit re-attempts only the slabs still unset here, and an
+    /// already-materialized pool commits for free (nothing left to eval).
     var kSlabMaterialized = false
     var vSlabMaterialized = false
 
     /// Bytes of ONE slab (K or V alone), poison page included — the unit
-    /// `materializeSlabs` allocates and the unit the commit headroom
-    /// re-check charges for.
+    /// `materializeSlabs` allocates and tracks.
     var slabBytes: Int {
         pageCount * key.kvHeads * pageSize * key.headDim * dtype.size
     }
@@ -1019,12 +1017,10 @@ public final class PagedKVPool {
 
     /// Bytes the slabs still need to ALLOCATE before the pool is fully
     /// resident: `bytesPhysical` before the first materialization, shrinking
-    /// slab-by-slab as evals complete, zero once wired. This — not
-    /// `bytesPhysical` — is what the commit headroom re-check must demand:
-    /// after a partial materialization the resident slabs already sit
-    /// inside MLX's `activeMemory`, so demanding the full pool would count
-    /// them on both sides of the inequality and permanently refuse an
-    /// exactly-fitting retry.
+    /// slab-by-slab as evals complete, zero once wired. Diagnostic and
+    /// failure-payload figure only — admission is decided by the
+    /// allocation attempt itself, never by comparing this against a
+    /// memory counter (see `PagedKVBackend.commitSlabs`).
     public var bytesUnmaterialized: Int {
         groups.values.reduce(0) {
             $0 + ($1.kSlabMaterialized ? 0 : $1.slabBytes)

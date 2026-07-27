@@ -70,25 +70,33 @@
 //
 // Why a failed commitment is a REFUSAL, not an abort
 // --------------------------------------------------
-// `commitSlabs()` protects the eval in two layers:
+// The commit's capacity test is THE ALLOCATION ATTEMPT ITSELF, nothing
+// else. Each slab's eval runs under MLX's SCOPED error handler
+// (`withError`, task-local — never a process-global handler swap): an
+// allocation failure inside the C++ layer is caught at the mlx-c boundary
+// after a clean C++ unwind and surfaces as a thrown Swift error. Nothing
+// throws across C++ frames. See `PagedKVPool.materializeSlabs`.
 //
-//  1. PROACTIVE. Before the eval, the pool's full physical byte demand
-//     (`bytesPhysical`) is re-checked against MLX's OWN memory accounting —
-//     active bytes vs the allocator's configured limit (`commitShortfall`).
-//     A pool that no longer fits throws `CBv2KVError.capacityExhausted`
-//     naming needed and available bytes, without touching MLX state. This
-//     closes the co-residency window: a neighbor that ate the headroom
-//     since construction turns the admission into a retryable rejection.
-//  2. DEFENSIVE. The eval itself runs under MLX's SCOPED error handler
-//     (`withError`, task-local — never a process-global handler swap): an
-//     allocation failure inside the C++ layer is caught at the mlx-c
-//     boundary after a clean C++ unwind and surfaces as a thrown Swift
-//     error. Nothing throws across C++ frames, and the failed slab keeps
-//     its `Full` primitive (MLX only marks arrays evaluated AFTER their
-//     primitive ran), so a retry re-evaluates exactly the missing slabs.
-//     See `PagedKVPool.materializeSlabs`.
+// There is deliberately NO proactive pre-check, because no MLX counter
+// predicts whether the allocator will refuse. What actually makes
+// `MetalAllocator::malloc` throw (vendored `allocator.cpp`) is: a single
+// buffer above `maxBufferLength` (enforced per-slab at `PagedKVPool.init`,
+// before any pool exists), the Metal resource-COUNT limit, or the OS
+// returning a null buffer. `Memory.memoryLimit` gates NONE of these — the
+// allocator GCs its cache and allocates straight past the byte limit; the
+// limit's real semantics are a THROTTLE (`transforms.cpp`: active >
+// limit → serialize work; docs/engine-v2/kernel-research.md). And the
+// embedding provider RELIES on those semantics: its MLXMemoryGuard pins
+// `memoryLimit = physical − reserve` precisely so MLX throttles instead
+// of jetsam-killing the process, while its UnifiedMemoryCap doc states
+// the capacity cap "lives in the admission layer, not in an MLX setting".
+// A pre-check that hard-refused at `memoryLimit` therefore rejected
+// serveable pools in exactly the deployment that lowers the limit on
+// purpose — a permanently capacity-erroring backend on a healthy box —
+// while never predicting a real failure the eval attempt would not
+// surface anyway.
 //
-// Either refusal surfaces as `capacityExhausted` — the engine's RETRYABLE
+// A failed attempt surfaces as `capacityExhausted` — the engine's RETRYABLE
 // capacity class: `EngineLoopV2.ensureKVState` requeues the request while
 // the pool waits for room, then finish-errors with
 // `capacityExhaustedFinishPrefix`, which bridges map to a retryable
@@ -101,12 +109,11 @@
 // A PARTIAL commit (some slabs evaluated, a later one failed) retries
 // exactly the REMAINDER. `materializeSlabs` evaluates slab-by-slab and
 // records each slab's residency the moment its blocking eval returns
-// (`PagedKVGroup.kSlabMaterialized`/`vSlabMaterialized`), so the retry's
-// headroom re-check demands `bytesUnmaterialized` — never the full
-// `bytesPhysical`. Demanding the full pool would count the resident slabs
-// TWICE: once in the demand and once inside `activeMemory` (their buffers
-// are owned by the pool's live MLXArrays), permanently refusing an
-// exactly-fitting retry — the wedge this file exists to prevent.
+// (`PagedKVGroup.kSlabMaterialized`/`vSlabMaterialized`), so a retry
+// re-attempts only the missing slabs and never re-evals a resident one.
+// The same flags make an ALREADY-materialized pool (the profiler calls
+// `pool.materializeSlabs()` directly before minting rows) commit for
+// free: nothing left to eval, the pool is simply marked wired.
 //
 // Byte accounting
 // ---------------
@@ -116,11 +123,11 @@
 // none of them observes evaluation state. In particular `bytesPhysical`
 // remains the allocation CEILING (`pageCount * pageBytes`, poison pages
 // included) and stays the right input for sizing and wired-limit consumers.
-// The time-varying figures are `PagedKVPool.bytesUnmaterialized` (what the
-// commit re-check demands — the only admission-relevant one, and it only
-// ever shrinks) and its complements `bytesMaterialized` /
-// `PagedKVBackend.bytesWired`, which are deliberately diagnostic: nothing
-// admits or refuses on them.
+// The time-varying figures are `PagedKVPool.bytesUnmaterialized` (what a
+// commit still has to allocate — it only ever shrinks) and its
+// complements `bytesMaterialized` / `PagedKVBackend.bytesWired`. All are
+// deliberately diagnostic: nothing admits or refuses on them — admission
+// is decided by the allocation attempt.
 
 import Foundation
 import MLX
@@ -142,26 +149,6 @@ public enum PagedKVSlabCommitment: String, Sendable, Equatable, CaseIterable {
     case atFirstAdmission
 }
 
-/// Memory accounting consulted by `commitSlabs()` before the slabs are
-/// wired. Production reads MLX's own counters (`live`); tests inject
-/// deterministic values to drive the refusal and retry paths without
-/// mutating process-global MLX limits.
-struct PagedKVCommitMemoryProbe {
-    /// Bytes held by live MLXArrays right now (`Memory.activeMemory`).
-    var activeBytes: () -> Int
-    /// The allocator's configured ceiling (`Memory.memoryLimit` — MLX's
-    /// `block_limit_`, min(1.5 × recommended working set, 0.95 × RAM)
-    /// unless the embedding process lowered it).
-    var limitBytes: () -> Int
-
-    /// MLX's real accounting.
-    static var live: PagedKVCommitMemoryProbe {
-        PagedKVCommitMemoryProbe(
-            activeBytes: { Memory.activeMemory },
-            limitBytes: { Memory.memoryLimit })
-    }
-}
-
 extension PagedKVBackend {
     /// Bytes the slabs have ACTUALLY committed to MLX right now: zero until
     /// the pool's first admission under `.atFirstAdmission`, `bytesPhysical`
@@ -176,26 +163,6 @@ extension PagedKVBackend {
     /// pool construction.
     public var bytesWired: Int { pool.bytesMaterialized }
 
-    /// Bytes of headroom MISSING for a slab commitment of `required` bytes,
-    /// or nil when the commitment fits.
-    ///
-    /// MLX's own accounting, not a restatement of provider policy: headroom
-    /// is `limitBytes - activeBytes`. Cache memory is deliberately NOT
-    /// subtracted — the Metal allocator reclaims cached buffers before it
-    /// fails an allocation, so cache is available to the slabs by
-    /// construction. No slab byte can hide in that cache and be counted as
-    /// available twice: buffers enter the cache only when FREED
-    /// (`MetalAllocator::free` recycles), the resident slabs' buffers are
-    /// owned by the pool's live MLXArrays (never freed while the backend
-    /// exists, hence in `activeBytes`), and a slab whose allocation FAILED
-    /// never received a buffer at all (the malloc threw before any
-    /// assignment). An over-committed box (`activeBytes > limitBytes`)
-    /// reports the full deficit.
-    static func commitShortfall(required: Int, activeBytes: Int, limitBytes: Int) -> Int? {
-        let available = limitBytes - activeBytes
-        return required <= available ? nil : required - available
-    }
-
     /// Evaluate every group's slabs, making the pool's pages physically
     /// resident. Idempotent after success: once wired this is a bool test,
     /// so the admission path can call it unconditionally.
@@ -203,40 +170,38 @@ extension PagedKVBackend {
     /// REFUSES rather than traps when the box can no longer take the pool:
     /// throws `CBv2KVError.capacityExhausted` — the engine's retryable
     /// capacity class — and leaves the pool unwired so a later admission
-    /// retries the commit. See the file header for the two layers.
+    /// retries the commit.
+    ///
+    /// The capacity test is the ALLOCATION ATTEMPT itself — there is
+    /// deliberately no headroom pre-check here. Nothing the engine can
+    /// read predicts the allocator: `MetalAllocator::malloc` throws only
+    /// on per-buffer `maxBufferLength` (already enforced per-slab at
+    /// `PagedKVPool.init`), the Metal resource-count limit, or the OS
+    /// refusing the buffer — never on `Memory.memoryLimit`, whose real
+    /// semantics are a work-serializing THROTTLE that the embedding
+    /// provider deliberately pins low (`MLXMemoryGuard`: throttle instead
+    /// of jetsam; capacity enforcement lives in the provider's admission
+    /// layer). Rejecting on `activeMemory + demand > memoryLimit` refused
+    /// serveable pools in exactly that deployment. See the file header.
+    ///
+    /// An already-materialized pool (`pool.materializeSlabs()` called
+    /// directly, as the profiler does) commits for free regardless of any
+    /// memory condition: nothing is left to eval, so the pool is simply
+    /// marked wired.
     ///
     /// Thread-affinity is the pool's: the engine loop thread, no locking.
     public func commitSlabs() throws {
         guard !slabsAreWired else { return }
-        // Only the bytes still needing ALLOCATION. After a partial commit
-        // the resident slabs already sit inside `activeBytes`; demanding
-        // the full `bytesPhysical` would count them on both sides of the
-        // shortfall inequality and permanently refuse an exactly-fitting
-        // retry (PR #100 review). First commit: equals `bytesPhysical`.
-        let required = pool.bytesUnmaterialized
-
-        // Layer 1 — proactive: the headroom measured at model load is stale
-        // by first admission; re-check against what MLX says is left NOW.
-        let active = commitMemoryProbe.activeBytes()
-        let limit = commitMemoryProbe.limitBytes()
-        if Self.commitShortfall(required: required, activeBytes: active, limitBytes: limit)
-            != nil
-        {
-            throw CBv2KVError.capacityExhausted(
-                needed: required, available: max(0, limit - active))
-        }
-
-        // Layer 2 — defensive: the eval can still lose a race with a
-        // co-resident allocator (or hit the Metal resource-count limit);
-        // a failure here is a thrown error, never the process-fatal
-        // default handler. `needed` reports what is STILL missing after
-        // the partial progress this attempt made.
         do {
             try pool.materializeSlabs()
         } catch {
+            // `needed` is what is STILL missing after the partial progress
+            // this attempt made; `available` is a diagnostic-only reading
+            // of the throttle limit's remaining headroom (it is NOT what
+            // admission decided on — the failed attempt is).
             throw CBv2KVError.capacityExhausted(
                 needed: pool.bytesUnmaterialized,
-                available: max(0, commitMemoryProbe.limitBytes() - commitMemoryProbe.activeBytes()))
+                available: max(0, Memory.memoryLimit - Memory.activeMemory))
         }
         markSlabsWired()
     }

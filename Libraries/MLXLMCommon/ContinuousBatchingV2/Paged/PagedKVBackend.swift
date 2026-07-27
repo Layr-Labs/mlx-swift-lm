@@ -60,10 +60,6 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// of reach of everything except `commitSlabs()`, which lives in the
     /// other file.
     func markSlabsWired() { slabsAreWired = true }
-    /// Memory accounting consulted by `commitSlabs()`'s pre-commit headroom
-    /// re-check. Production is MLX's own counters; tests inject
-    /// deterministic values. See PagedKVSlabCommitment.swift.
-    var commitMemoryProbe = PagedKVCommitMemoryProbe.live
 
     public init(
         layerKinds: [CBv2LayerKind],
