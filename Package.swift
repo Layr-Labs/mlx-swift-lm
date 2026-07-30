@@ -162,6 +162,7 @@ let package = Package(
                 .process("Resources/dflash-gpt-oss-120b-config.json"),
                 .process("Resources/dflash-qwen35-27b-config.json"),
                 .process("Resources/dflash-gemma4-gated-schema-config.json"),
+                .process("Resources/dflash-laguna-xs-2.1-config.json"),
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
             ]
         ),

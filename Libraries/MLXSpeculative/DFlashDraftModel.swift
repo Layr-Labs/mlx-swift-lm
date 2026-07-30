@@ -109,6 +109,7 @@ private final class DFlashAttention: Module {
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+    @ModuleInfo(key: "g_proj") var gProj: Linear?
 
     private var fusedProposalQKVProj: Linear?
     private var fusedContextKVProj: Linear?
@@ -130,6 +131,9 @@ private final class DFlashAttention: Module {
             config.attentionHeads * config.headDim, config.hiddenSize, bias: false)
         _qNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: config.headDim, eps: config.rmsNormEps)
+        if config.decoderLayerType == .lagunaXS {
+            _gProj.wrappedValue = Linear(config.hiddenSize, config.attentionHeads, bias: false)
+        }
 
         super.init()
     }
@@ -247,15 +251,20 @@ private final class DFlashAttention: Module {
             mask = .none
         }
 
-        let output = MLXFast.scaledDotProductAttention(
+        var output = MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: keys,
             values: values,
             scale: scale,
             mask: mask
-        )
+        ).transposed(0, 2, 1, 3).reshaped(B, L, -1)
 
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        if let gProj {
+            let gate = softplus(gProj(x).asType(.float32)).asType(output.dtype)
+            output = (output.reshaped(B, L, config.attentionHeads, config.headDim)
+                * gate[.ellipsis, .newAxis]).reshaped(B, L, -1)
+        }
+        return oProj(output)
     }
 
     private func fusedProposalQKV() -> Linear? {
@@ -314,6 +323,8 @@ private final class DFlashDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
+    let normalizesContext: Bool
+
     init(_ config: DFlashConfiguration, layerIdx: Int) {
         _selfAttn.wrappedValue = DFlashAttention(config, layerIdx: layerIdx)
         _mlp.wrappedValue = DFlashMLP(
@@ -324,6 +335,7 @@ private final class DFlashDecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        self.normalizesContext = config.decoderLayerType == .lagunaXS
         super.init()
     }
 
@@ -333,7 +345,9 @@ private final class DFlashDecoderLayer: Module {
         rope: RoPELayer,
         cache: KVCache
     ) throws -> MLXArray {
-        let h = try x + selfAttn(inputLayerNorm(x), context: context, rope: rope, cache: cache)
+        let layerContext = normalizesContext ? inputLayerNorm(context) : context
+        let h = try x + selfAttn(
+            inputLayerNorm(x), context: layerContext, rope: rope, cache: cache)
         return h + mlp(postAttentionLayerNorm(h))
     }
 }
@@ -345,6 +359,7 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
     @ModuleInfo(key: "hidden_norm") public var hiddenNorm: RMSNorm
     @ModuleInfo(key: "layers") private var layers: [DFlashDecoderLayer]
     @ModuleInfo public var norm: RMSNorm
+    @ModuleInfo(key: "aux_hidden_norms") public var auxHiddenNorms: [RMSNorm]?
 
     private let rope: RoPELayer
     private var targetEmbed: ((MLXArray) -> MLXArray)?
@@ -361,6 +376,11 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
             DFlashDecoderLayer(config, layerIdx: $0)
         }
         _norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        if config.decoderLayerType == .lagunaXS {
+            _auxHiddenNorms.wrappedValue = (0 ..< config.targetLayerIds.count).map { _ in
+                RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            }
+        }
         self.rope = initializeRope(
             dims: config.headDim,
             base: config.ropeTheta,
@@ -453,7 +473,17 @@ public final class DFlashDraftModel: Module, @unchecked Sendable {
         }
 
         var h = targetEmbed(inputs)
-        let context = hiddenNorm(contextProjection(targetHidden))
+
+        var combinedTargetHidden = targetHidden
+        if let auxHiddenNorms {
+            let sliceCount = auxHiddenNorms.count
+            let normed = (0 ..< sliceCount).map { j in
+                auxHiddenNorms[j](
+                    targetHidden[.ellipsis, (j * config.hiddenSize) ..< ((j + 1) * config.hiddenSize)])
+            }
+            combinedTargetHidden = concatenated(normed, axis: -1)
+        }
+        let context = hiddenNorm(contextProjection(combinedTargetHidden))
 
         for (i, layer) in layers.enumerated() {
             h = try layer(h, context: context, rope: rope, cache: cache[i])
