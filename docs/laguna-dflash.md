@@ -131,3 +131,51 @@ the operator) is a deferred manual step — it is not part of this
 conversion pipeline or its test coverage. Until that happens, consumers of
 the converted artifact use the local path produced by the conversion
 command above.
+
+## Measured results (M5-B, Apple M5 Max 128 GB, 2026-07-26)
+
+Target: the mlxfast-challenge transformed Laguna XS 2.1 NVFP4 reference
+checkpoint (`model_type: laguna`, quantization nvfp4 group 16, 5 shards /
+20 GB), consumed via a symlink overlay that patches only
+`tokenizer_config.json` (`tokenizer_class` → `GPT2Tokenizer`, because
+swift-transformers does not map the checkpoint's `TokenizersBackend`; plus
+the checkpoint's own `chat_template.jinja` injected as `chat_template`).
+Drafter: the converted artifact from this repo's converter. Both loaded by
+`.build/release/mlx-bench dflash` after `swift build -c release` and
+`MLX_SWIFT_DIR=$PWD/.build/checkouts/mlx-swift ./scripts/build-mlx-metallib.sh`
+(copy the resulting `mlx.metallib` next to the release binary).
+
+Throughput/acceptance (256 generated tokens, chat-templated coding prompt,
+`--warmup-tokens 32`):
+
+| K | base tok/s | dflash tok/s | speedup | accepted/block |
+|---|---|---|---|---|
+| 4 | 83.4 | 130.2 | 1.56x | 2.19/3 |
+| 5 | 83.4 | 133.2 | 1.60x | 2.59/4 |
+| 6 | 83.4 | 146.8 | 1.76x | 3.11/5 |
+| 8 | 83.4 | 155.1 | 1.86x | 3.55/7 |
+| 16 | 83.4 | 150.7 | 1.81x | 4.10/15 |
+
+Acceptance criteria: mean accepted 4.10 per 16-block (>= 4.0 target);
+peak speedup 1.86x at K=8. IMPORTANT: prompts must go through the chat
+template — the drafter was trained on chat-formatted data, and the same
+prompt encoded raw (no template) roughly halves acceptance (1.90/15) and
+drops speedup to ~1.1x.
+
+Parity (`--parity-check`, 128 tokens): every DFlash-side comparison passed
+in all rounds across block sizes 4/5/6/8/16. The only mismatches (5 runs,
+2 distinct positions) were of kind `baseline_path_block_vs_sequential` —
+the TARGET's own block-shaped forward vs its sequential forward flipping
+near-tie argmaxes (identical top-5 sets, <= 0.4-logit deltas, recurring at
+the same absolute positions regardless of block segmentation). That is
+inherent NVFP4 kernel numerics at different matmul widths, not a DFlash
+defect; it equally bounds any block-verify scheme on this target, so exact
+token-identity with a *sequential* baseline is not an achievable criterion
+on this model family.
+
+Prefill (target-only, same M5-B session, 1,138-token chat-templated prompt):
+0.313 s for the full prompt = **3,636 tok/s** (~0.28 ms/token). DFlash does
+not alter prefill — the drafter participates only in decode. (`mlx-bench`
+prints this as `prefill[i]` in the baseline pass.) Note acceptance is
+prompt-dependent: a summarization-style prompt at 64 tokens measured only
+~1.7 accepted/block vs ~3.6–4.1 for code-writing prompts at 256 tokens.

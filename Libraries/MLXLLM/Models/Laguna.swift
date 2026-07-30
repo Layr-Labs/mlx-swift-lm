@@ -279,6 +279,43 @@ private class LagunaModelInner: Module {
         self.slidingAttentionIdx = layerTypes.firstIndex(of: "sliding_attention") ?? 0
     }
 
+    /// Laguna's released checkpoints quantize only the expert / shared-expert
+    /// projections (see the file header comment); every other projection,
+    /// including the dense MLP used by `mlp_only_layers` (layer 0 by
+    /// default), stays full precision. That means the loader's whole-model
+    /// `quantize(model:filter:)` pass (`Load.swift`) produces zero leaf
+    /// replacements for a dense layer's subtree.
+    ///
+    /// `MLXNN.Module.update(modules:...)` decides how to handle the `layers`
+    /// array purely from its first element's replacement shape: an untouched
+    /// layer's slot arrives as `.none`, and if that happens to be the first
+    /// slot, `Module.update` throws `UpdateError.unexpectedStructure` instead
+    /// of recursing into the remaining (quantized) layers. Backfill any
+    /// `.none` layer slot with an empty dictionary so `Module.update`
+    /// recurses into (and correctly leaves unmodified) that layer, matching
+    /// the behavior of a layer that was simply never selected for
+    /// quantization. This changes no computation: a layer updated with zero
+    /// replacements is identical to a layer that update(modules:) never
+    /// visited.
+    @discardableResult
+    override func update(
+        modules: ModuleChildren, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        var modules = modules
+        if let layersItem = modules["layers"], case .array(let values) = layersItem {
+            let backfilled: [NestedItem<String, Module>] = values.map { value in
+                if case .none = value {
+                    return .dictionary([:])
+                }
+                return value
+            }
+            modules["layers"] = .array(backfilled)
+        }
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
+
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h = embedTokens(inputs)
 

@@ -230,6 +230,12 @@ extension MLXBench {
                 stopAfterGeneratedTokenCount: stopPredicate)
             baselineRates.append(result.tokensPerSecond)
             baselineHashes.append(tokenHash(result.generatedTokenIds))
+            if result.prefillSeconds > 0 {
+                print(
+                    "   prefill[\(promptIndex)]: tokens=\(prompt.count)"
+                        + " seconds=\(String(format: "%.3f", result.prefillSeconds))"
+                        + " tok_s=\(String(format: "%.1f", Double(prompt.count) / result.prefillSeconds))")
+            }
             if dumpTokens {
                 print(
                     "   baseline_tokens[\(promptIndex)]="
