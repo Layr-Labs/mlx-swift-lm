@@ -267,9 +267,9 @@ enum Gemma4AssistantConfigurationValidator {
                 field: "textConfig.slidingAttention")
         }
         if hasFull {
-            let fullKVHeads = text.attentionKeqV
-                ? text.numGlobalKeyValueHeads!
-                : text.numKeyValueHeads
+            // Full layers honor num_global_key_value_heads whenever present,
+            // independent of attention_k_eq_v (mirrors Gemma4Attention.init).
+            let fullKVHeads = text.numGlobalKeyValueHeads ?? text.numKeyValueHeads
             try validateAttentionProducts(
                 heads: text.numAttentionHeads,
                 kvHeads: fullKVHeads,
