@@ -1,6 +1,7 @@
 import Foundation
 import MLX
-import MLXLMCommon
+
+@testable import MLXLMCommon
 import MLXNN
 import Testing
 
@@ -26,7 +27,6 @@ struct Gemma4SharedTowerContractTests {
             "\"global_head_dim\": 16",
             "\"num_key_value_heads\": 2",
             "\"num_kv_shared_layers\": 0",
-            "\"layer_types\": [\"sliding_attention\", \"full_attention\"]",
             "\"sliding_window\": 16",
             "\"final_logit_softcapping\": 30.0",
             "\"hidden_size_per_layer_input\": 0",
@@ -36,6 +36,9 @@ struct Gemma4SharedTowerContractTests {
             "\"vocab_size_per_layer_input\": 64",
             "\"rms_norm_eps\": 1e-6",
         ]
+        if !extraFields.contains(where: { $0.hasPrefix("\"layer_types\"") }) {
+            fields.append("\"layer_types\": [\"sliding_attention\", \"full_attention\"]")
+        }
         fields.append(contentsOf: extraFields)
         return "{ \(fields.joined(separator: ", ")) }"
     }
@@ -74,6 +77,20 @@ struct Gemma4SharedTowerContractTests {
         let equal = allClose(singleton, batched, rtol: 0, atol: 0)
         eval(equal)
         #expect(equal.item(Bool.self))
+    }
+
+    /// The second normalized entry point: the MTP verify surface
+    /// (`callCapturingPreNorm`) must accept [N] ids identically.
+    @Test("rank-1 token ids through the preNorm capture entry point")
+    func rankOneTokenAcceptancePreNorm() throws {
+        let config = try tinyConfig()
+        let model = tinyModel(config)
+        let ids = MLXArray([Int32(3), 5, 7, 11])
+        let singleton = model.model.callCapturingPreNorm(ids)
+        let batched = model.model.callCapturingPreNorm(ids.expandedDimensions(axis: 0))
+        eval(singleton.postNorm, batched.postNorm)
+        #expect(singleton.postNorm.shape == batched.postNorm.shape)
+        #expect(allClose(singleton.postNorm, batched.postNorm, rtol: 0, atol: 0).item(Bool.self))
     }
 
     // MARK: F3 — global KV heads independent of k_eq_v
@@ -122,13 +139,81 @@ struct Gemma4SharedTowerContractTests {
         #expect(param(params, "model.layers.1.self_attn.v_proj.weight") == nil)
     }
 
+    /// The CBv2 layer-kind derivation (KV storage geometry) must agree with
+    /// the model, layer for layer — `CBv2LayerCache` preconditions on it.
+    @Test("CBv2 layer kinds agree with model head counts across k_eq_v")
+    func layerKindsAgreeWithModel() throws {
+        for keqV in [false, true] {
+            let config = try tinyConfig(extraFields: [
+                "\"attention_k_eq_v\": \(keqV)",
+                "\"num_global_key_value_heads\": 1",
+                "\"num_key_value_heads\": 2",
+            ])
+            let model = tinyModel(config)
+            let kinds = config.cbv2LayerKinds
+            #expect(kinds.map(\.kvHeads) == model.kvHeads)
+            #expect(kinds[1].kvHeads == 1)
+        }
+    }
+
+    /// Short explicit `layer_types` lists normalize at decode (padding
+    /// sliding) instead of trapping at model construction; an empty list
+    /// falls back to all-sliding.
+    @Test("short and empty layer_types lists are normalized")
+    func shortLayerTypesNormalized() throws {
+        let short = try tinyConfig(extraFields: [
+            "\"layer_types\": [\"full_attention\"]",
+        ])
+        #expect(short.layerTypes == ["full_attention", "sliding_attention"])
+        _ = tinyModel(short)  // must not trap
+
+        let empty = try tinyConfig(extraFields: ["\"layer_types\": []"])
+        #expect(empty.layerTypes == ["sliding_attention", "sliding_attention"])
+        _ = tinyModel(empty)
+    }
+
+    // MARK: Full-layer RoPE construction (disclosed divergence from the
+    // deleted inline tower)
+
+    /// The canonical full-layer rope is `ProportionalRoPE` over the FULL head
+    /// dim with `/dims` denominators and +inf-padded pass-through pairs —
+    /// matching the HF `modeling_rope_utils._compute_proportional_rope_parameters`
+    /// and mlx-lm `ProportionalRoPE` references. The deleted inline VLM tower
+    /// instead built a default rope over the truncated 128 dims (with
+    /// `/rotatedDims` frequencies and NeoX pairing) — that tower was the
+    /// anomaly, and the cutover corrects it. This pin locks the canonical
+    /// construction so any future convergence back to the truncated scheme is
+    /// an explicit, reviewed change.
+    @Test("full-layer rope uses proportional construction over the full head dim")
+    func fullLayerRoPEConstruction() {
+        let rope = ProportionalRoPE(
+            dims: 512,
+            traditional: false,
+            base: 1_000_000,
+            scalingConfig: ["partial_rotary_factor": .float(0.25)])
+        let freqs = try! #require(rope._freqs)
+        eval(freqs)
+        // 64 real frequencies + 192 infinities = dims/2 entries over the FULL
+        // head dim (a truncated-rope scheme would stop at 64 entries).
+        #expect(freqs.shape == [256])
+        for i in [0, 1, 31, 63] as [Int] {
+            let expected = pow(1_000_000 as Float, Float(2 * i) / 512)
+            #expect(abs(freqs[i].item(Float.self) - expected) / expected < 1e-5)
+        }
+        for i in [64, 128, 255] as [Int] {
+            #expect(freqs[i].item(Float.self) == .infinity)
+        }
+    }
+
     // MARK: F1 — fp16 attention promotion
 
-    /// fp16 activations are promoted to fp32 around SDPA (vmlx #52). Forging
-    /// the Q/K projection weights to magnitude ~600 guarantees fp16-range
-    /// overflow in any fused or composed score computation (|q·k| ~ 10^6 ≫
-    /// 65504), so a non-promoting build would return non-finite logits; the
-    /// promoted tower must stay finite end-to-end.
+    /// fp16 activations are promoted to fp32 around SDPA (vmlx #52). Scaling
+    /// `q_norm`/`k_norm` GAINS (post-normalization) by 600 reaches the score
+    /// computation un-normalized: |q·k| ≈ 600²×16×|x·y| ≫ 65504, so any build
+    /// WITHOUT the promotion produces non-finite logits (negative-control
+    /// property). The promoted tower must stay finite and softcap-bounded.
+    /// Forging the projections instead would be vacuous — RMSNorm divides
+    /// projection scale out before attention.
     @Test("fp16 forward with fp16-overflowing Q×K scores stays finite")
     func fp16AttentionPromotion() throws {
         let config = try tinyConfig()
@@ -137,7 +222,7 @@ struct Gemma4SharedTowerContractTests {
         var fp16: [String: MLXArray] = [:]
         for (key, value) in model.parameters().flattened() {
             var value = value.asType(.float16)
-            if key.hasSuffix(".self_attn.q_proj.weight") || key.hasSuffix(".self_attn.k_proj.weight") {
+            if key.hasSuffix(".self_attn.q_norm.weight") || key.hasSuffix(".self_attn.k_norm.weight") {
                 value = (value.asType(.float32) * 600).asType(.float16)
             }
             fp16[key] = value
@@ -146,9 +231,10 @@ struct Gemma4SharedTowerContractTests {
 
         let out = model(MLXArray([Int32(3), 5, 7, 11]), cache: nil as [KVCache]?)
         eval(out)
-        #expect(abs(out).max().item(Float.self).isFinite)
+        let magnitude = abs(out).max().item(Float.self)
+        #expect(magnitude.isFinite)
         // Soft-capped logits are bounded by the configured cap.
-        #expect(abs(out).max().item(Float.self) <= 30.0)
+        #expect(magnitude <= 30.0)
     }
 
     // MARK: F4 — nested quantization round trip

@@ -217,9 +217,10 @@ enum Gemma4AssistantConfigurationValidator {
                     "textConfig.numGlobalKeyValueHeads",
                     "is required when full attention uses K=V")
             }
-            let fullKVHeads = text.attentionKeqV
-                ? text.numGlobalKeyValueHeads!
-                : text.numKeyValueHeads
+            // Mirrors Gemma4Attention.init: full layers honor
+            // num_global_key_value_heads whenever present, independent of
+            // attention_k_eq_v (k_eq_v only elides v_proj).
+            let fullKVHeads = text.numGlobalKeyValueHeads ?? text.numKeyValueHeads
             try divides(
                 fullKVHeads,
                 into: text.numAttentionHeads,
@@ -584,12 +585,9 @@ enum Gemma4MTPCompatibilityValidator {
                     drafterText.attentionKeqV,
                     target.attentionKeqV,
                     field: "fullAttention.attentionKeqV")
-                if drafterText.attentionKeqV {
-                    try equalOptional(
-                        drafterText.numGlobalKeyValueHeads,
-                        target.numGlobalKeyValueHeads,
-                        field: "fullAttention.numGlobalKeyValueHeads")
-                }
+                // The gated `numGlobalKeyValueHeads` equality check was
+                // removed with the k_eq_v-gated head rule: full-layer KV
+                // geometry is now compared unconditionally right below.
                 try equal(
                     effectiveFullKVHeads(drafterText),
                     effectiveFullKVHeads(target),
@@ -611,10 +609,10 @@ enum Gemma4MTPCompatibilityValidator {
     }
 
     private static func effectiveFullKVHeads(_ config: Gemma4TextConfiguration) -> Int {
-        if config.attentionKeqV, let global = config.numGlobalKeyValueHeads {
-            return global
-        }
-        return config.numKeyValueHeads
+        // Mirrors Gemma4Attention.init: full layers honor
+        // num_global_key_value_heads whenever present, independent of
+        // attention_k_eq_v (k_eq_v only elides v_proj).
+        config.numGlobalKeyValueHeads ?? config.numKeyValueHeads
     }
 
     private static func equal<T: Equatable & CustomStringConvertible>(

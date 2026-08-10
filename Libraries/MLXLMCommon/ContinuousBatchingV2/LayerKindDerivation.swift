@@ -81,9 +81,9 @@ public enum CBv2LayerKindDerivation {
     /// Field semantics (mirroring `Gemma4Attention.init`):
     ///  - sliding layers use `headDim`, full layers use `globalHeadDim`
     ///    (asymmetric head dims: 256 / 512 on the production configs);
-    ///  - K-eq-V (`attention_k_eq_v`, 26B/31B) applies to FULL layers only
-    ///    and switches their kv-head count to `numGlobalKeyValueHeads` when
-    ///    that field is present;
+    ///  - full layers honor `numGlobalKeyValueHeads` whenever it is present,
+    ///    INDEPENDENT of `attention_k_eq_v` (k_eq_v only elides `v_proj` in
+    ///    the model — KV geometry is unaffected);
     ///  - the trailing `numKvSharedLayers` layers own no KV storage and
     ///    borrow from the last non-shared layer of the same type;
     ///  - Gemma 4 has no attention sinks.
@@ -95,21 +95,17 @@ public enum CBv2LayerKindDerivation {
         globalHeadDim: Int,
         numAttentionHeads: Int,
         numKeyValueHeads: Int,
-        numGlobalKeyValueHeads: Int?,
-        attentionKeqV: Bool
+        numGlobalKeyValueHeads: Int?
     ) -> [CBv2LayerKind] {
         let sources = gemma4SharedKVSources(
             layerTypes: layerTypes, numKvSharedLayers: numKvSharedLayers)
 
         return layerTypes.enumerated().map { index, layerType in
             let isSliding = layerType == slidingAttentionType
-            let useKeqV = attentionKeqV && !isSliding
-            let kvHeads: Int
-            if useKeqV, let globalKvHeads = numGlobalKeyValueHeads {
-                kvHeads = globalKvHeads
-            } else {
-                kvHeads = numKeyValueHeads
-            }
+            let kvHeads =
+                isSliding
+                ? numKeyValueHeads
+                : (numGlobalKeyValueHeads ?? numKeyValueHeads)
             return CBv2LayerKind(
                 attention: isSliding ? .slidingWindow(slidingWindow) : .full,
                 sharesKVWithLayer: sources[index],

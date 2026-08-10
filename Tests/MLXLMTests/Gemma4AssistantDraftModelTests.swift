@@ -184,8 +184,29 @@ struct Gemma4AssistantDraftModelTests {
         }
     }
 
-    @Test func bindIgnoresUnusedGlobalKVHeadsWhenKeqVDisabled() throws {
+    @Test func bindRejectsMismatchedEffectiveKVHeadsWhenKeqVDisabled() throws {
+        // Global KV heads are honored independent of k_eq_v: a drafter whose
+        // full layers use 1 KV head cannot verify a target using 2.
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        let target = Gemma4TextModel(
+            try targetConfig(attentionKeqV: false, numGlobalKVHeads: 2))
+        eval(drafter, target)
+
+        do {
+            try drafter.bind(target: target)
+            Issue.record("binding unexpectedly succeeded")
+        } catch let Gemma4MTPError.incompatibleDrafter(field, _, _) {
+            #expect(field == "fullAttention.effectiveKVHeads")
+        } catch {
+            Issue.record("threw unexpected error \(error)")
+        }
+    }
+
+    @Test func bindAcceptsMatchedEffectiveKVHeadsWhenKeqVDisabled() throws {
+        // Matched effective full-layer KV head counts bind cleanly even with
+        // k_eq_v disabled on both sides.
+        let drafter = try Gemma4AssistantDraftModel(
+            config: drafterConfig(attentionKeqV: false, numGlobalKVHeads: 2))
         let target = Gemma4TextModel(
             try targetConfig(attentionKeqV: false, numGlobalKVHeads: 2))
         eval(drafter, target)
@@ -230,7 +251,7 @@ struct Gemma4AssistantDraftModelTests {
                     $0.numGlobalKeyValueHeads = 1
                 }),
             (
-                "global KV heads", "fullAttention.numGlobalKeyValueHeads",
+                "global KV heads", "fullAttention.effectiveKVHeads",
                 {
                     $0.textConfig.attentionKeqV = true
                     $0.textConfig.numGlobalKeyValueHeads = 1

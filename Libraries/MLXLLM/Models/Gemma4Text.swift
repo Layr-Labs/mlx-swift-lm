@@ -468,11 +468,21 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
             try container.decodeIfPresent(Bool.self, forKey: .useDoubleWideMlp)
             ?? !isVLM
         if let decoded = try container.decodeIfPresent([String].self, forKey: .layerTypes) {
-            if isVLM && decoded.isEmpty {
+            if decoded.isEmpty {
                 // The deleted VLM tower interpreted an explicit empty list as
-                // all sliding-attention layers.
+                // all sliding-attention layers (non-VLM checkpoints inherit
+                // the same robust fallback rather than trapping later).
                 self.layerTypes = Array(
                     repeating: "sliding_attention", count: numHiddenLayers)
+            } else if decoded.count < numHiddenLayers {
+                // The deleted towers fell back to sliding attention for
+                // out-of-range layer indices; normalize short explicit lists
+                // by padding instead of trapping at model construction.
+                self.layerTypes =
+                    decoded
+                    + Array(
+                        repeating: "sliding_attention",
+                        count: numHiddenLayers - decoded.count)
             } else {
                 self.layerTypes = decoded
             }
@@ -886,6 +896,11 @@ private class Gemma4Attention: Module {
         // float32 for the attention math when the activation dtype is fp16,
         // then cast back so `oProj` sees its own dtype. Mirrors the deleted
         // inline VLM twin; bf16 activations (production) skip the cast.
+        // SCOPE: this restores the deleted tower's fp16 guarantee on the
+        // legacy/direct surface (its only reachable path). The CBv2/forwardV2
+        // path dispatches Q/K/V into the layer cache's own attention in the
+        // activation dtype (bf16 per the production contract); fp16-serving
+        // through CBv2 remains out of scope and should not be admitted.
         let attentionInputDType = queries.dtype
         var attentionQueries = queries
         var attentionKeys = keys
@@ -1967,8 +1982,7 @@ extension Gemma4TextConfiguration {
             globalHeadDim: globalHeadDim,
             numAttentionHeads: numAttentionHeads,
             numKeyValueHeads: numKeyValueHeads,
-            numGlobalKeyValueHeads: numGlobalKeyValueHeads,
-            attentionKeqV: attentionKeqV
+            numGlobalKeyValueHeads: numGlobalKeyValueHeads
         )
     }
 }

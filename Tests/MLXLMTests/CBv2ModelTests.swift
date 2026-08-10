@@ -383,8 +383,7 @@ struct CBv2ModelLayerKindTests {
             globalHeadDim: 512,
             numAttentionHeads: 8,
             numKeyValueHeads: 4,
-            numGlobalKeyValueHeads: nil,
-            attentionKeqV: true
+            numGlobalKeyValueHeads: nil
         )
         #expect(kinds[0].kvHeads == 4)
         #expect(kinds[1].kvHeads == 4)
