@@ -317,6 +317,55 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         case quantizationConfig = "quantization_config"
     }
 
+    /// The synthesized encoder silently dropped `quantizationBits` /
+    /// `quantizationGroupSize` (they have no `CodingKeys` case), so a
+    /// decode→encode→decode round trip lost the nested quantization contract
+    /// and a later strict load of a quantized checkpoint skipped quantization
+    /// outright. Encode explicitly: every keyed property plus the nested
+    /// `quantization` block in exactly the shape the decoder first looks for.
+    /// The derived rope thetas/partial factor re-derive from `ropeParameters`
+    /// on decode, so they are intentionally not keyed.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(modelType, forKey: .modelType)
+        try c.encode(hiddenSize, forKey: .hiddenSize)
+        try c.encode(numHiddenLayers, forKey: .numHiddenLayers)
+        try c.encode(intermediateSize, forKey: .intermediateSize)
+        try c.encode(numAttentionHeads, forKey: .numAttentionHeads)
+        try c.encode(headDim, forKey: .headDim)
+        try c.encode(globalHeadDim, forKey: .globalHeadDim)
+        try c.encode(globalPartialRotaryFactor, forKey: .globalPartialRotaryFactor)
+        try c.encode(rmsNormEps, forKey: .rmsNormEps)
+        try c.encode(vocabSize, forKey: .vocabSize)
+        try c.encode(vocabSizePerLayerInput, forKey: .vocabSizePerLayerInput)
+        try c.encode(numKeyValueHeads, forKey: .numKeyValueHeads)
+        try c.encodeIfPresent(numGlobalKeyValueHeads, forKey: .numGlobalKeyValueHeads)
+        try c.encode(numKvSharedLayers, forKey: .numKvSharedLayers)
+        try c.encode(hiddenSizePerLayerInput, forKey: .hiddenSizePerLayerInput)
+        try c.encode(slidingWindow, forKey: .slidingWindow)
+        try c.encode(slidingWindowPattern, forKey: .slidingWindowPattern)
+        try c.encode(maxPositionEmbeddings, forKey: .maxPositionEmbeddings)
+        try c.encode(attentionKeqV, forKey: .attentionKeqV)
+        try c.encode(finalLogitSoftcapping, forKey: .finalLogitSoftcapping)
+        try c.encode(useDoubleWideMlp, forKey: .useDoubleWideMlp)
+        try c.encode(layerTypes, forKey: .layerTypes)
+        try c.encode(tieWordEmbeddings, forKey: .tieWordEmbeddings)
+        try c.encodeIfPresent(ropeParameters, forKey: .ropeParameters)
+        try c.encode(enableMoeBlock, forKey: .enableMoeBlock)
+        try c.encodeIfPresent(numExperts, forKey: .numExperts)
+        try c.encodeIfPresent(topKExperts, forKey: .topKExperts)
+        try c.encodeIfPresent(moeIntermediateSize, forKey: .moeIntermediateSize)
+        try c.encodeIfPresent(useBidirectionalAttention, forKey: .useBidirectionalAttention)
+
+        if quantizationBits != nil || quantizationGroupSize != nil {
+            var qc = encoder.container(keyedBy: QuantizationCodingKeys.self)
+            try qc.encode(
+                Gemma4WeightQuantizationMetadata(
+                    bits: quantizationBits, groupSize: quantizationGroupSize),
+                forKey: .quantization)
+        }
+    }
+
     public init(from decoder: Decoder) throws {
         try self.init(from: decoder, defaults: .languageModel)
     }
@@ -691,7 +740,13 @@ private class Gemma4Attention: Module {
 
         // K-eq-V for full attention layers
         self.useKeqV = config.attentionKeqV && !isSliding
-        if useKeqV, let globalKvHeads = config.numGlobalKeyValueHeads {
+        // Full layers honor `num_global_key_value_heads` whenever it is
+        // present, independent of `attention_k_eq_v`; k_eq_v only elides the
+        // v_proj. This restores the deleted inline VLM tower's rule — a full
+        // layer with global heads different from the sliding count and
+        // k_eq_v=false still allocates its K/V projections for the global
+        // count, matching such checkpoints' weights.
+        if !isSliding, let globalKvHeads = config.numGlobalKeyValueHeads {
             self.nKvHeads = globalKvHeads
         } else {
             self.nKvHeads = config.numKeyValueHeads
@@ -825,23 +880,42 @@ private class Gemma4Attention: Module {
             hasCachedPrefix = true
         }
 
-        let attention: MLXArray
+        // vmlx #52 text-path: Gemma 4 attention scores can exceed the fp16
+        // range (±65504) on long contexts, and the fused/composed SDPA shapes
+        // would materialize non-finite intermediates. Promote Q/K/V to
+        // float32 for the attention math when the activation dtype is fp16,
+        // then cast back so `oProj` sees its own dtype. Mirrors the deleted
+        // inline VLM twin; bf16 activations (production) skip the cast.
+        let attentionInputDType = queries.dtype
+        var attentionQueries = queries
+        var attentionKeys = keys
+        var attentionValues = values
+        if attentionInputDType == .float16 {
+            attentionQueries = attentionQueries.asType(.float32)
+            attentionKeys = attentionKeys.asType(.float32)
+            attentionValues = attentionValues.asType(.float32)
+        }
+
+        let attentionRaw: MLXArray
         if L > 1 && hasCachedPrefix {
-            attention = gemma4AttentionFallback(
-                queries: queries,
-                keys: keys,
-                values: values,
+            attentionRaw = gemma4AttentionFallback(
+                queries: attentionQueries,
+                keys: attentionKeys,
+                values: attentionValues,
                 scale: scale,
                 mask: adjustedMask ?? .none)
         } else {
-            attention = MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
+            attentionRaw = MLXFast.scaledDotProductAttention(
+                queries: attentionQueries,
+                keys: attentionKeys,
+                values: attentionValues,
                 scale: scale,
                 mask: adjustedMask ?? .none
             )
         }
+        let attention =
+            attentionInputDType == .float16
+            ? attentionRaw.asType(.float16) : attentionRaw
 
         let output = attention
         .transposed(0, 2, 1, 3)
@@ -1376,7 +1450,12 @@ public class Gemma4TextModelInner: Module {
         inputEmbedding: MLXArray? = nil,
         imageTokenMask: MLXArray? = nil
     ) -> MLXArray {
-        forwardTrunk(
+        // Callers may hand rank-1 token ids ([N] on cache-reuse turns, e.g.
+        // the deprecated TokenIterator API) — the deleted inline VLM twin
+        // normalized them before any dimension read. Expand first so both
+        // `inputs.dim(1)` below and the trunk see [1, N].
+        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        return forwardTrunk(
             inputs, cache: cache, captureHook: captureHook, capturePreNorm: false,
             inputEmbedding: inputEmbedding, imageTokenMask: imageTokenMask,
             allowWeightedExpertUnsort: inputs.dim(1) > 1
@@ -1408,6 +1487,9 @@ public class Gemma4TextModelInner: Module {
         cache: [KVCache]? = nil,
         captureHook: ((Int, (MLXArray, MLXArray)) -> Void)? = nil
     ) -> (postNorm: MLXArray, preNorm: MLXArray) {
+        // Same rank-1 defense as `callAsFunction`: token ids may arrive as
+        // [N] on cache-reuse turns; forwardTrunk assumes [B, L].
+        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let r = forwardTrunk(
             inputs, cache: cache, captureHook: captureHook, capturePreNorm: true,
             allowWeightedExpertUnsort: false)
@@ -1704,7 +1786,15 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let fuseWeightedUnsort = gemma4ShouldFuseWeightedUnsort(config)
         self.config = config
         self.vocabularySize = config.vocabSize
-        self.kvHeads = (0 ..< config.numHiddenLayers).map { _ in config.numKeyValueHeads }
+        // Per-layer KV head counts must agree with `Gemma4Attention.init`:
+        // full layers use `num_global_key_value_heads` when present (whether
+        // or not k_eq_v is enabled), sliding layers the sliding count.
+        self.kvHeads = (0 ..< config.numHiddenLayers).map { idx in
+            let layerType = idx < config.layerTypes.count ? config.layerTypes[idx] : "sliding_attention"
+            return layerType == "full_attention"
+                ? (config.numGlobalKeyValueHeads ?? config.numKeyValueHeads)
+                : config.numKeyValueHeads
+        }
         self.fuseWeightedUnsort = fuseWeightedUnsort
         self.model = Gemma4TextModelInner(
             config,
