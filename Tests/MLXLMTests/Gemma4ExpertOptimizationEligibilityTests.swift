@@ -224,6 +224,37 @@ struct Gemma4ExpertOptimizationEligibilityTests {
         #expect(gemma4SupportsCoupledExpertOptimizations(c))
     }
 
+    @Test func textWrapperMergesRootQuantizationModeAndExpertOverrides() throws {
+        let json = """
+            {
+                "model_type": "gemma4",
+                "vocab_size": 262144,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 2816,
+                    "num_hidden_layers": 30,
+                    "enable_moe_block": true,
+                    "num_experts": 128,
+                    "top_k_experts": 8,
+                    "moe_intermediate_size": 704,
+                    "use_bidirectional_attention": "vision"
+                },
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "mode": "mxfp4",
+                    "model.layers.0.experts.switch_glu.gate_proj": false
+                }
+            }
+            """
+        let wrapper = try JSONDecoder().decode(
+            Gemma4Configuration.self, from: Data(json.utf8))
+        #expect(wrapper.textConfig.quantizationMode == .mxfp4)
+        #expect(wrapper.textConfig.hasExpertQuantizationOverrides)
+        #expect(!gemma4SupportsSafeExpertQMMQuantization(wrapper.textConfig))
+        #expect(!gemma4ShouldFuseWeightedUnsort(wrapper.textConfig, requested: true))
+    }
+
     /// A tiny MoE checkpoint still keeps the generic SwitchGLU reduction: it
     /// carries the 4-bit/group-64 contract but not the production topology, so
     /// the model's reported eligibility must be false on both surfaces and

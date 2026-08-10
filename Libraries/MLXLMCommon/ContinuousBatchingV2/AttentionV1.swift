@@ -674,6 +674,11 @@ enum CBv2AttentionV1 {
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
         bidirectional: Bool = false
     ) -> MLXArray {
+        // A model may widen Q for safer attention math while retaining compact
+        // K/V storage. SDPA requires one dtype, so widen only these views.
+        let attentionKeys = keys.dtype == queries.dtype ? keys : keys.asType(queries.dtype)
+        let attentionValues =
+            values.dtype == queries.dtype ? values : values.asType(queries.dtype)
         guard let softcap else {
             // Sinks arrive ALREADY normalized to the query dtype: see
             // `sdpaSinks` (MLX aborts the process on a wider sink) and
@@ -683,13 +688,13 @@ enum CBv2AttentionV1 {
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
             return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale,
+                queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: maskMode(
                     L: L, kL: kL, window: window, bidirectional: bidirectional),
                 sinks: sinks)
         }
         return PagedAttentionReference.composedAttention(
-            queries: queries, keys: keys, values: values, scale: scale,
+            queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
             boolMask: boolMask(
                 L: L, kL: kL, window: window, bidirectional: bidirectional),
             sinks: sinks, softcap: softcap)
@@ -810,6 +815,9 @@ enum CBv2AttentionV1 {
         window: Int?, blocks: ArraySlice<CBv2ImageSpan>,
         sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
+        let attentionKeys = keys.dtype == queries.dtype ? keys : keys.asType(queries.dtype)
+        let attentionValues =
+            values.dtype == queries.dtype ? values : values.asType(queries.dtype)
         let mask = spanMask(
             queryAbsoluteStart: queryAbsoluteStart, queryCount: queries.dim(2),
             keyAbsoluteStart: keyAbsoluteStart, keyCount: keys.dim(2),
@@ -821,11 +829,11 @@ enum CBv2AttentionV1 {
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
             return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: keys, values: values, scale: scale,
+                queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: .array(mask), sinks: sinks)
         }
         return PagedAttentionReference.composedAttention(
-            queries: queries, keys: keys, values: values, scale: scale,
+            queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
             boolMask: mask, sinks: sinks, softcap: softcap)
     }
 }

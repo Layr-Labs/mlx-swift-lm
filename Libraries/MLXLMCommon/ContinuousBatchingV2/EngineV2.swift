@@ -422,6 +422,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         guard request.prefixCacheEnabled else {
             return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
         }
+        guard cbv2LayerKindsAllowPrefixReuse(layerKinds) else {
+            return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
+        }
         // Vision requests NEVER look up the prefix cache (v1 policy — the
         // donation side is excluded symmetrically in
         // `EngineLoopV2.donationIntent`): token-id hashes cannot see image

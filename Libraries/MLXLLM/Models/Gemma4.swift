@@ -33,6 +33,7 @@ public struct Gemma4Configuration: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let quantizationContainer = try decoder.container(keyedBy: QuantizationCodingKeys.self)
+        let rootPerLayerQuantization = (try? BaseConfiguration(from: decoder))?.perLayerQuantization
         self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"
         self.vocabSize = try container.decodeIfPresent(Int.self, forKey: .vocabSize) ?? 262144
 
@@ -52,9 +53,12 @@ public struct Gemma4Configuration: Codable, Sendable {
                 Gemma4WeightQuantizationMetadata.self, forKey: .quantization)
             ?? quantizationContainer.decodeIfPresent(
                 Gemma4WeightQuantizationMetadata.self, forKey: .quantizationConfig)
-        if let quantization {
+        if let rootPerLayerQuantization {
+            self.textConfig.mergeQuantization(rootPerLayerQuantization)
+        } else if let quantization {
             self.textConfig.quantizationBits = quantization.bits
             self.textConfig.quantizationGroupSize = quantization.groupSize
+            self.textConfig.quantizationMode = quantization.mode ?? .affine
         }
     }
 }

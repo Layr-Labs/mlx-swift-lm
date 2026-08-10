@@ -240,6 +240,15 @@ public struct CBv2LayerKind: Sendable, Equatable {
     }
 }
 
+/// Prefix snapshots are reusable only when prefill visibility is independent
+/// of the donor's chunk history. Fully bidirectional chunks do not satisfy
+/// that contract: generated rows donated one token at a time had no future
+/// visibility, while those same rows in a later prompt would.
+@inline(__always)
+func cbv2LayerKindsAllowPrefixReuse(_ layerKinds: [CBv2LayerKind]) -> Bool {
+    !layerKinds.contains(where: \.isBidirectional)
+}
+
 // MARK: - Per-sequence KV state
 
 /// KV storage for ONE sequence at ONE layer. Self-contained: owns its

@@ -2081,6 +2081,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     ) -> CBv2DonationIntent? {
         guard prefixCache != nil else { return nil }
         guard rec.request.prefixCacheEnabled else { return nil }
+        guard cbv2LayerKindsAllowPrefixReuse(layerKinds) else { return nil }
         // Vision requests NEVER donate (v1 policy, enforced in BOTH
         // directions — lookup is skipped in `EngineV2.makePrefixLookup`): the
         // prefix cache keys on token-id chain hashes, and an image span's

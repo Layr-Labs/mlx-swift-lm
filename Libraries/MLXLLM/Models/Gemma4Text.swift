@@ -980,11 +980,8 @@ private class Gemma4Attention: Module {
         // float32 for the attention math when the activation dtype is fp16,
         // then cast back so `oProj` sees its own dtype. Mirrors the deleted
         // inline VLM twin; bf16 activations (production) skip the cast.
-        // SCOPE: this restores the deleted tower's fp16 guarantee on the
-        // legacy/direct surface (its only reachable path). The CBv2/forwardV2
-        // path dispatches Q/K/V into the layer cache's own attention in the
-        // activation dtype (bf16 per the production contract); fp16-serving
-        // through CBv2 remains out of scope and should not be admitted.
+        // The CBv2 path applies the same promotion to queries below; its cache
+        // keeps K/V in their storage dtype and widens the attention views.
         let attentionInputDType = queries.dtype
         var attentionQueries = queries
         var attentionKeys = keys
@@ -1083,11 +1080,17 @@ private class Gemma4Attention: Module {
                     """)
             }
             queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
+            let outputDType = queries.dtype
+            let attentionQueries =
+                outputDType == .float16 ? queries.asType(.float32) : queries
             let attention = layerCache.attendBorrowing(
-                source: source, queries: queries, scale: scale, sinks: nil)
+                source: source, queries: attentionQueries, scale: scale, sinks: nil)
             var output = attention.transposed(0, 2, 1, 3).reshaped(B, L, -1)
             if outputStart > 0 {
                 output = output[0..., outputStart..., 0...]
+            }
+            if output.dtype != outputDType {
+                output = output.asType(outputDType)
             }
             return (oProj(output), sharedKV, positionOffset)
         }
@@ -1129,18 +1132,24 @@ private class Gemma4Attention: Module {
         v = vNorm(v)
         v = v.transposed(0, 2, 1, 3)
 
+        let outputDType = queries.dtype
+        let attentionQueries =
+            outputDType == .float16 ? queries.asType(.float32) : queries
         let attention: MLXArray
         if let lastQueryCache {
             attention = lastQueryCache.updateAndAttendLastQuery(
-                queries: queries, keys: k, values: v, scale: scale, sinks: nil)
+                queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         } else {
             attention = layerCache.updateAndAttend(
-                queries: queries, keys: k, values: v, scale: scale, sinks: nil)
+                queries: attentionQueries, keys: k, values: v, scale: scale, sinks: nil)
         }
 
         var output = attention.transposed(0, 2, 1, 3).reshaped(B, queryLength, -1)
         if lastQueryCache == nil && outputStart > 0 {
             output = output[0..., outputStart..., 0...]
+        }
+        if output.dtype != outputDType {
+            output = output.asType(outputDType)
         }
         return (oProj(output), (k, v), captured)
     }

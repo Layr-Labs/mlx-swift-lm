@@ -139,6 +139,7 @@ public struct Gemma4Configuration: Codable, Sendable {
     let videoTokenId: Int?
     let visionSoftTokensPerImage: Int
     let quantization: BaseConfiguration.Quantization?
+    private let rootPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
 
     enum CodingKeys: String, CodingKey {
         case textConfig = "text_config"
@@ -179,6 +180,7 @@ public struct Gemma4Configuration: Codable, Sendable {
             try c.decodeIfPresent(Int.self, forKey: .visionSoftTokensPerImage)
             ?? visionConfig.defaultOutputLength
         quantization = rootQuantization
+        self.rootPerLayerQuantization = rootPerLayerQuantization
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -189,7 +191,42 @@ public struct Gemma4Configuration: Codable, Sendable {
         try c.encode(imageTokenId, forKey: .imageTokenId)
         try c.encodeIfPresent(videoTokenId, forKey: .videoTokenId)
         try c.encode(visionSoftTokensPerImage, forKey: .visionSoftTokensPerImage)
-        try c.encodeIfPresent(quantization, forKey: .quantization)
+        if let rootPerLayerQuantization,
+            let fallback = rootPerLayerQuantization.quantization
+        {
+            try c.encode(
+                Gemma4RootQuantizationConfiguration(
+                    fallback: fallback,
+                    overrides: rootPerLayerQuantization.perLayerQuantization),
+                forKey: .quantization)
+        } else {
+            try c.encodeIfPresent(quantization, forKey: .quantization)
+        }
+    }
+}
+
+private struct Gemma4RootQuantizationConfiguration: Encodable {
+    let fallback: BaseConfiguration.Quantization
+    let overrides: [String: BaseConfiguration.QuantizationOption]
+
+    private struct DynamicKey: CodingKey {
+        let stringValue: String
+        let intValue: Int? = nil
+        init(stringValue: String) { self.stringValue = stringValue }
+        init(intValue: Int) { self.stringValue = "\(intValue)" }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try fallback.encode(to: encoder)
+        var container = encoder.container(keyedBy: DynamicKey.self)
+        for (path, option) in overrides {
+            switch option {
+            case .skip:
+                try container.encode(false, forKey: DynamicKey(stringValue: path))
+            case .quantize(let quantization):
+                try container.encode(quantization, forKey: DynamicKey(stringValue: path))
+            }
+        }
     }
 }
 

@@ -315,6 +315,41 @@ struct Gemma4SharedTowerContractTests {
         #expect(magnitude <= 30.0)
     }
 
+    @Test("fp16 CBv2 forward keeps overflowing attention scores finite")
+    func fp16CBv2AttentionPromotion() throws {
+        let config = try tinyConfig()
+        let model = tinyModel(config)
+        var fp16: [String: MLXArray] = [:]
+        for (key, value) in model.parameters().flattened() {
+            var value = value.asType(.float16)
+            if key.hasSuffix(".self_attn.q_norm.weight") || key.hasSuffix(".self_attn.k_norm.weight") {
+                value = (value.asType(.float32) * 600).asType(.float16)
+            }
+            fp16[key] = value
+        }
+        model.update(parameters: ModuleParameters.unflattened(fp16))
+
+        let layerKinds = model.cbv2LayerKinds
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20))
+        let state = try backend.makeSequenceState(
+            layerKinds: layerKinds, promptLength: 4, maxLength: 8)
+        defer { backend.release(state) }
+        let caches: [CBv2LayerCache] = layerKinds.enumerated().map {
+            CBv2LayerCache(layerIndex: $0.offset, kind: $0.element)
+        }
+        for index in layerKinds.indices where layerKinds[index].sharesKVWithLayer == nil {
+            caches[index].setRows([state[index]!])
+        }
+
+        let out = model(
+            MLXArray([Int32(3), 5, 7, 11]).reshaped(1, 4),
+            cache: caches.map { $0 as KVCache })
+        eval(out)
+        let magnitude = abs(out).max().item(Float.self)
+        #expect(magnitude.isFinite)
+        #expect(magnitude <= 30.0)
+    }
+
     // MARK: F4 — nested quantization round trip
 
     private func vlmJSON(textQuantization: String?, rootQuantization: String?) -> String {
@@ -416,5 +451,26 @@ struct Gemma4SharedTowerContractTests {
         #expect(second.textConfig.quantizationBits == 4)
         #expect(second.textConfig.quantizationGroupSize == 64)
         #expect(second.textConfig.quantizationMode == .affine)
+    }
+
+    @Test("root per-layer quantization survives VLM round-trip")
+    func rootPerLayerQuantizationRoundTrip() throws {
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        let path = "model.layers.0.experts.switch_glu.gate_proj"
+        let first = try decoder.decode(
+            MLXVLM.Gemma4Configuration.self,
+            from: Data(vlmJSON(
+                textQuantization: nil,
+                rootQuantization:
+                    "{\"bits\": 4, \"group_size\": 64, \"\(path)\": false}").utf8))
+        #expect(first.textConfig.hasExpertQuantizationOverrides)
+
+        let second = try decoder.decode(
+            MLXVLM.Gemma4Configuration.self, from: try encoder.encode(first))
+        #expect(second.textConfig.quantizationBits == 4)
+        #expect(second.textConfig.quantizationGroupSize == 64)
+        #expect(second.textConfig.hasExpertQuantizationOverrides)
+        #expect(!gemma4SupportsSafeExpertQMMQuantization(second.textConfig))
     }
 }
