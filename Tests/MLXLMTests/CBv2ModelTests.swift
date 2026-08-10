@@ -389,6 +389,22 @@ struct CBv2ModelLayerKindTests {
         #expect(kinds[1].kvHeads == 4)
     }
 
+    @Test func gemma4LegacyLayerKindOverloadRemainsSourceCompatible() {
+        let kinds = CBv2LayerKindDerivation.gemma4LayerKinds(
+            layerTypes: ["sliding_attention", "full_attention"],
+            slidingWindow: 512,
+            numKvSharedLayers: 0,
+            headDim: 256,
+            globalHeadDim: 512,
+            numAttentionHeads: 8,
+            numKeyValueHeads: 4,
+            numGlobalKeyValueHeads: 2,
+            attentionKeqV: false)
+
+        #expect(kinds[1].kvHeads == 2)
+        #expect(kinds.allSatisfy { !$0.isBidirectional })
+    }
+
     @Test func gemma4NoSharedLayers() {
         let sources = CBv2LayerKindDerivation.gemma4SharedKVSources(
             layerTypes: CBv2LayerKindDerivation.layerTypes(

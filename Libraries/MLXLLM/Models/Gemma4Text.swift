@@ -1933,6 +1933,25 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        // Fully bidirectional prompt states require whole-prompt visibility.
+        // Returning the complete prompt lets TokenIterator evaluate it once.
+        guard config.useBidirectionalAttention != "all" else {
+            return .tokens(input.text)
+        }
+
+        let prefillStepSize = windowSize ?? 512
+        var remaining = input.text
+        while remaining.tokens.size > prefillStepSize {
+            let chunk = remaining[.newAxis, ..<prefillStepSize]
+            _ = self(chunk, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            remaining = remaining[prefillStepSize...]
+        }
+        return .tokens(remaining)
+    }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let hidden = model(inputs, cache: cache)

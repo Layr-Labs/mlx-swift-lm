@@ -119,6 +119,33 @@ public enum CBv2LayerKindDerivation {
         }
     }
 
+    @available(
+        *, deprecated,
+        message: "attentionKeqV does not affect Gemma 4 KV geometry; use isBidirectional")
+    public static func gemma4LayerKinds(
+        layerTypes: [String],
+        slidingWindow: Int,
+        numKvSharedLayers: Int,
+        headDim: Int,
+        globalHeadDim: Int,
+        numAttentionHeads: Int,
+        numKeyValueHeads: Int,
+        numGlobalKeyValueHeads: Int?,
+        attentionKeqV: Bool
+    ) -> [CBv2LayerKind] {
+        _ = attentionKeqV
+        return gemma4LayerKinds(
+            layerTypes: layerTypes,
+            slidingWindow: slidingWindow,
+            numKvSharedLayers: numKvSharedLayers,
+            headDim: headDim,
+            globalHeadDim: globalHeadDim,
+            numAttentionHeads: numAttentionHeads,
+            numKeyValueHeads: numKeyValueHeads,
+            numGlobalKeyValueHeads: numGlobalKeyValueHeads,
+            isBidirectional: false)
+    }
+
     // MARK: - GPT-OSS
 
     /// Derive per-layer attention structure for GPT-OSS.

@@ -240,6 +240,32 @@ struct Gemma4SharedTowerContractTests {
         }
     }
 
+    @Test("all-mode legacy prepare keeps the prompt in one forward")
+    func allModeLegacyPrefillIsNotChunked() throws {
+        let tokens = MLXArray([Int32(1), 2, 3, 4])
+        let input = LMInput(tokens: tokens)
+        let allMode = tinyModel(try tinyConfig(extraFields: [
+            "\"use_bidirectional_attention\": \"all\"",
+        ]))
+        let ordinary = tinyModel(try tinyConfig())
+
+        guard case .tokens(let allTokens) = try allMode.prepare(
+            input, cache: allMode.newCache(parameters: nil), windowSize: 2)
+        else {
+            Issue.record("all-mode prepare unexpectedly returned logits")
+            return
+        }
+        guard case .tokens(let ordinaryTokens) = try ordinary.prepare(
+            input, cache: ordinary.newCache(parameters: nil), windowSize: 2)
+        else {
+            Issue.record("ordinary prepare unexpectedly returned logits")
+            return
+        }
+
+        #expect(allTokens.tokens.size == 4)
+        #expect(ordinaryTokens.tokens.size == 2)
+    }
+
     // MARK: Full-layer RoPE construction (disclosed divergence from the
     // deleted inline tower)
 
