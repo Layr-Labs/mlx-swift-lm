@@ -97,10 +97,9 @@ func gemma4SupportsProductionExpertTopology(_ config: Gemma4TextConfiguration) -
 
 /// The safe Gemma 4 expert-QMM selector (`classify_gemma4_expert_qmm`) rejects
 /// anything that is not affine 4-bit at group size 64 with
-/// `fallback_quantization`, before it ever looks at topology. Only bits and
-/// group size are declared on the checkpoint; the remaining selector
-/// conditions (affine mode, dtypes, contiguity, assignment count, AOT
-/// metallib, NAX precedence) are dispatch-time facts MLX reports separately.
+/// `fallback_quantization`, before it ever looks at topology. The remaining
+/// selector conditions (dtypes, contiguity, assignment count, AOT metallib,
+/// NAX precedence) are dispatch-time facts MLX reports separately.
 func gemma4HasExpertQuantizationOverrides(
     _ quantization: BaseConfiguration.PerLayerQuantization?
 ) -> Bool {
@@ -111,6 +110,7 @@ func gemma4HasExpertQuantizationOverrides(
 
 func gemma4SupportsSafeExpertQMMQuantization(_ config: Gemma4TextConfiguration) -> Bool {
     config.quantizationBits == 4 && config.quantizationGroupSize == 64
+        && config.quantizationMode == .affine
         && !config.hasExpertQuantizationOverrides
 }
 
@@ -222,10 +222,12 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
 struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
     var bits: Int?
     var groupSize: Int?
+    var mode: QuantizationMode?
 
     enum CodingKeys: String, CodingKey {
         case bits
         case groupSize = "group_size"
+        case mode
     }
 }
 
@@ -289,6 +291,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     public internal(set) var tieWordEmbeddings: Bool = true
     public internal(set) var quantizationBits: Int?
     public internal(set) var quantizationGroupSize: Int?
+    public internal(set) var quantizationMode: QuantizationMode = .affine
     public internal(set) var perLayerQuantization: BaseConfiguration.PerLayerQuantization?
     /// Any explicit expert-path quantization entry makes the coupled
     /// weighted-unsort/R1 optimization fail closed. The runtime quantizer
@@ -359,8 +362,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         case quantizationConfig = "quantization_config"
     }
 
-    /// The synthesized encoder silently dropped `quantizationBits` /
-    /// `quantizationGroupSize` (they have no `CodingKeys` case), so a
+    /// The synthesized encoder silently dropped the effective quantization
+    /// metadata (it has no `CodingKeys` case), so a
     /// decode→encode→decode round trip lost the nested quantization contract
     /// and a later strict load of a quantized checkpoint skipped quantization
     /// outright. Encode explicitly: every keyed property plus the nested
@@ -402,7 +405,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
         if quantizationBits != nil || quantizationGroupSize != nil {
             var qc = encoder.container(keyedBy: QuantizationCodingKeys.self)
             let metadata = Gemma4WeightQuantizationMetadata(
-                bits: quantizationBits, groupSize: quantizationGroupSize)
+                bits: quantizationBits, groupSize: quantizationGroupSize,
+                mode: quantizationMode)
             if let perLayerQuantization {
                 try qc.encode(
                     Gemma4WeightQuantizationConfiguration(
@@ -562,6 +566,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
                 Gemma4WeightQuantizationMetadata.self, forKey: .quantizationConfig)
         self.quantizationBits = quantization?.bits
         self.quantizationGroupSize = quantization?.groupSize
+        self.quantizationMode =
+            perLayerQuantization?.quantization?.mode ?? quantization?.mode ?? .affine
         self.perLayerQuantization = perLayerQuantization
         self.ropeParameters =
             try container.decodeIfPresent(
@@ -600,6 +606,7 @@ extension Gemma4TextConfiguration {
         guard let quantization else { return }
         quantizationBits = quantization.bits
         quantizationGroupSize = quantization.groupSize
+        quantizationMode = quantization.mode
         if var effective = perLayerQuantization {
             effective.quantization = quantization
             perLayerQuantization = effective
@@ -616,6 +623,7 @@ extension Gemma4TextConfiguration {
         if let fallback = quantization.quantization {
             quantizationBits = fallback.bits
             quantizationGroupSize = fallback.groupSize
+            quantizationMode = fallback.mode
         }
         perLayerQuantization = quantization
     }

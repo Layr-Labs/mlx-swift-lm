@@ -13,7 +13,8 @@ import Testing
 /// on its own, so both must gate on exactly one configuration contract: the
 /// exact production expert topology AND the quantization contract that
 /// `classify_gemma4_expert_qmm` enforces before it inspects topology
-/// (`group_size == 64 && bits == 4`; anything else is `fallback_quantization`).
+/// (`group_size == 64 && bits == 4 && mode == affine`; anything else is
+/// `fallback_quantization`).
 @Suite("Gemma4 coupled expert-optimization eligibility")
 struct Gemma4ExpertOptimizationEligibilityTests {
 

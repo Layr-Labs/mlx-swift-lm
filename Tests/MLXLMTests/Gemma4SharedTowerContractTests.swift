@@ -361,17 +361,42 @@ struct Gemma4SharedTowerContractTests {
         #expect(first.quantization == nil)
         #expect(first.textConfig.quantizationBits == 4)
         #expect(first.textConfig.quantizationGroupSize == 64)
+        #expect(first.textConfig.quantizationMode == .affine)
+        #expect(gemma4SupportsSafeExpertQMMQuantization(first.textConfig))
 
         let encoded = try encoder.encode(first)
         let second = try decoder.decode(MLXVLM.Gemma4Configuration.self, from: encoded)
         #expect(second.textConfig.quantizationBits == 4)
         #expect(second.textConfig.quantizationGroupSize == 64)
+        #expect(second.textConfig.quantizationMode == .affine)
+        #expect(gemma4SupportsSafeExpertQMMQuantization(second.textConfig))
 
         // A third cycle must be idempotent (no drift, no duplication).
         let third = try decoder.decode(
             MLXVLM.Gemma4Configuration.self, from: try encoder.encode(second))
         #expect(third.textConfig.quantizationBits == 4)
         #expect(third.textConfig.quantizationGroupSize == 64)
+        #expect(third.textConfig.quantizationMode == .affine)
+    }
+
+    @Test("mxfp4 mode survives round-trip and remains unsafe for expert R1")
+    func mxfp4QuantizationRoundTrip() throws {
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        let first = try decoder.decode(
+            MLXVLM.Gemma4Configuration.self, from: Data(vlmJSON(
+                textQuantization:
+                    "{\"bits\": 4, \"group_size\": 64, \"mode\": \"mxfp4\"}",
+                rootQuantization: nil).utf8))
+        #expect(first.textConfig.quantizationMode == .mxfp4)
+        #expect(!gemma4SupportsSafeExpertQMMQuantization(first.textConfig))
+
+        let second = try decoder.decode(
+            MLXVLM.Gemma4Configuration.self, from: try encoder.encode(first))
+        #expect(second.textConfig.quantizationBits == 4)
+        #expect(second.textConfig.quantizationGroupSize == 64)
+        #expect(second.textConfig.quantizationMode == .mxfp4)
+        #expect(!gemma4SupportsSafeExpertQMMQuantization(second.textConfig))
     }
 
     @Test("root quantization keeps precedence and round-trips")
@@ -385,9 +410,11 @@ struct Gemma4SharedTowerContractTests {
         // Root metadata overlays nested text config at decode.
         #expect(first.textConfig.quantizationBits == 4)
         #expect(first.textConfig.quantizationGroupSize == 64)
+        #expect(first.textConfig.quantizationMode == .affine)
         let second = try decoder.decode(
             MLXVLM.Gemma4Configuration.self, from: try encoder.encode(first))
         #expect(second.textConfig.quantizationBits == 4)
         #expect(second.textConfig.quantizationGroupSize == 64)
+        #expect(second.textConfig.quantizationMode == .affine)
     }
 }
