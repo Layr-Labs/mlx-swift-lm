@@ -207,7 +207,6 @@ struct CBv2MTPEngineParityTests {
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: maxConcurrent, maxBatchedTokensPerStep: 256,
                 prefillChunkSize: 16, maxWaiting: 16),
-            compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: false),
             mtpDrafter: drafter,
             mtpConfig: mtpConfig)
     }

@@ -153,15 +153,21 @@ public struct Gemma4Configuration: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        let rootQuantization =
+        let rootBaseConfiguration = try? BaseConfiguration(from: decoder)
+        let rootPerLayerQuantization = rootBaseConfiguration?.perLayerQuantization
+        let decodedRootQuantization =
             try c.decodeIfPresent(
                 BaseConfiguration.Quantization.self, forKey: .quantization)
             ?? c.decodeIfPresent(
                 BaseConfiguration.Quantization.self, forKey: .quantizationConfig)
+        let rootQuantization =
+            rootPerLayerQuantization?.quantization
+            ?? decodedRootQuantization
         var textConfig = try MLXLLM.Gemma4TextConfiguration(
             from: c.superDecoder(forKey: .textConfig),
             defaults: .visionLanguageModel)
         textConfig.mergeQuantization(rootQuantization)
+        textConfig.mergeQuantization(rootPerLayerQuantization)
         self.textConfig = textConfig
         visionConfig = try c.decode(Gemma4VisionConfig.self, forKey: .visionConfig)
         modelType = try c.decodeIfPresent(String.self, forKey: .modelType) ?? "gemma4"

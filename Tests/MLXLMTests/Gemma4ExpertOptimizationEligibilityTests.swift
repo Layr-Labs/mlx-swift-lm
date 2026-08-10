@@ -87,6 +87,7 @@ struct Gemma4ExpertOptimizationEligibilityTests {
         #expect(!gemma4SupportsSafeExpertQMMQuantization(c))
         #expect(!gemma4SupportsCoupledExpertOptimizations(c))
         #expect(!gemma4ShouldFuseWeightedUnsort(c, requested: true))
+
     }
 
     @Test func nonSixtyFourGroupSizeIsIneligibleForBoth() throws {
@@ -159,6 +160,61 @@ struct Gemma4ExpertOptimizationEligibilityTests {
         c.mergeQuantization(BaseConfiguration.Quantization(groupSize: 64, bits: 8))
         #expect(!gemma4SupportsCoupledExpertOptimizations(c))
         #expect(!gemma4ShouldFuseWeightedUnsort(c, requested: true))
+    }
+
+    @Test func expertPerLayerQuantizationOverridesFailClosed() throws {
+        let json = """
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 2816,
+                "num_hidden_layers": 30,
+                "enable_moe_block": true,
+                "num_experts": 128,
+                "top_k_experts": 8,
+                "moe_intermediate_size": 704,
+                "use_bidirectional_attention": "vision",
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "model.layers.0.experts.switch_glu.gate_proj": false
+                }
+            }
+            """
+        let c = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self, from: Data(json.utf8))
+        #expect(c.hasExpertQuantizationOverrides)
+        #expect(!gemma4SupportsSafeExpertQMMQuantization(c))
+        #expect(!gemma4SupportsCoupledExpertOptimizations(c))
+        #expect(!gemma4ShouldFuseWeightedUnsort(c, requested: true))
+
+        let roundTripped = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self, from: JSONEncoder().encode(c))
+        #expect(roundTripped.hasExpertQuantizationOverrides)
+        #expect(!gemma4SupportsCoupledExpertOptimizations(roundTripped))
+    }
+
+    @Test func unrelatedPerLayerQuantizationOverrideDoesNotDisableExperts() throws {
+        let json = """
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 2816,
+                "num_hidden_layers": 30,
+                "enable_moe_block": true,
+                "num_experts": 128,
+                "top_k_experts": 8,
+                "moe_intermediate_size": 704,
+                "use_bidirectional_attention": "vision",
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "model.embed_tokens": false
+                }
+            }
+            """
+        let c = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self, from: Data(json.utf8))
+        #expect(!c.hasExpertQuantizationOverrides)
+        #expect(gemma4SupportsCoupledExpertOptimizations(c))
     }
 
     /// A tiny MoE checkpoint still keeps the generic SwitchGLU reduction: it

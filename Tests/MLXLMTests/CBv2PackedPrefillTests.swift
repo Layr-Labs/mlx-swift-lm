@@ -227,7 +227,6 @@ final class CBv2PackedTestCacheProvider: CBv2LayerCacheProvider, CBv2Composition
         self.claim = claimsPackedPrefill
     }
 
-    var uniformAttentionSoftcap: Float?? { bank.uniformAttentionSoftcap }
     var supportsMultimodalSpans: Bool { bank.supportsMultimodalSpans }
     var supportsPackedPrefill: Bool { claim }
 

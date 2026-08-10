@@ -212,6 +212,10 @@ public struct CBv2LayerKind: Sendable, Equatable {
     /// sharing). A shared layer owns NO storage; it borrows (K, V) and the
     /// position offset from the source layer at attention time.
     public var sharesKVWithLayer: Int?
+    /// Multi-token prompt attention is bidirectional within the current
+    /// chunk. Cached prefix columns retain their established visibility;
+    /// decode remains unchanged because no future keys exist yet.
+    public var isBidirectional: Bool
     /// Learned per-head attention sinks (GPT-OSS). Sinks are a kernel
     /// parameter (folded into the softmax denominator), never KV state.
     /// A backend that cannot honor sinks MUST be statically ineligible for
@@ -223,11 +227,13 @@ public struct CBv2LayerKind: Sendable, Equatable {
 
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
+        isBidirectional: Bool = false,
         headDim: Int, kvHeads: Int, queryHeads: Int
     ) {
         self.attention = attention
         self.sharesKVWithLayer = sharesKVWithLayer
         self.hasSinks = hasSinks
+        self.isBidirectional = isBidirectional
         self.headDim = headDim
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
@@ -254,18 +260,6 @@ public protocol CBv2SequenceKV: AnyObject {
     /// Zero-copy-ish snapshot for prefix-cache donation / checkpointing.
     /// Returns (keys, values, absoluteOffset) in temporal order.
     func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int)
-    /// True when `snapshot()` is VALUE-EXACT: adopting the returned arrays
-    /// reproduces this row's effective KV exactly (full-precision storage).
-    /// Quantized storage MUST return false — its snapshot dequantizes, and
-    /// MLX affine re-quantization is not idempotent (the kernel snaps the
-    /// scale to the dominant group edge, so quantize∘dequantize lands on a
-    /// different grid, drifting values by up to one quantization step per
-    /// donate→adopt generation). The engine therefore SKIPS prefix-cache
-    /// donation for states whose cacheable rows report false; adopting
-    /// full-precision donations INTO such backends remains allowed (one
-    /// quantization, same as a cold prefill of the same values). Default:
-    /// true.
-    var snapshotIsLossless: Bool { get }
     /// Rollback the last `n` tokens (speculative rejection). Must scrub
     /// un-confirmed tail state so it can never be attended to.
     func rollback(_ n: Int)
@@ -283,12 +277,11 @@ public protocol CBv2SequenceKV: AnyObject {
     /// in-place writes destroy the oldest in-window entries — see
     /// `CBv2WindowedSequenceKV`'s rollback discussion) MUST return false so
     /// the engine falls back to plain decode for that row. Default: false
-    /// (fail-safe — unknown row classes never speculate), mirroring
-    /// `CBv2KVBackend.producesCompiledDecodeEligibleRows`.
+    /// (fail-safe — unknown row classes never speculate).
     var supportsSpeculativeWrites: Bool { get }
     /// Begin one speculative-write transaction. Storage
-    /// whose plain rollback is already value-exact (full, quantized,
-    /// paged-full) may make this a no-op. Ring storage (contiguous windowed)
+    /// whose plain rollback is already value-exact (full, paged-full) may
+    /// make this a no-op. Ring storage (contiguous windowed)
     /// must STAGE every update until commit — each call returns the exact
     /// views its corresponding plain update would return and advances
     /// counters, but destructive ring writes are deferred so a final
@@ -319,9 +312,6 @@ extension CBv2SequenceKV {
         preconditionFailure(
             "fastForward(to:) is only valid on windowed sequence KV (\(type(of: self)))")
     }
-
-    /// Default: full-precision snapshots are value-exact.
-    public var snapshotIsLossless: Bool { true }
 
     /// Default: fail-safe — unknown row classes never speculate.
     public var supportsSpeculativeWrites: Bool { false }
@@ -391,23 +381,24 @@ public protocol CBv2KVBackend: AnyObject {
     /// `EngineV2` enforces this pairing at construction. Defaults to false
     /// (contiguous per-sequence buffers are ARC-owned by their views).
     var requiresMaterializedSnapshots: Bool { get }
-    /// True when this backend mints request rows the compiled [B, 1] decode
-    /// path can bind (`CBv2FullSequenceKV` / `CBv2WindowedSequenceKV`).
-    /// `CBv2CompiledDecode.laneInfo` rejects every other row class
-    /// (quantized, paged) at bind time, so an ineligible backend would warm
-    /// the compiled graphs against fp16 scratch, carve the padding reserve
-    /// out of admission, and then fall back eager on EVERY live step — a
-    /// permanently tighter ceiling for zero benefit (PR#62 review).
-    /// `EngineV2` skips the compiled build entirely when this is false.
-    /// Defaults to false (fail-safe: unknown backends stay eager).
-    var producesCompiledDecodeEligibleRows: Bool { get }
+    /// How this backend's rows OCCUPY storage, consulted by `AdmissionV2`
+    /// so the byte ledger charges what will really be allocated instead of
+    /// inferring it from `CBv2LayerKind` alone. The distinction is
+    /// load-bearing: a contiguous windowed row allocates its whole
+    /// `window`-row ring on the first write, while a paged row reserves
+    /// `min(ceil(maxLength / pageSize), ringPageCount)` pages and never
+    /// commits the ring for a short request (PR#87 review).
+    /// Defaults to `CBv2ContiguousKVResidency` — the CONSERVATIVE policy, so
+    /// a backend that forgets to declare one over-charges and under-admits
+    /// rather than over-committing the device.
+    var kvResidency: any CBv2KVResidencyPolicy { get }
 }
 
 extension CBv2KVBackend {
     public var prefixReuseBackend: CBv2PrefixReuseBackend { .unknown }
     public var bytesReserved: Int { bytesInUse }
     public var requiresMaterializedSnapshots: Bool { false }
-    public var producesCompiledDecodeEligibleRows: Bool { false }
+    public var kvResidency: any CBv2KVResidencyPolicy { CBv2ContiguousKVResidency() }
     public func updateBytesCapacity(_ bytes: Int) {}
     public func makeSequenceState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
@@ -901,6 +892,46 @@ public func cbv2RequiredRecompute(layerKinds: [CBv2LayerKind], matched: Int) -> 
 
 // MARK: - Engine public API (what the provider binds to)
 
+/// Packed-prefill EVIDENCE: what the engine is allowed to do, and what it
+/// actually did.
+///
+/// `EngineLoopV2.executeMixed` coalesces equal-length text prompt chunks
+/// into one rectangular `[B > 1, chunk]` forward when BOTH capability gates
+/// agree (`CBv2LayerCacheProvider.supportsPackedPrefill` and
+/// `CBv2PackedPrefillSteppableModel.supportsPackedPrefill`). Those gates are
+/// CONFIGURATION: a model may claim rectangular safety and still never pack
+/// — one row per step, unequal chunk lengths, or span-bearing chunks all
+/// keep the per-request `[1, chunk]` path. `rowsExecuted` / `groupsExecuted`
+/// are the only fields that prove the path RAN; they are incremented at the
+/// packed forward itself and stay zero otherwise, whatever `isSupported`
+/// says. Callers gating a parity claim on packed prefill MUST read the
+/// counters, never `isSupported` alone.
+///
+/// MTP round steps never pack (their chunked prefills stay per-request), so
+/// the counters describe the plain-decode prefill path only.
+public struct CBv2PackedPrefillActivity: Sendable, Equatable {
+    /// Both gates answer true, so the engine MAY pack. Configuration.
+    public let isSupported: Bool
+    /// Cumulative prompt rows carried by a rectangular packed forward.
+    public let rowsExecuted: Int
+    /// Cumulative rectangular forwards issued; `rowsExecuted` counts the
+    /// rows inside them, so `rowsExecuted >= 2 * groupsExecuted`.
+    public let groupsExecuted: Int
+
+    public init(isSupported: Bool, rowsExecuted: Int, groupsExecuted: Int) {
+        self.isSupported = isSupported
+        self.rowsExecuted = rowsExecuted
+        self.groupsExecuted = groupsExecuted
+    }
+
+    /// The measured answer: at least one rectangular forward happened.
+    public var didExecute: Bool { groupsExecuted > 0 }
+
+    /// Fail-closed default for engines with no packed-prefill path.
+    public static let none = CBv2PackedPrefillActivity(
+        isSupported: false, rowsExecuted: 0, groupsExecuted: 0)
+}
+
 /// `Sendable`: engine handles cross concurrency domains by design (the
 /// provider submits from request tasks, cancels from disconnect handlers,
 /// and reads capacity from heartbeat timers). Implementations synchronize
@@ -914,6 +945,10 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
+    /// Packed-prefill capability AND cumulative execution evidence. Cheap
+    /// (plain counter reads); safe to poll from a benchmark harness or
+    /// heartbeat. Fail-closed default: `.none`.
+    func packedPrefillActivity() -> CBv2PackedPrefillActivity
     /// Update the engine's KV byte budget at runtime (multi-model
     /// co-residency re-slicing). Fans out to the admission ledger and the
     /// KV backend; safe from any thread. Shrink leaves in-flight
@@ -923,8 +958,213 @@ public protocol CBv2Engine: AnyObject, Sendable {
     func updateKVBytesCapacity(_ bytes: Int)
     /// Graceful drain: finish running requests, reject new submissions.
     func shutdown() async
+    /// Teacher-forced top-1 scoring: force `continuation` through the
+    /// engine and return the ARGMAX at each continuation position.
+    ///
+    /// Backend parity is what this exists for. Comparing two arms by FREE
+    /// RUNNING is only valid up to their first disagreement — past it each
+    /// arm is reading its own context and every later position compares two
+    /// unrelated conversations, so a harness can report a first-flip index
+    /// but must refuse to compute an agreement RATE. Under teacher forcing
+    /// both arms score position `i` against the IDENTICAL context
+    /// `promptTokens + continuation[0..<i]`, so agreement is a real rate
+    /// over `continuation.count` comparable positions, and the threshold
+    /// can come from a control arm instead of a chosen number.
+    ///
+    /// Contract: the engine MUST consume `continuation` through its normal
+    /// path — same caches, same chunking, same masks. Scoring positions
+    /// outside the engine measures the MODEL, and the model is the one
+    /// thing the two backends share. Argmax only (returning logits would
+    /// make this the logit-digest seam with extra steps), and deterministic
+    /// by construction: no sampler, no temperature, no top-k.
+    ///
+    /// Returns exactly `continuation.count` ids. `result[0]` is the argmax
+    /// after the prompt alone; `result[i]` the argmax once
+    /// `continuation[i - 1]` has been forced in. Forcing a continuation the
+    /// engine would itself have produced therefore returns it unchanged.
+    ///
+    /// Fail-closed default: throws `CBv2TeacherForcingError.unsupported`.
+    func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int]
+    /// Fingerprint of the FINAL-POSITION prefill logit vector for
+    /// `promptTokens`, taken on this engine's own prefill path.
+    ///
+    /// Backend parity is what this exists for. `submit` yields tokens, text
+    /// and top-k logprobs; a top-k slice cannot reconstruct a full vector,
+    /// and calling the model directly bypasses the engine — which is the
+    /// thing under test. So the digest is taken where the engine's prompt
+    /// frontier actually produces logits: same caches, same chunking, same
+    /// masks, same backend.
+    ///
+    /// A digest rather than the vector, because this keeps tensors out of
+    /// the protocol and is cheap enough to call once per arm: gemma-4's
+    /// vocabulary is 262,144, so returning the vector would be 512 KB per
+    /// call at fp16.
+    ///
+    /// Fail-closed default: throws `CBv2PrefillLogitDigestError.unsupported`.
+    func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest
+    /// Cumulative EVIDENCE that teacher-forced scoring drove real engine
+    /// forwards, not a shortcut that produced the same shape of answer.
+    /// Cheap (plain counter reads). Fail-closed default: `.none`.
+    func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity
 }
 
 extension CBv2Engine {
     public func updateKVBytesCapacity(_ bytes: Int) {}
+    /// An engine with no packed-prefill path reports neither capability nor
+    /// execution.
+    public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
+}
+
+// MARK: - Teacher-forced top-1 scoring (backend parity measurement)
+
+/// Rejections from `CBv2Engine.teacherForcedTop1(promptTokens:continuation:)`.
+///
+/// Every case is a REFUSAL to produce a number. A parity harness divides
+/// agreements by positions scored; a seam that answered `[]`, or scored a
+/// truncated range, or silently fell back to free running would hand it a
+/// rate that reads like a measurement and is not one. Scoring either ran
+/// end to end on the engine or it throws.
+public enum CBv2TeacherForcingError: Error, Equatable {
+    /// This engine has no teacher-forced scoring path. Thrown by the
+    /// fail-closed protocol default: an unimplemented seam must never be
+    /// mistaken for a measured 100% agreement.
+    case unsupported(engine: String)
+    /// Empty prompt or empty continuation — there are no positions to score.
+    case nothingToScore(promptTokens: Int, continuation: Int)
+    /// Other requests are live. Scoring is refused not because it would be
+    /// unsafe — the row is bound alone, so batch composition cannot reach
+    /// its arithmetic — but because it would not be COMPARABLE: a contended
+    /// pool seats the row on different pages, and storage order is exactly
+    /// the drift a parity harness is measuring. Score on a quiet engine or
+    /// do not score.
+    case engineBusy(scheduledRequests: Int)
+    /// The engine is shut down or draining: no forward will run.
+    case engineNotRunning
+}
+
+/// Teacher-forced scoring EXECUTION evidence — what the engine RAN, never
+/// what a caller asked for.
+///
+/// `teacherForcedTop1` returns `continuation.count` ids whatever produced
+/// them: the engine's own chunked prefill plus one forward per forced
+/// token, an offline batched scoring pass, or a reference implementation
+/// that never touched a KV page. Only the first measures the ENGINE, which
+/// is the one thing the two backends do not share. These counters move at
+/// the forwards themselves, so the identity a harness should assert across
+/// one call is exact:
+///
+/// ```
+/// after.decodeForwardsExecuted - before.decodeForwardsExecuted
+///     == continuation.count - 1
+/// ```
+///
+/// A shortcut leaves them flat while still returning a plausible rate.
+public struct CBv2TeacherForcedScoringActivity: Sendable, Equatable {
+    /// Cumulative prompt chunks driven through the engine's prefill seam.
+    public let prefillChunksExecuted: Int
+    /// Cumulative `[1, 1]` decode forwards issued for FORCED tokens. One
+    /// per continuation position except the last, whose logits would score
+    /// past the measured range.
+    public let decodeForwardsExecuted: Int
+
+    public init(prefillChunksExecuted: Int, decodeForwardsExecuted: Int) {
+        self.prefillChunksExecuted = prefillChunksExecuted
+        self.decodeForwardsExecuted = decodeForwardsExecuted
+    }
+
+    /// The measured answer: at least one prompt chunk really ran.
+    public var didExecute: Bool { prefillChunksExecuted > 0 }
+
+    /// Fail-closed default for engines with no teacher-forced path.
+    public static let none = CBv2TeacherForcedScoringActivity(
+        prefillChunksExecuted: 0, decodeForwardsExecuted: 0)
+}
+
+extension CBv2Engine {
+    /// Fail-closed: an engine with no teacher-forced scoring path REFUSES.
+    /// The alternative defaults are all worse than an error — `[]` divides
+    /// to a vacuous 100%, echoing `continuation` back reports perfect
+    /// agreement for two arms that were never run, and free running
+    /// reintroduces exactly the post-flip incomparability this seam exists
+    /// to remove. A capability that never executed must not be readable as
+    /// a measurement.
+    public func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int] {
+        throw CBv2TeacherForcingError.unsupported(engine: String(describing: type(of: self)))
+    }
+}
+
+extension CBv2Engine {
+    /// An engine with no teacher-forced scoring path reports no execution.
+    public func teacherForcedScoringActivity() -> CBv2TeacherForcedScoringActivity { .none }
+}
+
+// MARK: - Prefill logit digest (backend parity measurement)
+
+/// Fingerprint of ONE engine's final-position prefill logit vector.
+///
+/// `sha256` is over the RAW BYTES of that vector in the MODEL's dtype — no
+/// upcast, no rounding, no host-side renormalization. Two arms that agree
+/// here agreed bit-for-bit at the prompt frontier; two that disagree
+/// disagreed somewhere upstream of sampling, which is the half of a
+/// divergence a token stream cannot separate.
+///
+/// `dtype` is the RESOLVED dtype the digest was taken in, never a requested
+/// one: a bf16 model reporting `"float32"` would mean the seam upcast
+/// behind the caller's back and the hash describes something the engine
+/// never computed. `count` and `maxAbs` exist so a mismatch can be SIZED
+/// rather than merely flagged — a differing `count` is a vocabulary or
+/// shape defect, an order-of-magnitude `maxAbs` gap is a scale defect, and
+/// equal `count`/`maxAbs` with differing `sha256` is the numerical-drift
+/// case this whole gate was built to distinguish.
+public struct CBv2PrefillLogitDigest: Sendable, Equatable {
+    /// Resolved MLX dtype name of the digested vector ("bfloat16",
+    /// "float16", "float32", …). Reported, never requested.
+    public let dtype: String
+    /// Elements in the digested vector — the model's vocabulary size.
+    public let count: Int
+    /// Lowercase hex SHA-256 over `count * itemSize` raw bytes.
+    public let sha256: String
+    /// max(|logit|) over the vector, read in fp32 (a widening conversion
+    /// from every supported dtype, so this loses nothing).
+    public let maxAbs: Float
+
+    public init(dtype: String, count: Int, sha256: String, maxAbs: Float) {
+        self.dtype = dtype
+        self.count = count
+        self.sha256 = sha256
+        self.maxAbs = maxAbs
+    }
+}
+
+/// Rejections from `CBv2Engine.prefillLogitDigest(_:)`.
+///
+/// Every case is a REFUSAL to produce a digest. A fabricated one — the hash
+/// of an empty buffer, of a zero vector, of a re-run outside the engine —
+/// would compare EQUAL across two arms and read as parity. The digest was
+/// taken on the engine's prefill path or this throws.
+public enum CBv2PrefillLogitDigestError: Error, Equatable {
+    /// This engine has no prefill-digest path. Thrown by the fail-closed
+    /// protocol default.
+    case unsupported(engine: String)
+    /// No prompt, so no frontier position exists to digest.
+    case emptyPrompt
+    /// The probe prefill never reached a sampled prompt frontier within
+    /// `seconds` — a wedged step, a rejected admission, or a cancelled row.
+    /// No digest is invented for it.
+    case prefillProducedNoLogits(seconds: Double)
+    /// The frontier handed back something that is not a single logit
+    /// vector. Hashing it anyway would produce a stable, comparable, wrong
+    /// answer.
+    case unexpectedLogitShape([Int])
+}
+
+extension CBv2Engine {
+    /// Fail-closed: an engine with no prefill-digest path REFUSES. Every
+    /// alternative default is worse than an error — a digest of nothing is
+    /// still a digest, and two engines that both fabricated one compare
+    /// EQUAL, which is precisely the false PASS this seam replaces.
+    public func prefillLogitDigest(_ promptTokens: [Int]) throws -> CBv2PrefillLogitDigest {
+        throw CBv2PrefillLogitDigestError.unsupported(
+            engine: String(describing: type(of: self)))
+    }
 }

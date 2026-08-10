@@ -44,8 +44,7 @@ final class CBv2KVResizeTests: XCTestCase {
             sampler: CBv2DefaultSampler(fallbackSeed: 7),
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: 4, maxBatchedTokensPerStep: 256,
-                prefillChunkSize: 16, maxWaiting: maxWaiting),
-            compiledDecodeConfig: CBv2CompiledDecodeConfig(enabled: false))
+                prefillChunkSize: 16, maxWaiting: maxWaiting))
         return Stack(engine: engine, backend: backend, admission: engine.admissionForTesting)
     }
 

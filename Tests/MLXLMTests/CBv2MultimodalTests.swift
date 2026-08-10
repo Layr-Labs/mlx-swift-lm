@@ -351,7 +351,6 @@ final class CBv2PackedSpanTestCacheProvider:
         self.packedSpanClaim = packedSpanClaim
     }
 
-    var uniformAttentionSoftcap: Float?? { bank.uniformAttentionSoftcap }
     var supportsMultimodalSpans: Bool { bank.supportsMultimodalSpans }
     var supportsPackedPrefill: Bool { bank.supportsPackedPrefill }
     var supportsPackedMultimodalSpans: Bool {
@@ -1286,7 +1285,6 @@ private final class CBv2PlainSteppable: CBv2SteppableModel {
 
 /// A layer-cache provider whose caches cannot bind span contexts.
 private final class CBv2NonSpanCacheProvider: CBv2LayerCacheProvider {
-    var uniformAttentionSoftcap: Float?? { .some(nil) }
     // supportsMultimodalSpans defaults to false.
     func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] { [] }
 }

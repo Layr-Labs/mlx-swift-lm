@@ -101,8 +101,17 @@ func gemma4SupportsProductionExpertTopology(_ config: Gemma4TextConfiguration) -
 /// group size are declared on the checkpoint; the remaining selector
 /// conditions (affine mode, dtypes, contiguity, assignment count, AOT
 /// metallib, NAX precedence) are dispatch-time facts MLX reports separately.
+func gemma4HasExpertQuantizationOverrides(
+    _ quantization: BaseConfiguration.PerLayerQuantization?
+) -> Bool {
+    quantization?.perLayerQuantization.keys.contains { path in
+        path.split(separator: ".").contains("experts")
+    } ?? false
+}
+
 func gemma4SupportsSafeExpertQMMQuantization(_ config: Gemma4TextConfiguration) -> Bool {
     config.quantizationBits == 4 && config.quantizationGroupSize == 64
+        && !config.hasExpertQuantizationOverrides
 }
 
 /// Direct weighted unsort and the safe expert-QMM (R1) kernel are one measured
@@ -220,6 +229,31 @@ struct Gemma4WeightQuantizationMetadata: Codable, Sendable {
     }
 }
 
+private struct Gemma4WeightQuantizationConfiguration: Encodable {
+    let fallback: Gemma4WeightQuantizationMetadata
+    let overrides: [String: BaseConfiguration.QuantizationOption]
+
+    private struct DynamicKey: CodingKey {
+        let stringValue: String
+        let intValue: Int? = nil
+        init(stringValue: String) { self.stringValue = stringValue }
+        init(intValue: Int) { self.stringValue = "\(intValue)" }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try fallback.encode(to: encoder)
+        var container = encoder.container(keyedBy: DynamicKey.self)
+        for (path, option) in overrides {
+            switch option {
+            case .skip:
+                try container.encode(false, forKey: DynamicKey(stringValue: path))
+            case .quantize(let quantization):
+                try container.encode(quantization, forKey: DynamicKey(stringValue: path))
+            }
+        }
+    }
+}
+
 /// Default profile used while decoding Gemma4 text configuration. Direct
 /// language-model checkpoints and nested VLM checkpoints historically shipped
 /// different omission semantics; selecting the profile at the decoder boundary
@@ -255,6 +289,14 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     public internal(set) var tieWordEmbeddings: Bool = true
     public internal(set) var quantizationBits: Int?
     public internal(set) var quantizationGroupSize: Int?
+    public internal(set) var perLayerQuantization: BaseConfiguration.PerLayerQuantization?
+    /// Any explicit expert-path quantization entry makes the coupled
+    /// weighted-unsort/R1 optimization fail closed. The runtime quantizer
+    /// resolves these entries per module, so global bits/group size alone is
+    /// not proof that every expert projection reaches safe R1.
+    public var hasExpertQuantizationOverrides: Bool {
+        gemma4HasExpertQuantizationOverrides(perLayerQuantization)
+    }
 
     // MoE (only set on the 26B-A4B variant; 2B/4B/31B are dense)
     public internal(set) var enableMoeBlock: Bool = false
@@ -359,10 +401,17 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
 
         if quantizationBits != nil || quantizationGroupSize != nil {
             var qc = encoder.container(keyedBy: QuantizationCodingKeys.self)
-            try qc.encode(
-                Gemma4WeightQuantizationMetadata(
-                    bits: quantizationBits, groupSize: quantizationGroupSize),
-                forKey: .quantization)
+            let metadata = Gemma4WeightQuantizationMetadata(
+                bits: quantizationBits, groupSize: quantizationGroupSize)
+            if let perLayerQuantization {
+                try qc.encode(
+                    Gemma4WeightQuantizationConfiguration(
+                        fallback: metadata,
+                        overrides: perLayerQuantization.perLayerQuantization),
+                    forKey: .quantization)
+            } else {
+                try qc.encode(metadata, forKey: .quantization)
+            }
         }
     }
 
@@ -376,6 +425,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     ) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let quantizationContainer = try decoder.container(keyedBy: QuantizationCodingKeys.self)
+        let baseConfiguration = try? BaseConfiguration(from: decoder)
+        let perLayerQuantization = baseConfiguration?.perLayerQuantization
         let compatibilityContainer = try decoder.container(
             keyedBy: VLMCompatibilityCodingKeys.self)
         let isVLM = defaults == .visionLanguageModel
@@ -484,7 +535,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
                         repeating: "sliding_attention",
                         count: numHiddenLayers - decoded.count)
             } else {
-                self.layerTypes = decoded
+                self.layerTypes = Array(decoded.prefix(numHiddenLayers))
             }
         } else if isVLM {
             // The same VLM fallback applies when the key is absent.
@@ -511,6 +562,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
                 Gemma4WeightQuantizationMetadata.self, forKey: .quantizationConfig)
         self.quantizationBits = quantization?.bits
         self.quantizationGroupSize = quantization?.groupSize
+        self.perLayerQuantization = perLayerQuantization
         self.ropeParameters =
             try container.decodeIfPresent(
                 [String: [String: StringOrNumber]].self, forKey: .ropeParameters)
@@ -548,6 +600,24 @@ extension Gemma4TextConfiguration {
         guard let quantization else { return }
         quantizationBits = quantization.bits
         quantizationGroupSize = quantization.groupSize
+        if var effective = perLayerQuantization {
+            effective.quantization = quantization
+            perLayerQuantization = effective
+        }
+    }
+
+    /// Overlay the effective root mixed-precision map used by the model
+    /// loader. Expert-path entries make the coupled optimization fail closed,
+    /// even when the root default remains nominally 4-bit/group-64.
+    public mutating func mergeQuantization(
+        _ quantization: BaseConfiguration.PerLayerQuantization?
+    ) {
+        guard let quantization else { return }
+        if let fallback = quantization.quantization {
+            quantizationBits = fallback.bits
+            quantizationGroupSize = fallback.groupSize
+        }
+        perLayerQuantization = quantization
     }
 }
 
@@ -1467,9 +1537,17 @@ public class Gemma4TextModelInner: Module {
     ) -> MLXArray {
         // Callers may hand rank-1 token ids ([N] on cache-reuse turns, e.g.
         // the deprecated TokenIterator API) — the deleted inline VLM twin
-        // normalized them before any dimension read. Expand first so both
-        // `inputs.dim(1)` below and the trunk see [1, N].
-        let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        // normalized the whole multimodal tuple before any dimension read.
+        // Expand tokens, supplied embeddings, and the visual mask together
+        // so they continue to agree on [B, L].
+        let rankOneInputs = inputs.ndim == 1
+        let inputs = rankOneInputs ? inputs.expandedDimensions(axis: 0) : inputs
+        let inputEmbedding =
+            rankOneInputs && inputEmbedding?.ndim == 2
+            ? inputEmbedding?.expandedDimensions(axis: 0) : inputEmbedding
+        let imageTokenMask =
+            rankOneInputs && imageTokenMask?.ndim == 1
+            ? imageTokenMask?.expandedDimensions(axis: 0) : imageTokenMask
         return forwardTrunk(
             inputs, cache: cache, captureHook: captureHook, capturePreNorm: false,
             inputEmbedding: inputEmbedding, imageTokenMask: imageTokenMask,
@@ -1748,12 +1826,23 @@ private func gemma4TextOverlayBidirectionalVision(
 /// Symmetrize the materialized causal/windowed mask for
 /// `use_bidirectional_attention == "all"`. Global layers become fully
 /// bidirectional; sliding layers remain bounded by their symmetric window.
-private func gemma4TextSymmetrizeMask(
+func gemma4TextSymmetrizeMask(
     _ mode: MLXFast.ScaledDotProductAttentionMaskMode
 ) -> MLXFast.ScaledDotProductAttentionMaskMode {
     switch mode {
     case .array(let maskArray):
-        return .array(logicalOr(maskArray, maskArray.swappedAxes(-1, -2)))
+        let queryCount = maskArray.dim(-2)
+        let keyCount = maskArray.dim(-1)
+        guard keyCount >= queryCount else { return mode }
+        let prefixCount = keyCount - queryCount
+        let current = maskArray[.ellipsis, prefixCount...]
+        let symmetricCurrent = logicalOr(current, current.swappedAxes(-1, -2))
+        guard prefixCount > 0 else { return .array(symmetricCurrent) }
+        // Cached columns already describe the exact visible prefix for every
+        // current query. Only the trailing current-query square has a valid
+        // transpose; keep the rectangular prefix unchanged.
+        return .array(concatenated(
+            [maskArray[.ellipsis, ..<prefixCount], symmetricCurrent], axis: -1))
     default:
         return mode
     }
@@ -1982,7 +2071,8 @@ extension Gemma4TextConfiguration {
             globalHeadDim: globalHeadDim,
             numAttentionHeads: numAttentionHeads,
             numKeyValueHeads: numKeyValueHeads,
-            numGlobalKeyValueHeads: numGlobalKeyValueHeads
+            numGlobalKeyValueHeads: numGlobalKeyValueHeads,
+            isBidirectional: useBidirectionalAttention == "all"
         )
     }
 }

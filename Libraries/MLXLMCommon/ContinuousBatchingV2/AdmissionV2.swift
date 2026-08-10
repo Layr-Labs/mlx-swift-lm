@@ -57,6 +57,65 @@ extension CBv2StepCapacity {
     }
 }
 
+// MARK: - Backend storage policy
+
+/// How many token ROWS of ONE layer's KV a backend actually occupies once a
+/// sequence is bounded by `tokens` tokens. `AdmissionV2` multiplies these
+/// rows by that layer's per-token byte cost, so the ledger charges what the
+/// backend will really allocate instead of a figure inferred from the layer
+/// kind alone.
+///
+/// The shipped policies differ exactly where the fixed-ring charge is right
+/// and where it is wrong:
+///
+/// * CONTIGUOUS — `CBv2WindowedSequenceKV.allocateIfNeeded` allocates
+///   `MLXArray.zeros([1, kvHeads, window, headDim])` on the FIRST write, so
+///   a windowed layer occupies its whole ring from token one. Charging only
+///   `min(tokens, window)` hid ~0.9 GB of overshoot at B=8 on Gemma-style
+///   hybrids (PR#87).
+/// * PAGED — `PagedKVPool.pageDemand` reserves
+///   `min(ceil(tokens / pageSize), ringPageCount(window))` pages, so a short
+///   row holds a handful of pages and NEVER the whole ring. Charging the
+///   whole ring there rejects requests the pool can serve: a one-token
+///   request needs ONE page, not 1,024 window rows (PR#87 review).
+///
+/// The backend answers for itself — admission never switches on a backend
+/// enum, because the knowledge belongs where the allocation happens.
+public protocol CBv2KVResidencyPolicy: Sendable {
+    /// nil when the figure cannot be represented in `Int`; admission then
+    /// fails cold instead of admitting on wrapped arithmetic.
+    func residentRows(layer kind: CBv2LayerKind, tokens: Int) -> Int?
+    /// Rows are handed out in multiples of this (1 for per-token contiguous
+    /// arrays, `pageSize` for paged). The conservative headroom probe rounds
+    /// its token count up to this so a decode step that crosses a page
+    /// boundary is never counted as costing a single row.
+    var rowGranularity: Int { get }
+}
+
+extension CBv2KVResidencyPolicy {
+    public var rowGranularity: Int { 1 }
+}
+
+/// Per-sequence contiguous arrays (`CBv2ContiguousKVBackend`): full layers
+/// grow with the sequence; windowed layers allocate their whole `window`-row
+/// ring on the first write and never grow again.
+///
+/// This is also the DEFAULT for any backend that does not declare a policy,
+/// deliberately: it is the CONSERVATIVE one. A backend that forgets to
+/// implement `kvResidency` over-charges its windowed rows and under-admits,
+/// which costs throughput — never the reverse, which costs the process.
+public struct CBv2ContiguousKVResidency: CBv2KVResidencyPolicy {
+    public init() {}
+
+    public func residentRows(layer kind: CBv2LayerKind, tokens: Int) -> Int? {
+        guard tokens >= 0 else { return nil }
+        switch kind.attention {
+        case .full: return tokens
+        case .slidingWindow(let window): return max(0, window)
+        }
+    }
+}
+
 // MARK: - AdmissionV2
 
 /// Byte-ledger admission controller. Thread-safe: `canEverFit` runs on the
@@ -66,6 +125,24 @@ extension CBv2StepCapacity {
 /// (`sharesKVWithLayer != nil`) own no bytes; sliding-window layers plateau
 /// at `window` tokens — so a long-context request on Gemma-style hybrids is
 /// charged truthfully, not as if every layer were full-attention.
+///
+/// The LEDGER charges `allocatedBytes(forTokens:)`, NOT
+/// `estimatedBytes(forTokens:)`: occupancy, not retained content. What a
+/// row OCCUPIES is a property of the BACKEND, so the conversion runs
+/// through the `CBv2KVResidencyPolicy` the backend hands `EngineV2` — the
+/// ledger never guesses from the layer kind alone.
+///
+/// * Contiguous rows allocate a fixed `window`-row ring on the FIRST write
+///   (`CBv2WindowedSequenceKV.allocateIfNeeded`) instead of growing with
+///   the sequence, so a 500-token request against a 1024 window occupies
+///   the whole ring the moment it is touched. Charging only the retained
+///   tokens left the gate believing it had margin it did not have (~0.9 GB
+///   of hidden overshoot at B=8 on Gemma-style hybrids), and on unified
+///   memory that surfaces as swap pressure, not a clean rejection (PR#87).
+/// * Paged rows do NOT commit a ring: `PagedKVPool.pageDemand` caps the
+///   reservation at `min(ceil(tokens / pageSize), ringPageCount)` pages.
+///   Charging them the whole ring made `canEverFit` and the step ledger
+///   reject short requests the pool can serve (PR#87 review).
 public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public struct Config: Sendable {
         /// Fraction of capacity kept free as the optimism watermark.
@@ -137,17 +214,28 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// tighter than the hardware truth (PR#62 review). Lock-protected.
     private var externalReserveBytes: Int
 
-    /// Cumulative reserved tokens per request (window capping is applied when
-    /// converting to bytes, so decode reservations past a layer's window add
-    /// zero bytes for that layer).
+    /// Backend storage policy: how many rows of each layer a row of this
+    /// engine's backend really occupies. Immutable — a live engine never
+    /// swaps backends.
+    private let residency: any CBv2KVResidencyPolicy
+
+    /// Cumulative reserved tokens per request. Under the CONTIGUOUS policy
+    /// the token→byte conversion charges every windowed layer its whole
+    /// fixed ring once, so decode reservations past a layer's window add
+    /// zero bytes for that layer — and so do reservations below it, the
+    /// ring being already paid. Under the PAGED policy the same conversion
+    /// charges page-capped rows, so short rows stay cheap and the charge
+    /// plateaus at the ring instead of starting there.
     private var reservedTokens: [CBv2RequestID: Int] = [:]
     private var reservedExactBytes: [CBv2RequestID: Int] = [:]
     private var ledgerBytes = 0
 
     public init(
         layerKinds: [CBv2LayerKind], bytesCapacity: Int, config: Config = .init(),
+        residency: any CBv2KVResidencyPolicy = CBv2ContiguousKVResidency(),
         externalReserveBytes: Int = 0
     ) {
+        self.residency = residency
         self.layerKinds = layerKinds
         self._bytesCapacity = bytesCapacity
         self.externalReserveBytes = max(0, externalReserveBytes)
@@ -191,7 +279,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     // MARK: Estimation
 
-    /// KV bytes retained after processing `tokens` tokens of one sequence.
+    /// KV bytes whose CONTENT is retained after processing `tokens` tokens
+    /// of one sequence (windowed layers cap at their window). This is NOT
+    /// what a sequence occupies — see `allocatedBytes(forTokens:)`, the
+    /// figure the ledger charges.
     public func estimatedBytes(forTokens tokens: Int) -> Int {
         estimatedBytesChecked(forTokens: tokens) ?? Int.max
     }
@@ -217,14 +308,31 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         return total
     }
 
-    /// Bytes needed to materialize every fixed sliding ring beyond what a
-    /// token reservation at `tokens` already charges. Adoption allocates full
-    /// rings immediately even when replay starts before the window fills.
+    /// Bytes the BACKEND occupies at `tokens` beyond the content
+    /// `estimatedBytes(forTokens:)` retains. `allocatedBytesChecked` folds
+    /// this into every ledger charge, which is why no caller adds it a
+    /// second time. nil on accounting overflow.
+    ///
+    /// Under the contiguous policy this is exactly the still-unfilled
+    /// remainder of every fixed sliding ring — the windowed rows allocate
+    /// the whole ring on first write, so the gap is real occupancy from the
+    /// first token onward, and the name is literal. Under the paged policy
+    /// there is no fixed ring to fill: the gap is the page-granularity
+    /// remainder of `PagedKVPool.pageDemand`, which for a short row is a
+    /// page or two rather than a whole window.
     public func fixedWindowBytesShortfall(afterReservingTokens tokens: Int) -> Int? {
         var total = 0
+        let held = max(0, tokens)
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
-            guard case .slidingWindow(let window) = kind.attention else { continue }
-            let missing = max(0, window - max(0, tokens))
+            let retained: Int
+            switch kind.attention {
+            case .full: retained = held
+            case .slidingWindow(let window): retained = max(0, min(held, window))
+            }
+            guard let occupied = residency.residentRows(layer: kind, tokens: held),
+                occupied >= 0
+            else { return nil }
+            let missing = max(0, occupied - retained)
             guard
                 let perTokenBytes = Self.storageBytesPerToken(
                     kind: kind,
@@ -234,6 +342,25 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             else { return nil }
             total = newTotal
         }
+        return total
+    }
+
+    /// KV bytes a sequence OCCUPIES once it has processed `tokens` tokens:
+    /// retained content plus whatever the backend holds on top of it. This
+    /// is what the ledger charges and what the backend actually allocates —
+    /// a contiguous windowed layer costs its whole `window`-row ring from
+    /// the first token, while the same layer on the paged backend costs
+    /// `min(ceil(tokens / pageSize), ringPageCount)` pages.
+    public func allocatedBytes(forTokens tokens: Int) -> Int {
+        allocatedBytesChecked(forTokens: tokens) ?? Int.max
+    }
+
+    private func allocatedBytesChecked(forTokens tokens: Int) -> Int? {
+        guard tokens > 0 else { return 0 }
+        guard let retained = estimatedBytesChecked(forTokens: tokens),
+            let ringShortfall = fixedWindowBytesShortfall(afterReservingTokens: tokens),
+            let total = Self.add(retained, ringShortfall)
+        else { return nil }
         return total
     }
 
@@ -294,10 +421,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// watermark-adjusted capacity (`admissibleBytesCapacity` — the most
     /// `reserve` will ever grant). Requests that could never fit are
     /// rejected up front; requests that fit only sometimes are admitted
-    /// optimistically and preempted if optimism loses.
+    /// optimistically and preempted if optimism loses. Judged on OCCUPANCY
+    /// (fixed sliding rings included), so the gate agrees with both what
+    /// `reserve` charges and what the backend allocates.
     public func canEverFit(promptTokens: Int, maxTokens: Int) -> Bool {
         let (tokens, overflow) = promptTokens.addingReportingOverflow(max(maxTokens, 0))
-        guard !overflow, let bytes = estimatedBytesChecked(forTokens: tokens) else {
+        guard !overflow, let bytes = allocatedBytesChecked(forTokens: tokens) else {
             return false
         }
         return bytes <= admissibleBytesCapacity
@@ -322,8 +451,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let oldExact = reservedExactBytes[id] ?? 0
         let (newExact, exactOverflow) = oldExact.addingReportingOverflow(additionalBytes)
         guard !tokenCountOverflow, !exactOverflow,
-            let oldTokenBytes = estimatedBytesChecked(forTokens: old),
-            let newTokenBytes = estimatedBytesChecked(forTokens: new)
+            let oldTokenBytes = allocatedBytesChecked(forTokens: old),
+            let newTokenBytes = allocatedBytesChecked(forTokens: new)
         else {
             throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
         }
@@ -358,7 +487,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let new = max(0, old - tokens)
         let oldExact = reservedExactBytes[id] ?? 0
         let newExact = max(0, oldExact - bytes)
-        ledgerBytes += estimatedBytes(forTokens: new) - estimatedBytes(forTokens: old)
+        ledgerBytes += allocatedBytes(forTokens: new) - allocatedBytes(forTokens: old)
             + newExact - oldExact
         if new == 0 {
             reservedTokens.removeValue(forKey: id)
@@ -377,19 +506,31 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         defer { lock.unlock() }
         guard let old = reservedTokens.removeValue(forKey: id) else { return }
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
-        ledgerBytes -= estimatedBytes(forTokens: old) + exact
+        ledgerBytes -= allocatedBytes(forTokens: old) + exact
     }
 
     /// Conservative (window caps ignored): may under-report headroom, which
-    /// only breaks a decode chain — never over-admits.
+    /// only breaks a decode chain — never over-admits. The token count is
+    /// first rounded UP to the backend's row granularity, so on a paged
+    /// backend a single decode token that crosses a page boundary is priced
+    /// as the whole page it can cost, not as one row.
     public func hasHeadroom(additionalTokens: Int) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard additionalTokens >= 0,
-            let additionalBytes = Self.multiply(additionalTokens, maxPerTokenBytes),
+            let chargedTokens = Self.roundUp(additionalTokens, to: residency.rowGranularity),
+            let additionalBytes = Self.multiply(chargedTokens, maxPerTokenBytes),
             let after = Self.add(ledgerBytes, additionalBytes)
         else { return false }
         return after <= reserveCeiling
+    }
+
+    /// Smallest multiple of `granularity` at or above `value`; nil on
+    /// overflow. A non-positive granularity means "no rounding".
+    private static func roundUp(_ value: Int, to granularity: Int) -> Int? {
+        guard granularity > 1 else { return value }
+        guard let bumped = add(value, granularity - 1) else { return nil }
+        return (bumped / granularity) * granularity
     }
 
     private static func storageBytesPerToken(

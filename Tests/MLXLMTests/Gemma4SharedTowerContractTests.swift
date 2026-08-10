@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 
 @testable import MLXLMCommon
 import MLXNN
@@ -93,6 +94,28 @@ struct Gemma4SharedTowerContractTests {
         #expect(allClose(singleton.postNorm, batched.postNorm, rtol: 0, atol: 0).item(Bool.self))
     }
 
+    @Test("rank-1 multimodal tuple normalizes tokens, embeddings, and mask")
+    func rankOneMultimodalNormalization() throws {
+        let config = try tinyConfig(extraFields: [
+            "\"use_bidirectional_attention\": \"vision\"",
+        ])
+        let model = tinyModel(config)
+        let ids = MLXArray([Int32(3), 5, 7, 11])
+        let batchedIDs = ids.expandedDimensions(axis: 0)
+        let embedding = model.scaledInputEmbeddings(ids)
+        let batchedEmbedding = embedding.expandedDimensions(axis: 0)
+        let mask = MLXArray([false, true, true, false])
+
+        let rankOne = model(
+            ids, inputEmbedding: embedding, cache: nil, imageTokenMask: mask)
+        let batched = model(
+            batchedIDs, inputEmbedding: batchedEmbedding, cache: nil,
+            imageTokenMask: mask.expandedDimensions(axis: 0))
+        eval(rankOne, batched)
+        #expect(rankOne.shape == batched.shape)
+        #expect(allClose(rankOne, batched, rtol: 0, atol: 0).item(Bool.self))
+    }
+
     // MARK: F3 — global KV heads independent of k_eq_v
 
     /// A full-attention layer with `num_global_key_value_heads` different from
@@ -170,6 +193,61 @@ struct Gemma4SharedTowerContractTests {
         let empty = try tinyConfig(extraFields: ["\"layer_types\": []"])
         #expect(empty.layerTypes == ["sliding_attention", "sliding_attention"])
         _ = tinyModel(empty)
+    }
+
+    @Test("oversized layer_types is truncated to the declared layer count")
+    func oversizedLayerTypesNormalized() throws {
+        let config = try tinyConfig(extraFields: [
+            "\"layer_types\": [\"full_attention\", \"sliding_attention\", \"full_attention\"]",
+        ])
+        #expect(config.layerTypes == ["full_attention", "sliding_attention"])
+        #expect(config.cbv2LayerKinds.count == config.numHiddenLayers)
+        _ = tinyModel(config)
+    }
+
+    @Test("all-mode rectangular masks preserve cached columns")
+    func rectangularAllModeMaskSymmetrization() throws {
+        let base = MLXArray([
+            false, true, true, false,
+            false, false, true, true,
+        ]).reshaped(1, 1, 2, 4)
+        let mode = gemma4TextSymmetrizeMask(.array(base))
+        guard case .array(let result) = mode else {
+            Issue.record("all-mode mask was not materialized")
+            return
+        }
+        let expected = MLXArray([
+            false, true, true, true,
+            false, false, true, true,
+        ]).reshaped(1, 1, 2, 4)
+        eval(result, expected)
+        #expect(result.shape == [1, 1, 2, 4])
+        #expect(allClose(result.asType(.int32), expected.asType(.int32)).item(Bool.self))
+    }
+
+    @Test("all-mode CBv2 prefill matches the legacy shared tower")
+    func allModeCBv2PrefillParity() throws {
+        let config = try tinyConfig(extraFields: [
+            "\"use_bidirectional_attention\": \"all\"",
+        ])
+        let model = tinyModel(config)
+        let tokens = MLXArray([Int32(3), 5, 7, 11]).reshaped(1, 4)
+        let legacy = model(tokens, cache: nil as [KVCache]?)
+
+        let kinds = config.cbv2LayerKinds
+        #expect(kinds.map(\.isBidirectional) == [true, true])
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20))
+        let state = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 4, maxLength: 8)
+        let caches = model.newCacheV2 { index, kind in
+            CBv2LayerCache(
+                layerIndex: index, kind: kind,
+                rows: kind.sharesKVWithLayer == nil ? [state[index]!] : [])
+        }
+        let cbv2 = model(tokens, cache: caches.map { $0 as! any KVCache })
+        eval(legacy, cbv2)
+        #expect(legacy.shape == cbv2.shape)
+        #expect(allClose(legacy, cbv2, rtol: 1e-5, atol: 1e-5).item(Bool.self))
     }
 
     // MARK: Full-layer RoPE construction (disclosed divergence from the

@@ -44,6 +44,13 @@ struct PagedAttentionKernelKey: Hashable {
     var simdgroups: Int
     var hasSinks: Bool
     var hasSoftcap: Bool
+    /// Tokens per flash-decoding partition (the shader's PTOK). Adaptive —
+    /// see `PagedAttentionKernel.partitionTokens(for:)` — so it MUST be part
+    /// of the variant identity: MLX's custom-kernel library cache is keyed
+    /// by kernel NAME and re-JITs whenever a name's generated source
+    /// changes, so two PTOKs sharing a name would thrash the pipeline cache
+    /// on every batch-shape change.
+    var partitionTokens: Int
     /// Pass A only: fuse the decode KV write into the kernel.
     var hasWrite: Bool = false
 
@@ -62,7 +69,8 @@ struct PagedAttentionKernelKey: Hashable {
         case .write: p = "write"
         }
         return "cbv2_paged_\(p)_\(d)_d\(headDim)_s\(pageSize)_g\(gqa)"
-            + "_n\(simdgroups)_sink\(hasSinks ? 1 : 0)_cap\(hasSoftcap ? 1 : 0)"
+            + "_n\(simdgroups)_t\(partitionTokens)"
+            + "_sink\(hasSinks ? 1 : 0)_cap\(hasSoftcap ? 1 : 0)"
             + (hasWrite ? "_w1" : "")
     }
 }
@@ -150,12 +158,210 @@ public enum PagedAttentionKernel {
     /// (headDim 512, GQA 8) run split 2-heads-per-threadgroup.
     public static let supportedHeadDims: Set<Int> = [64, 128, 256, 512]
 
-    /// Tokens per flash-decoding partition. Must be a multiple of the page
-    /// size. 256 gives ceil(len/256) partitions per (row, kv head) —
-    /// enough threadgroups to saturate the GPU at B=1 (the per-token online
-    /// softmax is ALU-serialized within a simdgroup, so parallelism comes
-    /// from partition count) without bloating the partial buffers.
+    /// Tokens per flash-decoding partition — the MAXIMUM, and the value the
+    /// sizer returns whenever the GPU is already saturated. Must be a
+    /// multiple of the page size; the pool refuses a page size that does
+    /// not divide it (`PagedKVPool.init`).
+    ///
+    /// 256 keeps the partial buffers small, but it is the wrong choice at
+    /// short context and small batch: see `partitionTokensForDispatch`.
     public static let partitionTokens = 256
+
+    /// The ONLY partition lengths the sizer may return, ascending.
+    ///
+    /// The sizer is deliberately quantised to a three-rung ladder rather
+    /// than returning any page multiple in `[64, 256]`. PTOK is a kernel
+    /// TEMPLATE parameter, so every distinct value is a distinct compiled
+    /// variant with its own name and its own JIT
+    /// (`PagedAttentionKernelKey`). A continuous sizer would mint a new
+    /// variant per context bucket per layer shape and defeat
+    /// `PagedAttentionKernelSmoke.runtimeSmoke`, whose whole job is that
+    /// traffic never pays compilation. Three rungs bound the decode variant
+    /// set at 3x per shape, and the occupancy win is coarse — 4x more
+    /// threadgroups — so nothing is lost by not resolving 80 from 96.
+    ///
+    /// The bottom rung is the floor: below it the partial buffers and the
+    /// merge pass grow faster than the extra occupancy pays back, and a
+    /// threadgroup has too few tokens to amortise staging its query into
+    /// threadgroup memory. The top rung is `partitionTokens`.
+    ///
+    /// Every rung must divide evenly into pages for the page sizes the pool
+    /// admits; rungs that do not are filtered per dispatch.
+    public static let partitionTokenLadder = [64, 128, 256]
+
+    /// Floor for the adaptive sizer — the ladder's bottom rung. DERIVED, so
+    /// that changing the ladder cannot leave a stale floor behind.
+    public static var minPartitionTokens: Int { partitionTokenLadder[0] }
+
+    /// Pass-A threadgroups the sizer aims to launch.
+    ///
+    /// WS-6.4. Pass A launches `kvHeads * (gqa / hpt) * batch *
+    /// ceil(len / PTOK)` threadgroups. At GPT-OSS decode shapes (8 kv
+    /// heads, GQA 8, hpt 8 so no split) with B == 1 and a 512-token
+    /// context that is `8 * 1 * 2 == 16` threadgroups — on a 40-core GPU,
+    /// under half the machine, and it is why paged trails contiguous at
+    /// B == 1 (88.5 vs 101.8 tok/s) while matching it at B >= 4. Sizing
+    /// PTOK down multiplies the partition count until the machine is full.
+    ///
+    /// MEASURED, M4 Max (40-core GPU), GPT-OSS decode shape, us/dispatch,
+    /// `partitionSizingBenchmark` with `TARGET=0` as the baseline column:
+    ///
+    ///     B=1 ctx  256   369 / 385  ->  303 / 310 / 348   (PTOK 64)
+    ///     B=1 ctx  512   378 / 394  ->  306 / 331 / 336   (PTOK 64)
+    ///     B=1 ctx 1024   381 / 384  ->  292 / 349 / 393   (PTOK 64)
+    ///     B=2 ctx  512   378 / 375  ->  318              (PTOK 64)
+    ///
+    /// 128 is chosen to be the LEAST aggressive value that captures this.
+    /// It moves PTOK only for B == 1 and B == 2 at short context — every
+    /// other operating point, including B == 1 at ctx 4096 and all of
+    /// B >= 4, still dispatches at PTOK 256 and is bit-identical to the
+    /// pre-WS-6.4 behaviour.
+    ///
+    /// Larger targets looked better still in one sweep (`TARGET=512` took
+    /// B=1 ctx 4096 from 511 to 304 us by dropping to PTOK 64), but that
+    /// did NOT reproduce: repeat runs of the identical configuration
+    /// measured 511 and 1386 us. The box was running ~30 concurrent build
+    /// and test processes, so anything outside the short-context regime is
+    /// below the noise floor and is deliberately NOT claimed. Retune on a
+    /// quiet machine via the env knob before widening the default.
+    ///
+    /// `DARKBLOOM_CBV2_PAGED_PTOK_TARGET=0` disables adaptation and pins
+    /// PTOK to `partitionTokens` — the pre-WS-6.4 behaviour, and the kill
+    /// switch. Values above `partitionTargetLimit` are CLAMPED, not
+    /// rejected.
+    public static let partitionTargetThreadgroups: Int = partitionTarget(
+        environment: ProcessInfo.processInfo.environment)
+
+    /// Environment variable backing `partitionTargetThreadgroups`.
+    static let partitionTargetEnvironmentKey = "DARKBLOOM_CBV2_PAGED_PTOK_TARGET"
+
+    /// Target used when the knob is unset or unparseable.
+    ///
+    /// DEFAULT 0 (adaptation OFF) as of v0.8.0. The sizer derives PTOK from
+    /// `batch` and the batch-wide `maxAttendLength`, so a row's partition
+    /// count — and therefore its online-softmax summation order — moved with
+    /// its BATCHMATES. That contradicts design goal 1 in
+    /// `pagedattention.metal`, which promises a row is "bit-identical
+    /// regardless of batchmates" and predicates that proof on a FIXED PTOK.
+    /// Measured: a 1024-token row on the GPT-OSS shape takes PTOK 64 alone,
+    /// 128 at B=2, 256 at B=4 — and one 2048-token batchmate moves it 64->256
+    /// on its own. Summation-order changes flip tokens at argmax near-ties
+    /// (the same effect the query-block knob demonstrated at the v0.8.0
+    /// gate), so this was observable nondeterminism under concurrent load.
+    ///
+    /// Set the env knob to restore adaptation; recovering the WS-6.4 B=1
+    /// occupancy win invariantly needs per-row sizing (`batch: 1`, each row's
+    /// OWN attended length) plus dispatch bucketed by rung, because PTOK is a
+    /// kernel template parameter and one dispatch carries one value.
+    static let partitionTargetDefault = 0
+
+    /// Ceiling on the operator-settable threadgroup target.
+    ///
+    /// The target is a THREADGROUP COUNT — "how much of the machine one
+    /// decode dispatch should fill". The largest Apple GPU in the fleet has
+    /// 80 cores, so 4,096 is ~50x saturation, and past it the knob stops
+    /// expressing anything new: with a target this high the sizer already
+    /// returns the ladder floor for every context a served model can hold
+    /// (the next rung up needs `128 * target / perPartition` attended
+    /// tokens — over 65,000 even at the least favourable shape). Clamping
+    /// therefore costs no reachable behaviour and buys two things:
+    ///
+    ///  - `partitionTokensForDispatch` can no longer be handed a target
+    ///    whose ceiling division overflows. This is an operator-facing kill
+    ///    switch; `DARKBLOOM_CBV2_PAGED_PTOK_TARGET=9223372036854775807`
+    ///    used to parse as a valid non-negative tuning value and then trap
+    ///    the daemon on its first paged decode.
+    ///  - `PagedAttentionKernelSmoke.smokeAttendLengths` can sweep the WHOLE
+    ///    reachable partition range instead of a prefix of it, so no rung
+    ///    the sizer can select is left to JIT on live traffic.
+    public static let partitionTargetLimit = 4096
+
+    /// `partitionTargetThreadgroups` as a function of an environment, so the
+    /// knob's own parse — including a hostile value — is testable without a
+    /// second process.
+    static func partitionTarget(environment: [String: String]) -> Int {
+        guard let raw = environment[partitionTargetEnvironmentKey] else {
+            return partitionTargetDefault
+        }
+        if let value = Int(raw), value >= 0 {
+            return min(value, partitionTargetLimit)
+        }
+        // All-digit values too large for `Int` are an over-range tuning
+        // setting, not a typo: clamp them exactly as `Int.max` clamps,
+        // rather than silently reverting to the default.
+        let digits = raw.hasPrefix("+") ? raw.dropFirst() : raw[...]
+        if !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }) {
+            return partitionTargetLimit
+        }
+        return partitionTargetDefault
+    }
+
+    /// Tokens per partition for one decode dispatch: a rung of
+    /// `partitionTokenLadder` that divides evenly into `pageSize` pages, so
+    /// `PTOK % pageSize == 0` holds by construction — the invariant `decode`
+    /// preconditions and `PagedKVPool.init` guards.
+    ///
+    /// A pure function of the dispatch shape, with no device state: the same
+    /// shape always maps to the same rung, so the kernel-variant cache sees
+    /// a small stable set of names rather than one per step.
+    ///
+    /// - Parameters:
+    ///   - maxAttendLength: longest attended range over the batch's rows.
+    ///   - batch: rows in this dispatch.
+    ///   - kvHeads: KV heads of the layer.
+    ///   - headSplits: threadgroups per kv head (`gqa / headsPerThreadgroup`).
+    public static func partitionTokensForDispatch(
+        maxAttendLength: Int, batch: Int, kvHeads: Int, headSplits: Int, pageSize: Int
+    ) -> Int {
+        partitionTokensForDispatch(
+            maxAttendLength: maxAttendLength, batch: batch, kvHeads: kvHeads,
+            headSplits: headSplits, pageSize: pageSize,
+            target: partitionTargetThreadgroups)
+    }
+
+    /// `partitionTokensForDispatch` with the threadgroup target injected —
+    /// the seam the smoke and its tests use to reason about a target other
+    /// than this process's.
+    static func partitionTokensForDispatch(
+        maxAttendLength: Int, batch: Int, kvHeads: Int, headSplits: Int, pageSize: Int,
+        target: Int
+    ) -> Int {
+        // Rungs this page size can express. A page larger than a rung cannot
+        // be subdivided into it; the pool refuses a page size that does not
+        // divide `partitionTokens`, but `decode` is callable directly.
+        let rungs = partitionTokenLadder.filter {
+            $0 % pageSize == 0 && $0 <= partitionTokens
+        }
+        guard let smallest = rungs.first, target > 0 else {
+            return partitionTokens
+        }
+        let largest = rungs[rungs.count - 1]
+
+        // Threadgroups already launched per partition: everything except the
+        // partition count is fixed by the layer and the batch.
+        let perPartition = max(1, kvHeads * headSplits * batch)
+        let wantedPartitions = ceilingDivide(target, perPartition)
+        guard wantedPartitions > 1 else { return largest }
+
+        // Largest rung that still yields `wantedPartitions` partitions —
+        // the smallest partial buffers that fill the machine. When even the
+        // smallest rung cannot (the context is simply too short), take it:
+        // that is the floor, not a target miss to correct further.
+        let idealTokens = ceilingDivide(maxAttendLength, wantedPartitions)
+        return rungs.last { $0 <= idealTokens } ?? smallest
+    }
+
+    /// `ceil(lhs / rhs)` without the `lhs + rhs - 1` overflow. Both operands
+    /// can come from outside the process (`maxAttendLength` from a caller,
+    /// the target from an operator's environment), and an overflow trap on
+    /// this path takes the daemon down on its first paged decode.
+    private static func ceilingDivide(_ lhs: Int, _ rhs: Int) -> Int {
+        precondition(rhs > 0, "ceilingDivide by \(rhs)")
+        let quotient = lhs / rhs
+        // `quotient + 1` cannot overflow: reaching `Int.max` needs rhs == 1,
+        // and then the remainder is 0 and this returns early.
+        return lhs % rhs == 0 ? quotient : quotient + 1
+    }
 
     // MARK: - Threadgroup-memory budget (single source of truth)
     //
@@ -337,6 +543,57 @@ public enum PagedAttentionKernel {
         return z
     }()
 
+    /// One row of the `[B, 8]` int32 `seqinfo` argument `decode` takes.
+    ///
+    /// The layout — `{attendStart, attendLen, tableLen, writePage,
+    /// writeSlot, 0, 0, 0}` — used to exist only as prose in `decode`'s
+    /// parameter list while five call sites hand-packed it, and it had
+    /// already diverged: `PagedDecodeProfiler` fed `row.table.count` as
+    /// `tableLen` where the production path feeds
+    /// `PagedSequenceKV.decodeTableLength`. Those are the same number only
+    /// while a row's physical table happens to be as long as its ring, which
+    /// the profiler's gpt-oss shapes make true and a partially-allocated
+    /// ring (a prefix-adopted windowed row) makes false — and then the
+    /// shader's `table[logicalPage % tableLen]` wraps at the wrong length and
+    /// aliases the wrong physical pages.
+    ///
+    /// So the layout is a type, next to its only consumer.
+    struct SeqInfoRow: Equatable {
+        /// First absolute position this row may attend.
+        var attendStart: Int
+        /// Positions attended, INCLUDING the newly written one.
+        var attendLength: Int
+        /// Divisor for `table[logicalPage % tableLen]`. For a row, this is
+        /// `PagedSequenceKV.decodeTableLength` — never `table.count`.
+        var tableLength: Int
+        /// Fused-write destination. Both zero for a dispatch that does not
+        /// write (KV-borrowing layers, attention-only probes).
+        var writePage: Int32 = 0
+        var writeSlot: Int = 0
+
+        var packed: [Int32] {
+            [
+                Int32(attendStart), Int32(attendLength), Int32(tableLength),
+                writePage, Int32(writeSlot), 0, 0, 0,
+            ]
+        }
+    }
+
+    /// Pack rows into the `[B, 8]` int32 array `decode` takes, and report the
+    /// `maxAttendLength` that must accompany it — the two always travel
+    /// together, and computing the max separately is its own drift risk.
+    static func seqinfo(_ rows: [SeqInfoRow]) -> (array: MLXArray, maxAttendLength: Int) {
+        precondition(!rows.isEmpty, "[PagedAttentionKernel] seqinfo needs at least one row")
+        var flat = [Int32]()
+        flat.reserveCapacity(rows.count * 8)
+        var maxAttendLength = 1
+        for row in rows {
+            flat.append(contentsOf: row.packed)
+            maxAttendLength = max(maxAttendLength, row.attendLength)
+        }
+        return (MLXArray(flat, [rows.count, 8]), maxAttendLength)
+    }
+
     /// Dispatch decode attention for `B` rows.
     ///
     /// - Parameters:
@@ -350,9 +607,9 @@ public enum PagedAttentionKernel {
     ///     owning layer).
     ///   - kSlab/vSlab: pool slabs `[P, kvHeads, pageSize, headDim]`.
     ///   - tables: `[B, maxPages]` int32, `maxPages >= 8`.
-    ///   - seqinfo: `[B, 8]` int32 rows `{attendStart, attendLen, tableLen,
-    ///     writePage, writeSlot, 0…}` — attend fields describe the range
-    ///     INCLUDING the newly written position.
+    ///   - seqinfo: `[B, 8]` int32 rows — build it with `SeqInfoRow` and
+    ///     `PagedAttentionKernel.seqinfo(_:)` rather than packing the layout
+    ///     by hand.
     ///   - maxAttendLength: max over rows of the attended length (host-side
     ///     Swift Int — sizes the partial buffers, never a device sync).
     ///   - sinks: optional per-query-head sink logits `[queryHeads]`.
@@ -404,7 +661,7 @@ public enum PagedAttentionKernel {
         precondition(supportedHeadDims.contains(headDim), "unsupported head dim \(headDim)")
         precondition(tables.dim(0) == b && seqinfo.dim(0) == b)
         precondition(tables.dim(1) >= 8, "pad tables to >= 8 columns for a stable signature")
-        precondition(partitionTokens % pageSize == 0, "PTOK must be a page multiple")
+        precondition(pageSize > 0)
         precondition(maxAttendLength >= 1)
 
         let gqa = queryHeads / kvHeads
@@ -414,7 +671,6 @@ public enum PagedAttentionKernel {
                     + (ineligibilityReason(headDim: headDim, gqa: gqa)
                         ?? "headDim \(headDim), GQA \(gqa)"))
         }
-        let maxParts = (maxAttendLength + partitionTokens - 1) / partitionTokens
 
         if q.dtype != dtype { q = q.asType(dtype) }
 
@@ -433,9 +689,20 @@ public enum PagedAttentionKernel {
 
         let hpt = headsPerThreadgroup(headDim: headDim, gqa: gqa)
         let splits = gqa / hpt
+        // WS-6.4: partition length adapts to context and batch so a short
+        // B == 1 decode still fills the GPU. Every value it can return is a
+        // page multiple, which is the invariant the shader relies on.
+        let ptok = partitionTokensForDispatch(
+            maxAttendLength: maxAttendLength, batch: b, kvHeads: kvHeads,
+            headSplits: splits, pageSize: pageSize)
+        precondition(ptok % pageSize == 0, "PTOK must be a page multiple")
+        // `ceilingDivide`, not `(a + b - 1) / b`: `maxAttendLength` is
+        // caller-supplied, and this is the site that motivated the helper.
+        let maxParts = ceilingDivide(maxAttendLength, ptok)
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
-            simdgroups: nsg, hasSinks: false, hasSoftcap: softcap, hasWrite: hasWrite)
+            simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
+            partitionTokens: ptok, hasWrite: hasWrite)
         let tg = 32 * nsg
         let partOut = kernel(for: partKey, source: kernelSource)(
             partInputs,
@@ -446,7 +713,7 @@ public enum PagedAttentionKernel {
                 ("GQA", gqa),
                 ("HPT", hpt),
                 ("NSG", nsg),
-                ("PTOK", partitionTokens),
+                ("PTOK", ptok),
                 ("HAS_SOFTCAP", softcap),
             ],
             grid: (kvHeads * splits * tg, b, maxParts),
@@ -460,13 +727,14 @@ public enum PagedAttentionKernel {
 
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
-            simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false)
+            simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false,
+            partitionTokens: ptok)
         let outputs = kernel(for: mergeKey, source: kernelSource)(
             [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks],
             template: [
                 ("T", dtype),
                 ("D", headDim),
-                ("PTOK", partitionTokens),
+                ("PTOK", ptok),
                 ("HAS_SINKS", sinks != nil),
             ],
             grid: (queryHeads * 32, b, 1),
@@ -506,9 +774,11 @@ public enum PagedAttentionKernel {
         precondition(kSlab.dim(2) == pageSize)
         precondition(slots.dim(0) >= max(n, 8) && n > 0, "pad slots to >= 8 entries")
 
+        // The write kernel has no PTOK template parameter; 0 keeps its
+        // variant identity independent of the decode partition sizing.
         let key = PagedAttentionKernelKey(
             pass: .write, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: 0,
-            simdgroups: 0, hasSinks: false, hasSoftcap: false)
+            simdgroups: 0, hasSinks: false, hasSoftcap: false, partitionTokens: 0)
         let outputs = kernel(for: key, source: kernelSource)(
             [keys, values, slots, prevFence, kSlab, vSlab],
             template: [

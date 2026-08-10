@@ -125,9 +125,12 @@ enum PagedAttentionResources {
             sourceAncestor.deleteLastPathComponent()
         }
 
+        // Dedupe on the RESOLVED path, in lockstep with `locate`. SwiftPM
+        // writes `.build/debug` as a symlink to `.build/<triple>/debug`, so
+        // the two roots appended above can name the same directory.
         var seen = Set<String>()
         return roots.filter {
-            seen.insert($0.standardizedFileURL.path).inserted
+            seen.insert($0.resolvingSymlinksInPath().standardizedFileURL.path).inserted
         }
     }
 
@@ -156,14 +159,24 @@ enum PagedAttentionResources {
     ) throws -> URL {
         var matches: [URL] = []
         for root in roots {
-            let direct = root.appendingPathComponent(resourceName)
+            // Resolve before touching the filesystem. `.build/debug` is a
+            // symlink to `.build/<triple>/debug`, and a URL-based directory
+            // enumeration does NOT follow it: `contentsOfDirectory` returns
+            // zero children, the resource inside the SwiftPM bundle is never
+            // seen, preflight throws `.missing`, and the factory falls back
+            // to contiguous WITHOUT a word. That silent fallback is the one
+            // failure mode that makes a paged benchmark meaningless.
+            // `packagedAppResourcesURL` above already resolves for the same
+            // class of reason; this mirrors it.
+            let resolved = root.resolvingSymlinksInPath()
+            let direct = resolved.appendingPathComponent(resourceName)
             if fileManager.isReadableFile(atPath: direct.path) {
                 matches.append(direct)
             }
 
             guard
                 let children = try? fileManager.contentsOfDirectory(
-                    at: root,
+                    at: resolved,
                     includingPropertiesForKeys: [.isDirectoryKey],
                     options: [.skipsHiddenFiles])
             else { continue }
@@ -175,14 +188,43 @@ enum PagedAttentionResources {
             }
         }
 
-        var seen = Set<String>()
-        let unique = matches.filter {
-            seen.insert($0.standardizedFileURL.path).inserted
+        // Dedupe on CONTENT, not on path.
+        //
+        // Path dedupe cannot express what this check is actually for. The
+        // `.ambiguous` error exists to stop the process loading an unknown
+        // variant of the kernel source, so two matches only conflict when
+        // their BYTES differ. Two are routinely reachable at once and are
+        // identical: building `provider-swift` populates its own
+        // `.build/<triple>/debug/mlx-swift-lm_MLXLMCommon.bundle`, and
+        // building the submodule standalone populates
+        // `libs/mlx-swift-lm/.build/...` — the source-ancestor walk above
+        // finds the second. `pagedattention.metal` is copied verbatim as a
+        // resource, never compiled, so both copies are byte-identical and
+        // choosing either is the same choice.
+        //
+        // This also subsumes the symlink case: the same physical file reached
+        // through `.build/debug` and `.build/<triple>/debug` reads identical
+        // bytes and collapses here. Root order decides which URL is kept, so
+        // the result is deterministic. A genuinely divergent resource still
+        // throws.
+        var seenContent = Set<Data>()
+        var seenUnreadable = Set<String>()
+        let unique = matches.filter { url in
+            if let data = try? Data(contentsOf: url) {
+                return seenContent.insert(data).inserted
+            }
+            // Unreadable: keep it distinct so the caller still gets a real
+            // diagnostic rather than a silent drop.
+            return seenUnreadable.insert(
+                url.resolvingSymlinksInPath().standardizedFileURL.path
+            ).inserted
         }
         guard !unique.isEmpty else {
             throw PagedAttentionResourceError.missing(
                 resource: resourceName,
-                searchedRoots: roots.map(\.standardizedFileURL.path))
+                searchedRoots: roots.map {
+                    $0.resolvingSymlinksInPath().standardizedFileURL.path
+                })
         }
         guard unique.count == 1 else {
             throw PagedAttentionResourceError.ambiguous(

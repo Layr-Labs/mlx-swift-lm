@@ -95,7 +95,8 @@ public enum CBv2LayerKindDerivation {
         globalHeadDim: Int,
         numAttentionHeads: Int,
         numKeyValueHeads: Int,
-        numGlobalKeyValueHeads: Int?
+        numGlobalKeyValueHeads: Int?,
+        isBidirectional: Bool = false
     ) -> [CBv2LayerKind] {
         let sources = gemma4SharedKVSources(
             layerTypes: layerTypes, numKvSharedLayers: numKvSharedLayers)
@@ -110,6 +111,7 @@ public enum CBv2LayerKindDerivation {
                 attention: isSliding ? .slidingWindow(slidingWindow) : .full,
                 sharesKVWithLayer: sources[index],
                 hasSinks: false,
+                isBidirectional: isBidirectional,
                 headDim: isSliding ? headDim : globalHeadDim,
                 kvHeads: kvHeads,
                 queryHeads: numAttentionHeads

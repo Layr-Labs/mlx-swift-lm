@@ -8,9 +8,16 @@
 // offsets, shared `_idx`, batch-wide trims) and the property that makes the
 // v2 per-request-KV design correct by construction.
 //
-// All tests run on `TinyTestModel` (seeded random weights, no downloads)
-// through the v2 path (per-request KV + per-row attention). At integration
-// the same suites re-point at the real WS-A/WS-B implementations.
+// Every arm but the last runs on `TinyTestModel` (seeded random weights, no
+// downloads) through the v2 path (per-request KV + per-row attention). At
+// integration the same suites re-point at the real WS-A/WS-B implementations.
+//
+// The LAST arm is the PAGED one. `TinyTestModel`'s head dim (16) is not one
+// the paged kernel accepts, so it cannot reach `PagedAttentionKernel.decode`
+// at all; that arm therefore carries its own minimal fixture and states the
+// same contract one layer down, as bit-identity of a row's attention output.
+// It is a regression gate for the WS-6.4 partition sizer — see its doc
+// comment for the environment that must break it.
 
 import Foundation
 import MLX
@@ -181,6 +188,227 @@ final class CBv2InvarianceTests: XCTestCase {
         XCTAssertEqual(
             engine.generated(for: subject), solo,
             "sink model output changed under batching")
+    }
+
+    // MARK: - Paged backend: a row's partitioning must not see its batchmates
+
+    /// `pagedattention.metal` (:12-16) states design goal 1 as "a row's
+    /// partition count depends only on ITS OWN attended length (fixed PTOK),
+    /// so its arithmetic — including summation order — is bit-identical
+    /// regardless of batchmates". WS-6.4's adaptive sizer voided the
+    /// parenthetical: `PagedAttentionKernel.partitionTokensForDispatch`
+    /// (PagedAttentionKernel.swift:313) derives PTOK from the DISPATCH's
+    /// batch size and the batch-wide `maxAttendLength`, so a 1024-token row
+    /// is split 16 ways alone and 4 ways beside a 2048-token batchmate.
+    /// Different partition counts mean a different online-softmax merge
+    /// order — batch-composition dependence, the one thing this suite
+    /// exists to forbid. `partitionTargetDefault` (:256) is 0 as of v0.8.0
+    /// precisely to shut it off; this arm is what holds that shut.
+    ///
+    /// REGRESSION GATE. Restoring the pre-v0.8.0 adaptation must break it:
+    ///
+    ///     DARKBLOOM_CBV2_PAGED_PTOK_TARGET=128 swift test --filter CBv2Invariance
+    ///
+    /// FIXTURE. `TinyTestModel` cannot carry this arm at all: its head dim is
+    /// 16 (CBv2Fixtures.swift:472) and the paged kernel accepts only
+    /// 64/128/256/512 (`PagedAttentionKernel.supportedHeadDims`, :159), so
+    /// `CBv2HarnessEngine` can never reach `PagedAttentionKernel.decode`.
+    /// This is therefore the smallest fixture that DOES reach it with a
+    /// genuine multi-row batch: one paged attention layer on the GPT-OSS
+    /// decode shape (8 kv heads, GQA 8, head dim 64 — the shape the sizer's
+    /// own tuning note measures) driven as a recurrent greedy decoder,
+    /// attention out -> mix -> logits -> argmax -> next query. The recurrence
+    /// is what a real stack supplies and what turns a one-ULP attention
+    /// difference into a flipped token; the KV is fixed prefilled context, so
+    /// `maxAttendLength` — and hence the sizer's input — is constant per run.
+    func testPagedRowInvariantToBatchmateAttendedLength() throws {
+        let source: String
+        do {
+            source = try PagedAttentionResources.loadSourceForCurrentProcess()
+        } catch {
+            throw XCTSkip("paged attention runtime resource unavailable: \(error)")
+        }
+
+        let kvHeads = 8
+        let queryHeads = 64
+        let headDim = 64
+        let pageSize = 16
+        let dtype = DType.float16
+        let features = queryHeads * headDim
+        let vocab = 1024
+        let subjectContext = 1024
+        let batchmateContext = 2048
+        let steps = Self.soloSteps
+        // Post-norm query magnitude. A unit-RMS query against unit-variance
+        // keys puts the pre-softmax scores at std 1 over a 1024-token
+        // context — a near-uniform softmax, i.e. an AVERAGING operator, and
+        // averaging is a contraction that damps exactly the divergence under
+        // test (measured: unit gain holds the same tokens for 1024 steps
+        // while the attention output is already wrong). Real decode
+        // attention is peaked, not uniform; a gain of 8 puts the scores at
+        // std 8, which is an ordinary attention-logit range and makes the
+        // recurrence expansive the way a real stack is.
+        let queryGain: Float = 8
+
+        let hpt = PagedAttentionKernel.headsPerThreadgroup(
+            headDim: headDim, gqa: queryHeads / kvHeads)
+        let splits = (queryHeads / kvHeads) / hpt
+        func partitionTokens(batch: Int, maxAttendLength: Int, target: Int) -> Int {
+            PagedAttentionKernel.partitionTokensForDispatch(
+                maxAttendLength: maxAttendLength, batch: batch, kvHeads: kvHeads,
+                headSplits: splits, pageSize: pageSize, target: target)
+        }
+
+        // Non-vacuity guard. This fixture is only a regression test while the
+        // ADAPTIVE sizer still hands this row two different partition lengths
+        // depending on its batchmates. If a ladder or shape change ever makes
+        // the two agree, the arm has stopped testing anything and must be
+        // re-sized — it must not go quiet.
+        let legacyTarget = 128
+        XCTAssertNotEqual(
+            partitionTokens(batch: 1, maxAttendLength: subjectContext, target: legacyTarget),
+            partitionTokens(batch: 2, maxAttendLength: batchmateContext, target: legacyTarget),
+            "fixture no longer exercises batch-composition-dependent partitioning")
+
+        // Shared, deterministic readout weights: identical in both runs, so
+        // the ONLY difference between them is the decode dispatch's shape.
+        let mix =
+            (MLXRandom.normal([features, features], key: MLXRandom.key(0x5EED_0001))
+            * (1.0 / Float(features).squareRoot())).asType(dtype)
+        let unembed = MLXRandom.normal([features, vocab], key: MLXRandom.key(0x5EED_0002))
+        let embed = MLXRandom.normal([vocab, features], key: MLXRandom.key(0x5EED_0003))
+            .asType(dtype)
+        var paramValues = [Float](repeating: 0, count: 8)
+        paramValues[1] = 1.0 / Float(headDim).squareRoot()  // scale; params[0] = softcap
+        let params = MLXArray(paramValues)
+        eval(mix, unembed, embed, params)
+
+        /// Greedy-decode `contexts.count` rows for `steps` steps, one paged
+        /// dispatch per step. Returns row 0's tokens plus its raw per-step
+        /// attention output — the bitwise witness.
+        func run(contexts: [Int]) -> (tokens: [Int], attention: [[Float]]) {
+            let batch = contexts.count
+            let pages = contexts.map { ($0 + pageSize - 1) / pageSize }
+
+            // Row r's KV is keyed on r alone, so row 0's pages hold identical
+            // bytes at identical physical indices whether or not row 1 exists.
+            var keyBlocks: [MLXArray] = []
+            var valueBlocks: [MLXArray] = []
+            for row in contexts.indices {
+                let shape = [pages[row], kvHeads, pageSize, headDim]
+                keyBlocks.append(
+                    MLXRandom.normal(shape, key: MLXRandom.key(0x51AB_0000 + UInt64(row)))
+                        .asType(dtype))
+                valueBlocks.append(
+                    MLXRandom.normal(shape, key: MLXRandom.key(0x51AB_1000 + UInt64(row)))
+                        .asType(dtype))
+            }
+            let kSlab = concatenated(keyBlocks, axis: 0)
+            let vSlab = concatenated(valueBlocks, axis: 0)
+
+            let maxPages = max(8, pages.max() ?? 8)
+            var table = [Int32](repeating: 0, count: batch * maxPages)
+            var physical = 0
+            for row in contexts.indices {
+                for page in 0 ..< pages[row] {
+                    table[row * maxPages + page] = Int32(physical)
+                    physical += 1
+                }
+            }
+            let tables = MLXArray(table, [batch, maxPages])
+            let (seqinfo, maxAttendLength) = PagedAttentionKernel.seqinfo(
+                contexts.indices.map { row in
+                    PagedAttentionKernel.SeqInfoRow(
+                        attendStart: 0, attendLength: contexts[row], tableLength: pages[row])
+                })
+            let fence = MLXArray.zeros([1], dtype: .int32)
+
+            var queries = concatenated(
+                contexts.indices.map { row in
+                    MLXRandom.normal(
+                        [1, queryHeads, headDim],
+                        key: MLXRandom.key(0x0B1E_0000 + UInt64(row))
+                    ).asType(dtype)
+                }, axis: 0)
+            eval(kSlab, vSlab, tables, seqinfo, fence, queries)
+
+            var tokens: [Int] = []
+            var attention: [[Float]] = []
+            for _ in 0 ..< steps {
+                let out = PagedAttentionKernel.decode(
+                    queries: queries, kSlab: kSlab, vSlab: vSlab, tables: tables,
+                    seqinfo: seqinfo, maxAttendLength: maxAttendLength, sinks: nil,
+                    params: params, softcap: false, pageSize: pageSize,
+                    writeFence: fence, kernelSource: source
+                ).out
+                eval(out)
+                attention.append(out[0].asArray(Float.self))
+
+                // Readout runs per row on a [1, features] slice, so the
+                // subject's downstream arithmetic is shape-identical in both
+                // runs: a [2, F] matmul is under no obligation to reduce row 0
+                // the same way a [1, F] one does, and that would masquerade as
+                // the very divergence under test.
+                var nextQueries: [MLXArray] = []
+                for row in 0 ..< batch {
+                    let hidden = out[row].reshaped([1, features])
+                    let token = argMax(
+                        matmul(hidden.asType(.float32), unembed), axis: -1
+                    ).item(Int.self)
+                    if row == 0 { tokens.append(token) }
+                    let mixed = (matmul(hidden, mix) + embed[token].reshaped([1, features]))
+                        .asType(.float32)
+                    let normed =
+                        mixed
+                        * (rsqrt(mean(mixed * mixed, axis: -1, keepDims: true) + 1e-6)
+                            * queryGain)
+                    nextQueries.append(
+                        normed.asType(dtype).reshaped([1, queryHeads, headDim]))
+                }
+                queries = batch == 1 ? nextQueries[0] : concatenated(nextQueries, axis: 0)
+                eval(queries)
+            }
+            return (tokens, attention)
+        }
+
+        let solo = run(contexts: [subjectContext])
+        let batched = run(contexts: [subjectContext, batchmateContext])
+
+        let target = PagedAttentionKernel.partitionTargetThreadgroups
+        let dispatched =
+            "PTOK solo="
+            + "\(partitionTokens(batch: 1, maxAttendLength: subjectContext, target: target))"
+            + " batched="
+            + "\(partitionTokens(batch: 2, maxAttendLength: batchmateContext, target: target))"
+            + " (\(PagedAttentionKernel.partitionTargetEnvironmentKey)=\(target))"
+
+        // The property, in the form the user sees it.
+        let tokenDivergence =
+            zip(solo.tokens, batched.tokens)
+            .enumerated().first { $0.element.0 != $0.element.1 }?.offset
+        XCTAssertNil(
+            tokenDivergence,
+            "subject row's decoded token \(tokenDivergence ?? -1) changed because a "
+                + "\(batchmateContext)-token batchmate joined its dispatch — \(dispatched)")
+
+        // The same property one layer down, where it is deterministic instead
+        // of contingent on an argmax landing near a tie: the row's attention
+        // output must be bit-identical, which is what design goal 1 promises
+        // and what every downstream readout inherits.
+        var firstDivergentStep: Int?
+        var maxDifferingElements = 0
+        for step in 0 ..< steps {
+            let differing = zip(solo.attention[step], batched.attention[step])
+                .reduce(into: 0) { $0 += $1.0 == $1.1 ? 0 : 1 }
+            guard differing > 0 else { continue }
+            if firstDivergentStep == nil { firstDivergentStep = step }
+            maxDifferingElements = max(maxDifferingElements, differing)
+        }
+        XCTAssertNil(
+            firstDivergentStep,
+            "subject row's attention output is not bit-identical across batch "
+                + "composition: first diverges at step \(firstDivergentStep ?? -1), up to "
+                + "\(maxDifferingElements)/\(features) elements per step — \(dispatched)")
     }
 
     // MARK: - Stochastic sampling with per-request seeds (WS-E)

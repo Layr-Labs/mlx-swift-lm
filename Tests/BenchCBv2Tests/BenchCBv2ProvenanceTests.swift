@@ -1,7 +1,7 @@
 import Foundation
 import Testing
 
-@testable import BenchCBv2
+@testable import BenchCBv2Core
 
 @Suite("BenchCBv2 optimization provenance")
 struct BenchCBv2ProvenanceTests {
