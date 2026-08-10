@@ -268,8 +268,9 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
 }
 
 public class SwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
+    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
+    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear?
     @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
 
     let inputDims: Int
@@ -298,6 +299,7 @@ public class SwitchGLU: Module {
         hiddenDims: Int,
         numExperts: Int,
         bias: Bool = false,
+        fuseGateUp: Bool = false,
         weightedReductionProfile: SwitchGLUWeightedReductionProfile = .generic
     ) {
         self.inputDims = inputDims
@@ -312,10 +314,18 @@ public class SwitchGLU: Module {
         self.isSiluActivation = true
         self.isGeluActivation = false
 
-        self._gateProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        self._upProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        if fuseGateUp {
+            self._gateUpProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims * 2,
+                numExperts: numExperts, bias: bias)
+        } else {
+            self._gateProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims,
+                numExperts: numExperts, bias: bias)
+            self._upProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims,
+                numExperts: numExperts, bias: bias)
+        }
         self._downProj.wrappedValue = SwitchLinear(
             inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
 
@@ -329,6 +339,7 @@ public class SwitchGLU: Module {
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray,
         bias: Bool = false,
+        fuseGateUp: Bool = false,
         weightedReductionProfile: SwitchGLUWeightedReductionProfile = .generic
     ) {
         self.inputDims = inputDims
@@ -349,10 +360,18 @@ public class SwitchGLU: Module {
         self.isGeluActivation =
             !detectedSilu && (probeOut .== safeGeluApproximate(probe)).all().item(Bool.self)
 
-        self._gateProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        self._upProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
+        if fuseGateUp {
+            self._gateUpProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims * 2,
+                numExperts: numExperts, bias: bias)
+        } else {
+            self._gateProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims,
+                numExperts: numExperts, bias: bias)
+            self._upProj.wrappedValue = SwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims,
+                numExperts: numExperts, bias: bias)
+        }
         self._downProj.wrappedValue = SwitchLinear(
             inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
 
@@ -371,8 +390,19 @@ public class SwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        let xUp = upProj(x, idx, sortedIndices: doSort)
-        let xGate = gateProj(x, idx, sortedIndices: doSort)
+        let xGate: MLXArray
+        let xUp: MLXArray
+        if let gateUpProj {
+            let xGateUp = gateUpProj(x, idx, sortedIndices: doSort)
+            xGate = xGateUp[.ellipsis, ..<hiddenDims]
+            xUp = xGateUp[.ellipsis, hiddenDims...]
+        } else {
+            guard let gateProj, let upProj else {
+                preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
+            }
+            xUp = upProj(x, idx, sortedIndices: doSort)
+            xGate = gateProj(x, idx, sortedIndices: doSort)
+        }
 
         let activated: MLXArray
         if let activationProduct {
@@ -411,6 +441,7 @@ public class SwitchGLU: Module {
         return inputDims == 2816
             && hiddenDims == 704
             && numExperts == 128
+            && gateUpProj == nil
             && activationProduct == nil
             && isGeluActivation
             && x.ndim == 2

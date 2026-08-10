@@ -11,6 +11,28 @@ import Testing
 // another blocks on the same function's lock from init).
 @Suite(.serialized)
 struct SwitchGLUTests {
+    @Test func fusedGateUpInitializerShapeRemainsPublicAndLoadable() {
+        let defaultGLU = SwitchGLU(
+            inputDims: 8, hiddenDims: 4, numExperts: 2,
+            fuseGateUp: true)
+        let customGLU = SwitchGLU(
+            inputDims: 8, hiddenDims: 4, numExperts: 2,
+            activation: { $0 + 0.5 }, fuseGateUp: true)
+
+        for glu in [defaultGLU, customGLU] {
+            let keys = Set(glu.parameters().flattened().map(\.0))
+            #expect(keys.contains("gate_up_proj.weight"))
+            #expect(!keys.contains("gate_proj.weight"))
+            #expect(!keys.contains("up_proj.weight"))
+
+            let x = MLXArray.ones([1, 8])
+            let indices = MLXArray([Int32(0), 1]).reshaped(1, 2)
+            let output = glu(x, indices)
+            eval(output)
+            #expect(output.shape == [1, 2, 8])
+        }
+    }
+
     @Test func weightedExpertUnsortMatchesLegacyForB1B2B4PrefillReorderings() {
         let topK = 8
         let hidden = 2816
