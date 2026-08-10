@@ -8,7 +8,7 @@ import Testing
 
 @testable import MLXLLM
 
-/// The retained production tuple pairs direct weighted unsort with the safe
+/// The retained production tuple pairs CBv2-prefill weighted unsort with the safe
 /// Gemma 4 expert-QMM (R1) kernel. Weighted unsort measured materially slower
 /// on its own, so both must gate on exactly one configuration contract: the
 /// exact production expert topology AND the quantization contract that
@@ -17,6 +17,12 @@ import Testing
 /// `fallback_quantization`).
 @Suite("Gemma4 coupled expert-optimization eligibility")
 struct Gemma4ExpertOptimizationEligibilityTests {
+
+    @Test("weighted expert reduction is scoped to scheduled CBv2 prefill")
+    func weightedReductionScope() {
+        #expect(!gemma4AllowsWeightedExpertUnsort(schedulePrefill: false))
+        #expect(gemma4AllowsWeightedExpertUnsort(schedulePrefill: true))
+    }
 
     /// The measured checkpoint's expert topology, parameterized only on the
     /// declared weight quantization and on whether the topology matches.

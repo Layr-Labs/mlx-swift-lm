@@ -83,6 +83,12 @@ func gemma4FusedWeightedUnsortFlag(_ raw: String?) -> Bool {
     gemma4TruthyFlag(raw)
 }
 
+/// The retained weighted/R1 pair is measured only on scheduled CBv2 prefill.
+/// Direct model forwards keep the established reduction path.
+func gemma4AllowsWeightedExpertUnsort(schedulePrefill: Bool) -> Bool {
+    schedulePrefill
+}
+
 /// The exact production expert topology. Near matches retain the established
 /// unsort + weighted sum and the generic gather-QMM route.
 func gemma4SupportsProductionExpertTopology(_ config: Gemma4TextConfiguration) -> Bool {
@@ -1558,8 +1564,7 @@ public class Gemma4TextModelInner: Module {
             ? imageTokenMask?.expandedDimensions(axis: 0) : imageTokenMask
         return forwardTrunk(
             inputs, cache: cache, captureHook: captureHook, capturePreNorm: false,
-            inputEmbedding: inputEmbedding, imageTokenMask: imageTokenMask,
-            allowWeightedExpertUnsort: inputs.dim(1) > 1
+            inputEmbedding: inputEmbedding, imageTokenMask: imageTokenMask
         ).postNorm
     }
 
@@ -1573,8 +1578,7 @@ public class Gemma4TextModelInner: Module {
     ) -> MLXArray {
         forwardTrunk(
             inputs, cache: cache, captureHook: nil, capturePreNorm: false,
-            inputEmbedding: inputEmbedding, schedulePrefill: true,
-            allowWeightedExpertUnsort: true
+            inputEmbedding: inputEmbedding, schedulePrefill: true
         ).postNorm
     }
 
@@ -1592,8 +1596,7 @@ public class Gemma4TextModelInner: Module {
         // [N] on cache-reuse turns; forwardTrunk assumes [B, L].
         let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
         let r = forwardTrunk(
-            inputs, cache: cache, captureHook: captureHook, capturePreNorm: true,
-            allowWeightedExpertUnsort: false)
+            inputs, cache: cache, captureHook: captureHook, capturePreNorm: true)
         return (r.postNorm, r.preNorm!)
     }
 
@@ -1604,8 +1607,7 @@ public class Gemma4TextModelInner: Module {
         capturePreNorm: Bool,
         inputEmbedding: MLXArray? = nil,
         imageTokenMask: MLXArray? = nil,
-        schedulePrefill: Bool = false,
-        allowWeightedExpertUnsort: Bool = false
+        schedulePrefill: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
@@ -1751,7 +1753,12 @@ public class Gemma4TextModelInner: Module {
                 v2SharedSource: v2SharedSource,
                 outputTailRows: outputTailRows,
                 useLastQueryPrefill: useLastQueryPrefill,
-                isExpertPrefill: allowWeightedExpertUnsort
+                // The retained pair is a CBv2 production-prefill optimization.
+                // Ordinary direct forwards keep the established reduction;
+                // enabling it there regressed the raw-prefill control without
+                // affecting the serving path selected by the benchmark.
+                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
+                    schedulePrefill: schedulePrefill)
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
