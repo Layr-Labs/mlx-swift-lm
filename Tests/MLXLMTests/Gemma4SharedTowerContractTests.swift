@@ -225,29 +225,19 @@ struct Gemma4SharedTowerContractTests {
         #expect(allClose(result.asType(.int32), expected.asType(.int32)).item(Bool.self))
     }
 
-    @Test("all-mode CBv2 prefill matches the legacy shared tower")
-    func allModeCBv2PrefillParity() throws {
+    @Test("all-mode Gemma rejects chunked CBv2 prefill")
+    func allModeCBv2PrefillRejection() throws {
         let config = try tinyConfig(extraFields: [
             "\"use_bidirectional_attention\": \"all\"",
         ])
         let model = tinyModel(config)
-        let tokens = MLXArray([Int32(3), 5, 7, 11]).reshaped(1, 4)
-        let legacy = model(tokens, cache: nil as [KVCache]?)
-
         let kinds = config.cbv2LayerKinds
         #expect(kinds.map(\.isBidirectional) == [true, true])
-        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20))
-        let state = try backend.makeSequenceState(
-            layerKinds: kinds, promptLength: 4, maxLength: 8)
-        let caches = model.newCacheV2 { index, kind in
-            CBv2LayerCache(
-                layerIndex: index, kind: kind,
-                rows: kind.sharesKVWithLayer == nil ? [state[index]!] : [])
+        #expect(throws: Gemma4TextModel.CBv2CompatibilityError.fullyBidirectionalAttentionUnsupported) {
+            try model.newCacheV2 { index, kind in
+                CBv2LayerCache(layerIndex: index, kind: kind)
+            }
         }
-        let cbv2 = model(tokens, cache: caches.map { $0 as! any KVCache })
-        eval(legacy, cbv2)
-        #expect(legacy.shape == cbv2.shape)
-        #expect(allClose(legacy, cbv2, rtol: 1e-5, atol: 1e-5).item(Bool.self))
     }
 
     // MARK: Full-layer RoPE construction (disclosed divergence from the

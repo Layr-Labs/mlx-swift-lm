@@ -2115,6 +2115,17 @@ extension Gemma4TextModel {
         gemma4PrefillChunkEvalLayers
     }
 
+    public enum CBv2CompatibilityError: Error, Equatable, CustomStringConvertible {
+        case fullyBidirectionalAttentionUnsupported
+
+        public var description: String {
+            switch self {
+            case .fullyBidirectionalAttentionUnsupported:
+                return "Gemma4 CBv2 does not support use_bidirectional_attention=all because split prefill cannot preserve whole-prompt visibility"
+            }
+        }
+    }
+
     /// Build the per-layer CBv2 attending caches for this model: one
     /// `CBv2AttendingLayerCache` per hidden layer (KV-shared layers get a
     /// cache object too — it owns no storage and serves `attendBorrowing`).
@@ -2125,8 +2136,11 @@ extension Gemma4TextModel {
     public func newCacheV2(
         makeLayerCache: (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
             any CBv2AttendingLayerCache
-    ) rethrows -> [any CBv2AttendingLayerCache] {
-        try cbv2LayerKinds.enumerated().map { index, kind in
+    ) throws -> [any CBv2AttendingLayerCache] {
+        guard config.useBidirectionalAttention != "all" else {
+            throw CBv2CompatibilityError.fullyBidirectionalAttentionUnsupported
+        }
+        return try cbv2LayerKinds.enumerated().map { index, kind in
             try makeLayerCache(index, kind)
         }
     }

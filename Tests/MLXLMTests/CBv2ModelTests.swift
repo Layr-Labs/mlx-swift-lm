@@ -491,7 +491,7 @@ struct CBv2ModelGemma4ForwardTests {
         let model = Gemma4TextModel(config)
         eval(model)
         var mocks = [CBv2ModelMockLayerCache]()
-        let caches = model.newCacheV2 { index, kind in
+        let caches = try model.newCacheV2 { index, kind in
             let mock = CBv2ModelMockLayerCache(layerIndex: index, kind: kind, rowCount: rowCount)
             mocks.append(mock)
             return mock
@@ -638,9 +638,9 @@ struct CBv2ModelGemma4ForwardTests {
         eval(model)
         #expect(model is CBv2EmbeddingForwardable)
 
-        func freshCaches() -> [CBv2ModelMockLayerCache] {
+        func freshCaches() throws -> [CBv2ModelMockLayerCache] {
             var mocks = [CBv2ModelMockLayerCache]()
-            _ = model.newCacheV2 { index, kind in
+            _ = try model.newCacheV2 { index, kind in
                 let mock = CBv2ModelMockLayerCache(layerIndex: index, kind: kind, rowCount: 1)
                 mocks.append(mock)
                 return mock
@@ -650,10 +650,10 @@ struct CBv2ModelGemma4ForwardTests {
 
         let prompt = MLXArray([Int32(1), 2, 3, 4, 5])[.newAxis, .ellipsis]
 
-        let tokenLogits = model(prompt, cache: freshCaches() as [KVCache])
+        let tokenLogits = model(prompt, cache: try freshCaches() as [KVCache])
         let spliced = (model as CBv2EmbeddingForwardable).scaledInputEmbeddings(prompt)
         let embeddingLogits = (model as CBv2EmbeddingForwardable).embeddingForward(
-            prompt, inputEmbedding: spliced, cache: freshCaches() as [KVCache])
+            prompt, inputEmbedding: spliced, cache: try freshCaches() as [KVCache])
         eval(tokenLogits, embeddingLogits)
 
         #expect(tokenLogits.shape == embeddingLogits.shape)
@@ -793,9 +793,9 @@ struct CBv2Gemma4ScheduledPrefillTests {
 
     private func caches(
         for model: Gemma4TextModel, rowCount: Int = 1
-    ) -> [CBv2ModelMockLayerCache] {
+    ) throws -> [CBv2ModelMockLayerCache] {
         var mocks: [CBv2ModelMockLayerCache] = []
-        _ = model.newCacheV2 { index, kind in
+        _ = try model.newCacheV2 { index, kind in
             let mock = CBv2ModelMockLayerCache(
                 layerIndex: index, kind: kind, rowCount: rowCount)
             mocks.append(mock)
@@ -883,7 +883,7 @@ struct CBv2Gemma4ScheduledPrefillTests {
         CBv2StepProfiler.armEvents()
         defer { CBv2StepProfiler.reset() }
 
-        let scheduledCaches: [KVCache] = caches(for: model)
+        let scheduledCaches: [KVCache] = try caches(for: model)
         let scheduled = model.cbv2Prefill(
             inputs, inputEmbedding: nil, cache: scheduledCaches,
             requirement: .lastPositionLogits)
@@ -893,7 +893,7 @@ struct CBv2Gemma4ScheduledPrefillTests {
             submissionCount() == expectedSubmissionCount,
             "\(layerCount) layers must submit once per effective interval, including zero submissions when the interval is disabled or above the layer count")
 
-        let ordinaryCaches: [KVCache] = caches(for: model)
+        let ordinaryCaches: [KVCache] = try caches(for: model)
         let ordinary = model(inputs, cache: ordinaryCaches)
         eval(ordinary)
         #expect(
@@ -904,7 +904,7 @@ struct CBv2Gemma4ScheduledPrefillTests {
             "intermediate submission and final-layer tail narrowing must not change logits")
 
         CBv2StepProfiler.reset()
-        let decodeCaches: [KVCache] = caches(for: model)
+        let decodeCaches: [KVCache] = try caches(for: model)
         let decode = model.cbv2Prefill(
             MLXArray([Int32(3)]).reshaped(1, 1),
             inputEmbedding: nil, cache: decodeCaches,
@@ -913,7 +913,7 @@ struct CBv2Gemma4ScheduledPrefillTests {
         #expect(submissionCount() == 0, "single-token scheduled forwards are decode")
 
         CBv2StepProfiler.reset()
-        let mtpCaches: [KVCache] = caches(for: model)
+        let mtpCaches: [KVCache] = try caches(for: model)
         let mtp = model.cbv2ForwardWithHidden(
             inputs[0..., 0 ..< 4], caches: mtpCaches)
         eval(mtp.logits, mtp.lastHidden)
