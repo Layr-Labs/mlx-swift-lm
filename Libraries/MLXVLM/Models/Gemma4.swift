@@ -139,7 +139,6 @@ public struct Gemma4Configuration: Codable, Sendable {
     let videoTokenId: Int?
     let visionSoftTokensPerImage: Int
     let quantization: BaseConfiguration.Quantization?
-    private let rootPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
 
     enum CodingKeys: String, CodingKey {
         case textConfig = "text_config"
@@ -180,7 +179,6 @@ public struct Gemma4Configuration: Codable, Sendable {
             try c.decodeIfPresent(Int.self, forKey: .visionSoftTokensPerImage)
             ?? visionConfig.defaultOutputLength
         quantization = rootQuantization
-        self.rootPerLayerQuantization = rootPerLayerQuantization
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -191,16 +189,16 @@ public struct Gemma4Configuration: Codable, Sendable {
         try c.encode(imageTokenId, forKey: .imageTokenId)
         try c.encodeIfPresent(videoTokenId, forKey: .videoTokenId)
         try c.encode(visionSoftTokensPerImage, forKey: .visionSoftTokensPerImage)
-        if let rootPerLayerQuantization,
-            let fallback = rootPerLayerQuantization.quantization
-        {
-            try c.encode(
-                Gemma4RootQuantizationConfiguration(
-                    fallback: fallback,
-                    overrides: rootPerLayerQuantization.perLayerQuantization),
-                forKey: .quantization)
-        } else {
-            try c.encodeIfPresent(quantization, forKey: .quantization)
+        if let quantization {
+            let overrides = textConfig.perLayerQuantization?.perLayerQuantization ?? [:]
+            if overrides.isEmpty {
+                try c.encode(quantization, forKey: .quantization)
+            } else {
+                try c.encode(
+                    Gemma4RootQuantizationConfiguration(
+                        fallback: quantization, overrides: overrides),
+                    forKey: .quantization)
+            }
         }
     }
 }
