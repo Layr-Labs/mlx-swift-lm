@@ -207,7 +207,9 @@ struct CBv2TokenConstraintSamplingTests {
     func boundedMaskingOverhead() throws {
         try ensureConstraintTestMetallib()
         let vocab = 262_144
-        let steps = 8
+        let steps = 16
+        let warmupPairs = 2
+        let samplePairs = 9
         let clock = ContinuousClock()
         for batch in [1, 2, 4] {
             let logits = MLXArray.zeros([batch, vocab], type: Float.self)
@@ -215,7 +217,7 @@ struct CBv2TokenConstraintSamplingTests {
                 repeating: .init(temperature: 0), count: batch)
             let ids = (0 ..< batch).map { CBv2RequestID(UInt64(100 + $0)) }
 
-            func measure(constrained: Bool) -> Duration {
+            func measure(constrained: Bool) -> Double {
                 let sampler = CBv2DefaultSampler(fallbackSeed: 1)
                 let constraints = ids.map { _ in
                     FixedTokenConstraint(
@@ -239,22 +241,51 @@ struct CBv2TokenConstraintSamplingTests {
                         rows[index].outputTokens.append(host[index])
                     }
                 }
-                return start.duration(to: clock.now)
+                return durationMilliseconds(start.duration(to: clock.now))
             }
 
-            _ = measure(constrained: false)
-            _ = measure(constrained: true)
-            let baseline = measure(constrained: false)
-            let constrained = measure(constrained: true)
-            let overhead = max(
-                0,
-                durationMilliseconds(constrained)
-                    - durationMilliseconds(baseline))
-                / Double(steps)
+            // Warm both paths and alternate their order so Metal JIT, allocator
+            // state, and monotonic thermal drift cannot favor one path.
+            for pair in 0 ..< warmupPairs {
+                if pair.isMultiple(of: 2) {
+                    _ = measure(constrained: false)
+                    _ = measure(constrained: true)
+                } else {
+                    _ = measure(constrained: true)
+                    _ = measure(constrained: false)
+                }
+            }
+
+            var baselineSamples: [Double] = []
+            var constrainedSamples: [Double] = []
+            var overheadSamples: [Double] = []
+            baselineSamples.reserveCapacity(samplePairs)
+            constrainedSamples.reserveCapacity(samplePairs)
+            overheadSamples.reserveCapacity(samplePairs)
+            for pair in 0 ..< samplePairs {
+                let baseline: Double
+                let constrained: Double
+                if pair.isMultiple(of: 2) {
+                    baseline = measure(constrained: false)
+                    constrained = measure(constrained: true)
+                } else {
+                    constrained = measure(constrained: true)
+                    baseline = measure(constrained: false)
+                }
+                baselineSamples.append(baseline)
+                constrainedSamples.append(constrained)
+                overheadSamples.append((constrained - baseline) / Double(steps))
+            }
+
+            let baseline = median(baselineSamples)
+            let constrained = median(constrainedSamples)
+            let overhead = max(0, median(overheadSamples))
+            let ratio = constrained / baseline
             print(
-                "[tool-constraint-perf] B=\(batch) baseline_ms=\(durationMilliseconds(baseline)) "
-                    + "constrained_ms=\(durationMilliseconds(constrained)) "
-                    + "overhead_ms_per_step=\(overhead)")
+                "[tool-constraint-perf] B=\(batch) baseline_median_ms=\(baseline) "
+                    + "constrained_median_ms=\(constrained) ratio=\(ratio) "
+                    + "overhead_median_ms_per_step=\(overhead) "
+                    + "paired_overheads=\(overheadSamples)")
             #expect(overhead < 5)
         }
     }
@@ -328,4 +359,13 @@ private func durationMilliseconds(_ duration: Duration) -> Double {
     let components = duration.components
     return Double(components.seconds) * 1_000
         + Double(components.attoseconds) / 1_000_000_000_000_000
+}
+
+private func median(_ values: [Double]) -> Double {
+    precondition(!values.isEmpty)
+    let sorted = values.sorted()
+    let middle = sorted.count / 2
+    return sorted.count.isMultiple(of: 2)
+        ? (sorted[middle - 1] + sorted[middle]) / 2
+        : sorted[middle]
 }

@@ -122,6 +122,12 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         caches.allSatisfy { $0 is CBv2LayerCache }
     }
 
+    /// Packed vision rows additionally require one independently bound
+    /// optional span context per row on every owning and borrowing layer.
+    public var supportsPackedMultimodalSpans: Bool {
+        caches.allSatisfy { $0 is CBv2PackedSpanMaskBinding }
+    }
+
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {

@@ -25,6 +25,26 @@ public class BaseConfigurationTests: XCTestCase {
             config.perLayerQuantization?.quantization(layer: "x"), .init(groupSize: 128, bits: 4))
     }
 
+    func testQuantizationConfigAliasFeedsPerLayerQuantization() throws {
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization_config": {
+                    "group_size": 64,
+                    "bits": 4
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: Data(json.utf8))
+
+        XCTAssertEqual(
+            config.perLayerQuantization?.quantization(layer: "model.layers.0.self_attn.q_proj"),
+            .init(groupSize: 64, bits: 4))
+    }
+
     func testHeterogenousQuantization() throws {
         // from https://huggingface.co/mlx-community/Qwen3-1.7B-4bit-AWQ/blob/main/config.json#L20
         let json =

@@ -16,8 +16,9 @@
 //      semantics), for spans at chunk-boundary-adjacent positions, spans
 //      that would straddle a naive boundary (snapped), multiple spans, a
 //      span at position 0, and the KV-sharing model shape;
-//  (b) BATCH INVARIANCE: a vision request batched with text neighbors is
-//      token-exact vs its solo run, and the neighbors are unaffected;
+//  (b) PACKED INVARIANCE: multiple vision rows with distinct/multiple spans
+//      and a text neighbor remain token-exact, while model/cache vetoes take
+//      the established singleton fallback;
 //  (c) TEXT REGRESSION: text-only requests are byte-identical with the
 //      feature compiled in (a no-multimodal request takes the untouched
 //      path);
@@ -270,6 +271,101 @@ final class CBv2VisionDriver {
     func run(steps: Int) { for _ in 0 ..< steps { decodeStep() } }
 }
 
+/// Explicitly opts the seeded fixture into rectangular text + multimodal
+/// prefill and records the embedding-forward shapes reached by the engine.
+final class CBv2PackedVisionTestModel:
+    CBv2PackedPrefillSteppableModel, CBv2MultimodalSteppableModel, @unchecked Sendable
+{
+    let base: TinyTestModel
+    let packedMultimodalClaim: Bool
+    private let lock = NSLock()
+    private var _embeddingForwardShapes: [[Int]] = []
+
+    init(_ base: TinyTestModel, packedMultimodal: Bool = true) {
+        self.base = base
+        self.packedMultimodalClaim = packedMultimodal
+    }
+
+    var supportsPackedPrefill: Bool { true }
+    var supportsPackedMultimodalPrefill: Bool { packedMultimodalClaim }
+
+    var embeddingForwardShapes: [[Int]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _embeddingForwardShapes
+    }
+
+    func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+        base.forward(tokens: tokens, caches: caches)
+    }
+
+    func prefill(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        let logits: MLXArray
+        if let inputEmbeddings {
+            logits = forward(
+                tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+        } else {
+            logits = forward(tokens: tokens, caches: caches)
+        }
+        switch requirement {
+        case .evaluationOnly:
+            return logits[0..., -1, 0 ..< 1]
+        case .lastPositionLogits:
+            return logits[0..., -1, 0...]
+        }
+    }
+
+    func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
+        base.embedPromptTokens(tokens)
+    }
+
+    func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        lock.lock()
+        _embeddingForwardShapes.append(tokens.shape)
+        lock.unlock()
+        return base.forward(
+            tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+    }
+}
+
+/// Real contiguous caches with an independently controllable packed-span
+/// capability, used to prove the provider veto falls back rather than
+/// silently binding a batch-wide mask.
+final class CBv2PackedSpanTestCacheProvider:
+    CBv2LayerCacheProvider, CBv2CompositionInvalidating
+{
+    let bank: CBv2LayerCacheBank
+    let packedSpanClaim: Bool
+
+    init(layerKinds: [CBv2LayerKind], packedSpanClaim: Bool) {
+        self.bank = CBv2LayerCacheBank(layerKinds: layerKinds)
+        self.packedSpanClaim = packedSpanClaim
+    }
+
+    var uniformAttentionSoftcap: Float?? { bank.uniformAttentionSoftcap }
+    var supportsMultimodalSpans: Bool { bank.supportsMultimodalSpans }
+    var supportsPackedPrefill: Bool { bank.supportsPackedPrefill }
+    var supportsPackedMultimodalSpans: Bool {
+        packedSpanClaim && bank.supportsPackedMultimodalSpans
+    }
+
+    func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
+        bank.layerCaches(rowStates: rowStates)
+    }
+
+    func invalidateBoundComposition() { bank.invalidateBoundComposition() }
+    func releaseBoundRows() { bank.releaseBoundRows() }
+}
+
 // MARK: - Resolution helper (bypasses the async engine for driver tests)
 
 extension CBv2MultimodalTests {
@@ -482,6 +578,136 @@ final class CBv2MultimodalTests: XCTestCase {
     }
 
     // MARK: (b) Batch invariance — vision + text neighbors
+
+    func testPackedVisionRowsKeepIndependentSpansAndTextNeighbor() async throws {
+        let base = TinyTestModel.make(seed: 0xC0FFEE, withKVSharing: true)
+        let packedModel = CBv2PackedVisionTestModel(base)
+        let decodeSteps = 4
+        // Both vision rows carry multiple images, with deliberately different
+        // bounds, while the third row is plain text.
+        let spansA = [
+            CBv2ImageSpan(tokenOffset: 2, length: 3),
+            CBv2ImageSpan(tokenOffset: 10, length: 4),
+        ]
+        let spansB = [
+            CBv2ImageSpan(tokenOffset: 5, length: 2),
+            CBv2ImageSpan(tokenOffset: 12, length: 3),
+        ]
+        let (promptA, imagesA) = CBv2VisionFixtures.make(
+            model: base, length: 24, spans: spansA, seed: 120)
+        let (promptB, imagesB) = CBv2VisionFixtures.make(
+            model: base, length: 24, spans: spansB, seed: 121)
+        let textPrompt = makePromptTokens(length: 24, seed: 122)
+
+        let referenceA = CBv2VisionReference.greedy(
+            model: base, prompt: promptA, images: imagesA, decodeSteps: decodeSteps)
+        let referenceB = CBv2VisionReference.greedy(
+            model: base, prompt: promptB, images: imagesB, decodeSteps: decodeSteps)
+        let referenceText = CBv2VisionReference.greedy(
+            model: base, prompt: textPrompt, images: [], decodeSteps: decodeSteps)
+
+        let engine = EngineV2(
+            model: packedModel,
+            layerKinds: base.layerKinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 27)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: base.layerKinds),
+            sampler: CBv2DefaultSampler(fallbackSeed: 5),
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 3, maxBatchedTokensPerStep: 48,
+                prefillChunkSize: 16, maxWaiting: 4))
+        engine.loopForTesting.enqueueStartDelayForTesting = 0.05
+
+        let streamA = try engine.submit(
+            CBv2Request(
+                id: CBv2RequestID(120), promptTokens: promptA,
+                sampling: .init(temperature: 0), maxTokens: decodeSteps,
+                multimodal: CBv2VisionFixtures.input(imagesA)))
+        let streamB = try engine.submit(
+            CBv2Request(
+                id: CBv2RequestID(121), promptTokens: promptB,
+                sampling: .init(temperature: 0), maxTokens: decodeSteps,
+                multimodal: CBv2VisionFixtures.input(imagesB)))
+        let streamText = try engine.submit(
+            CBv2Request(
+                id: CBv2RequestID(122), promptTokens: textPrompt,
+                sampling: .init(temperature: 0), maxTokens: decodeSteps))
+
+        async let outputA = cbv2SchedCollect(streamA)
+        async let outputB = cbv2SchedCollect(streamB)
+        async let outputText = cbv2SchedCollect(streamText)
+        let results = await (outputA, outputB, outputText)
+        await engine.shutdown()
+
+        XCTAssertEqual(results.0.tokens, referenceA)
+        XCTAssertEqual(results.1.tokens, referenceB)
+        XCTAssertEqual(results.2.tokens, referenceText)
+        XCTAssertTrue(
+            packedModel.embeddingForwardShapes.contains([3, 16]),
+            "two independently spliced vision rows plus text must share [3,16]: "
+                + "\(packedModel.embeddingForwardShapes)")
+    }
+
+    func testPackedVisionModelAndCacheCapabilitiesFailClosed() async throws {
+        let cases: [(name: String, modelClaim: Bool, cacheClaim: Bool)] = [
+            ("model veto", false, true),
+            ("cache veto", true, false),
+        ]
+        for (caseIndex, testCase) in cases.enumerated() {
+            let base = TinyTestModel.make(
+                seed: 0xC0FFEE + UInt64(caseIndex), withKVSharing: true)
+            let packedModel = CBv2PackedVisionTestModel(
+                base, packedMultimodal: testCase.modelClaim)
+            let provider = CBv2PackedSpanTestCacheProvider(
+                layerKinds: base.layerKinds, packedSpanClaim: testCase.cacheClaim)
+            let spansA = [CBv2ImageSpan(tokenOffset: 2, length: 5)]
+            let spansB = [CBv2ImageSpan(tokenOffset: 9, length: 6)]
+            let (promptA, imagesA) = CBv2VisionFixtures.make(
+                model: base, length: 24, spans: spansA, seed: 130 + UInt64(caseIndex * 2))
+            let (promptB, imagesB) = CBv2VisionFixtures.make(
+                model: base, length: 24, spans: spansB, seed: 131 + UInt64(caseIndex * 2))
+            let decodeSteps = 3
+            let referenceA = CBv2VisionReference.greedy(
+                model: base, prompt: promptA, images: imagesA, decodeSteps: decodeSteps)
+            let referenceB = CBv2VisionReference.greedy(
+                model: base, prompt: promptB, images: imagesB, decodeSteps: decodeSteps)
+
+            let engine = EngineV2(
+                model: packedModel,
+                layerKinds: base.layerKinds,
+                backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 27)),
+                cacheProvider: provider,
+                sampler: CBv2DefaultSampler(fallbackSeed: 5),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 2, maxBatchedTokensPerStep: 32,
+                    prefillChunkSize: 16, maxWaiting: 4))
+            engine.loopForTesting.enqueueStartDelayForTesting = 0.05
+            let streamA = try engine.submit(
+                CBv2Request(
+                    id: CBv2RequestID(UInt64(140 + caseIndex * 2)),
+                    promptTokens: promptA, sampling: .init(temperature: 0),
+                    maxTokens: decodeSteps,
+                    multimodal: CBv2VisionFixtures.input(imagesA)))
+            let streamB = try engine.submit(
+                CBv2Request(
+                    id: CBv2RequestID(UInt64(141 + caseIndex * 2)),
+                    promptTokens: promptB, sampling: .init(temperature: 0),
+                    maxTokens: decodeSteps,
+                    multimodal: CBv2VisionFixtures.input(imagesB)))
+            async let outputA = cbv2SchedCollect(streamA)
+            async let outputB = cbv2SchedCollect(streamB)
+            let results = await (outputA, outputB)
+            await engine.shutdown()
+
+            XCTAssertEqual(results.0.tokens, referenceA, testCase.name)
+            XCTAssertEqual(results.1.tokens, referenceB, testCase.name)
+            XCTAssertFalse(
+                packedModel.embeddingForwardShapes.contains([2, 16]),
+                "\(testCase.name) must keep span rows on independent singleton forwards")
+            XCTAssertTrue(
+                packedModel.embeddingForwardShapes.filter { $0 == [1, 16] }.count >= 2,
+                "\(testCase.name) must preserve the established singleton fallback")
+        }
+    }
 
     func testBatchInvarianceVisionWithTextNeighbors() throws {
         let model = TinyTestModel.make(seed: 0xC0FFEE)

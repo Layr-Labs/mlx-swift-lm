@@ -7,14 +7,10 @@ import MLXLMCommon
 /// Abstraction over a Gemma 4 text tower that can drive MTP speculative
 /// decoding.
 ///
-/// Both the text-only ``Gemma4TextModel`` (MLXLLM) and the vision-language
-/// `Gemma4` tower (MLXVLM) conform, so the single-stream MTP round loop, the
-/// token iterator, and the drafter binding all work against either tower. The
-/// MTP drafter (``Gemma4AssistantDraftModel``) is trained against the Gemma 4
-/// text architecture; because the VLM tower implements the *same* text
-/// architecture and loads the *same* text weights, a drafter bound to a VLM
-/// tower produces the same speculative tokens it would against the text-only
-/// tower (validated by the parity spike).
+/// ``Gemma4TextModel`` is the canonical target for text-only loads and for
+/// MLXVLM Gemma 4: the VLM owns and exposes this exact object as `textModel`.
+/// Single-stream and CBv2 MTP therefore bind to the same text architecture,
+/// weights, hidden capture, and cache identity used by direct VLM forwards.
 public protocol Gemma4MTPTarget: AnyObject {
 
     /// The resolved text configuration, used for drafter-compatibility
@@ -40,7 +36,7 @@ public protocol Gemma4MTPTarget: AnyObject {
         _ caches: [KVCache], accepted: Gemma4AcceptCount, blockSize: Int)
 }
 
-// MARK: - Text-only tower conformance
+// MARK: - Shared text-tower conformance
 
 extension Gemma4TextModel: Gemma4MTPTarget {
     public var mtpConfiguration: Gemma4TextConfiguration { configuration }

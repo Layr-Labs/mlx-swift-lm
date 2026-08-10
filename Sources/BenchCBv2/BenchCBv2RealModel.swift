@@ -68,10 +68,34 @@ func percentile(_ sorted: [Double], _ q: Double) -> Double {
 
 // MARK: - V2 stack construction
 
+/// Immutable requested/effective topology resolved when the benchmark model
+/// is constructed. These values are repeated in every measured cell so a
+/// standalone JSON result cannot lose its run-level feature provenance.
+struct ModelOptimizationProvenance: Codable, Sendable, Equatable {
+    let layer18Requested: Bool
+    let layer18Effective: Bool
+    let layer18Interval: Int?
+    let weightedUnsortRequested: Bool
+    let weightedUnsortEffective: Bool
+    let safeR1GeometryEligible: Bool
+
+    var markdown: String {
+        "layer18(requested=\(layer18Requested), effective=\(layer18Effective), "
+            + "interval=\(layer18Interval.map(String.init) ?? "n/a")); "
+            + "weightedUnsort(requested=\(weightedUnsortRequested), "
+            + "effective=\(weightedUnsortEffective)); "
+            + "safeR1GeometryEligible=\(safeR1GeometryEligible)"
+    }
+}
+
 /// CBv2 structural hooks for the loaded model (layer kinds + cache builder,
 /// which for GPT-OSS also primes the sinks-activation probe at build time).
 struct V2ModelHooks {
+    /// Exact model instance driven by EngineV2. For an outer Gemma4Model this
+    /// is its owned text tower; all hooks below are derived from this object.
+    let model: any LanguageModel
     let layerKinds: [CBv2LayerKind]
+    let optimizations: ModelOptimizationProvenance
     let buildCaches:
         (@escaping (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache) throws ->
             [any CBv2AttendingLayerCache]
@@ -79,17 +103,52 @@ struct V2ModelHooks {
 
 func v2Hooks(for model: any LanguageModel) -> V2ModelHooks? {
     if let m = model as? Gemma4Model {
-        return V2ModelHooks(layerKinds: m.textModel.cbv2LayerKinds) { mk in
-            try m.textModel.newCacheV2(makeLayerCache: mk)
+        let textModel = m.textModel
+        let interval = textModel.cbv2PrefillChunkEvalInterval
+        let layerKinds = textModel.cbv2LayerKinds
+        return V2ModelHooks(
+            model: textModel,
+            layerKinds: layerKinds,
+            optimizations: ModelOptimizationProvenance(
+                layer18Requested: interval > 0,
+                layer18Effective: interval > 0 && layerKinds.count >= interval,
+                layer18Interval: interval,
+                weightedUnsortRequested: textModel.weightedExpertUnsortRequested,
+                weightedUnsortEffective: textModel.weightedExpertUnsortEffective,
+                safeR1GeometryEligible: textModel.expertQMMGeometryEligible)
+        ) { mk in
+            try textModel.newCacheV2(makeLayerCache: mk)
         }
     }
     if let m = model as? Gemma4TextModel {
-        return V2ModelHooks(layerKinds: m.cbv2LayerKinds) { mk in
+        let interval = m.cbv2PrefillChunkEvalInterval
+        let layerKinds = m.cbv2LayerKinds
+        return V2ModelHooks(
+            model: m,
+            layerKinds: layerKinds,
+            optimizations: ModelOptimizationProvenance(
+                layer18Requested: interval > 0,
+                layer18Effective: interval > 0 && layerKinds.count >= interval,
+                layer18Interval: interval,
+                weightedUnsortRequested: m.weightedExpertUnsortRequested,
+                weightedUnsortEffective: m.weightedExpertUnsortEffective,
+                safeR1GeometryEligible: m.expertQMMGeometryEligible)
+        ) { mk in
             try m.newCacheV2(makeLayerCache: mk)
         }
     }
     if let m = model as? GPTOSSModel {
-        return V2ModelHooks(layerKinds: m.cbv2LayerKinds) { mk in
+        return V2ModelHooks(
+            model: m,
+            layerKinds: m.cbv2LayerKinds,
+            optimizations: ModelOptimizationProvenance(
+                layer18Requested: false,
+                layer18Effective: false,
+                layer18Interval: nil,
+                weightedUnsortRequested: false,
+                weightedUnsortEffective: false,
+                safeR1GeometryEligible: false)
+        ) { mk in
             try m.newCacheV2(makeLayerCache: mk)
         }
     }
@@ -141,7 +200,7 @@ func makeV2Engine(
         kvBackend = paged
     }
     return EngineV2(
-        model: CBv2SteppableLanguageModelAdapter(context.model),
+        model: CBv2SteppableLanguageModelAdapter(hooks.model),
         layerKinds: hooks.layerKinds,
         backend: kvBackend,
         cacheProvider: CBv2LayerCacheBank(caches: caches),
@@ -246,7 +305,202 @@ func logprobDetail(_ r: RunResult, at index: Int, label: String) -> String {
 
 // MARK: - Perf cells
 
-struct CellResult: Sendable {
+struct RunOptimizationProvenance: Codable, Sendable, Equatable {
+    let model: ModelOptimizationProvenance
+    let safeR1Requested: Bool
+    let safeR1AOTAvailable: Bool
+    let safeR1NAXAvailable: Bool
+    let safeR1Effective: Bool
+}
+
+struct SafeR1Provenance: Codable, Sendable, Equatable {
+    let requested: Bool
+    let aotAvailable: Bool
+    let naxAvailable: Bool
+    let armed: Bool
+    let exactGeometryExpected: Bool
+    let attempts: UInt64
+    let hits: UInt64
+    let effective: Bool
+    let fallbackNAX: UInt64
+    let fallbackOuterRoute: UInt64
+    let fallbackQuantization: UInt64
+    let fallbackTopology: UInt64
+    let fallbackAssignmentCount: UInt64
+    let fallbackGeometry: UInt64
+    let fallbackMetallibUnavailable: UInt64
+    let fallbacks: UInt64
+
+    init(
+        diagnostics: GPU.Gemma4ExpertQMMDiagnostics,
+        exactGeometryExpected: Bool
+    ) {
+        requested = diagnostics.requested
+        aotAvailable = diagnostics.aotAvailable
+        naxAvailable = diagnostics.naxAvailable
+        armed = diagnostics.armed
+        self.exactGeometryExpected = exactGeometryExpected
+        attempts = diagnostics.attempts
+        hits = diagnostics.hits
+        effective = diagnostics.hits > 0
+        fallbackNAX = diagnostics.fallbackNAX
+        fallbackOuterRoute = diagnostics.fallbackOuterRoute
+        fallbackQuantization = diagnostics.fallbackQuantization
+        fallbackTopology = diagnostics.fallbackTopology
+        fallbackAssignmentCount = diagnostics.fallbackAssignmentCount
+        fallbackGeometry = diagnostics.fallbackGeometry
+        fallbackMetallibUnavailable = diagnostics.fallbackMetallibUnavailable
+        fallbacks = diagnostics.fallbacks
+    }
+
+    init(
+        requested: Bool, aotAvailable: Bool, naxAvailable: Bool,
+        armed: Bool = true,
+        exactGeometryExpected: Bool, attempts: UInt64, hits: UInt64,
+        fallbackNAX: UInt64 = 0, fallbackOuterRoute: UInt64 = 0,
+        fallbackQuantization: UInt64 = 0, fallbackTopology: UInt64 = 0,
+        fallbackAssignmentCount: UInt64 = 0, fallbackGeometry: UInt64 = 0,
+        fallbackMetallibUnavailable: UInt64 = 0
+    ) {
+        self.requested = requested
+        self.aotAvailable = aotAvailable
+        self.naxAvailable = naxAvailable
+        self.armed = armed
+        self.exactGeometryExpected = exactGeometryExpected
+        self.attempts = attempts
+        self.hits = hits
+        self.effective = hits > 0
+        self.fallbackNAX = fallbackNAX
+        self.fallbackOuterRoute = fallbackOuterRoute
+        self.fallbackQuantization = fallbackQuantization
+        self.fallbackTopology = fallbackTopology
+        self.fallbackAssignmentCount = fallbackAssignmentCount
+        self.fallbackGeometry = fallbackGeometry
+        self.fallbackMetallibUnavailable = fallbackMetallibUnavailable
+        self.fallbacks =
+            fallbackNAX + fallbackOuterRoute + fallbackQuantization
+            + fallbackTopology + fallbackAssignmentCount + fallbackGeometry
+            + fallbackMetallibUnavailable
+    }
+
+
+    var guardFailure: String? {
+        guard armed else {
+            return "safe R1 diagnostics were not armed for the measured cell"
+        }
+        guard attempts == hits + fallbacks else {
+            return "safe R1 counters are inconsistent: attempts=\(attempts), "
+                + "hits+fallbacks=\(hits + fallbacks)"
+        }
+        guard requested else {
+            return attempts == 0
+                ? nil : "safe R1 recorded \(attempts) attempts while not requested"
+        }
+        guard exactGeometryExpected else { return nil }
+        if naxAvailable {
+            return fallbackNAX > 0
+                ? nil : "safe R1 expected NAX precedence but recorded no NAX fallback"
+        }
+        return hits > 0
+            ? nil : "safe R1 was requested for exact non-NAX geometry but recorded no hit"
+    }
+}
+
+struct CellOptimizationProvenance: Codable, Sendable, Equatable {
+    let model: ModelOptimizationProvenance
+    let layer18IntermediateSubmissions: Int
+    let layer18ExpectedMinimumSubmissions: Int
+    let layer18Engaged: Bool
+    let weightedUnsortEffectiveCalls: Int
+    let weightedUnsortEngaged: Bool
+    let safeR1: SafeR1Provenance
+
+    init(
+        model: ModelOptimizationProvenance,
+        layer18IntermediateSubmissions: Int,
+        layer18ExpectedMinimumSubmissions: Int,
+        weightedUnsortEffectiveCalls: Int,
+        safeR1: SafeR1Provenance
+    ) {
+        self.model = model
+        self.layer18IntermediateSubmissions = layer18IntermediateSubmissions
+        self.layer18ExpectedMinimumSubmissions = layer18ExpectedMinimumSubmissions
+        self.layer18Engaged = layer18IntermediateSubmissions > 0
+        self.weightedUnsortEffectiveCalls = weightedUnsortEffectiveCalls
+        self.weightedUnsortEngaged = weightedUnsortEffectiveCalls > 0
+        self.safeR1 = safeR1
+    }
+
+    var guardFailure: String? {
+        if model.layer18Effective
+            && layer18IntermediateSubmissions < layer18ExpectedMinimumSubmissions
+        {
+            return "layer18 expected at least \(layer18ExpectedMinimumSubmissions) "
+                + "intermediate submissions but recorded \(layer18IntermediateSubmissions)"
+        }
+        if model.weightedUnsortEffective && !weightedUnsortEngaged {
+            return "weighted expert unsort was effective but recorded no call"
+        }
+        return safeR1.guardFailure
+    }
+
+    func markdown(scope: String) -> String {
+        "- optimization provenance [\(scope)]: \(model.markdown); "
+            + "layer18ExpectedMinimumSubmissions=\(layer18ExpectedMinimumSubmissions), "
+            + "layer18Submissions=\(layer18IntermediateSubmissions), "
+            + "layer18Engaged=\(layer18Engaged); "
+            + "weightedCalls=\(weightedUnsortEffectiveCalls), "
+            + "weightedEngaged=\(weightedUnsortEngaged); "
+            + "safeR1(requested=\(safeR1.requested), "
+            + "effective=\(safeR1.effective), armed=\(safeR1.armed), "
+            + "aot=\(safeR1.aotAvailable), nax=\(safeR1.naxAvailable), "
+            + "exactGeometryExpected=\(safeR1.exactGeometryExpected), "
+            + "attempts=\(safeR1.attempts), hits=\(safeR1.hits), "
+            + "fallbacks=\(safeR1.fallbacks), "
+            + "fallbackNAX=\(safeR1.fallbackNAX), "
+            + "fallbackOuterRoute=\(safeR1.fallbackOuterRoute), "
+            + "fallbackQuantization=\(safeR1.fallbackQuantization), "
+            + "fallbackTopology=\(safeR1.fallbackTopology), "
+            + "fallbackAssignmentCount=\(safeR1.fallbackAssignmentCount), "
+            + "fallbackGeometry=\(safeR1.fallbackGeometry), "
+            + "fallbackMetallibUnavailable=\(safeR1.fallbackMetallibUnavailable))"
+    }
+}
+
+private struct SafeR1PrefillGroupKey: Hashable {
+    let width: Int
+    let samples: Bool
+}
+
+/// Whether the first scheduled prefill wave has one of the three exact token
+/// counts accepted by safe R1 (the kernel sees token count × Gemma topK=8
+/// assignments). CBv2 coalesces rows only when both chunk width and whether
+/// the chunk samples are equal, so the guard mirrors those group keys.
+func safeR1ExactGeometryExpected(
+    modelEligible: Bool,
+    promptLengths: [Int],
+    prefillChunkSize: Int
+) -> Bool {
+    guard modelEligible, prefillChunkSize > 0 else { return false }
+    let rows = promptLengths.map {
+        SafeR1PrefillGroupKey(
+            width: min($0, prefillChunkSize),
+            samples: $0 <= prefillChunkSize)
+    }
+    let groups = Dictionary(grouping: rows, by: { $0 })
+    return groups.contains { key, rows in
+        let tokenCount = key.width * rows.count
+        return tokenCount == 512 || tokenCount == 1024 || tokenCount == 2048
+    }
+}
+
+func benchmarkJSONString<T: Encodable>(_ value: T) throws -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return String(decoding: try encoder.encode(value), as: UTF8.self)
+}
+
+struct CellResult: Codable, Sendable {
     var engine: String
     var batch: Int
     var promptMix: [Int]
@@ -255,6 +509,7 @@ struct CellResult: Sendable {
     var ttftP50Ms: Double
     var itlP50Ms: Double
     var perRequest: [String]
+    var optimizationProvenance: CellOptimizationProvenance?
 
     var markdownRow: String {
         String(
@@ -269,7 +524,45 @@ struct CellResult: Sendable {
         """
 }
 
-func summarize(engine: String, batch: Int, promptMix: [Int], results: [RunResult]) -> CellResult {
+/// Validate and serialize one cell's fail-closed optimization provenance.
+func optimizationProvenanceLines(
+    _ cell: CellResult, scope: String
+) throws -> [String] {
+    guard let provenance = cell.optimizationProvenance else {
+        throw CBv2KVError.backendIneligible(
+            reason: "optimization provenance was not armed for \(scope)")
+    }
+    if let failure = provenance.guardFailure {
+        throw CBv2KVError.backendIneligible(
+            reason: "invalid optimization provenance in \(scope): \(failure)")
+    }
+    return [
+        provenance.markdown(scope: scope),
+        "- optimization-cell-json [\(scope)]: \(try benchmarkJSONString(cell))",
+    ]
+}
+
+/// Keep every Markdown table row contiguous, then append the per-cell
+/// provenance records in the same order as their rows.
+func performanceMarkdown(
+    rows: [String], provenanceLines: [String]
+) -> String {
+    var lines = [CellResult.markdownHeader]
+    lines.append(contentsOf: rows)
+    if !provenanceLines.isEmpty {
+        lines.append("")
+        lines.append(contentsOf: provenanceLines)
+    }
+    return lines.joined(separator: "\n")
+}
+
+func summarize(
+    engine: String,
+    batch: Int,
+    promptMix: [Int],
+    results: [RunResult],
+    optimizationProvenance: CellOptimizationProvenance? = nil
+) -> CellResult {
     let totalTokens = results.reduce(0) { $0 + $1.tokens.count }
     let start = results.map(\.submittedAt).min() ?? 0
     let end = results.map(\.finishedAt).max() ?? 1
@@ -287,7 +580,8 @@ func summarize(engine: String, batch: Int, promptMix: [Int], results: [RunResult
         aggregateTPS: Double(totalTokens) / max(end - start, 1e-9),
         ttftP50Ms: percentile(ttfts, 0.5),
         itlP50Ms: percentile(itls, 0.5),
-        perRequest: perRequest)
+        perRequest: perRequest,
+        optimizationProvenance: optimizationProvenance)
 }
 
 func promptMix(batch: Int) -> [Int] {
@@ -302,13 +596,16 @@ func promptMix(batch: Int) -> [Int] {
 func runV2Cell(
     context: ModelContext, hooks: V2ModelHooks, backend: V2Backend,
     batch: Int, promptLengths: [Int], steps: Int, vocabSize: Int, kvBytes: Int,
-    compiledDecode: Bool = false, emit: ((String) -> Void)? = nil
+    compiledDecode: Bool = false,
+    trackOptimizationProvenance: Bool = false,
+    emit: ((String) -> Void)? = nil
 ) async throws -> CellResult {
+    let prefillChunkSize = 512
     let engine = try makeV2Engine(
         context: context, hooks: hooks, backend: backend,
         schedulerConfig: CBv2SchedulerConfig(
             maxConcurrentRequests: batch, maxBatchedTokensPerStep: 2048,
-            prefillChunkSize: 512, maxWaiting: 16),
+            prefillChunkSize: prefillChunkSize, maxWaiting: 16),
         kvBytes: kvBytes, compiledDecode: compiledDecode)
     if compiledDecode {
         // Absorb this fresh engine's per-bucket traces (the compile cache is
@@ -329,11 +626,16 @@ func runV2Cell(
                 stats.disabledReason.map { " DISABLED: \($0)" } ?? ""))
         }
     }
-    // Measurement boundary: reset the process-wide peak AFTER engine
-    // construction and the compiled-decode warm-up so the caller's per-row
-    // gpuPeak covers only the measured request group — not trace-building
-    // or an earlier cell's high-water mark.
+
+    // One shared measured boundary after all warmup. Performance cells arm
+    // only the independent provenance counters; phase timers remain in their
+    // caller-selected state. Every counter snapshots/disarms after shutdown.
     MLX.Memory.peakMemory = 0
+    if trackOptimizationProvenance {
+        resetWeightedExpertUnsortStats()
+        MLX.GPU.clearAndArmGemma4ExpertQMMDiagnostics()
+        CBv2StepProfiler.armEvents()
+    }
     let results = await withTaskGroup(of: (Int, RunResult).self) { group in
         for (i, length) in promptLengths.enumerated() {
             let prompt = syntheticPrompt(
@@ -350,6 +652,38 @@ func runV2Cell(
         return all.sorted { $0.0 < $1.0 }.map(\.1)
     }
     await engine.shutdown()
+
+    let optimizationProvenance: CellOptimizationProvenance?
+    if trackOptimizationProvenance {
+        let layer18Submissions = CBv2StepProfiler.snapshotAndDisarmEvents()[
+            "v2.gemma4.prefill.chunk_eval"] ?? 0
+        let weighted = weightedExpertUnsortProvenance(
+            requested: hooks.optimizations.weightedUnsortEffective)
+        let r1 = SafeR1Provenance(
+            diagnostics: MLX.GPU.snapshotAndDisarmGemma4ExpertQMMDiagnostics(),
+            exactGeometryExpected: safeR1ExactGeometryExpected(
+                modelEligible: hooks.optimizations.safeR1GeometryEligible,
+                promptLengths: promptLengths,
+                prefillChunkSize: prefillChunkSize))
+        let expectedLayer18Minimum: Int
+        if let interval = hooks.optimizations.layer18Interval,
+            interval > 0,
+            promptLengths.contains(where: { $0 > 1 })
+        {
+            expectedLayer18Minimum = hooks.layerKinds.count / interval
+        } else {
+            expectedLayer18Minimum = 0
+        }
+        optimizationProvenance = CellOptimizationProvenance(
+            model: hooks.optimizations,
+            layer18IntermediateSubmissions: layer18Submissions,
+            layer18ExpectedMinimumSubmissions: expectedLayer18Minimum,
+            weightedUnsortEffectiveCalls: weighted.effectiveCalls,
+            safeR1: r1)
+    } else {
+        optimizationProvenance = nil
+    }
+
     if compiledDecode, let emit, let stats = engine.compiledDecodeStats {
         emit(
             "    [v2-compiled B=\(batch)] compiledSteps=\(stats.compiledSteps) "
@@ -358,7 +692,8 @@ func runV2Cell(
     }
     return summarize(
         engine: compiledDecode ? "v2-compiled" : backend.rawValue,
-        batch: batch, promptMix: promptLengths, results: results)
+        batch: batch, promptMix: promptLengths, results: results,
+        optimizationProvenance: optimizationProvenance)
 }
 
 // MARK: - Correctness
@@ -858,10 +1193,28 @@ struct BenchCBv2RealModel {
                     throw CBv2KVError.backendIneligible(
                         reason: "model type \(type(of: context.model)) has no CBv2 hooks")
                 }
-                emit("model class: \(type(of: context.model)); layers: \(hooks.layerKinds.count)")
+                emit("model class: \(type(of: hooks.model)); layers: \(hooks.layerKinds.count)")
+                let runR1 = MLX.GPU.gemma4ExpertQMMDiagnostics()
+                let runOptimizations = RunOptimizationProvenance(
+                    model: hooks.optimizations,
+                    safeR1Requested: runR1.requested,
+                    safeR1AOTAvailable: runR1.aotAvailable,
+                    safeR1NAXAvailable: runR1.naxAvailable,
+                    safeR1Effective:
+                        hooks.optimizations.safeR1GeometryEligible
+                        && runR1.requested && runR1.aotAvailable && !runR1.naxAvailable)
+                emit("- optimization model: \(hooks.optimizations.markdown); "
+                    + "safeR1(requested=\(runR1.requested), "
+                    + "effective=\(runOptimizations.safeR1Effective), "
+                    + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
+                emit("- optimization-run-json: \(try benchmarkJSONString(runOptimizations))")
+
+
 
                 // Vocab probe ([1,1] cache-less forward) for synthetic prompts.
-                let probe = context.model(MLXArray([Int32(0)]).reshaped(1, 1), cache: nil)
+                // Use the exact model EngineV2 will drive so Gemma 4 VLM
+                // checkpoints report and probe their owned text tower.
+                let probe = hooks.model(MLXArray([Int32(0)]).reshaped(1, 1), cache: nil)
                 let vocabSize = probe.dim(-1)
                 emit("vocabSize=\(vocabSize)")
 
@@ -907,10 +1260,16 @@ struct BenchCBv2RealModel {
                             let cell = try await runV2Cell(
                                 context: context, hooks: hooks, backend: .contiguous,
                                 batch: 1, promptLengths: [500], steps: stepsCopy,
-                                vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                                vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                                trackOptimizationProvenance: true)
                             CBv2StepProfiler.enabled = false
                             emit("### v2 (contiguous) B=1 — decodeTPS \(String(format: "%.1f", cell.decodeTPSPerRequest))\n")
                             emit(CBv2StepProfiler.summaryTable())
+                            for line in try optimizationProvenanceLines(
+                                cell, scope: "profile/v2/B1")
+                            {
+                                emit(line)
+                            }
                         default:
                             continue
                         }
@@ -919,8 +1278,12 @@ struct BenchCBv2RealModel {
 
                 // Perf -------------------------------------------------------
                 if modeCopy == "all" || modeCopy == "perf" {
+                    // Performance mode never inherits opt-in phase clocks;
+                    // profile mode above is the only timer-owning benchmark.
+                    CBv2StepProfiler.enabled = false
                     emit("\n## Performance (maxTokens \(stepsCopy))\n")
-                    emit(CellResult.markdownHeader)
+                    var tableRows: [String] = []
+                    var provenanceLines: [String] = []
                     var details: [String] = []
                     for engineName in enginesCopy {
                         // Warmup: absorb kernel compile / cache-shape costs.
@@ -936,7 +1299,7 @@ struct BenchCBv2RealModel {
                                 context: context, hooks: hooks, backend: .contiguous,
                                 batch: 1, promptLengths: warmPrompt, steps: 8,
                                 vocabSize: vocabSize, kvBytes: kvBytesCopy,
-                                compiledDecode: true, emit: { emit($0) })
+                                compiledDecode: true, emit: { details.append($0) })
                         case "v2-paged":
                             do {
                                 _ = try await runV2Cell(
@@ -944,11 +1307,13 @@ struct BenchCBv2RealModel {
                                     batch: 1, promptLengths: warmPrompt, steps: 8,
                                     vocabSize: vocabSize, kvBytes: kvBytesCopy)
                             } catch {
-                                emit("| v2-paged | - | - | skipped: \(error) | | | |")
+                                tableRows.append(
+                                    "| v2-paged | - | - | skipped: \(error) | | | |")
                                 continue
                             }
                         default:
-                            emit("| \(engineName) | - | - | unknown engine | | | |")
+                            tableRows.append(
+                                "| \(engineName) | - | - | unknown engine | | | |")
                             continue
                         }
 
@@ -960,22 +1325,28 @@ struct BenchCBv2RealModel {
                                 cell = try await runV2Cell(
                                     context: context, hooks: hooks, backend: .contiguous,
                                     batch: batch, promptLengths: mix, steps: stepsCopy,
-                                    vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                                    vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                                    trackOptimizationProvenance: true)
                             case "v2-compiled":
                                 cell = try await runV2Cell(
                                     context: context, hooks: hooks, backend: .contiguous,
                                     batch: batch, promptLengths: mix, steps: stepsCopy,
                                     vocabSize: vocabSize, kvBytes: kvBytesCopy,
                                     compiledDecode: true,
+                                    trackOptimizationProvenance: true,
                                     emit: { details.append($0) })
                             default:
                                 cell = try await runV2Cell(
                                     context: context, hooks: hooks, backend: .paged,
                                     batch: batch, promptLengths: mix, steps: stepsCopy,
-                                    vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                                    vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                                    trackOptimizationProvenance: true)
                             }
-                            emit(cell.markdownRow)
-                            emit(String(
+                            tableRows.append(cell.markdownRow)
+                            provenanceLines.append(
+                                contentsOf: try optimizationProvenanceLines(
+                                    cell, scope: "perf/\(engineName)/B\(batch)"))
+                            details.append(String(
                                 format: "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
                                 cell.engine, batch,
                                 Double(MLX.GPU.activeMemory) / Double(1 << 30),
@@ -985,6 +1356,8 @@ struct BenchCBv2RealModel {
                                     + cell.perRequest.joined(separator: "\n"))
                         }
                     }
+                    emit(performanceMarkdown(
+                        rows: tableRows, provenanceLines: provenanceLines))
                     emit("\nPer-request detail:\n" + details.joined(separator: "\n"))
                 }
                 return out

@@ -205,6 +205,26 @@ public struct BaseConfiguration: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
+        case quantizationConfiguration = "quantization_config"
         case eosTokenIds = "eos_token_id"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        quantizationContainer =
+            try container.decodeIfPresent(
+                QuantizationContainer.self, forKey: .quantizationContainer)
+            ?? container.decodeIfPresent(
+                QuantizationContainer.self, forKey: .quantizationConfiguration)
+        eosTokenIds = try container.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(modelType, forKey: .modelType)
+        try container.encodeIfPresent(
+            quantizationContainer, forKey: .quantizationContainer)
+        try container.encodeIfPresent(eosTokenIds, forKey: .eosTokenIds)
     }
 }

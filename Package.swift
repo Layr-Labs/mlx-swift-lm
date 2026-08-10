@@ -257,6 +257,11 @@ let package = Package(
             ],
             path: "Sources/BenchCBv2"
         ),
+        .testTarget(
+            name: "BenchCBv2Tests",
+            dependencies: ["BenchCBv2"],
+            path: "Tests/BenchCBv2Tests"
+        ),
     ]
 )
 

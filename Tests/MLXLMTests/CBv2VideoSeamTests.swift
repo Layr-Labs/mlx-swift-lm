@@ -34,19 +34,19 @@
 //      `videoPlaceholderTokenId` mirrors `video_token_id` including its
 //      258_884 default.
 //
-// Wrapper-vs-extracted-model bit parity is structurally unattainable across
-// module trees (see provider EngineV2VLMTextExtraction.assertForwardParity),
-// so real-checkpoint greedy parity lives in the provider's live suites; the
-// engine-repo contract is exactness against the wrapper-semantics reference
-// over shared weights, per the PR#63 precedent.
+// Direct VLM and CBv2 forwards now share one `Gemma4TextModel` object. The
+// engine contract below therefore exercises the same language tower as the
+// wrapper-semantics reference rather than a separately reconstructed module.
 
 import AVFoundation
 import CoreImage
 import CoreMedia
 import Foundation
 import MLX
+import MLXLLM
+import MLXNN
 import MLXRandom
-import MLXVLM
+@testable import MLXVLM
 import XCTest
 
 @testable import MLXLMCommon
@@ -193,11 +193,11 @@ final class CBv2VideoSeamTests: XCTestCase {
     }
 
     private func makeTinyVLM(configJSON: String = CBv2VideoSeamTests.tinyVLMConfigJSON) throws
-        -> Gemma4
+        -> MLXVLM.Gemma4
     {
         let config = try JSONDecoder().decode(
-            Gemma4Configuration.self, from: Data(configJSON.utf8))
-        return Gemma4(config)
+            MLXVLM.Gemma4Configuration.self, from: Data(configJSON.utf8))
+        return MLXVLM.Gemma4(config)
     }
 
     /// Two solid-color 64×64 frames at t = 0s and t = 2s. The `.frames` video
@@ -445,6 +445,280 @@ final class CBv2VideoSeamTests: XCTestCase {
             vlm.imagePlaceholderTokenId, Gemma4VideoStubTokenizer.imageMarkerId)
     }
 
+    /// The wrapper owns one shared Gemma4TextModel: repeated access, direct
+    /// VLM, CBv2, strict loading, and parameter accounting all meet at that
+    /// same module boundary. Vision tensors remain outside text sanitization.
+    func testSharedTextTowerOwnershipStrictLoadAndSanitizerBoundary() throws {
+        let untiedJSON = Self.tinyVLMConfigJSON.replacingOccurrences(
+            of: "\"tie_word_embeddings\": true",
+            with: "\"tie_word_embeddings\": false")
+        let vlm = try makeTinyVLM(configJSON: untiedJSON)
+        let ownedTextModel = vlm.textModel
+        XCTAssertTrue(ownedTextModel === vlm.textModel)
+
+        let adapter = CBv2SteppableLanguageModelAdapter(ownedTextModel)
+        XCTAssertTrue(
+            adapter.supportsMultimodalPrefill,
+            "the VLM-owned text tower must expose Gemma4 vision-span prefill to CBv2")
+
+        let vlmParameters = vlm.parameters().flattened()
+        let textParameters = ownedTextModel.parameters().flattened()
+        let vlmKeys = Set(vlmParameters.map(\.0))
+        XCTAssertTrue(vlmKeys.contains("language_model.model.embed_tokens.weight"))
+        XCTAssertTrue(vlmKeys.contains("language_model.lm_head.weight"))
+        for (key, _) in textParameters {
+            XCTAssertTrue(
+                vlmKeys.contains("language_model.\(key)"),
+                "VLM parameter tree must own the shared text parameter \(key)")
+        }
+        XCTAssertEqual(
+            vlmParameters.filter { $0.0.hasPrefix("language_model.") }
+                .reduce(0) { $0 + $1.1.nbytes },
+            textParameters.reduce(0) { $0 + $1.1.nbytes },
+            "the VLM must account for exactly one text tower")
+
+        let exactTree = Dictionary(uniqueKeysWithValues: vlmParameters)
+        try vlm.update(
+            parameters: ModuleParameters.unflattened(exactTree), verify: [.all])
+
+        let sanitized = vlm.sanitize(weights: [
+            "model.language_model.embed_tokens.weight": MLXArray.zeros([512, 32]),
+            "model.language_model.lm_head.weight": MLXArray.zeros([512, 32]),
+            "model.language_model.layers.0.experts.gate_up_proj":
+                MLXArray.zeros([4, 2]),
+            "language_model.model.layers.0.experts.switch_glu.gate_proj.scales":
+                MLXArray.zeros([2, 1]),
+            "model.vision_tower.transformer.layers.0.self_attn.k_proj.linear.weight":
+                MLXArray.zeros([2, 2]),
+        ])
+
+        XCTAssertNotNil(sanitized["language_model.model.embed_tokens.weight"])
+        XCTAssertNotNil(sanitized["language_model.lm_head.weight"])
+        XCTAssertNotNil(
+            sanitized[
+                "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"])
+        XCTAssertNotNil(
+            sanitized[
+                "language_model.model.layers.0.experts.switch_glu.up_proj.weight"])
+        XCTAssertNotNil(
+            sanitized[
+                "language_model.model.layers.0.experts.switch_glu.gate_proj.scales"])
+        XCTAssertNotNil(
+            sanitized[
+                "vision_tower.transformer.layers.0.self_attn.k_proj.weight"])
+        XCTAssertNil(
+            sanitized["language_model.model.layers.0.experts.gate_up_proj"])
+    }
+
+    /// Gemma4 VLM adapters have always interpreted explicit keys relative to
+    /// decoder layers. The shared-tower cutover must retain that root contract,
+    /// while the nil-key default still reaches every Linear descendant.
+    func testSharedTowerPreservesExplicitAndDefaultLoRARoots() throws {
+        func module(named name: String, in layer: Module) -> Module? {
+            layer.namedModules().first { $0.0 == name }?.1
+        }
+
+        let explicitVLM = try makeTinyVLM()
+        XCTAssertEqual(explicitVLM.loraLayers.count, 2)
+        for (root, decoder) in zip(
+            explicitVLM.loraLayers, explicitVLM.textModel.decoderLayers)
+        {
+            XCTAssertTrue(
+                root === decoder,
+                "LoRA roots must be the decoder objects owned by the shared tower")
+        }
+        XCTAssertTrue(
+            explicitVLM.loraLayers.allSatisfy {
+                module(named: "self_attn.q_proj", in: $0) is Linear
+                    && module(named: "mlp.gate_proj", in: $0) is Linear
+            },
+            "VLM LoRA roots must be canonical decoder layers")
+
+        let explicitAdapter = try LoRAContainer.from(
+            model: explicitVLM,
+            configuration: LoRAConfiguration(
+                numLayers: 1,
+                loraParameters: .init(
+                    rank: 2, scale: 1, keys: ["self_attn.q_proj"])))
+        XCTAssertFalse(
+            module(named: "self_attn.q_proj", in: explicitVLM.loraLayers[0])
+                is LoRALinear)
+        XCTAssertTrue(
+            module(named: "self_attn.q_proj", in: explicitVLM.loraLayers[1])
+                is LoRALinear)
+        XCTAssertFalse(
+            module(named: "mlp.gate_proj", in: explicitVLM.loraLayers[1])
+                is LoRALinear)
+        XCTAssertTrue(
+            explicitAdapter.parameters.flattened().allSatisfy {
+                $0.0.hasPrefix("language_model.model.layers.1.self_attn.q_proj.")
+            },
+            "explicit decoder-relative keys must not cross into the vision tower")
+
+        let defaultVLM = try makeTinyVLM()
+        let defaultKeys = Set(defaultVLM.loraDefaultKeys)
+        XCTAssertTrue(defaultKeys.contains("self_attn.q_proj"))
+        XCTAssertTrue(defaultKeys.contains("mlp.gate_proj"))
+        XCTAssertFalse(defaultKeys.contains("q_proj"))
+
+        let defaultAdapter = try LoRAContainer.from(
+            model: defaultVLM,
+            configuration: LoRAConfiguration(
+                numLayers: 1,
+                loraParameters: .init(rank: 2, scale: 1)))
+        XCTAssertTrue(
+            module(named: "self_attn.q_proj", in: defaultVLM.loraLayers[1])
+                is LoRALinear)
+        XCTAssertTrue(
+            module(named: "mlp.gate_proj", in: defaultVLM.loraLayers[1])
+                is LoRALinear)
+        XCTAssertTrue(
+            defaultAdapter.parameters.flattened().allSatisfy {
+                $0.0.hasPrefix("language_model.model.layers.1.")
+            },
+            "default LoRA must remain inside the owned decoder-layer boundary")
+    }
+
+    /// Production VLM configs keep quantization beside `text_config`. Both
+    /// accepted root spellings must overlay the canonical configuration that
+    /// the shared target and automatic MTP policy consume.
+    func testRootOnlyQuantizationDrivesCanonicalTextConfigurationAndMTPPolicy() throws {
+        for rootKey in ["quantization", "quantization_config"] {
+            var json = Self.tinyVLMConfigJSON.replacingOccurrences(
+                of: "\"model_type\": \"gemma4\",",
+                with:
+                    "\"model_type\": \"gemma4\", \"\(rootKey)\": {\"bits\": 4, \"group_size\": 64},")
+            json = json.replacingOccurrences(
+                of: "\"hidden_size\": 32", with: "\"hidden_size\": 1536")
+            json = json.replacingOccurrences(
+                of: "\"num_hidden_layers\": 2", with: "\"num_hidden_layers\": 35")
+
+            let config = try JSONDecoder().decode(
+                MLXVLM.Gemma4Configuration.self, from: Data(json.utf8))
+            XCTAssertEqual(config.quantization?.bits, 4)
+            XCTAssertEqual(config.quantization?.groupSize, 64)
+            XCTAssertEqual(config.textConfig.quantizationBits, 4)
+            XCTAssertEqual(config.textConfig.quantizationGroupSize, 64)
+
+            let policy = Gemma4MTPAutomaticPolicy.automatic(for: config.textConfig)
+            XCTAssertEqual(policy.family, .e2b)
+            XCTAssertFalse(policy.supportsBatchedMTP)
+            XCTAssertEqual(
+                policy.strategy(forBatchSize: 4), .singleStream(blockSize: 3))
+        }
+    }
+
+
+    /// Nested Gemma4 VLM configs predate the canonical text-only defaults.
+    /// Omitting fields must retain the former VLM topology rather than silently
+    /// selecting the 4B text defaults.
+    func testNestedVLMOmissionsUseFormerDefaults() throws {
+        let json = """
+            {
+                "model_type": "gemma4",
+                "text_config": {},
+                "vision_config": {}
+            }
+            """
+        let config = try JSONDecoder().decode(
+            MLXVLM.Gemma4Configuration.self, from: Data(json.utf8))
+        let text = config.textConfig
+
+        XCTAssertEqual(text.hiddenSize, 2816)
+        XCTAssertEqual(text.numHiddenLayers, 30)
+        XCTAssertEqual(text.intermediateSize, 2112)
+        XCTAssertEqual(text.numAttentionHeads, 16)
+        XCTAssertEqual(text.numKeyValueHeads, 8)
+        XCTAssertEqual(text.slidingWindow, 1024)
+        XCTAssertEqual(text.layerTypes, Array(repeating: "sliding_attention", count: 30))
+        XCTAssertEqual(text.finalLogitSoftcapping, 0)
+        XCTAssertEqual(text.hiddenSizePerLayerInput, 0)
+        XCTAssertEqual(text.vocabSizePerLayerInput, 0)
+        XCTAssertEqual(text.numKvSharedLayers, 0)
+        XCTAssertFalse(text.useDoubleWideMlp)
+        XCTAssertEqual(text.fullPartialRotaryFactor, 0.25)
+    }
+
+    /// The deleted VLM DTO supported these switches, while the canonical
+    /// tower intentionally does not. True values must fail at configuration
+    /// decode instead of silently changing attention parameters or RoPE math.
+    func testNestedVLMRejectsUnsupportedAttentionTopologyFlags() throws {
+        for field in ["attention_bias", "rope_traditional"] {
+            let json = """
+                {
+                    "model_type": "gemma4",
+                    "text_config": { "\(field)": true },
+                    "vision_config": {}
+                }
+                """
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(
+                    MLXVLM.Gemma4Configuration.self, from: Data(json.utf8)),
+                "\(field)=true must fail explicitly")
+        }
+    }
+
+
+    /// Alias-only quantization must reach BaseConfiguration and the real
+    /// loadWeights quantization pass before strict parameter verification.
+    func testQuantizationConfigAliasStrictLoadsQuantizedVLMWeights() throws {
+        let json = Self.tinyVLMConfigJSON.replacingOccurrences(
+            of: "\"model_type\": \"gemma4\",",
+            with:
+                "\"model_type\": \"gemma4\", \"quantization_config\": {\"bits\": 4, \"group_size\": 32},")
+        let data = Data(json.utf8)
+        let config = try JSONDecoder().decode(
+            MLXVLM.Gemma4Configuration.self, from: data)
+        let baseConfig = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        let quantization = try XCTUnwrap(baseConfig.perLayerQuantization)
+
+        let source = MLXVLM.Gemma4(config)
+        quantize(model: source, groupSize: 32, bits: 4) { path, module in
+            guard path.hasPrefix("language_model"),
+                let linear = module as? Linear
+            else { return false }
+            return linear.weight.dim(-1).isMultiple(of: 32)
+        }
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try MLX.save(
+            arrays: Dictionary(uniqueKeysWithValues: source.parameters().flattened()),
+            url: directory.appendingPathComponent("model.safetensors"))
+
+        let loaded = MLXVLM.Gemma4(config)
+        try loadWeights(
+            modelDirectory: directory, model: loaded,
+            perLayerQuantization: quantization)
+
+        let qProjection = loaded.textModel.decoderLayers[0].namedModules()
+            .first { $0.0 == "self_attn.q_proj" }?.1
+        XCTAssertTrue(qProjection is QuantizedLinear)
+        XCTAssertTrue(
+            loaded.parameters().flattened().contains {
+                $0.0 == "language_model.model.layers.0.self_attn.q_proj.scales"
+            })
+    }
+
+    /// Direct VLM generation must honor the requested full-attention bound;
+    /// the no-bound path remains the canonical standard cache.
+    func testDirectVLMFullAttentionCacheHonorsMaxKVSize() throws {
+        let vlm = try makeTinyVLM()
+        let bounded = vlm.newCache(
+            parameters: GenerateParameters(maxKVSize: 7))
+        XCTAssertEqual(bounded.count, 2)
+        XCTAssertTrue(bounded[0] is RotatingKVCache)
+        XCTAssertEqual(bounded[0].maxSize, 16)
+        XCTAssertTrue(bounded[1] is RotatingKVCache)
+        XCTAssertEqual(bounded[1].maxSize, 7)
+
+        let unbounded = vlm.newCache(parameters: nil)
+        XCTAssertTrue(unbounded[1] is StandardKVCache)
+        XCTAssertNil(unbounded[1].maxSize)
+    }
     /// `video_token_id` absent from config.json ⇒ the accessor reports the
     /// Gemma4 default 258_884 — the same fallback the processor uses when
     /// the tokenizer cannot resolve `<|video|>`, keeping model and processor

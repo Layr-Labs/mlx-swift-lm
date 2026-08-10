@@ -78,22 +78,22 @@ enum CBv2AttentionV1 {
     /// Update each row with this step's K/V and attend.
     ///
     /// - queries/keys/values: `[B, heads, L, headDim]` with `L == 1` for
-    ///   decode (B == rows.count), `B == 1` for a prefill chunk, or a
-    ///   RECTANGULAR `[B > 1, L > 1]` MTP verify batch (every row processes
-    ///   the same 1+k tokens; per row this is exactly the [1, L] chunk path).
+    ///   decode, `B == 1` for a singleton prefill chunk, or rectangular
+    ///   `[B > 1, L > 1]` packed prefill / MTP verification. Every row
+    ///   dispatches against its own KV and optional span context.
     /// - softcap: construction-time attention-logit soft cap
     ///   (`cap * tanh(qk / cap)` before softmax, Gemma-2 style). When set,
     ///   BOTH phases take the composed reference path (SDPA cannot express
     ///   softcapping) — still one pinned path per phase.
-    /// - spanContext: non-nil ONLY for a vision prefill chunk containing
-    ///   image spans (a NEW pinned path — see `spanChunkMask`). Text-only
-    ///   chunks and decode always pass nil and are untouched.
+    /// - spanContexts: when bound, one optional context per row. Non-nil
+    ///   entries select that row's vision overlay; nil entries retain q=128
+    ///   query-block causal/window semantics in the same rectangular call.
     /// - Returns `[B, queryHeads, L, headDim]`.
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
-        spanContext: CBv2SpanChunkContext? = nil,
+        spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
@@ -101,12 +101,18 @@ enum CBv2AttentionV1 {
         precondition(!rows.isEmpty, "CBv2AttentionV1: no rows")
         precondition(
             B == rows.count,
-            "CBv2AttentionV1: batch \(B) != rows \(rows.count) — prefill must run per-request [1, chunk]"
-        )
-        precondition(
-            spanContext == nil || (B == 1 && L > 1),
-            "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
-        )
+            "CBv2AttentionV1: batch \(B) != bound cache rows \(rows.count)")
+        if let spanContexts {
+            precondition(
+                spanContexts.count == B,
+                "CBv2AttentionV1: span contexts \(spanContexts.count) != batch \(B)")
+            precondition(
+                L > 1,
+                "CBv2AttentionV1: decode and one-token chunks never bind span masks")
+            precondition(
+                !serializeQueries || spanContexts.allSatisfy { $0 == nil },
+                "CBv2AttentionV1: serialized MTP queries cannot carry span contexts")
+        }
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if B == 1 {
@@ -120,7 +126,7 @@ enum CBv2AttentionV1 {
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContext)
+                spanContext: spanContexts?[0])
         }
 
         if L == 1 {
@@ -144,10 +150,10 @@ enum CBv2AttentionV1 {
             return concatenated(outputs, axis: 0)
         }
 
-        // Rectangular [B > 1, L > 1] verify batch (MTP rounds): every row
-        // takes the SAME per-row path a [1, L] prefill chunk takes today —
-        // one pinned attention path per (model, phase); the loop reuses it,
-        // it does not invent a new one. Each row attends exactly its own KV.
+        // Rectangular [B > 1, L > 1] packed prefill or MTP verify: every row
+        // takes the same per-row path as a singleton chunk and attends
+        // exactly its own KV. Serialized queries remain MTP-only; ordinary
+        // packed prefill keeps q-blocking and optional row-local span masks.
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
         for (index, row) in rows.enumerated() {
@@ -167,7 +173,7 @@ enum CBv2AttentionV1 {
                     keys: keys[index ..< (index + 1)],
                     values: values[index ..< (index + 1)],
                     scale: scale, sinks: effectiveSinks, softcap: softcap,
-                    spanContext: nil))
+                    spanContext: spanContexts?[index]))
             }
         }
         return concatenated(outputs, axis: 0)
@@ -240,20 +246,18 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if let spanContext, L > 1 {
-            // Vision spans carry a bidirectional overlay across the WHOLE
-            // chunk, so a query block cannot be sliced to a causal-only
-            // visible span. Span chunks keep the single-call path.
-            return attendSpanChunk(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-                context: spanContext, sinks: sinks, softcap: softcap)
-        }
         if shouldBlockQueries(L) {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize)
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                spanContext: spanContext)
+        }
+        if let spanContext {
+            return attendSpanChunk(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                L: L, kL: cachedKeys.dim(2), window: window(of: kind),
+                context: spanContext, sinks: sinks, softcap: softcap)
         }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
@@ -294,7 +298,7 @@ enum CBv2AttentionV1 {
     static func attendBorrowing(
         sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind, kind: CBv2LayerKind,
         queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil,
-        spanContext: CBv2SpanChunkContext? = nil,
+        spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
@@ -303,10 +307,17 @@ enum CBv2AttentionV1 {
         precondition(
             B == sourceRows.count,
             "CBv2AttentionV1: batch \(B) != source rows \(sourceRows.count)")
-        precondition(
-            spanContext == nil || (B == 1 && L > 1),
-            "CBv2AttentionV1: span contexts exist only for [1, chunk] prefill — decode never carries one"
-        )
+        if let spanContexts {
+            precondition(
+                spanContexts.count == B,
+                "CBv2AttentionV1: span contexts \(spanContexts.count) != batch \(B)")
+            precondition(
+                L > 1,
+                "CBv2AttentionV1: decode and one-token chunks never bind span masks")
+            precondition(
+                !serializeQueries || spanContexts.allSatisfy { $0 == nil },
+                "CBv2AttentionV1: serialized MTP queries cannot carry span contexts")
+        }
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
         if L > 1 {
@@ -321,10 +332,10 @@ enum CBv2AttentionV1 {
                 return borrowAndAttendRow(
                     sourceRow: sourceRows[0], sourceKind: sourceKind,
                     queries: queries, scale: scale, sinks: effectiveSinks, softcap: softcap,
-                    spanContext: spanContext)
+                    spanContext: spanContexts?[0])
             }
-            // Rectangular [B > 1, L > 1] verify batch: per-row chunk borrow,
-            // same pinned path as [1, chunk] (see updateAndAttend).
+            // Rectangular [B > 1, L > 1] packed prefill / MTP verify:
+            // independently borrow each source row's current chunk views.
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in sourceRows.enumerated() {
@@ -342,7 +353,7 @@ enum CBv2AttentionV1 {
                         sourceRow: row, sourceKind: sourceKind,
                         queries: queries[index ..< (index + 1)],
                         scale: scale, sinks: effectiveSinks, softcap: softcap,
-                        spanContext: nil))
+                        spanContext: spanContexts?[index]))
                 }
             }
             return concatenated(outputs, axis: 0)
@@ -381,21 +392,20 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        if let spanContext {
-            // Same overlay as the storage-owning path: the MLXVLM
-            // reference applies the bidirectional-span overlay to the
-            // masks KV-shared layers reuse (they share their source's
-            // layer type, hence its window).
-            return attendSpanChunk(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
-                context: spanContext, sinks: sinks, softcap: softcap)
-        }
         if shouldBlockQueries(L) {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize)
+                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                spanContext: spanContext)
+        }
+        if let spanContext {
+            // Same overlay as the storage-owning path: the MLXVLM reference
+            // applies it to the masks KV-shared layers reuse.
+            return attendSpanChunk(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
+                context: spanContext, sinks: sinks, softcap: softcap)
         }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
@@ -450,17 +460,18 @@ enum CBv2AttentionV1 {
     /// kernel specialization, so results can differ in the last ulp.
     ///
     /// Scope: this applies to every multi-token prompt call that reaches
-    /// `updateAndAttendRow` / `borrowAndAttendRow`, which includes the
-    /// RECTANGULAR packed-prefill path (`[B > 1, L > 1]`) — packed rows are
-    /// dispatched per row, so each row blocks independently against its own
-    /// `historyCount`. It does NOT apply to decode (`L == 1`) or to
-    /// span-bearing vision chunks, which keep the single-call path.
+    /// `updateAndAttendRow` / `borrowAndAttendRow`, including rectangular
+    /// packed prefill. Vision rows keep the same q=128 blocking; each query
+    /// block expands its K/V slice only as needed to include complete image
+    /// spans touched by that block, then composes causal/window and
+    /// bidirectional-span masks. Decode (`L == 1`) remains outside this path.
     ///
     /// `blockSize == 1` reproduces the MTP serial-query path exactly.
     private static func attendQueryBlocks(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
-        sinks: MLXArray?, softcap: Float?, blockSize: Int
+        sinks: MLXArray?, softcap: Float?, blockSize: Int,
+        spanContext: CBv2SpanChunkContext? = nil
     ) -> MLXArray {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
         let keyCount = keys.dim(2)
@@ -471,25 +482,51 @@ enum CBv2AttentionV1 {
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)
-            // The block's queries occupy absolute columns
-            // [historyCount + offset, historyCount + offset + count). Its
-            // visible span starts at the EARLIEST query's window floor and
-            // ends at the LATEST query's own position, so the queries are
-            // exactly the trailing `count` entries of the slice — which is
-            // the invariant `maskMode` assumes.
-            let visibleEnd = historyCount + offset + count
-            let visibleStart = window.map { max(0, historyCount + offset + 1 - $0) } ?? 0
-            outputs.append(
-                attend(
-                    queries: queries[0..., 0..., offset ..< (offset + count), 0...],
-                    keys: keys[0..., 0..., visibleStart ..< visibleEnd, 0...],
-                    values: values[0..., 0..., visibleStart ..< visibleEnd, 0...],
-                    scale: scale, L: count, kL: visibleEnd - visibleStart,
-                    // `window` still applies WITHIN the slice: with count > 1
-                    // the slice is `window - 1 + count` long, so the earliest
-                    // key is outside the latest query's window and `maskMode`
-                    // correctly selects the causal-and-window array mask.
-                    window: window, sinks: sinks, softcap: softcap))
+            var visibleEnd = historyCount + offset + count
+            var visibleStart =
+                window.map { max(0, historyCount + offset + 1 - $0) } ?? 0
+            var intersectingBlocks: ArraySlice<CBv2ImageSpan>?
+            let queryAbsoluteStart =
+                spanContext.map { $0.chunkEnd - newTokenCount + offset }
+            let keyAbsoluteStart = spanContext.map { $0.chunkEnd - keyCount }
+            if let context = spanContext,
+                let qStart = queryAbsoluteStart,
+                let kStart = keyAbsoluteStart
+            {
+                let blocks = spanBlocksIntersectingQueryRange(
+                    queryAbsoluteStart: qStart, queryCount: count, context: context)
+                intersectingBlocks = blocks
+                for block in blocks {
+                    // Bidirectional span attention can see future keys and,
+                    // on windowed layers, older same-span keys. Retain the
+                    // complete touched span while keeping all other keys at
+                    // the ordinary q-block bounds.
+                    visibleStart = min(visibleStart, max(0, block.tokenOffset - kStart))
+                    visibleEnd = max(visibleEnd, min(keyCount, block.end - kStart))
+                }
+            }
+
+            let querySlice = queries[0..., 0..., offset ..< (offset + count), 0...]
+            let keySlice = keys[0..., 0..., visibleStart ..< visibleEnd, 0...]
+            let valueSlice = values[0..., 0..., visibleStart ..< visibleEnd, 0...]
+            if let blocks = intersectingBlocks, !blocks.isEmpty,
+                let qStart = queryAbsoluteStart,
+                let kStart = keyAbsoluteStart
+            {
+                outputs.append(
+                    attendSpanSlice(
+                        queries: querySlice, keys: keySlice, values: valueSlice,
+                        scale: scale, queryAbsoluteStart: qStart,
+                        keyAbsoluteStart: kStart + visibleStart,
+                        window: window, blocks: blocks,
+                        sinks: sinks, softcap: softcap))
+            } else {
+                outputs.append(
+                    attend(
+                        queries: querySlice, keys: keySlice, values: valueSlice,
+                        scale: scale, L: count, kL: visibleEnd - visibleStart,
+                        window: window, sinks: sinks, softcap: softcap))
+            }
             offset += count
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
@@ -545,33 +582,68 @@ enum CBv2AttentionV1 {
 
     // MARK: - Vision span-chunk path (pinned; span-containing chunks only)
 
-    /// Boolean mask for a span-containing prefill chunk: the causal(∧window)
-    /// base OR bidirectional-within-block, matching MLXVLM Gemma4's
-    /// `gemma4BidirectionalVisionMask` overlay exactly (`baseMask ∨
-    /// sameBlock`, where sameBlock un-masks BOTH forward attention inside an
-    /// image block and window-evicted backward attention inside it).
-    ///
-    /// Coordinates: queries are the last `L` absolute positions before
-    /// `context.chunkEnd`; keys are the last `kL` (both backends' chunk
-    /// views end at the chunk's last token). Blocks are absolute and fully
-    /// inside the chunk, so every same-block (q, k) pair is present in the
-    /// returned KV view by construction.
+    /// Zero-copy selection of the coalesced image blocks that can affect one
+    /// query slice. Context blocks are sorted/non-overlapping by resolution,
+    /// so intersections form one contiguous `ArraySlice`.
+    static func spanBlocksIntersectingQueryRange(
+        queryAbsoluteStart: Int, queryCount: Int,
+        context: CBv2SpanChunkContext
+    ) -> ArraySlice<CBv2ImageSpan> {
+        precondition(queryCount >= 0)
+        let queryEnd = queryAbsoluteStart + queryCount
+        var lower = context.blocks.startIndex
+        while lower < context.blocks.endIndex,
+            context.blocks[lower].end <= queryAbsoluteStart
+        {
+            lower += 1
+        }
+        var upper = lower
+        while upper < context.blocks.endIndex,
+            context.blocks[upper].tokenOffset < queryEnd
+        {
+            upper += 1
+        }
+        return context.blocks[lower ..< upper]
+    }
+
+    /// Boolean causal(∧window) mask over arbitrary absolute query/key slices,
+    /// overlaid only with the image blocks intersecting this query slice.
+    private static func spanMask(
+        queryAbsoluteStart: Int, queryCount: Int,
+        keyAbsoluteStart: Int, keyCount: Int,
+        window: Int?, blocks: ArraySlice<CBv2ImageSpan>
+    ) -> MLXArray {
+        let qAbs =
+            MLXArray(
+                Int32(queryAbsoluteStart) ..< Int32(queryAbsoluteStart + queryCount)
+            ).expandedDimensions(axis: 1)
+        let kAbs =
+            MLXArray(
+                Int32(keyAbsoluteStart) ..< Int32(keyAbsoluteStart + keyCount)
+            ).expandedDimensions(axis: 0)
+        var mask = kAbs .<= qAbs
+        if let window {
+            mask = mask .&& (kAbs .> (qAbs - Int32(window)))
+        }
+        for block in blocks {
+            let lo = Int32(block.tokenOffset)
+            let hi = Int32(block.end)
+            let qIn = (qAbs .>= lo) .&& (qAbs .< hi)
+            let kIn = (kAbs .>= lo) .&& (kAbs .< hi)
+            mask = mask .|| (qIn .&& kIn)
+        }
+        return mask
+    }
+
+    /// Whole-chunk form retained for focused mask contracts.
     static func spanChunkMask(
         L: Int, kL: Int, window: Int?, context: CBv2SpanChunkContext
     ) -> MLXArray {
         precondition(L > 1, "span chunks are multi-token by construction")
-        var mask = boolMask(L: L, kL: kL, window: window)!
-        let chunkEnd = context.chunkEnd
-        let qAbs = MLXArray(Int32(chunkEnd - L) ..< Int32(chunkEnd)).expandedDimensions(axis: 1)
-        let kAbs = MLXArray(Int32(chunkEnd - kL) ..< Int32(chunkEnd)).expandedDimensions(axis: 0)
-        for block in context.blocks {
-            let lo = Int32(block.tokenOffset)
-            let hi = Int32(block.end)
-            let qIn = (qAbs .>= lo) .&& (qAbs .< hi)  // [L, 1]
-            let kIn = (kAbs .>= lo) .&& (kAbs .< hi)  // [1, kL]
-            mask = mask .|| (qIn .&& kIn)
-        }
-        return mask
+        return spanMask(
+            queryAbsoluteStart: context.chunkEnd - L, queryCount: L,
+            keyAbsoluteStart: context.chunkEnd - kL, keyCount: kL,
+            window: window, blocks: context.blocks[...])
     }
 
     /// Span-chunk attention dispatch: always an explicit boolean array mask
@@ -583,7 +655,24 @@ enum CBv2AttentionV1 {
         L: Int, kL: Int, window: Int?, context: CBv2SpanChunkContext,
         sinks: MLXArray?, softcap: Float?
     ) -> MLXArray {
-        let mask = spanChunkMask(L: L, kL: kL, window: window, context: context)
+        attendSpanSlice(
+            queries: queries, keys: keys, values: values, scale: scale,
+            queryAbsoluteStart: context.chunkEnd - L,
+            keyAbsoluteStart: context.chunkEnd - kL,
+            window: window, blocks: context.blocks[...],
+            sinks: sinks, softcap: softcap)
+    }
+
+    private static func attendSpanSlice(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
+        queryAbsoluteStart: Int, keyAbsoluteStart: Int,
+        window: Int?, blocks: ArraySlice<CBv2ImageSpan>,
+        sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray {
+        let mask = spanMask(
+            queryAbsoluteStart: queryAbsoluteStart, queryCount: queries.dim(2),
+            keyAbsoluteStart: keyAbsoluteStart, keyCount: keys.dim(2),
+            window: window, blocks: blocks)
         guard let softcap else {
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale,

@@ -45,9 +45,9 @@
 //     pre-existing history, where `historyCount` is derived from the SOURCE
 //     row's pre-eviction borrow views.
 //  7. `CBv2QueryBlockAttentionGatingTests` — `shouldBlockQueries` truth table
-//     against the live `queryBlockSize` (including the `0` kill switch when
-//     the env knob is set), and proof that a span-bearing chunk still takes
-//     the single-call span-mask path even when it is longer than a block.
+//     against the live `queryBlockSize` (including the `0` kill switch), plus
+//     whole-mask parity for q-blocked vision spans and mixed packed
+//     vision/text rows with independent per-row contexts.
 //
 // Tiny synthetic tensors, seeded RNG, no model download, no checkpoint.
 //
@@ -326,7 +326,7 @@ struct CBv2QueryBlockAttentionParityTests {
         let produced = CBv2AttentionV1.updateAndAttend(
             rows: [productionRow], kind: kind,
             queries: fixture.queries, keys: fixture.keys, values: fixture.values,
-            scale: attnScale, sinks: nil, softcap: nil, spanContext: nil,
+            scale: attnScale, sinks: nil, softcap: nil, spanContexts: nil,
             serializeQueries: serialize)
 
         // Oracle A: one SDPA over the full rectangle on an identical row.
@@ -561,7 +561,7 @@ struct CBv2QueryBlockAttentionSerialTests {
                     let produced = CBv2AttentionV1.updateAndAttend(
                         rows: [productionRow], kind: kind,
                         queries: fixture.queries, keys: fixture.keys, values: fixture.values,
-                        scale: attnScale, sinks: nil, softcap: nil, spanContext: nil,
+                        scale: attnScale, sinks: nil, softcap: nil, spanContexts: nil,
                         serializeQueries: true)
 
                     let reference = fixture.committedRow()
@@ -805,7 +805,7 @@ struct CBv2QueryBlockAttentionKVStateTests {
         _ = CBv2AttentionV1.updateAndAttend(
             rows: [serialRow], kind: kind,
             queries: fixture.queries, keys: fixture.keys, values: fixture.values,
-            scale: attnScale, sinks: nil, softcap: nil, spanContext: nil,
+            scale: attnScale, sinks: nil, softcap: nil, spanContexts: nil,
             serializeQueries: true)
 
         let commitOnlyRow = fixture.freshRow()
@@ -866,7 +866,7 @@ struct CBv2QueryBlockAttentionBorrowTests {
         let produced = CBv2AttentionV1.attendBorrowing(
             sourceRows: [sourceRow], sourceKind: sourceKind, kind: sharedKind,
             queries: fixture.queries, scale: attnScale, sinks: nil, softcap: nil,
-            spanContext: nil, serializeQueries: serialize)
+            spanContexts: nil, serializeQueries: serialize)
 
         // Identical twin, same commit, references taken from the same views.
         let twin = fixture.freshRow()
@@ -1019,11 +1019,11 @@ struct CBv2QueryBlockAttentionGatingTests {
             "long chunks must be blocked")
     }
 
-    /// A vision span-bearing chunk carries a bidirectional overlay across the
-    /// WHOLE chunk, so it cannot be sliced into causal-only query blocks. Even
-    /// when it is longer than a block, it must still take the single-call
-    /// span-mask path — asserted BIT-exactly against that path.
-    @Test func spanBearingChunksKeepTheSingleCallPath() {
+    /// Vision chunks retain q-blocking without losing the bidirectional
+    /// overlay. A span that crosses a q-block boundary must make each touched
+    /// block retain the complete span's K/V, then match the whole-rectangle
+    /// reference within the ordinary blocked-attention reduction tolerance.
+    @Test func spanBearingChunksRetainOverlayUnderQueryBlocking() {
         let n = max(300, liveBlock * 2 + 40)
         for window in [nil, 1024] as [Int?] {
             for history in [0, 512] {
@@ -1048,7 +1048,7 @@ struct CBv2QueryBlockAttentionGatingTests {
                 let produced = CBv2AttentionV1.updateAndAttend(
                     rows: [row], kind: kind,
                     queries: fixture.queries, keys: fixture.keys, values: fixture.values,
-                    scale: attnScale, sinks: nil, softcap: nil, spanContext: context)
+                    scale: attnScale, sinks: nil, softcap: nil, spanContexts: [context])
 
                 let reference = fixture.committedRow()
                 let mask = CBv2AttentionV1.spanChunkMask(
@@ -1063,9 +1063,9 @@ struct CBv2QueryBlockAttentionGatingTests {
                     "window=\(windowLabel(window)) n=\(n) history=\(history) shouldBlockQueries=\(gate)"
                 let delta = maxAbsDiff(produced, single)
                 #expect(
-                    bitIdentical(produced, single),
+                    delta < 2e-5,
                     note(
-                        "span chunks must keep the single-call span-mask path — \(label) (maxAbsDiff=\(delta))"
+                        "q-blocked span chunks must match the whole-span mask — \(label) (maxAbsDiff=\(delta))"
                     ))
 
                 // And the span overlay must actually be doing something —
@@ -1080,5 +1080,103 @@ struct CBv2QueryBlockAttentionGatingTests {
                     "the bidirectional span overlay must change the result — \(label)")
             }
         }
+    }
+
+    @Test func packedVisionAndTextRowsKeepIndependentQueryBlockMasks() {
+        let n = max(300, liveBlock * 2 + 40)
+        let history = 96
+        for window in [nil, 64] as [Int?] {
+            let vision = ChunkFixture(
+                n: n, history: history, window: window, seed: 0xB10C_7101)
+            let text = ChunkFixture(
+                n: n, history: history, window: window, seed: 0xB10C_7102)
+            let kind = layerKind(window: window)
+            let boundary = max(32, liveBlock)
+            let context = CBv2SpanChunkContext(
+                chunkEnd: history + n,
+                blocks: [
+                    CBv2ImageSpan(
+                        tokenOffset: history + boundary - 8, length: 24)
+                ])
+
+            let rows = [vision.freshRow(), text.freshRow()]
+            let produced = CBv2AttentionV1.updateAndAttend(
+                rows: rows, kind: kind,
+                queries: concatenated([vision.queries, text.queries], axis: 0),
+                keys: concatenated([vision.keys, text.keys], axis: 0),
+                values: concatenated([vision.values, text.values], axis: 0),
+                scale: attnScale, sinks: nil, softcap: nil,
+                spanContexts: [context, nil])
+
+            let visionReference = vision.committedRow()
+            let visionMask = CBv2AttentionV1.spanChunkMask(
+                L: n, kL: visionReference.keys.dim(2),
+                window: window, context: context)
+            let expectedVision = MLXFast.scaledDotProductAttention(
+                queries: vision.queries, keys: visionReference.keys,
+                values: visionReference.values, scale: attnScale,
+                mask: .array(visionMask), sinks: nil)
+            let textReference = text.committedRow()
+            let expectedText = singleCallReference(
+                queries: text.queries, keys: textReference.keys,
+                values: textReference.values, window: window)
+            eval(produced, expectedVision, expectedText)
+
+            let label = "window=\(windowLabel(window)) n=\(n)"
+            #expect(
+                maxAbsDiff(produced[0 ..< 1], expectedVision) < 2e-5,
+                "packed vision row must retain its bidirectional overlay — \(label)")
+            #expect(
+                maxAbsDiff(produced[1 ..< 2], expectedText) < 2e-5,
+                "neighboring text row must retain q-block causal/window attention — \(label)")
+        }
+    }
+
+    @Test func separatedSpansEmitOnlyIntersectingMaskTermsAndKeepParity() {
+        let n = max(400, liveBlock * 3)
+        let spans = [
+            CBv2ImageSpan(tokenOffset: 20, length: 16),
+            CBv2ImageSpan(tokenOffset: 140, length: 16),
+            CBv2ImageSpan(tokenOffset: 280, length: 16),
+        ]
+        let context = CBv2SpanChunkContext(chunkEnd: n, blocks: spans)
+
+        #expect(
+            Array(
+                CBv2AttentionV1.spanBlocksIntersectingQueryRange(
+                    queryAbsoluteStart: 0, queryCount: 64, context: context))
+                == [spans[0]])
+        #expect(
+            CBv2AttentionV1.spanBlocksIntersectingQueryRange(
+                queryAbsoluteStart: 64, queryCount: 32, context: context
+            ).isEmpty)
+        #expect(
+            Array(
+                CBv2AttentionV1.spanBlocksIntersectingQueryRange(
+                    queryAbsoluteStart: 96, queryCount: 96, context: context))
+                == [spans[1]])
+        #expect(
+            Array(
+                CBv2AttentionV1.spanBlocksIntersectingQueryRange(
+                    queryAbsoluteStart: 224, queryCount: 96, context: context))
+                == [spans[2]])
+
+        let fixture = ChunkFixture(
+            n: n, history: 0, window: 64, seed: 0xB10C_7201)
+        let row = fixture.freshRow()
+        let produced = CBv2AttentionV1.updateAndAttend(
+            rows: [row], kind: layerKind(window: 64),
+            queries: fixture.queries, keys: fixture.keys, values: fixture.values,
+            scale: attnScale, sinks: nil, spanContexts: [context])
+        let reference = fixture.committedRow()
+        let wholeMask = CBv2AttentionV1.spanChunkMask(
+            L: n, kL: reference.keys.dim(2), window: 64, context: context)
+        let expected = MLXFast.scaledDotProductAttention(
+            queries: fixture.queries, keys: reference.keys, values: reference.values,
+            scale: attnScale, mask: .array(wholeMask), sinks: nil)
+        eval(produced, expected)
+        #expect(
+            maxAbsDiff(produced, expected) < 2e-5,
+            "intersecting-only span terms must preserve whole-mask attention parity")
     }
 }
