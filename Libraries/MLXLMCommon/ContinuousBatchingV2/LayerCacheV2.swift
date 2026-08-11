@@ -58,15 +58,11 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// the same parameter); never part of the per-call contract surface.
     public let attentionSoftcap: Float?
 
-    /// Vision span context for the CURRENT span-containing prefill chunk,
-    /// bound by the engine immediately before that chunk's graph build and
-    /// unbound immediately after (`CBv2SpanMaskBinding`). ALWAYS nil outside
-    /// that window, so decode, text chunks, and other requests' chunks take
-    /// the untouched pinned paths. The engine only ever binds it while the
-    /// cache's rows are exactly the one vision request's row (prefill is
-    /// per-request [1, chunk]), so the span mask can never leak onto a
-    /// batchmate's computation.
-    private(set) var boundSpanContext: CBv2SpanChunkContext?
+    /// Optional vision span context for each CURRENT prefill row. The engine
+    /// binds this array immediately before graph construction and clears it
+    /// immediately after. nil outside that window; nil entries are ordinary
+    /// text rows sharing a rectangular call.
+    private(set) var boundSpanContexts: [CBv2SpanChunkContext?]?
 
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
@@ -120,10 +116,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
-            spanContext: boundSpanContext,
+            spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention)
-        // Advance offsets ON-DEVICE (uniform: decode is [B,1], prefill is
-        // [1,chunk] — L is the same for every row in the call).
+        // Advance offsets ON-DEVICE. Decode and packed prefill are
+        // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
         return output
     }
@@ -164,7 +160,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return CBv2AttentionV1.attendBorrowing(
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
             queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,
-            spanContext: boundSpanContext,
+            spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention)
     }
 
@@ -187,9 +183,13 @@ extension CBv2LayerCache: CBv2LastQueryPrefillLayerCache {}
 
 // MARK: - Vision span-mask binding
 
-extension CBv2LayerCache: CBv2SpanMaskBinding {
+extension CBv2LayerCache: CBv2PackedSpanMaskBinding {
     public func bindSpanContext(_ context: CBv2SpanChunkContext?) {
-        boundSpanContext = context
+        boundSpanContexts = context.map { [$0] }
+    }
+
+    public func bindSpanContexts(_ contexts: [CBv2SpanChunkContext?]?) {
+        boundSpanContexts = contexts
     }
 }
 

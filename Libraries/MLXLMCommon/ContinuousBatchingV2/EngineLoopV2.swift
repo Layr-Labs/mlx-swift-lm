@@ -46,11 +46,16 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     /// equal-length text chunks may be coalesced into one layer-major
     /// forward. Fail-safe default false (paged/custom providers).
     var supportsPackedPrefill: Bool { get }
+    /// True only when every layer cache can bind one optional span context
+    /// per rectangular row. This is stricter than single-row multimodal
+    /// support and fails closed for paged/custom providers.
+    var supportsPackedMultimodalSpans: Bool { get }
 }
 
 extension CBv2LayerCacheProvider {
     public var supportsMultimodalSpans: Bool { false }
     public var supportsPackedPrefill: Bool { false }
+    public var supportsPackedMultimodalSpans: Bool { false }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
@@ -1516,15 +1521,20 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         // Prompt chunks. Default shape is per-request [1, chunk]; when the
         // model AND the cache provider both prove rectangular per-row
-        // semantics, equal-length TEXT chunks are coalesced into one
-        // layer-major [B, chunk] forward so each layer's weights are read
-        // once for the whole cohort. Span-bearing multimodal chunks always
-        // stay per-request.
+        // semantics, equal-length chunks are coalesced into one layer-major
+        // [B, chunk] forward so each layer's weights are read once for the
+        // whole cohort. Span-bearing rows require the stronger model and
+        // cache capabilities for row-local embeddings and attention masks.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var evalTargets: [MLXArray] = []
         var packedIDs = Set<CBv2RequestID>()
 
-        if packedPrefillSupported {
+        if packedPrefillSupported,
+            let packedModel = model as? CBv2PackedPrefillSteppableModel
+        {
+            let canPackMultimodal =
+                packedModel.supportsPackedMultimodalPrefill
+                && cacheProvider.supportsPackedMultimodalSpans
             struct PackedGroup {
                 let count: Int
                 let samples: Bool
@@ -1532,13 +1542,13 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
-                // Pure function of has-spans, exactly like the singleton
-                // path: a multimodal REQUEST whose current chunk carries no
-                // span is still packable.
+                // A multimodal request's text-only chunks remain packable.
+                // A span-bearing chunk needs explicit rectangular embedding
+                // and row-mask capability from both model and cache provider.
                 let hasSpan =
                     multimodalByID[row.rec.id]?.chunkContext(
                         start: row.start, count: row.count) != nil
-                if hasSpan { continue }
+                if hasSpan && !canPackMultimodal { continue }
                 if let index = groups.firstIndex(where: {
                     $0.count == row.count && $0.samples == row.samples
                 }) {
@@ -1561,9 +1571,24 @@ public final class EngineLoopV2: @unchecked Sendable {
                 let caches = eagerCaches(rowStates: group.rows.map { kvStates[$0.rec.id]! })
                 let requirement: CBv2PrefillRequirement =
                     group.samples ? .lastPositionLogits : .evaluationOnly
-                let output = prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+                let spanContexts = group.rows.map {
+                    multimodalByID[$0.rec.id]?.chunkContext(
+                        start: $0.start, count: $0.count)
+                }
+                let output: MLXArray
+                if spanContexts.contains(where: { $0 != nil }) {
+                    output = packedMultimodalChunksForward(
+                        tokens: inputs,
+                        starts: group.rows.map(\.start),
+                        multimodal: group.rows.map { multimodalByID[$0.rec.id] },
+                        spanContexts: spanContexts,
+                        caches: caches,
+                        requirement: requirement)
+                } else {
+                    output = prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
 
                 if group.samples {
@@ -1723,6 +1748,58 @@ public final class EngineLoopV2: @unchecked Sendable {
         let bindables = count > 1 ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
         for bindable in bindables { bindable.bindSpanContext(spanContext) }
         defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
+        return prefillOutput(
+            tokens: tokens, inputEmbeddings: spliced, caches: caches,
+            requirement: requirement)
+    }
+
+    /// Rectangular counterpart of `multimodalChunkForward`. Each row keeps
+    /// its own token embeddings, image splice coordinates, KV state, and
+    /// optional span mask while the model traverses the cohort layer-major.
+    func packedMultimodalChunksForward(
+        tokens: MLXArray,
+        starts: [Int],
+        multimodal: [CBv2ResolvedMultimodal?],
+        spanContexts: [CBv2SpanChunkContext?],
+        caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        guard let mmModel = model as? CBv2MultimodalSteppableModel else {
+            preconditionFailure(
+                "CBv2 packed multimodal chunk reached a model without embedding-forward support")
+        }
+        let batch = tokens.dim(0)
+        let count = tokens.dim(1)
+        precondition(
+            starts.count == batch && multimodal.count == batch
+                && spanContexts.count == batch,
+            "CBv2 packed multimodal metadata must match batch \(batch)")
+
+        let textEmbeddings = mmModel.embedPromptTokens(tokens)
+        var embeddingRows: [MLXArray] = []
+        embeddingRows.reserveCapacity(batch)
+        for index in 0 ..< batch {
+            let textRow = textEmbeddings[index ..< index + 1]
+            if spanContexts[index] != nil, let rowMultimodal = multimodal[index] {
+                embeddingRows.append(
+                    CBv2MultimodalPlan.spliceEmbeddings(
+                        textEmbeddings: textRow,
+                        chunkStart: starts[index],
+                        spans: rowMultimodal.spansInChunk(
+                            start: starts[index], count: count)))
+            } else {
+                embeddingRows.append(textRow)
+            }
+        }
+        let spliced = concatenated(embeddingRows, axis: 0)
+
+        let bindables =
+            count > 1 ? caches.compactMap { $0 as? CBv2PackedSpanMaskBinding } : []
+        precondition(
+            count == 1 || bindables.count == caches.count,
+            "CBv2 packed multimodal prefill requires per-row span binding on every cache")
+        for bindable in bindables { bindable.bindSpanContexts(spanContexts) }
+        defer { for bindable in bindables { bindable.bindSpanContexts(nil) } }
         return prefillOutput(
             tokens: tokens, inputEmbeddings: spliced, caches: caches,
             requirement: requirement)
@@ -2004,6 +2081,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     ) -> CBv2DonationIntent? {
         guard prefixCache != nil else { return nil }
         guard rec.request.prefixCacheEnabled else { return nil }
+        guard cbv2LayerKindsAllowPrefixReuse(layerKinds) else { return nil }
         // Vision requests NEVER donate (v1 policy, enforced in BOTH
         // directions — lookup is skipped in `EngineV2.makePrefixLookup`): the
         // prefix cache keys on token-id chain hashes, and an image span's

@@ -383,11 +383,26 @@ struct CBv2ModelLayerKindTests {
             globalHeadDim: 512,
             numAttentionHeads: 8,
             numKeyValueHeads: 4,
-            numGlobalKeyValueHeads: nil,
-            attentionKeqV: true
+            numGlobalKeyValueHeads: nil
         )
         #expect(kinds[0].kvHeads == 4)
         #expect(kinds[1].kvHeads == 4)
+    }
+
+    @Test func gemma4LegacyLayerKindOverloadRemainsSourceCompatible() {
+        let kinds = CBv2LayerKindDerivation.gemma4LayerKinds(
+            layerTypes: ["sliding_attention", "full_attention"],
+            slidingWindow: 512,
+            numKvSharedLayers: 0,
+            headDim: 256,
+            globalHeadDim: 512,
+            numAttentionHeads: 8,
+            numKeyValueHeads: 4,
+            numGlobalKeyValueHeads: 2,
+            attentionKeqV: false)
+
+        #expect(kinds[1].kvHeads == 2)
+        #expect(kinds.allSatisfy { !$0.isBidirectional })
     }
 
     @Test func gemma4NoSharedLayers() {
@@ -492,7 +507,7 @@ struct CBv2ModelGemma4ForwardTests {
         let model = Gemma4TextModel(config)
         eval(model)
         var mocks = [CBv2ModelMockLayerCache]()
-        let caches = model.newCacheV2 { index, kind in
+        let caches = try model.newCacheV2 { index, kind in
             let mock = CBv2ModelMockLayerCache(layerIndex: index, kind: kind, rowCount: rowCount)
             mocks.append(mock)
             return mock
@@ -639,9 +654,9 @@ struct CBv2ModelGemma4ForwardTests {
         eval(model)
         #expect(model is CBv2EmbeddingForwardable)
 
-        func freshCaches() -> [CBv2ModelMockLayerCache] {
+        func freshCaches() throws -> [CBv2ModelMockLayerCache] {
             var mocks = [CBv2ModelMockLayerCache]()
-            _ = model.newCacheV2 { index, kind in
+            _ = try model.newCacheV2 { index, kind in
                 let mock = CBv2ModelMockLayerCache(layerIndex: index, kind: kind, rowCount: 1)
                 mocks.append(mock)
                 return mock
@@ -651,10 +666,10 @@ struct CBv2ModelGemma4ForwardTests {
 
         let prompt = MLXArray([Int32(1), 2, 3, 4, 5])[.newAxis, .ellipsis]
 
-        let tokenLogits = model(prompt, cache: freshCaches() as [KVCache])
+        let tokenLogits = model(prompt, cache: try freshCaches() as [KVCache])
         let spliced = (model as CBv2EmbeddingForwardable).scaledInputEmbeddings(prompt)
         let embeddingLogits = (model as CBv2EmbeddingForwardable).embeddingForward(
-            prompt, inputEmbedding: spliced, cache: freshCaches() as [KVCache])
+            prompt, inputEmbedding: spliced, cache: try freshCaches() as [KVCache])
         eval(tokenLogits, embeddingLogits)
 
         #expect(tokenLogits.shape == embeddingLogits.shape)
@@ -726,7 +741,202 @@ struct CBv2ModelGemma4ForwardTests {
             ).item(Bool.self),
             "cached vision overlay must align with the last L key columns")
     }
+
+    /// `all` is not an alias for ordinary causal attention: future-token
+    /// changes must reach an earlier query on the canonical shared trunk.
+    @Test func allBidirectionalModeLetsEarlierQueriesSeeFutureTokens() throws {
+        let prefixStable = MLXArray([Int32(1), 2, 3, 4])[.newAxis, .ellipsis]
+        let futureChanged = MLXArray([Int32(1), 9, 10, 11])[.newAxis, .ellipsis]
+
+        let causal = Gemma4TextModel(try tinyConfig())
+        eval(causal)
+        let causalA = causal(prefixStable, cache: nil)[0, 0, 0...]
+        let causalB = causal(futureChanged, cache: nil)[0, 0, 0...]
+        eval(causalA, causalB)
+        #expect(
+            allClose(causalA, causalB, atol: 1e-6).item(Bool.self),
+            "ordinary causal attention must isolate the first query from future tokens")
+
+        var allConfig = try tinyConfig()
+        allConfig.useBidirectionalAttention = "all"
+        let bidirectional = Gemma4TextModel(allConfig)
+        eval(bidirectional)
+        let allA = bidirectional(prefixStable, cache: nil)[0, 0, 0...]
+        let allB = bidirectional(futureChanged, cache: nil)[0, 0, 0...]
+        eval(allA, allB)
+        #expect(
+            !allClose(allA, allB, atol: 1e-6).item(Bool.self),
+            "all-mode must expose future tokens to the first query")
+    }
 }
+
+// MARK: - Gemma 4 scheduled-prefill submission contracts
+
+@Suite("CBv2 Gemma4 scheduled prefill submissions", .serialized)
+struct CBv2Gemma4ScheduledPrefillTests {
+    private let eventName = "v2.gemma4.prefill.chunk_eval"
+    private let layerCount = 18
+
+    private func config() throws -> Gemma4TextConfiguration {
+        let layerTypes = (0 ..< layerCount).map {
+            $0.isMultiple(of: 2) ? "\"sliding_attention\"" : "\"full_attention\""
+        }.joined(separator: ",")
+        let json = """
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 16,
+                "num_hidden_layers": \(layerCount),
+                "intermediate_size": 32,
+                "num_attention_heads": 2,
+                "head_dim": 8,
+                "global_head_dim": 8,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 0,
+                "layer_types": [\(layerTypes)],
+                "sliding_window": 16,
+                "final_logit_softcapping": 30.0,
+                "hidden_size_per_layer_input": 0,
+                "use_double_wide_mlp": false,
+                "tie_word_embeddings": true,
+                "vocab_size": 64,
+                "vocab_size_per_layer_input": 64,
+                "rms_norm_eps": 1e-6
+            }
+            """
+        return try JSONDecoder.json5().decode(
+            Gemma4TextConfiguration.self, from: Data(json.utf8))
+    }
+
+    private func caches(
+        for model: Gemma4TextModel, rowCount: Int = 1
+    ) throws -> [CBv2ModelMockLayerCache] {
+        var mocks: [CBv2ModelMockLayerCache] = []
+        _ = try model.newCacheV2 { index, kind in
+            let mock = CBv2ModelMockLayerCache(
+                layerIndex: index, kind: kind, rowCount: rowCount)
+            mocks.append(mock)
+            return mock
+        }
+        return mocks
+    }
+
+    private func submissionCount() -> Int {
+        CBv2StepProfiler.eventCountsSnapshot()[eventName] ?? 0
+    }
+
+    @Test func intervalResolution() {
+        #expect(resolveGemma4PrefillChunkEvalLayers(nil) == 18)
+        #expect(resolveGemma4PrefillChunkEvalLayers("not-an-int") == 18)
+        #expect(resolveGemma4PrefillChunkEvalLayers("0") == 0)
+        #expect(resolveGemma4PrefillChunkEvalLayers("-7") == 0)
+        #expect(resolveGemma4PrefillChunkEvalLayers("6") == 6)
+        #expect(resolveGemma4PrefillChunkEvalLayers("19") == 19)
+    }
+
+    @Test func submissionPolicy() {
+        #expect(
+            !gemma4ShouldSubmitPrefillChunkEval(
+                schedulePrefill: true, isCBv2: true, inputLength: 128,
+                layerNumber: layerCount, interval: -7))
+        #expect(
+            !gemma4ShouldSubmitPrefillChunkEval(
+                schedulePrefill: true, isCBv2: true, inputLength: 128,
+                layerNumber: layerCount, interval: 0))
+        #expect(
+            gemma4ShouldSubmitPrefillChunkEval(
+                schedulePrefill: true, isCBv2: true, inputLength: 128,
+                layerNumber: layerCount, interval: 18))
+        #expect(
+            !gemma4ShouldSubmitPrefillChunkEval(
+                schedulePrefill: true, isCBv2: true, inputLength: 128,
+                layerNumber: layerCount, interval: 19))
+        #expect(
+            !gemma4ShouldSubmitPrefillChunkEval(
+                schedulePrefill: true, isCBv2: true, inputLength: 1,
+                layerNumber: layerCount, interval: 18))
+        #expect(
+            !gemma4ShouldSubmitPrefillChunkEval(
+                schedulePrefill: true, isCBv2: false, inputLength: 128,
+                layerNumber: layerCount, interval: 18))
+    }
+
+    @Test func eventCounterArmsWithoutPhaseTiming() {
+        CBv2StepProfiler.enabled = false
+        CBv2StepProfiler.reset()
+        CBv2StepProfiler.armEvents()
+        #expect(CBv2StepProfiler.eventsEnabled)
+        #expect(!CBv2StepProfiler.enabled)
+
+        CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")
+        CBv2StepProfiler.record("must-not-time", seconds: 1)
+        let events = CBv2StepProfiler.snapshotAndDisarmEvents()
+
+        #expect(events[eventName] == 1)
+        #expect(!CBv2StepProfiler.eventsEnabled)
+        #expect(CBv2StepProfiler.snapshot().isEmpty)
+        CBv2StepProfiler.reset()
+    }
+
+    @Test func effectiveIntervalEngagesOnlyScheduledMultitokenCBv2() throws {
+        MLXRandom.seed(0x18E)
+        let model = Gemma4TextModel(try config())
+        eval(model)
+        let effectiveInterval = model.cbv2PrefillChunkEvalInterval
+        #expect(
+            effectiveInterval
+                == resolveGemma4PrefillChunkEvalLayers(
+                    ProcessInfo.processInfo.environment[
+                        "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"]))
+        let expectedSubmissionCount =
+            effectiveInterval > 0 ? layerCount / effectiveInterval : 0
+
+        let inputLength = 128
+        let inputs = MLXArray(
+            (0 ..< inputLength).map { Int32(($0 * 7 + 1) % 64) }
+        ).reshaped(1, inputLength)
+
+        CBv2StepProfiler.reset()
+        CBv2StepProfiler.armEvents()
+        defer { CBv2StepProfiler.reset() }
+
+        let scheduledCaches: [KVCache] = try caches(for: model)
+        let scheduled = model.cbv2Prefill(
+            inputs, inputEmbedding: nil, cache: scheduledCaches,
+            requirement: .lastPositionLogits)
+        eval(scheduled)
+        #expect(scheduled.shape == [1, 64])
+        #expect(
+            submissionCount() == expectedSubmissionCount,
+            "\(layerCount) layers must submit once per effective interval, including zero submissions when the interval is disabled or above the layer count")
+
+        let ordinaryCaches: [KVCache] = try caches(for: model)
+        let ordinary = model(inputs, cache: ordinaryCaches)
+        eval(ordinary)
+        #expect(
+            submissionCount() == expectedSubmissionCount,
+            "ordinary multi-token forward must not add an intermediate submission")
+        #expect(
+            allClose(scheduled, ordinary[0..., -1, 0...], atol: 1e-5).item(Bool.self),
+            "intermediate submission and final-layer tail narrowing must not change logits")
+
+        CBv2StepProfiler.reset()
+        let decodeCaches: [KVCache] = try caches(for: model)
+        let decode = model.cbv2Prefill(
+            MLXArray([Int32(3)]).reshaped(1, 1),
+            inputEmbedding: nil, cache: decodeCaches,
+            requirement: .lastPositionLogits)
+        eval(decode)
+        #expect(submissionCount() == 0, "single-token scheduled forwards are decode")
+
+        CBv2StepProfiler.reset()
+        let mtpCaches: [KVCache] = try caches(for: model)
+        let mtp = model.cbv2ForwardWithHidden(
+            inputs[0..., 0 ..< 4], caches: mtpCaches)
+        eval(mtp.logits, mtp.lastHidden)
+        #expect(submissionCount() == 0, "MTP verification must not use scheduled prefill")
+    }
+}
+
 
 // MARK: - GPT-OSS forward smoke tests (v2 branch)
 

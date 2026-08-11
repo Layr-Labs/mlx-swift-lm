@@ -13,20 +13,20 @@
 //  2. SCHEDULES prefill chunks that never split a block (SchedulerV2 snaps
 //     chunk boundaries to block edges; a block longer than
 //     `maxBatchedTokensPerStep` is rejected at submit).
-//  3. EXECUTES span-containing chunks on a NEW pinned attention path:
-//     input embeddings = scaled text-token embeddings with the span
-//     embeddings spliced verbatim (`spliceEmbeddings`), and a per-chunk
+//  3. EXECUTES span-containing chunks through the embedding-forward path:
+//     input embeddings = scaled text-token embeddings with each row's span
+//     embeddings spliced verbatim (`spliceEmbeddings`), and a row-local
 //     boolean mask implementing causal-plus-bidirectional-within-blocks —
 //     the exact semantics of MLXVLM Gemma4's
-//     `gemma4BidirectionalVisionMask` overlay (`_apply_blockwise_
-//     bidirectional_overlay` in the Python reference): tokens of the same
-//     image block attend each other in BOTH directions, overriding both
-//     causality and the sliding window; everything else stays causal
-//     (∧ window). Text-only chunks — including the text chunks of a vision
-//     request — keep the existing maskless/causal path untouched, and
-//     decode after prefill is UNCHANGED (image tokens are history in KV by
-//     then). The path choice is a pure function of has-spans-in-chunk;
-//     never data-dependent.
+//     `gemma4BidirectionalVisionMask` overlay. Tokens of the same image block
+//     attend each other in BOTH directions, overriding causality and the
+//     sliding window; everything else stays causal (∧ window). Long rows
+//     retain q=128 query blocking, expanding only touched blocks' K/V slices
+//     enough to include the complete image span. Explicit model + cache
+//     capabilities allow independently spliced vision rows and nil-context
+//     text neighbors to share a rectangular call. Decode after prefill is
+//     unchanged (image tokens are history in KV by then). The path choice is
+//     a pure function of has-spans-in-chunk; never data-dependent.
 //  4. EXCLUDES vision requests from prefix-cache lookup AND donation
 //     (v1 policy): token-id chain hashes cannot see image content, so a
 //     hit would silently reuse the wrong KV. Image-digest extra keys in the
@@ -65,6 +65,15 @@ public struct CBv2SpanChunkContext: Sendable, Equatable {
 /// (decode, text chunks, other requests' chunks) is untouched.
 public protocol CBv2SpanMaskBinding: AnyObject {
     func bindSpanContext(_ context: CBv2SpanChunkContext?)
+}
+
+/// Stronger binding contract for rectangular multimodal prefill. The array
+/// is row-aligned with the cache's current batch: non-nil entries carry that
+/// row's vision overlay and nil entries retain ordinary text attention.
+/// Custom and paged providers must opt in explicitly; structural
+/// `CBv2SpanMaskBinding` conformance alone is insufficient.
+public protocol CBv2PackedSpanMaskBinding: CBv2SpanMaskBinding {
+    func bindSpanContexts(_ contexts: [CBv2SpanChunkContext?]?)
 }
 
 // MARK: - Model surfaces

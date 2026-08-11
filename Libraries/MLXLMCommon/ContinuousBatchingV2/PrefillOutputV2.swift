@@ -57,17 +57,23 @@ public protocol CBv2PrefillSteppableModel: CBv2SteppableModel {
 }
 
 /// Opt-in refinement for models whose prompt forward keeps per-row
-/// semantics when several EQUAL-LENGTH text chunks are executed as one
+/// semantics when several EQUAL-LENGTH chunks are executed as one
 /// rectangular `[B, L]` pass. This makes the transformer traversal
 /// layer-major across those rows: each layer's weights are read once for
 /// the whole cohort instead of once per row.
 ///
 /// This is a claim about the MODEL only. The engine additionally requires
 /// the cache provider to vouch that its layer caches keep independent rows
-/// (`CBv2LayerCacheProvider.supportsPackedPrefill`), and it never packs
-/// span-bearing multimodal chunks, which stay on the per-request path.
+/// (`CBv2LayerCacheProvider.supportsPackedPrefill`). Packing rows that splice
+/// image embeddings and carry row-local span masks requires the stronger,
+/// separately fail-closed `supportsPackedMultimodalPrefill` claim.
 public protocol CBv2PackedPrefillSteppableModel: CBv2PrefillSteppableModel {
     var supportsPackedPrefill: Bool { get }
+    var supportsPackedMultimodalPrefill: Bool { get }
+}
+
+extension CBv2PackedPrefillSteppableModel {
+    public var supportsPackedMultimodalPrefill: Bool { false }
 }
 
 /// Model-level (KVCache-shaped) twin of `CBv2PrefillSteppableModel`, for
@@ -85,8 +91,13 @@ public protocol CBv2LanguageModelPrefillForwardable {
     /// Whether this model's prompt forward is safe to run as a rectangular
     /// `[B, L]` cohort of independent rows. Fail-closed default: false.
     var cbv2SupportsPackedPrefill: Bool { get }
+
+    /// Stronger claim for rectangular embedding-forward rows with one
+    /// optional vision span-mask context per row. Fail-closed default: false.
+    var cbv2SupportsPackedMultimodalPrefill: Bool { get }
 }
 
 extension CBv2LanguageModelPrefillForwardable {
     public var cbv2SupportsPackedPrefill: Bool { false }
+    public var cbv2SupportsPackedMultimodalPrefill: Bool { false }
 }

@@ -3,6 +3,16 @@ import XCTest
 @testable import MLXLMCommon
 
 final class CBv2FrozenReplayPlanTests: XCTestCase {
+    func testFullyBidirectionalLayersDisablePrefixReuse() {
+        let causal = CBv2LayerKind(
+            attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)
+        var bidirectional = causal
+        bidirectional.isBidirectional = true
+
+        XCTAssertTrue(cbv2LayerKindsAllowPrefixReuse([causal]))
+        XCTAssertFalse(cbv2LayerKindsAllowPrefixReuse([causal, bidirectional]))
+    }
+
     private func full(sharedWith source: Int? = nil) -> CBv2LayerKind {
         CBv2LayerKind(
             attention: .full,

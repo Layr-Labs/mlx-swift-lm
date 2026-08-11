@@ -106,36 +106,52 @@ struct Gemma4MTPTokenIteratorTests {
         let drafter1 = try tinyDrafter()
         eval(target1, drafter1)
 
-        // Same seed → same weights, but we need to replay exactly:
-        // build a second pair from the same seeded init so iterator
-        // and stream see identical weights.
-        MLXRandom.seed(42)
+        // MLXRandom.seed is process-global, while Swift Testing runs suites
+        // concurrently. Re-seeding and rebuilding is therefore not a safe
+        // way to clone a fixture: another suite can consume/reset the global
+        // stream between the two constructions. Build distinct module
+        // identities, then copy the already-realized immutable parameters.
         let target2 = try tinyTarget()
         let drafter2 = try tinyDrafter()
+        target2.update(parameters: target1.parameters())
+        drafter2.update(parameters: drafter1.parameters())
         eval(target2, drafter2)
 
-        let promptTokens = MLXArray([Int32](repeating: 7, count: 8))
+        #expect(ObjectIdentifier(target1) != ObjectIdentifier(target2))
+        #expect(ObjectIdentifier(drafter1) != ObjectIdentifier(drafter2))
 
-        // Iterator path.
+        let promptTokens = MLXArray([Int32](repeating: 7, count: 8))
+        let iteratorCache = target1.newCache(parameters: nil)
+        let streamCache = target2.newCache(parameters: nil)
+        #expect(iteratorCache.map(\.offset).allSatisfy { $0 == 0 })
+        #expect(streamCache.map(\.offset).allSatisfy { $0 == 0 })
+
+        // Iterator path. Temperature zero makes both the initial bonus and
+        // every MTP round greedy, so neither path consumes RNG state.
         let input = LMInput(text: .init(tokens: promptTokens))
         var iter = try Gemma4MTPTokenIterator(
             input: input, target: target1, drafter: drafter1,
+            cache: iteratorCache,
             parameters: GenerateParameters(maxTokens: 12, temperature: 0),
-            blockSize: 3)
+            blockSize: 3,
+            rngSeed: 42)
         var iteratorTokens: [Int] = []
         while let t = iter.next() { iteratorTokens.append(t) }
+        #expect(
+            streamCache.map(\.offset).allSatisfy { $0 == 0 },
+            "running the iterator must not advance the stream cache")
 
-        // AsyncStream path.
-        let cache = target2.newCache(parameters: nil)
+
+        // AsyncStream path, starting from an independent reset cache.
         let prefillOut = target2.forwardForMTP(
-            promptTokens[.newAxis, .ellipsis], cache: cache)
+            promptTokens[.newAxis, .ellipsis], cache: streamCache)
         let firstBonus = Int(prefillOut.logits[0..., -1, 0...]
                                  .asType(.float32).argMax(axis: -1).item(Int32.self))
         let firstHidden = prefillOut.lastHidden[
             0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         let stream = try runGemma4MTPRounds(
             target: target2, drafter: drafter2,
-            targetCache: cache,
+            targetCache: streamCache,
             firstBonus: firstBonus, firstHidden: firstHidden,
             firstSharedKV: prefillOut.capturedSharedKV,
             maxTokens: 12, blockSize: 3)
@@ -146,11 +162,32 @@ struct Gemma4MTPTokenIteratorTests {
             }
         }
 
+        #expect(iteratorTokens.count == 12)
+        #expect(streamTokens.count == 12)
+        #expect(iteratorCache.count == streamCache.count)
+        for (layer, caches) in zip(iteratorCache, streamCache).enumerated() {
+            let (iteratorLayer, streamLayer) = caches
+            #expect(
+                iteratorLayer.offset == streamLayer.offset,
+                "cache offset differs at layer \(layer)")
+            #expect(
+                iteratorLayer.state.count == streamLayer.state.count,
+                "cache state arity differs at layer \(layer)")
+            for (stateIndex, states) in zip(
+                iteratorLayer.state, streamLayer.state
+            ).enumerated() {
+                let (iteratorState, streamState) = states
+                #expect(
+                    allClose(iteratorState, streamState, rtol: 0, atol: 0).item(Bool.self),
+                    "cache state differs at layer \(layer), state \(stateIndex)")
+            }
+        }
         #expect(
             iteratorTokens == streamTokens,
             """
             TokenIterator output differs from AsyncStream output — they
-            must be identical for the same seed + config.
+            must be identical for cloned model weights, reset caches, the
+            same prompt, and deterministic greedy sampling.
               iterator=\(iteratorTokens)
               stream  =\(streamTokens)
             """)

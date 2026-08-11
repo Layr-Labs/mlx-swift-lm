@@ -11,105 +11,154 @@ import Testing
 // another blocks on the same function's lock from init).
 @Suite(.serialized)
 struct SwitchGLUTests {
-    @Test func fusedGateUpMatchesSeparateProjections() {
-        let inputDims = 8
-        let hiddenDims = 4
-        let numExperts = 3
+    @Test func fusedGateUpInitializerShapeRemainsPublicAndLoadable() {
+        let defaultGLU = SwitchGLU(
+            inputDims: 8, hiddenDims: 4, numExperts: 2,
+            fuseGateUp: true)
+        let customGLU = SwitchGLU(
+            inputDims: 8, hiddenDims: 4, numExperts: 2,
+            activation: { $0 + 0.5 }, fuseGateUp: true)
 
-        let separate = SwitchGLU(
-            inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts,
-            activation: { $0 }, bias: false)
-        let fused = SwitchGLU(
-            inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts,
-            activation: { $0 }, bias: false, fuseGateUp: true)
+        for glu in [defaultGLU, customGLU] {
+            let keys = Set(glu.parameters().flattened().map(\.0))
+            #expect(keys.contains("gate_up_proj.weight"))
+            #expect(!keys.contains("gate_proj.weight"))
+            #expect(!keys.contains("up_proj.weight"))
 
-        let gate = values(numExperts * hiddenDims * inputDims)
-            .reshaped(numExperts, hiddenDims, inputDims)
-            .asType(.float32)
-        let up = values(numExperts * hiddenDims * inputDims, offset: 1000)
-            .reshaped(numExperts, hiddenDims, inputDims)
-            .asType(.float32)
-        let down = values(numExperts * inputDims * hiddenDims, offset: 2000)
-            .reshaped(numExperts, inputDims, hiddenDims)
-            .asType(.float32)
-
-        separate.update(parameters: ModuleParameters.unflattened([
-            "gate_proj.weight": gate,
-            "up_proj.weight": up,
-            "down_proj.weight": down,
-        ]))
-        fused.update(parameters: ModuleParameters.unflattened([
-            "gate_up_proj.weight": concatenated([gate, up], axis: -2),
-            "down_proj.weight": down,
-        ]))
-
-        let x = values(2 * inputDims, offset: 3000)
-            .reshaped(2, inputDims)
-            .asType(.float32)
-        let indices = MLXArray([Int32(0), 2, 1, 0]).reshaped(2, 2)
-
-        let separateOut = separate(x, indices)
-        let fusedOut = fused(x, indices)
-        eval(separateOut, fusedOut)
-
-        let maxDiff = max(abs(separateOut - fusedOut)).item(Float.self)
-        #expect(maxDiff == 0)
+            let x = MLXArray.ones([1, 8])
+            let indices = MLXArray([Int32(0), 1]).reshaped(1, 2)
+            let output = glu(x, indices)
+            eval(output)
+            #expect(output.shape == [1, 2, 8])
+        }
     }
 
-    /// N1 fast-follow: same parity check for the *quantized* fused path. Affine
-    /// quantization is independent per output row, so quantizing the fused
-    /// `[gate; up]` weight yields gate/up rows bit-identical to quantizing the
-    /// two projections separately -- the single gathered quantized matmul + split
-    /// must therefore match two separate quantized matmuls exactly.
-    @Test func fusedGateUpQuantizedMatchesSeparateProjections() {
+    @Test func weightedExpertUnsortMatchesLegacyForB1B2B4PrefillReorderings() {
+        let topK = 8
+        let hidden = 2816
+        let tolerance: Float = 0.01
+
+        resetWeightedExpertUnsortStats()
+        for batch in [1, 2, 4] {
+            // Eight prompt rows per batch keeps all three cases on the sorted
+            // dispatch (64/128/256 assignments) while changing token order.
+            let tokens = batch * 8
+            let assignments = tokens * topK
+            MLXRandom.seed(UInt64(80 + batch))
+            let original = MLXRandom.normal([tokens, topK, hidden]).asType(.bfloat16)
+            let weights = softmax(
+                MLXRandom.normal([tokens, topK]).asType(.bfloat16),
+                axis: -1,
+                precise: true)
+            let expertIndices = MLXArray(
+                (0 ..< assignments).map {
+                    UInt32(($0 * 37 + ($0 / topK) * 11 + batch) % 128)
+                }
+            )
+            let order = argSort(expertIndices)
+            let inverseOrder = argSort(order)
+            let sorted = original.reshaped(assignments, hidden)[order]
+
+            let expected = weightedExpertSum(original, weights)
+            let actual = weightedExpertUnsort(
+                sortedOutputs: sorted,
+                inverseOrder: inverseOrder,
+                weights: weights)
+            eval(expected, actual)
+
+            let maxDiff = max(abs(expected - actual)).item(Float.self)
+            #expect(actual.shape == [tokens, hidden])
+            #expect(
+                maxDiff <= tolerance,
+                Comment(rawValue: "B\(batch) reordered prefill max diff \(maxDiff)"))
+        }
+
+        let provenance = weightedExpertUnsortProvenance(requested: true)
+        #expect(provenance.effectiveCalls == 3)
+        #expect(provenance.engaged)
+        #expect(!provenance.missingExpectedEngagement)
+
+        // Snapshot disarms the boundary-scoped probe. A later production call
+        // remains uncounted until the next explicit reset/arm.
+        let unarmedOutputs = MLXArray.zeros([64, hidden], dtype: .bfloat16)
+        let unarmedOrder = MLXArray((0 ..< 64).map { UInt32($0) })
+        let unarmedWeights = MLXArray.zeros([8, topK], dtype: .bfloat16)
+        _ = weightedExpertUnsort(
+            sortedOutputs: unarmedOutputs,
+            inverseOrder: unarmedOrder,
+            weights: unarmedWeights)
+        #expect(weightedExpertUnsortStats().effectiveCalls == 3)
+    }
+
+    @Test func combinedWeightedReductionPreservesDisabledDecodeAndGenericFallbacks() {
         let inputDims = 64
-        let hiddenDims = 64
-        let numExperts = 3
-        let groupSize = 64
-        let bits = 4
+        let hiddenDims = 32
+        let numExperts = 8
+        let topK = 8
+        let tolerance: Float = 0.01
+        let glu = SwitchGLU(
+            inputDims: inputDims,
+            hiddenDims: hiddenDims,
+            numExperts: numExperts,
+            activation: { $0 + 0.25 },
+            bias: false)
 
-        let separate = SwitchGLU(
-            inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts,
-            activation: { $0 }, bias: false)
-        let fused = SwitchGLU(
-            inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts,
-            activation: { $0 }, bias: false, fuseGateUp: true)
-
-        let gate = values(numExperts * hiddenDims * inputDims)
-            .reshaped(numExperts, hiddenDims, inputDims)
-            .asType(.float32)
-        let up = values(numExperts * hiddenDims * inputDims, offset: 20000)
-            .reshaped(numExperts, hiddenDims, inputDims)
-            .asType(.float32)
-        let down = values(numExperts * inputDims * hiddenDims, offset: 40000)
-            .reshaped(numExperts, inputDims, hiddenDims)
-            .asType(.float32)
-
-        separate.update(parameters: ModuleParameters.unflattened([
-            "gate_proj.weight": gate,
-            "up_proj.weight": up,
-            "down_proj.weight": down,
-        ]))
-        fused.update(parameters: ModuleParameters.unflattened([
-            "gate_up_proj.weight": concatenated([gate, up], axis: -2),
-            "down_proj.weight": down,
+        glu.update(parameters: ModuleParameters.unflattened([
+            "gate_proj.weight": values(
+                numExperts * hiddenDims * inputDims, offset: 1000
+            ).reshaped(numExperts, hiddenDims, inputDims).asType(.bfloat16),
+            "up_proj.weight": values(
+                numExperts * hiddenDims * inputDims, offset: 5000
+            ).reshaped(numExperts, hiddenDims, inputDims).asType(.bfloat16),
+            "down_proj.weight": values(
+                numExperts * inputDims * hiddenDims, offset: 9000
+            ).reshaped(numExperts, inputDims, hiddenDims).asType(.bfloat16),
         ]))
 
-        quantize(model: separate, groupSize: groupSize, bits: bits)
-        quantize(model: fused, groupSize: groupSize, bits: bits)
+        resetWeightedExpertUnsortStats()
+        let cases: [
+            (name: String, rows: Int, enabled: Bool, productionPrefill: Bool, dtype: DType)
+        ] = [
+            ("disabled-sorted", 8, false, true, .bfloat16),
+            ("decode-b1", 1, true, false, .bfloat16),
+            ("decode-b2", 2, true, false, .bfloat16),
+            ("decode-b4", 4, true, false, .bfloat16),
+            ("decode-b8-sorted-size", 8, true, false, .bfloat16),
+            ("custom-near-geometry", 8, true, true, .bfloat16),
+            ("unsupported-dtype", 8, true, true, .float32),
+        ]
+        for testCase in cases {
+            let x = values(testCase.rows * inputDims, offset: 13000)
+                .reshaped(testCase.rows, inputDims).asType(testCase.dtype)
+            let indices = MLXArray(
+                (0 ..< testCase.rows * topK).map {
+                    UInt32(($0 * 5 + $0 / topK) % numExperts)
+                }
+            ).reshaped(testCase.rows, topK)
+            let weights = values(testCase.rows * topK, offset: 17)
+                .reshaped(testCase.rows, topK).asType(testCase.dtype)
 
-        let x = values(2 * inputDims, offset: 60000)
-            .reshaped(2, inputDims)
-            .asType(.float32)
-        let indices = MLXArray([Int32(0), 2, 1, 0]).reshaped(2, 2)
+            let expected = weightedExpertSum(glu(x, indices), weights)
+            let actual = glu.callAndWeightedReduce(
+                x,
+                indices,
+                weights: weights,
+                fuseSortedReduction: testCase.enabled,
+                isProductionPrefill: testCase.productionPrefill)
+            eval(expected, actual)
 
-        let separateOut = separate(x, indices)
-        let fusedOut = fused(x, indices)
-        eval(separateOut, fusedOut)
+            let maxDiff = max(abs(expected - actual)).item(Float.self)
+            #expect(
+                maxDiff <= tolerance,
+                Comment(rawValue: "\(testCase.name) fallback max diff \(maxDiff)"))
+        }
 
-        let maxDiff = max(abs(separateOut - fusedOut)).item(Float.self)
-        #expect(maxDiff == 0)
+        let provenance = weightedExpertUnsortProvenance(requested: true)
+        #expect(provenance.effectiveCalls == 0)
+        #expect(!provenance.engaged)
+        #expect(provenance.missingExpectedEngagement)
     }
+
 
     /// Regression for the removed runtime fused gate+up cache: SwitchGLU must
     /// retain NO weight copies beyond its parameters. The removed cache

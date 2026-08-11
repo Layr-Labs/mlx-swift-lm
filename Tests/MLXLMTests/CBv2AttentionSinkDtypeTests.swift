@@ -393,10 +393,10 @@ struct CBv2AttentionSinkDtypeTests {
 
         let wide = CBv2AttentionV1.updateAndAttend(
             rows: [try freshRow()], kind: kind, queries: q, keys: k, values: v,
-            scale: scale, sinks: wideSinks, spanContext: context)
+            scale: scale, sinks: wideSinks, spanContexts: [context])
         let narrow = CBv2AttentionV1.updateAndAttend(
             rows: [try freshRow()], kind: kind, queries: q, keys: k, values: v,
-            scale: scale, sinks: narrowSinks, spanContext: context)
+            scale: scale, sinks: narrowSinks, spanContexts: [context])
 
         #expect(wide.shape == [1, 8, chunk, 64])
         assertIdentical(wide, narrow)

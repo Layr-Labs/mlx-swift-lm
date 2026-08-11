@@ -752,10 +752,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // inside its own block, and those columns are not in the slice.
         // The overlay itself lives in `attendQueryBlock`, so the mask stays
         // defined in one place either way.
-        guard boundSpanContext == nil, CBv2AttentionV1.shouldBlockQueries(l) else {
+        guard boundSpanContext == nil, !kind.isBidirectional,
+            CBv2AttentionV1.shouldBlockQueries(l)
+        else {
             return attendQueryBlock(
                 queries: queries, keys: k, values: v,
-                qpos: qpos, kpos: kpos, scale: scale, sinks: sinks)
+                qpos: qpos, kpos: kpos, queryStart: qStart,
+                scale: scale, sinks: sinks)
         }
 
         // Block bounds are SHARED with the contiguous backend
@@ -779,7 +782,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                     values: v[0..., 0..., visibleStart ..< visibleEnd, 0...],
                     qpos: qpos[offset ..< (offset + count), 0...],
                     kpos: kpos[0..., visibleStart ..< visibleEnd],
-                    scale: scale, sinks: sinks))
+                    queryStart: qStart, scale: scale, sinks: sinks))
             offset += count
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
@@ -803,11 +806,19 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// systems cannot drift apart.
     private func attendQueryBlock(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        qpos: MLXArray, kpos: MLXArray, scale: Float, sinks: MLXArray?
+        qpos: MLXArray, kpos: MLXArray, queryStart: Int,
+        scale: Float, sinks: MLXArray?
     ) -> MLXArray {
         var mask = kpos .<= qpos
         if case .slidingWindow(let window) = kind.attention {
             mask = mask & (kpos .> (qpos - Int32(window)))
+        }
+        if kind.isBidirectional {
+            var reverse = (kpos .>= qpos) .&& (kpos .>= Int32(queryStart))
+            if case .slidingWindow(let window) = kind.attention {
+                reverse = reverse .&& (kpos .< (qpos + Int32(window)))
+            }
+            mask = mask .|| reverse
         }
         if let spans = boundSpanContext {
             for block in spans.blocks {

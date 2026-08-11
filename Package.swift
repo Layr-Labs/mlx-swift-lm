@@ -282,7 +282,7 @@ let package = Package(
             path: "Sources/BenchCBv2"
         ),
         // Harness-integrity tests: option parsing, engine resolution, and
-        // report provenance. Model-free, so they run in CI.
+        // report/optimization provenance. Model-free, so they run in CI.
         .testTarget(
             name: "BenchCBv2Tests",
             dependencies: ["BenchCBv2Core"],

@@ -1,10 +1,10 @@
 // CBv2PackedPrefillTests.swift — rectangular [B, L] packed prompt prefill.
 //
 // `EngineLoopV2.executeMixed` groups the step's PROMPT rows by
-// (chunk length, samples flag) and, when BOTH capability gates agree, runs
-// each equal-length TEXT group of >1 rows as ONE rectangular `[B, L]`
+// (chunk length, samples flag) and, when BOTH base capability gates agree,
+// runs each equal-length group of >1 rows as ONE rectangular `[B, L]`
 // forward through `prefillOutput` instead of B separate `[1, L]` forwards.
-// The gates are:
+// The base gates are:
 //
 //   * `CBv2LayerCacheProvider.supportsPackedPrefill` — the caches keep rows
 //     independent (`CBv2LayerCacheBank`: true only when every cache is the
@@ -13,8 +13,9 @@
 //     prompt forward is shape-generic over the batch axis
 //     (`Gemma4TextModel.cbv2SupportsPackedPrefill == true`).
 //
-// Span-bearing multimodal chunks are NEVER packed, and already-packed ids
-// are skipped by the per-request loop.
+// Span-bearing rows additionally require the model's packed-multimodal claim
+// and the provider's row-aligned span-binding claim. The fixture below omits
+// that stronger model claim so its span row pins the singleton fallback.
 //
 // This suite pins the whole seam:
 //
@@ -34,7 +35,7 @@
 //     `testSingleRowGroupTakesTheSingletonPath` — grouping rules.
 //  5. `testCacheProviderVetoPreventsPacking`,
 //     `testModelVetoPreventsPacking`,
-//     `testSpanBearingChunkIsNeverPackedWithItsNeighbours`,
+//     `testSpanBearingChunkFallsBackWithoutMultimodalClaim`,
 //     `testLayerCacheBankVouchesOnlyForContiguousCaches` — fail-closed gates.
 //  6. `testDecodeRowsKeepTheirOwnRectangularBatchAlongsidePacking` — decode
 //     is untouched: it stays a `[Bdecode, 1]` `forward`, and its tokens are
@@ -783,9 +784,9 @@ final class CBv2PackedPrefillTests: XCTestCase {
                 + "must keep the per-request path")
     }
 
-    /// (c) A span-bearing multimodal chunk is never packed, even when its
-    /// same-length, same-requirement TEXT neighbours are.
-    func testSpanBearingChunkIsNeverPackedWithItsNeighbours() throws {
+    /// (c) Without the stronger packed-multimodal model claim, a span chunk
+    /// stays singleton even beside same-shape text rows.
+    func testSpanBearingChunkFallsBackWithoutMultimodalClaim() throws {
         let base = TinyTestModel.make(seed: weightSeed)
         let harness = CBv2PackedHarness(
             inner: base, layerKinds: base.layerKinds,
@@ -838,6 +839,9 @@ final class CBv2PackedPrefillTests: XCTestCase {
         XCTAssertTrue(
             contiguous.supportsPackedPrefill,
             "a bank of contiguous CBv2LayerCaches keeps rows independent")
+        XCTAssertTrue(
+            contiguous.supportsPackedMultimodalSpans,
+            "contiguous caches bind one optional span context per row")
 
         let mixed = CBv2LayerCacheBank(caches: [
             CBv2LayerCache(layerIndex: 0, kind: kinds[0]),
@@ -846,6 +850,9 @@ final class CBv2PackedPrefillTests: XCTestCase {
         XCTAssertFalse(
             mixed.supportsPackedPrefill,
             "one cache that makes no per-row claim must veto packing for the whole bank")
+        XCTAssertFalse(
+            mixed.supportsPackedMultimodalSpans,
+            "one cache without row-aligned span binding must veto packed vision")
     }
 
     // MARK: 6. Decode is untouched
@@ -961,10 +968,16 @@ final class CBv2PackedPrefillTests: XCTestCase {
         XCTAssertTrue(
             gemma.cbv2SupportsPackedPrefill,
             "Gemma4TextModel claims rectangular-prompt safety")
+        XCTAssertTrue(
+            gemma.cbv2SupportsPackedMultimodalPrefill,
+            "Gemma4TextModel explicitly claims row-local embedding/span safety")
         let adapter = CBv2SteppableLanguageModelAdapter(gemma)
         XCTAssertTrue(
             adapter.supportsPackedPrefill,
             "the steppable adapter must propagate the model's claim")
+        XCTAssertTrue(
+            adapter.supportsPackedMultimodalPrefill,
+            "the steppable adapter must propagate the stronger multimodal claim")
 
         let kinds = config.cbv2LayerKinds
         let prompts = (0 ..< 2).map {

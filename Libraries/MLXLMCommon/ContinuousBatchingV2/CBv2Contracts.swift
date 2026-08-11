@@ -212,6 +212,10 @@ public struct CBv2LayerKind: Sendable, Equatable {
     /// sharing). A shared layer owns NO storage; it borrows (K, V) and the
     /// position offset from the source layer at attention time.
     public var sharesKVWithLayer: Int?
+    /// Multi-token prompt attention is bidirectional within the current
+    /// chunk. Cached prefix columns retain their established visibility;
+    /// decode remains unchanged because no future keys exist yet.
+    public var isBidirectional: Bool
     /// Learned per-head attention sinks (GPT-OSS). Sinks are a kernel
     /// parameter (folded into the softmax denominator), never KV state.
     /// A backend that cannot honor sinks MUST be statically ineligible for
@@ -223,15 +227,26 @@ public struct CBv2LayerKind: Sendable, Equatable {
 
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
+        isBidirectional: Bool = false,
         headDim: Int, kvHeads: Int, queryHeads: Int
     ) {
         self.attention = attention
         self.sharesKVWithLayer = sharesKVWithLayer
         self.hasSinks = hasSinks
+        self.isBidirectional = isBidirectional
         self.headDim = headDim
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
     }
+}
+
+/// Prefix snapshots are reusable only when prefill visibility is independent
+/// of the donor's chunk history. Fully bidirectional chunks do not satisfy
+/// that contract: generated rows donated one token at a time had no future
+/// visibility, while those same rows in a later prompt would.
+@inline(__always)
+func cbv2LayerKindsAllowPrefixReuse(_ layerKinds: [CBv2LayerKind]) -> Bool {
+    !layerKinds.contains(where: \.isBidirectional)
 }
 
 // MARK: - Per-sequence KV state

@@ -30,6 +30,7 @@ import MLXRandom
 import Testing
 
 @testable import MLXLMCommon
+@testable import MLXLLM
 
 @Suite("CBv2PagedQueryBlocking")
 struct CBv2PagedQueryBlockingTests {
@@ -83,7 +84,7 @@ struct CBv2PagedQueryBlockingTests {
     /// blocking, no slicing, no shared helper with `PagedLayerCache`.
     private func wholeRectangle(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        qStart: Int, kStart: Int, window: Int?
+        qStart: Int, kStart: Int, window: Int?, isBidirectional: Bool = false
     ) -> MLXArray {
         let qEnd = qStart + queries.dim(2)
         let kEnd = kStart + keys.dim(2)
@@ -92,6 +93,13 @@ struct CBv2PagedQueryBlockingTests {
         var mask = kpos .<= qpos
         if let window = window {
             mask = mask & (kpos .> (qpos - Int32(window)))
+        }
+        if isBidirectional {
+            var reverse = (kpos .>= qpos) .&& (kpos .>= Int32(qStart))
+            if let window = window {
+                reverse = reverse .&& (kpos .< (qpos + Int32(window)))
+            }
+            mask = mask .|| reverse
         }
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: keys, values: values, scale: scale, boolMask: mask)
@@ -152,6 +160,53 @@ struct CBv2PagedQueryBlockingTests {
                 queries: queries,
                 keys: k.expandedDimensions(axis: 0), values: v.expandedDimensions(axis: 0),
                 qStart: 0, kStart: 0, window: nil))
+    }
+
+    @Test func gemma4AllModePagedPrefillAttendsFutureKeys() throws {
+        let json = """
+            {
+                "model_type": "gemma4_text",
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "head_dim": 64,
+                "global_head_dim": 64,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 0,
+                "layer_types": ["full_attention"],
+                "use_bidirectional_attention": "all"
+            }
+            """
+        let modelConfig = try JSONDecoder().decode(
+            Gemma4TextConfiguration.self, from: Data(json.utf8))
+        let layer = try #require(modelConfig.cbv2LayerKinds.first)
+        #expect(layer.isBidirectional)
+
+        let chunk = 192
+        let dtype = DType.float32
+        let backend = try PagedKVBackend(
+            layerKinds: [layer], config: config(maxPrefillChunk: chunk, dtype: dtype))
+        let cache = backend.makeLayerCaches()[0]
+        let state = try backend.makeSequenceState(
+            layerKinds: [layer], promptLength: chunk, maxLength: 512)
+        defer { backend.release(state) }
+        cache.setRows([state[0]!])
+
+        let (k, v) = codedKV(0 ..< chunk, dtype: dtype)
+        let queries = MLXArray.zeros([1, queryHeads, chunk, headDim], dtype: dtype)
+        let keys = k.expandedDimensions(axis: 0)
+        let values = v.expandedDimensions(axis: 0)
+        let got = cache.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+        let bidirectional = wholeRectangle(
+            queries: queries, keys: keys, values: values,
+            qStart: 0, kStart: 0, window: nil, isBidirectional: true)
+        let causal = wholeRectangle(
+            queries: queries, keys: keys, values: values,
+            qStart: 0, kStart: 0, window: nil)
+
+        assertClose(got, bidirectional)
+        let causalDelta = abs(got - causal).max().item(Float.self)
+        #expect(causalDelta > 0.01, "fixture must distinguish all-mode from causal attention")
     }
 
     /// Sliding window, and the WS-1.2 pin on gather ORDER: consecutive
