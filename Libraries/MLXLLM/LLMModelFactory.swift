@@ -46,12 +46,11 @@ public enum LLMTypeRegistry {
         // the 3.6 MTP head + backbone have not been run/verified yet.
         "qwen3_6": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_6_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
-        "qwen3_6_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_6_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
         // Compact ("qwen36") and dotted ("qwen3.6") spellings of the same type, aliased too.
+        // Dense 27B only — no MoE alias (we are not targeting the 35B-A3B MoE).
         "qwen36": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen36_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
-        "qwen36_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3.6": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3.6_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
