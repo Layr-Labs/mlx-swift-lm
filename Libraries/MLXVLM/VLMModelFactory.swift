@@ -92,6 +92,12 @@ public enum VLMTypeRegistry {
         "qwen3_6": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_6_mtp": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_6_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        // Compact ("qwen36") and dotted ("qwen3.6") spellings, aliased too.
+        "qwen36": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen36_mtp": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen36_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        "qwen3.6": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3.6_mtp": create(Qwen35Configuration.self, Qwen35.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),

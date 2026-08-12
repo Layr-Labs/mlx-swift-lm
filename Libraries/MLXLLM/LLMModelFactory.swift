@@ -48,6 +48,12 @@ public enum LLMTypeRegistry {
         "qwen3_6_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_6_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_6_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        // Compact ("qwen36") and dotted ("qwen3.6") spellings of the same type, aliased too.
+        "qwen36": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen36_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen36_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
+        "qwen3.6": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3.6_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),
