@@ -61,6 +61,29 @@ public protocol CBv2MTPForwardable: AnyObject {
         -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
+extension CBv2MTPForwardable {
+    /// Identity may normalize an outer language-model wrapper to the inner
+    /// text target that actually owns embeddings, logits, hidden, and KV.
+    public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(self) }
+}
+
+/// Recurrent target counterpart to `CBv2MTPForwardable`. Hybrid targets must
+/// receive the same request-owned transaction objects used by ordinary CBv2
+/// decode; the assistant never owns or aliases these states.
+public protocol CBv2RecurrentMTPForwardable:
+    AnyObject, CBv2RecurrentLanguageModelForwardable
+{
+    var cbv2MTPTargetIdentity: ObjectIdentifier { get }
+    func cbv2ForwardWithHidden(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2RecurrentMTPForwardable {
+    public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(self) }
+}
+
 /// Steppable models that can drive MTP rounds. Additive refinement of
 /// `CBv2SteppableModel`; the engine speculates only when the bound model
 /// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
@@ -68,6 +91,9 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// nil when the underlying model cannot drive MTP (adapters over
     /// arbitrary models answer at runtime).
     var mtpCaptureLayers: CBv2MTPCaptureLayers? { get }
+    /// True only when the target has the recurrent hidden/state transaction
+    /// seam required by a request-stateful assistant.
+    var supportsRequestStatefulMTP: Bool { get }
     /// Identity of the exact target instance that owns verification logits,
     /// hidden states, and KV. nil means compatibility cannot be proven and
     /// must fail safe to plain decode.
@@ -80,6 +106,19 @@ public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
 
 extension CBv2MTPSteppableModel {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+    public var supportsRequestStatefulMTP: Bool { false }
+}
+
+/// Engine-facing recurrent hidden-capture refinement. A recurrent MTP target
+/// is only activated when this seam and request-owned recurrent state are both
+/// present, so no call can silently fall through to the stateless forward.
+public protocol CBv2RecurrentMTPSteppableModel:
+    CBv2MTPSteppableModel, CBv2RecurrentSteppableModel
+{
+    func forwardWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
 // MARK: - Drafter seam
@@ -133,6 +172,14 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// this drafter consumes. nil means compatibility cannot be proven and
     /// must fail safe to plain decode.
     var mtpTargetIdentity: ObjectIdentifier? { get }
+    /// A drafter may narrow target verification, depth, or batch policy for
+    /// correctness. nil preserves the Gemma/default engine configuration.
+    var requiredVerificationMode: CBv2MTPVerificationMode? { get }
+    var maximumDraftTokens: Int? { get }
+    var maximumSpeculativeBatch: Int? { get }
+    /// Variable request-owned residency outside target KV. Admission charges
+    /// this conservatively for every reserved token when the drafter is active.
+    var requestStateBytesPerToken: Int { get }
     /// Build round-scoped batch state from per-row captures. `rows` order
     /// == the round's speculating-row order.
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
@@ -151,6 +198,40 @@ public protocol CBv2MTPDrafter: AnyObject {
 
 extension CBv2MTPDrafter {
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
+    public var requiredVerificationMode: CBv2MTPVerificationMode? { nil }
+    public var maximumDraftTokens: Int? { nil }
+    public var maximumSpeculativeBatch: Int? { nil }
+    public var requestStateBytesPerToken: Int { 0 }
+}
+
+/// Opaque, request-owned assistant state. It is deliberately distinct from
+/// target recurrent state and target attention KV.
+public protocol CBv2MTPRequestState: AnyObject {
+    var committedInputCount: Int { get }
+    var stagedInputCount: Int { get }
+}
+
+/// Alternate drafter seam for autoregressive assistants such as Qwen3.5/3.6.
+/// Calls are row-local so histories and assistant-cache offsets may differ;
+/// the target verifier may still batch the resulting columns as `[B,1]`.
+public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
+    func makeRequestState() -> any CBv2MTPRequestState
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// Device arrays that make assistant-cache mutation part of the round's
+    /// evaluation fence.
+    func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
+    /// Complete one staged round. The drafter stages the seed plus every
+    /// proposal it consumes while chaining; `confirmedInputTokens` is the
+    /// exact prefix of those inputs that became canonical target history.
+    func finalizeRound(
+        requestState: any CBv2MTPRequestState, confirmedInputTokens: Int)
+    /// Reject/discard all assistant writes made by the current round.
+    func discardRound(requestState: any CBv2MTPRequestState)
+    /// Explicitly sever device-array ownership on finish/cancel/preemption.
+    func releaseRequestState(_ requestState: any CBv2MTPRequestState)
 }
 
 // MARK: - Config

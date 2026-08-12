@@ -26,6 +26,7 @@ struct CBv2MTPGraphBuild {
     let verify: CBv2MTPRoundInFlight.Verify?
     let seedRows: [(id: CBv2RequestID, decodeIndex: Int)]
     let seedHidden: MLXArray?
+    let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
 }
 
 extension EngineLoopV2 {
@@ -96,11 +97,41 @@ extension EngineLoopV2 {
         var decodeSampled: MLXArray?
         var seedRows: [(id: CBv2RequestID, decodeIndex: Int)] = []
         var seedHidden: MLXArray?
+        var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
-            let (logits, hidden) = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+            let logits: MLXArray
+            let hidden: MLXArray
+            if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
+                recurrentModel.recurrentStateSpec != nil
+            {
+                let evaluations = decodeRows.map { row -> CBv2RecurrentStateEvaluation in
+                    guard let state = recurrentStates[row.rec.id] else {
+                        preconditionFailure("CBv2 recurrent MTP seed state missing")
+                    }
+                    do { return try state.bind() } catch {
+                        preconditionFailure("CBv2 recurrent MTP seed bind failed: \(error)")
+                    }
+                }
+                let output = recurrentModel.forwardWithHidden(
+                    tokens: inputs, caches: caches, recurrentState: evaluations)
+                logits = output.logits
+                hidden = output.lastHidden
+                for (row, evaluation) in zip(decodeRows, evaluations) {
+                    do {
+                        cacheInnerState.append(contentsOf: try evaluation.evaluate())
+                    } catch {
+                        preconditionFailure("CBv2 recurrent MTP seed evaluation failed: \(error)")
+                    }
+                    recurrentEvaluations[row.rec.id] = evaluation
+                }
+            } else {
+                let output = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                logits = output.logits
+                hidden = output.lastHidden
+            }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
@@ -203,7 +234,8 @@ extension EngineLoopV2 {
             logprobSegments: logprobSegments,
             verify: verify,
             seedRows: seedRows,
-            seedHidden: seedHidden)
+            seedHidden: seedHidden,
+            recurrentEvaluations: recurrentEvaluations)
     }
 
     private func mtpBuildVerifyGraph(
@@ -230,49 +262,75 @@ extension EngineLoopV2 {
         for row in verifyRows {
             let state = kvStates[row.rec.id]!
             let carry = row.carry!
-            // Captured BEFORE the target forward writes the round's
-            // speculative columns. On a backend whose snapshots are lazy
-            // reads of in-place-mutated storage that ordering is not free —
-            // `mtpFreezeCaptures` below is what actually enforces it.
-            let fullRow = state[mtp.captureLayers.full]!
-            let slidingRow = state[mtp.captureLayers.sliding]!
-            precondition(
-                fullRow.absoluteOffset == carry.kvOffset,
-                "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
-            )
-            let fullSnapshot = fullRow.snapshot()
-            let slidingSnapshot = slidingRow.snapshot()
-            captures.append(
-                CBv2MTPRowCapture(
-                    fullKeys: fullSnapshot.keys,
-                    fullValues: fullSnapshot.values,
-                    slidingKeys: slidingSnapshot.keys,
-                    slidingValues: slidingSnapshot.values,
-                    slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
-                    anchor: fullRow.absoluteOffset))
-            captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
-            captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
+            if let captureLayers = mtp.captureLayers, !mtp.usesRequestStatefulDrafter {
+                // Capture before target verification writes the speculative
+                // columns; paged storage is fenced below before those writes.
+                let fullRow = state[captureLayers.full]!
+                let slidingRow = state[captureLayers.sliding]!
+                precondition(
+                    fullRow.absoluteOffset == carry.kvOffset,
+                    "CBv2 MTP: verify row anchor \(fullRow.absoluteOffset) != carry \(carry.kvOffset)"
+                )
+                let fullSnapshot = fullRow.snapshot()
+                let slidingSnapshot = slidingRow.snapshot()
+                captures.append(
+                    CBv2MTPRowCapture(
+                        fullKeys: fullSnapshot.keys,
+                        fullValues: fullSnapshot.values,
+                        slidingKeys: slidingSnapshot.keys,
+                        slidingValues: slidingSnapshot.values,
+                        slidingStart: slidingRow.absoluteOffset - slidingRow.retainedCount,
+                        anchor: fullRow.absoluteOffset))
+                captured.append((fullRow, fullSnapshot.keys, fullSnapshot.values))
+                captured.append((slidingRow, slidingSnapshot.keys, slidingSnapshot.values))
+            } else {
+                precondition(
+                    state.compactMap { $0 }.allSatisfy { $0.absoluteOffset == carry.kvOffset },
+                    "CBv2 request-stateful MTP target KV is not aligned with its carry")
+            }
             rowMetadata.append(
                 CBv2MTPRoundInFlight.VerifyRow(
-                    id: row.rec.id, storageRows: state.compactMap { $0 }))
+                    id: row.rec.id, storageRows: state.compactMap { $0 },
+                    assistantState:
+                        mtp.usesRequestStatefulDrafter
+                        ? mtp.takeAssistantState(for: row.rec.id) : nil))
             seedTokens.append(Int32(carry.token))
             carryHiddens.append(carry.hidden)
         }
 
         mtpFreezeCaptures(captured)
-
-        let prepared = mtp.drafter.prepare(rows: captures)
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
-        var draftInput = seedColumn
-        var draftHidden = concatenated(carryHiddens, axis: 0)
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
-        for _ in 0 ..< k {
-            let (next, nextHidden) = mtp.drafter.draftStep(
-                tokens: draftInput, hidden: draftHidden, prepared: prepared)
-            draftSteps.append(next)
-            draftInput = next.reshaped([batch, 1])
-            draftHidden = nextHidden
+        var assistantEvalTargets: [MLXArray] = []
+        if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
+            precondition(k == 1, "CBv2 request-stateful MTP currently supports one draft")
+            var nextRows: [MLXArray] = []
+            nextRows.reserveCapacity(batch)
+            for (index, row) in verifyRows.enumerated() {
+                guard let requestState = rowMetadata[index].assistantState else {
+                    preconditionFailure(
+                        "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
+                }
+                let result = stateful.draftStep(
+                    tokens: seedColumn[index ..< index + 1, 0...],
+                    hidden: carryHiddens[index], requestState: requestState)
+                nextRows.append(result.tokens.reshaped([1]))
+                assistantEvalTargets.append(
+                    contentsOf: stateful.evaluationTargets(for: requestState))
+            }
+            draftSteps.append(concatenated(nextRows, axis: 0))
+        } else {
+            let prepared = mtp.drafter.prepare(rows: captures)
+            var draftInput = seedColumn
+            var draftHidden = concatenated(carryHiddens, axis: 0)
+            for _ in 0 ..< k {
+                let (next, nextHidden) = mtp.drafter.draftStep(
+                    tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                draftSteps.append(next)
+                draftInput = next.reshaped([batch, 1])
+                draftHidden = nextHidden
+            }
         }
         let draftIDs = stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
@@ -290,6 +348,7 @@ extension EngineLoopV2 {
         let target = mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
+        cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
@@ -300,7 +359,8 @@ extension EngineLoopV2 {
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
-            lastHidden: target.hidden)
+            lastHidden: target.hidden,
+            recurrentEvaluations: target.recurrent)
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes

@@ -161,13 +161,36 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         /// nil ⇒ uniform `elementBytes`. Entries for KV-shared layers are
         /// ignored (those layers own no storage).
         public var layerElementBytes: [Int]?
+        /// Fixed non-KV residency charged once for every active request.
+        /// Hybrid recurrent models use this for conv + SSM state; attention-
+        /// only models keep the source-compatible zero default.
+        public var fixedBytesPerRequest: Int
+        /// Variable request-owned residency outside target KV. Stateful MTP
+        /// assistants use this for their independent autoregressive cache.
+        public var auxiliaryBytesPerToken: Int
         public init(
             watermarkFraction: Double = 0.05, elementBytes: Int = 2,
-            layerElementBytes: [Int]? = nil
+            layerElementBytes: [Int]? = nil,
+            fixedBytesPerRequest: Int = 0
+        ) {
+            self.init(
+                watermarkFraction: watermarkFraction,
+                elementBytes: elementBytes,
+                layerElementBytes: layerElementBytes,
+                fixedBytesPerRequest: fixedBytesPerRequest,
+                auxiliaryBytesPerToken: 0)
+        }
+
+        public init(
+            watermarkFraction: Double, elementBytes: Int,
+            layerElementBytes: [Int]?, fixedBytesPerRequest: Int,
+            auxiliaryBytesPerToken: Int
         ) {
             self.watermarkFraction = watermarkFraction
             self.elementBytes = elementBytes
             self.layerElementBytes = layerElementBytes
+            self.fixedBytesPerRequest = fixedBytesPerRequest
+            self.auxiliaryBytesPerToken = auxiliaryBytesPerToken
         }
 
         /// Build a per-layer element-bytes table from probed cache dtypes
@@ -193,6 +216,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// Per-token bytes if every storage-owning layer retained the token
     /// (upper bound; used for the conservative headroom probe).
     private let maxPerTokenBytes: Int
+    public let fixedBytesPerRequest: Int
+    public let auxiliaryBytesPerToken: Int
     /// Nominal bytes per token for storage-owning full-attention rows under
     /// this ledger's actual per-layer dtype assumptions.
     public let fullKVBytesPerToken: Int
@@ -239,6 +264,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         self.layerKinds = layerKinds
         self._bytesCapacity = bytesCapacity
         self.externalReserveBytes = max(0, externalReserveBytes)
+        self.fixedBytesPerRequest = max(0, config.fixedBytesPerRequest)
+        self.auxiliaryBytesPerToken = max(0, config.auxiliaryBytesPerToken)
         if let table = config.layerElementBytes {
             precondition(
                 table.count == layerKinds.count,
@@ -273,7 +300,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 fullPerToken = newFullPerToken
             }
         }
-        self.maxPerTokenBytes = accountingOverflow ? Int.max : perToken
+        let (totalPerToken, auxiliaryOverflow) = perToken.addingReportingOverflow(
+            self.auxiliaryBytesPerToken)
+        self.maxPerTokenBytes = accountingOverflow || auxiliaryOverflow
+            ? Int.max : totalPerToken
         self.fullKVBytesPerToken = accountingOverflow ? Int.max : fullPerToken
     }
 
@@ -289,7 +319,11 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     private func estimatedBytesChecked(forTokens tokens: Int) -> Int? {
         guard tokens > 0 else { return 0 }
-        var total = 0
+        var total = fixedBytesPerRequest
+        guard let auxiliary = Self.multiply(tokens, auxiliaryBytesPerToken),
+            let totalWithAuxiliary = Self.add(total, auxiliary)
+        else { return nil }
+        total = totalWithAuxiliary
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
             let retained: Int
             switch kind.attention {
@@ -504,7 +538,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public func releaseAll(id: CBv2RequestID) {
         lock.lock()
         defer { lock.unlock() }
-        guard let old = reservedTokens.removeValue(forKey: id) else { return }
+        let old = reservedTokens.removeValue(forKey: id) ?? 0
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
         ledgerBytes -= allocatedBytes(forTokens: old) + exact
     }

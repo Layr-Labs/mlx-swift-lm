@@ -13,8 +13,8 @@ import MLXLMCommon
 import MLXNN
 
 public struct Qwen35Configuration: Codable, Sendable {
-    var modelType: String
-    var textConfig: Qwen35TextConfiguration
+    public var modelType: String
+    public var textConfig: Qwen35TextConfiguration
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -33,6 +33,16 @@ public struct Qwen35Configuration: Codable, Sendable {
             self.textConfig = try Qwen35TextConfiguration(from: decoder)
         }
     }
+
+    public var cbv2LayerKinds: [CBv2LayerKind] { textConfig.cbv2LayerKinds }
+
+    public func cbv2RecurrentStateSpec(
+        activationDType: DType = .bfloat16
+    ) -> CBv2RecurrentStateSpec {
+        textConfig.cbv2RecurrentStateSpec(activationDType: activationDType)
+    }
+
+    public var cbv2Capabilities: CBv2ModelCapabilities { .initialRecurrentTarget }
 }
 
 public class Qwen35MoEModel: Qwen35Model {

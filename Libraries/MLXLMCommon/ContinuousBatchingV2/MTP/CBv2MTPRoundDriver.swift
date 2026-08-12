@@ -54,6 +54,10 @@ final class CBv2MTPRoundInFlight {
         /// the whole state is released via the deferred-release fence and
         /// this list is not touched).
         let storageRows: [CBv2SequenceKV]
+        /// Request-owned autoregressive assistant state moved out of the
+        /// driver for the duration of this in-flight round. This fences its
+        /// release behind target/assistant evaluation on cancellation.
+        let assistantState: (any CBv2MTPRequestState)?
     }
 
     struct Verify {
@@ -68,6 +72,9 @@ final class CBv2MTPRoundInFlight {
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
+        /// Serial recurrent target generations in target-column order. Empty
+        /// for attention-only targets.
+        let recurrentEvaluations: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
     }
 
     /// nil when this round only seeded (no row had a valid carry yet).
@@ -163,11 +170,12 @@ final class CBv2MTPRoundDriver {
     /// The engine's model, downcast once at build (verify forwards go
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
-    let captureLayers: CBv2MTPCaptureLayers
+    let captureLayers: CBv2MTPCaptureLayers?
     private let depthController: CBv2MTPDepthController
 
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
+    private var assistantStates: [CBv2RequestID: any CBv2MTPRequestState] = [:]
     /// Plan-scoped: rows the planner offered a 1+k round this plan.
     private(set) var roundMarks: [CBv2RequestID: Int] = [:]
     /// Plan-scoped: eligible rows without a valid carry — their decode step
@@ -188,16 +196,30 @@ final class CBv2MTPRoundDriver {
 
     private init(
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
-        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers
+        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?
     ) {
+        var config = config
+        if let required = drafter.requiredVerificationMode {
+            config.verificationMode = required
+            if required != .rectangular { config.maxAutomaticRectangularTokens = 0 }
+        }
+        if let maximum = drafter.maximumDraftTokens {
+            config.maxDraftTokens = min(config.maxDraftTokens, max(0, maximum))
+            config.fixedDraftTokens = config.fixedDraftTokens.map {
+                min($0, config.maxDraftTokens)
+            }
+        }
+        if let maximum = drafter.maximumSpeculativeBatch {
+            config.maxSpeculativeBatch = min(config.maxSpeculativeBatch, max(1, maximum))
+        }
         self.config = config
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
         self.depthController = CBv2MTPDepthController(
-            maxDepth: config.maxDraftTokens, fixedDepth: config.fixedDraftTokens)
-        self.metrics.verificationMode = config.verificationMode
-        self.metrics.maxAutomaticRectangularTokens = config.maxAutomaticRectangularTokens
+            maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens)
+        self.metrics.verificationMode = self.config.verificationMode
+        self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
     }
 
     /// Build the driver, or nil when MTP cannot activate: config off (or the
@@ -207,8 +229,12 @@ final class CBv2MTPRoundDriver {
         model: CBv2SteppableModel, drafter: (any CBv2MTPDrafter)?, config: CBv2MTPConfig
     ) -> CBv2MTPRoundDriver? {
         guard config.effectiveEnabled, let drafter else { return nil }
-        guard let mtpModel = model as? (any CBv2MTPSteppableModel),
-            let captureLayers = mtpModel.mtpCaptureLayers
+        guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
+        let stateful = drafter is any CBv2MTPRequestStatefulDrafter
+        let recurrent = model is any CBv2RecurrentMTPSteppableModel
+        let captureLayers = mtpModel.mtpCaptureLayers
+        guard (stateful && recurrent && mtpModel.supportsRequestStatefulMTP)
+            || (!stateful && captureLayers != nil)
         else { return nil }
         guard let modelTarget = mtpModel.mtpTargetIdentity,
             let drafterTarget = drafter.mtpTargetIdentity,
@@ -352,8 +378,45 @@ final class CBv2MTPRoundDriver {
     func storeCarry(
         id: CBv2RequestID, token: Int, hidden: MLXArray, tokensCount: Int, kvOffset: Int
     ) {
+        if let stateful = drafter as? any CBv2MTPRequestStatefulDrafter,
+            assistantStates[id] == nil
+        {
+            assistantStates[id] = stateful.makeRequestState()
+        }
         carries[id] = CBv2MTPCarry(
             token: token, hidden: hidden, tokensCount: tokensCount, kvOffset: kvOffset)
+    }
+
+    func takeAssistantState(for id: CBv2RequestID) -> (any CBv2MTPRequestState)? {
+        assistantStates.removeValue(forKey: id)
+    }
+
+    func restoreAssistantState(
+        _ state: any CBv2MTPRequestState, for id: CBv2RequestID
+    ) {
+        precondition(assistantStates[id] == nil, "duplicate CBv2 MTP assistant state")
+        assistantStates[id] = state
+    }
+
+    func releaseDetachedAssistantState(_ state: any CBv2MTPRequestState) {
+        (drafter as? any CBv2MTPRequestStatefulDrafter)?.releaseRequestState(state)
+    }
+
+    func assistantStateCountsForTesting(
+        _ id: CBv2RequestID
+    ) -> (committed: Int, staged: Int)? {
+        assistantStates[id].map { ($0.committedInputCount, $0.stagedInputCount) }
+    }
+
+    var usesRequestStatefulDrafter: Bool {
+        drafter is any CBv2MTPRequestStatefulDrafter
+    }
+
+    private func releaseAssistantState(_ id: CBv2RequestID) {
+        guard let state = assistantStates.removeValue(forKey: id),
+            let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
+        else { return }
+        stateful.releaseRequestState(state)
     }
 
     /// Preemption / membership hygiene: the structural fingerprint would
@@ -361,6 +424,7 @@ final class CBv2MTPRoundDriver {
     /// arrays alive.
     func invalidateCarry(_ id: CBv2RequestID) {
         carries.removeValue(forKey: id)
+        releaseAssistantState(id)
         pendingSeedCosts.invalidate(id)
     }
 
@@ -368,6 +432,7 @@ final class CBv2MTPRoundDriver {
     /// every per-id trace must go (a reused id must never inherit a carry).
     func requestDidFinish(_ id: CBv2RequestID) {
         carries.removeValue(forKey: id)
+        releaseAssistantState(id)
         roundMarks.removeValue(forKey: id)
         seedMarks.remove(id)
         pendingSeedCosts.invalidate(id)
@@ -377,13 +442,15 @@ final class CBv2MTPRoundDriver {
     /// retaining cumulative metrics/controller estimates for a final poll.
     func removeAllRequestState() {
         carries.removeAll(keepingCapacity: false)
+        for id in Array(assistantStates.keys) { releaseAssistantState(id) }
         roundMarks.removeAll(keepingCapacity: false)
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
     }
 
     var requestStateCountForTesting: Int {
-        carries.count + roundMarks.count + seedMarks.count + pendingSeedCosts.count
+        carries.count + assistantStates.count + roundMarks.count + seedMarks.count
+            + pendingSeedCosts.count
     }
 
     // MARK: Metrics (lock-protected; polled cross-thread)

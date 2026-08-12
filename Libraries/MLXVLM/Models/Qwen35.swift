@@ -221,6 +221,160 @@ public struct Qwen35Configuration: Codable, Sendable {
     }
 }
 
+// MARK: - Public Serving Seams
+
+/// Attention semantics for Qwen3.5 visual placeholder tokens in the language
+/// model. Unlike Gemma, Qwen keeps these tokens on the ordinary causal path.
+public enum Qwen35VisionTokenAttention: Sendable, Equatable {
+    case causal
+}
+
+/// Public configuration facts needed to locate visual spans and reproduce
+/// Qwen3.5 M-RoPE positions outside the legacy `prepare` path.
+public struct Qwen35VisionSeamConfiguration: Sendable, Equatable {
+    /// Token ids whose text embeddings are replaced by vision features.
+    public let imagePlaceholderTokenId: Int
+    public let videoPlaceholderTokenId: Int
+
+    /// Token ids consumed by Qwen's M-RoPE position calculation. These are
+    /// normally identical to the placeholder ids, but both config fields are
+    /// exposed because checkpoints may encode them separately.
+    public let imagePositionTokenId: Int
+    public let videoPositionTokenId: Int
+    public let visionStartTokenId: Int
+    public let visionEndTokenId: Int
+
+    public let spatialMergeSize: Int
+    public let temporalPatchSize: Int
+    public let attention: Qwen35VisionTokenAttention
+}
+
+/// One text-space slice of Qwen3.5 vision tower output.
+public struct Qwen35VisionFeature: @unchecked Sendable {
+    public enum Kind: Sendable, Equatable {
+        /// One processor image, in image packing order.
+        case image(index: Int)
+        /// One temporal vision frame within one processor video grid.
+        ///
+        /// A temporal vision frame represents `temporalPatchSize` sampled
+        /// source frames (the processor pads the last group when necessary).
+        case videoFrame(videoIndex: Int, frameIndex: Int)
+    }
+
+    public let kind: Kind
+
+    /// `[1, visualTokens, textHidden]`, in the language token-embedding dtype.
+    public let features: MLXArray
+
+    fileprivate init(kind: Kind, features: MLXArray) {
+        self.kind = kind
+        self.features = features
+    }
+}
+
+/// Exact final text-space vision features used by `Qwen35.prepare`.
+///
+/// `ordered` contains all images first, followed by videos in video order and
+/// each video's temporal frames in time order. This is the same order in which
+/// `prepare` packs image pixels followed by video pixels. Concatenating the
+/// entries along their token axis yields `flattenedFeatures` exactly.
+///
+/// `@unchecked Sendable` is limited to immutable, request-owned `MLXArray`
+/// handles. Callers crossing isolation must `eval` the arrays first and must
+/// not mutate them after transfer.
+public struct Qwen35VisionFeatures: @unchecked Sendable {
+    public let ordered: [Qwen35VisionFeature]
+
+    /// `[totalVisualTokens, textHidden]`, exactly what `prepare` scatters over
+    /// image and video placeholder tokens.
+    public let flattenedFeatures: MLXArray
+
+    fileprivate init(ordered: [Qwen35VisionFeature], flattenedFeatures: MLXArray) {
+        self.ordered = ordered
+        self.flattenedFeatures = flattenedFeatures
+    }
+}
+
+public enum Qwen35VisionSeamError: Error, Equatable {
+    case missingImagePixels
+    case missingImageGrids
+    case missingVideoPixels
+    case missingVideoGrids
+    case invalidGrid(kind: String, index: Int)
+    case invalidPixelRank(kind: String, actual: Int)
+    case pixelCountMismatch(expected: Int, actual: Int)
+    case featureCountMismatch(expected: Int, actual: Int)
+}
+
+/// Request-owned decode position state. It contains no model-global mutable
+/// state and can therefore remain attached to one serving request while other
+/// requests prefill or decode on the same model.
+///
+public struct Qwen35PositionState: Sendable, Equatable {
+    /// Per-request M-RoPE deltas, one host value per batch row. Host values
+    /// make the state safely transferable without sharing an MLX graph or a
+    /// mutable model property across requests.
+    public let deltas: [Int32]
+    public var batchSize: Int { deltas.count }
+
+    fileprivate init(deltas: [Int32]) {
+        self.deltas = deltas
+    }
+
+    /// Build `[3, batch, length]` decode position ids from this request's
+    /// delta and its current cache offset.
+    public func decodePositionIds(cacheOffset: Int, length: Int = 1) -> MLXArray {
+        precondition(cacheOffset >= 0, "cacheOffset must be non-negative")
+        precondition(length > 0, "decode position length must be positive")
+
+        var base = MLXArray(0 ..< length).asType(.int32)
+        base = broadcast(base[.newAxis, 0...], to: [batchSize, length])
+        let offset = MLXArray(cacheOffset).asType(.int32) + MLXArray(deltas)
+        base = base + offset[0..., .newAxis]
+        return broadcast(base[.newAxis, 0..., 0...], to: [3, batchSize, length])
+    }
+}
+
+/// Prompt M-RoPE positions and the request-owned state used for subsequent
+/// decode positions.
+///
+/// `@unchecked Sendable` is limited to the immutable prompt `MLXArray` handle.
+/// Evaluate it under model-container isolation before transferring the result;
+/// `decodeState` itself is ordinary host data with checked `Sendable` safety.
+public struct Qwen35PositionResult: @unchecked Sendable {
+    /// Full prompt position ids, shape `[3, batch, promptLength]`.
+    public let promptPositionIds: MLXArray
+    public let decodeState: Qwen35PositionState
+    public let promptLength: Int
+
+    fileprivate init(
+        promptPositionIds: MLXArray,
+        decodeState: Qwen35PositionState,
+        promptLength: Int
+    ) {
+        self.promptPositionIds = promptPositionIds
+        self.decodeState = decodeState
+        self.promptLength = promptLength
+    }
+
+    /// Slice prompt positions for chunked prefill without recomputing or
+    /// mutating request state.
+    public func promptPositionIds(in range: Range<Int>) -> MLXArray {
+        precondition(
+            range.lowerBound >= 0 && range.upperBound <= promptLength,
+            "prompt position range must be within 0..<promptLength")
+        return promptPositionIds[0..., 0..., range]
+    }
+}
+
+public enum Qwen35PositionSeamError: Error, Equatable {
+    case invalidInputRank(Int)
+    case invalidAttentionMaskRank(Int)
+    case attentionMaskShapeMismatch
+    case multimodalBatchUnsupported(Int)
+    case invalidGrid(kind: String, index: Int)
+}
+
 // MARK: - Language
 
 enum Qwen35Language {
@@ -958,6 +1112,192 @@ public class Qwen35: Module, VLMModel {
 
     public var vocabularySize: Int { config.vocabSize }
 
+    public var visionSeamConfiguration: Qwen35VisionSeamConfiguration {
+        Qwen35VisionSeamConfiguration(
+            imagePlaceholderTokenId: config.imageTokenIndex,
+            videoPlaceholderTokenId: config.videoTokenIndex,
+            imagePositionTokenId: config.imageTokenId,
+            videoPositionTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            visionEndTokenId: config.visionEndTokenId,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            temporalPatchSize: config.visionConfiguration.temporalPatchSize,
+            attention: .causal)
+    }
+
+    public var imagePlaceholderTokenId: Int { config.imageTokenIndex }
+    public var videoPlaceholderTokenId: Int { config.videoTokenIndex }
+
+    /// Compute all prompt and decode positions without reading or writing the
+    /// legacy language module's `ropeDeltas` property.
+    public func positionResult(
+        tokens: MLXArray,
+        imageGrids: [THW]? = nil,
+        videoGrids: [THW]? = nil,
+        attentionMask: MLXArray? = nil
+    ) throws -> Qwen35PositionResult {
+        guard tokens.ndim == 1 || tokens.ndim == 2 else {
+            throw Qwen35PositionSeamError.invalidInputRank(tokens.ndim)
+        }
+        let tokens = tokens.ndim == 1 ? tokens.expandedDimensions(axis: 0) : tokens
+
+        var mask = attentionMask
+        if let attentionMask {
+            guard attentionMask.ndim == 1 || attentionMask.ndim == 2 else {
+                throw Qwen35PositionSeamError.invalidAttentionMaskRank(attentionMask.ndim)
+            }
+            mask = attentionMask.ndim == 1
+                ? attentionMask.expandedDimensions(axis: 0) : attentionMask
+            guard mask?.shape == tokens.shape else {
+                throw Qwen35PositionSeamError.attentionMaskShapeMismatch
+            }
+        }
+
+        let imageGrids = imageGrids?.nilIfEmpty
+        let videoGrids = videoGrids?.nilIfEmpty
+        if (imageGrids != nil || videoGrids != nil), tokens.dim(0) != 1 {
+            throw Qwen35PositionSeamError.multimodalBatchUnsupported(tokens.dim(0))
+        }
+
+        let merge = config.visionConfiguration.spatialMergeSize
+        for (kind, grids) in [("image", imageGrids ?? []), ("video", videoGrids ?? [])] {
+            for (index, grid) in grids.enumerated()
+            where grid.t <= 0 || grid.h <= 0 || grid.w <= 0
+                || grid.h % merge != 0 || grid.w % merge != 0
+            {
+                throw Qwen35PositionSeamError.invalidGrid(kind: kind, index: index)
+            }
+        }
+
+        let (positionIds, delta) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: tokens,
+            imageGridTHW: imageGrids,
+            videoGridTHW: videoGrids,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            attentionMask: mask)
+
+        return Qwen35PositionResult(
+            promptPositionIds: positionIds,
+            decodeState: Qwen35PositionState(deltas: delta.asArray(Int32.self)),
+            promptLength: tokens.dim(1))
+    }
+
+    /// Run the exact vision tower path used by `prepare`, cast its final
+    /// output to the text embedding dtype, and return stable ordered slices.
+    ///
+    /// Images are emitted first in `imageGrids` order. Videos follow in
+    /// `videoGrids` order, split into temporal vision frames. Qwen visual
+    /// tokens remain ordinary causal language tokens; this API supplies no
+    /// Gemma-style bidirectional span mask.
+    public func visionFeatures(
+        imagePixels: MLXArray? = nil,
+        imageGrids: [THW]? = nil,
+        videoPixels: MLXArray? = nil,
+        videoGrids: [THW]? = nil
+    ) throws -> Qwen35VisionFeatures {
+        if imagePixels != nil, imageGrids?.isEmpty != false {
+            throw Qwen35VisionSeamError.missingImageGrids
+        }
+        if imagePixels == nil, imageGrids?.isEmpty == false {
+            throw Qwen35VisionSeamError.missingImagePixels
+        }
+        if videoPixels != nil, videoGrids?.isEmpty != false {
+            throw Qwen35VisionSeamError.missingVideoGrids
+        }
+        if videoPixels == nil, videoGrids?.isEmpty == false {
+            throw Qwen35VisionSeamError.missingVideoPixels
+        }
+
+        let imageGrids = imageGrids ?? []
+        let videoGrids = videoGrids ?? []
+        let merge = config.visionConfiguration.spatialMergeSize
+
+        func validate(grids: [THW], kind: String) throws {
+            for (index, grid) in grids.enumerated()
+            where grid.t <= 0 || grid.h <= 0 || grid.w <= 0
+                || grid.h % merge != 0 || grid.w % merge != 0
+            {
+                throw Qwen35VisionSeamError.invalidGrid(kind: kind, index: index)
+            }
+        }
+        try validate(grids: imageGrids, kind: "image")
+        try validate(grids: videoGrids, kind: "video")
+
+        var pixelParts: [MLXArray] = []
+        if let imagePixels {
+            guard imagePixels.ndim == 2 else {
+                throw Qwen35VisionSeamError.invalidPixelRank(
+                    kind: "image", actual: imagePixels.ndim)
+            }
+            pixelParts.append(imagePixels)
+        }
+        if let videoPixels {
+            guard videoPixels.ndim == 2 else {
+                throw Qwen35VisionSeamError.invalidPixelRank(
+                    kind: "video", actual: videoPixels.ndim)
+            }
+            pixelParts.append(videoPixels)
+        }
+
+        let grids = imageGrids + videoGrids
+        let expectedPixels = grids.reduce(0) { $0 + $1.product }
+        let actualPixels = pixelParts.reduce(0) { $0 + $1.dim(0) }
+        guard expectedPixels == actualPixels else {
+            throw Qwen35VisionSeamError.pixelCountMismatch(
+                expected: expectedPixels, actual: actualPixels)
+        }
+
+        let textDType = languageModel.model.embedTokens(
+            MLXArray([Int32(0)]).reshaped(1, 1)
+        ).dtype
+        guard !pixelParts.isEmpty else {
+            return Qwen35VisionFeatures(
+                ordered: [],
+                flattenedFeatures: MLXArray.zeros(
+                    [0, config.textConfiguration.hiddenSize], dtype: textDType))
+        }
+
+        let pixels = (pixelParts.count == 1 ? pixelParts[0] : concatenated(pixelParts))
+            .asType(visionModel.patchEmbed.proj.weight.dtype)
+        let (visionHidden, _) = visionModel(pixels, gridTHW: grids)
+        let flattened = visionHidden.asType(textDType)
+        let expectedFeatures = grids.reduce(0) { $0 + $1.product / (merge * merge) }
+        guard flattened.dim(0) == expectedFeatures else {
+            throw Qwen35VisionSeamError.featureCountMismatch(
+                expected: expectedFeatures, actual: flattened.dim(0))
+        }
+
+        var ordered: [Qwen35VisionFeature] = []
+        ordered.reserveCapacity(imageGrids.count + videoGrids.reduce(0) { $0 + $1.t })
+        var cursor = 0
+
+        for (index, grid) in imageGrids.enumerated() {
+            let count = grid.product / (merge * merge)
+            let slice = flattened[cursor ..< cursor + count, 0...]
+                .expandedDimensions(axis: 0)
+            ordered.append(.init(kind: .image(index: index), features: slice))
+            cursor += count
+        }
+        for (videoIndex, grid) in videoGrids.enumerated() {
+            let count = (grid.h / merge) * (grid.w / merge)
+            for frameIndex in 0 ..< grid.t {
+                let slice = flattened[cursor ..< cursor + count, 0...]
+                    .expandedDimensions(axis: 0)
+                ordered.append(
+                    .init(
+                        kind: .videoFrame(
+                            videoIndex: videoIndex, frameIndex: frameIndex),
+                        features: slice))
+                cursor += count
+            }
+        }
+
+        return Qwen35VisionFeatures(ordered: ordered, flattenedFeatures: flattened)
+    }
+
     public var loraLayers: [Module] {
         languageModel.model.layers
     }
@@ -1053,16 +1393,18 @@ public class Qwen35: Module, VLMModel {
 
         var inputEmbeddings: MLXArray?
 
-        if let pixelValues,
-            let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
-                .nilIfEmpty
+        if pixelValues != nil,
+            combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames).nilIfEmpty != nil
         {
             let textEmbeds = languageModel.model.embedTokens(inputIds)
-            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
-            let visionFeatures = visionHidden.asType(textEmbeds.dtype)
+            let features = try visionFeatures(
+                imagePixels: input.image?.pixels,
+                imageGrids: imageFrames,
+                videoPixels: input.video?.pixels,
+                videoGrids: videoFrames)
 
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
-                imageFeatures: visionFeatures,
+                imageFeatures: features.flattenedFeatures,
                 inputEmbeds: textEmbeds,
                 inputIds: inputIds,
                 imageTokenIndex: config.imageTokenIndex,
@@ -1107,7 +1449,13 @@ public class Qwen35: Module, VLMModel {
         MLXArray]
     {
         if metadata["format"]?.lowercased() == "mlx" {
-            return weights
+            // A combined Qwen3.5/3.6 checkpoint may keep the native MTP head
+            // under `mtp.*` in the same shards. The VLM wrapper has no MTP
+            // module, so partition those tensors for the dedicated assistant
+            // loader while preserving every already-converted target tensor
+            // byte-for-byte. Calling the source-layout sanitizer here would
+            // reapply its RMSNorm +1 conversion to serialized MLX weights.
+            return weights.filter { !$0.key.hasPrefix("mtp.") }
         }
         return sanitize(weights: weights)
     }

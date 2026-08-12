@@ -40,6 +40,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     var headDim: Int?
     var ropeScaling: [String: StringOrNumber]?
     var fullAttentionInterval: Int = 4
+    var mropeSection: [Int] = [11, 11, 10]
 
     // MoE fields
     var numExperts: Int = 0
@@ -150,6 +151,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
             self.partialRotaryFactor =
                 ropeParameters["partial_rotary_factor"]?.asFloat() ?? 0.25
             self.ropeScaling = ropeParameters
+            self.mropeSection = ropeParameters["mrope_section"]?.asInts() ?? [11, 11, 10]
         } else {
             self.ropeTheta =
                 try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 100000.0
@@ -158,11 +160,55 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
             self.ropeScaling =
                 try container.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
                 ?? defaultRopeParameters
+            self.mropeSection = self.ropeScaling?["mrope_section"]?.asInts() ?? [11, 11, 10]
         }
 
         if self.headDim == nil {
             self.headDim = self.hiddenSize / self.attentionHeads
         }
+    }
+
+    /// Compact CBv2 attention-storage layout. Recurrent layers are absent by
+    /// design; `modelLayerIndex` maps each of the 10 full-attention KV rows
+    /// back to its original transformer layer.
+    public var cbv2LayerKinds: [CBv2LayerKind] {
+        precondition(fullAttentionInterval > 0, "full_attention_interval must be positive")
+        let dimension = headDim ?? (hiddenSize / attentionHeads)
+        return (0 ..< hiddenLayers).compactMap { modelLayerIndex in
+            guard (modelLayerIndex + 1) % fullAttentionInterval == 0 else { return nil }
+            return CBv2LayerKind(
+                attention: .full,
+                headDim: dimension,
+                kvHeads: kvHeads,
+                queryHeads: attentionHeads,
+                modelLayerIndex: modelLayerIndex)
+        }
+    }
+
+    public func cbv2RecurrentStateSpec(
+        activationDType: DType = .bfloat16
+    ) -> CBv2RecurrentStateSpec {
+        precondition(fullAttentionInterval > 0, "full_attention_interval must be positive")
+        let keyDim = linearNumKeyHeads * linearKeyHeadDim
+        let valueDim = linearNumValueHeads * linearValueHeadDim
+        let convDim = 2 * keyDim + valueDim
+        let layers: [CBv2RecurrentLayerStateSpec] = (0 ..< hiddenLayers).compactMap {
+            modelLayerIndex -> CBv2RecurrentLayerStateSpec? in
+            guard (modelLayerIndex + 1) % fullAttentionInterval != 0 else { return nil }
+            return CBv2RecurrentLayerStateSpec(
+                modelLayerIndex: modelLayerIndex,
+                convShape: [1, max(0, linearConvKernelDim - 1), convDim],
+                convDType: activationDType,
+                ssmShape: [1, linearNumValueHeads, linearValueHeadDim, linearKeyHeadDim],
+                ssmDType: .float32)
+        }
+        return CBv2RecurrentStateSpec(layers: layers)
+    }
+
+    public var cbv2Capabilities: CBv2ModelCapabilities {
+        var capabilities = CBv2ModelCapabilities.initialRecurrentTarget
+        capabilities.supportsMTP = true
+        return capabilities
     }
 }
 
@@ -381,6 +427,61 @@ final class Qwen35GatedDeltaNet: Module {
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
+
+    /// CBv2 target path. Request-owned conv/SSM rows are gathered into the
+    /// active rectangle, evaluated once, then split back into their owning
+    /// transactions. No recurrent tensor is represented as attention KV.
+    func cbv2Forward(
+        _ inputs: MLXArray,
+        modelLayerIndex: Int,
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        let S = inputs.dim(1)
+        precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
+
+        let qkv = inProjQKV(inputs)
+        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
+        let b = inProjB(inputs)
+        let a = inProjA(inputs)
+
+        var convRows: [MLXArray] = []
+        var ssmRows: [MLXArray] = []
+        convRows.reserveCapacity(B)
+        ssmRows.reserveCapacity(B)
+        for evaluation in recurrentState {
+            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+            convRows.append(
+                state?.conv
+                    ?? MLXArray.zeros(
+                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+            ssmRows.append(
+                state?.ssm
+                    ?? MLXArray.zeros(
+                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+        }
+
+        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+        let (out, newConvState, newSsmState) = processChunk(
+            qkv: qkv, a: a, b: b,
+            convState: convState, ssmState: ssmState, mask: nil)
+
+        for (row, evaluation) in recurrentState.enumerated() {
+            do {
+                try evaluation.stage(
+                    modelLayerIndex: modelLayerIndex,
+                    conv: newConvState[row ..< row + 1],
+                    ssm: newSsmState[row ..< row + 1])
+            } catch {
+                preconditionFailure(
+                    "Qwen35 CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
+            }
+        }
+
+        let normedOut = norm(out, gate: z)
+        return outProj(normedOut.reshaped(B, S, -1))
+    }
 }
 
 // MARK: - Attention
@@ -399,6 +500,7 @@ final class Qwen35Attention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
     let rope: RoPELayer
+    let mrope: Qwen35MRoPE
 
     init(_ args: Qwen35TextConfiguration) {
         let headDim = args.headDim ?? (args.hiddenSize / args.attentionHeads)
@@ -426,6 +528,9 @@ final class Qwen35Attention: Module {
             scalingConfig: args.ropeScaling,
             maxPositionEmbeddings: args.maxPositionEmbeddings
         )
+        self.mrope = Qwen35MRoPE(
+            dim: max(1, ropeDims), base: args.ropeTheta,
+            sections: args.mropeSection)
 
         super.init()
     }
@@ -463,6 +568,105 @@ final class Qwen35Attention: Module {
         .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
+    }
+
+    func cbv2Forward(
+        _ x: MLXArray, cache: any CBv2AttendingLayerCache,
+        positionIds: MLXArray? = nil
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        let qProjOutput = qProj(x)
+        let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
+        var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+        let gate = qSplit[1].reshaped(B, L, -1)
+        var keys = kNorm(kProj(x).reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
+        let values = vProj(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+
+        // Text-only Qwen positions are ordinary scalar-equivalent positions,
+        // but histories differ across rows. Capture the per-row device offsets
+        // before the cache advances and use the array RoPE overload.
+        if let positionIds {
+            (queries, keys) = mrope.apply(
+                queries: queries, keys: keys, positionIds: positionIds)
+        } else {
+            let offsets = cache.positionOffsets + 0
+            queries = rope(queries, offset: offsets)
+            keys = rope(keys, offset: offsets)
+        }
+
+        let output = cache.updateAndAttend(
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: nil)
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+        return oProj(sigmoidMultiply(output, gate))
+    }
+}
+
+/// Qwen3.5 interleaved 3-axis M-RoPE. Request positions arrive as function
+/// inputs; the module retains configuration only.
+final class Qwen35MRoPE {
+    private let invFreq: MLXArray
+    private let sections: [Int]
+
+    init(dim: Int, base: Float, sections: [Int]) {
+        var frequency = MLXArray(stride(from: 0, to: max(1, dim), by: 2)).asType(.float32)
+        frequency = frequency / Float(max(1, dim))
+        self.invFreq = 1 / pow(MLXArray(base), frequency)
+        self.sections = sections.count >= 3 ? sections : [11, 11, 10]
+    }
+
+    private func frequencies(positionIds: MLXArray, dtype: DType) -> (MLXArray, MLXArray) {
+        var positions = positionIds
+        if positions.ndim == 2 {
+            positions = broadcast(
+                positions[.newAxis, 0..., 0...],
+                to: [3, positions.dim(0), positions.dim(1)])
+        }
+        precondition(positions.ndim == 3 && positions.dim(0) == 3)
+        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+            * invFreq.asType(.float32)[.newAxis, .newAxis, .newAxis, 0...]
+        let temporal = all[0, 0..., 0..., 0...]
+        var selected: [MLXArray] = []
+        selected.reserveCapacity(temporal.dim(-1))
+        for index in 0 ..< temporal.dim(-1) {
+            var value = temporal[0..., 0..., index]
+            for (axis, offset) in [(1, 1), (2, 2)] {
+                let length = min(sections[axis] * 3, temporal.dim(-1))
+                if index >= offset && index < length && (index - offset) % 3 == 0 {
+                    value = all[axis, 0..., 0..., index]
+                    break
+                }
+            }
+            selected.append(value)
+        }
+        let frequency = stacked(selected, axis: -1)
+        let embedding = concatenated([frequency, frequency], axis: -1)
+        return (cos(embedding).asType(dtype), sin(embedding).asType(dtype))
+    }
+
+    func apply(
+        queries: MLXArray, keys: MLXArray, positionIds: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        let (cosine, sine) = frequencies(positionIds: positionIds, dtype: queries.dtype)
+        let cos = cosine.expandedDimensions(axis: 1)
+        let sin = sine.expandedDimensions(axis: 1)
+        let rotaryDim = cos.dim(-1)
+        func rotateHalf(_ value: MLXArray) -> MLXArray {
+            let half = value.dim(-1) / 2
+            return concatenated(
+                [-value[.ellipsis, half...], value[.ellipsis, ..<half]], axis: -1)
+        }
+        func applyOne(_ value: MLXArray) -> MLXArray {
+            let rotating = value[.ellipsis, ..<rotaryDim]
+            let rotated = rotating * cos + rotateHalf(rotating) * sin
+            return rotaryDim < value.dim(-1)
+                ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
+                : rotated
+        }
+        return (applyOne(queries), applyOne(keys))
     }
 }
 
@@ -585,6 +789,30 @@ final class Qwen35DecoderLayer: Module {
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
+
+    func cbv2Forward(
+        _ x: MLXArray,
+        modelLayerIndex: Int,
+        attentionCache: (any CBv2AttendingLayerCache)?,
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray? = nil
+    ) -> MLXArray {
+        let r: MLXArray
+        if isLinear {
+            precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
+            r = linearAttn!.cbv2Forward(
+                inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
+                recurrentState: recurrentState)
+        } else {
+            guard let attentionCache else {
+                preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
+            }
+            r = selfAttn!.cbv2Forward(
+                inputLayerNorm(x), cache: attentionCache, positionIds: positionIds)
+        }
+        let h = x + r
+        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+    }
 }
 
 // MARK: - Text Model
@@ -655,6 +883,40 @@ public class Qwen35TextModelInner: Module {
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
     }
+
+    func cbv2Forward(
+        _ inputs: MLXArray,
+        inputEmbeddings: MLXArray? = nil,
+        caches: [any CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray? = nil
+    ) -> MLXArray {
+        precondition(
+            caches.count == layers.filter({ !$0.isLinear }).count,
+            "Qwen35 CBv2 requires only full-attention caches")
+        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+        var attentionIndex = 0
+        for (modelLayerIndex, layer) in layers.enumerated() {
+            let attentionCache: (any CBv2AttendingLayerCache)?
+            if layer.isLinear {
+                attentionCache = nil
+            } else {
+                attentionCache = caches[attentionIndex]
+                precondition(
+                    attentionCache!.kind.modelLayerIndex == nil
+                        || attentionCache!.kind.modelLayerIndex == modelLayerIndex,
+                    "Qwen35 CBv2 attention cache mapped to the wrong model layer")
+                attentionIndex += 1
+            }
+            hiddenStates = layer.cbv2Forward(
+                hiddenStates,
+                modelLayerIndex: modelLayerIndex,
+                attentionCache: attentionCache,
+                recurrentState: recurrentState,
+                positionIds: positionIds)
+        }
+        return hiddenStates
+    }
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -707,6 +969,23 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 return MambaCache()
             }
             return KVCacheSimple()
+        }
+    }
+
+    public var cbv2LayerKinds: [CBv2LayerKind] { configuration.cbv2LayerKinds }
+
+    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
+        configuration.cbv2RecurrentStateSpec(activationDType: model.embedTokens.weight.dtype)
+    }
+
+    public var cbv2Capabilities: CBv2ModelCapabilities { configuration.cbv2Capabilities }
+
+    public func newCacheV2(
+        makeLayerCache: (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
+            any CBv2AttendingLayerCache
+    ) rethrows -> [any CBv2AttendingLayerCache] {
+        try cbv2LayerKinds.enumerated().map { storageIndex, kind in
+            try makeLayerCache(kind.modelLayerIndex ?? storageIndex, kind)
         }
     }
 
@@ -773,6 +1052,88 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return weights
+    }
+}
+
+extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
+    CBv2PositionedRecurrentEmbeddingForwardable
+{
+    public func cbv2Forward(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        positionedForward(
+            tokens, inputEmbedding: nil, cache: caches,
+            recurrentState: recurrentState, positionIds: nil)
+    }
+
+    public func cbv2Forward(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        positionedForward(
+            tokens, inputEmbedding: nil, cache: caches,
+            recurrentState: recurrentState, positionIds: positionIds)
+    }
+
+    public var supportsVisionSpanPrefill: Bool { false }
+    public var supportsCausalVisionPrefill: Bool { true }
+
+    public func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray {
+        model.embedTokens(inputs)
+    }
+
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        preconditionFailure("Qwen35 embedding prefill requires request-owned recurrent state")
+    }
+
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        positionedForward(
+            inputs, inputEmbedding: inputEmbedding, cache: cache,
+            recurrentState: recurrentState, positionIds: positionIds)
+    }
+
+    private func positionedForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        let caches = cache ?? []
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            inputs, inputEmbeddings: inputEmbedding, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        let normalized = model.norm(hidden)
+        return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+    }
+}
+
+extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
+    public func cbv2ForwardWithHidden(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: nil)
+        let normalized = model.norm(hidden)
+        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        return (logits, hidden)
     }
 }
 
@@ -863,6 +1224,19 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         languageModel.newCache(parameters: parameters)
     }
 
+    public var cbv2LayerKinds: [CBv2LayerKind] { languageModel.cbv2LayerKinds }
+    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
+        languageModel.cbv2RecurrentStateSpec
+    }
+    public var cbv2Capabilities: CBv2ModelCapabilities { languageModel.cbv2Capabilities }
+
+    public func newCacheV2(
+        makeLayerCache: (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
+            any CBv2AttendingLayerCache
+    ) rethrows -> [any CBv2AttendingLayerCache] {
+        try languageModel.newCacheV2(makeLayerCache: makeLayerCache)
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
         for (key, value) in weights {
@@ -881,6 +1255,63 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return languageModel.sanitize(weights: sanitized)
+    }
+}
+
+extension Qwen35Model: CBv2PositionedRecurrentLanguageModelForwardable,
+    CBv2PositionedRecurrentEmbeddingForwardable
+{
+    public func cbv2Forward(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        languageModel.cbv2Forward(
+            tokens, caches: caches, recurrentState: recurrentState)
+    }
+
+    public func cbv2Forward(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        languageModel.cbv2Forward(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+
+    public var supportsVisionSpanPrefill: Bool { languageModel.supportsVisionSpanPrefill }
+    public var supportsCausalVisionPrefill: Bool { languageModel.supportsCausalVisionPrefill }
+
+    public func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray {
+        languageModel.scaledInputEmbeddings(inputs)
+    }
+
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        languageModel.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache)
+    }
+
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        languageModel.embeddingForward(
+            inputs, inputEmbedding: inputEmbedding, cache: cache,
+            recurrentState: recurrentState, positionIds: positionIds)
+    }
+}
+
+extension Qwen35Model: CBv2RecurrentMTPForwardable {
+    public var cbv2MTPTargetIdentity: ObjectIdentifier {
+        ObjectIdentifier(languageModel)
+    }
+
+    public func cbv2ForwardWithHidden(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHidden(
+            tokens, caches: caches, recurrentState: recurrentState)
     }
 }
 

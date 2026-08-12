@@ -22,11 +22,15 @@ extension EngineLoopV2 {
     /// Degrading to it is a SAFETY NET, never a plan.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
-    ) -> (argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray]) {
+    ) -> (
+        argmax: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray],
+        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
+    ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
         let argmax: MLXArray
         let hidden: MLXArray
+        var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
 
         var useRectangular = switch mtp.config.verificationMode {
         case .serialTarget: false
@@ -69,12 +73,40 @@ extension EngineLoopV2 {
             hiddenColumns.reserveCapacity(columns.count)
             for column in columns {
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
-                let output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
+                let output: (logits: MLXArray, lastHidden: MLXArray)
+                var recurrentArrays: [MLXArray] = []
+                if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
+                    recurrentModel.recurrentStateSpec != nil
+                {
+                    let evaluations = rows.map { row -> CBv2RecurrentStateEvaluation in
+                        guard let state = recurrentStates[row.rec.id] else {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP state missing for \(row.rec.id)")
+                        }
+                        do { return try state.bind() } catch {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP bind failed for \(row.rec.id): \(error)")
+                        }
+                    }
+                    output = recurrentModel.forwardWithHidden(
+                        tokens: column, caches: caches, recurrentState: evaluations)
+                    for (row, evaluation) in zip(rows, evaluations) {
+                        do { recurrentArrays.append(contentsOf: try evaluation.evaluate()) } catch {
+                            preconditionFailure(
+                                "CBv2 recurrent MTP evaluation failed for \(row.rec.id): \(error)")
+                        }
+                        recurrent[row.rec.id, default: []].append(evaluation)
+                    }
+                } else {
+                    output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
+                }
                 let columnArgmax = argMax(output.logits, axis: -1).asType(.int32)
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
                 // each canonical target step before constructing the next.
-                eval([columnArgmax, output.lastHidden] + eagerCacheInnerState(caches))
+                eval(
+                    [columnArgmax, output.lastHidden] + eagerCacheInnerState(caches)
+                        + recurrentArrays)
                 argmaxColumns.append(columnArgmax)
                 hiddenColumns.append(output.lastHidden)
             }
@@ -92,6 +124,6 @@ extension EngineLoopV2 {
             hidden = output.lastHidden
         }
 
-        return (argmax, hidden, eagerCacheInnerState(caches))
+        return (argmax, hidden, eagerCacheInnerState(caches), recurrent)
     }
 }

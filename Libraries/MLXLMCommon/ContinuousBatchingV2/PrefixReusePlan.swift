@@ -30,6 +30,7 @@ public enum CBv2PrefixReuseUnsupportedReason: String, Sendable, Equatable {
     case invalidLayout = "invalid_layout"
     case unknownBackend = "unknown_backend"
     case accountingOverflow = "accounting_overflow"
+    case modelRequestStateUnsupported = "model_request_state_unsupported"
 }
 
 /// Model/backend capability established before a prefix cache is constructed.
@@ -63,8 +64,12 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
     /// conservative dependency span is windowed-layer count × largest window.
     public static func derive(
         layerKinds: [CBv2LayerKind],
-        backend: CBv2PrefixReuseBackend
+        backend: CBv2PrefixReuseBackend,
+        modelSupportsPrefixReuse: Bool = true
     ) -> Self {
+        guard modelSupportsPrefixReuse else {
+            return unsupported(backend: backend, reason: .modelRequestStateUnsupported)
+        }
         guard !layerKinds.isEmpty else {
             return unsupported(backend: backend, reason: .emptyLayout)
         }
