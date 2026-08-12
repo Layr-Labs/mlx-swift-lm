@@ -88,6 +88,10 @@ public enum VLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_mtp": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        // Qwen 3.6 == qwen3_5 architecture; alias to the qwen3_5 path. UNTESTED at runtime.
+        "qwen3_6": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_6_mtp": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_6_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),

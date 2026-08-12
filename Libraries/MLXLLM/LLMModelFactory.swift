@@ -41,6 +41,13 @@ public enum LLMTypeRegistry {
         "qwen3_5_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        // Qwen 3.6 is the same qwen3_5 architecture (a later checkpoint generation);
+        // alias its model_type strings to the qwen3_5 path. UNTESTED at runtime —
+        // the 3.6 MTP head + backbone have not been run/verified yet.
+        "qwen3_6": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3_6_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3_6_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
+        "qwen3_6_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),
