@@ -259,8 +259,7 @@ final class CBv2RecurrentStateTests: XCTestCase {
                 maxBatchedTokensPerStep: 8,
                 prefillChunkSize: 8,
                 maxWaiting: 2),
-            admissionConfig: .init(watermarkFraction: 0),
-            compiledDecodeConfig: .init(enabled: false))
+            admissionConfig: .init(watermarkFraction: 0))
 
         let stream = try engine.submit(
             CBv2Request(
@@ -296,8 +295,7 @@ final class CBv2RecurrentStateTests: XCTestCase {
                 maxBatchedTokensPerStep: 2,
                 prefillChunkSize: 2,
                 maxWaiting: 2),
-            admissionConfig: .init(watermarkFraction: 0),
-            compiledDecodeConfig: .init(enabled: false))
+            admissionConfig: .init(watermarkFraction: 0))
         let prompt = [1, 7, 7, 7, 2]
         let positions = CBv2PositionState(
             promptPositionIds: MLXArray(Array(repeating: Int32(0), count: 15))

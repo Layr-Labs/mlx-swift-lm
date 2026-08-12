@@ -177,7 +177,6 @@ struct CBv2QwenMTPIntegrationTests {
                     maxConcurrentRequests: 2, maxBatchedTokensPerStep: 32,
                     prefillChunkSize: 8, maxWaiting: 4),
                 admissionConfig: .init(watermarkFraction: 0),
-                compiledDecodeConfig: .init(enabled: false),
                 mtpDrafter: enabled ? drafter : nil,
                 mtpConfig: .init(
                     enabled: enabled, maxDraftTokens: 7,
@@ -223,7 +222,6 @@ struct CBv2QwenMTPIntegrationTests {
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
             sampler: CBv2GreedySampler(),
             admissionConfig: .init(watermarkFraction: 0),
-            compiledDecodeConfig: .init(enabled: false),
             mtpDrafter: drafter,
             mtpConfig: .init(enabled: true, fixedDraftTokens: 1))
         #expect(engine.mtpMetricsSnapshot() == nil)
