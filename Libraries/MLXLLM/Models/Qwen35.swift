@@ -52,6 +52,11 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     // MTP — number of Multi-Token Prediction head layers.
     // Port of omlx commit 696d90a: patches/mlx_lm_mtp/qwen35_model.py
     // `_patch_text_model_args` attaches this from config.json at runtime.
+    //
+    // Sourced from `mtp_num_hidden_layers`, falling back to the HF-native
+    // `num_nextn_predict_layers` alias used by some Qwen3.6 MTP checkpoints.
+    // Alias handling adapted from SharpAI/SwiftLM (MIT),
+    // https://github.com/SharpAI/SwiftLM
     var mtpNumHiddenLayers: Int = 0
 
     enum CodingKeys: String, CodingKey {
@@ -83,6 +88,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case moeIntermediateSize = "moe_intermediate_size"
         case normTopkProb = "norm_topk_prob"
         case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+    }
+
+    // Decoded via a separate container so it does not participate in the
+    // synthesized `Encodable` conformance (it has no dedicated stored property).
+    private enum MTPAliasCodingKey: String, CodingKey {
+        case numNextnPredictLayers = "num_nextn_predict_layers"
     }
 
     public init(from decoder: Decoder) throws {
@@ -135,8 +146,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         self.moeIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
-        self.mtpNumHiddenLayers =
+        let mtpLayers =
             try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
+        let mtpAliasContainer = try decoder.container(keyedBy: MTPAliasCodingKey.self)
+        self.mtpNumHiddenLayers =
+            try mtpAliasContainer.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers)
+            ?? mtpLayers
 
         let ropeContainer = try decoder.container(keyedBy: RopeParametersCodingKey.self)
         let ropeParameters = try ropeContainer.decodeIfPresent(
