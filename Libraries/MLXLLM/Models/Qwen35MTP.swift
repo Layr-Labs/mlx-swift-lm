@@ -55,6 +55,7 @@ struct Qwen35InlineMTPMetadata: Sendable {
     let textConfiguration: Qwen35TextConfiguration
     let prefix: String
     let blockSize: Int
+    let defaultQuantization: BaseConfiguration.Quantization?
     let quantizationByPath: [String: BaseConfiguration.Quantization]
 }
 
@@ -239,13 +240,14 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             guard key.hasSuffix(".scales") else { return nil }
             return String(key.dropLast(".scales".count))
         })
-        for path in scaledPaths where metadata.quantizationByPath[path] == nil {
+        for path in scaledPaths
+        where metadata.quantizationByPath[path] == nil && metadata.defaultQuantization == nil {
             throw Qwen35InlineMTPError.missingQuantization(path)
         }
         if !scaledPaths.isEmpty {
             quantize(model: assistant.mtp) { path, _ in
                 guard scaledPaths.contains(path) else { return nil }
-                return metadata.quantizationByPath[path]?.asTuple
+                return (metadata.quantizationByPath[path] ?? metadata.defaultQuantization)?.asTuple
             }
         }
 
@@ -264,7 +266,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             "target type \(String(describing: type(of: target))) is not Qwen3.5/3.6")
     }
 
-    private static func loadMetadata(from directory: URL) throws -> Qwen35InlineMTPMetadata {
+    static func loadMetadata(from directory: URL) throws -> Qwen35InlineMTPMetadata {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let inline = root["mtplx_mtp"] as? [String: Any],
@@ -275,10 +277,9 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 "mtplx_mtp.included and text_config are required")
         }
         let prefix = (inline["prefix"] as? String) ?? "mtp."
-        guard !prefix.isEmpty, prefix.utf8.count <= 128,
-            prefix.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." })
-        else {
-            throw Qwen35InlineMTPError.invalidConfiguration("mtp prefix is invalid")
+        guard prefix == "mtp." else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "only the mtp. prefix is supported")
         }
         let blockSize = (inline["block_size"] as? NSNumber)?.intValue ?? 3
         guard (2...8).contains(blockSize) else {
@@ -301,6 +302,19 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 "mtplx_mtp_quantization is required")
         }
         var quantizationByPath: [String: BaseConfiguration.Quantization] = [:]
+        let defaultKeys = ["group_size", "bits", "mode"]
+        let defaultObject = Dictionary(
+            uniqueKeysWithValues: defaultKeys.compactMap { key in
+                rawQuantization[key].map { (key, $0) }
+            })
+        let defaultQuantization: BaseConfiguration.Quantization?
+        if defaultObject.isEmpty {
+            defaultQuantization = nil
+        } else {
+            let data = try JSONSerialization.data(withJSONObject: defaultObject)
+            defaultQuantization = try JSONDecoder().decode(
+                BaseConfiguration.Quantization.self, from: data)
+        }
         for (path, raw) in rawQuantization {
             guard path.contains(".") else { continue }
             guard let object = raw as? [String: Any] else {
@@ -315,6 +329,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             textConfiguration: configuration,
             prefix: prefix,
             blockSize: blockSize,
+            defaultQuantization: defaultQuantization,
             quantizationByPath: quantizationByPath)
     }
 

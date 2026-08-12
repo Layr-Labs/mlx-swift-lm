@@ -1820,7 +1820,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         return step
     }
 
-    private func narrowPrefillOutput(
+    func narrowPrefillOutput(
         _ logits: MLXArray, requirement: CBv2PrefillRequirement
     ) -> MLXArray {
         switch requirement {
@@ -1891,31 +1891,6 @@ public final class EngineLoopV2: @unchecked Sendable {
             narrowPrefillOutput(forward.logits, requirement: requirement),
             forward.recurrent,
             forward.innerState)
-    }
-
-    /// Source-compatible Gemma-only seam used by the MTP execution module.
-    /// Qwen's recurrent capability vetoes MTP, so positioned/recurrent media
-    /// always uses the request-id overload above.
-    func multimodalChunkForward(
-        tokens: MLXArray, start: Int, count: Int,
-        multimodal: CBv2ResolvedMultimodal, spanContext: CBv2SpanChunkContext,
-        caches: [CBv2AttendingLayerCache],
-        requirement: CBv2PrefillRequirement
-    ) -> MLXArray {
-        guard let mmModel = model as? CBv2MultimodalSteppableModel else {
-            preconditionFailure(
-                "CBv2 multimodal chunk reached a model without embedding-forward support")
-        }
-        let textEmbeddings = mmModel.embedPromptTokens(tokens)
-        let spliced = CBv2MultimodalPlan.spliceEmbeddings(
-            textEmbeddings: textEmbeddings, chunkStart: start,
-            spans: multimodal.spansInChunk(start: start, count: count))
-        let bindables = count > 1 ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
-        for bindable in bindables { bindable.bindSpanContext(spanContext) }
-        defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
-        return prefillOutput(
-            tokens: tokens, inputEmbeddings: spliced, caches: caches,
-            requirement: requirement)
     }
 
     /// Rectangular counterpart of `multimodalChunkForward`. Each row keeps
@@ -2750,7 +2725,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Gauges
 
-    private func publishGauges() {
+    func publishGauges() {
         // kvBytesCapacity carries the ADMISSION ceiling so a runtime
         // re-slice reads back consistently between the resize point-update
         // and per-step publishes (on the paged backend the two ledgers
@@ -2758,13 +2733,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         // authoritative even at 0 (a legitimate zero re-slice must not be
         // overwritten with pool truth and re-advertise capacity that
         // admission rejects); backend truth is the fallback only for
-        // ledger-less (bare-loop test) constructions. Reserved bytes carry
-        // the backend's admission-truth promises, so "capacity − reserved"
-        // the backend's admission-truth promises plus request-owned recurrent
-        // state, so "capacity - reserved" stays truthful for planners.
+        // ledger-less (bare-loop test) constructions. The installed admission
+        // ledger already includes target KV, recurrent fixed residency,
+        // assistant KV, and external carve-outs, so it is the reserved-byte
+        // authority and must not be combined with those components again.
         let recurrentBytes = recurrentStates.values.reduce(0) { total, state in
             let (sum, overflow) = total.addingReportingOverflow(state.byteCount)
             return overflow ? Int.max : sum
+        }
+        let reservedBytes: Int
+        if let admission = capacity as? AdmissionV2 {
+            reservedBytes = admission.snapshot(
+                activeRequests: scheduler.runningCount,
+                waitingRequests: scheduler.waitingCount,
+                activeTokens: scheduler.activeTokens,
+                backendBytesInUse: backend.bytesInUse
+            ).kvBytesReserved
+        } else {
+            reservedBytes = Self.saturatingAdd(backend.bytesReserved, recurrentBytes)
         }
         gauges.update(
             CBv2CapacitySnapshot(
@@ -2773,8 +2759,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 kvBytesInUse: Self.saturatingAdd(backend.bytesInUse, recurrentBytes),
                 kvBytesCapacity: capacity?.bytesCapacity ?? backend.bytesCapacity,
                 kvBytesBackendCapacity: backend.bytesCapacity,
-                kvBytesReserved: Self.saturatingAdd(
-                    backend.bytesReserved, recurrentBytes),
+                kvBytesReserved: reservedBytes,
                 activeTokens: scheduler.activeTokens,
                 stepsExecuted: stepCount))
     }
@@ -2784,7 +2769,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         return overflow ? Int.max : value
     }
 
-    private static func positionOffset(_ state: [CBv2SequenceKV?]) -> Int {
+    static func positionOffset(_ state: [CBv2SequenceKV?]) -> Int {
         guard let row = state.compactMap({ $0 }).first else {
             preconditionFailure("CBv2 position state has no owning attention row")
         }

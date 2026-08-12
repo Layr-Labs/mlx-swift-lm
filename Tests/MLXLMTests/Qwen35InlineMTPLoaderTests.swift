@@ -1,17 +1,18 @@
 import Foundation
 import MLX
-import MLXLLM
 import MLXLMCommon
 import Testing
 
-private func qwenInlineMTPConfig(blockSize: Int = 3) -> Data {
+@testable import MLXLLM
+
+private func qwenInlineMTPConfig(blockSize: Int = 3, prefix: String = "mtp.") -> Data {
     Data(
         """
         {
           "model_type": "qwen3_5_moe",
           "mtplx_mtp": {
             "included": true,
-            "prefix": "mtp.",
+            "prefix": "\(prefix)",
             "block_size": \(blockSize)
           },
           "mtplx_mtp_quantization": {
@@ -97,6 +98,31 @@ struct Qwen35InlineMTPLoaderTests {
             #expect(throws: Qwen35InlineMTPError.self) {
                 _ = try Qwen35InlineMTPAssistant.load(from: directory, target: target)
             }
+        }
+    }
+
+    @Test("top-level quantization is retained as the default")
+    func defaultQuantization() throws {
+        try withInlineMTPDirectory { directory in
+            let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+            #expect(metadata.defaultQuantization?.groupSize == 32)
+            #expect(metadata.defaultQuantization?.bits == 8)
+            #expect(metadata.defaultQuantization?.mode == .mxfp8)
+            #expect(metadata.quantizationByPath["layers.0.self_attn.q_proj"] != nil)
+        }
+    }
+
+    @Test("custom assistant prefixes fail before target loading")
+    func customPrefixRejected() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-inline-mtp-prefix-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try qwenInlineMTPConfig(prefix: "assistant.")
+            .write(to: directory.appendingPathComponent("config.json"))
+
+        #expect(throws: Qwen35InlineMTPError.self) {
+            _ = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
         }
     }
 }

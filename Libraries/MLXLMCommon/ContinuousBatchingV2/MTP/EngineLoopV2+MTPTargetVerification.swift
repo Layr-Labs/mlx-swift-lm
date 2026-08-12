@@ -11,15 +11,12 @@ extension EngineLoopV2 {
     /// while one surrounding speculative KV transaction defers commit until
     /// the accept walk. Rectangular mode is an explicit optimized strategy.
     ///
-    /// **Serial is an oracle, not a performance mode.** Production ALWAYS
-    /// selects rectangular: `CBv2MTPRoundDriver.maximumAutomaticDepth`
-    /// pre-clamps depth so `(1 + k) * B <= maxAutomaticRectangularTokens`
-    /// always holds, so the `.automatic` arm below can never pick serial,
-    /// and `MTPAutomaticVerificationPolicy` returns 8 on M3/M4/M5 and 4 on
-    /// M1/M2 — never 0. Serial has never executed in the shipping provider.
-    /// It is also strictly slower than MTP-off: `1 + k` target forwards emit
-    /// at most `1 + k` tokens where plain decode emits one per forward.
-    /// Degrading to it is a SAFETY NET, never a plan.
+    /// Attention-only production targets select rectangular verification:
+    /// `CBv2MTPRoundDriver.maximumAutomaticDepth` pre-clamps depth so
+    /// `(1 + k) * B <= maxAutomaticRectangularTokens`. Request-stateful
+    /// recurrent assistants may explicitly require serial verification so
+    /// each target column gets its own recurrent transaction and position
+    /// tensor. For all other targets serial remains the safety oracle.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) -> (
@@ -88,8 +85,12 @@ extension EngineLoopV2 {
                                 "CBv2 recurrent MTP bind failed for \(row.rec.id): \(error)")
                         }
                     }
+                    let positionIds = CBv2PositionState.decodePositionIds(
+                        states: rows.map(\.rec.request.positionState),
+                        cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
                     output = recurrentModel.forwardWithHidden(
-                        tokens: column, caches: caches, recurrentState: evaluations)
+                        tokens: column, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds)
                     for (row, evaluation) in zip(rows, evaluations) {
                         do { recurrentArrays.append(contentsOf: try evaluation.evaluate()) } catch {
                             preconditionFailure(

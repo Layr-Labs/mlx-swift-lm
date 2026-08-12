@@ -1120,7 +1120,7 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
 extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
     public func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -1130,7 +1130,7 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
         }
         let hidden = model.cbv2Forward(
             tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: nil)
+            recurrentState: recurrentState, positionIds: positionIds)
         let normalized = model.norm(hidden)
         let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
         return (logits, hidden)
@@ -1308,10 +1308,11 @@ extension Qwen35Model: CBv2RecurrentMTPForwardable {
 
     public func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         languageModel.cbv2ForwardWithHidden(
-            tokens, caches: caches, recurrentState: recurrentState)
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 }
 

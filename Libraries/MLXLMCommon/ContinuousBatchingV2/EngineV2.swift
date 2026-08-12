@@ -341,6 +341,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// live: the duplicate is rejected BEFORE any stream registration, so
     /// the original request's stream is never touched (PR#62 review).
     public func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
+        var request = request
+        if request.positionState == nil {
+            request.positionState = request.multimodal?.positionState
+        }
         stateLock.lock()
         let rejecting = rejectingSubmissions
         stateLock.unlock()
@@ -368,6 +372,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 throw CBv2MultimodalError.invalidSpans(
                     "explicit model positions require multimodal input")
             }
+        }
+        if request.multimodal?.attention == .causal, request.positionState == nil {
+            throw CBv2MultimodalError.invalidSpans(
+                "causal multimodal input requires request-owned position state")
         }
 
         if let constraint = request.tokenConstraint {

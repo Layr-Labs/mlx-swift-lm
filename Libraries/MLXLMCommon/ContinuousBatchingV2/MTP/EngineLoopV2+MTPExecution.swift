@@ -115,8 +115,12 @@ extension EngineLoopV2 {
                         preconditionFailure("CBv2 recurrent MTP seed bind failed: \(error)")
                     }
                 }
+                let positionIds = CBv2PositionState.decodePositionIds(
+                    states: decodeRows.map(\.rec.request.positionState),
+                    cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
                 let output = recurrentModel.forwardWithHidden(
-                    tokens: inputs, caches: caches, recurrentState: evaluations)
+                    tokens: inputs, caches: caches, recurrentState: evaluations,
+                    positionIds: positionIds)
                 logits = output.logits
                 hidden = output.lastHidden
                 for (row, evaluation) in zip(decodeRows, evaluations) {
@@ -161,12 +165,30 @@ extension EngineLoopV2 {
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
             if let multimodal = multimodalByID[rec.id],
-                let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
+                !multimodal.spansInChunk(start: row.start, count: row.count).isEmpty
             {
-                output = multimodalChunkForward(
+                let forward = multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches,
+                    id: rec.id, multimodal: multimodal, caches: caches,
                     requirement: requirement)
+                output = forward.output
+                cacheInnerState.append(contentsOf: forward.innerState)
+                recurrentEvaluations.merge(forward.recurrent) { _, _ in
+                    preconditionFailure("duplicate recurrent evaluation")
+                }
+            } else if let recurrentModel = model as? any CBv2RecurrentSteppableModel,
+                recurrentModel.recurrentStateSpec != nil
+            {
+                let positions = rec.request.positionState?.promptSlice(
+                    row.start ..< row.start + row.count)
+                let forward = targetForward(
+                    tokens: inputs, caches: caches, ids: [rec.id],
+                    positionIds: positions)
+                output = narrowPrefillOutput(forward.logits, requirement: requirement)
+                cacheInnerState.append(contentsOf: forward.innerState)
+                recurrentEvaluations.merge(forward.recurrent) { _, _ in
+                    preconditionFailure("duplicate recurrent evaluation")
+                }
             } else {
                 output = prefillOutput(
                     tokens: inputs, inputEmbeddings: nil, caches: caches,

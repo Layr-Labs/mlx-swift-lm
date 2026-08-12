@@ -244,13 +244,14 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
 extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
     public func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         guard let forwardable = model as? any CBv2RecurrentMTPForwardable else {
             preconditionFailure(
                 "CBv2 recurrent MTP: \(type(of: model)) lacks hidden capture")
         }
         return forwardable.cbv2ForwardWithHidden(
-            tokens, caches: asKVCaches(caches), recurrentState: recurrentState)
+            tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 }

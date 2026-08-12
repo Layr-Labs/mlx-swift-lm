@@ -76,7 +76,7 @@ public protocol CBv2RecurrentMTPForwardable:
     var cbv2MTPTargetIdentity: ObjectIdentifier { get }
     func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
@@ -117,7 +117,7 @@ public protocol CBv2RecurrentMTPSteppableModel:
 {
     func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 

@@ -82,7 +82,9 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
     }
 }
 
-private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel {
+private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
+    CBv2PositionedRecurrentSteppableModel, CBv2PositionedMultimodalSteppableModel
+{
     let cbv2Capabilities = CBv2ModelCapabilities(
         supportsPrefixReuse: false, supportsPagedKV: false,
         supportsCompiledDecode: false, supportsPackedPrefill: false,
@@ -96,6 +98,18 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel {
     let mtpCaptureLayers: CBv2MTPCaptureLayers? = .init(full: 0, sliding: 0)
     var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(self) }
     var supportsRequestStatefulMTP: Bool { true }
+    private(set) var hiddenPositionIDs: [[Int32]] = []
+
+    func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
+        tokens.asType(.float32)[0..., 0..., .newAxis]
+    }
+
+    func forward(
+        tokens: MLXArray, inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        preconditionFailure("fixture requires recurrent multimodal forward")
+    }
 
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         preconditionFailure("fixture requires recurrent forward")
@@ -111,14 +125,47 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel {
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        forwardWithHidden(
-            tokens: tokens, caches: caches, recurrentState: recurrentState).logits
+        fixtureForward(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: nil, recordsHiddenPositions: false).logits
+    }
+
+    func forward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        fixtureForward(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, recordsHiddenPositions: false).logits
+    }
+
+    func forward(
+        tokens: MLXArray, inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        forward(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 
     func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        fixtureForward(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds, recordsHiddenPositions: true)
+    }
+
+    private func fixtureForward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        recordsHiddenPositions: Bool
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        if recordsHiddenPositions, let positionIds {
+            hiddenPositionIDs.append(positionIds[0].asArray(Int32.self))
+        }
         let batch = tokens.dim(0)
         let length = tokens.dim(1)
         let qkv = tokens.asType(.float32).reshaped([batch, 1, length, 1])
@@ -204,6 +251,16 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(driver.config.fixedDraftTokens == 1)
         #expect(driver.config.maxSpeculativeBatch == 1)
         #expect(engine.admissionForTesting.auxiliaryBytesPerToken == 8)
+        let id = CBv2RequestID(404)
+        try engine.admissionForTesting.reserve(id: id, additionalTokens: 3)
+        engine.loopForTesting.onEngineQueueSync {
+            engine.loopForTesting.publishGauges()
+        }
+        #expect(
+            engine.capacity().kvBytesReserved
+                == engine.admissionForTesting.bytesReserved)
+        #expect(engine.capacity().kvBytesReserved > 3 * 8)
+        engine.admissionForTesting.releaseAll(id: id)
         await engine.shutdown()
     }
 
@@ -260,6 +317,74 @@ struct CBv2QwenMTPIntegrationTests {
             #expect(mtp.loopForTesting.recurrentStates.isEmpty)
             #expect(mtp.loopForTesting.mtp?.requestStateCountForTesting == 0)
         }
+    }
+
+    @Test("positioned causal media reaches MTP seed and serial verification")
+    func positionedCausalMediaMTP() async throws {
+        let model = QwenMTPFixtureModel()
+        let drafter = QwenMTPFixtureDrafter(target: model, correctionOffset: 0)
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
+        ]
+        let engine = EngineV2(
+            model: model, layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(
+                config: .init(bytesCapacity: 1 << 20, kvDType: .float32)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 8,
+                prefillChunkSize: 8, maxWaiting: 2),
+            admissionConfig: .init(watermarkFraction: 0),
+            mtpDrafter: drafter,
+            mtpConfig: .init(enabled: true, fixedDraftTokens: 1))
+        let positions = CBv2PositionState(
+            promptPositionIds: MLXArray([
+                Int32(0), 1, 2,
+                Int32(0), 1, 2,
+                Int32(0), 1, 2,
+            ]).reshaped([3, 1, 3]),
+            decodeDeltas: [100])
+        let media = CBv2MultimodalInput(
+            spans: [.init(tokenOffset: 1, length: 1)], attention: .causal,
+            positionState: positions
+        ) { [MLXArray.ones([1, 1, 1])] }
+
+        _ = await cbv2SchedCollect(
+            try engine.submit(
+                CBv2Request(
+                    id: CBv2RequestID(405), promptTokens: [2, 4, 6],
+                    sampling: .init(temperature: 0), maxTokens: 6,
+                    multimodal: media)))
+        await engine.shutdown()
+
+        #expect(model.hiddenPositionIDs.count >= 3)
+        let forwarded = model.hiddenPositionIDs.flatMap { $0 }
+        #expect(forwarded.allSatisfy { $0 >= 103 })
+        #expect(Set(forwarded).count > 1)
+    }
+
+    @Test("MTP verification can share a plan with recurrent prompt prefill")
+    func mixedVerificationAndPrefill() async throws {
+        let (engine, _) = engine(correctionOffset: 0)
+        let shortStream = try engine.submit(
+            CBv2Request(
+                id: CBv2RequestID(406), promptTokens: [2],
+                sampling: .init(temperature: 0), maxTokens: 12))
+        let longStream = try engine.submit(
+            CBv2Request(
+                id: CBv2RequestID(407),
+                promptTokens: Array(repeating: 3, count: 48),
+                sampling: .init(temperature: 0), maxTokens: 2))
+        async let short = cbv2SchedCollect(shortStream)
+        async let long = cbv2SchedCollect(longStream)
+        let (shortResult, longResult) = await (short, long)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+
+        #expect(shortResult.finishReason == .length)
+        #expect(longResult.finishReason == .length)
+        #expect(metrics.serialVerificationRounds > 0)
     }
 
     @Test("cancel releases assistant and recurrent request state")

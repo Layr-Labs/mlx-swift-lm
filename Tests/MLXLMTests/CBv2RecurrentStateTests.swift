@@ -309,14 +309,43 @@ final class CBv2RecurrentStateTests: XCTestCase {
         let stream = try engine.submit(
             CBv2Request(
                 id: CBv2RequestID(199), promptTokens: prompt,
-                maxTokens: 1, multimodal: media,
-                positionState: positions))
+                maxTokens: 1, multimodal: media))
         for await _ in stream {}
         await engine.shutdown()
 
         XCTAssertTrue(engine.loopForTesting.recurrentStates.isEmpty)
         XCTAssertEqual(backend.bytesReserved, 0)
         XCTAssertEqual(engine.capacity().kvBytesInUse, 0)
+    }
+
+    func testCausalVisionWithoutPositionStateFailsAtSubmission() async throws {
+        let kinds = [
+            CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
+        ]
+        let engine = EngineV2(
+            model: RecurrentMultimodalFixtureModel(),
+            layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(
+                config: .init(bytesCapacity: 1 << 20, kvDType: .float32)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            sampler: CBv2GreedySampler(),
+            admissionConfig: .init(watermarkFraction: 0))
+        let media = CBv2MultimodalInput(
+            spans: [.init(tokenOffset: 1, length: 1)], attention: .causal
+        ) { [MLXArray.ones([1, 1, 1])] }
+
+        XCTAssertThrowsError(
+            try engine.submit(
+                CBv2Request(
+                    id: CBv2RequestID(200), promptTokens: [1, 7, 2],
+                    maxTokens: 1, multimodal: media))
+        ) { error in
+            guard case CBv2MultimodalError.invalidSpans(let detail) = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+            XCTAssertTrue(detail.contains("position"))
+        }
+        await engine.shutdown()
     }
 
     private func deltaSpec() -> CBv2RecurrentStateSpec {
