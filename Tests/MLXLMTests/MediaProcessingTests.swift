@@ -9,6 +9,111 @@ import XCTest
 
 @testable import MLXLMCommon
 
+private enum SuspendedDurationLoaderError: Error {
+    case cancelledByTest
+    case pendingRequestStreamEnded
+    case pendingRequestTimedOut
+}
+
+private final class SuspendedDurationResourceLoader: NSObject,
+    AVAssetResourceLoaderDelegate, @unchecked Sendable
+{
+    private let delegateQueue = DispatchQueue(
+        label: "MediaProcessingTests.SuspendedDurationResourceLoader")
+    private let resourceData = Data([
+        0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70,
+        0x71, 0x74, 0x20, 0x20, 0, 0, 0, 0,
+        0x71, 0x74, 0x20, 0x20,
+    ])
+    private let stateLock = NSLock()
+    private let pendingRequestEvents: AsyncStream<Void>
+    private let pendingRequestContinuation: AsyncStream<Void>.Continuation
+
+    var pendingRequestCount: Int {
+        stateLock.withLock { pendingRequests.count }
+    }
+    private var pendingRequests: [AVAssetResourceLoadingRequest] = []
+    private var hasSignalledPendingRequest = false
+
+    override init() {
+        let events = AsyncStream<Void>.makeStream(
+            of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        pendingRequestEvents = events.stream
+        pendingRequestContinuation = events.continuation
+        super.init()
+    }
+
+    func makeAsset() -> AVURLAsset {
+        let url = URL(string: "suspended-duration://asset/video.mov")!
+        let asset = AVURLAsset(url: url)
+        asset.resourceLoader.setDelegate(self, queue: delegateQueue)
+        return asset
+    }
+
+    func waitForPendingRequest() async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { [pendingRequestEvents] in
+                var iterator = pendingRequestEvents.makeAsyncIterator()
+                guard await iterator.next() != nil else {
+                    throw SuspendedDurationLoaderError.pendingRequestStreamEnded
+                }
+            }
+            group.addTask {
+                try await Task.sleep(for: .seconds(5))
+                throw SuspendedDurationLoaderError.pendingRequestTimedOut
+            }
+            defer { group.cancelAll() }
+            _ = try await group.next()
+        }
+    }
+
+    func failPendingRequests() {
+        let requests = stateLock.withLock {
+            defer { pendingRequests.removeAll() }
+            return pendingRequests
+        }
+        for request in requests {
+            request.finishLoading(with: SuspendedDurationLoaderError.cancelledByTest)
+        }
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        if let information = loadingRequest.contentInformationRequest {
+            information.contentType = AVFileType.mov.rawValue
+            information.contentLength = Int64(resourceData.count)
+            information.isByteRangeAccessSupported = true
+        }
+
+        guard loadingRequest.dataRequest != nil else {
+            loadingRequest.finishLoading()
+            return true
+        }
+
+        let shouldSignal = stateLock.withLock {
+            pendingRequests.append(loadingRequest)
+            guard !hasSignalledPendingRequest else { return false }
+            hasSignalledPendingRequest = true
+            return true
+        }
+        if shouldSignal {
+            pendingRequestContinuation.yield()
+        }
+        return true
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        didCancel loadingRequest: AVAssetResourceLoadingRequest
+    ) {
+        stateLock.withLock {
+            pendingRequests.removeAll { $0 === loadingRequest }
+        }
+    }
+}
+
 public class MediaProcesingTests: XCTestCase {
 
     func testResize() {
@@ -113,6 +218,49 @@ public class MediaProcesingTests: XCTestCase {
             AVFileType.mov.rawValue)
     }
 
+    func testLegacyQuickTimeAtomLayoutsWithoutFtypAreRecognizedAsMovies() throws {
+        let leadingMoov = Data([
+            0, 0, 0, 16, 0x6d, 0x6f, 0x6f, 0x76,
+            0, 0, 0, 8, 0x6d, 0x76, 0x68, 0x64,
+            0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74,
+        ])
+        let mediaBeforeMetadata = Data([
+            0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74,
+            0, 0, 0, 16, 0x6d, 0x6f, 0x6f, 0x76,
+            0, 0, 0, 8, 0x6d, 0x76, 0x68, 0x64,
+        ])
+
+        XCTAssertEqual(
+            try MemoryBackedVideoAsset.validatedContentType(leadingMoov),
+            AVFileType.mov.rawValue)
+        XCTAssertEqual(
+            try MemoryBackedVideoAsset.validatedContentType(mediaBeforeMetadata),
+            AVFileType.mov.rawValue)
+    }
+
+    func testLegacyQuickTimeValidationRejectsIncompleteOrOverflowingAtoms() throws {
+        let missingMediaData = Data([
+            0, 0, 0, 16, 0x6d, 0x6f, 0x6f, 0x76,
+            0, 0, 0, 8, 0x6d, 0x76, 0x68, 0x64,
+        ])
+        let truncatedAtom = Data([
+            0, 0, 0, 24, 0x6d, 0x6f, 0x6f, 0x76,
+            0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74,
+        ])
+        let overflowingExtendedAtom = Data([
+            0, 0, 0, 1, 0x6d, 0x6f, 0x6f, 0x76,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74,
+        ])
+
+        for malformed in [missingMediaData, truncatedAtom, overflowingExtendedAtom] {
+            XCTAssertThrowsError(try MemoryBackedVideoAsset.validatedContentType(malformed)) {
+                error in
+                XCTAssertEqual(error as? MemoryBackedVideoAssetError, .invalidContainer)
+            }
+        }
+    }
+
     func testMemoryBackedMP4RejectsMalformedContainers() throws {
         XCTAssertThrowsError(try MemoryBackedVideoAsset(videoData: Data())) { error in
             XCTAssertEqual(error as? MemoryBackedVideoAssetError, .emptyData)
@@ -180,6 +328,39 @@ public class MediaProcesingTests: XCTestCase {
         }
     }
 
+    func testCancellationDuringSuspendedDurationLoadPropagatesCancellationError() async throws {
+        let loader = SuspendedDurationResourceLoader()
+        defer { withExtendedLifetime(loader) {} }
+        let asset = loader.makeAsset()
+        let processingTask = Task<Void, Error> {
+            _ = try await MediaProcessing.asProcessedSequence(
+                asset, maxFrames: 1, targetFPS: { _ in 1 })
+        }
+        defer {
+            processingTask.cancel()
+            loader.failPendingRequests()
+        }
+
+        // A custom-scheme range request can only be pending after MediaProcessing
+        // has passed its entry cancellation check and suspended in asset.load(.duration).
+        try await loader.waitForPendingRequest()
+        XCTAssertFalse(processingTask.isCancelled)
+        XCTAssertGreaterThan(loader.pendingRequestCount, 0)
+
+        processingTask.cancel()
+        loader.failPendingRequests()
+
+        do {
+            _ = try await processingTask.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // The former `try?` path discarded this cancellation and replaced it
+            // with MediaProcessing's generic duration-loading NSError.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
     func testFinalFrameCancellationIsObservedBeforeArrayConversion() async throws {
         let image = CIImage(color: .red).cropped(
             to: CGRect(x: 0, y: 0, width: 2, height: 2))
@@ -199,6 +380,26 @@ public class MediaProcesingTests: XCTestCase {
         } catch is CancellationError {
             // The cancellation occurs in the final frame callback and must be
             // observed before the synchronous CIImage-to-MLX conversion begins.
+        }
+    }
+
+    func testCancellationPropagatesWhenAnAssetProducesNoFrames() async throws {
+        let emptyAsset = AVMutableComposition()
+        let task = Task<Void, Error> {
+            _ = try await MediaProcessing.asProcessedSequence(
+                emptyAsset, maxFrames: 1,
+                targetFPS: { _ in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    return 0
+                })
+        }
+
+        do {
+            try await task.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // The empty asset has no image results, so cancellation must be
+            // checked after the generator sequence reaches its terminal boundary.
         }
     }
 

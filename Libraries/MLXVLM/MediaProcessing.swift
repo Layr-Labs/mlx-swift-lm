@@ -298,9 +298,24 @@ public enum MediaProcessing {
         return image
     }
 
+    private static func loadDuration(_ asset: AVAsset) async throws -> CMTime {
+        do {
+            return try await asset.load(.duration)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            throw NSError(
+                domain: "MediaProcessing", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to load the asset's duration"])
+        }
+    }
+
     public static func asCIImageSequence(_ asset: AVAsset, samplesPerSecond: Int) async throws
         -> [CIImage]
     {
+        try Task.checkCancellation()
+
         // Use AVAssetImageGenerator to extract frames
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -308,11 +323,8 @@ public enum MediaProcessing {
         generator.requestedTimeToleranceAfter = .zero
 
         // Calculate the time values we want to sample
-        guard let duration = try? await asset.load(.duration) else {
-            throw NSError(
-                domain: "MediaProcessing", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to load the asset's duration"])
-        }
+        let duration = try await loadDuration(asset)
+        try Task.checkCancellation()
 
         let durationInSeconds = duration.seconds
         let samplesPerSecond = Double(samplesPerSecond)
@@ -329,6 +341,7 @@ public enum MediaProcessing {
         // Collect the frames
         var ciImages: [CIImage] = []
         for await result in generator.images(for: sampledTimes) {
+            try Task.checkCancellation()
             switch result {
             case .success(requestedTime: _, let image, actualTime: _):
                 let ciImage = CIImage(
@@ -338,6 +351,7 @@ public enum MediaProcessing {
                 break
             }
         }
+        try Task.checkCancellation()
 
         return ciImages
     }
@@ -490,11 +504,7 @@ public enum MediaProcessing {
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
 
-        guard let duration = try? await asset.load(.duration) else {
-            throw NSError(
-                domain: "MediaProcessing", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to load the asset's duration"])
-        }
+        let duration = try await loadDuration(asset)
         try Task.checkCancellation()
         let fps = targetFPS(duration)
         // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
@@ -528,6 +538,7 @@ public enum MediaProcessing {
                 break
             }
         }
+        try Task.checkCancellation()
 
         let framesAsArrays = try convertToArraysCheckingCancellation(ciImages)
         return ProcessedFrames(

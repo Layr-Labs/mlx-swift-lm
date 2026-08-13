@@ -28,10 +28,10 @@ public final class MemoryBackedVideoAsset: @unchecked Sendable {
 
     /// Creates an in-memory ISO BMFF MP4 or QuickTime asset.
     ///
-    /// The first box must be a complete `ftyp` box. This intentionally rejects
-    /// arbitrary bytes and non-ISO-BMFF container formats before AVFoundation
-    /// sees them; callers must fail closed rather than letting the framework
-    /// infer an unrelated format.
+    /// The top-level atom table must be structurally complete. Modern files are
+    /// identified from `ftyp`; legacy QuickTime files without `ftyp` must contain
+    /// both `moov` and `mdat`. This rejects arbitrary bytes before AVFoundation
+    /// sees them rather than asking the framework to infer an unrelated format.
     public init(videoData data: Data) throws {
         let contentType = try Self.validatedContentType(data)
 
@@ -75,42 +75,96 @@ public final class MemoryBackedVideoAsset: @unchecked Sendable {
     package var resourceRequestCount: Int { loader.resourceRequestCount }
 
     static func validatedContentType(_ data: Data) throws -> String {
-        // ISO BMFF: 32-bit size + "ftyp" + major brand + minor version.
-        guard data.count >= 16 else {
-            throw data.isEmpty
-                ? MemoryBackedVideoAssetError.emptyData
-                : MemoryBackedVideoAssetError.invalidContainer
-        }
-        let prefix = [UInt8](data.prefix(24))
-        guard prefix[4] == 0x66, prefix[5] == 0x74, prefix[6] == 0x79, prefix[7] == 0x70
-        else {
-            throw MemoryBackedVideoAssetError.invalidContainer
+        guard !data.isEmpty else { throw MemoryBackedVideoAssetError.emptyData }
+        guard data.count >= 8 else { throw MemoryBackedVideoAssetError.invalidContainer }
+
+        let ftyp = UInt64(0x66_74_79_70)
+        let moov = UInt64(0x6d_6f_6f_76)
+        let mdat = UInt64(0x6d_64_61_74)
+        let quickTimeBrand = UInt64(0x71_74_20_20)
+
+        var offset = 0
+        var ftypContentType: String?
+        var foundMoov = false
+        var foundMdat = false
+
+        while offset < data.count {
+            let remaining = data.count - offset
+            guard remaining >= 8,
+                let size32 = unsignedInteger(in: data, at: offset, byteCount: 4),
+                let atomType = unsignedInteger(in: data, at: offset + 4, byteCount: 4)
+            else { throw MemoryBackedVideoAssetError.invalidContainer }
+
+            let headerSize: Int
+            let atomSize: Int
+            switch size32 {
+            case 0:
+                headerSize = 8
+                atomSize = remaining
+            case 1:
+                headerSize = 16
+                guard remaining >= headerSize,
+                    let extendedSize = unsignedInteger(
+                        in: data, at: offset + 8, byteCount: 8),
+                    extendedSize >= UInt64(headerSize),
+                    extendedSize <= UInt64(remaining)
+                else { throw MemoryBackedVideoAssetError.invalidContainer }
+                atomSize = Int(extendedSize)
+            default:
+                headerSize = 8
+                guard size32 >= UInt64(headerSize), size32 <= UInt64(remaining) else {
+                    throw MemoryBackedVideoAssetError.invalidContainer
+                }
+                atomSize = Int(size32)
+            }
+
+            let (atomEnd, overflow) = offset.addingReportingOverflow(atomSize)
+            guard !overflow, atomEnd <= data.count else {
+                throw MemoryBackedVideoAssetError.invalidContainer
+            }
+
+            switch atomType {
+            case ftyp:
+                guard ftypContentType == nil, size32 != 0, atomSize >= headerSize + 8,
+                    let majorBrand = unsignedInteger(
+                        in: data, at: offset + headerSize, byteCount: 4)
+                else { throw MemoryBackedVideoAssetError.invalidContainer }
+                ftypContentType =
+                    majorBrand == quickTimeBrand ? AVFileType.mov.rawValue : AVFileType.mp4.rawValue
+            case moov:
+                foundMoov = true
+            case mdat:
+                foundMdat = true
+            default:
+                break
+            }
+
+            offset = atomEnd
         }
 
-        let size32 = prefix[0 ... 3].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-        let boxSize: UInt64
-        let minimumSize: UInt64
-        let majorBrandOffset: Int
-        if size32 == 1 {
-            guard data.count >= 24 else { throw MemoryBackedVideoAssetError.invalidContainer }
-            boxSize = prefix[8 ... 15].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
-            minimumSize = 24
-            majorBrandOffset = 16
-        } else {
-            // A zero size means "to EOF" in ISO BMFF. It is legal, but an
-            // `ftyp` box that consumes the whole file cannot contain media, so
-            // reject it here instead of relying on a later metadata failure.
-            guard size32 != 0 else { throw MemoryBackedVideoAssetError.invalidContainer }
-            boxSize = UInt64(size32)
-            minimumSize = 16
-            majorBrandOffset = 8
+        if let ftypContentType {
+            return ftypContentType
         }
-        guard boxSize >= minimumSize, boxSize <= UInt64(data.count) else {
+        guard foundMoov, foundMdat else {
             throw MemoryBackedVideoAssetError.invalidContainer
         }
-        return prefix[majorBrandOffset ..< majorBrandOffset + 4].elementsEqual(
-            [0x71, 0x74, 0x20, 0x20])
-            ? AVFileType.mov.rawValue : AVFileType.mp4.rawValue
+        return AVFileType.mov.rawValue
+    }
+
+    private static func unsignedInteger(
+        in data: Data, at offset: Int, byteCount: Int
+    ) -> UInt64? {
+        guard offset >= 0, byteCount == 4 || byteCount == 8 else { return nil }
+        let (end, overflow) = offset.addingReportingOverflow(byteCount)
+        guard !overflow, end <= data.count else { return nil }
+
+        var value: UInt64 = 0
+        var index = data.index(data.startIndex, offsetBy: offset)
+        for _ in 0 ..< byteCount {
+            value = (value << 8) | UInt64(data[index])
+            data.formIndex(after: &index)
+        }
+        return value
     }
 
     /// Computes the safe slice for an AVFoundation data request.
