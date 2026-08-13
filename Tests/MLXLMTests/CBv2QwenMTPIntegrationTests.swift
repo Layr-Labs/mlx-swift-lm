@@ -17,6 +17,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
     let correctionOffset: Int
     let verification: CBv2MTPVerificationMode
     let targetPrefix: Bool
+    let maxDraft: Int?
     private(set) var created = 0
     private(set) var released = 0
     private(set) var finalized: [Int] = []
@@ -26,17 +27,18 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
     init(
         target: AnyObject, correctionOffset: Int,
         verification: CBv2MTPVerificationMode = .serialTarget,
-        targetPrefix: Bool = false
+        targetPrefix: Bool = false, maxDraft: Int? = 1
     ) {
         self.targetIdentity = ObjectIdentifier(target)
         self.correctionOffset = correctionOffset
         self.verification = verification
         self.targetPrefix = targetPrefix
+        self.maxDraft = maxDraft
     }
 
     var mtpTargetIdentity: ObjectIdentifier? { targetIdentity }
     var requiredVerificationMode: CBv2MTPVerificationMode? { verification }
-    var maximumDraftTokens: Int? { 1 }
+    var maximumDraftTokens: Int? { maxDraft }
     var maximumSpeculativeBatch: Int? { 1 }
     var supportsTargetPrefixAcceptance: Bool { targetPrefix }
     var requestStateBytesPerToken: Int { 8 }
@@ -281,14 +283,15 @@ struct CBv2QwenMTPIntegrationTests {
         mtpConfig: CBv2MTPConfig? = nil,
         captureWindows: Bool = false, spreadLogits: Bool = false,
         verification: CBv2MTPVerificationMode = .serialTarget,
-        targetPrefix: Bool = false,
+        targetPrefix: Bool = false, maxDraft: Int? = 1,
         sampler: (any CBv2StepSampler)? = nil
     ) -> (EngineV2, QwenMTPFixtureDrafter, QwenMTPFixtureModel) {
         let model = QwenMTPFixtureModel(
             captureWindows: captureWindows, spreadLogits: spreadLogits)
         let drafter = QwenMTPFixtureDrafter(
             target: model, correctionOffset: correctionOffset,
-            verification: verification, targetPrefix: targetPrefix)
+            verification: verification, targetPrefix: targetPrefix,
+            maxDraft: maxDraft)
         let kinds = [
             CBv2LayerKind(
                 attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
@@ -666,6 +669,68 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(result.finishReason == .length)
         #expect(metrics.serialVerificationRounds > 0)
         #expect(metrics.rectangularVerificationRounds == 0)
+    }
+
+    @Test("adaptive captured-window depth stays clamped to the k == 1 verify contract")
+    func adaptiveCapturedWindowDepthClamp() async throws {
+        // A drafter that leaves maximumDraftTokens unset while selecting
+        // rectangular verification over a captured-window model: without
+        // the driver-side clamp the adaptive controller could plan k > 1
+        // and trap mtpBuildVerifyGraph's request-stateful k == 1
+        // precondition.
+        let model = QwenMTPFixtureModel(captureWindows: true)
+        let drafter = QwenMTPFixtureDrafter(
+            target: model, correctionOffset: 0,
+            verification: .rectangular, maxDraft: nil)
+        let config = CBv2MTPConfig(
+            enabled: true, maxDraftTokens: 7, maxSpeculativeBatch: 8,
+            fixedDraftTokens: nil, verificationMode: .rectangular,
+            maxAutomaticRectangularTokens: 64)
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(model: model, drafter: drafter, config: config))
+        #expect(driver.config.verificationMode == .rectangular)
+        #expect(driver.config.maxDraftTokens == 1)
+        #expect(driver.config.fixedDraftTokens == nil)
+
+        // Control: an UNCLAMPED controller under this exact pressure (flat
+        // cost curve, perfect acceptance) genuinely prefers k > 1 — the
+        // scenario the clamp defends against is real, not hypothetical.
+        let unclamped = CBv2MTPDepthController(
+            maxDepth: config.maxDraftTokens, fixedDepth: config.fixedDraftTokens)
+        for depth in 0 ... 4 {
+            unclamped.observeCost(
+                decodeRowBucket: 1, depth: depth,
+                wallTimeNanos: UInt64(100_000_000 + depth * 1_000_000))
+        }
+        for _ in 0 ..< 20 {
+            unclamped.observeAcceptance(decodeRowBucket: 1, drafted: 4, accepted: 4)
+        }
+        #expect(unclamped.select(plannedDecodeRows: 1, canSpeculate: true).depth > 1)
+
+        // The driver's controller is built AFTER the clamp: under the same
+        // perfect-acceptance pressure, every planned depth across warmup
+        // and exploration stays within the verify-graph contract.
+        for _ in 0 ..< 20 {
+            driver.recordStepAcceptance(
+                drafted: 4, accepted: 4, observedDrafts: 4, decodeRowBucket: 1)
+        }
+        for _ in 0 ..< 32 {
+            driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
+            #expect(driver.planDecision.depth <= 1)
+        }
+
+        // End-to-end: the engine runs adaptive capture-verify rounds to
+        // completion (no trap), and never selects a depth beyond one.
+        let (engine, _, _) = engine(
+            correctionOffset: 0, mtpConfig: config,
+            captureWindows: true, verification: .rectangular, maxDraft: nil)
+        let result = try await run(engine, id: 650, maxTokens: 20)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(result.finishReason == .length)
+        #expect(metrics.rounds > 0)
+        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(metrics.depthSelections.keys.allSatisfy { $0 <= 1 })
     }
 
     // MARK: - target-prefix acceptance (temperature > 0)

@@ -110,6 +110,35 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         XCTAssertEqual(state.state(modelLayerIndex: 0)!.conv![0, 0, 0].item(Float.self), 1)
     }
 
+    func testCapturedWindowResidencyChargesPerPosition() throws {
+        // The bare-loop capacity gauge derives from materializedByteCount:
+        // a captured verify window of P positions holds P full conv/SSM
+        // copies, so it must be charged P× — not as one generation.
+        let state = try CBv2RecurrentRequestState(spec: scalarSpec)
+        XCTAssertEqual(state.materializedByteCount, 0)
+
+        let baseline = try state.bind()
+        try baseline.stage(
+            modelLayerIndex: 0,
+            conv: MLXArray.full([1, 2, 3], values: MLXArray(Float(10))),
+            ssm: MLXArray.full([1, 1, 2, 2], values: MLXArray(Float(10))))
+        _ = try baseline.evaluate()
+        try baseline.commit()
+        XCTAssertEqual(state.materializedByteCount, state.byteCount)
+
+        // Committed state + captured window of 2 positions = 3 copies.
+        let captured = try state.bind()
+        let stacks = capturedStacks(positions: 2, base: 10)
+        try captured.stageCaptured(
+            modelLayerIndex: 0, conv: stacks.conv, ssm: stacks.ssm, positions: 2)
+        _ = try captured.evaluate()
+        XCTAssertEqual(state.materializedByteCount, 3 * state.byteCount)
+
+        // Committing one position collapses the window back to one copy.
+        try captured.commit(keepPositions: 1)
+        XCTAssertEqual(state.materializedByteCount, state.byteCount)
+    }
+
     // MARK: - 2. GDN captured-window equivalence
 
     private func smallGDNConfiguration() throws -> Qwen35TextConfiguration {

@@ -147,7 +147,16 @@ public final class CBv2RecurrentRequestState {
     public let spec: CBv2RecurrentStateSpec
     public let byteCount: Int
     public var materializedByteCount: Int {
-        let generations = (committed.isEmpty ? 0 : 1) + pending.count
+        // A captured verify window holds one full conv/SSM copy PER captured
+        // position (its leading `[S, ...]` axis); a plain generation holds
+        // exactly one.
+        var generations = committed.isEmpty ? 0 : 1
+        for generation in pending {
+            let (next, overflow) = generations.addingReportingOverflow(
+                generation.capturedPositions ?? 1)
+            if overflow { return Int.max }
+            generations = next
+        }
         let (bytes, overflow) = byteCount.multipliedReportingOverflow(by: generations)
         return overflow ? Int.max : bytes
     }
