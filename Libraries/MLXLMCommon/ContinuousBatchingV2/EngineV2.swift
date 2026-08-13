@@ -232,6 +232,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         }
         admissionConfig.auxiliaryBytesPerToken =
             mtpDriver?.drafter.requestStateBytesPerToken ?? 0
+        admissionConfig.auxiliaryTokenGranularity =
+            mtpDriver?.drafter.requestStateTokenGranularity ?? 1
+        admissionConfig.auxiliaryTokenAllocationPadding =
+            mtpDriver?.drafter.requestStateTokenAllocationPadding ?? 0
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
             config: admissionConfig, residency: backend.kvResidency)

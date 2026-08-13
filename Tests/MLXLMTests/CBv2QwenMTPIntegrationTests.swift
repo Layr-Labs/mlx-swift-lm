@@ -30,6 +30,8 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
     var maximumDraftTokens: Int? { 1 }
     var maximumSpeculativeBatch: Int? { 1 }
     var requestStateBytesPerToken: Int { 8 }
+    var requestStateTokenGranularity: Int { 256 }
+    var requestStateTokenAllocationPadding: Int { 1 }
 
     func makeRequestState() -> any CBv2MTPRequestState {
         created += 1
@@ -251,6 +253,13 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(driver.config.fixedDraftTokens == 1)
         #expect(driver.config.maxSpeculativeBatch == 1)
         #expect(engine.admissionForTesting.auxiliaryBytesPerToken == 8)
+        #expect(engine.admissionForTesting.auxiliaryTokenGranularity == 256)
+        #expect(engine.admissionForTesting.auxiliaryTokenAllocationPadding == 1)
+        #expect(engine.admissionForTesting.allocatedBytes(forTokens: 1) == 2_060)
+        #expect(engine.admissionForTesting.allocatedBytes(forTokens: 256) == 5_128)
+        #expect(engine.admissionForTesting.allocatedBytes(forTokens: 257) == 5_132)
+        #expect(engine.admissionForTesting.allocatedBytes(forTokens: 511) == 6_148)
+        #expect(engine.admissionForTesting.allocatedBytes(forTokens: 512) == 8_200)
         let id = CBv2RequestID(404)
         try engine.admissionForTesting.reserve(id: id, additionalTokens: 3)
         engine.loopForTesting.onEngineQueueSync {

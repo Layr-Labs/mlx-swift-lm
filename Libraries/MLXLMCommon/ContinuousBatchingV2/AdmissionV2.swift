@@ -168,6 +168,11 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         /// Variable request-owned residency outside target KV. Stateful MTP
         /// assistants use this for their independent autoregressive cache.
         public var auxiliaryBytesPerToken: Int
+        /// Physical token-block allocation granularity of auxiliary state.
+        /// `1` preserves linear per-token accounting.
+        public var auxiliaryTokenGranularity: Int
+        /// Retained speculative high-water state beyond committed tokens.
+        public var auxiliaryTokenAllocationPadding: Int
         public init(
             watermarkFraction: Double = 0.05, elementBytes: Int = 2,
             layerElementBytes: [Int]? = nil,
@@ -178,19 +183,25 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 elementBytes: elementBytes,
                 layerElementBytes: layerElementBytes,
                 fixedBytesPerRequest: fixedBytesPerRequest,
-                auxiliaryBytesPerToken: 0)
+                auxiliaryBytesPerToken: 0,
+                auxiliaryTokenGranularity: 1,
+                auxiliaryTokenAllocationPadding: 0)
         }
 
         public init(
             watermarkFraction: Double, elementBytes: Int,
             layerElementBytes: [Int]?, fixedBytesPerRequest: Int,
-            auxiliaryBytesPerToken: Int
+            auxiliaryBytesPerToken: Int,
+            auxiliaryTokenGranularity: Int = 1,
+            auxiliaryTokenAllocationPadding: Int = 0
         ) {
             self.watermarkFraction = watermarkFraction
             self.elementBytes = elementBytes
             self.layerElementBytes = layerElementBytes
             self.fixedBytesPerRequest = fixedBytesPerRequest
             self.auxiliaryBytesPerToken = auxiliaryBytesPerToken
+            self.auxiliaryTokenGranularity = auxiliaryTokenGranularity
+            self.auxiliaryTokenAllocationPadding = auxiliaryTokenAllocationPadding
         }
 
         /// Build a per-layer element-bytes table from probed cache dtypes
@@ -218,6 +229,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private let maxPerTokenBytes: Int
     public let fixedBytesPerRequest: Int
     public let auxiliaryBytesPerToken: Int
+    public let auxiliaryTokenGranularity: Int
+    public let auxiliaryTokenAllocationPadding: Int
     /// Nominal bytes per token for storage-owning full-attention rows under
     /// this ledger's actual per-layer dtype assumptions.
     public let fullKVBytesPerToken: Int
@@ -266,6 +279,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         self.externalReserveBytes = max(0, externalReserveBytes)
         self.fixedBytesPerRequest = max(0, config.fixedBytesPerRequest)
         self.auxiliaryBytesPerToken = max(0, config.auxiliaryBytesPerToken)
+        self.auxiliaryTokenGranularity = max(1, config.auxiliaryTokenGranularity)
+        self.auxiliaryTokenAllocationPadding = max(
+            0, config.auxiliaryTokenAllocationPadding)
         if let table = config.layerElementBytes {
             precondition(
                 table.count == layerKinds.count,
@@ -300,9 +316,13 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 fullPerToken = newFullPerToken
             }
         }
+        let (maximumAuxiliaryGrowth, auxiliaryGrowthOverflow) =
+            self.auxiliaryBytesPerToken.multipliedReportingOverflow(
+                by: self.auxiliaryTokenGranularity)
         let (totalPerToken, auxiliaryOverflow) = perToken.addingReportingOverflow(
-            self.auxiliaryBytesPerToken)
+            maximumAuxiliaryGrowth)
         self.maxPerTokenBytes = accountingOverflow || auxiliaryOverflow
+            || auxiliaryGrowthOverflow
             ? Int.max : totalPerToken
         self.fullKVBytesPerToken = accountingOverflow ? Int.max : fullPerToken
     }
@@ -320,7 +340,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private func estimatedBytesChecked(forTokens tokens: Int) -> Int? {
         guard tokens > 0 else { return 0 }
         var total = fixedBytesPerRequest
-        guard let auxiliary = Self.multiply(tokens, auxiliaryBytesPerToken),
+        guard let paddedTokens = Self.add(tokens, auxiliaryTokenAllocationPadding),
+            let auxiliaryTokens = Self.roundUp(paddedTokens, to: auxiliaryTokenGranularity),
+            let auxiliary = Self.multiply(auxiliaryTokens, auxiliaryBytesPerToken),
             let totalWithAuxiliary = Self.add(total, auxiliary)
         else { return nil }
         total = totalWithAuxiliary

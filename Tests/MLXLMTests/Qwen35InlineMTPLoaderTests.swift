@@ -112,6 +112,23 @@ struct Qwen35InlineMTPLoaderTests {
         }
     }
 
+    @Test("assistant KV accounting follows allocation width and block size")
+    func assistantKVAccounting() throws {
+        let root = try #require(
+            try JSONSerialization.jsonObject(with: qwenInlineMTPConfig()) as? [String: Any])
+        let textData = try JSONSerialization.data(withJSONObject: root["text_config"]!)
+        let configuration = try JSONDecoder.json5().decode(
+            Qwen35TextConfiguration.self, from: textData)
+
+        #expect(Qwen35InlineMTPAssistant.cacheAllocationStep == 256)
+        #expect(
+            Qwen35InlineMTPAssistant.cacheBytesPerToken(
+                configuration: configuration, layerCount: 1, elementBytes: 2) == 32)
+        #expect(
+            Qwen35InlineMTPAssistant.cacheBytesPerToken(
+                configuration: configuration, layerCount: 1, elementBytes: 4) == 64)
+    }
+
     @Test("custom assistant prefixes fail before target loading")
     func customPrefixRejected() throws {
         let directory = FileManager.default.temporaryDirectory

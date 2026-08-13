@@ -174,6 +174,8 @@ final class Qwen35MTPModule: Module {
 /// not duplicate the target checkpoint and does not require
 /// `_qwen35MTPEnabled`.
 public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
+    static let cacheAllocationStep = 256
+
     private let mtp: Qwen35MTPModule
     private let target: Qwen35TextModel
 
@@ -194,7 +196,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     /// Allocate the assistant's own autoregressive full-attention KV.
     /// Target recurrent and attention state is never reused as assistant KV.
     public func makeCache() -> [any KVCache] {
-        mtp.layers.map { _ in KVCacheSimple() as any KVCache }
+        mtp.layers.map { _ in
+            let cache = KVCacheSimple()
+            cache.step = Self.cacheAllocationStep
+            return cache as any KVCache
+        }
     }
 
     /// Advance the assistant by one or more already-chosen target/draft tokens.
@@ -421,13 +427,26 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var maximumDraftTokens: Int? { 1 }
     public var maximumSpeculativeBatch: Int? { 1 }
     public var requestStateBytesPerToken: Int {
-        let configuration = target.configuration
+        Self.cacheBytesPerToken(
+            configuration: target.configuration,
+            layerCount: mtp.layers.count,
+            elementBytes: mtp.norm.weight.dtype.size)
+    }
+    public var requestStateTokenGranularity: Int { Self.cacheAllocationStep }
+    public var requestStateTokenAllocationPadding: Int { 1 }
+
+    static func cacheBytesPerToken(
+        configuration: Qwen35TextConfiguration,
+        layerCount: Int,
+        elementBytes: Int
+    ) -> Int {
         let (headsByDimension, geometryOverflow) = configuration.kvHeads
             .multipliedReportingOverflow(by: configuration.headDim ?? 0)
         let (kvElements, kvOverflow) = headsByDimension.multipliedReportingOverflow(by: 2)
         let (layerElements, layerOverflow) = kvElements.multipliedReportingOverflow(
-            by: mtp.layers.count)
-        let (bytes, byteOverflow) = layerElements.multipliedReportingOverflow(by: 2)
+            by: layerCount)
+        let (bytes, byteOverflow) = layerElements.multipliedReportingOverflow(
+            by: elementBytes)
         return geometryOverflow || kvOverflow || layerOverflow || byteOverflow ? Int.max : bytes
     }
 

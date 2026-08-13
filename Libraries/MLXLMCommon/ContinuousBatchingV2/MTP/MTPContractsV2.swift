@@ -180,6 +180,11 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
+    /// Physical allocation granularity of the request-owned state, in tokens.
+    /// A value greater than one makes admission charge whole allocation blocks.
+    var requestStateTokenGranularity: Int { get }
+    /// Maximum physical high-water tokens retained beyond committed logical state.
+    var requestStateTokenAllocationPadding: Int { get }
     /// Build round-scoped batch state from per-row captures. `rows` order
     /// == the round's speculating-row order.
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
@@ -202,6 +207,8 @@ extension CBv2MTPDrafter {
     public var maximumDraftTokens: Int? { nil }
     public var maximumSpeculativeBatch: Int? { nil }
     public var requestStateBytesPerToken: Int { 0 }
+    public var requestStateTokenGranularity: Int { 1 }
+    public var requestStateTokenAllocationPadding: Int { 0 }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
