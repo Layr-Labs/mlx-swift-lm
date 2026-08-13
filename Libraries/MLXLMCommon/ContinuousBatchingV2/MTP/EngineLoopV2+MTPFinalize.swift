@@ -6,6 +6,14 @@ import Foundation
 import MLX
 
 extension EngineLoopV2 {
+    /// Minimum target top-K probability mass (parts-per-million) at the
+    /// carry position before the next draft may score only the shortlist
+    /// rows. Below this the shortlist would too often miss the token the
+    /// target actually produces next, costing acceptance for no byte win —
+    /// the round simply reads the full head instead. 0.90 keeps greedy
+    /// production traffic (mass typically ≥0.99 at K=256) shortlisted while
+    /// flat/uncertain positions fall back.
+    static let mtpShortlistMassThresholdPPM: Int32 = 900_000
 
     /// Runs at the step's existing host-sync boundary after ordinary sampled
     /// rows finalize and before deferred KV releases.
@@ -240,11 +248,25 @@ extension EngineLoopV2 {
                 // semantics to the ordinary decode path.
                 let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
                     targetOutputIndex: confirmed - 1, draftDepth: k)
+                // Shortlist coverage gate: hand the accepted position's
+                // target top-K ids to the next draft only when their
+                // probability mass (packet tail, parts-per-million) clears
+                // the threshold; otherwise the draft falls back to the full
+                // head for that round.
+                var carryShortlist: MLXArray?
+                if let shortlistIDs = verify.shortlistIDs {
+                    let massBase = draftCount + verify.rows.count * targetWidth
+                    let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
+                    if mass >= Self.mtpShortlistMassThresholdPPM {
+                        carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
+                    }
+                }
                 mtp.storeCarry(
                     id: id, token: kept[confirmed - 1],
                     hidden: verify.lastHidden[
                         batchIndex ..< (batchIndex + 1),
                         hiddenColumn ..< (hiddenColumn + 1), 0...],
+                    shortlist: carryShortlist,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
             }

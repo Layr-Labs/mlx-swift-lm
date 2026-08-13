@@ -30,13 +30,16 @@ extension EngineLoopV2 {
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) -> (
-        scores: MLXArray, hidden: MLXArray, cacheInnerState: [MLXArray],
+        scores: MLXArray, hidden: MLXArray,
+        shortlist: (ids: MLXArray, massScaled: MLXArray)?,
+        cacheInnerState: [MLXArray],
         recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
         let scores: MLXArray
         let hidden: MLXArray
+        var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
         var capturedInnerState: [MLXArray] = []
 
@@ -216,8 +219,39 @@ extension EngineLoopV2 {
             }
             scores = scoreColumns(output.logits, columnOffset: 0)
             hidden = output.lastHidden
+            // Draft-head shortlist (rectangular only; the serial oracle stays
+            // byte-identical to the shipped path): each verify position's
+            // target top-K ids feed the NEXT round's shortlisted draft, and
+            // the captured probability mass rides the acceptance packet so
+            // finalize can gate coverage without an extra host sync.
+            if let size = (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?
+                .draftShortlistSize
+            {
+                shortlist = Self.mtpDraftShortlist(logits: output.logits, size: size)
+            }
         }
 
-        return (scores, hidden, eagerCacheInnerState(caches) + capturedInnerState, recurrent)
+        return (
+            scores, hidden, shortlist,
+            eagerCacheInnerState(caches) + capturedInnerState, recurrent)
+    }
+
+    /// Top-`size` token ids per verify position plus their probability mass
+    /// scaled to int32 parts-per-million. nil when the shortlist would not
+    /// actually narrow the head.
+    static func mtpDraftShortlist(
+        logits: MLXArray, size: Int
+    ) -> (ids: MLXArray, massScaled: MLXArray)? {
+        let vocabulary = logits.dim(-1)
+        guard size > 0, size < vocabulary else { return nil }
+        // argPartition guarantees positions kth... hold the largest values
+        // (unsorted — argmax over the gathered rows doesn't need order).
+        let ids = argPartition(logits, kth: vocabulary - size, axis: -1)[
+            .ellipsis, (vocabulary - size)...]
+        let values = takeAlong(logits, ids, axis: -1).asType(.float32)
+        let mass = sum(
+            exp(values - logSumExp(logits.asType(.float32), axis: -1, keepDims: true)),
+            axis: -1)
+        return (ids.asType(.int32), (mass * 1_000_000).asType(.int32))
     }
 }

@@ -29,6 +29,11 @@ struct CBv2MTPCarry {
     let token: Int
     /// [1, 1, H], lazy slice of an already-evaluated step output.
     let hidden: MLXArray
+    /// [K] int32 target top-K token ids at the carry position, lazy slice of
+    /// an already-evaluated verify shortlist. Non-nil only when the drafter
+    /// opted in AND the captured top-K probability mass cleared the coverage
+    /// threshold at finalize; nil ⇒ the next draft scores the full head.
+    let shortlist: MLXArray?
     /// `rec.tokens.count` at capture — the carry token must still be
     /// `tokens.last` with the same count.
     let tokensCount: Int
@@ -66,12 +71,18 @@ final class CBv2MTPRoundInFlight {
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
         /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
-        /// [B, 1+k] target argmaxes. One `asArray` at finalize reads both,
-        /// preserving the single host-sync boundary.
+        /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
+        /// all [B, 1+k] shortlist probability masses in parts-per-million.
+        /// One `asArray` at finalize reads everything, preserving the single
+        /// host-sync boundary.
         let acceptancePacket: MLXArray
         /// Lazy [B, 1+k, H] pre-norm hidden — the next carry is gathered
         /// from it at the finalize sync (index = accepted position).
         let lastHidden: MLXArray
+        /// Lazy [B, 1+k, K] int32 target top-K ids per verify position, for
+        /// shortlisted drafting next round. nil when the drafter did not opt
+        /// in or verification ran on the serial oracle.
+        let shortlistIDs: MLXArray?
         /// Serial recurrent target generations in target-column order. Empty
         /// for attention-only targets.
         let recurrentEvaluations: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
@@ -415,7 +426,8 @@ final class CBv2MTPRoundDriver {
     }
 
     func storeCarry(
-        id: CBv2RequestID, token: Int, hidden: MLXArray, tokensCount: Int, kvOffset: Int
+        id: CBv2RequestID, token: Int, hidden: MLXArray,
+        shortlist: MLXArray? = nil, tokensCount: Int, kvOffset: Int
     ) {
         if let stateful = drafter as? any CBv2MTPRequestStatefulDrafter,
             assistantStates[id] == nil
@@ -423,7 +435,8 @@ final class CBv2MTPRoundDriver {
             assistantStates[id] = stateful.makeRequestState()
         }
         carries[id] = CBv2MTPCarry(
-            token: token, hidden: hidden, tokensCount: tokensCount, kvOffset: kvOffset)
+            token: token, hidden: hidden, shortlist: shortlist,
+            tokensCount: tokensCount, kvOffset: kvOffset)
     }
 
     func takeAssistantState(for id: CBv2RequestID) -> (any CBv2MTPRequestState)? {

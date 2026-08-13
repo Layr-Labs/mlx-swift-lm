@@ -241,6 +241,9 @@ extension EngineLoopV2 {
         if let verify {
             asyncEvalTargets.append(verify.acceptancePacket)
             asyncEvalTargets.append(verify.lastHidden)
+            if let shortlistIDs = verify.shortlistIDs {
+                asyncEvalTargets.append(shortlistIDs)
+            }
         }
         if let seedHidden { asyncEvalTargets.append(seedHidden) }
         if !cacheInnerState.isEmpty {
@@ -336,7 +339,9 @@ extension EngineLoopV2 {
                 }
                 let result = stateful.draftStep(
                     tokens: seedColumn[index ..< index + 1, 0...],
-                    hidden: carryHiddens[index], requestState: requestState)
+                    hidden: carryHiddens[index],
+                    shortlist: row.carry!.shortlist,
+                    requestState: requestState)
                 nextRows.append(result.tokens.reshaped([1]))
                 assistantEvalTargets.append(
                     contentsOf: stateful.evaluationTargets(for: requestState))
@@ -375,13 +380,17 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        let acceptancePacket = concatenated(
-            [draftIDs.reshaped([-1]), target.scores.reshaped([-1])], axis: 0)
+        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+        if let shortlist = target.shortlist {
+            packetParts.append(shortlist.massScaled.reshaped([-1]))
+        }
+        let acceptancePacket = concatenated(packetParts, axis: 0)
         return CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
             lastHidden: target.hidden,
+            shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent)
     }
 
