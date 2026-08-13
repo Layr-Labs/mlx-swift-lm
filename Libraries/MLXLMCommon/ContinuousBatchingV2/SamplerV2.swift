@@ -141,6 +141,32 @@ public final class SamplerV2 {
         return concatenated(perRow, axis: 0)
     }
 
+    /// MTP verify pre-sampling noise: one Exp(1) row per (request, window
+    /// position), keyed EXACTLY like the step path —
+    /// `mix(seed ?? fallbackSeed, id, step)` with the same uniform→-log(1-u)
+    /// transform and zero clamp — so a verify position's draw is bitwise the
+    /// draw the ordinary path would have made at that per-request step.
+    /// Greedy rows receive the same constant placeholder as `sample`.
+    func verifyExponentialNoise(
+        rows: [(seed: UInt64?, id: UInt64, step: UInt64, greedy: Bool)], vocab: Int
+    ) -> MLXArray {
+        var perRow = [MLXArray]()
+        perRow.reserveCapacity(rows.count)
+        for row in rows {
+            if row.greedy {
+                perRow.append(MLXArray.full([1, vocab], values: MLXArray(Float(1))))
+                continue
+            }
+            let key = MLXRandom.key(
+                Self.mix(seed: row.seed ?? fallbackSeed, id: row.id, step: row.step))
+            let u = MLXRandom.uniform(
+                low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
+            let e = maximum(-log(1 - u), MLXArray(Float(1e-20)))
+            perRow.append(e)
+        }
+        return concatenated(perRow, axis: 0)
+    }
+
     /// SplitMix64-style mix of (seed, requestID, step) into one RNG key
     /// seed. Deterministic across processes (no `Hasher`), and a pure
     /// function of exactly the three inputs the contract allows.

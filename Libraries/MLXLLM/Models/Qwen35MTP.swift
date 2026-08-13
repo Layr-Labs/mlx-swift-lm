@@ -429,9 +429,41 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     private final class UnusedPreparedCapture: CBv2MTPPreparedCapture {}
 
     public var mtpTargetIdentity: ObjectIdentifier? { targetIdentity }
-    public var requiredVerificationMode: CBv2MTPVerificationMode? { .serialTarget }
+    /// Verification policy. Rectangular selects CAPTURE-VERIFY: the target
+    /// scores all 1+k columns in ONE `[B, 1+k]` forward while the 30
+    /// GatedDeltaNet layers stage per-position captured conv/SSM states
+    /// (`Qwen35GatedDeltaNet.cbv2ForwardCaptured`); finalize commits the
+    /// accepted position by device-side slice and rolls back by restoring
+    /// the pre-verify snapshot. This replaces the serial per-column loop
+    /// whose k+1 full-model re-reads made the round ≤1.0x by construction.
+    ///
+    /// NUMERICS POLICY: bitwise greedy parity with serial decode is NOT the
+    /// bar here — batched verify changes accumulation geometry exactly like
+    /// every other CBv2 batch-shape change (chunked prefill, B>1 decode).
+    /// Distribution-exactness is the invariant: committed tokens are always
+    /// target-authoritative (argmax when greedy, genuine target samples
+    /// under target-prefix acceptance). The serial oracle remains available
+    /// via `DARKBLOOM_QWEN_MTP_SERIAL=1` for A/B and certification runs.
+    public var requiredVerificationMode: CBv2MTPVerificationMode? {
+        Self.forceSerialVerification ? .serialTarget : .rectangular
+    }
+    /// k=1 today: `draftStep` stages exactly [seed, draft]. Deeper chains
+    /// (k=2 self-application) extend the staging loop, not the verify path —
+    /// the capture window and finalize already handle any 1+k.
     public var maximumDraftTokens: Int? { 1 }
     public var maximumSpeculativeBatch: Int? { 1 }
+    /// Target-prefix acceptance is exact at any temperature (every committed
+    /// token IS a target sample), so this drafter lifts the greedy gate when
+    /// the engine sampler supports verify pre-sampling.
+    public var supportsTargetPrefixAcceptance: Bool { true }
+
+    /// `DARKBLOOM_QWEN_MTP_SERIAL=1/true/yes/on` pins the serial per-column
+    /// verification oracle (the pre-capture-verify behavior).
+    static let forceSerialVerification: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_QWEN_MTP_SERIAL"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }()
     public var requestStateBytesPerToken: Int {
         Self.cacheBytesPerToken(
             configuration: target.configuration,

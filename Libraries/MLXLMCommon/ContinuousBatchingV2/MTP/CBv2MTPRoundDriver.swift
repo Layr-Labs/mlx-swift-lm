@@ -171,6 +171,10 @@ final class CBv2MTPRoundDriver {
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
     let captureLayers: CBv2MTPCaptureLayers?
+    /// True when acceptance may use target-prefix pre-sampling (drafter
+    /// opt-in). The planner additionally requires the installed sampler's
+    /// `supportsMTPTargetPrefix` before lifting the greedy gate.
+    let targetPrefixAcceptance: Bool
     private let depthController: CBv2MTPDepthController
 
     // Engine-thread confined.
@@ -216,15 +220,36 @@ final class CBv2MTPRoundDriver {
             drafter is any CBv2MTPRequestStatefulDrafter
             && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
         if requestStatefulRecurrent {
-            // This implementation builds one request-local assistant proposal
-            // and one recurrent target transaction per serial column. Enforce
-            // that proven shape here instead of relying on later preconditions.
-            config.verificationMode = .serialTarget
-            config.maxAutomaticRectangularTokens = 0
-            config.maxDraftTokens = 1
-            config.fixedDraftTokens = 1
-            config.maxSpeculativeBatch = 1
+            // Rectangular verification over a recurrent target needs the
+            // captured-window forward (per-position conv/SSM capture +
+            // commit-select). Without that seam every verify column needs
+            // its own recurrent transaction — the serial oracle. Fail safe
+            // to serial rather than trap; drafter-declared depth/batch
+            // clamps above already bound the round shape.
+            let capturedWindow =
+                (model as? any CBv2RecurrentMTPSteppableModel)?
+                .supportsCapturedVerifyWindow ?? false
+            if config.verificationMode != .serialTarget && !capturedWindow {
+                config.verificationMode = .serialTarget
+                config.maxAutomaticRectangularTokens = 0
+            }
+            // `mtpBuildVerifyGraph` preconditions k == 1 for request-stateful
+            // drafters — every round is exactly one assistant proposal per
+            // row, in BOTH the serial and the captured-window rectangular
+            // shape. Clamp the effective depth here regardless of mode so an
+            // adaptive controller (drafter left `maximumDraftTokens` unset)
+            // can never plan k > 1 and trap the engine. An explicit caller
+            // depth keeps its 0 (target-only probe) or 1 meaning.
+            config.maxDraftTokens = min(config.maxDraftTokens, 1)
+            config.fixedDraftTokens = config.fixedDraftTokens.map { min($0, 1) }
+            if config.verificationMode == .serialTarget {
+                // The serial column loop is additionally the proven B=1
+                // shape: one request-local assistant proposal and one
+                // recurrent target transaction per column.
+                config.maxSpeculativeBatch = 1
+            }
         }
+        self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
         self.config = config
         self.drafter = drafter
         self.model = model

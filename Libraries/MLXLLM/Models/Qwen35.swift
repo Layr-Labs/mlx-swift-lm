@@ -482,6 +482,119 @@ final class Qwen35GatedDeltaNet: Module {
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
+
+    /// CBv2 MTP capture-verify path (MTPLX `gdn_forward_with_capture`
+    /// pattern). Runs the same projections/conv batched over the whole
+    /// `[B, S]` verify window, then the gated-delta recurrence one position
+    /// at a time so every intermediate (conv tail, SSM state) is
+    /// MATERIALIZED instead of discarded. Each row's transaction receives
+    /// `[S, ...]` captured stacks; committing position `p` later selects the
+    /// state after consuming window token `p` with a device-side slice.
+    ///
+    /// Numerics: the recurrence itself is computed by the identical
+    /// `gatedDeltaUpdate` kernel as S chained T=1 steps with the fp32 state
+    /// carried across, so the final captured state matches the single-call
+    /// scan; the batched projections/conv/norm change accumulation geometry
+    /// versus S serial `[B, 1]` forwards within the usual batch-shape
+    /// tolerance CBv2 already accepts (distribution-exact, not bitwise).
+    func cbv2ForwardCaptured(
+        _ inputs: MLXArray,
+        modelLayerIndex: Int,
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        let S = inputs.dim(1)
+        precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
+        precondition(S >= 1, "Qwen35 capture-verify window must be non-empty")
+
+        let qkv = inProjQKV(inputs)
+        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
+        let b = inProjB(inputs)
+        let a = inProjA(inputs)
+
+        var convRows: [MLXArray] = []
+        var ssmRows: [MLXArray] = []
+        convRows.reserveCapacity(B)
+        ssmRows.reserveCapacity(B)
+        for evaluation in recurrentState {
+            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+            convRows.append(
+                state?.conv
+                    ?? MLXArray.zeros(
+                        [1, convKernelSize - 1, convDim], dtype: inputs.dtype))
+            ssmRows.append(
+                state?.ssm
+                    ?? MLXArray.zeros(
+                        [1, numVHeads, headVDim, headKDim], dtype: .float32))
+        }
+        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+
+        // Conv over the whole window in one call (same as processChunk); the
+        // per-position conv tail is a free slice of the padded input: after
+        // consuming position s, the retained tail is convInput[:, s+1 ..<
+        // s+1+nKeep].
+        let nKeep = convKernelSize - 1
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let convOut = silu(conv1d(convInput))
+
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        // Per-position recurrence, materializing each intermediate state.
+        var outs: [MLXArray] = []
+        var ssmStates: [MLXArray] = []
+        outs.reserveCapacity(S)
+        ssmStates.reserveCapacity(S)
+        var state = ssmState
+        for s in 0 ..< S {
+            let (out, next) = gatedDeltaUpdate(
+                q: qNormed[0..., s ..< (s + 1)],
+                k: kNormed[0..., s ..< (s + 1)],
+                v: v[0..., s ..< (s + 1)],
+                a: a[0..., s ..< (s + 1)],
+                b: b[0..., s ..< (s + 1)],
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: nil)
+            outs.append(out)
+            ssmStates.append(next)
+            state = next
+        }
+
+        for (row, evaluation) in recurrentState.enumerated() {
+            let convStack = concatenated(
+                (0 ..< S).map { s in
+                    convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
+                }, axis: 0)
+            let ssmStack = concatenated(
+                ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
+            do {
+                try evaluation.stageCaptured(
+                    modelLayerIndex: modelLayerIndex,
+                    conv: convStack, ssm: ssmStack, positions: S)
+            } catch {
+                preconditionFailure(
+                    "Qwen35 CBv2 captured stage failed at layer \(modelLayerIndex): \(error)")
+            }
+        }
+
+        let out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
+        let normedOut = norm(out, gate: z)
+        return outProj(normedOut.reshaped(B, S, -1))
+    }
 }
 
 // MARK: - Attention
@@ -847,14 +960,21 @@ final class Qwen35DecoderLayer: Module {
         modelLayerIndex: Int,
         attentionCache: (any CBv2AttendingLayerCache)?,
         recurrentState: [CBv2RecurrentStateEvaluation],
-        positionIds: MLXArray? = nil
+        positionIds: MLXArray? = nil,
+        captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
             precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
-            r = linearAttn!.cbv2Forward(
-                inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
-                recurrentState: recurrentState)
+            if captureRecurrentWindow {
+                r = linearAttn!.cbv2ForwardCaptured(
+                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState)
+            } else {
+                r = linearAttn!.cbv2Forward(
+                    inputLayerNorm(x), modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState)
+            }
         } else {
             guard let attentionCache else {
                 preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
@@ -941,7 +1061,8 @@ public class Qwen35TextModelInner: Module {
         inputEmbeddings: MLXArray? = nil,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        positionIds: MLXArray? = nil
+        positionIds: MLXArray? = nil,
+        captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
@@ -965,7 +1086,8 @@ public class Qwen35TextModelInner: Module {
                 modelLayerIndex: modelLayerIndex,
                 attentionCache: attentionCache,
                 recurrentState: recurrentState,
-                positionIds: positionIds)
+                positionIds: positionIds,
+                captureRecurrentWindow: captureRecurrentWindow)
         }
         return hiddenStates
     }
@@ -1193,6 +1315,31 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
     }
 }
 
+extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
+    /// MTP capture-verify: identical to `cbv2ForwardWithHidden` except each
+    /// GatedDeltaNet layer stages per-position captured conv/SSM stacks so
+    /// finalize can commit the accepted position on device. Attention and
+    /// MoE/projection layers are stateless over the window and run batched.
+    public func cbv2ForwardWithHiddenCaptured(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 MTP target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            tokens, inputEmbeddings: nil, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds,
+            captureRecurrentWindow: true)
+        let normalized = model.norm(hidden)
+        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        return (logits, hidden)
+    }
+}
+
 // MARK: - Qwen35TextModel + MTPCapable
 
 extension Qwen35TextModel: MTPCapable {
@@ -1367,6 +1514,17 @@ extension Qwen35Model: CBv2RecurrentMTPForwardable {
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         languageModel.cbv2ForwardWithHidden(
+            tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+}
+
+extension Qwen35Model: CBv2RecurrentCaptureMTPForwardable {
+    public func cbv2ForwardWithHiddenCaptured(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenCaptured(
             tokens, caches: caches, recurrentState: recurrentState,
             positionIds: positionIds)
     }

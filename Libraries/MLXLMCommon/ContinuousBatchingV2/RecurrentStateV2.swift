@@ -147,7 +147,16 @@ public final class CBv2RecurrentRequestState {
     public let spec: CBv2RecurrentStateSpec
     public let byteCount: Int
     public var materializedByteCount: Int {
-        let generations = (committed.isEmpty ? 0 : 1) + pending.count
+        // A captured verify window holds one full conv/SSM copy PER captured
+        // position (its leading `[S, ...]` axis); a plain generation holds
+        // exactly one.
+        var generations = committed.isEmpty ? 0 : 1
+        for generation in pending {
+            let (next, overflow) = generations.addingReportingOverflow(
+                generation.capturedPositions ?? 1)
+            if overflow { return Int.max }
+            generations = next
+        }
         let (bytes, overflow) = byteCount.multipliedReportingOverflow(by: generations)
         return overflow ? Int.max : bytes
     }
@@ -155,6 +164,12 @@ public final class CBv2RecurrentRequestState {
     private struct Generation {
         let id: UInt64
         let layers: [Int: CBv2RecurrentLayerState]
+        /// Non-nil marks a CAPTURED verify-window generation: every layer's
+        /// conv/ssm array carries a leading per-position axis of this length
+        /// (`[S, ...]` instead of the spec's `[1, ...]`). Such a generation
+        /// can only leave `pending` through `commit(keepPositions:)` (which
+        /// selects one position) or `rollback()`.
+        let capturedPositions: Int?
     }
 
     private var committed: [Int: CBv2RecurrentLayerState] = [:]
@@ -179,7 +194,12 @@ public final class CBv2RecurrentRequestState {
             throw CBv2RecurrentStateError.lifecycleViolation("overlapping recurrent bindings")
         }
         bindingOpen = true
-        let input = pending.last?.layers ?? committed
+        let last = pending.last
+        if let captured = last?.capturedPositions {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "bind over an unresolved captured verify window (\(captured) positions)")
+        }
+        let input = last?.layers ?? committed
         let evaluation = CBv2RecurrentStateEvaluation(
             owner: self, generation: nextGeneration, input: input,
             requiredLayers: Set(spec.modelLayerIndices))
@@ -188,12 +208,15 @@ public final class CBv2RecurrentRequestState {
     }
 
     fileprivate func evaluate(
-        generation: UInt64, layers: [Int: CBv2RecurrentLayerState]
+        generation: UInt64, layers: [Int: CBv2RecurrentLayerState],
+        capturedPositions: Int?
     ) throws {
         guard bindingOpen, !isReleased else {
             throw CBv2RecurrentStateError.lifecycleViolation("evaluate without an active binding")
         }
-        pending.append(Generation(id: generation, layers: layers))
+        pending.append(
+            Generation(
+                id: generation, layers: layers, capturedPositions: capturedPositions))
         bindingOpen = false
     }
 
@@ -201,12 +224,33 @@ public final class CBv2RecurrentRequestState {
         bindingOpen = false
     }
 
-    fileprivate func commit(generation: UInt64) throws {
+    fileprivate func commit(generation: UInt64, keepPositions: Int? = nil) throws {
         guard !isReleased, let first = pending.first, first.id == generation else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent commits must follow evaluation order")
         }
-        committed = first.layers
+        if let captured = first.capturedPositions {
+            guard let keep = keepPositions, (1 ... captured).contains(keep) else {
+                throw CBv2RecurrentStateError.lifecycleViolation(
+                    "captured commit requires keepPositions in 1...\(captured) "
+                        + "(got \(String(describing: keepPositions)))")
+            }
+            // Device-side select: committing position `keep` keeps the state
+            // AFTER consuming `keep` window tokens. The slice restores the
+            // spec's leading singleton row axis, so downstream forwards read
+            // the same shapes a plain generation would have staged.
+            committed = first.layers.mapValues { layer in
+                CBv2RecurrentLayerState(
+                    conv: layer.conv.map { $0[(keep - 1) ..< keep] },
+                    ssm: layer.ssm.map { $0[(keep - 1) ..< keep] })
+            }
+        } else {
+            guard keepPositions == nil else {
+                throw CBv2RecurrentStateError.lifecycleViolation(
+                    "keepPositions is only valid for captured verify windows")
+            }
+            committed = first.layers
+        }
         pending.removeFirst()
     }
 
@@ -243,8 +287,14 @@ public final class CBv2RecurrentStateEvaluation {
     private let input: [Int: CBv2RecurrentLayerState]
     private let requiredLayers: Set<Int>
     private var staged: [Int: CBv2RecurrentLayerState] = [:]
+    private var stagedCapturedPositions: Int?
     private var evaluated = false
     private var finalized = false
+
+    /// True when this transaction staged per-position captured stacks
+    /// (MTP capture-verify) and must be finalized via
+    /// `commit(keepPositions:)` or `rollback()`.
+    public var isCaptured: Bool { stagedCapturedPositions != nil }
 
     fileprivate init(
         owner: CBv2RecurrentRequestState, generation: UInt64,
@@ -265,6 +315,14 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     public func stage(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
+        guard stagedCapturedPositions == nil else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "cannot mix captured and plain recurrent stages")
+        }
+        try stageRaw(modelLayerIndex: modelLayerIndex, conv: conv, ssm: ssm)
+    }
+
+    private func stageRaw(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
         guard !evaluated, requiredLayers.contains(modelLayerIndex) else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "stage for undeclared or already-evaluated recurrent layer \(modelLayerIndex)")
@@ -276,13 +334,46 @@ public final class CBv2RecurrentStateEvaluation {
         staged[modelLayerIndex] = CBv2RecurrentLayerState(conv: conv, ssm: ssm)
     }
 
+    /// Stage one layer's CAPTURED per-position states for an MTP verify
+    /// window: `conv`/`ssm` carry a leading position axis of length
+    /// `positions` (`[S, ...]`) where index `s` is the state after consuming
+    /// window token `s`. Index `positions - 1` must equal the state a plain
+    /// `stage` would have produced for the whole window. Mixing captured and
+    /// plain stages in one transaction is a lifecycle violation.
+    public func stageCaptured(
+        modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray, positions: Int
+    ) throws {
+        guard positions >= 1 else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "captured stage requires at least one position")
+        }
+        if let existing = stagedCapturedPositions, existing != positions {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "captured position count changed mid-transaction "
+                    + "(\(existing) -> \(positions))")
+        }
+        if stagedCapturedPositions == nil, !staged.isEmpty {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "cannot mix captured and plain recurrent stages")
+        }
+        guard conv.dim(0) == positions, ssm.dim(0) == positions else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "captured stacks must carry the position axis first "
+                    + "(conv \(conv.shape), ssm \(ssm.shape), positions \(positions))")
+        }
+        try stageRaw(modelLayerIndex: modelLayerIndex, conv: conv, ssm: ssm)
+        stagedCapturedPositions = positions
+    }
+
     @discardableResult
     public func evaluate() throws -> [MLXArray] {
         guard !evaluated, Set(staged.keys) == requiredLayers else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent evaluation did not stage every declared layer")
         }
-        try owner.evaluate(generation: generation, layers: staged)
+        try owner.evaluate(
+            generation: generation, layers: staged,
+            capturedPositions: stagedCapturedPositions)
         evaluated = true
         return staged.keys.sorted().flatMap { index in
             [staged[index]!.conv, staged[index]!.ssm].compactMap { $0 }
@@ -290,10 +381,22 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     public func commit() throws {
-        guard evaluated, !finalized else {
+        guard evaluated, !finalized, stagedCapturedPositions == nil else {
             throw CBv2RecurrentStateError.lifecycleViolation("invalid recurrent commit")
         }
         try owner.commit(generation: generation)
+        finalized = true
+    }
+
+    /// Finalize a captured verify window by committing the state after
+    /// `keepPositions` consumed window tokens (1-based; the accepted prefix
+    /// length including the seed column).
+    public func commit(keepPositions: Int) throws {
+        guard evaluated, !finalized, stagedCapturedPositions != nil else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "captured commit on a non-captured recurrent transaction")
+        }
+        try owner.commit(generation: generation, keepPositions: keepPositions)
         finalized = true
     }
 

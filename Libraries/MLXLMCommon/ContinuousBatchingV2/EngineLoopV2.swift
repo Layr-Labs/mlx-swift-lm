@@ -117,6 +117,36 @@ public protocol CBv2StepSampler: AnyObject {
 
     /// Typed constraint failure latched while masking or advancing a row.
     func tokenConstraintFailure(for id: CBv2RequestID) -> String?
+
+    /// True when `mtpVerifySample` reproduces this sampler's ordinary
+    /// per-token draws (same transform pipeline, same keyed RNG stream) for
+    /// MTP-eligible rows. Gates target-prefix acceptance: with it, verify
+    /// acceptance compares drafts against genuine target samples, which is
+    /// exact for the output distribution at any temperature.
+    var supportsMTPTargetPrefix: Bool { get }
+
+    /// Pre-sample the target token at every MTP verify position with each
+    /// row's REAL sampler semantics. `logits` is `[B, W, vocab]` raw target
+    /// logits for the verify window; `stepBases[r]` is row r's per-request
+    /// output-step index at window position 0 (its confirmed generated-token
+    /// count), so position j draws with the exact RNG key the ordinary path
+    /// would use for output index `stepBases[r] + j`. Rows admitted here
+    /// satisfy the MTP eligibility gates (no constraints/bias/penalties/
+    /// logprobs), so the transform is the stateless temperature → top-k/
+    /// top-p/min-p pipeline. Greedy rows yield plain argmax. Pure: MUST NOT
+    /// mutate sampler state or host-sync; returns lazy `[B, W]` int32, or
+    /// nil when unsupported (callers then use argmax acceptance).
+    func mtpVerifySample(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray?
+
+    /// An MTP round confirmed tokens for `requestIDs` OUTSIDE `sample`
+    /// (verify rows never pass through it). Stateful samplers must drop the
+    /// affected row configuration so the next `sample` reconfigures from
+    /// confirmed history — penalty counts and RNG step indices stay a pure
+    /// function of each request's history. Default: no-op.
+    func mtpRoundDidCommit(requestIDs: [CBv2RequestID])
 }
 
 extension CBv2StepSampler {
@@ -125,6 +155,12 @@ extension CBv2StepSampler {
     public func requestDidFinish(_ id: CBv2RequestID) {}
     public func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID]) {}
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? { nil }
+    public var supportsMTPTargetPrefix: Bool { false }
+    public func mtpVerifySample(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray? { nil }
+    public func mtpRoundDidCommit(requestIDs: [CBv2RequestID]) {}
 }
 
 /// Greedy stub — vectorized argmax, batch-composition invariant by

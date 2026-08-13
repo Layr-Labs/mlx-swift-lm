@@ -15,21 +15,32 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
 
     let targetIdentity: ObjectIdentifier
     let correctionOffset: Int
+    let verification: CBv2MTPVerificationMode
+    let targetPrefix: Bool
+    let maxDraft: Int?
     private(set) var created = 0
     private(set) var released = 0
     private(set) var finalized: [Int] = []
     private(set) var committedBeforeDraft: [Int] = []
     private(set) var discarded = 0
 
-    init(target: AnyObject, correctionOffset: Int) {
+    init(
+        target: AnyObject, correctionOffset: Int,
+        verification: CBv2MTPVerificationMode = .serialTarget,
+        targetPrefix: Bool = false, maxDraft: Int? = 1
+    ) {
         self.targetIdentity = ObjectIdentifier(target)
         self.correctionOffset = correctionOffset
+        self.verification = verification
+        self.targetPrefix = targetPrefix
+        self.maxDraft = maxDraft
     }
 
     var mtpTargetIdentity: ObjectIdentifier? { targetIdentity }
-    var requiredVerificationMode: CBv2MTPVerificationMode? { .serialTarget }
-    var maximumDraftTokens: Int? { 1 }
+    var requiredVerificationMode: CBv2MTPVerificationMode? { verification }
+    var maximumDraftTokens: Int? { maxDraft }
     var maximumSpeculativeBatch: Int? { 1 }
+    var supportsTargetPrefixAcceptance: Bool { targetPrefix }
     var requestStateBytesPerToken: Int { 8 }
     var requestStateTokenGranularity: Int { 256 }
     var requestStateTokenAllocationPadding: Int { 1 }
@@ -100,10 +111,22 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
             ssmShape: [1, 1, 1, 1], ssmDType: .float32)
     ])
     let mtpCaptureLayers: CBv2MTPCaptureLayers? = .init(full: 0, sliding: 0)
+    /// True: `forwardWithHiddenCaptured` stages per-position captured
+    /// stacks (the capture-verify rectangular path).
+    let captureWindows: Bool
+    /// True: logits are a deterministic moderate-entropy function of
+    /// (token, state) instead of a ±10 one-hot — exercises real sampling.
+    let spreadLogits: Bool
     var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(self) }
     var supportsRequestStatefulMTP: Bool { true }
+    var supportsCapturedVerifyWindow: Bool { captureWindows }
     var cbv2PositionAxisCount: Int? { 3 }
     private(set) var hiddenPositionIDs: [[Int32]] = []
+
+    init(captureWindows: Bool = false, spreadLogits: Bool = false) {
+        self.captureWindows = captureWindows
+        self.spreadLogits = spreadLogits
+    }
 
     func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
         tokens.asType(.float32)[0..., 0..., .newAxis]
@@ -194,11 +217,58 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
         let targetIDs = (
             tokens.asType(.int32)
                 + broadcast(stateValues, to: [batch, length])) % Int32(32)
-        let vocab = MLXArray(Int32(0) ..< Int32(32)).reshaped([1, 32])
-        let targets = targetIDs.reshaped([-1, 1])
-        let logits = MLX.where(vocab .== targets, 10, -10).reshaped([batch, length, 32])
+        let logits = fixtureLogits(targetIDs: targetIDs, batch: batch, length: length)
         let hidden = concatenated(stateRows, axis: 0).reshaped([batch, 1, 1])
         return (logits, hidden)
+    }
+
+    /// Capture-verify window: per-position states `previous + s + 1` are
+    /// staged as `[length, ...]` stacks; per-position logits/hidden use the
+    /// per-position state so the rectangular path is semantically identical
+    /// to the serial per-column oracle.
+    func forwardWithHiddenCaptured(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        precondition(captureWindows, "fixture built without capture-window support")
+        if let positionIds {
+            hiddenPositionIDs.append(positionIds[0].asArray(Int32.self))
+        }
+        let batch = tokens.dim(0)
+        let length = tokens.dim(1)
+        let qkv = tokens.asType(.float32).reshaped([batch, 1, length, 1])
+        for cache in caches {
+            _ = cache.updateAndAttend(
+                queries: qkv, keys: qkv, values: qkv, scale: 1, sinks: nil)
+        }
+        var perRowStates: [MLXArray] = []
+        for evaluation in recurrentState {
+            let previous = evaluation.inputState(modelLayerIndex: 0)?.conv
+                ?? MLXArray.zeros([1, 1, 1])
+            let stack = concatenated(
+                (0 ..< length).map { previous + Float($0 + 1) }, axis: 0)
+            try! evaluation.stageCaptured(
+                modelLayerIndex: 0, conv: stack,
+                ssm: stack.reshaped([length, 1, 1, 1]), positions: length)
+            perRowStates.append(stack.reshaped([1, length]))
+        }
+        let states = concatenated(perRowStates, axis: 0)
+        let targetIDs = (tokens.asType(.int32) + states.asType(.int32)) % Int32(32)
+        let logits = fixtureLogits(targetIDs: targetIDs, batch: batch, length: length)
+        let hidden = states.reshaped([batch, length, 1])
+        return (logits, hidden)
+    }
+
+    private func fixtureLogits(
+        targetIDs: MLXArray, batch: Int, length: Int
+    ) -> MLXArray {
+        let vocab = MLXArray(Int32(0) ..< Int32(32)).reshaped([1, 32])
+        let targets = targetIDs.reshaped([-1, 1])
+        if spreadLogits {
+            return ((targets * 7 + vocab * 5) % 13)
+                .asType(.float32).reshaped([batch, length, 32]) * 0.5
+        }
+        return MLX.where(vocab .== targets, 10, -10).reshaped([batch, length, 32])
     }
 }
 
@@ -210,11 +280,18 @@ private final class QwenMTPIncompatibleTarget: QwenMTPFixtureModel {
 struct CBv2QwenMTPIntegrationTests {
     private func engine(
         correctionOffset: Int, enabled: Bool = true,
-        mtpConfig: CBv2MTPConfig? = nil
-    ) -> (EngineV2, QwenMTPFixtureDrafter) {
-        let model = QwenMTPFixtureModel()
+        mtpConfig: CBv2MTPConfig? = nil,
+        captureWindows: Bool = false, spreadLogits: Bool = false,
+        verification: CBv2MTPVerificationMode = .serialTarget,
+        targetPrefix: Bool = false, maxDraft: Int? = 1,
+        sampler: (any CBv2StepSampler)? = nil
+    ) -> (EngineV2, QwenMTPFixtureDrafter, QwenMTPFixtureModel) {
+        let model = QwenMTPFixtureModel(
+            captureWindows: captureWindows, spreadLogits: spreadLogits)
         let drafter = QwenMTPFixtureDrafter(
-            target: model, correctionOffset: correctionOffset)
+            target: model, correctionOffset: correctionOffset,
+            verification: verification, targetPrefix: targetPrefix,
+            maxDraft: maxDraft)
         let kinds = [
             CBv2LayerKind(
                 attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
@@ -225,7 +302,7 @@ struct CBv2QwenMTPIntegrationTests {
                 backend: CBv2ContiguousKVBackend(
                     config: .init(bytesCapacity: 1 << 20, kvDType: .float32)),
                 cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
-                sampler: CBv2GreedySampler(),
+                sampler: sampler ?? CBv2GreedySampler(),
                 schedulerConfig: .init(
                     maxConcurrentRequests: 2, maxBatchedTokensPerStep: 32,
                     prefillChunkSize: 8, maxWaiting: 4),
@@ -236,20 +313,24 @@ struct CBv2QwenMTPIntegrationTests {
                     maxSpeculativeBatch: 8, fixedDraftTokens: 7,
                     verificationMode: .rectangular,
                     maxAutomaticRectangularTokens: 64)),
-            drafter)
+            drafter, model)
     }
 
-    private func run(_ engine: EngineV2, id: UInt64 = 1) async throws -> CBv2SchedCollected {
+    private func run(
+        _ engine: EngineV2, id: UInt64 = 1,
+        sampling: CBv2SamplingParams = .init(temperature: 0),
+        maxTokens: Int = 10
+    ) async throws -> CBv2SchedCollected {
         await cbv2SchedCollect(
             try engine.submit(
                 CBv2Request(
                     id: CBv2RequestID(id), promptTokens: [2, 4, 6],
-                    sampling: .init(temperature: 0), maxTokens: 10)))
+                    sampling: sampling, maxTokens: maxTokens)))
     }
 
     @Test("policy is forced to serial B1 depth one")
     func forcedPolicy() async throws {
-        let (engine, _) = engine(correctionOffset: 0)
+        let (engine, _, _) = engine(correctionOffset: 0)
         let driver = try #require(engine.loopForTesting.mtp)
         #expect(driver.config.verificationMode == .serialTarget)
         #expect(driver.config.maxAutomaticRectangularTokens == 0)
@@ -308,22 +389,30 @@ struct CBv2QwenMTPIntegrationTests {
         await engine.shutdown()
     }
 
-    @Test("default and zero caller policies are forced to serial B1 depth one")
+    @Test("default and zero caller policies clamp to serial B1 depth <= 1")
     func forcedDefaultAndZeroPolicy() async throws {
-        let configs = [
-            CBv2MTPConfig(enabled: true),
-            CBv2MTPConfig(
-                enabled: true, maxDraftTokens: 7, maxSpeculativeBatch: 8,
-                fixedDraftTokens: 0, verificationMode: .rectangular,
-                maxAutomaticRectangularTokens: 64),
+        // Contract update (capture-verify): the driver no longer force-pins
+        // `fixedDraftTokens = 1` for request-stateful recurrent drafters. A
+        // serial-mode drafter still clamps depth/batch to the proven k<=1 /
+        // B=1 shape, but a nil fixed depth stays adaptive (the controller
+        // works within maxDraftTokens == 1) and an explicit caller 0 stays
+        // an explicit target-only probe mode instead of being promoted.
+        let configs: [(CBv2MTPConfig, Int?)] = [
+            (CBv2MTPConfig(enabled: true), nil),
+            (
+                CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 7, maxSpeculativeBatch: 8,
+                    fixedDraftTokens: 0, verificationMode: .rectangular,
+                    maxAutomaticRectangularTokens: 64), 0
+            ),
         ]
-        for (index, config) in configs.enumerated() {
-            let (engine, _) = engine(correctionOffset: 0, mtpConfig: config)
+        for (index, (config, expectedFixed)) in configs.enumerated() {
+            let (engine, _, _) = engine(correctionOffset: 0, mtpConfig: config)
             let driver = try #require(engine.loopForTesting.mtp)
             #expect(driver.config.verificationMode == .serialTarget)
             #expect(driver.config.maxAutomaticRectangularTokens == 0)
             #expect(driver.config.maxDraftTokens == 1)
-            #expect(driver.config.fixedDraftTokens == 1)
+            #expect(driver.config.fixedDraftTokens == expectedFixed)
             #expect(driver.config.maxSpeculativeBatch == 1)
             _ = try await run(engine, id: UInt64(500 + index))
             await engine.shutdown()
@@ -352,7 +441,7 @@ struct CBv2QwenMTPIntegrationTests {
 
     @Test("incompatible Qwen position axes fail before model execution")
     func incompatiblePositionAxesRejected() async {
-        let (engine, _) = engine(correctionOffset: 0)
+        let (engine, _, _) = engine(correctionOffset: 0)
         let positions = CBv2PositionState(
             promptPositionIds: MLXArray.zeros([2, 1, 3], dtype: .int32),
             decodeDeltas: [0])
@@ -372,12 +461,12 @@ struct CBv2QwenMTPIntegrationTests {
 
     @Test("accepted and rejected drafts preserve target token authority and state")
     func acceptedRejectedParity() async throws {
-        let (baseline, _) = engine(correctionOffset: 0, enabled: false)
+        let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
         let expected = try await run(baseline)
         await baseline.shutdown()
 
         for correctionOffset in [0, 1] {
-            let (mtp, drafter) = engine(correctionOffset: correctionOffset)
+            let (mtp, drafter, _) = engine(correctionOffset: correctionOffset)
             let actual = try await run(mtp)
             let metrics = try #require(mtp.mtpMetricsSnapshot())
             await mtp.shutdown()
@@ -450,7 +539,7 @@ struct CBv2QwenMTPIntegrationTests {
 
     @Test("MTP verification can share a plan with recurrent prompt prefill")
     func mixedVerificationAndPrefill() async throws {
-        let (engine, _) = engine(correctionOffset: 0)
+        let (engine, _, _) = engine(correctionOffset: 0)
         let shortStream = try engine.submit(
             CBv2Request(
                 id: CBv2RequestID(406), promptTokens: [2],
@@ -473,7 +562,7 @@ struct CBv2QwenMTPIntegrationTests {
 
     @Test("cancel releases assistant and recurrent request state")
     func cancellationCleanup() async throws {
-        let (engine, drafter) = engine(correctionOffset: 0)
+        let (engine, drafter, _) = engine(correctionOffset: 0)
         let request = CBv2Request(
             id: CBv2RequestID(99), promptTokens: [1, 3, 5],
             sampling: .init(temperature: 0), maxTokens: 512)
@@ -522,5 +611,181 @@ struct CBv2QwenMTPIntegrationTests {
         driver.invalidateCarry(id)
         #expect(drafter.released == 1)
         #expect(driver.requestStateCountForTesting == 0)
+    }
+
+    // MARK: - Capture-verify (rectangular recurrent verification)
+
+    @Test("capture-verify rounds preserve target token authority and state")
+    func captureVerifyParity() async throws {
+        // Baseline never speculates. Fixture logits are a function of the
+        // request-owned recurrent STATE at every position, so token parity
+        // with the baseline proves both commit paths restore/select exactly
+        // the right captured state: correctionOffset 0 drafts always match
+        // (accepted commit selects position 2), offset 1 never matches
+        // (rejected commit restores the post-seed snapshot).
+        let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
+        let expected = try await run(baseline)
+        await baseline.shutdown()
+
+        for correctionOffset in [0, 1] {
+            let (mtp, drafter, _) = engine(
+                correctionOffset: correctionOffset,
+                captureWindows: true, verification: .rectangular)
+            let driver = try #require(mtp.loopForTesting.mtp)
+            #expect(driver.config.verificationMode == .rectangular)
+            #expect(driver.config.maxDraftTokens == 1)
+            #expect(driver.config.maxSpeculativeBatch == 1)
+            let actual = try await run(mtp)
+            let metrics = try #require(mtp.mtpMetricsSnapshot())
+            await mtp.shutdown()
+
+            #expect(actual.tokens == expected.tokens)
+            #expect(metrics.rectangularVerificationRounds > 0)
+            #expect(metrics.serialVerificationRounds == 0)
+            if correctionOffset == 0 {
+                #expect(metrics.acceptedTokens > 0)
+            } else {
+                #expect(metrics.acceptedTokens == 0)
+                #expect(metrics.rounds > 0)
+            }
+            #expect(drafter.released == drafter.created)
+            #expect(mtp.loopForTesting.recurrentStates.isEmpty)
+            #expect(mtp.loopForTesting.mtp?.requestStateCountForTesting == 0)
+        }
+    }
+
+    @Test("capture-verify without the captured seam degrades to serial")
+    func captureVerifyDegradesWithoutSeam() async throws {
+        // Rectangular requested but the model lacks the captured-window
+        // forward: the driver must fall back to the serial oracle instead of
+        // trapping or silently running stateless.
+        let (engine, _, _) = engine(
+            correctionOffset: 0, captureWindows: false, verification: .rectangular)
+        let driver = try #require(engine.loopForTesting.mtp)
+        #expect(driver.config.verificationMode == .serialTarget)
+        let result = try await run(engine, id: 601)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(result.finishReason == .length)
+        #expect(metrics.serialVerificationRounds > 0)
+        #expect(metrics.rectangularVerificationRounds == 0)
+    }
+
+    @Test("adaptive captured-window depth stays clamped to the k == 1 verify contract")
+    func adaptiveCapturedWindowDepthClamp() async throws {
+        // A drafter that leaves maximumDraftTokens unset while selecting
+        // rectangular verification over a captured-window model: without
+        // the driver-side clamp the adaptive controller could plan k > 1
+        // and trap mtpBuildVerifyGraph's request-stateful k == 1
+        // precondition.
+        let model = QwenMTPFixtureModel(captureWindows: true)
+        let drafter = QwenMTPFixtureDrafter(
+            target: model, correctionOffset: 0,
+            verification: .rectangular, maxDraft: nil)
+        let config = CBv2MTPConfig(
+            enabled: true, maxDraftTokens: 7, maxSpeculativeBatch: 8,
+            fixedDraftTokens: nil, verificationMode: .rectangular,
+            maxAutomaticRectangularTokens: 64)
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(model: model, drafter: drafter, config: config))
+        #expect(driver.config.verificationMode == .rectangular)
+        #expect(driver.config.maxDraftTokens == 1)
+        #expect(driver.config.fixedDraftTokens == nil)
+
+        // Control: an UNCLAMPED controller under this exact pressure (flat
+        // cost curve, perfect acceptance) genuinely prefers k > 1 — the
+        // scenario the clamp defends against is real, not hypothetical.
+        let unclamped = CBv2MTPDepthController(
+            maxDepth: config.maxDraftTokens, fixedDepth: config.fixedDraftTokens)
+        for depth in 0 ... 4 {
+            unclamped.observeCost(
+                decodeRowBucket: 1, depth: depth,
+                wallTimeNanos: UInt64(100_000_000 + depth * 1_000_000))
+        }
+        for _ in 0 ..< 20 {
+            unclamped.observeAcceptance(decodeRowBucket: 1, drafted: 4, accepted: 4)
+        }
+        #expect(unclamped.select(plannedDecodeRows: 1, canSpeculate: true).depth > 1)
+
+        // The driver's controller is built AFTER the clamp: under the same
+        // perfect-acceptance pressure, every planned depth across warmup
+        // and exploration stays within the verify-graph contract.
+        for _ in 0 ..< 20 {
+            driver.recordStepAcceptance(
+                drafted: 4, accepted: 4, observedDrafts: 4, decodeRowBucket: 1)
+        }
+        for _ in 0 ..< 32 {
+            driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
+            #expect(driver.planDecision.depth <= 1)
+        }
+
+        // End-to-end: the engine runs adaptive capture-verify rounds to
+        // completion (no trap), and never selects a depth beyond one.
+        let (engine, _, _) = engine(
+            correctionOffset: 0, mtpConfig: config,
+            captureWindows: true, verification: .rectangular, maxDraft: nil)
+        let result = try await run(engine, id: 650, maxTokens: 20)
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(result.finishReason == .length)
+        #expect(metrics.rounds > 0)
+        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(metrics.depthSelections.keys.allSatisfy { $0 <= 1 })
+    }
+
+    // MARK: - target-prefix acceptance (temperature > 0)
+
+    @Test("target-prefix keeps MTP-on output token-identical to MTP-off")
+    func targetPrefixExactness() async throws {
+        // Spread logits give a genuine multi-candidate distribution; the
+        // fixture computes them from exact integers, so MTP-off and MTP-on
+        // see bitwise-identical logits at equal (token, state) positions.
+        // With per-request seeds, target-prefix pre-sampling must reproduce
+        // the ordinary keyed draws exactly — greedy AND temp 0.7.
+        let samplings: [CBv2SamplingParams] = [
+            .init(temperature: 0, seed: 42),
+            .init(temperature: 0.7, topP: 0.9, topK: 8, seed: 42),
+        ]
+        for (index, sampling) in samplings.enumerated() {
+            let (baseline, _, _) = engine(
+                correctionOffset: 0, enabled: false, spreadLogits: true,
+                sampler: CBv2DefaultSampler(fallbackSeed: 1717))
+            let expected = try await run(
+                baseline, id: UInt64(700 + index), sampling: sampling)
+            await baseline.shutdown()
+
+            let (mtp, _, _) = engine(
+                correctionOffset: 0, captureWindows: true, spreadLogits: true,
+                verification: .rectangular, targetPrefix: true,
+                sampler: CBv2DefaultSampler(fallbackSeed: 1717))
+            // Same request id as the baseline: the keyed RNG stream is a
+            // function of (seed, requestID, per-request step). Separate
+            // engines, so the reuse is legal.
+            let actual = try await run(
+                mtp, id: UInt64(700 + index), sampling: sampling)
+            let metrics = try #require(mtp.mtpMetricsSnapshot())
+            await mtp.shutdown()
+
+            #expect(actual.tokens == expected.tokens, "sampling \(sampling.temperature)")
+            // Eligibility admitted the row (greedy always; temp 0.7 through
+            // the lifted gate) and rounds actually ran.
+            #expect(metrics.rounds > 0, "sampling \(sampling.temperature)")
+        }
+    }
+
+    @Test("temperature gate stays without sampler target-prefix support")
+    func temperatureGateWithoutSamplerSupport() async throws {
+        // Drafter opted in, but CBv2GreedySampler cannot pre-sample verify
+        // positions — non-greedy rows must remain ineligible (no rounds).
+        let (engine, _, _) = engine(
+            correctionOffset: 0, captureWindows: true, spreadLogits: true,
+            verification: .rectangular, targetPrefix: true)
+        let result = try await run(
+            engine, id: 720, sampling: .init(temperature: 0.7, seed: 9))
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(result.finishReason == .length)
+        #expect(metrics.rounds == 0)
+        #expect(metrics.draftedTokens == 0)
     }
 }

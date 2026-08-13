@@ -84,6 +84,23 @@ extension CBv2RecurrentMTPForwardable {
     public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(self) }
 }
 
+/// Capture-verify refinement of `CBv2RecurrentMTPForwardable` (MTPLX GDN
+/// capture-commit pattern): ONE forward over the whole `[B, 1+k]` verify
+/// window during which every recurrent layer stages per-position captured
+/// conv/SSM stacks via `CBv2RecurrentStateEvaluation.stageCaptured`. Commit
+/// selects the captured state at the accepted position on device; rollback
+/// keeps the pre-verify committed state. Attention KV rolls back by trim as
+/// usual, so no repair forward is ever needed.
+public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable {
+    /// Same contract as `cbv2ForwardWithHidden`, but each recurrent
+    /// transaction receives captured `[L, ...]` per-position stacks
+    /// (`L == tokens.dim(1)`) instead of a single final state.
+    func cbv2ForwardWithHiddenCaptured(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
 /// Steppable models that can drive MTP rounds. Additive refinement of
 /// `CBv2SteppableModel`; the engine speculates only when the bound model
 /// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
@@ -119,6 +136,31 @@ public protocol CBv2RecurrentMTPSteppableModel:
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+    /// True only when `forwardWithHiddenCaptured` stages per-position
+    /// captured recurrent stacks (MTP capture-verify). Without it,
+    /// rectangular verification over a recurrent target is impossible and
+    /// the driver falls back to the serial oracle.
+    var supportsCapturedVerifyWindow: Bool { get }
+    /// Capture-verify forward over the whole verify window. Only called when
+    /// `supportsCapturedVerifyWindow == true`.
+    func forwardWithHiddenCaptured(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
+extension CBv2RecurrentMTPSteppableModel {
+    /// Fail-safe defaults for first-generation recurrent targets: no
+    /// captured-window support (the serial oracle remains the verify path).
+    public var supportsCapturedVerifyWindow: Bool { false }
+
+    public func forwardWithHiddenCaptured(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        preconditionFailure(
+            "CBv2 capture-verify forward called on a model without captured-window support")
+    }
 }
 
 // MARK: - Drafter seam
@@ -177,6 +219,9 @@ public protocol CBv2MTPDrafter: AnyObject {
     var requiredVerificationMode: CBv2MTPVerificationMode? { get }
     var maximumDraftTokens: Int? { get }
     var maximumSpeculativeBatch: Int? { get }
+    /// True when this drafter's rounds may accept via target-prefix
+    /// pre-sampling; see the extension default for the full contract.
+    var supportsTargetPrefixAcceptance: Bool { get }
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
@@ -209,6 +254,14 @@ extension CBv2MTPDrafter {
     public var requestStateBytesPerToken: Int { 0 }
     public var requestStateTokenGranularity: Int { 1 }
     public var requestStateTokenAllocationPadding: Int { 0 }
+    /// True when this drafter's rounds may accept via target-prefix
+    /// pre-sampling (accept draft iff it equals a token pre-sampled from the
+    /// target's real per-request sampler distribution; the committed token is
+    /// always that target sample — exact for the output distribution at ANY
+    /// temperature/top-p/top-k). Lifts the engine's `temperature == 0`
+    /// eligibility gate when the installed sampler also supports MTP verify
+    /// sampling. Default false: greedy argmax acceptance only.
+    public var supportsTargetPrefixAcceptance: Bool { false }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
