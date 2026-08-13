@@ -282,8 +282,21 @@ extension CBv2MTPRequestState {
 /// the target verifier may still batch the resulting columns as `[B,1]`.
 public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     func makeRequestState() -> any CBv2MTPRequestState
+    /// Draft-head shortlist opt-in. Non-nil K asks target verification to
+    /// additionally surface each verify position's top-K token ids and
+    /// their probability mass; finalize threads the accepted position's ids
+    /// into the next round's carry when the mass clears the engine coverage
+    /// threshold. nil keeps full-head draft scoring and adds zero verify
+    /// work. Default nil.
+    var draftShortlistSize: Int? { get }
+    /// One request-local draft proposal.
+    /// - shortlist: [K] int32 target top-K token ids captured at the carry
+    ///   position, non-nil only when `draftShortlistSize` is set AND the
+    ///   captured mass cleared the coverage threshold. When present the
+    ///   drafter MUST propose a token from these ids (it may score only the
+    ///   matching head rows instead of the full vocabulary).
     func draftStep(
-        tokens: MLXArray, hidden: MLXArray,
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
         requestState: any CBv2MTPRequestState
     ) -> (tokens: MLXArray, hidden: MLXArray)
     /// Device arrays that make assistant-cache mutation part of the round's
@@ -298,6 +311,10 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     func discardRound(requestState: any CBv2MTPRequestState)
     /// Explicitly sever device-array ownership on finish/cancel/preemption.
     func releaseRequestState(_ requestState: any CBv2MTPRequestState)
+}
+
+extension CBv2MTPRequestStatefulDrafter {
+    public var draftShortlistSize: Int? { nil }
 }
 
 // MARK: - Config

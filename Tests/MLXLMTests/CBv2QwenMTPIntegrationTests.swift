@@ -58,12 +58,21 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
         preconditionFailure("request-stateful fixture used frozen capture")
     }
 
+    /// Shortlists observed per round (nil ⇒ full-head draft) and the round
+    /// seed tokens, for plumbing assertions.
+    private(set) var shortlists: [[Int32]?] = []
+    private(set) var seeds: [Int32] = []
+    var shortlistSize: Int?
+    var draftShortlistSize: Int? { shortlistSize }
+
     func draftStep(
-        tokens: MLXArray, hidden: MLXArray,
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
         requestState: any CBv2MTPRequestState
     ) -> (tokens: MLXArray, hidden: MLXArray) {
         let state = requestState as! QwenMTPFixtureState
         committedBeforeDraft.append(state.committedInputCount)
+        seeds.append(tokens.asType(.int32).reshaped([1]).asArray(Int32.self)[0])
+        shortlists.append(shortlist.map { $0.asArray(Int32.self) })
         state.stagedInputCount += 2
         let next = (
             tokens.asType(.int32).reshaped([1])
@@ -787,5 +796,80 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(result.finishReason == .length)
         #expect(metrics.rounds == 0)
         #expect(metrics.draftedTokens == 0)
+    }
+    // MARK: - Draft-head shortlist (draft trim)
+
+    @Test("verify rounds thread coverage-gated shortlists into the next carry")
+    func shortlistPlumbing() async throws {
+        // One-hot ±10 fixture logits concentrate essentially all probability
+        // mass on the argmax, so every verify position clears the coverage
+        // gate. The first round's carry comes from a SEED step (no verify
+        // shortlist); every chained round after it must receive the target
+        // top-K ids captured at the carry position — which by construction
+        // contain the very token the target committed there (the next
+        // round's seed). Output tokens must be untouched by the plumbing.
+        let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
+        let expected = try await run(baseline, id: 801)
+        await baseline.shutdown()
+
+        let (mtp, drafter, _) = engine(
+            correctionOffset: 0, captureWindows: true, verification: .rectangular)
+        drafter.shortlistSize = 8
+        let actual = try await run(mtp, id: 801)
+        let metrics = try #require(mtp.mtpMetricsSnapshot())
+        await mtp.shutdown()
+
+        #expect(actual.tokens == expected.tokens)
+        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(drafter.shortlists.count == drafter.seeds.count)
+        #expect(drafter.shortlists.count > 2)
+        #expect(drafter.shortlists[0] == nil)
+        for round in 1 ..< drafter.shortlists.count {
+            let shortlist = try #require(drafter.shortlists[round])
+            #expect(shortlist.count == 8, "round \(round)")
+            // Correct column: the carry position's argmax IS this round's
+            // seed token. A wrong column would only contain it by tie luck.
+            #expect(shortlist.contains(drafter.seeds[round]), "round \(round)")
+        }
+    }
+
+    @Test("shortlists stay off for drafters that do not opt in")
+    func shortlistRequiresOptIn() async throws {
+        let (mtp, drafter, _) = engine(
+            correctionOffset: 0, captureWindows: true, verification: .rectangular)
+        _ = try await run(mtp, id: 802)
+        let metrics = try #require(mtp.mtpMetricsSnapshot())
+        await mtp.shutdown()
+        #expect(metrics.rectangularVerificationRounds > 0)
+        #expect(drafter.shortlists.allSatisfy { $0 == nil })
+    }
+
+    @Test("shortlist coverage math: ids and parts-per-million mass")
+    func shortlistCoverageMath() throws {
+        // Column 0: one dominant logit — top-2 mass ≈ (e^10 + 1) / (e^10 + 7)
+        // ≈ 0.999728 ⇒ clears the 0.90 gate. Column 1: flat — top-2 mass is
+        // exactly 2/8 = 0.25 ⇒ must fall back to the full head.
+        var values = [Float](repeating: 0, count: 8)
+        values[5] = 10
+        let logits = concatenated(
+            [
+                MLXArray(values).reshaped([1, 1, 8]),
+                MLXArray.zeros([1, 1, 8]),
+            ], axis: 1)
+        let shortlist = try #require(
+            EngineLoopV2.mtpDraftShortlist(logits: logits, size: 2))
+        #expect(shortlist.ids.shape == [1, 2, 2])
+        #expect(shortlist.massScaled.shape == [1, 2])
+        let ids = shortlist.ids.asArray(Int32.self)
+        #expect(ids[0 ..< 2].contains(5))
+        let mass = shortlist.massScaled.asArray(Int32.self)
+        #expect(mass[0] >= EngineLoopV2.mtpShortlistMassThresholdPPM)
+        #expect(abs(Int(mass[0]) - 999_728) < 200)
+        #expect(mass[1] < EngineLoopV2.mtpShortlistMassThresholdPPM)
+        #expect(abs(Int(mass[1]) - 250_000) < 200)
+
+        // A shortlist as wide as the vocabulary is refused (no byte win).
+        #expect(EngineLoopV2.mtpDraftShortlist(logits: logits, size: 8) == nil)
+        #expect(EngineLoopV2.mtpDraftShortlist(logits: logits, size: 0) == nil)
     }
 }
