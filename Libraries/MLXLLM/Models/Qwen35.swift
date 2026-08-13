@@ -1188,6 +1188,17 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         var weights = weights
 
+        // Routed experts are built fused (`SwitchGLU(fuseGateUp: true)`), and
+        // the `qwen3_5_text` registry entry reaches this sanitizer directly —
+        // without the MoE/VLM wrappers that call the fusion helper. Apply it
+        // here so raw stacked `experts.gate_up_proj` exports and converted
+        // split `switch_mlp.{gate,up}_proj.*` checkpoints both match the
+        // module tree. Idempotent, so the wrapper paths that already fused
+        // are unaffected; `mtp.*` keys stay split.
+        if configuration.numExperts > 0 {
+            weights = qwen35FuseSwitchMLPGateUp(weights: weights)
+        }
+
         // Keep mtp.* keys if the head is attached; strip them otherwise.
         // omlx: `if not hasattr(self, "mtp"): weights = {k:v if "mtp." not in k}`
         if mtp == nil {

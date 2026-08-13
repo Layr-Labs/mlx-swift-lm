@@ -9,6 +9,7 @@
 
 import MLX
 import MLXLLM
+import MLXLMCommon
 
 public final class Qwen35MoE: Qwen35 {
     // Routed experts run with `SwitchGLU(fuseGateUp: true)`; the shared
@@ -33,5 +34,14 @@ public final class Qwen35MoE: Qwen35 {
 
     public override func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         super.sanitize(weights: qwen35FuseSwitchMLPGateUp(weights: weights))
+    }
+}
+
+// On the base class so both the dense-registry and MoE-registry entries
+// resolve fused `gate_up_proj` quantization through the split-path
+// overrides that mixed-precision configs are keyed on.
+extension Qwen35: QuantizationPathAliasing {
+    public func quantizationPathAliases(for path: String) -> [String] {
+        qwen35GateUpQuantizationAliases(for: path)
     }
 }

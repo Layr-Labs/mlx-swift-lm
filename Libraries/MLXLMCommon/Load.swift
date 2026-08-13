@@ -54,6 +54,41 @@ private final class ParallelShardState: @unchecked Sendable {
     }
 }
 
+/// Implemented by models whose ``BaseLanguageModel/sanitize(weights:)``
+/// renames or fuses modules relative to the checkpoint layout.
+///
+/// Per-layer quantization tables in `config.json` are keyed on the
+/// checkpoint's module paths. When a sanitizer renames a module (e.g. fusing
+/// split `gate_proj`/`up_proj` experts into one `gate_up_proj`), the new path
+/// no longer matches its explicit overrides, and
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)``
+/// would fall back to the default quantization — or to none at all for
+/// mixed-precision configs without a default — and the subsequent strict
+/// update would reject the renamed `.scales`/`.biases` tensors. Aliases
+/// restore the lookup: the first alias with an explicit per-layer entry wins.
+public protocol QuantizationPathAliasing {
+    /// Checkpoint-layout config paths to consult, in order, when `path`
+    /// itself has no explicit per-layer quantization entry.
+    func quantizationPathAliases(for path: String) -> [String]
+}
+
+/// Resolve the quantization for one module path during weight loading,
+/// consulting `aliasing` when the per-layer table has no explicit entry for
+/// a post-sanitize (renamed/fused) module path.
+public func resolveQuantization(
+    path: String,
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization,
+    aliasing: QuantizationPathAliasing?
+) -> BaseConfiguration.Quantization? {
+    if perLayerQuantization.perLayerQuantization[path] == nil, let aliasing {
+        for alias in aliasing.quantizationPathAliases(for: path)
+        where perLayerQuantization.perLayerQuantization[alias] != nil {
+            return perLayerQuantization.quantization(layer: alias)
+        }
+    }
+    return perLayerQuantization.quantization(layer: path)
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -134,15 +169,15 @@ public func loadWeights(
 
     // quantize if needed
     if quantization != nil || perLayerQuantization != nil {
+        let aliasing = model as? QuantizationPathAliasing
         quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
+            guard weights["\(path).scales"] != nil else { return nil }
+            if let perLayerQuantization {
+                return resolveQuantization(
+                    path: path, perLayerQuantization: perLayerQuantization,
+                    aliasing: aliasing)?.asTuple
             } else {
-                return nil
+                return quantization?.asTuple
             }
         }
     }

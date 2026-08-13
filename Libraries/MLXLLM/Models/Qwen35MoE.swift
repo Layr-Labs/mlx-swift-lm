@@ -61,8 +61,10 @@ public struct Qwen35Configuration: Codable, Sendable {
 ///   exact for any per-output-row grouped quantization (affine or mxfp8):
 ///   rows quantize independently, so `weight`, `scales`, and `biases` all
 ///   concatenate on axis -2 and an unquantized `bias` on axis -1. The fused
-///   module path resolves to the same default quantization entry the split
-///   paths used (per-layer overrides only name the W8 routers).
+///   module path resolves its quantization through
+///   `qwen35GateUpQuantizationAliases`: explicit per-layer overrides written
+///   against the split paths keep applying to the fused projection, and
+///   default-quantized checkpoints resolve the default as before.
 ///
 /// `mtp.*` keys are never touched: the inline MTP head keeps split modules
 /// (`Qwen35MTPDecoderLayer` passes `fuseGateUp: false`) because its
@@ -107,6 +109,37 @@ public func qwen35FuseSwitchMLPGateUp(weights: [String: MLXArray]) -> [String: M
     }
 
     return weights
+}
+
+/// Per-layer quantization aliases for the fused routed-expert projection.
+///
+/// Mixed-precision configs are written against the checkpoint layout, so
+/// their explicit overrides name the split `…switch_mlp.gate_proj` /
+/// `…switch_mlp.up_proj` module paths that `qwen35FuseSwitchMLPGateUp`
+/// erases. `loadWeights` consults these aliases whenever the fused path has
+/// no entry of its own. Gate is listed first; the sanitizer's concatenation
+/// has already forced both halves onto identical packed shapes, so whichever
+/// half carries an entry describes the fused tensor.
+///
+/// `mtp.*` paths return no aliases: the inline MTP head keeps split modules.
+public func qwen35GateUpQuantizationAliases(for path: String) -> [String] {
+    let fusedSuffix = ".gate_up_proj"
+    guard path.hasSuffix(fusedSuffix), !path.contains("mtp.") else { return [] }
+    let base = String(path.dropLast(fusedSuffix.count))
+    return ["\(base).gate_proj", "\(base).up_proj"]
+}
+
+extension Qwen35TextModel: QuantizationPathAliasing {
+    public func quantizationPathAliases(for path: String) -> [String] {
+        qwen35GateUpQuantizationAliases(for: path)
+    }
+}
+
+// Covers `Qwen35MoEModel` through inheritance.
+extension Qwen35Model: QuantizationPathAliasing {
+    public func quantizationPathAliases(for path: String) -> [String] {
+        qwen35GateUpQuantizationAliases(for: path)
+    }
 }
 
 public class Qwen35MoEModel: Qwen35Model {
