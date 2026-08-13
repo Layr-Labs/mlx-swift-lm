@@ -128,6 +128,112 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         }
     }
 
+    // MARK: - MTP target-prefix verify sampling
+
+    public var supportsMTPTargetPrefix: Bool { true }
+
+    /// Pure re-derivation of the ordinary per-token draw for every verify
+    /// window position. Eligibility gating guarantees the admitted rows use
+    /// only the STATELESS transforms (temperature → top-k/top-p/min-p; no
+    /// bias, penalties, constraints, or logprob capture), so this mirrors
+    /// `LogitsPipelineV2.process` + `SamplerV2.sample` per (row, position)
+    /// without touching the incremental pipeline state. RNG keys use the
+    /// per-request output index (`stepBases[r] + j`), i.e. exactly the key
+    /// the ordinary path would use for that output token.
+    public func mtpVerifySample(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray? {
+        precondition(logits.ndim == 3, "MTP verify logits must be [B, W, vocab]")
+        let b = logits.dim(0)
+        let w = logits.dim(1)
+        let vocab = logits.dim(2)
+        precondition(
+            params.count == b && requestIDs.count == b && stepBases.count == b,
+            "MTP verify sampling row metadata mismatch")
+        let flat = logits.reshaped([b * w, vocab]).asType(.float32)
+        let greedyTokens = argMax(flat, axis: -1).asType(.int32)
+        let anyStochastic = params.contains {
+            $0.temperature >= LogitsPipelineV2.greedyEpsilon
+        }
+        if !anyStochastic {
+            // Bit-identical to the historical argmax acceptance walk.
+            return greedyTokens.reshaped([b, w])
+        }
+
+        // Mirror LogitsPipelineV2.setRows parameter resolution, expanded to
+        // one row per (request, position). Greedy rows keep the identity
+        // sentinels; their pick is the argmax merge below.
+        var temps = [Float](repeating: 1, count: b * w)
+        var topKs = [Int32](repeating: Int32(vocab), count: b * w)
+        var topPs = [Float](repeating: 2, count: b * w)
+        var minPs = [Float](repeating: 0, count: b * w)
+        var greedyFlags = [Bool](repeating: true, count: b * w)
+        var noiseRows: [(seed: UInt64?, id: UInt64, step: UInt64, greedy: Bool)] = []
+        noiseRows.reserveCapacity(b * w)
+        var anyTemperature = false
+        var anyTopKPMinP = false
+        for r in 0 ..< b {
+            let p = params[r]
+            let greedy = p.temperature < LogitsPipelineV2.greedyEpsilon
+            for j in 0 ..< w {
+                let i = r * w + j
+                greedyFlags[i] = greedy
+                noiseRows.append(
+                    (
+                        seed: p.seed, id: requestIDs[r].raw,
+                        step: UInt64(stepBases[r] + j), greedy: greedy
+                    ))
+                guard !greedy else { continue }
+                temps[i] = p.temperature
+                if p.temperature != 1 { anyTemperature = true }
+                if p.topK > 0, p.topK < vocab {
+                    topKs[i] = Int32(p.topK)
+                    anyTopKPMinP = true
+                }
+                if p.topP > 0, p.topP < 1 {
+                    topPs[i] = p.topP
+                    anyTopKPMinP = true
+                } else if p.topP <= 0 {
+                    topPs[i] = 0
+                    anyTopKPMinP = true
+                }
+                if p.minP > 0 {
+                    minPs[i] = min(p.minP, 1)
+                    anyTopKPMinP = true
+                }
+            }
+        }
+
+        var x = flat
+        if anyTemperature {
+            x = x / MLXArray(temps).reshaped([b * w, 1])
+        }
+        if anyTopKPMinP {
+            x = LogitsPipelineV2.applyTopKTopPMinP(
+                x,
+                topK: MLXArray(topKs).reshaped([b * w, 1]),
+                topP: MLXArray(topPs).reshaped([b * w, 1]),
+                minP: MLXArray(minPs).reshaped([b * w, 1]))
+        }
+        let probs = softmax(x, axis: -1)
+        let noise = sampler.verifyExponentialNoise(rows: noiseRows, vocab: vocab)
+        let sampledTokens = argMax(probs / noise, axis: -1).asType(.int32)
+        let merged = which(MLXArray(greedyFlags), greedyTokens, sampledTokens)
+        return merged.reshaped([b, w])
+    }
+
+    /// Verify rows never pass through `sample`, so their pipeline/RNG row
+    /// state goes stale the moment a round confirms tokens. Dropping the
+    /// fingerprint forces the next `sample` to reconfigure from confirmed
+    /// history — exact by the same argument as `requestDidFinish`.
+    public func mtpRoundDidCommit(requestIDs: [CBv2RequestID]) {
+        guard !configuredIDs.isEmpty else { return }
+        if requestIDs.contains(where: { configuredIDs.contains($0) }) {
+            configuredIDs = []
+        }
+    }
+
     public func confirmSampledTokens(
         _ tokens: [Int], requestIDs: [CBv2RequestID]
     ) {

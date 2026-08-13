@@ -376,7 +376,7 @@ extension EngineLoopV2 {
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
         let acceptancePacket = concatenated(
-            [draftIDs.reshaped([-1]), target.argmax.reshaped([-1])], axis: 0)
+            [draftIDs.reshaped([-1]), target.scores.reshaped([-1])], axis: 0)
         return CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,

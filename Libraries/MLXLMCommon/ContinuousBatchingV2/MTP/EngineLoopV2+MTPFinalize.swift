@@ -160,19 +160,36 @@ extension EngineLoopV2 {
                     requestState: state, confirmedInputTokens: confirmed)
             }
             if let evaluations = verify.recurrentEvaluations[id] {
-                precondition(
-                    evaluations.count == 1 + k,
-                    "CBv2 recurrent MTP verification generation count mismatch")
-                do {
-                    for evaluation in evaluations.suffix(rejected).reversed() {
-                        try evaluation.rollback()
+                if evaluations.count == 1, evaluations[0].isCaptured {
+                    // Capture-verify: one transaction spans the window. The
+                    // accepted prefix commits by device-side selection of the
+                    // captured state at position `confirmed`; zero confirmed
+                    // tokens restore the pre-verify snapshot by rollback.
+                    do {
+                        if confirmed > 0 {
+                            try evaluations[0].commit(keepPositions: confirmed)
+                        } else {
+                            try evaluations[0].rollback()
+                        }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 captured MTP finalization failed for \(id): \(error)")
                     }
-                    for evaluation in evaluations.prefix(confirmed) {
-                        try evaluation.commit()
+                } else {
+                    precondition(
+                        evaluations.count == 1 + k,
+                        "CBv2 recurrent MTP verification generation count mismatch")
+                    do {
+                        for evaluation in evaluations.suffix(rejected).reversed() {
+                            try evaluation.rollback()
+                        }
+                        for evaluation in evaluations.prefix(confirmed) {
+                            try evaluation.commit()
+                        }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 recurrent MTP finalization failed for \(id): \(error)")
                     }
-                } catch {
-                    preconditionFailure(
-                        "CBv2 recurrent MTP finalization failed for \(id): \(error)")
                 }
             }
             if rejected > 0 {
@@ -231,6 +248,14 @@ extension EngineLoopV2 {
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
             }
+        }
+
+        // Verify rows emitted tokens without passing through the sampler;
+        // drop their configured row state so the next ordinary sample
+        // reconfigures from confirmed history (exact penalty counts and
+        // per-request RNG step indices).
+        if !outcomes.isEmpty {
+            sampler.mtpRoundDidCommit(requestIDs: outcomes.map { $0.metadata.id })
         }
 
         // Rejected suffixes advanced eager device offsets past host truth.

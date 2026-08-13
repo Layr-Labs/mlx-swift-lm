@@ -6,10 +6,23 @@ extension EngineLoopV2 {
 
     /// Per-row hard gates. Ineligible rows remain ordinary target rows and do
     /// not contribute MTP skip metrics.
+    ///
+    /// The historical `temperature == 0` gate is lifted when the drafter
+    /// opted into target-prefix acceptance AND the installed sampler can
+    /// pre-sample verify positions with the request's real sampler semantics
+    /// (`CBv2StepSampler.mtpVerifySample`): every committed token is then a
+    /// genuine target sample, which is exact for the output distribution at
+    /// any temperature/top-p/top-k/min-p. The remaining gates stay: token
+    /// constraints, logprob capture, logit bias, and penalties are stateful
+    /// per-position transforms the verify pre-sampler does not reproduce,
+    /// and stop strings need the serial detokenizer walk.
     private func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         let sampling = rec.request.sampling
+        let samplingEligible =
+            sampling.temperature == 0
+            || (mtp?.targetPrefixAcceptance == true && sampler.supportsMTPTargetPrefix)
         guard rec.request.tokenConstraint == nil,
-            sampling.temperature == 0,
+            samplingEligible,
             sampling.topLogprobs == 0,
             sampling.logitBias.isEmpty,
             sampling.repetitionPenalty == 1,
