@@ -13,6 +13,19 @@ public struct ProcessedFrames {
     public let totalDuration: CMTime
 }
 
+/// Metadata needed to bound video decoding without exposing the underlying asset.
+public struct VideoMetadata {
+    public struct Track {
+        /// Dimensions reported by the track's codec format descriptions.
+        public let decodedFrameDimensions: [CGSize]
+        /// Presentation dimensions, when AVFoundation can load them.
+        public let naturalSize: CGSize?
+    }
+
+    public let duration: CMTime
+    public let tracks: [Track]
+}
+
 // `.cacheIntermediates: false` prevents CoreImage from holding IOSurface-backed
 // GPU textures between frames. With the default (caching) context, a large-library
 // scan accumulates thousands of cached intermediate surfaces and hits the
@@ -285,9 +298,24 @@ public enum MediaProcessing {
         return image
     }
 
+    private static func loadDuration(_ asset: AVAsset) async throws -> CMTime {
+        do {
+            return try await asset.load(.duration)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            throw NSError(
+                domain: "MediaProcessing", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to load the asset's duration"])
+        }
+    }
+
     public static func asCIImageSequence(_ asset: AVAsset, samplesPerSecond: Int) async throws
         -> [CIImage]
     {
+        try Task.checkCancellation()
+
         // Use AVAssetImageGenerator to extract frames
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -295,11 +323,8 @@ public enum MediaProcessing {
         generator.requestedTimeToleranceAfter = .zero
 
         // Calculate the time values we want to sample
-        guard let duration = try? await asset.load(.duration) else {
-            throw NSError(
-                domain: "MediaProcessing", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to load the asset's duration"])
-        }
+        let duration = try await loadDuration(asset)
+        try Task.checkCancellation()
 
         let durationInSeconds = duration.seconds
         let samplesPerSecond = Double(samplesPerSecond)
@@ -316,6 +341,7 @@ public enum MediaProcessing {
         // Collect the frames
         var ciImages: [CIImage] = []
         for await result in generator.images(for: sampledTimes) {
+            try Task.checkCancellation()
             switch result {
             case .success(requestedTime: _, let image, actualTime: _):
                 let ciImage = CIImage(
@@ -325,22 +351,73 @@ public enum MediaProcessing {
                 break
             }
         }
+        try Task.checkCancellation()
 
         return ciImages
     }
 
+    /// Loads duration and per-track decoded dimensions while retaining an
+    /// in-memory asset's resource-loader owner for the complete metadata probe.
+    public static func metadata(for video: MemoryBackedVideoAsset) async throws -> VideoMetadata {
+        try Task.checkCancellation()
+        return try await video.withAsset { asset in
+            try Task.checkCancellation()
+            let duration = try await asset.load(.duration)
+            try Task.checkCancellation()
+            let assetTracks = try await asset.loadTracks(withMediaType: .video)
+            try Task.checkCancellation()
+
+            var tracks: [VideoMetadata.Track] = []
+            tracks.reserveCapacity(assetTracks.count)
+            for track in assetTracks {
+                try Task.checkCancellation()
+                let formatDescriptions = try await track.load(.formatDescriptions)
+                try Task.checkCancellation()
+                let naturalSize = try? await track.load(.naturalSize)
+                try Task.checkCancellation()
+                let decodedFrameDimensions = formatDescriptions.map {
+                    let dimensions = CMVideoFormatDescriptionGetDimensions($0)
+                    return CGSize(
+                        width: CGFloat(dimensions.width), height: CGFloat(dimensions.height))
+                }
+                tracks.append(
+                    .init(
+                        decodedFrameDimensions: decodedFrameDimensions,
+                        naturalSize: naturalSize))
+            }
+
+            return VideoMetadata(duration: duration, tracks: tracks)
+        }
+    }
+
     private static func validateAsset(_ asset: AVAsset) async throws {
+        try Task.checkCancellation()
         let tracks = try await asset.loadTracks(withMediaType: .video)
+        try Task.checkCancellation()
 
         guard !tracks.isEmpty,
             let videoTrack = tracks.first
         else { throw VLMError.noVideoTrackFound }
 
         let isDecodable = try await videoTrack.load(.isDecodable)
+        try Task.checkCancellation()
 
         if !isDecodable {
             throw VLMError.videoNotDecodable
         }
+    }
+
+    private static func convertToArraysCheckingCancellation(_ images: [CIImage]) throws
+        -> [MLXArray]
+    {
+        var arrays: [MLXArray] = []
+        arrays.reserveCapacity(images.count)
+        for image in images {
+            try Task.checkCancellation()
+            arrays.append(image.asMLXArray())
+            try Task.checkCancellation()
+        }
+        return arrays
     }
 
     static public func asProcessedSequence(
@@ -362,6 +439,7 @@ public enum MediaProcessing {
         maxFrames: Int = Int.max,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
+        try Task.checkCancellation()
 
         switch video
         {
@@ -369,6 +447,16 @@ public enum MediaProcessing {
             try await Self.validateAsset(asset)
             return try await _asProcessedSequence(
                 asset, maxFrames: maxFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
+
+        case .memoryBacked(let owner):
+            return try await owner.withAsset { asset in
+                try Task.checkCancellation()
+                try await Self.validateAsset(asset)
+                try Task.checkCancellation()
+                return try await _asProcessedSequence(
+                    asset, maxFrames: maxFrames, targetFPS: targetFPS,
+                    frameProcessing: frameProcessing)
+            }
 
         case .url(let url):
             let asset = AVAsset(url: url)
@@ -409,17 +497,15 @@ public enum MediaProcessing {
         _ asset: AVAsset, maxFrames: Int, targetFPS: (CMTime) -> Double,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
+        try Task.checkCancellation()
         // Use AVAssetImageGenerator to extract frames
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
 
-        guard let duration = try? await asset.load(.duration) else {
-            throw NSError(
-                domain: "MediaProcessing", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to load the asset's duration"])
-        }
+        let duration = try await loadDuration(asset)
+        try Task.checkCancellation()
         let fps = targetFPS(duration)
         // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
         let estimatedFrames = Int(round(fps * duration.seconds))
@@ -439,19 +525,22 @@ public enum MediaProcessing {
         var timestamps: [CMTime] = []
 
         for await result in generator.images(for: sampledTimes) {
+            try Task.checkCancellation()
             switch result {
             case .success(requestedTime: _, let image, actualTime: let actual):
                 let ciImage = CIImage(
                     cgImage: image, options: [.colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!])
                 let frame = try frameProcessing(.init(frame: ciImage, timeStamp: actual))
+                try Task.checkCancellation()
                 ciImages.append(frame.frame)
                 timestamps.append(frame.timeStamp)
             case .failure(requestedTime: _, _):
                 break
             }
         }
+        try Task.checkCancellation()
 
-        let framesAsArrays = ciImages.map { $0.asMLXArray() }
+        let framesAsArrays = try convertToArraysCheckingCancellation(ciImages)
         return ProcessedFrames(
             frames: framesAsArrays,
             timestamps: timestamps,
@@ -465,6 +554,7 @@ public enum MediaProcessing {
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
 
+        try Task.checkCancellation()
         precondition(videoFrames.isEmpty == false)
 
         let startTime = videoFrames.first?.timeStamp ?? .zero
@@ -474,6 +564,7 @@ public enum MediaProcessing {
         let duration = timeRangeOfVideoFrames.duration
 
         let fps = targetFPS(duration)
+        try Task.checkCancellation()
         // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
         let estimatedFrames = Int(round(fps * duration.seconds))
         let desiredFrames = min(estimatedFrames, videoFrames.count)
@@ -495,6 +586,7 @@ public enum MediaProcessing {
 
         var frameIndex = videoFrames.startIndex
         for value in sampledTimeValues {
+            try Task.checkCancellation()
             let targetTime = CMTime(value: value, timescale: timescale)
 
             // find the last frame <= the targetTime
@@ -512,12 +604,13 @@ public enum MediaProcessing {
                 let videoFrame = videoFrames[targetIndex]
                 let frame = try frameProcessing(
                     .init(frame: videoFrame.frame, timeStamp: videoFrame.timeStamp))
+                try Task.checkCancellation()
                 ciImages.append(frame.frame)
                 timestamps.append(frame.timeStamp)
             }
         }
 
-        let framesAsArrays = ciImages.map { $0.asMLXArray() }
+        let framesAsArrays = try convertToArraysCheckingCancellation(ciImages)
         return ProcessedFrames(
             frames: framesAsArrays,
             timestamps: timestamps,
