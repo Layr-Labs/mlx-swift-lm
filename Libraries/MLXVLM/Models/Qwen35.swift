@@ -1108,6 +1108,12 @@ public class Qwen35: Module, VLMModel {
 
     public let config: Qwen35Configuration
 
+    /// Checkpoint quantization policy staged by `loadWeights` (via
+    /// `QuantizationPolicyReceiving`) before `sanitize` runs; drives the
+    /// per-layer decision whether routed-expert gate/up halves may fuse
+    /// (`Qwen35MoE.sanitize`). `nil` for unquantized checkpoints.
+    public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
+
     public init(_ config: Qwen35Configuration) {
         self.config = config
         _visionModel.wrappedValue = Qwen3VLVision.VisionModel(config.visionConfiguration)

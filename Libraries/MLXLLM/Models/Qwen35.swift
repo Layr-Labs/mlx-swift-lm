@@ -1114,6 +1114,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPModule?
 
+    /// Checkpoint quantization policy staged by `loadWeights` (via
+    /// `QuantizationPolicyReceiving`) before `sanitize` runs; drives the
+    /// per-layer decision whether routed-expert gate/up halves may fuse.
+    /// `nil` for unquantized checkpoints.
+    public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
+
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
@@ -1196,7 +1202,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // module tree. Idempotent, so the wrapper paths that already fused
         // are unaffected; `mtp.*` keys stay split.
         if configuration.numExperts > 0 {
-            weights = qwen35FuseSwitchMLPGateUp(weights: weights)
+            weights = qwen35FuseSwitchMLPGateUp(
+                weights: weights,
+                perLayerQuantization: checkpointPerLayerQuantization,
+                unfuse: { qwen35UnfuseSwitchGLU(at: $0, in: self) })
         }
 
         // Keep mtp.* keys if the head is attached; strip them otherwise.

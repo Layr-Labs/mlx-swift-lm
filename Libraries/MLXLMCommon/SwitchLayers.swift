@@ -378,6 +378,48 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// True while the routed gate/up projection uses the fused
+    /// `gate_up_proj` layout built by `fuseGateUp: true`.
+    public var hasFusedGateUp: Bool { gateUpProj != nil }
+
+    /// Structural twin of a fused-gate_up instance with split
+    /// `gate_proj`/`up_proj` projections.
+    ///
+    /// Used when a heterogeneous checkpoint assigns different quantization
+    /// policies to the gate and up halves: one fused quantized projection has
+    /// a single bits/group_size/mode, so such a pair must load through split
+    /// modules. The split projections are freshly initialized (the caller's
+    /// subsequent quantize + strict update supplies their tensors);
+    /// `down_proj` and every activation/profile setting carry over.
+    private init(splitting other: SwitchGLU) {
+        self.inputDims = other.inputDims
+        self.hiddenDims = other.hiddenDims
+        self.numExperts = other.numExperts
+        self.activation = other.activation
+        self.activationProduct = other.activationProduct
+        self.weightedReductionProfile = other.weightedReductionProfile
+        self.isSiluActivation = other.isSiluActivation
+        self.isGeluActivation = other.isGeluActivation
+
+        let bias = (other.gateUpProj ?? other.gateProj)?.bias != nil
+        self._gateProj.wrappedValue = SwitchLinear(
+            inputDims: other.inputDims, outputDims: other.hiddenDims,
+            numExperts: other.numExperts, bias: bias)
+        self._upProj.wrappedValue = SwitchLinear(
+            inputDims: other.inputDims, outputDims: other.hiddenDims,
+            numExperts: other.numExperts, bias: bias)
+        self._downProj.wrappedValue = other.downProj
+
+        super.init()
+    }
+
+    /// Returns the split twin described by `init(splitting:)`. Swap it in
+    /// with `Module.update(modules:)`; direct property assignment would not
+    /// refresh the module cache.
+    public func splittingGateUp() -> SwitchGLU {
+        SwitchGLU(splitting: self)
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {

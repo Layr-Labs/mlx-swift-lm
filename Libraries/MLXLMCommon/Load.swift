@@ -89,6 +89,26 @@ public func resolveQuantization(
     return perLayerQuantization.quantization(layer: path)
 }
 
+/// Implemented by models whose ``BaseLanguageModel/sanitize(weights:)``
+/// makes module-topology decisions that depend on the checkpoint's
+/// quantization policy.
+///
+/// Fusing two checkpoint modules into one (e.g. split `gate_proj`/`up_proj`
+/// experts into a fused `gate_up_proj`) is only representable when both
+/// halves share one quantization policy — a single quantized projection has
+/// one bits/group_size/mode. Sanitizers consult the staged policy to keep
+/// such pairs split (and reshape the module tree accordingly) whenever the
+/// halves' effective policies differ.
+///
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)``
+/// stages the checkpoint's resolved policy here before calling `sanitize`;
+/// a uniform `quantization` is staged as a table with only a default.
+public protocol QuantizationPolicyReceiving: AnyObject {
+    /// Quantization policy of the checkpoint currently being loaded, or
+    /// `nil` for unquantized checkpoints.
+    var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization? { get set }
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -162,6 +182,18 @@ public func loadWeights(
         if i == 0 || metadata.isEmpty { metadata = m }
     }
     mark("read shards (parallel)")
+
+    // Stage the checkpoint's quantization policy for sanitizers whose
+    // module-topology decisions depend on it (e.g. the Qwen3.5 routed-expert
+    // gate/up fusion, which must keep heterogeneous pairs split).
+    if let policyReceiving = model as? QuantizationPolicyReceiving {
+        policyReceiving.checkpointPerLayerQuantization =
+            perLayerQuantization
+            ?? quantization.map {
+                BaseConfiguration.PerLayerQuantization(
+                    quantization: $0, perLayerQuantization: [:])
+            }
+    }
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
