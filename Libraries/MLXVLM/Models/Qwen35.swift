@@ -302,7 +302,7 @@ public enum Qwen35VisionSeamError: Error, Equatable {
     case missingVideoGrids
     case invalidGrid(kind: String, index: Int)
     case invalidPixelRank(kind: String, actual: Int)
-    case pixelCountMismatch(expected: Int, actual: Int)
+    case pixelCountMismatch(kind: String, expected: Int, actual: Int)
     case featureCountMismatch(expected: Int, actual: Int)
 }
 
@@ -373,6 +373,7 @@ public enum Qwen35PositionSeamError: Error, Equatable {
     case attentionMaskShapeMismatch
     case multimodalBatchUnsupported(Int)
     case invalidGrid(kind: String, index: Int)
+    case visualTokenRunMismatch(kind: String, gridIndex: Int, expected: Int, actual: Int)
 }
 
 // MARK: - Language
@@ -1168,6 +1169,9 @@ public class Qwen35: Module, VLMModel {
                 throw Qwen35PositionSeamError.invalidGrid(kind: kind, index: index)
             }
         }
+        try validateVisualTokenRuns(
+            tokens: tokens, attentionMask: mask,
+            imageGrids: imageGrids ?? [], videoGrids: videoGrids ?? [], merge: merge)
 
         let (positionIds, delta) = Qwen3VLLanguage.getRopeIndex(
             inputIds: tokens,
@@ -1183,6 +1187,78 @@ public class Qwen35: Module, VLMModel {
             promptPositionIds: positionIds,
             decodeState: Qwen35PositionState(deltas: delta.asArray(Int32.self)),
             promptLength: tokens.dim(1))
+    }
+
+    private func validateVisualTokenRuns(
+        tokens: MLXArray,
+        attentionMask: MLXArray?,
+        imageGrids: [THW],
+        videoGrids: [THW],
+        merge: Int
+    ) throws {
+        guard tokens.dim(0) == 1 else { return }
+        let values = tokens[0, 0...].asArray(Int32.self).map(Int.init)
+        let maskValues = attentionMask?.asType(.int32)[0, 0...].asArray(Int32.self)
+        var imageIndex = 0
+        var videoIndex = 0
+        var cursor = 0
+
+        while cursor < values.count {
+            let visible = maskValues.map { $0[cursor] == 1 } ?? true
+            let token = values[cursor]
+            guard visible, token == config.imageTokenId || token == config.videoTokenId else {
+                cursor += 1
+                continue
+            }
+
+            let kind = token == config.imageTokenId ? "image" : "video"
+            let gridIndex = kind == "image" ? imageIndex : videoIndex
+            let grids = kind == "image" ? imageGrids : videoGrids
+            var end = cursor + 1
+            while end < values.count,
+                (maskValues.map { $0[end] == 1 } ?? true), values[end] == token
+            {
+                end += 1
+            }
+            let actual = end - cursor
+            guard gridIndex < grids.count else {
+                throw Qwen35PositionSeamError.visualTokenRunMismatch(
+                    kind: kind, gridIndex: gridIndex, expected: 0, actual: actual)
+            }
+            let expected = try mergedTokenCount(
+                grids[gridIndex], merge: merge, kind: kind, index: gridIndex)
+            guard actual == expected else {
+                throw Qwen35PositionSeamError.visualTokenRunMismatch(
+                    kind: kind, gridIndex: gridIndex, expected: expected, actual: actual)
+            }
+            if kind == "image" { imageIndex += 1 } else { videoIndex += 1 }
+            cursor = end
+        }
+
+        if imageIndex < imageGrids.count {
+            let expected = try mergedTokenCount(
+                imageGrids[imageIndex], merge: merge, kind: "image", index: imageIndex)
+            throw Qwen35PositionSeamError.visualTokenRunMismatch(
+                kind: "image", gridIndex: imageIndex, expected: expected, actual: 0)
+        }
+        if videoIndex < videoGrids.count {
+            let expected = try mergedTokenCount(
+                videoGrids[videoIndex], merge: merge, kind: "video", index: videoIndex)
+            throw Qwen35PositionSeamError.visualTokenRunMismatch(
+                kind: "video", gridIndex: videoIndex, expected: expected, actual: 0)
+        }
+    }
+
+    private func mergedTokenCount(
+        _ grid: THW, merge: Int, kind: String, index: Int
+    ) throws -> Int {
+        let (spatial, spatialOverflow) = (grid.h / merge).multipliedReportingOverflow(
+            by: grid.w / merge)
+        let (count, temporalOverflow) = grid.t.multipliedReportingOverflow(by: spatial)
+        guard !spatialOverflow, !temporalOverflow else {
+            throw Qwen35PositionSeamError.invalidGrid(kind: kind, index: index)
+        }
+        return count
     }
 
     /// Run the exact vision tower path used by `prepare`, cast its final
@@ -1242,14 +1318,29 @@ public class Qwen35: Module, VLMModel {
             pixelParts.append(videoPixels)
         }
 
-        let grids = imageGrids + videoGrids
-        let expectedPixels = grids.reduce(0) { $0 + $1.product }
-        let actualPixels = pixelParts.reduce(0) { $0 + $1.dim(0) }
-        guard expectedPixels == actualPixels else {
-            throw Qwen35VisionSeamError.pixelCountMismatch(
-                expected: expectedPixels, actual: actualPixels)
+        func validatePixels(
+            _ pixels: MLXArray?, grids: [THW], kind: String
+        ) throws {
+            var expected = 0
+            for (index, grid) in grids.enumerated() {
+                let (spatial, spatialOverflow) = grid.h.multipliedReportingOverflow(by: grid.w)
+                let (count, temporalOverflow) = grid.t.multipliedReportingOverflow(by: spatial)
+                let (total, totalOverflow) = expected.addingReportingOverflow(count)
+                guard !spatialOverflow, !temporalOverflow, !totalOverflow else {
+                    throw Qwen35VisionSeamError.invalidGrid(kind: kind, index: index)
+                }
+                expected = total
+            }
+            let actual = pixels?.dim(0) ?? 0
+            guard expected == actual else {
+                throw Qwen35VisionSeamError.pixelCountMismatch(
+                    kind: kind, expected: expected, actual: actual)
+            }
         }
+        try validatePixels(imagePixels, grids: imageGrids, kind: "image")
+        try validatePixels(videoPixels, grids: videoGrids, kind: "video")
 
+        let grids = imageGrids + videoGrids
         let textDType = languageModel.model.embedTokens(
             MLXArray([Int32(0)]).reshaped(1, 1)
         ).dtype

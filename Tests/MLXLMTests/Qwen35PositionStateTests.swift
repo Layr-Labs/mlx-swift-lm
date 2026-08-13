@@ -102,6 +102,50 @@ final class Qwen35PositionStateTests: XCTestCase {
             "request A's decode positions must still use request A's delta")
     }
 
+    func testVisualTokenRunsMustExactlyMatchOrderedGrids() throws {
+        let model = Qwen35MoE(try makeConfig())
+
+        XCTAssertThrowsError(
+            try model.positionResult(
+                tokens: MLXArray([Int32(9), 10, 10, 10, 14]),
+                imageGrids: [THW(1, 4, 4)])) { error in
+            XCTAssertEqual(
+                error as? Qwen35PositionSeamError,
+                .visualTokenRunMismatch(
+                    kind: "image", gridIndex: 0, expected: 4, actual: 3))
+        }
+        XCTAssertThrowsError(
+            try model.positionResult(
+                tokens: MLXArray([Int32(1), 2, 3]),
+                imageGrids: [THW(1, 4, 4)])) { error in
+            XCTAssertEqual(
+                error as? Qwen35PositionSeamError,
+                .visualTokenRunMismatch(
+                    kind: "image", gridIndex: 0, expected: 4, actual: 0))
+        }
+        XCTAssertThrowsError(
+            try model.positionResult(
+                tokens: MLXArray([Int32(9), 10, 10, 10, 10, 14]))) { error in
+            XCTAssertEqual(
+                error as? Qwen35PositionSeamError,
+                .visualTokenRunMismatch(
+                    kind: "image", gridIndex: 0, expected: 0, actual: 4))
+        }
+        XCTAssertThrowsError(
+            try model.positionResult(
+                tokens: MLXArray([
+                    Int32(9), 10, 10, 10, 10, 14,
+                    9, 11, 14,
+                ]),
+                imageGrids: [THW(1, 4, 4)],
+                videoGrids: [THW(2, 2, 2)])) { error in
+            XCTAssertEqual(
+                error as? Qwen35PositionSeamError,
+                .visualTokenRunMismatch(
+                    kind: "video", gridIndex: 0, expected: 2, actual: 1))
+        }
+    }
+
     func testPositionSeamDoesNotChangeLegacySerialCalls() throws {
         MLXRandom.seed(0)
         let model = Qwen35MoE(try makeConfig())

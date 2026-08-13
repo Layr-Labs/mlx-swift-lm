@@ -225,7 +225,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
 
         var admissionConfig = admissionConfig
         if let recurrent = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec {
-            guard let fixedBytes = try? recurrent.fixedBytesPerRequest() else {
+            guard let fixedBytes = try? recurrent.peakBytesPerRequest() else {
                 preconditionFailure("EngineV2: recurrent-state byte accounting overflow")
             }
             admissionConfig.fixedBytesPerRequest = fixedBytes

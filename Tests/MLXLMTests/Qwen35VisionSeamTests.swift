@@ -108,6 +108,33 @@ final class Qwen35VisionSeamTests: XCTestCase {
             "ordered slices must reconstruct the exact flattened prepare features")
     }
 
+    func testMixedMediaPixelCountsAreValidatedPerKind() throws {
+        let model = Qwen35MoE(try makeConfig())
+        let imagePixels = MLXArray([Float(1), 2, 3]).reshaped(3, 1)
+        let videoPixels = MLXArray([Float(4), 5, 6]).reshaped(3, 1)
+
+        XCTAssertThrowsError(
+            try model.visionFeatures(
+                imagePixels: imagePixels,
+                imageGrids: [THW(1, 1, 2)],
+                videoPixels: videoPixels,
+                videoGrids: [THW(1, 1, 4)])) { error in
+            XCTAssertEqual(
+                error as? Qwen35VisionSeamError,
+                .pixelCountMismatch(kind: "image", expected: 2, actual: 3))
+        }
+        XCTAssertThrowsError(
+            try model.visionFeatures(
+                imagePixels: MLXArray([Float(1), 2]).reshaped(2, 1),
+                imageGrids: [THW(1, 1, 2)],
+                videoPixels: videoPixels,
+                videoGrids: [THW(1, 1, 4)])) { error in
+            XCTAssertEqual(
+                error as? Qwen35VisionSeamError,
+                .pixelCountMismatch(kind: "video", expected: 4, actual: 3))
+        }
+    }
+
     func testLegacyPrepareStillAcceptsMixedMedia() throws {
         MLXRandom.seed(2)
         let model = Qwen35MoE(try makeConfig())

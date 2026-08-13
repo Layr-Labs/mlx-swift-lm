@@ -2738,7 +2738,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // assistant KV, and external carve-outs, so it is the reserved-byte
         // authority and must not be combined with those components again.
         let recurrentBytes = recurrentStates.values.reduce(0) { total, state in
-            let (sum, overflow) = total.addingReportingOverflow(state.byteCount)
+            let (sum, overflow) = total.addingReportingOverflow(state.materializedByteCount)
             return overflow ? Int.max : sum
         }
         let detachedAssistantStates = inFlight?.mtpRound?.verify?.rows.compactMap(

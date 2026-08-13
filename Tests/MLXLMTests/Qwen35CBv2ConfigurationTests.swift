@@ -53,6 +53,7 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
 
         XCTAssertEqual(spec.layers.count, 30)
         XCTAssertEqual(try spec.fixedBytesPerRequest(), 64_389_120)
+        XCTAssertEqual(try spec.peakBytesPerRequest(), 193_167_360)
         XCTAssertTrue(spec.layers.allSatisfy { $0.convShape == [1, 3, 8192] })
         XCTAssertTrue(spec.layers.allSatisfy { $0.convDType == .bfloat16 })
         XCTAssertTrue(spec.layers.allSatisfy { $0.ssmShape == [1, 32, 128, 128] })

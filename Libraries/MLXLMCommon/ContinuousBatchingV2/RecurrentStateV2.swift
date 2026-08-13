@@ -74,6 +74,10 @@ public enum CBv2RecurrentStateError: Error, Equatable {
 
 /// Complete fixed-residency description for one request.
 public struct CBv2RecurrentStateSpec: Sendable, Equatable {
+    /// One committed generation plus the two pending generations retained by
+    /// chained decode and serial MTP verification before finalization.
+    public static let maximumLiveGenerations = 3
+
     public let layers: [CBv2RecurrentLayerStateSpec]
 
     public init(layers: [CBv2RecurrentLayerStateSpec]) {
@@ -101,6 +105,13 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
             total = newTotal
         }
         return total
+    }
+
+    public func peakBytesPerRequest() throws -> Int {
+        let (bytes, overflow) = try fixedBytesPerRequest().multipliedReportingOverflow(
+            by: Self.maximumLiveGenerations)
+        guard !overflow else { throw CBv2RecurrentStateError.byteCountOverflow }
+        return bytes
     }
 
     public var modelLayerIndices: [Int] { layers.map(\.modelLayerIndex) }
@@ -135,6 +146,11 @@ public struct CBv2RecurrentLayerState {
 public final class CBv2RecurrentRequestState {
     public let spec: CBv2RecurrentStateSpec
     public let byteCount: Int
+    public var materializedByteCount: Int {
+        let generations = (committed.isEmpty ? 0 : 1) + pending.count
+        let (bytes, overflow) = byteCount.multipliedReportingOverflow(by: generations)
+        return overflow ? Int.max : bytes
+    }
 
     private struct Generation {
         let id: UInt64

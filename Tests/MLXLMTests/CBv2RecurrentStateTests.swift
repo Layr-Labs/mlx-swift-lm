@@ -170,12 +170,16 @@ final class CBv2RecurrentStateTests: XCTestCase {
 
     func testChainedOneTokenRollbackRestoresExactPriorState() throws {
         let state = try CBv2RecurrentRequestState(spec: oneLayerSpec)
+        XCTAssertEqual(state.materializedByteCount, 0)
         try stage(1, on: state).commit()
+        XCTAssertEqual(state.materializedByteCount, state.byteCount)
 
         let accepted = try stage(2, on: state)
         let speculative = try stage(3, on: state)
+        XCTAssertEqual(state.materializedByteCount, 3 * state.byteCount)
         try accepted.commit()
         try speculative.rollback()
+        XCTAssertEqual(state.materializedByteCount, state.byteCount)
 
         let restored = state.state(modelLayerIndex: 0)!
         XCTAssertEqual(scalar(restored.conv), 2)
@@ -184,25 +188,25 @@ final class CBv2RecurrentStateTests: XCTestCase {
         XCTAssertTrue(state.isReleased)
     }
 
-    func testAdmissionChargesFixedStateOnceAndReleaseRestoresCapacity() throws {
+    func testAdmissionChargesPeakRecurrentStateAndReleaseRestoresCapacity() throws {
         let kind = CBv2LayerKind(
             attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
         let admission = AdmissionV2(
-            layerKinds: [kind], bytesCapacity: 216,
+            layerKinds: [kind], bytesCapacity: 416,
             config: .init(
                 watermarkFraction: 0, elementBytes: 2,
-                fixedBytesPerRequest: 100))
+                fixedBytesPerRequest: 300))
 
-        XCTAssertEqual(admission.estimatedBytes(forTokens: 4), 116)
+        XCTAssertEqual(admission.estimatedBytes(forTokens: 4), 316)
         XCTAssertFalse(admission.canEverFit(promptTokens: 30, maxTokens: 0))
         try admission.reserve(id: CBv2RequestID(1), additionalTokens: 4)
-        XCTAssertEqual(admission.bytesReserved, 116)
+        XCTAssertEqual(admission.bytesReserved, 316)
         XCTAssertThrowsError(
             try admission.reserve(id: CBv2RequestID(2), additionalTokens: 1))
         admission.releaseAll(id: CBv2RequestID(1))
         XCTAssertEqual(admission.bytesReserved, 0)
         try admission.reserve(id: CBv2RequestID(2), additionalTokens: 1)
-        XCTAssertEqual(admission.bytesReserved, 104)
+        XCTAssertEqual(admission.bytesReserved, 304)
         admission.releaseAll(id: CBv2RequestID(2))
     }
 
@@ -210,10 +214,10 @@ final class CBv2RecurrentStateTests: XCTestCase {
         let kind = CBv2LayerKind(
             attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
         let admission = AdmissionV2(
-            layerKinds: [kind], bytesCapacity: 208,
+            layerKinds: [kind], bytesCapacity: 608,
             config: .init(
                 watermarkFraction: 0, elementBytes: 2,
-                fixedBytesPerRequest: 100))
+                fixedBytesPerRequest: 300))
         let scheduler = SchedulerV2(
             config: .init(
                 maxConcurrentRequests: 2,
@@ -232,12 +236,12 @@ final class CBv2RecurrentStateTests: XCTestCase {
 
         let first = scheduler.plan()
         XCTAssertEqual(first.assignments.count, 2)
-        XCTAssertEqual(admission.bytesReserved, 208)
+        XCTAssertEqual(admission.bytesReserved, 608)
 
         let second = scheduler.plan()
         XCTAssertEqual(second.preemptions, [CBv2RequestID(2)])
         XCTAssertEqual(second.assignments.map(\.id), [CBv2RequestID(1)])
-        XCTAssertEqual(admission.bytesReserved, 108)
+        XCTAssertEqual(admission.bytesReserved, 308)
         admission.releaseAll(id: CBv2RequestID(1))
         XCTAssertEqual(admission.bytesReserved, 0)
     }
