@@ -2741,6 +2741,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             let (sum, overflow) = total.addingReportingOverflow(state.byteCount)
             return overflow ? Int.max : sum
         }
+        let detachedAssistantStates = inFlight?.mtpRound?.verify?.rows.compactMap(
+            \.assistantState) ?? []
+        let assistantBytes = mtp?.materializedAssistantBytes(
+            detachedStates: detachedAssistantStates) ?? 0
         let reservedBytes: Int
         if let admission = capacity as? AdmissionV2 {
             reservedBytes = admission.snapshot(
@@ -2756,7 +2760,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
                 waitingRequests: scheduler.waitingCount,
-                kvBytesInUse: Self.saturatingAdd(backend.bytesInUse, recurrentBytes),
+                kvBytesInUse: Self.saturatingAdd(
+                    Self.saturatingAdd(backend.bytesInUse, recurrentBytes), assistantBytes),
                 kvBytesCapacity: capacity?.bytesCapacity ?? backend.bytesCapacity,
                 kvBytesBackendCapacity: backend.bytesCapacity,
                 kvBytesReserved: reservedBytes,

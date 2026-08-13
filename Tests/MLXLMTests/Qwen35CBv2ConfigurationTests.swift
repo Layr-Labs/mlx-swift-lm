@@ -99,6 +99,22 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
                 capabilities: capability, backend: PagedIdentityBackend()))
     }
 
+    func testOuterConfigurationDelegatesCapabilitiesToTextConfig() throws {
+        let text = try configuration()
+        let textObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(text)) as? [String: Any])
+        let root: [String: Any] = [
+            "model_type": "qwen3_5_moe",
+            "text_config": textObject,
+        ]
+        let outer = try JSONDecoder().decode(
+            Qwen35Configuration.self,
+            from: JSONSerialization.data(withJSONObject: root))
+
+        XCTAssertEqual(outer.cbv2Capabilities, outer.textConfig.cbv2Capabilities)
+        XCTAssertTrue(outer.cbv2Capabilities.supportsMTP)
+    }
+
     func testOverflowingRecurrentShapeFailsClosed() {
         let spec = CBv2RecurrentStateSpec(layers: [
             CBv2RecurrentLayerStateSpec(

@@ -416,6 +416,12 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         var stagedInputs = 0
         var committedInputCount: Int { (caches.first?.offset ?? 0) - stagedInputs }
         var stagedInputCount: Int { stagedInputs }
+        var materializedBytes: Int {
+            caches.flatMap { $0.innerState() }.reduce(0) { total, array in
+                let (next, overflow) = total.addingReportingOverflow(array.nbytes)
+                return overflow ? Int.max : next
+            }
+        }
 
         init(caches: [any KVCache]) { self.caches = caches }
     }

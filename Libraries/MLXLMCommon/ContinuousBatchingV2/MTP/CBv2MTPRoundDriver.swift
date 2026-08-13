@@ -234,7 +234,7 @@ final class CBv2MTPRoundDriver {
         let recurrent = model is any CBv2RecurrentMTPSteppableModel
         let captureLayers = mtpModel.mtpCaptureLayers
         guard (stateful && recurrent && mtpModel.supportsRequestStatefulMTP)
-            || (!stateful && captureLayers != nil)
+            || (!stateful && !recurrent && captureLayers != nil)
         else { return nil }
         guard let modelTarget = mtpModel.mtpTargetIdentity,
             let drafterTarget = drafter.mtpTargetIdentity,
@@ -406,6 +406,19 @@ final class CBv2MTPRoundDriver {
         _ id: CBv2RequestID
     ) -> (committed: Int, staged: Int)? {
         assistantStates[id].map { ($0.committedInputCount, $0.stagedInputCount) }
+    }
+
+    func materializedAssistantBytes(
+        detachedStates: [any CBv2MTPRequestState] = []
+    ) -> Int {
+        var seen = Set<ObjectIdentifier>()
+        var total = 0
+        for state in Array(assistantStates.values) + detachedStates {
+            guard seen.insert(ObjectIdentifier(state)).inserted else { continue }
+            let (next, overflow) = total.addingReportingOverflow(state.materializedBytes)
+            total = overflow ? Int.max : next
+        }
+        return total
     }
 
     var usesRequestStatefulDrafter: Bool {

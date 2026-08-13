@@ -42,7 +42,7 @@ public struct Qwen35Configuration: Codable, Sendable {
         textConfig.cbv2RecurrentStateSpec(activationDType: activationDType)
     }
 
-    public var cbv2Capabilities: CBv2ModelCapabilities { .initialRecurrentTarget }
+    public var cbv2Capabilities: CBv2ModelCapabilities { textConfig.cbv2Capabilities }
 }
 
 public class Qwen35MoEModel: Qwen35Model {

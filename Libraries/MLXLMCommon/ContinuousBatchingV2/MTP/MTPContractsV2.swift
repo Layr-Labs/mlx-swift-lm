@@ -216,6 +216,12 @@ extension CBv2MTPDrafter {
 public protocol CBv2MTPRequestState: AnyObject {
     var committedInputCount: Int { get }
     var stagedInputCount: Int { get }
+    /// Actual materialized device-array residency currently owned by this state.
+    var materializedBytes: Int { get }
+}
+
+extension CBv2MTPRequestState {
+    public var materializedBytes: Int { 0 }
 }
 
 /// Alternate drafter seam for autoregressive assistants such as Qwen3.5/3.6.

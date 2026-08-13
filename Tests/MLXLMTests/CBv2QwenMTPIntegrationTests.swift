@@ -7,6 +7,7 @@ import Testing
 private final class QwenMTPFixtureState: CBv2MTPRequestState {
     var committedInputCount = 0
     var stagedInputCount = 0
+    var materializedBytes = 0
 }
 
 private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
@@ -260,6 +261,14 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 257) == 5_132)
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 511) == 6_148)
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 512) == 8_200)
+        let state = QwenMTPFixtureState()
+        state.materializedBytes = 1_234
+        driver.restoreAssistantState(state, for: CBv2RequestID(403))
+        #expect(driver.materializedAssistantBytes() == 1_234)
+        let detached = QwenMTPFixtureState()
+        detached.materializedBytes = 321
+        #expect(driver.materializedAssistantBytes(detachedStates: [state, detached]) == 1_555)
+        driver.invalidateCarry(CBv2RequestID(403))
         let id = CBv2RequestID(404)
         try engine.admissionForTesting.reserve(id: id, additionalTokens: 3)
         engine.loopForTesting.onEngineQueueSync {
@@ -293,6 +302,26 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(engine.mtpMetricsSnapshot() == nil)
         #expect(engine.mtpInactiveReason != nil)
         await engine.shutdown()
+    }
+
+    @Test("recurrent targets reject non-stateful drafters")
+    func nonStatefulDrafterFallback() {
+        final class FrozenDrafter: CBv2MTPDrafter {
+            final class Prepared: CBv2MTPPreparedCapture {}
+            let target: ObjectIdentifier
+            init(_ target: AnyObject) { self.target = ObjectIdentifier(target) }
+            var mtpTargetIdentity: ObjectIdentifier? { target }
+            func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { Prepared() }
+            func draftStep(
+                tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
+            ) -> (tokens: MLXArray, hidden: MLXArray) { (tokens, hidden) }
+        }
+
+        let model = QwenMTPFixtureModel()
+        #expect(
+            CBv2MTPRoundDriver.build(
+                model: model, drafter: FrozenDrafter(model),
+                config: .init(enabled: true, fixedDraftTokens: 1)) == nil)
     }
 
     @Test("accepted and rejected drafts preserve target token authority and state")
