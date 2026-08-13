@@ -212,6 +212,19 @@ final class CBv2MTPRoundDriver {
         if let maximum = drafter.maximumSpeculativeBatch {
             config.maxSpeculativeBatch = min(config.maxSpeculativeBatch, max(1, maximum))
         }
+        let requestStatefulRecurrent =
+            drafter is any CBv2MTPRequestStatefulDrafter
+            && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
+        if requestStatefulRecurrent {
+            // This implementation builds one request-local assistant proposal
+            // and one recurrent target transaction per serial column. Enforce
+            // that proven shape here instead of relying on later preconditions.
+            config.verificationMode = .serialTarget
+            config.maxAutomaticRectangularTokens = 0
+            config.maxDraftTokens = 1
+            config.fixedDraftTokens = 1
+            config.maxSpeculativeBatch = 1
+        }
         self.config = config
         self.drafter = drafter
         self.model = model

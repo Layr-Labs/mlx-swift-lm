@@ -529,7 +529,8 @@ final class Qwen35Attention: Module {
             maxPositionEmbeddings: args.maxPositionEmbeddings
         )
         self.mrope = Qwen35MRoPE(
-            dim: max(1, ropeDims), base: args.ropeTheta,
+            rope: self.rope, dim: max(1, ropeDims), base: args.ropeTheta,
+            scalingConfig: args.ropeScaling,
             sections: args.mropeSection)
 
         super.init()
@@ -608,17 +609,48 @@ final class Qwen35Attention: Module {
 /// Qwen3.5 interleaved 3-axis M-RoPE. Request positions arrive as function
 /// inputs; the module retains configuration only.
 final class Qwen35MRoPE {
-    private let invFreq: MLXArray
+    private let rope: RoPELayer
+    private let rotaryDim: Int
+    private let defaultInvFreq: MLXArray?
     private let sections: [Int]
 
-    init(dim: Int, base: Float, sections: [Int]) {
-        var frequency = MLXArray(stride(from: 0, to: max(1, dim), by: 2)).asType(.float32)
-        frequency = frequency / Float(max(1, dim))
-        self.invFreq = 1 / pow(MLXArray(base), frequency)
+    init(
+        rope: RoPELayer, dim: Int, base: Float,
+        scalingConfig: [String: StringOrNumber]?, sections: [Int]
+    ) {
+        self.rope = rope
+        self.rotaryDim = max(1, dim)
+        let ropeType: String = {
+            if let value = scalingConfig?["type"] ?? scalingConfig?["rope_type"],
+                case .string(let type) = value
+            {
+                return type
+            }
+            return "default"
+        }()
+        if ropeType == "default" || ropeType == "mrope" {
+            let exponents = MLXArray(stride(from: 0, to: self.rotaryDim, by: 2))
+                .asType(.float32) / Float(self.rotaryDim)
+            self.defaultInvFreq = 1 / pow(MLXArray(base), exponents)
+        } else {
+            self.defaultInvFreq = nil
+        }
         self.sections = sections.count >= 3 ? sections : [11, 11, 10]
     }
 
-    private func frequencies(positionIds: MLXArray, dtype: DType) -> (MLXArray, MLXArray) {
+    private func axis(forFrequency index: Int, frequencyCount: Int) -> Int {
+        for (axis, offset) in [(1, 1), (2, 2)] {
+            let length = min(sections[axis] * 3, frequencyCount)
+            if index >= offset && index < length && (index - offset) % 3 == 0 {
+                return axis
+            }
+        }
+        return 0
+    }
+
+    func apply(
+        queries: MLXArray, keys: MLXArray, positionIds: MLXArray
+    ) -> (MLXArray, MLXArray) {
         var positions = positionIds
         if positions.ndim == 2 {
             positions = broadcast(
@@ -626,47 +658,67 @@ final class Qwen35MRoPE {
                 to: [3, positions.dim(0), positions.dim(1)])
         }
         precondition(positions.ndim == 3 && positions.dim(0) == 3)
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
-            * invFreq.asType(.float32)[.newAxis, .newAxis, .newAxis, 0...]
-        let temporal = all[0, 0..., 0..., 0...]
-        var selected: [MLXArray] = []
-        selected.reserveCapacity(temporal.dim(-1))
-        for index in 0 ..< temporal.dim(-1) {
-            var value = temporal[0..., 0..., index]
-            for (axis, offset) in [(1, 1), (2, 2)] {
-                let length = min(sections[axis] * 3, temporal.dim(-1))
-                if index >= offset && index < length && (index - offset) % 3 == 0 {
-                    value = all[axis, 0..., 0..., index]
-                    break
-                }
-            }
-            selected.append(value)
-        }
-        let frequency = stacked(selected, axis: -1)
-        let embedding = concatenated([frequency, frequency], axis: -1)
-        return (cos(embedding).asType(dtype), sin(embedding).asType(dtype))
-    }
+        precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
-    func apply(
-        queries: MLXArray, keys: MLXArray, positionIds: MLXArray
-    ) -> (MLXArray, MLXArray) {
-        let (cosine, sine) = frequencies(positionIds: positionIds, dtype: queries.dtype)
-        let cos = cosine.expandedDimensions(axis: 1)
-        let sin = sine.expandedDimensions(axis: 1)
-        let rotaryDim = cos.dim(-1)
-        func rotateHalf(_ value: MLXArray) -> MLXArray {
-            let half = value.dim(-1) / 2
-            return concatenated(
-                [-value[.ellipsis, half...], value[.ellipsis, ..<half]], axis: -1)
+        if let defaultInvFreq {
+            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+                * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
+            var selected: [MLXArray] = []
+            let frequencyCount = rotaryDim / 2
+            selected.reserveCapacity(frequencyCount)
+            for index in 0 ..< frequencyCount {
+                selected.append(
+                    all[axis(forFrequency: index, frequencyCount: frequencyCount),
+                        0..., 0..., index])
+            }
+            let frequency = stacked(selected, axis: -1)
+            let angles = concatenated([frequency, frequency], axis: -1)
+            let cosine = cos(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+            let sine = sin(angles).asType(queries.dtype).expandedDimensions(axis: 1)
+            func applyDefault(_ value: MLXArray) -> MLXArray {
+                let rotating = value[.ellipsis, ..<rotaryDim]
+                let half = rotating.dim(-1) / 2
+                let rotatedHalf = concatenated(
+                    [-rotating[.ellipsis, half...], rotating[.ellipsis, ..<half]], axis: -1)
+                let rotated = rotating * cosine + rotatedHalf * sine
+                return rotaryDim < value.dim(-1)
+                    ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
+                    : rotated
+            }
+            return (applyDefault(queries), applyDefault(keys))
         }
-        func applyOne(_ value: MLXArray) -> MLXArray {
-            let rotating = value[.ellipsis, ..<rotaryDim]
-            let rotated = rotating * cos + rotateHalf(rotating) * sin
-            return rotaryDim < value.dim(-1)
-                ? concatenated([rotated, value[.ellipsis, rotaryDim...]], axis: -1)
-                : rotated
+
+        let queryHeads = queries.dim(1)
+        let combined = concatenated([queries, keys], axis: 1)
+        let batch = combined.dim(0)
+        let heads = combined.dim(1)
+        let length = combined.dim(2)
+        let headDim = combined.dim(3)
+        let flattened = combined.transposed(0, 2, 1, 3)
+            .reshaped([batch * length, heads, 1, headDim])
+        let byAxis = (0 ..< 3).map { axis in
+            rope(flattened, offset: positions[axis, 0..., 0...].flattened())
+                .reshaped([batch, length, heads, headDim])
+                .transposed(0, 2, 1, 3)
         }
-        return (applyOne(queries), applyOne(keys))
+        let frequencyCount = rotaryDim / 2
+        var firstHalf: [MLXArray] = []
+        var secondHalf: [MLXArray] = []
+        firstHalf.reserveCapacity(frequencyCount)
+        secondHalf.reserveCapacity(frequencyCount)
+        for index in 0 ..< frequencyCount {
+            let rotated = byAxis[axis(forFrequency: index, frequencyCount: frequencyCount)]
+            firstHalf.append(rotated[.ellipsis, index ..< index + 1])
+            secondHalf.append(
+                rotated[.ellipsis, frequencyCount + index ..< frequencyCount + index + 1])
+        }
+        var result = concatenated(firstHalf + secondHalf, axis: -1)
+        if rotaryDim < combined.dim(-1) {
+            result = concatenated([result, combined[.ellipsis, rotaryDim...]], axis: -1)
+        }
+        return (
+            result[0..., ..<queryHeads, 0..., 0...],
+            result[0..., queryHeads..., 0..., 0...])
     }
 }
 
@@ -1053,6 +1105,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         return weights
     }
+}
+
+extension Qwen35TextModel: CBv2PositionAxisProviding {
+    public var cbv2PositionAxisCount: Int? { 3 }
 }
 
 extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,

@@ -112,6 +112,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let loopConfig: CBv2EngineLoopConfig
     private let gauges: CBv2EngineGauges
     private let layerKinds: [CBv2LayerKind]
+    private let requiredPositionAxisCount: Int?
     private let samplerSupportsTokenConstraints: Bool
     /// Non-nil only when active (instance supplied AND
     /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
@@ -182,6 +183,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
+        self.requiredPositionAxisCount =
+            (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
         self.backend = backend
         self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints
         let modelCapabilities =
@@ -375,6 +378,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             guard request.multimodal != nil else {
                 throw CBv2MultimodalError.invalidSpans(
                     "explicit model positions require multimodal input")
+            }
+            if let requiredAxes = requiredPositionAxisCount,
+                positions.axisCount != requiredAxes
+            {
+                throw CBv2MultimodalError.invalidSpans(
+                    "position axes \(positions.axisCount) != model axes \(requiredAxes)")
             }
         }
         if request.multimodal?.attention == .causal, request.positionState == nil {

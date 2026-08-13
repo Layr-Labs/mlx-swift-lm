@@ -86,7 +86,8 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
 }
 
 private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
-    CBv2PositionedRecurrentSteppableModel, CBv2PositionedMultimodalSteppableModel
+    CBv2PositionedRecurrentSteppableModel, CBv2PositionedMultimodalSteppableModel,
+    CBv2PositionAxisProviding
 {
     let cbv2Capabilities = CBv2ModelCapabilities(
         supportsPrefixReuse: false, supportsPagedKV: false,
@@ -101,6 +102,7 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
     let mtpCaptureLayers: CBv2MTPCaptureLayers? = .init(full: 0, sliding: 0)
     var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(self) }
     var supportsRequestStatefulMTP: Bool { true }
+    var cbv2PositionAxisCount: Int? { 3 }
     private(set) var hiddenPositionIDs: [[Int32]] = []
 
     func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
@@ -207,7 +209,8 @@ private final class QwenMTPIncompatibleTarget: QwenMTPFixtureModel {
 @Suite("CBv2 Qwen-style request-stateful MTP", .serialized)
 struct CBv2QwenMTPIntegrationTests {
     private func engine(
-        correctionOffset: Int, enabled: Bool = true
+        correctionOffset: Int, enabled: Bool = true,
+        mtpConfig: CBv2MTPConfig? = nil
     ) -> (EngineV2, QwenMTPFixtureDrafter) {
         let model = QwenMTPFixtureModel()
         let drafter = QwenMTPFixtureDrafter(
@@ -228,7 +231,7 @@ struct CBv2QwenMTPIntegrationTests {
                     prefillChunkSize: 8, maxWaiting: 4),
                 admissionConfig: .init(watermarkFraction: 0),
                 mtpDrafter: enabled ? drafter : nil,
-                mtpConfig: .init(
+                mtpConfig: mtpConfig ?? .init(
                     enabled: enabled, maxDraftTokens: 7,
                     maxSpeculativeBatch: 8, fixedDraftTokens: 7,
                     verificationMode: .rectangular,
@@ -305,6 +308,28 @@ struct CBv2QwenMTPIntegrationTests {
         await engine.shutdown()
     }
 
+    @Test("default and zero caller policies are forced to serial B1 depth one")
+    func forcedDefaultAndZeroPolicy() async throws {
+        let configs = [
+            CBv2MTPConfig(enabled: true),
+            CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 7, maxSpeculativeBatch: 8,
+                fixedDraftTokens: 0, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 64),
+        ]
+        for (index, config) in configs.enumerated() {
+            let (engine, _) = engine(correctionOffset: 0, mtpConfig: config)
+            let driver = try #require(engine.loopForTesting.mtp)
+            #expect(driver.config.verificationMode == .serialTarget)
+            #expect(driver.config.maxAutomaticRectangularTokens == 0)
+            #expect(driver.config.maxDraftTokens == 1)
+            #expect(driver.config.fixedDraftTokens == 1)
+            #expect(driver.config.maxSpeculativeBatch == 1)
+            _ = try await run(engine, id: UInt64(500 + index))
+            await engine.shutdown()
+        }
+    }
+
     @Test("recurrent targets reject non-stateful drafters")
     func nonStatefulDrafterFallback() {
         final class FrozenDrafter: CBv2MTPDrafter {
@@ -323,6 +348,26 @@ struct CBv2QwenMTPIntegrationTests {
             CBv2MTPRoundDriver.build(
                 model: model, drafter: FrozenDrafter(model),
                 config: .init(enabled: true, fixedDraftTokens: 1)) == nil)
+    }
+
+    @Test("incompatible Qwen position axes fail before model execution")
+    func incompatiblePositionAxesRejected() async {
+        let (engine, _) = engine(correctionOffset: 0)
+        let positions = CBv2PositionState(
+            promptPositionIds: MLXArray.zeros([2, 1, 3], dtype: .int32),
+            decodeDeltas: [0])
+        let media = CBv2MultimodalInput(
+            spans: [CBv2ImageSpan(tokenOffset: 1, length: 1)],
+            attention: .causal,
+            positionState: positions,
+            embeddings: { [MLXArray.zeros([1, 1, 1])] })
+        #expect(throws: CBv2MultimodalError.self) {
+            _ = try engine.submit(
+                CBv2Request(
+                    id: CBv2RequestID(506), promptTokens: [1, 2, 3], maxTokens: 1,
+                    multimodal: media, positionState: positions))
+        }
+        await engine.shutdown()
     }
 
     @Test("accepted and rejected drafts preserve target token authority and state")
@@ -437,6 +482,14 @@ struct CBv2QwenMTPIntegrationTests {
         for await event in stream {
             switch event {
             case .delta:
+                let admission = engine.admissionForTesting
+                let target = admission.targetBytesReserved(
+                    partitionedBy: Set(engine.loopForTesting.kvStates.keys))
+                let expected = max(
+                    engine.loopForTesting.backend.bytesReserved, target.materialized)
+                    + target.unmaterialized + admission.nonBackendBytesReserved
+                #expect(engine.loopForTesting.backend.bytesReserved > target.materialized)
+                #expect(engine.capacity().kvBytesReserved == expected)
                 engine.cancel(request.id)
             case .finished(let reason, _):
                 finish = reason

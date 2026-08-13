@@ -2734,9 +2734,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         // overwritten with pool truth and re-advertise capacity that
         // admission rejects); backend truth is the fallback only for
         // ledger-less (bare-loop test) constructions. The installed admission
-        // ledger already includes target KV, recurrent fixed residency,
-        // assistant KV, and external carve-outs, so it is the reserved-byte
-        // authority and must not be combined with those components again.
+        // ledger includes target KV, recurrent fixed residency, assistant KV,
+        // and external carve-outs. The backend can hold a larger target-only
+        // promise (for example contiguous prompt + initial growth slack), so
+        // reconcile that target promise with the ledger's non-backend portion
+        // and take the larger complete obligation.
         let recurrentBytes = recurrentStates.values.reduce(0) { total, state in
             let (sum, overflow) = total.addingReportingOverflow(state.materializedByteCount)
             return overflow ? Int.max : sum
@@ -2747,12 +2749,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             detachedStates: detachedAssistantStates) ?? 0
         let reservedBytes: Int
         if let admission = capacity as? AdmissionV2 {
-            reservedBytes = admission.snapshot(
-                activeRequests: scheduler.runningCount,
-                waitingRequests: scheduler.waitingCount,
-                activeTokens: scheduler.activeTokens,
-                backendBytesInUse: backend.bytesInUse
-            ).kvBytesReserved
+            let target = admission.targetBytesReserved(
+                partitionedBy: Set(kvStates.keys))
+            let materializedTarget = max(backend.bytesReserved, target.materialized)
+            reservedBytes = Self.saturatingAdd(
+                Self.saturatingAdd(materializedTarget, target.unmaterialized),
+                admission.nonBackendBytesReserved)
         } else {
             reservedBytes = Self.saturatingAdd(backend.bytesReserved, recurrentBytes)
         }

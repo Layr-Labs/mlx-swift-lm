@@ -43,6 +43,12 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
+    public var cbv2PositionAxisCount: Int? {
+        (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
+    }
+}
+
 // MARK: - Request-owned recurrent state
 
 extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentSteppableModel {

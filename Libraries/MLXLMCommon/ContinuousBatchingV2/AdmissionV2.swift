@@ -339,13 +339,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     private func estimatedBytesChecked(forTokens tokens: Int) -> Int? {
         guard tokens > 0 else { return 0 }
-        var total = fixedBytesPerRequest
-        guard let paddedTokens = Self.add(tokens, auxiliaryTokenAllocationPadding),
-            let auxiliaryTokens = Self.roundUp(paddedTokens, to: auxiliaryTokenGranularity),
-            let auxiliary = Self.multiply(auxiliaryTokens, auxiliaryBytesPerToken),
-            let totalWithAuxiliary = Self.add(total, auxiliary)
-        else { return nil }
-        total = totalWithAuxiliary
+        guard var total = nonBackendBytesChecked(forTokens: tokens) else { return nil }
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
             let retained: Int
             switch kind.attention {
@@ -361,6 +355,16 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             else { return nil }
             total = newTotal
         }
+        return total
+    }
+
+    private func nonBackendBytesChecked(forTokens tokens: Int) -> Int? {
+        guard tokens > 0 else { return 0 }
+        guard let paddedTokens = Self.add(tokens, auxiliaryTokenAllocationPadding),
+            let auxiliaryTokens = Self.roundUp(paddedTokens, to: auxiliaryTokenGranularity),
+            let auxiliary = Self.multiply(auxiliaryTokens, auxiliaryBytesPerToken),
+            let total = Self.add(fixedBytesPerRequest, auxiliary)
+        else { return nil }
         return total
     }
 
@@ -618,6 +622,58 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return ledgerBytes
+    }
+
+    /// Live obligations the KV backend does not own: fixed recurrent state,
+    /// block-rounded assistant state, and the external compiled-decode carve.
+    /// Gauge publication adds this once after reconciling backend target-KV
+    /// promises with the materialized and waiting target ledger partitions.
+    public var nonBackendBytesReserved: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        var total = externalReserveBytes
+        for tokens in reservedTokens.values where tokens > 0 {
+            guard let bytes = nonBackendBytesChecked(forTokens: tokens),
+                let next = Self.add(total, bytes)
+            else { return Int.max }
+            total = next
+        }
+        return total
+    }
+
+    /// Target-KV ledger split by whether the engine has already materialized
+    /// that request's backend rows. Materialized target charges overlap the
+    /// backend reservation; unmaterialized charges do not and remain additive.
+    public func targetBytesReserved(
+        partitionedBy materializedIDs: Set<CBv2RequestID>
+    ) -> (materialized: Int, unmaterialized: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        var materialized = 0
+        var unmaterialized = 0
+        let ids = Set(reservedTokens.keys).union(reservedExactBytes.keys)
+        for id in ids {
+            let tokens = reservedTokens[id] ?? 0
+            guard let allocated = allocatedBytesChecked(forTokens: tokens),
+                let nonBackend = nonBackendBytesChecked(forTokens: tokens)
+            else { return (Int.max, Int.max) }
+            let (target, subtractionOverflow) = allocated.subtractingReportingOverflow(nonBackend)
+            let (withExact, exactOverflow) = target.addingReportingOverflow(
+                reservedExactBytes[id] ?? 0)
+            guard !subtractionOverflow, !exactOverflow else { return (Int.max, Int.max) }
+            if materializedIDs.contains(id) {
+                guard let next = Self.add(materialized, withExact) else {
+                    return (Int.max, Int.max)
+                }
+                materialized = next
+            } else {
+                guard let next = Self.add(unmaterialized, withExact) else {
+                    return (Int.max, Int.max)
+                }
+                unmaterialized = next
+            }
+        }
+        return (materialized, unmaterialized)
     }
 
     public func snapshot(

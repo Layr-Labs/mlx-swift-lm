@@ -78,6 +78,8 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
         XCTAssertEqual(originalIndices, [3, 7])
         XCTAssertEqual(caches.map(\.layerIndex), [3, 7])
         XCTAssertEqual(caches.map { $0.kind.modelLayerIndex }, [3, 7])
+        XCTAssertEqual(
+            CBv2SteppableLanguageModelAdapter(model).cbv2PositionAxisCount, 3)
     }
 
     func testInitialAdapterCapabilitiesFailClosed() throws {
@@ -114,6 +116,76 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
 
         XCTAssertEqual(outer.cbv2Capabilities, outer.textConfig.cbv2Capabilities)
         XCTAssertTrue(outer.cbv2Capabilities.supportsMTP)
+    }
+
+    func testMRoPEUsesConfiguredLinearScaling() {
+        let scaling: [String: StringOrNumber] = [
+            "type": .string("linear"),
+            "factor": .float(2),
+        ]
+        let rope = initializeRope(
+            dims: 8, base: 10_000, traditional: false,
+            scalingConfig: scaling, maxPositionEmbeddings: 128)
+        let mrope = Qwen35MRoPE(
+            rope: rope, dim: 8, base: 10_000, scalingConfig: scaling,
+            sections: [2, 1, 1])
+        let value = MLXArray(Array(0 ..< 16).map(Float.init)).reshaped([1, 1, 2, 8])
+        let scalarPositions = MLXArray([Int32(3), 7]).reshaped([1, 2])
+        let positions = broadcast(scalarPositions[.newAxis, 0..., 0...], to: [3, 1, 2])
+
+        let expected = rope(
+            value.transposed(0, 2, 1, 3).reshaped([2, 1, 1, 8]),
+            offset: scalarPositions.flattened()
+        ).reshaped([1, 2, 1, 8]).transposed(0, 2, 1, 3)
+        let actual = mrope.apply(
+            queries: value, keys: value, positionIds: positions).0
+        eval(expected, actual)
+        XCTAssertTrue(allClose(expected, actual, rtol: 0, atol: 0).item(Bool.self))
+    }
+
+    func testDefaultMRoPEMatchesInterleavedReference() {
+        let rope = initializeRope(
+            dims: 8, base: 10_000, traditional: false,
+            scalingConfig: ["type": .string("default")], maxPositionEmbeddings: 128)
+        let sections = [2, 1, 1]
+        let mrope = Qwen35MRoPE(
+            rope: rope, dim: 8, base: 10_000,
+            scalingConfig: ["type": .string("default")], sections: sections)
+        let value = MLXArray(Array(0 ..< 16).map(Float.init)).reshaped([1, 1, 2, 8])
+        let positions = MLXArray([
+            Int32(3), 7,
+            5, 11,
+            9, 13,
+        ]).reshaped([3, 1, 2])
+
+        let exponents = MLXArray(stride(from: 0, to: 8, by: 2)).asType(.float32) / 8
+        let invFreq = 1 / pow(MLXArray(Float(10_000)), exponents)
+        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+            * invFreq[.newAxis, .newAxis, .newAxis, 0...]
+        var selected: [MLXArray] = []
+        for index in 0 ..< 4 {
+            var axis = 0
+            for (candidate, offset) in [(1, 1), (2, 2)] {
+                if index >= offset && index < min(sections[candidate] * 3, 4)
+                    && (index - offset) % 3 == 0
+                {
+                    axis = candidate
+                    break
+                }
+            }
+            selected.append(all[axis, 0..., 0..., index])
+        }
+        let angles = concatenated([
+            stacked(selected, axis: -1), stacked(selected, axis: -1),
+        ], axis: -1)
+        let cosine = cos(angles).expandedDimensions(axis: 1)
+        let sine = sin(angles).expandedDimensions(axis: 1)
+        let rotatedHalf = concatenated(
+            [-value[.ellipsis, 4...], value[.ellipsis, ..<4]], axis: -1)
+        let expected = value * cosine + rotatedHalf * sine
+        let actual = mrope.apply(queries: value, keys: value, positionIds: positions).0
+        eval(expected, actual)
+        XCTAssertTrue(allClose(expected, actual, rtol: 1e-5, atol: 1e-5).item(Bool.self))
     }
 
     func testOverflowingRecurrentShapeFailsClosed() {

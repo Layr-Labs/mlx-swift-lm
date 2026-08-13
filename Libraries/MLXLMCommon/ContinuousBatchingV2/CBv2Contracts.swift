@@ -201,6 +201,12 @@ public struct CBv2PositionState: @unchecked Sendable {
     }
 }
 
+/// Optional model contract for validating request-owned position geometry
+/// before a forward reaches model-specific preconditions.
+public protocol CBv2PositionAxisProviding {
+    var cbv2PositionAxisCount: Int? { get }
+}
+
 // MARK: - Multimodal input (vision prefill; additive)
 
 /// Attention behavior for visual placeholder tokens.
