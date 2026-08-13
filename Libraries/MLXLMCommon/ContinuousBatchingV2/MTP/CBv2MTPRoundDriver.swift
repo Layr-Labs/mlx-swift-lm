@@ -231,7 +231,8 @@ final class CBv2MTPRoundDriver {
         guard config.effectiveEnabled, let drafter else { return nil }
         guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
         let stateful = drafter is any CBv2MTPRequestStatefulDrafter
-        let recurrent = model is any CBv2RecurrentMTPSteppableModel
+        let recurrent =
+            (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
         let captureLayers = mtpModel.mtpCaptureLayers
         guard (stateful && recurrent && mtpModel.supportsRequestStatefulMTP)
             || (!stateful && !recurrent && captureLayers != nil)
