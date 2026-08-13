@@ -45,6 +45,70 @@ public struct Qwen35Configuration: Codable, Sendable {
     public var cbv2Capabilities: CBv2ModelCapabilities { textConfig.cbv2Capabilities }
 }
 
+/// Fuse split routed-expert projections into the fused `gate_up_proj` layout
+/// that `SwitchGLU(fuseGateUp: true)` expects (one gather_qmm serving
+/// gate+up).
+///
+/// Two checkpoint families are handled, prefix-agnostically:
+/// - Raw HF exports carry one stacked tensor `<mlp>.experts.gate_up_proj`
+///   (`[E, 2*ffn, hidden]`, gate rows first — exactly the order
+///   `SwitchGLU` slices) plus `<mlp>.experts.down_proj`; both map directly
+///   onto `<mlp>.switch_mlp.{gate_up_proj,down_proj}.weight` without the
+///   historical split.
+/// - MLX-converted checkpoints (including quantized ones, e.g. the
+///   production W4/g64 artifact) carry split `<mlp>.switch_mlp.gate_proj.*`
+///   and `up_proj.*` tensors. Concatenating along the output-row axis is
+///   exact for any per-output-row grouped quantization (affine or mxfp8):
+///   rows quantize independently, so `weight`, `scales`, and `biases` all
+///   concatenate on axis -2 and an unquantized `bias` on axis -1. The fused
+///   module path resolves to the same default quantization entry the split
+///   paths used (per-layer overrides only name the W8 routers).
+///
+/// `mtp.*` keys are never touched: the inline MTP head keeps split modules
+/// (`Qwen35MTPDecoderLayer` passes `fuseGateUp: false`) because its
+/// quantization table (`mtplx_mtp_quantization`) is keyed on the split
+/// module paths.
+///
+/// A split checkpoint missing one half of a gate/up pair fails loudly here
+/// rather than surfacing as an opaque strict-update error.
+public func qwen35FuseSwitchMLPGateUp(weights: [String: MLXArray]) -> [String: MLXArray] {
+    var weights = weights
+
+    // Raw HF stacked exports: already fused, just re-keyed.
+    let rawSuffix = ".experts.gate_up_proj"
+    for key in Array(weights.keys)
+    where key.hasSuffix(rawSuffix) && !key.contains("mtp.") {
+        guard let gateUp = weights.removeValue(forKey: key) else { continue }
+        let prefix = String(key.dropLast(rawSuffix.count))
+        weights["\(prefix).switch_mlp.gate_up_proj.weight"] = gateUp
+        if let downProj = weights.removeValue(forKey: "\(prefix).experts.down_proj") {
+            weights["\(prefix).switch_mlp.down_proj.weight"] = downProj
+        }
+    }
+
+    // MLX split checkpoints (float or quantized): concatenate gate then up.
+    let splitMarker = ".switch_mlp.gate_proj."
+    for key in Array(weights.keys)
+    where key.contains(splitMarker) && !key.contains("mtp.") {
+        guard let gate = weights.removeValue(forKey: key) else { continue }
+        let range = key.range(of: splitMarker)!
+        let base = String(key[..<range.lowerBound]) + ".switch_mlp."
+        let suffix = String(key[range.upperBound...])  // weight | scales | biases | bias
+        let upKey = "\(base)up_proj.\(suffix)"
+        guard let up = weights.removeValue(forKey: upKey) else {
+            preconditionFailure(
+                "qwen35FuseSwitchMLPGateUp: \(key) has no matching \(upKey); "
+                    + "refusing to load a half-split expert projection")
+        }
+        // Quantized tensors are [E, rows, packed-cols]; the row axis is -2.
+        // An unquantized per-row bias is [E, rows]; its row axis is -1.
+        let axis = suffix == "bias" ? -1 : -2
+        weights["\(base)gate_up_proj.\(suffix)"] = concatenated([gate, up], axis: axis)
+    }
+
+    return weights
+}
+
 public class Qwen35MoEModel: Qwen35Model {
 
     override public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -63,22 +127,7 @@ public class Qwen35MoEModel: Qwen35Model {
             newWeights[key] = value
         }
 
-        for l in 0 ..< languageModel.configuration.hiddenLayers {
-            let prefix = "language_model.model.layers.\(l).mlp"
-            let gateUpKey = "\(prefix).experts.gate_up_proj"
-            if let gateUp = newWeights[gateUpKey] {
-                newWeights[gateUpKey] = nil
-                let mid = gateUp.dim(-2) / 2
-                newWeights["\(prefix).switch_mlp.gate_proj.weight"] =
-                    gateUp[.ellipsis, ..<mid, 0...]
-                newWeights["\(prefix).switch_mlp.up_proj.weight"] =
-                    gateUp[.ellipsis, mid..., 0...]
-                if let downProj = newWeights["\(prefix).experts.down_proj"] {
-                    newWeights["\(prefix).experts.down_proj"] = nil
-                    newWeights["\(prefix).switch_mlp.down_proj.weight"] = downProj
-                }
-            }
-        }
+        newWeights = qwen35FuseSwitchMLPGateUp(weights: newWeights)
 
         return languageModel.sanitize(weights: newWeights)
     }

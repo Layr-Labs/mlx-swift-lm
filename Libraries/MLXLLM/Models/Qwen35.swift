@@ -848,7 +848,13 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-    init(_ args: Qwen35TextConfiguration) {
+    /// - Parameter fuseGateUp: when true the routed experts use one fused
+    ///   `gate_up_proj` SwitchLinear (one gather_qmm serves gate+up; the
+    ///   sanitizers concatenate split checkpoints into the fused layout).
+    ///   The inline MTP head passes false: its weights load through
+    ///   `Qwen35InlineMTPAssistant` whose per-path quantization table is
+    ///   keyed on the split `gate_proj`/`up_proj` module paths.
+    init(_ args: Qwen35TextConfiguration, fuseGateUp: Bool = true) {
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
@@ -857,7 +863,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
+            numExperts: args.numExperts,
+            fuseGateUp: fuseGateUp
         )
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
@@ -880,7 +887,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         }
 
         let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let combined = weightedExpertSum(y, scores.asType(y.dtype))
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
