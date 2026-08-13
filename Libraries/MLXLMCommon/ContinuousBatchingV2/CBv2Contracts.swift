@@ -105,6 +105,10 @@ public struct CBv2Request: Sendable {
     /// every code path is byte-identical to the pre-multimodal engine.
     /// See `CBv2MultimodalInput` for the full semantics.
     public var multimodal: CBv2MultimodalInput?
+    /// Optional request-owned model positions. nil preserves the scalar
+    /// cache-offset path byte-for-byte. Multiaxis users provide an evaluated
+    /// prompt tensor plus host decode deltas; no model-global state is shared.
+    public var positionState: CBv2PositionState?
     /// Optional inference-time token automaton. nil preserves the ordinary
     /// sampler byte-for-byte. Required/named/none tool choices install a
     /// row-local machine compiled before submission.
@@ -115,6 +119,7 @@ public struct CBv2Request: Sendable {
         maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0,
         cacheSalt: String? = nil, prefixCacheEnabled: Bool = true,
         multimodal: CBv2MultimodalInput? = nil,
+        positionState: CBv2PositionState? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
         tokenConstraint: (any CBv2TokenConstraint)? = nil
     ) {
@@ -128,12 +133,91 @@ public struct CBv2Request: Sendable {
         self.cacheSalt = cacheSalt
         self.prefixCacheEnabled = prefixCacheEnabled
         self.multimodal = multimodal
+        self.positionState = positionState
         self.prefixCacheReceiptID = prefixCacheReceiptID
         self.tokenConstraint = tokenConstraint
     }
 }
 
+/// Request-owned position payload with no model-family dependency.
+///
+/// `promptPositionIds` is evaluated before submission and must be
+/// `[axes, 1, promptLength]`. `decodeDeltas` is ordinary host data, one value
+/// per request; the engine combines it with each row's own cache offset to
+/// form a rectangular `[axes, B, 1]` decode tensor.
+public struct CBv2PositionState: @unchecked Sendable {
+    public let promptPositionIds: MLXArray
+    public let decodeDeltas: [Int32]
+    public let axisCount: Int
+    public let promptLength: Int
+
+    public init(promptPositionIds: MLXArray, decodeDeltas: [Int32]) {
+        precondition(promptPositionIds.ndim == 3, "CBv2 positions must be [axes, 1, length]")
+        precondition(promptPositionIds.dim(0) > 0, "CBv2 positions require at least one axis")
+        precondition(promptPositionIds.dim(1) == 1, "CBv2 prompt positions require batch 1")
+        precondition(decodeDeltas.count == 1, "CBv2 request positions require one decode delta")
+        self.promptPositionIds = promptPositionIds
+        self.decodeDeltas = decodeDeltas
+        self.axisCount = promptPositionIds.dim(0)
+        self.promptLength = promptPositionIds.dim(2)
+    }
+
+    public func promptSlice(_ range: Range<Int>) -> MLXArray {
+        precondition(
+            range.lowerBound >= 0 && range.upperBound <= promptLength,
+            "CBv2 prompt position slice is out of bounds")
+        return promptPositionIds[0..., 0..., range]
+    }
+
+    public static func decodePositionIds(
+        states: [CBv2PositionState?], cacheOffsets: [Int], length: Int = 1
+    ) -> MLXArray? {
+        precondition(states.count == cacheOffsets.count, "CBv2 position rows and offsets differ")
+        guard states.contains(where: { $0 != nil }) else { return nil }
+        guard let first = states.compactMap({ $0 }).first else { return nil }
+        precondition(length > 0, "CBv2 decode position length must be positive")
+
+        let axes = first.axisCount
+        var rows: [MLXArray] = []
+        rows.reserveCapacity(states.count)
+        for (state, cacheOffset) in zip(states, cacheOffsets) {
+            precondition(cacheOffset >= 0, "CBv2 cache offset must be non-negative")
+            let delta: Int32
+            if let state {
+                precondition(state.axisCount == axes, "CBv2 position axes differ across decode rows")
+                delta = state.decodeDeltas[0]
+            } else {
+                delta = 0
+            }
+            let start = Int32(clamping: cacheOffset) &+ delta
+            let row = MLXArray((0 ..< length).map { start &+ Int32(clamping: $0) })
+                .reshaped([1, length])
+            rows.append(row)
+        }
+        let rectangular = rows.count == 1 ? rows[0] : concatenated(rows, axis: 0)
+        return broadcast(
+            rectangular[.newAxis, 0..., 0...],
+            to: [axes, states.count, length])
+    }
+}
+
+/// Optional model contract for validating request-owned position geometry
+/// before a forward reaches model-specific preconditions.
+public protocol CBv2PositionAxisProviding {
+    var cbv2PositionAxisCount: Int? { get }
+}
+
 // MARK: - Multimodal input (vision prefill; additive)
+
+/// Attention behavior for visual placeholder tokens.
+public enum CBv2MultimodalAttention: Sendable, Equatable {
+    /// Gemma: contiguous visual spans attend bidirectionally and therefore
+    /// require block coalescing, chunk snapping, and bound span masks.
+    case bidirectionalSpans
+    /// Qwen: visual embeddings replace ordinary causal language tokens.
+    /// Spans may cross normal chunk boundaries and never bind an overlay.
+    case causal
+}
 
 /// One image's soft-token span inside the prompt: `length` placeholder token
 /// ids starting at `tokenOffset` (absolute prompt position). That is how VLM
@@ -170,11 +254,23 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     /// inside the prompt. Validated at submit; violations throw
     /// `CBv2MultimodalError`.
     public var spans: [CBv2ImageSpan]
+    public var attention: CBv2MultimodalAttention
+    /// Optional positions paired with these exact prompt spans. Keeping this
+    /// on the media input lets existing provider call sites hand one atomic
+    /// prepared object to the bridge.
+    public var positionState: CBv2PositionState?
     /// Embeddings provider — one array per span, same order as `spans`.
     public var embeddings: () throws -> [MLXArray]
 
-    public init(spans: [CBv2ImageSpan], embeddings: @escaping () throws -> [MLXArray]) {
+    public init(
+        spans: [CBv2ImageSpan],
+        attention: CBv2MultimodalAttention = .bidirectionalSpans,
+        positionState: CBv2PositionState? = nil,
+        embeddings: @escaping () throws -> [MLXArray]
+    ) {
         self.spans = spans
+        self.attention = attention
+        self.positionState = positionState
         self.embeddings = embeddings
     }
 }
@@ -224,11 +320,16 @@ public struct CBv2LayerKind: Sendable, Equatable {
     public var headDim: Int
     public var kvHeads: Int
     public var queryHeads: Int
+    /// Original transformer-layer index when the CBv2 storage layout is a
+    /// compact subset of the model layers (for example, hybrid recurrent +
+    /// full-attention trunks). nil preserves the historical identity mapping:
+    /// storage index == model layer index.
+    public var modelLayerIndex: Int?
 
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
         isBidirectional: Bool = false,
-        headDim: Int, kvHeads: Int, queryHeads: Int
+        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil
     ) {
         self.attention = attention
         self.sharesKVWithLayer = sharesKVWithLayer
@@ -237,6 +338,7 @@ public struct CBv2LayerKind: Sendable, Equatable {
         self.headDim = headDim
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
+        self.modelLayerIndex = modelLayerIndex
     }
 }
 

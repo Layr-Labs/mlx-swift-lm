@@ -12,6 +12,25 @@ import XCTest
 
 final class Qwen35SanitizeTests: XCTestCase {
 
+    func testMLXMetadataDropsInlineMTPWithoutChangingTargetWeights() throws {
+        let model = Qwen35(try makeMinimalConfig())
+        let target = MLXArray([Float(0.25), Float(0.5)])
+        let mtp = MLXArray([Float(1), Float(2)])
+
+        let sanitized = model.sanitize(
+            weights: [
+                "language_model.model.norm.weight": target,
+                "mtp.norm.weight": mtp,
+            ],
+            metadata: ["format": "mlx"])
+
+        XCTAssertNotNil(sanitized["language_model.model.norm.weight"])
+        XCTAssertNil(sanitized["mtp.norm.weight"])
+        XCTAssertEqual(
+            sanitized["language_model.model.norm.weight"]?.asArray(Float.self),
+            target.asArray(Float.self))
+    }
+
     private func makeMinimalConfig() throws -> Qwen35Configuration {
         // Minimum-viable config with small dims so module init stays cheap.
         // Only the fields without defaults need values; everything else

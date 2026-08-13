@@ -25,6 +25,9 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+        precondition(
+            !(model is any CBv2RecurrentLanguageModelForwardable),
+            "CBv2 recurrent model requires explicit request-owned recurrent state")
         return model(tokens, cache: asKVCaches(caches))
     }
 
@@ -40,6 +43,50 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
+    public var cbv2PositionAxisCount: Int? {
+        (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
+    }
+}
+
+// MARK: - Request-owned recurrent state
+
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentSteppableModel {
+    public var cbv2Capabilities: CBv2ModelCapabilities {
+        (model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities ?? .attentionOnly
+    }
+
+    public var recurrentStateSpec: CBv2RecurrentStateSpec? {
+        (model as? any CBv2RecurrentLanguageModelForwardable)?.cbv2RecurrentStateSpec
+    }
+
+    public func forward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        guard let recurrent = model as? any CBv2RecurrentLanguageModelForwardable else {
+            preconditionFailure(
+                "CBv2 recurrent forward reached a model without recurrent-state support")
+        }
+        return recurrent.cbv2Forward(
+            tokens, caches: asKVCaches(caches), recurrentState: recurrentState)
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionedRecurrentSteppableModel {
+    public func forward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let recurrent = model as? any CBv2PositionedRecurrentLanguageModelForwardable else {
+            preconditionFailure("CBv2 positioned recurrent forward reached an unsupported model")
+        }
+        return recurrent.cbv2Forward(
+            tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+}
+
 // MARK: - Prompt-output narrowing (prefill only)
 
 /// Answered at RUNTIME like the multimodal/MTP capabilities: only models
@@ -50,7 +97,9 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
 
     public var supportsPackedPrefill: Bool {
-        (model as? CBv2LanguageModelPrefillForwardable)?.cbv2SupportsPackedPrefill ?? false
+        guard cbv2Capabilities.supportsPackedPrefill else { return false }
+        return (model as? CBv2LanguageModelPrefillForwardable)?.cbv2SupportsPackedPrefill
+            ?? false
     }
 
     public var supportsPackedMultimodalPrefill: Bool {
@@ -104,7 +153,16 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
 extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
 
     public var supportsMultimodalPrefill: Bool {
-        (model as? CBv2EmbeddingForwardable)?.supportsVisionSpanPrefill ?? false
+        guard let model = model as? CBv2EmbeddingForwardable else { return false }
+        return model.supportsVisionSpanPrefill || model.supportsCausalVisionPrefill
+    }
+
+    public func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
+        guard let model = model as? CBv2EmbeddingForwardable else { return false }
+        switch attention {
+        case .bidirectionalSpans: return model.supportsVisionSpanPrefill
+        case .causal: return model.supportsCausalVisionPrefill
+        }
     }
 
     public func embedPromptTokens(_ tokens: MLXArray) -> MLXArray {
@@ -129,6 +187,27 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionedMultimodalSteppableModel {
+    public func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let positioned = model as? any CBv2PositionedRecurrentEmbeddingForwardable else {
+            preconditionFailure(
+                "CBv2 positioned multimodal forward reached an unsupported model")
+        }
+        return positioned.embeddingForward(
+            tokens,
+            inputEmbedding: inputEmbeddings,
+            cache: asKVCaches(caches),
+            recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+}
+
 // MARK: - MTP (speculative decoding)
 
 /// Answered at RUNTIME like the multimodal capability: the adapter wraps any
@@ -139,12 +218,22 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
 extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
 
     public var mtpCaptureLayers: CBv2MTPCaptureLayers? {
-        (model as? CBv2MTPForwardable)?.cbv2MTPCaptureLayers
+        if let forwardable = model as? CBv2MTPForwardable {
+            return forwardable.cbv2MTPCaptureLayers
+        }
+        return (model as? any CBv2RecurrentMTPForwardable) != nil
+            ? CBv2MTPCaptureLayers(full: 0, sliding: 0) : nil
     }
 
     public var mtpTargetIdentity: ObjectIdentifier? {
-        guard let target = model as? any CBv2MTPForwardable else { return nil }
-        return ObjectIdentifier(target)
+        if let target = model as? any CBv2MTPForwardable {
+            return target.cbv2MTPTargetIdentity
+        }
+        return (model as? any CBv2RecurrentMTPForwardable)?.cbv2MTPTargetIdentity
+    }
+
+    public var supportsRequestStatefulMTP: Bool {
+        model is any CBv2RecurrentMTPForwardable
     }
 
     public func forwardWithHidden(
@@ -155,5 +244,20 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
                 "CBv2 MTP: \(type(of: model)) is not CBv2MTPForwardable — engine gating failed")
         }
         return forwardable.cbv2ForwardWithHidden(tokens, caches: asKVCaches(caches))
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        guard let forwardable = model as? any CBv2RecurrentMTPForwardable else {
+            preconditionFailure(
+                "CBv2 recurrent MTP: \(type(of: model)) lacks hidden capture")
+        }
+        return forwardable.cbv2ForwardWithHidden(
+            tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 }

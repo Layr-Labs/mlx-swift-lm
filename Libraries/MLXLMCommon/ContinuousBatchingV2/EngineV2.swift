@@ -112,6 +112,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let loopConfig: CBv2EngineLoopConfig
     private let gauges: CBv2EngineGauges
     private let layerKinds: [CBv2LayerKind]
+    private let requiredPositionAxisCount: Int?
     private let samplerSupportsTokenConstraints: Bool
     /// Non-nil only when active (instance supplied AND
     /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
@@ -119,6 +120,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// thread); adoption and donation are handled by the loop.
     private let prefixCache: CBv2PrefixCache?
     public let prefixReuseCapability: CBv2PrefixReuseCapability
+    public let modelCapabilities: CBv2ModelCapabilities
 
     private let stateLock = NSLock()
     private var rejectingSubmissions = false
@@ -181,11 +183,22 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
+        self.requiredPositionAxisCount =
+            (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
         self.backend = backend
         self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints
+        let modelCapabilities =
+            (model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities ?? .attentionOnly
+        self.modelCapabilities = modelCapabilities
+        if let violation = Self.backendCapabilityViolation(
+            capabilities: modelCapabilities, backend: backend)
+        {
+            preconditionFailure(violation)
+        }
         let prefixReuseCapability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
-            backend: backend.prefixReuseBackend)
+            backend: backend.prefixReuseBackend,
+            modelSupportsPrefixReuse: modelCapabilities.supportsPrefixReuse)
         self.prefixReuseCapability = prefixReuseCapability
         let activePrefixCache =
             schedulerConfig.enablePrefixCache && prefixReuseCapability.isSupported
@@ -200,6 +213,32 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // occupies (`CBv2KVResidencyPolicy`): contiguous windowed rows own
         // their whole fixed ring from the first write, paged rows own only
         // the pages `PagedKVPool.pageDemand` reserves.
+        // MTP verification bypasses the sampler and emits raw target
+        // argmaxes. Only the two known argmax-equivalent implementations may
+        // activate it; custom samplers fail safe to ordinary target decode.
+        let samplerSupportsMTP =
+            sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler
+        let mtpDriver: CBv2MTPRoundDriver?
+        if samplerSupportsMTP && modelCapabilities.supportsMTP {
+            mtpDriver = CBv2MTPRoundDriver.build(
+                model: model, drafter: mtpDrafter, config: mtpConfig)
+        } else {
+            mtpDriver = nil
+        }
+
+        var admissionConfig = admissionConfig
+        if let recurrent = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec {
+            guard let fixedBytes = try? recurrent.peakBytesPerRequest() else {
+                preconditionFailure("EngineV2: recurrent-state byte accounting overflow")
+            }
+            admissionConfig.fixedBytesPerRequest = fixedBytes
+        }
+        admissionConfig.auxiliaryBytesPerToken =
+            mtpDriver?.drafter.requestStateBytesPerToken ?? 0
+        admissionConfig.auxiliaryTokenGranularity =
+            mtpDriver?.drafter.requestStateTokenGranularity ?? 1
+        admissionConfig.auxiliaryTokenAllocationPadding =
+            mtpDriver?.drafter.requestStateTokenAllocationPadding ?? 0
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
             config: admissionConfig, residency: backend.kvResidency)
@@ -208,18 +247,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             kvBytesCapacity: backend.bytesCapacity,
             kvBytesBackendCapacity: backend.bytesCapacity)
         self.gauges = gauges
-        // MTP verification bypasses the sampler and emits raw target
-        // argmaxes. Only the two known argmax-equivalent implementations may
-        // activate it; custom samplers fail safe to ordinary target decode.
-        let samplerSupportsMTP =
-            sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler
-        let mtpDriver: CBv2MTPRoundDriver?
-        if samplerSupportsMTP {
-            mtpDriver = CBv2MTPRoundDriver.build(
-                model: model, drafter: mtpDrafter, config: mtpConfig)
-        } else {
-            mtpDriver = nil
-        }
         let mtpInactiveReason: String?
         if mtpDriver != nil {
             mtpInactiveReason = nil
@@ -299,6 +326,18 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             """
     }
 
+    /// Static feature veto used by production factories before construction
+    /// and enforced again by `init`. Paged KV cannot own or transact a
+    /// recurrent model's separate request state in the initial adapter.
+    public static func backendCapabilityViolation(
+        capabilities: CBv2ModelCapabilities, backend: CBv2KVBackend
+    ) -> String? {
+        guard !capabilities.supportsPagedKV,
+            backend.prefixReuseBackend == .pagedFP16
+        else { return nil }
+        return "EngineV2: model capability vetoes paged KV for request-owned recurrent state"
+    }
+
     // MARK: CBv2Engine
 
     /// Submit a request; events stream until `.finished`. Throws
@@ -309,6 +348,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// live: the duplicate is rejected BEFORE any stream registration, so
     /// the original request's stream is never touched (PR#62 review).
     public func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
+        var request = request
+        if request.positionState == nil {
+            request.positionState = request.multimodal?.positionState
+        }
         stateLock.lock()
         let rejecting = rejectingSubmissions
         stateLock.unlock()
@@ -325,6 +368,27 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             return Self.immediateStream(
                 reason: .error("empty prompt"),
                 usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+        }
+        if let positions = request.positionState {
+            guard positions.promptLength == request.promptTokens.count else {
+                throw CBv2MultimodalError.invalidSpans(
+                    "position length \(positions.promptLength) != prompt length "
+                        + "\(request.promptTokens.count)")
+            }
+            guard request.multimodal != nil else {
+                throw CBv2MultimodalError.invalidSpans(
+                    "explicit model positions require multimodal input")
+            }
+            if let requiredAxes = requiredPositionAxisCount,
+                positions.axisCount != requiredAxes
+            {
+                throw CBv2MultimodalError.invalidSpans(
+                    "position axes \(positions.axisCount) != model axes \(requiredAxes)")
+            }
+        }
+        if request.multimodal?.attention == .causal, request.positionState == nil {
+            throw CBv2MultimodalError.invalidSpans(
+                "causal multimodal input requires request-owned position state")
         }
 
         if let constraint = request.tokenConstraint {

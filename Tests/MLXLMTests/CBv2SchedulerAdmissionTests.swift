@@ -524,6 +524,9 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         try admission.reserve(id: id(9), additionalTokens: 100)
         let busy = admission.snapshot(activeRequests: 1, waitingRequests: 0, activeTokens: 100)
         XCTAssertEqual(busy.kvBytesReserved, 700)
+        XCTAssertEqual(admission.nonBackendBytesReserved, 300)
+        XCTAssertEqual(
+            admission.targetBytesReserved(partitionedBy: [id(9)]).materialized, 400)
         XCTAssertEqual(busy.kvBytesInUse, 400, "the carve is not storage")
         XCTAssertEqual(busy.kvBytesCapacity - busy.kvBytesReserved, 300)
         try admission.reserve(id: id(9), additionalTokens: 75)
@@ -533,8 +536,27 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         // reserved; the ledger remains.
         admission.refundExternalReserve()
         XCTAssertEqual(admission.bytesExternallyReserved, 0)
+        XCTAssertEqual(admission.nonBackendBytesReserved, 0)
         let refunded = admission.snapshot(activeRequests: 1, waitingRequests: 0, activeTokens: 175)
         XCTAssertEqual(refunded.kvBytesReserved, 700)
+    }
+
+    func testTargetReservationsPartitionMaterializedAndWaitingRows() throws {
+        let kinds = [CBv2LayerKind(
+            attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1_000,
+            config: .init(
+                watermarkFraction: 0, elementBytes: 2,
+                layerElementBytes: nil, fixedBytesPerRequest: 100,
+                auxiliaryBytesPerToken: 0))
+        try admission.reserve(id: id(1), additionalTokens: 10)
+        try admission.reserve(id: id(2), additionalTokens: 20)
+
+        let target = admission.targetBytesReserved(partitionedBy: [id(1)])
+        XCTAssertEqual(target.materialized, 40)
+        XCTAssertEqual(target.unmaterialized, 80)
+        XCTAssertEqual(admission.nonBackendBytesReserved, 200)
     }
 
     // MARK: Backend-aware occupancy (PR#87 review — paged over-charge)

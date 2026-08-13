@@ -86,6 +86,7 @@ public protocol CBv2MultimodalSteppableModel: CBv2SteppableModel {
     /// True when the underlying model actually supports the embedding
     /// forward (adapters over arbitrary models answer at runtime).
     var supportsMultimodalPrefill: Bool { get }
+    func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool
     /// The scaled text-token embeddings exactly as the model's trunk would
     /// compute before layer 0 (`embed(tokens) * embedScale` for Gemma-class
     /// models) — the tensor the engine splices span embeddings into.
@@ -101,8 +102,23 @@ public protocol CBv2MultimodalSteppableModel: CBv2SteppableModel {
     ) -> MLXArray
 }
 
+/// Optional request-owned refinement for models whose embedding forward also
+/// needs recurrent transactions and/or explicit model positions.
+public protocol CBv2PositionedMultimodalSteppableModel: CBv2MultimodalSteppableModel {
+    func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?
+    ) -> MLXArray
+}
+
 extension CBv2MultimodalSteppableModel {
     public var supportsMultimodalPrefill: Bool { true }
+    public func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
+        supportsMultimodalPrefill
+    }
 }
 
 /// Model-level surface for `LanguageModel` conformers reached through
@@ -120,6 +136,8 @@ public protocol CBv2EmbeddingForwardable {
     /// `supportsMultimodalPrefill` must match, so such configs reject
     /// multimodal requests at submit (PR#63 review).
     var supportsVisionSpanPrefill: Bool { get }
+    /// True when visual tokens are ordinary causal tokens (Qwen).
+    var supportsCausalVisionPrefill: Bool { get }
     /// `embed(tokens) * embedScale` — the trunk's pre-layer-0 hidden state.
     func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray
     /// Forward with the trunk's embedding lookup replaced by
@@ -128,6 +146,23 @@ public protocol CBv2EmbeddingForwardable {
     /// as the token forward when `cache` holds CBv2 layer caches.
     func embeddingForward(
         _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
+    ) -> MLXArray
+}
+
+extension CBv2EmbeddingForwardable {
+    public var supportsCausalVisionPrefill: Bool { false }
+}
+
+
+/// Model-level embedding forward with request-owned recurrent state and
+/// explicit positions. Qwen uses this; Gemma remains on the legacy seam.
+public protocol CBv2PositionedRecurrentEmbeddingForwardable: CBv2EmbeddingForwardable {
+    func embeddingForward(
+        _ inputs: MLXArray,
+        inputEmbedding: MLXArray,
+        cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?
     ) -> MLXArray
 }
 
@@ -141,6 +176,7 @@ public protocol CBv2EmbeddingForwardable {
 /// `CBv2PrefixAdoption`).
 struct CBv2ResolvedMultimodal: @unchecked Sendable {
     let spans: [CBv2ImageSpan]
+    let attention: CBv2MultimodalAttention
     /// Adjacent spans coalesced (a contiguous placeholder run attends as ONE
     /// bidirectional block — `gemma4VisionBlockIds` groups contiguous runs).
     let blocks: [CBv2ImageSpan]
@@ -151,6 +187,7 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
     /// `[start, start + count)`, or nil when the chunk contains no span
     /// tokens (the chunk then takes the untouched text path).
     func chunkContext(start: Int, count: Int) -> CBv2SpanChunkContext? {
+        guard attention == .bidirectionalSpans else { return nil }
         let end = start + count
         let contained = blocks.filter { $0.tokenOffset >= start && $0.end <= end }
         // Scheduler invariant: a block intersecting the chunk is fully
@@ -170,8 +207,21 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
     /// embedding arrays (same containment invariant as `chunkContext`).
     func spansInChunk(start: Int, count: Int) -> [(span: CBv2ImageSpan, embedding: MLXArray)] {
         let end = start + count
-        return zip(spans, embeddings).filter { span, _ in
-            span.tokenOffset >= start && span.end <= end
+        return zip(spans, embeddings).compactMap { span, embedding in
+            let lo = max(start, span.tokenOffset)
+            let hi = min(end, span.end)
+            guard lo < hi else { return nil }
+            if lo == span.tokenOffset && hi == span.end {
+                return (span, embedding)
+            }
+            precondition(
+                attention == .causal,
+                "CBv2 multimodal: bidirectional span split across a chunk")
+            let relativeLo = lo - span.tokenOffset
+            let relativeHi = hi - span.tokenOffset
+            return (
+                CBv2ImageSpan(tokenOffset: lo, length: hi - lo),
+                embedding[0..., relativeLo ..< relativeHi, 0...])
         }
     }
 
@@ -183,7 +233,7 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
     /// rows never trip this — their positions are past every span (spans
     /// live inside the prompt).
     func containsSpan(at position: Int) -> Bool {
-        blocks.contains { $0.tokenOffset <= position && position < $0.end }
+        spans.contains { $0.tokenOffset <= position && position < $0.end }
     }
 }
 
@@ -225,14 +275,18 @@ enum CBv2MultimodalPlan {
         maxBatchedTokensPerStep: Int
     ) throws -> [CBv2ImageSpan] {
         guard let mmModel = model as? CBv2MultimodalSteppableModel,
-            mmModel.supportsMultimodalPrefill
+            mmModel.supportsMultimodalPrefill(attention: input.attention)
         else {
             throw CBv2MultimodalError.unsupportedModel(
                 "\(type(of: model)) does not support embedding-spliced prefill")
         }
+        // All production VLMs currently use contiguous KV. Causal visual
+        // tokens need no span-mask binding, but retaining the backend gate
+        // keeps the media path's compact/position semantics off unproven
+        // paged caches until an explicit paged VLM test exists.
         guard cacheProvider.supportsMultimodalSpans else {
             throw CBv2MultimodalError.unsupportedBackend(
-                "\(type(of: cacheProvider)) cannot honor span attention masks")
+                "\(type(of: cacheProvider)) cannot honor multimodal prefill")
         }
 
         let spans = input.spans
@@ -257,7 +311,8 @@ enum CBv2MultimodalPlan {
             previousEnd = span.end
         }
 
-        let blocks = coalescedBlocks(spans: spans)
+        let blocks = input.attention == .bidirectionalSpans
+            ? coalescedBlocks(spans: spans) : []
         if let oversized = blocks.first(where: { $0.length > maxBatchedTokensPerStep }) {
             throw CBv2MultimodalError.spanTooLong(
                 blockTokens: oversized.length,
@@ -332,7 +387,8 @@ enum CBv2MultimodalPlan {
             normalized.append(shaped)
         }
 
-        return CBv2ResolvedMultimodal(spans: spans, blocks: blocks, embeddings: normalized)
+        return CBv2ResolvedMultimodal(
+            spans: spans, attention: input.attention, blocks: blocks, embeddings: normalized)
     }
 
     /// Splice span embeddings over the scaled text embeddings of one prefill

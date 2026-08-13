@@ -95,8 +95,9 @@ public final class CBv2ScheduledRequest {
         self.arrivalSeq = arrivalSeq
         self.submittedAt = submittedAt
         self.tokens = request.promptTokens
-        self.multimodalBlocks = CBv2MultimodalPlan.coalescedBlocks(
-            spans: request.multimodal?.spans ?? [])
+        self.multimodalBlocks = request.multimodal?.attention == .bidirectionalSpans
+            ? CBv2MultimodalPlan.coalescedBlocks(spans: request.multimodal?.spans ?? [])
+            : []
     }
 
     /// Snap a proposed prefill chunk `[start, start + proposed)` so no

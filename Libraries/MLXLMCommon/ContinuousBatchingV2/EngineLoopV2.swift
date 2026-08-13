@@ -321,8 +321,12 @@ final class CBv2InFlightStep {
     fileprivate var deferredReleases:
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
-            donation: CBv2DonationIntent?
+            donation: CBv2DonationIntent?, recurrent: CBv2RecurrentRequestState?
         )] = []
+    /// One recurrent transaction per participating row. A normal finalized
+    /// step commits it; a one-step-late discarded chained decode rolls it
+    /// back before the request state is released.
+    var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
     /// Non-nil marks this step as an MTP round (verify and/or seed work,
     /// finalized by `finalizeMTPRound`). MTP rounds NEVER chain: the
     /// chained path's finalize loop and `deferredReleases` assume exactly
@@ -511,6 +515,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     // driver in EngineLoopV2+MTP.swift is part of the loop).
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
+    var recurrentStates: [CBv2RequestID: CBv2RecurrentRequestState] = [:]
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     private var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
@@ -1104,10 +1109,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if previous.participants.contains(id) {
                     previous.deferredReleases.append(
                         (
-                            id: id, state: state, rollbackOne: false, donation: nil
+                            id: id, state: state, rollbackOne: false, donation: nil,
+                            recurrent: recurrentStates.removeValue(forKey: id)
                         ))
                 } else {
                     backend.release(state)
+                    releaseRecurrentState(recurrentStates.removeValue(forKey: id))
                 }
             }
         }
@@ -1218,16 +1225,90 @@ public final class EngineLoopV2: @unchecked Sendable {
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
 
+    /// Build one target forward with explicit row-aligned recurrent
+    /// transactions when the model requires them. The returned arrays are
+    /// appended to the step's eval set so conv/SSM state is materialized at
+    /// the same boundary as KV and logits.
+    func targetForward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache], ids: [CBv2RequestID],
+        positionIds: MLXArray? = nil,
+        inputEmbeddings: MLXArray? = nil
+    ) -> (logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
+        innerState: [MLXArray])
+    {
+        guard let recurrentModel = model as? any CBv2RecurrentSteppableModel,
+            recurrentModel.recurrentStateSpec != nil
+        else {
+            if let inputEmbeddings {
+                guard let multimodal = model as? any CBv2MultimodalSteppableModel else {
+                    preconditionFailure("CBv2 embedding forward reached an unsupported model")
+                }
+                return (
+                    multimodal.forward(
+                        tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches),
+                    [:], [])
+            }
+            return (model.forward(tokens: tokens, caches: caches), [:], [])
+        }
+        let evaluations = ids.map { id -> CBv2RecurrentStateEvaluation in
+            guard let state = recurrentStates[id] else {
+                preconditionFailure("CBv2 recurrent state missing for \(id)")
+            }
+            do { return try state.bind() } catch {
+                preconditionFailure("CBv2 recurrent bind failed for \(id): \(error)")
+            }
+        }
+        let logits: MLXArray
+        if let inputEmbeddings {
+            guard let positioned = model as? any CBv2PositionedMultimodalSteppableModel else {
+                preconditionFailure(
+                    "CBv2 recurrent embedding forward reached an unsupported model")
+            }
+            logits = positioned.forward(
+                tokens: tokens,
+                inputEmbeddings: inputEmbeddings,
+                caches: caches,
+                recurrentState: evaluations,
+                positionIds: positionIds)
+        } else if positionIds != nil {
+            guard let positioned = model as? any CBv2PositionedRecurrentSteppableModel else {
+                preconditionFailure("CBv2 positioned forward reached an unsupported model")
+            }
+            logits = positioned.forward(
+                tokens: tokens, caches: caches,
+                recurrentState: evaluations, positionIds: positionIds)
+        } else {
+            logits = recurrentModel.forward(
+                tokens: tokens, caches: caches, recurrentState: evaluations)
+        }
+        var arrays: [MLXArray] = []
+        for evaluation in evaluations {
+            do { arrays.append(contentsOf: try evaluation.evaluate()) } catch {
+                preconditionFailure("CBv2 recurrent evaluation failed: \(error)")
+            }
+        }
+        return (logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)), arrays)
+    }
+
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
     /// batch. The second tuple element is the eager caches' inner state
     /// (offset chain + KV buffers) that must ride the step's `asyncEval`
     /// (DAR-325).
     private func decodeLogits(
-        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray
-    ) -> (logits: MLXArray, cacheInnerState: [MLXArray]) {
+        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray, ids: [CBv2RequestID]
+    ) -> (logits: MLXArray, cacheInnerState: [MLXArray],
+        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation])
+    {
         let caches = eagerCaches(rowStates: rowStates)
-        let logits = model.forward(tokens: tokens, caches: caches)
-        return (logits[0..., -1, 0...], eagerCacheInnerState(caches))
+        let positionIds = CBv2PositionState.decodePositionIds(
+            states: ids.map { scheduler.record(for: $0)?.request.positionState },
+            cacheOffsets: rowStates.map(Self.positionOffset))
+        let forward = targetForward(
+            tokens: tokens, caches: caches, ids: ids, positionIds: positionIds)
+        return (
+            forward.logits[0..., -1, 0...],
+            eagerCacheInnerState(caches) + forward.innerState,
+            forward.recurrent)
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
@@ -1411,7 +1492,8 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let (last, cacheInnerState) = decodeLogits(rowStates: rowStates, tokens: inputs)  // [B, vocab]
+        let (last, cacheInnerState, recurrent) = decodeLogits(
+            rowStates: rowStates, tokens: inputs, ids: ids)  // [B, vocab]
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
@@ -1449,6 +1531,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
             wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
+        step.recurrentEvaluations = recurrent
         return step
     }
 
@@ -1496,6 +1579,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // the step's asyncEval so the `+ L` offset advance can't accumulate
         // O(steps) of unevaluated graph (DAR-325).
         var cacheInnerState: [MLXArray] = []
+        var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
 
         // Rectangular decode batch, in plan order.
         let decodeRows = work.filter(\.isDecode)
@@ -1504,9 +1588,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let (last, decodeInnerState) = decodeLogits(
-                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs)
+            let decodeIDs = decodeRows.map(\.rec.id)
+            let (last, decodeInnerState, recurrent) = decodeLogits(
+                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
+                ids: decodeIDs)
             cacheInnerState.append(contentsOf: decodeInnerState)
+            recurrentEvaluations.merge(recurrent) { _, _ in
+                preconditionFailure("duplicate recurrent evaluation")
+            }
             decodeSampled = sampler.sample(
                 logits: last,
                 params: decodeRows.map(\.rec.request.sampling),
@@ -1635,20 +1724,40 @@ public final class EngineLoopV2: @unchecked Sendable {
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
             if let multimodal = multimodalByID[rec.id],
-                let spanContext = multimodal.chunkContext(start: row.start, count: row.count)
+                !multimodal.spansInChunk(start: row.start, count: row.count).isEmpty
             {
                 // Vision chunk (contains image spans): the NEW pinned path —
                 // spliced input embeddings + span attention masks. Chunks of
                 // the SAME request without spans fall through to the
                 // untouched text path (pure function of has-spans).
-                output = multimodalChunkForward(
+                let forward = multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
-                    multimodal: multimodal, spanContext: spanContext, caches: caches,
+                    id: rec.id, multimodal: multimodal, caches: caches,
                     requirement: requirement)
+                output = forward.output
+                recurrentEvaluations.merge(forward.recurrent) { _, _ in
+                    preconditionFailure("duplicate recurrent evaluation")
+                }
+                cacheInnerState.append(contentsOf: forward.innerState)
             } else {
-                output = prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+                if let recurrentModel = model as? any CBv2RecurrentSteppableModel,
+                    recurrentModel.recurrentStateSpec != nil
+                {
+                    let positions = rec.request.positionState?.promptSlice(
+                        row.start ..< row.start + row.count)
+                    let forward = targetForward(
+                        tokens: inputs, caches: caches, ids: [rec.id],
+                        positionIds: positions)
+                    output = narrowPrefillOutput(forward.logits, requirement: requirement)
+                    cacheInnerState.append(contentsOf: forward.innerState)
+                    recurrentEvaluations.merge(forward.recurrent) { _, _ in
+                        preconditionFailure("duplicate recurrent evaluation")
+                    }
+                } else {
+                    output = prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -1707,7 +1816,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             evalTargets: evalTargets,
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = logprobSegments
+        step.recurrentEvaluations = recurrentEvaluations
         return step
+    }
+
+    func narrowPrefillOutput(
+        _ logits: MLXArray, requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        switch requirement {
+        case .evaluationOnly: return logits[0..., -1, 0 ..< 1]
+        case .lastPositionLogits: return logits[0..., -1, 0...]
+        }
     }
 
     // MARK: Vision prefill (span-containing chunks only)
@@ -1730,10 +1849,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// 1-token prefill chunk).
     func multimodalChunkForward(
         tokens: MLXArray, start: Int, count: Int,
-        multimodal: CBv2ResolvedMultimodal, spanContext: CBv2SpanChunkContext,
+        id: CBv2RequestID, multimodal: CBv2ResolvedMultimodal,
         caches: [CBv2AttendingLayerCache],
         requirement: CBv2PrefillRequirement
-    ) -> MLXArray {
+    ) -> (
+        output: MLXArray,
+        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
+        innerState: [MLXArray]
+    ) {
         guard let mmModel = model as? CBv2MultimodalSteppableModel else {
             // Unreachable: EngineV2.submit gates multimodal requests on this
             // capability before they ever reach the scheduler.
@@ -1745,12 +1868,29 @@ public final class EngineLoopV2: @unchecked Sendable {
             textEmbeddings: textEmbeddings,
             chunkStart: start,
             spans: multimodal.spansInChunk(start: start, count: count))
-        let bindables = count > 1 ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
+        let spanContext = multimodal.chunkContext(start: start, count: count)
+        let bindables = spanContext != nil && count > 1
+            ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
         for bindable in bindables { bindable.bindSpanContext(spanContext) }
         defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
-        return prefillOutput(
-            tokens: tokens, inputEmbeddings: spliced, caches: caches,
-            requirement: requirement)
+        let positions = scheduler.record(for: id)?.request.positionState?.promptSlice(
+            start ..< start + count)
+        if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
+            positions == nil
+        {
+            return (
+                prefillOutput(
+                    tokens: tokens, inputEmbeddings: spliced, caches: caches,
+                    requirement: requirement),
+                [:], [])
+        }
+        let forward = targetForward(
+            tokens: tokens, caches: caches, ids: [id],
+            positionIds: positions, inputEmbeddings: spliced)
+        return (
+            narrowPrefillOutput(forward.logits, requirement: requirement),
+            forward.recurrent,
+            forward.innerState)
     }
 
     /// Rectangular counterpart of `multimodalChunkForward`. Each row keeps
@@ -1825,6 +1965,21 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !step.sampledRows.isEmpty {
             sampler.confirmSampledTokens(
                 host.map(Int.init), requestIDs: step.sampledRows)
+        }
+
+        // Recurrent state follows the same one-step-late transaction as KV.
+        // A discarded chained successor never becomes visible: rollback pops
+        // exactly its newest generation, restoring the prior conv/SSM arrays.
+        for (id, evaluation) in step.recurrentEvaluations {
+            do {
+                if step.discard.contains(id) {
+                    try evaluation.rollback()
+                } else {
+                    try evaluation.commit()
+                }
+            } catch {
+                preconditionFailure("CBv2 recurrent finalization failed for \(id): \(error)")
+            }
         }
 
         // Materialize any lazy logprob gathers at this same boundary (they
@@ -1930,11 +2085,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
-        for (_, state, rollbackOne, donation) in step.deferredReleases {
+        for (_, state, rollbackOne, donation, recurrent) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
             retire(state: state, donating: donation)
+            releaseRecurrentState(recurrent)
         }
         if let measurement = step.mtpMeasurement {
             let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
@@ -2034,11 +2190,15 @@ public final class EngineLoopV2: @unchecked Sendable {
                     (
                         id: id, state: state,
                         rollbackOne: inFlight.sampledRows.contains(id),
-                        donation: donation
+                        donation: donation,
+                        recurrent: recurrentStates.removeValue(forKey: id)
                     ))
             } else {
                 retire(state: state, donating: donation)
+                releaseRecurrentState(recurrentStates.removeValue(forKey: id))
             }
+        } else {
+            releaseRecurrentState(recurrentStates.removeValue(forKey: id))
         }
 
         let detokenizer = detokenizers.removeValue(forKey: id)
@@ -2434,6 +2594,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             if let state = kvStates.removeValue(forKey: id) {
                 backend.release(state)
             }
+            releaseRecurrentState(recurrentStates.removeValue(forKey: id))
         }
     }
 
@@ -2449,6 +2610,30 @@ public final class EngineLoopV2: @unchecked Sendable {
             let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
             let state = try backend.makeSequenceState(
                 layerKinds: layerKinds, promptLength: rec.tokens.count, maxLength: maxLength)
+            if let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec {
+                do {
+                    let recurrent = try CBv2RecurrentRequestState(spec: spec)
+                    let existingRecurrentBytes = recurrentStates.values.reduce(0) { total, live in
+                        Self.saturatingAdd(total, live.byteCount)
+                    }
+                    let combined = Self.saturatingAdd(
+                        backend.bytesReserved,
+                        Self.saturatingAdd(existingRecurrentBytes, recurrent.byteCount))
+                    guard combined <= backend.bytesCapacity else {
+                        throw CBv2KVError.capacityExhausted(
+                            needed: recurrent.byteCount,
+                            available: max(
+                                0, backend.bytesCapacity - backend.bytesReserved
+                                    - existingRecurrentBytes))
+                    }
+                    recurrentStates[rec.id] = recurrent
+                } catch {
+                    backend.release(state)
+                    if let kvError = error as? CBv2KVError { throw kvError }
+                    throw CBv2KVError.backendIneligible(
+                        reason: "recurrent state allocation failed: \(error)")
+                }
+            }
             kvStates[rec.id] = state
             capacityRequeues.removeValue(forKey: rec.id)
             return state
@@ -2493,6 +2678,13 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    private func releaseRecurrentState(_ state: CBv2RecurrentRequestState?) {
+        guard let state else { return }
+        do { try state.release() } catch {
+            preconditionFailure("CBv2 recurrent release failed: \(error)")
+        }
+    }
+
     // MARK: Streams
 
     func stream(for id: CBv2RequestID) -> CBv2OutputStream? {
@@ -2533,7 +2725,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Gauges
 
-    private func publishGauges() {
+    func publishGauges() {
         // kvBytesCapacity carries the ADMISSION ceiling so a runtime
         // re-slice reads back consistently between the resize point-update
         // and per-step publishes (on the paged backend the two ledgers
@@ -2541,19 +2733,54 @@ public final class EngineLoopV2: @unchecked Sendable {
         // authoritative even at 0 (a legitimate zero re-slice must not be
         // overwritten with pool truth and re-advertise capacity that
         // admission rejects); backend truth is the fallback only for
-        // ledger-less (bare-loop test) constructions. Reserved bytes carry
-        // the backend's admission-truth promises, so "capacity − reserved"
-        // stays truthful for capacity planners.
+        // ledger-less (bare-loop test) constructions. The installed admission
+        // ledger includes target KV, recurrent fixed residency, assistant KV,
+        // and external carve-outs. The backend can hold a larger target-only
+        // promise (for example contiguous prompt + initial growth slack), so
+        // reconcile that target promise with the ledger's non-backend portion
+        // and take the larger complete obligation.
+        let recurrentBytes = recurrentStates.values.reduce(0) { total, state in
+            let (sum, overflow) = total.addingReportingOverflow(state.materializedByteCount)
+            return overflow ? Int.max : sum
+        }
+        let detachedAssistantStates = inFlight?.mtpRound?.verify?.rows.compactMap(
+            \.assistantState) ?? []
+        let assistantBytes = mtp?.materializedAssistantBytes(
+            detachedStates: detachedAssistantStates) ?? 0
+        let reservedBytes: Int
+        if let admission = capacity as? AdmissionV2 {
+            let target = admission.targetBytesReserved(
+                partitionedBy: Set(kvStates.keys))
+            let materializedTarget = max(backend.bytesReserved, target.materialized)
+            reservedBytes = Self.saturatingAdd(
+                Self.saturatingAdd(materializedTarget, target.unmaterialized),
+                admission.nonBackendBytesReserved)
+        } else {
+            reservedBytes = Self.saturatingAdd(backend.bytesReserved, recurrentBytes)
+        }
         gauges.update(
             CBv2CapacitySnapshot(
                 activeRequests: scheduler.runningCount,
                 waitingRequests: scheduler.waitingCount,
-                kvBytesInUse: backend.bytesInUse,
+                kvBytesInUse: Self.saturatingAdd(
+                    Self.saturatingAdd(backend.bytesInUse, recurrentBytes), assistantBytes),
                 kvBytesCapacity: capacity?.bytesCapacity ?? backend.bytesCapacity,
                 kvBytesBackendCapacity: backend.bytesCapacity,
-                kvBytesReserved: backend.bytesReserved,
+                kvBytesReserved: reservedBytes,
                 activeTokens: scheduler.activeTokens,
                 stepsExecuted: stepCount))
+    }
+
+    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : value
+    }
+
+    static func positionOffset(_ state: [CBv2SequenceKV?]) -> Int {
+        guard let row = state.compactMap({ $0 }).first else {
+            preconditionFailure("CBv2 position state has no owning attention row")
+        }
+        return row.absoluteOffset
     }
 
     // MARK: Watchdog (engine health signal)

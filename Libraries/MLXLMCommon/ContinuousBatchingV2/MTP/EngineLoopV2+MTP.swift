@@ -58,6 +58,7 @@ extension EngineLoopV2 {
             evalTargets: graph.prefillEvalTargets,
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = graph.logprobSegments
+        step.recurrentEvaluations = graph.recurrentEvaluations
         if graph.verify != nil || !graph.seedRows.isEmpty {
             step.mtpRound = CBv2MTPRoundInFlight(
                 verify: graph.verify,

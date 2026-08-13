@@ -54,6 +54,20 @@ extension EngineLoopV2 {
             // A departed row is fenced by deferred release. Its device offset
             // is stale, so force the next eager composition to rebuild.
             if step.discard.contains(id) || scheduler.record(for: id) == nil {
+                if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                    let state = metadata.assistantState
+                {
+                    stateful.discardRound(requestState: state)
+                    mtp.releaseDetachedAssistantState(state)
+                }
+                if let evaluations = verify.recurrentEvaluations[id] {
+                    do {
+                        for evaluation in evaluations.reversed() { try evaluation.rollback() }
+                    } catch {
+                        preconditionFailure(
+                            "CBv2 recurrent MTP discard rollback failed for \(id): \(error)")
+                    }
+                }
                 anyRejected = true
                 continue
             }
@@ -139,6 +153,28 @@ extension EngineLoopV2 {
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
             let rejected = (1 + k) - confirmed
+            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                let state = metadata.assistantState
+            {
+                stateful.finalizeRound(
+                    requestState: state, confirmedInputTokens: confirmed)
+            }
+            if let evaluations = verify.recurrentEvaluations[id] {
+                precondition(
+                    evaluations.count == 1 + k,
+                    "CBv2 recurrent MTP verification generation count mismatch")
+                do {
+                    for evaluation in evaluations.suffix(rejected).reversed() {
+                        try evaluation.rollback()
+                    }
+                    for evaluation in evaluations.prefix(confirmed) {
+                        try evaluation.commit()
+                    }
+                } catch {
+                    preconditionFailure(
+                        "CBv2 recurrent MTP finalization failed for \(id): \(error)")
+                }
+            }
             if rejected > 0 {
                 for sequence in metadata.storageRows { sequence.rollback(rejected) }
                 anyRejected = true
@@ -171,8 +207,14 @@ extension EngineLoopV2 {
                 drafted: k, accepted: committedAccepted, emitted: confirmed)
 
             if let finishReason {
+                if let state = metadata.assistantState {
+                    mtp.releaseDetachedAssistantState(state)
+                }
                 finishRequest(id, reason: finishReason)
             } else {
+                if let state = metadata.assistantState {
+                    mtp.restoreAssistantState(state, for: id)
+                }
                 // No inline deadline check: an MTP row that just confirmed
                 // tokens is making progress and its decode lease is refreshed
                 // in `refreshProgressLeases` (run at the end of the enclosing
