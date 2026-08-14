@@ -17,3 +17,10 @@ MLX Swift was developed with contributions from the following individuals:
 
 SOFTWARE.
 
+
+# Third-Party Portions
+
+- Portions of the Qwen3.5/3.6 Multi-Token Prediction (MTP) model-type handling
+  are adapted from [SharpAI/SwiftLM](https://github.com/SharpAI/SwiftLM) (MIT):
+  the `num_nextn_predict_layers` config alias and the `qwen3_5_mtp` model-type
+  registration used to load community Qwen3.6 MTP checkpoints.

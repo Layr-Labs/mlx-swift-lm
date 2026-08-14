@@ -86,7 +86,17 @@ public enum VLMTypeRegistry {
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_5_mtp": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        // Qwen 3.6 == qwen3_5 architecture; alias to the qwen3_5 path. UNTESTED at runtime.
+        "qwen3_6": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_6_mtp": create(Qwen35Configuration.self, Qwen35.init),
+        // Compact ("qwen36") and dotted ("qwen3.6") spellings, aliased too.
+        // Dense 27B only — no MoE alias (we are not targeting the 35B-A3B MoE).
+        "qwen36": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen36_mtp": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3.6": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3.6_mtp": create(Qwen35Configuration.self, Qwen35.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),

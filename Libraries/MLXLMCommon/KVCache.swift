@@ -1170,7 +1170,7 @@ public class ChunkedKVCache: KVCacheSimple {
 }
 
 /// Base cache for array-based state storage
-public class ArraysCache: BaseKVCache {
+open class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
@@ -1364,7 +1364,11 @@ public class ArraysCache: BaseKVCache {
 }
 
 /// Simple cache for Mamba-style state space models
-public class MambaCache: ArraysCache {
+///
+/// `open` so downstream speculative-decode rollback caches (e.g. the DFlash
+/// GatedDeltaNet RecurrentRollbackCache used for Qwen 3.6 native-MTP) can
+/// subclass it and be recognized by `cache as? MambaCache` in the GDN forward.
+open class MambaCache: ArraysCache {
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }

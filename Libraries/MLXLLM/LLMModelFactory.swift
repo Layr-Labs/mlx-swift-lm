@@ -38,8 +38,21 @@ public enum LLMTypeRegistry {
         "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
         "qwen3_next": create(Qwen3NextConfiguration.self, Qwen3NextModel.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3_5_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        // Qwen 3.6 is the same qwen3_5 architecture (a later checkpoint generation);
+        // alias its model_type strings to the qwen3_5 path. UNTESTED at runtime —
+        // the 3.6 MTP head + backbone have not been run/verified yet.
+        "qwen3_6": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3_6_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3_6_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        // Compact ("qwen36") and dotted ("qwen3.6") spellings of the same type, aliased too.
+        // Dense 27B only — no MoE alias (we are not targeting the 35B-A3B MoE).
+        "qwen36": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen36_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3.6": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3.6_mtp": create(Qwen35Configuration.self, Qwen35Model.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),

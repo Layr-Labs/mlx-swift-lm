@@ -53,6 +53,11 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     // MTP — number of Multi-Token Prediction head layers.
     // Port of omlx commit 696d90a: patches/mlx_lm_mtp/qwen35_model.py
     // `_patch_text_model_args` attaches this from config.json at runtime.
+    //
+    // Sourced from `mtp_num_hidden_layers`, falling back to the HF-native
+    // `num_nextn_predict_layers` alias used by some Qwen3.6 MTP checkpoints.
+    // Alias handling adapted from SharpAI/SwiftLM (MIT),
+    // https://github.com/SharpAI/SwiftLM
     var mtpNumHiddenLayers: Int = 0
 
     enum CodingKeys: String, CodingKey {
@@ -84,6 +89,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case moeIntermediateSize = "moe_intermediate_size"
         case normTopkProb = "norm_topk_prob"
         case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+    }
+
+    // Decoded via a separate container so it does not participate in the
+    // synthesized `Encodable` conformance (it has no dedicated stored property).
+    private enum MTPAliasCodingKey: String, CodingKey {
+        case numNextnPredictLayers = "num_nextn_predict_layers"
     }
 
     public init(from decoder: Decoder) throws {
@@ -136,8 +147,12 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         self.moeIntermediateSize =
             try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
         self.normTopkProb = try container.decodeIfPresent(Bool.self, forKey: .normTopkProb) ?? true
-        self.mtpNumHiddenLayers =
+        let mtpLayers =
             try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
+        let mtpAliasContainer = try decoder.container(keyedBy: MTPAliasCodingKey.self)
+        self.mtpNumHiddenLayers =
+            try mtpAliasContainer.decodeIfPresent(Int.self, forKey: .numNextnPredictLayers)
+            ?? mtpLayers
 
         let ropeContainer = try decoder.container(keyedBy: RopeParametersCodingKey.self)
         let ropeParameters = try ropeContainer.decodeIfPresent(
@@ -1348,8 +1363,15 @@ extension Qwen35TextModel: MTPCapable {
     /// Run a backbone forward that also returns pre-norm hidden states.
     ///
     /// Returns `(logits, preNormHidden)` where `preNormHidden` is the raw backbone output
-    /// BEFORE `model.norm`. The MTP head applies its own `pre_fc_norm_hidden` normalization,
-    /// so it expects un-normalized input. Passing post-norm would double-normalize.
+    /// BEFORE `model.norm`.
+    ///
+    /// NOTE: this is the `hidden_variant == "pre_norm"` variant. MTPLX — the exactness
+    /// reference — defaults to `base_hidden_variant == "post_norm"` and feeds
+    /// `inner.norm(hidden_states)` to the MTP head (mtplx/mtp_patch.py:50,
+    /// `_MTPLXTextModel.__call__`; mtplx/gdn_capture.py `hidden = pre_norm if
+    /// hidden_variant == "pre_norm" else post_norm`), even though the head then applies
+    /// `pre_fc_norm_hidden` on top. Callers that want the MTPLX default must run the
+    /// returned hidden through `applyFinalNorm(_:)` first.
     ///
     /// PR #990: `return out, hidden  # pre-norm hidden for MTP head`
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
@@ -1370,13 +1392,32 @@ extension Qwen35TextModel: MTPCapable {
         return (logits, hidden)
     }
 
-    /// Run the MTP head forward.
-    /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.mtp_forward
-    public func mtpForward(
+    /// Apply the backbone's final `model.norm` to a hidden state.
+    ///
+    /// `callWithHidden` returns the PRE-norm hidden. MTPLX's contract default is
+    /// `base_hidden_variant == "post_norm"` (mtplx/mtp_patch.py:50, and
+    /// `hidden = pre_norm if variant == "pre_norm" else post_norm` in
+    /// `_MTPLXTextModel.__call__`), i.e. the hidden fed to the MTP head is the
+    /// backbone output AFTER `model.norm`. This accessor lets a caller produce that
+    /// variant without changing `callWithHidden`'s existing pre-norm contract.
+    public func applyFinalNorm(_ x: MLXArray) -> MLXArray {
+        model.norm(x)
+    }
+
+    /// Run the MTP head forward, returning `(logits, headHidden)`.
+    ///
+    /// `headHidden` is the MTP head's own post-norm output (`mtp.norm(x)`), which is
+    /// what MTPLX chains into the next draft level when
+    /// `mtp_hidden_variant == "post_norm"` (its default):
+    /// `h = hidden_level[:, -1:, :]` in `_make_device_draft_core.chain_fn`
+    /// (mtplx/generation.py) with `post_norm = self.mtp.norm(x)` in `_mtp_core`
+    /// (mtplx/mtp_patch.py). Required for multi-step (depth > 1) drafting.
+    /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.mtp_forward(return_hidden=True)
+    public func mtpForwardWithHidden(
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
-    ) -> MLXArray {
+    ) -> (MLXArray, MLXArray) {
         guard let mtp else {
-            fatalError("mtpForward called but MTP head is not attached. "
+            fatalError("mtpForwardWithHidden called but MTP head is not attached. "
                 + "Set _qwen35MTPEnabled = true before loading the model.")
         }
         let mtpOut = mtp(
@@ -1384,10 +1425,21 @@ extension Qwen35TextModel: MTPCapable {
             nextTokenIds: nextTokenIds,
             embedTokens: model.embedTokens,
             cache: cache)
+        let logits: MLXArray
         if configuration.tieWordEmbeddings {
-            return model.embedTokens.asLinear(mtpOut)
+            logits = model.embedTokens.asLinear(mtpOut)
+        } else {
+            logits = lmHead!(mtpOut)
         }
-        return lmHead!(mtpOut)
+        return (logits, mtpOut)
+    }
+
+    /// Run the MTP head forward.
+    /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.mtp_forward
+    public func mtpForward(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> MLXArray {
+        mtpForwardWithHidden(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache).0
     }
 
     /// Allocate a fresh KV cache for the MTP head layers.
@@ -1554,6 +1606,19 @@ extension Qwen35Model: MTPCapable {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
         languageModel.mtpForward(hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.mtpForwardWithHidden`.
+    public func mtpForwardWithHidden(
+        hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
+    ) -> (MLXArray, MLXArray) {
+        languageModel.mtpForwardWithHidden(
+            hidden: hidden, nextTokenIds: nextTokenIds, cache: cache)
+    }
+
+    /// See `Qwen35TextModel.applyFinalNorm`.
+    public func applyFinalNorm(_ x: MLXArray) -> MLXArray {
+        languageModel.applyFinalNorm(x)
     }
 
     public func makeMTPCache() -> [any KVCache] {
