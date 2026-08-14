@@ -74,7 +74,11 @@ final class Qwen35MTPDecoderLayer: Module {
     init(_ args: Qwen35TextConfiguration) {
         _selfAttn.wrappedValue = Qwen35Attention(args)
         if args.numExperts > 0 {
-            _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
+            // Split gate/up: the assistant's quantization table
+            // (`mtplx_mtp_quantization`) and the checkpoint's mtp.* tensors
+            // are keyed on the split module paths, and the MTP head loads
+            // outside the target sanitizers that perform gate/up fusion.
+            _mlp.wrappedValue = Qwen35SparseMoeBlock(args, fuseGateUp: false)
         } else {
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,

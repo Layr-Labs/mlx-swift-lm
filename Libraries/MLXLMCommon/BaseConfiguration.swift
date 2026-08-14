@@ -30,6 +30,17 @@ public struct BaseConfiguration: Codable, Sendable {
             self.bits = bits
         }
 
+        /// Initializes a new quantization configuration with an explicit mode.
+        /// - Parameters:
+        ///   - groupSize: The number of weights that share the same scale and bias.
+        ///   - bits: The bit-depth of the quantized weights (e.g., 4 or 8).
+        ///   - mode: The quantization method (affine, mxfp4, mxfp8, ...).
+        public init(groupSize: Int, bits: Int, mode: QuantizationMode) {
+            self.groupSize = groupSize
+            self.bits = bits
+            self._mode = mode
+        }
+
         /// The size of the quantization group.
         public let groupSize: Int
 

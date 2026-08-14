@@ -378,6 +378,61 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// True while the routed gate/up projection uses the fused
+    /// `gate_up_proj` layout built by `fuseGateUp: true`.
+    public var hasFusedGateUp: Bool { gateUpProj != nil }
+
+    /// Structural twin with the requested gate/up topology: same
+    /// dims/bias/activation/profile, freshly initialized gate/up
+    /// projection(s) (the caller's subsequent quantize + strict update
+    /// supplies their tensors), `down_proj` carried over.
+    ///
+    /// Used because the gate/up fusion is a per-load, per-layer decision: a
+    /// heterogeneous checkpoint (different gate vs up quantization policies)
+    /// must load through split modules, and a later homogeneous load on the
+    /// same model instance must be able to restore the fused layout.
+    private init(copying other: SwitchGLU, fusedGateUp: Bool) {
+        self.inputDims = other.inputDims
+        self.hiddenDims = other.hiddenDims
+        self.numExperts = other.numExperts
+        self.activation = other.activation
+        self.activationProduct = other.activationProduct
+        self.weightedReductionProfile = other.weightedReductionProfile
+        self.isSiluActivation = other.isSiluActivation
+        self.isGeluActivation = other.isGeluActivation
+
+        let bias = (other.gateUpProj ?? other.gateProj)?.bias != nil
+        if fusedGateUp {
+            self._gateUpProj.wrappedValue = SwitchLinear(
+                inputDims: other.inputDims, outputDims: other.hiddenDims * 2,
+                numExperts: other.numExperts, bias: bias)
+        } else {
+            self._gateProj.wrappedValue = SwitchLinear(
+                inputDims: other.inputDims, outputDims: other.hiddenDims,
+                numExperts: other.numExperts, bias: bias)
+            self._upProj.wrappedValue = SwitchLinear(
+                inputDims: other.inputDims, outputDims: other.hiddenDims,
+                numExperts: other.numExperts, bias: bias)
+        }
+        self._downProj.wrappedValue = other.downProj
+
+        super.init()
+    }
+
+    /// Returns the split twin described by `init(copying:fusedGateUp:)`.
+    /// Swap it in with `Module.update(modules:)`; direct property assignment
+    /// would not refresh the module cache.
+    public func splittingGateUp() -> SwitchGLU {
+        SwitchGLU(copying: self, fusedGateUp: false)
+    }
+
+    /// Returns the fused twin described by `init(copying:fusedGateUp:)` —
+    /// the inverse of ``splittingGateUp()``, restoring the fused layout when
+    /// a homogeneous checkpoint is loaded onto a previously split instance.
+    public func fusingGateUp() -> SwitchGLU {
+        SwitchGLU(copying: self, fusedGateUp: true)
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {

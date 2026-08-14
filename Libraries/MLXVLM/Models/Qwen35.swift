@@ -756,10 +756,14 @@ enum Qwen35Language {
             self.topK = args.numExpertsPerTok
 
             _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
+            // Fused gate_up: one gather_qmm serves gate+up. The wrapper's
+            // sanitize concatenates split checkpoints into this layout
+            // (`qwen35FuseSwitchMLPGateUp`).
             _switchMLP.wrappedValue = SwitchGLU(
                 inputDims: args.hiddenSize,
                 hiddenDims: args.moeIntermediateSize,
-                numExperts: args.numExperts
+                numExperts: args.numExperts,
+                fuseGateUp: true
             )
 
             _sharedExpert.wrappedValue = MLP(
@@ -782,7 +786,7 @@ enum Qwen35Language {
             }
 
             let y = switchMLP(x, inds)
-            let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+            let combined = weightedExpertSum(y, scores.asType(y.dtype))
 
             var sharedY = sharedExpert(x)
             sharedY = sigmoid(sharedExpertGate(x)) * sharedY
@@ -1103,6 +1107,12 @@ public class Qwen35: Module, VLMModel {
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
     public let config: Qwen35Configuration
+
+    /// Checkpoint quantization policy staged by `loadWeights` (via
+    /// `QuantizationPolicyReceiving`) before `sanitize` runs; drives the
+    /// per-layer decision whether routed-expert gate/up halves may fuse
+    /// (`Qwen35MoE.sanitize`). `nil` for unquantized checkpoints.
+    public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
 
     public init(_ config: Qwen35Configuration) {
         self.config = config

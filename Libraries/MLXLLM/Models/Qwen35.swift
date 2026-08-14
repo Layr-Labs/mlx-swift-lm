@@ -848,7 +848,13 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
-    init(_ args: Qwen35TextConfiguration) {
+    /// - Parameter fuseGateUp: when true the routed experts use one fused
+    ///   `gate_up_proj` SwitchLinear (one gather_qmm serves gate+up; the
+    ///   sanitizers concatenate split checkpoints into the fused layout).
+    ///   The inline MTP head passes false: its weights load through
+    ///   `Qwen35InlineMTPAssistant` whose per-path quantization table is
+    ///   keyed on the split `gate_proj`/`up_proj` module paths.
+    init(_ args: Qwen35TextConfiguration, fuseGateUp: Bool = true) {
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
@@ -857,7 +863,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
+            numExperts: args.numExperts,
+            fuseGateUp: fuseGateUp
         )
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
@@ -880,7 +887,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         }
 
         let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        let combined = weightedExpertSum(y, scores.asType(y.dtype))
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
@@ -1107,6 +1114,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__init__ (MTPModule attachment)
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPModule?
 
+    /// Checkpoint quantization policy staged by `loadWeights` (via
+    /// `QuantizationPolicyReceiving`) before `sanitize` runs; drives the
+    /// per-layer decision whether routed-expert gate/up halves may fuse.
+    /// `nil` for unquantized checkpoints.
+    public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
+
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
@@ -1180,6 +1193,20 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let shouldShiftNormWeights = hasUnsanitizedConv1d  // NOT hasMTPWeights
 
         var weights = weights
+
+        // Routed experts are built fused (`SwitchGLU(fuseGateUp: true)`), and
+        // the `qwen3_5_text` registry entry reaches this sanitizer directly —
+        // without the MoE/VLM wrappers that call the fusion helper. Apply it
+        // here so raw stacked `experts.gate_up_proj` exports and converted
+        // split `switch_mlp.{gate,up}_proj.*` checkpoints both match the
+        // module tree. Idempotent, so the wrapper paths that already fused
+        // are unaffected; `mtp.*` keys stay split.
+        if configuration.numExperts > 0 {
+            weights = qwen35FuseSwitchMLPGateUp(
+                weights: weights,
+                perLayerQuantization: checkpointPerLayerQuantization,
+                setFused: { qwen35SetSwitchGLUGateUpFused($1, at: $0, in: self) })
+        }
 
         // Keep mtp.* keys if the head is attached; strip them otherwise.
         // omlx: `if not hasattr(self, "mtp"): weights = {k:v if "mtp." not in k}`
