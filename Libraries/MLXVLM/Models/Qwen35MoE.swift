@@ -18,9 +18,10 @@ public final class Qwen35MoE: Qwen35 {
     // (quantized included) onto the fused `switch_mlp.gate_up_proj.*`
     // layout. Suffix matching covers both the `model.language_model.*`
     // and `language_model.model.*` key spaces. The fuse decision is per
-    // layer: pairs whose gate/up halves resolve to different quantization
-    // policies stay split, and the `unfuse` callback swaps that layer's
-    // `SwitchGLU` for its split twin so the strict update matches.
+    // layer AND per load: pairs whose gate/up halves resolve to different
+    // quantization policies stay split, and the `setFused` callback
+    // reshapes that layer's `SwitchGLU` in either direction so a later
+    // homogeneous load restores the fused layout.
     //
     // The metadata variant MUST be overridden too: for `format == "mlx"`
     // checkpoints (the production artifact) the base implementation
@@ -34,7 +35,7 @@ public final class Qwen35MoE: Qwen35 {
         qwen35FuseSwitchMLPGateUp(
             weights: super.sanitize(weights: weights, metadata: metadata),
             perLayerQuantization: checkpointPerLayerQuantization,
-            unfuse: { qwen35UnfuseSwitchGLU(at: $0, in: self) })
+            setFused: { qwen35SetSwitchGLUGateUpFused($1, at: $0, in: self) })
     }
 
     public override func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -42,7 +43,7 @@ public final class Qwen35MoE: Qwen35 {
             weights: qwen35FuseSwitchMLPGateUp(
                 weights: weights,
                 perLayerQuantization: checkpointPerLayerQuantization,
-                unfuse: { qwen35UnfuseSwitchGLU(at: $0, in: self) }))
+                setFused: { qwen35SetSwitchGLUGateUpFused($1, at: $0, in: self) }))
     }
 }
 

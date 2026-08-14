@@ -66,18 +66,21 @@ public struct Qwen35Configuration: Codable, Sendable {
 ///   against the split paths keep applying to the fused projection, and
 ///   default-quantized checkpoints resolve the default as before.
 ///
-/// Fusing is a PER-LAYER decision: it is only representable when both
-/// halves resolve to one quantization policy, because a single quantized
-/// projection has one bits/group_size/mode. For every pair whose halves
-/// differ — in resolved policy (`perLayerQuantization`, explicit entries
-/// first, default fallback), in carried tensor sets (e.g. affine `biases`
-/// vs mxfp without), or in packed shapes/dtypes (bits or group_size
-/// mismatch, caught even without a policy table) — the split tensors are
-/// kept verbatim, the reason is logged, and `unfuse` is invoked with the
-/// `<mlp>.switch_mlp` path so the caller can swap that layer's `SwitchGLU`
-/// for its split twin (`qwen35UnfuseSwitchGLU`). Split loading is bit-exact:
-/// the tensors are untouched and each half quantizes through its own
-/// explicit table entry.
+/// Fusing is a PER-LAYER, PER-LOAD decision: it is only representable when
+/// both halves resolve to one quantization policy, because a single
+/// quantized projection has one bits/group_size/mode. For every pair whose
+/// halves differ — in resolved policy (`perLayerQuantization`, explicit
+/// entries first, default fallback), in carried tensor sets (e.g. affine
+/// `biases` vs mxfp without), or in packed shapes/dtypes (bits or
+/// group_size mismatch, caught even without a policy table) — the split
+/// tensors are kept verbatim, the reason is logged, and `setFused` is
+/// invoked with (`<mlp>.switch_mlp`, false). Every pair that IS fused (and
+/// every already-fused checkpoint tensor) reports (path, true) instead, so
+/// the caller can reshape that layer's `SwitchGLU` in either direction
+/// (`qwen35SetSwitchGLUGateUpFused`) — the topology follows each load
+/// rather than ratcheting one way. Split loading is bit-exact: the tensors
+/// are untouched and each half quantizes through its own explicit table
+/// entry.
 ///
 /// `mtp.*` keys are never touched: the inline MTP head keeps split modules
 /// (`Qwen35MTPDecoderLayer` passes `fuseGateUp: false`) because its
@@ -93,7 +96,7 @@ public struct Qwen35Configuration: Codable, Sendable {
 public func qwen35FuseSwitchMLPGateUp(
     weights: [String: MLXArray],
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    unfuse: ((String) -> Void)? = nil
+    setFused: ((String, Bool) -> Void)? = nil
 ) -> [String: MLXArray] {
     var weights = weights
 
@@ -146,7 +149,7 @@ public func qwen35FuseSwitchMLPGateUp(
         {
             let modulePath = String(base.dropLast())
             print("[INFO] qwen35FuseSwitchMLPGateUp: keeping \(modulePath) split — \(reason)")
-            unfuse?(modulePath)
+            setFused?(modulePath, false)
             continue
         }
 
@@ -158,6 +161,22 @@ public func qwen35FuseSwitchMLPGateUp(
             // An unquantized per-row bias is [E, rows]; its row axis is -1.
             let axis = suffix == "bias" ? -1 : -2
             weights["\(base)gate_up_proj.\(suffix)"] = concatenated([gate, up], axis: axis)
+        }
+    }
+
+    // Report every fused pair — freshly concatenated, re-keyed raw exports,
+    // and checkpoints that already carry fused tensors — so a split twin
+    // installed by an earlier heterogeneous load is restored to the fused
+    // layout when the current load is homogeneous.
+    if let setFused {
+        let fusedMarker = ".switch_mlp.gate_up_proj."
+        var fusedBases = Set<String>()
+        for key in weights.keys where key.contains(fusedMarker) && !key.contains("mtp.") {
+            let range = key.range(of: fusedMarker)!
+            fusedBases.insert(String(key[..<range.lowerBound]) + ".switch_mlp")
+        }
+        for base in fusedBases.sorted() {
+            setFused(base, true)
         }
     }
 
@@ -255,21 +274,28 @@ private func qwen35ResolvedQuantization(
     return table.quantization
 }
 
-/// Swap the fused-gate_up `SwitchGLU` at `path` (checkpoint key space) for
-/// its split twin, so a heterogeneous gate/up pair loads through split
-/// `gate_proj`/`up_proj` modules. Intended as the `unfuse` callback of
-/// `qwen35FuseSwitchMLPGateUp`. No-op when the module is absent or already
-/// split. The swap goes through `Module.update(modules:)` so the module
-/// cache sees the new children.
-public func qwen35UnfuseSwitchGLU(at path: String, in root: Module) {
+/// Reshape the `SwitchGLU` at `path` (checkpoint key space) to the fused or
+/// split gate/up topology, whichever the current load requires. Intended as
+/// the `setFused` callback of `qwen35FuseSwitchMLPGateUp`: heterogeneous
+/// pairs load through split `gate_proj`/`up_proj` modules, and a later
+/// homogeneous load on the same instance restores the fused layout. No-op
+/// when the module is absent or already has the requested topology. The
+/// swap goes through `Module.update(modules:)` so the module cache sees the
+/// new children.
+public func qwen35SetSwitchGLUGateUpFused(_ fused: Bool, at path: String, in root: Module) {
     let candidates = qwen35PolicyPathCandidates(for: path)
     for (modulePath, module) in root.namedModules() {
         guard candidates.contains(modulePath), let glu = module as? SwitchGLU else {
             continue
         }
-        if glu.hasFusedGateUp {
-            root.update(
-                modules: ModuleChildren.unflattened([(modulePath, glu.splittingGateUp())]))
+        if glu.hasFusedGateUp != fused {
+            if fused {
+                print(
+                    "[INFO] qwen35SetSwitchGLUGateUpFused: restoring fused gate_up "
+                        + "topology at \(modulePath)")
+            }
+            let twin = fused ? glu.fusingGateUp() : glu.splittingGateUp()
+            root.update(modules: ModuleChildren.unflattened([(modulePath, twin)]))
         }
         return
     }
@@ -368,7 +394,7 @@ public class Qwen35MoEModel: Qwen35Model {
         newWeights = qwen35FuseSwitchMLPGateUp(
             weights: newWeights,
             perLayerQuantization: checkpointPerLayerQuantization,
-            unfuse: { qwen35UnfuseSwitchGLU(at: $0, in: self) })
+            setFused: { qwen35SetSwitchGLUGateUpFused($1, at: $0, in: self) })
 
         return languageModel.sanitize(weights: newWeights)
     }

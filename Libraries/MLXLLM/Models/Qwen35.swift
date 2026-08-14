@@ -1205,7 +1205,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             weights = qwen35FuseSwitchMLPGateUp(
                 weights: weights,
                 perLayerQuantization: checkpointPerLayerQuantization,
-                unfuse: { qwen35UnfuseSwitchGLU(at: $0, in: self) })
+                setFused: { qwen35SetSwitchGLUGateUpFused($1, at: $0, in: self) })
         }
 
         // Keep mtp.* keys if the head is attached; strip them otherwise.

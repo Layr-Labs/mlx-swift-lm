@@ -422,7 +422,7 @@ struct Qwen35FusedGateUpTests {
         var keptSplit: [String] = []
         let sanitized = qwen35FuseSwitchMLPGateUp(
             weights: weights, perLayerQuantization: table,
-            unfuse: { keptSplit.append($0) })
+            setFused: { path, fused in if !fused { keptSplit.append(path) } })
 
         // Mixed layer: split tensors kept verbatim, nothing fused, callback
         // named exactly this layer's switch_mlp.
@@ -441,7 +441,8 @@ struct Qwen35FusedGateUpTests {
         // 4-bit/8-bit pair split (packed columns differ).
         var backstop: [String] = []
         let noTable = qwen35FuseSwitchMLPGateUp(
-            weights: original, unfuse: { backstop.append($0) })
+            weights: original,
+            setFused: { path, fused in if !fused { backstop.append(path) } })
         #expect(backstop == [mixed])
         #expect(noTable["\(mixed).gate_up_proj.weight"] == nil)
         #expect(noTable["\(uniform).gate_up_proj.weight"] != nil)
@@ -485,7 +486,7 @@ struct Qwen35FusedGateUpTests {
                 "\(prefix).up_proj.scales": up.scales,
             ],
             perLayerQuantization: table,
-            unfuse: { keptSplit.append($0) })
+            setFused: { path, fused in if !fused { keptSplit.append(path) } })
         #expect(keptSplit == [prefix])
         #expect(sanitized["\(prefix).gate_up_proj.weight"] == nil)
         #expect(sanitized["\(prefix).gate_proj.weight"] != nil)
@@ -506,7 +507,7 @@ struct Qwen35FusedGateUpTests {
                 "\(prefix).up_proj.biases": gate.biases!,
             ],
             perLayerQuantization: table,
-            unfuse: { policyOnly.append($0) })
+            setFused: { path, fused in if !fused { policyOnly.append(path) } })
         #expect(policyOnly == [prefix])
         #expect(policySanitized["\(prefix).gate_up_proj.weight"] == nil)
 
@@ -783,7 +784,7 @@ struct Qwen35FusedGateUpTests {
                 "\(module).up_proj.biases": up.2,
             ],
             perLayerQuantization: heterogeneous,
-            unfuse: { keptSplit.append($0) })
+            setFused: { path, fused in if !fused { keptSplit.append(path) } })
         #expect(keptSplit == [module])
         #expect(sanitized["\(module).gate_up_proj.weight"] == nil)
         #expect(
@@ -864,5 +865,132 @@ struct Qwen35FusedGateUpTests {
         #expect(
             String(describing: error).contains("gate"),
             Comment(rawValue: "error should name the offending tensors: \(error)"))
+    }
+
+    /// PR #107 P2 follow-up: the per-layer topology decision must follow
+    /// EACH load, not ratchet one way. Three-phase round-trip on one model
+    /// instance: homogeneous load (fused) → heterogeneous load (split,
+    /// strict-green) → homogeneous load again (re-fused, strict-green,
+    /// forward parity with the first load).
+    @Test func topologyRoundTripsAcrossReloads() throws {
+        let json = """
+            {
+              "model_type": "qwen3_5_text",
+              "hidden_size": 64,
+              "num_hidden_layers": 2,
+              "intermediate_size": 64,
+              "num_attention_heads": 4,
+              "num_key_value_heads": 2,
+              "head_dim": 8,
+              "linear_num_value_heads": 2,
+              "linear_num_key_heads": 1,
+              "linear_key_head_dim": 32,
+              "linear_value_head_dim": 32,
+              "linear_conv_kernel_dim": 4,
+              "vocab_size": 64,
+              "full_attention_interval": 2,
+              "num_experts": 4,
+              "num_experts_per_tok": 2,
+              "moe_intermediate_size": 64,
+              "shared_expert_intermediate_size": 16
+            }
+            """
+        let config = try JSONDecoder().decode(
+            Qwen35TextConfiguration.self, from: Data(json.utf8))
+        let model = Qwen35TextModel(config)
+        let reference = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+
+        let fourBit = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        let eightBit = BaseConfiguration.Quantization(groupSize: 64, bits: 8)
+        func table(upBitsLayer0 upQuant: BaseConfiguration.Quantization)
+            -> BaseConfiguration.PerLayerQuantization
+        {
+            BaseConfiguration.PerLayerQuantization(
+                quantization: nil,
+                perLayerQuantization: [
+                    "model.layers.0.mlp.switch_mlp.gate_proj": .quantize(fourBit),
+                    "model.layers.0.mlp.switch_mlp.up_proj": .quantize(upQuant),
+                    "model.layers.1.mlp.switch_mlp.gate_proj": .quantize(fourBit),
+                    "model.layers.1.mlp.switch_mlp.up_proj": .quantize(fourBit),
+                ])
+        }
+        let homogeneous = table(upBitsLayer0: fourBit)
+        let heterogeneous = table(upBitsLayer0: eightBit)
+
+        // Split quantized checkpoint for a given policy table, derived from
+        // the reference float weights.
+        func checkpoint(for policy: BaseConfiguration.PerLayerQuantization)
+            -> [String: MLXArray]
+        {
+            var checkpoint: [String: MLXArray] = [:]
+            for (key, value) in reference {
+                guard key.hasSuffix(".switch_mlp.gate_up_proj.weight") else {
+                    checkpoint[key] = value
+                    continue
+                }
+                let base = String(key.dropLast("gate_up_proj.weight".count))
+                let modulePath = String(base.dropLast(1))
+                let halves = split(value, parts: 2, axis: -2)
+                for (half, name) in [(halves[0], "gate_proj"), (halves[1], "up_proj")] {
+                    let quant = policy.quantization(layer: "\(modulePath).\(name)")!
+                    let q = quantized(
+                        half.asType(.bfloat16), groupSize: quant.groupSize,
+                        bits: quant.bits, mode: .affine)
+                    checkpoint["\(base)\(name).weight"] = q.wq
+                    checkpoint["\(base)\(name).scales"] = q.scales
+                    checkpoint["\(base)\(name).biases"] = q.biases!
+                }
+            }
+            return checkpoint
+        }
+
+        // One full loadWeights-shaped pass: stage policy, sanitize, quantize
+        // with alias resolution, strict update.
+        let aliasing = model as Any as? QuantizationPathAliasing
+        func load(_ policy: BaseConfiguration.PerLayerQuantization) throws {
+            (model as Any as? QuantizationPolicyReceiving)?
+                .checkpointPerLayerQuantization = policy
+            let sanitized = model.sanitize(weights: checkpoint(for: policy))
+            quantize(model: model) { path, _ in
+                guard sanitized["\(path).scales"] != nil else { return nil }
+                return resolveQuantization(
+                    path: path, perLayerQuantization: policy, aliasing: aliasing)?.asTuple
+            }
+            try model.update(
+                parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
+        }
+        func layer0GLU() throws -> SwitchGLU {
+            try #require(
+                model.namedModules().first {
+                    $0.0 == "model.layers.0.mlp.switch_mlp"
+                }?.1 as? SwitchGLU)
+        }
+
+        let tokens = 16
+        let x = MLXRandom.normal([tokens, 64]).asType(.bfloat16)
+        let indices = MLXRandom.randInt(0 ..< 4, [tokens, 8]).asType(.uint32)
+
+        // Phase 1: homogeneous → fused.
+        try load(homogeneous)
+        #expect(try layer0GLU().hasFusedGateUp == true)
+        let phase1 = try layer0GLU()(x, indices)
+        eval(phase1)
+
+        // Phase 2: heterogeneous on the SAME instance → split, strict-green.
+        try load(heterogeneous)
+        #expect(try layer0GLU().hasFusedGateUp == false)
+        eval(try layer0GLU()(x, indices))
+
+        // Phase 3: homogeneous again → re-fused, strict-green, and forward
+        // parity with phase 1 (identical checkpoint, identical codes).
+        try load(homogeneous)
+        #expect(try layer0GLU().hasFusedGateUp == true)
+        let phase3 = try layer0GLU()(x, indices)
+        eval(phase3)
+        #expect(phase1.shape == phase3.shape)
+        let maxErr = (phase3 - phase1).abs().max().item(Float.self)
+        #expect(
+            phase3.allClose(phase1, rtol: 0, atol: 0).item(Bool.self),
+            Comment(rawValue: "re-fused forward diverged from first fused load: max abs err \(maxErr)"))
     }
 }
