@@ -359,15 +359,24 @@ struct Qwen35FusedGateUpTests {
             parameters: ModuleParameters.unflattened(sanitizedRaw), verify: [.all])
 
         // The direct-path model advertises the split-path quantization
-        // aliases that `loadWeights` consults for fused modules.
+        // aliases that `loadWeights` consults for fused modules. Contract
+        // (not an exact list — the candidate matrix spans every key space):
+        // the fused name in the OTHER key spaces comes first, then the
+        // split halves with gate before up, and the path itself is never
+        // its own alias.
         let aliasing = try #require(model as Any as? QuantizationPathAliasing)
-        #expect(
-            aliasing.quantizationPathAliases(
-                for: "model.layers.0.mlp.switch_mlp.gate_up_proj")
-                == [
-                    "model.layers.0.mlp.switch_mlp.gate_proj",
-                    "model.layers.0.mlp.switch_mlp.up_proj",
-                ])
+        let fusedPath = "model.layers.0.mlp.switch_mlp.gate_up_proj"
+        let aliases = aliasing.quantizationPathAliases(for: fusedPath)
+        #expect(!aliases.contains(fusedPath))
+        #expect(aliases.contains("language_model.model.layers.0.mlp.switch_mlp.gate_up_proj"))
+        let gateIdx = try #require(
+            aliases.firstIndex(of: "model.layers.0.mlp.switch_mlp.gate_proj"))
+        let upIdx = try #require(
+            aliases.firstIndex(of: "model.layers.0.mlp.switch_mlp.up_proj"))
+        #expect(gateIdx < upIdx)
+        let lastFusedIdx = try #require(
+            aliases.lastIndex(where: { $0.hasSuffix(".gate_up_proj") }))
+        #expect(lastFusedIdx < gateIdx, "fused-name aliases precede split halves")
         // MTP trees stay split and get no aliases; unrelated paths get none.
         #expect(
             aliasing.quantizationPathAliases(
@@ -795,6 +804,106 @@ struct Qwen35FusedGateUpTests {
             resolveQuantization(
                 path: "\(module).up_proj", perLayerQuantization: heterogeneous,
                 aliasing: aliasing) == upQuant)
+    }
+
+    /// PR #107 P1 follow-up (bare candidate for raw VLM paths): the VLM
+    /// sanitizer fuses on RAW checkpoint keys (`model.language_model.*`)
+    /// BEFORE the namespace remap, while mixed-precision tables may key the
+    /// equivalent bare `model.*` paths. The policy candidates must bridge
+    /// raw→bare directly — otherwise both halves fall to the fallback
+    /// policy, a heterogeneous pair fuses, and load-time aliasing applies
+    /// the gate policy to the up rows (silent dequant corruption).
+    @Test func bareKeyedTableResolvesAgainstRawVlmPaths() throws {
+        struct GateUpAliases: QuantizationPathAliasing {
+            func quantizationPathAliases(for path: String) -> [String] {
+                qwen35GateUpQuantizationAliases(for: path)
+            }
+        }
+        let aliasing = GateUpAliases()
+
+        let raw = "model.language_model.layers.0.mlp.switch_mlp"
+        let bare = "model.layers.0.mlp.switch_mlp"
+        let gateQuant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        let upQuant = BaseConfiguration.Quantization(groupSize: 64, bits: 8)
+
+        // Heterogeneous table keyed on BARE paths, weights arriving RAW
+        // (the VLM pre-remap fuse call): the pair must stay split.
+        let bareHeterogeneous = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(bare).gate_proj": .quantize(gateQuant),
+                "\(bare).up_proj": .quantize(upQuant),
+            ])
+        let inputDims = 128
+        let hiddenDims = 64
+        let numExperts = 4
+        func randomQuantized(
+            _ rows: Int, _ cols: Int, _ quant: BaseConfiguration.Quantization
+        ) -> (MLXArray, MLXArray, MLXArray) {
+            let w = MLXRandom.normal([numExperts, rows, cols]).asType(.bfloat16)
+            let q = quantized(w, groupSize: quant.groupSize, bits: quant.bits, mode: .affine)
+            return (q.wq, q.scales, q.biases!)
+        }
+        let gate = randomQuantized(hiddenDims, inputDims, gateQuant)
+        let up = randomQuantized(hiddenDims, inputDims, upQuant)
+        var keptSplit: [String] = []
+        let sanitized = qwen35FuseSwitchMLPGateUp(
+            weights: [
+                "\(raw).gate_proj.weight": gate.0,
+                "\(raw).gate_proj.scales": gate.1,
+                "\(raw).gate_proj.biases": gate.2,
+                "\(raw).up_proj.weight": up.0,
+                "\(raw).up_proj.scales": up.1,
+                "\(raw).up_proj.biases": up.2,
+            ],
+            perLayerQuantization: bareHeterogeneous,
+            setFused: { path, fused in if !fused { keptSplit.append(path) } })
+        #expect(keptSplit == [raw])
+        #expect(sanitized["\(raw).gate_up_proj.weight"] == nil)
+        #expect(sanitized["\(raw).gate_proj.weight"] != nil)
+
+        // Each kept-split RAW module path resolves its own BARE entry.
+        #expect(
+            resolveQuantization(
+                path: "\(raw).gate_proj", perLayerQuantization: bareHeterogeneous,
+                aliasing: aliasing) == gateQuant)
+        #expect(
+            resolveQuantization(
+                path: "\(raw).up_proj", perLayerQuantization: bareHeterogeneous,
+                aliasing: aliasing) == upQuant)
+
+        // Homogeneous bare-keyed table: the same raw-keyed pair fuses, and
+        // the fused module path (in ANY key space) resolves the policy.
+        let bareHomogeneous = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(bare).gate_proj": .quantize(gateQuant),
+                "\(bare).up_proj": .quantize(gateQuant),
+            ])
+        let up2 = randomQuantized(hiddenDims, inputDims, gateQuant)
+        var fusedPaths: [String] = []
+        let fusedSanitized = qwen35FuseSwitchMLPGateUp(
+            weights: [
+                "\(raw).gate_proj.weight": gate.0,
+                "\(raw).gate_proj.scales": gate.1,
+                "\(raw).gate_proj.biases": gate.2,
+                "\(raw).up_proj.weight": up2.0,
+                "\(raw).up_proj.scales": up2.1,
+                "\(raw).up_proj.biases": up2.2,
+            ],
+            perLayerQuantization: bareHomogeneous,
+            setFused: { path, fused in if fused { fusedPaths.append(path) } })
+        #expect(fusedPaths == [raw])
+        #expect(fusedSanitized["\(raw).gate_up_proj.weight"] != nil)
+        for space in [
+            raw, "language_model.model.layers.0.mlp.switch_mlp", bare,
+        ] {
+            #expect(
+                resolveQuantization(
+                    path: "\(space).gate_up_proj", perLayerQuantization: bareHomogeneous,
+                    aliasing: aliasing) == gateQuant,
+                "fused policy must resolve from key space \(space)")
+        }
     }
 
     /// PR #107 P2 follow-up: a half-split checkpoint (gate tensors without

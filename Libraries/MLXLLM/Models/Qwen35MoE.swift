@@ -236,22 +236,36 @@ private func qwen35GateUpFuseBlocker(
     return nil
 }
 
-/// Config-table path candidates for one checkpoint module path, bridging the
-/// key spaces the sanitizers operate in: `language_model.model.*` (wrapper
-/// module tree), `model.language_model.*` (raw HF VLM exports), and
-/// `model.*` (text-model checkpoints).
+/// Config-table path candidates for one checkpoint module path, bridging
+/// every key space the sanitizers and configs are known to use:
+/// `language_model.model.*` (wrapper module tree), `model.language_model.*`
+/// (raw HF VLM exports — the VLM sanitizer fuses BEFORE remapping, so raw
+/// paths reach policy lookups directly), `model.*` (bare text-model
+/// checkpoints and bare-keyed mixed-precision tables), and
+/// `language_model.*`. The caller's exact path is always the first
+/// candidate so a same-space entry wins; the remaining spaces follow in a
+/// fixed order. Raw, wrapper, and bare inputs normalize symmetrically —
+/// each produces the full candidate set.
 private func qwen35PolicyPathCandidates(for path: String) -> [String] {
+    // Longest prefix first so "model.language_model." is not consumed by
+    // the bare "model." arm.
+    let prefixes = [
+        "language_model.model.", "model.language_model.", "language_model.", "model.",
+    ]
+    var suffix = path
+    for prefix in prefixes where path.hasPrefix(prefix) {
+        suffix = String(path.dropFirst(prefix.count))
+        break
+    }
     var candidates = [path]
-    if path.hasPrefix("language_model.model.") {
-        candidates.append(
-            "model.language_model." + path.dropFirst("language_model.model.".count))
-    }
-    if path.hasPrefix("model.language_model.") {
-        candidates.append(
-            "language_model.model." + path.dropFirst("model.language_model.".count))
-    }
-    if path.hasPrefix("language_model.") {
-        candidates.append(String(path.dropFirst("language_model.".count)))
+    for candidate in [
+        "language_model.model." + suffix,
+        "model.language_model." + suffix,
+        "model." + suffix,
+        "language_model." + suffix,
+        suffix,
+    ] where !candidates.contains(candidate) {
+        candidates.append(candidate)
     }
     return candidates
 }
