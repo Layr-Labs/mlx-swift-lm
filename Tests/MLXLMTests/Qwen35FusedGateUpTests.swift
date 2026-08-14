@@ -664,4 +664,205 @@ struct Qwen35FusedGateUpTests {
             actual.allClose(expected, rtol: 0, atol: 0).item(Bool.self),
             Comment(rawValue: "split-path load diverged from reference: max abs err \(maxErr)"))
     }
+
+    /// PR #107 P1 follow-up: Qwen VLM mixed-precision configs key their
+    /// per-module entries on RAW checkpoint paths
+    /// (`model.language_model.layers.*`) while sanitization remaps modules
+    /// to `language_model.model.layers.*`. Alias resolution must bridge the
+    /// namespaces for the fused name, the split halves, and split modules
+    /// kept by the per-layer policy decision — otherwise the fused module
+    /// falls back to the default (or nothing) and strict loading rejects the
+    /// scale tensors.
+    @Test func rawCheckpointKeySpaceAliasesResolvePolicies() throws {
+        struct GateUpAliases: QuantizationPathAliasing {
+            func quantizationPathAliases(for path: String) -> [String] {
+                qwen35GateUpQuantizationAliases(for: path)
+            }
+        }
+        let aliasing = GateUpAliases()
+
+        let inputDims = 128
+        let hiddenDims = 64
+        let numExperts = 4
+        let raw = "model.language_model.layers.0.mlp.switch_mlp"
+        let module = "language_model.model.layers.0.mlp.switch_mlp"
+
+        let expertQuant = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        let upQuant = BaseConfiguration.Quantization(groupSize: 64, bits: 8)
+        let downQuant = BaseConfiguration.Quantization(groupSize: 32, bits: 8)
+
+        // Homogeneous VLM config keyed on raw split paths, NO default: the
+        // fused module path must resolve the experts' policy through the
+        // cross-namespace aliases.
+        let rawSplitTable = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(raw).gate_proj": .quantize(expertQuant),
+                "\(raw).up_proj": .quantize(expertQuant),
+                "\(raw).down_proj": .quantize(downQuant),
+            ])
+        #expect(
+            resolveQuantization(
+                path: "\(module).gate_up_proj", perLayerQuantization: rawSplitTable,
+                aliasing: nil) == nil)
+        #expect(
+            resolveQuantization(
+                path: "\(module).gate_up_proj", perLayerQuantization: rawSplitTable,
+                aliasing: aliasing) == expertQuant)
+        #expect(
+            resolveQuantization(
+                path: "\(module).down_proj", perLayerQuantization: rawSplitTable,
+                aliasing: aliasing) == downQuant)
+
+        // Raw-keyed FUSED entry resolves too (same-name alias in the raw
+        // namespace wins before the split-half fallbacks).
+        let rawFusedTable = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: ["\(raw).gate_up_proj": .quantize(expertQuant)])
+        #expect(
+            resolveQuantization(
+                path: "\(module).gate_up_proj", perLayerQuantization: rawFusedTable,
+                aliasing: aliasing) == expertQuant)
+
+        // Fused strict load driven entirely by the raw-keyed table.
+        func randomQuantized(
+            _ rows: Int, _ cols: Int, _ quant: BaseConfiguration.Quantization
+        ) -> (MLXArray, MLXArray, MLXArray) {
+            let w = MLXRandom.normal([numExperts, rows, cols]).asType(.bfloat16)
+            let q = quantized(w, groupSize: quant.groupSize, bits: quant.bits, mode: .affine)
+            return (q.wq, q.scales, q.biases!)
+        }
+        let gate = randomQuantized(hiddenDims, inputDims, expertQuant)
+        let up = randomQuantized(hiddenDims, inputDims, expertQuant)
+        let down = randomQuantized(inputDims, hiddenDims, downQuant)
+        var weights: [String: MLXArray] = [
+            "\(module).gate_proj.weight": gate.0, "\(module).gate_proj.scales": gate.1,
+            "\(module).gate_proj.biases": gate.2,
+            "\(module).up_proj.weight": up.0, "\(module).up_proj.scales": up.1,
+            "\(module).up_proj.biases": up.2,
+            "\(module).down_proj.weight": down.0, "\(module).down_proj.scales": down.1,
+            "\(module).down_proj.biases": down.2,
+        ]
+        weights = qwen35FuseSwitchMLPGateUp(
+            weights: weights, perLayerQuantization: rawSplitTable)
+        #expect(weights["\(module).gate_up_proj.weight"] != nil)
+
+        let fusedGLU = SwitchGLU(
+            inputDims: inputDims, hiddenDims: hiddenDims, numExperts: numExperts,
+            fuseGateUp: true)
+        quantize(model: fusedGLU) { path, _ in
+            let full = "\(module).\(path)"
+            guard weights["\(full).scales"] != nil else { return nil }
+            return resolveQuantization(
+                path: full, perLayerQuantization: rawSplitTable,
+                aliasing: aliasing)?.asTuple
+        }
+        let bare = Dictionary(
+            uniqueKeysWithValues: weights.map {
+                (String($0.key.dropFirst(module.count + 1)), $0.value)
+            })
+        try fusedGLU.update(parameters: ModuleParameters.unflattened(bare), verify: [.all])
+
+        // Heterogeneous raw-keyed config: the pair stays split (the policy
+        // candidates bridge the namespaces), and each kept-split module path
+        // resolves its own raw entry through the aliases.
+        let heterogeneous = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(raw).gate_proj": .quantize(expertQuant),
+                "\(raw).up_proj": .quantize(upQuant),
+            ])
+        var keptSplit: [String] = []
+        let sanitized = qwen35FuseSwitchMLPGateUp(
+            weights: [
+                "\(module).gate_proj.weight": gate.0,
+                "\(module).gate_proj.scales": gate.1,
+                "\(module).gate_proj.biases": gate.2,
+                "\(module).up_proj.weight": up.0,
+                "\(module).up_proj.scales": up.1,
+                "\(module).up_proj.biases": up.2,
+            ],
+            perLayerQuantization: heterogeneous,
+            unfuse: { keptSplit.append($0) })
+        #expect(keptSplit == [module])
+        #expect(sanitized["\(module).gate_up_proj.weight"] == nil)
+        #expect(
+            resolveQuantization(
+                path: "\(module).gate_proj", perLayerQuantization: heterogeneous,
+                aliasing: aliasing) == expertQuant)
+        #expect(
+            resolveQuantization(
+                path: "\(module).up_proj", perLayerQuantization: heterogeneous,
+                aliasing: aliasing) == upQuant)
+    }
+
+    /// PR #107 P2 follow-up: a half-split checkpoint (gate tensors without
+    /// their up counterparts) must surface as a catchable load error, not a
+    /// preconditionFailure that kills the host process from inside the
+    /// throwing `loadWeights` API. The sanitizer leaves the orphaned tensors
+    /// untouched and the strict update rejects them by name.
+    @Test func halfSplitCheckpointSurfacesCatchableError() throws {
+        let json = """
+            {
+              "model_type": "qwen3_5_text",
+              "hidden_size": 32,
+              "num_hidden_layers": 2,
+              "intermediate_size": 64,
+              "num_attention_heads": 4,
+              "num_key_value_heads": 2,
+              "head_dim": 8,
+              "linear_num_value_heads": 2,
+              "linear_num_key_heads": 1,
+              "linear_key_head_dim": 32,
+              "linear_value_head_dim": 32,
+              "linear_conv_kernel_dim": 4,
+              "vocab_size": 64,
+              "full_attention_interval": 2,
+              "num_experts": 4,
+              "num_experts_per_tok": 2,
+              "moe_intermediate_size": 16,
+              "shared_expert_intermediate_size": 16
+            }
+            """
+        let config = try JSONDecoder().decode(
+            Qwen35TextConfiguration.self, from: Data(json.utf8))
+        let model = Qwen35TextModel(config)
+        let reference = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+
+        // Corrupt checkpoint: layer 0 carries gate_proj but its up_proj half
+        // is missing (partial download / bad conversion).
+        var checkpoint: [String: MLXArray] = [:]
+        for (key, value) in reference {
+            if key.hasSuffix(".switch_mlp.gate_up_proj.weight") {
+                let base = String(key.dropLast("gate_up_proj.weight".count))
+                let halves = split(value, parts: 2, axis: -2)
+                checkpoint["\(base)gate_proj.weight"] = halves[0]
+                if !key.contains("layers.0.") {
+                    checkpoint["\(base)up_proj.weight"] = halves[1]
+                }
+            } else {
+                checkpoint[key] = value
+            }
+        }
+
+        // Sanitize must not trap; the orphaned half stays for verification.
+        let sanitized = model.sanitize(weights: checkpoint)
+        #expect(sanitized["model.layers.0.mlp.switch_mlp.gate_proj.weight"] != nil)
+        #expect(sanitized["model.layers.0.mlp.switch_mlp.gate_up_proj.weight"] == nil)
+        #expect(sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.weight"] != nil)
+
+        // The strict update throws a catchable error naming the bad tensors;
+        // the process stays alive.
+        var caught: Error?
+        do {
+            try model.update(
+                parameters: ModuleParameters.unflattened(sanitized), verify: [.all])
+        } catch {
+            caught = error
+        }
+        let error = try #require(caught)
+        #expect(
+            String(describing: error).contains("gate"),
+            Comment(rawValue: "error should name the offending tensors: \(error)"))
+    }
 }

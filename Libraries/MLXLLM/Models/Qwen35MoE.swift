@@ -84,8 +84,12 @@ public struct Qwen35Configuration: Codable, Sendable {
 /// quantization table (`mtplx_mtp_quantization`) is keyed on the split
 /// module paths.
 ///
-/// A split checkpoint missing one half of a gate/up pair fails loudly here
-/// rather than surfacing as an opaque strict-update error.
+/// A split checkpoint missing one half of a gate/up pair (corrupt, partial
+/// download, bad conversion) is left untouched — with a warning naming the
+/// layer — so the strict update reports a catchable `UpdateError` (the
+/// orphaned keys are unhandled and the fused parameters stay unset), exactly
+/// like other malformed checkpoints. `loadWeights` stays a throwing API;
+/// nothing here terminates the host process.
 public func qwen35FuseSwitchMLPGateUp(
     weights: [String: MLXArray],
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
@@ -125,9 +129,15 @@ public func qwen35FuseSwitchMLPGateUp(
         let gateSuffixes = suffixes("gate_proj")
         let upSuffixes = suffixes("up_proj")
         guard !upSuffixes.isEmpty else {
-            preconditionFailure(
-                "qwen35FuseSwitchMLPGateUp: \(base)gate_proj.* has no matching "
-                    + "\(base)up_proj.*; refusing to load a half-split expert projection")
+            // Corrupt/partial checkpoint. Leave the orphaned tensors for the
+            // strict update to reject with a catchable error naming them —
+            // trapping here would kill the host process from inside the
+            // throwing loadWeights API.
+            print(
+                "[WARNING] qwen35FuseSwitchMLPGateUp: \(base)gate_proj.* has no "
+                    + "matching \(base)up_proj.*; leaving the half-split expert "
+                    + "projection for strict verification to reject")
+            continue
         }
 
         if let reason = qwen35GateUpFuseBlocker(
@@ -265,22 +275,51 @@ public func qwen35UnfuseSwitchGLU(at path: String, in root: Module) {
     }
 }
 
-/// Per-layer quantization aliases for the fused routed-expert projection.
+/// Per-layer quantization aliases for the routed-expert projections, across
+/// every checkpoint key space.
 ///
-/// Mixed-precision configs are written against the checkpoint layout, so
-/// their explicit overrides name the split `…switch_mlp.gate_proj` /
-/// `…switch_mlp.up_proj` module paths that `qwen35FuseSwitchMLPGateUp`
-/// erases. `loadWeights` consults these aliases whenever the fused path has
-/// no entry of its own. Gate is listed first; a pair is only fused when both
-/// halves resolved to one quantization policy, so whichever half carries an
-/// entry describes the fused tensor.
+/// Mixed-precision configs are written against the checkpoint layout, which
+/// differs from the post-sanitize module tree in two independent ways:
+/// - `qwen35FuseSwitchMLPGateUp` erases the split `…switch_mlp.gate_proj` /
+///   `…switch_mlp.up_proj` names when it fuses a pair, and
+/// - the wrappers remap the namespace itself (raw VLM checkpoints key
+///   entries on `model.language_model.*` while the module tree is
+///   `language_model.model.*`; text-only checkpoints use bare `model.*`).
 ///
-/// `mtp.*` paths return no aliases: the inline MTP head keeps split modules.
+/// `loadWeights` consults these aliases whenever the module path has no
+/// entry of its own, so both remappings must be bridged: a fused
+/// `gate_up_proj` module aliases to its own name in the other key spaces
+/// first, then to the split halves in every key space (gate first; a pair
+/// is only fused when both halves resolved to one quantization policy, so
+/// whichever half carries an entry describes the fused tensor). A split
+/// `gate_proj`/`up_proj` module kept by the per-layer policy decision
+/// aliases to its own name in the other key spaces.
+///
+/// `mtp.*` paths return no aliases: the inline MTP head keeps split modules
+/// with its own quantization table.
 public func qwen35GateUpQuantizationAliases(for path: String) -> [String] {
+    guard !path.contains("mtp.") else { return [] }
+
+    var aliases: [String] = []
+    func appendCandidates(for name: String) {
+        for candidate in qwen35PolicyPathCandidates(for: name)
+        where candidate != path && !aliases.contains(candidate) {
+            aliases.append(candidate)
+        }
+    }
+
     let fusedSuffix = ".gate_up_proj"
-    guard path.hasSuffix(fusedSuffix), !path.contains("mtp.") else { return [] }
-    let base = String(path.dropLast(fusedSuffix.count))
-    return ["\(base).gate_proj", "\(base).up_proj"]
+    if path.hasSuffix(fusedSuffix) {
+        let base = String(path.dropLast(fusedSuffix.count))
+        appendCandidates(for: path)
+        appendCandidates(for: "\(base).gate_proj")
+        appendCandidates(for: "\(base).up_proj")
+    } else if path.hasSuffix(".switch_mlp.gate_proj") || path.hasSuffix(".switch_mlp.up_proj")
+        || path.hasSuffix(".switch_mlp.down_proj")
+    {
+        appendCandidates(for: path)
+    }
+    return aliases
 }
 
 extension Qwen35TextModel: QuantizationPathAliasing {
