@@ -240,8 +240,15 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             let usesCompactRectangularReplay =
                 modelCapabilities.supportsCompactRecurrentMTPReplay
                 && (mtpDriver.map { $0.config.verificationMode != .serialTarget } ?? false)
-            if mtpDriver?.usesRequestStatefulDrafter == true,
-               !usesCompactRectangularReplay
+            let recurrentDepth =
+                mtpDriver?.config.fixedDraftTokens
+                ?? mtpDriver?.config.maxDraftTokens
+                ?? 0
+            let compactContinuationHeadroom =
+                usesCompactRectangularReplay && recurrentDepth >= 2
+            if compactContinuationHeadroom
+                || (mtpDriver?.usesRequestStatefulDrafter == true
+                    && !usesCompactRectangularReplay)
             {
                 guard let perGeneration = try? recurrent.fixedBytesPerRequest() else {
                     preconditionFailure("EngineV2: MTP recurrent-state byte accounting overflow")
@@ -250,14 +257,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 // generation plus one state per [seed,d1...dk] position. The
                 // base recurrent charge already covers three generations
                 // (k=1); a fixed depth reserves only its reachable width,
-                // while adaptive mode reserves the configured maximum. Only
-                // a non-serial driver for a model proving compact rectangular
-                // replay may omit this expansion.
-                let recurrentDepth =
-                    mtpDriver?.config.fixedDraftTokens
-                    ?? mtpDriver?.config.maxDraftTokens
-                    ?? 0
-                let extraGenerations = max(0, recurrentDepth - 1)
+                // while adaptive mode reserves the configured maximum.
+                // Compact S>=3 replay instead needs one extra generation of
+                // headroom while a strict-prefix tape survives into its
+                // successor. S<=2 uses the captured path and needs no extra.
+                let extraGenerations = compactContinuationHeadroom
+                    ? 1 : max(0, recurrentDepth - 1)
                 let (extraBytes, multiplyOverflow) =
                     perGeneration.multipliedReportingOverflow(by: extraGenerations)
                 let (expanded, addOverflow) = fixedBytes.addingReportingOverflow(extraBytes)

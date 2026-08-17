@@ -151,12 +151,25 @@ public struct CBv2RecurrentLayerState {
 
 /// One layer's compact representation of a rectangular recurrent verify.
 /// The replay closure is invoked only for a strict accepted prefix. Full
-/// acceptance commits `finalState` directly and rollback discards the stage.
+/// acceptance may lazily materialize an exact final state; rollback discards
+/// both commit paths.
 public struct CBv2RecurrentPrefixReplayStage {
     public let positions: Int
     public let finalState: CBv2RecurrentLayerState
     public let materializedByteCount: Int
     public let evaluationRoots: [MLXArray]
+    /// Additional materialized roots retained only after a strict-prefix
+    /// commit. They stay charged until a later recurrent generation commits.
+    public let strictReplayRetainedByteCount: Int
+    public let strictReplayRetainedRoots: [MLXArray]
+    /// Roots needed by a lazy full-accept materialization until its successor
+    /// evaluates and commits. The final state itself remains covered by the
+    /// request's ordinary one-generation charge.
+    public let fullAcceptanceRetainedByteCount: Int
+    public let fullAcceptanceRetainedRoots: [MLXArray]
+    /// Optional commit-time materialization for full acceptance. This keeps
+    /// rejectable exact-tail copies out of the verify graph.
+    fileprivate let fullAcceptance: (() -> CBv2RecurrentLayerState)?
     fileprivate let replay: (Int) -> CBv2RecurrentLayerState
 
     public init(
@@ -165,13 +178,21 @@ public struct CBv2RecurrentPrefixReplayStage {
         finalSSM: MLXArray,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
+        strictReplayRetainedByteCount: Int,
+        strictReplayRetainedRoots: [MLXArray],
+        fullAcceptanceRetainedByteCount: Int = 0,
+        fullAcceptanceRetainedRoots: [MLXArray] = [],
+        fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard positions >= 2 else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "prefix replay requires at least two positions")
         }
-        guard materializedByteCount >= 0 else {
+        guard materializedByteCount >= 0,
+              strictReplayRetainedByteCount >= 0,
+              fullAcceptanceRetainedByteCount >= 0
+        else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "prefix replay materialized bytes must be nonnegative")
         }
@@ -179,6 +200,11 @@ public struct CBv2RecurrentPrefixReplayStage {
         self.finalState = CBv2RecurrentLayerState(conv: finalConv, ssm: finalSSM)
         self.materializedByteCount = materializedByteCount
         self.evaluationRoots = evaluationRoots
+        self.strictReplayRetainedByteCount = strictReplayRetainedByteCount
+        self.strictReplayRetainedRoots = strictReplayRetainedRoots
+        self.fullAcceptanceRetainedByteCount = fullAcceptanceRetainedByteCount
+        self.fullAcceptanceRetainedRoots = fullAcceptanceRetainedRoots
+        self.fullAcceptance = fullAcceptance
         self.replay = replay
     }
 }
@@ -189,6 +215,10 @@ public final class CBv2RecurrentRequestState {
     public let byteCount: Int
     public var materializedByteCount: Int {
         var total = committed.isEmpty ? 0 : byteCount
+        let (retainedTotal, retainedOverflow) = total.addingReportingOverflow(
+            committedTransitionRetainedByteCount)
+        if retainedOverflow { return Int.max }
+        total = retainedTotal
         for generation in pending {
             let generationBytes: Int
             if let replay = generation.prefixReplay {
@@ -226,6 +256,9 @@ public final class CBv2RecurrentRequestState {
     }
 
     private var committed: [Int: CBv2RecurrentLayerState] = [:]
+    private var committedTransitionGeneration: UInt64?
+    private var committedTransitionRetainedByteCount = 0
+    private var committedTransitionRetainedRoots: [MLXArray] = []
     private var pending: [Generation] = []
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false
@@ -292,12 +325,21 @@ public final class CBv2RecurrentRequestState {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent commits must follow evaluation order")
         }
+        func clearOlderTransitionRetention() {
+            guard let retainedGeneration = committedTransitionGeneration,
+                generation > retainedGeneration
+            else { return }
+            committedTransitionGeneration = nil
+            committedTransitionRetainedByteCount = 0
+            committedTransitionRetainedRoots.removeAll(keepingCapacity: false)
+        }
         if let captured = first.capturedPositions {
             guard let keep = keepPositions, (1 ... captured).contains(keep) else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "captured commit requires keepPositions in 1...\(captured) "
                         + "(got \(String(describing: keepPositions)))")
             }
+            clearOlderTransitionRetention()
             committed = first.layers.mapValues { layer in
                 CBv2RecurrentLayerState(
                     conv: layer.conv.map { $0[(keep - 1) ..< keep] },
@@ -310,16 +352,40 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
             }
-            if keep == positions {
-                committed = first.layers
+            clearOlderTransitionRetention()
+            let fullAcceptance = keep == positions
+            if fullAcceptance {
+                committed = replay.mapValues { stage in
+                    stage.fullAcceptance?() ?? stage.finalState
+                }
             } else {
                 committed = replay.mapValues { $0.replay(keep) }
+            }
+            var retainedBytes = 0
+            var retainedRoots: [MLXArray] = []
+            for index in replay.keys.sorted() {
+                guard let stage = replay[index] else { continue }
+                let stageBytes = fullAcceptance
+                    ? stage.fullAcceptanceRetainedByteCount
+                    : stage.strictReplayRetainedByteCount
+                let (sum, overflow) = retainedBytes.addingReportingOverflow(stageBytes)
+                retainedBytes = overflow ? Int.max : sum
+                retainedRoots.append(
+                    contentsOf: fullAcceptance
+                        ? stage.fullAcceptanceRetainedRoots
+                        : stage.strictReplayRetainedRoots)
+            }
+            if retainedBytes > 0 || !retainedRoots.isEmpty {
+                committedTransitionGeneration = generation
+                committedTransitionRetainedByteCount = retainedBytes
+                committedTransitionRetainedRoots = retainedRoots
             }
         } else {
             guard keepPositions == nil else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "keepPositions is only valid for captured or prefix replay verify windows")
             }
+            clearOlderTransitionRetention()
             committed = first.layers
         }
         pending.removeFirst()
@@ -344,6 +410,9 @@ public final class CBv2RecurrentRequestState {
                 "release with recurrent work still in flight")
         }
         committed.removeAll(keepingCapacity: false)
+        committedTransitionGeneration = nil
+        committedTransitionRetainedByteCount = 0
+        committedTransitionRetainedRoots.removeAll(keepingCapacity: false)
         isReleased = true
     }
 }
@@ -450,6 +519,11 @@ public final class CBv2RecurrentStateEvaluation {
         finalSSM: MLXArray,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
+        strictReplayRetainedByteCount: Int,
+        strictReplayRetainedRoots: [MLXArray],
+        fullAcceptanceRetainedByteCount: Int = 0,
+        fullAcceptanceRetainedRoots: [MLXArray] = [],
+        fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard !evaluated, stagedCapturedPositions == nil, staged.isEmpty else {
@@ -474,6 +548,11 @@ public final class CBv2RecurrentStateEvaluation {
             finalSSM: finalSSM,
             materializedByteCount: materializedByteCount,
             evaluationRoots: evaluationRoots,
+            strictReplayRetainedByteCount: strictReplayRetainedByteCount,
+            strictReplayRetainedRoots: strictReplayRetainedRoots,
+            fullAcceptanceRetainedByteCount: fullAcceptanceRetainedByteCount,
+            fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
+            fullAcceptance: fullAcceptance,
             replay: replay)
     }
 

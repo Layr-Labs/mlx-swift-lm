@@ -162,7 +162,9 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             modelLayerIndex: 0, positions: 4,
             finalConv: MLXArray.full([1, 2, 3], values: MLXArray(Float(14))),
             finalSSM: MLXArray.full([1, 1, 2, 2], values: MLXArray(Float(14))),
-            materializedByteCount: 37, evaluationRoots: [root]
+            materializedByteCount: 37, evaluationRoots: [root],
+            strictReplayRetainedByteCount: 17,
+            strictReplayRetainedRoots: [root]
         ) { keep in
             strictReplayKeeps.append(keep)
             return CBv2RecurrentLayerState(
@@ -180,40 +182,83 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         XCTAssertEqual(strictReplayKeeps, [2])
         XCTAssertEqual(
             strictState.state(modelLayerIndex: 0)!.ssm![0, 0, 0, 0].item(Float.self), 12)
+        XCTAssertEqual(
+            strictState.materializedByteCount, strictState.byteCount + 17)
+        let settled = try strictState.bind()
+        let strictCommitted = strictState.state(modelLayerIndex: 0)!
+        try settled.stage(
+            modelLayerIndex: 0,
+            conv: try XCTUnwrap(strictCommitted.conv),
+            ssm: try XCTUnwrap(strictCommitted.ssm))
+        eval(try settled.evaluate())
+        try settled.commit()
         XCTAssertEqual(strictState.materializedByteCount, strictState.byteCount)
 
         let fullState = try makeState()
         let full = try fullState.bind()
+        let fullRetentionRoot = MLXArray(Float(456))
+        var fullMaterializationCount = 0
         var fullReplayCount = 0
         try full.stagePrefixReplay(
             modelLayerIndex: 0, positions: 4,
-            finalConv: MLXArray.full([1, 2, 3], values: MLXArray(Float(14))),
-            finalSSM: MLXArray.full([1, 1, 2, 2], values: MLXArray(Float(14))),
-            materializedByteCount: 41, evaluationRoots: []
+            finalConv: MLXArray.full([1, 2, 3], values: MLXArray(Float(99))),
+            finalSSM: MLXArray.full([1, 1, 2, 2], values: MLXArray(Float(99))),
+            materializedByteCount: 41, evaluationRoots: [],
+            strictReplayRetainedByteCount: 0,
+            strictReplayRetainedRoots: [],
+            fullAcceptanceRetainedByteCount: 19,
+            fullAcceptanceRetainedRoots: [fullRetentionRoot],
+            fullAcceptance: {
+                fullMaterializationCount += 1
+                return CBv2RecurrentLayerState(
+                    conv: MLXArray.full([1, 2, 3], values: MLXArray(Float(14))),
+                    ssm: MLXArray.full(
+                        [1, 1, 2, 2], values: MLXArray(Float(14))))
+            }
         ) { _ in
             fullReplayCount += 1
             return CBv2RecurrentLayerState(conv: nil, ssm: nil)
         }
         _ = try full.evaluate()
+        XCTAssertEqual(fullMaterializationCount, 0)
         try full.commit(keepPositions: 4)
+        XCTAssertEqual(fullMaterializationCount, 1)
         XCTAssertEqual(fullReplayCount, 0)
         XCTAssertEqual(
             fullState.state(modelLayerIndex: 0)!.conv![0, 0, 0].item(Float.self), 14)
+        XCTAssertEqual(fullState.materializedByteCount, fullState.byteCount + 19)
+        let fullSettled = try fullState.bind()
+        let fullCommitted = fullState.state(modelLayerIndex: 0)!
+        try fullSettled.stage(
+            modelLayerIndex: 0,
+            conv: try XCTUnwrap(fullCommitted.conv),
+            ssm: try XCTUnwrap(fullCommitted.ssm))
+        eval(try fullSettled.evaluate())
+        try fullSettled.commit()
+        XCTAssertEqual(fullState.materializedByteCount, fullState.byteCount)
 
         let rolledBackState = try makeState()
         let rolledBack = try rolledBackState.bind()
+        var rollbackFullAcceptanceCount = 0
         var rollbackReplayCount = 0
         try rolledBack.stagePrefixReplay(
             modelLayerIndex: 0, positions: 3,
             finalConv: MLXArray.full([1, 2, 3], values: MLXArray(Float(13))),
             finalSSM: MLXArray.full([1, 1, 2, 2], values: MLXArray(Float(13))),
-            materializedByteCount: 29, evaluationRoots: []
+            materializedByteCount: 29, evaluationRoots: [],
+            strictReplayRetainedByteCount: 0,
+            strictReplayRetainedRoots: [],
+            fullAcceptance: {
+                rollbackFullAcceptanceCount += 1
+                return CBv2RecurrentLayerState(conv: nil, ssm: nil)
+            }
         ) { _ in
             rollbackReplayCount += 1
             return CBv2RecurrentLayerState(conv: nil, ssm: nil)
         }
         _ = try rolledBack.evaluate()
         try rolledBack.rollback()
+        XCTAssertEqual(rollbackFullAcceptanceCount, 0)
         XCTAssertEqual(rollbackReplayCount, 0)
         XCTAssertEqual(
             rolledBackState.state(modelLayerIndex: 0)!.conv![0, 0, 0].item(Float.self), 10)
@@ -234,7 +279,9 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                 modelLayerIndex: layer, positions: positions,
                 finalConv: MLXArray.zeros([1, 2, 3]),
                 finalSSM: MLXArray.zeros([1, 1, 2, 2]),
-                materializedByteCount: 1, evaluationRoots: []
+                materializedByteCount: 1, evaluationRoots: [],
+                strictReplayRetainedByteCount: 0,
+                strictReplayRetainedRoots: []
             ) { _ in
                 CBv2RecurrentLayerState(
                     conv: MLXArray.zeros([1, 2, 3]),
@@ -451,7 +498,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         }
     }
 
-    func testProductionWidthCompactReplayFitsBaseThreeGenerationCharge() throws {
+    func testProductionWidthCompactReplayFitsFourGenerationContinuationCharge() throws {
         let json = Data(
             """
             {
@@ -497,8 +544,46 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         XCTAssertEqual(fixedThreeGenerations, 3 * state.byteCount)
         XCTAssertLessThanOrEqual(
             state.materializedByteCount, fixedThreeGenerations,
-            "production k=4 compact replay must fit its resolved base 3F charge")
-        try verify.rollback()
+            "the compact verify itself must fit the base recurrent charge")
+
+        // A strict-prefix commit retains its replay tape until a successor
+        // generation commits. That reachable transition exceeds 3F but must
+        // fit the compact driver's resolved 4F admission reservation.
+        try verify.commit(keepPositions: 3)
+        let successor = try state.bind()
+        _ = layer.cbv2Forward(
+            MLXRandom.normal([1, 1, config.hiddenSize]),
+            modelLayerIndex: 0, recurrentState: [successor])
+        eval(try successor.evaluate())
+        let fixedFourGenerations = 4 * state.byteCount
+        XCTAssertGreaterThan(state.materializedByteCount, fixedThreeGenerations)
+        XCTAssertLessThanOrEqual(
+            state.materializedByteCount, fixedFourGenerations,
+            "strict-prefix continuation must fit resolved compact 4F headroom")
+        try successor.commit()
+        XCTAssertEqual(state.materializedByteCount, state.byteCount)
+
+        // Full acceptance defers the exact conv-tail copy until commit. Its
+        // lazy graph keeps the verify-window backing charged until the next
+        // evaluated generation provides the release fence.
+        let fullVerify = try state.bind()
+        _ = layer.cbv2ForwardCaptured(
+            MLXRandom.normal([1, 5, config.hiddenSize]),
+            modelLayerIndex: 0, recurrentState: [fullVerify])
+        eval(try fullVerify.evaluate())
+        try fullVerify.commit(keepPositions: 5)
+        XCTAssertGreaterThan(state.materializedByteCount, state.byteCount)
+        XCTAssertLessThanOrEqual(state.materializedByteCount, fixedThreeGenerations)
+
+        let fullSuccessor = try state.bind()
+        _ = layer.cbv2Forward(
+            MLXRandom.normal([1, 1, config.hiddenSize]),
+            modelLayerIndex: 0, recurrentState: [fullSuccessor])
+        eval(try fullSuccessor.evaluate())
+        XCTAssertLessThanOrEqual(
+            state.materializedByteCount, fixedFourGenerations)
+        try fullSuccessor.commit()
+        XCTAssertEqual(state.materializedByteCount, state.byteCount)
     }
 
     // MARK: - 3. Compact recurrent prefix replay

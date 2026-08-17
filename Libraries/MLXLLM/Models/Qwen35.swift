@@ -465,10 +465,12 @@ final class Qwen35GatedDeltaNet: Module {
             state: tape.ssmPre,
             mask: tape.mask.map { $0[0..., rows] }
         ).1
-        let boundaryConv = tape.convInput[
+        let boundaryConvView = tape.convInput[
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
             0...]
+        let boundaryConv = boundaryConvView + MLXArray.zeros(
+            boundaryConvView.shape, dtype: boundaryConvView.dtype)
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
     }
 
@@ -735,10 +737,10 @@ final class Qwen35GatedDeltaNet: Module {
                     rowCount: S,
                     convStateRows: nKeep)
                 // Count unique additional buffers retained by this stage.
-                // `finalConv` aliases `convInput`; a one-row `ssmPre`
-                // aliases the already-accounted committed generation when it
-                // existed before this verify. `v` is a view retaining the
-                // whole conv output, so root/count that backing explicitly.
+                // `finalConv` aliases `convInput` until full acceptance detaches
+                // its exact tail at commit. A one-row `ssmPre` aliases the
+                // already-accounted committed generation when it existed before
+                // this verify. `v` retains the whole conv output backing.
                 let convOutBacking = convOut[rowRange]
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
@@ -746,20 +748,32 @@ final class Qwen35GatedDeltaNet: Module {
                 let inputSSM =
                     evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
                 if B > 1 || inputSSM == nil {
-                    roots.append(tape.ssmPre!)
+                    if let ssmPre = tape.ssmPre { roots.append(ssmPre) }
                 }
-                var materializedBytes = 0
-                for array in roots + [finalSSM] {
-                    let (bytes, multiplyOverflow) =
-                        array.size.multipliedReportingOverflow(by: array.dtype.size)
-                    let (sum, addOverflow) =
-                        materializedBytes.addingReportingOverflow(bytes)
-                    guard !multiplyOverflow, !addOverflow else {
-                        preconditionFailure(
-                            "Qwen35 compact recurrent replay byte accounting overflow")
+                var strictReplayRoots = roots
+                if B == 1, let inputSSM {
+                    // The pending baseline already charges this state. After
+                    // strict acceptance it becomes an additional replay input.
+                    strictReplayRoots.append(inputSSM)
+                }
+
+                func checkedByteCount(_ arrays: [MLXArray]) -> Int {
+                    var total = 0
+                    for array in arrays {
+                        let (bytes, multiplyOverflow) =
+                            array.size.multipliedReportingOverflow(by: array.dtype.size)
+                        let (sum, addOverflow) = total.addingReportingOverflow(bytes)
+                        guard !multiplyOverflow, !addOverflow else {
+                            preconditionFailure(
+                                "Qwen35 compact recurrent replay byte accounting overflow")
+                        }
+                        total = sum
                     }
-                    materializedBytes = sum
+                    return total
                 }
+                let materializedBytes = checkedByteCount(roots + [finalSSM])
+                let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
+                let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
                 do {
                     try evaluation.stagePrefixReplay(
                         modelLayerIndex: modelLayerIndex,
@@ -767,7 +781,17 @@ final class Qwen35GatedDeltaNet: Module {
                         finalConv: finalConv,
                         finalSSM: finalSSM,
                         materializedByteCount: materializedBytes,
-                        evaluationRoots: roots,
+                        evaluationRoots: strictReplayRoots,
+                        strictReplayRetainedByteCount: strictReplayRetainedBytes,
+                        strictReplayRetainedRoots: strictReplayRoots,
+                        fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
+                        fullAcceptanceRetainedRoots: [tape.convInput],
+                        fullAcceptance: {
+                            let detachedConv = finalConv + MLXArray.zeros(
+                                finalConv.shape, dtype: finalConv.dtype)
+                            return CBv2RecurrentLayerState(
+                                conv: detachedConv, ssm: finalSSM)
+                        },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
                                 tape: tape, committedRows: keepPositions)

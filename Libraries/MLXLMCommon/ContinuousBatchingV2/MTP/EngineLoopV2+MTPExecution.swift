@@ -36,6 +36,27 @@ struct CBv2MTPGraphBuild {
 
 extension EngineLoopV2 {
 
+    /// Record only the assignments the scheduler demoted. Known capacity
+    /// reasons retain their provenance; an unclassified width mismatch means
+    /// the reservation changed after MTP planning and is one step-level race.
+    func mtpRecordSchedulerDemotions(_ plan: CBv2StepPlan) {
+        guard let mtp else { return }
+        var sawReservationRace = false
+        for assignment in plan.assignments {
+            guard let k = mtp.roundMark(for: assignment.id),
+                assignment.numTokens != 1 + k
+            else { continue }
+            switch plan.speculationFallbacks[assignment.id] {
+            case .tokenBudget: mtp.recordSkip("token_budget")
+            case .kvHeadroom: mtp.recordSkip("kv_headroom")
+            case nil: sawReservationRace = true
+            }
+        }
+        if sawReservationRace {
+            mtp.recordControllerFallback("step_reservation_race")
+        }
+    }
+
     func mtpPrepareRoundWork(
         _ plan: CBv2StepPlan,
         driver mtp: CBv2MTPRoundDriver,
@@ -72,12 +93,6 @@ extension EngineLoopV2 {
                     scheduler.rollbackComputed(id: id, tokens: k)
                     count = 1
                     preserveHistorySeed = mtp.tracksPersistentHistory
-                } else {
-                    switch plan.speculationFallbacks[id] {
-                    case .tokenBudget: mtp.recordSkip("token_budget")
-                    case .kvHeadroom: mtp.recordSkip("kv_headroom")
-                    case nil: mtp.recordSkip("planner_clamp")
-                    }
                 }
             }
 

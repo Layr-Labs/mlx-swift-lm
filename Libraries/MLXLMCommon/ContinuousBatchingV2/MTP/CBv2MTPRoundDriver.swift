@@ -330,15 +330,6 @@ final class CBv2MTPRoundDriver {
         guard (stateful && recurrent && mtpModel.supportsRequestStatefulMTP)
             || (!stateful && !recurrent && captureLayers != nil)
         else { return nil }
-        if stateful {
-            guard mtpModel is any CBv2MTPPolicyTopTwoProviding else { return nil }
-            if let availability =
-                mtpModel as? any CBv2MTPPolicyTopTwoCapabilityProviding,
-                !availability.cbv2MTPPolicyTopTwoAvailable
-            {
-                return nil
-            }
-        }
         guard let modelTarget = mtpModel.mtpTargetIdentity,
             let drafterTarget = drafter.mtpTargetIdentity,
             modelTarget == drafterTarget
@@ -353,8 +344,18 @@ final class CBv2MTPRoundDriver {
             config.fixedDraftTokens = config.fixedDraftTokens.map { _ in 0 }
             config.maxAutomaticRectangularTokens = 0
         }
-        return CBv2MTPRoundDriver(
+        let driver = CBv2MTPRoundDriver(
             config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers)
+        if driver.usesMarginalPolicy {
+            guard mtpModel is any CBv2MTPPolicyTopTwoProviding else { return nil }
+            if let availability =
+                mtpModel as? any CBv2MTPPolicyTopTwoCapabilityProviding,
+                !availability.cbv2MTPPolicyTopTwoAvailable
+            {
+                return nil
+            }
+        }
+        return driver
     }
 
     // MARK: Plan-scoped marks

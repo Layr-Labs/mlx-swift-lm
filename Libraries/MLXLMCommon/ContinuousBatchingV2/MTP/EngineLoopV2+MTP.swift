@@ -24,7 +24,7 @@ extension EngineLoopV2 {
             return assignment.numTokens != 1 + k
         }
         if demoteAllRounds {
-            mtp.recordControllerFallback("step_reservation_race")
+            mtpRecordSchedulerDemotions(plan)
         }
 
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0

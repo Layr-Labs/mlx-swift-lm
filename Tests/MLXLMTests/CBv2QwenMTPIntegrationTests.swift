@@ -133,7 +133,8 @@ private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
 
 private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
     CBv2PositionedRecurrentSteppableModel, CBv2PositionedMultimodalSteppableModel,
-    CBv2PositionAxisProviding, CBv2MTPPolicyTopTwoProviding
+    CBv2PositionAxisProviding, CBv2MTPPolicyTopTwoProviding,
+    CBv2MTPPolicyTopTwoCapabilityProviding
 {
     let cbv2Capabilities: CBv2ModelCapabilities
     let recurrentStateSpec: CBv2RecurrentStateSpec? = .init(layers: [
@@ -167,6 +168,7 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
     /// (token, state) instead of a ±10 one-hot — exercises real sampling.
     let spreadLogits: Bool
     let compactReplay: Bool
+    let cbv2MTPPolicyTopTwoAvailable: Bool
     var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(self) }
     var supportsRequestStatefulMTP: Bool { true }
     var supportsCapturedVerifyWindow: Bool { captureWindows }
@@ -177,11 +179,12 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
 
     init(
         captureWindows: Bool = false, spreadLogits: Bool = false,
-        compactReplay: Bool = false
+        compactReplay: Bool = false, policyTopTwoAvailable: Bool = true
     ) {
         self.captureWindows = captureWindows
         self.spreadLogits = spreadLogits
         self.compactReplay = compactReplay
+        self.cbv2MTPPolicyTopTwoAvailable = policyTopTwoAvailable
         self.cbv2Capabilities = CBv2ModelCapabilities(
             supportsPrefixReuse: false, supportsPagedKV: false,
             supportsCompiledDecode: false, supportsPackedPrefill: false,
@@ -757,6 +760,31 @@ struct CBv2QwenMTPIntegrationTests {
         await targetOnly.shutdown()
     }
 
+    @Test("fixed stateful depth does not require adaptive top-two policy")
+    func fixedStatefulDepthWithoutTopTwoPolicy() {
+        let model = QwenMTPFixtureModel(
+            captureWindows: true, policyTopTwoAvailable: false)
+        let drafter = QwenMTPFixtureDrafter(
+            target: model, correctionOffset: 0, verification: .rectangular,
+            maxDraft: 2)
+        let fixed = CBv2MTPRoundDriver.build(
+            model: model, drafter: drafter,
+            config: CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1,
+                fixedDraftTokens: 2, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 4))
+        #expect(fixed?.config.fixedDraftTokens == 2)
+        #expect(fixed?.config.maxDraftTokens == 2)
+
+        let adaptive = CBv2MTPRoundDriver.build(
+            model: model, drafter: drafter,
+            config: CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1,
+                fixedDraftTokens: nil, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 4))
+        #expect(adaptive == nil)
+    }
+
     @Test("fixed positive depth captures decode history while batch pressure forces zero")
     func fixedDepthTemporaryZeroCapturesHistory() async throws {
         let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
@@ -855,7 +883,9 @@ struct CBv2QwenMTPIntegrationTests {
             #expect(
                 captured.admissionForTesting.fixedBytesPerRequest
                     == 24 + 8 * (depth - 1))
-            #expect(compact.admissionForTesting.fixedBytesPerRequest == 24)
+            #expect(
+                compact.admissionForTesting.fixedBytesPerRequest
+                    == (depth >= 2 ? 32 : 24))
             await captured.shutdown()
             await compact.shutdown()
         }
@@ -937,6 +967,78 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(result.finishReason == .length)
         #expect(drafter.created == 0)
         await engine.shutdown()
+    }
+
+    @Test("persistent-history planner fallback is a replacement seed")
+    func persistentHistoryPlannerFallbackPreservesCarryPipeline() throws {
+        let model = QwenMTPFixtureModel(captureWindows: true, compactReplay: true)
+        let drafter = QwenMTPFixtureDrafter(
+            target: model, correctionOffset: 0,
+            verification: .rectangular, targetPrefix: true, maxDraft: 2)
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model, drafter: drafter,
+                config: .init(
+                    enabled: true, maxDraftTokens: 2,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: 2,
+                    verificationMode: .rectangular)))
+        #expect(driver.tracksPersistentHistory)
+
+        let kinds = [
+            CBv2LayerKind(
+                attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
+        ]
+        let scheduler = SchedulerV2(
+            config: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 2,
+                prefillChunkSize: 2, maxWaiting: 1))
+        var request = CBv2SchedFixtures.request(prompt: [1, 2], maxTokens: 8)
+        request.sampling.temperature = 0
+        try scheduler.enqueue(request)
+        CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())
+        #expect(scheduler.record(for: request.id)?.isDecodeReady == true)
+
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let loop = EngineLoopV2(
+            model: model, layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds),
+            sampler: CBv2GreedySampler(),
+            detokenizerFactory: CBv2NullDetokenizerFactory(),
+            scheduler: scheduler, capacity: nil, mtp: driver,
+            config: CBv2EngineLoopConfig(),
+            gauges: CBv2EngineGauges(kvBytesCapacity: backend.bytesCapacity))
+
+        driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
+        scheduler.speculationPlanner = { rec in
+            driver.markRound(rec.id, k: 2)
+            return 2
+        }
+        let plan = scheduler.plan()
+        #expect(plan.assignments.map(\.numTokens) == [1])
+        #expect(plan.speculationFallbacks[request.id] == .tokenBudget)
+
+        let step = try #require(loop.executeMTPRound(plan))
+        #expect(step.mtpRound?.seedRows.map(\.id) == [request.id])
+        #expect(step.mtpRound?.verify == nil)
+        let metrics = driver.metricsSnapshot()
+        #expect(metrics.skippedRows["token_budget"] == 1)
+        #expect(metrics.controllerFallbacks["step_reservation_race"] == nil)
+
+        let host = try #require(step.sampledTokens).asArray(Int32.self)
+        #expect(host.count == 1)
+        for evaluation in step.recurrentEvaluations.values {
+            try evaluation.commit()
+        }
+        scheduler.recordSampled(id: request.id, token: Int(host[0]))
+        loop.finalizeMTPRound(step)
+
+        let advanced = try #require(scheduler.record(for: request.id))
+        #expect(driver.hasValidCarry(for: advanced))
+        driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
+        #expect(loop.mtpPlanSpeculation(for: advanced) == 2)
+        #expect(driver.roundMark(for: request.id) == 2)
+        #expect(!driver.isSeedMarked(request.id))
     }
 
     @Test("adaptive cost discards one cold head sample then recovers or rejects")
