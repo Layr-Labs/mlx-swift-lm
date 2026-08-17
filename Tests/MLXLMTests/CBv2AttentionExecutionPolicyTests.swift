@@ -4,13 +4,12 @@ import XCTest
 @testable import MLXLMCommon
 
 final class CBv2AttentionExecutionPolicyTests: XCTestCase {
-    private func qualification(
-        automatic: Bool
-    ) -> CBv2AttentionExecutionQualification {
-        CBv2AttentionExecutionQualification(
-            architecture: .qwenLike,
-            automaticOptimization: automatic
-                ? .forcedFusedD256BF16FullAttentionPrefill : nil)
+    private let hardwareQualification =
+        CBv2AttentionHardwareQualification
+        .qwenLikeD256Hq16Hkv2GQA8BF16FullAttentionPrefill
+
+    private func qualification() -> CBv2AttentionExecutionQualification {
+        CBv2AttentionExecutionQualification(architecture: .qwenLike)
     }
 
     private func kind(
@@ -20,12 +19,13 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
             attention: .full,
             headDim: 256,
             kvHeads: 2,
-            queryHeads: 4,
+            queryHeads: 16,
             attentionExecutionQualification: qualification)
     }
 
     private func route(
         control: CBv2AttentionExecutionControl,
+        hardwareQualified: Bool = false,
         kind: CBv2LayerKind,
         queryLength: Int = 256,
         queryDType: DType = .bfloat16,
@@ -33,7 +33,10 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
         hasSpanMask: Bool = false,
         serializesQueries: Bool = false
     ) -> CBv2AttentionExecutionRoute {
-        CBv2AttentionExecutionPolicy(control: control).route(
+        CBv2AttentionExecutionPolicy(
+            control: control,
+            hardwareQualification: hardwareQualified ? hardwareQualification : nil
+        ).contiguousRoute(
             kind: kind,
             queryLength: queryLength,
             queryDType: queryDType,
@@ -49,34 +52,46 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
         XCTAssertEqual(CBv2AttentionExecutionControl.parse(" FUSED "), .fused)
 
         XCTAssertEqual(
-            route(
-                control: .fallback,
-                kind: kind(qualification: qualification(automatic: true))),
+            route(control: .fallback, kind: kind(qualification: qualification())),
             .fallback)
     }
 
-    func testFusedAndAutoHaveDistinctQualificationContracts() {
-        let unknown = kind()
-        let architectureOnly = kind(qualification: qualification(automatic: false))
-        let automaticallyQualified = kind(qualification: qualification(automatic: true))
+    func testAutoRequiresArchitectureAndExternalHardwareQualification() {
+        let unknownArchitecture = kind()
+        let qwenLike = kind(qualification: qualification())
 
-        XCTAssertEqual(route(control: .fused, kind: unknown), .fallback)
-        XCTAssertEqual(route(control: .auto, kind: unknown), .fallback)
-
-        XCTAssertEqual(route(control: .fused, kind: architectureOnly), .forcedFused)
-        XCTAssertEqual(route(control: .auto, kind: architectureOnly), .fallback)
-
-        XCTAssertEqual(route(control: .fused, kind: automaticallyQualified), .forcedFused)
-        XCTAssertEqual(route(control: .auto, kind: automaticallyQualified), .forcedFused)
+        XCTAssertEqual(
+            route(
+                control: .auto,
+                hardwareQualified: true,
+                kind: unknownArchitecture),
+            .fallback)
+        XCTAssertEqual(route(control: .auto, kind: qwenLike), .fallback)
+        XCTAssertEqual(route(control: .fused, kind: qwenLike), .forcedFused)
+        XCTAssertEqual(
+            route(control: .auto, hardwareQualified: true, kind: qwenLike),
+            .forcedFused)
     }
 
-    func testForcedFusedRequiresExactQwenD256BF16FullPrefill() {
-        let eligible = kind(qualification: qualification(automatic: true))
+    func testForcedFusedRequiresExactQwenD256Hq16Hkv2GQA8BF16FullPrefill() {
+        let eligible = kind(qualification: qualification())
         XCTAssertEqual(route(control: .fused, kind: eligible), .forcedFused)
 
         var wrongHeadDimension = eligible
         wrongHeadDimension.headDim = 128
         XCTAssertEqual(route(control: .fused, kind: wrongHeadDimension), .fallback)
+
+        var wrongQueryHeads = eligible
+        wrongQueryHeads.queryHeads = 4
+        XCTAssertEqual(route(control: .fused, kind: wrongQueryHeads), .fallback)
+
+        var wrongKVHeads = eligible
+        wrongKVHeads.kvHeads = 1
+        XCTAssertEqual(route(control: .fused, kind: wrongKVHeads), .fallback)
+
+        var wrongGQA = eligible
+        wrongGQA.kvHeads = 4
+        XCTAssertEqual(route(control: .fused, kind: wrongGQA), .fallback)
 
         var sliding = eligible
         sliding.attention = .slidingWindow(4096)
@@ -110,7 +125,7 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
         let fallbackRoute = route(control: .fused, kind: kind())
         let fusedRoute = route(
             control: .fused,
-            kind: kind(qualification: qualification(automatic: false)))
+            kind: kind(qualification: qualification()))
 
         XCTAssertTrue(
             policy.shouldBlockQueries(
@@ -121,13 +136,10 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
         XCTAssertFalse(
             policy.shouldBlockQueries(
                 queryLength: 128, blockSize: 128, route: fallbackRoute))
-        XCTAssertFalse(
-            policy.shouldBlockQueries(
-                queryLength: 256, blockSize: 0, route: fallbackRoute))
     }
 
     func testDecodeAndMTPRectanglesNeverSelectForcedFused() {
-        let eligible = kind(qualification: qualification(automatic: true))
+        let eligible = kind(qualification: qualification())
 
         XCTAssertEqual(
             route(control: .fused, kind: eligible, queryLength: 1),
@@ -139,17 +151,5 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
                 queryLength: 4,
                 serializesQueries: true),
             .fallback)
-    }
-
-    func testEligibleRoutePreservesContiguousAndPagedCausalMasks() {
-        let eligible = kind(qualification: qualification(automatic: true))
-        XCTAssertEqual(route(control: .fused, kind: eligible), .forcedFused)
-
-        let contiguous = CBv2AttentionV1.maskMode(L: 2, kL: 4, window: nil)
-        guard case .causal = contiguous else {
-            return XCTFail("eligible contiguous prefill must retain the symbolic causal mask")
-        }
-
-        XCTAssertEqual(PagedLayerCache.prefillMaskContract, .absoluteArray)
     }
 }

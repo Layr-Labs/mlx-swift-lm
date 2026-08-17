@@ -20,6 +20,7 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
         hiddenLayers: Int = 40,
         fullAttentionInterval: Int = 4,
         attentionHeadDim: Int = 16,
+        attentionHeads: Int = 4,
         valueHeads: Int = 32,
         keyHeads: Int = 16,
         keyHeadDim: Int = 128,
@@ -32,7 +33,7 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
               "hidden_size": 64,
               "num_hidden_layers": \(hiddenLayers),
               "intermediate_size": 128,
-              "num_attention_heads": 4,
+              "num_attention_heads": \(attentionHeads),
               "num_key_value_heads": 2,
               "head_dim": \(attentionHeadDim),
               "linear_num_value_heads": \(valueHeads),
@@ -67,20 +68,29 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
         XCTAssertTrue(
             kinds.allSatisfy {
                 $0.attentionExecutionQualification?.architecture == .qwenLike
-                    && $0.attentionExecutionQualification?.automaticOptimization == nil
             })
     }
 
-    func testD256LayersAffirmAutomaticFusedPrefillQualification() throws {
-        let kinds = try configuration(attentionHeadDim: 256).cbv2LayerKinds
+    func testD256LayersSupplyIdentityButNotHardwareQualification() throws {
+        let kinds = try configuration(
+            attentionHeadDim: 256,
+            attentionHeads: 16
+        ).cbv2LayerKinds
 
         XCTAssertFalse(kinds.isEmpty)
         XCTAssertTrue(
             kinds.allSatisfy {
                 $0.attentionExecutionQualification?.architecture == .qwenLike
-                    && $0.attentionExecutionQualification?.automaticOptimization
-                        == .forcedFusedD256BF16FullAttentionPrefill
             })
+        XCTAssertEqual(
+            CBv2AttentionExecutionPolicy(control: .auto).contiguousRoute(
+                kind: kinds[0],
+                queryLength: 2,
+                queryDType: .bfloat16,
+                attentionSoftcap: nil,
+                hasSpanMask: false,
+                serializesQueries: false),
+            .fallback)
     }
 
     func testCacheConstructionUsesCompactStorageAndOriginalLayerIndices() throws {

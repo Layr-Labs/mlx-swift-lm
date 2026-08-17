@@ -7,26 +7,25 @@
 import Foundation
 import MLX
 
-/// Model-supplied qualification for attention execution optimizations.
+/// Model-supplied architecture identity. This is deliberately insufficient
+/// for automatic optimization: hardware qualification comes from the caller.
 public struct CBv2AttentionExecutionQualification: Sendable, Equatable {
     public enum Architecture: Sendable, Equatable {
         case qwenLike
     }
 
-    public enum AutomaticOptimization: Sendable, Equatable {
-        case forcedFusedD256BF16FullAttentionPrefill
-    }
-
     public var architecture: Architecture
-    public var automaticOptimization: AutomaticOptimization?
 
-    public init(
-        architecture: Architecture,
-        automaticOptimization: AutomaticOptimization? = nil
-    ) {
+    public init(architecture: Architecture) {
         self.architecture = architecture
-        self.automaticOptimization = automaticOptimization
     }
+}
+
+/// External evidence that the forced-fused route is qualified on this
+/// hardware/runtime combination. Model identity and tensor shape cannot mint
+/// this value; the engine builder must supply it after hardware qualification.
+public enum CBv2AttentionHardwareQualification: Sendable, Equatable {
+    case qwenLikeD256Hq16Hkv2GQA8BF16FullAttentionPrefill
 }
 
 /// Operator control for the CBv2 attention execution route.
@@ -35,7 +34,7 @@ public enum CBv2AttentionExecutionControl: String, Sendable, Equatable {
     case fallback
     /// Explicit A/B arm: force the fused kernel for exactly eligible calls.
     case fused
-    /// Production selection: also requires model-supplied optimization approval.
+    /// Production selection: also requires external hardware qualification.
     case auto
 
     static func parse(_ value: String?) -> Self {
@@ -50,27 +49,56 @@ enum CBv2AttentionExecutionRoute: Sendable, Equatable {
     case forcedFused
 }
 
-/// Small, injectable policy shared by the contiguous and paged CBv2 caches.
+enum CBv2AttentionExecutionPath: Sendable, Equatable {
+    case singleCall
+    case queryBlocked
+    case span
+    case serializedQueries
+    case lastQuery
+}
+
+struct CBv2AttentionExecutionObservation: Sendable, Equatable {
+    var route: CBv2AttentionExecutionRoute
+    var path: CBv2AttentionExecutionPath
+    var queryLength: Int
+}
+
+/// Small, injectable policy for the contiguous CBv2 attention cache.
 public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
     public static let environmentVariable = "DARKBLOOM_CBV2_ATTN_EXECUTION"
 
     public var control: CBv2AttentionExecutionControl
+    public var hardwareQualification: CBv2AttentionHardwareQualification?
 
-    public init(control: CBv2AttentionExecutionControl) {
+    public init(
+        control: CBv2AttentionExecutionControl,
+        hardwareQualification: CBv2AttentionHardwareQualification? = nil
+    ) {
         self.control = control
+        self.hardwareQualification = hardwareQualification
     }
 
-    /// Process-level production control. Missing and invalid values fail closed.
+    /// Process-level production control. Missing and invalid values fail
+    /// closed, and environment control alone never supplies hardware evidence.
     public static var production: Self {
+        production(hardwareQualification: nil)
+    }
+
+    /// Process-level control paired with externally established hardware
+    /// evidence. This is the production entry point for an enabled `auto`.
+    public static func production(
+        hardwareQualification: CBv2AttentionHardwareQualification?
+    ) -> Self {
         Self(
             control: .parse(
-                ProcessInfo.processInfo.environment[environmentVariable]))
+                ProcessInfo.processInfo.environment[environmentVariable]),
+            hardwareQualification: hardwareQualification)
     }
 
     /// The fallback policy used by lower-level direct callers that do not opt in.
     public static let fallback = Self(control: .fallback)
 
-    func route(
+    func contiguousRoute(
         kind: CBv2LayerKind,
         queryLength: Int,
         queryDType: DType,
@@ -85,6 +113,9 @@ public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
             !kind.isBidirectional,
             !kind.hasSinks,
             kind.headDim == 256,
+            kind.queryHeads == 16,
+            kind.kvHeads == 2,
+            kind.queryHeads == kind.kvHeads * 8,
             queryLength > 1,
             queryDType == .bfloat16,
             attentionSoftcap == nil,
@@ -100,8 +131,8 @@ public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
         case .fused:
             return .forcedFused
         case .auto:
-            guard kind.attentionExecutionQualification?.automaticOptimization
-                == .forcedFusedD256BF16FullAttentionPrefill
+            guard hardwareQualification
+                == .qwenLikeD256Hq16Hkv2GQA8BF16FullAttentionPrefill
             else {
                 return .fallback
             }

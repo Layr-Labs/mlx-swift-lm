@@ -68,6 +68,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// text rows sharing a rectangular call.
     private(set) var boundSpanContexts: [CBv2SpanChunkContext?]?
 
+    /// Internal route observation seam for focused cache-level tests.
+    var attentionExecutionObserver: ((CBv2AttentionExecutionObservation) -> Void)?
+
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
         attentionSoftcap: Float? = nil,
@@ -124,7 +127,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
-            executionPolicy: attentionExecutionPolicy)
+            executionPolicy: attentionExecutionPolicy,
+            executionObserver: attentionExecutionObserver)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -148,7 +152,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         let output = CBv2AttentionV1.updateAndAttendLastQuery(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+            scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            executionObserver: attentionExecutionObserver)
         cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
         return output
     }

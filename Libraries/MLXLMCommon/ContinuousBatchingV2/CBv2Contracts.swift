@@ -320,8 +320,8 @@ public struct CBv2LayerKind: Sendable, Equatable {
     public var headDim: Int
     public var kvHeads: Int
     public var queryHeads: Int
-    /// Explicit model identity and optional automatic-optimization approval
-    /// for attention execution policy. nil is fail-closed.
+    /// Explicit model architecture identity for attention execution policy.
+    /// nil is fail-closed; automatic hardware approval lives on the policy.
     public var attentionExecutionQualification: CBv2AttentionExecutionQualification?
     /// Original transformer-layer index when the CBv2 storage layout is a
     /// compact subset of the model layers (for example, hybrid recurrent +

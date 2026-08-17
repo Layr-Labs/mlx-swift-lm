@@ -189,7 +189,8 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
-        executionPolicy: CBv2AttentionExecutionPolicy = .fallback
+        executionPolicy: CBv2AttentionExecutionPolicy = .fallback,
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -216,13 +217,15 @@ enum CBv2AttentionV1 {
                 return updateAndAttendRowSerialQueries(
                     row: rows[0], kind: kind,
                     queries: queries, keys: keys, values: values,
-                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+                    scale: scale, sinks: effectiveSinks, softcap: softcap,
+                    executionObserver: executionObserver)
             }
             return updateAndAttendRow(
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[0], executionPolicy: executionPolicy)
+                spanContext: spanContexts?[0], executionPolicy: executionPolicy,
+                executionObserver: executionObserver)
         }
 
         if L == 1 {
@@ -236,6 +239,9 @@ enum CBv2AttentionV1 {
                 let (cachedKeys, cachedValues) = row.update(
                     keys: keys[index ..< (index + 1)],
                     values: values[index ..< (index + 1)])
+                executionObserver?(
+                    CBv2AttentionExecutionObservation(
+                        route: .fallback, path: .singleCall, queryLength: 1))
                 outputs.append(
                     attend(
                         queries: queries[index ..< (index + 1)],
@@ -255,13 +261,15 @@ enum CBv2AttentionV1 {
                 return updateAndAttendRowSerialQueries(
                     row: rows[index], kind: kind,
                     queries: slice(queries), keys: slice(keys), values: slice(values),
-                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+                    scale: scale, sinks: effectiveSinks, softcap: softcap,
+                    executionObserver: executionObserver)
             }
             return updateAndAttendRow(
                 row: rows[index], kind: kind,
                 queries: slice(queries), keys: slice(keys), values: slice(values),
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[index], executionPolicy: executionPolicy)
+                spanContext: spanContexts?[index], executionPolicy: executionPolicy,
+                executionObserver: executionObserver)
         }
     }
 
@@ -306,7 +314,8 @@ enum CBv2AttentionV1 {
     static func updateAndAttendLastQuery(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float? = nil
+        scale: Float, sinks: MLXArray?, softcap: Float? = nil,
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)? = nil
     ) -> MLXArray {
         precondition(
             kind.attention == .full,
@@ -346,6 +355,9 @@ enum CBv2AttentionV1 {
             let (cachedKeys, cachedValues) = row.update(
                 keys: keys[index ..< index + 1],
                 values: values[index ..< index + 1])
+            executionObserver?(
+                CBv2AttentionExecutionObservation(
+                    route: .fallback, path: .lastQuery, queryLength: 1))
             outputs.append(
                 attend(
                     queries: queries[index ..< index + 1],
@@ -364,10 +376,11 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?,
-        executionPolicy: CBv2AttentionExecutionPolicy
+        executionPolicy: CBv2AttentionExecutionPolicy,
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)?
     ) -> MLXArray {
         let L = queries.dim(2)
-        let executionRoute = executionPolicy.route(
+        let executionRoute = executionPolicy.contiguousRoute(
             kind: kind,
             queryLength: L,
             queryDType: queries.dtype,
@@ -375,10 +388,13 @@ enum CBv2AttentionV1 {
             hasSpanMask: spanContext != nil,
             serializesQueries: false)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if executionPolicy.shouldBlockQueries(
+        let blocksQueries = executionPolicy.shouldBlockQueries(
             queryLength: L, blockSize: queryBlockSize, route: executionRoute)
             && !kind.isBidirectional
-        {
+        if blocksQueries {
+            executionObserver?(
+                CBv2AttentionExecutionObservation(
+                    route: executionRoute, path: .queryBlocked, queryLength: L))
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
@@ -386,11 +402,17 @@ enum CBv2AttentionV1 {
                 spanContext: spanContext)
         }
         if let spanContext {
+            executionObserver?(
+                CBv2AttentionExecutionObservation(
+                    route: executionRoute, path: .span, queryLength: L))
             return attendSpanChunk(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
                 context: spanContext, sinks: sinks, softcap: softcap)
         }
+        executionObserver?(
+            CBv2AttentionExecutionObservation(
+                route: executionRoute, path: .singleCall, queryLength: L))
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
@@ -401,10 +423,14 @@ enum CBv2AttentionV1 {
     private static func updateAndAttendRowSerialQueries(
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)?
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        executionObserver?(
+            CBv2AttentionExecutionObservation(
+                route: .fallback, path: .serializedQueries, queryLength: L))
         return attendSerialQueries(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
