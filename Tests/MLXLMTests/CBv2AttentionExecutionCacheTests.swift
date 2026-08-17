@@ -2,6 +2,10 @@ import Foundation
 import MLX
 import XCTest
 
+#if canImport(Metal)
+    import Metal
+#endif
+
 @testable import MLXLMCommon
 
 final class CBv2AttentionExecutionCacheTests: XCTestCase {
@@ -23,6 +27,16 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
 
     private var hardwareQualification: CBv2AttentionHardwareQualification {
         .qwenLikeD256Hq16Hkv2GQA8BF16FullAttentionPrefill
+    }
+
+    private func requireMetal() throws {
+        #if canImport(Metal)
+            guard MTLCreateSystemDefaultDevice() != nil else {
+                throw XCTSkip("Metal device unavailable")
+            }
+        #else
+            throw XCTSkip("Metal framework unavailable")
+        #endif
     }
 
     private struct Run {
@@ -184,10 +198,11 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
         }
     }
 
-    func testForcedFusedBypassesThe128QueryBlockOnActualCacheRoute() {
+    func testForcedFusedBypassesThe128QueryBlockOnActualCacheRoute() throws {
+        try requireMetal()
         XCTAssertEqual(CBv2AttentionV1.queryBlockSize, 128)
 
-        Device.withDefaultDevice(.cpu) {
+        Device.withDefaultDevice(.gpu) {
             let fallbackRun = runPrefill(
                 queryLength: 129,
                 policy: .fallback)
@@ -219,8 +234,9 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
         }
     }
 
-    func testActualCacheRoutesOnlyVectorOrFullCompatibleQueryLengthsToForcedFused() {
-        Device.withDefaultDevice(.cpu) {
+    func testActualCacheRoutesOnlyVectorOrFullCompatibleQueryLengthsToForcedFused() throws {
+        try requireMetal()
+        Device.withDefaultDevice(.gpu) {
             let policy = CBv2AttentionExecutionPolicy(
                 control: .fused,
                 fallbackQueryBlockSize: 128)
@@ -263,8 +279,9 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
         }
     }
 
-    func testAutoCacheRequiresExternalHardwareQualification() {
-        Device.withDefaultDevice(.cpu) {
+    func testAutoCacheRequiresExternalHardwareQualification() throws {
+        try requireMetal()
+        Device.withDefaultDevice(.gpu) {
             let unqualified = runPrefill(
                 queryLength: 2,
                 policy: CBv2AttentionExecutionPolicy(control: .auto))

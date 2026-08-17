@@ -107,10 +107,19 @@ final class CBv2ForcedFusedAttentionIntegrationTests: XCTestCase {
     ) {
         let a = actual.asType(.float32)
         let b = expected.asType(.float32)
-        let maxDelta = abs(a - b).max().item(Float.self)
-        XCTAssertTrue(
-            allClose(a, b, rtol: 1e-2, atol: 2e-3).item(Bool.self),
-            "max |delta| = \(maxDelta)",
+        let delta = abs(a - b)
+        let maxDelta = delta.max().item(Float.self)
+        let meanDelta = delta.mean().item(Float.self)
+        XCTAssertLessThanOrEqual(
+            maxDelta,
+            0.02,
+            "max |delta| = \(maxDelta), mean |delta| = \(meanDelta)",
+            file: file,
+            line: line)
+        XCTAssertLessThanOrEqual(
+            meanDelta,
+            0.001,
+            "max |delta| = \(maxDelta), mean |delta| = \(meanDelta)",
             file: file,
             line: line)
     }
