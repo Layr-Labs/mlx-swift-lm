@@ -187,7 +187,8 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false,
         executionPolicy: CBv2AttentionExecutionPolicy = .fallback,
-        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)? = nil
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)? = nil,
+        forcedFusedExecutionObserver: (() -> Void)? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -222,7 +223,8 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[0], executionPolicy: executionPolicy,
-                executionObserver: executionObserver)
+                executionObserver: executionObserver,
+                forcedFusedExecutionObserver: forcedFusedExecutionObserver)
         }
 
         if L == 1 {
@@ -266,7 +268,8 @@ enum CBv2AttentionV1 {
                 queries: slice(queries), keys: slice(keys), values: slice(values),
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[index], executionPolicy: executionPolicy,
-                executionObserver: executionObserver)
+                executionObserver: executionObserver,
+                forcedFusedExecutionObserver: forcedFusedExecutionObserver)
         }
     }
 
@@ -374,7 +377,8 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?,
         executionPolicy: CBv2AttentionExecutionPolicy,
-        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)?
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)?,
+        forcedFusedExecutionObserver: (() -> Void)?
     ) -> MLXArray {
         let L = queries.dim(2)
         let executionRoute = executionPolicy.contiguousRoute(
@@ -415,7 +419,8 @@ enum CBv2AttentionV1 {
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
             sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional,
-            executionRoute: executionRoute)
+            executionRoute: executionRoute,
+            forcedFusedExecutionObserver: forcedFusedExecutionObserver)
     }
 
     private static func updateAndAttendRowSerialQueries(
@@ -741,7 +746,8 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
         bidirectional: Bool = false,
-        executionRoute: CBv2AttentionExecutionRoute = .fallback
+        executionRoute: CBv2AttentionExecutionRoute = .fallback,
+        forcedFusedExecutionObserver: (() -> Void)? = nil
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
@@ -766,7 +772,8 @@ enum CBv2AttentionV1 {
             case .forcedFused:
                 return CBv2ForcedFusedAttention.call(
                     queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
-                    mask: mask, sinks: sinks)
+                    mask: mask, sinks: sinks,
+                    executionObserver: forcedFusedExecutionObserver)
             }
         }
         return PagedAttentionReference.composedAttention(

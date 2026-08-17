@@ -14,9 +14,11 @@ enum CBv2ForcedFusedAttention {
         values: MLXArray,
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        sinks: MLXArray?
+        sinks: MLXArray?,
+        executionObserver: (() -> Void)? = nil
     ) -> MLXArray {
-        MLXFast.scaledDotProductAttention(
+        executionObserver?()
+        return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: keys,
             values: values,

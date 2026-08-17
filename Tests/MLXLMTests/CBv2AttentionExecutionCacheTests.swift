@@ -29,6 +29,7 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
         var cache: CBv2LayerCache
         var output: MLXArray
         var observations: [CBv2AttentionExecutionObservation]
+        var forcedFusedExecutions: Int = 0
     }
 
     private func tensors(
@@ -69,7 +70,9 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
         }
 
         var observations: [CBv2AttentionExecutionObservation] = []
+        var forcedFusedExecutions = 0
         cache.attentionExecutionObserver = { observations.append($0) }
+        cache.forcedFusedExecutionObserver = { forcedFusedExecutions += 1 }
         cache.mtpSerializesRectangularAttention = serializesQueries
         cache.bindSpanContext(spanContext)
 
@@ -80,7 +83,11 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
             values: tensors.values,
             scale: scale,
             sinks: nil)
-        return Run(cache: cache, output: output, observations: observations)
+        return Run(
+            cache: cache,
+            output: output,
+            observations: observations,
+            forcedFusedExecutions: forcedFusedExecutions)
     }
 
     private func runLastQuery(
@@ -209,6 +216,27 @@ final class CBv2AttentionExecutionCacheTests: XCTestCase {
                 ])
             XCTAssertEqual(fusedWith512.observations, fusedRun.observations)
             XCTAssertEqual(fusedRun.output.shape, fallbackRun.output.shape)
+        }
+    }
+
+    func testActualCacheRoutesOnlyVectorOrFullCompatibleQueryLengthsToForcedFused() {
+        Device.withDefaultDevice(.cpu) {
+            let policy = CBv2AttentionExecutionPolicy(
+                control: .fused,
+                fallbackQueryBlockSize: 128)
+            let expected: [(queryLength: Int, route: CBv2AttentionExecutionRoute, calls: Int)] = [
+                (4, .forcedFused, 1),
+                (5, .fallback, 0),
+                (8, .fallback, 0),
+                (9, .forcedFused, 1),
+            ]
+
+            for item in expected {
+                let run = runPrefill(queryLength: item.queryLength, policy: policy)
+                XCTAssertEqual(run.observations.first?.route, item.route)
+                XCTAssertEqual(run.forcedFusedExecutions, item.calls)
+                XCTAssertEqual(run.output.shape, [1, queryHeads, item.queryLength, headDim])
+            }
         }
     }
 

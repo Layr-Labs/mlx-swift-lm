@@ -132,7 +132,7 @@ public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
             kind.queryHeads == 16,
             kind.kvHeads == 2,
             kind.queryHeads == kind.kvHeads * 8,
-            queryLength > 1,
+            Self.forcedFusedQueryLengthEligible(queryLength),
             queryDType == .bfloat16,
             attentionSoftcap == nil,
             !hasSpanMask,
@@ -154,6 +154,13 @@ public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
             }
             return .forcedFused
         }
+    }
+
+    /// The dependency exposes separate vector (qL 2...4) and full (qL > 8)
+    /// fused implementations. qL 5...8 has no compatible forced terminal.
+    @inline(__always)
+    static func forcedFusedQueryLengthEligible(_ queryLength: Int) -> Bool {
+        (2 ... 4).contains(queryLength) || queryLength > 8
     }
 
     /// Query blocking remains authoritative unless this exact call selected

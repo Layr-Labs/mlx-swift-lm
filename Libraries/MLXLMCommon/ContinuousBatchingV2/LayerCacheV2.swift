@@ -70,6 +70,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     /// Internal route observation seam for focused cache-level tests.
     var attentionExecutionObserver: ((CBv2AttentionExecutionObservation) -> Void)?
+    /// Fires inside the isolated forced-fused wrapper, immediately before its
+    /// dependency call. Tests use this to distinguish routing from execution.
+    var forcedFusedExecutionObserver: (() -> Void)?
 
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
@@ -128,7 +131,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             spanContexts: boundSpanContexts,
             serializeQueries: mtpSerializesRectangularAttention,
             executionPolicy: attentionExecutionPolicy,
-            executionObserver: attentionExecutionObserver)
+            executionObserver: attentionExecutionObserver,
+            forcedFusedExecutionObserver: forcedFusedExecutionObserver)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))

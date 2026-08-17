@@ -137,6 +137,46 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
             .fallback)
     }
 
+    func testForcedFusedQueryLengthGeometryUsesVectorOrFullCompatibleRanges() {
+        let eligible = kind(qualification: qualification())
+        let expected: [(queryLength: Int, route: CBv2AttentionExecutionRoute)] = [
+            (1, .fallback),
+            (2, .forcedFused),
+            (3, .forcedFused),
+            (4, .forcedFused),
+            (5, .fallback),
+            (8, .fallback),
+            (9, .forcedFused),
+        ]
+
+        for item in expected {
+            XCTAssertEqual(
+                route(
+                    control: .fused,
+                    kind: eligible,
+                    queryLength: item.queryLength),
+                item.route)
+        }
+
+        XCTAssertEqual(
+            route(control: .auto, kind: eligible, queryLength: 4),
+            .fallback)
+        XCTAssertEqual(
+            route(
+                control: .auto,
+                hardwareQualified: true,
+                kind: eligible,
+                queryLength: 5),
+            .fallback)
+        XCTAssertEqual(
+            route(
+                control: .auto,
+                hardwareQualified: true,
+                kind: eligible,
+                queryLength: 9),
+            .forcedFused)
+    }
+
     func testQueryBlockingIsBypassedOnlyForForcedFusedRoute() {
         let policy = CBv2AttentionExecutionPolicy(
             control: .fused,
@@ -170,5 +210,17 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
                 queryLength: 4,
                 serializesQueries: true),
             .fallback)
+    }
+
+    func testCompatibleAndFallbackQueryLengthsRetainCausalMaskSemantics() {
+        for queryLength in [4, 5, 8, 9] {
+            let mask = CBv2AttentionV1.maskMode(
+                L: queryLength,
+                kL: queryLength + 3,
+                window: nil)
+            guard case .causal = mask else {
+                return XCTFail("qL \(queryLength) must retain symbolic causal masking")
+            }
+        }
     }
 }
