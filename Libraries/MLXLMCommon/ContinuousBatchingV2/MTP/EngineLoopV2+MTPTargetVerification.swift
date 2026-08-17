@@ -32,6 +32,7 @@ extension EngineLoopV2 {
     ) -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
+        policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
         recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
     ) {
@@ -40,6 +41,7 @@ extension EngineLoopV2 {
         let scores: MLXArray
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
+        var policyTopTwo: (ids: MLXArray, values: MLXArray)?
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
         var capturedInnerState: [MLXArray] = []
 
@@ -86,12 +88,15 @@ extension EngineLoopV2 {
         }
 
         // A recurrent target may only verify rectangularly through the
-        // captured-window seam. The driver already forces serial when the
-        // seam is absent; degrade (never trap) here as well so a stale
-        // config cannot reach the stateless forward with recurrent rows.
+        // captured-window seam. Stateful production never falls back to
+        // serial after draft construction: that would add target forwards.
         if useRectangular, recurrentModel != nil,
             recurrentModel?.supportsCapturedVerifyWindow != true
         {
+            if mtp.usesRequestStatefulDrafter {
+                preconditionFailure(
+                    "CBv2 production request-stateful MTP requires captured rectangular verification")
+            }
             mtp.recordControllerFallback("captured_verify_unsupported")
             useRectangular = false
         }
@@ -117,6 +122,10 @@ extension EngineLoopV2 {
         if useRectangular {
             serializingCaches = caches.compactMap { $0 as? CBv2MTPRectangularSerializing }
             if serializingCaches.count != caches.count {
+                if mtp.usesRequestStatefulDrafter, recurrentModel != nil {
+                    preconditionFailure(
+                        "CBv2 production request-stateful MTP cache lacks rectangular serialization")
+                }
                 mtp.recordControllerFallback("rectangular_cache_unsupported")
                 useRectangular = false
             }
@@ -217,7 +226,27 @@ extension EngineLoopV2 {
             } else {
                 output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
             }
-            scores = scoreColumns(output.logits, columnOffset: 0)
+            if mtp.usesRequestStatefulDrafter {
+                guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
+                    preconditionFailure(
+                        "CBv2 request-stateful rectangular MTP target lacks top-two provider")
+                }
+                let batch = output.logits.dim(0)
+                let width = output.logits.dim(1)
+                let vocabulary = output.logits.dim(2)
+                let flat = output.logits.reshaped([1, batch * width, vocabulary])
+                let topTwo = provider.cbv2MTPTopTwo(flat)
+                policyTopTwo = (
+                    topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
+                    topTwo.values.reshaped([batch, width, 2]).asType(.float32))
+            }
+            if useTargetPrefix {
+                scores = scoreColumns(output.logits, columnOffset: 0)
+            } else if let policyTopTwo {
+                scores = policyTopTwo.ids[0..., 0..., 0]
+            } else {
+                scores = argMax(output.logits, axis: -1).asType(.int32)
+            }
             hidden = output.lastHidden
             // Draft-head shortlist (rectangular only; the serial oracle stays
             // byte-identical to the shipped path): each verify position's
@@ -232,7 +261,7 @@ extension EngineLoopV2 {
         }
 
         return (
-            scores, hidden, shortlist,
+            scores, hidden, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, recurrent)
     }
 

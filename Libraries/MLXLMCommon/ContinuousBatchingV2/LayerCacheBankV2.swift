@@ -180,6 +180,10 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         caches.allSatisfy { $0 is CBv2PackedSpanMaskBinding }
     }
 
+    public var supportsMTPRectangularVerification: Bool {
+        caches.allSatisfy { $0 is any CBv2MTPRectangularSerializing }
+    }
+
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {

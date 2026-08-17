@@ -59,11 +59,15 @@ extension EngineLoopV2 {
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = graph.logprobSegments
         step.recurrentEvaluations = graph.recurrentEvaluations
-        if graph.verify != nil || !graph.seedRows.isEmpty {
+        if graph.verify != nil || !graph.seedRows.isEmpty
+            || !graph.committedObservationRows.isEmpty
+        {
             step.mtpRound = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
-                seedHidden: graph.seedHidden)
+                seedHidden: graph.seedHidden,
+                seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
+                committedObservationRows: graph.committedObservationRows)
         }
         return step
     }

@@ -16,7 +16,7 @@ extension EngineLoopV2 {
     /// constraints, logprob capture, logit bias, and penalties are stateful
     /// per-position transforms the verify pre-sampler does not reproduce,
     /// and stop strings need the serial detokenizer walk.
-    private func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+    func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
         let sampling = rec.request.sampling
         let samplingEligible =
             sampling.temperature == 0
@@ -30,10 +30,25 @@ extension EngineLoopV2 {
             sampling.presencePenalty == 0,
             rec.request.stopStrings.isEmpty
         else { return false }
-        if multimodalByID[rec.id]?.containsSpan(at: rec.tokens.count - 1) ?? false {
+        // The current multimodal seam does not return trusted pre-norm
+        // hidden rows from embedding-spliced forwards. Only persistent-history
+        // drafters require those rows; stateless Gemma keeps its established
+        // frozen-KV multimodal path.
+        let hasMultimodalSpans =
+            multimodalByID[rec.id]?.spans.isEmpty == false
+        if !Self.mtpMultimodalHistoryEligible(
+            hasSpans: hasMultimodalSpans,
+            tracksPersistentHistory: mtp?.tracksPersistentHistory == true)
+        {
             return false
         }
         return true
+    }
+
+    static func mtpMultimodalHistoryEligible(
+        hasSpans: Bool, tracksPersistentHistory: Bool
+    ) -> Bool {
+        !hasSpans || !tracksPersistentHistory
     }
 
     /// Every storage-owning row must support value-exact multi-token writes
@@ -54,16 +69,22 @@ extension EngineLoopV2 {
         guard let mtp else { return .none }
         guard mtpBasicEligible(rec) else { return .none }
         let depth = mtp.planDepth
-        guard depth > 0 else { return .none }
         guard let state = kvStates[rec.id] else { return .none }
         guard Self.mtpStorageEligible(state) else {
             if recordSkips { mtp.recordSkip("kv_unsupported") }
             return .none
         }
 
+        let remainingToLength = rec.request.maxTokens - rec.generatedTokenCount
+        if mtp.forceSeedPlan {
+            return remainingToLength > 0 ? .seed : .none
+        }
+        if depth == 0 {
+            return mtp.tracksPersistentHistory && remainingToLength > 0 ? .seed : .none
+        }
+
         // Verify writes 1+k entries at [C-1, C-1+k]. A seed only pays off
         // when a full round can follow after its one generated token.
-        let remainingToLength = rec.request.maxTokens - rec.generatedTokenCount
         switch mtp.validatedCarry(for: rec) {
         case .valid:
             guard remainingToLength >= depth else {
@@ -99,6 +120,9 @@ extension EngineLoopV2 {
     func mtpWantsStep(ids: [CBv2RequestID]) -> Bool {
         guard let mtp else { return false }
         let rows = ids.compactMap { scheduler.record(for: $0) }
+        if mtp.config.fixedDraftTokens == 0, mtp.usesRequestStatefulDrafter {
+            return false
+        }
         let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
         let canSpeculate = withinBatchGate && rows.count == ids.count
             && mtpRowsCanSpeculate(rows)
@@ -109,6 +133,12 @@ extension EngineLoopV2 {
             return Self.mtpStorageEligible(state)
         }
         guard !eligible.isEmpty else { return false }
+        // Every positive-cap stateful Qwen request owns trusted target
+        // history, including fixed-depth requests temporarily forced to k=0
+        // by batch/headroom pressure. Route those target-only steps through
+        // the hidden-returning MTP path. Explicit fixed k=0 has no history
+        // ownership and remains on ordinary chained decode.
+        if mtp.tracksPersistentHistory { return true }
         if decision.depth == 0 {
             if mtp.config.verificationMode == .automatic,
                 mtp.maximumAutomaticDepth(plannedDecodeRows: ids.count) == 0
@@ -141,6 +171,25 @@ extension EngineLoopV2 {
             return Self.mtpStorageEligible(state)
         }
 
+
+        if mtp.shouldApplyMarginalPolicyToPlan, mtp.planDepth > 0,
+            !eligibleRows.isEmpty
+        {
+            let verificationLimit = mtp.maximumAutomaticDepth(
+                plannedDecodeRows: rows.count)
+            let marginalDepth =
+                eligibleRows.map { rec in
+                    mtp.marginalDepth(
+                        for: rec.id,
+                        offeredDepth: mtp.planDepth,
+                        remainingTokens: rec.request.maxTokens - rec.generatedTokenCount,
+                        verificationLimit: verificationLimit,
+                        decodeRowBucket: mtp.planDecodeRowBucket)
+                }.min() ?? 0
+            if marginalDepth < mtp.planDepth {
+                mtp.clampPlanDepth(to: marginalDepth, reason: "marginal_policy")
+            }
+        }
         if mtp.planDepth > 0 {
             let depth = mtp.planDepth
             let tailDepth = eligibleRows.map { rec in
@@ -170,9 +219,10 @@ extension EngineLoopV2 {
         if mtp.planDepth > 0,
             eligibleRows.contains(where: { !mtp.hasValidCarry(for: $0) })
         {
-            // Seeding is step-global. Mixing L=1 seed rows with verify rows
-            // would recreate the batch-shape drift synchronized commits avoid.
-            for rec in eligibleRows { mtp.invalidateCarry(rec.id) }
+            // Seeding is step-global. Keep existing persistent histories
+            // resident and perform one ordinary hidden-returning target step
+            // for every eligible row rather than destroying their carries.
+            mtp.forceSynchronizedSeed()
             mtp.recordControllerFallback("synchronized_seed")
         }
 
@@ -181,7 +231,9 @@ extension EngineLoopV2 {
             if mtpBasicEligible(rec), kvStates[rec.id] != nil, !storageEligible {
                 mtp.recordSkip("kv_unsupported")
             }
-            if mtp.planDepth == 0 || !mtpBasicEligible(rec) || !storageEligible {
+            if !mtpBasicEligible(rec) || !storageEligible
+                || (mtp.planDepth == 0 && !mtp.tracksPersistentHistory)
+            {
                 mtp.invalidateCarry(rec.id)
             }
         }
@@ -199,9 +251,22 @@ extension EngineLoopV2 {
 
     /// True when this scheduler plan carries seed or verify work.
     func mtpRoundNeeded(_ plan: CBv2StepPlan) -> Bool {
-        guard let mtp, mtp.planHasMTPWork else { return false }
-        return plan.assignments.contains {
-            mtp.roundMark(for: $0.id) != nil || mtp.isSeedMarked($0.id)
+        guard let mtp else { return false }
+        if mtp.planHasMTPWork {
+            return plan.assignments.contains {
+                mtp.roundMark(for: $0.id) != nil || mtp.isSeedMarked($0.id)
+            }
+        }
+        guard mtp.tracksPersistentHistory else { return false }
+        return plan.assignments.contains { assignment in
+            guard let rec = scheduler.record(for: assignment.id),
+                mtpBasicEligible(rec)
+            else { return false }
+            // Prompt rows acquire their KV state inside execution. Absence
+            // here is not ineligibility; route them through the hidden-returning
+            // MTP prefill path so persistent history starts at prompt position 0.
+            guard let state = kvStates[assignment.id] else { return true }
+            return Self.mtpStorageEligible(state)
         }
     }
 }

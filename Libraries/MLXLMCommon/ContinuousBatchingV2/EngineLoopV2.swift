@@ -50,12 +50,17 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     /// per rectangular row. This is stricter than single-row multimodal
     /// support and fails closed for paged/custom providers.
     var supportsPackedMultimodalSpans: Bool { get }
+    /// True only when every layer cache can serialize the columns of one
+    /// rectangular recurrent MTP verification window without cross-column
+    /// attention. Stateful Qwen drafting fails closed without this seam.
+    var supportsMTPRectangularVerification: Bool { get }
 }
 
 extension CBv2LayerCacheProvider {
     public var supportsMultimodalSpans: Bool { false }
     public var supportsPackedPrefill: Bool { false }
     public var supportsPackedMultimodalSpans: Bool { false }
+    public var supportsMTPRectangularVerification: Bool { false }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)
@@ -2037,6 +2042,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var finalizedPlainWork = false
+        let mtpSeedIDs = Set(step.mtpRound?.seedRows.map(\.id) ?? [])
+        var deferredMTPFinishes: [CBv2RequestID: CBv2FinishReason] = [:]
+
+        func finishPlainRow(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+            if mtpSeedIDs.contains(id) {
+                deferredMTPFinishes[id] = reason
+            } else {
+                finishRequest(id, reason: reason)
+            }
+        }
         for (i, id) in step.sampledRows.enumerated() {
             if step.discard.contains(id) { continue }
             guard let rec = scheduler.record(for: id) else { continue }
@@ -2102,11 +2117,11 @@ public final class EngineLoopV2: @unchecked Sendable {
             // of each step, and this confirmed token refreshes the decode lease
             // in `refreshProgressLeases` below.
             if isStopToken {
-                finishRequest(id, reason: .stop)
+                finishPlainRow(id, reason: .stop)
             } else if matchedStopString {
-                finishRequest(id, reason: .stop)
+                finishPlainRow(id, reason: .stop)
             } else if rec.generatedTokenCount >= rec.request.maxTokens {
-                finishRequest(id, reason: .length)
+                finishPlainRow(id, reason: .length)
             }
         }
 
@@ -2116,6 +2131,22 @@ public final class EngineLoopV2: @unchecked Sendable {
         // confirmed there) and BEFORE the fenced frees below.
         if step.mtpRound != nil {
             finalizeMTPRound(step)
+        }
+        if let measurement = step.mtpMeasurement {
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
+            mtp?.recordStepCost(
+                measurement,
+                wallTimeNanos: elapsed,
+                finalizedPlainWork: finalizedPlainWork,
+                finalizedSeedIDs: step.mtpRound?.finalizedSeedIDs ?? [],
+                finalizedVerification: !(step.mtpRound?.finalizedVerifyIDs.isEmpty ?? true),
+                claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
+        }
+        for (id, reason) in deferredMTPFinishes {
+            if let state = mtp?.takeAssistantState(for: id) {
+                step.mtpRound?.deferredAssistantReleases.append(state)
+            }
+            finishRequest(id, reason: reason)
         }
 
         // Fenced frees: rows finished/cancelled while this step was in
@@ -2128,15 +2159,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             retire(state: state, donating: donation)
             releaseRecurrentState(recurrent)
         }
-        if let measurement = step.mtpMeasurement {
-            let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
-            mtp?.recordStepCost(
-                measurement,
-                wallTimeNanos: elapsed,
-                finalizedPlainWork: finalizedPlainWork,
-                finalizedSeedIDs: step.mtpRound?.finalizedSeedIDs ?? [],
-                finalizedVerification: !(step.mtpRound?.finalizedVerifyIDs.isEmpty ?? true),
-                claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
+        if let mtp {
+            for state in step.mtpRound?.deferredAssistantReleases ?? [] {
+                mtp.releaseDetachedAssistantState(state)
+            }
         }
 
         // Refresh progress leases from CONFIRMED work this step — covers plain
@@ -2779,8 +2805,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             let (sum, overflow) = total.addingReportingOverflow(state.materializedByteCount)
             return overflow ? Int.max : sum
         }
-        let detachedAssistantStates = inFlight?.mtpRound?.verify?.rows.compactMap(
-            \.assistantState) ?? []
+        let detachedAssistantStates =
+            (inFlight?.mtpRound?.verify?.rows.compactMap(\.assistantState) ?? [])
+            + (inFlight?.mtpRound?.committedObservationRows.map(\.assistantState) ?? [])
+            + (inFlight?.mtpRound?.deferredAssistantReleases ?? [])
         let assistantBytes = mtp?.materializedAssistantBytes(
             detachedStates: detachedAssistantStates) ?? 0
         let reservedBytes: Int

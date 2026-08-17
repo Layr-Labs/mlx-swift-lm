@@ -112,8 +112,8 @@ struct Qwen35InlineMTPLoaderTests {
         }
     }
 
-    @Test("assistant KV accounting follows allocation width and block size")
-    func assistantKVAccounting() throws {
+    @Test("assistant state accounting includes KV, target hidden, and token storage")
+    func assistantStateAccounting() throws {
         let root = try #require(
             try JSONSerialization.jsonObject(with: qwenInlineMTPConfig()) as? [String: Any])
         let textData = try JSONSerialization.data(withJSONObject: root["text_config"]!)
@@ -127,6 +127,18 @@ struct Qwen35InlineMTPLoaderTests {
         #expect(
             Qwen35InlineMTPAssistant.cacheBytesPerToken(
                 configuration: configuration, layerCount: 1, elementBytes: 4) == 64)
+        #expect(
+            Qwen35InlineMTPAssistant.stateBytesPerToken(
+                configuration: configuration, layerCount: 1,
+                cacheElementBytes: 2, hiddenElementBytes: 2) == 52)
+        #expect(
+            Qwen35InlineMTPAssistant.stateBytesPerToken(
+                configuration: configuration, layerCount: 1,
+                cacheElementBytes: 4, hiddenElementBytes: 4) == 100)
+        #expect(
+            Qwen35InlineMTPAssistant.stateBytesPerToken(
+                configuration: configuration, layerCount: Int.max,
+                cacheElementBytes: Int.max, hiddenElementBytes: Int.max) == Int.max)
     }
 
     @Test("custom assistant prefixes fail before target loading")

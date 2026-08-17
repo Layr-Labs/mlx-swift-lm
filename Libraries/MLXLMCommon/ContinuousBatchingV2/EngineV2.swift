@@ -121,6 +121,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let prefixCache: CBv2PrefixCache?
     public let prefixReuseCapability: CBv2PrefixReuseCapability
     public let modelCapabilities: CBv2ModelCapabilities
+    /// Exact fixed per-request charge after recurrent/MTP capability
+    /// resolution. Shared/global budget bridges must use this value rather
+    /// than recomputing the base recurrent peak from the model spec.
+    public let resolvedFixedBytesPerRequest: Int
 
     private let stateLock = NSLock()
     private var rejectingSubmissions = false
@@ -221,24 +225,59 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         let mtpDriver: CBv2MTPRoundDriver?
         if samplerSupportsMTP && modelCapabilities.supportsMTP {
             mtpDriver = CBv2MTPRoundDriver.build(
-                model: model, drafter: mtpDrafter, config: mtpConfig)
+                model: model, drafter: mtpDrafter, config: mtpConfig,
+                supportsRectangularCacheBank:
+                    cacheProvider.supportsMTPRectangularVerification)
         } else {
             mtpDriver = nil
         }
 
         var admissionConfig = admissionConfig
         if let recurrent = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec {
-            guard let fixedBytes = try? recurrent.peakBytesPerRequest() else {
+            guard var fixedBytes = try? recurrent.peakBytesPerRequest() else {
                 preconditionFailure("EngineV2: recurrent-state byte accounting overflow")
+            }
+            let usesCompactRectangularReplay =
+                modelCapabilities.supportsCompactRecurrentMTPReplay
+                && (mtpDriver.map { $0.config.verificationMode != .serialTarget } ?? false)
+            if mtpDriver?.usesRequestStatefulDrafter == true,
+               !usesCompactRectangularReplay
+            {
+                guard let perGeneration = try? recurrent.fixedBytesPerRequest() else {
+                    preconditionFailure("EngineV2: MTP recurrent-state byte accounting overflow")
+                }
+                // Captured or serial verification retains the committed
+                // generation plus one state per [seed,d1...dk] position. The
+                // base recurrent charge already covers three generations
+                // (k=1); a fixed depth reserves only its reachable width,
+                // while adaptive mode reserves the configured maximum. Only
+                // a non-serial driver for a model proving compact rectangular
+                // replay may omit this expansion.
+                let recurrentDepth =
+                    mtpDriver?.config.fixedDraftTokens
+                    ?? mtpDriver?.config.maxDraftTokens
+                    ?? 0
+                let extraGenerations = max(0, recurrentDepth - 1)
+                let (extraBytes, multiplyOverflow) =
+                    perGeneration.multipliedReportingOverflow(by: extraGenerations)
+                let (expanded, addOverflow) = fixedBytes.addingReportingOverflow(extraBytes)
+                guard !multiplyOverflow, !addOverflow else {
+                    preconditionFailure("EngineV2: MTP recurrent-state byte accounting overflow")
+                }
+                fixedBytes = expanded
             }
             admissionConfig.fixedBytesPerRequest = fixedBytes
         }
+        self.resolvedFixedBytesPerRequest = admissionConfig.fixedBytesPerRequest
+        let fixedTargetOnly =
+            mtpDriver?.config.fixedDraftTokens == 0
+            || mtpDriver?.config.maxDraftTokens == 0
         admissionConfig.auxiliaryBytesPerToken =
-            mtpDriver?.drafter.requestStateBytesPerToken ?? 0
+            fixedTargetOnly ? 0 : (mtpDriver?.drafter.requestStateBytesPerToken ?? 0)
         admissionConfig.auxiliaryTokenGranularity =
-            mtpDriver?.drafter.requestStateTokenGranularity ?? 1
+            fixedTargetOnly ? 1 : (mtpDriver?.drafter.requestStateTokenGranularity ?? 1)
         admissionConfig.auxiliaryTokenAllocationPadding =
-            mtpDriver?.drafter.requestStateTokenAllocationPadding ?? 0
+            fixedTargetOnly ? 0 : (mtpDriver?.drafter.requestStateTokenAllocationPadding ?? 0)
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
             config: admissionConfig, residency: backend.kvResidency)

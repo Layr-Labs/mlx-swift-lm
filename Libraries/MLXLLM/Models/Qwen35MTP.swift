@@ -59,6 +59,23 @@ struct Qwen35InlineMTPMetadata: Sendable {
     let quantizationByPath: [String: BaseConfiguration.Quantization]
 }
 
+// MARK: - MTP history KV
+
+extension Qwen35Attention {
+    /// Append committed proposal-head history without computing unused query,
+    /// gate, attention, or output-projection rows.
+    func appendMTPHistoryKV(_ x: MLXArray, cache: any KVCache) {
+        let batch = x.dim(0)
+        let length = x.dim(1)
+        var keys = kNorm(kProj(x).reshaped(batch, length, kvHeads, -1))
+            .transposed(0, 2, 1, 3)
+        let values = vProj(x).reshaped(batch, length, kvHeads, -1)
+            .transposed(0, 2, 1, 3)
+        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        _ = cache.update(keys: keys, values: values)
+    }
+}
+
 // MARK: - MTPDecoderLayer
 
 /// Full-attention transformer layer used inside the Qwen3.5/3.6 MTP head.
@@ -102,14 +119,20 @@ final class Qwen35MTPDecoderLayer: Module {
         let h = x + r
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
+
+    /// Populate this layer's K/V history without computing a dead decoder
+    /// output. Only valid when no later MTP layer consumes that output.
+    func appendHistoryKV(_ x: MLXArray, cache: any KVCache) {
+        selfAttn.appendMTPHistoryKV(inputLayerNorm(x), cache: cache)
+    }
 }
 
 // MARK: - MTPModule
 
 /// Multi-Token Prediction head for Qwen3.5/3.6.
 ///
-/// Fuses the backbone's pre-norm hidden state at position t with the embedding of
-/// the sampled main token (t+1) to predict the draft token at (t+2).
+/// Fuses the backbone's final-normalized hidden state at position t with the
+/// embedding of the sampled main token (t+1) to predict the draft token at (t+2).
 ///
 /// Architecture (port of PR #990):
 /// ```
@@ -166,6 +189,34 @@ final class Qwen35MTPModule: Module {
 
         // 4. Return pre-lm_head hidden (norm applied; lm_head is in TextModel).
         return norm(fused)
+    }
+
+    /// Append every leading committed row through a K/V-only path and compute
+    /// a full decoder output only for the final proposal row. Multi-layer heads
+    /// fail closed before any cache mutation because later layers require the
+    /// omitted leading outputs.
+    func lastHiddenWithKVOnlyHistory(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> MLXArray? {
+        guard layers.count == 1, cache.count == 1,
+            hidden.dim(1) > 1,
+            nextTokenIds.dim(1) == hidden.dim(1)
+        else { return nil }
+
+        let embeds = embedTokens(nextTokenIds)
+        let e = preFcNormEmbedding(embeds)
+        let h = preFcNormHidden(hidden)
+        let fused = fc(concatenated([e, h], axis: -1))
+        let historyCount = fused.dim(1) - 1
+        layers[0].appendHistoryKV(
+            fused[0..., 0 ..< historyCount, 0...], cache: cache[0])
+
+        let current = fused[0..., historyCount..., 0...]
+        let mask = createAttentionMask(h: current, cache: cache[0])
+        return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
 }
 
@@ -231,6 +282,14 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         return target.lmHead!(output)
     }
 
+    /// Apply the exact final norm of the bound target once at the boundary
+    /// where target-derived hidden enters assistant history. Target hidden
+    /// capture is deliberately pre-norm; recursive assistant hidden is already
+    /// post-`mtp.norm` and must never pass through this helper.
+    func targetFinalNorm(_ hidden: MLXArray) -> MLXArray {
+        target.model.norm(hidden)
+    }
+
     /// Assistant hidden states WITHOUT the output projection — the draft
     /// path applies the head to the last position only (or to a shortlist).
     func moduleForward(
@@ -239,6 +298,21 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         cache: [any KVCache]
     ) -> MLXArray {
         mtp(
+            hidden: hidden,
+            nextTokenIds: tokens,
+            embedTokens: target.model.embedTokens,
+            cache: cache)
+    }
+
+    /// History-flush specialization. Returns one final hidden row while every
+    /// leading trusted row contributes only K/V state. nil means the head
+    /// geometry cannot safely omit intermediate layer outputs.
+    func moduleLastHiddenWithKVOnlyHistory(
+        hidden: MLXArray,
+        tokens: MLXArray,
+        cache: [any KVCache]
+    ) -> MLXArray? {
+        mtp.lastHiddenWithKVOnlyHistory(
             hidden: hidden,
             nextTokenIds: tokens,
             embedTokens: target.model.embedTokens,
@@ -471,54 +545,111 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     private final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
-        /// Legacy double-forward staging depth. Non-zero only under the
-        /// `DARKBLOOM_QWEN_MTP_DOUBLE_FORWARD` oracle pin; the single-forward
-        /// path appends exclusively canonical (already-committed) pairs and
-        /// never needs a trim.
-        var stagedInputs = 0
-        /// Single-forward mode: the round's proposed draft and the assistant
-        /// hidden that produced it. The pair enters the assistant KV only as
-        /// part of the NEXT round's forward, and only if the target accepted
-        /// the draft (`finalizeRound(confirmedInputTokens: 2)`). Deferring it
-        /// removes the second per-round MTP/lm_head forward AND the KV trim
-        /// on rejection: content is bit-compatible with the legacy staging
-        /// forward because the fused input (assistant hidden, draft embed)
-        /// is identical — only the batch geometry ([1,2] vs 2×[1,1]) differs,
-        /// within the documented NUMERICS POLICY.
-        var pendingToken: MLXArray?
-        var pendingHidden: MLXArray?
-        /// A draft has been proposed and not yet finalized/discarded.
+
+        /// Trusted target transitions not yet appended to the persistent head KV.
+        /// Each hidden row at position t is paired with the token at t+1.
+        var backlogHidden: [MLXArray] = []
+        var backlogTokens: [MLXArray] = []
+        /// Last trusted target hidden in an observed chunk. It becomes the
+        /// preceding row when the next observed target chunk crosses a boundary.
+        var targetHiddenFrontier: MLXArray?
+
+        /// Cache geometry captured before and after the round's trusted flush.
+        /// Every later head-chain input is speculative and is trimmed to
+        /// `roundValidHistoryOffset` at finalize.
+        var roundBaseOffset = 0
+        var roundValidHistoryOffset = 0
+        var roundDraftSteps = 0
         var roundInFlight = false
-        var committedInputCount: Int { (caches.first?.offset ?? 0) - stagedInputs }
-        var stagedInputCount: Int { stagedInputs }
+        var isReleased = false
+
+        /// Trusted inputs moved out of the backlog for this round. Retaining
+        /// their original roots both fences lazy concatenation and lets discard
+        /// restore them without a host read.
+        var roundTrustedHidden: [MLXArray] = []
+        var roundTrustedTokens: [MLXArray] = []
+        /// Final proposal hidden rows and draft ids that retain each lazy
+        /// head-step graph until the engine's existing finalize synchronization.
+        var roundRoots: [MLXArray] = []
+
+        var cacheOffset: Int {
+            guard let first = caches.first else { return 0 }
+            precondition(
+                caches.dropFirst().allSatisfy { $0.offset == first.offset },
+                "inline Qwen MTP cache offsets diverged")
+            return first.offset
+        }
+
+        private var backlogInputCount: Int {
+            backlogTokens.reduce(0) { total, tokens in
+                let (next, overflow) = total.addingReportingOverflow(tokens.dim(1))
+                return overflow ? Int.max : next
+            }
+        }
+
+        var committedInputCount: Int {
+            let committedCache =
+                roundInFlight ? roundValidHistoryOffset : cacheOffset
+            let (total, overflow) = committedCache.addingReportingOverflow(
+                backlogInputCount)
+            return overflow ? Int.max : total
+        }
+
+        var stagedInputCount: Int {
+            guard roundInFlight else { return 0 }
+            return max(0, cacheOffset - roundValidHistoryOffset)
+        }
+
         var materializedBytes: Int {
             let arrays =
                 caches.flatMap { $0.innerState() }
-                + [pendingToken, pendingHidden].compactMap { $0 }
+                + backlogHidden + backlogTokens
+                + [targetHiddenFrontier].compactMap { $0 }
+                + roundTrustedHidden + roundTrustedTokens + roundRoots
             return arrays.reduce(0) { total, array in
                 let (next, overflow) = total.addingReportingOverflow(array.nbytes)
                 return overflow ? Int.max : next
             }
         }
 
-        func clearPending() {
-            pendingToken = nil
-            pendingHidden = nil
+        init(caches: [any KVCache]) { self.caches = caches }
+
+        func clearRound() {
+            roundBaseOffset = cacheOffset
+            roundValidHistoryOffset = cacheOffset
+            roundDraftSteps = 0
+            roundInFlight = false
+            roundTrustedHidden.removeAll(keepingCapacity: true)
+            roundTrustedTokens.removeAll(keepingCapacity: true)
+            roundRoots.removeAll(keepingCapacity: true)
         }
 
-        init(caches: [any KVCache]) { self.caches = caches }
+        func clearAll() {
+            caches.removeAll(keepingCapacity: false)
+            backlogHidden.removeAll(keepingCapacity: false)
+            backlogTokens.removeAll(keepingCapacity: false)
+            targetHiddenFrontier = nil
+            roundTrustedHidden.removeAll(keepingCapacity: false)
+            roundTrustedTokens.removeAll(keepingCapacity: false)
+            roundRoots.removeAll(keepingCapacity: false)
+            roundBaseOffset = 0
+            roundValidHistoryOffset = 0
+            roundDraftSteps = 0
+            roundInFlight = false
+            isReleased = true
+        }
     }
 
     private final class UnusedPreparedCapture: CBv2MTPPreparedCapture {}
 
     public var mtpTargetIdentity: ObjectIdentifier? { targetIdentity }
-    /// Verification policy. Rectangular selects CAPTURE-VERIFY: the target
-    /// scores all 1+k columns in ONE `[B, 1+k]` forward while the 30
-    /// GatedDeltaNet layers stage per-position captured conv/SSM states
-    /// (`Qwen35GatedDeltaNet.cbv2ForwardCaptured`); finalize commits the
-    /// accepted position by device-side slice and rolls back by restoring
-    /// the pre-verify snapshot. This replaces the serial per-column loop
-    /// whose k+1 full-model re-reads made the round ≤1.0x by construction.
+    /// Verification policy. Rectangular scores all 1+k columns in one
+    /// `[B, 1+k]` target forward. Widths one and two stage ordinary captured
+    /// recurrent states. At S>=3 each GatedDeltaNet layer runs one full-window
+    /// recurrence and retains compact transformed inputs: full acceptance
+    /// installs the final state directly, while a strict accepted prefix lazily
+    /// replays only that prefix. This replaces the serial per-column loop whose
+    /// k+1 full-model re-reads made the round ≤1.0x by construction.
     ///
     /// NUMERICS POLICY: bitwise greedy parity with serial decode is NOT the
     /// bar here — batched verify changes accumulation geometry exactly like
@@ -530,11 +661,9 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
         Self.forceSerialVerification ? .serialTarget : .rectangular
     }
-    /// k=1 today: each round proposes one draft from one [1, 1+p] forward
-    /// (p = the previous round's accepted deferred pair). Deeper chains
-    /// (k=2 self-application) extend the proposal chain, not the verify
-    /// path — the capture window and finalize already handle any 1+k.
-    public var maximumDraftTokens: Int? { 1 }
+    /// Production Qwen drafting self-applies the recurrent MTP head up to
+    /// four times. The legacy double-forward oracle stays a k=1 A/B control.
+    public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : 4 }
     public var maximumSpeculativeBatch: Int? { 1 }
     /// Target-prefix acceptance is exact at any temperature (every committed
     /// token IS a target sample), so this drafter lifts the greedy gate when
@@ -580,19 +709,20 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         return value
     }()
 
-    /// Shortlisted drafting needs the deferred-pair single-forward round
-    /// shape; the legacy oracle always scores the full head.
+    /// Shortlisting and the double-forward oracle are intentionally separate
+    /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
         Self.forceDoubleForward ? nil : Self.shortlistSize
     }
     public var requestStateBytesPerToken: Int {
-        Self.cacheBytesPerToken(
+        Self.stateBytesPerToken(
             configuration: target.configuration,
             layerCount: mtp.layers.count,
-            elementBytes: mtp.norm.weight.dtype.size)
+            cacheElementBytes: mtp.norm.weight.dtype.size,
+            hiddenElementBytes: target.model.norm.weight.dtype.size)
     }
     public var requestStateTokenGranularity: Int { Self.cacheAllocationStep }
-    public var requestStateTokenAllocationPadding: Int { 1 }
+    public var requestStateTokenAllocationPadding: Int { 4 }
 
     static func cacheBytesPerToken(
         configuration: Qwen35TextConfiguration,
@@ -609,8 +739,61 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         return geometryOverflow || kvOverflow || layerOverflow || byteOverflow ? Int.max : bytes
     }
 
+    static func stateBytesPerToken(
+        configuration: Qwen35TextConfiguration,
+        layerCount: Int,
+        cacheElementBytes: Int,
+        hiddenElementBytes: Int
+    ) -> Int {
+        let cacheBytes = cacheBytesPerToken(
+            configuration: configuration, layerCount: layerCount,
+            elementBytes: cacheElementBytes)
+        let (hiddenBytes, hiddenOverflow) = configuration.hiddenSize
+            .multipliedReportingOverflow(by: hiddenElementBytes)
+        guard cacheBytes != Int.max, !hiddenOverflow else { return Int.max }
+        let (withHidden, hiddenAdditionOverflow) = cacheBytes.addingReportingOverflow(
+            hiddenBytes)
+        let (withToken, tokenAdditionOverflow) = withHidden.addingReportingOverflow(
+            MemoryLayout<Int32>.stride)
+        return hiddenAdditionOverflow || tokenAdditionOverflow ? Int.max : withToken
+    }
+
     public func makeRequestState() -> any CBv2MTPRequestState {
         RequestState(caches: makeCache())
+    }
+
+    public func observeCommittedTarget(
+        _ observation: CBv2MTPCommittedTargetObservation,
+        requestState: any CBv2MTPRequestState
+    ) {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP observed released request state")
+        precondition(!state.roundInFlight, "inline Qwen MTP observed target during a round")
+        precondition(
+            observation.tokens.ndim == 2 && observation.hidden.ndim == 3
+                && observation.tokens.dim(0) == 1 && observation.hidden.dim(0) == 1
+                && observation.tokens.dim(1) == observation.hidden.dim(1),
+            "inline Qwen MTP target observation shape mismatch")
+
+        let count = observation.tokens.dim(1)
+        guard count > 0 else { return }
+        let normalizedHidden = targetFinalNorm(observation.hidden)
+
+        // Cross-chunk transition: the preceding chunk's final normalized
+        // target hidden pairs with this chunk's first target input.
+        if let frontier = state.targetHiddenFrontier {
+            state.backlogHidden.append(frontier)
+            state.backlogTokens.append(observation.tokens[0..., 0 ..< 1])
+        }
+        // Intra-chunk transitions: finalNorm(hidden[t]) conditions token[t+1].
+        if count > 1 {
+            state.backlogHidden.append(normalizedHidden[0..., 0 ..< count - 1, 0...])
+            state.backlogTokens.append(observation.tokens[0..., 1 ..< count])
+        }
+        state.targetHiddenFrontier =
+            normalizedHidden[0..., (count - 1) ..< count, 0...]
     }
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
@@ -630,119 +813,193 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         guard let state = requestState as? RequestState else {
             preconditionFailure("inline Qwen MTP received foreign request state")
         }
-        precondition(tokens.dim(0) == 1 && tokens.dim(1) == 1)
+        precondition(!state.isReleased, "inline Qwen MTP drafted with released request state")
+        precondition(
+            tokens.ndim == 2 && hidden.ndim == 3
+                && tokens.dim(0) == 1 && tokens.dim(1) == 1
+                && hidden.dim(0) == 1 && hidden.dim(1) == 1,
+            "inline Qwen MTP draft input shape mismatch")
+
         if Self.forceDoubleForward {
             return legacyDoubleForwardDraftStep(tokens: tokens, hidden: hidden, state: state)
         }
-        precondition(!state.roundInFlight, "inline Qwen MTP round already staged")
-        // ONE MTP forward per round: the previous round's accepted draft
-        // pair (deferred, now canonical) rides the same window as this
-        // round's seed pair, so the MTP layer weights stream once and the
-        // head scores only the final position.
-        var feedTokens = tokens
-        var feedHidden = hidden
-        if let pendingToken = state.pendingToken, let pendingHidden = state.pendingHidden {
-            feedTokens = concatenated([pendingToken, tokens], axis: 1)
-            feedHidden = concatenated([pendingHidden, hidden], axis: 1)
-        }
-        state.clearPending()
-        let output = moduleForward(
-            hidden: feedHidden, tokens: feedTokens, cache: state.caches)
-        let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
-        let draft: MLXArray
-        if let shortlist {
-            let logits = shortlistLogits(hidden: lastHidden, ids: shortlist)
-            draft = shortlist[argMax(logits[0..., -1, 0...], axis: -1)].asType(.int32)
+
+        let isFirstStep = !state.roundInFlight
+        let feed: (tokens: MLXArray, hidden: MLXArray)
+        if isFirstStep {
+            feed = beginRound(tokens: tokens, hidden: hidden, state: state)
         } else {
-            draft = argMax(headLogits(lastHidden)[0..., -1, 0...], axis: -1)
-                .asType(.int32)
+            precondition(
+                state.roundDraftSteps < 4,
+                "inline Qwen MTP exceeded its four-step draft chain")
+            feed = (tokens, hidden)
         }
-        state.pendingToken = draft.reshaped([1, 1])
-        state.pendingHidden = lastHidden
-        state.roundInFlight = true
+
+        let output =
+            isFirstStep
+            ? (moduleLastHiddenWithKVOnlyHistory(
+                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+                ?? moduleForward(
+                    hidden: feed.hidden, tokens: feed.tokens, cache: state.caches))
+            : moduleForward(
+                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+        let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
+        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        state.roundRoots.append(contentsOf: [lastHidden, draft])
+        state.roundDraftSteps += 1
+
+        if isFirstStep {
+            // The engine immediately submits evaluationTargets for this first
+            // cache generation before constructing a deeper draft step.
+            state.roundValidHistoryOffset = state.cacheOffset
+        }
         return (draft, lastHidden)
     }
 
-    /// The pre-trim oracle: proposal forward + full re-forward that stages
-    /// the draft pair eagerly (so rejection trims it). Costs a second full
-    /// lm_head read per round plus a blocking mid-build `eval`.
+    private func beginRound(
+        tokens: MLXArray, hidden: MLXArray, state: RequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        precondition(!state.roundInFlight, "inline Qwen MTP round already in flight")
+        precondition(
+            state.backlogHidden.count == state.backlogTokens.count,
+            "inline Qwen MTP trusted backlog diverged")
+
+        state.roundBaseOffset = state.cacheOffset
+        state.roundValidHistoryOffset = state.cacheOffset
+        state.roundDraftSteps = 0
+        state.roundInFlight = true
+        state.roundTrustedHidden = state.backlogHidden
+        state.roundTrustedTokens = state.backlogTokens
+        state.backlogHidden.removeAll(keepingCapacity: true)
+        state.backlogTokens.removeAll(keepingCapacity: true)
+
+        // The current target carry is trusted and completes the frontier
+        // transition. Normalize it exactly once before it enters head history.
+        state.roundTrustedHidden.append(targetFinalNorm(hidden))
+        state.roundTrustedTokens.append(tokens)
+        state.targetHiddenFrontier = nil
+
+        if state.roundTrustedTokens.count == 1 {
+            return (state.roundTrustedTokens[0], state.roundTrustedHidden[0])
+        }
+        let feedTokens = concatenated(state.roundTrustedTokens, axis: 1)
+        let feedHidden = concatenated(state.roundTrustedHidden, axis: 1)
+        return (feedTokens, feedHidden)
+    }
+
+    private func draftToken(hidden: MLXArray, shortlist: MLXArray?) -> MLXArray {
+        if let shortlist {
+            let logits = shortlistLogits(hidden: hidden, ids: shortlist)
+            return shortlist[argMax(logits[0..., -1, 0...], axis: -1)]
+                .asType(.int32)
+        }
+        return argMax(headLogits(hidden)[0..., -1, 0...], axis: -1)
+            .asType(.int32)
+    }
+
+    /// Explicit pre-cutover A/B oracle. It shares production history upkeep,
+    /// but stages the proposed draft through a second complete MTP/lm-head
+    /// forward and performs the historical blocking mid-round evaluation.
     private func legacyDoubleForwardDraftStep(
         tokens: MLXArray, hidden: MLXArray, state: RequestState
     ) -> (tokens: MLXArray, hidden: MLXArray) {
-        precondition(state.stagedInputs == 0, "inline Qwen MTP round already staged")
-        let output = forward(hidden: hidden, tokens: tokens, cache: state.caches)
-        let draft = argMax(output.logits[0..., -1, 0...], axis: -1).asType(.int32)
-        // KVCacheSimple owns mutable buffers. Complete the proposal step
-        // before constructing the history-only draft feed so the proposal
-        // cannot observe the later cache version.
-        eval([draft, output.hidden] + state.caches.flatMap { $0.innerState() })
-        // The next round starts after target verification. Stage the proposed
-        // draft now as well so acceptance retains [seed, draft], while a
-        // rejection trims only the draft and retains the canonical seed.
+        precondition(!state.roundInFlight, "inline Qwen MTP round already in flight")
+        let feed = beginRound(tokens: tokens, hidden: hidden, state: state)
+        let output =
+            moduleLastHiddenWithKVOnlyHistory(
+                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+            ?? moduleForward(
+                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+        let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
+        let logits = headLogits(lastHidden)
+        let draft = argMax(logits[0..., -1, 0...], axis: -1).asType(.int32)
+        state.roundRoots.append(contentsOf: [lastHidden, draft])
+        state.roundDraftSteps = 1
+        state.roundValidHistoryOffset = state.cacheOffset
+
+        eval([draft, lastHidden] + state.caches.flatMap { $0.innerState() })
         _ = forward(
-            hidden: output.hidden, tokens: draft.reshaped([1, 1]), cache: state.caches)
-        state.stagedInputs = 2
-        return (
-            draft,
-            output.hidden)
+            hidden: lastHidden, tokens: draft.reshaped([1, 1]), cache: state.caches)
+        return (draft, lastHidden)
     }
 
     public func evaluationTargets(
         for requestState: any CBv2MTPRequestState
     ) -> [MLXArray] {
-        guard let state = requestState as? RequestState else { return [] }
+        guard let state = requestState as? RequestState, !state.isReleased else {
+            return []
+        }
         return state.caches.flatMap { $0.innerState() }
-            + [state.pendingToken, state.pendingHidden].compactMap { $0 }
+            + state.backlogHidden + state.backlogTokens
+            + [state.targetHiddenFrontier].compactMap { $0 }
+            + state.roundTrustedHidden + state.roundTrustedTokens + state.roundRoots
     }
 
     public func finalizeRound(
-        requestState: any CBv2MTPRequestState, confirmedInputTokens: Int
+        requestState: any CBv2MTPRequestState,
+        confirmedInputTokens: Int,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray
     ) {
         guard let state = requestState as? RequestState else {
             preconditionFailure("inline Qwen MTP received foreign request state")
         }
-        if Self.forceDoubleForward {
-            precondition((0 ... state.stagedInputs).contains(confirmedInputTokens))
-            let rollback = state.stagedInputs - confirmedInputTokens
-            if rollback > 0 {
-                for cache in state.caches {
-                    precondition(cache.trim(rollback) == rollback)
-                }
-            }
-            state.stagedInputs = 0
-            return
+        precondition(!state.isReleased, "inline Qwen MTP finalized released request state")
+        precondition(state.roundInFlight, "inline Qwen MTP finalized without a round")
+        precondition(
+            (0 ... state.roundDraftSteps + 1).contains(confirmedInputTokens),
+            "inline Qwen MTP confirmed prefix exceeds the draft round")
+        precondition(
+            committedDraftTokens.ndim == 2 && committedTargetHidden.ndim == 3
+                && committedDraftTokens.dim(0) == 1
+                && committedTargetHidden.dim(0) == 1
+                && committedDraftTokens.dim(1) == committedTargetHidden.dim(1),
+            "inline Qwen MTP committed target rows mismatch")
+        let committedDraftCount = committedDraftTokens.dim(1)
+        precondition(
+            committedDraftCount <= state.roundDraftSteps
+                && committedDraftCount <= max(0, confirmedInputTokens - 1),
+            "inline Qwen MTP committed drafts exceed confirmed target inputs")
+
+        trim(state: state, to: state.roundValidHistoryOffset)
+        if committedDraftCount > 0 {
+            // These are pre-final-norm target verify hiddens, never speculative
+            // assistant hiddens. Normalize exactly once, retain lazily, and
+            // flush them with the next carry.
+            state.backlogTokens.append(committedDraftTokens)
+            state.backlogHidden.append(targetFinalNorm(committedTargetHidden))
         }
-        precondition(state.roundInFlight, "inline Qwen MTP finalize without a round")
-        precondition((0 ... 2).contains(confirmedInputTokens))
-        state.roundInFlight = false
-        // The round staged nothing in assistant KV; only the deferred draft
-        // pair needs an accept/reject decision. Both round inputs confirmed
-        // ⇒ the draft is canonical history and feeds the next forward;
-        // anything less ⇒ the target replaced it, drop the pair (this IS the
-        // carry rollback — the engine re-seeds the next round from the
-        // target's replacement token and captured hidden).
-        if confirmedInputTokens < 2 {
-            state.clearPending()
-        }
+        state.clearRound()
     }
 
     public func discardRound(requestState: any CBv2MTPRequestState) {
-        guard let state = requestState as? RequestState else { return }
-        if state.stagedInputs > 0 {
-            for cache in state.caches {
-                precondition(cache.trim(state.stagedInputs) == state.stagedInputs)
-            }
+        guard let state = requestState as? RequestState,
+            !state.isReleased, state.roundInFlight
+        else { return }
+
+        trim(state: state, to: state.roundBaseOffset)
+        // Restore all trusted transitions consumed by the abandoned graph in
+        // original order. No speculative assistant hidden enters the backlog.
+        state.backlogHidden =
+            state.roundTrustedHidden + state.backlogHidden
+        state.backlogTokens =
+            state.roundTrustedTokens + state.backlogTokens
+        state.clearRound()
+    }
+
+    private func trim(state: RequestState, to offset: Int) {
+        let rollback = state.cacheOffset - offset
+        precondition(rollback >= 0, "inline Qwen MTP cache checkpoint moved forward")
+        guard rollback > 0 else { return }
+        for cache in state.caches {
+            precondition(cache.trim(rollback) == rollback)
         }
-        state.stagedInputs = 0
-        state.roundInFlight = false
-        state.clearPending()
     }
 
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
-        guard let state = requestState as? RequestState else { return }
-        state.caches.removeAll(keepingCapacity: false)
-        state.stagedInputs = 0
-        state.roundInFlight = false
-        state.clearPending()
+        guard let state = requestState as? RequestState, !state.isReleased else {
+            return
+        }
+        state.clearAll()
     }
 }

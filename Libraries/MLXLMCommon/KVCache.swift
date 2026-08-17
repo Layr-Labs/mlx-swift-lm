@@ -1182,6 +1182,55 @@ public class ArraysCache: BaseKVCache {
     /// Port of omlx commit 696d90a: patches/mlx_lm_mtp/cache_rollback.py ArraysCache.rollback_state
     public var rollbackState: (MLXArray, MLXArray)? = nil
 
+    /// Compact inputs for rebuilding a recurrent state at an arbitrary boundary
+    /// of a multi-row verify forward. This is deliberately transient: the
+    /// verify round must consume or clear it before another forward.
+    public var prefixReplayTape: PrefixReplayTape? = nil
+
+    public struct PrefixReplayTape {
+        public let convInput: MLXArray
+        public let q: MLXArray
+        public let k: MLXArray
+        public let v: MLXArray
+        public let a: MLXArray
+        public let b: MLXArray
+        public let ssmPre: MLXArray?
+        public let mask: MLXArray?
+        public let rowCount: Int
+        public let convStateRows: Int
+
+        public init(
+            convInput: MLXArray,
+            q: MLXArray,
+            k: MLXArray,
+            v: MLXArray,
+            a: MLXArray,
+            b: MLXArray,
+            ssmPre: MLXArray?,
+            mask: MLXArray?,
+            rowCount: Int,
+            convStateRows: Int
+        ) {
+            self.convInput = convInput
+            self.q = q
+            self.k = k
+            self.v = v
+            self.a = a
+            self.b = b
+            self.ssmPre = ssmPre
+            self.mask = mask
+            self.rowCount = rowCount
+            self.convStateRows = convStateRows
+        }
+    }
+
+    /// Release all arrays retained solely for speculative recurrent rollback.
+    /// Persistent conv/SSM state is left untouched.
+    public func clearMTPTransientState() {
+        rollbackState = nil
+        prefixReplayTape = nil
+    }
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }
@@ -1202,6 +1251,7 @@ public class ArraysCache: BaseKVCache {
             return cache.compactMap { $0 }
         }
         set {
+            clearMTPTransientState()
             cache = newValue.map { $0 as MLXArray? }
         }
     }
@@ -1219,6 +1269,7 @@ public class ArraysCache: BaseKVCache {
 
     /// In-place filter to keep just the given indices in the cache
     public func filter(batchIndices: MLXArray) {
+        clearMTPTransientState()
         cache = cache.map { c in
             c?[batchIndices]
         }
@@ -1228,6 +1279,7 @@ public class ArraysCache: BaseKVCache {
 
     /// In-place extend this cache with the other cache
     public func extend(other: ArraysCache) {
+        clearMTPTransientState()
         let lhsBatch = batchSize
         let rhsBatch = other.batchSize
 
@@ -1312,6 +1364,7 @@ public class ArraysCache: BaseKVCache {
 
     /// Restore from saved metaState + state arrays. Handles both new (slot-aware) and legacy formats.
     internal func restoreFromMetaState(state: [MLXArray], savedMetaState: [String]) {
+        clearMTPTransientState()
         // Detect new format: first element parses as int (slotCount), second element is present slots
         if savedMetaState.count >= 2, let slotCount = Int(savedMetaState[0]) {
             let presentSlots =

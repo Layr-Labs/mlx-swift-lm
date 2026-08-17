@@ -20,15 +20,37 @@ extension EngineLoopV2 {
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
         guard let mtp, let round = step.mtpRound else { return }
 
+        // Plain prompt/decode observations may own request-state arrays that
+        // the just-fenced target graph referenced. Restore or release them
+        // only now, never at cancellation time while evaluation is live.
+        for observation in round.committedObservationRows {
+            if step.discard.contains(observation.id)
+                || scheduler.record(for: observation.id) == nil
+            {
+                round.deferredAssistantReleases.append(
+                    observation.assistantState)
+            } else {
+                mtp.restoreAssistantState(
+                    observation.assistantState, for: observation.id)
+            }
+        }
+
         // The ordinary finalize loop has confirmed each seed row's bonus.
         if let seedHidden = round.seedHidden {
+            let seedPolicyTopTwo =
+                round.seedPolicyTopTwoValues?.asArray(Float.self)
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
                     let rec = scheduler.record(for: id)
                 else { continue }
+                let margin = seedPolicyTopTwo.map { values in
+                    let base = decodeIndex * 2
+                    return Double(values[base] - values[base + 1])
+                }
                 mtp.storeCarry(
                     id: id, token: rec.tokens.last!,
                     hidden: seedHidden[decodeIndex ..< (decodeIndex + 1), 0..., 0...],
+                    previousTopTwoMargin: margin,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
                 round.finalizedSeedIDs.insert(id)
@@ -38,6 +60,7 @@ extension EngineLoopV2 {
         guard let verify = round.verify else { return }
         let k = verify.k
         let host = verify.acceptancePacket.asArray(Int32.self)
+        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -51,23 +74,14 @@ extension EngineLoopV2 {
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step. This keeps subsequent
-        // quantized MoE target batches shape-identical across all rows.
+        // one committed width for the rectangular step.
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
         var commonEmitted = targetWidth
 
         for (batchIndex, metadata) in verify.rows.enumerated() {
             let id = metadata.id
-            // A departed row is fenced by deferred release. Its device offset
-            // is stale, so force the next eager composition to rebuild.
             if step.discard.contains(id) || scheduler.record(for: id) == nil {
-                if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
-                    let state = metadata.assistantState
-                {
-                    stateful.discardRound(requestState: state)
-                    mtp.releaseDetachedAssistantState(state)
-                }
                 if let evaluations = verify.recurrentEvaluations[id] {
                     do {
                         for evaluation in evaluations.reversed() { try evaluation.rollback() }
@@ -75,6 +89,9 @@ extension EngineLoopV2 {
                         preconditionFailure(
                             "CBv2 recurrent MTP discard rollback failed for \(id): \(error)")
                     }
+                }
+                if let state = metadata.assistantState {
+                    round.deferredAssistantReleases.append(state)
                 }
                 anyRejected = true
                 continue
@@ -161,12 +178,6 @@ extension EngineLoopV2 {
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
             let rejected = (1 + k) - confirmed
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
-                let state = metadata.assistantState
-            {
-                stateful.finalizeRound(
-                    requestState: state, confirmedInputTokens: confirmed)
-            }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
@@ -205,6 +216,24 @@ extension EngineLoopV2 {
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
+            let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                let state = metadata.assistantState
+            {
+                // Target KV/recurrent truth is committed first. The assistant
+                // receives only accepted draft inputs and their trusted target
+                // hidden rows; every speculative head suffix is discarded.
+                stateful.finalizeRound(
+                    requestState: state,
+                    confirmedInputTokens: 1 + committedDraftCount,
+                    committedDraftTokens: verify.draftIDs[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount],
+                    committedTargetHidden: verify.lastHidden[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount,
+                        0...])
+            }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
@@ -227,9 +256,18 @@ extension EngineLoopV2 {
                 }
             }
 
-            let committedAccepted = min(accepted, confirmed)
+            let observedAccepted = min(accepted, confirmed)
             mtp.recordRound(
-                drafted: k, accepted: committedAccepted, emitted: confirmed)
+                drafted: k, accepted: observedAccepted, emitted: confirmed)
+            let rejectionObserved = accepted < k && confirmed > accepted
+            let acceptanceTruncated =
+                !rejectionObserved && confirmed <= accepted && confirmed < k
+            mtp.observeRequestAcceptance(
+                id: id,
+                draftedDepth: k,
+                acceptedDepth: observedAccepted,
+                rejectionObserved: rejectionObserved,
+                endedByTruncation: acceptanceTruncated)
 
             if let finishReason {
                 if let state = metadata.assistantState {
@@ -261,12 +299,19 @@ extension EngineLoopV2 {
                         carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
                     }
                 }
+                let previousTopTwoMargin: Double? = policyTopTwoHost.map { values in
+                    let base =
+                        (batchIndex * targetWidth + hiddenColumn) * 2
+                    return Double(values[base] - values[base + 1])
+                }
                 mtp.storeCarry(
                     id: id, token: kept[confirmed - 1],
                     hidden: verify.lastHidden[
                         batchIndex ..< (batchIndex + 1),
                         hiddenColumn ..< (hiddenColumn + 1), 0...],
                     shortlist: carryShortlist,
+                    previousTopTwoMargin: previousTopTwoMargin,
+                    needsHistoryTransition: mtp.tracksPersistentHistory,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
             }

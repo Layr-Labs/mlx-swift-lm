@@ -14,6 +14,9 @@ struct CBv2MTPRowWork {
     let isSeed: Bool
     /// Non-nil for verify rows: the consumed carry.
     let carry: CBv2MTPCarry?
+    /// Verify-produced carry transition that must prime assistant history
+    /// before this target-only row processes the carry token.
+    let historyCarry: CBv2MTPCarry?
 }
 
 struct CBv2MTPGraphBuild {
@@ -26,7 +29,9 @@ struct CBv2MTPGraphBuild {
     let verify: CBv2MTPRoundInFlight.Verify?
     let seedRows: [(id: CBv2RequestID, decodeIndex: Int)]
     let seedHidden: MLXArray?
+    let seedPolicyTopTwoValues: MLXArray?
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
+    let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
 }
 
 extension EngineLoopV2 {
@@ -43,23 +48,30 @@ extension EngineLoopV2 {
             guard let rec = scheduler.record(for: id) else { continue }
             guard ensureKVState(rec) != nil else { continue }
             var count = assignedTokens
+            var preserveHistorySeed = false
 
             if let k = mtp.roundMark(for: id) {
                 if demoteAllRounds {
                     if count == 1 + k { scheduler.rollbackComputed(id: id, tokens: k) }
                     count = 1
-                    mtp.invalidateCarry(id)
+                    if mtp.tracksPersistentHistory {
+                        preserveHistorySeed = true
+                    } else {
+                        mtp.invalidateCarry(id)
+                    }
                 } else if count == 1 + k, let carry = mtp.consumeCarry(for: id) {
                     work.append(
                         CBv2MTPRowWork(
                             rec: rec, start: rec.numComputedTokens - count, count: count,
-                            samples: true, isDecode: false, isSeed: false, carry: carry))
+                            samples: true, isDecode: false, isSeed: false,
+                            carry: carry, historyCarry: nil))
                     continue
                 } else if count == 1 + k {
                     // A marked assignment without a consumable carry demotes
                     // exactly like the scheduler's headroom retry.
                     scheduler.rollbackComputed(id: id, tokens: k)
                     count = 1
+                    preserveHistorySeed = mtp.tracksPersistentHistory
                 } else {
                     switch plan.speculationFallbacks[id] {
                     case .tokenBudget: mtp.recordSkip("token_budget")
@@ -80,7 +92,11 @@ extension EngineLoopV2 {
             work.append(
                 CBv2MTPRowWork(
                     rec: rec, start: start, count: count, samples: samples,
-                    isDecode: isDecode, isSeed: isDecode && mtp.isSeedMarked(id), carry: nil))
+                    isDecode: isDecode,
+                    isSeed:
+                        isDecode && (mtp.isSeedMarked(id) || preserveHistorySeed),
+                    carry: nil,
+                    historyCarry: mtp.pendingHistoryCarry(for: id)))
         }
         return work
     }
@@ -97,7 +113,35 @@ extension EngineLoopV2 {
         var decodeSampled: MLXArray?
         var seedRows: [(id: CBv2RequestID, decodeIndex: Int)] = []
         var seedHidden: MLXArray?
+        var seedPolicyTopTwoValues: MLXArray?
         var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
+        var committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow] = []
+        var committedObservationEvalTargets: [MLXArray] = []
+
+        func observeCommittedTarget(
+            row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
+        ) {
+            guard mtp.tracksPersistentHistory, mtpBasicEligible(row.rec),
+                let state = mtp.takeOrMakeAssistantState(for: row.rec.id)
+            else { return }
+            if let carry = row.historyCarry {
+                mtp.observeCommittedTarget(
+                    id: row.rec.id,
+                    observation: CBv2MTPCommittedTargetObservation(
+                        tokens: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
+                        hidden: carry.hidden),
+                    detachedState: state)
+                committedObservationEvalTargets.append(carry.hidden)
+            }
+            mtp.observeCommittedTarget(
+                id: row.rec.id,
+                observation: CBv2MTPCommittedTargetObservation(
+                    tokens: tokens, hidden: hidden),
+                detachedState: state)
+            committedObservationRows.append(
+                .init(id: row.rec.id, assistantState: state))
+            committedObservationEvalTargets.append(hidden)
+        }
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
@@ -151,6 +195,23 @@ extension EngineLoopV2 {
                 seedRows.append((id: row.rec.id, decodeIndex: index))
             }
             if !seedRows.isEmpty { seedHidden = hidden }
+            if mtp.usesMarginalPolicy, !seedRows.isEmpty {
+                guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
+                    preconditionFailure("CBv2 adaptive seed target lacks top-two provider")
+                }
+                let vocabulary = logits.dim(-1)
+                let topTwo = provider.cbv2MTPTopTwo(
+                    logits.reshaped([1, decodeRows.count, vocabulary]))
+                seedPolicyTopTwoValues = topTwo.values
+                    .reshaped([decodeRows.count, 1, 2])
+                    .asType(.float32)
+            }
+            for (index, row) in decodeRows.enumerated() {
+                observeCommittedTarget(
+                    row: row,
+                    tokens: inputs[index ..< index + 1, 0...],
+                    hidden: hidden[index ..< index + 1, 0..., 0...])
+            }
         }
 
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
@@ -164,6 +225,7 @@ extension EngineLoopV2 {
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
+            var observedHidden: MLXArray?
             if let multimodal = multimodalByID[rec.id],
                 !multimodal.spansInChunk(start: row.start, count: row.count).isEmpty
             {
@@ -176,6 +238,31 @@ extension EngineLoopV2 {
                 recurrentEvaluations.merge(forward.recurrent) { _, _ in
                     preconditionFailure("duplicate recurrent evaluation")
                 }
+            } else if mtp.tracksPersistentHistory,
+                let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
+                recurrentModel.recurrentStateSpec != nil
+            {
+                guard let recurrentState = recurrentStates[rec.id] else {
+                    preconditionFailure("CBv2 recurrent MTP prefill state missing")
+                }
+                let evaluation: CBv2RecurrentStateEvaluation
+                do { evaluation = try recurrentState.bind() } catch {
+                    preconditionFailure("CBv2 recurrent MTP prefill bind failed: \(error)")
+                }
+                let positions = rec.request.positionState?.promptSlice(
+                    row.start ..< row.start + row.count)
+                let forward = recurrentModel.forwardWithHidden(
+                    tokens: inputs, caches: caches, recurrentState: [evaluation],
+                    positionIds: positions)
+                output = narrowPrefillOutput(forward.logits, requirement: requirement)
+                observedHidden = forward.lastHidden
+                do {
+                    cacheInnerState.append(contentsOf: try evaluation.evaluate())
+                } catch {
+                    preconditionFailure(
+                        "CBv2 recurrent MTP prefill evaluation failed: \(error)")
+                }
+                recurrentEvaluations[rec.id] = evaluation
             } else if let recurrentModel = model as? any CBv2RecurrentSteppableModel,
                 recurrentModel.recurrentStateSpec != nil
             {
@@ -189,10 +276,17 @@ extension EngineLoopV2 {
                 recurrentEvaluations.merge(forward.recurrent) { _, _ in
                     preconditionFailure("duplicate recurrent evaluation")
                 }
+            } else if mtp.tracksPersistentHistory {
+                let forward = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                output = narrowPrefillOutput(forward.logits, requirement: requirement)
+                observedHidden = forward.lastHidden
             } else {
                 output = prefillOutput(
                     tokens: inputs, inputEmbeddings: nil, caches: caches,
                     requirement: requirement)
+            }
+            if let observedHidden {
+                observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -244,8 +338,15 @@ extension EngineLoopV2 {
             if let shortlistIDs = verify.shortlistIDs {
                 asyncEvalTargets.append(shortlistIDs)
             }
+            if let policyTopTwoValues = verify.policyTopTwoValues {
+                asyncEvalTargets.append(policyTopTwoValues)
+            }
         }
         if let seedHidden { asyncEvalTargets.append(seedHidden) }
+        if let seedPolicyTopTwoValues {
+            asyncEvalTargets.append(seedPolicyTopTwoValues)
+        }
+        asyncEvalTargets.append(contentsOf: committedObservationEvalTargets)
         if !cacheInnerState.isEmpty {
             asyncEvalTargets.append(contentsOf: cacheInnerState)
             offsetChainEvalSteps += 1
@@ -260,7 +361,9 @@ extension EngineLoopV2 {
             verify: verify,
             seedRows: seedRows,
             seedHidden: seedHidden,
-            recurrentEvaluations: recurrentEvaluations)
+            seedPolicyTopTwoValues: seedPolicyTopTwoValues,
+            recurrentEvaluations: recurrentEvaluations,
+            committedObservationRows: committedObservationRows)
     }
 
     private func mtpBuildVerifyGraph(
@@ -329,24 +432,44 @@ extension EngineLoopV2 {
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
-            precondition(k == 1, "CBv2 request-stateful MTP currently supports one draft")
-            var nextRows: [MLXArray] = []
-            nextRows.reserveCapacity(batch)
-            for (index, row) in verifyRows.enumerated() {
-                guard let requestState = rowMetadata[index].assistantState else {
-                    preconditionFailure(
-                        "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
-                }
-                let result = stateful.draftStep(
-                    tokens: seedColumn[index ..< index + 1, 0...],
-                    hidden: carryHiddens[index],
-                    shortlist: row.carry!.shortlist,
-                    requestState: requestState)
-                nextRows.append(result.tokens.reshaped([1]))
-                assistantEvalTargets.append(
-                    contentsOf: stateful.evaluationTargets(for: requestState))
+            var currentTokens = (0 ..< batch).map {
+                seedColumn[$0 ..< $0 + 1, 0...]
             }
-            draftSteps.append(concatenated(nextRows, axis: 0))
+            var currentHidden = carryHiddens
+            for draftIndex in 0 ..< k {
+                var nextRows: [MLXArray] = []
+                var nextHiddens: [MLXArray] = []
+                var stepEvalTargets: [MLXArray] = []
+                nextRows.reserveCapacity(batch)
+                nextHiddens.reserveCapacity(batch)
+                for (index, row) in verifyRows.enumerated() {
+                    guard let requestState = rowMetadata[index].assistantState else {
+                        preconditionFailure(
+                            "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
+                    }
+                    let result = stateful.draftStep(
+                        tokens: currentTokens[index],
+                        hidden: currentHidden[index],
+                        shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
+                        requestState: requestState)
+                    let next = result.tokens.reshaped([1])
+                    nextRows.append(next)
+                    nextHiddens.append(result.hidden)
+                    stepEvalTargets.append(next)
+                    stepEvalTargets.append(result.hidden)
+                    stepEvalTargets.append(
+                        contentsOf: stateful.evaluationTargets(for: requestState))
+                }
+                // Publish the first mutable head-cache generation before
+                // constructing a deeper generation. This is nonblocking and
+                // joins the round's sole finalize fence.
+                if draftIndex == 0 { asyncEval(stepEvalTargets) }
+                assistantEvalTargets.append(contentsOf: stepEvalTargets)
+                let stepTokens = concatenated(nextRows, axis: 0)
+                draftSteps.append(stepTokens)
+                currentTokens = nextRows.map { $0.reshaped([1, 1]) }
+                currentHidden = nextHiddens
+            }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
             var draftInput = seedColumn
@@ -389,9 +512,11 @@ extension EngineLoopV2 {
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
+            draftIDs: draftIDs,
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
-            recurrentEvaluations: target.recurrent)
+            recurrentEvaluations: target.recurrent,
+            policyTopTwoValues: target.policyTopTwo?.values)
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes
