@@ -173,7 +173,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
             queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            executionPolicy: attentionExecutionPolicy,
+            executionObserver: attentionExecutionObserver)
     }
 
     // MARK: - Private

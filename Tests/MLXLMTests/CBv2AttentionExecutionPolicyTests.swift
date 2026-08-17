@@ -56,6 +56,23 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
             .fallback)
     }
 
+    func testQueryBlockEnvironmentParsingPreservesHistoricalFallbacks() {
+        XCTAssertEqual(CBv2AttentionExecutionPolicy.parseFallbackQueryBlockSize(nil), 128)
+        XCTAssertEqual(CBv2AttentionExecutionPolicy.parseFallbackQueryBlockSize(""), 128)
+        XCTAssertEqual(CBv2AttentionExecutionPolicy.parseFallbackQueryBlockSize("invalid"), 128)
+        XCTAssertEqual(CBv2AttentionExecutionPolicy.parseFallbackQueryBlockSize("-1"), 128)
+        XCTAssertEqual(CBv2AttentionExecutionPolicy.parseFallbackQueryBlockSize("0"), 0)
+        XCTAssertEqual(CBv2AttentionExecutionPolicy.parseFallbackQueryBlockSize("128"), 128)
+        XCTAssertEqual(CBv2AttentionExecutionPolicy.parseFallbackQueryBlockSize("512"), 512)
+
+        XCTAssertEqual(
+            CBv2AttentionExecutionPolicy(
+                control: .fallback,
+                fallbackQueryBlockSize: 512
+            ).fallbackQueryBlockSize,
+            512)
+    }
+
     func testAutoRequiresArchitectureAndExternalHardwareQualification() {
         let unknownArchitecture = kind()
         let qwenLike = kind(qualification: qualification())
@@ -121,7 +138,9 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
     }
 
     func testQueryBlockingIsBypassedOnlyForForcedFusedRoute() {
-        let policy = CBv2AttentionExecutionPolicy(control: .fused)
+        let policy = CBv2AttentionExecutionPolicy(
+            control: .fused,
+            fallbackQueryBlockSize: 128)
         let fallbackRoute = route(control: .fused, kind: kind())
         let fusedRoute = route(
             control: .fused,
@@ -129,13 +148,13 @@ final class CBv2AttentionExecutionPolicyTests: XCTestCase {
 
         XCTAssertTrue(
             policy.shouldBlockQueries(
-                queryLength: 256, blockSize: 128, route: fallbackRoute))
+                queryLength: 256, route: fallbackRoute))
         XCTAssertFalse(
             policy.shouldBlockQueries(
-                queryLength: 256, blockSize: 128, route: fusedRoute))
+                queryLength: 256, route: fusedRoute))
         XCTAssertFalse(
             policy.shouldBlockQueries(
-                queryLength: 128, blockSize: 128, route: fallbackRoute))
+                queryLength: 128, route: fallbackRoute))
     }
 
     func testDecodeAndMTPRectanglesNeverSelectForcedFused() {

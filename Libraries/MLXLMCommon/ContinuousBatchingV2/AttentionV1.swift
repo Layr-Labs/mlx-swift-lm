@@ -31,20 +31,17 @@ enum CBv2AttentionV1 {
     /// 128 keeps >97% of the achievable work reduction at a quarter of the
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
-    /// this is ever implicated in a numerics or latency regression. The exact
-    /// forced-fused policy route also bypasses blocking for its one whole-chunk
-    /// call; fallback routes continue to obey this setting.
-    static let queryBlockSize: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
-            let value = Int(raw), value >= 0
-        else { return 128 }
-        return value
-    }()
+    /// this is ever implicated in a numerics or latency regression.
+    ///
+    /// This compatibility value preserves the environment-backed default for
+    /// paged code and direct tests. Contiguous caches use their construction-
+    /// time `CBv2AttentionExecutionPolicy.fallbackQueryBlockSize` instead.
+    /// Forced-fused bypasses blocking only after that route is selected.
+    static let queryBlockSize = CBv2AttentionExecutionPolicy.productionFallbackQueryBlockSize
 
-    /// Whether a chunk of `L` queries should be split into blocks. Single
-    /// queries (decode) and chunks already at or below the block width take
-    /// the unchanged single-call path, so decode is provably untouched.
+    /// Whether a default-policy chunk of `L` queries should be split into
+    /// blocks. Single queries (decode) and chunks already at or below the
+    /// block width take the unchanged single-call path.
     @inline(__always)
     static func shouldBlockQueries(_ L: Int) -> Bool {
         queryBlockSize > 0 && L > queryBlockSize
@@ -389,7 +386,7 @@ enum CBv2AttentionV1 {
             serializesQueries: false)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         let blocksQueries = executionPolicy.shouldBlockQueries(
-            queryLength: L, blockSize: queryBlockSize, route: executionRoute)
+            queryLength: L, route: executionRoute)
             && !kind.isBidirectional
         if blocksQueries {
             executionObserver?(
@@ -398,7 +395,8 @@ enum CBv2AttentionV1 {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                sinks: sinks, softcap: softcap,
+                blockSize: executionPolicy.fallbackQueryBlockSize,
                 spanContext: spanContext)
         }
         if let spanContext {
@@ -458,7 +456,9 @@ enum CBv2AttentionV1 {
         sourceRows: [CBv2SequenceKV], sourceKind: CBv2LayerKind, kind: CBv2LayerKind,
         queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        executionPolicy: CBv2AttentionExecutionPolicy = .fallback,
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -484,6 +484,9 @@ enum CBv2AttentionV1 {
             if B == 1 {
                 if serializeQueries {
                     let (keys, values) = chunkBorrowViews(of: sourceRows[0])
+                    executionObserver?(
+                        CBv2AttentionExecutionObservation(
+                            route: .fallback, path: .serializedQueries, queryLength: L))
                     return attendSerialQueries(
                         queries: queries, keys: keys, values: values,
                         newTokenCount: L, window: window(of: sourceKind), scale: scale,
@@ -492,7 +495,8 @@ enum CBv2AttentionV1 {
                 return borrowAndAttendRow(
                     sourceRow: sourceRows[0], sourceKind: sourceKind,
                     queries: queries, scale: scale, sinks: effectiveSinks, softcap: softcap,
-                    spanContext: spanContexts?[0])
+                    spanContext: spanContexts?[0], executionPolicy: executionPolicy,
+                    executionObserver: executionObserver)
             }
             // Rectangular [B > 1, L > 1] packed prefill / MTP verify:
             // independently borrow each source row's current chunk views.
@@ -501,6 +505,9 @@ enum CBv2AttentionV1 {
             for (index, row) in sourceRows.enumerated() {
                 if serializeQueries {
                     let (keys, values) = chunkBorrowViews(of: row)
+                    executionObserver?(
+                        CBv2AttentionExecutionObservation(
+                            route: .fallback, path: .serializedQueries, queryLength: L))
                     outputs.append(
                         attendSerialQueries(
                             queries: queries[index ..< (index + 1)],
@@ -513,7 +520,8 @@ enum CBv2AttentionV1 {
                         sourceRow: row, sourceKind: sourceKind,
                         queries: queries[index ..< (index + 1)],
                         scale: scale, sinks: effectiveSinks, softcap: softcap,
-                        spanContext: spanContexts?[index]))
+                        spanContext: spanContexts?[index], executionPolicy: executionPolicy,
+                        executionObserver: executionObserver))
                 }
             }
             return concatenated(outputs, axis: 0)
@@ -532,6 +540,9 @@ enum CBv2AttentionV1 {
             } else {
                 (cachedKeys, cachedValues, _) = row.snapshot()
             }
+            executionObserver?(
+                CBv2AttentionExecutionObservation(
+                    route: .fallback, path: .singleCall, queryLength: 1))
             outputs.append(
                 attend(
                     queries: B == 1 ? queries : queries[index ..< (index + 1)],
@@ -548,18 +559,29 @@ enum CBv2AttentionV1 {
     private static func borrowAndAttendRow(
         sourceRow: CBv2SequenceKV, sourceKind: CBv2LayerKind,
         queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContext: CBv2SpanChunkContext?
+        spanContext: CBv2SpanChunkContext?,
+        executionPolicy: CBv2AttentionExecutionPolicy,
+        executionObserver: ((CBv2AttentionExecutionObservation) -> Void)?
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        if shouldBlockQueries(L) && !sourceKind.isBidirectional {
+        if executionPolicy.shouldBlockQueries(queryLength: L, route: .fallback)
+            && !sourceKind.isBidirectional
+        {
+            executionObserver?(
+                CBv2AttentionExecutionObservation(
+                    route: .fallback, path: .queryBlocked, queryLength: L))
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                sinks: sinks, softcap: softcap,
+                blockSize: executionPolicy.fallbackQueryBlockSize,
                 spanContext: spanContext)
         }
         if let spanContext {
+            executionObserver?(
+                CBv2AttentionExecutionObservation(
+                    route: .fallback, path: .span, queryLength: L))
             // Same overlay as the storage-owning path: the MLXVLM reference
             // applies it to the masks KV-shared layers reuse.
             return attendSpanChunk(
@@ -567,6 +589,9 @@ enum CBv2AttentionV1 {
                 L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),
                 context: spanContext, sinks: sinks, softcap: softcap)
         }
+        executionObserver?(
+            CBv2AttentionExecutionObservation(
+                route: .fallback, path: .singleCall, queryLength: L))
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: sourceKind),

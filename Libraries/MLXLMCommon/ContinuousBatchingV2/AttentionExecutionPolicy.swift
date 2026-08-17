@@ -66,16 +66,30 @@ struct CBv2AttentionExecutionObservation: Sendable, Equatable {
 /// Small, injectable policy for the contiguous CBv2 attention cache.
 public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
     public static let environmentVariable = "DARKBLOOM_CBV2_ATTN_EXECUTION"
+    public static let queryBlockEnvironmentVariable = "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"
+
+    /// Process-default fallback block width. Read once and parsed with the
+    /// historical semantics: missing, non-integer, and negative values use
+    /// 128; zero disables fallback blocking.
+    public static let productionFallbackQueryBlockSize =
+        parseFallbackQueryBlockSize(
+            ProcessInfo.processInfo.environment[queryBlockEnvironmentVariable])
 
     public var control: CBv2AttentionExecutionControl
     public var hardwareQualification: CBv2AttentionHardwareQualification?
+    public let fallbackQueryBlockSize: Int
 
     public init(
         control: CBv2AttentionExecutionControl,
-        hardwareQualification: CBv2AttentionHardwareQualification? = nil
+        hardwareQualification: CBv2AttentionHardwareQualification? = nil,
+        fallbackQueryBlockSize: Int? = nil
     ) {
+        let fallbackQueryBlockSize =
+            fallbackQueryBlockSize ?? Self.productionFallbackQueryBlockSize
+        precondition(fallbackQueryBlockSize >= 0, "fallback query block size must be non-negative")
         self.control = control
         self.hardwareQualification = hardwareQualification
+        self.fallbackQueryBlockSize = fallbackQueryBlockSize
     }
 
     /// Process-level production control. Missing and invalid values fail
@@ -87,12 +101,14 @@ public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
     /// Process-level control paired with externally established hardware
     /// evidence. This is the production entry point for an enabled `auto`.
     public static func production(
-        hardwareQualification: CBv2AttentionHardwareQualification?
+        hardwareQualification: CBv2AttentionHardwareQualification?,
+        fallbackQueryBlockSize: Int? = nil
     ) -> Self {
         Self(
             control: .parse(
                 ProcessInfo.processInfo.environment[environmentVariable]),
-            hardwareQualification: hardwareQualification)
+            hardwareQualification: hardwareQualification,
+            fallbackQueryBlockSize: fallbackQueryBlockSize)
     }
 
     /// The fallback policy used by lower-level direct callers that do not opt in.
@@ -144,8 +160,15 @@ public struct CBv2AttentionExecutionPolicy: Sendable, Equatable {
     /// forced-fused execution. This is the only blocking bypass.
     @inline(__always)
     func shouldBlockQueries(
-        queryLength: Int, blockSize: Int, route: CBv2AttentionExecutionRoute
+        queryLength: Int, route: CBv2AttentionExecutionRoute
     ) -> Bool {
-        route == .fallback && blockSize > 0 && queryLength > blockSize
+        route == .fallback
+            && fallbackQueryBlockSize > 0
+            && queryLength > fallbackQueryBlockSize
+    }
+
+    static func parseFallbackQueryBlockSize(_ raw: String?) -> Int {
+        guard let raw, let value = Int(raw), value >= 0 else { return 128 }
+        return value
     }
 }
