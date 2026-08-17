@@ -42,7 +42,9 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
+        .package(
+            url: "https://github.com/Layr-Labs/mlx-swift.git",
+            revision: "c9a6c77b3aff2ba1b0fe545e72c65105c55e8c28"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
