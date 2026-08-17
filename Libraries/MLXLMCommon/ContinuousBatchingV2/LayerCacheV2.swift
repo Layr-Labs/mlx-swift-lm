@@ -58,6 +58,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// the same parameter); never part of the per-call contract surface.
     public let attentionSoftcap: Float?
 
+    /// Construction-time attention route control. The default reads the
+    /// process kill-switch/A-B setting and fails closed to fallback.
+    public let attentionExecutionPolicy: CBv2AttentionExecutionPolicy
+
     /// Optional vision span context for each CURRENT prefill row. The engine
     /// binds this array immediately before graph construction and clears it
     /// immediately after. nil outside that window; nil entries are ordinary
@@ -66,7 +70,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
-        attentionSoftcap: Float? = nil
+        attentionSoftcap: Float? = nil,
+        attentionExecutionPolicy: CBv2AttentionExecutionPolicy = .production
     ) {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
@@ -75,6 +80,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
+        self.attentionExecutionPolicy = attentionExecutionPolicy
         self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
     }
 
@@ -117,7 +123,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            executionPolicy: attentionExecutionPolicy)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))

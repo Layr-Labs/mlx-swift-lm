@@ -563,11 +563,15 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// One layer cache per model layer (KV-shared layers get a borrowing
     /// cache with no rows). `attentionSoftcap` comes from model config —
     /// it is not part of the contract's per-call surface.
-    public func makeLayerCaches(attentionSoftcap: Float? = nil) -> [PagedLayerCache] {
+    public func makeLayerCaches(
+        attentionSoftcap: Float? = nil,
+        attentionExecutionPolicy: CBv2AttentionExecutionPolicy = .production
+    ) -> [PagedLayerCache] {
         layerKinds.enumerated().map { index, kind in
             PagedLayerCache(
                 layerIndex: index, kind: kind, pool: pool,
-                attentionSoftcap: attentionSoftcap)
+                attentionSoftcap: attentionSoftcap,
+                attentionExecutionPolicy: attentionExecutionPolicy)
         }
     }
 }

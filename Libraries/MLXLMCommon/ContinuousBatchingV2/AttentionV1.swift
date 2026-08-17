@@ -31,7 +31,9 @@ enum CBv2AttentionV1 {
     /// 128 keeps >97% of the achievable work reduction at a quarter of the
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
-    /// this is ever implicated in a numerics or latency regression.
+    /// this is ever implicated in a numerics or latency regression. The exact
+    /// forced-fused policy route also bypasses blocking for its one whole-chunk
+    /// call; fallback routes continue to obey this setting.
     static let queryBlockSize: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
@@ -186,7 +188,8 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        executionPolicy: CBv2AttentionExecutionPolicy = .fallback
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -219,7 +222,7 @@ enum CBv2AttentionV1 {
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[0])
+                spanContext: spanContexts?[0], executionPolicy: executionPolicy)
         }
 
         if L == 1 {
@@ -258,7 +261,7 @@ enum CBv2AttentionV1 {
                 row: rows[index], kind: kind,
                 queries: slice(queries), keys: slice(keys), values: slice(values),
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[index])
+                spanContext: spanContexts?[index], executionPolicy: executionPolicy)
         }
     }
 
@@ -360,11 +363,22 @@ enum CBv2AttentionV1 {
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContext: CBv2SpanChunkContext?
+        spanContext: CBv2SpanChunkContext?,
+        executionPolicy: CBv2AttentionExecutionPolicy
     ) -> MLXArray {
         let L = queries.dim(2)
+        let executionRoute = executionPolicy.route(
+            kind: kind,
+            queryLength: L,
+            queryDType: queries.dtype,
+            attentionSoftcap: softcap,
+            hasSpanMask: spanContext != nil,
+            serializesQueries: false)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if shouldBlockQueries(L) && !kind.isBidirectional {
+        if executionPolicy.shouldBlockQueries(
+            queryLength: L, blockSize: queryBlockSize, route: executionRoute)
+            && !kind.isBidirectional
+        {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
@@ -380,7 +394,8 @@ enum CBv2AttentionV1 {
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional)
+            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional,
+            executionRoute: executionRoute)
     }
 
     private static func updateAndAttendRowSerialQueries(
@@ -578,12 +593,14 @@ enum CBv2AttentionV1 {
     /// different `kL` changes the reduction tiling and may select a different
     /// kernel specialization, so results can differ in the last ulp.
     ///
-    /// Scope: this applies to every multi-token prompt call that reaches
-    /// `updateAndAttendRow` / `borrowAndAttendRow`, including rectangular
-    /// packed prefill. Vision rows keep the same q=128 blocking; each query
-    /// block expands its K/V slice only as needed to include complete image
-    /// spans touched by that block, then composes causal/window and
-    /// bidirectional-span masks. Decode (`L == 1`) remains outside this path.
+    /// Scope: this applies to every fallback multi-token prompt call that
+    /// reaches `updateAndAttendRow` / `borrowAndAttendRow`, including
+    /// rectangular packed prefill. The explicitly selected forced-fused route
+    /// keeps the whole chunk in one call. Vision rows keep the same q=128
+    /// blocking; each query block expands its K/V slice only as needed to
+    /// include complete image spans touched by that block, then composes
+    /// causal/window and bidirectional-span masks. Decode (`L == 1`) remains
+    /// outside this path.
     ///
     /// `blockSize == 1` reproduces the MTP serial-query path exactly.
     private static func attendQueryBlocks(
@@ -672,7 +689,8 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false
+        bidirectional: Bool = false,
+        executionRoute: CBv2AttentionExecutionRoute = .fallback
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
@@ -687,11 +705,18 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
-                mask: maskMode(
-                    L: L, kL: kL, window: window, bidirectional: bidirectional),
-                sinks: sinks)
+            let mask = maskMode(
+                L: L, kL: kL, window: window, bidirectional: bidirectional)
+            switch executionRoute {
+            case .fallback:
+                return MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
+                    mask: mask, sinks: sinks)
+            case .forcedFused:
+                return CBv2ForcedFusedAttention.call(
+                    queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
+                    mask: mask, sinks: sinks)
+            }
         }
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,

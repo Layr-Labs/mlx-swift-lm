@@ -174,6 +174,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     public var cbv2LayerKinds: [CBv2LayerKind] {
         precondition(fullAttentionInterval > 0, "full_attention_interval must be positive")
         let dimension = headDim ?? (hiddenSize / attentionHeads)
+        let attentionQualification = CBv2AttentionExecutionQualification(
+            architecture: .qwenLike,
+            automaticOptimization: dimension == 256
+                ? .forcedFusedD256BF16FullAttentionPrefill : nil)
         return (0 ..< hiddenLayers).compactMap { modelLayerIndex in
             guard (modelLayerIndex + 1) % fullAttentionInterval == 0 else { return nil }
             return CBv2LayerKind(
@@ -181,7 +185,8 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
                 headDim: dimension,
                 kvHeads: kvHeads,
                 queryHeads: attentionHeads,
-                modelLayerIndex: modelLayerIndex)
+                modelLayerIndex: modelLayerIndex,
+                attentionExecutionQualification: attentionQualification)
         }
     }
 

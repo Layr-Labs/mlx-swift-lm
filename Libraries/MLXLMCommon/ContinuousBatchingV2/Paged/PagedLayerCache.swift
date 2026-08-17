@@ -14,12 +14,13 @@
 //     (always `.array`, never `.none`/`.causal`, so the path cannot drift
 //     — see MLX #3384). Models with an attention-logit softcap use the
 //     composed reference path instead (SDPA cannot express softcap).
-//     The chunk is attended in QUERY BLOCKS (`CBv2AttentionV1.queryBlockSize`,
-//     shared kill switch `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK`), which bounds the
-//     materialized score tensor at `[1, queryHeads, block, visible]` instead
-//     of `[1, queryHeads, chunk, retained]`. The mask representation is
-//     unchanged by blocking: every block still gets an absolute-position
-//     BOOL `.array`.
+//     Fallback execution attends the chunk in QUERY BLOCKS
+//     (`CBv2AttentionV1.queryBlockSize`, shared kill switch
+//     `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK`), which bounds the materialized score
+//     tensor at `[1, queryHeads, block, visible]` instead of
+//     `[1, queryHeads, chunk, retained]`. The exact forced-fused policy route
+//     uses one whole-chunk call. Both retain the absolute-position BOOL
+//     `.array` mask representation.
 //   - PACKED prefill (`B > 1`, `L > 1`, WS-2.1): the SAME per-request chunk
 //     path, run once per row and concatenated on the batch axis — the
 //     storage-agnostic rectangular loop `CBv2AttentionV1.updateAndAttend`
@@ -49,6 +50,10 @@ import Foundation
 import MLX
 import MLXFast
 
+enum CBv2PagedPrefillMaskContract: Equatable {
+    case absoluteArray
+}
+
 public final class PagedLayerCache: CBv2AttendingLayerCache {
     public let layerIndex: Int
     public let kind: CBv2LayerKind
@@ -57,6 +62,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// `updateAndAttend` signature, so it is layer-cache configuration
     /// (from model config) instead.
     public let attentionSoftcap: Float?
+    /// Same construction-time fallback/fused/auto policy as the contiguous
+    /// cache. Missing or invalid process control remains fallback.
+    public let attentionExecutionPolicy: CBv2AttentionExecutionPolicy
 
     private var pagedRows: [PagedSequenceKV] = []
 
@@ -140,12 +148,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     public init(
         layerIndex: Int, kind: CBv2LayerKind, pool: PagedKVPool,
-        attentionSoftcap: Float? = nil
+        attentionSoftcap: Float? = nil,
+        attentionExecutionPolicy: CBv2AttentionExecutionPolicy = .production
     ) {
         self.layerIndex = layerIndex
         self.kind = kind
         self.pool = pool
         self.attentionSoftcap = attentionSoftcap
+        self.attentionExecutionPolicy = attentionExecutionPolicy
     }
 
     // MARK: - Rows
@@ -716,9 +726,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     ///     `arange`s that get uploaded; rebuilding them in the loop repeats
     ///     nearly the whole history once per block on a full layer.
     ///
-    /// The kill switch is `CBv2AttentionV1`'s, shared with the contiguous
-    /// backend: `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK=0` restores the single
-    /// unblocked call on BOTH backends. There is no paged-only knob.
+    /// The blocking kill switch is `CBv2AttentionV1`'s, shared with the
+    /// contiguous backend: `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK=0` restores the
+    /// fallback single-call path on BOTH backends. The exact forced-fused
+    /// route also uses a single call. There is no paged-only knob.
     ///
     /// `sinks` arrives already prepared for the SDPA terminal (see
     /// `prefillSinks`) — this function and `attendQueryBlock` forward it
@@ -734,6 +745,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let k = cast(kv.keys, to: queries.dtype)
         let v = cast(kv.values, to: queries.dtype)
         let keyCount = k.dim(2)
+        let executionRoute = attentionExecutionPolicy.route(
+            kind: kind,
+            queryLength: l,
+            queryDType: queries.dtype,
+            attentionSoftcap: attentionSoftcap,
+            hasSpanMask: boundSpanContext != nil,
+            serializesQueries: mtpSerializesRectangularAttention)
 
         // Absolute positions: the queries are the trailing `l` key columns.
         // Built ONCE and sliced per block — because they are absolute, a
@@ -753,12 +771,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // The overlay itself lives in `attendQueryBlock`, so the mask stays
         // defined in one place either way.
         guard boundSpanContext == nil, !kind.isBidirectional,
-            CBv2AttentionV1.shouldBlockQueries(l)
+            attentionExecutionPolicy.shouldBlockQueries(
+                queryLength: l,
+                blockSize: CBv2AttentionV1.queryBlockSize,
+                route: executionRoute)
         else {
             return attendQueryBlock(
                 queries: queries, keys: k, values: v,
                 qpos: qpos, kpos: kpos, queryStart: qStart,
-                scale: scale, sinks: sinks)
+                scale: scale, sinks: sinks, executionRoute: executionRoute)
         }
 
         // Block bounds are SHARED with the contiguous backend
@@ -804,10 +825,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// the blocks; `qpos`/`kpos` are already absolute here, so the block
     /// bounds are compared directly against them and the two coordinate
     /// systems cannot drift apart.
-    private func attendQueryBlock(
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        qpos: MLXArray, kpos: MLXArray, queryStart: Int,
-        scale: Float, sinks: MLXArray?
+    static func prefillMask(
+        kind: CBv2LayerKind,
+        qpos: MLXArray,
+        kpos: MLXArray,
+        queryStart: Int,
+        spanContext: CBv2SpanChunkContext?
     ) -> MLXArray {
         var mask = kpos .<= qpos
         if case .slidingWindow(let window) = kind.attention {
@@ -820,15 +843,41 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             }
             mask = mask .|| reverse
         }
-        if let spans = boundSpanContext {
+        if let spans = spanContext {
             for block in spans.blocks {
                 let lo = Int32(block.tokenOffset)
                 let hi = Int32(block.end)
-                let qIn = (qpos .>= lo) .&& (qpos .< hi)  // [q, 1]
-                let kIn = (kpos .>= lo) .&& (kpos .< hi)  // [1, kL]
+                let qIn = (qpos .>= lo) .&& (qpos .< hi)
+                let kIn = (kpos .>= lo) .&& (kpos .< hi)
                 mask = mask .|| (qIn .&& kIn)
             }
         }
+        return mask
+    }
+
+    @inline(__always)
+    static func prefillMaskMode(
+        _ mask: MLXArray
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        switch prefillMaskContract {
+        case .absoluteArray: return .array(mask)
+        }
+    }
+
+    static let prefillMaskContract = CBv2PagedPrefillMaskContract.absoluteArray
+
+    private func attendQueryBlock(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        qpos: MLXArray, kpos: MLXArray, queryStart: Int,
+        scale: Float, sinks: MLXArray?,
+        executionRoute: CBv2AttentionExecutionRoute = .fallback
+    ) -> MLXArray {
+        let mask = Self.prefillMask(
+            kind: kind,
+            qpos: qpos,
+            kpos: kpos,
+            queryStart: queryStart,
+            spanContext: boundSpanContext)
 
         if let softcap = attentionSoftcap {
             // SDPA cannot express logit softcapping — composed path, pinned
@@ -842,9 +891,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // `sinks` already promotes to the output dtype: the caller narrowed
         // it once per dispatch through `prefillSinks`. Do not re-cast here —
         // that is the per-block, per-row rebuild the hoist exists to remove.
-        return MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale,
-            mask: .array(mask), sinks: sinks)
+        let maskMode = Self.prefillMaskMode(mask)
+        switch executionRoute {
+        case .fallback:
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values, scale: scale,
+                mask: maskMode, sinks: sinks)
+        case .forcedFused:
+            return CBv2ForcedFusedAttention.call(
+                queries: queries, keys: keys, values: values, scale: scale,
+                mask: maskMode, sinks: sinks)
+        }
     }
 }
 

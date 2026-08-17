@@ -19,6 +19,7 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
     private func configuration(
         hiddenLayers: Int = 40,
         fullAttentionInterval: Int = 4,
+        attentionHeadDim: Int = 16,
         valueHeads: Int = 32,
         keyHeads: Int = 16,
         keyHeadDim: Int = 128,
@@ -33,7 +34,7 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
               "intermediate_size": 128,
               "num_attention_heads": 4,
               "num_key_value_heads": 2,
-              "head_dim": 16,
+              "head_dim": \(attentionHeadDim),
               "linear_num_value_heads": \(valueHeads),
               "linear_num_key_heads": \(keyHeads),
               "linear_key_head_dim": \(keyHeadDim),
@@ -63,6 +64,23 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
         XCTAssertEqual(kinds.count, 10)
         XCTAssertEqual(kinds.compactMap(\.modelLayerIndex), Array(stride(from: 3, to: 40, by: 4)))
         XCTAssertTrue(kinds.allSatisfy { $0.attention == .full })
+        XCTAssertTrue(
+            kinds.allSatisfy {
+                $0.attentionExecutionQualification?.architecture == .qwenLike
+                    && $0.attentionExecutionQualification?.automaticOptimization == nil
+            })
+    }
+
+    func testD256LayersAffirmAutomaticFusedPrefillQualification() throws {
+        let kinds = try configuration(attentionHeadDim: 256).cbv2LayerKinds
+
+        XCTAssertFalse(kinds.isEmpty)
+        XCTAssertTrue(
+            kinds.allSatisfy {
+                $0.attentionExecutionQualification?.architecture == .qwenLike
+                    && $0.attentionExecutionQualification?.automaticOptimization
+                        == .forcedFusedD256BF16FullAttentionPrefill
+            })
     }
 
     func testCacheConstructionUsesCompactStorageAndOriginalLayerIndices() throws {
