@@ -247,6 +247,26 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPSteppableModel {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
+    public func cbv2MTPTopTwo(
+        _ logits: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray) {
+        guard let provider = model as? any CBv2MTPPolicyTopTwoProviding else {
+            preconditionFailure(
+                "CBv2 MTP top-two reached a target without the additive provider")
+        }
+        return provider.cbv2MTPTopTwo(logits)
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter:
+    CBv2MTPPolicyTopTwoCapabilityProviding
+{
+    public var cbv2MTPPolicyTopTwoAvailable: Bool {
+        model is any CBv2MTPPolicyTopTwoProviding
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
     public func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],

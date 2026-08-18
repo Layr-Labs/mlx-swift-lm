@@ -33,6 +33,18 @@ import MLX
 
 // MARK: - Model seam (verify forward + capture geometry)
 
+/// Additive target capability for extracting exact top-two policy evidence
+/// from logits without forcing device evaluation.
+public protocol CBv2MTPPolicyTopTwoProviding: AnyObject {
+    func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray)
+}
+
+/// Runtime availability for type-erased model adapters whose static wrapper
+/// type cannot express whether the wrapped target implements top-two.
+public protocol CBv2MTPPolicyTopTwoCapabilityProviding: AnyObject {
+    var cbv2MTPPolicyTopTwoAvailable: Bool { get }
+}
+
 /// Which layer indices the engine snapshots for the drafter's frozen KV.
 /// Indices are MODEL layer indices (== positions in the engine's per-layer
 /// caches array). Both referenced layers must OWN storage (non-KV-shared).
@@ -277,11 +289,29 @@ extension CBv2MTPRequestState {
     public var materializedBytes: Int { 0 }
 }
 
+/// Trusted target inputs and their corresponding pre-norm hidden rows.
+/// Both arrays remain lazy and device-resident until the engine's existing
+/// finalize fence.
+public struct CBv2MTPCommittedTargetObservation {
+    public let tokens: MLXArray
+    public let hidden: MLXArray
+
+    public init(tokens: MLXArray, hidden: MLXArray) {
+        self.tokens = tokens
+        self.hidden = hidden
+    }
+}
+
 /// Alternate drafter seam for autoregressive assistants such as Qwen3.5/3.6.
 /// Calls are row-local so histories and assistant-cache offsets may differ;
 /// the target verifier may still batch the resulting columns as `[B,1]`.
 public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     func makeRequestState() -> any CBv2MTPRequestState
+    /// Queue trusted target inputs/hidden rows without evaluating them.
+    func observeCommittedTarget(
+        _ observation: CBv2MTPCommittedTargetObservation,
+        requestState: any CBv2MTPRequestState)
+
     /// Draft-head shortlist opt-in. Non-nil K asks target verification to
     /// additionally surface each verify position's top-K token ids and
     /// their probability mass; finalize threads the accepted position's ids
@@ -306,7 +336,10 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// proposal it consumes while chaining; `confirmedInputTokens` is the
     /// exact prefix of those inputs that became canonical target history.
     func finalizeRound(
-        requestState: any CBv2MTPRequestState, confirmedInputTokens: Int)
+        requestState: any CBv2MTPRequestState,
+        confirmedInputTokens: Int,
+        committedDraftTokens: MLXArray,
+        committedTargetHidden: MLXArray)
     /// Reject/discard all assistant writes made by the current round.
     func discardRound(requestState: any CBv2MTPRequestState)
     /// Explicitly sever device-array ownership on finish/cancel/preemption.

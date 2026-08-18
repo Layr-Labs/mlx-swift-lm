@@ -208,6 +208,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     public var cbv2Capabilities: CBv2ModelCapabilities {
         var capabilities = CBv2ModelCapabilities.initialRecurrentTarget
         capabilities.supportsMTP = true
+        capabilities.supportsCompactRecurrentMTPReplay = true
         return capabilities
     }
 }
@@ -341,6 +342,155 @@ final class Qwen35GatedDeltaNet: Module {
         return (out, newConvState, newSsmState)
     }
 
+    /// Run one legacy-cache verify chunk while retaining only the transformed
+    /// recurrence inputs needed to rebuild a shorter committed prefix. The
+    /// CBv2 rectangular path below uses the same tape and replay math.
+    private func processChunkStashingPrefix(
+        qkv: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        convState: MLXArray,
+        ssmState: MLXArray?,
+        mask: MLXArray?
+    ) -> (
+        out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray,
+        tape: ArraysCache.PrefixReplayTape
+    ) {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let nKeep = convKernelSize - 1
+        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
+
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        let recurrence = gatedDeltaUpdate(
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            aLog: aLog,
+            dtBias: dtBias,
+            state: ssmState,
+            mask: mask
+        )
+        let tape = ArraysCache.PrefixReplayTape(
+            convInput: convInput,
+            q: qNormed,
+            k: kNormed,
+            v: v,
+            a: a,
+            b: b,
+            ssmPre: ssmState.map { $0[.ellipsis] },
+            mask: mask.map { $0[.ellipsis] },
+            rowCount: S,
+            convStateRows: nKeep
+        )
+        return (recurrence.0, newConvState, recurrence.1, tape)
+    }
+
+    private func canReplayPrefix(
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+    ) -> Bool {
+        guard committedRows > 0,
+              committedRows < tape.rowCount,
+              tape.convStateRows == convKernelSize - 1,
+              tape.convInput.ndim == 3,
+              tape.q.ndim == 4,
+              tape.k.ndim == 4,
+              tape.v.ndim == 4,
+              tape.a.ndim == 3,
+              tape.b.ndim == 3
+        else { return false }
+
+        let batch = tape.q.dim(0)
+        guard tape.convInput.shape
+                  == [batch, tape.convStateRows + tape.rowCount, convDim],
+              tape.q.shape == [batch, tape.rowCount, numKHeads, headKDim],
+              tape.k.shape == [batch, tape.rowCount, numKHeads, headKDim],
+              tape.v.shape == [batch, tape.rowCount, numVHeads, headVDim],
+              tape.a.shape == [batch, tape.rowCount, numVHeads],
+              tape.b.shape == [batch, tape.rowCount, numVHeads]
+        else { return false }
+
+        if let ssmPre = tape.ssmPre,
+           ssmPre.shape != [batch, numVHeads, headVDim, headKDim]
+        {
+            return false
+        }
+        if let mask = tape.mask,
+           mask.shape != [batch, tape.rowCount]
+        {
+            return false
+        }
+        return true
+    }
+
+    fileprivate func canReplayPrefix(
+        cache: MambaCache, committedRows: Int
+    ) -> Bool {
+        guard let tape = cache.prefixReplayTape else { return false }
+        return canReplayPrefix(tape: tape, committedRows: committedRows)
+    }
+
+    private func replayedPrefixState(
+        tape: ArraysCache.PrefixReplayTape, committedRows: Int
+    ) -> CBv2RecurrentLayerState {
+        precondition(
+            canReplayPrefix(tape: tape, committedRows: committedRows),
+            "Qwen35 invalid compact recurrent prefix replay")
+        let rows = 0 ..< committedRows
+        let boundarySsm = gatedDeltaUpdate(
+            q: tape.q[0..., rows, 0...],
+            k: tape.k[0..., rows, 0...],
+            v: tape.v[0..., rows, 0...],
+            a: tape.a[0..., rows, 0...],
+            b: tape.b[0..., rows, 0...],
+            aLog: aLog,
+            dtBias: dtBias,
+            state: tape.ssmPre,
+            mask: tape.mask.map { $0[0..., rows] }
+        ).1
+        let boundaryConvView = tape.convInput[
+            0...,
+            committedRows ..< (committedRows + tape.convStateRows),
+            0...]
+        let boundaryConv = boundaryConvView + MLXArray.zeros(
+            boundaryConvView.shape, dtype: boundaryConvView.dtype)
+        return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
+    }
+
+    /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
+    /// from the exact pre-verify state and transformed recurrence inputs.
+    /// Call only after every GDN layer has passed `canReplayPrefix`.
+    fileprivate func replayPrefix(
+        cache: MambaCache, committedRows: Int
+    ) -> Bool {
+        guard canReplayPrefix(cache: cache, committedRows: committedRows),
+              let tape = cache.prefixReplayTape
+        else { return false }
+
+        let state = replayedPrefixState(tape: tape, committedRows: committedRows)
+        cache[0] = state.conv
+        cache[1] = state.ssm
+        cache.clearMTPTransientState()
+        return true
+    }
+
     // MARK: - callAsFunction
 
     func callAsFunction(
@@ -353,6 +503,11 @@ final class Qwen35GatedDeltaNet: Module {
         //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
         let B = inputs.dim(0)
         let S = inputs.dim(1)
+
+        // A verify tape belongs to exactly one forward. Starting another
+        // forward consumes neither its values nor its state, so release it
+        // before constructing this forward's transient rollback data.
+        cache?.clearMTPTransientState()
 
         var qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
@@ -375,11 +530,21 @@ final class Qwen35GatedDeltaNet: Module {
         let out: MLXArray
         let finalConvState: MLXArray
         let finalSsmState: MLXArray
+        var pendingPrefixTape: ArraysCache.PrefixReplayTape?
 
-        if nConfirmed > 0 && nConfirmed < S {
-            // Split at nConfirmed boundary for the MTP 2-token verify forward.
-            // Run confirmed prefix first, snapshot rollback state, then run draft.
-            // omlx: GatedDeltaNet.__call__ nConfirmed > 0 branch
+        if nConfirmed == 1 && S >= 3 && mask == nil {
+            // A wider MTP verify stays as one recurrence. Retain transformed
+            // inputs instead of one full fp32 SSM checkpoint per boundary.
+            let (o, c, s, tape) = processChunkStashingPrefix(
+                qkv: qkv, a: a, b: b,
+                convState: convState, ssmState: ssmState, mask: mask)
+            out = o
+            finalConvState = c
+            finalSsmState = s
+            pendingPrefixTape = tape
+        } else if nConfirmed > 0 && nConfirmed < S {
+            // Width-2 and masked verification retain the established rollback
+            // snapshot path. CBv2 capture uses its separate request-state API.
             let maskC = mask.map { $0[0..., 0..<nConfirmed] }
             let maskD = mask.map { $0[0..., nConfirmed...] }
 
@@ -391,8 +556,6 @@ final class Qwen35GatedDeltaNet: Module {
                 ssmState: ssmState,
                 mask: maskC
             )
-            // Snapshot (conv_state, ssm_state) after confirmed prefix for rollback.
-            // omlx: cache.rollback_state = (conv_c, ssm_c)
             cache?.rollbackState = (convC, ssmC)
 
             let (outD, convF, ssmF) = processChunk(
@@ -407,7 +570,6 @@ final class Qwen35GatedDeltaNet: Module {
             finalConvState = convF
             finalSsmState = ssmF
         } else {
-            // Standard single-chunk path (nConfirmed == 0 or S == 1).
             let (o, c, s) = processChunk(
                 qkv: qkv, a: a, b: b,
                 convState: convState,
@@ -422,6 +584,7 @@ final class Qwen35GatedDeltaNet: Module {
         if let cache {
             cache[0] = finalConvState
             cache[1] = finalSsmState
+            cache.prefixReplayTape = pendingPrefixTape
         }
 
         let normedOut = norm(out, gate: z)
@@ -483,20 +646,11 @@ final class Qwen35GatedDeltaNet: Module {
         return outProj(normedOut.reshaped(B, S, -1))
     }
 
-    /// CBv2 MTP capture-verify path (MTPLX `gdn_forward_with_capture`
-    /// pattern). Runs the same projections/conv batched over the whole
-    /// `[B, S]` verify window, then the gated-delta recurrence one position
-    /// at a time so every intermediate (conv tail, SSM state) is
-    /// MATERIALIZED instead of discarded. Each row's transaction receives
-    /// `[S, ...]` captured stacks; committing position `p` later selects the
-    /// state after consuming window token `p` with a device-side slice.
-    ///
-    /// Numerics: the recurrence itself is computed by the identical
-    /// `gatedDeltaUpdate` kernel as S chained T=1 steps with the fp32 state
-    /// carried across, so the final captured state matches the single-call
-    /// scan; the batched projections/conv/norm change accumulation geometry
-    /// versus S serial `[B, 1]` forwards within the usual batch-shape
-    /// tolerance CBv2 already accepts (distribution-exact, not bitwise).
+    /// CBv2 MTP rectangular verify path. Widths one and two retain the
+    /// established captured-boundary implementation. Wider windows run the
+    /// recurrence once over the whole window and retain compact transformed
+    /// inputs, allowing a strict accepted prefix to be replayed lazily without
+    /// another target-model forward or a per-position fp32 SSM stack.
     func cbv2ForwardCaptured(
         _ inputs: MLXArray,
         modelLayerIndex: Int,
@@ -552,46 +706,143 @@ final class Qwen35GatedDeltaNet: Module {
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        // Per-position recurrence, materializing each intermediate state.
-        var outs: [MLXArray] = []
-        var ssmStates: [MLXArray] = []
-        outs.reserveCapacity(S)
-        ssmStates.reserveCapacity(S)
-        var state = ssmState
-        for s in 0 ..< S {
-            let (out, next) = gatedDeltaUpdate(
-                q: qNormed[0..., s ..< (s + 1)],
-                k: kNormed[0..., s ..< (s + 1)],
-                v: v[0..., s ..< (s + 1)],
-                a: a[0..., s ..< (s + 1)],
-                b: b[0..., s ..< (s + 1)],
+        let out: MLXArray
+        if S >= 3 {
+            let recurrence = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
                 aLog: aLog,
                 dtBias: dtBias,
-                state: state,
+                state: ssmState,
                 mask: nil)
-            outs.append(out)
-            ssmStates.append(next)
-            state = next
-        }
+            out = recurrence.0
+            let finalSsmState = recurrence.1
 
-        for (row, evaluation) in recurrentState.enumerated() {
-            let convStack = concatenated(
-                (0 ..< S).map { s in
-                    convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
-                }, axis: 0)
-            let ssmStack = concatenated(
-                ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
-            do {
-                try evaluation.stageCaptured(
-                    modelLayerIndex: modelLayerIndex,
-                    conv: convStack, ssm: ssmStack, positions: S)
-            } catch {
-                preconditionFailure(
-                    "Qwen35 CBv2 captured stage failed at layer \(modelLayerIndex): \(error)")
+            for (row, evaluation) in recurrentState.enumerated() {
+                let rowRange = row ..< (row + 1)
+                let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
+                let finalSSM = finalSsmState[rowRange]
+                let tape = ArraysCache.PrefixReplayTape(
+                    convInput: convInput[rowRange],
+                    q: qNormed[rowRange],
+                    k: kNormed[rowRange],
+                    v: v[rowRange],
+                    a: a[rowRange],
+                    b: b[rowRange],
+                    ssmPre: ssmState[rowRange],
+                    mask: nil,
+                    rowCount: S,
+                    convStateRows: nKeep)
+                // Count unique additional buffers retained by this stage.
+                // `finalConv` aliases `convInput` until full acceptance detaches
+                // its exact tail at commit. A one-row `ssmPre` aliases the
+                // already-accounted committed generation when it existed before
+                // this verify. `v` retains the whole conv output backing.
+                let convOutBacking = convOut[rowRange]
+                var roots = [
+                    tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
+                ]
+                let inputSSM =
+                    evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
+                if B > 1 || inputSSM == nil {
+                    if let ssmPre = tape.ssmPre { roots.append(ssmPre) }
+                }
+                var strictReplayRoots = roots
+                if B == 1, let inputSSM {
+                    // The pending baseline already charges this state. After
+                    // strict acceptance it becomes an additional replay input.
+                    strictReplayRoots.append(inputSSM)
+                }
+
+                func checkedByteCount(_ arrays: [MLXArray]) -> Int {
+                    var total = 0
+                    for array in arrays {
+                        let (bytes, multiplyOverflow) =
+                            array.size.multipliedReportingOverflow(by: array.dtype.size)
+                        let (sum, addOverflow) = total.addingReportingOverflow(bytes)
+                        guard !multiplyOverflow, !addOverflow else {
+                            preconditionFailure(
+                                "Qwen35 compact recurrent replay byte accounting overflow")
+                        }
+                        total = sum
+                    }
+                    return total
+                }
+                let materializedBytes = checkedByteCount(roots + [finalSSM])
+                let strictReplayRetainedBytes = checkedByteCount(strictReplayRoots)
+                let fullAcceptanceRetainedBytes = checkedByteCount([tape.convInput])
+                do {
+                    try evaluation.stagePrefixReplay(
+                        modelLayerIndex: modelLayerIndex,
+                        positions: S,
+                        finalConv: finalConv,
+                        finalSSM: finalSSM,
+                        materializedByteCount: materializedBytes,
+                        evaluationRoots: strictReplayRoots,
+                        strictReplayRetainedByteCount: strictReplayRetainedBytes,
+                        strictReplayRetainedRoots: strictReplayRoots,
+                        fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
+                        fullAcceptanceRetainedRoots: [tape.convInput],
+                        fullAcceptance: {
+                            let detachedConv = finalConv + MLXArray.zeros(
+                                finalConv.shape, dtype: finalConv.dtype)
+                            return CBv2RecurrentLayerState(
+                                conv: detachedConv, ssm: finalSSM)
+                        },
+                        replay: { [unowned self] keepPositions in
+                            self.replayedPrefixState(
+                                tape: tape, committedRows: keepPositions)
+                        })
+                } catch {
+                    preconditionFailure(
+                        "Qwen35 CBv2 compact replay stage failed at layer "
+                            + "\(modelLayerIndex): \(error)")
+                }
             }
-        }
+        } else {
+            var outs: [MLXArray] = []
+            var ssmStates: [MLXArray] = []
+            outs.reserveCapacity(S)
+            ssmStates.reserveCapacity(S)
+            var state = ssmState
+            for s in 0 ..< S {
+                let (stepOut, next) = gatedDeltaUpdate(
+                    q: qNormed[0..., s ..< (s + 1)],
+                    k: kNormed[0..., s ..< (s + 1)],
+                    v: v[0..., s ..< (s + 1)],
+                    a: a[0..., s ..< (s + 1)],
+                    b: b[0..., s ..< (s + 1)],
+                    aLog: aLog,
+                    dtBias: dtBias,
+                    state: state,
+                    mask: nil)
+                outs.append(stepOut)
+                ssmStates.append(next)
+                state = next
+            }
 
-        let out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
+            for (row, evaluation) in recurrentState.enumerated() {
+                let convStack = concatenated(
+                    (0 ..< S).map { s in
+                        convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep)]
+                    }, axis: 0)
+                let ssmStack = concatenated(
+                    ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
+                do {
+                    try evaluation.stageCaptured(
+                        modelLayerIndex: modelLayerIndex,
+                        conv: convStack, ssm: ssmStack, positions: S)
+                } catch {
+                    preconditionFailure(
+                        "Qwen35 CBv2 captured stage failed at layer "
+                            + "\(modelLayerIndex): \(error)")
+                }
+            }
+            out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
+        }
         let normedOut = norm(out, gate: z)
         return outProj(normedOut.reshaped(B, S, -1))
     }
@@ -1028,8 +1279,8 @@ public class Qwen35TextModelInner: Module {
     /// Returns the pre-norm hidden state from the final layer.
     ///
     /// The caller (`Qwen35TextModel`) applies `norm` and the LM head on top.
-    /// This split lets `callWithHidden` return both pre-norm hidden (for the MTP head)
-    /// and the normalised logits in one forward pass.
+    /// This split returns logits and raw capture rows in one pass; the bound
+    /// Qwen MTP adapter applies this same final norm at trusted-history ingress.
     ///
     /// Port of omlx commit 696d90a:
     ///   patches/mlx_lm_mtp/qwen35_model.py `_patch_qwen3_5_text_model`
@@ -1061,6 +1312,56 @@ public class Qwen35TextModelInner: Module {
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
+    }
+
+    /// Rebuild every recurrent layer at the same committed verify boundary.
+    /// Eligibility is checked for every layer before persistent state changes.
+    /// Attention caches are intentionally untouched; the caller trims their
+    /// rejected suffix after recurrent replay succeeds.
+    func replayRecurrentPrefix(
+        cache: [KVCache?], committedRows: Int
+    ) -> Bool {
+        guard cache.count == layers.count, committedRows > 0 else {
+            clearRecurrentPrefixReplay(cache: cache)
+            return false
+        }
+
+        var foundRecurrentLayer = false
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            foundRecurrentLayer = true
+            guard let mamba = cache[i] as? MambaCache,
+                  let linear = layer.linearAttn,
+                  linear.canReplayPrefix(
+                    cache: mamba, committedRows: committedRows)
+            else {
+                clearRecurrentPrefixReplay(cache: cache)
+                return false
+            }
+        }
+        guard foundRecurrentLayer else {
+            clearRecurrentPrefixReplay(cache: cache)
+            return false
+        }
+
+        for (i, layer) in layers.enumerated() where layer.isLinear {
+            guard let mamba = cache[i] as? MambaCache,
+                  let linear = layer.linearAttn,
+                  linear.replayPrefix(
+                    cache: mamba, committedRows: committedRows)
+            else {
+                clearRecurrentPrefixReplay(cache: cache)
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Discard verify-only recurrent data without changing committed cache
+    /// state. Used after full acceptance and by fallback/reset paths.
+    func clearRecurrentPrefixReplay(cache: [KVCache?]) {
+        for case let arrays as ArraysCache in cache.compactMap({ $0 }) {
+            arrays.clearMTPTransientState()
+        }
     }
 
     func cbv2Forward(
@@ -1367,16 +1668,36 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
     }
 }
 
+extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
+    public func cbv2MTPTopTwo(
+        _ logits: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray) {
+        precondition(logits.ndim == 3, "Qwen35 MTP policy logits must be [B,L,V]")
+        let batch = logits.dim(0)
+        let length = logits.dim(1)
+        let vocabularySize = logits.dim(2)
+        precondition(batch > 0 && length > 0 && vocabularySize >= 2)
+        let rows = batch * length
+        let topTwo = qwen35MTPTopTwoRows(
+            logits.reshaped([1, rows, vocabularySize]))
+        return (
+            topTwo.ids.reshaped([batch, length, 2]),
+            topTwo.values.reshaped([batch, length, 2]))
+    }
+}
+
 // MARK: - Qwen35TextModel + MTPCapable
 
 extension Qwen35TextModel: MTPCapable {
     public var hasMTPHead: Bool { mtp != nil }
 
-    /// Run a backbone forward that also returns pre-norm hidden states.
+    /// Run a backbone forward that also returns pre-final-norm hidden states.
     ///
-    /// Returns `(logits, preNormHidden)` where `preNormHidden` is the raw backbone output
-    /// BEFORE `model.norm`. The MTP head applies its own `pre_fc_norm_hidden` normalization,
-    /// so it expects un-normalized input. Passing post-norm would double-normalize.
+    /// Returns `(logits, preNormHidden)` where `preNormHidden` is the raw
+    /// backbone output before `model.norm`. Qwen MTP applies this exact final
+    /// norm once at the target-to-assistant boundary, followed by the head's
+    /// separately trained `pre_fc_norm_hidden`; recursive assistant hidden
+    /// bypasses the target final norm.
     ///
     /// PR #990: `return out, hidden  # pre-norm hidden for MTP head`
     /// omlx: patches/mlx_lm_mtp/qwen35_model.py TextModel.__call__ with return_hidden=True
@@ -1392,9 +1713,26 @@ extension Qwen35TextModel: MTPCapable {
         } else {
             logits = model.embedTokens.asLinear(normed)
         }
-        // Return pre-norm hidden, not post-norm. The MTP module's pre_fc_norm_hidden
-        // is the normalization step — it expects the raw backbone output as input.
+        // Return raw capture hidden. The bound Qwen MTP adapter owns the exact
+        // target final-norm application when these rows enter trusted history.
         return (logits, hidden)
+    }
+
+    /// Commit a shorter accepted recurrent prefix from the most recent wide
+    /// verify. On false, transient rollback data is cleared so a fallback
+    /// repair cannot accidentally reuse an incompatible tape.
+    public func replayRecurrentPrefix(
+        cache: [any KVCache], committedRows: Int
+    ) -> Bool {
+        model.replayRecurrentPrefix(
+            cache: cache.map { Optional($0) },
+            committedRows: committedRows)
+    }
+
+    /// Release a verify tape after full acceptance or an external fallback.
+    /// Persistent recurrent state and attention offsets are unchanged.
+    public func clearRecurrentPrefixReplay(cache: [any KVCache]) {
+        model.clearRecurrentPrefixReplay(cache: cache.map { Optional($0) })
     }
 
     /// Run the MTP head forward.
@@ -1557,6 +1895,14 @@ extension Qwen35Model: CBv2RecurrentCaptureMTPForwardable {
     }
 }
 
+extension Qwen35Model: CBv2MTPPolicyTopTwoProviding {
+    public func cbv2MTPTopTwo(
+        _ logits: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray) {
+        languageModel.cbv2MTPTopTwo(logits)
+    }
+}
+
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
@@ -1575,6 +1921,17 @@ extension Qwen35Model: MTPCapable {
         input: LMInput.Text, cache: [any KVCache], nConfirmed: Int
     ) -> (MLXArray, MLXArray) {
         languageModel.callWithHidden(input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func replayRecurrentPrefix(
+        cache: [any KVCache], committedRows: Int
+    ) -> Bool {
+        languageModel.replayRecurrentPrefix(
+            cache: cache, committedRows: committedRows)
+    }
+
+    public func clearRecurrentPrefixReplay(cache: [any KVCache]) {
+        languageModel.clearRecurrentPrefixReplay(cache: cache)
     }
 
     public func mtpForward(

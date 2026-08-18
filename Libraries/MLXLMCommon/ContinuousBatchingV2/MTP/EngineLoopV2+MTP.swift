@@ -24,7 +24,7 @@ extension EngineLoopV2 {
             return assignment.numTokens != 1 + k
         }
         if demoteAllRounds {
-            mtp.recordControllerFallback("step_reservation_race")
+            mtpRecordSchedulerDemotions(plan)
         }
 
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
@@ -59,11 +59,15 @@ extension EngineLoopV2 {
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = graph.logprobSegments
         step.recurrentEvaluations = graph.recurrentEvaluations
-        if graph.verify != nil || !graph.seedRows.isEmpty {
+        if graph.verify != nil || !graph.seedRows.isEmpty
+            || !graph.committedObservationRows.isEmpty
+        {
             step.mtpRound = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
-                seedHidden: graph.seedHidden)
+                seedHidden: graph.seedHidden,
+                seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
+                committedObservationRows: graph.committedObservationRows)
         }
         return step
     }

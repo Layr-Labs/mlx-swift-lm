@@ -16,19 +16,25 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
     public var supportsCompiledDecode: Bool
     public var supportsPackedPrefill: Bool
     public var supportsMTP: Bool
+    /// The model's rectangular MTP forward stages compact recurrence inputs
+    /// and can reconstruct a strict accepted prefix without retaining one
+    /// full recurrent state per verify position.
+    public var supportsCompactRecurrentMTPReplay: Bool
 
     public init(
         supportsPrefixReuse: Bool = true,
         supportsPagedKV: Bool = true,
         supportsCompiledDecode: Bool = true,
         supportsPackedPrefill: Bool = true,
-        supportsMTP: Bool = true
+        supportsMTP: Bool = true,
+        supportsCompactRecurrentMTPReplay: Bool = false
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
         self.supportsPagedKV = supportsPagedKV
         self.supportsCompiledDecode = supportsCompiledDecode
         self.supportsPackedPrefill = supportsPackedPrefill
         self.supportsMTP = supportsMTP
+        self.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
     }
 
     public static let attentionOnly = CBv2ModelCapabilities()
@@ -37,7 +43,8 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         supportsPagedKV: false,
         supportsCompiledDecode: false,
         supportsPackedPrefill: false,
-        supportsMTP: false)
+        supportsMTP: false,
+        supportsCompactRecurrentMTPReplay: false)
 }
 
 public protocol CBv2ModelCapabilityProviding {
@@ -142,23 +149,95 @@ public struct CBv2RecurrentLayerState {
     }
 }
 
+/// One layer's compact representation of a rectangular recurrent verify.
+/// The replay closure is invoked only for a strict accepted prefix. Full
+/// acceptance may lazily materialize an exact final state; rollback discards
+/// both commit paths.
+public struct CBv2RecurrentPrefixReplayStage {
+    public let positions: Int
+    public let finalState: CBv2RecurrentLayerState
+    public let materializedByteCount: Int
+    public let evaluationRoots: [MLXArray]
+    /// Additional materialized roots retained only after a strict-prefix
+    /// commit. They stay charged until a later recurrent generation commits.
+    public let strictReplayRetainedByteCount: Int
+    public let strictReplayRetainedRoots: [MLXArray]
+    /// Roots needed by a lazy full-accept materialization until its successor
+    /// evaluates and commits. The final state itself remains covered by the
+    /// request's ordinary one-generation charge.
+    public let fullAcceptanceRetainedByteCount: Int
+    public let fullAcceptanceRetainedRoots: [MLXArray]
+    /// Optional commit-time materialization for full acceptance. This keeps
+    /// rejectable exact-tail copies out of the verify graph.
+    fileprivate let fullAcceptance: (() -> CBv2RecurrentLayerState)?
+    fileprivate let replay: (Int) -> CBv2RecurrentLayerState
+
+    public init(
+        positions: Int,
+        finalConv: MLXArray,
+        finalSSM: MLXArray,
+        materializedByteCount: Int,
+        evaluationRoots: [MLXArray],
+        strictReplayRetainedByteCount: Int,
+        strictReplayRetainedRoots: [MLXArray],
+        fullAcceptanceRetainedByteCount: Int = 0,
+        fullAcceptanceRetainedRoots: [MLXArray] = [],
+        fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        replay: @escaping (Int) -> CBv2RecurrentLayerState
+    ) throws {
+        guard positions >= 2 else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "prefix replay requires at least two positions")
+        }
+        guard materializedByteCount >= 0,
+              strictReplayRetainedByteCount >= 0,
+              fullAcceptanceRetainedByteCount >= 0
+        else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "prefix replay materialized bytes must be nonnegative")
+        }
+        self.positions = positions
+        self.finalState = CBv2RecurrentLayerState(conv: finalConv, ssm: finalSSM)
+        self.materializedByteCount = materializedByteCount
+        self.evaluationRoots = evaluationRoots
+        self.strictReplayRetainedByteCount = strictReplayRetainedByteCount
+        self.strictReplayRetainedRoots = strictReplayRetainedRoots
+        self.fullAcceptanceRetainedByteCount = fullAcceptanceRetainedByteCount
+        self.fullAcceptanceRetainedRoots = fullAcceptanceRetainedRoots
+        self.fullAcceptance = fullAcceptance
+        self.replay = replay
+    }
+}
+
 /// One request's recurrent state. Mutated only by the engine thread.
 public final class CBv2RecurrentRequestState {
     public let spec: CBv2RecurrentStateSpec
     public let byteCount: Int
     public var materializedByteCount: Int {
-        // A captured verify window holds one full conv/SSM copy PER captured
-        // position (its leading `[S, ...]` axis); a plain generation holds
-        // exactly one.
-        var generations = committed.isEmpty ? 0 : 1
+        var total = committed.isEmpty ? 0 : byteCount
+        let (retainedTotal, retainedOverflow) = total.addingReportingOverflow(
+            committedTransitionRetainedByteCount)
+        if retainedOverflow { return Int.max }
+        total = retainedTotal
         for generation in pending {
-            let (next, overflow) = generations.addingReportingOverflow(
-                generation.capturedPositions ?? 1)
+            let generationBytes: Int
+            if let replay = generation.prefixReplay {
+                generationBytes = replay.values.reduce(0) { partial, stage in
+                    let (sum, overflow) = partial.addingReportingOverflow(
+                        stage.materializedByteCount)
+                    return overflow ? Int.max : sum
+                }
+            } else {
+                let generations = generation.capturedPositions ?? 1
+                let (bytes, overflow) = byteCount.multipliedReportingOverflow(
+                    by: generations)
+                generationBytes = overflow ? Int.max : bytes
+            }
+            let (sum, overflow) = total.addingReportingOverflow(generationBytes)
             if overflow { return Int.max }
-            generations = next
+            total = sum
         }
-        let (bytes, overflow) = byteCount.multipliedReportingOverflow(by: generations)
-        return overflow ? Int.max : bytes
+        return total
     }
 
     private struct Generation {
@@ -170,9 +249,16 @@ public final class CBv2RecurrentRequestState {
         /// can only leave `pending` through `commit(keepPositions:)` (which
         /// selects one position) or `rollback()`.
         let capturedPositions: Int?
+        /// Non-nil marks a compact replay verify generation. It is mutually
+        /// exclusive with `capturedPositions`; `layers` contains its final
+        /// full-window states.
+        let prefixReplay: [Int: CBv2RecurrentPrefixReplayStage]?
     }
 
     private var committed: [Int: CBv2RecurrentLayerState] = [:]
+    private var committedTransitionGeneration: UInt64?
+    private var committedTransitionRetainedByteCount = 0
+    private var committedTransitionRetainedRoots: [MLXArray] = []
     private var pending: [Generation] = []
     private var nextGeneration: UInt64 = 0
     private var bindingOpen = false
@@ -193,12 +279,16 @@ public final class CBv2RecurrentRequestState {
         guard !bindingOpen else {
             throw CBv2RecurrentStateError.lifecycleViolation("overlapping recurrent bindings")
         }
-        bindingOpen = true
         let last = pending.last
         if let captured = last?.capturedPositions {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "bind over an unresolved captured verify window (\(captured) positions)")
         }
+        if last?.prefixReplay != nil {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "bind over an unresolved compact prefix replay window")
+        }
+        bindingOpen = true
         let input = last?.layers ?? committed
         let evaluation = CBv2RecurrentStateEvaluation(
             owner: self, generation: nextGeneration, input: input,
@@ -209,14 +299,20 @@ public final class CBv2RecurrentRequestState {
 
     fileprivate func evaluate(
         generation: UInt64, layers: [Int: CBv2RecurrentLayerState],
-        capturedPositions: Int?
+        capturedPositions: Int?,
+        prefixReplay: [Int: CBv2RecurrentPrefixReplayStage]?
     ) throws {
         guard bindingOpen, !isReleased else {
             throw CBv2RecurrentStateError.lifecycleViolation("evaluate without an active binding")
         }
+        guard capturedPositions == nil || prefixReplay == nil else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "cannot mix captured and compact replay generations")
+        }
         pending.append(
             Generation(
-                id: generation, layers: layers, capturedPositions: capturedPositions))
+                id: generation, layers: layers,
+                capturedPositions: capturedPositions, prefixReplay: prefixReplay))
         bindingOpen = false
     }
 
@@ -229,26 +325,67 @@ public final class CBv2RecurrentRequestState {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent commits must follow evaluation order")
         }
+        func clearOlderTransitionRetention() {
+            guard let retainedGeneration = committedTransitionGeneration,
+                generation > retainedGeneration
+            else { return }
+            committedTransitionGeneration = nil
+            committedTransitionRetainedByteCount = 0
+            committedTransitionRetainedRoots.removeAll(keepingCapacity: false)
+        }
         if let captured = first.capturedPositions {
             guard let keep = keepPositions, (1 ... captured).contains(keep) else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "captured commit requires keepPositions in 1...\(captured) "
                         + "(got \(String(describing: keepPositions)))")
             }
-            // Device-side select: committing position `keep` keeps the state
-            // AFTER consuming `keep` window tokens. The slice restores the
-            // spec's leading singleton row axis, so downstream forwards read
-            // the same shapes a plain generation would have staged.
+            clearOlderTransitionRetention()
             committed = first.layers.mapValues { layer in
                 CBv2RecurrentLayerState(
                     conv: layer.conv.map { $0[(keep - 1) ..< keep] },
                     ssm: layer.ssm.map { $0[(keep - 1) ..< keep] })
             }
+        } else if let replay = first.prefixReplay {
+            guard let positions = replay.values.first?.positions,
+                  let keep = keepPositions, (1 ... positions).contains(keep)
+            else {
+                throw CBv2RecurrentStateError.lifecycleViolation(
+                    "prefix replay commit requires a valid keepPositions")
+            }
+            clearOlderTransitionRetention()
+            let fullAcceptance = keep == positions
+            if fullAcceptance {
+                committed = replay.mapValues { stage in
+                    stage.fullAcceptance?() ?? stage.finalState
+                }
+            } else {
+                committed = replay.mapValues { $0.replay(keep) }
+            }
+            var retainedBytes = 0
+            var retainedRoots: [MLXArray] = []
+            for index in replay.keys.sorted() {
+                guard let stage = replay[index] else { continue }
+                let stageBytes = fullAcceptance
+                    ? stage.fullAcceptanceRetainedByteCount
+                    : stage.strictReplayRetainedByteCount
+                let (sum, overflow) = retainedBytes.addingReportingOverflow(stageBytes)
+                retainedBytes = overflow ? Int.max : sum
+                retainedRoots.append(
+                    contentsOf: fullAcceptance
+                        ? stage.fullAcceptanceRetainedRoots
+                        : stage.strictReplayRetainedRoots)
+            }
+            if retainedBytes > 0 || !retainedRoots.isEmpty {
+                committedTransitionGeneration = generation
+                committedTransitionRetainedByteCount = retainedBytes
+                committedTransitionRetainedRoots = retainedRoots
+            }
         } else {
             guard keepPositions == nil else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
-                    "keepPositions is only valid for captured verify windows")
+                    "keepPositions is only valid for captured or prefix replay verify windows")
             }
+            clearOlderTransitionRetention()
             committed = first.layers
         }
         pending.removeFirst()
@@ -273,6 +410,9 @@ public final class CBv2RecurrentRequestState {
                 "release with recurrent work still in flight")
         }
         committed.removeAll(keepingCapacity: false)
+        committedTransitionGeneration = nil
+        committedTransitionRetainedByteCount = 0
+        committedTransitionRetainedRoots.removeAll(keepingCapacity: false)
         isReleased = true
     }
 }
@@ -288,13 +428,16 @@ public final class CBv2RecurrentStateEvaluation {
     private let requiredLayers: Set<Int>
     private var staged: [Int: CBv2RecurrentLayerState] = [:]
     private var stagedCapturedPositions: Int?
+    private var stagedPrefixReplay: [Int: CBv2RecurrentPrefixReplayStage] = [:]
     private var evaluated = false
     private var finalized = false
 
     /// True when this transaction staged per-position captured stacks
     /// (MTP capture-verify) and must be finalized via
     /// `commit(keepPositions:)` or `rollback()`.
-    public var isCaptured: Bool { stagedCapturedPositions != nil }
+    public var isCaptured: Bool {
+        stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
+    }
 
     fileprivate init(
         owner: CBv2RecurrentRequestState, generation: UInt64,
@@ -315,9 +458,9 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     public func stage(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
-        guard stagedCapturedPositions == nil else {
+        guard stagedCapturedPositions == nil, stagedPrefixReplay.isEmpty else {
             throw CBv2RecurrentStateError.lifecycleViolation(
-                "cannot mix captured and plain recurrent stages")
+                "cannot mix captured, compact replay, and plain recurrent stages")
         }
         try stageRaw(modelLayerIndex: modelLayerIndex, conv: conv, ssm: ssm)
     }
@@ -352,9 +495,11 @@ public final class CBv2RecurrentStateEvaluation {
                 "captured position count changed mid-transaction "
                     + "(\(existing) -> \(positions))")
         }
-        if stagedCapturedPositions == nil, !staged.isEmpty {
+        if stagedCapturedPositions == nil,
+           (!staged.isEmpty || !stagedPrefixReplay.isEmpty)
+        {
             throw CBv2RecurrentStateError.lifecycleViolation(
-                "cannot mix captured and plain recurrent stages")
+                "cannot mix captured, compact replay, and plain recurrent stages")
         }
         guard conv.dim(0) == positions, ssm.dim(0) == positions else {
             throw CBv2RecurrentStateError.lifecycleViolation(
@@ -365,39 +510,102 @@ public final class CBv2RecurrentStateEvaluation {
         stagedCapturedPositions = positions
     }
 
+    /// Stage compact recurrence inputs for one layer. Every layer in the
+    /// transaction must use this mode and the same verify width.
+    public func stagePrefixReplay(
+        modelLayerIndex: Int,
+        positions: Int,
+        finalConv: MLXArray,
+        finalSSM: MLXArray,
+        materializedByteCount: Int,
+        evaluationRoots: [MLXArray],
+        strictReplayRetainedByteCount: Int,
+        strictReplayRetainedRoots: [MLXArray],
+        fullAcceptanceRetainedByteCount: Int = 0,
+        fullAcceptanceRetainedRoots: [MLXArray] = [],
+        fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        replay: @escaping (Int) -> CBv2RecurrentLayerState
+    ) throws {
+        guard !evaluated, stagedCapturedPositions == nil, staged.isEmpty else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "cannot mix compact replay with captured or plain recurrent stages")
+        }
+        guard requiredLayers.contains(modelLayerIndex),
+              stagedPrefixReplay[modelLayerIndex] == nil
+        else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "compact replay stage for undeclared, duplicate, or evaluated layer "
+                    + "\(modelLayerIndex)")
+        }
+        if let width = stagedPrefixReplay.values.first?.positions, width != positions {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "compact replay position count changed mid-transaction "
+                    + "(\(width) -> \(positions))")
+        }
+        stagedPrefixReplay[modelLayerIndex] = try CBv2RecurrentPrefixReplayStage(
+            positions: positions,
+            finalConv: finalConv,
+            finalSSM: finalSSM,
+            materializedByteCount: materializedByteCount,
+            evaluationRoots: evaluationRoots,
+            strictReplayRetainedByteCount: strictReplayRetainedByteCount,
+            strictReplayRetainedRoots: strictReplayRetainedRoots,
+            fullAcceptanceRetainedByteCount: fullAcceptanceRetainedByteCount,
+            fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
+            fullAcceptance: fullAcceptance,
+            replay: replay)
+    }
+
     @discardableResult
     public func evaluate() throws -> [MLXArray] {
-        guard !evaluated, Set(staged.keys) == requiredLayers else {
+        let replayMode = !stagedPrefixReplay.isEmpty
+        let stagedLayers =
+            replayMode
+            ? stagedPrefixReplay.mapValues(\.finalState)
+            : staged
+        guard !evaluated, Set(stagedLayers.keys) == requiredLayers else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent evaluation did not stage every declared layer")
         }
         try owner.evaluate(
-            generation: generation, layers: staged,
-            capturedPositions: stagedCapturedPositions)
+            generation: generation, layers: stagedLayers,
+            capturedPositions: stagedCapturedPositions,
+            prefixReplay: replayMode ? stagedPrefixReplay : nil)
         evaluated = true
-        return staged.keys.sorted().flatMap { index in
-            [staged[index]!.conv, staged[index]!.ssm].compactMap { $0 }
+        var roots = stagedLayers.keys.sorted().flatMap { index in
+            [stagedLayers[index]!.conv, stagedLayers[index]!.ssm].compactMap { $0 }
         }
+        for index in stagedPrefixReplay.keys.sorted() {
+            roots.append(contentsOf: stagedPrefixReplay[index]!.evaluationRoots)
+        }
+        return roots
     }
 
     public func commit() throws {
-        guard evaluated, !finalized, stagedCapturedPositions == nil else {
+        guard evaluated, !finalized, stagedCapturedPositions == nil,
+              stagedPrefixReplay.isEmpty
+        else {
             throw CBv2RecurrentStateError.lifecycleViolation("invalid recurrent commit")
         }
         try owner.commit(generation: generation)
         finalized = true
+        staged.removeAll(keepingCapacity: false)
     }
 
     /// Finalize a captured verify window by committing the state after
     /// `keepPositions` consumed window tokens (1-based; the accepted prefix
     /// length including the seed column).
     public func commit(keepPositions: Int) throws {
-        guard evaluated, !finalized, stagedCapturedPositions != nil else {
+        guard evaluated, !finalized,
+              stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
+        else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "captured commit on a non-captured recurrent transaction")
         }
         try owner.commit(generation: generation, keepPositions: keepPositions)
         finalized = true
+        staged.removeAll(keepingCapacity: false)
+        stagedPrefixReplay.removeAll(keepingCapacity: false)
     }
 
     public func rollback() throws {
@@ -406,6 +614,8 @@ public final class CBv2RecurrentStateEvaluation {
         }
         try owner.rollback(generation: generation)
         finalized = true
+        staged.removeAll(keepingCapacity: false)
+        stagedPrefixReplay.removeAll(keepingCapacity: false)
     }
 }
 

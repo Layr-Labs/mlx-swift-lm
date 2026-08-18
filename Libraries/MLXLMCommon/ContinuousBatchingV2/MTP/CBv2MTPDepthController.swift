@@ -398,3 +398,227 @@ final class CBv2MTPDepthController {
         return decision
     }
 }
+
+/// Request-owned conditional acceptance estimates for the Qwen MTP marginal
+/// depth policy. Hardware cost observations deliberately do not live here.
+struct CBv2MTPRequestAcceptanceState: Equatable {
+    static let maximumDepth = 4
+    private static let alpha = 0.15
+
+    private(set) var probabilities: [Double] =
+        (0 ..< CBv2MTPRequestAcceptanceState.maximumDepth).map {
+            0.85 * pow(0.98, Double($0))
+        }
+
+    /// Records positions whose target outcome was actually observed and, after
+    /// a fully accepted round, transfers bounded optimism to the next position.
+    /// A truncation (stop, token budget, or common-width clamp) passes
+    /// `rejectionObserved: false` and `endedByTruncation: true`, so it never
+    /// manufactures either a failure or next-position optimism.
+    mutating func observe(
+        draftedDepth: Int,
+        acceptedDepth: Int,
+        rejectionObserved: Bool,
+        endedByTruncation: Bool = false
+    ) {
+        let drafted = min(max(draftedDepth, 0), Self.maximumDepth)
+        let accepted = min(max(acceptedDepth, 0), drafted)
+
+        for position in 0 ..< accepted {
+            probabilities[position] += Self.alpha * (1.0 - probabilities[position])
+        }
+        if rejectionObserved, accepted < drafted {
+            probabilities[accepted] += Self.alpha * (0.0 - probabilities[accepted])
+        } else if !rejectionObserved, !endedByTruncation,
+            drafted > 0, accepted == drafted, drafted < Self.maximumDepth,
+            probabilities[drafted] < 0.95
+        {
+            // A fully accepted round is bounded evidence that the hot chain
+            // may profitably extend one position farther.
+            probabilities[drafted] += Self.alpha * (0.95 - probabilities[drafted])
+        }
+    }
+}
+
+/// Engine-shared raw, nonchained wall-cost estimates for the marginal policy.
+/// Callers record the isolated interval itself: seed-attributed cost has no
+/// input in this API and therefore cannot contaminate the inferred slope.
+struct CBv2MTPRawCostEstimator {
+    static let bootstrapHeadStepCostRatio = 0.18
+    private static let maximumDepth = CBv2MTPRequestAcceptanceState.maximumDepth
+    private static let alpha = 0.3
+    private static let clampFraction = 0.25
+
+    private struct Cost {
+        var samples = 0
+        var ewmaNanos = 0.0
+
+        mutating func observe(_ sample: Double) {
+            if samples == 0 {
+                ewmaNanos = sample
+            } else {
+                let limit = CBv2MTPRawCostEstimator.clampFraction * ewmaNanos
+                let innovation = min(max(sample - ewmaNanos, -limit), limit)
+                ewmaNanos += CBv2MTPRawCostEstimator.alpha * innovation
+            }
+            samples += 1
+        }
+    }
+
+    private var costs: [Int: Cost] = [:]
+    private var positiveDepthWarmups: Set<Int> = []
+
+    /// Returns whether the raw sample entered the steady-state estimate.
+    /// The first isolated sample at each positive depth is a compile/JIT
+    /// warm-up: remember that it occurred, but never anchor the clamped EWMA
+    /// to it. Depth zero uses its first sample because the target is already
+    /// compiled before the nonchained baseline probe.
+    @discardableResult
+    mutating func observe(
+        depth: Int,
+        rawWallTimeNanos: Double,
+        chained: Bool = false
+    ) -> Bool {
+        guard depth >= 0, depth <= Self.maximumDepth,
+            !chained, rawWallTimeNanos.isFinite, rawWallTimeNanos > 0
+        else { return false }
+
+        if depth > 0, positiveDepthWarmups.insert(depth).inserted {
+            return false
+        }
+        var cost = costs[depth] ?? Cost()
+        cost.observe(rawWallTimeNanos)
+        costs[depth] = cost
+        return true
+    }
+
+    /// Sample-count-weighted h_k = max(0, (Ck/C0 - 1)/k). Until both C0 and
+    /// at least one positive-depth Ck exist, use the measured bootstrap.
+    var headStepCostRatio: Double {
+        guard let baseline = costs[0], baseline.ewmaNanos.isFinite,
+            baseline.ewmaNanos > 0
+        else { return Self.bootstrapHeadStepCostRatio }
+
+        var weightedSlope = 0.0
+        var weight = 0
+        for depth in 1 ... Self.maximumDepth {
+            guard let cost = costs[depth],
+                cost.samples > 0, cost.ewmaNanos.isFinite, cost.ewmaNanos > 0
+            else {
+                continue
+            }
+            let normalizedIncrement =
+                cost.ewmaNanos <= baseline.ewmaNanos
+                ? 0
+                : (cost.ewmaNanos - baseline.ewmaNanos) / baseline.ewmaNanos
+            let rawSlope = normalizedIncrement / Double(depth)
+            let slope = rawSlope.isFinite ? rawSlope : Double.greatestFiniteMagnitude
+            let newWeight = weight + cost.samples
+            let fraction = Double(cost.samples) / Double(newWeight)
+            // Incremental weighting cannot overflow for nonnegative finite
+            // slopes, unlike accumulating `slope * samples`.
+            weightedSlope += (slope - weightedSlope) * fraction
+            weight = newWeight
+        }
+        guard weight > 0 else { return Self.bootstrapHeadStepCostRatio }
+        return weightedSlope.isFinite ? weightedSlope : Double.greatestFiniteMagnitude
+    }
+
+    /// True until a post-warm-up isolated sample exists at `depth`. The engine
+    /// may satisfy this with a bounded one-token probe even when confidence
+    /// or the provisional cost estimate would otherwise select zero.
+    func needsSteadyStateProbe(depth: Int) -> Bool {
+        guard depth > 0, depth <= Self.maximumDepth, costs[0] != nil else {
+            return false
+        }
+        return costs[depth] == nil
+    }
+    func sampleCount(depth: Int) -> Int {
+        costs[depth]?.samples ?? 0
+    }
+}
+
+/// Pure marginal-cost selector. One request supplies its own acceptance
+/// probabilities; a caller may share only `headStepCostRatio` across requests.
+enum CBv2MTPMarginalDepthPolicy {
+    static let maximumDepth = CBv2MTPRequestAcceptanceState.maximumDepth
+
+    static func selectDepth(
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int,
+        acceptanceProbabilities: [Double],
+        previousTargetTopTwoMargin: Double?,
+        headStepCostRatio: Double
+    ) -> Int {
+        guard offeredDepth > 0, remainingTokens > 1, verificationLimit > 0 else {
+            return 0
+        }
+        let cap = min(
+            maximumDepth,
+            min(offeredDepth, min(remainingTokens - 1, verificationLimit)))
+        guard cap > 0 else { return 0 }
+
+        let h =
+            headStepCostRatio.isFinite && headStepCostRatio >= 0
+            ? headStepCostRatio
+            : CBv2MTPRawCostEstimator.bootstrapHeadStepCostRatio
+        var reach = 1.0
+        var expected = 0.0
+        var depth = 0
+        while depth < cap {
+            let rawProbability =
+                depth < acceptanceProbabilities.count
+                ? acceptanceProbabilities[depth]
+                : 0
+            let probability = cappedAcceptanceProbability(
+                position: depth,
+                acceptanceProbability: rawProbability,
+                previousMargin: previousTargetTopTwoMargin)
+            reach *= probability
+            let threshold = h * (1.0 + expected) / (1.0 + Double(depth) * h)
+            guard reach > threshold else { break }
+            expected += reach
+            depth += 1
+        }
+        return depth
+    }
+
+    /// A cost-confirmation probe is always at most one draft and obeys every
+    /// ordinary capacity limit. Whether a probe is due remains engine cadence
+    /// state; this helper keeps its depth choice pure and deterministic.
+    static func boundedProbeDepth(
+        offeredDepth: Int,
+        remainingTokens: Int,
+        verificationLimit: Int
+    ) -> Int {
+        guard offeredDepth > 0, remainingTokens > 1, verificationLimit > 0 else {
+            return 0
+        }
+        return min(1, min(offeredDepth, min(remainingTokens - 1, verificationLimit)))
+    }
+
+    private static func cappedAcceptanceProbability(
+        position: Int,
+        acceptanceProbability: Double,
+        previousMargin: Double?
+    ) -> Double {
+        guard acceptanceProbability.isFinite else { return 0 }
+        var probability = min(max(acceptanceProbability, 0), 1)
+        guard (position == 0 || position == 1),
+            let margin = previousMargin, margin.isFinite
+        else { return probability }
+
+        let divisor = position == 0 ? 2.0 : 3.0
+        probability = min(probability, sigmoid(margin / divisor))
+        return probability
+    }
+
+    private static func sigmoid(_ value: Double) -> Double {
+        if value >= 0 {
+            return 1.0 / (1.0 + exp(-value))
+        }
+        let exponential = exp(value)
+        return exponential / (1.0 + exponential)
+    }
+}
