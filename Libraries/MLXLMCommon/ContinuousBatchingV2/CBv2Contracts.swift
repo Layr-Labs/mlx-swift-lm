@@ -686,6 +686,22 @@ public struct CBv2SchedulerConfig: Sendable {
     public var maxBatchedTokensPerStep: Int
     /// Preferred prefill chunk size (adaptive sizer may override).
     public var prefillChunkSize: Int
+    /// Solo-prefill stripe (opt-in; nil = off). When ONE text request holds
+    /// the scheduler's entire schedulable population — no decode-ready row,
+    /// no other live running row, no waiter — its prefill chunk (and, when
+    /// necessary, that step's budget) may extend to this many tokens.
+    ///
+    /// Why: a 512-token chunk streams every weight per chunk and leaves the
+    /// E=256 expert-tile kernel at 16 rows/expert (~50% tile occupancy). A
+    /// 2048-token stripe reads weights once per 2048 tokens, fills tiles
+    /// (64 rows/expert), and amortizes per-chunk dispatch/drain overhead —
+    /// while a SOLO gate guarantees no coexisting decode row can stall.
+    ///
+    /// Values above `prefillChunkSize` arm the stripe; anything else is
+    /// ignored. NOTE: gather-QMM expert tiles qualify assignment counts up
+    /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
+    /// fall back off the tile route for MoE models with that geometry.
+    public var soloPrefillStripeTokens: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
     /// Prefix-cache participation (lookup+adopt on submit, donate on
@@ -694,12 +710,14 @@ public struct CBv2SchedulerConfig: Sendable {
     public var enablePrefixCache: Bool
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
-        prefillChunkSize: Int = 512, maxWaiting: Int = 64,
+        prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
+        maxWaiting: Int = 64,
         enablePrefixCache: Bool = false
     ) {
         self.maxConcurrentRequests = maxConcurrentRequests
         self.maxBatchedTokensPerStep = maxBatchedTokensPerStep
         self.prefillChunkSize = prefillChunkSize
+        self.soloPrefillStripeTokens = soloPrefillStripeTokens
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
     }
