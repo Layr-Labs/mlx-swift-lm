@@ -713,6 +713,15 @@ public struct CBv2SchedulerConfig: Sendable {
     /// integrity outranks the cap, mirroring the mixed-step quota).
     /// Nonpositive values are treated as unlimited (fail-open): a literal
     /// cap of 0 would permanently starve every waiter.
+    ///
+    /// The cap serializes prompt WORK per step, not running-set membership:
+    /// at most this many rows receive prompt chunks in one plan (FCFS by
+    /// running order, then admission). A PAUSED mid-prefill row holds no
+    /// slot — counting it would let one stalled consumer's backpressure
+    /// head-of-line block every other user's admission — so a pause/resume
+    /// cycle can transiently leave more than `cap` mid-prefill rows in the
+    /// running set; from the first resumed step onward only `cap` of them
+    /// make progress, restoring the serialization where it matters.
     public var maxConcurrentPartialPrefills: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int

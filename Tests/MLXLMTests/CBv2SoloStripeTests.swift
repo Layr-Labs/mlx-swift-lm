@@ -230,6 +230,38 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
             "successor must admit at the PLAIN chunk beside A's final remainder")
     }
 
+
+    func testPausedPartialHoldsNoSlotButResumeReserializesWork() throws {
+        // A pauses mid-prefill: B must still admit (a stalled consumer must
+        // not head-of-line block admission). On resume, only ONE of them
+        // receives prompt work per step — FCFS gives the elder A the slot.
+        let scheduler = makeScheduler(cap: 1)
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 2048), maxTokens: 2))
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 2048), maxTokens: 2))
+        let p1 = scheduler.plan()
+        XCTAssertEqual(p1.assignments.map(\.numTokens), [512], "cap admits only A")
+        _ = CBv2SchedSim.confirm(scheduler, plan: p1)
+
+        let a = scheduler.running[0]
+        a.isPaused = true
+        let p2 = scheduler.plan()
+        XCTAssertEqual(
+            p2.assignments.map(\.numTokens), [512],
+            "paused A holds no slot: B admits and progresses")
+        _ = CBv2SchedSim.confirm(scheduler, plan: p2)
+
+        a.isPaused = false
+        // Both A and B are now mid-prefill (transient over-membership), but
+        // each subsequent step assigns prompt work to exactly ONE of them.
+        for _ in 0 ..< 2 {
+            let plan = scheduler.plan()
+            XCTAssertEqual(
+                plan.assignments.map(\.numTokens), [512],
+                "post-resume steps serialize prompt work to one row")
+            _ = CBv2SchedSim.confirm(scheduler, plan: plan)
+        }
+    }
+
     func testCapUnsetKeepsInterleavedAdmission() throws {
         let scheduler = makeScheduler(cap: nil)
         try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))

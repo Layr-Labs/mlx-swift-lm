@@ -349,6 +349,14 @@ public final class SchedulerV2 {
         // early is what lets the quota bind on prefill rows that are visited
         // BEFORE the decode row in running order.
         var prefillTokensAssigned = 0
+        // Mean-TTFT cap slot accounting: rows that RECEIVED prompt work this
+        // plan and remain mid-prefill after their optimistic advance. Work
+        // assignment — not membership — is what the cap serializes: a paused
+        // row holds no slot (its stalled consumer must not head-of-line
+        // block admission), and on resume the FCFS running order hands the
+        // slot back to the elder row while younger partials simply receive
+        // no prompt work until it finishes.
+        var midPrefillAssigned = 0
         let prefillCap: Int? = {
             guard let cap = mixedStepPrefillTokenCap else { return nil }
             let hasDecodeWork = running.contains { rec in
@@ -406,6 +414,16 @@ public final class SchedulerV2 {
             // flip `isDecodeReady`, and the quota must charge what the row
             // WAS when it was scheduled.
             let isPrefillRow = !rec.isDecodeReady
+            // Cap binds BEFORE any mutation, exactly like the quota skip: a
+            // row beyond the cap is left untouched for a later step (FCFS —
+            // earlier running rows claimed the slots).
+            if isPrefillRow, rec.remainingTokens > 1,
+                let cap = config.maxConcurrentPartialPrefills, cap > 0,
+                midPrefillAssigned >= cap
+            {
+                idx += 1
+                continue
+            }
             var n = rec.remainingTokens
             var speculated = false
             if n > 1 {
@@ -546,6 +564,7 @@ public final class SchedulerV2 {
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
             if isPrefillRow { prefillTokensAssigned += n }
+            if isPrefillRow, rec.remainingTokens > 1 { midPrefillAssigned += 1 }
             assignmentIndex[rec.id] = assignments.count
             assignments.append((id: rec.id, numTokens: n))
             idx += 1
@@ -583,11 +602,11 @@ public final class SchedulerV2 {
                     // cap > 0: nonpositive values are treated as UNLIMITED
                     // (fail-open to the historical interleave) — a cap of 0
                     // would otherwise starve the head waiter forever and
-                    // hang accepted requests until their deadline.
-                    let partial = running.filter {
-                        !$0.cancelRequested && !$0.isPaused && $0.remainingTokens > 1
-                    }.count
-                    guard partial < cap else { break }
+                    // hang accepted requests until their deadline. The slot
+                    // counter covers running-pass assignments AND earlier
+                    // admissions this plan; a row whose final chunk samples
+                    // this step frees its slot for the successor.
+                    guard midPrefillAssigned < cap else { break }
                 }
                 // Mixed-step prefill quota. Every admission is prefill work,
                 // so an exhausted quota ends the pass (like an exhausted
@@ -649,6 +668,7 @@ public final class SchedulerV2 {
                 rec.numComputedTokens += chunk
                 budget -= chunk
                 prefillTokensAssigned += chunk
+                if rec.remainingTokens > 1 { midPrefillAssigned += 1 }
                 assignmentIndex[rec.id] = assignments.count
                 assignments.append((id: rec.id, numTokens: chunk))
                 running.append(rec)
