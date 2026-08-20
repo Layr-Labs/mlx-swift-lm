@@ -304,11 +304,16 @@ public final class SchedulerV2 {
                 candidate = liveRunning.first ?? waiting.first
             } else if config.maxConcurrentPartialPrefills == 1,
                 liveRunning.count <= 1,
-                !liveRunning.contains(where: { $0.isDecodeReady && !$0.isPaused })
+                !liveRunning.contains(where: { $0.isDecodeReady && !$0.isPaused }),
+                deferredBlockRequestID == nil
             {
                 // Serialized-prefill policy: waiters queue behind the one
                 // active prefill BY POLICY, so striping it only brings
-                // their turns forward. Decode company still disarms.
+                // their turns forward. Decode company still disarms. A
+                // pending deferred BLOCK admission is the one waiter the
+                // policy does NOT serialize — it is cap-exempt and admitted
+                // ahead of the running pass with first claim on the step —
+                // so a stripe must never run beside it.
                 candidate = liveRunning.first ?? waiting.first
             } else {
                 candidate = nil
@@ -392,7 +397,7 @@ public final class SchedulerV2 {
                 deferredRunningID = deferredID
             } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
                 deferredAdmittedID = admitDeferredBlockRow(
-                    at: wIdx, budget: &budget,
+                    at: wIdx, budget: &budget, totalAssignedTokens: &totalAssignedTokens,
                     assignments: &assignments, assignmentIndex: &assignmentIndex)
             }
         }
@@ -705,7 +710,7 @@ public final class SchedulerV2 {
     /// (so the running pass skips it — one assignment per row per plan), or
     /// nil when the row is not currently admissible.
     private func admitDeferredBlockRow(
-        at wIdx: Int, budget: inout Int,
+        at wIdx: Int, budget: inout Int, totalAssignedTokens: inout Int,
         assignments: inout [(id: CBv2RequestID, numTokens: Int)],
         assignmentIndex: inout [CBv2RequestID: Int]
     ) -> CBv2RequestID? {
@@ -739,6 +744,7 @@ public final class SchedulerV2 {
         rec.status = .running
         rec.numComputedTokens += chunk
         budget -= chunk
+        totalAssignedTokens += chunk
         assignmentIndex[rec.id] = assignments.count
         assignments.append((id: rec.id, numTokens: chunk))
         running.append(rec)
