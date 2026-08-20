@@ -145,8 +145,13 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
 
     public var supportsPackedPrefill: Bool {
         guard cbv2Capabilities.supportsPackedPrefill else { return false }
-        return (model as? CBv2LanguageModelPrefillForwardable)?.cbv2SupportsPackedPrefill
-            ?? false
+        if let claim = (model as? CBv2LanguageModelPrefillForwardable)?
+            .cbv2SupportsPackedPrefill
+        {
+            return claim
+        }
+        return (model as? CBv2RecurrentLanguageModelPrefillForwardable)?
+            .cbv2SupportsPackedPrefill ?? false
     }
 
     public var supportsPackedMultimodalPrefill: Bool {

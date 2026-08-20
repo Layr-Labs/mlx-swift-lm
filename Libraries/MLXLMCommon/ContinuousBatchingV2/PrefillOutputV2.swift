@@ -125,6 +125,11 @@ public protocol CBv2RecurrentPrefillSteppableModel: CBv2RecurrentSteppableModel 
 /// reached through `CBv2SteppableLanguageModelAdapter` — the same indirection
 /// `CBv2PositionedRecurrentLanguageModelForwardable` uses.
 public protocol CBv2RecurrentLanguageModelPrefillForwardable {
+    /// Whether this model's prompt forward is safe to run as a rectangular
+    /// `[B, L]` cohort of independent rows (each row attends its OWN KV and
+    /// carries its OWN recurrent state). Fail-closed default: false.
+    var cbv2SupportsPackedPrefill: Bool { get }
+
     func cbv2RecurrentPrefill(
         _ inputs: MLXArray,
         inputEmbedding: MLXArray?,
@@ -133,4 +138,8 @@ public protocol CBv2RecurrentLanguageModelPrefillForwardable {
         positionIds: MLXArray?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray
+}
+
+extension CBv2RecurrentLanguageModelPrefillForwardable {
+    public var cbv2SupportsPackedPrefill: Bool { false }
 }

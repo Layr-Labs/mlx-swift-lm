@@ -1709,6 +1709,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                     multimodalByID[row.rec.id]?.chunkContext(
                         start: row.start, count: row.count) != nil
                 if hasSpan && !canPackMultimodal { continue }
+                // Recurrent packing v1 is text-only and position-free: rows
+                // carrying explicit position state (vision MRoPE) take the
+                // solo path rather than requiring stacked per-row positions.
+                if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil,
+                    hasSpan || row.rec.request.positionState != nil
+                { continue }
                 if let index = groups.firstIndex(where: {
                     $0.count == row.count && $0.samples == row.samples
                 }) {
@@ -1744,6 +1750,22 @@ public final class EngineLoopV2: @unchecked Sendable {
                         spanContexts: spanContexts,
                         caches: caches,
                         requirement: requirement)
+                } else if (model as? any CBv2RecurrentSteppableModel)?
+                    .recurrentStateSpec != nil
+                {
+                    // Recurrent packed cohort: `targetForward` binds one
+                    // recurrent state per row (row order == ids order), the
+                    // prefill seam narrows, and each row's staged state
+                    // evaluation is committed exactly as on the solo path.
+                    let forward = targetForward(
+                        tokens: inputs, caches: caches,
+                        ids: group.rows.map(\.rec.id),
+                        requirement: requirement)
+                    output = forward.logits
+                    recurrentEvaluations.merge(forward.recurrent) { _, _ in
+                        preconditionFailure("duplicate recurrent evaluation")
+                    }
+                    cacheInnerState.append(contentsOf: forward.innerState)
                 } else {
                     output = prefillOutput(
                         tokens: inputs, inputEmbeddings: nil, caches: caches,

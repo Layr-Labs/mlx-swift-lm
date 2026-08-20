@@ -209,6 +209,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         var capabilities = CBv2ModelCapabilities.initialRecurrentTarget
         capabilities.supportsMTP = true
         capabilities.supportsCompactRecurrentMTPReplay = true
+        // Rectangular [B, L] prompt cohorts: one recurrent state row per
+        // batch row; each packed row attends its own KV (see
+        // `cbv2SupportsPackedPrefill` on the prefill conformance).
+        capabilities.supportsPackedPrefill = true
         return capabilities
     }
 }
@@ -1634,6 +1638,12 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
 /// slice-after-norm for the surviving row. Decode, MTP draft/verify, and
 /// capture paths keep their existing full contracts.
 extension Qwen35TextModel: CBv2RecurrentLanguageModelPrefillForwardable {
+    /// The Qwen trunk is shape-generic over `[B, L]` with one recurrent
+    /// state row per batch row (`recurrentState.count == B` precondition),
+    /// and CBv2 attention attends each packed row against its OWN KV — a
+    /// packed row is semantically identical to running alone.
+    public var cbv2SupportsPackedPrefill: Bool { true }
+
     public func cbv2RecurrentPrefill(
         _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
@@ -1908,6 +1918,10 @@ extension Qwen35Model: CBv2PositionedRecurrentLanguageModelForwardable,
 }
 
 extension Qwen35Model: CBv2RecurrentLanguageModelPrefillForwardable {
+    public var cbv2SupportsPackedPrefill: Bool {
+        languageModel.cbv2SupportsPackedPrefill
+    }
+
     public func cbv2RecurrentPrefill(
         _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
