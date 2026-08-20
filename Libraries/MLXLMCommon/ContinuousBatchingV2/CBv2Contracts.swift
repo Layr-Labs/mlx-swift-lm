@@ -711,6 +711,8 @@ public struct CBv2SchedulerConfig: Sendable {
     /// Decode rows never count against the cap and are never delayed by it.
     /// The one-shot deferred multimodal-block row is exempt (block
     /// integrity outranks the cap, mirroring the mixed-step quota).
+    /// Nonpositive values are treated as unlimited (fail-open): a literal
+    /// cap of 0 would permanently starve every waiter.
     public var maxConcurrentPartialPrefills: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int

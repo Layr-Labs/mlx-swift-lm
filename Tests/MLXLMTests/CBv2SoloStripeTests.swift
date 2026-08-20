@@ -197,6 +197,20 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
             "A decodes alongside B's remaining prefill")
     }
 
+
+    func testNonpositiveCapIsTreatedAsUnlimited() throws {
+        for cap in [0, -1] {
+            let scheduler = makeScheduler(cap: cap)
+            try scheduler.enqueue(
+                CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))
+            try scheduler.enqueue(
+                CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))
+            XCTAssertEqual(
+                scheduler.plan().assignments.map(\.numTokens), [512, 512],
+                "cap \(cap) must fail open to the unlimited interleave, never starve")
+        }
+    }
+
     func testCapUnsetKeepsInterleavedAdmission() throws {
         let scheduler = makeScheduler(cap: nil)
         try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))

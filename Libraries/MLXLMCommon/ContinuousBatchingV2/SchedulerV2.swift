@@ -571,7 +571,11 @@ public final class SchedulerV2 {
                 // Mean-TTFT prefill serialization (opt-in): a full complement
                 // of mid-prefill running rows blocks further admission. FCFS:
                 // a capped head waiter must not be jumped, so the pass ends.
-                if let cap = config.maxConcurrentPartialPrefills {
+                if let cap = config.maxConcurrentPartialPrefills, cap > 0 {
+                    // cap > 0: nonpositive values are treated as UNLIMITED
+                    // (fail-open to the historical interleave) — a cap of 0
+                    // would otherwise starve the head waiter forever and
+                    // hang accepted requests until their deadline.
                     let partial = running.filter {
                         !$0.cancelRequested && !$0.isPaused && $0.remainingTokens > 1
                     }.count
