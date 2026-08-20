@@ -284,6 +284,61 @@ final class Qwen35GatedDeltaNet: Module {
         super.init()
     }
 
+    private var fusedInProj: Linear? = nil
+
+    private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
+        qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+    ) {
+        if fusedInProj == nil {
+            if let qQKV = inProjQKV as? QuantizedLinear,
+                let qZ = inProjZ as? QuantizedLinear,
+                let qB = inProjB as? QuantizedLinear,
+                let qA = inProjA as? QuantizedLinear,
+                qQKV.bits == qZ.bits && qQKV.groupSize == qZ.groupSize
+            {
+                let fusedWeight = concatenated(
+                    [qQKV.weight, qZ.weight, qB.weight, qA.weight], axis: 0)
+                let fusedScales = concatenated(
+                    [qQKV.scales, qZ.scales, qB.scales, qA.scales], axis: 0)
+                let fusedBiases: MLXArray?
+                if let bQKV = qQKV.biases, let bZ = qZ.biases, let bB = qB.biases,
+                    let bA = qA.biases
+                {
+                    fusedBiases = concatenated([bQKV, bZ, bB, bA], axis: 0)
+                } else {
+                    fusedBiases = nil
+                }
+                fusedInProj = QuantizedLinear(
+                    weight: fusedWeight,
+                    bias: nil,
+                    scales: fusedScales,
+                    biases: fusedBiases,
+                    groupSize: qQKV.groupSize,
+                    bits: qQKV.bits,
+                    mode: qQKV.mode
+                )
+            } else {
+                let fusedWeight = concatenated(
+                    [inProjQKV.weight, inProjZ.weight, inProjB.weight, inProjA.weight],
+                    axis: 0)
+                fusedInProj = Linear(weight: fusedWeight, bias: nil)
+            }
+        }
+        let outFused = fusedInProj!(inputs)
+        let qkvDim = keyDim * 2 + valueDim
+        let zDim = valueDim
+        let bDim = numVHeads
+        let aDim = numVHeads
+        let total = qkvDim + zDim + bDim + aDim
+        let qkv = outFused[0..., 0..., 0 ..< qkvDim]
+        let z = outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
+            B, S, numVHeads, headVDim)
+        let b = outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)]
+        let a = outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
+        return (qkv, z, b, a)
+    }
+
+
     // MARK: - _processChunk (MTP helper)
 
     /// Process one time-chunk of the linear-attention layer.
@@ -513,10 +568,7 @@ final class Qwen35GatedDeltaNet: Module {
         // before constructing this forward's transient rollback data.
         cache?.clearMTPTransientState()
 
-        var qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        var (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -607,10 +659,7 @@ final class Qwen35GatedDeltaNet: Module {
         let S = inputs.dim(1)
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
 
-        let qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
 
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
@@ -665,10 +714,7 @@ final class Qwen35GatedDeltaNet: Module {
         precondition(recurrentState.count == B, "Qwen35 CBv2 recurrent row count mismatch")
         precondition(S >= 1, "Qwen35 capture-verify window must be non-empty")
 
-        let qkv = inProjQKV(inputs)
-        let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        let (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
 
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
