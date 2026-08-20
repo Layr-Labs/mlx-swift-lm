@@ -292,7 +292,7 @@ public final class SchedulerV2 {
         // own budget-bounded contract), it is prefilling (not decode-ready),
         // and it is not itself paused. Solo also means raising the step
         // budget to the stripe cannot starve a decode row — there is none.
-        let soloStripeTokens: Int? = {
+        let soloStripe: (tokens: Int, id: CBv2RequestID)? = {
             guard let stripe = config.soloPrefillStripeTokens,
                 stripe > config.prefillChunkSize
             else { return nil }
@@ -318,9 +318,17 @@ public final class SchedulerV2 {
                 solo.multimodalBlocks.isEmpty,
                 solo.remainingTokens > 1
             else { return nil }
-            return stripe
+            return (tokens: stripe, id: solo.id)
         }()
-        let prefillChunkCap = soloStripeTokens ?? config.prefillChunkSize
+        let soloStripeTokens = soloStripe?.tokens
+        // The stripe belongs to ONE armed request. A successor admitted in
+        // the striped row's final step (its remainder < stripe leaves step
+        // budget behind) must take the PLAIN chunk, or its oversized first
+        // chunk delays the striped row's own sample — defeating the very
+        // TTFT the stripe exists for.
+        func prefillChunkCap(for rec: CBv2ScheduledRequest) -> Int {
+            soloStripe?.id == rec.id ? soloStripe!.tokens : config.prefillChunkSize
+        }
         var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
         var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
         var assignmentIndex: [CBv2RequestID: Int] = [:]
@@ -401,7 +409,7 @@ public final class SchedulerV2 {
             var n = rec.remainingTokens
             var speculated = false
             if n > 1 {
-                n = min(n, prefillChunkCap)  // chunk prefill only (solo stripe may raise)
+                n = min(n, prefillChunkCap(for: rec))  // solo stripe raises ONLY its own row
             } else if let planner = speculationPlanner {
                 // MTP: 1 known token + k speculative draft slots. Speculation
                 // never eats into a smaller budget — fall back to plain decode.
@@ -589,7 +597,7 @@ public final class SchedulerV2 {
                 let admissionHeadroom = prefillHeadroom()
                 guard admissionHeadroom > 0 else { break }
                 var chunk = min(
-                    rec.remainingTokens, prefillChunkCap, budget, admissionHeadroom)
+                    rec.remainingTokens, prefillChunkCap(for: rec), budget, admissionHeadroom)
                 // Same block snapping as the running path. 0 ⇒ this step's
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
