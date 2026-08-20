@@ -330,6 +330,11 @@ public final class SchedulerV2 {
             soloStripe?.id == rec.id ? soloStripe!.tokens : config.prefillChunkSize
         }
         var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
+        // The raise above exists ONLY for the armed row. Every other
+        // consumer stays inside the configured step limit, or a successor
+        // admitted beside the striped row's final short remainder could
+        // push the step past `maxBatchedTokensPerStep`.
+        var totalAssignedTokens = 0
         var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
         var assignmentIndex: [CBv2RequestID: Int] = [:]
         var preemptions: [CBv2RequestID] = []
@@ -563,6 +568,7 @@ public final class SchedulerV2 {
 
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
+            totalAssignedTokens += n
             if isPrefillRow { prefillTokensAssigned += n }
             if isPrefillRow, rec.remainingTokens > 1 { midPrefillAssigned += 1 }
             assignmentIndex[rec.id] = assignments.count
@@ -615,8 +621,16 @@ public final class SchedulerV2 {
                 // quota-blocked row never arms the block starvation guard.
                 let admissionHeadroom = prefillHeadroom()
                 guard admissionHeadroom > 0 else { break }
+                // Non-armed admissions may not touch the stripe-only budget
+                // surplus: they are bounded by what remains of the ORDINARY
+                // step limit. The armed row itself (admission-path solo
+                // striping) keeps the raised budget.
+                let normalHeadroom = soloStripe?.id == rec.id
+                    ? budget
+                    : max(0, config.maxBatchedTokensPerStep - totalAssignedTokens)
                 var chunk = min(
-                    rec.remainingTokens, prefillChunkCap(for: rec), budget, admissionHeadroom)
+                    rec.remainingTokens, prefillChunkCap(for: rec), budget,
+                    normalHeadroom, admissionHeadroom)
                 // Same block snapping as the running path. 0 ⇒ this step's
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
@@ -667,6 +681,7 @@ public final class SchedulerV2 {
                 rec.status = .running
                 rec.numComputedTokens += chunk
                 budget -= chunk
+                totalAssignedTokens += chunk
                 prefillTokensAssigned += chunk
                 if rec.remainingTokens > 1 { midPrefillAssigned += 1 }
                 assignmentIndex[rec.id] = assignments.count

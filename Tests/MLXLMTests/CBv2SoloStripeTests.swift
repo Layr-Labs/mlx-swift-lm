@@ -262,6 +262,34 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
         }
     }
 
+
+    func testStripeSurplusNeverLeaksToSuccessorBeyondStepBudget() throws {
+        // Non-default posture: stripe (2048) > step budget (512). The raise
+        // exists only for the armed row; the successor beside A's final
+        // 152-token remainder is bounded by the ORDINARY limit, so the step
+        // never exceeds maxBatchedTokensPerStep.
+        let scheduler = SchedulerV2(
+            config: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 512,
+                prefillChunkSize: 512, soloPrefillStripeTokens: 2048,
+                maxConcurrentPartialPrefills: 1, maxWaiting: 64),
+            capacity: nil)
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 2200), maxTokens: 2))
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 4096), maxTokens: 2))
+
+        let p1 = scheduler.plan()
+        XCTAssertEqual(p1.assignments.map(\.numTokens), [2048], "armed row may exceed the step budget")
+        _ = CBv2SchedSim.confirm(scheduler, plan: p1)
+        let p2 = scheduler.plan()
+        XCTAssertEqual(
+            p2.assignments.map(\.numTokens).sorted(), [152, 360],
+            "successor bounded by the ordinary limit: 152 + 360 == 512")
+        XCTAssertLessThanOrEqual(
+            p2.assignments.reduce(0) { $0 + $1.numTokens },
+            scheduler.config.maxBatchedTokensPerStep,
+            "non-armed consumers never exceed maxBatchedTokensPerStep")
+    }
+
     func testCapUnsetKeepsInterleavedAdmission() throws {
         let scheduler = makeScheduler(cap: nil)
         try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))
