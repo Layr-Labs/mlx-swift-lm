@@ -299,8 +299,21 @@ public final class SchedulerV2 {
             let liveRunning = running.filter {
                 !$0.cancelRequested && $0.remainingTokens > 0
             }
-            guard liveRunning.count + waiting.count == 1,
-                let solo = liveRunning.first ?? waiting.first,
+            let candidate: CBv2ScheduledRequest?
+            if liveRunning.count + waiting.count == 1 {
+                candidate = liveRunning.first ?? waiting.first
+            } else if config.maxConcurrentPartialPrefills == 1,
+                liveRunning.count <= 1,
+                !liveRunning.contains(where: { $0.isDecodeReady && !$0.isPaused })
+            {
+                // Serialized-prefill policy: waiters queue behind the one
+                // active prefill BY POLICY, so striping it only brings
+                // their turns forward. Decode company still disarms.
+                candidate = liveRunning.first ?? waiting.first
+            } else {
+                candidate = nil
+            }
+            guard let solo = candidate,
                 !solo.isPaused, !solo.cancelRequested,
                 solo.multimodalBlocks.isEmpty,
                 solo.remainingTokens > 1
@@ -555,6 +568,15 @@ public final class SchedulerV2 {
                 // stay blocked here until the finalize-side correction
                 // (recordSampled + discardPendingSamples) zeroes them.
                 guard rec.pendingSamples == 0 else { break }
+                // Mean-TTFT prefill serialization (opt-in): a full complement
+                // of mid-prefill running rows blocks further admission. FCFS:
+                // a capped head waiter must not be jumped, so the pass ends.
+                if let cap = config.maxConcurrentPartialPrefills {
+                    let partial = running.filter {
+                        !$0.cancelRequested && !$0.isPaused && $0.remainingTokens > 1
+                    }.count
+                    guard partial < cap else { break }
+                }
                 // Mixed-step prefill quota. Every admission is prefill work,
                 // so an exhausted quota ends the pass (like an exhausted
                 // budget): no later waiter could fit either, and stopping

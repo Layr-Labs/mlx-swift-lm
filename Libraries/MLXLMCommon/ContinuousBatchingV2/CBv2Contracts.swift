@@ -702,6 +702,16 @@ public struct CBv2SchedulerConfig: Sendable {
     /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
     /// fall back off the tile route for MoE models with that geometry.
     public var soloPrefillStripeTokens: Int?
+    /// Mean-TTFT prefill serialization (opt-in; nil = unlimited). Caps how
+    /// many RUNNING rows may be mid-prefill at once. Measured basis: with
+    /// the unlimited interleave, every row in a 4x8K burst reaches its
+    /// first token at the MAKESPAN (all TTFTs equal, ~4x the solo TTFT);
+    /// with a cap of 1 the same throughput delivers TTFTs of ~1x/2x/3x/4x
+    /// solo — mean TTFT roughly halves at identical aggregate tok/s.
+    /// Decode rows never count against the cap and are never delayed by it.
+    /// The one-shot deferred multimodal-block row is exempt (block
+    /// integrity outranks the cap, mirroring the mixed-step quota).
+    public var maxConcurrentPartialPrefills: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
     /// Prefix-cache participation (lookup+adopt on submit, donate on
@@ -711,6 +721,7 @@ public struct CBv2SchedulerConfig: Sendable {
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
         prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
+        maxConcurrentPartialPrefills: Int? = nil,
         maxWaiting: Int = 64,
         enablePrefixCache: Bool = false
     ) {
@@ -718,6 +729,7 @@ public struct CBv2SchedulerConfig: Sendable {
         self.maxBatchedTokensPerStep = maxBatchedTokensPerStep
         self.prefillChunkSize = prefillChunkSize
         self.soloPrefillStripeTokens = soloPrefillStripeTokens
+        self.maxConcurrentPartialPrefills = maxConcurrentPartialPrefills
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
     }

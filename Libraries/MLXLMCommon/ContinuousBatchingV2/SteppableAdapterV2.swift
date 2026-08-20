@@ -87,6 +87,53 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionedRecurrentSteppableMod
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentPrefillSteppableModel {
+    /// Recurrent prompt-output narrowing. Fail SAFE, not fatal: a model
+    /// without the narrowing conformance reproduces the full positioned
+    /// forward and the engine's own slicing, so this conformance can never
+    /// change what a non-conforming model computes.
+    public func recurrentPrefill(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        if let prefillable = model as? any CBv2RecurrentLanguageModelPrefillForwardable {
+            return prefillable.cbv2RecurrentPrefill(
+                tokens, inputEmbedding: inputEmbeddings, cache: asKVCaches(caches),
+                recurrentState: recurrentState, positionIds: positionIds,
+                requirement: requirement)
+        }
+        let logits: MLXArray
+        if let inputEmbeddings {
+            guard let positioned = model as? any CBv2PositionedRecurrentEmbeddingForwardable
+            else {
+                preconditionFailure(
+                    "CBv2 recurrent embedding prefill reached an unsupported model")
+            }
+            logits = positioned.embeddingForward(
+                tokens, inputEmbedding: inputEmbeddings,  // non-nil in this branch
+                cache: asKVCaches(caches),
+                recurrentState: recurrentState, positionIds: positionIds)
+        } else {
+            guard let recurrent = model as? any CBv2PositionedRecurrentLanguageModelForwardable
+            else {
+                preconditionFailure(
+                    "CBv2 recurrent prefill reached an unsupported model")
+            }
+            logits = recurrent.cbv2Forward(
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+                positionIds: positionIds)
+        }
+        switch requirement {
+        case .evaluationOnly: return logits[0..., -1, 0 ..< 1]
+        case .lastPositionLogits: return logits[0..., -1, 0...]
+        }
+    }
+}
+
 // MARK: - Prompt-output narrowing (prefill only)
 
 /// Answered at RUNTIME like the multimodal/MTP capabilities: only models

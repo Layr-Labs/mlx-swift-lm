@@ -1270,10 +1270,23 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// transactions when the model requires them. The returned arrays are
     /// appended to the step's eval set so conv/SSM state is materialized at
     /// the same boundary as KV and logits.
+    /// `DARKBLOOM_CBV2_PREFILL_NARROWING=0` restores the engine-sliced full
+    /// vocabulary projection (byte-old prompt behavior) as the A/B control
+    /// and incident escape; any other value (or absence) keeps narrowing on.
+    static let prefillNarrowingEnabled: Bool =
+        ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_PREFILL_NARROWING"] != "0"
+
+    /// `requirement` non-nil marks a PREFILL call: the returned `logits` are
+    /// then already narrowed to the requirement (`[B,1]` handle or
+    /// `[B, vocab]` frontier row) — by the model itself when it conforms to
+    /// `CBv2RecurrentPrefillSteppableModel` (skipping the unused vocabulary
+    /// projection), else by the engine's own slice. Decode and MTP callers
+    /// pass nil and keep the full-logits contract.
     func targetForward(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache], ids: [CBv2RequestID],
         positionIds: MLXArray? = nil,
-        inputEmbeddings: MLXArray? = nil
+        inputEmbeddings: MLXArray? = nil,
+        requirement: CBv2PrefillRequirement? = nil
     ) -> (logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
         innerState: [MLXArray])
     {
@@ -1284,12 +1297,16 @@ public final class EngineLoopV2: @unchecked Sendable {
                 guard let multimodal = model as? any CBv2MultimodalSteppableModel else {
                     preconditionFailure("CBv2 embedding forward reached an unsupported model")
                 }
+                let logits = multimodal.forward(
+                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
                 return (
-                    multimodal.forward(
-                        tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches),
+                    requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
                     [:], [])
             }
-            return (model.forward(tokens: tokens, caches: caches), [:], [])
+            let logits = model.forward(tokens: tokens, caches: caches)
+            return (
+                requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
+                [:], [])
         }
         let evaluations = ids.map { id -> CBv2RecurrentStateEvaluation in
             guard let state = recurrentStates[id] else {
@@ -1300,27 +1317,40 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
         let logits: MLXArray
-        if let inputEmbeddings {
+        if let requirement, Self.prefillNarrowingEnabled,
+            let prefillable = model as? any CBv2RecurrentPrefillSteppableModel
+        {
+            // Prefill seam: state already bound above, staging identical to
+            // the full forward; the model returns only what the requirement
+            // needs (no vocabulary projection on discarded rows).
+            logits = prefillable.recurrentPrefill(
+                tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches,
+                recurrentState: evaluations, positionIds: positionIds,
+                requirement: requirement)
+        } else if let inputEmbeddings {
             guard let positioned = model as? any CBv2PositionedMultimodalSteppableModel else {
                 preconditionFailure(
                     "CBv2 recurrent embedding forward reached an unsupported model")
             }
-            logits = positioned.forward(
+            let full = positioned.forward(
                 tokens: tokens,
                 inputEmbeddings: inputEmbeddings,
                 caches: caches,
                 recurrentState: evaluations,
                 positionIds: positionIds)
+            logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         } else if positionIds != nil {
             guard let positioned = model as? any CBv2PositionedRecurrentSteppableModel else {
                 preconditionFailure("CBv2 positioned forward reached an unsupported model")
             }
-            logits = positioned.forward(
+            let full = positioned.forward(
                 tokens: tokens, caches: caches,
                 recurrentState: evaluations, positionIds: positionIds)
+            logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         } else {
-            logits = recurrentModel.forward(
+            let full = recurrentModel.forward(
                 tokens: tokens, caches: caches, recurrentState: evaluations)
+            logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         }
         var arrays: [MLXArray] = []
         for evaluation in evaluations {
@@ -1788,8 +1818,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                         row.start ..< row.start + row.count)
                     let forward = targetForward(
                         tokens: inputs, caches: caches, ids: [rec.id],
-                        positionIds: positions)
-                    output = narrowPrefillOutput(forward.logits, requirement: requirement)
+                        positionIds: positions, requirement: requirement)
+                    output = forward.logits  // already narrowed by targetForward
                     cacheInnerState.append(contentsOf: forward.innerState)
                     recurrentEvaluations.merge(forward.recurrent) { _, _ in
                         preconditionFailure("duplicate recurrent evaluation")
@@ -1927,11 +1957,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let forward = targetForward(
             tokens: tokens, caches: caches, ids: [id],
-            positionIds: positions, inputEmbeddings: spliced)
-        return (
-            narrowPrefillOutput(forward.logits, requirement: requirement),
-            forward.recurrent,
-            forward.innerState)
+            positionIds: positions, inputEmbeddings: spliced,
+            requirement: requirement)
+        return (forward.logits, forward.recurrent, forward.innerState)
     }
 
     /// Rectangular counterpart of `multimodalChunkForward`. Each row keeps

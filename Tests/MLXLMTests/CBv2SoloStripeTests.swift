@@ -161,3 +161,68 @@ final class CBv2SoloStripeEngineTests: XCTestCase {
             "striped solo prefill must not fall back to plain chunks: \(striped.model.forwardShapes)")
     }
 }
+
+
+// MARK: - Mean-TTFT prefill serialization (maxConcurrentPartialPrefills)
+
+final class CBv2PartialPrefillCapTests: XCTestCase {
+
+    private func makeScheduler(cap: Int?, stripe: Int? = nil) -> SchedulerV2 {
+        SchedulerV2(
+            config: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 2048,
+                prefillChunkSize: 512, soloPrefillStripeTokens: stripe,
+                maxConcurrentPartialPrefills: cap, maxWaiting: 64),
+            capacity: nil)
+    }
+
+    func testCapOneSerializesPrefillAdmission() throws {
+        let scheduler = makeScheduler(cap: 1)
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))
+
+        let p1 = scheduler.plan()
+        XCTAssertEqual(p1.assignments.map(\.numTokens), [512], "only A admits under cap 1")
+        _ = CBv2SchedSim.confirm(scheduler, plan: p1)
+        // A's FINAL prefill chunk samples this very step, so admitting B
+        // alongside it delays nobody and starts B one step earlier.
+        let p2 = scheduler.plan()
+        XCTAssertEqual(
+            p2.assignments.map(\.numTokens).sorted(), [512, 512],
+            "B admits alongside A's final (sampling) chunk")
+        _ = CBv2SchedSim.confirm(scheduler, plan: p2)
+        let p3 = scheduler.plan()
+        XCTAssertEqual(
+            p3.assignments.map(\.numTokens).sorted(), [1, 512],
+            "A decodes alongside B's remaining prefill")
+    }
+
+    func testCapUnsetKeepsInterleavedAdmission() throws {
+        let scheduler = makeScheduler(cap: nil)
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 1024), maxTokens: 2))
+        XCTAssertEqual(
+            scheduler.plan().assignments.map(\.numTokens), [512, 512],
+            "unlimited interleave is unchanged")
+    }
+
+    func testCapOnePlusStripeStripesTheActiveRowDespiteWaiters() throws {
+        let scheduler = makeScheduler(cap: 1, stripe: 2048)
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 4096), maxTokens: 2))
+        try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 4096), maxTokens: 2))
+
+        let p1 = scheduler.plan()
+        XCTAssertEqual(
+            p1.assignments.map(\.numTokens), [2048],
+            "serialized-prefill policy stripes the active row even with a waiter")
+        _ = CBv2SchedSim.confirm(scheduler, plan: p1)
+        let p2 = scheduler.plan()
+        XCTAssertEqual(p2.assignments.map(\.numTokens), [2048])
+        _ = CBv2SchedSim.confirm(scheduler, plan: p2)
+        // A sampled -> decode-ready company: stripe disarms; B admits at 512.
+        let p3 = scheduler.plan()
+        XCTAssertEqual(
+            p3.assignments.map(\.numTokens).sorted(), [1, 512],
+            "decode company disarms the stripe for B")
+    }
+}
