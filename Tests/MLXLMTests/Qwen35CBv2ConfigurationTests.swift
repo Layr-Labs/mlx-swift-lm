@@ -88,7 +88,10 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
         XCTAssertFalse(capability.supportsPrefixReuse)
         XCTAssertFalse(capability.supportsPagedKV)
         XCTAssertFalse(capability.supportsCompiledDecode)
-        XCTAssertFalse(capability.supportsPackedPrefill)
+        // Packed prefill is now a deliberate Qwen claim (rectangular [B, L]
+        // cohorts, one recurrent state row per batch row) — no longer part
+        // of the fail-closed initial-target set.
+        XCTAssertTrue(capability.supportsPackedPrefill)
         XCTAssertTrue(capability.supportsMTP)
 
         let prefix = CBv2PrefixReuseCapability.derive(

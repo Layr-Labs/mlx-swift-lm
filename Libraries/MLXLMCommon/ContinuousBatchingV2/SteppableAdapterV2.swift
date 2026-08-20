@@ -117,15 +117,25 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentPrefillSteppableModel 
                 tokens, inputEmbedding: inputEmbeddings,  // non-nil in this branch
                 cache: asKVCaches(caches),
                 recurrentState: recurrentState, positionIds: positionIds)
+        } else if let positioned = model
+            as? any CBv2PositionedRecurrentLanguageModelForwardable
+        {
+            logits = positioned.cbv2Forward(
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+                positionIds: positionIds)
         } else {
-            guard let recurrent = model as? any CBv2PositionedRecurrentLanguageModelForwardable
+            // A model conforming only to the unpositioned recurrent protocol
+            // keeps its pre-seam prefill path; explicit positions without
+            // the positioned refinement were unreachable before the seam
+            // and stay a programmer error.
+            guard positionIds == nil,
+                let recurrent = model as? any CBv2RecurrentLanguageModelForwardable
             else {
                 preconditionFailure(
                     "CBv2 recurrent prefill reached an unsupported model")
             }
             logits = recurrent.cbv2Forward(
-                tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
-                positionIds: positionIds)
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState)
         }
         switch requirement {
         case .evaluationOnly: return logits[0..., -1, 0 ..< 1]
