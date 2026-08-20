@@ -209,6 +209,10 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         var capabilities = CBv2ModelCapabilities.initialRecurrentTarget
         capabilities.supportsMTP = true
         capabilities.supportsCompactRecurrentMTPReplay = true
+        // Rectangular [B, L] prompt cohorts: one recurrent state row per
+        // batch row; each packed row attends its own KV (see
+        // `cbv2SupportsPackedPrefill` on the prefill conformance).
+        capabilities.supportsPackedPrefill = true
         return capabilities
     }
 }
@@ -1623,6 +1627,50 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
     }
 }
 
+// MARK: - ContinuousBatchingV2 prompt-only output narrowing
+
+/// CBv2 consumes only the final prompt position, so the prompt path skips
+/// the [B, L, 248320] vocabulary projection for discarded rows: intermediate
+/// chunks return a one-element hidden handle, the frontier chunk projects
+/// exactly one row. The trunk — every K/V write, every recurrent-state
+/// stage, positions, embeddings — is byte-identical to `positionedForward`;
+/// final RMSNorm is row-independent, so norm-after-slice equals
+/// slice-after-norm for the surviving row. Decode, MTP draft/verify, and
+/// capture paths keep their existing full contracts.
+extension Qwen35TextModel: CBv2RecurrentLanguageModelPrefillForwardable {
+    /// The Qwen trunk is shape-generic over `[B, L]` with one recurrent
+    /// state row per batch row (`recurrentState.count == B` precondition),
+    /// and CBv2 attention attends each packed row against its OWN KV — a
+    /// packed row is semantically identical to running alone.
+    public var cbv2SupportsPackedPrefill: Bool { true }
+
+    public func cbv2RecurrentPrefill(
+        _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        let caches = cache ?? []
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("Qwen35 CBv2 target received a legacy KV cache")
+            }
+            return attending
+        }
+        let hidden = model.cbv2Forward(
+            inputs, inputEmbeddings: inputEmbedding, caches: attending,
+            recurrentState: recurrentState, positionIds: positionIds)
+        switch requirement {
+        case .evaluationOnly:
+            // Small handle whose graph depends on the whole trunk — forcing
+            // it commits every layer's K/V write and recurrent stage.
+            return hidden[0..., -1, 0 ..< 1]
+        case .lastPositionLogits:
+            let last = model.norm(hidden[0..., -1, 0...])
+            return lmHead.map { $0(last) } ?? model.embedTokens.asLinear(last)
+        }
+    }
+}
+
 extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
     public func cbv2ForwardWithHidden(
         _ tokens: MLXArray, caches: [KVCache],
@@ -1866,6 +1914,23 @@ extension Qwen35Model: CBv2PositionedRecurrentLanguageModelForwardable,
         languageModel.embeddingForward(
             inputs, inputEmbedding: inputEmbedding, cache: cache,
             recurrentState: recurrentState, positionIds: positionIds)
+    }
+}
+
+extension Qwen35Model: CBv2RecurrentLanguageModelPrefillForwardable {
+    public var cbv2SupportsPackedPrefill: Bool {
+        languageModel.cbv2SupportsPackedPrefill
+    }
+
+    public func cbv2RecurrentPrefill(
+        _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        languageModel.cbv2RecurrentPrefill(
+            inputs, inputEmbedding: inputEmbedding, cache: cache,
+            recurrentState: recurrentState, positionIds: positionIds,
+            requirement: requirement)
     }
 }
 

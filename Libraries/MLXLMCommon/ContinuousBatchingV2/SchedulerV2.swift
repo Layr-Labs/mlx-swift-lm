@@ -285,7 +285,61 @@ public final class SchedulerV2 {
     /// - `numComputedTokens` advances optimistically at plan time; use
     ///   `rollback(_:)` if the planned step is never executed.
     public func plan() -> CBv2StepPlan {
-        var budget = config.maxBatchedTokensPerStep
+        // Solo-prefill stripe (`CBv2SchedulerConfig.soloPrefillStripeTokens`).
+        // Armed ONLY when this plan cannot delay anyone else's work: exactly
+        // one live request exists across running+waiting (paused rows count —
+        // they resume), it is text-only (multimodal block snapping keeps its
+        // own budget-bounded contract), it is prefilling (not decode-ready),
+        // and it is not itself paused. Solo also means raising the step
+        // budget to the stripe cannot starve a decode row — there is none.
+        let soloStripe: (tokens: Int, id: CBv2RequestID)? = {
+            guard let stripe = config.soloPrefillStripeTokens,
+                stripe > config.prefillChunkSize
+            else { return nil }
+            let liveRunning = running.filter {
+                !$0.cancelRequested && $0.remainingTokens > 0
+            }
+            let candidate: CBv2ScheduledRequest?
+            if liveRunning.count + waiting.count == 1 {
+                candidate = liveRunning.first ?? waiting.first
+            } else if config.maxConcurrentPartialPrefills == 1,
+                liveRunning.count <= 1,
+                !liveRunning.contains(where: { $0.isDecodeReady && !$0.isPaused }),
+                deferredBlockRequestID == nil
+            {
+                // Serialized-prefill policy: waiters queue behind the one
+                // active prefill BY POLICY, so striping it only brings
+                // their turns forward. Decode company still disarms. A
+                // pending deferred BLOCK admission is the one waiter the
+                // policy does NOT serialize — it is cap-exempt and admitted
+                // ahead of the running pass with first claim on the step —
+                // so a stripe must never run beside it.
+                candidate = liveRunning.first ?? waiting.first
+            } else {
+                candidate = nil
+            }
+            guard let solo = candidate,
+                !solo.isPaused, !solo.cancelRequested,
+                solo.multimodalBlocks.isEmpty,
+                solo.remainingTokens > 1
+            else { return nil }
+            return (tokens: stripe, id: solo.id)
+        }()
+        let soloStripeTokens = soloStripe?.tokens
+        // The stripe belongs to ONE armed request. A successor admitted in
+        // the striped row's final step (its remainder < stripe leaves step
+        // budget behind) must take the PLAIN chunk, or its oversized first
+        // chunk delays the striped row's own sample — defeating the very
+        // TTFT the stripe exists for.
+        func prefillChunkCap(for rec: CBv2ScheduledRequest) -> Int {
+            soloStripe?.id == rec.id ? soloStripe!.tokens : config.prefillChunkSize
+        }
+        var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
+        // The raise above exists ONLY for the armed row. Every other
+        // consumer stays inside the configured step limit, or a successor
+        // admitted beside the striped row's final short remainder could
+        // push the step past `maxBatchedTokensPerStep`.
+        var totalAssignedTokens = 0
         var assignments: [(id: CBv2RequestID, numTokens: Int)] = []
         var assignmentIndex: [CBv2RequestID: Int] = [:]
         var preemptions: [CBv2RequestID] = []
@@ -305,6 +359,14 @@ public final class SchedulerV2 {
         // early is what lets the quota bind on prefill rows that are visited
         // BEFORE the decode row in running order.
         var prefillTokensAssigned = 0
+        // Mean-TTFT cap slot accounting: rows that RECEIVED prompt work this
+        // plan and remain mid-prefill after their optimistic advance. Work
+        // assignment — not membership — is what the cap serializes: a paused
+        // row holds no slot (its stalled consumer must not head-of-line
+        // block admission), and on resume the FCFS running order hands the
+        // slot back to the elder row while younger partials simply receive
+        // no prompt work until it finishes.
+        var midPrefillAssigned = 0
         let prefillCap: Int? = {
             guard let cap = mixedStepPrefillTokenCap else { return nil }
             let hasDecodeWork = running.contains { rec in
@@ -335,7 +397,7 @@ public final class SchedulerV2 {
                 deferredRunningID = deferredID
             } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
                 deferredAdmittedID = admitDeferredBlockRow(
-                    at: wIdx, budget: &budget,
+                    at: wIdx, budget: &budget, totalAssignedTokens: &totalAssignedTokens,
                     assignments: &assignments, assignmentIndex: &assignmentIndex)
             }
         }
@@ -362,10 +424,20 @@ public final class SchedulerV2 {
             // flip `isDecodeReady`, and the quota must charge what the row
             // WAS when it was scheduled.
             let isPrefillRow = !rec.isDecodeReady
+            // Cap binds BEFORE any mutation, exactly like the quota skip: a
+            // row beyond the cap is left untouched for a later step (FCFS —
+            // earlier running rows claimed the slots).
+            if isPrefillRow, rec.remainingTokens > 1,
+                let cap = config.maxConcurrentPartialPrefills, cap > 0,
+                midPrefillAssigned >= cap
+            {
+                idx += 1
+                continue
+            }
             var n = rec.remainingTokens
             var speculated = false
             if n > 1 {
-                n = min(n, config.prefillChunkSize)  // chunk prefill only
+                n = min(n, prefillChunkCap(for: rec))  // solo stripe raises ONLY its own row
             } else if let planner = speculationPlanner {
                 // MTP: 1 known token + k speculative draft slots. Speculation
                 // never eats into a smaller budget — fall back to plain decode.
@@ -428,6 +500,13 @@ public final class SchedulerV2 {
             }
 
             // Reserve KV headroom; preemption is the backstop.
+            // A striped solo chunk holds capacity it only wants
+            // opportunistically: on reservation failure it shrinks back to
+            // the plain chunk size ONCE (like the speculation fallback)
+            // before the preemption machinery may run. Text-only by the solo
+            // gate, so re-snapping is a no-op and the shrink cannot split a
+            // multimodal block.
+            var striped = soloStripeTokens != nil && n > config.prefillChunkSize
             var reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
                 start: rec.numComputedTokens,
                 count: n) ?? n
@@ -444,6 +523,17 @@ public final class SchedulerV2 {
                         additionalBytes: reservationBytes)
                     reserved = true
                 } catch {
+                    if striped {
+                        striped = false
+                        n = min(n, config.prefillChunkSize)
+                        reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                            start: rec.numComputedTokens,
+                            count: n) ?? n
+                        reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                            start: rec.numComputedTokens,
+                            count: n) ?? 0
+                        continue
+                    }
                     // Speculative slack must never trigger the preemption
                     // backstop: retry once as plain decode before preempting.
                     if speculated {
@@ -483,7 +573,9 @@ public final class SchedulerV2 {
 
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
+            totalAssignedTokens += n
             if isPrefillRow { prefillTokensAssigned += n }
+            if isPrefillRow, rec.remainingTokens > 1 { midPrefillAssigned += 1 }
             assignmentIndex[rec.id] = assignments.count
             assignments.append((id: rec.id, numTokens: n))
             idx += 1
@@ -514,6 +606,19 @@ public final class SchedulerV2 {
                 // stay blocked here until the finalize-side correction
                 // (recordSampled + discardPendingSamples) zeroes them.
                 guard rec.pendingSamples == 0 else { break }
+                // Mean-TTFT prefill serialization (opt-in): a full complement
+                // of mid-prefill running rows blocks further admission. FCFS:
+                // a capped head waiter must not be jumped, so the pass ends.
+                if let cap = config.maxConcurrentPartialPrefills, cap > 0 {
+                    // cap > 0: nonpositive values are treated as UNLIMITED
+                    // (fail-open to the historical interleave) — a cap of 0
+                    // would otherwise starve the head waiter forever and
+                    // hang accepted requests until their deadline. The slot
+                    // counter covers running-pass assignments AND earlier
+                    // admissions this plan; a row whose final chunk samples
+                    // this step frees its slot for the successor.
+                    guard midPrefillAssigned < cap else { break }
+                }
                 // Mixed-step prefill quota. Every admission is prefill work,
                 // so an exhausted quota ends the pass (like an exhausted
                 // budget): no later waiter could fit either, and stopping
@@ -521,8 +626,16 @@ public final class SchedulerV2 {
                 // quota-blocked row never arms the block starvation guard.
                 let admissionHeadroom = prefillHeadroom()
                 guard admissionHeadroom > 0 else { break }
+                // Non-armed admissions may not touch the stripe-only budget
+                // surplus: they are bounded by what remains of the ORDINARY
+                // step limit. The armed row itself (admission-path solo
+                // striping) keeps the raised budget.
+                let normalHeadroom = soloStripe?.id == rec.id
+                    ? budget
+                    : max(0, config.maxBatchedTokensPerStep - totalAssignedTokens)
                 var chunk = min(
-                    rec.remainingTokens, config.prefillChunkSize, budget, admissionHeadroom)
+                    rec.remainingTokens, prefillChunkCap(for: rec), budget,
+                    normalHeadroom, admissionHeadroom)
                 // Same block snapping as the running path. 0 ⇒ this step's
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
@@ -537,28 +650,45 @@ public final class SchedulerV2 {
                     break
                 }
                 if let capacity {
-                    let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-                        start: rec.numComputedTokens,
-                        count: chunk) ?? chunk
-                    let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                        start: rec.numComputedTokens,
-                        count: chunk) ?? 0
-                    do {
-                        if reservationTokens > 0 || reservationBytes > 0 {
-                            try capacity.reserve(
-                                id: rec.id,
-                                additionalTokens: reservationTokens,
-                                additionalBytes: reservationBytes)
+                    // Mirrors the running path's striped shrink: a stripe the
+                    // KV limiter cannot hold falls back to the plain chunk
+                    // size once (text-only by the solo gate — no block to
+                    // split) before admission gives up for this step.
+                    var striped = soloStripeTokens != nil && chunk > config.prefillChunkSize
+                    var reservedAdmission = false
+                    while !reservedAdmission {
+                        let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
+                            start: rec.numComputedTokens,
+                            count: chunk) ?? chunk
+                        let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
+                            start: rec.numComputedTokens,
+                            count: chunk) ?? 0
+                        do {
+                            if reservationTokens > 0 || reservationBytes > 0 {
+                                try capacity.reserve(
+                                    id: rec.id,
+                                    additionalTokens: reservationTokens,
+                                    additionalBytes: reservationBytes)
+                            }
+                            reservedAdmission = true
+                        } catch {
+                            if striped {
+                                striped = false
+                                chunk = min(chunk, config.prefillChunkSize)
+                                continue
+                            }
+                            break  // no preemption on behalf of WAITING requests
                         }
-                    } catch {
-                        break  // no preemption on behalf of WAITING requests
                     }
+                    guard reservedAdmission else { break }
                 }
                 waiting.remove(at: wIdx)  // wIdx now points at the next record
                 rec.status = .running
                 rec.numComputedTokens += chunk
                 budget -= chunk
+                totalAssignedTokens += chunk
                 prefillTokensAssigned += chunk
+                if rec.remainingTokens > 1 { midPrefillAssigned += 1 }
                 assignmentIndex[rec.id] = assignments.count
                 assignments.append((id: rec.id, numTokens: chunk))
                 running.append(rec)
@@ -580,7 +710,7 @@ public final class SchedulerV2 {
     /// (so the running pass skips it — one assignment per row per plan), or
     /// nil when the row is not currently admissible.
     private func admitDeferredBlockRow(
-        at wIdx: Int, budget: inout Int,
+        at wIdx: Int, budget: inout Int, totalAssignedTokens: inout Int,
         assignments: inout [(id: CBv2RequestID, numTokens: Int)],
         assignmentIndex: inout [CBv2RequestID: Int]
     ) -> CBv2RequestID? {
@@ -614,6 +744,7 @@ public final class SchedulerV2 {
         rec.status = .running
         rec.numComputedTokens += chunk
         budget -= chunk
+        totalAssignedTokens += chunk
         assignmentIndex[rec.id] = assignments.count
         assignments.append((id: rec.id, numTokens: chunk))
         running.append(rec)

@@ -101,3 +101,45 @@ extension CBv2LanguageModelPrefillForwardable {
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var cbv2SupportsPackedMultimodalPrefill: Bool { false }
 }
+
+
+/// Recurrent twin of `CBv2PrefillSteppableModel`: the prompt-forward seam for
+/// models whose chunks carry request-owned recurrent state and positions
+/// (Qwen3.x hybrids). The engine binds `recurrentState` BEFORE calling (state
+/// staging is identical to the full forward); the model returns only what the
+/// requirement needs. Same invariants as `CBv2PrefillSteppableModel`: every
+/// token processed, every KV write and recurrent-state stage preserved — only
+/// the unused vocabulary projection may be skipped.
+public protocol CBv2RecurrentPrefillSteppableModel: CBv2RecurrentSteppableModel {
+    func recurrentPrefill(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray
+}
+
+/// Model-level (KVCache-shaped) twin of `CBv2RecurrentPrefillSteppableModel`,
+/// reached through `CBv2SteppableLanguageModelAdapter` — the same indirection
+/// `CBv2PositionedRecurrentLanguageModelForwardable` uses.
+public protocol CBv2RecurrentLanguageModelPrefillForwardable {
+    /// Whether this model's prompt forward is safe to run as a rectangular
+    /// `[B, L]` cohort of independent rows (each row attends its OWN KV and
+    /// carries its OWN recurrent state). Fail-closed default: false.
+    var cbv2SupportsPackedPrefill: Bool { get }
+
+    func cbv2RecurrentPrefill(
+        _ inputs: MLXArray,
+        inputEmbedding: MLXArray?,
+        cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray
+}
+
+extension CBv2RecurrentLanguageModelPrefillForwardable {
+    public var cbv2SupportsPackedPrefill: Bool { false }
+}

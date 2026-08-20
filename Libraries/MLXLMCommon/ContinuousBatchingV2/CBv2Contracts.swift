@@ -686,6 +686,43 @@ public struct CBv2SchedulerConfig: Sendable {
     public var maxBatchedTokensPerStep: Int
     /// Preferred prefill chunk size (adaptive sizer may override).
     public var prefillChunkSize: Int
+    /// Solo-prefill stripe (opt-in; nil = off). When ONE text request holds
+    /// the scheduler's entire schedulable population — no decode-ready row,
+    /// no other live running row, no waiter — its prefill chunk (and, when
+    /// necessary, that step's budget) may extend to this many tokens.
+    ///
+    /// Why: a 512-token chunk streams every weight per chunk and leaves the
+    /// E=256 expert-tile kernel at 16 rows/expert (~50% tile occupancy). A
+    /// 2048-token stripe reads weights once per 2048 tokens, fills tiles
+    /// (64 rows/expert), and amortizes per-chunk dispatch/drain overhead —
+    /// while a SOLO gate guarantees no coexisting decode row can stall.
+    ///
+    /// Values above `prefillChunkSize` arm the stripe; anything else is
+    /// ignored. NOTE: gather-QMM expert tiles qualify assignment counts up
+    /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
+    /// fall back off the tile route for MoE models with that geometry.
+    public var soloPrefillStripeTokens: Int?
+    /// Mean-TTFT prefill serialization (opt-in; nil = unlimited). Caps how
+    /// many RUNNING rows may be mid-prefill at once. Measured basis: with
+    /// the unlimited interleave, every row in a 4x8K burst reaches its
+    /// first token at the MAKESPAN (all TTFTs equal, ~4x the solo TTFT);
+    /// with a cap of 1 the same throughput delivers TTFTs of ~1x/2x/3x/4x
+    /// solo — mean TTFT roughly halves at identical aggregate tok/s.
+    /// Decode rows never count against the cap and are never delayed by it.
+    /// The one-shot deferred multimodal-block row is exempt (block
+    /// integrity outranks the cap, mirroring the mixed-step quota).
+    /// Nonpositive values are treated as unlimited (fail-open): a literal
+    /// cap of 0 would permanently starve every waiter.
+    ///
+    /// The cap serializes prompt WORK per step, not running-set membership:
+    /// at most this many rows receive prompt chunks in one plan (FCFS by
+    /// running order, then admission). A PAUSED mid-prefill row holds no
+    /// slot — counting it would let one stalled consumer's backpressure
+    /// head-of-line block every other user's admission — so a pause/resume
+    /// cycle can transiently leave more than `cap` mid-prefill rows in the
+    /// running set; from the first resumed step onward only `cap` of them
+    /// make progress, restoring the serialization where it matters.
+    public var maxConcurrentPartialPrefills: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
     /// Prefix-cache participation (lookup+adopt on submit, donate on
@@ -694,12 +731,16 @@ public struct CBv2SchedulerConfig: Sendable {
     public var enablePrefixCache: Bool
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
-        prefillChunkSize: Int = 512, maxWaiting: Int = 64,
+        prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
+        maxConcurrentPartialPrefills: Int? = nil,
+        maxWaiting: Int = 64,
         enablePrefixCache: Bool = false
     ) {
         self.maxConcurrentRequests = maxConcurrentRequests
         self.maxBatchedTokensPerStep = maxBatchedTokensPerStep
         self.prefillChunkSize = prefillChunkSize
+        self.soloPrefillStripeTokens = soloPrefillStripeTokens
+        self.maxConcurrentPartialPrefills = maxConcurrentPartialPrefills
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
     }
