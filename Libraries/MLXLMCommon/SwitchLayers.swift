@@ -258,6 +258,12 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+private let qwenDirectExpertReductionEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN_DIRECT_EXPERT_REDUCTION"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return raw == "1" || raw == "true" || raw == "on"
+}()
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -513,7 +519,8 @@ public class SwitchGLU: Module {
                 && weights.dtype == .bfloat16
                 && indices.size >= 64
         case .qwen35ProductionSwiGLU:
-            return inputDims == 2048
+            return qwenDirectExpertReductionEnabled
+                && inputDims == 2048
                 && hiddenDims == 512
                 && numExperts == 256
                 && isSiluActivation
