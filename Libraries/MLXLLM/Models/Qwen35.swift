@@ -1165,7 +1165,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
             numExperts: args.numExperts,
-            fuseGateUp: fuseGateUp
+            fuseGateUp: fuseGateUp,
+            weightedReductionProfile: .qwen35ProductionSwiGLU
         )
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
@@ -1187,8 +1188,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
             scores = scores / scores.sum(axis: -1, keepDims: true)
         }
 
-        let y = switchMLP(x, inds)
-        let combined = weightedExpertSum(y, scores.asType(y.dtype))
+        let combined = switchMLP.callAndWeightedReduce(
+            x, inds, weights: scores.asType(x.dtype), fuseSortedReduction: true, isProductionPrefill: true)
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
