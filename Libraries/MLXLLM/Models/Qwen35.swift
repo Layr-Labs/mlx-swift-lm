@@ -298,6 +298,7 @@ final class Qwen35GatedDeltaNet: Module {
             ObjectIdentifier(type(of: z)) == ObjectIdentifier(QuantizedLinear.self),
             ObjectIdentifier(type(of: b)) == ObjectIdentifier(QuantizedLinear.self),
             ObjectIdentifier(type(of: a)) == ObjectIdentifier(QuantizedLinear.self),
+            qkv.bias == nil, z.bias == nil, b.bias == nil, a.bias == nil,
             qkv.bits == z.bits, qkv.bits == b.bits, qkv.bits == a.bits,
             qkv.groupSize == z.groupSize,
             qkv.groupSize == b.groupSize,
@@ -344,9 +345,13 @@ final class Qwen35GatedDeltaNet: Module {
             bits: projections.qkv.bits,
             mode: projections.qkv.mode
         )
+        // Realize the fused arrays while the source modules are still alive,
+        // then replace them. This leaves one registered resident weight set
+        // instead of a lazy concat graph retaining both source and fused data.
+        eval(fused)
         // Replace, rather than cache alongside, the source projections. This
-        // keeps one registered weight set resident and prevents adapter-backed
-        // subclasses from being bypassed by the inference-only fusion.
+        // prevents adapter-backed subclasses from being bypassed by the
+        // inference-only fusion.
         try! update(
             modules: ModuleChildren(values: [
                 "in_proj_fused": .value(fused),
