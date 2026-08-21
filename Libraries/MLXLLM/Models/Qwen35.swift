@@ -231,10 +231,11 @@ final class Qwen35GatedDeltaNet: Module {
     let convDim: Int
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
-    @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
-    @ModuleInfo(key: "in_proj_z") var inProjZ: Linear
-    @ModuleInfo(key: "in_proj_b") var inProjB: Linear
-    @ModuleInfo(key: "in_proj_a") var inProjA: Linear
+    @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear?
+    @ModuleInfo(key: "in_proj_z") var inProjZ: Linear?
+    @ModuleInfo(key: "in_proj_b") var inProjB: Linear?
+    @ModuleInfo(key: "in_proj_a") var inProjA: Linear?
+    @ModuleInfo(key: "in_proj_fused") var fusedInProj: Linear?
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -273,6 +274,7 @@ final class Qwen35GatedDeltaNet: Module {
         _inProjZ.wrappedValue = Linear(hiddenSize, valueDim, bias: false)
         _inProjB.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
         _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
+        _fusedInProj.wrappedValue = nil
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
         let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
@@ -284,60 +286,109 @@ final class Qwen35GatedDeltaNet: Module {
         super.init()
     }
 
-    private var fusedInProj: Linear? = nil
+    private func exactQuantizedInputProjections() -> (
+        qkv: QuantizedLinear, z: QuantizedLinear,
+        b: QuantizedLinear, a: QuantizedLinear
+    )? {
+        guard let qkv = inProjQKV as? QuantizedLinear,
+            let z = inProjZ as? QuantizedLinear,
+            let b = inProjB as? QuantizedLinear,
+            let a = inProjA as? QuantizedLinear,
+            ObjectIdentifier(type(of: qkv)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: z)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: b)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: a)) == ObjectIdentifier(QuantizedLinear.self),
+            qkv.bits == z.bits, qkv.bits == b.bits, qkv.bits == a.bits,
+            qkv.groupSize == z.groupSize,
+            qkv.groupSize == b.groupSize,
+            qkv.groupSize == a.groupSize,
+            qkv.mode == z.mode, qkv.mode == b.mode, qkv.mode == a.mode
+        else { return nil }
+        return (qkv, z, b, a)
+    }
+
+    var hasFusedInputProjection: Bool { fusedInProj != nil }
+
+    @discardableResult
+    func prepareFusedInputProjection() -> Bool {
+        if fusedInProj != nil { return true }
+        return makeFusedInputProjection() != nil
+    }
+
+    private func makeFusedInputProjection() -> Linear? {
+        guard let projections = exactQuantizedInputProjections() else { return nil }
+        let fusedBiases: MLXArray?
+        switch (
+            projections.qkv.biases, projections.z.biases,
+            projections.b.biases, projections.a.biases
+        ) {
+        case let (.some(qkv), .some(z), .some(b), .some(a)):
+            fusedBiases = concatenated([qkv, z, b, a], axis: 0)
+        case (nil, nil, nil, nil):
+            fusedBiases = nil
+        default:
+            return nil
+        }
+        let fused = QuantizedLinear(
+            weight: concatenated([
+                projections.qkv.weight, projections.z.weight,
+                projections.b.weight, projections.a.weight,
+            ], axis: 0),
+            bias: nil,
+            scales: concatenated([
+                projections.qkv.scales, projections.z.scales,
+                projections.b.scales, projections.a.scales,
+            ], axis: 0),
+            biases: fusedBiases,
+            groupSize: projections.qkv.groupSize,
+            bits: projections.qkv.bits,
+            mode: projections.qkv.mode
+        )
+        // Replace, rather than cache alongside, the source projections. This
+        // keeps one registered weight set resident and prevents adapter-backed
+        // subclasses from being bypassed by the inference-only fusion.
+        try! update(
+            modules: ModuleChildren(values: [
+                "in_proj_fused": .value(fused),
+                "in_proj_qkv": .none,
+                "in_proj_z": .none,
+                "in_proj_b": .none,
+                "in_proj_a": .none,
+            ]),
+            verify: []
+        )
+        return fusedInProj
+    }
 
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
-        if fusedInProj == nil {
-            if let qQKV = inProjQKV as? QuantizedLinear,
-                let qZ = inProjZ as? QuantizedLinear,
-                let qB = inProjB as? QuantizedLinear,
-                let qA = inProjA as? QuantizedLinear,
-                qQKV.bits == qZ.bits && qQKV.groupSize == qZ.groupSize
-            {
-                let fusedWeight = concatenated(
-                    [qQKV.weight, qZ.weight, qB.weight, qA.weight], axis: 0)
-                let fusedScales = concatenated(
-                    [qQKV.scales, qZ.scales, qB.scales, qA.scales], axis: 0)
-                let fusedBiases: MLXArray?
-                if let bQKV = qQKV.biases, let bZ = qZ.biases, let bB = qB.biases,
-                    let bA = qA.biases
-                {
-                    fusedBiases = concatenated([bQKV, bZ, bB, bA], axis: 0)
-                } else {
-                    fusedBiases = nil
-                }
-                fusedInProj = QuantizedLinear(
-                    weight: fusedWeight,
-                    bias: nil,
-                    scales: fusedScales,
-                    biases: fusedBiases,
-                    groupSize: qQKV.groupSize,
-                    bits: qQKV.bits,
-                    mode: qQKV.mode
-                )
-            } else {
-                let fusedWeight = concatenated(
-                    [inProjQKV.weight, inProjZ.weight, inProjB.weight, inProjA.weight],
-                    axis: 0)
-                fusedInProj = Linear(weight: fusedWeight, bias: nil)
+        let outFused: MLXArray
+        if let fused = fusedInProj ?? makeFusedInputProjection() {
+            outFused = fused(inputs)
+        } else {
+            guard let inProjQKV, let inProjZ, let inProjB, let inProjA else {
+                preconditionFailure("Qwen35 GDN input projections are unavailable")
             }
+            return (
+                inProjQKV(inputs),
+                inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
+                inProjB(inputs),
+                inProjA(inputs)
+            )
         }
-        let outFused = fusedInProj!(inputs)
         let qkvDim = keyDim * 2 + valueDim
         let zDim = valueDim
         let bDim = numVHeads
-        let aDim = numVHeads
-        let total = qkvDim + zDim + bDim + aDim
-        let qkv = outFused[0..., 0..., 0 ..< qkvDim]
-        let z = outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
-            B, S, numVHeads, headVDim)
-        let b = outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)]
-        let a = outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
-        return (qkv, z, b, a)
+        let total = qkvDim + zDim + 2 * bDim
+        return (
+            outFused[0..., 0..., 0 ..< qkvDim],
+            outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
+                B, S, numVHeads, headVDim),
+            outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)],
+            outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
+        )
     }
-
 
     // MARK: - _processChunk (MTP helper)
 
@@ -1136,6 +1187,17 @@ final class Qwen35MRoPE {
     }
 }
 
+func qwen35FlattenMoEInputs(
+    x: MLXArray, indices: MLXArray, scores: MLXArray
+) -> (x: MLXArray, indices: MLXArray, scores: MLXArray) {
+    precondition(x.ndim >= 2 && indices.ndim >= 2 && scores.shape == indices.shape)
+    return (
+        x.reshaped([-1, x.dim(-1)]),
+        indices.reshaped([-1, indices.dim(-1)]),
+        scores.reshaped([-1, scores.dim(-1)])
+    )
+}
+
 // MARK: - SparseMoeBlock
 
 final class Qwen35SparseMoeBlock: Module, UnaryLayer {
@@ -1188,8 +1250,15 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
             scores = scores / scores.sum(axis: -1, keepDims: true)
         }
 
+        let tokenShape = x.shape
+        let flattened = qwen35FlattenMoEInputs(x: x, indices: inds, scores: scores)
+        let flatX = flattened.x
+        let flatIndices = flattened.indices
+        let flatScores = flattened.scores
         let combined = switchMLP.callAndWeightedReduce(
-            x, inds, weights: scores.asType(x.dtype), fuseSortedReduction: true, isProductionPrefill: true)
+            flatX, flatIndices, weights: flatScores.asType(x.dtype),
+            fuseSortedReduction: true, isProductionPrefill: true
+        ).reshaped(tokenShape)
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY

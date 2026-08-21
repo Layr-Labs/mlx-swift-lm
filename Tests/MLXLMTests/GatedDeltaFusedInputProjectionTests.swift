@@ -5,6 +5,8 @@ import XCTest
 @testable import MLX
 @testable import MLXNN
 @testable import MLXFast
+@testable import MLXLLM
+import MLXLMCommon
 
 final class GatedDeltaFusedInputProjectionTests: XCTestCase {
 
@@ -75,4 +77,92 @@ final class GatedDeltaFusedInputProjectionTests: XCTestCase {
         XCTAssertEqual(diffB, 0.0, accuracy: 1e-5)
         XCTAssertEqual(diffA, 0.0, accuracy: 1e-5)
     }
+}
+
+
+private func smallQwenGDNConfiguration() throws -> Qwen35TextConfiguration {
+    let json = """
+    {
+      "hidden_size": 64,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 1,
+      "linear_num_value_heads": 2,
+      "linear_num_key_heads": 1,
+      "linear_key_head_dim": 32,
+      "linear_value_head_dim": 32,
+      "linear_conv_kernel_dim": 4,
+      "vocab_size": 128,
+      "full_attention_interval": 4
+    }
+    """
+    return try JSONDecoder().decode(
+        Qwen35TextConfiguration.self, from: Data(json.utf8))
+}
+
+extension GatedDeltaFusedInputProjectionTests {
+    func testFusionReplacesSourceModulesInsteadOfRetainingDuplicates() throws {
+        let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
+        try layer.update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV!, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ!, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB!, groupSize: 32, bits: 4)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA!, groupSize: 32, bits: 4)),
+            ]), verify: [])
+
+        XCTAssertTrue(layer.prepareFusedInputProjection())
+        XCTAssertTrue(layer.hasFusedInputProjection)
+        XCTAssertNil(layer.inProjQKV)
+        XCTAssertNil(layer.inProjZ)
+        XCTAssertNil(layer.inProjB)
+        XCTAssertNil(layer.inProjA)
+        let keys = Set(layer.parameters().flattened().map(\.0))
+        XCTAssertTrue(keys.contains("in_proj_fused.weight"))
+        XCTAssertFalse(keys.contains("in_proj_qkv.weight"))
+    }
+
+    func testHeterogeneousQuantizationRetainsSeparateProjections() throws {
+        let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
+        try layer.update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV!, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ!, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB!, groupSize: 32, bits: 8)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA!, groupSize: 32, bits: 4)),
+            ]), verify: [])
+
+        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertNotNil(layer.inProjQKV)
+        XCTAssertNotNil(layer.inProjB)
+    }
+
+    func testAdapterBackedProjectionRetainsSeparateCalls() throws {
+        let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
+        let adapted = LoRALinear.from(
+            linear: layer.inProjQKV!, rank: 4, scale: 1) as! Linear
+        try layer.update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(adapted),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ!, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB!, groupSize: 32, bits: 4)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA!, groupSize: 32, bits: 4)),
+            ]), verify: [])
+
+        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertTrue(layer.inProjQKV is LoRALinear)
+    }
+    func testBatchedMoEInputsFlattenTokensAndPreserveTopK() {
+        let x = MLXArray.zeros([2, 7, 2048], dtype: .bfloat16)
+        let indices = MLXArray.zeros([2, 7, 8], dtype: .uint32)
+        let scores = MLXArray.zeros([2, 7, 8], dtype: .bfloat16)
+        let flattened = qwen35FlattenMoEInputs(
+            x: x, indices: indices, scores: scores)
+        XCTAssertEqual(flattened.x.shape, [14, 2048])
+        XCTAssertEqual(flattened.indices.shape, [14, 8])
+        XCTAssertEqual(flattened.scores.shape, [14, 8])
+    }
+
 }
