@@ -261,7 +261,7 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 private let qwenDirectExpertReductionEnabled: Bool = {
     let raw = ProcessInfo.processInfo.environment["MLX_QWEN_DIRECT_EXPERT_REDUCTION"]?
         .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    return raw == "1" || raw == "true" || raw == "on"
+    return raw != "0" && raw != "false" && raw != "off"
 }()
 
 // MARK: - SwitchGLU
