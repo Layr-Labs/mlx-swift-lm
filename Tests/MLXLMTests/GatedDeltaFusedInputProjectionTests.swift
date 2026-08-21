@@ -101,35 +101,38 @@ private func smallQwenGDNConfiguration() throws -> Qwen35TextConfiguration {
 }
 
 extension GatedDeltaFusedInputProjectionTests {
-    func testFusionReplacesSourceModulesInsteadOfRetainingDuplicates() throws {
+    func testFusionKeepsCheckpointTopologyAndFrozenCache() throws {
         let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
         try layer.update(
             modules: ModuleChildren(values: [
-                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV!, groupSize: 32, bits: 4)),
-                "in_proj_z": .value(QuantizedLinear(layer.inProjZ!, groupSize: 32, bits: 4)),
-                "in_proj_b": .value(QuantizedLinear(layer.inProjB!, groupSize: 32, bits: 4)),
-                "in_proj_a": .value(QuantizedLinear(layer.inProjA!, groupSize: 32, bits: 4)),
+                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB, groupSize: 32, bits: 4)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
             ]), verify: [])
 
         XCTAssertTrue(layer.prepareFusedInputProjection())
         XCTAssertTrue(layer.hasFusedInputProjection)
-        XCTAssertNil(layer.inProjQKV)
-        XCTAssertNil(layer.inProjZ)
-        XCTAssertNil(layer.inProjB)
-        XCTAssertNil(layer.inProjA)
+        XCTAssertNotNil(layer.inProjQKV)
+        XCTAssertNotNil(layer.inProjZ)
+        XCTAssertNotNil(layer.inProjB)
+        XCTAssertNotNil(layer.inProjA)
         let keys = Set(layer.parameters().flattened().map(\.0))
-        XCTAssertTrue(keys.contains("in_proj_fused.weight"))
-        XCTAssertFalse(keys.contains("in_proj_qkv.weight"))
+        XCTAssertFalse(keys.contains("in_proj_fused.weight"))
+        XCTAssertTrue(keys.contains("in_proj_qkv.weight"))
+        XCTAssertFalse(layer.trainableParameters().flattened().contains {
+            $0.0.hasPrefix("in_proj_fused")
+        })
     }
 
     func testHeterogeneousQuantizationRetainsSeparateProjections() throws {
         let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
         try layer.update(
             modules: ModuleChildren(values: [
-                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV!, groupSize: 32, bits: 4)),
-                "in_proj_z": .value(QuantizedLinear(layer.inProjZ!, groupSize: 32, bits: 4)),
-                "in_proj_b": .value(QuantizedLinear(layer.inProjB!, groupSize: 32, bits: 8)),
-                "in_proj_a": .value(QuantizedLinear(layer.inProjA!, groupSize: 32, bits: 4)),
+                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB, groupSize: 32, bits: 8)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
             ]), verify: [])
 
         XCTAssertFalse(layer.prepareFusedInputProjection())
@@ -141,13 +144,13 @@ extension GatedDeltaFusedInputProjectionTests {
     func testAdapterBackedProjectionRetainsSeparateCalls() throws {
         let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
         let adapted = LoRALinear.from(
-            linear: layer.inProjQKV!, rank: 4, scale: 1) as! Linear
+            linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
         try layer.update(
             modules: ModuleChildren(values: [
                 "in_proj_qkv": .value(adapted),
-                "in_proj_z": .value(QuantizedLinear(layer.inProjZ!, groupSize: 32, bits: 4)),
-                "in_proj_b": .value(QuantizedLinear(layer.inProjB!, groupSize: 32, bits: 4)),
-                "in_proj_a": .value(QuantizedLinear(layer.inProjA!, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB, groupSize: 32, bits: 4)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
             ]), verify: [])
 
         XCTAssertFalse(layer.prepareFusedInputProjection())
@@ -163,6 +166,20 @@ extension GatedDeltaFusedInputProjectionTests {
         XCTAssertEqual(flattened.x.shape, [14, 2048])
         XCTAssertEqual(flattened.indices.shape, [14, 8])
         XCTAssertEqual(flattened.scores.shape, [14, 8])
+    }
+
+    func testUnfrozenQuantizedProjectionsRetainDifferentiablePath() throws {
+        let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
+        let modules = ModuleChildren(values: [
+            "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV, groupSize: 32, bits: 4)),
+            "in_proj_z": .value(QuantizedLinear(layer.inProjZ, groupSize: 32, bits: 4)),
+            "in_proj_b": .value(QuantizedLinear(layer.inProjB, groupSize: 32, bits: 4)),
+            "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
+        ])
+        try layer.update(modules: modules, verify: [])
+        try layer.unfreeze(recursive: true)
+        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(layer.hasFusedInputProjection)
     }
 
 }

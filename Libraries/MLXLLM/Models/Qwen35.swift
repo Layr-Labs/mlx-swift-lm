@@ -231,11 +231,14 @@ final class Qwen35GatedDeltaNet: Module {
     let convDim: Int
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
-    @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear?
-    @ModuleInfo(key: "in_proj_z") var inProjZ: Linear?
-    @ModuleInfo(key: "in_proj_b") var inProjB: Linear?
-    @ModuleInfo(key: "in_proj_a") var inProjA: Linear?
-    @ModuleInfo(key: "in_proj_fused") var fusedInProj: Linear?
+    @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
+    @ModuleInfo(key: "in_proj_z") var inProjZ: Linear
+    @ModuleInfo(key: "in_proj_b") var inProjB: Linear
+    @ModuleInfo(key: "in_proj_a") var inProjA: Linear
+
+    // Inference-only cache. It is intentionally not registered in the module
+    // topology, so checkpoint and adapter paths remain stable.
+    private var fusedInProj: Linear?
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -274,7 +277,7 @@ final class Qwen35GatedDeltaNet: Module {
         _inProjZ.wrappedValue = Linear(hiddenSize, valueDim, bias: false)
         _inProjB.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
         _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
-        _fusedInProj.wrappedValue = nil
+        self.fusedInProj = nil
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
         let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
@@ -310,14 +313,41 @@ final class Qwen35GatedDeltaNet: Module {
 
     var hasFusedInputProjection: Bool { fusedInProj != nil }
 
+    private func sourceInputProjectionsAreFrozen() -> Bool {
+        let trainable = Set(trainableParameters().flattened().map(\.0))
+        return !trainable.contains("in_proj_qkv.weight")
+            && !trainable.contains("in_proj_z.weight")
+            && !trainable.contains("in_proj_b.weight")
+            && !trainable.contains("in_proj_a.weight")
+    }
+
+    private func exactFrozenQuantizedInputProjections() -> (
+        qkv: QuantizedLinear, z: QuantizedLinear,
+        b: QuantizedLinear, a: QuantizedLinear
+    )? {
+        guard sourceInputProjectionsAreFrozen(),
+            let qkv = inProjQKV as? QuantizedLinear,
+            let z = inProjZ as? QuantizedLinear,
+            let b = inProjB as? QuantizedLinear,
+            let a = inProjA as? QuantizedLinear,
+            ObjectIdentifier(type(of: qkv)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: z)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: b)) == ObjectIdentifier(QuantizedLinear.self),
+            ObjectIdentifier(type(of: a)) == ObjectIdentifier(QuantizedLinear.self),
+            qkv.bias == nil, z.bias == nil, b.bias == nil, a.bias == nil,
+            qkv.bits == z.bits, qkv.bits == b.bits, qkv.bits == a.bits,
+            qkv.groupSize == z.groupSize,
+            qkv.groupSize == b.groupSize,
+            qkv.groupSize == a.groupSize,
+            qkv.mode == z.mode, qkv.mode == b.mode, qkv.mode == a.mode
+        else { return nil }
+        return (qkv, z, b, a)
+    }
+
     @discardableResult
     func prepareFusedInputProjection() -> Bool {
         if fusedInProj != nil { return true }
-        return makeFusedInputProjection() != nil
-    }
-
-    private func makeFusedInputProjection() -> Linear? {
-        guard let projections = exactQuantizedInputProjections() else { return nil }
+        guard let projections = exactFrozenQuantizedInputProjections() else { return false }
         let fusedBiases: MLXArray?
         switch (
             projections.qkv.biases, projections.z.biases,
@@ -328,7 +358,7 @@ final class Qwen35GatedDeltaNet: Module {
         case (nil, nil, nil, nil):
             fusedBiases = nil
         default:
-            return nil
+            return false
         }
         let fused = QuantizedLinear(
             weight: concatenated([
@@ -345,36 +375,16 @@ final class Qwen35GatedDeltaNet: Module {
             bits: projections.qkv.bits,
             mode: projections.qkv.mode
         )
-        // Realize the fused arrays while the source modules are still alive,
-        // then replace them. This leaves one registered resident weight set
-        // instead of a lazy concat graph retaining both source and fused data.
         eval(fused)
-        // Replace, rather than cache alongside, the source projections. This
-        // prevents adapter-backed subclasses from being bypassed by the
-        // inference-only fusion.
-        try! update(
-            modules: ModuleChildren(values: [
-                "in_proj_fused": .value(fused),
-                "in_proj_qkv": .none,
-                "in_proj_z": .none,
-                "in_proj_b": .none,
-                "in_proj_a": .none,
-            ]),
-            verify: []
-        )
-        return fusedInProj
+        fused.freeze()
+        fusedInProj = fused
+        return true
     }
 
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
-        let outFused: MLXArray
-        if let fused = fusedInProj ?? makeFusedInputProjection() {
-            outFused = fused(inputs)
-        } else {
-            guard let inProjQKV, let inProjZ, let inProjB, let inProjA else {
-                preconditionFailure("Qwen35 GDN input projections are unavailable")
-            }
+        guard prepareFusedInputProjection(), let fusedInProj else {
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
@@ -382,6 +392,7 @@ final class Qwen35GatedDeltaNet: Module {
                 inProjA(inputs)
             )
         }
+        let outFused = fusedInProj(inputs)
         let qkvDim = keyDim * 2 + valueDim
         let zDim = valueDim
         let bDim = numVHeads
