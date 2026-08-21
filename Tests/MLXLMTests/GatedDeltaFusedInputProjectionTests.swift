@@ -177,7 +177,7 @@ extension GatedDeltaFusedInputProjectionTests {
             "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
         ])
         try layer.update(modules: modules, verify: [])
-        try layer.unfreeze(recursive: true)
+        layer.unfreeze(recursive: true)
         XCTAssertFalse(layer.prepareFusedInputProjection())
         XCTAssertFalse(layer.hasFusedInputProjection)
     }
@@ -204,6 +204,27 @@ extension GatedDeltaFusedInputProjectionTests {
         XCTAssertFalse(
             ObjectIdentifier(type(of: layer.inProjQKV))
                 == ObjectIdentifier(QuantizedLinear.self))
+    }
+
+    func testReplacingSourceParametersInvalidatesInferenceCache() throws {
+        let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
+        try layer.update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB, groupSize: 32, bits: 4)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
+            ]), verify: [])
+        XCTAssertTrue(layer.prepareFusedInputProjection())
+        let replacement = layer.inProjQKV.weight + MLXArray.zeros(
+            layer.inProjQKV.weight.shape, dtype: layer.inProjQKV.weight.dtype)
+        try layer.update(
+            parameters: ModuleParameters.unflattened([
+                "in_proj_qkv.weight": replacement,
+            ]), verify: [])
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertTrue(layer.prepareFusedInputProjection())
+        XCTAssertTrue(layer.hasFusedInputProjection)
     }
 
 }

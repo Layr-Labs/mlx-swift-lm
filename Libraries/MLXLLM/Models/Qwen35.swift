@@ -239,6 +239,8 @@ final class Qwen35GatedDeltaNet: Module {
     // Inference-only cache. It is intentionally not registered in the module
     // topology, so checkpoint and adapter paths remain stable.
     private var fusedInProj: Linear?
+    private var fusedInputSourceSignature: [MLXArray]?
+    private var fusedInputPermanentlyIneligible = false
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -278,6 +280,7 @@ final class Qwen35GatedDeltaNet: Module {
         _inProjB.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
         _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
         self.fusedInProj = nil
+        self.fusedInputSourceSignature = nil
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
         let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
@@ -311,31 +314,68 @@ final class Qwen35GatedDeltaNet: Module {
         return (qkv, z, b, a)
     }
 
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
+        let replacesInputProjection = parameters.flattened().contains { key, _ in
+            prefixes.contains(where: key.hasPrefix)
+        }
+        let result = try super.update(
+            parameters: parameters, verify: verify,
+            path: path, modulePath: modulePath)
+        if replacesInputProjection {
+            fusedInProj = nil
+            fusedInputSourceSignature = nil
+            fusedInputPermanentlyIneligible = false
+        }
+        return result
+    }
+
     override func updateModule(key: String, _ value: Any) throws {
         try super.updateModule(key: key, value)
         if key == "in_proj_qkv" || key == "in_proj_z"
             || key == "in_proj_b" || key == "in_proj_a"
         {
             fusedInProj = nil
+            fusedInputSourceSignature = nil
+            fusedInputPermanentlyIneligible = false
         }
     }
 
     var hasFusedInputProjection: Bool { fusedInProj != nil }
 
-    private func sourceInputProjectionsAreFrozen() -> Bool {
-        let trainable = Set(trainableParameters().flattened().map(\.0))
-        return !trainable.contains("in_proj_qkv.weight")
-            && !trainable.contains("in_proj_z.weight")
-            && !trainable.contains("in_proj_b.weight")
-            && !trainable.contains("in_proj_a.weight")
+    private func inputProjectionSourceSignature(
+        _ projections: (
+            qkv: QuantizedLinear, z: QuantizedLinear,
+            b: QuantizedLinear, a: QuantizedLinear
+        )
+    ) -> [MLXArray] {
+        [
+            projections.qkv.weight, projections.qkv.scales,
+            projections.z.weight, projections.z.scales,
+            projections.b.weight, projections.b.scales,
+            projections.a.weight, projections.a.scales,
+        ] + [
+            projections.qkv.biases, projections.z.biases,
+            projections.b.biases, projections.a.biases,
+        ].compactMap { $0 }
+    }
+
+    private func sourceSignatureMatches(_ current: [MLXArray], _ cached: [MLXArray]) -> Bool {
+        current.count == cached.count
+            && zip(current, cached).allSatisfy { $0 === $1 }
     }
 
     private func exactFrozenQuantizedInputProjections() -> (
         qkv: QuantizedLinear, z: QuantizedLinear,
         b: QuantizedLinear, a: QuantizedLinear
     )? {
-        guard sourceInputProjectionsAreFrozen(),
-            let qkv = inProjQKV as? QuantizedLinear,
+        // Reject ineligible module types and policies before traversing the
+        // trainable-parameter tree on hot decode forwards.
+        guard let qkv = inProjQKV as? QuantizedLinear,
             let z = inProjZ as? QuantizedLinear,
             let b = inProjB as? QuantizedLinear,
             let a = inProjA as? QuantizedLinear,
@@ -349,13 +389,30 @@ final class Qwen35GatedDeltaNet: Module {
             qkv.groupSize == b.groupSize,
             qkv.groupSize == a.groupSize,
             qkv.mode == z.mode, qkv.mode == b.mode, qkv.mode == a.mode
-        else { return nil }
+        else {
+            fusedInputPermanentlyIneligible = true
+            return nil
+        }
+        let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
+        guard !trainableParameters().flattened().contains(where: { key, _ in
+            prefixes.contains(where: key.hasPrefix)
+        }) else { return nil }
         return (qkv, z, b, a)
     }
 
     @discardableResult
     func prepareFusedInputProjection() -> Bool {
-        if fusedInProj != nil { return true }
+        if fusedInputPermanentlyIneligible { return false }
+        if let fusedInputSourceSignature {
+            guard let projections = exactFrozenQuantizedInputProjections(),
+                sourceSignatureMatches(inputProjectionSourceSignature(projections), fusedInputSourceSignature)
+            else {
+                fusedInProj = nil
+                self.fusedInputSourceSignature = nil
+                return false
+            }
+            return fusedInProj != nil
+        }
         guard let projections = exactFrozenQuantizedInputProjections() else { return false }
         let fusedBiases: MLXArray?
         switch (
@@ -398,13 +455,15 @@ final class Qwen35GatedDeltaNet: Module {
             (qkvRows + zRows + bRows) ..< (qkvRows + zRows + 2 * bRows),
         ]
         func sourceView(_ rows: Range<Int>) -> QuantizedLinear {
-            QuantizedLinear(
+            let view = QuantizedLinear(
                 weight: fusedWeight[rows], bias: nil,
                 scales: fusedScales[rows],
                 biases: fusedBiases.map { $0[rows] },
                 groupSize: projections.qkv.groupSize,
                 bits: projections.qkv.bits,
                 mode: projections.qkv.mode)
+            view.freeze()
+            return view
         }
         // Preserve checkpoint/adaptor-facing module names as views into the
         // one fused physical allocation. A later module replacement invalidates
@@ -419,6 +478,11 @@ final class Qwen35GatedDeltaNet: Module {
         // updateModule invalidates on source replacement; assign only after
         // the stable named views have been installed.
         fusedInProj = fused
+        guard let current = exactFrozenQuantizedInputProjections() else {
+            fusedInProj = nil
+            return false
+        }
+        fusedInputSourceSignature = inputProjectionSourceSignature(current)
         return true
     }
 
