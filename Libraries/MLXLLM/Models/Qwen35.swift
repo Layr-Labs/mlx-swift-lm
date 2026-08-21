@@ -311,6 +311,15 @@ final class Qwen35GatedDeltaNet: Module {
         return (qkv, z, b, a)
     }
 
+    override func updateModule(key: String, _ value: Any) throws {
+        try super.updateModule(key: key, value)
+        if key == "in_proj_qkv" || key == "in_proj_z"
+            || key == "in_proj_b" || key == "in_proj_a"
+        {
+            fusedInProj = nil
+        }
+    }
+
     var hasFusedInputProjection: Bool { fusedInProj != nil }
 
     private func sourceInputProjectionsAreFrozen() -> Bool {
@@ -360,23 +369,55 @@ final class Qwen35GatedDeltaNet: Module {
         default:
             return false
         }
+        let fusedWeight = concatenated([
+            projections.qkv.weight, projections.z.weight,
+            projections.b.weight, projections.a.weight,
+        ], axis: 0)
+        let fusedScales = concatenated([
+            projections.qkv.scales, projections.z.scales,
+            projections.b.scales, projections.a.scales,
+        ], axis: 0)
+        eval(fusedWeight, fusedScales)
+        if let fusedBiases { eval(fusedBiases) }
+
         let fused = QuantizedLinear(
-            weight: concatenated([
-                projections.qkv.weight, projections.z.weight,
-                projections.b.weight, projections.a.weight,
-            ], axis: 0),
-            bias: nil,
-            scales: concatenated([
-                projections.qkv.scales, projections.z.scales,
-                projections.b.scales, projections.a.scales,
-            ], axis: 0),
-            biases: fusedBiases,
+            weight: fusedWeight, bias: nil,
+            scales: fusedScales, biases: fusedBiases,
             groupSize: projections.qkv.groupSize,
             bits: projections.qkv.bits,
-            mode: projections.qkv.mode
-        )
-        eval(fused)
+            mode: projections.qkv.mode)
         fused.freeze()
+
+        let qkvRows = keyDim * 2 + valueDim
+        let zRows = valueDim
+        let bRows = numVHeads
+        let ranges = [
+            0 ..< qkvRows,
+            qkvRows ..< (qkvRows + zRows),
+            (qkvRows + zRows) ..< (qkvRows + zRows + bRows),
+            (qkvRows + zRows + bRows) ..< (qkvRows + zRows + 2 * bRows),
+        ]
+        func sourceView(_ rows: Range<Int>) -> QuantizedLinear {
+            QuantizedLinear(
+                weight: fusedWeight[rows], bias: nil,
+                scales: fusedScales[rows],
+                biases: fusedBiases.map { $0[rows] },
+                groupSize: projections.qkv.groupSize,
+                bits: projections.qkv.bits,
+                mode: projections.qkv.mode)
+        }
+        // Preserve checkpoint/adaptor-facing module names as views into the
+        // one fused physical allocation. A later module replacement invalidates
+        // `fusedInProj` through updateModule before the next forward.
+        try! update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(sourceView(ranges[0])),
+                "in_proj_z": .value(sourceView(ranges[1])),
+                "in_proj_b": .value(sourceView(ranges[2])),
+                "in_proj_a": .value(sourceView(ranges[3])),
+            ]), verify: [])
+        // updateModule invalidates on source replacement; assign only after
+        // the stable named views have been installed.
         fusedInProj = fused
         return true
     }

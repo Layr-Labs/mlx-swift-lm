@@ -182,4 +182,28 @@ extension GatedDeltaFusedInputProjectionTests {
         XCTAssertFalse(layer.hasFusedInputProjection)
     }
 
+    func testReplacingSourceProjectionInvalidatesInferenceCache() throws {
+        let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
+        try layer.update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB, groupSize: 32, bits: 4)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
+            ]), verify: [])
+        XCTAssertTrue(layer.prepareFusedInputProjection())
+        XCTAssertTrue(layer.hasFusedInputProjection)
+
+        let adapted = LoRALinear.from(
+            linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
+        try layer.update(
+            modules: ModuleChildren(values: ["in_proj_qkv": .value(adapted)]),
+            verify: [])
+        XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertFalse(layer.prepareFusedInputProjection())
+        XCTAssertFalse(
+            ObjectIdentifier(type(of: layer.inProjQKV))
+                == ObjectIdentifier(QuantizedLinear.self))
+    }
+
 }
