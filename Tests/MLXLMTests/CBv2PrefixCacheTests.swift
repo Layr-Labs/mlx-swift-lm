@@ -29,6 +29,92 @@ private func hexData(_ value: String) -> Data? {
     return data
 }
 
+private struct BlockHashCorpus: Decodable {
+    let schemaVersion: Int
+    let blockHashVersion: String
+    let vectors: [BlockHashVector]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case blockHashVersion = "block_hash_version"
+        case vectors
+    }
+}
+
+private struct BlockHashVector: Decodable {
+    let name: String
+    let contractId: String
+    let scopeId: String
+    let blockIndex: Int
+    let parentHash: String
+    let tokenStart: Int
+    let tokenCount: Int
+    let expectedHash: String
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case contractId = "contract_id"
+        case scopeId = "scope_id"
+        case blockIndex = "block_index"
+        case parentHash = "parent_hash"
+        case tokenStart = "token_start"
+        case tokenCount = "token_count"
+        case expectedHash = "expected_hash"
+    }
+}
+
+private enum BlockHashCorpusError: Error, Equatable {
+    case unsupportedSchema(Int)
+    case unnamedVector
+    case duplicateVectorName(String)
+}
+
+private func decodeBlockHashCorpus(_ data: Data) throws -> BlockHashCorpus {
+    let corpus = try JSONDecoder().decode(BlockHashCorpus.self, from: data)
+    guard corpus.schemaVersion == 1 else {
+        throw BlockHashCorpusError.unsupportedSchema(corpus.schemaVersion)
+    }
+    var vectorNames = Set<String>()
+    for vector in corpus.vectors {
+        guard !vector.name.isEmpty else {
+            throw BlockHashCorpusError.unnamedVector
+        }
+        guard vectorNames.insert(vector.name).inserted else {
+            throw BlockHashCorpusError.duplicateVectorName(vector.name)
+        }
+    }
+    return corpus
+}
+
+private func packagedBlockHashFixtureURL() throws -> URL {
+    try XCTUnwrap(
+        Bundle.module.url(
+            forResource: "block_hash_vectors",
+            withExtension: "json"))
+}
+
+private func monorepoBlockHashFixtureURL() throws -> URL? {
+    let packageRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let monorepoRoot = packageRoot
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+    let marker = monorepoRoot.appendingPathComponent(".gitmodules")
+    guard FileManager.default.fileExists(atPath: marker.path) else {
+        return nil
+    }
+    let canonical = monorepoRoot
+        .appendingPathComponent("fixtures")
+        .appendingPathComponent("prompt-contract")
+        .appendingPathComponent("v1")
+        .appendingPathComponent("block_hash_vectors.json")
+    return try XCTUnwrap(
+        FileManager.default.fileExists(atPath: canonical.path) ? canonical : nil,
+        "monorepo checkout is missing canonical block hash vectors")
+}
+
 private func fullLayer() -> CBv2LayerKind {
     CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
 }
@@ -158,40 +244,8 @@ final class CBv2PrefixCacheHasherTests: XCTestCase {
     }
 
     func testSharedBinaryHashVectors() throws {
-        struct Corpus: Decodable {
-            let blockHashVersion: String
-            let vectors: [Vector]
-
-            enum CodingKeys: String, CodingKey {
-                case blockHashVersion = "block_hash_version"
-                case vectors
-            }
-        }
-        struct Vector: Decodable {
-            let contractId: String
-            let scopeId: String
-            let blockIndex: Int
-            let parentHash: String
-            let tokenStart: Int
-            let tokenCount: Int
-            let expectedHash: String
-
-            enum CodingKeys: String, CodingKey {
-                case contractId = "contract_id"
-                case scopeId = "scope_id"
-                case blockIndex = "block_index"
-                case parentHash = "parent_hash"
-                case tokenStart = "token_start"
-                case tokenCount = "token_count"
-                case expectedHash = "expected_hash"
-            }
-        }
-
-        let fixture = try XCTUnwrap(
-            Bundle.module.url(
-                forResource: "block_hash_vectors",
-                withExtension: "json"))
-        let corpus = try JSONDecoder().decode(Corpus.self, from: Data(contentsOf: fixture))
+        let fixture = try packagedBlockHashFixtureURL()
+        let corpus = try decodeBlockHashCorpus(Data(contentsOf: fixture))
         XCTAssertEqual(corpus.blockHashVersion, CBv2BlockHasher.version)
         for vector in corpus.vectors {
             let parent = try XCTUnwrap(hexData(vector.parentHash))
@@ -204,7 +258,70 @@ final class CBv2PrefixCacheHasherTests: XCTestCase {
                 parent: parent,
                 blockTokens: tokens,
                 blockIndex: vector.blockIndex)
-            XCTAssertEqual(hex(actual), vector.expectedHash)
+            XCTAssertEqual(hex(actual), vector.expectedHash, vector.name)
+        }
+    }
+
+    func testPackagedBlockHashFixtureMatchesMonorepoCanonical() throws {
+        let packaged = try Data(contentsOf: packagedBlockHashFixtureURL())
+        _ = try decodeBlockHashCorpus(packaged)
+
+        guard let canonicalURL = try monorepoBlockHashFixtureURL() else {
+            return
+        }
+        let canonical = try Data(contentsOf: canonicalURL)
+        _ = try decodeBlockHashCorpus(canonical)
+        XCTAssertEqual(
+            packaged,
+            canonical,
+            "packaged block hash fixture diverged from the monorepo canonical fixture")
+    }
+
+    func testBlockHashFixtureSchemaFailsClosed() {
+        let unsupported = Data(
+            #"{"schema_version":2,"block_hash_version":"unused","vectors":[]}"#.utf8)
+        XCTAssertThrowsError(try decodeBlockHashCorpus(unsupported)) { error in
+            XCTAssertEqual(error as? BlockHashCorpusError, .unsupportedSchema(2))
+        }
+
+        let missing = Data(
+            #"{"block_hash_version":"unused","vectors":[]}"#.utf8)
+        XCTAssertThrowsError(try decodeBlockHashCorpus(missing))
+    }
+
+    func testBlockHashFixtureDuplicateNamesFailClosed() {
+        let duplicateNames = Data(
+            #"""
+            {
+              "schema_version": 1,
+              "block_hash_version": "unused",
+              "vectors": [
+                {
+                  "name": "duplicate",
+                  "contract_id": "",
+                  "scope_id": "",
+                  "block_index": 0,
+                  "parent_hash": "",
+                  "token_start": 0,
+                  "token_count": 0,
+                  "expected_hash": ""
+                },
+                {
+                  "name": "duplicate",
+                  "contract_id": "",
+                  "scope_id": "",
+                  "block_index": 1,
+                  "parent_hash": "",
+                  "token_start": 0,
+                  "token_count": 0,
+                  "expected_hash": ""
+                }
+              ]
+            }
+            """#.utf8)
+
+        XCTAssertThrowsError(try decodeBlockHashCorpus(duplicateNames)) { error in
+            XCTAssertEqual(error as? BlockHashCorpusError, .duplicateVectorName("duplicate"))
         }
     }
 
