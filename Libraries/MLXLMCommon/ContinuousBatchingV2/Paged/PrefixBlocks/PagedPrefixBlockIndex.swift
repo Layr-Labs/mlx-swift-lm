@@ -23,7 +23,18 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
             self.bytes = bytes
         }
 
-        var allPages: [PagedKVPageHandle] { layerPages.compactMap { $0 }.flatMap { $0 } }
+        func allPagesSatisfy(_ predicate: (PagedKVPageHandle) -> Bool) -> Bool {
+            for case let pages? in layerPages {
+                guard pages.allSatisfy(predicate) else { return false }
+            }
+            return true
+        }
+
+        func forEachPage(_ body: (PagedKVPageHandle) -> Void) {
+            for case let pages? in layerPages {
+                for handle in pages { body(handle) }
+            }
+        }
     }
 
     let config: CBv2PagedPrefixCacheConfig
@@ -37,9 +48,14 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
     /// A content hash may have multiple physical realizations. Keeping all of
     /// them matches vLLM and lets reuse of one page leave another hit alive.
     private var entryIDsByHash: [Data: [UInt64]] = [:]
-    /// Complete reverse aliases. Reusing one page removes every block bundle
-    /// that contains it before the generation changes.
-    private var entryIDsByPage: [PagedKVPageHandle: Set<UInt64>] = [:]
+    /// One content identity per physical realization, matching vLLM's
+    /// one-block-hash-per-allocator-block invariant. Reusing one constituent
+    /// removes the complete multi-layer bundle before the generation changes.
+    private var entryIDByPage: [PagedKVPageHandle: UInt64] = [:]
+    /// A same-generation page observed under conflicting content identities is
+    /// not safe to cache under either one. Quarantine it until allocator reuse
+    /// advances its generation. This set is bounded by the physical page pool.
+    private var conflictedPages: Set<PagedKVPageHandle> = []
     private var nextEntryID: UInt64 = 0
     private var bytesIndexed = 0
     private var hits = 0
@@ -142,7 +158,7 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
             var valid: Entry?
             for id in entryIDsByHash[hash] ?? [] {
                 guard let entry = entries[id] else { continue }
-                if entry.allPages.allSatisfy({ pool.isValid($0) }) {
+                if entry.allPagesSatisfy({ pool.isValid($0) }) {
                     valid = entry
                     break
                 }
@@ -181,6 +197,19 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
             let hash: Data
             let layerPages: [[PagedKVPageHandle]?]
             let bytes: Int
+
+            func allPagesSatisfy(_ predicate: (PagedKVPageHandle) -> Bool) -> Bool {
+                for case let pages? in layerPages {
+                    guard pages.allSatisfy(predicate) else { return false }
+                }
+                return true
+            }
+
+            func forEachPage(_ body: (PagedKVPageHandle) -> Void) {
+                for case let pages? in layerPages {
+                    for handle in pages { body(handle) }
+                }
+            }
         }
         var candidates: [Candidate] = []
         candidates.reserveCapacity(blockIndices.count)
@@ -188,6 +217,7 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
             let tokenRange =
                 (blockIndex * hasher.blockSize) ..< ((blockIndex + 1) * hasher.blockSize)
             var layerPages = [[PagedKVPageHandle]?](repeating: nil, count: layerKinds.count)
+            var distinctPages: Set<PagedKVPageHandle> = []
             var bytes = 0
             var sawCacheableLayer = false
             for layerIndex in layerKinds.indices where Self.isCacheable(layerKinds[layerIndex]) {
@@ -197,6 +227,9 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
                     handles.count == pagesPerBlock
                 else { return 0 }
                 layerPages[layerIndex] = handles
+                for handle in handles {
+                    guard distinctPages.insert(handle).inserted else { return 0 }
+                }
                 sawCacheableLayer = true
                 let pageBytes = pool.group(PagedKVGroupKey(layerKinds[layerIndex])).pageBytes
                 let (layerBytes, layerOverflow) = pageBytes.multipliedReportingOverflow(
@@ -217,13 +250,55 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
         defer { lock.unlock() }
         var published = 0
         for candidate in candidates {
-            let duplicate = (entryIDsByHash[candidate.hash] ?? []).contains { id in
-                entries[id]?.layerPages == candidate.layerPages
+            // A conflicting identity is impossible in a valid engine flow: a
+            // same-generation physical page contains exactly one logical token
+            // block under one immutable request scope. Do not let a malformed
+            // publisher multiply metadata aliases (or choose which identity is
+            // truthful). Invalidate every overlapping bundle and quarantine all
+            // involved pages until their generations advance.
+            guard candidate.allPagesSatisfy({ pool.isValid($0) }) else { break }
+            if !candidate.allPagesSatisfy({ !conflictedPages.contains($0) }) {
+                break
             }
-            if duplicate {
+            var overlappingIDs: Set<UInt64> = []
+            candidate.forEachPage { handle in
+                if let id = entryIDByPage[handle] { overlappingIDs.insert(id) }
+            }
+            if overlappingIDs.count == 1,
+                let id = overlappingIDs.first,
+                let existing = entries[id],
+                existing.hash == candidate.hash,
+                existing.layerPages == candidate.layerPages
+            {
                 published += 1
                 continue
             }
+            if !overlappingIDs.isEmpty,
+                overlappingIDs.allSatisfy({ entries[$0]?.hash == candidate.hash })
+            {
+                // A replay can replace only the tail page(s) of a logical
+                // block while retaining its earlier pages. The content hash
+                // is unchanged, so replace every overlapping realization and
+                // keep the newest complete bundle. This preserves one owner
+                // per physical page without rejecting supported block sizes
+                // larger than the allocator page size.
+                for id in overlappingIDs { removeEntryLocked(id) }
+            } else if !overlappingIDs.isEmpty {
+                var quarantine: Set<PagedKVPageHandle> = []
+                candidate.forEachPage { quarantine.insert($0) }
+                for id in overlappingIDs {
+                    entries[id]?.forEachPage { quarantine.insert($0) }
+                }
+                for id in overlappingIDs { removeEntryLocked(id) }
+                conflictedPages.formUnion(quarantine)
+                break
+            }
+
+            let (nextBytesIndexed, overflow) = bytesIndexed.addingReportingOverflow(
+                candidate.bytes)
+            precondition(
+                !overflow && nextBytesIndexed <= pool.bytesCapacity,
+                "paged prefix metadata exceeded the physical page pool")
             nextEntryID &+= 1
             precondition(nextEntryID != 0, "paged prefix entry id overflow")
             let entry = Entry(
@@ -233,10 +308,13 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
                 bytes: candidate.bytes)
             entries[entry.id] = entry
             entryIDsByHash[entry.hash, default: []].append(entry.id)
-            for handle in entry.allPages {
-                entryIDsByPage[handle, default: []].insert(entry.id)
+            candidate.forEachPage { handle in
+                precondition(
+                    entryIDByPage[handle] == nil && !conflictedPages.contains(handle),
+                    "physical page indexed under multiple content identities")
+                entryIDByPage[handle] = entry.id
             }
-            bytesIndexed += entry.bytes
+            bytesIndexed = nextBytesIndexed
             published += 1
         }
         return published
@@ -257,14 +335,14 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
         precondition(pool === self.pool)
         lock.lock()
         defer { lock.unlock() }
-        return !(entryIDsByPage[handle]?.isEmpty ?? true)
+        return entryIDByPage[handle] != nil
     }
 
     func pagedKVPool(_ pool: PagedKVPool, willReuse handle: PagedKVPageHandle) {
         precondition(pool === self.pool)
         lock.lock()
-        let ids = Array(entryIDsByPage[handle] ?? [])
-        for id in ids { removeEntryLocked(id) }
+        conflictedPages.remove(handle)
+        if let id = entryIDByPage[handle] { removeEntryLocked(id) }
         lock.unlock()
     }
 
@@ -281,15 +359,10 @@ final class PagedPrefixBlockIndex: PagedKVPageReuseObserver, @unchecked Sendable
             }
         }
         var orphanedPages: [PagedKVPageHandle] = []
-        for handle in entry.allPages {
-            guard var ids = entryIDsByPage[handle] else { continue }
-            ids.remove(id)
-            if ids.isEmpty {
-                entryIDsByPage.removeValue(forKey: handle)
-                orphanedPages.append(handle)
-            } else {
-                entryIDsByPage[handle] = ids
-            }
+        entry.forEachPage { handle in
+            guard entryIDByPage[handle] == id else { return }
+            entryIDByPage.removeValue(forKey: handle)
+            orphanedPages.append(handle)
         }
         bytesIndexed -= entry.bytes
         precondition(bytesIndexed >= 0)

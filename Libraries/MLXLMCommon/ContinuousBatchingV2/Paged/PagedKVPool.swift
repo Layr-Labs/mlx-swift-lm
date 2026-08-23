@@ -886,11 +886,17 @@ public final class PagedKVPool {
     public func reserve(_ needs: [PagedKVGroupKey: Int]) throws {
         // Validate everything first — no partial reservations.
         for (key, pages) in needs {
+            guard pages >= 0 else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "negative paged KV reservation for group \(key): \(pages)")
+            }
             let g = group(key)
             let available = g.usablePageCount - g.pagesReserved
             if pages > available {
+                let (neededBytes, overflow) = pages.multipliedReportingOverflow(by: g.pageBytes)
                 throw CBv2KVError.capacityExhausted(
-                    needed: pages * g.pageBytes, available: max(0, available) * g.pageBytes)
+                    needed: overflow ? Int.max : neededBytes,
+                    available: max(0, available) * g.pageBytes)
             }
         }
         for (key, pages) in needs {
@@ -899,10 +905,17 @@ public final class PagedKVPool {
     }
 
     public func unreserve(_ needs: [PagedKVGroupKey: Int]) {
+        // Validate the complete release before touching any group so a bad
+        // caller cannot partially corrupt a multi-group reservation ledger.
         for (key, pages) in needs {
-            let g = group(key)
-            g.pagesReserved -= pages
-            precondition(g.pagesReserved >= 0, "unreserve underflow for group \(key)")
+            let reserved = group(key).pagesReserved
+            precondition(pages >= 0, "negative paged KV unreservation for group \(key)")
+            precondition(
+                pages <= reserved,
+                "unreserve underflow for group \(key): \(pages) > \(reserved)")
+        }
+        for (key, pages) in needs {
+            group(key).pagesReserved -= pages
         }
     }
 

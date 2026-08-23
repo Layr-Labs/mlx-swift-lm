@@ -224,6 +224,40 @@ struct CBv2PagedPrefixBlockCacheTests {
         #expect(backend.residentPrefixCacheStats?.blockCount == 0)
     }
 
+    @Test func sameHashTailReplayReplacesTheOverlappingRealization() throws {
+        let backend = try makeBackend(capacityBytes: 64 << 10)
+        let tokens = Array(0 ..< 33)
+        let donor = try makeState(backend: backend, tokenCount: 32, maxLength: 32)
+        defer { backend.release(donor.state) }
+        let originalPages = try #require(
+            donor.row.prefixPageHandles(tokens: 0 ..< Self.blockSize))
+        _ = try publish(backend, state: donor.state, tokens: tokens)
+
+        // A tail replay can preserve the first allocator page of a logical
+        // cache block while replacing its second page. Its full-block content
+        // hash remains the same, so the new complete realization must replace
+        // the overlapping old one instead of being treated as a conflict.
+        donor.row.rollback(Self.pageSize)
+        for _ in 0 ..< Self.pageSize { _ = donor.row.prepareDecodeWrite() }
+        let replayedPages = try #require(
+            donor.row.prefixPageHandles(tokens: 0 ..< Self.blockSize))
+        #expect(replayedPages[0] == originalPages[0])
+        #expect(replayedPages[1] != originalPages[1])
+
+        _ = try publish(backend, state: donor.state, tokens: tokens)
+        let match = try #require(
+            backend.longestResidentPrefix(for: try probe(backend, tokens: tokens)))
+        let resolved = try #require(backend.residentPrefixIndex?.resolve(match))
+        #expect(try #require(resolved.layerPages.first ?? nil) == replayedPages)
+        #expect(backend.residentPrefixCacheStats?.blockCount == 1)
+        #expect(backend.residentPrefixCacheStats?.invalidations == 1)
+
+        let key = PagedKVGroupKey(fullKind())
+        #expect(
+            backend.pool.group(key).freeList.first == originalPages[1].page,
+            "the replaced tail must become immediately reusable")
+    }
+
     @Test func lookupStopsAtTheFirstDivergenceAndCacheSaltIsolatesChains() throws {
         let backend = try makeBackend()
         let common = Array(0 ..< 32)
@@ -251,9 +285,12 @@ struct CBv2PagedPrefixBlockCacheTests {
         #expect(
             backend.longestResidentPrefix(for: try probe(backend, tokens: foreignRoot)) == nil)
 
-        // One physical realization may be indexed under another authenticated
-        // scope, but a lookup can only traverse the chain for its own salt.
-        _ = try publish(backend, state: donorA.state, tokens: branchA, salt: "tenant-a")
+        // Each authenticated scope computes its own physical realization; a
+        // lookup can only traverse the chain for that scope's salt.
+        let tenantDonor = try makeState(backend: backend, tokenCount: 64, maxLength: 96)
+        defer { backend.release(tenantDonor.state) }
+        _ = try publish(
+            backend, state: tenantDonor.state, tokens: branchA, salt: "tenant-a")
         let tenantA = try #require(
             backend.longestResidentPrefix(
                 for: try probe(backend, tokens: branchA, salt: "tenant-a")))
