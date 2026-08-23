@@ -228,3 +228,21 @@ extension GatedDeltaFusedInputProjectionTests {
     }
 
 }
+
+/// The fused input projection is hardware dependent: qualified as a win on a
+/// large GPU, measured as a regression on a 16-core M1 Pro that grows with
+/// prompt length. It therefore ships opt-in rather than default-on, so a mixed
+/// Apple Silicon fleet does not inherit a speed change per device that was never
+/// measured there.
+final class GatedDeltaFusedInputProjectionOptInTests: XCTestCase {
+
+    func testFusionIsOptInByDefault() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLX_QWEN_FUSED_INPUT_PROJECTION"] == nil,
+            "switch overridden in this environment")
+        XCTAssertFalse(
+            qwenFusedInputProjectionEnabled,
+            "the fused GDN input projection must not engage unless explicitly enabled")
+    }
+
+}

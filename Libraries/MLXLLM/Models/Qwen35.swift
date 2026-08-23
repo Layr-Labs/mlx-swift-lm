@@ -219,6 +219,25 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+/// Opt-in switch for the fused GDN input projection.
+///
+/// The fusion replaces four quantized projections with one `hidden -> 12,352`
+/// projection plus views. Its benefit is hardware dependent: it was qualified on
+/// a large-GPU box, where one wide matmul fills the machine better than four
+/// narrow ones, but on a 16-core M1 Pro the same substitution is a measured
+/// regression that grows with prompt length (+5.0% at 2,048 tokens, +11.4% at
+/// 8,192; interleaved A/B, 40 chained projections per eval, tight IQRs).
+///
+/// Default off so a provider fleet of mixed Apple Silicon does not inherit a
+/// per-device speed change it was never measured on. Set
+/// `MLX_QWEN_FUSED_INPUT_PROJECTION=1` to enable, mirroring
+/// `MLX_QWEN_DIRECT_EXPERT_REDUCTION`.
+let qwenFusedInputProjectionEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN_FUSED_INPUT_PROJECTION"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return raw == "1" || raw == "true" || raw == "on"
+}()
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -489,7 +508,9 @@ final class Qwen35GatedDeltaNet: Module {
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
-        guard prepareFusedInputProjection(), let fusedInProj else {
+        guard qwenFusedInputProjectionEnabled,
+            prepareFusedInputProjection(), let fusedInProj
+        else {
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),
