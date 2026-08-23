@@ -486,10 +486,41 @@ final class Qwen35GatedDeltaNet: Module {
         return true
     }
 
+    /// Minimum token count for the fused input projection.
+    ///
+    /// The fusion amortizes one wide quantized matmul over a whole prefill
+    /// stripe, which is where its measured win comes from. A decode step is a
+    /// single token, so there is nothing to amortize: each of the 30 GDN layers
+    /// pays one wide matvec plus four non-contiguous slices to produce the same
+    /// four tensors the separate projections return directly. Defaults to 2, so
+    /// decode width takes the pre-fusion path and every wider shape keeps the
+    /// fused one. Override with `MLX_QWEN_FUSED_INPUT_MIN_TOKENS` to re-qualify
+    /// the crossover on real hardware.
+    static let fusedInputProjectionMinTokens: Int = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "MLX_QWEN_FUSED_INPUT_MIN_TOKENS"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            let parsed = Int(raw), parsed >= 1
+        else { return 2 }
+        return parsed
+    }()
+
+    /// Whether a projection of `tokenCount` rows should take the fused path.
+    /// Pure and independent of MLX so the policy can be tested without a device.
+    static func shouldFuseInputProjection(tokenCount: Int) -> Bool {
+        tokenCount >= fusedInputProjectionMinTokens
+    }
+
     private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
-        guard prepareFusedInputProjection(), let fusedInProj else {
+        // Gate on the row count of the projection, not just on eligibility. The
+        // fused path was previously taken for every shape including decode, which
+        // is the one width where it cannot pay for itself.
+        guard Self.shouldFuseInputProjection(tokenCount: S),
+            prepareFusedInputProjection(), let fusedInProj
+        else {
             return (
                 inProjQKV(inputs),
                 inProjZ(inputs).reshaped(B, S, numVHeads, headVDim),

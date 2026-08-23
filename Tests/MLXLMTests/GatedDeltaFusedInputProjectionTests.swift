@@ -228,3 +228,33 @@ extension GatedDeltaFusedInputProjectionTests {
     }
 
 }
+
+/// The fused input projection is a prefill optimization. Applying it at decode
+/// width costs one wide matvec plus four non-contiguous slices per GDN layer
+/// with nothing to amortize them against, which is what regressed production
+/// decode throughput when the fusion shipped ungated. These pin the shape gate.
+final class GatedDeltaFusedInputProjectionGateTests: XCTestCase {
+
+    func testDecodeWidthTakesTheSeparateProjections() {
+        XCTAssertFalse(
+            Qwen35GatedDeltaNet.shouldFuseInputProjection(tokenCount: 1),
+            "a single-token step must not pay for the fused projection")
+    }
+
+    func testPrefillWidthsTakeTheFusedProjection() {
+        for tokens in [2, 8, 128, 512, 2048, 8192] {
+            XCTAssertTrue(
+                Qwen35GatedDeltaNet.shouldFuseInputProjection(tokenCount: tokens),
+                "\(tokens) tokens should keep the fused projection")
+        }
+    }
+
+    func testDefaultThresholdIsDecodeWidthOnly() throws {
+        // Only S == 1 is excluded by default; the crossover above that is left to
+        // MLX_QWEN_FUSED_INPUT_MIN_TOKENS so it can be qualified on real hardware.
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MLX_QWEN_FUSED_INPUT_MIN_TOKENS"] == nil,
+            "threshold overridden in this environment")
+        XCTAssertEqual(Qwen35GatedDeltaNet.fusedInputProjectionMinTokens, 2)
+    }
+}
