@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Model | /Users/gaj/.cache/huggingface/hub/models--mlx-community--gemma-4-26B-A4B-it-qat-4bit/snapshots/0e3cbab38ce568cf6e23543010d08d03b731910c/ |
+| Model | ~/.cache/huggingface/hub/models--mlx-community--gemma-4-26B-A4B-it-qat-4bit/snapshots/0e3cbab38ce568cf6e23543010d08d03b731910c/ |
 | Chip | Apple M4 Max |
 | RAM | 128 GB |
 | OS | Version 26.5 (Build 25F71) |

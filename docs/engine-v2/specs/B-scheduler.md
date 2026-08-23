@@ -66,4 +66,4 @@ G's tiny fixture and F's adapters satisfy it. Do not import MLXLLM.
 ## References
 Report 08 §1 (vLLM scheduler mechanics, optimistic advance), report 09 §7
 (SGLang MLX chained overlap), plan §7 Phase 3. Corpus root:
-`/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+`~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
