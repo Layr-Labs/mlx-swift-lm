@@ -362,7 +362,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             let keepPages = (absoluteOffset + pool.config.pageSize - 1) / pool.config.pageSize
             if keepPages < table.count {
                 if speculativeBase == nil {
-                    pool.freePages(group: groupKey, pages: table[keepPages...])
+                    pool.freePages(group: groupKey, pages: table[keepPages...].reversed())
                 } else {
                     // Inside a round the release is DEFERRED to commit; see
                     // `commitSpeculativeWrite`. The pages stay out of the
@@ -370,7 +370,8 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
                     // ones — which cannot breach the reservation, because a
                     // transaction never writes after its rollback (the engine
                     // rolls back at finalize, EngineLoopV2+MTPFinalize).
-                    pool.deferFreePages(group: groupKey, pages: table[keepPages...])
+                    pool.deferFreePages(
+                        group: groupKey, pages: table[keepPages...].reversed())
                 }
                 table.removeSubrange(keepPages...)
                 tableVersion += 1
@@ -649,6 +650,51 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         writtenHighWater = offset
     }
 
+    // MARK: - Page-native prefix sharing
+
+    /// Generation-checked handles for an immutable, page-aligned range of a
+    /// FULL row. Publication never exposes a partial frontier page: an adopter
+    /// must be able to append without copy-on-write.
+    func prefixPageHandles(tokens range: Range<Int>) -> [PagedKVPageHandle]? {
+        guard windowSize == nil, !released else { return nil }
+        let pageSize = pool.config.pageSize
+        guard range.lowerBound >= 0, range.upperBound <= writtenHighWater,
+            range.lowerBound % pageSize == 0, range.upperBound % pageSize == 0
+        else { return nil }
+        let pageRange = (range.lowerBound / pageSize) ..< (range.upperBound / pageSize)
+        guard pageRange.upperBound <= table.count else { return nil }
+        return table[pageRange].map {
+            pool.currentHandle(group: groupKey, page: $0)
+        }
+    }
+
+    /// Install pages whose retains were acquired transactionally by the pool.
+    /// FULL rows only; the row takes ownership of exactly one reference per
+    /// handle and releases it through the normal table lifecycle.
+    func adoptSharedPages(
+        _ handles: [PagedKVPageHandle], storedThrough: Int, cursor: Int,
+        frozenThrough: Int
+    ) {
+        precondition(windowSize == nil, "shared-page adoption is full-attention only")
+        precondition(
+            table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
+            "shared-page adoption requires a fresh row")
+        let pageSize = pool.config.pageSize
+        precondition(storedThrough == handles.count * pageSize)
+        precondition(storedThrough <= maxLength && handles.count <= reservedPages)
+        precondition(cursor >= 0 && cursor <= storedThrough)
+        precondition(frozenThrough == 0 || frozenThrough == storedThrough)
+        precondition(frozenThrough == 0 ? cursor == storedThrough : cursor <= frozenThrough)
+        for handle in handles {
+            precondition(handle.group == groupKey && pool.isValid(handle))
+        }
+        table = handles.map(\.page)
+        tableVersion += 1
+        absoluteOffset = cursor
+        writtenHighWater = storedThrough
+        frozenHighWater = frozenThrough
+    }
+
     /// Adopt `[0, M)` as immutable storage with the logical cursor at C.
     /// FULL rows only; call once, on a fresh row, before anything else.
     /// `keys`/`values` are `[kvHeads, M, headDim]`.
@@ -697,7 +743,9 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             speculativeBase = nil
             pool.drainDeferredFrees()
         }
-        pool.freePages(group: groupKey, pages: table)
+        // Tail-first release gives equally recent cached pages leaf-biased
+        // eviction: divergent suffix pages re-enter the LRU before ancestors.
+        pool.freePages(group: groupKey, pages: table.reversed())
         table.removeAll()
         tableVersion += 1
         pool.unreserve([groupKey: reservedPages])

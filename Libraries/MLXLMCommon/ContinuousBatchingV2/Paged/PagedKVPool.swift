@@ -14,11 +14,12 @@
 //   are forbidden.
 // - Page size is 16 tokens (`CBv2PagedDefaults.pageSize`), matching
 //   vLLM/mistral.rs block sizes. Revisit after kernel benchmarks.
-// - The free list is a plain stack of page indices: O(1) allocate/free.
-//   Pages carry refcounts, but every count is 0 or 1 — nothing retains a
-//   page twice. Copy-free prefix sharing would be what pushes a count
-//   above 1, and it does not exist: window adoption COPIES bytes
-//   (`PagedKVBackend.installWindow`), it does not adopt pages.
+// - Zero-ref pages live in an intrusive FIFO free queue. Uncached releases
+//   go to its head for immediate reuse; cache-indexed releases go to its tail
+//   as the LRU end. A prefix hit can unlink a cached page from the middle in
+//   O(1), increment its refcount, and install the same physical page in a new
+//   request's table. Allocation removes every cache alias before incrementing
+//   the page generation and returning it for a write.
 // - Admission is RESERVATION based: the CBv2 contract's
 //   `CBv2SequenceKV.update` cannot throw, so capacity failures mid-decode
 //   would be unrecoverable. Instead, `reserve` claims the worst-case page
@@ -89,8 +90,9 @@ public struct PagedKVPoolConfig: Sendable {
     /// at, or `nil` for a pool that will never participate in block sharing
     /// (unit fixtures, microbenchmarks).
     ///
-    /// Set this to `CBv2BlockHasher.defaultBlockSize` for any pool behind a
-    /// prefix cache. It arms the WS-0.6 chunk-coverage guard below, which
+    /// Set this to the block size of the page-sharing cache. `PagedKVBackend`
+    /// does that automatically when `residentPrefixCache` is configured. It
+    /// arms the WS-0.6 chunk-coverage guard below, which
     /// is not merely advisory: WS-4's windowed-sharing residency proof
     /// assumes one prefill chunk plus the frontier's partial page covers a
     /// whole block, so a pool that cannot do that must be refused rather
@@ -152,14 +154,16 @@ final class PagedKVGroup {
     /// Latest fence of the group's bulk-write chain (`[1]` int32). Gathers
     /// consume it so page reads order after every prior bulk write.
     var writeFence: MLXArray
-    /// Stack of free page ids — O(1) alloc/free.
-    var freeList: [Int32]
-    /// Per-page refcount. Effectively a 0/1 owned flag: `allocatePage` sets
-    /// 1, `freePage` clears to 0, and the poison page is pinned at 1. No
-    /// code path raises a count above 1 — page sharing would need a retain
-    /// operation and a sharing-aware `installWindow` (which copies bytes, it
-    /// does not adopt pages), neither of which exists.
+    /// Intrusive free queue. The computed array preserves the historical
+    /// test/diagnostic surface without making arbitrary removal O(n).
+    private var freeQueue: PagedBlockFreeQueue
+    var freeList: [Int32] { freeQueue.elements }
+    /// Per-page active-owner count. A cached page may have count zero (in the
+    /// free queue) or positive (shared by one or more request tables).
     var refCounts: [Int]
+    /// Incremented immediately before a zero-ref page is reused for a write.
+    /// Prefix metadata carries this generation to close page-id ABA races.
+    var generations: [UInt64]
     /// Pages currently held by sequences (refCount > 0).
     private(set) var pagesInUse: Int = 0
     /// Pages promised to admitted sequences (lazily materialized).
@@ -227,11 +231,10 @@ final class PagedKVGroup {
         self.kSlab = MLXArray.zeros(shape, dtype: dtype)
         self.vSlab = MLXArray.zeros(shape, dtype: dtype)
         self.writeFence = MLXArray.zeros([1], dtype: .int32)
-        // LIFO stack: lowest ids pop first, so fresh sequential allocations
-        // tend to be physically consecutive (enables run-coalesced writes).
-        // The poison page is EXCLUDED — it is never handed out, so the
-        // stack starts one past it.
-        self.freeList = Array((Self.poisonPage + 1 ..< Int32(pageCount)).reversed())
+        // Initial FIFO order is ascending ids, so fresh allocations remain
+        // physically consecutive (enables run-coalesced writes). The poison
+        // page is excluded permanently.
+        self.freeQueue = PagedBlockFreeQueue(pageCount: pageCount, excluding: Self.poisonPage)
         // The slabs are zero-initialised and no write can ever address the
         // poison page (every slot comes from an allocated page id), so
         // pinning its refcount at 1 is the whole of "permanently zeroed":
@@ -239,6 +242,7 @@ final class PagedKVGroup {
         var counts = [Int](repeating: 0, count: pageCount)
         counts[Int(Self.poisonPage)] = 1
         self.refCounts = counts
+        self.generations = [UInt64](repeating: 0, count: pageCount)
     }
 
     /// True when `page` is a page a sequence row can own. The poison page
@@ -247,32 +251,93 @@ final class PagedKVGroup {
         page != Self.poisonPage && page >= 0 && Int(page) < pageCount
     }
 
-    func allocatePage() -> Int32 {
+    func currentHandle(_ page: Int32) -> PagedKVPageHandle {
+        precondition(isAllocatable(page))
+        return PagedKVPageHandle(
+            group: key, page: page, generation: generations[Int(page)])
+    }
+
+    func isValid(_ handle: PagedKVPageHandle) -> Bool {
+        handle.group == key && isAllocatable(handle.page)
+            && generations[Int(handle.page)] == handle.generation
+    }
+
+    func allocatePage(willReuse: (PagedKVPageHandle) -> Void) -> Int32 {
         precondition(
-            !freeList.isEmpty,
+            freeQueue.count > 0,
             "[PagedKVPool] free list underflow for group \(key) — reservation accounting bug")
-        let page = freeList.removeLast()
+        let page = freeQueue.first
         precondition(
             page != Self.poisonPage,
             "[PagedKVPool] poison page escaped the free list for group \(key)")
         precondition(refCounts[Int(page)] == 0)
+        // The prefix index is non-owning. Invalidate every alias while the
+        // page still names its old generation, before it can be returned for
+        // a write. The observer is internal/nonthrowing; it may only reorder
+        // generation-valid zero-ref pages whose last aliases disappear.
+        // This selected page stays queued until the callback returns, then is
+        // removed explicitly below, so no half-allocation can escape.
+        willReuse(currentHandle(page))
+        freeQueue.remove(page)
+        let nextGeneration = generations[Int(page)] &+ 1
+        precondition(nextGeneration != 0, "page generation overflow in group \(key)")
+        generations[Int(page)] = nextGeneration
         refCounts[Int(page)] = 1
         pagesInUse += 1
         return page
     }
 
-    func freePage(_ page: Int32) {
-        precondition(
-            page != Self.poisonPage,
-            "[PagedKVPool] free of the reserved poison page in group \(key) — a row "
-                + "should never have held it")
-        let i = Int(page)
-        precondition(refCounts[i] > 0, "double free of page \(page) in group \(key)")
-        refCounts[i] -= 1
-        if refCounts[i] == 0 {
-            freeList.append(page)
-            pagesInUse -= 1
+    /// Retain every handle after an all-or-nothing validation pass in the
+    /// owning pool. A zero-ref cached page is resurrected from the middle of
+    /// the free queue; an already-active page simply gains another owner.
+    func retain(_ handle: PagedKVPageHandle) {
+        precondition(isValid(handle))
+        let index = Int(handle.page)
+        if refCounts[index] == 0 {
+            precondition(freeQueue.contains(handle.page))
+            freeQueue.remove(handle.page)
+            pagesInUse += 1
+        } else {
+            precondition(!freeQueue.contains(handle.page))
         }
+        refCounts[index] += 1
+    }
+
+    func reclassifyAsUncached(_ handle: PagedKVPageHandle) {
+        guard isValid(handle) else { return }
+        let index = Int(handle.page)
+        guard refCounts[index] == 0, freeQueue.contains(handle.page) else { return }
+        freeQueue.moveToFront(handle.page)
+    }
+
+    /// Release in caller-supplied eviction order. vLLM frees a request's
+    /// page tables tail-first; cached pages append in that same order so a
+    /// branch suffix is reused before its more valuable ancestors. Uncached
+    /// pages prepend for immediate reuse.
+    func release<S: Sequence>(
+        _ pages: S, isCached: (PagedKVPageHandle) -> Bool
+    ) where S.Element == Int32 {
+        var uncached: [Int32] = []
+        var cached: [Int32] = []
+        for page in pages {
+            precondition(
+                page != Self.poisonPage,
+                "[PagedKVPool] free of the reserved poison page in group \(key) — a row "
+                    + "should never have held it")
+            let index = Int(page)
+            precondition(refCounts[index] > 0, "double free of page \(page) in group \(key)")
+            refCounts[index] -= 1
+            guard refCounts[index] == 0 else { continue }
+            precondition(!freeQueue.contains(page))
+            pagesInUse -= 1
+            if isCached(currentHandle(page)) {
+                cached.append(page)
+            } else {
+                uncached.append(page)
+            }
+        }
+        freeQueue.prepend(contentsOf: uncached)
+        freeQueue.append(contentsOf: cached)
     }
 
     /// Queue `page` for release at the end of a speculative transaction.
@@ -284,8 +349,8 @@ final class PagedKVGroup {
         deferredFrees.append(page)
     }
 
-    func drainDeferredFrees() {
-        for page in deferredFrees { freePage(page) }
+    func drainDeferredFrees(isCached: (PagedKVPageHandle) -> Bool) {
+        release(deferredFrees, isCached: isCached)
         deferredFrees.removeAll(keepingCapacity: true)
     }
 }
@@ -300,6 +365,9 @@ public final class PagedKVPool {
     /// request-time resource-failure path.
     let kernelSource: String
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
+    /// At most one page-native prefix index may observe a pool. Weak avoids a
+    /// cache↔backend ownership cycle; the cache retains the backend/pool.
+    weak var pageReuseObserver: (any PagedKVPageReuseObserver)?
 
     /// Monotonic identity for every `PagedSequenceKV` minted against this
     /// pool. Unlike `ObjectIdentifier` (a heap address, reusable after
@@ -311,6 +379,15 @@ public final class PagedKVPool {
     func nextRowSerial() -> UInt64 {
         lastRowSerial += 1
         return lastRowSerial
+    }
+
+    func installPageReuseObserver(_ observer: any PagedKVPageReuseObserver) {
+        if let existing = pageReuseObserver {
+            precondition(
+                existing === observer,
+                "[PagedKVPool] only one page-native prefix cache may observe a pool")
+        }
+        pageReuseObserver = observer
     }
 
     /// Groups in deterministic order (for tests/telemetry).
@@ -832,14 +909,46 @@ public final class PagedKVPool {
     // MARK: - Page lifecycle
 
     func allocatePage(group key: PagedKVGroupKey) -> Int32 {
-        group(key).allocatePage()
+        group(key).allocatePage { [unowned self] handle in
+            pageReuseObserver?.pagedKVPool(self, willReuse: handle)
+        }
     }
 
     func freePages(group key: PagedKVGroupKey, pages: some Sequence<Int32>) {
         let g = group(key)
-        for page in pages {
-            g.freePage(page)
+        g.release(pages) { [unowned self] handle in
+            pageReuseObserver?.pagedKVPool(self, isCached: handle) ?? false
         }
+    }
+
+    func currentHandle(group key: PagedKVGroupKey, page: Int32) -> PagedKVPageHandle {
+        group(key).currentHandle(page)
+    }
+
+    func isValid(_ handle: PagedKVPageHandle) -> Bool {
+        groups[handle.group]?.isValid(handle) == true
+    }
+
+    /// All-or-nothing generation validation, followed by one retain per page
+    /// table reference. Must run on the engine queue.
+    func retainPages(_ handles: some Collection<PagedKVPageHandle>) -> Bool {
+        guard handles.allSatisfy({ isValid($0) }) else { return false }
+        for handle in handles {
+            group(handle.group).retain(handle)
+        }
+        return true
+    }
+
+    func refCount(for handle: PagedKVPageHandle) -> Int? {
+        guard isValid(handle) else { return nil }
+        return group(handle.group).refCounts[Int(handle.page)]
+    }
+
+    /// Move a generation-valid, zero-ref page to the immediate-reuse end after
+    /// its final cache alias disappears. Active pages are classified when
+    /// their last owner releases them instead.
+    func reclassifyAsUncached(_ handle: PagedKVPageHandle) {
+        groups[handle.group]?.reclassifyAsUncached(handle)
     }
 
     /// Queue `pages` for release at the END of a speculative transaction
@@ -873,7 +982,9 @@ public final class PagedKVPool {
     /// queue per-row.
     func drainDeferredFrees() {
         for g in groups.values {
-            g.drainDeferredFrees()
+            g.drainDeferredFrees { [unowned self] handle in
+                pageReuseObserver?.pagedKVPool(self, isCached: handle) ?? false
+            }
         }
     }
 
