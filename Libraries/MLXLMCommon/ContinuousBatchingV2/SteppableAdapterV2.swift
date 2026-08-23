@@ -87,6 +87,63 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionedRecurrentSteppableMod
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentPrefillSteppableModel {
+    /// Recurrent prompt-output narrowing. Fail SAFE, not fatal: a model
+    /// without the narrowing conformance reproduces the full positioned
+    /// forward and the engine's own slicing, so this conformance can never
+    /// change what a non-conforming model computes.
+    public func recurrentPrefill(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        if let prefillable = model as? any CBv2RecurrentLanguageModelPrefillForwardable {
+            return prefillable.cbv2RecurrentPrefill(
+                tokens, inputEmbedding: inputEmbeddings, cache: asKVCaches(caches),
+                recurrentState: recurrentState, positionIds: positionIds,
+                requirement: requirement)
+        }
+        let logits: MLXArray
+        if let inputEmbeddings {
+            guard let positioned = model as? any CBv2PositionedRecurrentEmbeddingForwardable
+            else {
+                preconditionFailure(
+                    "CBv2 recurrent embedding prefill reached an unsupported model")
+            }
+            logits = positioned.embeddingForward(
+                tokens, inputEmbedding: inputEmbeddings,  // non-nil in this branch
+                cache: asKVCaches(caches),
+                recurrentState: recurrentState, positionIds: positionIds)
+        } else if let positioned = model
+            as? any CBv2PositionedRecurrentLanguageModelForwardable
+        {
+            logits = positioned.cbv2Forward(
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+                positionIds: positionIds)
+        } else {
+            // A model conforming only to the unpositioned recurrent protocol
+            // keeps its pre-seam prefill path; explicit positions without
+            // the positioned refinement were unreachable before the seam
+            // and stay a programmer error.
+            guard positionIds == nil,
+                let recurrent = model as? any CBv2RecurrentLanguageModelForwardable
+            else {
+                preconditionFailure(
+                    "CBv2 recurrent prefill reached an unsupported model")
+            }
+            logits = recurrent.cbv2Forward(
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState)
+        }
+        switch requirement {
+        case .evaluationOnly: return logits[0..., -1, 0 ..< 1]
+        case .lastPositionLogits: return logits[0..., -1, 0...]
+        }
+    }
+}
+
 // MARK: - Prompt-output narrowing (prefill only)
 
 /// Answered at RUNTIME like the multimodal/MTP capabilities: only models
@@ -98,8 +155,13 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
 
     public var supportsPackedPrefill: Bool {
         guard cbv2Capabilities.supportsPackedPrefill else { return false }
-        return (model as? CBv2LanguageModelPrefillForwardable)?.cbv2SupportsPackedPrefill
-            ?? false
+        if let claim = (model as? CBv2LanguageModelPrefillForwardable)?
+            .cbv2SupportsPackedPrefill
+        {
+            return claim
+        }
+        return (model as? CBv2RecurrentLanguageModelPrefillForwardable)?
+            .cbv2SupportsPackedPrefill ?? false
     }
 
     public var supportsPackedMultimodalPrefill: Bool {
