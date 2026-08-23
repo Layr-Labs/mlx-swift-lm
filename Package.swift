@@ -278,7 +278,12 @@ let package = Package(
         // report/optimization provenance. Model-free, so they run in CI.
         .testTarget(
             name: "BenchCBv2Tests",
-            dependencies: ["BenchCBv2Core"],
+            dependencies: [
+                "BenchCBv2Core",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
+            ],
             path: "Tests/BenchCBv2Tests"
         ),
     ]
