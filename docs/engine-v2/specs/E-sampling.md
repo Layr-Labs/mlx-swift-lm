@@ -48,4 +48,4 @@
 ## References
 Report 08 §6 (vLLM sampler order, Gumbel trick, BatchUpdate churn safety),
 critique items on seed/batch-invariance and detok (report 12 items 5, 6).
-Corpus: `/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+Corpus: `~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.

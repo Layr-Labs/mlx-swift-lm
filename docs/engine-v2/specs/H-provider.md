@@ -54,4 +54,4 @@ ContinuousBatchingV2/CBv2Contracts.swift` (read it first).
 ## References
 Contract file (path above), plan §7 Phase 2(e)/H notes, report 03
 (provider scheduler layer map). Corpus:
-`/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+`~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.

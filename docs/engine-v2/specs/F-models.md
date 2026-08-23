@@ -48,4 +48,4 @@ You own the two production models' integration. EXCLUSIVE ownership of
 
 ## References
 Report 10 §1 (exact model structures, file:line), §4 invariants 1, 2, 5,
-9, 11. Corpus: `/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+9, 11. Corpus: `~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.

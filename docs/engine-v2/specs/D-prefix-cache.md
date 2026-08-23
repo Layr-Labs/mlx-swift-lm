@@ -41,4 +41,4 @@
 Report 08 §2 (vLLM block hashing/eviction rules), report 09 §2 (SGLang
 radix — we deliberately use fixed blocks, not a radix tree), plan §7
 Phase 4, report 10 invariant 6 (windowed layers must not enter full-history
-prefix reuse). Corpus: `/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+prefix reuse). Corpus: `~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.

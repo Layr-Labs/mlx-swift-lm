@@ -3,7 +3,7 @@
 Maps every engine invariant to the executable test that pins it. Sources:
 report 10 §4 (the 11 invariants), report 12 (critique items 4, 5, 18), and
 the WS-G spec (`docs/engine-v2/specs/G-harness.md`). Corpus:
-`/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+`~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
 
 All suites live in `Tests/MLXLMTests/CBv2*.swift` and run on
 `TinyTestModel` (2-layer: full + sliding-window(16), optional GPT-OSS-style
