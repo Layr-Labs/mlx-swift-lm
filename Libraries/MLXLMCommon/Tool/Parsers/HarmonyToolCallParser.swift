@@ -24,6 +24,7 @@ public struct HarmonyToolCallParser: ToolCallParser, Sendable {
 
         if let startRange = firstRange(
             ofAny: [startTag].compactMap { $0 } + alternateStartTags, in: text)
+        {
             text = String(text[startRange.upperBound...])
         } else if let functionsRange = text.range(of: "to=functions.") ?? text.range(of: "functions.") {
             text = String(text[functionsRange.upperBound...])
