@@ -30,7 +30,8 @@ public enum ServerToolParser {
             return .json
         case "lfm2", "lfm2_5", "lfm25":
             return .lfm2
-        case "xml", "xml_function", "qwen_xml", "hermes", "nemotron":
+        case "xml", "xml_function", "qwen_xml", "qwen3", "qwen3_coder", "qwen3_5",
+            "hermes", "nemotron":
             return .xmlFunction
         case "glm4", "glm_4":
             return .glm4

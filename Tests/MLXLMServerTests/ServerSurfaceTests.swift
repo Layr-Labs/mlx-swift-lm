@@ -205,6 +205,7 @@ struct ServerSurfaceTests {
         #expect(try ServerToolParser.resolve(requested: "gemma4", modelType: nil) == .gemma)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma)
         #expect(try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: "qwen3_coder", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "gpt_oss", modelType: nil) == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gpt_oss") == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "lfm2") == .lfm2)
