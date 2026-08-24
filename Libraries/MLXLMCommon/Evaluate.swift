@@ -53,8 +53,14 @@ public protocol LogitProcessor {
 /// for the `TokenIterator`.
 public struct GenerateParameters: Sendable {
 
-    /// Step size for processing the prompt
-    public var prefillStepSize: Int
+    /// How the prompt is prefetched into the cache.
+    public var prefill: PrefillParameters
+
+    /// Legacy step-size spelling retained for callers of the Qwen runtime API.
+    public var prefillStepSize: Int {
+        get { prefill.stepSize ?? PrefillParameters.defaultStepSize }
+        set { prefill.stepSize = newValue }
+    }
 
     /// Maximum tokens to generate
     public var maxTokens: Int?
@@ -135,7 +141,8 @@ public struct GenerateParameters: Sendable {
         self.presenceContextSize = presenceContextSize
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
-        self.prefillStepSize = prefillStepSize
+        // Preserve the pre-merge fixed-stride behavior for this legacy initializer.
+        self.prefill = .init(stepSize: prefillStepSize, chunking: .remainder)
     }
 
     public func sampler() -> LogitSampler {
