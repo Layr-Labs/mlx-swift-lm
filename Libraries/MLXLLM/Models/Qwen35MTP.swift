@@ -369,8 +369,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         return logits
     }
 
-    /// Strictly load the inline assistant declared by a combined checkpoint.
-    /// Only indexed keys below the declared prefix are read and retained.
+    /// Strictly load either an inline assistant declared by a combined
+    /// checkpoint or a standalone `qwen3_5_mtp` artifact. Inline artifacts
+    /// read only indexed keys below their declared prefix; standalone
+    /// artifacts read every tensor from their bounded safetensors directory.
     public static func load(
         from modelDirectory: URL,
         target: any LanguageModel,
@@ -387,8 +389,13 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         let metadata = try loadMetadata(from: modelDirectory)
         try validate(metadata.textConfiguration, against: target.configuration)
 
-        let indexed = try loadIndexedWeights(
-            from: modelDirectory, prefix: metadata.prefix)
+        let indexed: [String: MLXArray]
+        if metadata.prefix.isEmpty {
+            indexed = try loadStandaloneWeights(from: modelDirectory)
+        } else {
+            indexed = try loadIndexedWeights(
+                from: modelDirectory, prefix: metadata.prefix)
+        }
         let assistant = Qwen35InlineMTPAssistant(
             configuration: metadata.textConfiguration,
             blockSize: metadata.blockSize,
@@ -428,19 +435,46 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     static func loadMetadata(from directory: URL) throws -> Qwen35InlineMTPMetadata {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let inline = root["mtplx_mtp"] as? [String: Any],
-            inline["included"] as? Bool == true,
             let text = root["text_config"] as? [String: Any]
         else {
             throw Qwen35InlineMTPError.invalidConfiguration(
-                "mtplx_mtp.included and text_config are required")
+                "text_config is required")
         }
-        let prefix = (inline["prefix"] as? String) ?? "mtp."
-        guard prefix == "mtp." else {
-            throw Qwen35InlineMTPError.invalidConfiguration(
-                "only the mtp. prefix is supported")
+
+        let prefix: String
+        let blockSize: Int
+        let rawQuantization: [String: Any]
+        if let inline = root["mtplx_mtp"] as? [String: Any],
+            inline["included"] as? Bool == true
+        {
+            prefix = (inline["prefix"] as? String) ?? "mtp."
+            guard prefix == "mtp." else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "only the mtp. prefix is supported")
+            }
+            blockSize = (inline["block_size"] as? NSNumber)?.intValue ?? 3
+            guard let quantization = root["mtplx_mtp_quantization"] as? [String: Any]
+            else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "mtplx_mtp_quantization is required")
+            }
+            rawQuantization = quantization
+        } else {
+            guard (root["model_type"] as? String)?.lowercased() == "qwen3_5_mtp"
+            else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "mtplx_mtp.included=true or model_type=qwen3_5_mtp is required")
+            }
+            prefix = ""
+            blockSize = (root["block_size"] as? NSNumber)?.intValue ?? 3
+            guard let quantization = (root["quantization"] ?? root["quantization_config"])
+                as? [String: Any]
+            else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "standalone MTP quantization is required")
+            }
+            rawQuantization = quantization
         }
-        let blockSize = (inline["block_size"] as? NSNumber)?.intValue ?? 3
         guard (2...8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
                 "block_size \(blockSize) is outside 2...8")
@@ -455,11 +489,6 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 "mtp_num_hidden_layers must be within 1...4")
         }
 
-        guard let rawQuantization = root["mtplx_mtp_quantization"] as? [String: Any]
-        else {
-            throw Qwen35InlineMTPError.invalidConfiguration(
-                "mtplx_mtp_quantization is required")
-        }
         var quantizationByPath: [String: BaseConfiguration.Quantization] = [:]
         let defaultKeys = ["group_size", "bits", "mode"]
         let defaultObject = Dictionary(
@@ -539,6 +568,40 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 }
             }
         }
+        return weights
+    }
+
+    private static func loadStandaloneWeights(
+        from directory: URL
+    ) throws -> [String: MLXArray] {
+        let urls: [URL]
+        do {
+            urls = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles])
+                .filter { $0.pathExtension == "safetensors" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        } catch {
+            throw Qwen35InlineMTPError.invalidWeightIndex(String(describing: error))
+        }
+        guard !urls.isEmpty, urls.count <= 64 else {
+            throw Qwen35InlineMTPError.missingWeights
+        }
+
+        var weights: [String: MLXArray] = [:]
+        for url in urls {
+            let (shard, _) = try loadArraysAndMetadata(url: url)
+            for (key, value) in shard {
+                guard !key.isEmpty, key.utf8.count <= 1024 else {
+                    throw Qwen35InlineMTPError.invalidWeightIndex(
+                        "standalone tensor key is empty or oversized")
+                }
+                guard weights.updateValue(value, forKey: key) == nil else {
+                    throw Qwen35InlineMTPError.duplicateWeight(key)
+                }
+            }
+        }
+        guard !weights.isEmpty else { throw Qwen35InlineMTPError.missingWeights }
         return weights
     }
 
