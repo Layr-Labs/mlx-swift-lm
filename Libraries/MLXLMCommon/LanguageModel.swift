@@ -377,6 +377,14 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 }
 
 extension LanguageModel {
+    /// Default legacy entry point for implementations that provide the newer
+    /// stateful/prefill-aware method instead.
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?
+    ) throws -> PrepareResult {
+        try prepare(input, cache: cache, state: nil, prefill: .init(stepSize: windowSize))
+    }
+
     /// Compatibility bridge for implementations that still provide only the
     /// legacy `windowSize` entry point.
     public func prepare(
