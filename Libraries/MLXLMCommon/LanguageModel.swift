@@ -308,6 +308,16 @@ public enum PrepareResult {
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 
+    /// Legacy prepare entry point retained for model and test-double source
+    /// compatibility while callers migrate to the stateful/prefill-aware API.
+    @available(
+        *, deprecated, renamed: "prepare(_:cache:state:prefill:)",
+        message: "prefill now defaults to balanced chunking; use the stateful overload"
+    )
+    func prepare(
+        _ input: LMInput, cache: [KVCache], windowSize: Int?
+    ) throws -> PrepareResult
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// `state` is the ``LMOutput/state`` a caller carried over from earlier
@@ -367,6 +377,14 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 }
 
 extension LanguageModel {
+    /// Compatibility bridge for implementations that still provide only the
+    /// legacy `windowSize` entry point.
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        try prepare(input, cache: cache, windowSize: prefill.stepSize)
+    }
+
     @available(
         *, deprecated, renamed: "prepare(_:cache:state:prefill:)",
         message:

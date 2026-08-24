@@ -16,6 +16,15 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     /// Nested objects and arrays are written in the dialect's brace form, whose keys are unquoted.
     private let structuredValues = BareKeyJSONParser()
 
+    /// Legacy Gemma parser defaults retained for callers that predate the
+    /// configurable Gemma/Gemma4 tag formats.
+    public init() {
+        self.init(
+            startTag: "<start_function_call>",
+            endTag: "<end_function_call>",
+            escapeMarker: "<escape>")
+    }
+
     public init(startTag: String, endTag: String, escapeMarker: String) {
         self.startTag = startTag
         self.endTag = endTag
