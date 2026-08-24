@@ -544,12 +544,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         case requested
     }
 
-    private var keep: Int
-    private var keys: MLXArray?
-    private var values: MLXArray?
-    private var maxCacheSize: Int
-    private var step: Int
-    private var idx: Int = 0
+    fileprivate var keep: Int
+    fileprivate var keys: MLXArray?
+    fileprivate var values: MLXArray?
+    fileprivate var maxCacheSize: Int
+    fileprivate var step: Int
+    fileprivate var idx: Int = 0
 
     /// Model-native sliding-window caches deliberately keep their architectural
     /// window and do not participate in requested-capacity validation.
