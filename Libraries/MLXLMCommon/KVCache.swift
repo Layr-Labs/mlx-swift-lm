@@ -1309,6 +1309,45 @@ public class ArraysCache: BaseKVCache {
     internal var leftPadding: MLXArray?
     internal var lengths: MLXArray?
 
+    /// Transient recurrent-state snapshots used by the Qwen3.5 MTP replay path.
+    public var rollbackState: (MLXArray, MLXArray)? = nil
+    public var prefixReplayTape: PrefixReplayTape? = nil
+
+    public struct PrefixReplayTape {
+        public let convInput: MLXArray
+        public let q: MLXArray
+        public let k: MLXArray
+        public let v: MLXArray
+        public let a: MLXArray
+        public let b: MLXArray
+        public let ssmPre: MLXArray?
+        public let mask: MLXArray?
+        public let rowCount: Int
+        public let convStateRows: Int
+
+        public init(
+            convInput: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray,
+            a: MLXArray, b: MLXArray, ssmPre: MLXArray?, mask: MLXArray?,
+            rowCount: Int, convStateRows: Int
+        ) {
+            self.convInput = convInput
+            self.q = q
+            self.k = k
+            self.v = v
+            self.a = a
+            self.b = b
+            self.ssmPre = ssmPre
+            self.mask = mask
+            self.rowCount = rowCount
+            self.convStateRows = convStateRows
+        }
+    }
+
+    public func clearMTPTransientState() {
+        rollbackState = nil
+        prefixReplayTape = nil
+    }
+
     public init(size: Int, leftPadding: [Int]? = nil) {
         self.cache = Array(repeating: nil, count: size)
         self.leftPadding = leftPadding.map { MLXArray($0) }
@@ -1329,6 +1368,7 @@ public class ArraysCache: BaseKVCache {
             return cache.compactMap { $0 }
         }
         set {
+            clearMTPTransientState()
             cache = newValue.map { $0 as MLXArray? }
         }
     }
@@ -1352,6 +1392,7 @@ public class ArraysCache: BaseKVCache {
 
     /// In-place filter to keep just the given indices in the cache
     public func filter(batchIndices: MLXArray) {
+        clearMTPTransientState()
         cache = cache.map { c in
             c?[batchIndices]
         }
@@ -1361,6 +1402,7 @@ public class ArraysCache: BaseKVCache {
 
     /// In-place extend this cache with the other cache
     public func extend(other: ArraysCache) {
+        clearMTPTransientState()
         let aBatch = batchSize
         let bBatch = other.batchSize
 
