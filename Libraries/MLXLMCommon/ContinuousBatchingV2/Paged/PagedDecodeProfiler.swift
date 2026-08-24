@@ -168,7 +168,7 @@ public struct PagedDecodeProfiler {
         let vBase = (0 ..< layerCount).map { _ in
             MLXRandom.normal([batch, kvh, 1, d], dtype: .float16)
         }
-        let zero = MLXArray(Float16(0))
+        let zero = MLXArray(Float(0))
 
         let step: () -> Void = {
             var carry = zero
@@ -273,7 +273,7 @@ public struct PagedDecodeProfiler {
         let vBase = (0 ..< layerCount).map { _ in
             MLXRandom.normal([batch, kvh, 1, d], dtype: .float16)
         }
-        let zero = MLXArray(Float16(0))
+        let zero = MLXArray(Float(0))
         var length = context
 
         let step: () -> Void = {
@@ -511,7 +511,7 @@ public struct PagedDecodeProfiler {
         let capture = Self.gemma4CaptureLayers(kinds)
         let scale = Float(1.0 / Double(kinds[0].headDim).squareRoot())
         let qkv = Self.roundTiles(kinds: kinds, columns: columns)
-        let zero = MLXArray(Float16(0))
+        let zero = MLXArray(Float(0))
 
         let step: () -> Void = {
             switch phase {
@@ -597,7 +597,7 @@ public struct PagedDecodeProfiler {
         let capture = Self.gemma4CaptureLayers(kinds)
         let scale = Float(1.0 / Double(kinds[0].headDim).squareRoot())
         let qkv = Self.roundTiles(kinds: kinds, columns: columns)
-        let zero = MLXArray(Float16(0))
+        let zero = MLXArray(Float(0))
 
         let step: () -> Void = {
             switch phase {
