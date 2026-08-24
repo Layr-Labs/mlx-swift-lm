@@ -573,7 +573,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = .init(tokens: prompt)
-        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cache = cache ?? (try model.newCache(parameters: parameters))
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -606,7 +606,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = input.text
-        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.cache = cache ?? (try model.newCache(parameters: parameters))
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -638,7 +638,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = input.text
-        self.cache = cache ?? model.newCache(parameters: nil)
+        self.cache = cache ?? (try model.newCache(parameters: nil))
 
         self.processor = processor
         self.sampler = sampler
@@ -799,8 +799,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.mainModel = mainModel
         self.draftModel = draftModel
 
-        self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
-        self.draftCache = draftCache ?? draftModel.newCache(parameters: parameters)
+        self.mainCache = mainCache ?? (try mainModel.newCache(parameters: parameters))
+        self.draftCache = draftCache ?? (try draftModel.newCache(parameters: parameters))
         guard canTrimPromptCache(self.mainCache), canTrimPromptCache(self.draftCache) else {
             throw KVCacheError(message: "Speculative decoding requires trimmable KV caches.")
         }
