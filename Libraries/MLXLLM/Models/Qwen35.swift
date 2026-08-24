@@ -14,6 +14,30 @@ import MLXNN
 
 // MARK: - Configuration
 
+/// Fixed post-block capture geometry used by the standalone Qwen 3.8
+/// DFlash2 runner. Keeping segment boundaries static lets the measured forward
+/// capture the five features without a dynamic layer-membership check.
+public enum Qwen35DFlashCapturePlan {
+    public static let layerIDs = [5, 19, 33, 47, 61]
+    public static let exclusiveSegmentEnds = [6, 20, 34, 48, 62, 64]
+
+    public static func concatenatedWidth(hiddenSize: Int) -> Int {
+        hiddenSize * layerIDs.count
+    }
+}
+
+public struct Qwen35DFlashForwardResult {
+    public let logits: MLXArray
+    public let targetFeatures: MLXArray
+    public let lastHidden: MLXArray
+
+    public init(logits: MLXArray, targetFeatures: MLXArray, lastHidden: MLXArray) {
+        self.logits = logits
+        self.targetFeatures = targetFeatures
+        self.lastHidden = lastHidden
+    }
+}
+
 private enum RopeParametersCodingKey: String, CodingKey {
     case ropeParameters = "rope_parameters"
 }
@@ -638,33 +662,34 @@ final class Qwen35GatedDeltaNet: Module {
         tape: ArraysCache.PrefixReplayTape, committedRows: Int
     ) -> Bool {
         guard committedRows > 0,
-              committedRows < tape.rowCount,
-              tape.convStateRows == convKernelSize - 1,
-              tape.convInput.ndim == 3,
-              tape.q.ndim == 4,
-              tape.k.ndim == 4,
-              tape.v.ndim == 4,
-              tape.a.ndim == 3,
-              tape.b.ndim == 3
+            committedRows < tape.rowCount,
+            tape.convStateRows == convKernelSize - 1,
+            tape.convInput.ndim == 3,
+            tape.q.ndim == 4,
+            tape.k.ndim == 4,
+            tape.v.ndim == 4,
+            tape.a.ndim == 3,
+            tape.b.ndim == 3
         else { return false }
 
         let batch = tape.q.dim(0)
-        guard tape.convInput.shape
-                  == [batch, tape.convStateRows + tape.rowCount, convDim],
-              tape.q.shape == [batch, tape.rowCount, numKHeads, headKDim],
-              tape.k.shape == [batch, tape.rowCount, numKHeads, headKDim],
-              tape.v.shape == [batch, tape.rowCount, numVHeads, headVDim],
-              tape.a.shape == [batch, tape.rowCount, numVHeads],
-              tape.b.shape == [batch, tape.rowCount, numVHeads]
+        guard
+            tape.convInput.shape
+                == [batch, tape.convStateRows + tape.rowCount, convDim],
+            tape.q.shape == [batch, tape.rowCount, numKHeads, headKDim],
+            tape.k.shape == [batch, tape.rowCount, numKHeads, headKDim],
+            tape.v.shape == [batch, tape.rowCount, numVHeads, headVDim],
+            tape.a.shape == [batch, tape.rowCount, numVHeads],
+            tape.b.shape == [batch, tape.rowCount, numVHeads]
         else { return false }
 
         if let ssmPre = tape.ssmPre,
-           ssmPre.shape != [batch, numVHeads, headVDim, headKDim]
+            ssmPre.shape != [batch, numVHeads, headVDim, headKDim]
         {
             return false
         }
         if let mask = tape.mask,
-           mask.shape != [batch, tape.rowCount]
+            mask.shape != [batch, tape.rowCount]
         {
             return false
         }
@@ -700,9 +725,42 @@ final class Qwen35GatedDeltaNet: Module {
             0...,
             committedRows ..< (committedRows + tape.convStateRows),
             0...]
-        let boundaryConv = boundaryConvView + MLXArray.zeros(
-            boundaryConvView.shape, dtype: boundaryConvView.dtype)
+        let boundaryConv =
+            boundaryConvView
+            + MLXArray.zeros(
+                boundaryConvView.shape, dtype: boundaryConvView.dtype)
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
+    }
+
+    /// Direct replay for the construction-validated DFlash2 lane. The fixed
+    /// Qwen route creates this tape itself, so shape eligibility is not
+    /// rechecked inside every measured verify cycle.
+    fileprivate func dflashReplayPrefix(
+        cache: MambaCache, committedRows: Int
+    ) {
+        let tape = cache.prefixReplayTape!
+        let rows = 0 ..< committedRows
+        let boundarySsm = gatedDeltaUpdate(
+            q: tape.q[0..., rows, 0...],
+            k: tape.k[0..., rows, 0...],
+            v: tape.v[0..., rows, 0...],
+            a: tape.a[0..., rows, 0...],
+            b: tape.b[0..., rows, 0...],
+            aLog: aLog,
+            dtBias: dtBias,
+            state: tape.ssmPre,
+            mask: tape.mask.map { $0[0..., rows] }
+        ).1
+        let boundaryConvView = tape.convInput[
+            0...,
+            committedRows ..< (committedRows + tape.convStateRows),
+            0...]
+        cache[0] =
+            boundaryConvView
+            + MLXArray.zeros(
+                boundaryConvView.shape, dtype: boundaryConvView.dtype)
+        cache[1] = boundarySsm
+        cache.clearMTPTransientState()
     }
 
     /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
@@ -712,7 +770,7 @@ final class Qwen35GatedDeltaNet: Module {
         cache: MambaCache, committedRows: Int
     ) -> Bool {
         guard canReplayPrefix(cache: cache, committedRows: committedRows),
-              let tape = cache.prefixReplayTape
+            let tape = cache.prefixReplayTape
         else { return false }
 
         let state = replayedPrefixState(tape: tape, committedRows: committedRows)
@@ -773,13 +831,13 @@ final class Qwen35GatedDeltaNet: Module {
         } else if nConfirmed > 0 && nConfirmed < S {
             // Width-2 and masked verification retain the established rollback
             // snapshot path. CBv2 capture uses its separate request-state API.
-            let maskC = mask.map { $0[0..., 0..<nConfirmed] }
+            let maskC = mask.map { $0[0..., 0 ..< nConfirmed] }
             let maskD = mask.map { $0[0..., nConfirmed...] }
 
             let (outC, convC, ssmC) = processChunk(
-                qkv: qkv[0..., 0..<nConfirmed, 0...],
-                a: a[0..., 0..<nConfirmed, 0...],
-                b: b[0..., 0..<nConfirmed, 0...],
+                qkv: qkv[0..., 0 ..< nConfirmed, 0...],
+                a: a[0..., 0 ..< nConfirmed, 0...],
+                b: b[0..., 0 ..< nConfirmed, 0...],
                 convState: convState,
                 ssmState: ssmState,
                 mask: maskC
@@ -1033,8 +1091,10 @@ final class Qwen35GatedDeltaNet: Module {
                         fullAcceptanceRetainedByteCount: fullAcceptanceRetainedBytes,
                         fullAcceptanceRetainedRoots: [tape.convInput],
                         fullAcceptance: {
-                            let detachedConv = finalConv + MLXArray.zeros(
-                                finalConv.shape, dtype: finalConv.dtype)
+                            let detachedConv =
+                                finalConv
+                                + MLXArray.zeros(
+                                    finalConv.shape, dtype: finalConv.dtype)
                             return CBv2RecurrentLayerState(
                                 conv: detachedConv, ssm: finalSSM)
                         },
@@ -1254,7 +1314,8 @@ final class Qwen35MRoPE {
             return "default"
         }()
         if ropeType == "default" || ropeType == "mrope" {
-            let exponents = MLXArray(stride(from: 0, to: self.rotaryDim, by: 2))
+            let exponents =
+                MLXArray(stride(from: 0, to: self.rotaryDim, by: 2))
                 .asType(.float32) / Float(self.rotaryDim)
             self.defaultInvFreq = 1 / pow(MLXArray(base), exponents)
         } else {
@@ -1286,14 +1347,16 @@ final class Qwen35MRoPE {
         precondition(rotaryDim % 2 == 0 && rotaryDim <= queries.dim(-1))
 
         if let defaultInvFreq {
-            let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+            let all =
+                positions.asType(.float32)[0..., 0..., 0..., .newAxis]
                 * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
             var selected: [MLXArray] = []
             let frequencyCount = rotaryDim / 2
             selected.reserveCapacity(frequencyCount)
             for index in 0 ..< frequencyCount {
                 selected.append(
-                    all[axis(forFrequency: index, frequencyCount: frequencyCount),
+                    all[
+                        axis(forFrequency: index, frequencyCount: frequencyCount),
                         0..., 0..., index])
             }
             let frequency = stacked(selected, axis: -1)
@@ -1343,7 +1406,8 @@ final class Qwen35MRoPE {
         }
         return (
             result[0..., ..<queryHeads, 0..., 0...],
-            result[0..., queryHeads..., 0..., 0...])
+            result[0..., queryHeads..., 0..., 0...]
+        )
     }
 }
 
@@ -1563,6 +1627,8 @@ public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
+    private let recurrentLayerIndices: [Int]
+    private let attentionLayerIndices: [Int]
     let norm: RMSNorm
 
     let ssmIdx: Int
@@ -1577,9 +1643,12 @@ public class Qwen35TextModelInner: Module {
             dimensions: args.hiddenSize
         )
 
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
+        let layers = (0 ..< args.hiddenLayers).map { layerIdx in
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
         }
+        self.layers = layers
+        self.recurrentLayerIndices = layers.indices.filter { layers[$0].isLinear }
+        self.attentionLayerIndices = layers.indices.filter { !layers[$0].isLinear }
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
@@ -1629,6 +1698,72 @@ public class Qwen35TextModelInner: Module {
         return hiddenStates
     }
 
+    @inline(__always)
+    private func dflashSegment(
+        _ hiddenStates: MLXArray,
+        range: Range<Int>,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> MLXArray {
+        var hiddenStates = hiddenStates
+        for i in range {
+            let layer = layers[i]
+            hiddenStates = layer(
+                hiddenStates,
+                attentionMask: layer.isLinear ? .none : attentionMask,
+                ssmMask: layer.isLinear ? ssmMask : nil,
+                cache: cache[i],
+                nConfirmed: nConfirmed)
+        }
+        return hiddenStates
+    }
+
+    /// Shape-locked DFlash2 target forward. The six fixed segments encode the
+    /// five post-block captures directly; no dynamic layer set is consulted in
+    /// the measured loop.
+    func dflashForward(
+        _ inputs: MLXArray,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (hidden: MLXArray, features: MLXArray) {
+        var hidden = embedTokens(inputs)
+        let attentionMask = createAttentionMask(h: hidden, cache: cache[faIdx])
+        let ssmMask = createSSMMask(h: hidden, cache: cache[ssmIdx] as? MambaCache)
+
+        hidden = dflashSegment(
+            hidden, range: 0 ..< 6, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature5 = hidden
+        hidden = dflashSegment(
+            hidden, range: 6 ..< 20, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature19 = hidden
+        hidden = dflashSegment(
+            hidden, range: 20 ..< 34, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature33 = hidden
+        hidden = dflashSegment(
+            hidden, range: 34 ..< 48, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature47 = hidden
+        hidden = dflashSegment(
+            hidden, range: 48 ..< 62, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature61 = hidden
+        hidden = dflashSegment(
+            hidden, range: 62 ..< 64, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+
+        return (
+            hidden,
+            concatenated(
+                [feature5, feature19, feature33, feature47, feature61],
+                axis: -1)
+        )
+    }
+
     /// Rebuild every recurrent layer at the same committed verify boundary.
     /// Eligibility is checked for every layer before persistent state changes.
     /// Attention caches are intentionally untouched; the caller trims their
@@ -1645,8 +1780,8 @@ public class Qwen35TextModelInner: Module {
         for (i, layer) in layers.enumerated() where layer.isLinear {
             foundRecurrentLayer = true
             guard let mamba = cache[i] as? MambaCache,
-                  let linear = layer.linearAttn,
-                  linear.canReplayPrefix(
+                let linear = layer.linearAttn,
+                linear.canReplayPrefix(
                     cache: mamba, committedRows: committedRows)
             else {
                 clearRecurrentPrefixReplay(cache: cache)
@@ -1660,8 +1795,8 @@ public class Qwen35TextModelInner: Module {
 
         for (i, layer) in layers.enumerated() where layer.isLinear {
             guard let mamba = cache[i] as? MambaCache,
-                  let linear = layer.linearAttn,
-                  linear.replayPrefix(
+                let linear = layer.linearAttn,
+                linear.replayPrefix(
                     cache: mamba, committedRows: committedRows)
             else {
                 clearRecurrentPrefixReplay(cache: cache)
@@ -1674,8 +1809,40 @@ public class Qwen35TextModelInner: Module {
     /// Discard verify-only recurrent data without changing committed cache
     /// state. Used after full acceptance and by fallback/reset paths.
     func clearRecurrentPrefixReplay(cache: [KVCache?]) {
-        for case let arrays as ArraysCache in cache.compactMap({ $0 }) {
-            arrays.clearMTPTransientState()
+        for index in recurrentLayerIndices {
+            (cache[index] as! MambaCache).clearMTPTransientState()
+        }
+    }
+
+    /// Commit the target cache after one DFlash2 verify. Cache types and layer
+    /// ownership are installed once by `newCache`; only acceptance and verify
+    /// width vary at runtime.
+    func dflashCommitCachePrefix(
+        cache: [KVCache?], committedRows: Int, verifyRows: Int
+    ) {
+        let rejectedRows = verifyRows - committedRows
+        if rejectedRows == 0 {
+            clearRecurrentPrefixReplay(cache: cache)
+            return
+        }
+
+        if verifyRows == 2 {
+            for index in recurrentLayerIndices {
+                let recurrent = cache[index] as! MambaCache
+                let rollback = recurrent.rollbackState!
+                recurrent[0] = rollback.0
+                recurrent[1] = rollback.1
+                recurrent.clearMTPTransientState()
+            }
+        } else {
+            for index in recurrentLayerIndices {
+                layers[index].linearAttn!.dflashReplayPrefix(
+                    cache: cache[index] as! MambaCache,
+                    committedRows: committedRows)
+            }
+        }
+        for index in attentionLayerIndices {
+            _ = cache[index]!.trim(rejectedRows)
         }
     }
 
@@ -1767,6 +1934,81 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return out
     }
 
+    /// Direct target path for the standalone Qwen 3.8 DFlash2 runner.
+    public func dflashForward(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> Qwen35DFlashForwardResult {
+        let forward = model.dflashForward(
+            input.tokens,
+            cache: cache.map { Optional($0) },
+            nConfirmed: nConfirmed)
+        let normalized = model.norm(forward.hidden)
+        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        return Qwen35DFlashForwardResult(
+            logits: logits,
+            targetFeatures: forward.features,
+            lastHidden: forward.hidden)
+    }
+
+    /// Prompt-chunk boundary for DFlash2. Captures remain full-width for the
+    /// draft projector, while the 248,320-way vocabulary projection is
+    /// evaluated for only the final row of each chunk.
+    public func dflashPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> Qwen35DFlashForwardResult {
+        let forward = model.dflashForward(
+            input.tokens,
+            cache: cache.map { Optional($0) },
+            nConfirmed: 0)
+        let lastHidden = forward.hidden[0..., -1, 0...]
+        let normalized = model.norm(lastHidden)
+        let logits =
+            lmHead.map { $0(normalized) }
+            ?? model.embedTokens.asLinear(normalized)
+        return Qwen35DFlashForwardResult(
+            logits: logits.expandedDimensions(axis: 1),
+            targetFeatures: forward.features,
+            lastHidden: lastHidden.expandedDimensions(axis: 1))
+    }
+
+    /// Target-only prompt chunk. This preserves the ordinary model forward but
+    /// applies final norm and the vocabulary projection to its last row only.
+    public func dflashTargetOnlyPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> MLXArray {
+        let hidden = model(input.tokens, cache: cache.map { Optional($0) })[
+            0..., -1, 0...]
+        let normalized = model.norm(hidden)
+        let logits =
+            lmHead.map { $0(normalized) }
+            ?? model.embedTokens.asLinear(normalized)
+        return logits.expandedDimensions(axis: 1)
+    }
+
+    public func dflashInputEmbedding(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    /// DFlash2 returns its own final-normalized hidden rows, so the target
+    /// boundary applies only the shared vocabulary projection.
+    public func dflashLogits(_ normalizedDraftHidden: MLXArray) -> MLXArray {
+        lmHead.map { $0(normalizedDraftHidden) }
+            ?? model.embedTokens.asLinear(normalizedDraftHidden)
+    }
+
+    public func dflashCommitCachePrefix(
+        cache: [any KVCache], committedRows: Int, verifyRows: Int
+    ) {
+        model.dflashCommitCachePrefix(
+            cache: cache.map { Optional($0) },
+            committedRows: committedRows,
+            verifyRows: verifyRows)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isLinear {
@@ -1834,8 +2076,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // omlx: raises ValueError with "weights are missing the mtp.* tensors"
             print(
                 "[WARNING] Qwen35TextModel.sanitize: MTP head is enabled but no mtp.* "
-                + "weights found. Load will likely fail or produce garbage. "
-                + "Re-convert the checkpoint with a converter that preserves MTP weights.")
+                    + "weights found. Load will likely fail or produce garbage. "
+                    + "Re-convert the checkpoint with a converter that preserves MTP weights.")
         }
 
         if configuration.tieWordEmbeddings {
@@ -2053,7 +2295,8 @@ extension Qwen35TextModel: CBv2MTPPolicyTopTwoProviding {
             logits.reshaped([1, rows, vocabularySize]))
         return (
             topTwo.ids.reshaped([batch, length, 2]),
-            topTwo.values.reshaped([batch, length, 2]))
+            topTwo.values.reshaped([batch, length, 2])
+        )
     }
 }
 
@@ -2112,8 +2355,9 @@ extension Qwen35TextModel: MTPCapable {
         hidden: MLXArray, nextTokenIds: MLXArray, cache: [any KVCache]
     ) -> MLXArray {
         guard let mtp else {
-            fatalError("mtpForward called but MTP head is not attached. "
-                + "Set _qwen35MTPEnabled = true before loading the model.")
+            fatalError(
+                "mtpForward called but MTP head is not attached. "
+                    + "Set _qwen35MTPEnabled = true before loading the model.")
         }
         let mtpOut = mtp(
             hidden: hidden,
@@ -2161,6 +2405,44 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
+    }
+
+    public func dflashForward(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> Qwen35DFlashForwardResult {
+        languageModel.dflashForward(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func dflashPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> Qwen35DFlashForwardResult {
+        languageModel.dflashPrefillChunk(input: input, cache: cache)
+    }
+
+    public func dflashTargetOnlyPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> MLXArray {
+        languageModel.dflashTargetOnlyPrefillChunk(input: input, cache: cache)
+    }
+
+    public func dflashInputEmbedding(_ tokens: MLXArray) -> MLXArray {
+        languageModel.dflashInputEmbedding(tokens)
+    }
+
+    public func dflashLogits(_ normalizedDraftHidden: MLXArray) -> MLXArray {
+        languageModel.dflashLogits(normalizedDraftHidden)
+    }
+
+    public func dflashCommitCachePrefix(
+        cache: [any KVCache], committedRows: Int, verifyRows: Int
+    ) {
+        languageModel.dflashCommitCachePrefix(
+            cache: cache, committedRows: committedRows, verifyRows: verifyRows)
     }
 
     public var cbv2LayerKinds: [CBv2LayerKind] { languageModel.cbv2LayerKinds }

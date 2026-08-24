@@ -1,0 +1,24 @@
+Third-party notices
+
+This runner is adapted from MTPLX, copyright 2026 Youssof Altoukhi, licensed
+under the Apache License 2.0. Source revision:
+26e27b78d5299dcafb319844283ac50a137bfee5
+
+  Powered by MTPLX
+  https://github.com/youssofal/mtplx
+
+The Apache License 2.0 text is in LICENSES/Apache-2.0-DFlash2.txt.
+
+The Qwen 3.8 DFlash2 runner includes a Swift port of DFlash2 model and runtime
+logic from dflash-mlx, copyright 2026 bstnxbt, licensed under the Apache
+License 2.0. Source revision:
+c5b76ddb62bdefb6eeef1282641842edcf23a1b8
+The license text is in LICENSES/Apache-2.0-DFlash2.txt.
+
+DFlash2 is based on the work described in arXiv:2602.06036.
+
+The Qwen 3.8 runner and optimization geometry are adapted from
+Layr-Labs/qwen-3.8-mtp-challenge, copyright 2026 Layr Labs, Inc., licensed
+under the MIT License. Source revision:
+eb5eadc7a165047d4321ce883b9ff30894d8bd19
+The license text is in LICENSES/MIT-Yukon.txt.

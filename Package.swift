@@ -40,6 +40,15 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "Qwen38FastCore",
+            targets: ["Qwen38FastCore"]),
+        .library(
+            name: "Qwen38DFlash2",
+            targets: ["Qwen38DFlash2"]),
+        .executable(
+            name: "qwen38-dflash2-runner",
+            targets: ["qwen38-dflash2-runner"]),
     ],
     dependencies: [
         .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
@@ -152,6 +161,35 @@ let package = Package(
             ],
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
+        ),
+        .target(
+            name: "Qwen38FastCore",
+            path: "Libraries/Qwen38FastCore"
+        ),
+        .target(
+            name: "Qwen38DFlash2",
+            dependencies: [
+                "Qwen38FastCore",
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/Qwen38DFlash2"
+        ),
+        .executableTarget(
+            name: "qwen38-dflash2-runner",
+            dependencies: [
+                "Qwen38FastCore",
+                "Qwen38DFlash2",
+                "MLXLLM",
+                "MLXLMCommon",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Executables/qwen38-dflash2-runner"
         ),
         .testTarget(
             name: "MLXLMTests",
@@ -287,6 +325,22 @@ let package = Package(
             name: "BenchCBv2Tests",
             dependencies: ["BenchCBv2Core"],
             path: "Tests/BenchCBv2Tests"
+        ),
+        .testTarget(
+            name: "Qwen38FastCoreTests",
+            dependencies: ["Qwen38FastCore"],
+            path: "Tests/Qwen38FastCoreTests"
+        ),
+        .testTarget(
+            name: "Qwen38DFlash2Tests",
+            dependencies: [
+                "Qwen38FastCore",
+                "Qwen38DFlash2",
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tests/Qwen38DFlash2Tests"
         ),
     ]
 )

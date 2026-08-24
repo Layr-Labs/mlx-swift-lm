@@ -641,20 +641,26 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     private func assertRecurrentStateEqual(
         _ lhs: [any KVCache],
         _ rhs: [any KVCache],
+        context: String = "",
+        rtol: Double = 1e-5,
+        atol: Double = 1e-6,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         XCTAssertEqual(lhs.count, rhs.count, file: file, line: line)
         for index in lhs.indices {
             guard let left = lhs[index] as? MambaCache,
-                  let right = rhs[index] as? MambaCache
+                let right = rhs[index] as? MambaCache
             else { continue }
             XCTAssertEqual(left.state.count, right.state.count, file: file, line: line)
-            for (leftArray, rightArray) in zip(left.state, right.state) {
+            for (stateIndex, pair) in zip(left.state, right.state).enumerated() {
+                let (leftArray, rightArray) = pair
                 XCTAssertEqual(leftArray.shape, rightArray.shape, file: file, line: line)
+                let maximumAbsoluteError = abs(leftArray - rightArray).max().item(Float.self)
                 XCTAssertTrue(
-                    allClose(leftArray, rightArray, rtol: 1e-5, atol: 1e-6)
+                    allClose(leftArray, rightArray, rtol: rtol, atol: atol)
                         .item(Bool.self),
+                    "\(context) layer=\(index) state=\(stateIndex) max_abs=\(maximumAbsoluteError)",
                     file: file,
                     line: line)
             }
@@ -717,9 +723,102 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                 tokens: Array(verifyTokens.prefix(committedRows)),
                 caches: oracle,
                 nConfirmed: 0)
-            assertRecurrentStateEqual(verify, oracle)
             for index in oracle.indices where !(oracle[index] is ArraysCache) {
                 XCTAssertEqual(verify[index].offset, oracle[index].offset)
+            }
+            let replayContinuation = legacyForward(
+                model, tokens: [8], caches: verify, nConfirmed: 0)
+            let serialContinuation = legacyForward(
+                model, tokens: [8], caches: oracle, nConfirmed: 0)
+            XCTAssertTrue(
+                allClose(
+                    replayContinuation,
+                    serialContinuation,
+                    rtol: 1e-3,
+                    atol: 1e-4
+                ).item(Bool.self),
+                "continuation committed=\(committedRows)")
+        }
+    }
+
+    /// The fixed DFlash2 cache route must exactly match the checked route when
+    /// both consume the same wide-verify tensors. A separate continuation
+    /// comparison covers the bounded MLX accumulation difference between a
+    /// wide projection and a serial M=1 projection.
+    func testDFlashCacheCommitMatchesSerialPrefixAtWidthTwoFourAndEight() throws {
+        MLXRandom.seed(61_340)
+        let model = Qwen35TextModel(try smallGDNConfiguration())
+        eval(model)
+
+        let base = legacyCaches(model)
+        _ = legacyForward(model, tokens: [1, 2, 3], caches: base, nConfirmed: 0)
+
+        for verifyTokens: [Int32] in [
+            [4, 5],
+            [4, 5, 6, 7],
+            [4, 5, 6, 7, 8, 9, 10, 11],
+        ] {
+            for committedRows in 1 ..< verifyTokens.count {
+                let verify = copiedCaches(base)
+                let checked = copiedCaches(base)
+                let oracle = copiedCaches(base)
+                _ = legacyForward(
+                    model, tokens: verifyTokens, caches: verify, nConfirmed: 1)
+                _ = legacyForward(
+                    model, tokens: verifyTokens, caches: checked, nConfirmed: 1)
+
+                model.dflashCommitCachePrefix(
+                    cache: verify,
+                    committedRows: committedRows,
+                    verifyRows: verifyTokens.count)
+                let rejectedRows = verifyTokens.count - committedRows
+                if verifyTokens.count == 2 {
+                    for case let recurrent as MambaCache in checked {
+                        let rollback = try XCTUnwrap(recurrent.rollbackState)
+                        recurrent[0] = rollback.0
+                        recurrent[1] = rollback.1
+                        recurrent.clearMTPTransientState()
+                    }
+                } else {
+                    XCTAssertTrue(
+                        model.replayRecurrentPrefix(
+                            cache: checked, committedRows: committedRows))
+                }
+                for index in checked.indices where !(checked[index] is ArraysCache) {
+                    XCTAssertEqual(checked[index].trim(rejectedRows), rejectedRows)
+                }
+
+                assertRecurrentStateEqual(
+                    verify,
+                    checked,
+                    context: "direct width=\(verifyTokens.count) committed=\(committedRows)",
+                    rtol: 0,
+                    atol: 0)
+                for index in checked.indices where !(checked[index] is ArraysCache) {
+                    XCTAssertEqual(verify[index].offset, checked[index].offset)
+                }
+                for case let recurrent as MambaCache in verify {
+                    XCTAssertNil(recurrent.prefixReplayTape)
+                    XCTAssertNil(recurrent.rollbackState)
+                }
+
+                _ = legacyForward(
+                    model,
+                    tokens: Array(verifyTokens.prefix(committedRows)),
+                    caches: oracle,
+                    nConfirmed: 0)
+                let directContinuation = legacyForward(
+                    model, tokens: [12], caches: verify, nConfirmed: 0)
+                let serialContinuation = legacyForward(
+                    model, tokens: [12], caches: oracle, nConfirmed: 0)
+                XCTAssertTrue(
+                    allClose(
+                        directContinuation,
+                        serialContinuation,
+                        rtol: 1e-3,
+                        atol: 1e-4
+                    ).item(Bool.self),
+                    "continuation width=\(verifyTokens.count) committed=\(committedRows)")
             }
         }
     }
@@ -809,7 +908,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         XCTAssertNotNil(resetCache.prefixReplayTape)
         resetCache.rollbackState = (
             try XCTUnwrap(resetCache[0]),
-            try XCTUnwrap(resetCache[1]))
+            try XCTUnwrap(resetCache[1])
+        )
         resetCache.state = []
         XCTAssertNil(resetCache.prefixReplayTape)
         XCTAssertNil(resetCache.rollbackState)
