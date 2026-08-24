@@ -2356,7 +2356,8 @@ public func quantizedScaledDotProductAttention(
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
     groupSize: Int = 64,
     bits: Int = 8,
-    mode: QuantizationMode = .affine
+    mode: QuantizationMode = .affine,
+    sinks: MLXArray? = nil
 ) -> MLXArray {
 
     let (B, nQHeads, L, D) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
@@ -2383,12 +2384,15 @@ public func quantizedScaledDotProductAttention(
         )
     }
 
-    // Compute attention scores using quantized matmul
-    var scores = quantizedMM(
+    // Compute attention scores using quantized matmul. Normalize GQA scores to
+    // the canonical 4-D layout while applying masks and attention sinks.
+    let rawScores = quantizedMM(
         scaledQueries, qKeys.0, scales: qKeys.1, biases: qKeys.2,
         transpose: true, groupSize: groupSize, bits: bits,
         mode: mode
     )
+    let kL = rawScores.dim(-1)
+    var scores = nRepeats > 1 ? rawScores.reshaped([B, nQHeads, L, kL]) : rawScores
 
     // Apply mask
     switch mask {
@@ -2413,7 +2417,23 @@ public func quantizedScaledDotProductAttention(
         break
     }
 
-    let attentionWeights = softmax(scores, axis: -1)
+    let attentionWeights4D: MLXArray
+    if let sinks {
+        let sinkLogits = sinks.reshaped([1, nQHeads, 1, 1])
+        let rowMax = scores.max(axis: -1, keepDims: true)
+        let m = maximum(rowMax, sinkLogits)
+        let expScores = exp(scores - m)
+        let sinkExp = exp(sinkLogits - m)
+        let denom = expScores.sum(axis: -1, keepDims: true) + sinkExp
+        attentionWeights4D = expScores / denom
+    } else {
+        attentionWeights4D = softmax(scores, axis: -1)
+    }
+
+    let attentionWeights =
+        nRepeats > 1
+        ? attentionWeights4D.reshaped([B, nKVHeads, nRepeats, L, kL])
+        : attentionWeights4D
 
     // Compute output using quantized matmul
     var output = quantizedMM(
