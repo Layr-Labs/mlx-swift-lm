@@ -45,7 +45,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(path: "../mlx-swift"),
+        .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -161,6 +161,7 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                "MLXRerankers",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
             path: "Libraries/IntegrationTestHelpers",

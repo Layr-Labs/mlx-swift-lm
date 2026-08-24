@@ -1950,12 +1950,16 @@ public enum Generation: Sendable {
     /// A tool call from the language model.
     case toolCall(ToolCall)
 
+    /// A tool-call-shaped output rejected by parsing or authorization.
+    case rejectedToolCall(RejectedToolCall)
+
     /// Generated text or nil
     public var chunk: String? {
         switch self {
         case .chunk(let string): string
         case .info: nil
         case .toolCall: nil
+        case .rejectedToolCall: nil
         }
     }
 
@@ -1965,6 +1969,7 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .info(let info): info
         case .toolCall: nil
+        case .rejectedToolCall: nil
         }
     }
 
@@ -1974,6 +1979,7 @@ public enum Generation: Sendable {
         case .chunk: nil
         case .info: nil
         case .toolCall(let toolCall): toolCall
+        case .rejectedToolCall: nil
         }
     }
 

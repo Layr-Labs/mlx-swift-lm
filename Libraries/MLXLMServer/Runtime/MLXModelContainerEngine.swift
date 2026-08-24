@@ -86,6 +86,8 @@ public struct MLXModelContainerEngine: MLXServerEngine {
                         continuation.yield(.content(text))
                     case .toolCall(let toolCall):
                         continuation.yield(.toolCall(toolCall))
+                    case .rejectedToolCall(let rejection):
+                        throw RejectedToolCallError(rejection)
                     case .info(let info):
                         continuation.yield(.info(.init(info)))
                     }

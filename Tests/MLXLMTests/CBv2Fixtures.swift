@@ -805,6 +805,12 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
         .tokens(input.text)
     }
 
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        try prepare(input, cache: cache, windowSize: prefill.stepSize)
+    }
+
     func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
         precondition(
             !config.withKVSharing,

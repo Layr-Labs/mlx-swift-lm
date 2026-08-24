@@ -62,6 +62,10 @@ extension ToolCallParser {
 ///
 /// Reference: https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/tool_parsers
 public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
+    /// Compatibility spelling used by the server-facing API. Harmony is the
+    /// GPT-OSS protocol implementation in this fork.
+    public static let harmony: Self = .gptOSS
+
     /// Default JSON format used by Llama, Qwen, and most models.
     /// Example: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
     case json

@@ -40,7 +40,6 @@ func runChecksum(directory: URL) async {
     }
 }
 
-@main
 struct BenchLoad {
     static func main() async {
         let args = CommandLine.arguments
@@ -124,3 +123,5 @@ struct BenchLoad {
         }
     }
 }
+
+await BenchLoad.main()

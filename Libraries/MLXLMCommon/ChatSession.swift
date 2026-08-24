@@ -326,6 +326,20 @@ public final class ChatSession {
         }
     }
 
+    /// Produces a streaming response after appending structured chat messages.
+    public func streamResponse(
+        to messages: consuming [Chat.Message]
+    ) -> AsyncThrowingStream<String, Error> {
+        streamMap(messages: messages) { $0.chunk }
+    }
+
+    /// Produces a detailed streaming response after appending structured chat messages.
+    public func streamDetails(
+        to messages: consuming [Chat.Message]
+    ) -> AsyncThrowingStream<Generation, Error> {
+        streamMap(messages: messages) { $0 }
+    }
+
     /// Produces a streaming response to a prompt by transforming the
     /// raw `Generation` values.
     ///
@@ -341,13 +355,23 @@ public final class ChatSession {
         videos: consuming [UserInput.Video],
         transform: @Sendable @escaping (Generation) -> R?
     ) -> AsyncThrowingStream<R, Error> {
+        streamMap(
+            messages: [
+                .init(role: role, content: prompt, images: images, videos: videos)
+            ],
+            transform: transform
+        )
+    }
+
+    private func streamMap<R: Sendable>(
+        messages: consuming [Chat.Message],
+        transform: @Sendable @escaping (Generation) -> R?
+    ) -> AsyncThrowingStream<R, Error> {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
 
         // images and videos are not Sendable (MLXArray) but they are consumed
         // and are only being sent to the inner async
-        let message = SendableBox<Chat.Message>(
-            .init(role: role, content: prompt, images: images, videos: videos)
-        )
+        let initialMessages = SendableBox<[Chat.Message]>(messages)
 
         let task = Task {
             [
@@ -402,7 +426,7 @@ public final class ChatSession {
                     }
 
                     // prepare the input
-                    messages.append(message.consume())
+                    messages.append(contentsOf: initialMessages.consume())
 
                     // loop can restart on tool calls
                     restart: while !messages.isEmpty {
