@@ -81,6 +81,18 @@ extension ToolCallFormat {
 
 extension ToolCallFormat {
 
+    /// Infer the parser family from a model architecture name.
+    public static func infer(from modelType: String) -> ToolCallFormat? {
+        let normalized = modelType.lowercased().replacingOccurrences(of: "-", with: "_")
+        if normalized.contains("gpt_oss") { return .gptOSS }
+        if normalized.contains("gemma4") { return .gemma4 }
+        if normalized.contains("qwen3_5") { return .qwen35 }
+        if normalized.contains("qwen") { return .json }
+        if normalized.contains("mistral") { return .mistral }
+        if normalized.contains("llama") { return .llama3 }
+        return nil
+    }
+
     /// Resolves a model declaration against the dialect selected by its checkpoint.
     ///
     /// An explicit `tool_parser_type` wins, matching mlx-lm, because it is the
