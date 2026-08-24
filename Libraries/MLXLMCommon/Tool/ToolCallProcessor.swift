@@ -57,6 +57,9 @@ public class ToolCallProcessor {
     /// Total rejected calls observed by this processor, including drained calls.
     public private(set) var rejectedToolCallCount = 0
 
+    /// Number of complete tool-call-shaped payloads that failed to parse.
+    public private(set) var parseFailureCount = 0
+
     // MARK: - State Enum
 
     private enum State {
