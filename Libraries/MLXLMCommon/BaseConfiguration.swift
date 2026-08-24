@@ -202,6 +202,11 @@ public struct BaseConfiguration: Codable, Sendable {
     /// EOS token IDs from config.json. Can be a single Int or an array of Ints.
     public var eosTokenIds: IntOrIntArray?
 
+    /// EOS token IDs in the set form consumed by generation configuration.
+    public var effectiveEOSTokenIds: Set<Int> {
+        Set(eosTokenIds?.values ?? [])
+    }
+
     /// The default quantization settings.
     @available(*, deprecated, message: "Please use perLayerQuantization instead")
     public var quantization: Quantization? {
