@@ -79,6 +79,9 @@ public struct UserInput {
     public enum Video {
         #if canImport(AVFoundation)
         case avAsset(AVAsset)
+        /// An MP4 retained together with the resource loader that serves its
+        /// bytes directly from memory. No file or network URL is involved.
+        case memoryBacked(MemoryBackedVideoAsset)
         #endif
         case url(URL)
         /// Useful for decoded frames held in memory
@@ -93,6 +96,10 @@ public struct UserInput {
             switch self {
             case .avAsset(let asset):
                 return asset
+            case .memoryBacked:
+                fatalError(
+                    "calling asAVAsset() on a memory-backed Video is unsupported because it would separate the asset from its resource-loader owner - use MediaProcessing.asProcessedSequence() instead"
+                )
             case .url(let url):
                 return AVAsset(url: url)
             case .frames:
