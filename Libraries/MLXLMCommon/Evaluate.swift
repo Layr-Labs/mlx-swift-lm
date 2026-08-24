@@ -69,6 +69,9 @@ public struct GenerateParameters: Sendable {
     /// When set, uses ``RotatingKVCache`` instead of ``KVCacheSimple``
     public var maxKVSize: Int?
 
+    /// Typed key-value cache configuration, when supplied.
+    public var kvCache: KVCacheConfiguration?
+
     /// Number of bits to use for KV cache quantization. nil implies no cache quantization.
     public var kvBits: Int?
 
@@ -77,6 +80,9 @@ public struct GenerateParameters: Sendable {
 
     /// Step to begin using a quantized KV cache when kvBits is non-nil (default: 0)
     public var quantizedKVStart: Int
+
+    /// Named cache compression scheme retained for the merged cache planner.
+    public var kvScheme: String?
 
     /// Sampling temperature
     public var temperature: Float
@@ -111,9 +117,11 @@ public struct GenerateParameters: Sendable {
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
+        kvCache: KVCacheConfiguration? = nil,
         kvBits: Int? = nil,
         kvGroupSize: Int = 64,
         quantizedKVStart: Int = 0,
+        kvScheme: String? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -128,9 +136,11 @@ public struct GenerateParameters: Sendable {
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
+        self.kvCache = kvCache
         self.kvBits = kvBits
         self.kvGroupSize = kvGroupSize
         self.quantizedKVStart = quantizedKVStart
+        self.kvScheme = kvScheme
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
@@ -506,6 +516,31 @@ public struct PenaltyProcessor: LogitProcessor {
     }
 }
 
+/// Processor that applies multiple logit processors in order.
+public struct ChainedLogitProcessor: LogitProcessor {
+    var processors: [any LogitProcessor]
+
+    public init(processors: [any LogitProcessor]) {
+        self.processors = processors
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        for index in processors.indices {
+            processors[index].prompt(prompt)
+        }
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        processors.reduce(logits) { $1.process(logits: $0) }
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        for index in processors.indices {
+            processors[index].didSample(token: token)
+        }
+    }
+}
+
 /// Common properties shared by token-generating iterators.
 ///
 /// Public so model-specific iterators outside `MLXLMCommon` can plug into
@@ -580,7 +615,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = .init(tokens: prompt)
-        self.cache = cache ?? (try model.newCache(parameters: parameters))
+        self.cache = try (cache ?? model.newCache(parameters: parameters))
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -613,7 +648,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = input.text
-        self.cache = cache ?? (try model.newCache(parameters: parameters))
+        self.cache = try (cache ?? model.newCache(parameters: parameters))
 
         self.processor = parameters.processor()
         self.sampler = parameters.sampler()
@@ -645,7 +680,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ) throws {
         self.model = model
         self.y = input.text
-        self.cache = cache ?? (try model.newCache(parameters: nil))
+        self.cache = try (cache ?? model.newCache(parameters: nil))
 
         self.processor = processor
         self.sampler = sampler
@@ -664,7 +699,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        switch try model.prepare(input, cache: cache, state: nil, windowSize: windowSize) {
         case .tokens(let tokens):
             y = tokens
 
@@ -806,8 +841,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.mainModel = mainModel
         self.draftModel = draftModel
 
-        self.mainCache = mainCache ?? (try mainModel.newCache(parameters: parameters))
-        self.draftCache = draftCache ?? (try draftModel.newCache(parameters: parameters))
+        self.mainCache = try (mainCache ?? mainModel.newCache(parameters: parameters))
+        self.draftCache = try (draftCache ?? draftModel.newCache(parameters: parameters))
         guard canTrimPromptCache(self.mainCache), canTrimPromptCache(self.draftCache) else {
             throw KVCacheError(message: "Speculative decoding requires trimmable KV caches.")
         }
@@ -837,7 +872,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         processor?.prompt(input.text.tokens)
 
         // Prefill main model
-        switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
+        switch try mainModel.prepare(input, cache: mainCache, state: nil, windowSize: windowSize) {
         case .tokens(let tokens):
             y = tokens
         case .logits(let result):
@@ -850,7 +885,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         // Prefill draft model, don't call didSample here -- processor tracks main model's accepted sequence only
-        switch try draftModel.prepare(input, cache: draftCache, windowSize: windowSize) {
+        switch try draftModel.prepare(input, cache: draftCache, state: nil, windowSize: windowSize) {
         case .tokens(let tokens):
             draftY = tokens
         case .logits(let result):
