@@ -48,6 +48,39 @@ private func qwenInlineMTPConfig(blockSize: Int = 3, prefix: String = "mtp.") ->
         """.utf8)
 }
 
+private func qwenStandaloneMTPConfig(blockSize: Int = 3) -> Data {
+    Data(
+        """
+        {
+          "block_size": \(blockSize),
+          "model_type": "qwen3_5_mtp",
+          "quantization": {
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine"
+          },
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+            "intermediate_size": 17408,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "linear_num_value_heads": 48,
+            "linear_num_key_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "vocab_size": 248320,
+            "full_attention_interval": 4,
+            "max_position_embeddings": 262144,
+            "mtp_num_hidden_layers": 1
+          }
+        }
+        """.utf8)
+}
+
 private func withInlineMTPDirectory(
     blockSize: Int = 3,
     weights: [String: MLXArray] = ["mtp.unexpected.weight": MLXArray([Float(1)])],
@@ -110,6 +143,26 @@ struct Qwen35InlineMTPLoaderTests {
             #expect(metadata.defaultQuantization?.mode == .mxfp8)
             #expect(metadata.quantizationByPath["layers.0.self_attn.q_proj"] != nil)
         }
+    }
+
+    @Test("standalone Qwen3.8 MTP metadata uses unprefixed weights")
+    func standaloneMetadata() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-standalone-mtp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try qwenStandaloneMTPConfig()
+            .write(to: directory.appendingPathComponent("config.json"))
+
+        let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+        #expect(metadata.prefix.isEmpty)
+        #expect(metadata.blockSize == 3)
+        #expect(metadata.defaultQuantization?.groupSize == 64)
+        #expect(metadata.defaultQuantization?.bits == 4)
+        #expect(metadata.defaultQuantization?.mode == .affine)
+        #expect(metadata.textConfiguration.modelType == "qwen3_5_text")
+        #expect(metadata.textConfiguration.hiddenLayers == 64)
+        #expect(metadata.textConfiguration.mtpNumHiddenLayers == 1)
     }
 
     @Test("assistant state accounting includes KV, target hidden, and token storage")
