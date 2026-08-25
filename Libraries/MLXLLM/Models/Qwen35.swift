@@ -892,11 +892,12 @@ final class Qwen35GatedDeltaNet: Module {
         let b: MLXArray
         let a: MLXArray
         if exactTargetVerify {
-            qkv = qwen35A3BExactW4G64Projection(inProjQKV, inputs)
-            z = qwen35A3BExactW4G64Projection(inProjZ, inputs)
-                .reshaped(B, S, numVHeads, headVDim)
-            b = qwen35A3BExactW4G64Projection(inProjB, inputs)
-            a = qwen35A3BExactW4G64Projection(inProjA, inputs)
+            let exact = qwen35A3BExactW4G64ProjectionQuad(
+                inProjQKV, inProjZ, inProjB, inProjA, inputs)
+            qkv = exact.0
+            z = exact.1.reshaped(B, S, numVHeads, headVDim)
+            b = exact.2
+            a = exact.3
         } else {
             // Preserve main's fused GDN projection construction and graph.
             (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
@@ -1441,8 +1442,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
         guard exact else { return self(x) }
-        let gate = qwen35A3BExactW4G64Projection(gateProj, x)
-        let up = qwen35A3BExactW4G64Projection(upProj, x)
+        let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
+            gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
     }
 }

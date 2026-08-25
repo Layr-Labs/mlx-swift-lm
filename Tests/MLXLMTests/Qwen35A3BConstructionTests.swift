@@ -193,6 +193,83 @@ final class Qwen35A3BConstructionTests: XCTestCase {
         XCTAssertEqual(difference.item(Float.self), 0)
     }
 
+    func testExactW4G64ProjectionPairMatchesIndependentM1QMVBitwise() {
+        let inputSize = 512
+        let outputSize = 16
+        let positions = 3
+        let indices = MLXArray(0 ..< outputSize * inputSize).asType(.float32)
+        let first = QuantizedLinear(
+            weight: sin(indices * 0.013).asType(.bfloat16)
+                .reshaped([outputSize, inputSize]),
+            bias: nil, groupSize: 64, bits: 4, mode: .affine)
+        let second = QuantizedLinear(
+            weight: cos(indices * 0.019).asType(.bfloat16)
+                .reshaped([outputSize, inputSize]),
+            bias: nil, groupSize: 64, bits: 4, mode: .affine)
+        let input = cos(
+            MLXArray(0 ..< positions * inputSize).asType(.float32) * 0.017
+        ).asType(.bfloat16).reshaped([1, positions, inputSize])
+
+        let expectedFirst = qwen35A3BTimewiseProjection(input) { first($0) }
+        let expectedSecond = qwen35A3BTimewiseProjection(input) { second($0) }
+        let (actualFirst, actualSecond) = qwen35A3BExactW4G64ProjectionPair(
+            first, second, input)
+        let firstDifference = max(abs(
+            actualFirst.asType(.float32) - expectedFirst.asType(.float32)))
+        let secondDifference = max(abs(
+            actualSecond.asType(.float32) - expectedSecond.asType(.float32)))
+        eval(expectedFirst, expectedSecond, actualFirst, actualSecond,
+             firstDifference, secondDifference)
+
+        XCTAssertEqual(actualFirst.shape, [1, positions, outputSize])
+        XCTAssertEqual(actualSecond.shape, [1, positions, outputSize])
+        XCTAssertEqual(firstDifference.item(Float.self), 0)
+        XCTAssertEqual(secondDifference.item(Float.self), 0)
+    }
+
+    func testExactW4G64ProjectionQuadMatchesIndependentM1QMVBitwise() {
+        let inputSize = 512
+        let positions = 3
+        func makeLinear(_ outputSize: Int, _ scale: Float) -> QuantizedLinear {
+            let indices = MLXArray(0 ..< outputSize * inputSize).asType(.float32)
+            return QuantizedLinear(
+                weight: sin(indices * scale).asType(.bfloat16)
+                    .reshaped([outputSize, inputSize]),
+                bias: nil, groupSize: 64, bits: 4, mode: .affine)
+        }
+        let first = makeLinear(16, 0.011)
+        let second = makeLinear(20, 0.013)
+        let third = makeLinear(24, 0.017)
+        let fourth = makeLinear(28, 0.019)
+        let input = cos(
+            MLXArray(0 ..< positions * inputSize).asType(.float32) * 0.023
+        ).asType(.bfloat16).reshaped([1, positions, inputSize])
+
+        let expectedFirst = qwen35A3BTimewiseProjection(input) { first($0) }
+        let expectedSecond = qwen35A3BTimewiseProjection(input) { second($0) }
+        let expectedThird = qwen35A3BTimewiseProjection(input) { third($0) }
+        let expectedFourth = qwen35A3BTimewiseProjection(input) { fourth($0) }
+        let (actualFirst, actualSecond, actualThird, actualFourth) =
+            qwen35A3BExactW4G64ProjectionQuad(
+                first, second, third, fourth, input)
+        let differences = [
+            max(abs(actualFirst.asType(.float32) - expectedFirst.asType(.float32))),
+            max(abs(actualSecond.asType(.float32) - expectedSecond.asType(.float32))),
+            max(abs(actualThird.asType(.float32) - expectedThird.asType(.float32))),
+            max(abs(actualFourth.asType(.float32) - expectedFourth.asType(.float32))),
+        ]
+        eval(actualFirst, actualSecond, actualThird, actualFourth)
+        eval(differences)
+
+        XCTAssertEqual(actualFirst.shape, [1, positions, 16])
+        XCTAssertEqual(actualSecond.shape, [1, positions, 20])
+        XCTAssertEqual(actualThird.shape, [1, positions, 24])
+        XCTAssertEqual(actualFourth.shape, [1, positions, 28])
+        for difference in differences {
+            XCTAssertEqual(difference.item(Float.self), 0)
+        }
+    }
+
     func testStockRouterKeepsTheLastAxisForWidePrefill() throws {
         let previous = qwen35A3BConstructionProfile
         qwen35A3BConstructionProfile = .stock
