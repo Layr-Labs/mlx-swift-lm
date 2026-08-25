@@ -658,4 +658,39 @@ struct BenchCBv2HarnessTests {
         #expect(FileManager.default.changeCurrentDirectoryPath("/tmp"))
         #expect(buildRevision() == revision)
     }
+
+    @Test("Qwen campaign evidence does not publish a macOS operator home")
+    func qwenEvidenceScrubsOperatorHomePaths() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let roots = [
+            repository.appendingPathComponent("benchmarks/qwen36-a3b"),
+            repository.appendingPathComponent("docs/plans"),
+            repository.appendingPathComponent("docs/specs"),
+            repository.appendingPathComponent("scripts"),
+        ]
+        let plainPrefix = Data("/Users/".utf8)
+        let escapedPrefix = Data("\\/Users\\/".utf8)
+        for root in roots {
+            guard let files = FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: [.isRegularFileKey])
+            else { continue }
+            for case let file as URL in files {
+                guard try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
+                else { continue }
+                if root.lastPathComponent != "qwen36-a3b",
+                    !file.lastPathComponent.lowercased().contains("qwen36")
+                {
+                    continue
+                }
+                let data = try Data(contentsOf: file, options: .mappedIfSafe)
+                #expect(
+                    data.range(of: plainPrefix) == nil
+                        && data.range(of: escapedPrefix) == nil,
+                    "operator home path leaked in \(file.path)")
+            }
+        }
+    }
 }

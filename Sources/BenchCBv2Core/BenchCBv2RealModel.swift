@@ -698,7 +698,7 @@ func runCampaignRequest(
         mtpRoute = "disabled"
     }
     let targetRoute = options.profile == .decode || options.profile == .full
-        ? "row-owned-E256-K8+combine-M1M2"
+        ? "row-owned-E256-K8+main-direct-expert-reduction"
         : "pinned-default"
     var routeSummary = [
         "engine": "v2-contiguous",

@@ -86,7 +86,8 @@ Retained on the measured source:
 - 8,192-token prefill chunk and solo stripe;
 - fixed-K2 rectangular target-authoritative fast decode;
 - fixed-K2 rectangular-exact decode relative to optimized AR;
-- exact-artifact row-owned E256/top8 router and M1/M2 expert reduction.
+- exact-artifact row-owned E256/top8 router, composed with main's direct expert
+  reduction rather than replacing it.
 
 Rejected:
 

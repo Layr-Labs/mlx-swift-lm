@@ -1365,7 +1365,6 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let numExperts: Int
     let topK: Int
     private let routerFinalizer: Qwen35A3BRouterFinalizer
-    private let expertCombiner: Qwen35A3BExpertCombiner
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -1386,8 +1385,6 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         self.routerFinalizer = qwen35A3BRouterFinalizer(
             hidden: args.hiddenSize, experts: args.numExperts,
             topK: args.numExpertsPerTok, normalize: args.normTopkProb)
-        self.expertCombiner = qwen35A3BExpertCombiner(
-            hidden: args.hiddenSize, topK: args.numExpertsPerTok)
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
