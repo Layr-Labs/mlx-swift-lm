@@ -31,4 +31,12 @@ public struct DFlash2CommitPlan: Equatable, Sendable {
         self.rejectedRows = rejectedRows
         self.fullyAccepted = fullyAccepted
     }
+
+    public func capped(to outputBudget: Int) -> DFlash2CommitPlan {
+        let rows = min(commitRows, outputBudget)
+        return DFlash2CommitPlan(
+            commitRows: rows,
+            rejectedRows: commitRows + rejectedRows - rows,
+            fullyAccepted: rows == commitRows + rejectedRows)
+    }
 }

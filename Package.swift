@@ -51,7 +51,9 @@ let package = Package(
             targets: ["qwen38-dflash2-runner"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
+        .package(
+            url: "https://github.com/davidtai/mlx-swift.git",
+            revision: "713cf35cdd86e219b69a56bafaeeec6607934218"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -189,7 +191,8 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
             ],
-            path: "Executables/qwen38-dflash2-runner"
+            path: "Executables/qwen38-dflash2-runner",
+            plugins: ["BenchRevisionStamp"]
         ),
         .testTarget(
             name: "MLXLMTests",

@@ -13,6 +13,7 @@ struct Qwen38DFlash2RunnerOptionsTests {
             "--mode", "dflash2",
             "--prompt", "hello",
             "--max-tokens", "128",
+            "--conditioner-tokens", "1024",
             "--receipt", "/tmp/receipt.json",
         ])
         #expect(options.targetPath == "/models/target")
@@ -20,8 +21,91 @@ struct Qwen38DFlash2RunnerOptionsTests {
         #expect(options.mode == .dflash2)
         #expect(options.prompt == "hello")
         #expect(options.maxTokens == 128)
+        #expect(options.conditionerTokens == 1024)
         #expect(options.receiptPath == "/tmp/receipt.json")
         #expect(options.dflashPhysicalWidth == nil)
+    }
+
+    @Test("same-prompt conditioner is explicit and positive")
+    func conditionerTokens() throws {
+        let ordinary = try Qwen38RunnerOptions.parse([
+            "--target", "/models/target",
+            "--draft", "/models/draft",
+            "--prompt", "hello",
+        ])
+        #expect(ordinary.conditionerTokens == 0)
+
+        #expect(throws: Qwen38RunnerOptionError.self) {
+            try Qwen38RunnerOptions.parse([
+                "--target", "/models/target",
+                "--draft", "/models/draft",
+                "--prompt", "hello",
+                "--conditioner-tokens", "0",
+            ])
+        }
+    }
+
+    @Test("cycle diagnostics are an explicit non-measured DFlash route")
+    func diagnosticCycles() throws {
+        let options = try Qwen38RunnerOptions.parse([
+            "--target", "/models/target",
+            "--draft", "/models/draft",
+            "--prompt", "hello",
+            "--receipt", "/tmp/diagnostic.json",
+            "--diagnostic-cycles",
+        ])
+        #expect(options.diagnosticCycles)
+
+        #expect(throws: Qwen38RunnerOptionError.self) {
+            try Qwen38RunnerOptions.parse([
+                "--target", "/models/target",
+                "--mode", "ar",
+                "--prompt", "hello",
+                "--receipt", "/tmp/diagnostic.json",
+                "--diagnostic-cycles",
+            ])
+        }
+        #expect(throws: Qwen38RunnerOptionError.self) {
+            try Qwen38RunnerOptions.parse([
+                "--target", "/models/target",
+                "--draft", "/models/draft",
+                "--prompt", "hello",
+                "--diagnostic-cycles",
+            ])
+        }
+    }
+
+    @Test("prefetched cycle diagnostics exercise the production scheduling route")
+    func diagnosticPrefetch() throws {
+        let options = try Qwen38RunnerOptions.parse([
+            "--target", "/models/target",
+            "--draft", "/models/draft",
+            "--prompt", "hello",
+            "--receipt", "/tmp/prefetched-diagnostic.json",
+            "--diagnostic-prefetch",
+        ])
+        #expect(options.diagnosticPrefetch)
+        #expect(!options.diagnosticCycles)
+
+        #expect(throws: Qwen38RunnerOptionError.self) {
+            try Qwen38RunnerOptions.parse([
+                "--target", "/models/target",
+                "--mode", "ar",
+                "--prompt", "hello",
+                "--receipt", "/tmp/prefetched-diagnostic.json",
+                "--diagnostic-prefetch",
+            ])
+        }
+        #expect(throws: Qwen38RunnerOptionError.self) {
+            try Qwen38RunnerOptions.parse([
+                "--target", "/models/target",
+                "--draft", "/models/draft",
+                "--prompt", "hello",
+                "--receipt", "/tmp/prefetched-diagnostic.json",
+                "--diagnostic-cycles",
+                "--diagnostic-prefetch",
+            ])
+        }
     }
 
     @Test("fixed DFlash width is a construction-time benchmark control")

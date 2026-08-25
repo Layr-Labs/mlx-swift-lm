@@ -48,6 +48,11 @@ private struct RunReceipt: Codable, Sendable {
     let decodeSeconds: Double
     let decodeTokensPerSecond: Double
     let tokenSHA256: String
+    let tokens: [Int]
+    let acceptanceHistory: [Int]?
+    let physicalWidths: [Int]?
+    let proposedCycles: [[Int]]?
+    let posteriorCycles: [[Int]]?
 }
 
 private struct RunnerReceipt: Codable, Sendable {
@@ -60,6 +65,7 @@ private struct RunnerReceipt: Codable, Sendable {
     let draftRepository: String
     let draftRevision: String
     let draftConfigSHA256: String?
+    let swiftPortRevision: String
     let swiftBaseRevision: String
     let mlxSwiftRevision: String
     let mlxRevision: String
@@ -79,6 +85,9 @@ private struct RunnerReceipt: Codable, Sendable {
     let targetTopP: Float
     let targetTopK: Int
     let targetSeed: UInt64
+    let conditionerPromptTokens: Int
+    let conditionerOutputTokens: Int
+    let conditionerMode: String
     let runs: [RunReceipt]
 }
 
@@ -195,7 +204,12 @@ private func runAutoregressive(
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             decodeTokensPerSecond: Double(generated.count) / decodeSeconds,
-            tokenSHA256: tokenDigest(generated))
+            tokenSHA256: tokenDigest(generated),
+            tokens: generated,
+            acceptanceHistory: nil,
+            physicalWidths: nil,
+            proposedCycles: nil,
+            posteriorCycles: nil)
     )
 }
 
@@ -215,14 +229,18 @@ private func runDFlash2(
     let decodeStart = CFAbsoluteTimeGetCurrent()
     var generated = [Int]()
     generated.reserveCapacity(outputBudget)
-    let nextCycle: () -> DFlash2CycleResult
+    let nextCycle: (Int) -> DFlash2CycleResult
     if let fixedPhysicalWidth {
-        nextCycle = { session.warmStep(physicalWidth: fixedPhysicalWidth) }
+        nextCycle = {
+            session.fixedStep(
+                physicalWidth: fixedPhysicalWidth,
+                remainingOutputTokens: $0)
+        }
     } else {
-        nextCycle = { session.step() }
+        nextCycle = { session.step(remainingOutputTokens: $0) }
     }
     while generated.count < outputBudget {
-        let cycle = nextCycle()
+        let cycle = nextCycle(outputBudget - generated.count)
         let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
         generated.append(contentsOf: cycleTokens.prefix(outputBudget - generated.count))
     }
@@ -236,7 +254,117 @@ private func runDFlash2(
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             decodeTokensPerSecond: Double(generated.count) / decodeSeconds,
-            tokenSHA256: tokenDigest(generated))
+            tokenSHA256: tokenDigest(generated),
+            tokens: generated,
+            acceptanceHistory: nil,
+            physicalWidths: nil,
+            proposedCycles: nil,
+            posteriorCycles: nil)
+    )
+}
+
+/// Root-cause route only. It deliberately records cycle-level state and emits
+/// zero timing values so its receipt cannot be mistaken for benchmark evidence.
+private func diagnoseDFlash2Cycles(
+    target: any DFlash2QwenTarget,
+    draft: DFlash2DraftModel,
+    prompt: MLXArray,
+    outputBudget: Int,
+    fixedPhysicalWidth: Int?
+) -> (tokens: [Int], receipt: RunReceipt) {
+    let session = DFlash2Session(
+        target: target, draft: draft, promptLength: prompt.dim(1))
+    session.prefill(promptTokens: prompt)
+
+    var generated = [Int]()
+    var acceptanceHistory = [Int]()
+    var physicalWidths = [Int]()
+    var proposedCycles = [[Int]]()
+    var posteriorCycles = [[Int]]()
+    generated.reserveCapacity(outputBudget)
+    while generated.count < outputBudget {
+        let diagnostic: DFlash2CycleDiagnosticResult
+        if let fixedPhysicalWidth {
+            diagnostic = session.diagnosticStep(physicalWidth: fixedPhysicalWidth)
+        } else {
+            diagnostic = session.diagnosticStep()
+        }
+        let cycle = diagnostic.cycle
+        let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
+        generated.append(contentsOf: cycleTokens.prefix(outputBudget - generated.count))
+        acceptanceHistory.append(cycle.acceptedDraftTokens)
+        physicalWidths.append(cycle.physicalWidth)
+        proposedCycles.append(
+            diagnostic.proposedTokens.asArray(Int32.self).map(Int.init))
+        posteriorCycles.append(
+            diagnostic.posteriorTokens.asArray(Int32.self).map(Int.init))
+    }
+    return (
+        generated,
+        RunReceipt(
+            mode: "dflash2-diagnostic",
+            promptTokens: prompt.dim(1),
+            outputTokens: generated.count,
+            prefillSeconds: 0,
+            decodeSeconds: 0,
+            decodeTokensPerSecond: 0,
+            tokenSHA256: tokenDigest(generated),
+            tokens: generated,
+            acceptanceHistory: acceptanceHistory,
+            physicalWidths: physicalWidths,
+            proposedCycles: proposedCycles,
+            posteriorCycles: posteriorCycles)
+    )
+}
+
+/// Non-measured production-scheduling diagnostic. Unlike the detailed capture
+/// route above, this calls the same prefetching step entrypoint as a timed run
+/// and records only state already returned by each cycle.
+private func diagnosePrefetchedDFlash2Cycles(
+    target: any DFlash2QwenTarget,
+    draft: DFlash2DraftModel,
+    prompt: MLXArray,
+    outputBudget: Int,
+    fixedPhysicalWidth: Int?
+) -> (tokens: [Int], receipt: RunReceipt) {
+    let session = DFlash2Session(
+        target: target, draft: draft, promptLength: prompt.dim(1))
+    session.prefill(promptTokens: prompt)
+
+    var generated = [Int]()
+    var acceptanceHistory = [Int]()
+    var physicalWidths = [Int]()
+    generated.reserveCapacity(outputBudget)
+    while generated.count < outputBudget {
+        let remaining = outputBudget - generated.count
+        let cycle: DFlash2CycleResult
+        if let fixedPhysicalWidth {
+            cycle = session.fixedStep(
+                physicalWidth: fixedPhysicalWidth,
+                remainingOutputTokens: remaining)
+        } else {
+            cycle = session.step(remainingOutputTokens: remaining)
+        }
+        let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
+        generated.append(contentsOf: cycleTokens.prefix(remaining))
+        acceptanceHistory.append(cycle.acceptedDraftTokens)
+        physicalWidths.append(cycle.physicalWidth)
+    }
+    return (
+        generated,
+        RunReceipt(
+            mode: "dflash2-prefetch-diagnostic",
+            promptTokens: prompt.dim(1),
+            outputTokens: generated.count,
+            prefillSeconds: 0,
+            decodeSeconds: 0,
+            decodeTokensPerSecond: 0,
+            tokenSHA256: tokenDigest(generated),
+            tokens: generated,
+            acceptanceHistory: acceptanceHistory,
+            physicalWidths: physicalWidths,
+            proposedCycles: nil,
+            posteriorCycles: nil)
     )
 }
 
@@ -310,9 +438,6 @@ private struct Qwen38DFlash2Runner {
             } else {
                 draft = nil
             }
-            let draftProjectionReport = try draft.map {
-                try installQwen38ProjectionStack(in: $0)
-            }
             let outcome = try await container.perform {
                 (context: ModelContext) async throws -> RunnerOutcome in
                 guard let target = context.model as? any DFlash2QwenTarget else {
@@ -352,6 +477,30 @@ private struct Qwen38DFlash2Runner {
                     wiredMemoryApplied = 0
                 }
 
+                if options.conditionerTokens > 0 {
+                    switch options.mode {
+                    case .autoregressive:
+                        _ = runAutoregressive(
+                            target: target, prompt: prompt,
+                            outputBudget: options.conditionerTokens)
+                    case .dflash2:
+                        _ = runDFlash2(
+                            target: target, draft: draft!, prompt: prompt,
+                            outputBudget: options.conditionerTokens,
+                            fixedPhysicalWidth: options.dflashPhysicalWidth)
+                    case .benchmark:
+                        _ = runAutoregressive(
+                            target: target, prompt: prompt,
+                            outputBudget: options.conditionerTokens)
+                        _ = runDFlash2(
+                            target: target, draft: draft!, prompt: prompt,
+                            outputBudget: options.conditionerTokens,
+                            fixedPhysicalWidth: options.dflashPhysicalWidth)
+                    }
+                    Memory.clearCache()
+                    Memory.peakMemory = 0
+                }
+
                 let runs: [(tokens: [Int], receipt: RunReceipt)]
                 switch options.mode {
                 case .autoregressive:
@@ -361,12 +510,28 @@ private struct Qwen38DFlash2Runner {
                     ]
                 case .dflash2:
                     let draft = draft!
-                    runs = [
-                        runDFlash2(
-                            target: target, draft: draft, prompt: prompt,
-                            outputBudget: options.maxTokens,
-                            fixedPhysicalWidth: options.dflashPhysicalWidth)
-                    ]
+                    if options.diagnosticCycles {
+                        runs = [
+                            diagnoseDFlash2Cycles(
+                                target: target, draft: draft, prompt: prompt,
+                                outputBudget: options.maxTokens,
+                                fixedPhysicalWidth: options.dflashPhysicalWidth)
+                        ]
+                    } else if options.diagnosticPrefetch {
+                        runs = [
+                            diagnosePrefetchedDFlash2Cycles(
+                                target: target, draft: draft, prompt: prompt,
+                                outputBudget: options.maxTokens,
+                                fixedPhysicalWidth: options.dflashPhysicalWidth)
+                        ]
+                    } else {
+                        runs = [
+                            runDFlash2(
+                                target: target, draft: draft, prompt: prompt,
+                                outputBudget: options.maxTokens,
+                                fixedPhysicalWidth: options.dflashPhysicalWidth)
+                        ]
+                    }
                 case .benchmark:
                     let draft = draft!
                     runs = [
@@ -400,6 +565,7 @@ private struct Qwen38DFlash2Runner {
                     draftRepository: manifest.draftArtifact.repository,
                     draftRevision: manifest.draftArtifact.revision,
                     draftConfigSHA256: draftConfigSHA256,
+                    swiftPortRevision: BenchBuildRevision.value,
                     swiftBaseRevision: manifest.swiftBaseRevision,
                     mlxSwiftRevision: manifest.mlxSwiftRevision,
                     mlxRevision: manifest.mlxRevision,
@@ -412,7 +578,7 @@ private struct Qwen38DFlash2Runner {
                     targetOptimizedProjections: targetProjectionReport.installed,
                     targetPreservedFusedGDNInputs:
                         targetProjectionReport.preservedFusedGDNInputs,
-                    draftOptimizedProjections: draftProjectionReport?.installed ?? 0,
+                    draftOptimizedProjections: 0,
                     activeMemoryAtConstruction: activeMemoryAtConstruction,
                     wiredMemoryLimit: wiredMemoryLimit ?? 0,
                     wiredMemoryApplied: wiredMemoryApplied,
@@ -420,6 +586,11 @@ private struct Qwen38DFlash2Runner {
                     targetTopP: Qwen38TargetSampler.topP,
                     targetTopK: Qwen38TargetSampler.topK,
                     targetSeed: Qwen38TargetSampler.seed,
+                    conditionerPromptTokens:
+                        options.conditionerTokens > 0 ? prompt.dim(1) : 0,
+                    conditionerOutputTokens: options.conditionerTokens,
+                    conditionerMode:
+                        options.conditionerTokens > 0 ? "same_prompt" : "none",
                     runs: runs.map(\.receipt))
                 return RunnerOutcome(text: text, receipt: receipt)
             }

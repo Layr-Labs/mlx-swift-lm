@@ -33,4 +33,16 @@ struct DFlash2AcceptanceTests {
             DFlash2CommitPlan(verifyRows: 6, acceptedDraftTokens: 5)
                 == DFlash2CommitPlan(commitRows: 6, rejectedRows: 0, fullyAccepted: true))
     }
+
+    @Test("final cycle commits no rows beyond the remaining output budget")
+    func outputBudgetCapsCommit() {
+        #expect(
+            DFlash2CommitPlan(verifyRows: 8, acceptedDraftTokens: 7)
+                .capped(to: 1)
+                == DFlash2CommitPlan(commitRows: 1, rejectedRows: 7, fullyAccepted: false))
+        #expect(
+            DFlash2CommitPlan(verifyRows: 8, acceptedDraftTokens: 3)
+                .capped(to: 3)
+                == DFlash2CommitPlan(commitRows: 3, rejectedRows: 5, fullyAccepted: false))
+    }
 }

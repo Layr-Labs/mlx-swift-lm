@@ -25,6 +25,16 @@ struct DFlash2ContextPolicyTests {
         #expect(policy.nextPhysicalWidth == 6)
     }
 
+    @Test("the padded width-seven cost class rounds up to physical width eight")
+    func costAlignsWidthSeven() {
+        var policy = DFlash2ContextPolicy(promptLength: 1_024)
+        for _ in 0 ..< 4 {
+            let width = policy.nextPhysicalWidth
+            policy.record(blockLength: width, acceptedDraftTokens: width - 1)
+        }
+        #expect(policy.nextPhysicalWidth == 8)
+    }
+
     @Test("repeated first-position rejection can select the direct M1 route")
     func rejectionContractsToM1() {
         var policy = DFlash2ContextPolicy(promptLength: 1_024)

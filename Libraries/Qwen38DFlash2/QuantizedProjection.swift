@@ -4,20 +4,22 @@
 
 import MLX
 import MLXFast
+import MLXLLM
 import MLXNN
 
 enum Qwen38ProjectionRoute: Equatable {
     case stock
-    case m4KSplit
+    case m4KConstSplit
     case m5Exact
     case m6(kParts: Int, barrierFree: Bool)
     case m8NAX(simdgroups: Int)
+    case m16NAX
 }
 
 func qwen38ProjectionRoute(width: Int, k: Int, n: Int) -> Qwen38ProjectionRoute {
     switch width {
     case 4:
-        return .m4KSplit
+        return .m4KConstSplit
     case 5:
         return .m5Exact
     case 6:
@@ -40,113 +42,164 @@ func qwen38ProjectionRoute(width: Int, k: Int, n: Int) -> Qwen38ProjectionRoute 
     }
 }
 
+/// PR #335's promoted receipts leave every production draft width on stock
+/// MLX quantized matmul (`custom_draft_qmv.active_modules == 0`). M16 remains
+/// available only as an isolated kernel fixture; the width-8 runtime never
+/// dispatches it.
+func qwen38DraftProjectionRoute(width: Int, k: Int, n: Int) -> Qwen38ProjectionRoute {
+    switch width {
+    case 16 where k % 256 == 0 && n % 32 == 0:
+        return .m16NAX
+    default:
+        return .stock
+    }
+}
+
 final class Qwen38M4ProjectionKernel {
+    private let k: Int
     private let kParts: Int
     private let kernel: MLXFast.MLXFastKernel
 
-    init(groupSize: Int, kParts: Int) {
+    init(k: Int, groupSize: Int, kParts: Int) {
+        precondition(k % 64 == 0)
         precondition([32, 64, 128].contains(groupSize))
         precondition(kParts == 2 || kParts == 4)
+        self.k = k
         self.kParts = kParts
         kernel = MLXFast.metalKernel(
-            name: "qwen38_m4_kp\(kParts)_g\(groupSize)",
+            name: "qwen38_vk_ks_m4_q4_kp\(kParts)_k\(k)_g\(groupSize)",
             inputNames: ["x", "w_q", "scales", "biases", "K_size", "N_size"],
             outputNames: ["y"],
             source: """
-                using namespace metal;
-                constexpr int M = 4;
-                constexpr int BN = 4;
-                constexpr int K_PARTS = \(kParts);
-                constexpr int GS = \(groupSize);
+                    using namespace metal;
+                    constexpr int M = 4;
+                    constexpr int BN = 4;
+                    constexpr int K_PARTS = \(kParts);
+                    constexpr int GS = \(groupSize);
 
-                uint part = simdgroup_index_in_threadgroup;
-                uint lane = thread_index_in_simdgroup;
-                uint tg_n = threadgroup_position_in_grid.y;
+                    uint part = simdgroup_index_in_threadgroup;
+                    uint lane = thread_index_in_simdgroup;
+                    uint tg_n = threadgroup_position_in_grid.y;
 
-                int K = int(K_size);
-                int N = int(N_size);
-                int K_by_8 = K / 8;
-                int K_by_gs = K / GS;
-                int n0 = int(tg_n) * BN;
-                int packs_per_part = K_by_8 / K_PARTS;
-                int pack_start = int(part) * packs_per_part;
-                int pack_end = (int(part) == K_PARTS - 1)
-                    ? K_by_8 : pack_start + packs_per_part;
+                    constexpr int K = KCONST;
+                    int N = int(N_size);
+                    constexpr int K_by_8 = K / 8;
+                    constexpr int K_by_gs = K / GS;
+                    constexpr int packs_per_part = K_by_8 / K_PARTS;
+                    int n0 = int(tg_n) * BN;
+                    int pack_start = int(part) * packs_per_part;
+                    int pack_end = (int(part) == K_PARTS - 1)
+                        ? K_by_8 : pack_start + packs_per_part;
 
-                float acc[BN * M];
-                for (int i = 0; i < BN * M; ++i) acc[i] = 0.0f;
+                    float acc[BN * M];
+                    for (int i = 0; i < BN * M; ++i) acc[i] = 0.0f;
 
-                using Vec8 = vec<T, 8>;
-                const device Vec8 *xv = (const device Vec8*)x;
-                for (int pack = pack_start + int(lane);
-                     pack < pack_end; pack += 32) {
-                    int k_base = pack * 8;
-                    Vec8 v0 = xv[(0 * K + k_base) / 8];
-                    Vec8 v1 = xv[(1 * K + k_base) / 8];
-                    Vec8 v2 = xv[(2 * K + k_base) / 8];
-                    Vec8 v3 = xv[(3 * K + k_base) / 8];
-                    uint32_t p0 = w_q[(n0 + 0) * K_by_8 + pack];
-                    uint32_t p1 = w_q[(n0 + 1) * K_by_8 + pack];
-                    uint32_t p2 = w_q[(n0 + 2) * K_by_8 + pack];
-                    uint32_t p3 = w_q[(n0 + 3) * K_by_8 + pack];
-                    float s0 = float(scales[(n0 + 0) * K_by_gs + (k_base / GS)]);
-                    float s1 = float(scales[(n0 + 1) * K_by_gs + (k_base / GS)]);
-                    float s2 = float(scales[(n0 + 2) * K_by_gs + (k_base / GS)]);
-                    float s3 = float(scales[(n0 + 3) * K_by_gs + (k_base / GS)]);
-                    float b0 = float(biases[(n0 + 0) * K_by_gs + (k_base / GS)]);
-                    float b1 = float(biases[(n0 + 1) * K_by_gs + (k_base / GS)]);
-                    float b2 = float(biases[(n0 + 2) * K_by_gs + (k_base / GS)]);
-                    float b3 = float(biases[(n0 + 3) * K_by_gs + (k_base / GS)]);
+                    using Vec8 = vec<T, 8>;
+                    const device Vec8 *xv = (const device Vec8*)x;
+                    for (int pack = pack_start + int(lane);
+                         pack < pack_end; pack += 32) {
+                        int k_base = pack * 8;
+                        Vec8 v0 = xv[(0 * K + k_base) / 8];
+                        Vec8 v1 = xv[(1 * K + k_base) / 8];
+                        Vec8 v2 = xv[(2 * K + k_base) / 8];
+                        Vec8 v3 = xv[(3 * K + k_base) / 8];
+                        uint32_t p0 = w_q[(n0 + 0) * K_by_8 + pack];
+                        uint32_t p1 = w_q[(n0 + 1) * K_by_8 + pack];
+                        uint32_t p2 = w_q[(n0 + 2) * K_by_8 + pack];
+                        uint32_t p3 = w_q[(n0 + 3) * K_by_8 + pack];
+                        float s0 = float(scales[(n0 + 0) * K_by_gs + (k_base / GS)]);
+                        float s1 = float(scales[(n0 + 1) * K_by_gs + (k_base / GS)]);
+                        float s2 = float(scales[(n0 + 2) * K_by_gs + (k_base / GS)]);
+                        float s3 = float(scales[(n0 + 3) * K_by_gs + (k_base / GS)]);
+                        float b0 = float(biases[(n0 + 0) * K_by_gs + (k_base / GS)]);
+                        float b1 = float(biases[(n0 + 1) * K_by_gs + (k_base / GS)]);
+                        float b2 = float(biases[(n0 + 2) * K_by_gs + (k_base / GS)]);
+                        float b3 = float(biases[(n0 + 3) * K_by_gs + (k_base / GS)]);
 
-                    uint32_t ps[4] = {p0, p1, p2, p3};
-                    float ss[4] = {s0, s1, s2, s3};
-                    float bs[4] = {b0, b1, b2, b3};
-                    _Pragma("unroll")
-                    for (int j = 0; j < 4; ++j) {
-                        uint32_t packed = ps[j];
-                        float s = ss[j];
-                        float b = bs[j];
-                        _Pragma("unroll")
-                        for (int ki = 0; ki < 8; ++ki) {
-                            float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
-                            acc[j * M + 0] += float(v0[ki]) * wv;
-                            acc[j * M + 1] += float(v1[ki]) * wv;
-                            acc[j * M + 2] += float(v2[ki]) * wv;
-                            acc[j * M + 3] += float(v3[ki]) * wv;
+                        {
+                            uint32_t packed = p0;
+                            float s = s0;
+                            float b = b0;
+                            _Pragma("unroll")
+                            for (int ki = 0; ki < 8; ++ki) {
+                                float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                                acc[0 * M + 0] += float(v0[ki]) * wv;
+                                acc[0 * M + 1] += float(v1[ki]) * wv;
+                                acc[0 * M + 2] += float(v2[ki]) * wv;
+                                acc[0 * M + 3] += float(v3[ki]) * wv;
+                            }
+                        }
+                        {
+                            uint32_t packed = p1;
+                            float s = s1;
+                            float b = b1;
+                            _Pragma("unroll")
+                            for (int ki = 0; ki < 8; ++ki) {
+                                float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                                acc[1 * M + 0] += float(v0[ki]) * wv;
+                                acc[1 * M + 1] += float(v1[ki]) * wv;
+                                acc[1 * M + 2] += float(v2[ki]) * wv;
+                                acc[1 * M + 3] += float(v3[ki]) * wv;
+                            }
+                        }
+                        {
+                            uint32_t packed = p2;
+                            float s = s2;
+                            float b = b2;
+                            _Pragma("unroll")
+                            for (int ki = 0; ki < 8; ++ki) {
+                                float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                                acc[2 * M + 0] += float(v0[ki]) * wv;
+                                acc[2 * M + 1] += float(v1[ki]) * wv;
+                                acc[2 * M + 2] += float(v2[ki]) * wv;
+                                acc[2 * M + 3] += float(v3[ki]) * wv;
+                            }
+                        }
+                        {
+                            uint32_t packed = p3;
+                            float s = s3;
+                            float b = b3;
+                            _Pragma("unroll")
+                            for (int ki = 0; ki < 8; ++ki) {
+                                float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                                acc[3 * M + 0] += float(v0[ki]) * wv;
+                                acc[3 * M + 1] += float(v1[ki]) * wv;
+                                acc[3 * M + 2] += float(v2[ki]) * wv;
+                                acc[3 * M + 3] += float(v3[ki]) * wv;
+                            }
                         }
                     }
-                }
 
-                for (int i = 0; i < BN * M; ++i) acc[i] = simd_sum(acc[i]);
-                threadgroup float partial[K_PARTS * BN * M];
-                if (lane == 0) {
-                    for (int i = 0; i < BN * M; ++i) {
-                        partial[int(part) * BN * M + i] = acc[i];
+                    for (int i = 0; i < BN * M; ++i) acc[i] = simd_sum(acc[i]);
+                    threadgroup float partial[K_PARTS * BN * M];
+                    if (lane == 0) {
+                        for (int i = 0; i < BN * M; ++i) {
+                            partial[int(part) * BN * M + i] = acc[i];
+                        }
                     }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (part == 0 && lane < BN * M) {
-                    float total = 0.0f;
-                    for (int p = 0; p < K_PARTS; ++p) {
-                        total += partial[p * BN * M + int(lane)];
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (part == 0 && lane < BN * M) {
+                        float total = 0.0f;
+                        for (int p = 0; p < K_PARTS; ++p) {
+                            total += partial[p * BN * M + int(lane)];
+                        }
+                        int j = int(lane) / M;
+                        int row = int(lane) - j * M;
+                        int n_global = n0 + j;
+                        if (n_global < N) y[row * N + n_global] = T(total);
                     }
-                    int j = int(lane) / M;
-                    int row = int(lane) - j * M;
-                    int n_global = n0 + j;
-                    if (n_global < N) y[row * N + n_global] = T(total);
-                }
-            """,
+                """,
             ensureRowContiguous: false)
     }
 
     func callAsFunction(
         input: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray
     ) -> MLXArray {
-        let k = input.dim(1)
+        precondition(input.dim(1) == k)
         let n = weight.dim(0)
         return kernel(
             [contiguous(input), weight, scales, biases, MLXArray(k), MLXArray(n)],
-            template: [("T", input.dtype)],
+            template: [("T", input.dtype), ("KCONST", k)],
             grid: (32 * kParts, n / 4, 1),
             threadGroup: (32 * kParts, 1, 1),
             outputShapes: [[4, n]],
@@ -191,82 +244,82 @@ final class Qwen38M78NAXProjectionKernel {
             inputNames: ["x", "w_q", "scales", "biases", "N_size"],
             outputNames: ["y"],
             source: """
-                using namespace metal;
-                using namespace mpp::tensor_ops;
-                constexpr int BM = \(tileRows);
-                constexpr int BN = 32;
-                constexpr int BK = 16;
-                constexpr int NSG = \(simdgroups);
-                constexpr int GS = \(groupSize);
-                constexpr int K = KCONST;
-                constexpr int K_by_8 = K / 8;
-                constexpr int K_by_gs = K / GS;
-                constexpr int K_chunk = K / NSG;
+                    using namespace metal;
+                    using namespace mpp::tensor_ops;
+                    constexpr int BM = \(tileRows);
+                    constexpr int BN = 32;
+                    constexpr int BK = 16;
+                    constexpr int NSG = \(simdgroups);
+                    constexpr int GS = \(groupSize);
+                    constexpr int K = KCONST;
+                    constexpr int K_by_8 = K / 8;
+                    constexpr int K_by_gs = K / GS;
+                    constexpr int K_chunk = K / NSG;
 
-                uint tid = thread_position_in_threadgroup.x;
-                uint sg_id = simdgroup_index_in_threadgroup;
-                uint lane = thread_index_in_simdgroup;
-                uint tg_n = threadgroup_position_in_grid.y;
-                int N = int(N_size);
-                int n0 = int(tg_n) * BN;
-                int k_begin = int(sg_id) * K_chunk;
-                int k_end = k_begin + K_chunk;
+                    uint tid = thread_position_in_threadgroup.x;
+                    uint sg_id = simdgroup_index_in_threadgroup;
+                    uint lane = thread_index_in_simdgroup;
+                    uint tg_n = threadgroup_position_in_grid.y;
+                    int N = int(N_size);
+                    int n0 = int(tg_n) * BN;
+                    int k_begin = int(sg_id) * K_chunk;
+                    int k_end = k_begin + K_chunk;
 
-                threadgroup T B_tile[NSG][BK * BN];
-                threadgroup float partial[NSG][BM * BN];
-                constexpr auto desc = matmul2d_descriptor(
-                    \(tileRows), 32, 16, false, false, false,
-                    matmul2d_descriptor::mode::multiply_accumulate);
-                matmul2d<desc, metal::execution_simdgroup> op;
+                    threadgroup T B_tile[NSG][BK * BN];
+                    threadgroup float partial[NSG][BM * BN];
+                    constexpr auto desc = matmul2d_descriptor(
+                        \(tileRows), 32, 16, false, false, false,
+                        matmul2d_descriptor::mode::multiply_accumulate);
+                    matmul2d<desc, metal::execution_simdgroup> op;
 
-                tensor<device T, dextents<int, 2>, tensor_inline> A(
-                    (device T*)x, dextents<int, 2>{K, BM}, array<int, 2>{1, K});
-                tensor<threadgroup T, dextents<int, 2>, tensor_inline> B(
-                    B_tile[sg_id], dextents<int, 2>{BN, BK}, array<int, 2>{1, BN});
-                tensor<threadgroup float, dextents<int, 2>, tensor_inline> C(
-                    partial[sg_id], dextents<int, 2>{BN, BM}, array<int, 2>{1, BN});
+                    tensor<device T, dextents<int, 2>, tensor_inline> A(
+                        (device T*)x, dextents<int, 2>{K, BM}, array<int, 2>{1, K});
+                    tensor<threadgroup T, dextents<int, 2>, tensor_inline> B(
+                        B_tile[sg_id], dextents<int, 2>{BN, BK}, array<int, 2>{1, BN});
+                    tensor<threadgroup float, dextents<int, 2>, tensor_inline> C(
+                        partial[sg_id], dextents<int, 2>{BN, BM}, array<int, 2>{1, BN});
 
-                auto ct_c = op.template get_destination_cooperative_tensor<
-                    tensor<device T, extents<int, \(tileRows), 16>, tensor_inline>,
-                    tensor<threadgroup T, extents<int, 32, 16>, tensor_inline>, float>();
-                _Pragma("unroll")
-                for (uint16_t i = 0; i < ct_c.get_capacity(); ++i) ct_c[i] = 0.0f;
-
-                int n_global = n0 + int(lane);
-                for (int k0 = k_begin; k0 < k_end; k0 += BK) {
-                    uint32_t p0 = w_q[n_global * K_by_8 + ((k0 + 0) >> 3)];
-                    uint32_t p1 = w_q[n_global * K_by_8 + ((k0 + 8) >> 3)];
-                    float s0 = float(scales[n_global * K_by_gs + ((k0 + 0) / GS)]);
-                    float s1 = float(scales[n_global * K_by_gs + ((k0 + 8) / GS)]);
-                    float b0 = float(biases[n_global * K_by_gs + ((k0 + 0) / GS)]);
-                    float b1 = float(biases[n_global * K_by_gs + ((k0 + 8) / GS)]);
+                    auto ct_c = op.template get_destination_cooperative_tensor<
+                        tensor<device T, extents<int, \(tileRows), 16>, tensor_inline>,
+                        tensor<threadgroup T, extents<int, 32, 16>, tensor_inline>, float>();
                     _Pragma("unroll")
-                    for (int ki = 0; ki < 8; ++ki) {
-                        uint32_t nib = (p0 >> (ki * 4)) & 0xFu;
-                        B_tile[sg_id][ki * BN + int(lane)] = T(float(nib) * s0 + b0);
-                    }
-                    _Pragma("unroll")
-                    for (int ki = 0; ki < 8; ++ki) {
-                        uint32_t nib = (p1 >> (ki * 4)) & 0xFu;
-                        B_tile[sg_id][(8 + ki) * BN + int(lane)] = T(float(nib) * s1 + b1);
-                    }
-                    simdgroup_barrier(mem_flags::mem_threadgroup);
-                    auto tA = A.template slice<16, \(tileRows)>(k0, 0);
-                    auto tB = B.template slice<32, 16>(0, 0);
-                    op.run(tA, tB, ct_c);
-                    simdgroup_barrier(mem_flags::mem_threadgroup);
-                }
+                    for (uint16_t i = 0; i < ct_c.get_capacity(); ++i) ct_c[i] = 0.0f;
 
-                auto tC = C.template slice<32, \(tileRows)>(0, 0);
-                ct_c.store(tC);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (int off = int(tid); off < BM * BN; off += NSG * 32) {
-                \(reduction)
-                    int row = off / BN;
-                    int col = off - row * BN;
-                    y[row * N + n0 + col] = T(acc);
-                }
-            """,
+                    int n_global = n0 + int(lane);
+                    for (int k0 = k_begin; k0 < k_end; k0 += BK) {
+                        uint32_t p0 = w_q[n_global * K_by_8 + ((k0 + 0) >> 3)];
+                        uint32_t p1 = w_q[n_global * K_by_8 + ((k0 + 8) >> 3)];
+                        float s0 = float(scales[n_global * K_by_gs + ((k0 + 0) / GS)]);
+                        float s1 = float(scales[n_global * K_by_gs + ((k0 + 8) / GS)]);
+                        float b0 = float(biases[n_global * K_by_gs + ((k0 + 0) / GS)]);
+                        float b1 = float(biases[n_global * K_by_gs + ((k0 + 8) / GS)]);
+                        _Pragma("unroll")
+                        for (int ki = 0; ki < 8; ++ki) {
+                            uint32_t nib = (p0 >> (ki * 4)) & 0xFu;
+                            B_tile[sg_id][ki * BN + int(lane)] = T(float(nib) * s0 + b0);
+                        }
+                        _Pragma("unroll")
+                        for (int ki = 0; ki < 8; ++ki) {
+                            uint32_t nib = (p1 >> (ki * 4)) & 0xFu;
+                            B_tile[sg_id][(8 + ki) * BN + int(lane)] = T(float(nib) * s1 + b1);
+                        }
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
+                        auto tA = A.template slice<16, \(tileRows)>(k0, 0);
+                        auto tB = B.template slice<32, 16>(0, 0);
+                        op.run(tA, tB, ct_c);
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+
+                    auto tC = C.template slice<32, \(tileRows)>(0, 0);
+                    ct_c.store(tC);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int off = int(tid); off < BM * BN; off += NSG * 32) {
+                    \(reduction)
+                        int row = off / BN;
+                        int col = off - row * BN;
+                        y[row * N + n0 + col] = T(acc);
+                    }
+                """,
             header: "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n",
             ensureRowContiguous: false)
     }
@@ -280,9 +333,10 @@ final class Qwen38M78NAXProjectionKernel {
         let tiledInput =
             rows == tileRows
             ? contiguous(input)
-            : contiguous(concatenated([
-                input, MLXArray.zeros([tileRows - rows, k], dtype: input.dtype),
-            ]))
+            : contiguous(
+                concatenated([
+                    input, MLXArray.zeros([tileRows - rows, k], dtype: input.dtype),
+                ]))
         let n = weight.dim(0)
         let output = kernel(
             [tiledInput, weight, scales, biases, MLXArray(n)],
@@ -317,40 +371,40 @@ final class Qwen38M56ProjectionKernel {
         let reduction: String
         if barrierFree {
             reduction = """
-                if (lane < BN * M) {
-                    int j = int(lane) / M;
-                    int row = int(lane) - j * M;
-                    int n_global = n0 + j;
-                    if (n_global < N) {
-                        y[row * N + n_global] = T(acc[int(lane)]);
+                    if (lane < BN * M) {
+                        int j = int(lane) / M;
+                        int row = int(lane) - j * M;
+                        int n_global = n0 + j;
+                        if (n_global < N) {
+                            y[row * N + n_global] = T(acc[int(lane)]);
+                        }
                     }
-                }
-            """
+                """
         } else {
             reduction = """
-                threadgroup float partial[K_PARTS * BN * M];
-                if (lane == 0) {
-                    _Pragma("unroll")
-                    for (int i = 0; i < BN * M; ++i) {
-                        partial[int(part) * BN * M + i] = acc[i];
+                    threadgroup float partial[K_PARTS * BN * M];
+                    if (lane == 0) {
+                        _Pragma("unroll")
+                        for (int i = 0; i < BN * M; ++i) {
+                            partial[int(part) * BN * M + i] = acc[i];
+                        }
                     }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                if (part == 0 && lane < BN * M) {
-                    float total = 0.0f;
-                    _Pragma("unroll")
-                    for (int p = 0; p < K_PARTS; ++p) {
-                        total += partial[p * BN * M + int(lane)];
+                    if (part == 0 && lane < BN * M) {
+                        float total = 0.0f;
+                        _Pragma("unroll")
+                        for (int p = 0; p < K_PARTS; ++p) {
+                            total += partial[p * BN * M + int(lane)];
+                        }
+                        int j = int(lane) / M;
+                        int row = int(lane) - j * M;
+                        int n_global = n0 + j;
+                        if (n_global < N) {
+                            y[row * N + n_global] = T(total);
+                        }
                     }
-                    int j = int(lane) / M;
-                    int row = int(lane) - j * M;
-                    int n_global = n0 + j;
-                    if (n_global < N) {
-                        y[row * N + n_global] = T(total);
-                    }
-                }
-            """
+                """
         }
 
         kernel = MLXFast.metalKernel(
@@ -358,59 +412,59 @@ final class Qwen38M56ProjectionKernel {
             inputNames: ["x", "w_q", "scales", "biases", "K_size", "N_size"],
             outputNames: ["y"],
             source: """
-                using namespace metal;
-                constexpr int M = \(rows);
-                constexpr int BN = 4;
-                constexpr int K_PARTS = \(kParts);
-                constexpr int GS = \(groupSize);
+                    using namespace metal;
+                    constexpr int M = \(rows);
+                    constexpr int BN = 4;
+                    constexpr int K_PARTS = \(kParts);
+                    constexpr int GS = \(groupSize);
 
-                uint part = simdgroup_index_in_threadgroup;
-                uint lane = thread_index_in_simdgroup;
-                uint tg_n = threadgroup_position_in_grid.y;
+                    uint part = simdgroup_index_in_threadgroup;
+                    uint lane = thread_index_in_simdgroup;
+                    uint tg_n = threadgroup_position_in_grid.y;
 
-                int K = int(K_size);
-                int N = int(N_size);
-                int K_by_8 = K / 8;
-                int K_by_gs = K / GS;
-                int n0 = int(tg_n) * BN;
-                int packs_per_part = K_by_8 / K_PARTS;
-                int pack_start = int(part) * packs_per_part;
-                int pack_end = (int(part) == K_PARTS - 1)
-                    ? K_by_8 : pack_start + packs_per_part;
+                    int K = int(K_size);
+                    int N = int(N_size);
+                    int K_by_8 = K / 8;
+                    int K_by_gs = K / GS;
+                    int n0 = int(tg_n) * BN;
+                    int packs_per_part = K_by_8 / K_PARTS;
+                    int pack_start = int(part) * packs_per_part;
+                    int pack_end = (int(part) == K_PARTS - 1)
+                        ? K_by_8 : pack_start + packs_per_part;
 
-                float acc[BN * M];
-                _Pragma("unroll")
-                for (int i = 0; i < BN * M; ++i) {
-                    acc[i] = 0.0f;
-                }
-
-                using Vec8 = vec<T, 8>;
-                const device Vec8 *xv = (const device Vec8*)x;
-
-                for (int pack = pack_start + int(lane);
-                     pack < pack_end; pack += 32) {
-                    int k_base = pack * 8;
-                \(rowLoads)
+                    float acc[BN * M];
                     _Pragma("unroll")
-                    for (int j = 0; j < BN; ++j) {
-                        uint32_t packed = w_q[(n0 + j) * K_by_8 + pack];
-                        float s = float(scales[(n0 + j) * K_by_gs + (k_base / GS)]);
-                        float b = float(biases[(n0 + j) * K_by_gs + (k_base / GS)]);
+                    for (int i = 0; i < BN * M; ++i) {
+                        acc[i] = 0.0f;
+                    }
+
+                    using Vec8 = vec<T, 8>;
+                    const device Vec8 *xv = (const device Vec8*)x;
+
+                    for (int pack = pack_start + int(lane);
+                         pack < pack_end; pack += 32) {
+                        int k_base = pack * 8;
+                    \(rowLoads)
                         _Pragma("unroll")
-                        for (int ki = 0; ki < 8; ++ki) {
-                            float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
-                \(rowFMAs)
+                        for (int j = 0; j < BN; ++j) {
+                            uint32_t packed = w_q[(n0 + j) * K_by_8 + pack];
+                            float s = float(scales[(n0 + j) * K_by_gs + (k_base / GS)]);
+                            float b = float(biases[(n0 + j) * K_by_gs + (k_base / GS)]);
+                            _Pragma("unroll")
+                            for (int ki = 0; ki < 8; ++ki) {
+                                float wv = float((packed >> (ki * 4)) & 0xFu) * s + b;
+                    \(rowFMAs)
+                            }
                         }
                     }
-                }
 
-                _Pragma("unroll")
-                for (int i = 0; i < BN * M; ++i) {
-                    acc[i] = simd_sum(acc[i]);
-                }
+                    _Pragma("unroll")
+                    for (int i = 0; i < BN * M; ++i) {
+                        acc[i] = simd_sum(acc[i]);
+                    }
 
-                \(reduction)
-            """,
+                    \(reduction)
+                """,
             ensureRowContiguous: false)
     }
 
@@ -458,8 +512,9 @@ func qwen38M4QuantizedMM(
     groupSize: Int
 ) -> MLXArray {
     Qwen38M4ProjectionKernel(
-        groupSize: groupSize, kParts: weight.dim(0) >= 4_096 ? 2 : 4)(
-        input: input, weight: weight, scales: scales, biases: biases)
+        k: input.dim(1), groupSize: groupSize,
+        kParts: weight.dim(0) >= 4_096 ? 2 : 4)(
+            input: input, weight: weight, scales: scales, biases: biases)
 }
 
 func qwen38M78NAXQuantizedMM(
@@ -503,7 +558,8 @@ private final class Qwen38OptimizedQuantizedLinear: QuantizedLinear {
         n = shape.0
         k = shape.1
         m4 = Qwen38M4ProjectionKernel(
-            groupSize: source.groupSize, kParts: shape.0 >= 4_096 ? 2 : 4)
+            k: shape.1, groupSize: source.groupSize,
+            kParts: shape.0 >= 4_096 ? 2 : 4)
         m5 = Qwen38M56ProjectionKernel(
             rows: 5, groupSize: source.groupSize, kParts: 2, barrierFree: false)
         let m6Route = qwen38ProjectionRoute(width: 6, k: shape.1, n: shape.0)
@@ -572,6 +628,58 @@ private final class Qwen38OptimizedQuantizedLinear: QuantizedLinear {
     }
 }
 
+/// Construction-only M16 fixture. The promoted PR #335 generation route does
+/// not install this wrapper around the draft model.
+private final class Qwen38DraftQuantizedLinear: QuantizedLinear {
+    private let k: Int
+    private let n: Int
+    private let m4: Qwen38M4ProjectionKernel
+    private let m16: Qwen38M78NAXProjectionKernel?
+
+    init(source: QuantizedLinear) {
+        let shape = source.shape
+        n = shape.0
+        k = shape.1
+        m4 = Qwen38M4ProjectionKernel(
+            k: shape.1, groupSize: source.groupSize,
+            kParts: shape.0 >= 4_096 ? 2 : 4)
+        if qwen38DraftProjectionRoute(width: 16, k: shape.1, n: shape.0) == .m16NAX {
+            m16 = Qwen38M78NAXProjectionKernel(
+                tileRows: 16, k: shape.1, groupSize: source.groupSize,
+                simdgroups: 8)
+        } else {
+            m16 = nil
+        }
+        super.init(
+            weight: source.weight, bias: source.bias,
+            scales: source.scales, biases: source.biases,
+            groupSize: source.groupSize, bits: source.bits, mode: source.mode)
+        freeze()
+    }
+
+    override func callAsFunction(_ input: MLXArray) -> MLXArray {
+        let width = input.shape.dropLast().reduce(1, *)
+        let input2 = input.reshaped([width, k])
+        let output2: MLXArray
+        switch width {
+        case 4:
+            output2 = m4(
+                input: input2, weight: weight, scales: scales, biases: biases!)
+        case 16 where m16 != nil:
+            output2 = m16!(
+                input: input2, weight: weight, scales: scales, biases: biases!)
+        default:
+            return super.callAsFunction(input)
+        }
+        return output2.reshaped(Array(input.shape.dropLast()) + [n])
+    }
+}
+
+private enum Qwen38ProjectionInstallProfile {
+    case targetFullStack
+    case dflashDraft
+}
+
 public struct Qwen38ProjectionInstallReport: Sendable, Equatable {
     public let installed: Int
     public let preservedFusedGDNInputs: Int
@@ -606,6 +714,23 @@ public enum Qwen38ProjectionInstallError: Error, CustomStringConvertible {
 public func installQwen38ProjectionStack(in model: Module) throws
     -> Qwen38ProjectionInstallReport
 {
+    try installQwen38ProjectionStack(in: model, profile: .targetFullStack)
+}
+
+/// Installs only the projection routes used by MTPLX's draft wrapper. The
+/// distinction is fixed during model construction and adds no measured-path
+/// eligibility branch.
+@discardableResult
+public func installQwen38DraftProjectionStack(in model: Module) throws
+    -> Qwen38ProjectionInstallReport
+{
+    try installQwen38ProjectionStack(in: model, profile: .dflashDraft)
+}
+
+private func installQwen38ProjectionStack(
+    in model: Module,
+    profile: Qwen38ProjectionInstallProfile
+) throws -> Qwen38ProjectionInstallReport {
     let gdnSourceSuffixes = [".in_proj_qkv", ".in_proj_z", ".in_proj_b", ".in_proj_a"]
     let leaves = model.leafModules().flattened()
     var replacements = [String: Module]()
@@ -644,7 +769,17 @@ public func installQwen38ProjectionStack(in model: Module) throws
             throw Qwen38ProjectionInstallError.invalidModule(
                 path: path, reason: "expected uint32 weights with BF16 scale and affine bias")
         }
-        replacements[path] = Qwen38OptimizedQuantizedLinear(source: linear)
+        switch profile {
+        case .targetFullStack:
+            replacements[path] = Qwen38OptimizedQuantizedLinear(source: linear)
+        case .dflashDraft:
+            guard linear.groupSize == 64 else {
+                throw Qwen38ProjectionInstallError.invalidModule(
+                    path: path,
+                    reason: "draft VerifyQuantizedLinear requires Q4/G64")
+            }
+            replacements[path] = Qwen38DraftQuantizedLinear(source: linear)
+        }
     }
     guard !replacements.isEmpty else { throw Qwen38ProjectionInstallError.emptyOptimizedLane }
     // Apply each replacement at its direct owning module. This avoids both
@@ -663,6 +798,26 @@ public func installQwen38ProjectionStack(in model: Module) throws
         try owner.update(
             modules: ModuleChildren(values: [childKey: .value(replacement)]),
             verify: .none)
+    }
+    switch profile {
+    case .targetFullStack:
+        let installedDFlashInputs: Bool
+        switch model {
+        case let target as Qwen35TextModel:
+            installedDFlashInputs = target.installDFlashInputProjections()
+        case let target as Qwen35Model:
+            installedDFlashInputs = target.installDFlashInputProjections()
+        default:
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: "<root>", reason: "target is not a Qwen 3.8 model")
+        }
+        guard installedDFlashInputs else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: "<root>",
+                reason: "cannot install every fused DFlash recurrent input")
+        }
+    case .dflashDraft:
+        break
     }
     return Qwen38ProjectionInstallReport(
         installed: replacements.count,

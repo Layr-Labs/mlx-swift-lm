@@ -1,12 +1,13 @@
 // Copyright © 2026 Eigen Labs.
 
 import Foundation
+import MLXLMCommon
 import XCTest
+
 @testable import MLX
-@testable import MLXNN
 @testable import MLXFast
 @testable import MLXLLM
-import MLXLMCommon
+@testable import MLXNN
 
 final class GatedDeltaFusedInputProjectionTests: XCTestCase {
 
@@ -16,7 +17,7 @@ final class GatedDeltaFusedInputProjectionTests: XCTestCase {
         let zDim = 4096
         let bDim = 32
         let aDim = 32
-        let totalOut = qkvDim + zDim + bDim + aDim // 12352
+        let totalOut = qkvDim + zDim + bDim + aDim  // 12352
 
         let linQKV = Linear(hiddenSize, qkvDim, bias: false)
         let linZ = Linear(hiddenSize, zDim, bias: false)
@@ -79,23 +80,22 @@ final class GatedDeltaFusedInputProjectionTests: XCTestCase {
     }
 }
 
-
 private func smallQwenGDNConfiguration() throws -> Qwen35TextConfiguration {
     let json = """
-    {
-      "hidden_size": 64,
-      "num_hidden_layers": 1,
-      "num_attention_heads": 2,
-      "num_key_value_heads": 1,
-      "linear_num_value_heads": 2,
-      "linear_num_key_heads": 1,
-      "linear_key_head_dim": 32,
-      "linear_value_head_dim": 32,
-      "linear_conv_kernel_dim": 4,
-      "vocab_size": 128,
-      "full_attention_interval": 4
-    }
-    """
+        {
+          "hidden_size": 64,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 1,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 32,
+          "linear_conv_kernel_dim": 4,
+          "vocab_size": 128,
+          "full_attention_interval": 4
+        }
+        """
     return try JSONDecoder().decode(
         Qwen35TextConfiguration.self, from: Data(json.utf8))
 }
@@ -113,6 +113,9 @@ extension GatedDeltaFusedInputProjectionTests {
 
         XCTAssertTrue(layer.prepareFusedInputProjection())
         XCTAssertTrue(layer.hasFusedInputProjection)
+        XCTAssertFalse(layer.hasInstalledDFlashInputProjection)
+        XCTAssertTrue(layer.installDFlashInputProjection())
+        XCTAssertTrue(layer.hasInstalledDFlashInputProjection)
         XCTAssertNotNil(layer.inProjQKV)
         XCTAssertNotNil(layer.inProjZ)
         XCTAssertNotNil(layer.inProjB)
@@ -120,9 +123,10 @@ extension GatedDeltaFusedInputProjectionTests {
         let keys = Set(layer.parameters().flattened().map(\.0))
         XCTAssertFalse(keys.contains("in_proj_fused.weight"))
         XCTAssertTrue(keys.contains("in_proj_qkv.weight"))
-        XCTAssertFalse(layer.trainableParameters().flattened().contains {
-            $0.0.hasPrefix("in_proj_fused")
-        })
+        XCTAssertFalse(
+            layer.trainableParameters().flattened().contains {
+                $0.0.hasPrefix("in_proj_fused")
+            })
     }
 
     func testHeterogeneousQuantizationRetainsSeparateProjections() throws {
@@ -143,8 +147,9 @@ extension GatedDeltaFusedInputProjectionTests {
 
     func testAdapterBackedProjectionRetainsSeparateCalls() throws {
         let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
-        let adapted = LoRALinear.from(
-            linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
+        let adapted =
+            LoRALinear.from(
+                linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
         try layer.update(
             modules: ModuleChildren(values: [
                 "in_proj_qkv": .value(adapted),
@@ -194,12 +199,14 @@ extension GatedDeltaFusedInputProjectionTests {
         XCTAssertTrue(layer.prepareFusedInputProjection())
         XCTAssertTrue(layer.hasFusedInputProjection)
 
-        let adapted = LoRALinear.from(
-            linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
+        let adapted =
+            LoRALinear.from(
+                linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
         try layer.update(
             modules: ModuleChildren(values: ["in_proj_qkv": .value(adapted)]),
             verify: [])
         XCTAssertFalse(layer.hasFusedInputProjection)
+        XCTAssertFalse(layer.hasInstalledDFlashInputProjection)
         XCTAssertFalse(layer.prepareFusedInputProjection())
         XCTAssertFalse(
             ObjectIdentifier(type(of: layer.inProjQKV))
@@ -216,11 +223,13 @@ extension GatedDeltaFusedInputProjectionTests {
                 "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
             ]), verify: [])
         XCTAssertTrue(layer.prepareFusedInputProjection())
-        let replacement = layer.inProjQKV.weight + MLXArray.zeros(
-            layer.inProjQKV.weight.shape, dtype: layer.inProjQKV.weight.dtype)
+        let replacement =
+            layer.inProjQKV.weight
+            + MLXArray.zeros(
+                layer.inProjQKV.weight.shape, dtype: layer.inProjQKV.weight.dtype)
         try layer.update(
             parameters: ModuleParameters.unflattened([
-                "in_proj_qkv.weight": replacement,
+                "in_proj_qkv.weight": replacement
             ]), verify: [])
         XCTAssertFalse(layer.hasFusedInputProjection)
         XCTAssertTrue(layer.prepareFusedInputProjection())

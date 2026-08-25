@@ -823,6 +823,109 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         }
     }
 
+    func testDFlashInnovationCommitUsesProductionRouteAtWidthTwoFourAndEight() throws {
+        MLXRandom.seed(61_341)
+        let model = Qwen35TextModel(try smallGDNConfiguration())
+        eval(model)
+
+        func populateAttention(_ caches: [any KVCache], rows: Int) {
+            for cache in caches where !(cache is ArraysCache) {
+                let values = MLXArray.zeros([1, 1, rows, 1], dtype: .bfloat16)
+                _ = cache.update(keys: values, values: values)
+            }
+        }
+
+        do {
+            let caches = legacyCaches(model)
+            populateAttention(caches, rows: 2)
+            let rollbackConv = MLXRandom.normal([1, 3, 16])
+            let rollbackSSM = MLXRandom.normal([1, 4, 16, 32])
+            for case let recurrent as MambaCache in caches {
+                recurrent[0] = MLXArray.zeros(like: rollbackConv)
+                recurrent[1] = MLXArray.zeros(like: rollbackSSM)
+                recurrent.rollbackState = (rollbackConv, rollbackSSM)
+            }
+            model.dflashCommitInnovationCachePrefix(
+                cache: caches, committedRows: 1, verifyRows: 2)
+            eval(rollbackConv, rollbackSSM, caches.flatMap { $0.innerState() })
+            for case let recurrent as MambaCache in caches {
+                XCTAssertTrue(
+                    allClose(recurrent[0]!, rollbackConv, rtol: 0, atol: 0)
+                        .item(Bool.self))
+                XCTAssertTrue(
+                    allClose(recurrent[1]!, rollbackSSM, rtol: 0, atol: 0)
+                        .item(Bool.self))
+                XCTAssertNil(recurrent.rollbackState)
+                XCTAssertNil(recurrent.prefixReplayTape)
+                XCTAssertNil(recurrent.dflashPrefixReplayTape)
+            }
+            for cache in caches where !(cache is ArraysCache) {
+                XCTAssertEqual(cache.offset, 1)
+            }
+        }
+
+        for verifyRows in [4, 8] {
+            for committedRows in [1, verifyRows - 1, verifyRows] {
+                let caches = legacyCaches(model)
+                populateAttention(caches, rows: verifyRows)
+                let convOutput = MLXRandom.normal([1, verifyRows, 10_240]).asType(.bfloat16)
+                let g = exp(
+                    -abs(MLXRandom.normal([1, verifyRows, 48]).asType(.float32)))
+                let beta = sigmoid(
+                    MLXRandom.normal([1, verifyRows, 48]).asType(.bfloat16)
+                ).asType(.float32)
+                let preState = MLXRandom.normal([1, 48, 128, 128]).asType(.float32)
+                let recurrence = qwen38GatedDeltaFromConvWithInnovationTape(
+                    convOutput: convOutput, g: g, beta: beta, state: preState)
+                let convInput = MLXRandom.normal([1, verifyRows + 3, 10_240])
+                    .asType(.bfloat16)
+                let expectedState =
+                    committedRows == verifyRows
+                    ? recurrence.state
+                    : qwen38ReplayInnovationTape(
+                        tape: recurrence.tape,
+                        convOutput: convOutput,
+                        g: g,
+                        state: preState,
+                        steps: committedRows)
+                let expectedConv = convInput[
+                    0..., committedRows ..< (committedRows + 3), 0...]
+                for case let recurrent as MambaCache in caches {
+                    recurrent[0] = convInput[0..., verifyRows ..< (verifyRows + 3), 0...]
+                    recurrent[1] = recurrence.state
+                    recurrent.dflashPrefixReplayTape = ArraysCache.DFlashPrefixReplayTape(
+                        convInput: convInput,
+                        convOutput: convOutput,
+                        innovation: recurrence.tape,
+                        g: g,
+                        ssmPre: preState,
+                        rowCount: verifyRows,
+                        convStateRows: 3)
+                }
+
+                model.dflashCommitInnovationCachePrefix(
+                    cache: caches,
+                    committedRows: committedRows,
+                    verifyRows: verifyRows)
+                eval(expectedConv, expectedState, caches.flatMap { $0.innerState() })
+                for case let recurrent as MambaCache in caches {
+                    XCTAssertTrue(
+                        allClose(recurrent[0]!, expectedConv, rtol: 0, atol: 0)
+                            .item(Bool.self))
+                    XCTAssertTrue(
+                        allClose(recurrent[1]!, expectedState, rtol: 0, atol: 0)
+                            .item(Bool.self))
+                    XCTAssertNil(recurrent.rollbackState)
+                    XCTAssertNil(recurrent.prefixReplayTape)
+                    XCTAssertNil(recurrent.dflashPrefixReplayTape)
+                }
+                for cache in caches where !(cache is ArraysCache) {
+                    XCTAssertEqual(cache.offset, committedRows)
+                }
+            }
+        }
+    }
+
     /// Shape-incompatible tapes fail closed before recurrent state mutation and
     /// release every layer's verify-only arrays for the fallback path.
     func testIneligibleRecurrentReplayCleansAllTapesWithoutStateMutation() throws {

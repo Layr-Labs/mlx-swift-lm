@@ -10,9 +10,9 @@ struct ArtifactManifestTests {
         let manifest = Qwen38ArtifactManifest.production
 
         #expect(manifest.swiftBaseRevision == "ab73a827c9dde6f8802507003aa0be71605aab8e")
-        #expect(manifest.mlxSwiftRevision == "606d28cfa8c1d66b2975d3162a4aac9756835c5f")
-        #expect(manifest.mlxRevision == "0a725e3000edabc4911cde345270ca950bfa152f")
-        #expect(manifest.mtplxSourceRevision == "26e27b78d5299dcafb319844283ac50a137bfee5")
+        #expect(manifest.mlxSwiftRevision == "713cf35cdd86e219b69a56bafaeeec6607934218")
+        #expect(manifest.mlxRevision == "734241bbff26467bb33eff8adc65b82d17b33578")
+        #expect(manifest.mtplxSourceRevision == "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c")
         #expect(manifest.yukonSourceRevision == "eb5eadc7a165047d4321ce883b9ff30894d8bd19")
         #expect(manifest.dflash2SourceRevision == "c5b76ddb62bdefb6eeef1282641842edcf23a1b8")
         #expect(manifest.targetArtifact.repository == "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed")

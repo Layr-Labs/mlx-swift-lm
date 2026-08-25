@@ -14,6 +14,29 @@ every decode width from 1 through 8 on throwaway state. It then releases the
 warm allocator cache and derives row 50's resident-weight budget from the live
 post-warm footprint.
 
+The optimized target route includes the retained row-21 Q/K fusion,
+row-24/26 evaluation ladders, row-48 residual boundary, construction-routed
+affine-Q4 M4--M8 projections, and DFlash innovation-tape rollback. At cached
+lengths 16,384 through 32,767 only, verify widths 6--8 use a grouped-GQA
+dispatch with the source's six-queries-per-KV-head layout. This is the
+bit-exact Swift adaptation of the source per-head route: the pinned MLX
+revision's one-query-head/16K-KV allocation produces invalid values.
+The wide recurrent path consumes the fixed 10,240-wide conv output directly,
+fusing Q/K normalization, recurrence, and fp32 innovation-tape construction.
+All model, dtype, packing, and geometry checks happen before warmup; an enabled
+decode route dispatches directly without a custom-to-stock failure fallback.
+
+Draft projections remain on stock `quantized_matmul`, matching the promoted
+source receipt where `custom_draft_qmv.active_modules == 0`. Reusing the target
+verification kernels in the greedy draft changes near-tied proposals and is
+therefore not installed.
+
+For short contexts, logical width 7 routes directly to physical width 8. Both
+widths occupy the same padded M8 target-projection cost class on this Swift
+backend, while width 8 can commit one more draft token. The policy decision is
+made once per speculative cycle; installed projection routes perform no
+eligibility checks or fallback accounting in their hot path.
+
 Build the executable and its source-matched MLX Metal library:
 
 ```sh
@@ -31,6 +54,25 @@ Run DFlash2:
   --max-tokens 1024 \
   --receipt /tmp/qwen38-dflash2.json
 ```
+
+For the PR #335 performance workload, pass the exact 1,024-token programming
+prompt as token IDs and request the source-matched same-prompt conditioner:
+
+```sh
+.build/release/qwen38-dflash2-runner \
+  --target /path/to/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed \
+  --draft /path/to/z-lab--Qwen3.8-27B-DFlash2 \
+  --mode dflash2 \
+  --tokens-file /path/to/python-programming-1024.tokens.json \
+  --conditioner-tokens 1024 \
+  --max-tokens 1024 \
+  --receipt /tmp/qwen38-dflash2-conditioned-1k.json
+```
+
+The conditioner generates 1,024 output tokens outside the measured interval.
+The runner then clears the allocator cache and peak-memory counter before the
+fresh measured pass: 1,024 input tokens of prefill plus 1,024 generated output
+tokens. The receipt records both conditioner counts explicitly.
 
 The unchanged target-only control does not construct or load the draft:
 

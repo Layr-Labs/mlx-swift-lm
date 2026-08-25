@@ -29,7 +29,11 @@ struct Qwen38DFlashQKKernelTests {
         eval(expectedQ, expectedK, actualQ, actualK)
         #expect(actualQ.shape == expectedQ.shape)
         #expect(actualK.shape == expectedK.shape)
-        #expect(abs(actualQ.asType(.float32) - expectedQ.asType(.float32)).max().item(Float.self) < 0.04)
-        #expect(abs(actualK.asType(.float32) - expectedK.asType(.float32)).max().item(Float.self) < 0.04)
+        #expect(
+            abs(actualQ.asType(.float32) - expectedQ.asType(.float32)).max().item(Float.self) < 0.04
+        )
+        #expect(
+            abs(actualK.asType(.float32) - expectedK.asType(.float32)).max().item(Float.self) < 0.04
+        )
     }
 }

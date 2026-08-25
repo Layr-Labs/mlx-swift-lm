@@ -24,7 +24,7 @@ public protocol DFlash2QwenTarget: AnyObject {
     ) -> MLXArray
     func dflashInputEmbedding(_ tokens: MLXArray) -> MLXArray
     func dflashLogits(_ normalizedDraftHidden: MLXArray) -> MLXArray
-    func dflashCommitCachePrefix(
+    func dflashCommitInnovationCachePrefix(
         cache: [any KVCache], committedRows: Int, verifyRows: Int)
 }
 
@@ -50,7 +50,32 @@ public struct DFlash2CycleResult {
     }
 }
 
+/// Cycle payload for the explicit non-measured diagnostic route. Production
+/// `step()` never constructs or retains these proposal/posterior arrays.
+public struct DFlash2CycleDiagnosticResult {
+    public let cycle: DFlash2CycleResult
+    public let proposedTokens: MLXArray
+    public let posteriorTokens: MLXArray
+}
+
+/// The source engine leaves rollback arrays lazy while it submits the next
+/// draft. The following target verification is their first consumer. A cycle
+/// without a next-draft launch materializes cache state immediately so warm and
+/// diagnostic callers still leave a settled session.
+enum DFlash2CycleEvaluationPlan {
+    static func explicitlyMaterializesTargetCache(
+        prefetchingNextDraft: Bool
+    ) -> Bool {
+        !prefetchingNextDraft
+    }
+}
+
 public final class DFlash2Session {
+    private struct PrefetchedDraft {
+        let stagedToken: MLXArray
+        let drafted: MLXArray
+    }
+
     private let target: any DFlash2QwenTarget
     private let draft: DFlash2DraftModel
     private let targetCache: [KVCache]
@@ -59,6 +84,7 @@ public final class DFlash2Session {
     private var contextPolicy: DFlash2ContextPolicy
     private var stagedToken: MLXArray?
     private var projectedDraftContext: MLXArray?
+    private var prefetchedDraft: PrefetchedDraft?
 
     public init(
         target: any DFlash2QwenTarget,
@@ -99,6 +125,7 @@ public final class DFlash2Session {
             logits: finalLogits![0..., -1, 0...]
         ).reshaped([-1])
         stagedToken = frontier
+        prefetchedDraft = nil
         projectedDraftContext = MLXArray.zeros(
             [promptTokens.dim(0), 0, draft.configuration.hiddenSize],
             dtype: projectedDType!)
@@ -106,8 +133,23 @@ public final class DFlash2Session {
         return frontier
     }
 
-    public func step() -> DFlash2CycleResult {
-        step(physicalWidth: contextPolicy.nextPhysicalWidth)
+    public func step(remainingOutputTokens: Int) -> DFlash2CycleResult {
+        return step(
+            physicalWidth: contextPolicy.nextPhysicalWidth,
+            remainingOutputTokens: remainingOutputTokens,
+            fixedNextWidth: nil,
+            prefetchNext: true)
+    }
+
+    public func fixedStep(
+        physicalWidth: Int,
+        remainingOutputTokens: Int
+    ) -> DFlash2CycleResult {
+        return step(
+            physicalWidth: physicalWidth,
+            remainingOutputTokens: remainingOutputTokens,
+            fixedNextWidth: physicalWidth,
+            prefetchNext: true)
     }
 
     /// Construction-only shape warm used before the measured session exists.
@@ -115,11 +157,19 @@ public final class DFlash2Session {
     /// no effect on production routing.
     public func warmStep(physicalWidth: Int) -> DFlash2CycleResult {
         precondition((1 ... 8).contains(physicalWidth))
-        return step(physicalWidth: physicalWidth)
+        return step(
+            physicalWidth: physicalWidth,
+            remainingOutputTokens: .max,
+            fixedNextWidth: nil,
+            prefetchNext: false)
     }
 
-    @inline(__always)
-    private func step(physicalWidth width: Int) -> DFlash2CycleResult {
+    public func diagnosticStep() -> DFlash2CycleDiagnosticResult {
+        diagnosticStep(physicalWidth: contextPolicy.nextPhysicalWidth)
+    }
+
+    public func diagnosticStep(physicalWidth width: Int) -> DFlash2CycleDiagnosticResult {
+        precondition((1 ... 8).contains(width))
         let stagedToken = stagedToken!
         let projectedDraftContext = projectedDraftContext!
         let drafted: MLXArray
@@ -174,7 +224,7 @@ public final class DFlash2Session {
             verifyRows: width,
             acceptedDraftTokens: acceptedDraftTokens)
 
-        target.dflashCommitCachePrefix(
+        target.dflashCommitInnovationCachePrefix(
             cache: targetCache,
             committedRows: plan.commitRows,
             verifyRows: width)
@@ -194,10 +244,142 @@ public final class DFlash2Session {
             self.projectedDraftContext!,
             targetCache.flatMap { $0.innerState() },
             draftCache.flatMap { $0.innerState() })
+        return DFlash2CycleDiagnosticResult(
+            cycle: DFlash2CycleResult(
+                committedTokens: committedTokens,
+                nextToken: nextToken,
+                acceptedDraftTokens: acceptedDraftTokens,
+                physicalWidth: width),
+            proposedTokens: verifyTokens[0],
+            posteriorTokens: posterior)
+    }
+
+    @inline(__always)
+    private func prepareDraft(
+        stagedToken: MLXArray,
+        projectedDraftContext: MLXArray,
+        physicalWidth width: Int
+    ) -> MLXArray {
+        if width == 1 {
+            draft.advanceProjectedContextCache(
+                draftContext: projectedDraftContext,
+                cache: draftCache)
+            return MLXArray([Int32]()).reshaped([1, 0])
+        }
+        let masks = MLXArray(
+            [Int32](
+                repeating: Int32(draft.configuration.maskTokenID),
+                count: width - 1))
+        let blockTokens = concatenated([stagedToken, masks], axis: 0)
+            .reshaped([1, width])
+        let noiseEmbedding = target.dflashInputEmbedding(blockTokens)
+        let draftHidden = draft.forwardProjectedContext(
+            noiseEmbedding: noiseEmbedding,
+            draftContext: projectedDraftContext,
+            cache: draftCache)
+        let proposalHidden = draftHidden[0..., 1..., 0...]
+        let draftLogits = target.dflashLogits(proposalHidden)
+        return draft.selectProposal(
+            draftHidden: proposalHidden,
+            logits: draftLogits,
+            anchorIDs: stagedToken,
+            temperature: 0
+        ).tokenIDs.asType(.int32)
+    }
+
+    @inline(__always)
+    private func step(
+        physicalWidth width: Int,
+        remainingOutputTokens: Int,
+        fixedNextWidth: Int?,
+        prefetchNext: Bool
+    ) -> DFlash2CycleResult {
+        let currentPrefetch = prefetchedDraft
+        prefetchedDraft = nil
+        let stagedToken = currentPrefetch?.stagedToken ?? stagedToken!
+        let projectedDraftContext = projectedDraftContext!
+        let drafted =
+            currentPrefetch?.drafted
+            ?? prepareDraft(
+                stagedToken: stagedToken,
+                projectedDraftContext: projectedDraftContext,
+                physicalWidth: width)
+        let verifyTokens: MLXArray
+        if width == 1 {
+            verifyTokens = stagedToken.reshaped([1, 1])
+        } else {
+            verifyTokens = concatenated(
+                [stagedToken.reshaped([1, 1]), drafted], axis: 1)
+        }
+
+        let verification = target.dflashForward(
+            input: LMInput.Text(tokens: verifyTokens),
+            cache: targetCache,
+            nConfirmed: 1)
+        let posterior = targetSampler.sample(logits: verification.logits[0])
+        let acceptedDraftTokens: Int
+        if width == 1 {
+            acceptedDraftTokens = 0
+        } else {
+            let accepted = (drafted[0] .== posterior[0 ..< (width - 1)])
+                .asType(.int32)
+                .cumprod()
+                .sum()
+                .item(Int32.self)
+            acceptedDraftTokens = Int(accepted)
+        }
+        let plan = DFlash2CommitPlan(
+            verifyRows: width,
+            acceptedDraftTokens: acceptedDraftTokens
+        ).capped(to: remainingOutputTokens)
+        let committedDraftTokens = plan.commitRows - 1
+
+        target.dflashCommitInnovationCachePrefix(
+            cache: targetCache,
+            committedRows: plan.commitRows,
+            verifyRows: width)
+
+        let committedTokens = verifyTokens[0, 0 ..< plan.commitRows]
+        let committedFeatures = verification.targetFeatures[
+            0..., 0 ..< plan.commitRows, 0...]
+        let nextToken = posterior[committedDraftTokens ..< (committedDraftTokens + 1)]
+        self.stagedToken = nextToken
+        self.projectedDraftContext = draft.projectTargetFeatures(committedFeatures)
+        contextPolicy.record(
+            blockLength: width,
+            acceptedDraftTokens: committedDraftTokens)
+        let remainingAfterCommit = remainingOutputTokens - plan.commitRows
+        let willPrefetchNext = prefetchNext && remainingAfterCommit > 0
+        if DFlash2CycleEvaluationPlan.explicitlyMaterializesTargetCache(
+            prefetchingNextDraft: willPrefetchNext)
+        {
+            asyncEval(
+                committedTokens,
+                nextToken,
+                self.projectedDraftContext!,
+                targetCache.flatMap { $0.innerState() },
+                draftCache.flatMap { $0.innerState() })
+        } else {
+            asyncEval(
+                committedTokens,
+                nextToken,
+                self.projectedDraftContext!)
+        }
+        if willPrefetchNext {
+            let nextWidth = fixedNextWidth ?? contextPolicy.nextPhysicalWidth
+            let nextDrafted = prepareDraft(
+                stagedToken: nextToken,
+                projectedDraftContext: self.projectedDraftContext!,
+                physicalWidth: nextWidth)
+            asyncEval(nextDrafted, draftCache.flatMap { $0.innerState() })
+            prefetchedDraft = PrefetchedDraft(
+                stagedToken: nextToken,
+                drafted: nextDrafted)
+        }
         return DFlash2CycleResult(
             committedTokens: committedTokens,
             nextToken: nextToken,
-            acceptedDraftTokens: acceptedDraftTokens,
+            acceptedDraftTokens: committedDraftTokens,
             physicalWidth: width)
     }
 }

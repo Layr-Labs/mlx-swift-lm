@@ -51,9 +51,12 @@ public struct Qwen38RunnerOptions: Equatable, Sendable {
     public let promptFile: String?
     public let tokensFile: String?
     public let maxTokens: Int
+    public let conditionerTokens: Int
     public let receiptPath: String?
     public let useChatTemplate: Bool
     public let dflashPhysicalWidth: Int?
+    public let diagnosticCycles: Bool
+    public let diagnosticPrefetch: Bool
 
     public static let usage = """
         qwen38-dflash2-runner \\
@@ -61,18 +64,32 @@ public struct Qwen38RunnerOptions: Equatable, Sendable {
           --mode <dflash2|ar|benchmark> \\
           [--draft <local-dflash2-directory>] \\
           (--prompt <text> | --prompt-file <path> | --tokens-file <path>) \\
-          [--max-tokens 1024] [--receipt <path>] [--no-chat-template] \
-          [--dflash-width <1...8>]
+          [--max-tokens 1024] [--conditioner-tokens 1024] \
+          [--receipt <path>] [--no-chat-template] \
+          [--dflash-width <1...8>] \
+          [--diagnostic-cycles | --diagnostic-prefetch]
         """
 
     public static func parse(_ arguments: [String]) throws -> Qwen38RunnerOptions {
         var values = [String: String]()
         var noChatTemplate = false
+        var diagnosticCycles = false
+        var diagnosticPrefetch = false
         var index = 0
         while index < arguments.count {
             let flag = arguments[index]
             if flag == "--no-chat-template" {
                 noChatTemplate = true
+                index += 1
+                continue
+            }
+            if flag == "--diagnostic-cycles" {
+                diagnosticCycles = true
+                index += 1
+                continue
+            }
+            if flag == "--diagnostic-prefetch" {
+                diagnosticPrefetch = true
                 index += 1
                 continue
             }
@@ -89,6 +106,7 @@ public struct Qwen38RunnerOptions: Equatable, Sendable {
         let known = Set([
             "--target", "--draft", "--mode", "--prompt", "--prompt-file",
             "--tokens-file", "--max-tokens", "--receipt", "--dflash-width",
+            "--conditioner-tokens",
         ])
         if let unknown = values.keys.first(where: { !known.contains($0) }) {
             throw Qwen38RunnerOptionError.invalid("unknown option \(unknown)")
@@ -99,6 +117,20 @@ public struct Qwen38RunnerOptions: Equatable, Sendable {
         let modeRaw = values["--mode"] ?? Qwen38RunnerMode.dflash2.rawValue
         guard let mode = Qwen38RunnerMode(rawValue: modeRaw) else {
             throw Qwen38RunnerOptionError.invalid("invalid --mode \(modeRaw)")
+        }
+        if diagnosticCycles && diagnosticPrefetch {
+            throw Qwen38RunnerOptionError.invalid(
+                "choose only one diagnostic route")
+        }
+        if diagnosticCycles || diagnosticPrefetch {
+            guard mode == .dflash2 else {
+                throw Qwen38RunnerOptionError.invalid(
+                    "cycle diagnostics require --mode dflash2")
+            }
+            guard values["--receipt"] != nil else {
+                throw Qwen38RunnerOptionError.invalid(
+                    "cycle diagnostics require --receipt")
+            }
         }
         let draftPath = values["--draft"]
         if mode != .autoregressive, draftPath?.isEmpty != false {
@@ -115,6 +147,16 @@ public struct Qwen38RunnerOptions: Equatable, Sendable {
         let maxTokens = Int(values["--max-tokens"] ?? "1024") ?? 0
         guard maxTokens > 0 else {
             throw Qwen38RunnerOptionError.invalid("--max-tokens must be positive")
+        }
+        let conditionerTokens: Int
+        if let rawConditionerTokens = values["--conditioner-tokens"] {
+            guard let parsed = Int(rawConditionerTokens), parsed > 0 else {
+                throw Qwen38RunnerOptionError.invalid(
+                    "--conditioner-tokens must be positive")
+            }
+            conditionerTokens = parsed
+        } else {
+            conditionerTokens = 0
         }
         let dflashPhysicalWidth: Int?
         if let rawWidth = values["--dflash-width"] {
@@ -138,8 +180,11 @@ public struct Qwen38RunnerOptions: Equatable, Sendable {
             promptFile: values["--prompt-file"],
             tokensFile: values["--tokens-file"],
             maxTokens: maxTokens,
+            conditionerTokens: conditionerTokens,
             receiptPath: values["--receipt"],
             useChatTemplate: !noChatTemplate,
-            dflashPhysicalWidth: dflashPhysicalWidth)
+            dflashPhysicalWidth: dflashPhysicalWidth,
+            diagnosticCycles: diagnosticCycles,
+            diagnosticPrefetch: diagnosticPrefetch)
     }
 }

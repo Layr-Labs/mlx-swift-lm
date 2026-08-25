@@ -5,6 +5,16 @@ import Testing
 
 @Suite("Qwen 3.8 DFlash2 speculative session")
 struct DFlash2SessionSurfaceTests {
+    @Test("next-draft prefetch does not force target-cache rollback first")
+    func prefetchEvaluationPlan() {
+        #expect(
+            !DFlash2CycleEvaluationPlan.explicitlyMaterializesTargetCache(
+                prefetchingNextDraft: true))
+        #expect(
+            DFlash2CycleEvaluationPlan.explicitlyMaterializesTargetCache(
+                prefetchingNextDraft: false))
+    }
+
     @Test("session owns target and draft caches for the full generation")
     func surfaceCompiles() {
         let factory:
@@ -16,13 +26,23 @@ struct DFlash2SessionSurfaceTests {
         let prefill: (DFlash2Session, MLXArray) -> MLXArray = {
             $0.prefill(promptTokens: $1)
         }
-        let cycle: (DFlash2Session) -> DFlash2CycleResult = { $0.step() }
+        let cycle: (DFlash2Session, Int) -> DFlash2CycleResult = {
+            $0.step(remainingOutputTokens: $1)
+        }
+        let fixedCycle: (DFlash2Session, Int, Int) -> DFlash2CycleResult = {
+            $0.fixedStep(physicalWidth: $1, remainingOutputTokens: $2)
+        }
         let warmCycle: (DFlash2Session, Int) -> DFlash2CycleResult = {
             $0.warmStep(physicalWidth: $1)
+        }
+        let diagnosticCycle: (DFlash2Session) -> DFlash2CycleDiagnosticResult = {
+            $0.diagnosticStep()
         }
         _ = factory
         _ = prefill
         _ = cycle
+        _ = fixedCycle
         _ = warmCycle
+        _ = diagnosticCycle
     }
 }

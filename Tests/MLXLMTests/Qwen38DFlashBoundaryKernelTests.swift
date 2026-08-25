@@ -13,7 +13,8 @@ struct Qwen38DFlashBoundaryKernelTests {
         let weight = MLXRandom.uniform(low: 0.8, high: 1.2, [5_120]).asType(.bfloat16)
         let epsilon: Float = 1e-6
         let expectedHidden = base + delta
-        let expectedNorm = expectedHidden
+        let expectedNorm =
+            expectedHidden
             * rsqrt(mean(expectedHidden * expectedHidden, axis: -1, keepDims: true) + epsilon)
             * weight
         let (hidden, normed) = qwen38FusedAddRMSNorm(

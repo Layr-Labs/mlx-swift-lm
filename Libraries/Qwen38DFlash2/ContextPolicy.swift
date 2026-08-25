@@ -24,7 +24,9 @@ public struct DFlash2ContextPolicy: Sendable {
     }
 
     public var nextPhysicalWidth: Int {
-        fixedM8 ? Self.fullPhysicalWidth : max(1, min(8, 1 + draftDepth))
+        if fixedM8 { return Self.fullPhysicalWidth }
+        let width = max(1, min(8, 1 + draftDepth))
+        return width == 7 ? 8 : width
     }
 
     public mutating func record(blockLength: Int, acceptedDraftTokens: Int) {
