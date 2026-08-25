@@ -1,16 +1,56 @@
 # EigenLabs Qwen3.6 35B-A3B Swift Optimization Report
 
-## Outcome
+## Realistic context matrix
 
-The retained construction profile combines an 8192-token solo prefill stripe, fixed-K2 inline MTP, an exact E256/top8 BF16 row-owned router finalizer, and an exact BF16 output-owned expert reduction. It generates exactly 100 greedy tokens on the frozen 129-token Python prompt.
+This matrix supersedes the earlier 129-token prompt / 100-token output
+microbenchmark as the headline result. Each cell uses a non-repeating CPython
+3.12 repository context with the coding task at the end, followed by exactly
+1,024 generated tokens. Values are medians of three order-alternated runs under
+the canonical GPU lock.
 
-On the Apple M5 Max benchmark host, the three independent invariant-clean full-profile runs reached 234.6, 232.8, and 232.1 steady-state decode tok/s. The median is **232.8 tok/s**, 1.663x the unchanged 140.0 tok/s control and 16.4% above the 200 tok/s requirement.
+| prefill context | stock TTFT | optimized TTFT | TTFT reduction | stock prefill | optimized prefill | stock AR decode | fast K2 decode | decode uplift | current exact candidate | parity |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1,024 | 380.2 ms | **285.9 ms** | **24.8%** | 2693.3 tok/s | **3582.1 tok/s** | 137.1 tok/s | **196.4 tok/s** | **43.3%** | 100.8 tok/s | **FAIL at token 13** |
+| 16,384 | 7579.8 ms | **4804.3 ms** | **36.6%** | 2161.5 tok/s | **3410.3 tok/s** | 120.5 tok/s | **163.9 tok/s** | **36.0%** | 91.0 tok/s | **FAIL at token 13** |
+| 32,768 | 16996.3 ms | **11309.7 ms** | **33.5%** | 1927.9 tok/s | **2897.3 tok/s** | 113.7 tok/s | **144.9 tok/s** | **27.4%** | 82.7 tok/s | **FAIL at token 0** |
+| 65,536 | 40033.9 ms | **29025.4 ms** | **27.5%** | 1637.0 tok/s | **2257.9 tok/s** | 95.2 tok/s | **105.4 tok/s** | **10.7%** | 70.3 tok/s | **FAIL at token 62** |
 
-The construction-time `--output-parity byte-exact` route reached 109.9, 103.9, and 107.2 tok/s, for a **107.2 tok/s median**. All three 100-token arrays are byte-for-byte identical to the stock serial control. Byte-exact is therefore an explicit correctness datapoint, not the throughput default; `--output-parity fast` remains the default.
+Decode throughput times the 1,023 inter-token intervals after the first token.
+The optimized prefill route is the 8,192-token construction-time chunk and solo
+stripe. The fast decode route is fixed K2 with rectangular target-authoritative
+verification.
 
-The 8192-token prefill stripe also fixes the reported long-context prefill bottleneck. In alternating matched three-run measurements, it reduced median TTFT by 42.6% at 8K and 34.2% at 32K.
+## Byte-exact finding
 
-## Exact pins and artifacts
+The previous 100-token check was too short. Over the full 1,024-token workload,
+the current serial `--output-parity byte-exact` route is deterministic but does
+not remain byte-identical to stock. It diverges at generated token 13, 13, 0,
+and 62 for the 1K, 16K, 32K, and 64K prompts and is slower than stock at every
+context. It is rejected evidence, not a passing exact mode or a retained
+optimization. The exact implementation must be replaced before the flag can be
+presented as useful.
+
+## Evidence
+
+All 36 measured cells have both a machine-readable JSON receipt and a
+human-readable Markdown report in [`context-matrix`](context-matrix). Every
+receipt contains:
+
+- all exact prompt and generated token IDs;
+- submitted, first-token, and last-token timestamps;
+- the requested and actual 1,024-token decode length;
+- construction routes and MTP acceptance totals;
+- model, source, and mlx-swift revisions;
+- GPU-lock ownership and peak memory.
+
+The issue/PR body contains the complete 36-row table with direct links to each
+receipt. Route order changes by repetition:
+
+1. stock, fast, current exact candidate;
+2. current exact candidate, fast, stock;
+3. fast, stock, current exact candidate.
+
+## Exact pins
 
 | item | value |
 |---|---|
@@ -18,103 +58,42 @@ The 8192-token prefill stripe also fixes the reported long-context prefill bottl
 | model revision | `73a03825c2226177f3e679210965dba3508cdee8` |
 | mlx-swift-lm base | `ab73a827c9dde6f8802507003aa0be71605aab8e` |
 | mlx-swift dependency | `606d28cfa8c1d66b2975d3162a4aac9756835c5f` |
-| frozen prompt SHA-256 | `ef6da4e0964d59b4f3099c3925d2ea98dc72a9608df4749806ab3950a20825de` |
-| release benchmark SHA-256 | `c27f0793bf48a41395065e81cb9268a3d1cee32b67c3b6d8b3bee18dbec69690` |
-| release metallib SHA-256 | `e3733805ff8549df57aebaf83efe7f491cfeadb851a1b8c8e2d3f476a5c1e0ea` |
+| measured benchmark source | `aa5c23d` |
+| chip | Apple M5 Max, 128 GiB unified memory |
+| GPU lock | `/tmp/mtplx-gpu-exclusive.lock` |
 
-Construction inspection fixes the target contract at H2048, E256/top8, I512, 40 layers, affine W4/g64 target experts, W8/g64 target routers/shared gates, and MXFP8/g32 inline-MTP matrices. The target affine kernel was not transplanted into the differently packed assistant.
+The prompt fixtures tokenize to exactly 1,024, 16,384, 32,768, and 65,536
+tokens under the model chat template. They are generated deterministically from
+real CPython 3.12 standard-library source by
+[`scripts/build-qwen36-python-contexts.py`](../../scripts/build-qwen36-python-contexts.py).
 
-## Decode comparison
+## Construction boundary
 
-| mode | output contract | repetitions | median steady decode | versus stock |
-|---|---|---:|---:|---:|
-| stock autoregressive control | byte-exact | 1 | 140.0 tok/s | 1.000x |
-| optimized K2, `--output-parity byte-exact` | byte-exact | 3 | **107.2 tok/s** | 0.766x |
-| optimized K2, `--output-parity fast` (default) | target-authoritative | 3 | **232.8 tok/s** | **1.663x** |
+Construction inspection fixes the target contract at H2048, E256/top8, I512,
+40 layers, affine W4/g64 target experts, W8/g64 target routers/shared gates,
+and MXFP8/g32 inline-MTP matrices. Target affine readers are not transplanted
+into the differently packed assistant.
 
-The byte-exact K2 route is 23.4% slower than stock and the fast route is 2.172x its throughput. This is why output arithmetic is a named construction choice rather than an unstated qualification on one headline number.
+The retained prefill and fast-decode routes are installed after the exact model
+contract is validated. Enabled hot paths route only on values that actually
+vary at runtime, such as logical M. They do not re-read model metadata or the
+environment, increment proof counters, or silently fall back to stock.
 
-### Fast route receipts
+## Current disposition
 
-| run | prefill | steady decode | generated | accepted |
-|---|---:|---:|---:|---:|
-| rep 1 | 102.8 ms | 234.6 tok/s | 100 | 64/68 |
-| rep 2 | 103.3 ms | 232.8 tok/s | 100 | 64/68 |
-| rep 3 | 103.4 ms | 232.1 tok/s | 100 | 64/68 |
-| median | 103.3 ms | **232.8 tok/s** | 100 | 64/68 |
+Retained:
 
-The exact invocation is recorded in every Markdown receipt. The historical fast repetitions omitted the new flag, which is equivalent to its `fast` default. A current explicit-flag smoke reached 233.5 tok/s and records `rectangular-target-authoritative` in both JSON and Markdown:
+- 8,192-token prefill chunk and solo stripe;
+- fixed-K2 rectangular target-authoritative fast decode;
+- exact-artifact row-owned E256/top8 router and M1/M2 expert reduction.
 
-```sh
-.build/arm64-apple-macosx/release/BenchCBv2 --model /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 100 --profile full --prefill-chunk 8192 --solo-stripe 8192 --mtp-depth 2 --output-parity fast --prompt-file benchmarks/qwen36-a3b/python-prompt.txt --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 606d28cfa8c1d66b2975d3162a4aac9756835c5f --gpu-lock-owner codex-mlx-swift-lm-eigenlabs-qwen36-a3b-fast-smoke --receipt benchmarks/qwen36-a3b/full-k2-c8192-fast-flag-smoke-20260825.json --label qwen36-a3b-full-k2-c8192-fast-flag-smoke --out benchmarks/qwen36-a3b/full-k2-c8192-fast-flag-smoke-20260825.md
-```
+Rejected or still incomplete:
 
-The raw JSON receipts contain all 129 prompt token IDs, all 100 generated token IDs, phase timestamps, peak memory, artifact contract, construction routes, exact revisions, and GPU lock owner:
+- the current serial byte-exact verifier: slower than stock and not exact over
+  the full 1,024-token generation;
+- a 16K prefill stripe: slower and higher-memory than the retained 8K stripe;
+- fixed K1/K3/K4: slower than K2;
+- transplanting target affine expert kernels into the MXFP8 assistant: invalid
+  physical packing.
 
-- `full-k2-c8192-hotpath-clean-rep{1,2,3}-20260824.json`
-- `full-k2-c8192-hotpath-clean-rep{1,2,3}-20260824.md`
-- `full-k2-c8192-fast-flag-smoke-20260825.{json,md}`
-
-### Byte-exact route receipts
-
-| run | prefill | steady decode | generated | accepted |
-|---|---:|---:|---:|---:|
-| rep 1 | 103.5 ms | 109.9 tok/s | 100 | 63/70 |
-| rep 2 | 103.3 ms | 103.9 tok/s | 100 | 63/70 |
-| rep 3 | 103.8 ms | 107.2 tok/s | 100 | 63/70 |
-| median | 103.5 ms | **107.2 tok/s** | 100 | 63/70 |
-
-The matched command differs from the explicit fast smoke only at `--output-parity byte-exact` and the output filenames. Every receipt records schema 2, `outputParity=byte-exact`, `verificationRoute=serial-byte-exact`, and `verify=serial_target`. Raw evidence is `full-k2-c8192-byte-exact-rep{1,2,3}-20260825.{json,md}`.
-
-## Prefill receipts
-
-The summary is calculated from the following 12 individual locked-GPU runs; no 8K or 32K repetition is hidden behind the median.
-
-| prompt | route | run | TTFT | prompt throughput | raw receipt |
-|---:|---|---:|---:|---:|---|
-| 8192 | stock 512-token stripe | 1 | 2876.7 ms | 2847.7 tok/s | [stock 8K rep 1](prefill-stock-L8192-rep1-20260824.md) |
-| 8192 | stock 512-token stripe | 2 | 3086.7 ms | 2653.9 tok/s | [stock 8K rep 2](prefill-stock-L8192-rep2-20260824.md) |
-| 8192 | stock 512-token stripe | 3 | 2986.7 ms | 2742.8 tok/s | [stock 8K rep 3](prefill-stock-L8192-rep3-20260824.md) |
-| 8192 | optimized 8192-token stripe | 1 | 1677.2 ms | 4884.4 tok/s | [optimized 8K rep 1](prefill-c8192-L8192-rep1-20260824.md) |
-| 8192 | optimized 8192-token stripe | 2 | 1803.8 ms | 4541.6 tok/s | [optimized 8K rep 2](prefill-c8192-L8192-rep2-20260824.md) |
-| 8192 | optimized 8192-token stripe | 3 | 1714.8 ms | 4777.3 tok/s | [optimized 8K rep 3](prefill-c8192-L8192-rep3-20260824.md) |
-| 32768 | stock 512-token stripe | 1 | 14356.3 ms | 2282.5 tok/s | [stock 32K rep 1](prefill-stock-L32768-rep1-20260824.md) |
-| 32768 | stock 512-token stripe | 2 | 14920.7 ms | 2196.1 tok/s | [stock 32K rep 2](prefill-stock-L32768-rep2-20260824.md) |
-| 32768 | stock 512-token stripe | 3 | 14647.6 ms | 2237.1 tok/s | [stock 32K rep 3](prefill-stock-L32768-rep3-20260824.md) |
-| 32768 | optimized 8192-token stripe | 1 | 9640.7 ms | 3398.9 tok/s | [optimized 32K rep 1](prefill-c8192-L32768-rep1-20260824.md) |
-| 32768 | optimized 8192-token stripe | 2 | 9650.8 ms | 3395.4 tok/s | [optimized 32K rep 2](prefill-c8192-L32768-rep2-20260824.md) |
-| 32768 | optimized 8192-token stripe | 3 | 9578.1 ms | 3421.1 tok/s | [optimized 32K rep 3](prefill-c8192-L32768-rep3-20260824.md) |
-
-| prompt | stock median TTFT | optimized median TTFT | TTFT reduction | stock median throughput | optimized median throughput | uplift |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8192 | 2986.7 ms | 1714.8 ms | 42.6% | 2742.8 tok/s | 4777.3 tok/s | 1.742x |
-| 32768 | 14647.6 ms | 9640.7 ms | 34.2% | 2237.1 tok/s | 3398.9 tok/s | 1.519x |
-
-The optimized peak memory was 23.86 GiB at 8K and 29.09 GiB at 32K. A 16K stripe was rejected because it was 4.6% slower at 32K and used 26.4% more peak memory than the 8K stripe.
-
-The cause of slow stock prefill is construction geometry: the default 512-token solo stripe fragments long prompts into too many target dispatches. The retained 8192-token stripe is installed once at engine construction. The optimized decode closures route only on logical M; artifact metadata and dtype are not revalidated, and no environment read, engagement counter, or invariant-based stock fallback exists in the measured hot path.
-
-## Arithmetic boundary
-
-The row-owned router and expert-reduction kernels have exact unit parity and leave the K2 generated stream unchanged relative to the same K2 route with stock target kernels.
-
-The fast K2 route uses rectangular target verification (logical target M3). It is greedy and the target model remains authoritative, but matrix geometry changes one near-tie relative to serial one-row autoregressive evaluation: output token 96 is 17 rather than stock token 18. The explicit serial target-verification route reproduces all stock tokens exactly, but its new three-run K2 median is 107.2 tok/s, so it cannot satisfy the speed requirement. The fast receipt must therefore not be described as byte-identical to serial stock decoding.
-
-## Candidate disposition
-
-The retained winner stack is:
-
-- 8192-token construction-time prefill chunk and solo stripe.
-- Fixed-K2 inline assistant route, bound at construction.
-- Row-owned E256/top8 BF16 target router finalizer for runtime logical M1...M16.
-- Output-owned BF16 target expert reduction for logical M1/M2.
-
-Not throughput winners or not installed:
-
-- 16K prefill stripe: 32K latency and memory regression.
-- Fixed K1/K3/K4: slower than K2.
-- Byte-exact serial MTP verification: retained as an opt-in correctness mode and measured datapoint, but not the throughput winner because it is slower than stock.
-- Target affine expert kernels in the MXFP8 assistant: incompatible physical packing.
-- Unmeasured GDN and whole-MoE hypotheses: not performance claims and not part of the retained route.
-
-See `OPTIMIZATION_LEDGER.md` for the complete candidate ledger and individual receipts.
+See [`OPTIMIZATION_LEDGER.md`](OPTIMIZATION_LEDGER.md) for the candidate history.
