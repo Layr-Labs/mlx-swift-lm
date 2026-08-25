@@ -233,6 +233,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 
     private let mtp: Qwen35MTPModule
     private let target: Qwen35TextModel
+    private let installedVerificationMode: CBv2MTPVerificationMode
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
@@ -240,12 +241,22 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     private init(
         configuration: Qwen35TextConfiguration,
         blockSize: Int,
-        target: Qwen35TextModel
+        target: Qwen35TextModel,
+        verificationMode: CBv2MTPVerificationMode?
     ) {
         self.mtp = Qwen35MTPModule(configuration)
         self.blockSize = blockSize
         self.target = target
+        self.installedVerificationMode = Self.resolvedVerificationMode(
+            requested: verificationMode,
+            forceSerialEnvironment: Self.forceSerialVerification)
         super.init()
+    }
+
+    static func resolvedVerificationMode(
+        requested: CBv2MTPVerificationMode?, forceSerialEnvironment: Bool
+    ) -> CBv2MTPVerificationMode {
+        requested ?? (forceSerialEnvironment ? .serialTarget : .rectangular)
     }
 
     /// Allocate the assistant's own autoregressive full-attention KV.
@@ -361,7 +372,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     /// Only indexed keys below the declared prefix are read and retained.
     public static func load(
         from modelDirectory: URL,
-        target: any LanguageModel
+        target: any LanguageModel,
+        verificationMode: CBv2MTPVerificationMode? = nil
     ) throws -> Qwen35InlineMTPAssistant {
         let target = try qwen35TextTarget(target)
         let metadata = try loadMetadata(from: modelDirectory)
@@ -372,7 +384,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         let assistant = Qwen35InlineMTPAssistant(
             configuration: metadata.textConfiguration,
             blockSize: metadata.blockSize,
-            target: target)
+            target: target,
+            verificationMode: verificationMode)
 
         let scaledPaths = Set(indexed.keys.compactMap { key -> String? in
             guard key.hasSuffix(".scales") else { return nil }
@@ -659,7 +672,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// under target-prefix acceptance). The serial oracle remains available
     /// via `DARKBLOOM_QWEN_MTP_SERIAL=1` for A/B and certification runs.
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
-        Self.forceSerialVerification ? .serialTarget : .rectangular
+        installedVerificationMode
     }
     /// Production Qwen drafting self-applies the recurrent MTP head up to
     /// four times. The legacy double-forward oracle stays a k=1 A/B control.

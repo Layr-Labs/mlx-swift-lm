@@ -1325,6 +1325,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let normTopkProb: Bool
     let numExperts: Int
     let topK: Int
+    private let routerFinalizer: Qwen35A3BRouterFinalizer
+    private let expertCombiner: Qwen35A3BExpertCombiner
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -1342,6 +1344,11 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
         self.topK = args.numExpertsPerTok
+        self.routerFinalizer = qwen35A3BRouterFinalizer(
+            hidden: args.hiddenSize, experts: args.numExperts,
+            topK: args.numExpertsPerTok, normalize: args.normTopkProb)
+        self.expertCombiner = qwen35A3BExpertCombiner(
+            hidden: args.hiddenSize, topK: args.numExpertsPerTok)
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
@@ -1363,13 +1370,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
-        let k = topK
-        let kth = gates.dim(-1) - k
-        let inds = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, (kth)...]
-        var scores = MLX.takeAlong(gates, inds, axis: -1)
-        if normTopkProb {
-            scores = scores / scores.sum(axis: -1, keepDims: true)
-        }
+        let (inds, scores) = routerFinalizer(gates)
 
         let tokenShape = x.shape
         let flattened = qwen35FlattenMoEInputs(x: x, indices: inds, scores: scores)

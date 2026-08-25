@@ -69,6 +69,22 @@ private func withInlineMTPDirectory(
 
 @Suite("Qwen inline MTP loader")
 struct Qwen35InlineMTPLoaderTests {
+    @Test("explicit verification mode overrides the assistant default")
+    func explicitVerificationModeWinsAtConstruction() {
+        #expect(
+            Qwen35InlineMTPAssistant.resolvedVerificationMode(
+                requested: .serialTarget, forceSerialEnvironment: false) == .serialTarget)
+        #expect(
+            Qwen35InlineMTPAssistant.resolvedVerificationMode(
+                requested: .rectangular, forceSerialEnvironment: true) == .rectangular)
+        #expect(
+            Qwen35InlineMTPAssistant.resolvedVerificationMode(
+                requested: nil, forceSerialEnvironment: false) == .rectangular)
+        #expect(
+            Qwen35InlineMTPAssistant.resolvedVerificationMode(
+                requested: nil, forceSerialEnvironment: true) == .serialTarget)
+    }
+
     @Test("loader is artifact-scoped and does not mutate the legacy process flag")
     func artifactScopedFlag() throws {
         _qwen35MTPEnabled = false
