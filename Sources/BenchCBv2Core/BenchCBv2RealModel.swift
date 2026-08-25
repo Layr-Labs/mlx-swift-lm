@@ -1473,14 +1473,14 @@ enum BenchOutputParity: String, Codable, CaseIterable, Sendable {
     var verificationMode: CBv2MTPVerificationMode {
         switch self {
         case .fast: .rectangular
-        case .byteExact: .serialTarget
+        case .byteExact: .rectangularExact
         }
     }
 
     var verificationRoute: String {
         switch self {
         case .fast: "rectangular-target-authoritative"
-        case .byteExact: "serial-byte-exact"
+        case .byteExact: "rectangular-timewise-byte-exact"
         }
     }
 }
@@ -1847,6 +1847,9 @@ public enum BenchCBv2Driver {
             qwen35A3BConstructionProfile = campaignContract == nil
                 ? .stock
                 : Qwen35A3BOptimizationProfile(rawValue: options.profile.rawValue)!
+            qwen35A3BTargetVerifyArithmetic =
+                campaignContract != nil && options.outputParity == .byteExact
+                ? .exactM1 : .rectangular
             let loadStart = CFAbsoluteTimeGetCurrent()
             // Explicitly the LLM factory: text-only benchmarking of checkpoints
             // that may carry a vision tower (see file header).

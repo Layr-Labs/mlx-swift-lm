@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXNN
 import XCTest
 
 @testable import MLXLLM
@@ -155,6 +156,43 @@ final class Qwen35A3BConstructionTests: XCTestCase {
         }
     }
 
+    func testExactTargetVerifyBuildsOnlyM1ProjectionCalls() {
+        var observedShapes: [[Int]] = []
+        let input = MLXArray(0 ..< 12).asType(.bfloat16).reshaped([1, 3, 4])
+        let output = qwen35A3BTimewiseProjection(input) { row in
+            observedShapes.append(row.shape)
+            return row + 1
+        }
+        eval(output)
+
+        XCTAssertEqual(observedShapes, [[1, 1, 4], [1, 1, 4], [1, 1, 4]])
+        XCTAssertEqual(output.shape, [1, 3, 4])
+        XCTAssertEqual(output.asArray(Int.self), Array(1 ... 12))
+    }
+
+    func testExactW4G64VerifyMatchesIndependentM1QMVBitwise() {
+        let inputSize = 512
+        let outputSize = 16
+        let positions = 3
+        let weights = sin(
+            MLXArray(0 ..< outputSize * inputSize).asType(.float32) * 0.013
+        ).asType(.bfloat16).reshaped([outputSize, inputSize])
+        let linear = QuantizedLinear(
+            weight: weights, bias: nil, groupSize: 64, bits: 4, mode: .affine)
+        let input = cos(
+            MLXArray(0 ..< positions * inputSize).asType(.float32) * 0.017
+        ).asType(.bfloat16).reshaped([1, positions, inputSize])
+
+        let expected = qwen35A3BTimewiseProjection(input) { linear($0) }
+        let actual = qwen35A3BExactW4G64Projection(linear, input)
+        let difference = max(abs(
+            actual.asType(.float32) - expected.asType(.float32)))
+        eval(expected, actual, difference)
+
+        XCTAssertEqual(actual.shape, [1, positions, outputSize])
+        XCTAssertEqual(difference.item(Float.self), 0)
+    }
+
     func testStockRouterKeepsTheLastAxisForWidePrefill() throws {
         let previous = qwen35A3BConstructionProfile
         qwen35A3BConstructionProfile = .stock
@@ -185,5 +223,16 @@ final class Qwen35A3BConstructionTests: XCTestCase {
         XCTAssertFalse(hotRoutes.contains("probabilities.dtype"))
         XCTAssertFalse(hotRoutes.contains("routed.dtype =="))
         XCTAssertFalse(hotRoutes.contains("scores.dtype =="))
+
+        let exactSourceURL = repositoryRoot.appendingPathComponent(
+            "Libraries/MLXLLM/Models/Qwen35A3BTargetVerify.swift")
+        let exactSource = try String(contentsOf: exactSourceURL, encoding: .utf8)
+        let installedExactRoute = try XCTUnwrap(
+            exactSource.components(
+                separatedBy: "func qwen35A3BExactW4G64Projection").last)
+        XCTAssertFalse(installedExactRoute.contains(".bits"))
+        XCTAssertFalse(installedExactRoute.contains(".groupSize"))
+        XCTAssertFalse(installedExactRoute.contains(".mode"))
+        XCTAssertFalse(installedExactRoute.contains("guard "))
     }
 }

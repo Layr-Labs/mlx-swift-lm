@@ -256,10 +256,11 @@ struct BenchCBv2HarnessTests {
 
         stock.outputParity = .byteExact
         let exact = campaignMTPConfig(stock)
-        #expect(exact.verificationMode == .serialTarget)
+        #expect(exact.verificationMode == .rectangularExact)
         #expect(BenchOutputParity.fast.verificationRoute
             == "rectangular-target-authoritative")
-        #expect(BenchOutputParity.byteExact.verificationRoute == "serial-byte-exact")
+        #expect(BenchOutputParity.byteExact.verificationRoute
+            == "rectangular-timewise-byte-exact")
     }
 
     @Test("campaign construction rejects installed verification drift")
@@ -306,8 +307,8 @@ struct BenchCBv2HarnessTests {
             verificationRoute: BenchOutputParity.byteExact.verificationRoute,
             routeSummary: [
                 "target": "optimized", "outputParity": "byte-exact",
-                "verificationRoute": "serial-byte-exact",
-                "mtp": "inline-fixed-k2,verify=serial_target,rounds=35",
+                "verificationRoute": "rectangular-timewise-byte-exact",
+                "mtp": "inline-fixed-k2,verify=rectangular_exact,rounds=35",
             ],
             gpuLockOwner: "owner", peakMemoryBytes: 123)
 
@@ -322,7 +323,8 @@ struct BenchCBv2HarnessTests {
             #expect(json.contains("\"\(key)\""), "missing receipt key \(key)")
         }
         #expect(json.contains("\"outputParity\":\"byte-exact\""))
-        #expect(json.contains("\"verificationRoute\":\"serial-byte-exact\""))
+        #expect(json.contains(
+            "\"verificationRoute\":\"rectangular-timewise-byte-exact\""))
 
         let mislabeled = CampaignReceipt(
             modelPath: receipt.modelPath, modelRevision: receipt.modelRevision,
@@ -535,7 +537,8 @@ struct BenchCBv2HarnessTests {
             revision: "abc1234", date: Date(timeIntervalSince1970: 0))
 
         #expect(header.contains("| Output parity | byte-exact |"))
-        #expect(header.contains("| Verification route | serial-byte-exact |"))
+        #expect(header.contains(
+            "| Verification route | rectangular-timewise-byte-exact |"))
     }
 
     // MARK: - Build revision provenance

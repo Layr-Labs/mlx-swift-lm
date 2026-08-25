@@ -243,6 +243,16 @@ public enum Qwen35A3BOptimizationProfile: String, Equatable, Sendable {
 public nonisolated(unsafe) var qwen35A3BConstructionProfile:
     Qwen35A3BOptimizationProfile = .stock
 
+public enum Qwen35A3BTargetVerifyArithmetic: Equatable, Sendable {
+    case rectangular
+    case exactM1
+}
+
+/// Published before target construction. The model captures this choice in
+/// immutable stored state; no verify layer reads process-global policy.
+public nonisolated(unsafe) var qwen35A3BTargetVerifyArithmetic:
+    Qwen35A3BTargetVerifyArithmetic = .rectangular
+
 enum Qwen35A3BRouteLane: String, Equatable, Sendable {
     case disabled
     case stock

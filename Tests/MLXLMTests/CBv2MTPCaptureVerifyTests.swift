@@ -13,6 +13,7 @@
 
 import Foundation
 import MLX
+import MLXNN
 import MLXRandom
 import XCTest
 
@@ -333,6 +334,31 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         return try JSONDecoder.json5().decode(Qwen35TextConfiguration.self, from: json)
     }
 
+    private func exactW4G64GDNConfiguration() throws -> Qwen35TextConfiguration {
+        let json = Data(
+            """
+            {
+              "model_type": "qwen3_5_moe",
+              "hidden_size": 512,
+              "num_hidden_layers": 4,
+              "intermediate_size": 512,
+              "num_attention_heads": 8,
+              "num_key_value_heads": 1,
+              "linear_num_value_heads": 16,
+              "linear_num_key_heads": 2,
+              "linear_key_head_dim": 32,
+              "linear_value_head_dim": 32,
+              "linear_conv_kernel_dim": 4,
+              "vocab_size": 512,
+              "head_dim": 64,
+              "full_attention_interval": 4,
+              "num_experts": 0,
+              "num_experts_per_tok": 0
+            }
+            """.utf8)
+        return try JSONDecoder.json5().decode(Qwen35TextConfiguration.self, from: json)
+    }
+
     private func gdnSpec(_ config: Qwen35TextConfiguration) -> CBv2RecurrentStateSpec {
         let keyDim = config.linearNumKeyHeads * config.linearKeyHeadDim
         let valueDim = config.linearNumValueHeads * config.linearValueHeadDim
@@ -353,13 +379,12 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// the state of a control that never speculated (only consumed the seed
     /// column); after an ACCEPTED draft the captured commit at keep=2 must
     /// match a control that decoded the same two tokens serially. Outputs
-    /// are compared within distributional tolerance (batched projections
-    /// change accumulation geometry; bitwise parity is NOT the contract —
-    /// see Qwen35MTP.swift NUMERICS POLICY).
-    func testGDNCapturedWindowMatchesSerialOracle() throws {
+    /// use the installed W4/g64 exact projection geometry.
+    func testExactGDNCapturedWindowMatchesSerialOracle() throws {
         MLXRandom.seed(4711)
-        let config = try smallGDNConfiguration()
+        let config = try exactW4G64GDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
+        quantize(model: layer, groupSize: 64, bits: 4)
         eval(layer)
 
         let hidden = config.hiddenSize
@@ -401,7 +426,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let rejectedState = try freshState()
         let rejected = try rejectedState.bind()
         let rejectedOut = layer.cbv2ForwardCaptured(
-            window, modelLayerIndex: 0, recurrentState: [rejected])
+            window, modelLayerIndex: 0, recurrentState: [rejected],
+            exactTargetVerify: true)
         XCTAssertTrue(rejected.isCaptured)
         _ = try rejected.evaluate()
         eval(rejectedOut)
@@ -422,7 +448,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let acceptedState = try freshState()
         let accepted = try acceptedState.bind()
         let acceptedOut = layer.cbv2ForwardCaptured(
-            window, modelLayerIndex: 0, recurrentState: [accepted])
+            window, modelLayerIndex: 0, recurrentState: [accepted],
+            exactTargetVerify: true)
         _ = try accepted.evaluate()
         eval(acceptedOut)
         try accepted.commit(keepPositions: 2)
