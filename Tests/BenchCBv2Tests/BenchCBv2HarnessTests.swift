@@ -263,8 +263,8 @@ struct BenchCBv2HarnessTests {
             == "rectangular-timewise-byte-exact")
     }
 
-    @Test("byte exact keeps fast prefill but installs stock target decode")
-    func byteExactConstructionSeparatesPrefillAndTargetArithmetic() throws {
+    @Test("byte exact preserves the installed fast construction profile")
+    func byteExactStartsFromFastConstruction() throws {
         let fast = try BenchOptions.parse([
             "--model", "/m/qwen", "--profile", "full", "--mtp-depth", "2",
             "--output-parity", "fast",
@@ -279,8 +279,8 @@ struct BenchCBv2HarnessTests {
         ])
 
         #expect(qwen35CampaignConstructionProfile(fast) == .full)
-        #expect(qwen35CampaignConstructionProfile(exactFull) == .prefill)
-        #expect(qwen35CampaignConstructionProfile(exactDecode) == .stock)
+        #expect(qwen35CampaignConstructionProfile(exactFull) == .full)
+        #expect(qwen35CampaignConstructionProfile(exactDecode) == .decode)
     }
 
     @Test("campaign construction rejects installed verification drift")

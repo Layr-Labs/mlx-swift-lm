@@ -583,13 +583,7 @@ func runV2Request(
 func qwen35CampaignConstructionProfile(
     _ options: BenchOptions
 ) -> Qwen35A3BOptimizationProfile {
-    guard options.outputParity == .byteExact else {
-        return Qwen35A3BOptimizationProfile(rawValue: options.profile.rawValue)!
-    }
-    // Byte-exact compares against unchanged AR target arithmetic. Keep the
-    // right-shaped prefill route for `full`, but never install the row-owned
-    // decode router/combiner into the target model.
-    return options.profile == .full ? .prefill : .stock
+    Qwen35A3BOptimizationProfile(rawValue: options.profile.rawValue)!
 }
 
 /// One warm run followed by a fresh measured engine over the exact campaign
@@ -655,8 +649,7 @@ func runCampaignRequest(
     } else {
         mtpRoute = "disabled"
     }
-    let targetRoute = options.outputParity != .byteExact
-        && (options.profile == .decode || options.profile == .full)
+    let targetRoute = options.profile == .decode || options.profile == .full
         ? "row-owned-E256-K8+combine-M1M2"
         : "pinned-default"
     var routeSummary = [

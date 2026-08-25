@@ -952,7 +952,7 @@ final class Qwen35GatedDeltaNet: Module {
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let out: MLXArray
-        if S >= 3 && !exactTargetVerify {
+        if S >= 3 {
             let recurrence = gatedDeltaUpdate(
                 q: qNormed,
                 k: kNormed,
