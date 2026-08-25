@@ -420,7 +420,7 @@ enum CampaignReceiptError: Error, Equatable, CustomStringConvertible {
         case .promptMetricMismatch(let expected, let actual):
             return "prompt token receipt/metric mismatch: \(expected) != \(actual)"
         case .promptLengthOutsideCampaign(let actual):
-            return "campaign prompt must tokenize to 80...140 tokens, received \(actual)"
+            return "campaign prompt must tokenize to 80...70000 tokens, received \(actual)"
         case .parityMetadataMismatch(let detail):
             return "campaign output-parity metadata mismatch: \(detail)"
         }
@@ -440,6 +440,7 @@ struct CampaignReceipt: Codable, Equatable, Sendable {
     let promptSHA256: String
     let promptTokenIDs: [Int]
     let generatedTokenIDs: [Int]
+    let requestedGeneratedTokens: Int
     let generatedText: String
     let phaseMetrics: PhaseMetrics
     let prefillChunk: Int
@@ -452,12 +453,12 @@ struct CampaignReceipt: Codable, Equatable, Sendable {
     let peakMemoryBytes: UInt64
 
     func validate() throws {
-        guard (80 ... 140).contains(promptTokenIDs.count) else {
+        guard (80 ... 70_000).contains(promptTokenIDs.count) else {
             throw CampaignReceiptError.promptLengthOutsideCampaign(actual: promptTokenIDs.count)
         }
-        guard generatedTokenIDs.count == 100 else {
+        guard generatedTokenIDs.count == requestedGeneratedTokens else {
             throw CampaignReceiptError.expectedGeneratedTokens(
-                expected: 100, actual: generatedTokenIDs.count)
+                expected: requestedGeneratedTokens, actual: generatedTokenIDs.count)
         }
         guard phaseMetrics.generatedTokens == generatedTokenIDs.count else {
             throw CampaignReceiptError.generatedMetricMismatch(
@@ -623,7 +624,7 @@ func runCampaignRequest(
     do {
         result = try await runV2Request(
             engine: measured, id: 9_001, promptTokens: promptTokens,
-            maxTokens: 100, stopTokens: [])
+            maxTokens: options.steps, stopTokens: [])
         mtpMetrics = measured.mtpMetricsSnapshot()
     } catch {
         await measured.shutdown()
@@ -1646,10 +1647,10 @@ struct BenchOptions: Equatable, Sendable {
                     option: "--receipt", value: options.receiptPath ?? "",
                     requirement: "requires --prompt-file")
             }
-            guard options.steps == 100 else {
+            guard options.steps == 1_024 else {
                 throw BenchOptionError.invalidValue(
                     option: "--steps", value: String(options.steps),
-                    requirement: "campaign receipts require exactly 100 generated tokens")
+                    requirement: "campaign receipts require exactly 1024 generated tokens")
             }
             for (option, value) in [
                 ("--model-revision", options.modelRevision),
@@ -1913,7 +1914,7 @@ public enum BenchCBv2Driver {
                 // into the synthetic correctness/perf matrix below.
                 if let campaignPrompt {
                     let promptTokenIDs = chatTokens(campaignPrompt.text)
-                    guard (80 ... 140).contains(promptTokenIDs.count) else {
+                    guard (80 ... 70_000).contains(promptTokenIDs.count) else {
                         throw CampaignReceiptError.promptLengthOutsideCampaign(
                             actual: promptTokenIDs.count)
                     }
@@ -1946,6 +1947,7 @@ public enum BenchCBv2Driver {
                         promptSHA256: campaignPrompt.sha256,
                         promptTokenIDs: promptTokenIDs,
                         generatedTokenIDs: campaign.result.tokens,
+                        requestedGeneratedTokens: campaignOptions.steps,
                         generatedText: campaign.result.text,
                         phaseMetrics: metrics,
                         prefillChunk: campaignOptions.prefillChunk,

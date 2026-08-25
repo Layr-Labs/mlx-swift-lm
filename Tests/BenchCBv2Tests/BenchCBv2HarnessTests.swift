@@ -114,7 +114,7 @@ struct BenchCBv2HarnessTests {
             "--model", "/m",
             "--profile", "prefill",
             "--prompt-file", "/p",
-            "--steps", "100",
+            "--steps", "1024",
             "--prefill-chunk", "2048",
             "--solo-stripe", "2048",
             "--model-revision", "model-sha",
@@ -125,7 +125,7 @@ struct BenchCBv2HarnessTests {
 
         #expect(options.profile == .prefill)
         #expect(options.promptFile == "/p")
-        #expect(options.steps == 100)
+        #expect(options.steps == 1_024)
         #expect(options.prefillChunk == 2_048)
         #expect(options.soloStripe == 2_048)
         #expect(options.mtpDepth == 0)
@@ -137,7 +137,7 @@ struct BenchCBv2HarnessTests {
         #expect(throws: BenchOptionError.self) {
             _ = try BenchOptions.parse([
                 "--model", "/m", "--profile", "stock", "--prompt-file", "/p",
-                "--steps", "100", "--prefill-chunk", "2048",
+                "--steps", "1024", "--prefill-chunk", "2048",
                 "--model-revision", "m", "--mlx-swift-revision", "s",
                 "--gpu-lock-owner", "o", "--receipt", "/r.json",
             ])
@@ -145,7 +145,7 @@ struct BenchCBv2HarnessTests {
         #expect(throws: BenchOptionError.self) {
             _ = try BenchOptions.parse([
                 "--model", "/m", "--profile", "prefill", "--prompt-file", "/p",
-                "--steps", "100", "--mtp-depth", "1",
+                "--steps", "1024", "--mtp-depth", "1",
                 "--model-revision", "m", "--mlx-swift-revision", "s",
                 "--gpu-lock-owner", "o", "--receipt", "/r.json",
             ])
@@ -187,15 +187,21 @@ struct BenchCBv2HarnessTests {
         }
     }
 
-    @Test("campaign receipts require an exact prompt and exactly 100 generated tokens")
+    @Test("campaign receipts accept the realistic 1024-token coding decode")
     func campaignReceiptModeIsExact() throws {
         #expect(throws: BenchOptionError.self) {
             _ = try BenchOptions.parse([
-                "--model", "/m", "--steps", "99", "--prompt-file", "/p",
+                "--model", "/m", "--steps", "100", "--prompt-file", "/p",
                 "--model-revision", "m", "--mlx-swift-revision", "s",
                 "--gpu-lock-owner", "o", "--receipt", "/r.json",
             ])
         }
+        let options = try BenchOptions.parse([
+            "--model", "/m", "--steps", "1024", "--prompt-file", "/p",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o", "--receipt", "/r.json",
+        ])
+        #expect(options.steps == 1024)
         #expect(throws: BenchOptionError.self) {
             _ = try BenchOptions.parse([
                 "--model", "/m", "--steps", "100", "--receipt", "/r.json",
@@ -284,16 +290,17 @@ struct BenchCBv2HarnessTests {
         #expect(prompt.sha256 == "cfcd09297db017afcada064c952b4625d20d1275dab4d58264cfd8f7bfa3a147")
     }
 
-    @Test("campaign receipt is complete and rejects non-100-token output")
+    @Test("campaign receipt records its requested decode length and accepts long contexts")
     func campaignReceiptIsStrict() throws {
         let metrics = PhaseMetrics(
-            promptTokens: 100, submittedAt: 10, firstTokenAt: 10.1,
-            lastTokenAt: 10.595, generatedTokens: 100)
+            promptTokens: 65_536, submittedAt: 10, firstTokenAt: 10.1,
+            lastTokenAt: 15.215, generatedTokens: 1_024)
         let receipt = CampaignReceipt(
             modelPath: "/models/qwen", modelRevision: "model-sha",
             sourceRevision: "source-sha", mlxSwiftRevision: "mlx-sha",
             profile: .decode, promptSHA256: "prompt-sha",
-            promptTokenIDs: Array(0 ..< 100), generatedTokenIDs: Array(0 ..< 100),
+            promptTokenIDs: Array(repeating: 7, count: 65_536),
+            generatedTokenIDs: Array(0 ..< 1_024), requestedGeneratedTokens: 1_024,
             generatedText: "output", phaseMetrics: metrics, prefillChunk: 512,
             soloStripe: nil, mtpDepth: 2, outputParity: .byteExact,
             verificationRoute: BenchOutputParity.byteExact.verificationRoute,
@@ -310,6 +317,7 @@ struct BenchCBv2HarnessTests {
             "modelRevision", "sourceRevision", "mlxSwiftRevision", "promptSHA256",
             "promptTokenIDs", "generatedTokenIDs", "phaseMetrics", "routeSummary",
             "gpuLockOwner", "peakMemoryBytes", "outputParity", "verificationRoute",
+            "requestedGeneratedTokens",
         ] {
             #expect(json.contains("\"\(key)\""), "missing receipt key \(key)")
         }
@@ -322,6 +330,7 @@ struct BenchCBv2HarnessTests {
             profile: receipt.profile, promptSHA256: receipt.promptSHA256,
             promptTokenIDs: receipt.promptTokenIDs,
             generatedTokenIDs: receipt.generatedTokenIDs,
+            requestedGeneratedTokens: receipt.requestedGeneratedTokens,
             generatedText: receipt.generatedText, phaseMetrics: metrics,
             prefillChunk: receipt.prefillChunk, soloStripe: receipt.soloStripe,
             mtpDepth: receipt.mtpDepth, outputParity: .byteExact,
@@ -339,6 +348,7 @@ struct BenchCBv2HarnessTests {
             profile: receipt.profile, promptSHA256: receipt.promptSHA256,
             promptTokenIDs: receipt.promptTokenIDs,
             generatedTokenIDs: Array(receipt.generatedTokenIDs.dropLast()),
+            requestedGeneratedTokens: receipt.requestedGeneratedTokens,
             generatedText: receipt.generatedText, phaseMetrics: metrics,
             prefillChunk: receipt.prefillChunk, soloStripe: receipt.soloStripe,
             mtpDepth: receipt.mtpDepth, outputParity: receipt.outputParity,
