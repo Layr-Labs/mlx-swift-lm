@@ -56,7 +56,7 @@ actually used in every receipt. The pinned draft config digest matches PR #335:
 
 ## Final policy disposition
 
-Retained from PR #335:
+Final Swift disposition:
 
 - DFlash2 physical block 8 and layers `[5, 19, 33, 47, 61]`.
 - Row-11 plus row-15 position-EMA width selection below 16,384 prompt tokens.
@@ -121,13 +121,12 @@ width-policy control. No Q8 custom route remains installed.
 | M4--M8 and padded-M16 affine Q4 kernels | Pass | `QuantizedProjectionKernelTests` on the real K/N/group geometries. |
 | Rows 21 and 48 fused kernels | Pass | `Qwen38DFlashQKKernelTests` and `Qwen38DFlashBoundaryKernelTests`. |
 | DFlash innovation and replay | Pass | `Qwen38DFlashTapeKernelTests` compares the production 10,240-wide conv-output route with stock output, final state, and every strict accepted prefix. |
-| Long-context GQA widths 6--8 | Numeric pass; performance pending | `Qwen38DFlashGQATests` uses the retained 16,384-token KV geometry and enforces the source route's fixed two-BF16-ULP maximum absolute error. The MLX 0.32.2 matched 16K A/B remains below. |
+| Long-context GQA widths 6--8 | Numeric and MLX 0.32.2 performance pass | `Qwen38DFlashGQATests` uses the retained 16,384-token KV geometry and enforces the source route's fixed two-BF16-ULP maximum absolute error. The locked 16K ABBA gate used fixed M8, an untimed same-prompt 1,024-output conditioner, and a fresh timed 1,024-output pass. Custom runs were 66.555 and 69.612 tok/s (mean 68.084); native-0.32.2 controls were 61.212 and 60.457 tok/s (mean 60.834). The custom route won by 11.916%; each variant reproduced its own token hash exactly. See the exact [`16K token fixture`](receipts/qwen38-dflash2-swift/python-modules-long-16384.tokens.json), [`aggregate`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-abba-summary.json), and raw custom [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-custom-run-1.json) / [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-custom-run-2.json), native [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-native-run-1.json) / [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-native-run-2.json). |
 | Real-artifact construction | Pass | Pinned local target and draft construct, warm widths 1--8, and install the projection counts above. |
 | Exact conditioned 1K throughput | MLX 0.32.2 pass with explicit fixed M8 | Exact 1,024-token programming input, untimed same-prompt 1,024-output conditioner, then a fresh measured 1,024-token output budget under the exclusive GPU lock. Clean Swift `2e14dca`, mlx-swift `713cf35c`, core `734241bb`. Fixed-M8 runs: 70.570 and 69.964 tok/s; mean 70.267 tok/s, identical token SHA-256 `5d6a93db36c5cd4d84fce4393db949211d63f994b9b59cd6c473554a85d561d4`. Raw [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-fixed8-conditioned-run-1.json) and [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-fixed8-conditioned-run-2.json). The earlier pre-0.32.2 adaptive evidence remains preserved above. |
 | MLX 0.32.2 adaptive control | Rejected for the 1K headline | 68.070 and 67.940 tok/s, mean 68.005, identical token SHA-256 `2bf047a0f6bca6c47c3e4d4f1c5a0b79ab841f79139a4ba52ce50bb2f01dd014`: [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-conditioned-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-conditioned-run-2.json). Fixed M8 improves the matched two-run mean by 3.326%. |
 | Width-policy behavior | Pass | On MLX 0.32.2, the adaptive production diagnostic completed in 230 cycles with 794 accepted draft tokens; M3: 2, M4: 28, M5: 53, M6: 54, M8: 93. This explains the adaptive headline regression despite faster normalized cycle time. Raw [`MLX 0.32.2 diagnostic`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-diagnostic.json). The pre-upgrade retained diagnostic completed in 204 cycles with 826 accepted draft tokens: [`pre-upgrade diagnostic`](receipts/qwen38-dflash2-swift/cost-aligned-widths-diagnostic.json). |
 | Turbo-Q8 candidate | Rejected | 68.005 tok/s on the exact conditioned workload; raw [`receipt`](receipts/qwen38-dflash2-swift/rejected-q8-conditioned-run.json). The custom route was removed. |
-| Matched 16K route | Pending | Run only after the short-context acceptance gate. |
 
 No per-token, per-layer, or per-cycle engagement counters are present in the
 timed lane. Python row names remain provenance; only Swift parity tests and
