@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Model | /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
+| Model | ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
 | Label | stock-source-final-L16384-rep1 |
 | Profile | stock |
 | Prefill construction | chunk=512, soloStripe=off |
@@ -10,9 +10,9 @@
 | RAM | 128 GB |
 | OS | Version 26.5.2 (Build 25F84) |
 | Host at start | load avg (1m) 2.3 / 18 cores; no darkbloom process |
-| Invocation | `/Users/davidtai/projects/OpenSourceWTF/.worktrees/mlx-swift-lm-eigenlabs-a3b/.build/arm64-apple-macosx/release/BenchCBv2 --model /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 1024 --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 6b0505cc790f512ae49d740b21e13f80802946bd --profile stock --mtp-depth 0 --gpu-lock-owner codex-a3b-exact-dispatch-fusion --prompt-file benchmarks/qwen36-a3b/contexts/python-coding-context-16384.txt --receipt benchmarks/qwen36-a3b/context-matrix/context-L16384-stock-source-final-rep1-20260825.json --label stock-source-final-L16384-rep1 --out benchmarks/qwen36-a3b/context-matrix/context-L16384-stock-source-final-rep1-20260825.md` |
-| Prompt lengths | default mix (B=1 500; B=2 100,1500; B=4 100,500,1500,500; else 500 x B) |
-| Paged nominalMaxSeqLen | 4096 |
+| Invocation | `~/projects/OpenSourceWTF/.worktrees/mlx-swift-lm-eigenlabs-a3b/.build/arm64-apple-macosx/release/BenchCBv2 --model ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 1024 --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 6b0505cc790f512ae49d740b21e13f80802946bd --profile stock --mtp-depth 0 --gpu-lock-owner codex-a3b-exact-dispatch-fusion --prompt-file benchmarks/qwen36-a3b/contexts/python-coding-context-16384.txt --receipt benchmarks/qwen36-a3b/context-matrix/context-L16384-stock-source-final-rep1-20260825.json --label stock-source-final-L16384-rep1 --out benchmarks/qwen36-a3b/context-matrix/context-L16384-stock-source-final-rep1-20260825.md` |
+| Prompt contract | measured campaign prompt; 16384 tokens; SHA-256 00abbf748514d7ff8609d5871156c8a8dea8e8eb5f355393c94296c846d0d1f9 |
+| Paged nominalMaxSeqLen | not used by one-prompt contiguous campaign |
 | mlx-swift-lm (build) | 3b20ab1 |
 | Date | 2026-08-25T14:47:51Z |
 

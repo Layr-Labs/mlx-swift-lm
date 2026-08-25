@@ -6,6 +6,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 public enum Qwen35A3BTargetPacking: Equatable, Sendable {
     case affine(bits: Int, groupSize: Int, routerBits: Int, routerGroupSize: Int)
@@ -191,6 +192,44 @@ public struct Qwen35A3BArtifactContract: Equatable, Sendable {
         }
 
         let layers = try int(text, "num_hidden_layers")
+        let targetMode = try string(target, "mode")
+        let targetBits = try int(target, "bits")
+        let targetGroupSize = try int(target, "group_size")
+
+        func requirePacking(
+            _ path: String, _ table: [String: Any], bits: Int, groupSize: Int
+        ) throws {
+            let actualMode = (table["mode"] as? String) ?? targetMode
+            let actualBits = (table["bits"] as? Int) ?? targetBits
+            let actualGroupSize = (table["group_size"] as? Int) ?? targetGroupSize
+            for (field, actual, expected) in [
+                ("mode", actualMode, "affine"),
+                ("bits", String(actualBits), String(bits)),
+                ("group_size", String(actualGroupSize), String(groupSize)),
+            ] where actual != expected {
+                throw Qwen35A3BArtifactError.mismatch(
+                    field: "quantization.\(path).\(field)", expected: expected,
+                    actual: actual)
+            }
+        }
+
+        let exactProjectionSuffixes = [
+            ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
+            ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
+            ".linear_attn.out_proj", ".self_attn.q_proj", ".self_attn.k_proj",
+            ".self_attn.v_proj", ".self_attn.o_proj",
+            ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+            ".mlp.shared_expert.down_proj",
+        ]
+        for (path, value) in target where
+            path == "lm_head" || exactProjectionSuffixes.contains(where: path.hasSuffix)
+        {
+            guard let override = value as? [String: Any] else {
+                throw Qwen35A3BArtifactError.malformed(field: "quantization.\(path)")
+            }
+            try requirePacking(path, override, bits: 4, groupSize: 64)
+        }
+
         var routerEntries = 0
         var sharedGateEntries = 0
         var routerBits: Int?
@@ -198,14 +237,20 @@ public struct Qwen35A3BArtifactContract: Equatable, Sendable {
         for layer in 0 ..< layers {
             let gateKey = "language_model.model.layers.\(layer).mlp.gate"
             let sharedKey = "language_model.model.layers.\(layer).mlp.shared_expert_gate"
-            if let gate = target[gateKey] as? [String: Any],
-                let bits = gate["bits"] as? Int
-            {
-                routerEntries += 1
-                routerBits = routerBits ?? bits
-                routerGroupSize = routerGroupSize ?? (gate["group_size"] as? Int)
+            guard let gate = target[gateKey] as? [String: Any] else {
+                throw Qwen35A3BArtifactError.malformed(field: "quantization.\(gateKey)")
             }
-            if target[sharedKey] is [String: Any] { sharedGateEntries += 1 }
+            try requirePacking(gateKey, gate, bits: 8, groupSize: 64)
+            routerEntries += 1
+            routerBits = routerBits ?? ((gate["bits"] as? Int) ?? targetBits)
+            routerGroupSize = routerGroupSize
+                ?? ((gate["group_size"] as? Int) ?? targetGroupSize)
+
+            guard let sharedGate = target[sharedKey] as? [String: Any] else {
+                throw Qwen35A3BArtifactError.malformed(field: "quantization.\(sharedKey)")
+            }
+            try requirePacking(sharedKey, sharedGate, bits: 8, groupSize: 64)
+            sharedGateEntries += 1
         }
 
         return try inspect(fixture: Qwen35A3BArtifactFixture(
@@ -218,8 +263,8 @@ public struct Qwen35A3BArtifactContract: Equatable, Sendable {
             layers: layers,
             recurrentLayers: layerTypes.filter { $0 == "linear_attention" }.count,
             fullAttentionLayers: layerTypes.filter { $0 == "full_attention" }.count,
-            targetMode: try string(target, "mode"), targetBits: try int(target, "bits"),
-            targetGroupSize: try int(target, "group_size"),
+            targetMode: targetMode, targetBits: targetBits,
+            targetGroupSize: targetGroupSize,
             routerBits: routerBits ?? -1, routerGroupSize: routerGroupSize ?? 64,
             routerLayerEntries: routerEntries, sharedGateLayerEntries: sharedGateEntries,
             mtpIncluded: (inline["included"] as? Bool) ?? false,
@@ -236,22 +281,142 @@ public enum Qwen35A3BOptimizationProfile: String, Equatable, Sendable {
     case full
 }
 
-/// Selected by an integrator before constructing the exact checkpoint. Sparse
-/// blocks bind their route closures during init; forwards never read this
-/// value. The benchmark process constructs one model, so profile publication
-/// is complete before any concurrent engine work begins.
-public nonisolated(unsafe) var qwen35A3BConstructionProfile:
-    Qwen35A3BOptimizationProfile = .stock
-
 public enum Qwen35A3BTargetVerifyArithmetic: Equatable, Sendable {
     case rectangular
     case exactM1
 }
 
-/// Published before target construction. The model captures this choice in
-/// immutable stored state; no verify layer reads process-global policy.
-public nonisolated(unsafe) var qwen35A3BTargetVerifyArithmetic:
-    Qwen35A3BTargetVerifyArithmetic = .rectangular
+/// Immutable construction capability. The only public constructor requires a
+/// previously inspected artifact contract, so an optimized lane cannot be
+/// selected independently of the checkpoint that proved its invariants.
+public struct Qwen35A3BConstructionInstallation: Sendable {
+    let profile: Qwen35A3BOptimizationProfile
+    let targetVerifyArithmetic: Qwen35A3BTargetVerifyArithmetic
+    public let contract: Qwen35A3BArtifactContract
+
+    public static func install(
+        contract: Qwen35A3BArtifactContract,
+        profile: Qwen35A3BOptimizationProfile,
+        targetVerifyArithmetic: Qwen35A3BTargetVerifyArithmetic = .rectangular
+    ) throws -> Self {
+        _ = try Qwen35A3BRouteTable.install(contract: contract, profile: profile)
+        if targetVerifyArithmetic == .exactM1,
+            profile != .decode && profile != .full
+        {
+            throw Qwen35A3BArtifactError.mismatch(
+                field: "target_verify_arithmetic", expected: "decode-capable profile",
+                actual: profile.rawValue)
+        }
+        return Self(
+            profile: profile, targetVerifyArithmetic: targetVerifyArithmetic,
+            contract: contract)
+    }
+}
+
+/// Task-scoped construction state. Model initializers capture these values in
+/// immutable callables and stored properties; forwards never read this state.
+/// Task locality also prevents simultaneous model loads from mixing routes.
+public enum Qwen35A3BConstructionContext {
+    @TaskLocal public static var installation: Qwen35A3BConstructionInstallation?
+
+    static var profile: Qwen35A3BOptimizationProfile {
+        installation?.profile ?? .stock
+    }
+
+    static var targetVerifyArithmetic: Qwen35A3BTargetVerifyArithmetic {
+        installation?.targetVerifyArithmetic ?? .rectangular
+    }
+
+    public static func withInstallation<T>(
+        _ installation: Qwen35A3BConstructionInstallation,
+        operation: () throws -> T
+    ) rethrows -> T {
+        try $installation.withValue(installation, operation: operation)
+    }
+
+    public static func withInstallation<T>(
+        _ installation: Qwen35A3BConstructionInstallation,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        try await $installation.withValue(installation, operation: operation)
+    }
+}
+
+/// Validate the concrete modules and buffers used by the unchecked exact
+/// kernels after weight loading and before the first model execution.
+func qwen35A3BValidateExactProjection(
+    _ linear: Linear, path: String
+) throws -> QuantizedLinear {
+    guard let quantized = linear as? QuantizedLinear else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.\(path).type", expected: "QuantizedLinear",
+            actual: String(describing: type(of: linear)))
+    }
+    guard quantized.bits == 4 else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.\(path).bits", expected: "4",
+            actual: String(quantized.bits))
+    }
+    guard quantized.groupSize == 64 else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.\(path).group_size", expected: "64",
+            actual: String(quantized.groupSize))
+    }
+    guard quantized.mode == .affine, let biases = quantized.biases else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.\(path).mode", expected: "affine with biases",
+            actual: quantized.mode.rawValue)
+    }
+    guard quantized.scales.dtype == .bfloat16, biases.dtype == .bfloat16 else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.\(path).scale_dtype", expected: "bfloat16",
+            actual: "\(quantized.scales.dtype)/\(biases.dtype)")
+    }
+    guard quantized.shape.0.isMultiple(of: 4) else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.\(path).output_tiling", expected: "multiple of 4",
+            actual: String(quantized.shape.0))
+    }
+    return quantized
+}
+
+public func qwen35A3BValidateLoadedExactTarget(
+    _ target: Qwen35TextModel, contract: Qwen35A3BArtifactContract
+) throws {
+    guard target.model.embedTokens.weight.dtype == .bfloat16 else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.embed_tokens.dtype", expected: "bfloat16",
+            actual: String(describing: target.model.embedTokens.weight.dtype))
+    }
+    let exactProjectionSuffixes = [
+        ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
+        ".linear_attn.in_proj_b", ".linear_attn.in_proj_a",
+        ".linear_attn.out_proj", ".self_attn.q_proj", ".self_attn.k_proj",
+        ".self_attn.v_proj", ".self_attn.o_proj",
+        ".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj",
+        ".mlp.shared_expert.down_proj",
+    ]
+    var validated = 0
+    for (path, module) in target.namedModules() where
+        path == "lm_head" || exactProjectionSuffixes.contains(where: path.hasSuffix)
+    {
+        guard let linear = module as? Linear else {
+            throw Qwen35A3BArtifactError.mismatch(
+                field: "loaded.\(path).type", expected: "Linear",
+                actual: String(describing: type(of: module)))
+        }
+        _ = try qwen35A3BValidateExactProjection(linear, path: path)
+        validated += 1
+    }
+    let expected = contract.geometry.recurrentLayers * 5
+        + contract.geometry.fullAttentionLayers * 4
+        + contract.geometry.layers * 3 + 1
+    guard validated == expected else {
+        throw Qwen35A3BArtifactError.mismatch(
+            field: "loaded.exact_projection_count", expected: String(expected),
+            actual: String(validated))
+    }
+}
 
 enum Qwen35A3BRouteLane: String, Equatable, Sendable {
     case disabled
@@ -432,8 +597,8 @@ func qwen35A3BRouterFinalizer(
         qwen35A3BStockRoute(
             probabilities, topK: topK, normalize: normalize)
     }
-    guard (qwen35A3BConstructionProfile == .decode
-        || qwen35A3BConstructionProfile == .full),
+    guard (Qwen35A3BConstructionContext.profile == .decode
+        || Qwen35A3BConstructionContext.profile == .full),
         hidden == 2_048, experts == 256, topK == 8, normalize
     else { return stock }
 
@@ -477,8 +642,8 @@ func qwen35A3BExpertCombiner(
     let stock: Qwen35A3BExpertCombiner = { routed, scores in
         weightedExpertSum(routed, scores.asType(routed.dtype))
     }
-    guard (qwen35A3BConstructionProfile == .decode
-        || qwen35A3BConstructionProfile == .full),
+    guard (Qwen35A3BConstructionContext.profile == .decode
+        || Qwen35A3BConstructionContext.profile == .full),
         hidden == 2_048, topK == 8
     else { return stock }
 

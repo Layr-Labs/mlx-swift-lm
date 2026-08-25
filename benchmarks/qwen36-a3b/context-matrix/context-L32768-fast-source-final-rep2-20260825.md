@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Model | /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
+| Model | ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
 | Label | fast-source-final-L32768-rep2 |
 | Output parity | fast |
 | Verification route | rectangular-target-authoritative |
@@ -12,9 +12,9 @@
 | RAM | 128 GB |
 | OS | Version 26.5.2 (Build 25F84) |
 | Host at start | load avg (1m) 1.4 / 18 cores; no darkbloom process |
-| Invocation | `/Users/davidtai/projects/OpenSourceWTF/.worktrees/mlx-swift-lm-eigenlabs-a3b/.build/arm64-apple-macosx/release/BenchCBv2 --model /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 1024 --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 6b0505cc790f512ae49d740b21e13f80802946bd --profile full --prefill-chunk 8192 --solo-stripe 8192 --gpu-lock-owner codex-a3b-exact-dispatch-fusion --mtp-depth 2 --output-parity fast --prompt-file benchmarks/qwen36-a3b/contexts/python-coding-context-32768.txt --receipt benchmarks/qwen36-a3b/context-matrix/context-L32768-fast-source-final-rep2-20260825.json --label fast-source-final-L32768-rep2 --out benchmarks/qwen36-a3b/context-matrix/context-L32768-fast-source-final-rep2-20260825.md` |
-| Prompt lengths | default mix (B=1 500; B=2 100,1500; B=4 100,500,1500,500; else 500 x B) |
-| Paged nominalMaxSeqLen | 4096 |
+| Invocation | `~/projects/OpenSourceWTF/.worktrees/mlx-swift-lm-eigenlabs-a3b/.build/arm64-apple-macosx/release/BenchCBv2 --model ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 1024 --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 6b0505cc790f512ae49d740b21e13f80802946bd --profile full --prefill-chunk 8192 --solo-stripe 8192 --gpu-lock-owner codex-a3b-exact-dispatch-fusion --mtp-depth 2 --output-parity fast --prompt-file benchmarks/qwen36-a3b/contexts/python-coding-context-32768.txt --receipt benchmarks/qwen36-a3b/context-matrix/context-L32768-fast-source-final-rep2-20260825.json --label fast-source-final-L32768-rep2 --out benchmarks/qwen36-a3b/context-matrix/context-L32768-fast-source-final-rep2-20260825.md` |
+| Prompt contract | measured campaign prompt; 32768 tokens; SHA-256 cd86e038f82ae86f75af17ffee3df8f82725e58926edb8f4a66961fe640c2e14 |
+| Paged nominalMaxSeqLen | not used by one-prompt contiguous campaign |
 | mlx-swift-lm (build) | 3b20ab1 |
 | Date | 2026-08-25T14:43:22Z |
 

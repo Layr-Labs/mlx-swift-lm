@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Model | /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
+| Model | ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
 | Label | qwen36-a3b-full-k2-c8192-hotpath-clean-rep1 |
 | Profile | full |
 | Prefill construction | chunk=8192, soloStripe=8192 |
@@ -10,9 +10,9 @@
 | RAM | 128 GB |
 | OS | Version 26.5.2 (Build 25F84) |
 | Host at start | load avg (1m) 1.5 / 18 cores; no darkbloom process |
-| Invocation | `.build/arm64-apple-macosx/release/BenchCBv2 --model /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 100 --profile full --prefill-chunk 8192 --solo-stripe 8192 --mtp-depth 2 --prompt-file benchmarks/qwen36-a3b/python-prompt.txt --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 606d28cfa8c1d66b2975d3162a4aac9756835c5f --gpu-lock-owner codex-mlx-swift-lm-eigenlabs-qwen36-a3b-audit --receipt benchmarks/qwen36-a3b/full-k2-c8192-hotpath-clean-rep1-20260824.json --label qwen36-a3b-full-k2-c8192-hotpath-clean-rep1 --out benchmarks/qwen36-a3b/full-k2-c8192-hotpath-clean-rep1-20260824.md` |
-| Prompt lengths | default mix (B=1 500; B=2 100,1500; B=4 100,500,1500,500; else 500 x B) |
-| Paged nominalMaxSeqLen | 4096 |
+| Invocation | `.build/arm64-apple-macosx/release/BenchCBv2 --model ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 100 --profile full --prefill-chunk 8192 --solo-stripe 8192 --mtp-depth 2 --prompt-file benchmarks/qwen36-a3b/python-prompt.txt --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 606d28cfa8c1d66b2975d3162a4aac9756835c5f --gpu-lock-owner codex-mlx-swift-lm-eigenlabs-qwen36-a3b-audit --receipt benchmarks/qwen36-a3b/full-k2-c8192-hotpath-clean-rep1-20260824.json --label qwen36-a3b-full-k2-c8192-hotpath-clean-rep1 --out benchmarks/qwen36-a3b/full-k2-c8192-hotpath-clean-rep1-20260824.md` |
+| Prompt contract | measured campaign prompt; 129 tokens; SHA-256 ef6da4e0964d59b4f3099c3925d2ea98dc72a9608df4749806ab3950a20825de |
+| Paged nominalMaxSeqLen | not used by one-prompt contiguous campaign |
 | mlx-swift-lm (build) | ab73a82-dirty |
 | Date | 2026-08-25T03:17:40Z |
 

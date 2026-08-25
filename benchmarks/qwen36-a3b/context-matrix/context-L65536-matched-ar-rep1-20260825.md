@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Model | /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
+| Model | ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 |
 | Label | context-L65536-matched-ar-rep1-20260825 |
 | Profile | full |
 | Prefill construction | chunk=8192, soloStripe=8192 |
@@ -10,9 +10,9 @@
 | RAM | 128 GB |
 | OS | Version 26.5.2 (Build 25F84) |
 | Host at start | load avg (1m) 2.2 / 18 cores; no darkbloom process |
-| Invocation | `.build/arm64-apple-macosx/release/BenchCBv2 --model /Users/davidtai/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 1024 --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 606d28cfa8c1d66b2975d3162a4aac9756835c5f --profile full --prefill-chunk 8192 --solo-stripe 8192 --mtp-depth 0 --gpu-lock-owner codex-qwen36-realistic-context-matrix-v2 --prompt-file benchmarks/qwen36-a3b/contexts/python-coding-context-65536.txt --receipt benchmarks/qwen36-a3b/context-matrix/context-L65536-matched-ar-rep1-20260825.json --label context-L65536-matched-ar-rep1-20260825 --out benchmarks/qwen36-a3b/context-matrix/context-L65536-matched-ar-rep1-20260825.md` |
-| Prompt lengths | default mix (B=1 500; B=2 100,1500; B=4 100,500,1500,500; else 500 x B) |
-| Paged nominalMaxSeqLen | 4096 |
+| Invocation | `.build/arm64-apple-macosx/release/BenchCBv2 --model ~/.cache/huggingface/hub/models--EigenLabs--Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8/snapshots/73a03825c2226177f3e679210965dba3508cdee8 --mode perf --engines v2 --batches 1 --steps 1024 --model-revision 73a03825c2226177f3e679210965dba3508cdee8 --mlx-swift-revision 606d28cfa8c1d66b2975d3162a4aac9756835c5f --profile full --prefill-chunk 8192 --solo-stripe 8192 --mtp-depth 0 --gpu-lock-owner codex-qwen36-realistic-context-matrix-v2 --prompt-file benchmarks/qwen36-a3b/contexts/python-coding-context-65536.txt --receipt benchmarks/qwen36-a3b/context-matrix/context-L65536-matched-ar-rep1-20260825.json --label context-L65536-matched-ar-rep1-20260825 --out benchmarks/qwen36-a3b/context-matrix/context-L65536-matched-ar-rep1-20260825.md` |
+| Prompt contract | measured campaign prompt; 65536 tokens; SHA-256 f21b3a6bdba10ab5e35ad8c968e15ea2566fc122b5e8c1aaa4e01207d659eb44 |
+| Paged nominalMaxSeqLen | not used by one-prompt contiguous campaign |
 | mlx-swift-lm (build) | 7eceded |
 | Date | 2026-08-25T11:27:06Z |
 

@@ -375,7 +375,7 @@ func qwen35A3BTimewiseProjection(
 func qwen35A3BExactW4G64Projection(
     _ linear: Linear, _ input: MLXArray
 ) -> MLXArray {
-    let quantized = linear as! QuantizedLinear
+    let quantized = unsafeDowncast(linear, to: QuantizedLinear.self)
     let quantizationBiases = quantized.biases!
     let batch = input.dim(0)
     let width = input.dim(1)
@@ -398,8 +398,8 @@ func qwen35A3BExactW4G64Projection(
 func qwen35A3BExactW4G64ProjectionPair(
     _ first: Linear, _ second: Linear, _ input: MLXArray
 ) -> (MLXArray, MLXArray) {
-    let firstQuantized = first as! QuantizedLinear
-    let secondQuantized = second as! QuantizedLinear
+    let firstQuantized = unsafeDowncast(first, to: QuantizedLinear.self)
+    let secondQuantized = unsafeDowncast(second, to: QuantizedLinear.self)
     let batch = input.dim(0)
     let width = input.dim(1)
     let inputSize = input.dim(2)
@@ -430,10 +430,10 @@ func qwen35A3BExactW4G64ProjectionQuad(
     _ first: Linear, _ second: Linear, _ third: Linear, _ fourth: Linear,
     _ input: MLXArray
 ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
-    let q0 = first as! QuantizedLinear
-    let q1 = second as! QuantizedLinear
-    let q2 = third as! QuantizedLinear
-    let q3 = fourth as! QuantizedLinear
+    let q0 = unsafeDowncast(first, to: QuantizedLinear.self)
+    let q1 = unsafeDowncast(second, to: QuantizedLinear.self)
+    let q2 = unsafeDowncast(third, to: QuantizedLinear.self)
+    let q3 = unsafeDowncast(fourth, to: QuantizedLinear.self)
     let batch = input.dim(0)
     let width = input.dim(1)
     let inputSize = input.dim(2)

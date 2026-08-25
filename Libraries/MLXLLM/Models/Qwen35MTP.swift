@@ -256,7 +256,8 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     static func resolvedVerificationMode(
         requested: CBv2MTPVerificationMode?, forceSerialEnvironment: Bool
     ) -> CBv2MTPVerificationMode {
-        requested ?? (forceSerialEnvironment ? .serialTarget : .rectangular)
+        if forceSerialEnvironment { return .serialTarget }
+        return requested ?? .rectangular
     }
 
     /// Allocate the assistant's own autoregressive full-attention KV.
@@ -376,6 +377,13 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         verificationMode: CBv2MTPVerificationMode? = nil
     ) throws -> Qwen35InlineMTPAssistant {
         let target = try qwen35TextTarget(target)
+        let resolvedVerificationMode = Self.resolvedVerificationMode(
+            requested: verificationMode,
+            forceSerialEnvironment: Self.forceSerialVerification)
+        if resolvedVerificationMode == .rectangularExact && !target.model.exactTargetVerify {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "rectangular_exact verification requires exact target arithmetic")
+        }
         let metadata = try loadMetadata(from: modelDirectory)
         try validate(metadata.textConfiguration, against: target.configuration)
 

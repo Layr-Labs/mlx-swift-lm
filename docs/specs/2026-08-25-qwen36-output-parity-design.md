@@ -4,108 +4,84 @@ Date: 2026-08-25
 
 ## Scope
 
-Add an explicit benchmark CLI choice between the highest-throughput MTP
-verification path and byte-exact agreement with the stock serial target path:
+The benchmark exposes `--output-parity fast|byte-exact` only for the
+one-prompt `decode` and `full` campaign routes with MTP depth greater than zero.
+`fast` is the default.
 
-```text
---output-parity fast|byte-exact
-```
+`fast` installs `.rectangular` verification and records
+`rectangular-target-authoritative`. `byte-exact` installs
+`.rectangularExact`, exact M1 target projection arithmetic, and records
+`rectangular-timewise-byte-exact`. Exact means byte-identical generated token
+IDs to the optimized autoregressive target route. It does not claim identity
+to a separately constructed stock model.
 
-The default is `fast`, preserving the optimized benchmark's current behavior.
-The option applies only to decode-capable `decode` and `full` runs with an MTP
-depth greater than zero.
+## Construction contract
 
-This change does not alter the model implementation, kernel geometry, cache
-layout, prefill route, or the arithmetic of either verification mode. It only
-selects one of two already-defined MTP verification routes at construction.
+The configuration is inspected before model construction. The resulting
+artifact contract proves model topology, layer ownership, target affine
+W4/g64 packing, W8/g64 router/shared-gate packing, and MXFP8/g32 MTP packing.
+Every per-layer override reached by an exact projection is validated.
 
-## Interface and behavior
+The contract, profile, and target arithmetic form one immutable task-scoped
+installation. A model load cannot publish a profile or exact arithmetic
+without the inspected contract, and concurrent loads cannot mix settings.
+After weights load, exact mode verifies the concrete projection types, affine
+bias buffers, BF16 scale/bias dtype, output tiling, and expected module count.
+Failure occurs before the vocabulary probe, warmup, or measured generation.
 
-`fast` constructs `CBv2MTPConfig` with `.rectangular`. Its stable receipt label
-is `rectangular-target-authoritative`. This is the optimized route used for the
-published decode result.
-
-`byte-exact` constructs `CBv2MTPConfig` with `.serialTarget`. Its stable receipt
-label is `serial-byte-exact`. This route preserves the stock target evaluation
-order and is intended for byte-for-byte output comparisons, with the known
-throughput cost made explicit.
-
-The parsed option is a typed enum. That enum is the single source of truth for
-both the `CBv2MTPVerificationMode` selected during benchmark construction and
-the label written to receipts. The enabled execution path contains no parity
-mode checks, environment reads, eligibility checks, or fallback branches.
-
-## Validation
-
-Validation occurs once after CLI parsing and before model or benchmark
-construction.
-
-The command fails clearly when:
-
-- `--output-parity` has a value other than `fast` or `byte-exact`.
-- The flag is supplied for a `stock` or `prefill` run.
-- The flag is supplied with an MTP depth of zero.
-
-Omitting the flag selects `fast`. An explicitly requested `byte-exact` mode
-must never downgrade to `fast`; if the serial route cannot be constructed, the
-run fails before measurement.
+The assistant refuses `.rectangularExact` unless its target captured exact
+arithmetic. `DARKBLOOM_QWEN_MTP_SERIAL` remains an unconditional diagnostic
+oracle override. A requested fixed depth greater than the installed drafter
+maximum is rejected before warmup.
 
 ## Data flow
 
-1. The CLI parser converts the argument to the typed output-parity enum.
-2. Construction-time validation checks the benchmark phase and MTP depth.
-3. `campaignMTPConfig` maps the enum directly to `.rectangular` or
-   `.serialTarget`.
-4. The selected enum and stable route label are recorded in JSON output and
-   the Markdown benchmark summary.
-5. Decode executes the installed route directly. Only values that genuinely
-   vary at runtime, such as logical M, remain runtime routing inputs.
+1. Parse the typed output-parity enum and reject campaign-only flags outside a
+   prompt-file campaign.
+2. Inspect `config.json` and create a validated construction installation.
+3. Load the model inside that task-scoped installation.
+4. For exact mode, validate all loaded modules and buffers used by unchecked
+   kernels.
+5. Load the assistant and verify target arithmetic, verifier mode, and fixed
+   depth.
+6. Execute the installed route directly. Only logical M and execution phase
+   remain runtime routing inputs.
+7. Record typed parity metadata and the exact comma-delimited installed
+   verifier field in the receipt.
 
-## Receipt schema
+Chat-template failure is fatal for a campaign prompt; the campaign never falls
+back to raw encoding and silently changes the prompt contract.
 
-Every decode-capable optimized receipt records:
+## Receipt contract
 
-- `outputParity`: `fast` or `byte-exact`
+Decode-capable receipts record:
+
+- `outputParity`: `fast` or `byte-exact`;
 - `verificationRoute`: `rectangular-target-authoritative` or
-  `serial-byte-exact`
+  `rectangular-timewise-byte-exact`;
+- an `mtp` route whose `verify` field must exactly equal the installed typed
+  verifier, rather than merely sharing a string prefix;
+- the requested depth only after it has been checked against the installed
+  drafter maximum.
 
-The Markdown report displays the same values beside the decode result so the
-performance and parity contract cannot be separated from the reported number.
+## Verification
 
-## Tests
+Focused tests cover parser rejection, exact route-field matching, fixed-depth
+drift, environment-override precedence, target-arithmetic binding, every
+router entry, malformed exact-projection overrides, unquantized loaded
+projections, and the no-hot-path-validation invariant.
 
-Tests are written before implementation and cover:
+The authentic gate is a locked, rebased-source comparison:
 
-- Parsing both accepted values and rejecting an unknown value.
-- Defaulting to `fast` when the flag is omitted.
-- Rejecting `stock`, `prefill`, and MTP-depth-zero combinations when the flag
-  is supplied.
-- Mapping `fast` to `.rectangular` and `byte-exact` to `.serialTarget`.
-- Emitting matching JSON and Markdown route labels from the selected enum.
-- Preserving the existing structural guarantee that installed optimized hot
-  paths contain no invariant validation or silent stock fallback.
-
-After the focused test gates pass, one locked-GPU smoke benchmark exercises
-each mode on the exact pinned model artifact. The byte-exact run must reproduce
-the stock token stream; the fast run is evaluated under its declared
-target-authoritative contract.
-
-## Failure modes and safeguards
-
-- **Receipt labels diverge from execution:** derive both the verification mode
-  and receipt label from the same enum rather than maintaining parallel flags.
-- **Byte-exact silently uses the fast route:** install `.serialTarget` directly
-  at construction and assert that mapping in tests; do not provide a runtime
-  fallback.
-- **A meaningless phase reports a parity mode:** reject unsupported phase/depth
-  combinations before benchmark construction.
-- **Parity selection adds hot-path overhead:** keep selection entirely at
-  construction time and pass the already-specialized configuration into the
-  measured path.
+- optimized AR versus rectangular-exact for all 1,024 generated tokens;
+- matched optimized AR, fast K2, and exact K2 timing;
+- separate prefill, decode, wall-time, and peak-memory reporting;
+- source and dependency revisions in every receipt.
 
 ## Non-goals
 
-- Making `byte-exact` as fast as the rectangular route in this change.
-- Changing output semantics of the existing `fast` route.
-- Applying this option to stock-only or prefill-only measurements.
-- Reworking Qwen3.6 A3B kernels, MTP scheduling, or prefill optimization.
+- Making exact mode as fast as fast mode.
+- Claiming that fast mode has the same generated stream as optimized AR.
+- Applying parity selection to ordinary synthetic matrices, stock-only runs,
+  or prefill-only runs.
+- Applying target affine kernels to the MXFP8 assistant.

@@ -1,99 +1,98 @@
 # EigenLabs Qwen3.6 35B-A3B Swift Optimization Report
 
-## Realistic context matrix
+## Source-final context matrix
 
-This matrix supersedes the earlier 129-token prompt / 100-token output
-microbenchmark as the headline result. Each cell uses a non-repeating CPython
-3.12 repository context with the coding task at the end, followed by exactly
-1,024 generated tokens. Values are medians of three order-alternated runs under
-the canonical GPU lock.
+Each cell uses a non-repeating CPython 3.12 repository context with the coding
+task at the end, followed by exactly 1,024 generated tokens. Stock has one run
+per context. Optimized AR, fast K2, and rectangular-exact K2 are medians of two
+paired runs. All runs held `/tmp/mtplx-gpu-exclusive.lock`.
 
-| prefill context | stock TTFT | optimized TTFT | TTFT reduction | stock prefill | optimized prefill | stock AR decode | fast K2 decode | decode uplift | current exact candidate | parity |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 1,024 | 380.2 ms | **285.9 ms** | **24.8%** | 2693.3 tok/s | **3582.1 tok/s** | 137.1 tok/s | **196.4 tok/s** | **43.3%** | 100.8 tok/s | **FAIL at token 13** |
-| 16,384 | 7579.8 ms | **4804.3 ms** | **36.6%** | 2161.5 tok/s | **3410.3 tok/s** | 120.5 tok/s | **163.9 tok/s** | **36.0%** | 91.0 tok/s | **FAIL at token 13** |
-| 32,768 | 16996.3 ms | **11309.7 ms** | **33.5%** | 1927.9 tok/s | **2897.3 tok/s** | 113.7 tok/s | **144.9 tok/s** | **27.4%** | 82.7 tok/s | **FAIL at token 0** |
-| 65,536 | 40033.9 ms | **29025.4 ms** | **27.5%** | 1637.0 tok/s | **2257.9 tok/s** | 95.2 tok/s | **105.4 tok/s** | **10.7%** | 70.3 tok/s | **FAIL at token 62** |
+| context | stock TTFT | optimized AR TTFT | reduction | stock prefill | optimized AR prefill | stock AR decode | optimized AR decode | fast K2 decode | exact K2 decode |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 293.2 ms | 233.7 ms | 20.3% | 3492.2 tok/s | 4381.6 tok/s | 141.6 tok/s | 147.7 tok/s | 211.6 tok/s | 191.1 tok/s |
+| 16,384 | 5793.1 ms | 3926.7 ms | 32.2% | 2828.2 tok/s | 4173.8 tok/s | 125.8 tok/s | 131.2 tok/s | 177.9 tok/s | 165.0 tok/s |
+| 32,768 | 13427.4 ms | 9524.7 ms | 29.1% | 2440.4 tok/s | 3440.3 tok/s | 116.0 tok/s | 121.2 tok/s | 150.9 tok/s | 140.2 tok/s |
+| 65,536 | 33361.5 ms | 26191.6 ms | 21.5% | 1964.4 tok/s | 2502.2 tok/s | 96.7 tok/s | 100.1 tok/s | 112.1 tok/s | 107.4 tok/s |
 
-Decode throughput times the 1,023 inter-token intervals after the first token.
-The optimized prefill route is the 8,192-token construction-time chunk and solo
-stripe. The fast decode route is fixed K2 with rectangular target-authoritative
-verification.
+Fast K2 improves decode over optimized AR by 43.3%, 35.5%, 24.5%, and
+12.0%. Rectangular-exact improves it by 29.4%, 25.7%, 15.8%, and 7.3%.
+End-to-end request wall time for fast K2 is approximately 29.1%, 16.2%, and
+6.1% faster at 1K, 16K, and 32K; at 64K it is 0.6% slower. Exact K2 is about
+21.8%, 11.2%, and 3.3% faster through 32K, then 1.6% slower at 64K.
 
-## Byte-exact finding
+Peak memory is not neutral:
 
-The previous 100-token check was too short. Over the full 1,024-token workload,
-the current serial `--output-parity byte-exact` route is deterministic but does
-not remain byte-identical to stock. It diverges at generated token 13, 13, 0,
-and 62 for the 1K, 16K, 32K, and 64K prompts and is slower than stock at every
-context. It is rejected evidence, not a passing exact mode or a retained
-optimization. The exact implementation must be replaced before the flag can be
-presented as useful.
+| context | stock | optimized AR | fast/exact K2 | K2 vs stock |
+|---:|---:|---:|---:|---:|
+| 1,024 | 19.29 GiB | 19.46 GiB | 20.64 GiB | +7.0% |
+| 16,384 | 19.70 GiB | 27.84 GiB | 32.03 GiB | +62.6% |
+| 32,768 | 20.22 GiB | 29.09 GiB | 32.40 GiB | +60.2% |
+| 65,536 | 21.31 GiB | 32.30 GiB | 33.34 GiB | +56.5% |
 
-## Evidence
+Decode throughput counts the 1,023 inter-token intervals after the first
+token. The optimized prefill route uses an 8,192-token chunk and solo stripe.
 
-All 36 measured cells have both a machine-readable JSON receipt and a
-human-readable Markdown report in [`context-matrix`](context-matrix). Every
-receipt contains:
+## Output parity
 
-- all exact prompt and generated token IDs;
-- submitted, first-token, and last-token timestamps;
-- the requested and actual 1,024-token decode length;
-- construction routes and MTP acceptance totals;
-- model, source, and mlx-swift revisions;
-- GPU-lock ownership and peak memory.
+The retained exact mode is `.rectangularExact`, recorded as
+`rectangular-timewise-byte-exact`. Its generated-token arrays match the paired
+optimized autoregressive receipts for all 1,024 tokens in both repetitions at
+all four contexts (8/8 comparisons). Fast K2 is target-authoritative and has a
+different stream.
 
-The issue/PR body contains the complete 36-row table with direct links to each
-receipt. Route order changes by repetition:
+This is exactness against the optimized AR target route, not against the stock
+construction: the committed stock and optimized-AR streams differ. The earlier
+serial candidate and its token-13/0/62 failures are rejected historical
+evidence; they are not the implementation summarized here.
 
-1. stock, fast, current exact candidate;
-2. current exact candidate, fast, stock;
-3. fast, stock, current exact candidate.
+## Evidence and pins
 
-## Exact pins
+The source-final JSON and Markdown receipts are in
+[`context-matrix`](context-matrix). They record exact prompt/generated token
+IDs, phase timestamps, requested and actual decode length, installed routes,
+MTP totals, revisions, lock ownership, and peak memory.
 
 | item | value |
 |---|---|
 | model | `EigenLabs/Qwen3.6-35B-A3B-MLX-VL-4bit-g64-router8` |
 | model revision | `73a03825c2226177f3e679210965dba3508cdee8` |
-| mlx-swift-lm base | `ab73a827c9dde6f8802507003aa0be71605aab8e` |
-| mlx-swift dependency | `606d28cfa8c1d66b2975d3162a4aac9756835c5f` |
-| measured benchmark source | `aa5c23d` |
+| measured benchmark source | `3b20ab1` |
+| mlx-swift dependency | `6b0505cc790f512ae49d740b21e13f80802946bd` |
 | chip | Apple M5 Max, 128 GiB unified memory |
-| GPU lock | `/tmp/mtplx-gpu-exclusive.lock` |
 
-The prompt fixtures tokenize to exactly 1,024, 16,384, 32,768, and 65,536
-tokens under the model chat template. They are generated deterministically from
-real CPython 3.12 standard-library source by
-[`scripts/build-qwen36-python-contexts.py`](../../scripts/build-qwen36-python-contexts.py).
+These receipts predate the rebase onto main's Qwen fused-GDN/direct-reduction
+changes. They accurately describe source `3b20ab1`, but they are not evidence
+for the rebased merge result; the parity and performance gates must be rerun on
+that integrated source before a current merge claim.
 
 ## Construction boundary
 
-Construction inspection fixes the target contract at H2048, E256/top8, I512,
-40 layers, affine W4/g64 target experts, W8/g64 target routers/shared gates,
-and MXFP8/g32 inline-MTP matrices. Target affine readers are not transplanted
-into the differently packed assistant.
+Artifact inspection fixes H2048, E256/top8, I512, 40 layers, affine W4/g64
+target projections, W8/g64 routers/shared gates, and MXFP8/g32 inline-MTP
+matrices. Every explicit per-layer packing used by the exact kernels is checked.
+After weights load, the exact route validates every concrete projection,
+affine bias buffer, dtype, and output tiling before model execution.
 
-The retained prefill and fast-decode routes are installed after the exact model
-contract is validated. Enabled hot paths route only on values that actually
-vary at runtime, such as logical M. They do not re-read model metadata or the
-environment, increment proof counters, or silently fall back to stock.
+The inspected contract produces an immutable, task-scoped construction
+installation. Concurrent loads cannot share or overwrite route selection.
+Enabled hot paths execute their installed lane directly and route only on
+logical M; they do not re-read metadata or the environment, count engagement,
+or silently fall back after an enabled-lane failure.
 
-## Current disposition
+## Disposition
 
-Retained:
+Retained on the measured source:
 
 - 8,192-token prefill chunk and solo stripe;
 - fixed-K2 rectangular target-authoritative fast decode;
+- fixed-K2 rectangular-exact decode relative to optimized AR;
 - exact-artifact row-owned E256/top8 router and M1/M2 expert reduction.
 
-Rejected or still incomplete:
+Rejected:
 
-- the current serial byte-exact verifier: slower than stock and not exact over
-  the full 1,024-token generation;
-- a 16K prefill stripe: slower and higher-memory than the retained 8K stripe;
-- fixed K1/K3/K4: slower than K2;
-- transplanting target affine expert kernels into the MXFP8 assistant: invalid
-  physical packing.
+- the old serial exact candidate;
+- a 16K prefill stripe;
+- fixed K1/K3/K4;
+- target affine kernels applied to the differently packed MXFP8 assistant.
 
-See [`OPTIMIZATION_LEDGER.md`](OPTIMIZATION_LEDGER.md) for the candidate history.
+See [`OPTIMIZATION_LEDGER.md`](OPTIMIZATION_LEDGER.md) for candidate history.

@@ -405,6 +405,8 @@ struct CampaignPrompt: Equatable, Sendable {
 }
 
 enum CampaignReceiptError: Error, Equatable, CustomStringConvertible {
+    case unsupportedSchema(actual: Int)
+    case invalidProvenance(field: String, value: String)
     case expectedGeneratedTokens(expected: Int, actual: Int)
     case generatedMetricMismatch(expected: Int, actual: Int)
     case promptMetricMismatch(expected: Int, actual: Int)
@@ -413,6 +415,10 @@ enum CampaignReceiptError: Error, Equatable, CustomStringConvertible {
 
     var description: String {
         switch self {
+        case .unsupportedSchema(let actual):
+            return "unsupported campaign receipt schema \(actual)"
+        case .invalidProvenance(let field, let value):
+            return "campaign receipt has invalid \(field): \(value)"
         case .expectedGeneratedTokens(let expected, let actual):
             return "campaign requires \(expected) generated tokens, received \(actual)"
         case .generatedMetricMismatch(let expected, let actual):
@@ -453,6 +459,34 @@ struct CampaignReceipt: Codable, Equatable, Sendable {
     let peakMemoryBytes: UInt64
 
     func validate() throws {
+        guard schemaVersion == 2 else {
+            throw CampaignReceiptError.unsupportedSchema(actual: schemaVersion)
+        }
+        func requireHexRevision(
+            _ field: String, _ value: String, lengths: ClosedRange<Int>
+        ) throws {
+            let isHex = !value.isEmpty && value.utf8.allSatisfy {
+                (48 ... 57).contains($0) || (97 ... 102).contains($0)
+            }
+            guard lengths.contains(value.count), isHex else {
+                throw CampaignReceiptError.invalidProvenance(field: field, value: value)
+            }
+        }
+        try requireHexRevision("modelRevision", modelRevision, lengths: 40 ... 64)
+        try requireHexRevision("sourceRevision", sourceRevision, lengths: 7 ... 64)
+        try requireHexRevision("mlxSwiftRevision", mlxSwiftRevision, lengths: 40 ... 64)
+        guard promptSHA256.count == 64,
+            promptSHA256.utf8.allSatisfy({
+                (48 ... 57).contains($0) || (97 ... 102).contains($0)
+            })
+        else {
+            throw CampaignReceiptError.invalidProvenance(
+                field: "promptSHA256", value: promptSHA256)
+        }
+        guard !gpuLockOwner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CampaignReceiptError.invalidProvenance(
+                field: "gpuLockOwner", value: gpuLockOwner)
+        }
         guard (80 ... 70_000).contains(promptTokenIDs.count) else {
             throw CampaignReceiptError.promptLengthOutsideCampaign(actual: promptTokenIDs.count)
         }
@@ -480,10 +514,14 @@ struct CampaignReceipt: Codable, Equatable, Sendable {
                 throw CampaignReceiptError.parityMetadataMismatch(
                     "top-level values do not match the construction route summary")
             }
-            let installedMarker = "verify=\(outputParity.verificationMode.rawValue)"
-            guard routeSummary["mtp"]?.contains(installedMarker) == true else {
+            let installedMode = routeSummary["mtp"]?
+                .split(separator: ",")
+                .first { $0.hasPrefix("verify=") }?
+                .dropFirst("verify=".count)
+            guard installedMode == Substring(outputParity.verificationMode.rawValue) else {
                 throw CampaignReceiptError.parityMetadataMismatch(
-                    "runtime MTP route does not contain \(installedMarker)")
+                    "runtime MTP route does not contain exact verifier "
+                        + outputParity.verificationMode.rawValue)
             }
         } else if outputParity != nil || verificationRoute != nil {
             throw CampaignReceiptError.parityMetadataMismatch(
@@ -497,6 +535,7 @@ enum CampaignExecutionError: Error, Equatable, CustomStringConvertible {
     case mtpNotInstalled(String)
     case mtpVerificationMismatch(
         expected: CBv2MTPVerificationMode, actual: CBv2MTPVerificationMode)
+    case mtpDepthMismatch(requested: Int, maximum: Int)
 
     var description: String {
         switch self {
@@ -507,7 +546,16 @@ enum CampaignExecutionError: Error, Equatable, CustomStringConvertible {
         case .mtpVerificationMismatch(let expected, let actual):
             return "campaign MTP verifier mismatch: requested \(expected.rawValue), installed "
                 + actual.rawValue
+        case .mtpDepthMismatch(let requested, let maximum):
+            return "campaign MTP depth \(requested) exceeds installed drafter maximum \(maximum)"
         }
+    }
+}
+
+func validateCampaignMTPDepth(requested: Int, drafterMaximum: Int?) throws {
+    if let drafterMaximum, requested > drafterMaximum {
+        throw CampaignExecutionError.mtpDepthMismatch(
+            requested: requested, maximum: drafterMaximum)
     }
 }
 
@@ -1642,6 +1690,13 @@ struct BenchOptions: Equatable, Sendable {
                     requirement: "requires --mtp-depth greater than zero")
             }
         }
+        if options.promptFile == nil,
+            options.profile != .stock || options.mtpDepth > 0 || options.outputParityWasSpecified
+        {
+            throw BenchOptionError.invalidValue(
+                option: "--prompt-file", value: "",
+                requirement: "optimization profiles and MTP flags require campaign mode")
+        }
         if options.promptFile != nil, options.receiptPath == nil {
             throw BenchOptionError.invalidValue(
                 option: "--prompt-file", value: options.promptFile ?? "",
@@ -1710,7 +1765,10 @@ struct BenchOptions: Equatable, Sendable {
     }
 
     var promptAxisDescription: String {
-        promptLengths.isEmpty
+        if let promptFile {
+            return "campaign file \(promptFile) (measured tokens and SHA-256 below)"
+        }
+        return promptLengths.isEmpty
             ? "default mix (B=1 500; B=2 100,1500; B=4 100,500,1500,500; else 500 x B)"
             : promptLengths.map(String.init).joined(separator: ",")
     }
@@ -1766,7 +1824,11 @@ func reportHeader(
         row("Host at start", hostLine),
         row("Invocation", "`\(shellQuotedInvocation(argv))`"),
         row("Prompt lengths", options.promptAxisDescription),
-        row("Paged nominalMaxSeqLen", "\(options.pagedNominalMaxSequenceLength)"),
+        row(
+            "Paged nominalMaxSeqLen",
+            options.promptFile == nil
+                ? "\(options.pagedNominalMaxSequenceLength)"
+                : "not used by one-prompt contiguous campaign"),
         // The revision the *binary* was built from — see `buildRevision()`.
         row("mlx-swift-lm (build)", revision),
         row("Date", ISO8601DateFormatter().string(from: date)),
@@ -1850,17 +1912,28 @@ public enum BenchCBv2Driver {
                 try Qwen35A3BArtifactContract.inspect(
                     configurationURL: directory.appendingPathComponent("config.json"))
             }
-            qwen35A3BConstructionProfile = campaignContract == nil
-                ? .stock
-                : qwen35CampaignConstructionProfile(options)
-            qwen35A3BTargetVerifyArithmetic =
-                campaignContract != nil && options.outputParity == .byteExact
-                ? .exactM1 : .rectangular
+            let campaignInstallation = try campaignContract.map {
+                try Qwen35A3BConstructionInstallation.install(
+                    contract: $0,
+                    profile: qwen35CampaignConstructionProfile(options),
+                    targetVerifyArithmetic: options.outputParity == .byteExact
+                        ? .exactM1 : .rectangular)
+            }
             let loadStart = CFAbsoluteTimeGetCurrent()
             // Explicitly the LLM factory: text-only benchmarking of checkpoints
             // that may carry a vision tower (see file header).
-            let container = try await LLMModelFactory.shared.loadContainer(
-                from: directory, using: #huggingFaceTokenizerLoader())
+            let container: ModelContainer
+            if let campaignInstallation {
+                container = try await Qwen35A3BConstructionContext.withInstallation(
+                    campaignInstallation
+                ) {
+                    try await LLMModelFactory.shared.loadContainer(
+                        from: directory, using: #huggingFaceTokenizerLoader())
+                }
+            } else {
+                container = try await LLMModelFactory.shared.loadContainer(
+                    from: directory, using: #huggingFaceTokenizerLoader())
+            }
             print(String(
                 format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
 
@@ -1898,6 +1971,18 @@ public enum BenchCBv2Driver {
                     + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
                 emit("- optimization-run-json: \(try benchmarkJSONString(runOptimizations))")
 
+                if campaignOptions.outputParity == .byteExact,
+                    let campaignContract
+                {
+                    guard let qwenTarget = hooks.model as? Qwen35TextModel else {
+                        throw Qwen35A3BArtifactError.mismatch(
+                            field: "loaded.target_type", expected: "Qwen35TextModel",
+                            actual: String(describing: type(of: hooks.model)))
+                    }
+                    try qwen35A3BValidateLoadedExactTarget(
+                        qwenTarget, contract: campaignContract)
+                }
+
 
 
                 // Vocab probe ([1,1] cache-less forward) for synthetic prompts.
@@ -1922,7 +2007,9 @@ public enum BenchCBv2Driver {
                 // This route is exclusive: a receipt invocation cannot drift
                 // into the synthetic correctness/perf matrix below.
                 if let campaignPrompt {
-                    let promptTokenIDs = chatTokens(campaignPrompt.text)
+                    let promptTokenIDs = try context.tokenizer.applyChatTemplate(
+                        messages: [["role": "user", "content": campaignPrompt.text]],
+                        tools: nil, additionalContext: nil)
                     guard (80 ... 70_000).contains(promptTokenIDs.count) else {
                         throw CampaignReceiptError.promptLengthOutsideCampaign(
                             actual: promptTokenIDs.count)
@@ -1933,6 +2020,9 @@ public enum BenchCBv2Driver {
                             from: directory, target: hooks.model,
                             verificationMode: campaignOptions.outputParity.verificationMode)
                         : nil
+                    try validateCampaignMTPDepth(
+                        requested: campaignOptions.mtpDepth,
+                        drafterMaximum: mtpAssistant?.maximumDraftTokens)
                     let campaign = try await runCampaignRequest(
                         context: context, hooks: hooks, promptTokens: promptTokenIDs,
                         options: campaignOptions, kvBytes: kvBytesCopy,

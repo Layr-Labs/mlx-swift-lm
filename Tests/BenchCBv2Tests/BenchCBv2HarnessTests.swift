@@ -161,6 +161,9 @@ struct BenchCBv2HarnessTests {
         let exact = try BenchOptions.parse([
             "--model", "/m", "--profile", "decode", "--mtp-depth", "2",
             "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
         ])
         #expect(exact.outputParity == .byteExact)
         #expect(exact.outputParityWasSpecified)
@@ -184,6 +187,19 @@ struct BenchCBv2HarnessTests {
             ],
         ] {
             #expect(throws: BenchOptionError.self) { _ = try BenchOptions.parse(arguments) }
+        }
+    }
+
+    @Test("optimization flags require the one-prompt campaign route")
+    func optimizationFlagsRejectOrdinaryMatrixRuns() {
+        for arguments in [
+            ["--model", "/m", "--profile", "prefill"],
+            ["--model", "/m", "--profile", "decode", "--mtp-depth", "2"],
+            ["--model", "/m", "--profile", "full", "--mtp-depth", "2"],
+        ] {
+            #expect(throws: BenchOptionError.self) {
+                _ = try BenchOptions.parse(arguments)
+            }
         }
     }
 
@@ -268,14 +284,23 @@ struct BenchCBv2HarnessTests {
         let fast = try BenchOptions.parse([
             "--model", "/m/qwen", "--profile", "full", "--mtp-depth", "2",
             "--output-parity", "fast",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r-fast.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
         ])
         let exactFull = try BenchOptions.parse([
             "--model", "/m/qwen", "--profile", "full", "--mtp-depth", "2",
             "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r-full.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
         ])
         let exactDecode = try BenchOptions.parse([
             "--model", "/m/qwen", "--profile", "decode", "--mtp-depth", "2",
             "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r-decode.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
         ])
 
         #expect(qwen35CampaignConstructionProfile(fast) == .full)
@@ -293,6 +318,16 @@ struct BenchCBv2HarnessTests {
 
         #expect(throws: CampaignExecutionError.self) {
             try validateCampaignMTPInstallation(config: config, metrics: installed)
+        }
+    }
+
+    @Test("campaign construction rejects a drafter-clamped fixed depth")
+    func campaignConstructionRejectsDepthDrift() {
+        #expect(throws: CampaignExecutionError.self) {
+            try validateCampaignMTPDepth(requested: 2, drafterMaximum: 1)
+        }
+        #expect(throws: Never.self) {
+            try validateCampaignMTPDepth(requested: 2, drafterMaximum: 4)
         }
     }
 
@@ -317,9 +352,11 @@ struct BenchCBv2HarnessTests {
             promptTokens: 65_536, submittedAt: 10, firstTokenAt: 10.1,
             lastTokenAt: 15.215, generatedTokens: 1_024)
         let receipt = CampaignReceipt(
-            modelPath: "/models/qwen", modelRevision: "model-sha",
-            sourceRevision: "source-sha", mlxSwiftRevision: "mlx-sha",
-            profile: .decode, promptSHA256: "prompt-sha",
+            modelPath: "/models/qwen",
+            modelRevision: String(repeating: "a", count: 40),
+            sourceRevision: "abcdef0",
+            mlxSwiftRevision: String(repeating: "b", count: 40),
+            profile: .decode, promptSHA256: String(repeating: "c", count: 64),
             promptTokenIDs: Array(repeating: 7, count: 65_536),
             generatedTokenIDs: Array(0 ..< 1_024), requestedGeneratedTokens: 1_024,
             generatedText: "output", phaseMetrics: metrics, prefillChunk: 512,
@@ -333,6 +370,9 @@ struct BenchCBv2HarnessTests {
             gpuLockOwner: "owner", peakMemoryBytes: 123)
 
         try receipt.validate()
+        var unsupported = receipt
+        unsupported.schemaVersion = 999
+        #expect(throws: CampaignReceiptError.self) { try unsupported.validate() }
         let json = try benchmarkJSONString(receipt)
         for key in [
             "modelRevision", "sourceRevision", "mlxSwiftRevision", "promptSHA256",
@@ -363,6 +403,25 @@ struct BenchCBv2HarnessTests {
             ],
             gpuLockOwner: receipt.gpuLockOwner, peakMemoryBytes: receipt.peakMemoryBytes)
         #expect(throws: CampaignReceiptError.self) { try mislabeled.validate() }
+
+        let prefixCollision = CampaignReceipt(
+            modelPath: receipt.modelPath, modelRevision: receipt.modelRevision,
+            sourceRevision: receipt.sourceRevision, mlxSwiftRevision: receipt.mlxSwiftRevision,
+            profile: receipt.profile, promptSHA256: receipt.promptSHA256,
+            promptTokenIDs: receipt.promptTokenIDs,
+            generatedTokenIDs: receipt.generatedTokenIDs,
+            requestedGeneratedTokens: receipt.requestedGeneratedTokens,
+            generatedText: receipt.generatedText, phaseMetrics: metrics,
+            prefillChunk: receipt.prefillChunk, soloStripe: receipt.soloStripe,
+            mtpDepth: receipt.mtpDepth, outputParity: .fast,
+            verificationRoute: BenchOutputParity.fast.verificationRoute,
+            routeSummary: [
+                "outputParity": "fast",
+                "verificationRoute": BenchOutputParity.fast.verificationRoute,
+                "mtp": "inline-fixed-k2,verify=rectangular_exact,rounds=34",
+            ],
+            gpuLockOwner: receipt.gpuLockOwner, peakMemoryBytes: receipt.peakMemoryBytes)
+        #expect(throws: CampaignReceiptError.self) { try prefixCollision.validate() }
 
         let short = CampaignReceipt(
             modelPath: receipt.modelPath, modelRevision: receipt.modelRevision,
@@ -549,6 +608,9 @@ struct BenchCBv2HarnessTests {
         let argv = [
             "BenchCBv2", "--model", "/m/qwen", "--profile", "decode",
             "--mtp-depth", "2", "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
         ]
         let options = try BenchOptions.parse(Array(argv.dropFirst()))
         let header = reportHeader(

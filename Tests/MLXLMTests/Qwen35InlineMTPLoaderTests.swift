@@ -76,13 +76,36 @@ struct Qwen35InlineMTPLoaderTests {
                 requested: .serialTarget, forceSerialEnvironment: false) == .serialTarget)
         #expect(
             Qwen35InlineMTPAssistant.resolvedVerificationMode(
-                requested: .rectangular, forceSerialEnvironment: true) == .rectangular)
+                requested: .rectangular, forceSerialEnvironment: true) == .serialTarget)
         #expect(
             Qwen35InlineMTPAssistant.resolvedVerificationMode(
                 requested: nil, forceSerialEnvironment: false) == .rectangular)
         #expect(
             Qwen35InlineMTPAssistant.resolvedVerificationMode(
                 requested: nil, forceSerialEnvironment: true) == .serialTarget)
+    }
+
+    @Test("exact verification rejects a target built with ordinary arithmetic")
+    func exactVerificationRequiresExactTargetArithmetic() throws {
+        try withInlineMTPDirectory { directory in
+            let root = try #require(
+                try JSONSerialization.jsonObject(with: qwenInlineMTPConfig())
+                    as? [String: Any])
+            let textData = try JSONSerialization.data(withJSONObject: root["text_config"]!)
+            let configuration = try JSONDecoder.json5().decode(
+                Qwen35TextConfiguration.self, from: textData)
+            let target = Qwen35TextModel(configuration)
+
+            do {
+                _ = try Qwen35InlineMTPAssistant.load(
+                    from: directory, target: target,
+                    verificationMode: .rectangularExact)
+                Issue.record("non-exact target accepted rectangular-exact verification")
+            } catch let error as Qwen35InlineMTPError {
+                #expect(error == .invalidConfiguration(
+                    "rectangular_exact verification requires exact target arithmetic"))
+            }
+        }
     }
 
     @Test("loader is artifact-scoped and does not mutate the legacy process flag")

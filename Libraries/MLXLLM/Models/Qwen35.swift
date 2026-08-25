@@ -1588,7 +1588,8 @@ public class Qwen35TextModelInner: Module {
 
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
-        self.exactTargetVerify = qwen35A3BTargetVerifyArithmetic == .exactM1
+        self.exactTargetVerify =
+            Qwen35A3BConstructionContext.targetVerifyArithmetic == .exactM1
 
         super.init()
     }

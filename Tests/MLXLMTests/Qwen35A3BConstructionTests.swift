@@ -43,6 +43,23 @@ final class Qwen35A3BConstructionTests: XCTestCase {
         XCTAssertEqual(contract.geometry.recurrentLayers, 30)
         XCTAssertEqual(contract.geometry.fullAttentionLayers, 10)
 
+        quantization["language_model.model.layers.0.linear_attn.in_proj_qkv"] = [
+            "bits": 8, "group_size": 64,
+        ]
+        var wrongProjectionRoot = root
+        wrongProjectionRoot["quantization"] = quantization
+        try JSONSerialization.data(withJSONObject: wrongProjectionRoot).write(to: url)
+        XCTAssertThrowsError(try Qwen35A3BArtifactContract.inspect(configurationURL: url)) {
+            XCTAssertEqual(
+                $0 as? Qwen35A3BArtifactError,
+                .mismatch(
+                    field:
+                        "quantization.language_model.model.layers.0.linear_attn.in_proj_qkv.bits",
+                    expected: "4", actual: "8"))
+        }
+        quantization.removeValue(
+            forKey: "language_model.model.layers.0.linear_attn.in_proj_qkv")
+
         quantization.removeValue(
             forKey: "language_model.model.layers.39.mlp.shared_expert_gate")
         var badRoot = root
@@ -78,6 +95,19 @@ final class Qwen35A3BConstructionTests: XCTestCase {
             XCTAssertEqual(
                 $0 as? Qwen35A3BArtifactError,
                 .mismatch(field: "mtp.group_size", expected: "32", actual: "64"))
+        }
+    }
+
+    func testExactProjectionRejectsUnquantizedModulesBeforeExecution() {
+        let linear = Linear(64, 64, bias: false)
+        XCTAssertThrowsError(
+            try qwen35A3BValidateExactProjection(linear, path: "model.layers.0.q_proj")
+        ) {
+            XCTAssertEqual(
+                $0 as? Qwen35A3BArtifactError,
+                .mismatch(
+                    field: "loaded.model.layers.0.q_proj.type",
+                    expected: "QuantizedLinear", actual: "Linear"))
         }
     }
 
@@ -134,10 +164,12 @@ final class Qwen35A3BConstructionTests: XCTestCase {
     }
 
     func testOutputOwnedCombinePreservesBF16ReductionOrder() throws {
-        let previous = qwen35A3BConstructionProfile
-        qwen35A3BConstructionProfile = .decode
-        defer { qwen35A3BConstructionProfile = previous }
-        let combine = qwen35A3BExpertCombiner(hidden: 2_048, topK: 8)
+        let contract = try Qwen35A3BArtifactContract.inspect(fixture: .eigenLabsRouter8)
+        let installation = try Qwen35A3BConstructionInstallation.install(
+            contract: contract, profile: .decode)
+        let combine = Qwen35A3BConstructionContext.withInstallation(installation) {
+            qwen35A3BExpertCombiner(hidden: 2_048, topK: 8)
+        }
 
         for rows in [1, 2] {
             let routed = sin(MLXArray(0 ..< rows * 8 * 2_048)
@@ -271,9 +303,6 @@ final class Qwen35A3BConstructionTests: XCTestCase {
     }
 
     func testStockRouterKeepsTheLastAxisForWidePrefill() throws {
-        let previous = qwen35A3BConstructionProfile
-        qwen35A3BConstructionProfile = .stock
-        defer { qwen35A3BConstructionProfile = previous }
         let finalize = qwen35A3BRouterFinalizer(
             hidden: 2_048, experts: 256, topK: 8, normalize: true)
         let probabilities = softmax(
