@@ -147,10 +147,11 @@ public func weightedExpertUnsort(
     inverseOrder: MLXArray,
     weights: MLXArray
 ) -> MLXArray {
+    let hidden = sortedOutputs.dim(1)
     precondition(
-        sortedOutputs.ndim == 2 && sortedOutputs.dim(1) == 2816
+        sortedOutputs.ndim == 2 && (hidden % 64 == 0)
             && sortedOutputs.dtype == .bfloat16,
-        "weightedExpertUnsort outputs must be bfloat16 [assignments, 2816]")
+        "weightedExpertUnsort outputs must be bfloat16 [assignments, hidden] with hidden % 64 == 0")
     precondition(
         inverseOrder.ndim == 1 && inverseOrder.dtype == .uint32,
         "weightedExpertUnsort inverse order must be flat uint32")
@@ -170,9 +171,9 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (hidden, tokens, 1),
         threadGroup: (64, 4, 1),
-        outputShapes: [[tokens, 2816]],
+        outputShapes: [[tokens, hidden]],
         outputDTypes: [.bfloat16]
     )[0]
 }
@@ -257,6 +258,12 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+private let qwenDirectExpertReductionEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN_DIRECT_EXPERT_REDUCTION"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return raw == "1" || raw == "true" || raw == "on"
+}()
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -265,6 +272,7 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 public enum SwitchGLUWeightedReductionProfile: Sendable {
     case generic
     case gemma4ProductionGeGLU
+    case qwen35ProductionSwiGLU
 }
 
 public class SwitchGLU: Module {
@@ -489,27 +497,45 @@ public class SwitchGLU: Module {
     private func supportsWeightedExpertUnsort(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> Bool {
-        // Exact Gemma 4 26B-A4B production contract. The explicit semantic
-        // profile keeps generic SwitchGLU/custom activations on the established
-        // implementation.
-        guard weightedReductionProfile == .gemma4ProductionGeGLU else { return false }
-        return inputDims == 2816
-            && hiddenDims == 704
-            && numExperts == 128
-            && gateUpProj == nil
-            && activationProduct == nil
-            && isGeluActivation
-            && x.ndim == 2
-            && x.dim(1) == 2816
-            && x.dtype == .bfloat16
-            && indices.ndim == 2
-            && indices.dim(0) == x.dim(0)
-            && indices.dim(1) == 8
-            && indices.dtype == .uint32
-            && weights.ndim == 2
-            && weights.shape == indices.shape
-            && weights.dtype == .bfloat16
-            && indices.size >= 64
+        switch weightedReductionProfile {
+        case .generic:
+            return false
+        case .gemma4ProductionGeGLU:
+            return inputDims == 2816
+                && hiddenDims == 704
+                && numExperts == 128
+                && gateUpProj == nil
+                && activationProduct == nil
+                && isGeluActivation
+                && x.ndim == 2
+                && x.dim(1) == 2816
+                && x.dtype == .bfloat16
+                && indices.ndim == 2
+                && indices.dim(0) == x.dim(0)
+                && indices.dim(1) == 8
+                && indices.dtype == .uint32
+                && weights.ndim == 2
+                && weights.shape == indices.shape
+                && weights.dtype == .bfloat16
+                && indices.size >= 64
+        case .qwen35ProductionSwiGLU:
+            return qwenDirectExpertReductionEnabled
+                && inputDims == 2048
+                && hiddenDims == 512
+                && numExperts == 256
+                && isSiluActivation
+                && x.ndim == 2
+                && x.dim(1) == 2048
+                && x.dtype == .bfloat16
+                && indices.ndim == 2
+                && indices.dim(0) == x.dim(0)
+                && indices.dim(1) == 8
+                && indices.dtype == .uint32
+                && weights.ndim == 2
+                && weights.shape == indices.shape
+                && weights.dtype == .bfloat16
+                && indices.size >= 64
+        }
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
@@ -546,7 +572,7 @@ public class SwitchGLU: Module {
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,
             projected.output.dim(-2) == 1,
-            projected.output.dim(-1) == 2816,
+            (projected.output.dim(-1) == 2816 || projected.output.dim(-1) == inputDims),
             projected.output.dtype == .bfloat16
         else {
             return legacyWeightedReduction(projected, indices: indices, weights: weights)

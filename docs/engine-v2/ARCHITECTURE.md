@@ -2,7 +2,7 @@
 
 **Goal:** production-grade continuous batching at B=3–4 (max 8) on all Apple M generations, correct-by-construction for Gemma 4 and GPT-OSS 20B. Replaces the left-padded dense-batch engine (`ContinuousBatching/`) which stays untouched as fallback.
 
-**Background:** full research corpus at `/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/` (reports 01–12) and the plan at `/Users/gaj/Documents/Builds/d-inference/docs/batching-engine-v2-plan.md`. Read report 10 (Gemma4/GPT-OSS invariants) before writing any KV/attention code.
+**Background:** full research corpus at `~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/` (reports 01–12) and the plan at `~/Documents/Builds/d-inference/docs/batching-engine-v2-plan.md`. Read report 10 (Gemma4/GPT-OSS invariants) before writing any KV/attention code.
 
 ## Core design (why v2 cannot have the old bug class)
 

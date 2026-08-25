@@ -57,4 +57,4 @@ backend on the harness tiny model.
 Report 08 §5 (kernel contract), report 07 (Metal ecosystem, mistral.rs/
 vllm-metal), report 04 (metalKernel API, resource limits, no output
 donation — KV writes must NOT go through the attention kernel). Corpus:
-`/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+`~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
