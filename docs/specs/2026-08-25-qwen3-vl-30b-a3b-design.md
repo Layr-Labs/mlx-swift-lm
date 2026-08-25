@@ -101,7 +101,8 @@ and original Hugging Face contract before comparison.
    the real four-shard checkpoint with strict model update verification.
 2. **Adding optional fields changes dense Qwen3-VL behavior.** This is
    critical. Dense defaults select the unchanged `MLP`; focused dense
-   construction and generation tests protect that route.
+   construction tests protect module selection, and the dense arithmetic is
+   left unchanged.
 3. **Text generation works but multimodal vision arithmetic diverges.** This is
    critical for a VLM port. Unit tests lock the checkpoint-specific GELU
    construction, and final verification includes a fixed image and corrected
