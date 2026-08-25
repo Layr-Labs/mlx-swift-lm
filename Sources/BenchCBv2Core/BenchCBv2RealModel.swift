@@ -580,6 +580,18 @@ func runV2Request(
     return await collectV2(stream, submittedAt: submittedAt)
 }
 
+func qwen35CampaignConstructionProfile(
+    _ options: BenchOptions
+) -> Qwen35A3BOptimizationProfile {
+    guard options.outputParity == .byteExact else {
+        return Qwen35A3BOptimizationProfile(rawValue: options.profile.rawValue)!
+    }
+    // Byte-exact compares against unchanged AR target arithmetic. Keep the
+    // right-shaped prefill route for `full`, but never install the row-owned
+    // decode router/combiner into the target model.
+    return options.profile == .full ? .prefill : .stock
+}
+
 /// One warm run followed by a fresh measured engine over the exact campaign
 /// prompt. Warmup and measurement use identical construction-time geometry;
 /// the measured engine has no eligibility branch or fallback route.
@@ -643,7 +655,8 @@ func runCampaignRequest(
     } else {
         mtpRoute = "disabled"
     }
-    let targetRoute = options.profile == .decode || options.profile == .full
+    let targetRoute = options.outputParity != .byteExact
+        && (options.profile == .decode || options.profile == .full)
         ? "row-owned-E256-K8+combine-M1M2"
         : "pinned-default"
     var routeSummary = [
@@ -1846,7 +1859,7 @@ public enum BenchCBv2Driver {
             }
             qwen35A3BConstructionProfile = campaignContract == nil
                 ? .stock
-                : Qwen35A3BOptimizationProfile(rawValue: options.profile.rawValue)!
+                : qwen35CampaignConstructionProfile(options)
             qwen35A3BTargetVerifyArithmetic =
                 campaignContract != nil && options.outputParity == .byteExact
                 ? .exactM1 : .rectangular

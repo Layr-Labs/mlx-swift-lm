@@ -263,6 +263,26 @@ struct BenchCBv2HarnessTests {
             == "rectangular-timewise-byte-exact")
     }
 
+    @Test("byte exact keeps fast prefill but installs stock target decode")
+    func byteExactConstructionSeparatesPrefillAndTargetArithmetic() throws {
+        let fast = try BenchOptions.parse([
+            "--model", "/m/qwen", "--profile", "full", "--mtp-depth", "2",
+            "--output-parity", "fast",
+        ])
+        let exactFull = try BenchOptions.parse([
+            "--model", "/m/qwen", "--profile", "full", "--mtp-depth", "2",
+            "--output-parity", "byte-exact",
+        ])
+        let exactDecode = try BenchOptions.parse([
+            "--model", "/m/qwen", "--profile", "decode", "--mtp-depth", "2",
+            "--output-parity", "byte-exact",
+        ])
+
+        #expect(qwen35CampaignConstructionProfile(fast) == .full)
+        #expect(qwen35CampaignConstructionProfile(exactFull) == .prefill)
+        #expect(qwen35CampaignConstructionProfile(exactDecode) == .stock)
+    }
+
     @Test("campaign construction rejects installed verification drift")
     func campaignConstructionRejectsVerificationDrift() {
         let config = CBv2MTPConfig(
