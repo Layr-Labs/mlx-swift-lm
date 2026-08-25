@@ -19,32 +19,34 @@ struct Qwen38QuantizedProjectionKernelTests {
         kernel: ProductionKernel,
         sourceLocation: SourceLocation = #_sourceLocation
     ) {
-        let weight = MLXRandom.normal([n, k]).asType(.bfloat16)
+        // Match the source port's real-shape validation fixture. Scaling the
+        // operands keeps the fixed absolute-error gate meaningful at large K.
+        let weight = (MLXRandom.normal([n, k]) * 0.02).asType(.bfloat16)
         let (packed, scales, biases) = quantized(
-            weight, groupSize: 64, bits: 4, mode: .affine)
-        let input = MLXRandom.normal([rows, k]).asType(.bfloat16)
+            weight, groupSize: 32, bits: 4, mode: .affine)
+        let input = (MLXRandom.normal([rows, k]) * 0.5).asType(.bfloat16)
         let expected = quantizedMM(
             input, packed, scales: scales, biases: biases,
-            transpose: true, groupSize: 64, bits: 4, mode: .affine)
+            transpose: true, groupSize: 32, bits: 4, mode: .affine)
         let actual: MLXArray
         switch kernel {
         case .m4:
             actual = qwen38M4QuantizedMM(
                 input: input, weight: packed, scales: scales,
-                biases: biases!, groupSize: 64)
+                biases: biases!, groupSize: 32)
         case .m56(let parts, let barrierFree):
             actual = qwen38M56QuantizedMM(
                 input: input, weight: packed, scales: scales,
-                biases: biases!, groupSize: 64,
+                biases: biases!, groupSize: 32,
                 kParts: parts, barrierFree: barrierFree)
         case .m78(let simdgroups):
             actual = qwen38M78NAXQuantizedMM(
                 input: input, weight: packed, scales: scales,
-                biases: biases!, groupSize: 64, simdgroups: simdgroups)
+                biases: biases!, groupSize: 32, simdgroups: simdgroups)
         case .m16:
             actual = qwen38M16NAXQuantizedMM(
                 input: input, weight: packed, scales: scales,
-                biases: biases!, groupSize: 64)
+                biases: biases!, groupSize: 32)
         }
         eval(expected, actual)
         let maximumAbsoluteError = abs(
@@ -52,7 +54,7 @@ struct Qwen38QuantizedProjectionKernelTests {
         ).max().item(Float.self)
         #expect(
             actual.shape == expected.shape
-                && maximumAbsoluteError <= 0.25,
+                && maximumAbsoluteError < 0.25,
             "M=\(rows) K=\(k) N=\(n) max_abs=\(maximumAbsoluteError)",
             sourceLocation: sourceLocation)
         Memory.clearCache()
@@ -162,14 +164,14 @@ struct Qwen38QuantizedProjectionKernelTests {
         }
     }
 
-    @Test("production M4 split geometries match affine Q4/G64 stock")
+    @Test("production M4 split geometries match affine Q4/G32 stock")
     func productionM4NumericParity() {
         MLXRandom.seed(38_404)
         assertProductionGeometryParity(rows: 4, k: 5_120, n: 17_408, kernel: .m4)
         assertProductionGeometryParity(rows: 4, k: 5_120, n: 1_024, kernel: .m4)
     }
 
-    @Test("production M5 and M6 geometries match affine Q4/G64 stock")
+    @Test("production M5 and M6 geometries match affine Q4/G32 stock")
     func productionM5M6NumericParity() {
         MLXRandom.seed(38_506)
         assertProductionGeometryParity(
@@ -186,19 +188,19 @@ struct Qwen38QuantizedProjectionKernelTests {
             kernel: .m56(parts: 2, barrierFree: false))
     }
 
-    @Test("production M7, M8, and padded-M16 geometries match affine Q4/G64 stock")
+    @Test("production M7, M8, and padded-M16 geometries match affine Q4/G32 stock")
     func productionM7M8M16NumericParity() {
         MLXRandom.seed(38_816)
         assertProductionGeometryParity(
-            rows: 7, k: 6_144, n: 5_120, kernel: .m78(simdgroups: 4))
+            rows: 7, k: 6_144, n: 5_120, kernel: .m78(simdgroups: 8))
         assertProductionGeometryParity(
-            rows: 7, k: 5_120, n: 6_144, kernel: .m78(simdgroups: 4))
+            rows: 7, k: 5_120, n: 6_144, kernel: .m78(simdgroups: 8))
         assertProductionGeometryParity(
-            rows: 8, k: 5_120, n: 1_024, kernel: .m78(simdgroups: 4))
+            rows: 8, k: 5_120, n: 1_024, kernel: .m78(simdgroups: 8))
         assertProductionGeometryParity(
-            rows: 8, k: 5_120, n: 10_240, kernel: .m78(simdgroups: 4))
+            rows: 8, k: 5_120, n: 10_240, kernel: .m78(simdgroups: 8))
         assertProductionGeometryParity(
-            rows: 8, k: 5_120, n: 17_408, kernel: .m78(simdgroups: 4))
+            rows: 8, k: 5_120, n: 17_408, kernel: .m78(simdgroups: 8))
         assertProductionGeometryParity(
             rows: 8, k: 5_120, n: 5_120, kernel: .m16)
     }

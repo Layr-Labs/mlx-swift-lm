@@ -31,7 +31,11 @@ public final class Qwen38TargetSampler: @unchecked Sendable {
         let keep = (higherMass .< Self.topP) | first
         values = MLX.where(keep, values, MLXArray(-Float.infinity))
 
-        let offsets = categorical(values, key: randomState)
+        // Spell out the source PR's MLX 0.32.0 categorical implementation.
+        // MLX 0.32.2 otherwise selects a new inverse-CDF path for width one,
+        // changing the seeded benchmark stream only at that runtime shape.
+        let offsets = (values + MLXRandom.gumbel(values.shape, key: randomState))
+            .argMax(axis: -1)
         indices = takeAlong(indices, offsets[.ellipsis, .newAxis], axis: -1)
         return indices[.ellipsis, 0].asType(.int32)
     }

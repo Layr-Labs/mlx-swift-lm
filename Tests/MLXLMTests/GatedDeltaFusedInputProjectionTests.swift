@@ -129,6 +129,25 @@ extension GatedDeltaFusedInputProjectionTests {
             })
     }
 
+    func testInstalledDFlashProjectionExecutesOneToken() throws {
+        let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
+        try layer.update(
+            modules: ModuleChildren(values: [
+                "in_proj_qkv": .value(QuantizedLinear(layer.inProjQKV, groupSize: 32, bits: 4)),
+                "in_proj_z": .value(QuantizedLinear(layer.inProjZ, groupSize: 32, bits: 4)),
+                "in_proj_b": .value(QuantizedLinear(layer.inProjB, groupSize: 32, bits: 4)),
+                "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
+            ]), verify: [])
+        XCTAssertTrue(layer.installDFlashInputProjection())
+
+        let input = MLXRandom.normal([1, 1, 64]).asType(.bfloat16)
+        let expected = layer(input)
+        let output = layer.dflashCallAsFunction(input)
+        eval(expected, output)
+        XCTAssertEqual(output.shape, [1, 1, 64])
+        XCTAssertTrue(output.allClose(expected, rtol: 0, atol: 0).item(Bool.self))
+    }
+
     func testHeterogeneousQuantizationRetainsSeparateProjections() throws {
         let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
         try layer.update(

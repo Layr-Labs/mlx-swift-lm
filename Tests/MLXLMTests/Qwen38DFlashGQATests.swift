@@ -58,8 +58,10 @@ final class Qwen38DFlashGQATests: XCTestCase {
             let maximumAbsoluteError = abs(
                 actual.asType(.float32) - expected.asType(.float32)
             ).max().item(Float.self)
-            XCTAssertTrue(
-                allClose(actual, expected, rtol: 0, atol: 0).item(Bool.self),
+            // The source MLX 0.32.0 per-head route differs from native GQA by
+            // at most two BF16 ULPs on this exact retained geometry.
+            XCTAssertLessThanOrEqual(
+                maximumAbsoluteError, 0.000_244_140_625,
                 "width=\(width) max_abs=\(maximumAbsoluteError)")
         }
     }

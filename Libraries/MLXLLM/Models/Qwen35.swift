@@ -582,7 +582,7 @@ final class Qwen35GatedDeltaNet: Module {
             outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
                 B, S, numVHeads, headVDim),
             outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)],
-            outFused[0..., 0..., (qkvDim + zDim) ..< total]
+            outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
         )
     }
 
