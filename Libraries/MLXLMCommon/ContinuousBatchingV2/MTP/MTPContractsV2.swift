@@ -362,6 +362,9 @@ extension CBv2MTPRequestStatefulDrafter {
 public enum CBv2MTPVerificationMode: String, Sendable, Equatable {
     case serialTarget = "serial_target"
     case rectangular
+    /// One captured rectangular target transaction whose shape-sensitive
+    /// arithmetic is explicitly M1-equivalent at the model boundary.
+    case rectangularExact = "rectangular_exact"
     case automatic
 }
 
