@@ -226,6 +226,16 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
         public var ropeScaling: RoPEScaling? { _ropeScaling }
         private let _normTopKProb: Bool?
         public var normTopKProb: Bool { _normTopKProb ?? true }
+        private let _numExperts: Int?
+        public var numExperts: Int { _numExperts ?? 0 }
+        private let _numExpertsPerTok: Int?
+        public var numExpertsPerTok: Int { _numExpertsPerTok ?? 0 }
+        private let _decoderSparseStep: Int?
+        public var decoderSparseStep: Int { _decoderSparseStep ?? 1 }
+        private let _mlpOnlyLayers: [Int]?
+        public var mlpOnlyLayers: [Int] { _mlpOnlyLayers ?? [] }
+        private let _moeIntermediateSize: Int?
+        public var moeIntermediateSize: Int { _moeIntermediateSize ?? intermediateSize }
         private let _tieWordEmbeddings: Bool?
         public var tieWordEmbeddings: Bool { _tieWordEmbeddings ?? true }
         private let _attentionBias: Bool?
@@ -247,10 +257,39 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
             case _rmsNormEps = "rms_norm_eps"
             case _ropeScaling = "rope_scaling"
             case _normTopKProb = "norm_topk_prob"
+            case _numExperts = "num_experts"
+            case _numExpertsPerTok = "num_experts_per_tok"
+            case _decoderSparseStep = "decoder_sparse_step"
+            case _mlpOnlyLayers = "mlp_only_layers"
+            case _moeIntermediateSize = "moe_intermediate_size"
             case _tieWordEmbeddings = "tie_word_embeddings"
             case _attentionBias = "attention_bias"
             case _hiddenAct = "hidden_act"
             case vocabSize = "vocab_size"
+        }
+
+        func validateForConstruction() {
+            guard numExperts > 0 else { return }
+
+            precondition(numExpertsPerTok > 0, "Qwen3-VL MoE top-k must be positive")
+            precondition(
+                numExpertsPerTok <= numExperts,
+                "Qwen3-VL MoE top-k cannot exceed the expert count")
+            precondition(
+                moeIntermediateSize > 0,
+                "Qwen3-VL MoE intermediate size must be positive")
+            precondition(
+                decoderSparseStep > 0,
+                "Qwen3-VL MoE decoder sparse step must be positive")
+            precondition(
+                mlpOnlyLayers.allSatisfy { $0 >= 0 && $0 < numHiddenLayers },
+                "Qwen3-VL MLP-only layer index is outside the decoder")
+        }
+
+        func usesSparseMoE(layerIndex: Int) -> Bool {
+            numExperts > 0
+                && !mlpOnlyLayers.contains(layerIndex)
+                && (layerIndex + 1) % decoderSparseStep == 0
         }
     }
 
@@ -271,6 +310,14 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
         public var hiddenAct: String { _hiddenAct ?? "gelu" }
         private let _deepstackVisualIndexes: [Int]?
         public var deepstackVisualIndexes: [Int] { _deepstackVisualIndexes ?? [] }
+
+        func visionMLPApproximationForConstruction() -> GELU.Approximation {
+            guard modelType == "qwen3_vl_moe" else { return .fast }
+            precondition(
+                hiddenAct == "gelu_pytorch_tanh",
+                "Qwen3-VL MoE vision blocks require gelu_pytorch_tanh")
+            return .tanh
+        }
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
@@ -568,10 +615,10 @@ enum Qwen3VLVision {
         @ModuleInfo(key: "linear_fc2") var linear2: Linear
         @ModuleInfo(key: "act") var activation: GELU
 
-        init(dim: Int, hiddenDim: Int) {
+        init(dim: Int, hiddenDim: Int, approximation: GELU.Approximation) {
             _linear1.wrappedValue = Linear(dim, hiddenDim, bias: true)
             _linear2.wrappedValue = Linear(hiddenDim, dim, bias: true)
-            _activation.wrappedValue = GELU(approximation: .fast)
+            _activation.wrappedValue = GELU(approximation: approximation)
         }
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -589,7 +636,10 @@ enum Qwen3VLVision {
             _norm1.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _norm2.wrappedValue = LayerNorm(dimensions: config.hiddenSize, eps: 1e-6)
             _attention.wrappedValue = Attention(dim: config.hiddenSize, numHeads: config.numHeads)
-            _mlp.wrappedValue = MLP(dim: config.hiddenSize, hiddenDim: config.intermediateSize)
+            _mlp.wrappedValue = MLP(
+                dim: config.hiddenSize,
+                hiddenDim: config.intermediateSize,
+                approximation: config.visionMLPApproximationForConstruction())
         }
 
         func callAsFunction(
@@ -1074,7 +1124,13 @@ enum Qwen3VLLanguage {
         }
     }
 
-    final class MLP: Module, UnaryLayer {
+    class FeedForward: Module, UnaryLayer {
+        func callAsFunction(_ x: MLXArray) -> MLXArray {
+            preconditionFailure("Qwen3-VL feed-forward base class cannot execute")
+        }
+    }
+
+    final class MLP: FeedForward {
         @ModuleInfo(key: "gate_proj") var gate: Linear
         @ModuleInfo(key: "up_proj") var up: Linear
         @ModuleInfo(key: "down_proj") var down: Linear
@@ -1085,23 +1141,65 @@ enum Qwen3VLLanguage {
             _down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
         }
 
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
+        override func callAsFunction(_ x: MLXArray) -> MLXArray {
             down(silu(gate(x)) * up(x))
+        }
+    }
+
+    final class SparseMoeBlock: FeedForward {
+        let numExperts: Int
+        let topK: Int
+        let normTopKProb: Bool
+
+        @ModuleInfo(key: "gate") var gate: Linear
+        @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+
+        init(_ config: Qwen3VLConfiguration.TextConfiguration) {
+            self.numExperts = config.numExperts
+            self.topK = config.numExpertsPerTok
+            self.normTopKProb = config.normTopKProb
+
+            _gate.wrappedValue = Linear(config.hiddenSize, config.numExperts, bias: false)
+            _switchMLP.wrappedValue = SwitchGLU(
+                inputDims: config.hiddenSize,
+                hiddenDims: config.moeIntermediateSize,
+                numExperts: config.numExperts)
+        }
+
+        func route(_ x: MLXArray) -> (indices: MLXArray, scores: MLXArray) {
+            let probabilities = softmax(gate(x), axis: -1, precise: true)
+            let kth = numExperts - topK
+            let indices = argPartition(probabilities, kth: kth, axis: -1)[.ellipsis, kth...]
+            var scores = takeAlong(probabilities, indices, axis: -1)
+            if normTopKProb {
+                scores = scores / scores.sum(axis: -1, keepDims: true)
+            }
+            return (indices, scores)
+        }
+
+        override func callAsFunction(_ x: MLXArray) -> MLXArray {
+            let (indices, scores) = route(x)
+            let expertOutput = switchMLP(x, indices)
+            return (expertOutput * expandedDimensions(scores, axis: -1)).sum(axis: -2)
         }
     }
 
     final class DecoderLayer: Module {
 
         @ModuleInfo(key: "self_attn") var attention: Attention
-        @ModuleInfo(key: "mlp") var mlp: MLP
+        @ModuleInfo(key: "mlp") var mlp: FeedForward
 
         @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
         @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-        init(_ config: Qwen3VLConfiguration.TextConfiguration) {
+        init(_ config: Qwen3VLConfiguration.TextConfiguration, layerIndex: Int) {
             _attention.wrappedValue = Attention(config)
-            _mlp.wrappedValue = MLP(
-                dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
+            if config.usesSparseMoE(layerIndex: layerIndex) {
+                _mlp.wrappedValue = SparseMoeBlock(config)
+            } else {
+                _mlp.wrappedValue = MLP(
+                    dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
+            }
             _inputLayerNorm.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSize, eps: Float(config.rmsNormEps))
             _postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -1130,10 +1228,13 @@ enum Qwen3VLLanguage {
 
         init(_ config: Qwen3VLConfiguration.TextConfiguration) {
             precondition(config.vocabSize > 0)
+            config.validateForConstruction()
             _embedTokens.wrappedValue = Embedding(
                 embeddingCount: config.vocabSize,
                 dimensions: config.hiddenSize)
-            _layers.wrappedValue = (0 ..< config.numHiddenLayers).map { _ in DecoderLayer(config) }
+            _layers.wrappedValue = (0 ..< config.numHiddenLayers).map {
+                DecoderLayer(config, layerIndex: $0)
+            }
             _norm.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSize, eps: Float(config.rmsNormEps))
         }

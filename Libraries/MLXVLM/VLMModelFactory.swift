@@ -85,6 +85,7 @@ public enum VLMTypeRegistry {
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
+        "qwen3_vl_moe": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
@@ -168,6 +169,11 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
     static public let qwen3VL4BInstruct8Bit = ModelConfiguration(
         id: "mlx-community/Qwen3-VL-4B-Instruct-8bit",
         defaultPrompt: "Write a haiku about Swift programming"
+    )
+
+    static public let qwen3VL30BA3BInstruct4Bit = ModelConfiguration(
+        id: "lmstudio-community/Qwen3-VL-30B-A3B-Instruct-MLX-4bit",
+        defaultPrompt: "Describe the image in English"
     )
 
     static public let smolvlminstruct4bit = ModelConfiguration(
@@ -260,6 +266,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen2_5VL3BInstruct4Bit,
             qwen3VL4BInstruct4Bit,
             qwen3VL4BInstruct8Bit,
+            qwen3VL30BA3BInstruct4Bit,
             smolvlminstruct4bit,
             gemma3_4B_qat_4bit,
             gemma3_12B_qat_4bit,
