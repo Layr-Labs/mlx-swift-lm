@@ -19,8 +19,8 @@ row-24/26 evaluation ladders, row-48 residual boundary, construction-routed
 affine-Q4 M4--M8 projections, and DFlash innovation-tape rollback. At cached
 lengths 16,384 through 32,767 only, verify widths 6--8 use a grouped-GQA
 dispatch with the source's six-queries-per-KV-head layout. This is the
-bit-exact Swift adaptation of the source per-head route: the pinned MLX
-revision's one-query-head/16K-KV allocation produces invalid values.
+Swift adaptation of the source per-head route and stays within its measured
+two-BF16-ULP bound on the real 16K geometry under MLX 0.32.2.
 The wide recurrent path consumes the fixed 10,240-wide conv output directly,
 fusing Q/K normalization, recurrence, and fp32 innovation-tape construction.
 All model, dtype, packing, and geometry checks happen before warmup; an enabled
@@ -66,13 +66,17 @@ prompt as token IDs and request the source-matched same-prompt conditioner:
   --tokens-file /path/to/python-programming-1024.tokens.json \
   --conditioner-tokens 1024 \
   --max-tokens 1024 \
+  --dflash-width 8 \
   --receipt /tmp/qwen38-dflash2-conditioned-1k.json
 ```
 
 The conditioner generates 1,024 output tokens outside the measured interval.
 The runner then clears the allocator cache and peak-memory counter before the
 fresh measured pass: 1,024 input tokens of prefill plus 1,024 generated output
-tokens. The receipt records both conditioner counts explicitly.
+tokens. The fixed width is a construction-time benchmark control selected by
+the matched MLX 0.32.2 gate; the adaptive short-context route remains the
+default for general use. The receipt records both conditioner counts
+explicitly.
 
 The unchanged target-only control does not construct or load the draft:
 

@@ -9,6 +9,8 @@
 | `Layr-Labs/qwen-3.8-mtp-challenge` | `eb5eadc7a165047d4321ce883b9ff30894d8bd19` | Arithmetic and runner provenance |
 | `davidtai/dflash-mlx` | `c5b76ddb62bdefb6eeef1282641842edcf23a1b8` | DFlash2 algorithm authority |
 | `youssofal/MTPLX` | `9a6f48e69f9c8c6932d0f005c364844b2bf33e9c` | PR #335 head; final policy, route, and receipt authority |
+| `davidtai/mlx-swift` | `713cf35cdd86e219b69a56bafaeeec6607934218` | MLX 0.32.2 Swift dependency pin |
+| MLX core | `734241bbff26467bb33eff8adc65b82d17b33578` | MLX 0.32.2 plus the target fork's retained kernels |
 | Qwen 3.8 target | `123db8bcc7101455b00d9aad36c0e760c6e7de02` | Exact target artifact |
 | DFlash2 draft | `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | Exact BF16 checkpoint; recursively installed as affine W4/G64 at construction |
 
@@ -24,7 +26,7 @@
 | Row-50 wired residency | Retained | On hosts with at least 96 GiB, the post-warm live footprint plus 64 MiB is capped 256 MiB below MLX's recommended working set. |
 | Row-53 command-buffer profile | Retained | Process settings are installed before MLX construction at 512 MiB and 50 operations. |
 | Rows 21/24/26/48 | Retained | Fixed Q/K RMSNorm+partial-RoPE, phase-specific evaluation ladders, and fused residual/RMSNorm boundaries use the exact target dimensions and execution phases. |
-| GQA widths 6--8 | Retained with Swift-specific execution layout | Only cached lengths 16,384--32,767 route. The pinned MLX revision returns NaNs for the Python source's one-query-head/16K-KV SDPA allocation; packing all four KV heads into one grouped-GQA dispatch is bit-exact on the production geometry (`max_abs=0`). |
+| GQA widths 6--8 | Retained with Swift-specific execution layout | Only cached lengths 16,384--32,767 route. Packing all four KV heads into one grouped-GQA dispatch stays within the source route's measured two-BF16-ULP bound on the production geometry after the MLX 0.32.2 upgrade. |
 | DFlash innovation tape | Retained | Wide verification fuses Q/K normalization and recurrence from the 10,240-wide conv output while writing fp32 innovations. Rejected-prefix replay recomputes only normalized K from that output and combines it with innovation, G, and the pre-state. |
 | Direct GDN projection replacement | Rejected and removed | Replacing the source-shaped GDN projection views expanded installation from 232 to 424 target modules and regressed the forced-M8 1K run to 66.456 tok/s. The retained fused one-allocation GDN input path remains intact. |
 
@@ -61,6 +63,9 @@ Retained from PR #335:
 - Swift cost alignment from logical width 7 to physical width 8. The target's
   width-7 affine-Q4 route already pads to M8, so the extra draft position uses
   the same target-projection cost class and can commit one additional token.
+- Explicit fixed M8 for the MLX 0.32.2 1K performance command. The adaptive
+  route remains the general short-context default, but its new deterministic
+  trajectory needs 230 cycles; fixed M8 wins the matched 1K gate by 3.326%.
 - Direct fixed-M8 route at 16,384 prompt tokens and above.
 - Target sampler temperature 1.0, top-p 0.95, top-k 20, seed 42.
 - Target-authoritative longest matching draft prefix.
@@ -116,10 +121,11 @@ width-policy control. No Q8 custom route remains installed.
 | M4--M8 and padded-M16 affine Q4 kernels | Pass | `QuantizedProjectionKernelTests` on the real K/N/group geometries. |
 | Rows 21 and 48 fused kernels | Pass | `Qwen38DFlashQKKernelTests` and `Qwen38DFlashBoundaryKernelTests`. |
 | DFlash innovation and replay | Pass | `Qwen38DFlashTapeKernelTests` compares the production 10,240-wide conv-output route with stock output, final state, and every strict accepted prefix. |
-| Long-context GQA widths 6--8 | Pass | `Qwen38DFlashGQATests` uses the retained 16,384-token KV geometry and matches native GQA bit-exactly. The incompatible per-head allocation is covered by the causal investigation above, not installed. |
+| Long-context GQA widths 6--8 | Numeric pass; performance pending | `Qwen38DFlashGQATests` uses the retained 16,384-token KV geometry and enforces the source route's fixed two-BF16-ULP maximum absolute error. The MLX 0.32.2 matched 16K A/B remains below. |
 | Real-artifact construction | Pass | Pinned local target and draft construct, warm widths 1--8, and install the projection counts above. |
-| Exact conditioned 1K throughput | Pre-MLX-0.32.2 baseline pass | Exact 1,024-token programming input, untimed same-prompt 1,024-output conditioner, then a fresh measured 1,024-token output budget under the exclusive GPU lock. Retained runs: 73.216, 67.394, 73.514, 73.077, and post-route-cleanup 73.431 tok/s; mean 72.126, median 73.216, identical token SHA-256 `614179983a59e4bf674a92a752ce11459b8976280c1afa10de4d5ae000f62eba`. Path-sanitized raw metric receipts: [`run 1`](receipts/qwen38-dflash2-swift/cost-aligned-widths-conditioned-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/cost-aligned-widths-conditioned-run-2.json), [`run 3`](receipts/qwen38-dflash2-swift/cost-aligned-widths-conditioned-run-3.json), [`post-cleanup run`](receipts/qwen38-dflash2-swift/final-conditioned-run.json), and [`post-route-cleanup run`](receipts/qwen38-dflash2-swift/final-conditioned-run-2.json). Operator-home prefixes are rendered as `~`; metric fields are unchanged. |
-| Width-policy behavior | Pass | The production-scheduling diagnostic completed in 204 cycles with 826 accepted draft tokens. Its width histogram is M3: 3, M4: 18, M5: 29, M6: 39, M8: 115, with no M7 dispatch. The unchanged policy needed 222 cycles and accepted 804 draft tokens. Raw [`retained diagnostic`](receipts/qwen38-dflash2-swift/cost-aligned-widths-diagnostic.json) and [`unchanged-policy diagnostic`](receipts/qwen38-dflash2-swift/stock-width-policy-diagnostic.json). |
+| Exact conditioned 1K throughput | MLX 0.32.2 pass with explicit fixed M8 | Exact 1,024-token programming input, untimed same-prompt 1,024-output conditioner, then a fresh measured 1,024-token output budget under the exclusive GPU lock. Clean Swift `2e14dca`, mlx-swift `713cf35c`, core `734241bb`. Fixed-M8 runs: 70.570 and 69.964 tok/s; mean 70.267 tok/s, identical token SHA-256 `5d6a93db36c5cd4d84fce4393db949211d63f994b9b59cd6c473554a85d561d4`. Raw [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-fixed8-conditioned-run-1.json) and [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-fixed8-conditioned-run-2.json). The earlier pre-0.32.2 adaptive evidence remains preserved above. |
+| MLX 0.32.2 adaptive control | Rejected for the 1K headline | 68.070 and 67.940 tok/s, mean 68.005, identical token SHA-256 `2bf047a0f6bca6c47c3e4d4f1c5a0b79ab841f79139a4ba52ce50bb2f01dd014`: [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-conditioned-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-conditioned-run-2.json). Fixed M8 improves the matched two-run mean by 3.326%. |
+| Width-policy behavior | Pass | On MLX 0.32.2, the adaptive production diagnostic completed in 230 cycles with 794 accepted draft tokens; M3: 2, M4: 28, M5: 53, M6: 54, M8: 93. This explains the adaptive headline regression despite faster normalized cycle time. Raw [`MLX 0.32.2 diagnostic`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-diagnostic.json). The pre-upgrade retained diagnostic completed in 204 cycles with 826 accepted draft tokens: [`pre-upgrade diagnostic`](receipts/qwen38-dflash2-swift/cost-aligned-widths-diagnostic.json). |
 | Turbo-Q8 candidate | Rejected | 68.005 tok/s on the exact conditioned workload; raw [`receipt`](receipts/qwen38-dflash2-swift/rejected-q8-conditioned-run.json). The custom route was removed. |
 | Matched 16K route | Pending | Run only after the short-context acceptance gate. |
 
