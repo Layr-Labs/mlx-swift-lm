@@ -105,6 +105,57 @@ matched full-workload gate. It installed 305 total target projections but ran
 at 68.005 tok/s, below both the retained route and the 68.351 tok/s unchanged
 width-policy control. No Q8 custom route remains installed.
 
+## Python-source context matrix
+
+The context matrix uses nested prefixes of actual Python source from the pinned
+MTPLX donor revision `9a6f48e`. Tracked `mtplx/**/*.py` blobs are concatenated
+in Git path order with Python-comment file boundaries, tokenized once with the
+pinned target tokenizer, and sliced at exactly 1,024, 16,384, 32,768, and
+65,536 tokens. The exact fixture construction, source blob IDs, and token
+hashes are in the [`prompt manifest`](receipts/qwen38-dflash2-swift/python-source-prefixes-manifest.json).
+
+Every timed sample uses fixed physical M8, temperature 1.0, top-p 0.95, top-k
+20, seed 42, an untimed same-prompt 1,024-output conditioner, and then a fresh
+timed 1,024-output pass. Each process held
+`/tmp/mtplx-gpu-exclusive.lock`. Values below are medians of three fresh
+processes; decode ranges preserve the full min--max spread.
+
+| Input | Output | Prefill s | Prefill tok/s | Decode s | Decode tok/s (range) | End-to-end output tok/s | Peak footprint |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1,024 | 1,024 | 1.387 | 738.0 | 16.890 | 60.626 (59.625--62.203) | 55.327 | 38.61 GiB |
+| 16,384 | 1,024 | 24.601 | 666.0 | 22.559 | 45.393 (41.912--46.724) | 21.620 | 42.55 GiB |
+| 32,768 | 1,024 | 48.090 | 681.4 | 29.360 | 34.877 (32.597--36.736) | 13.221 | 60.78 GiB |
+| 65,536 | 1,024 | 114.066 | 574.5 | 39.736 | 25.770 (24.086--27.165) | 6.658 | 95.69 GiB |
+
+`End-to-end output tok/s` is `1,024 / (prefill seconds + decode seconds)`.
+Peak footprint is the largest macOS `/usr/bin/time -l` process-footprint value
+among the three samples, not MLX construction residency. All three samples at
+every length produced an identical output hash. The 16K decode uses the custom
+grouped-GQA route; 32K and 64K use native MLX GQA because 32,768 is the
+exclusive upper bound of the validated custom interval. Later samples were
+systematically faster at 16K--64K, so the table reports medians and full ranges
+instead of hiding the warm-state drift.
+
+Acceptance and cycle counts come from separate untimed production-prefetch
+diagnostics. No counters were added to the timed path.
+
+| Input | Cycles | Accepted drafts | Accepted drafts/cycle | Output tokens/cycle | Nominal draft-slot acceptance | Output SHA-256 |
+|---:|---:|---:|---:|---:|---:|---|
+| 1,024 | 211 | 813 | 3.853 | 4.853 | 55.04% | `ea989349747f...` |
+| 16,384 | 256 | 768 | 3.000 | 4.000 | 42.86% | `d761f5c1cfe2...` |
+| 32,768 | 255 | 769 | 3.016 | 4.016 | 43.08% | `fe408d4cd8f6...` |
+| 65,536 | 276 | 748 | 2.710 | 3.710 | 38.72% | `8c2b3c08291f...` |
+
+The nominal acceptance denominator is `cycles * 7`; the final
+output-budget-capped cycle can expose fewer useful draft slots. The complete
+derived statistics and receipt index are in the [`matrix aggregate`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-context-matrix.json).
+Raw timed receipts and untimed diagnostics:
+
+- 1K: [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-1024-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-1024-run-2.json), [`run 3`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-1024-run-3.json), [`diagnostic`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-1024-diagnostic.json).
+- 16K: [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-16384-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-16384-run-2.json), [`run 3`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-16384-run-3.json), [`diagnostic`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-16384-diagnostic.json).
+- 32K: [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-32768-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-32768-run-2.json), [`run 3`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-32768-run-3.json), [`diagnostic`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-32768-diagnostic.json).
+- 64K: [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-65536-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-65536-run-2.json), [`run 3`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-65536-run-3.json), [`diagnostic`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-65536-diagnostic.json).
+
 ## Verification ledger
 
 | Gate | Status | Receipt |
@@ -124,6 +175,7 @@ width-policy control. No Q8 custom route remains installed.
 | Long-context GQA widths 6--8 | Numeric and MLX 0.32.2 performance pass | `Qwen38DFlashGQATests` uses the retained 16,384-token KV geometry and enforces the source route's fixed two-BF16-ULP maximum absolute error. The locked 16K ABBA gate used fixed M8, an untimed same-prompt 1,024-output conditioner, and a fresh timed 1,024-output pass. Custom runs were 66.555 and 69.612 tok/s (mean 68.084); native-0.32.2 controls were 61.212 and 60.457 tok/s (mean 60.834). The custom route won by 11.916%; each variant reproduced its own token hash exactly. See the exact [`16K token fixture`](receipts/qwen38-dflash2-swift/python-modules-long-16384.tokens.json), [`aggregate`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-abba-summary.json), and raw custom [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-custom-run-1.json) / [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-custom-run-2.json), native [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-native-run-1.json) / [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-gqa16k-native-run-2.json). |
 | Real-artifact construction | Pass | Pinned local target and draft construct, warm widths 1--8, and install the projection counts above. |
 | Exact conditioned 1K throughput | MLX 0.32.2 pass with explicit fixed M8 | Exact 1,024-token programming input, untimed same-prompt 1,024-output conditioner, then a fresh measured 1,024-token output budget under the exclusive GPU lock. Clean Swift `2e14dca`, mlx-swift `713cf35c`, core `734241bb`. Fixed-M8 runs: 70.570 and 69.964 tok/s; mean 70.267 tok/s, identical token SHA-256 `5d6a93db36c5cd4d84fce4393db949211d63f994b9b59cd6c473554a85d561d4`. Raw [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-fixed8-conditioned-run-1.json) and [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-fixed8-conditioned-run-2.json). The earlier pre-0.32.2 adaptive evidence remains preserved above. |
+| Python-source 1K--64K context matrix | Pass with visible warm-state range | Three locked fixed-M8 samples per length, exact 1,024-output budget, identical per-length output hashes, complete process-memory statistics, and separate untimed acceptance diagnostics. See the [`aggregate`](receipts/qwen38-dflash2-swift/mlx0322-python-prefix-context-matrix.json) and the Python-source context matrix above. |
 | MLX 0.32.2 adaptive control | Rejected for the 1K headline | 68.070 and 67.940 tok/s, mean 68.005, identical token SHA-256 `2bf047a0f6bca6c47c3e4d4f1c5a0b79ab841f79139a4ba52ce50bb2f01dd014`: [`run 1`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-conditioned-run-1.json), [`run 2`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-conditioned-run-2.json). Fixed M8 improves the matched two-run mean by 3.326%. |
 | Width-policy behavior | Pass | On MLX 0.32.2, the adaptive production diagnostic completed in 230 cycles with 794 accepted draft tokens; M3: 2, M4: 28, M5: 53, M6: 54, M8: 93. This explains the adaptive headline regression despite faster normalized cycle time. Raw [`MLX 0.32.2 diagnostic`](receipts/qwen38-dflash2-swift/mlx0322-adaptive-diagnostic.json). The pre-upgrade retained diagnostic completed in 204 cycles with 826 accepted draft tokens: [`pre-upgrade diagnostic`](receipts/qwen38-dflash2-swift/cost-aligned-widths-diagnostic.json). |
 | Turbo-Q8 candidate | Rejected | 68.005 tok/s on the exact conditioned workload; raw [`receipt`](receipts/qwen38-dflash2-swift/rejected-q8-conditioned-run.json). The custom route was removed. |

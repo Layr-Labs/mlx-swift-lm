@@ -1,0 +1,1221 @@
+{
+  "addSpecialTokens": false,
+  "corpusBytes": 7579562,
+  "corpusTokens": 1920802,
+  "corpusUTF8SHA256": "317a65f65ab776f7e713cc3b4fa957334db6b8006a5b3a0cc292587d69fe6bc8",
+  "files": [
+    {
+      "bytes": 1735,
+      "gitBlob": "b52156bb10dfde1f535528c1af8a929032175989",
+      "path": "mtplx/__init__.py"
+    },
+    {
+      "bytes": 36343,
+      "gitBlob": "3614723a72476522caa8b9593b8da4f2db447022",
+      "path": "mtplx/a3b_compiled_target_prefix.py"
+    },
+    {
+      "bytes": 127932,
+      "gitBlob": "f60e0dd0d2094330912f0369c197a6ec2a21454f",
+      "path": "mtplx/a3b_mtp_batch.py"
+    },
+    {
+      "bytes": 41551,
+      "gitBlob": "f5179a41121a5489d6ed26c056632ae0ed099973",
+      "path": "mtplx/a3b_whole_moe.py"
+    },
+    {
+      "bytes": 23536,
+      "gitBlob": "20cbfb60be1b3c3c059acb6a9117f5efa9e4ebb4",
+      "path": "mtplx/adaptive.py"
+    },
+    {
+      "bytes": 3357,
+      "gitBlob": "9e5df0aeba600afe8137214c018726802baabbe5",
+      "path": "mtplx/app_settings.py"
+    },
+    {
+      "bytes": 3795,
+      "gitBlob": "5c93d95cb431b684abacf78aab6b14cc65b264b9",
+      "path": "mtplx/arrays_cache_patch.py"
+    },
+    {
+      "bytes": 52856,
+      "gitBlob": "6e38811d04655a680e2220369a16639d58ffb0a0",
+      "path": "mtplx/artifacts.py"
+    },
+    {
+      "bytes": 2105,
+      "gitBlob": "1c118d3796a77ded2b27192203dfe62c3fc4f296",
+      "path": "mtplx/attention_context.py"
+    },
+    {
+      "bytes": 21624,
+      "gitBlob": "3f1833feef9466274023907e2e60457058ca0d85",
+      "path": "mtplx/attention_split.py"
+    },
+    {
+      "bytes": 1494,
+      "gitBlob": "ac1c2c86649bef0697486fa2e784633f7a4e8110",
+      "path": "mtplx/backends/__init__.py"
+    },
+    {
+      "bytes": 2100,
+      "gitBlob": "53a31ae11e67292ddb246bdbcf6022a3ea41143a",
+      "path": "mtplx/backends/deepseek_mtp.py"
+    },
+    {
+      "bytes": 59709,
+      "gitBlob": "5e0ca7736b8b558c7f8a002f3f7a77a868768d8b",
+      "path": "mtplx/backends/descriptors.py"
+    },
+    {
+      "bytes": 30989,
+      "gitBlob": "7416aa5f40ffd62ac18a99701c3d940e3679b745",
+      "path": "mtplx/backends/dflash2.py"
+    },
+    {
+      "bytes": 124073,
+      "gitBlob": "2eec980afb69add3690315aa2862840cdceda71a",
+      "path": "mtplx/backends/gemma4_assistant.py"
+    },
+    {
+      "bytes": 2093,
+      "gitBlob": "8becbe123e391039bc4c06455c76785a889cd801",
+      "path": "mtplx/backends/glm_mtp.py"
+    },
+    {
+      "bytes": 2966,
+      "gitBlob": "e6634e2da18d7a03dffb96cb6a99d4b4cf8e5c7b",
+      "path": "mtplx/backends/hy_v3_mtp.py"
+    },
+    {
+      "bytes": 1662,
+      "gitBlob": "92d49b46ba57f2e508df77ad3eca4985289ff8d6",
+      "path": "mtplx/backends/mimo_mtp.py"
+    },
+    {
+      "bytes": 1822,
+      "gitBlob": "e021d9e5607c8e5832bef34599c9f1445c1de193",
+      "path": "mtplx/backends/nemotron_h_mtp.py"
+    },
+    {
+      "bytes": 1983,
+      "gitBlob": "a274dfe007cd15f310da6770ccd0b242bfeb5234",
+      "path": "mtplx/backends/qwen3_next.py"
+    },
+    {
+      "bytes": 75420,
+      "gitBlob": "b85f37e2bade761b23453ecd12070f6a8bb7916a",
+      "path": "mtplx/backends/registry.py"
+    },
+    {
+      "bytes": 2440,
+      "gitBlob": "c9c8e7a1dd3487e6abc648ebe3503bbc24a2a37c",
+      "path": "mtplx/backends/step3p5_mtp.py"
+    },
+    {
+      "bytes": 67421,
+      "gitBlob": "6d18fa4de23754ccf58a4210817e9566762930bc",
+      "path": "mtplx/batched_decode.py"
+    },
+    {
+      "bytes": 1161,
+      "gitBlob": "05c2a0fc8b5fafab727459e1b1a0d276532d98f5",
+      "path": "mtplx/batching/__init__.py"
+    },
+    {
+      "bytes": 4416,
+      "gitBlob": "e69e93ec296fdbb039673e0d5654a37fc1585b01",
+      "path": "mtplx/batching/admission.py"
+    },
+    {
+      "bytes": 2331,
+      "gitBlob": "29daa951e402d0f818ba706f31d1046ecc06d2e3",
+      "path": "mtplx/batching/buckets.py"
+    },
+    {
+      "bytes": 13632,
+      "gitBlob": "0e03721e2cedd3ab3a379857d75a43c046ea3de5",
+      "path": "mtplx/batching/scheduler.py"
+    },
+    {
+      "bytes": 6573,
+      "gitBlob": "fceacd8ff4ab54c64b0a6948af6f74eab4a0eba7",
+      "path": "mtplx/batching/state.py"
+    },
+    {
+      "bytes": 35,
+      "gitBlob": "ceea876ca9e041a1df3d1b071edb0043ec177b7b",
+      "path": "mtplx/benchmarks/__init__.py"
+    },
+    {
+      "bytes": 13820,
+      "gitBlob": "3796d66792889c34328e85a43f74060de2bf868a",
+      "path": "mtplx/benchmarks/code_eval.py"
+    },
+    {
+      "bytes": 5292,
+      "gitBlob": "5b7df9c3366de422c2072b24d9c8fafdf47b0b0e",
+      "path": "mtplx/benchmarks/dflash2_contract.py"
+    },
+    {
+      "bytes": 5454,
+      "gitBlob": "495cd1436d8798192f11870b02f04159e97c689f",
+      "path": "mtplx/benchmarks/dflash2_runtime.py"
+    },
+    {
+      "bytes": 7796,
+      "gitBlob": "4e7158f786d7def9e84a5c9df5fed6e42552295b",
+      "path": "mtplx/benchmarks/programming_prompts.py"
+    },
+    {
+      "bytes": 25,
+      "gitBlob": "3313ef436a108c166961ab56a9f326b529d4986b",
+      "path": "mtplx/benchmarks/runners/__init__.py"
+    },
+    {
+      "bytes": 160544,
+      "gitBlob": "41c970ec8284dfbfb3a7eb84ea5836e121902757",
+      "path": "mtplx/benchmarks/runners/aime.py"
+    },
+    {
+      "bytes": 6956,
+      "gitBlob": "637a5c099d92219014d0209263328ebeec441474",
+      "path": "mtplx/benchmarks/runners/batch_equivalence.py"
+    },
+    {
+      "bytes": 9456,
+      "gitBlob": "c59544137d156e21078ce01489d9e7f42526bf54",
+      "path": "mtplx/benchmarks/runners/capture_commit_equivalence.py"
+    },
+    {
+      "bytes": 12233,
+      "gitBlob": "809283a6b62f03902d1ad03968164fe6597ef550",
+      "path": "mtplx/benchmarks/runners/competitor_baselines.py"
+    },
+    {
+      "bytes": 3841,
+      "gitBlob": "93bdc562a5b272e2323871a29bc6473f92d31017",
+      "path": "mtplx/benchmarks/runners/contract_probe.py"
+    },
+    {
+      "bytes": 18724,
+      "gitBlob": "c7710d8feb5aa535d12dba094afce44d46a72696",
+      "path": "mtplx/benchmarks/runners/dflash2_depth_sweep.py"
+    },
+    {
+      "bytes": 943,
+      "gitBlob": "3020953839a95991a6b080e5276212577c8feb9c",
+      "path": "mtplx/benchmarks/runners/harness.py"
+    },
+    {
+      "bytes": 5693,
+      "gitBlob": "b32c7d0cd2e71eedcb5f0d2ad39b155a9f230ed5",
+      "path": "mtplx/benchmarks/runners/mtp1_gate.py"
+    },
+    {
+      "bytes": 8421,
+      "gitBlob": "7385dd2df1c5d37c560e03b160bfcc225b10f742",
+      "path": "mtplx/benchmarks/runners/mtp1_sampler_smoke.py"
+    },
+    {
+      "bytes": 14405,
+      "gitBlob": "5e7a3906abad0f89169eb307f1404ba675e2ec97",
+      "path": "mtplx/benchmarks/runners/mtp_adaptive.py"
+    },
+    {
+      "bytes": 16922,
+      "gitBlob": "a0a37424b92773e5eb849e5821a47b41ef3c66f4",
+      "path": "mtplx/benchmarks/runners/mtp_chain_probe.py"
+    },
+    {
+      "bytes": 13323,
+      "gitBlob": "2abcd751e871e75754b26122d960d89815c873ec",
+      "path": "mtplx/benchmarks/runners/mtp_depth_grid.py"
+    },
+    {
+      "bytes": 39397,
+      "gitBlob": "04480abb8201464d382d272d00aea7f6686f5607",
+      "path": "mtplx/benchmarks/runners/mtp_depth_sweep.py"
+    },
+    {
+      "bytes": 11087,
+      "gitBlob": "81515599a45ff81a16dcc3d4af16e9aad49d7466",
+      "path": "mtplx/benchmarks/runners/mtp_tree_probe.py"
+    },
+    {
+      "bytes": 11414,
+      "gitBlob": "d8ff6408c74e2aeaa11eb85f9967283313d636b4",
+      "path": "mtplx/benchmarks/runners/multi_qmv_probe.py"
+    },
+    {
+      "bytes": 4018,
+      "gitBlob": "d9226df9bdae70511f9344257ccb346d041ea4f4",
+      "path": "mtplx/benchmarks/runners/preflight.py"
+    },
+    {
+      "bytes": 1591,
+      "gitBlob": "1b52d03c5c9edb8e49cf9c1b071bf4bb5669e863",
+      "path": "mtplx/benchmarks/runners/runtime_smoke.py"
+    },
+    {
+      "bytes": 7829,
+      "gitBlob": "83bcb0f0419dbfc4da28e60478478205d61d13c9",
+      "path": "mtplx/benchmarks/runners/session_bank.py"
+    },
+    {
+      "bytes": 19184,
+      "gitBlob": "f2f363453836f47e3ea5aa3fb08cb6e9d6eb9d13",
+      "path": "mtplx/benchmarks/runners/truth.py"
+    },
+    {
+      "bytes": 12624,
+      "gitBlob": "2c11daa0805e62c67fd6666024b8047e7ac4955c",
+      "path": "mtplx/benchmarks/runners/verify_profile.py"
+    },
+    {
+      "bytes": 11116,
+      "gitBlob": "f1ae1deb40ed298e9931b5704d2602f950dc0223",
+      "path": "mtplx/benchmarks/runners/verify_qmm_probe.py"
+    },
+    {
+      "bytes": 2140,
+      "gitBlob": "92448468c453ba5da6722b59776723691d1c1b65",
+      "path": "mtplx/benchmarks/runners/verify_ratio.py"
+    },
+    {
+      "bytes": 4416,
+      "gitBlob": "bf9e528f043f8925ef58059f640b3b4488813145",
+      "path": "mtplx/benchmarks/schema.py"
+    },
+    {
+      "bytes": 28,
+      "gitBlob": "509dbcf78c3e5f0d579271e0cee25b1b8d2a95a2",
+      "path": "mtplx/benchmarks/validators/__init__.py"
+    },
+    {
+      "bytes": 3247,
+      "gitBlob": "cd7852780514e8f523d054fbfe215d83f7a7278e",
+      "path": "mtplx/benchmarks/validators/aime.py"
+    },
+    {
+      "bytes": 5813,
+      "gitBlob": "61118e188f20f2d41422fb345155cb9865ce66d0",
+      "path": "mtplx/benchmarks/validators/basic.py"
+    },
+    {
+      "bytes": 3211,
+      "gitBlob": "d7ae73b2ceb744201def4f33c421a0c7235c8cc6",
+      "path": "mtplx/block_attention.py"
+    },
+    {
+      "bytes": 734,
+      "gitBlob": "1c43a4bd53223f951e0f3c3378d09fc1c341190e",
+      "path": "mtplx/cache_bank/__init__.py"
+    },
+    {
+      "bytes": 13807,
+      "gitBlob": "769537f1dcd64620edfccc8deeb1b48b591e243a",
+      "path": "mtplx/cache_bank/codec.py"
+    },
+    {
+      "bytes": 91918,
+      "gitBlob": "b92a46a9801899083dcebe68fca5a85ad548d446",
+      "path": "mtplx/cache_bank/cold_tier.py"
+    },
+    {
+      "bytes": 169826,
+      "gitBlob": "9efc7864f98934a58f5927ddaa45c031de9f8b9d",
+      "path": "mtplx/cache_state.py"
+    },
+    {
+      "bytes": 3192,
+      "gitBlob": "6e2044920453c1a7e83162374b99c7e6aa64b6a8",
+      "path": "mtplx/chat_encode_cache.py"
+    },
+    {
+      "bytes": 10023,
+      "gitBlob": "29ae7cd21d171829cd7fe35557e02bc554ba33f9",
+      "path": "mtplx/chat_encoding.py"
+    },
+    {
+      "bytes": 188396,
+      "gitBlob": "d71e6e39be5f33842720a5f51a88b41c8ead6661",
+      "path": "mtplx/cli.py"
+    },
+    {
+      "bytes": 37,
+      "gitBlob": "89445876206ba7c612fbf432cdcdf576f83581b2",
+      "path": "mtplx/commands/__init__.py"
+    },
+    {
+      "bytes": 133841,
+      "gitBlob": "3362e63aedd5a7b5793843004d1f201281d3f467",
+      "path": "mtplx/commands/forge.py"
+    },
+    {
+      "bytes": 3581,
+      "gitBlob": "51ed79a334559041371da316572dfa982f9a3cec",
+      "path": "mtplx/commands/forge_mixed_convert.py"
+    },
+    {
+      "bytes": 593118,
+      "gitBlob": "d98ebfae0bbcaa409fc3f785d9593d901c86f3d0",
+      "path": "mtplx/commands/public.py"
+    },
+    {
+      "bytes": 34609,
+      "gitBlob": "8d76bd7ece244616b45dfdc32487963055cffcfb",
+      "path": "mtplx/commands/trace.py"
+    },
+    {
+      "bytes": 39895,
+      "gitBlob": "f4ce36ab4d770edcde80d0d965c2b36f932b0853",
+      "path": "mtplx/commands/trace_report.py"
+    },
+    {
+      "bytes": 1500,
+      "gitBlob": "4a42b07966b87e6c1d95103b4c7cfee7136ef1a2",
+      "path": "mtplx/compile_state.py"
+    },
+    {
+      "bytes": 6065,
+      "gitBlob": "58a4261e865d74c4ecb70fcc1648c2eaa5052ec1",
+      "path": "mtplx/compiled_forward.py"
+    },
+    {
+      "bytes": 35315,
+      "gitBlob": "b85af0322503cb8f4141973b2fd6cb17f479de0d",
+      "path": "mtplx/compressed_tensors.py"
+    },
+    {
+      "bytes": 14337,
+      "gitBlob": "e0d17b1c7fcc1eb9355a1807c9a3546bd7defe21",
+      "path": "mtplx/config.py"
+    },
+    {
+      "bytes": 7479,
+      "gitBlob": "19535a3b69ea48b57dd8cfc283d2a73036f8a483",
+      "path": "mtplx/constants.py"
+    },
+    {
+      "bytes": 21423,
+      "gitBlob": "1a591b12c2bf50913044f399e258089b316248be",
+      "path": "mtplx/constrained.py"
+    },
+    {
+      "bytes": 6909,
+      "gitBlob": "c87e651727f38222c00cd478930e4b8340047199",
+      "path": "mtplx/context_copy.py"
+    },
+    {
+      "bytes": 1601,
+      "gitBlob": "def9b4910938a4a04e0dd440809e03ce419ef599",
+      "path": "mtplx/correctors/__init__.py"
+    },
+    {
+      "bytes": 10165,
+      "gitBlob": "9caf4d7fafab1423c2fad3ca6a87151a9acd528d",
+      "path": "mtplx/correctors/diagonal_affine.py"
+    },
+    {
+      "bytes": 6349,
+      "gitBlob": "50c80404fd4af8179ce0aafb95cee39eca54bd8f",
+      "path": "mtplx/correctors/low_rank.py"
+    },
+    {
+      "bytes": 19908,
+      "gitBlob": "6420157cc559ac394f5d21893029338eec2cbc11",
+      "path": "mtplx/daemon_client.py"
+    },
+    {
+      "bytes": 1554,
+      "gitBlob": "a3925b12ea1591eda2617ec1e66d28b83c84ef97",
+      "path": "mtplx/dashboard/__init__.py"
+    },
+    {
+      "bytes": 15561,
+      "gitBlob": "f230170b93bbaec737d7a462b20cf01fd1735832",
+      "path": "mtplx/deepseek_mtp_patch.py"
+    },
+    {
+      "bytes": 12729,
+      "gitBlob": "2b096636f46276059df2884a1ddb06737167d450",
+      "path": "mtplx/deepseek_v4_adaptive_width.py"
+    },
+    {
+      "bytes": 20365,
+      "gitBlob": "93b28a24280187f4b4cd91f8128f30a3ced2ea57",
+      "path": "mtplx/deepseek_v4_attention_island.py"
+    },
+    {
+      "bytes": 17840,
+      "gitBlob": "76a3686ca3afa6e2b3d4581dcf3b74d593599c5f",
+      "path": "mtplx/deepseek_v4_attn_proj_wide_m3.py"
+    },
+    {
+      "bytes": 36853,
+      "gitBlob": "9165c6b8c8fc7e2c76d7da758739fc4d50b03f5e",
+      "path": "mtplx/default_models.py"
+    },
+    {
+      "bytes": 32802,
+      "gitBlob": "51e3caa9599376b22873a5b3d8fbcca135325a87",
+      "path": "mtplx/dflash2_bundle.py"
+    },
+    {
+      "bytes": 28005,
+      "gitBlob": "389386832f8ba484d9be017842a4529388170cc9",
+      "path": "mtplx/diagnostics.py"
+    },
+    {
+      "bytes": 16877,
+      "gitBlob": "c66b2093afe71bfabb989868dd571327e1adc617",
+      "path": "mtplx/draft_lm_head.py"
+    },
+    {
+      "bytes": 2697,
+      "gitBlob": "bbf7cb6a0e10fc236e3e2f5a73440a60633b4850",
+      "path": "mtplx/draft_sampling.py"
+    },
+    {
+      "bytes": 70743,
+      "gitBlob": "2b608b6aa18ac4866bb3467779a371c166a45801",
+      "path": "mtplx/engine_session.py"
+    },
+    {
+      "bytes": 4673,
+      "gitBlob": "891266e6c76791447333bc7c17a0892d4028dabb",
+      "path": "mtplx/env.py"
+    },
+    {
+      "bytes": 2364,
+      "gitBlob": "422c459e0c53b31fb656944dc33c93641bc24a3a",
+      "path": "mtplx/errors.py"
+    },
+    {
+      "bytes": 6018,
+      "gitBlob": "e877552b9985d786fddb3583af83407e4a00847f",
+      "path": "mtplx/expert_layout.py"
+    },
+    {
+      "bytes": 1132,
+      "gitBlob": "b28932100509e7cec4b8a9277f8d345f4fe1c380",
+      "path": "mtplx/fan_mode.py"
+    },
+    {
+      "bytes": 22379,
+      "gitBlob": "28fc77b8b1754ecd62ae7ec4a5fdf8dbf568bc8e",
+      "path": "mtplx/fast_sampling.py"
+    },
+    {
+      "bytes": 116591,
+      "gitBlob": "0ba3718ec2cbb4f6f9a6bfc5a1635075dcfc1a69",
+      "path": "mtplx/gdn_capture.py"
+    },
+    {
+      "bytes": 8073,
+      "gitBlob": "0b2317b93ac8aaaed07ea3f622de278770caed20",
+      "path": "mtplx/gemma4_pair.py"
+    },
+    {
+      "bytes": 478572,
+      "gitBlob": "ae9ebf276816c8fd327ee43c6c3f1512239dbc86",
+      "path": "mtplx/generation.py"
+    },
+    {
+      "bytes": 15078,
+      "gitBlob": "48d9dbd1d9dbc5c4a6e320051360d38875c1f0db",
+      "path": "mtplx/glm_mtp_patch.py"
+    },
+    {
+      "bytes": 104206,
+      "gitBlob": "80de3b8eeb27b6df149b5dae6ea469884251e450",
+      "path": "mtplx/graphbank.py"
+    },
+    {
+      "bytes": 8150,
+      "gitBlob": "82d0aa56f8f00c7a60150b0d47220bafd6362c7b",
+      "path": "mtplx/hardware.py"
+    },
+    {
+      "bytes": 44016,
+      "gitBlob": "73b15936458c307f68a524a58780446f8020265d",
+      "path": "mtplx/hf_loader.py"
+    },
+    {
+      "bytes": 17539,
+      "gitBlob": "983621228251401dac31485e9f180c8303c9e51e",
+      "path": "mtplx/hy_v3_mtp_patch.py"
+    },
+    {
+      "bytes": 27001,
+      "gitBlob": "940a41ddd1933cfb6fe57e73def6d978637bcd45",
+      "path": "mtplx/kernel_selfcheck.py"
+    },
+    {
+      "bytes": 983,
+      "gitBlob": "2b21b450d7e9424b27b043a0f9698be2c6c6fbf1",
+      "path": "mtplx/kernels/__init__.py"
+    },
+    {
+      "bytes": 114327,
+      "gitBlob": "954e95708eab30a69bdb25192a6f96aa6913de29",
+      "path": "mtplx/kernels/a3b_whole_moe.py"
+    },
+    {
+      "bytes": 1583,
+      "gitBlob": "c2b38121d6cfa307a8e75ec7dbbb9907dd46ff8d",
+      "path": "mtplx/kernels/copy_leaf.py"
+    },
+    {
+      "bytes": 13204,
+      "gitBlob": "5c08f8e1f25e96dc45716a167ae83d1c26db5da2",
+      "path": "mtplx/kernels/fused_norm.py"
+    },
+    {
+      "bytes": 17799,
+      "gitBlob": "dc316b50036bea4791143be4c0ffdc7f84df1f4c",
+      "path": "mtplx/kernels/gdn_blocked_prefill.py"
+    },
+    {
+      "bytes": 8246,
+      "gitBlob": "1991c4658cc790ab72a283f1fb492d0db22858ea",
+      "path": "mtplx/kernels/gdn_tape_headquarter.py"
+    },
+    {
+      "bytes": 52884,
+      "gitBlob": "8fab618b14b46f3f4f2bfecb444f2d0aaad41a6e",
+      "path": "mtplx/kernels/laguna_decode.py"
+    },
+    {
+      "bytes": 20109,
+      "gitBlob": "d58a298343928bccbf4e3acfa7edfb944f4c9aa5",
+      "path": "mtplx/kernels/laguna_dense_mlp.py"
+    },
+    {
+      "bytes": 16041,
+      "gitBlob": "f52cbbfefdc1cd649278eb73510e9e024d89215b",
+      "path": "mtplx/kernels/laguna_gated_oproj.py"
+    },
+    {
+      "bytes": 11046,
+      "gitBlob": "63c0ac0002ec6076e80705ce90da9ccc455810e4",
+      "path": "mtplx/kernels/laguna_moe_combine.py"
+    },
+    {
+      "bytes": 10385,
+      "gitBlob": "a19e2cca03599985a977fce3d6c6c9b42831f359",
+      "path": "mtplx/kernels/laguna_moe_gather_gemm.py"
+    },
+    {
+      "bytes": 20533,
+      "gitBlob": "1b89b71a2eebee7fbc2b045bf3f79407e02f1b2c",
+      "path": "mtplx/kernels/laguna_moe_merged.py"
+    },
+    {
+      "bytes": 14455,
+      "gitBlob": "cf0cb9d9a73b06b29fc5d4056c9df708c2e6286f",
+      "path": "mtplx/kernels/laguna_moe_shared.py"
+    },
+    {
+      "bytes": 14429,
+      "gitBlob": "6e55bdf6353a371f91bc8398c6af3731fab75953",
+      "path": "mtplx/kernels/laguna_moe_swiglu.py"
+    },
+    {
+      "bytes": 7018,
+      "gitBlob": "b715144c0cfacc13eeb64b0d217d174fb4c4635a",
+      "path": "mtplx/kernels/laguna_prefill_moe_combine.py"
+    },
+    {
+      "bytes": 17922,
+      "gitBlob": "92e61839f4c9b4218ab9bb8965c402bbfd7f9985",
+      "path": "mtplx/kernels/laguna_prefill_qk_rope.py"
+    },
+    {
+      "bytes": 9655,
+      "gitBlob": "c83109e0b5385dc420369d8ba8fa7b14c374e391",
+      "path": "mtplx/kernels/laguna_prefill_router.py"
+    },
+    {
+      "bytes": 12521,
+      "gitBlob": "4aff772bc7cb436a508098012ca6e1978e11e986",
+      "path": "mtplx/kernels/laguna_qk_rope_sliding.py"
+    },
+    {
+      "bytes": 16302,
+      "gitBlob": "94bb00ed31ebb2c5fc6d9fe697391923efd09de4",
+      "path": "mtplx/kernels/laguna_qk_yarn_full.py"
+    },
+    {
+      "bytes": 21159,
+      "gitBlob": "b33236eca0531b7b2ca469c3029b8c5c4da0d85c",
+      "path": "mtplx/kernels/laguna_qkvg_fused.py"
+    },
+    {
+      "bytes": 12077,
+      "gitBlob": "976e204dd3368fc55229f9ee9e9d15f103d1c60c",
+      "path": "mtplx/kernels/laguna_residual_router.py"
+    },
+    {
+      "bytes": 7847,
+      "gitBlob": "6d473be2f0a5f2d04489976bdf201f749b0211d4",
+      "path": "mtplx/kernels/laguna_route_csort.py"
+    },
+    {
+      "bytes": 13132,
+      "gitBlob": "54b54629b4c05e3aa9c5e0337916bd875f4bf475",
+      "path": "mtplx/kernels/laguna_router_topk.py"
+    },
+    {
+      "bytes": 12115,
+      "gitBlob": "22af19fd7eca493b4c8174fc25042e983310b069",
+      "path": "mtplx/kernels/laguna_sdpa_2pass.py"
+    },
+    {
+      "bytes": 10226,
+      "gitBlob": "6e8cfe694070f4654a9c7d6965749c47f3e6cb80",
+      "path": "mtplx/kernels/laguna_sdpa_pair.py"
+    },
+    {
+      "bytes": 18297,
+      "gitBlob": "e83024babe823fe551f0ed87173c690c5c85c6c8",
+      "path": "mtplx/kernels/laguna_steel_attn.py"
+    },
+    {
+      "bytes": 19721,
+      "gitBlob": "24496dd2ea1227183f6e374af6a47ccafcf7fc31",
+      "path": "mtplx/kernels/lm_head_topk.py"
+    },
+    {
+      "bytes": 9714,
+      "gitBlob": "7937a45766fca461c9a14df70bf64302efacc8d6",
+      "path": "mtplx/kernels/logits_topk.py"
+    },
+    {
+      "bytes": 3195,
+      "gitBlob": "adcc56cb985d0c3657e9b4d6044a5c0cda65a9d9",
+      "path": "mtplx/kernels/native_gdn_tail.py"
+    },
+    {
+      "bytes": 12043,
+      "gitBlob": "349ff0ec35ab9d09ffd729e2317c4c9ccfa01ec8",
+      "path": "mtplx/kernels/sdpa_2pass.py"
+    },
+    {
+      "bytes": 17630,
+      "gitBlob": "02773590d7bfc7f9e32e2588a1f60fa44d1308ec",
+      "path": "mtplx/kernels/sdpa_2pass_paged.py"
+    },
+    {
+      "bytes": 11750,
+      "gitBlob": "0cbd2929bccd5809d3496493251d2db5fd6bc6bd",
+      "path": "mtplx/kernels/sdpa_2pass_paged_q8.py"
+    },
+    {
+      "bytes": 13424,
+      "gitBlob": "b28955c0e9dde2d70f32d3bb2e6bbc754bedf5fe",
+      "path": "mtplx/kernels/sdpa_gqa_packed.py"
+    },
+    {
+      "bytes": 33540,
+      "gitBlob": "06603aef717857bc7c5a5915255a8237ff6c4eb1",
+      "path": "mtplx/kernels/verify_mlp_fused.py"
+    },
+    {
+      "bytes": 979,
+      "gitBlob": "d53d5a6f129ff5e588587765eaa8b3b31a57b6c3",
+      "path": "mtplx/kpi/__init__.py"
+    },
+    {
+      "bytes": 7356,
+      "gitBlob": "b99eff73de872a2fcc2f1daa088c2eafafe56309",
+      "path": "mtplx/kpi/reference_vllm.py"
+    },
+    {
+      "bytes": 16643,
+      "gitBlob": "cb3aae67804a2ab4bfe0d7061848908500a922c5",
+      "path": "mtplx/kpi/runtime_kpis.py"
+    },
+    {
+      "bytes": 4344,
+      "gitBlob": "e3f8c48ddc2ff5527b07f1628668cee8af56cced",
+      "path": "mtplx/kv_quant.py"
+    },
+    {
+      "bytes": 29668,
+      "gitBlob": "58be1b96e7d410bec4d652df8bcc8b76ff147234",
+      "path": "mtplx/laguna_alt_step.py"
+    },
+    {
+      "bytes": 35497,
+      "gitBlob": "c40f396039b2973057e8791c2c85d65520507792",
+      "path": "mtplx/laguna_compiled_step.py"
+    },
+    {
+      "bytes": 5117,
+      "gitBlob": "f5214677664316934f943b325c0042320014a839",
+      "path": "mtplx/lfm2_fast.py"
+    },
+    {
+      "bytes": 19066,
+      "gitBlob": "6f1a21a1fc6ddfceead419e0847e91580c080286",
+      "path": "mtplx/loop_guard.py"
+    },
+    {
+      "bytes": 4373,
+      "gitBlob": "7dfbbb3cd7fb97b5326fb8aea31cc3ac7885d690",
+      "path": "mtplx/metadata_scrub.py"
+    },
+    {
+      "bytes": 11490,
+      "gitBlob": "ed5063ea6111e85eefa61e881a665e6c955b7d1c",
+      "path": "mtplx/mimo_mtp_patch.py"
+    },
+    {
+      "bytes": 25750,
+      "gitBlob": "e28abe9f0cfcb7be0c29e5ba5d4c356174a0d6cf",
+      "path": "mtplx/model_catalog.py"
+    },
+    {
+      "bytes": 24744,
+      "gitBlob": "a7dd119903be4a87c04214752520bcb73293c2ac",
+      "path": "mtplx/model_scheduler.py"
+    },
+    {
+      "bytes": 16235,
+      "gitBlob": "a8e8e6e67f60e0e83dc6e817577a324b570bdd62",
+      "path": "mtplx/model_updates.py"
+    },
+    {
+      "bytes": 74,
+      "gitBlob": "1ccd7499dd5e681881ab88e371c1cab53a5d479b",
+      "path": "mtplx/models/__init__.py"
+    },
+    {
+      "bytes": 196238,
+      "gitBlob": "c9e390f48fedf54710a32c557dc43b990e745d07",
+      "path": "mtplx/models/deepseek_v4.py"
+    },
+    {
+      "bytes": 19841,
+      "gitBlob": "a33bcd7328ece25b928fb6783d44b6727fb7d809",
+      "path": "mtplx/models/laguna.py"
+    },
+    {
+      "bytes": 13357,
+      "gitBlob": "9ae75123666335fb5e6459fc0774948eede02705",
+      "path": "mtplx/models/laguna_config.py"
+    },
+    {
+      "bytes": 52076,
+      "gitBlob": "055c7eefcdacf515df6454cd8e24ad4002f9e941",
+      "path": "mtplx/models/laguna_fused.py"
+    },
+    {
+      "bytes": 14335,
+      "gitBlob": "fe140bbfb3ceb7980e1326fc1d3f4729e51f99af",
+      "path": "mtplx/moe_packed_projections.py"
+    },
+    {
+      "bytes": 10252,
+      "gitBlob": "eda3fc66f03e688753c8190723aa8878a0fe01df",
+      "path": "mtplx/mtp_activation_stats.py"
+    },
+    {
+      "bytes": 21709,
+      "gitBlob": "ed47b3c79ed8c75de5776b147fc061c39d630af3",
+      "path": "mtplx/mtp_adapters.py"
+    },
+    {
+      "bytes": 903,
+      "gitBlob": "55fabf0486f72b89703ccd6e2d67eed3512acc35",
+      "path": "mtplx/mtp_batch_numerics.py"
+    },
+    {
+      "bytes": 55882,
+      "gitBlob": "451ce1f80514b6277361b2a1f8d38a29f252ca38",
+      "path": "mtplx/mtp_patch.py"
+    },
+    {
+      "bytes": 9516,
+      "gitBlob": "b32f064d74a6a7fc5bb151183d9d3aa0b05b8a98",
+      "path": "mtplx/native_mlp.py"
+    },
+    {
+      "bytes": 57352,
+      "gitBlob": "6ddb32e7ce6a6af02ab526b8908630efe9d7dea1",
+      "path": "mtplx/nax_verify.py"
+    },
+    {
+      "bytes": 14596,
+      "gitBlob": "27416a3b2c33abf877263b53a3dd94b2372c25e8",
+      "path": "mtplx/nemotron_h_mtp_patch.py"
+    },
+    {
+      "bytes": 30096,
+      "gitBlob": "4b6b8a608d504130ebf4aae04ecc1766f65e0e61",
+      "path": "mtplx/opencode.py"
+    },
+    {
+      "bytes": 7831,
+      "gitBlob": "29352e287af97ebeb2f3b4f063ea53a5ab5cae0c",
+      "path": "mtplx/optimization_profiles.py"
+    },
+    {
+      "bytes": 9073,
+      "gitBlob": "78ba130a4419cb1b986a2d87544cb8b891895b2f",
+      "path": "mtplx/packed_concats.py"
+    },
+    {
+      "bytes": 12245,
+      "gitBlob": "25c7363c85935750742b36eb4e14ae2977ae6ee8",
+      "path": "mtplx/pi.py"
+    },
+    {
+      "bytes": 48771,
+      "gitBlob": "b8ec1dc1ff19e53fad78fd76340e85b6be982417",
+      "path": "mtplx/prefill_bench.py"
+    },
+    {
+      "bytes": 3716,
+      "gitBlob": "89fbfb965e0849374e382841e2449d753134ae19",
+      "path": "mtplx/prefill_rungs.py"
+    },
+    {
+      "bytes": 36162,
+      "gitBlob": "4c93ac9fe41b3eb15b14a1e73de4784ad9e2235d",
+      "path": "mtplx/profiles.py"
+    },
+    {
+      "bytes": 735,
+      "gitBlob": "6793ee63d00e5a467a5f2ef4e3afd118c4eaf064",
+      "path": "mtplx/progress_heartbeat.py"
+    },
+    {
+      "bytes": 5574,
+      "gitBlob": "8803c39dcca877e6010bf028f76505705afac0ca",
+      "path": "mtplx/proj_quant.py"
+    },
+    {
+      "bytes": 7196,
+      "gitBlob": "9e7627e6a2f45b75b3bc41edf736369f1b14163a",
+      "path": "mtplx/proposal_reranker.py"
+    },
+    {
+      "bytes": 23721,
+      "gitBlob": "b49660f52428a8d6ec09481570997d4d8948bbdf",
+      "path": "mtplx/qwen38_challenge.py"
+    },
+    {
+      "bytes": 40129,
+      "gitBlob": "f117d24a23e2f84106224e61831180d62792e7b7",
+      "path": "mtplx/qwen38_challenge_kernels.py"
+    },
+    {
+      "bytes": 11207,
+      "gitBlob": "2d39838c4aa33eed034fd8540105aa82bdbed9f1",
+      "path": "mtplx/qwen38_dflash_adaptive.py"
+    },
+    {
+      "bytes": 10610,
+      "gitBlob": "4c07d3bec9635958969c83ffdf305ab81af41205",
+      "path": "mtplx/qwen38_mtp_block_artifacts.py"
+    },
+    {
+      "bytes": 15864,
+      "gitBlob": "d2542249c7e10a21a071dc4c7ab9a6d0446d05af",
+      "path": "mtplx/qwen38_qmv.py"
+    },
+    {
+      "bytes": 41115,
+      "gitBlob": "3a4ad3f3e6d63f0c6136cccf5d6f2ff45c2df9d7",
+      "path": "mtplx/qwen38_source_proposal.py"
+    },
+    {
+      "bytes": 16299,
+      "gitBlob": "1a18ab426810b95758de26fd67e95789e5e9bc74",
+      "path": "mtplx/qwen3_5_mtp_patch.py"
+    },
+    {
+      "bytes": 25918,
+      "gitBlob": "f270af8401761dd71c6dd4fad7df7c20ff60d000",
+      "path": "mtplx/qwen_row_owned_router.py"
+    },
+    {
+      "bytes": 4209,
+      "gitBlob": "dbf2d3bdf93b1b06b7eabe416e6e0456e191260b",
+      "path": "mtplx/ragged_attention.py"
+    },
+    {
+      "bytes": 23623,
+      "gitBlob": "868a59c3f527ec9230901ba099f4d57908f938a0",
+      "path": "mtplx/ragged_kv_cache.py"
+    },
+    {
+      "bytes": 22643,
+      "gitBlob": "514a6d676da171c6ce42284f4376e4d9d9c37a3f",
+      "path": "mtplx/reasoning_codecs.py"
+    },
+    {
+      "bytes": 1498,
+      "gitBlob": "1366d21b2800c72f0afdb677517c7d56d049eb9b",
+      "path": "mtplx/reasoning_effort.py"
+    },
+    {
+      "bytes": 4431,
+      "gitBlob": "8c7a7727a14cfebcefdd30305490049646ee6b7c",
+      "path": "mtplx/request_capture.py"
+    },
+    {
+      "bytes": 45232,
+      "gitBlob": "294711c44cd43dc3d45da3f9956c8d3f36447032",
+      "path": "mtplx/retrieval.py"
+    },
+    {
+      "bytes": 10734,
+      "gitBlob": "9ec83b964bf26e18c8f4cc726fc3ede62bd7d5db",
+      "path": "mtplx/roofline_profile.py"
+    },
+    {
+      "bytes": 52899,
+      "gitBlob": "4ede185d50c9c4aaae01931147e9476fed2b7c01",
+      "path": "mtplx/runtime.py"
+    },
+    {
+      "bytes": 8313,
+      "gitBlob": "d92789a95aa1cea78d47005d7a2e6d03547260c4",
+      "path": "mtplx/runtime_options.py"
+    },
+    {
+      "bytes": 13790,
+      "gitBlob": "44535357ed9dd91f540063801e8ea713b292800c",
+      "path": "mtplx/sampling.py"
+    },
+    {
+      "bytes": 94,
+      "gitBlob": "59b7e4672bf4a8ca0d11e1dd35f8178b7e9291b2",
+      "path": "mtplx/server/__init__.py"
+    },
+    {
+      "bytes": 23180,
+      "gitBlob": "47a2eb193e1fb568f6bd25858daa175f082eb3d2",
+      "path": "mtplx/server/dashboard_state.py"
+    },
+    {
+      "bytes": 18419,
+      "gitBlob": "29bf77a12b5e61a01cd7966b1fb7bdf2476bb3f1",
+      "path": "mtplx/server/flight_recorder.py"
+    },
+    {
+      "bytes": 31627,
+      "gitBlob": "69bb9005f2b1fcc10337abc3f4ff73ac8b6bb4c2",
+      "path": "mtplx/server/mtp_batch.py"
+    },
+    {
+      "bytes": 888,
+      "gitBlob": "de80d21fad78652fdbc7fc0e43c174c7b9ed997c",
+      "path": "mtplx/server/omlx_bridge/__init__.py"
+    },
+    {
+      "bytes": 9900,
+      "gitBlob": "66862760ef2ba76883691e11c7887f7aa8a31478",
+      "path": "mtplx/server/omlx_bridge/adapter.py"
+    },
+    {
+      "bytes": 3932,
+      "gitBlob": "7585fe768a1892a7714f82e5f95fbaee5b0ac532",
+      "path": "mtplx/server/omlx_bridge/thinking.py"
+    },
+    {
+      "bytes": 43722,
+      "gitBlob": "6788ef682de660eab7c28724edb565a539d3a6fa",
+      "path": "mtplx/server/omlx_bridge/tool_calling.py"
+    },
+    {
+      "bytes": 1365039,
+      "gitBlob": "3e4a998cfab7ab1aa5ec347390bafbf7e3e52ad7",
+      "path": "mtplx/server/openai.py"
+    },
+    {
+      "bytes": 37160,
+      "gitBlob": "266939017e28450b4adafc807aa30f5e3ee8e7e3",
+      "path": "mtplx/server/request_policy.py"
+    },
+    {
+      "bytes": 2339,
+      "gitBlob": "c401358b37a4ea971a0cb053819cca0f67478865",
+      "path": "mtplx/server/response_envelope.py"
+    },
+    {
+      "bytes": 2677,
+      "gitBlob": "7215ddea37f4e61b119ed97c60f7bd363475d8db",
+      "path": "mtplx/server_urls.py"
+    },
+    {
+      "bytes": 98549,
+      "gitBlob": "a9ac4afce871a732060b49734caf279b72b1a449",
+      "path": "mtplx/session_bank.py"
+    },
+    {
+      "bytes": 481,
+      "gitBlob": "3e57d4e91014414e099ced53d6a87c75b9af2d96",
+      "path": "mtplx/speculative.py"
+    },
+    {
+      "bytes": 19178,
+      "gitBlob": "a68880e8285212c608b76900ddbd073c1d7488bf",
+      "path": "mtplx/step3p5_mtp_patch.py"
+    },
+    {
+      "bytes": 1375,
+      "gitBlob": "fdc4eff3eaece93e833e4b255e6f2d6eeea36d89",
+      "path": "mtplx/swival.py"
+    },
+    {
+      "bytes": 99408,
+      "gitBlob": "6b9638a0fcce1044c2157fa0ba10399a2b90f70b",
+      "path": "mtplx/thermal.py"
+    },
+    {
+      "bytes": 5465,
+      "gitBlob": "ed2f2610a98d859fcca3845560f588c366ee98e9",
+      "path": "mtplx/thermal_sidecar.py"
+    },
+    {
+      "bytes": 17460,
+      "gitBlob": "fb3961579b7cc30acd2a539c2c616f0e21d4cc36",
+      "path": "mtplx/thinking_guard.py"
+    },
+    {
+      "bytes": 10790,
+      "gitBlob": "adfa4b6b426cffed6f8d1dd05a81ffe04fa6ec7c",
+      "path": "mtplx/trace_parity.py"
+    },
+    {
+      "bytes": 6329,
+      "gitBlob": "cbacd916498d63d52b811a7463c88908b1528fdf",
+      "path": "mtplx/turboquant.py"
+    },
+    {
+      "bytes": 1249,
+      "gitBlob": "b46b0b01da122eb478a0bb1d5b15f8a39a4a8a4e",
+      "path": "mtplx/ui/__init__.py"
+    },
+    {
+      "bytes": 2702,
+      "gitBlob": "eb62f764f3975eec7aded49dc8973a769eb9b441",
+      "path": "mtplx/ui/banner.py"
+    },
+    {
+      "bytes": 6122,
+      "gitBlob": "f471f355c157859e3dfd35dcd8e532c82be3c769",
+      "path": "mtplx/ui/chat_printer.py"
+    },
+    {
+      "bytes": 9977,
+      "gitBlob": "d6cf6ecbe820d800e7410e289daefda40af25ac3",
+      "path": "mtplx/ui/download_progress.py"
+    },
+    {
+      "bytes": 76096,
+      "gitBlob": "54f189e8404fbbe17ca52db709d81bff283ebbbb",
+      "path": "mtplx/ui/onboarding.py"
+    },
+    {
+      "bytes": 2738,
+      "gitBlob": "5708962f1bccdebd182763b772ff00880e02d86a",
+      "path": "mtplx/ui/panels.py"
+    },
+    {
+      "bytes": 4319,
+      "gitBlob": "8800c8d7430e1ea41a36dc0d79d92aa9f6c36408",
+      "path": "mtplx/ui/progress.py"
+    },
+    {
+      "bytes": 36334,
+      "gitBlob": "f8f79f304fae65b45ad32fc3d08c7ed40251ea0a",
+      "path": "mtplx/vendored_arrays_cache.py"
+    },
+    {
+      "bytes": 17060,
+      "gitBlob": "12cd7b42748a813fac96aad3685430dd89cd1ea7",
+      "path": "mtplx/vendored_hy_v3.py"
+    },
+    {
+      "bytes": 23990,
+      "gitBlob": "854457b5b775d0f3f43da1d0199683a20701bdd3",
+      "path": "mtplx/verify_kernels.py"
+    },
+    {
+      "bytes": 53195,
+      "gitBlob": "340098d14e547ab38d1ac205e025bac39c1aa6e8",
+      "path": "mtplx/verify_qmv.py"
+    },
+    {
+      "bytes": 131,
+      "gitBlob": "5533ce864d3d4e253c731d4a28d2240855155f0f",
+      "path": "mtplx/version.py"
+    },
+    {
+      "bytes": 2909,
+      "gitBlob": "c2faf08f2d36d4d464e2c28a794d419c32b03650",
+      "path": "mtplx/vision/__init__.py"
+    },
+    {
+      "bytes": 5267,
+      "gitBlob": "8cf53ba8e4031cf9c4e0ae7cd0e5c6854754f22c",
+      "path": "mtplx/vision/processing.py"
+    },
+    {
+      "bytes": 17966,
+      "gitBlob": "d4eb3b9e764f56755e640e905af9723f203d683e",
+      "path": "mtplx/vision/qwen3_vl_tower.py"
+    },
+    {
+      "bytes": 7890,
+      "gitBlob": "c5e87db9beb03e6e0cf555034914f61b88672ff0",
+      "path": "mtplx/vision/splice.py"
+    },
+    {
+      "bytes": 13439,
+      "gitBlob": "19e62f08bbc9d4732dd878fd14c87ccedaa6ef9e",
+      "path": "mtplx/vision_graft.py"
+    }
+  ],
+  "framing": "# BEGIN FILE: <path> and # END FILE: <path> comments around exact UTF-8 Git blobs",
+  "prefixes": [
+    {
+      "file": "python-source-1024.tokens.json",
+      "hashEncoding": "comma-joined ASCII decimal token IDs",
+      "tokenSHA256": "c9d89eb183050ae76337c18cefc80a0eac46949ed82e3f49acb2298046a1b077",
+      "tokens": 1024
+    },
+    {
+      "file": "python-source-16384.tokens.json",
+      "hashEncoding": "comma-joined ASCII decimal token IDs",
+      "tokenSHA256": "bc14eceaaf60b76061cec894a6a04e35815347bff7b8bb9c3ba8b536303a50bf",
+      "tokens": 16384
+    },
+    {
+      "file": "python-source-32768.tokens.json",
+      "hashEncoding": "comma-joined ASCII decimal token IDs",
+      "tokenSHA256": "3d393c81f779c8c19db1bdd39cf5cdea6f2ccd8454ec917d4e40b74e3f0a7c09",
+      "tokens": 32768
+    },
+    {
+      "file": "python-source-65536.tokens.json",
+      "hashEncoding": "comma-joined ASCII decimal token IDs",
+      "tokenSHA256": "3afacbf45c1578d96875c567673c46559c63353d45bd2cdc0551898a3c115fb0",
+      "tokens": 65536
+    }
+  ],
+  "schemaVersion": 1,
+  "selection": "Git path order of tracked mtplx/**/*.py files",
+  "sourceRepository": "https://github.com/youssofal/MTPLX",
+  "sourceRevision": "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
+  "tokenizerRepository": "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+  "tokenizerRevision": "123db8bcc7101455b00d9aad36c0e760c6e7de02"
+}
