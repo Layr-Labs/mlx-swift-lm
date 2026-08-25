@@ -70,6 +70,25 @@ enum DFlash2CycleEvaluationPlan {
     }
 }
 
+public enum DFlash2WidthPolicy: Equatable, Sendable {
+    case adaptive
+    case fixed(Int)
+
+    var isValid: Bool {
+        switch self {
+        case .adaptive: true
+        case .fixed(let width): (1 ... 8).contains(width)
+        }
+    }
+
+    func resolve(adaptiveWidth: Int) -> Int {
+        switch self {
+        case .adaptive: adaptiveWidth
+        case .fixed(let width): width
+        }
+    }
+}
+
 public final class DFlash2Session {
     private struct PrefetchedDraft {
         let stagedToken: MLXArray
@@ -81,6 +100,7 @@ public final class DFlash2Session {
     private let targetCache: [KVCache]
     private let draftCache: [DFlash2ContextKVCache]
     private let targetSampler: Qwen38TargetSampler
+    private let widthPolicy: DFlash2WidthPolicy
     private var contextPolicy: DFlash2ContextPolicy
     private var stagedToken: MLXArray?
     private var projectedDraftContext: MLXArray?
@@ -90,10 +110,15 @@ public final class DFlash2Session {
         target: any DFlash2QwenTarget,
         draft: DFlash2DraftModel,
         promptLength: Int,
+        widthPolicy: DFlash2WidthPolicy = .adaptive,
         seed: UInt64 = Qwen38TargetSampler.seed
     ) {
+        precondition(
+            widthPolicy.isValid,
+            "DFlash2 fixed width must be in 1...8")
         self.target = target
         self.draft = draft
+        self.widthPolicy = widthPolicy
         targetCache = target.newCache(parameters: nil)
         draftCache = draft.makeCache()
         targetSampler = Qwen38TargetSampler(seed: seed)
@@ -134,21 +159,14 @@ public final class DFlash2Session {
     }
 
     public func step(remainingOutputTokens: Int) -> DFlash2CycleResult {
-        return step(
-            physicalWidth: contextPolicy.nextPhysicalWidth,
-            remainingOutputTokens: remainingOutputTokens,
-            fixedNextWidth: nil,
-            prefetchNext: true)
-    }
-
-    public func fixedStep(
-        physicalWidth: Int,
-        remainingOutputTokens: Int
-    ) -> DFlash2CycleResult {
+        precondition(
+            remainingOutputTokens > 0,
+            "DFlash2 step requires a positive remaining output budget")
+        let physicalWidth = widthPolicy.resolve(
+            adaptiveWidth: contextPolicy.nextPhysicalWidth)
         return step(
             physicalWidth: physicalWidth,
             remainingOutputTokens: remainingOutputTokens,
-            fixedNextWidth: physicalWidth,
             prefetchNext: true)
     }
 
@@ -157,10 +175,12 @@ public final class DFlash2Session {
     /// no effect on production routing.
     public func warmStep(physicalWidth: Int) -> DFlash2CycleResult {
         precondition((1 ... 8).contains(physicalWidth))
+        precondition(
+            prefetchedDraft == nil,
+            "DFlash2 warm step cannot follow a prefetched production step")
         return step(
             physicalWidth: physicalWidth,
             remainingOutputTokens: .max,
-            fixedNextWidth: nil,
             prefetchNext: false)
     }
 
@@ -170,6 +190,9 @@ public final class DFlash2Session {
 
     public func diagnosticStep(physicalWidth width: Int) -> DFlash2CycleDiagnosticResult {
         precondition((1 ... 8).contains(width))
+        precondition(
+            prefetchedDraft == nil,
+            "DFlash2 diagnostic step cannot follow a prefetched production step")
         let stagedToken = stagedToken!
         let projectedDraftContext = projectedDraftContext!
         let drafted: MLXArray
@@ -291,7 +314,6 @@ public final class DFlash2Session {
     private func step(
         physicalWidth width: Int,
         remainingOutputTokens: Int,
-        fixedNextWidth: Int?,
         prefetchNext: Bool
     ) -> DFlash2CycleResult {
         let currentPrefetch = prefetchedDraft
@@ -366,7 +388,8 @@ public final class DFlash2Session {
                 self.projectedDraftContext!)
         }
         if willPrefetchNext {
-            let nextWidth = fixedNextWidth ?? contextPolicy.nextPhysicalWidth
+            let nextWidth = widthPolicy.resolve(
+                adaptiveWidth: contextPolicy.nextPhysicalWidth)
             let nextDrafted = prepareDraft(
                 stagedToken: nextToken,
                 projectedDraftContext: self.projectedDraftContext!,

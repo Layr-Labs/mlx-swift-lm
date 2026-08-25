@@ -5,6 +5,17 @@ import Testing
 
 @Suite("Qwen 3.8 DFlash2 speculative session")
 struct DFlash2SessionSurfaceTests {
+    @Test("step width is selected and validated once at construction")
+    func stepBoundaryContract() {
+        #expect(DFlash2WidthPolicy.adaptive.isValid)
+        #expect(DFlash2WidthPolicy.fixed(1).isValid)
+        #expect(DFlash2WidthPolicy.fixed(8).isValid)
+        #expect(!DFlash2WidthPolicy.fixed(0).isValid)
+        #expect(!DFlash2WidthPolicy.fixed(9).isValid)
+        #expect(DFlash2WidthPolicy.adaptive.resolve(adaptiveWidth: 6) == 6)
+        #expect(DFlash2WidthPolicy.fixed(8).resolve(adaptiveWidth: 6) == 8)
+    }
+
     @Test("next-draft prefetch does not force target-cache rollback first")
     func prefetchEvaluationPlan() {
         #expect(
@@ -29,9 +40,6 @@ struct DFlash2SessionSurfaceTests {
         let cycle: (DFlash2Session, Int) -> DFlash2CycleResult = {
             $0.step(remainingOutputTokens: $1)
         }
-        let fixedCycle: (DFlash2Session, Int, Int) -> DFlash2CycleResult = {
-            $0.fixedStep(physicalWidth: $1, remainingOutputTokens: $2)
-        }
         let warmCycle: (DFlash2Session, Int) -> DFlash2CycleResult = {
             $0.warmStep(physicalWidth: $1)
         }
@@ -41,7 +49,6 @@ struct DFlash2SessionSurfaceTests {
         _ = factory
         _ = prefill
         _ = cycle
-        _ = fixedCycle
         _ = warmCycle
         _ = diagnosticCycle
     }

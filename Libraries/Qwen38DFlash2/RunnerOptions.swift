@@ -33,6 +33,20 @@ public enum Qwen38RunnerMode: String, Equatable, Sendable {
     case benchmark
 }
 
+public enum Qwen38TargetProfile: String, Equatable, Sendable {
+    case stock
+    case dflash2
+}
+
+extension Qwen38RunnerMode {
+    public var targetProfile: Qwen38TargetProfile {
+        switch self {
+        case .autoregressive: .stock
+        case .dflash2, .benchmark: .dflash2
+        }
+    }
+}
+
 public enum Qwen38RunnerOptionError: Error, Equatable, CustomStringConvertible {
     case invalid(String)
 

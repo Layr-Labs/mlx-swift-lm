@@ -89,12 +89,18 @@ The unchanged target-only control does not construct or load the draft:
   --receipt /tmp/qwen38-ar.json
 ```
 
+Standalone `--mode ar` also leaves every target projection module unchanged.
+The AR legs inside `--mode benchmark` share the installed DFlash projection
+stack so one loaded model can execute the ABBA sequence; those legs are
+installed-stack controls, not stock-construction baselines.
+
 Both paths use target temperature `1.0`, top-p `0.95`, top-k `20`, and seed
 `42`. Draft proposals are greedy, matching the pinned DFlash2 benchmark. The
-JSON receipt stamps the exact Swift base, `mlx-swift`, MLX, MTPLX PR head,
-Yukon source, DFlash2 source, target artifact, and draft artifact revisions
-alongside the applied runtime settings and token digest. The runner serializes
-GPU ownership through `/tmp/mtplx-gpu-exclusive.lock` and
+schema-v2 JSON receipt omits local artifact paths, binds the canonical prompt
+token IDs by SHA-256, and stamps the exact Swift base, `mlx-swift`, MLX, MTPLX
+PR head, Yukon source, DFlash2 source, target artifact, and draft artifact
+revisions alongside the applied runtime settings and token digest. The runner
+serializes GPU ownership through `/tmp/mtplx-gpu-exclusive.lock` and
 requires the measured 512 MiB / 50-operation MLX command-buffer contract.
 On the measured 96-GiB-and-larger machine class it requests a wired limit of
 active bytes plus 64 MiB, capped 256 MiB below MLX's recommended working set;

@@ -695,6 +695,8 @@ public struct Qwen38ProjectionInstallReport: Sendable, Equatable {
 public enum Qwen38ProjectionInstallError: Error, CustomStringConvertible {
     case invalidModule(path: String, reason: String)
     case emptyOptimizedLane
+    case incompleteInstall(
+        expected: Qwen38ProjectionInstallReport, actual: Qwen38ProjectionInstallReport)
 
     public var description: String {
         switch self {
@@ -702,7 +704,200 @@ public enum Qwen38ProjectionInstallError: Error, CustomStringConvertible {
             "Qwen 3.8 projection invariant failed at \(path): \(reason)"
         case .emptyOptimizedLane:
             "Qwen 3.8 projection lane found no affine Q4 modules"
+        case .incompleteInstall(let expected, let actual):
+            "Qwen 3.8 projection lane is incomplete: expected "
+                + "\(expected.installed)/\(expected.preservedFusedGDNInputs)/"
+                + "\(expected.stockQuantized) installed/preserved/stock, got "
+                + "\(actual.installed)/\(actual.preservedFusedGDNInputs)/"
+                + "\(actual.stockQuantized)"
         }
+    }
+}
+
+private let qwen38ProductionProjectionInstall = Qwen38ProjectionInstallReport(
+    installed: 232,
+    preservedFusedGDNInputs: 192,
+    stockQuantized: 73)
+
+private let qwen38DraftProjectionInstall = Qwen38ProjectionInstallReport(
+    installed: 47,
+    preservedFusedGDNInputs: 0,
+    stockQuantized: 0)
+
+struct Qwen38ProductionProjectionInventory {
+    let optimized: Set<String>
+    let preserved: Set<String>
+    let stock: Set<String>
+}
+
+func qwen38ProductionProjectionInventory() -> Qwen38ProductionProjectionInventory {
+    var optimized = Set<String>()
+    var preserved = Set<String>()
+    var stock: Set<String> = ["lm_head"]
+    for layer in 0 ..< 64 {
+        let prefix = "model.layers.\(layer)"
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            let path = "\(prefix).mlp.\(projection)"
+            if layer >= 56 {
+                stock.insert(path)
+            } else {
+                optimized.insert(path)
+            }
+        }
+        if layer % 4 == 3 {
+            for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                optimized.insert("\(prefix).self_attn.\(projection)")
+            }
+        } else {
+            for projection in ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"] {
+                preserved.insert("\(prefix).linear_attn.\(projection)")
+            }
+            stock.insert("\(prefix).linear_attn.out_proj")
+        }
+    }
+    return Qwen38ProductionProjectionInventory(
+        optimized: optimized, preserved: preserved, stock: stock)
+}
+
+func qwen38DraftProjectionInventory() -> Set<String> {
+    var paths: Set<String> = ["fc", "candidate_selector.hidden_projection"]
+    for layer in 0 ..< 5 {
+        let prefix = "layers.\(layer)"
+        for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            paths.insert("\(prefix).self_attn.\(projection)")
+        }
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            paths.insert("\(prefix).mlp.\(projection)")
+        }
+        paths.insert("\(prefix).attention_conv.kernel_projection")
+        paths.insert("\(prefix).mlp_conv.kernel_projection")
+    }
+    return paths
+}
+
+private func qwen38TargetRelativeProjectionPath(_ path: String) -> String {
+    let prefix = "language_model."
+    return path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)) : path
+}
+
+private func qwen38DescribeInventoryMismatch(
+    expected: Set<String>, actual: Set<String>
+) -> String {
+    let missing = expected.subtracting(actual).sorted()
+    let unexpected = actual.subtracting(expected).sorted()
+    return "missing=\(missing), unexpected=\(unexpected)"
+}
+
+func validateQwen38AffineQuantizedLinear(
+    _ linear: QuantizedLinear,
+    path: String,
+    bits: Int,
+    groupSize: Int
+) throws {
+    guard linear.bits == bits,
+        linear.groupSize == groupSize,
+        linear.mode.rawValue == QuantizationMode.affine.rawValue
+    else {
+        throw Qwen38ProjectionInstallError.invalidModule(
+            path: path,
+            reason:
+                "expected affine Q\(bits)/G\(groupSize), got Q\(linear.bits)/G\(linear.groupSize)")
+    }
+    guard linear.bias == nil, linear.biases != nil else {
+        throw Qwen38ProjectionInstallError.invalidModule(
+            path: path, reason: "expected bias-free affine quantization")
+    }
+    guard linear.weight.dtype == .uint32,
+        linear.scales.dtype == .bfloat16,
+        linear.biases!.dtype == .bfloat16
+    else {
+        throw Qwen38ProjectionInstallError.invalidModule(
+            path: path, reason: "expected uint32 weights with BF16 scale and affine bias")
+    }
+}
+
+@discardableResult
+func validateQwen38DraftQuantization(in model: Module) throws -> Int {
+    var actual = Set<String>()
+    for (path, module) in model.leafModules().flattened() {
+        guard let linear = module as? QuantizedLinear else { continue }
+        guard ObjectIdentifier(type(of: linear)) == ObjectIdentifier(QuantizedLinear.self) else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: path,
+                reason: "expected an unwrapped QuantizedLinear after draft quantization")
+        }
+        try validateQwen38AffineQuantizedLinear(
+            linear, path: path, bits: 4, groupSize: 64)
+        actual.insert(path)
+    }
+    let expected = qwen38DraftProjectionInventory()
+    guard actual == expected else {
+        throw Qwen38ProjectionInstallError.invalidModule(
+            path: "<draft quantization inventory>",
+            reason: qwen38DescribeInventoryMismatch(expected: expected, actual: actual))
+    }
+    return actual.count
+}
+
+public func validateQwen38StockTargetQuantization(in model: Module) throws {
+    let expected = qwen38ProductionProjectionInventory()
+    var optimized = Set<String>()
+    var preserved = Set<String>()
+    var stock = Set<String>()
+    for (path, module) in model.leafModules().flattened() {
+        guard let linear = module as? QuantizedLinear else { continue }
+        guard ObjectIdentifier(type(of: linear)) == ObjectIdentifier(QuantizedLinear.self) else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: path,
+                reason: "expected an unwrapped QuantizedLinear in the stock target")
+        }
+        let relativePath = qwen38TargetRelativeProjectionPath(path)
+        if expected.stock.contains(relativePath) {
+            try validateQwen38AffineQuantizedLinear(
+                linear, path: path, bits: 8, groupSize: 64)
+            stock.insert(relativePath)
+        } else if expected.optimized.contains(relativePath) {
+            try validateQwen38AffineQuantizedLinear(
+                linear, path: path, bits: 4, groupSize: 32)
+            optimized.insert(relativePath)
+        } else if expected.preserved.contains(relativePath) {
+            try validateQwen38AffineQuantizedLinear(
+                linear, path: path, bits: 4, groupSize: 32)
+            preserved.insert(relativePath)
+        } else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: path, reason: "unexpected stock target projection")
+        }
+    }
+    for (label, expectedPaths, actualPaths) in [
+        ("optimized", expected.optimized, optimized),
+        ("preserved", expected.preserved, preserved),
+        ("stock", expected.stock, stock),
+    ] where expectedPaths != actualPaths {
+        throw Qwen38ProjectionInstallError.invalidModule(
+            path: "<stock target \(label) inventory>",
+            reason: qwen38DescribeInventoryMismatch(
+                expected: expectedPaths, actual: actualPaths))
+    }
+}
+
+func validateQwen38ProductionProjectionInstall(
+    _ report: Qwen38ProjectionInstallReport
+) throws {
+    guard report == qwen38ProductionProjectionInstall else {
+        throw Qwen38ProjectionInstallError.incompleteInstall(
+            expected: qwen38ProductionProjectionInstall,
+            actual: report)
+    }
+}
+
+private func validateQwen38DraftProjectionInstall(
+    _ report: Qwen38ProjectionInstallReport
+) throws {
+    guard report == qwen38DraftProjectionInstall else {
+        throw Qwen38ProjectionInstallError.incompleteInstall(
+            expected: qwen38DraftProjectionInstall,
+            actual: report)
     }
 }
 
@@ -736,17 +931,36 @@ private func installQwen38ProjectionStack(
     var replacements = [String: Module]()
     var preservedFusedGDNInputs = 0
     var stockQuantized = 0
+    var optimizedPaths = Set<String>()
+    var preservedPaths = Set<String>()
+    var stockPaths = Set<String>()
 
     for (path, module) in leaves {
-        guard let linear = module as? QuantizedLinear,
-            ObjectIdentifier(type(of: linear)) == ObjectIdentifier(QuantizedLinear.self)
-        else { continue }
+        guard let linear = module as? QuantizedLinear else { continue }
+        guard ObjectIdentifier(type(of: linear)) == ObjectIdentifier(QuantizedLinear.self) else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: path,
+                reason: "expected an unwrapped QuantizedLinear at installation")
+        }
+        let relativePath: String
+        switch profile {
+        case .targetFullStack:
+            relativePath = qwen38TargetRelativeProjectionPath(path)
+        case .dflashDraft:
+            relativePath = path
+        }
         guard linear.bits == 4 && linear.mode.rawValue == QuantizationMode.affine.rawValue else {
+            try validateQwen38AffineQuantizedLinear(
+                linear, path: path, bits: 8, groupSize: 64)
             stockQuantized += 1
+            stockPaths.insert(relativePath)
             continue
         }
         if gdnSourceSuffixes.contains(where: path.hasSuffix) {
+            try validateQwen38AffineQuantizedLinear(
+                linear, path: path, bits: 4, groupSize: 32)
             preservedFusedGDNInputs += 1
+            preservedPaths.insert(relativePath)
             continue
         }
         let (n, k) = linear.shape
@@ -771,17 +985,54 @@ private func installQwen38ProjectionStack(
         }
         switch profile {
         case .targetFullStack:
+            try validateQwen38AffineQuantizedLinear(
+                linear, path: path, bits: 4, groupSize: 32)
             replacements[path] = Qwen38OptimizedQuantizedLinear(source: linear)
+            optimizedPaths.insert(relativePath)
         case .dflashDraft:
-            guard linear.groupSize == 64 else {
-                throw Qwen38ProjectionInstallError.invalidModule(
-                    path: path,
-                    reason: "draft VerifyQuantizedLinear requires Q4/G64")
-            }
+            try validateQwen38AffineQuantizedLinear(
+                linear, path: path, bits: 4, groupSize: 64)
             replacements[path] = Qwen38DraftQuantizedLinear(source: linear)
+            optimizedPaths.insert(relativePath)
         }
     }
     guard !replacements.isEmpty else { throw Qwen38ProjectionInstallError.emptyOptimizedLane }
+    let report = Qwen38ProjectionInstallReport(
+        installed: replacements.count,
+        preservedFusedGDNInputs: preservedFusedGDNInputs,
+        stockQuantized: stockQuantized)
+    switch profile {
+    case .targetFullStack:
+        try validateQwen38ProductionProjectionInstall(report)
+        let expected = qwen38ProductionProjectionInventory()
+        guard optimizedPaths == expected.optimized else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: "<optimized inventory>",
+                reason: qwen38DescribeInventoryMismatch(
+                    expected: expected.optimized, actual: optimizedPaths))
+        }
+        guard preservedPaths == expected.preserved else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: "<preserved inventory>",
+                reason: qwen38DescribeInventoryMismatch(
+                    expected: expected.preserved, actual: preservedPaths))
+        }
+        guard stockPaths == expected.stock else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: "<stock inventory>",
+                reason: qwen38DescribeInventoryMismatch(
+                    expected: expected.stock, actual: stockPaths))
+        }
+    case .dflashDraft:
+        try validateQwen38DraftProjectionInstall(report)
+        let expected = qwen38DraftProjectionInventory()
+        guard optimizedPaths == expected else {
+            throw Qwen38ProjectionInstallError.invalidModule(
+                path: "<draft inventory>",
+                reason: qwen38DescribeInventoryMismatch(
+                    expected: expected, actual: optimizedPaths))
+        }
+    }
     // Apply each replacement at its direct owning module. This avoids both
     // sparse-array reconstruction and unrelated non-ModuleInfo leaves (such as
     // RoPE helpers) while keeping every mutation at the construction boundary.
@@ -819,8 +1070,5 @@ private func installQwen38ProjectionStack(
     case .dflashDraft:
         break
     }
-    return Qwen38ProjectionInstallReport(
-        installed: replacements.count,
-        preservedFusedGDNInputs: preservedFusedGDNInputs,
-        stockQuantized: stockQuantized)
+    return report
 }

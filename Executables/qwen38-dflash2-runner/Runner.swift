@@ -1,4 +1,3 @@
-import CryptoKit
 import Darwin
 import Foundation
 import MLX
@@ -56,15 +55,12 @@ private struct RunReceipt: Codable, Sendable {
 }
 
 private struct RunnerReceipt: Codable, Sendable {
+    let schemaVersion: Int
     let createdAt: String
-    let targetPath: String
-    let draftPath: String?
-    let targetRepository: String
-    let targetRevision: String
-    let targetConfigSHA256: String
-    let draftRepository: String
-    let draftRevision: String
-    let draftConfigSHA256: String?
+    let targetArtifact: Qwen38ReceiptArtifact
+    let draftArtifact: Qwen38ReceiptArtifact?
+    let promptTokenSHA256: String
+    let targetProfile: String
     let swiftPortRevision: String
     let swiftBaseRevision: String
     let mlxSwiftRevision: String
@@ -97,8 +93,7 @@ private struct RunnerOutcome: Sendable {
 }
 
 private func tokenDigest(_ tokens: [Int]) -> String {
-    let data = Data(tokens.map(String.init).joined(separator: ",").utf8)
-    return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    Qwen38TokenDigest.sha256(tokens)
 }
 
 private func installRuntimeContract() throws {
@@ -221,7 +216,10 @@ private func runDFlash2(
     fixedPhysicalWidth: Int?
 ) -> (tokens: [Int], receipt: RunReceipt) {
     let session = DFlash2Session(
-        target: target, draft: draft, promptLength: prompt.dim(1))
+        target: target,
+        draft: draft,
+        promptLength: prompt.dim(1),
+        widthPolicy: fixedPhysicalWidth.map(DFlash2WidthPolicy.fixed) ?? .adaptive)
     let prefillStart = CFAbsoluteTimeGetCurrent()
     session.prefill(promptTokens: prompt)
     let prefillSeconds = CFAbsoluteTimeGetCurrent() - prefillStart
@@ -229,18 +227,9 @@ private func runDFlash2(
     let decodeStart = CFAbsoluteTimeGetCurrent()
     var generated = [Int]()
     generated.reserveCapacity(outputBudget)
-    let nextCycle: (Int) -> DFlash2CycleResult
-    if let fixedPhysicalWidth {
-        nextCycle = {
-            session.fixedStep(
-                physicalWidth: fixedPhysicalWidth,
-                remainingOutputTokens: $0)
-        }
-    } else {
-        nextCycle = { session.step(remainingOutputTokens: $0) }
-    }
     while generated.count < outputBudget {
-        let cycle = nextCycle(outputBudget - generated.count)
+        let cycle = session.step(
+            remainingOutputTokens: outputBudget - generated.count)
         let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
         generated.append(contentsOf: cycleTokens.prefix(outputBudget - generated.count))
     }
@@ -273,7 +262,10 @@ private func diagnoseDFlash2Cycles(
     fixedPhysicalWidth: Int?
 ) -> (tokens: [Int], receipt: RunReceipt) {
     let session = DFlash2Session(
-        target: target, draft: draft, promptLength: prompt.dim(1))
+        target: target,
+        draft: draft,
+        promptLength: prompt.dim(1),
+        widthPolicy: fixedPhysicalWidth.map(DFlash2WidthPolicy.fixed) ?? .adaptive)
     session.prefill(promptTokens: prompt)
 
     var generated = [Int]()
@@ -328,7 +320,10 @@ private func diagnosePrefetchedDFlash2Cycles(
     fixedPhysicalWidth: Int?
 ) -> (tokens: [Int], receipt: RunReceipt) {
     let session = DFlash2Session(
-        target: target, draft: draft, promptLength: prompt.dim(1))
+        target: target,
+        draft: draft,
+        promptLength: prompt.dim(1),
+        widthPolicy: fixedPhysicalWidth.map(DFlash2WidthPolicy.fixed) ?? .adaptive)
     session.prefill(promptTokens: prompt)
 
     var generated = [Int]()
@@ -337,14 +332,7 @@ private func diagnosePrefetchedDFlash2Cycles(
     generated.reserveCapacity(outputBudget)
     while generated.count < outputBudget {
         let remaining = outputBudget - generated.count
-        let cycle: DFlash2CycleResult
-        if let fixedPhysicalWidth {
-            cycle = session.fixedStep(
-                physicalWidth: fixedPhysicalWidth,
-                remainingOutputTokens: remaining)
-        } else {
-            cycle = session.step(remainingOutputTokens: remaining)
-        }
+        let cycle = session.step(remainingOutputTokens: remaining)
         let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
         generated.append(contentsOf: cycleTokens.prefix(remaining))
         acceptanceHistory.append(cycle.acceptedDraftTokens)
@@ -445,8 +433,18 @@ private struct Qwen38DFlash2Runner {
                         "target model is not the pinned Qwen 3.8 text model: "
                             + "\(type(of: context.model))")
                 }
-                let targetProjectionReport = try installQwen38ProjectionStack(
-                    in: context.model)
+                let targetProjectionReport: Qwen38ProjectionInstallReport
+                switch options.mode.targetProfile {
+                case .stock:
+                    try validateQwen38StockTargetQuantization(in: context.model)
+                    targetProjectionReport = Qwen38ProjectionInstallReport(
+                        installed: 0,
+                        preservedFusedGDNInputs: 0,
+                        stockQuantized: 73)
+                case .dflash2:
+                    targetProjectionReport = try installQwen38ProjectionStack(
+                        in: context.model)
+                }
                 let ids = try promptTokens(options: options, tokenizer: context.tokenizer)
                 guard !ids.isEmpty else {
                     throw RunnerError.message("prompt token sequence is empty")
@@ -556,15 +554,20 @@ private struct Qwen38DFlash2Runner {
                     ? nil
                     : context.tokenizer.decode(tokenIds: runs[0].tokens)
                 let receipt = RunnerReceipt(
+                    schemaVersion: 2,
                     createdAt: ISO8601DateFormatter().string(from: Date()),
-                    targetPath: options.targetPath,
-                    draftPath: options.draftPath,
-                    targetRepository: manifest.targetArtifact.repository,
-                    targetRevision: manifest.targetArtifact.revision,
-                    targetConfigSHA256: targetConfigSHA256,
-                    draftRepository: manifest.draftArtifact.repository,
-                    draftRevision: manifest.draftArtifact.revision,
-                    draftConfigSHA256: draftConfigSHA256,
+                    targetArtifact: Qwen38ReceiptArtifact(
+                        repository: manifest.targetArtifact.repository,
+                        revision: manifest.targetArtifact.revision,
+                        configSHA256: targetConfigSHA256),
+                    draftArtifact: draftConfigSHA256.map {
+                        Qwen38ReceiptArtifact(
+                            repository: manifest.draftArtifact.repository,
+                            revision: manifest.draftArtifact.revision,
+                            configSHA256: $0)
+                    },
+                    promptTokenSHA256: Qwen38TokenDigest.sha256(ids),
+                    targetProfile: options.mode.targetProfile.rawValue,
                     swiftPortRevision: BenchBuildRevision.value,
                     swiftBaseRevision: manifest.swiftBaseRevision,
                     mlxSwiftRevision: manifest.mlxSwiftRevision,

@@ -162,6 +162,7 @@ public final class DFlash2DraftModel: Module, @unchecked Sendable {
             groupSize: runtimeQuantization.groupSize,
             bits: runtimeQuantization.bits,
             mode: runtimeQuantization.mode)
+        try validateQwen38DraftQuantization(in: model)
         eval(model)
         return model
     }

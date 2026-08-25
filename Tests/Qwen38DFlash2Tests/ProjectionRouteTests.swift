@@ -4,6 +4,57 @@ import Testing
 
 @Suite("Qwen 3.8 projection route table")
 struct Qwen38ProjectionRouteTests {
+    @Test("production installation requires the complete pinned module set")
+    func productionInstallContract() throws {
+        let complete = Qwen38ProjectionInstallReport(
+            installed: 232,
+            preservedFusedGDNInputs: 192,
+            stockQuantized: 73)
+        try validateQwen38ProductionProjectionInstall(complete)
+
+        for incomplete in [
+            Qwen38ProjectionInstallReport(
+                installed: 231,
+                preservedFusedGDNInputs: 192,
+                stockQuantized: 73),
+            Qwen38ProjectionInstallReport(
+                installed: 232,
+                preservedFusedGDNInputs: 191,
+                stockQuantized: 73),
+            Qwen38ProjectionInstallReport(
+                installed: 232,
+                preservedFusedGDNInputs: 192,
+                stockQuantized: 72),
+        ] {
+            #expect(throws: Qwen38ProjectionInstallError.self) {
+                try validateQwen38ProductionProjectionInstall(incomplete)
+            }
+        }
+    }
+
+    @Test("production installation inventory is path exact")
+    func productionInstallInventory() {
+        let inventory = qwen38ProductionProjectionInventory()
+        #expect(inventory.optimized.count == 232)
+        #expect(inventory.preserved.count == 192)
+        #expect(inventory.stock.count == 73)
+        #expect(inventory.optimized.contains("model.layers.3.self_attn.q_proj"))
+        #expect(inventory.preserved.contains("model.layers.0.linear_attn.in_proj_qkv"))
+        #expect(inventory.stock.contains("model.layers.56.mlp.down_proj"))
+        #expect(inventory.stock.contains("lm_head"))
+        #expect(!inventory.optimized.contains("model.layers.0.linear_attn.out_proj"))
+    }
+
+    @Test("draft quantization inventory covers every exact linear")
+    func draftInstallInventory() {
+        let inventory = qwen38DraftProjectionInventory()
+        #expect(inventory.count == 47)
+        #expect(inventory.contains("fc"))
+        #expect(inventory.contains("layers.0.self_attn.q_proj"))
+        #expect(inventory.contains("layers.4.mlp_conv.kernel_projection"))
+        #expect(inventory.contains("candidate_selector.hidden_projection"))
+    }
+
     @Test("retained width and shape island is exact")
     func retainedRouteTable() {
         #expect(qwen38ProjectionRoute(width: 4, k: 5_120, n: 17_408) == .m4KConstSplit)

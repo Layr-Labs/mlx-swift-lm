@@ -5,6 +5,13 @@ import Testing
 
 @Suite("Qwen 3.8 DFlash2 runner options")
 struct Qwen38DFlash2RunnerOptionsTests {
+    @Test("standalone AR uses the unchanged stock target construction")
+    func targetConstructionProfile() {
+        #expect(Qwen38RunnerMode.autoregressive.targetProfile == .stock)
+        #expect(Qwen38RunnerMode.dflash2.targetProfile == .dflash2)
+        #expect(Qwen38RunnerMode.benchmark.targetProfile == .dflash2)
+    }
+
     @Test("parses the pinned local runner surface")
     func parse() throws {
         let options = try Qwen38RunnerOptions.parse([
