@@ -26,6 +26,17 @@ public enum Qwen35DFlashCapturePlan {
     }
 }
 
+/// Retained row-24/26 command-submission boundaries. Values are exclusive
+/// layer ends so they compose directly with the fixed DFlash capture segments.
+public enum Qwen35DFlashEvaluationPlan {
+    public static let decodeExclusiveEnds = [1, 2, 10, 20, 30, 40, 50, 58]
+
+    public static func prefillExclusiveEnds(stride step: Int) -> [Int] {
+        precondition(step == 3 || step == 4)
+        return [1] + stride(from: step, through: 63, by: step)
+    }
+}
+
 public struct Qwen35DFlashForwardResult {
     public let logits: MLXArray
     public let targetFeatures: MLXArray
@@ -1245,6 +1256,41 @@ final class Qwen35Attention: Module {
         return oProj(sigmoidMultiply(output, gate))
     }
 
+    /// Direct row-21 DFlash route. The outer DFlash entrypoint owns phase
+    /// selection; lengths above row 24's proven bound use the ordinary path.
+    func dflashCallAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        if L > 32 { return callAsFunction(x, mask: mask, cache: cache) }
+
+        let qProjection = qProj(x)
+        let qSplit = qProjection.reshaped(B, L, 24, -1).split(parts: 2, axis: -1)
+        let queries = qSplit[0]
+        let gate = qSplit[1].reshaped(B, L, -1)
+        let keys = kProj(x).reshaped(B, L, 4, 256)
+        let values = vProj(x).reshaped(B, L, 4, 256).transposed(0, 2, 1, 3)
+        let (rotatedQueries, rotatedKeys) = qwen38FusedQKRMSRoPE(
+            queries: queries,
+            keys: keys,
+            queryWeight: qNorm.weight,
+            keyWeight: kNorm.weight,
+            epsilon: qNorm.eps,
+            offset: cache?.offset ?? 0)
+        let output = attentionWithCacheUpdate(
+            queries: rotatedQueries,
+            keys: rotatedKeys,
+            values: values,
+            cache: cache,
+            scale: scale,
+            mask: mask
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
+        return oProj(sigmoidMultiply(output, gate))
+    }
+
     func cbv2Forward(
         _ x: MLXArray, cache: any CBv2AttendingLayerCache,
         positionIds: MLXArray? = nil,
@@ -1575,6 +1621,48 @@ final class Qwen35DecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
+    /// Row-48 DFlash boundary step. Once the DFlash route is constructed, the
+    /// residual base and MLP delta remain split between layers so both residual
+    /// additions can share the fused add + RMSNorm kernel.
+    @inline(__always)
+    func dflashBoundaryStep(
+        base: MLXArray,
+        delta: MLXArray?,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?,
+        nConfirmed: Int
+    ) -> (base: MLXArray, delta: MLXArray) {
+        let hiddenInput: MLXArray
+        let normalizedInput: MLXArray
+        if let delta {
+            (hiddenInput, normalizedInput) = qwen38FusedAddRMSNorm(
+                base: base,
+                delta: delta,
+                weight: inputLayerNorm.weight,
+                epsilon: inputLayerNorm.eps)
+        } else {
+            hiddenInput = base
+            normalizedInput = inputLayerNorm(base)
+        }
+
+        let residual: MLXArray
+        if isLinear {
+            residual = linearAttn!(
+                normalizedInput, mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed)
+        } else {
+            residual = selfAttn!.dflashCallAsFunction(
+                normalizedInput, mask: attentionMask, cache: cache)
+        }
+        let (nextBase, mlpInput) = qwen38FusedAddRMSNorm(
+            base: hiddenInput,
+            delta: residual,
+            weight: postAttentionLayerNorm.weight,
+            epsilon: postAttentionLayerNorm.eps)
+        return (nextBase, (mlp as! UnaryLayer)(mlpInput))
+    }
+
     func cbv2Forward(
         _ x: MLXArray,
         modelLayerIndex: Int,
@@ -1699,25 +1787,167 @@ public class Qwen35TextModelInner: Module {
     }
 
     @inline(__always)
-    private func dflashSegment(
-        _ hiddenStates: MLXArray,
+    private func dflashBoundarySegment(
+        _ state: (base: MLXArray, delta: MLXArray?),
         range: Range<Int>,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: [KVCache?],
         nConfirmed: Int
-    ) -> MLXArray {
-        var hiddenStates = hiddenStates
+    ) -> (base: MLXArray, delta: MLXArray?) {
+        var state = state
         for i in range {
             let layer = layers[i]
-            hiddenStates = layer(
-                hiddenStates,
+            state = layer.dflashBoundaryStep(
+                base: state.base,
+                delta: state.delta,
                 attentionMask: layer.isLinear ? .none : attentionMask,
                 ssmMask: layer.isLinear ? ssmMask : nil,
                 cache: cache[i],
                 nConfirmed: nConfirmed)
         }
-        return hiddenStates
+        return state
+    }
+
+    @inline(__always)
+    private func dflashEvaluatedBoundarySegment(
+        _ state: (base: MLXArray, delta: MLXArray?),
+        range: Range<Int>,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (base: MLXArray, delta: MLXArray?) {
+        let state = dflashBoundarySegment(
+            state, range: range, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        asyncEval(dflashBoundaryHidden(state))
+        return state
+    }
+
+    @inline(__always)
+    private func dflashBoundaryHidden(
+        _ state: (base: MLXArray, delta: MLXArray?)
+    ) -> MLXArray {
+        if let delta = state.delta { return state.base + delta }
+        return state.base
+    }
+
+    private func dflashDecodeForward(
+        _ hiddenStates: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (hidden: MLXArray, features: MLXArray) {
+        var state = dflashEvaluatedBoundarySegment(
+            (hiddenStates, nil), range: 0 ..< 1, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 1 ..< 2, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 2 ..< 6, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature5 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 6 ..< 10, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 10 ..< 20, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature19 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 20 ..< 30, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 30 ..< 34, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature33 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 34 ..< 40, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 40 ..< 48, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature47 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 48 ..< 50, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 50 ..< 58, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 58 ..< 62, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature61 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 62 ..< 64, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        return (
+            dflashBoundaryHidden(state),
+            concatenated([feature5, feature19, feature33, feature47, feature61], axis: -1))
+    }
+
+    private func dflashPrefillForward(
+        _ hiddenStates: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (hidden: MLXArray, features: MLXArray) {
+        var state = dflashEvaluatedBoundarySegment(
+            (hiddenStates, nil), range: 0 ..< 1, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 1 ..< 3, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 3 ..< 6, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature5 = dflashBoundaryHidden(state)
+        for range in [6 ..< 9, 9 ..< 12, 12 ..< 15, 15 ..< 18] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        state = dflashBoundarySegment(
+            state, range: 18 ..< 20, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature19 = dflashBoundaryHidden(state)
+        for range in [20 ..< 21, 21 ..< 24, 24 ..< 27, 27 ..< 30, 30 ..< 33] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        state = dflashBoundarySegment(
+            state, range: 33 ..< 34, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature33 = dflashBoundaryHidden(state)
+        for range in [34 ..< 36, 36 ..< 39, 39 ..< 42, 42 ..< 45, 45 ..< 48] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        let feature47 = dflashBoundaryHidden(state)
+        for range in [48 ..< 51, 51 ..< 54, 54 ..< 57, 57 ..< 60] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        state = dflashBoundarySegment(
+            state, range: 60 ..< 62, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature61 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 62 ..< 63, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 63 ..< 64, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        return (
+            dflashBoundaryHidden(state),
+            concatenated([feature5, feature19, feature33, feature47, feature61], axis: -1))
     }
 
     /// Shape-locked DFlash2 target forward. The six fixed segments encode the
@@ -1732,32 +1962,44 @@ public class Qwen35TextModelInner: Module {
         let attentionMask = createAttentionMask(h: hidden, cache: cache[faIdx])
         let ssmMask = createSSMMask(h: hidden, cache: cache[ssmIdx] as? MambaCache)
 
-        hidden = dflashSegment(
-            hidden, range: 0 ..< 6, attentionMask: attentionMask,
+        if inputs.dim(1) <= 9 {
+            return dflashDecodeForward(
+                hidden, attentionMask: attentionMask, ssmMask: ssmMask,
+                cache: cache, nConfirmed: nConfirmed)
+        }
+        if inputs.dim(1) >= 512 {
+            return dflashPrefillForward(
+                hidden, attentionMask: attentionMask, ssmMask: ssmMask,
+                cache: cache, nConfirmed: nConfirmed)
+        }
+
+        var state: (base: MLXArray, delta: MLXArray?) = (hidden, nil)
+        state = dflashBoundarySegment(
+            state, range: 0 ..< 6, attentionMask: attentionMask,
             ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
-        let feature5 = hidden
-        hidden = dflashSegment(
-            hidden, range: 6 ..< 20, attentionMask: attentionMask,
+        let feature5 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 6 ..< 20, attentionMask: attentionMask,
             ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
-        let feature19 = hidden
-        hidden = dflashSegment(
-            hidden, range: 20 ..< 34, attentionMask: attentionMask,
+        let feature19 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 20 ..< 34, attentionMask: attentionMask,
             ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
-        let feature33 = hidden
-        hidden = dflashSegment(
-            hidden, range: 34 ..< 48, attentionMask: attentionMask,
+        let feature33 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 34 ..< 48, attentionMask: attentionMask,
             ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
-        let feature47 = hidden
-        hidden = dflashSegment(
-            hidden, range: 48 ..< 62, attentionMask: attentionMask,
+        let feature47 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 48 ..< 62, attentionMask: attentionMask,
             ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
-        let feature61 = hidden
-        hidden = dflashSegment(
-            hidden, range: 62 ..< 64, attentionMask: attentionMask,
+        let feature61 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 62 ..< 64, attentionMask: attentionMask,
             ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
 
         return (
-            hidden,
+            dflashBoundaryHidden(state),
             concatenated(
                 [feature5, feature19, feature33, feature47, feature61],
                 axis: -1)

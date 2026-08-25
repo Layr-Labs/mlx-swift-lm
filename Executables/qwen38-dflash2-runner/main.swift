@@ -69,6 +69,9 @@ private struct RunnerReceipt: Codable, Sendable {
     let commandBufferMegabytes: Int
     let commandBufferOperations: Int
     let dflashPhysicalWidth: Int
+    let targetOptimizedProjections: Int
+    let targetPreservedFusedGDNInputs: Int
+    let draftOptimizedProjections: Int
     let activeMemoryAtConstruction: Int
     let wiredMemoryLimit: Int
     let wiredMemoryApplied: Int
@@ -307,6 +310,9 @@ private struct Qwen38DFlash2Runner {
             } else {
                 draft = nil
             }
+            let draftProjectionReport = try draft.map {
+                try installQwen38ProjectionStack(in: $0)
+            }
             let outcome = try await container.perform {
                 (context: ModelContext) async throws -> RunnerOutcome in
                 guard let target = context.model as? any DFlash2QwenTarget else {
@@ -314,6 +320,8 @@ private struct Qwen38DFlash2Runner {
                         "target model is not the pinned Qwen 3.8 text model: "
                             + "\(type(of: context.model))")
                 }
+                let targetProjectionReport = try installQwen38ProjectionStack(
+                    in: context.model)
                 let ids = try promptTokens(options: options, tokenizer: context.tokenizer)
                 guard !ids.isEmpty else {
                     throw RunnerError.message("prompt token sequence is empty")
@@ -401,6 +409,10 @@ private struct Qwen38DFlash2Runner {
                     commandBufferMegabytes: 512,
                     commandBufferOperations: 50,
                     dflashPhysicalWidth: options.dflashPhysicalWidth ?? 0,
+                    targetOptimizedProjections: targetProjectionReport.installed,
+                    targetPreservedFusedGDNInputs:
+                        targetProjectionReport.preservedFusedGDNInputs,
+                    draftOptimizedProjections: draftProjectionReport?.installed ?? 0,
                     activeMemoryAtConstruction: activeMemoryAtConstruction,
                     wiredMemoryLimit: wiredMemoryLimit ?? 0,
                     wiredMemoryApplied: wiredMemoryApplied,
