@@ -66,14 +66,31 @@ The raw JSON receipts contain all 129 prompt token IDs, all 100 generated token 
 
 The matched command differs from the explicit fast smoke only at `--output-parity byte-exact` and the output filenames. Every receipt records schema 2, `outputParity=byte-exact`, `verificationRoute=serial-byte-exact`, and `verify=serial_target`. Raw evidence is `full-k2-c8192-byte-exact-rep{1,2,3}-20260825.{json,md}`.
 
-## Prefill receipt
+## Prefill receipts
 
-| prompt | stock median TTFT | retained median TTFT | TTFT reduction | stock throughput | retained throughput | uplift |
-|---|---:|---:|---:|---:|---:|---:|
+The summary is calculated from the following 12 individual locked-GPU runs; no 8K or 32K repetition is hidden behind the median.
+
+| prompt | route | run | TTFT | prompt throughput | raw receipt |
+|---:|---|---:|---:|---:|---|
+| 8192 | stock 512-token stripe | 1 | 2876.7 ms | 2847.7 tok/s | [stock 8K rep 1](prefill-stock-L8192-rep1-20260824.md) |
+| 8192 | stock 512-token stripe | 2 | 3086.7 ms | 2653.9 tok/s | [stock 8K rep 2](prefill-stock-L8192-rep2-20260824.md) |
+| 8192 | stock 512-token stripe | 3 | 2986.7 ms | 2742.8 tok/s | [stock 8K rep 3](prefill-stock-L8192-rep3-20260824.md) |
+| 8192 | optimized 8192-token stripe | 1 | 1677.2 ms | 4884.4 tok/s | [optimized 8K rep 1](prefill-c8192-L8192-rep1-20260824.md) |
+| 8192 | optimized 8192-token stripe | 2 | 1803.8 ms | 4541.6 tok/s | [optimized 8K rep 2](prefill-c8192-L8192-rep2-20260824.md) |
+| 8192 | optimized 8192-token stripe | 3 | 1714.8 ms | 4777.3 tok/s | [optimized 8K rep 3](prefill-c8192-L8192-rep3-20260824.md) |
+| 32768 | stock 512-token stripe | 1 | 14356.3 ms | 2282.5 tok/s | [stock 32K rep 1](prefill-stock-L32768-rep1-20260824.md) |
+| 32768 | stock 512-token stripe | 2 | 14920.7 ms | 2196.1 tok/s | [stock 32K rep 2](prefill-stock-L32768-rep2-20260824.md) |
+| 32768 | stock 512-token stripe | 3 | 14647.6 ms | 2237.1 tok/s | [stock 32K rep 3](prefill-stock-L32768-rep3-20260824.md) |
+| 32768 | optimized 8192-token stripe | 1 | 9640.7 ms | 3398.9 tok/s | [optimized 32K rep 1](prefill-c8192-L32768-rep1-20260824.md) |
+| 32768 | optimized 8192-token stripe | 2 | 9650.8 ms | 3395.4 tok/s | [optimized 32K rep 2](prefill-c8192-L32768-rep2-20260824.md) |
+| 32768 | optimized 8192-token stripe | 3 | 9578.1 ms | 3421.1 tok/s | [optimized 32K rep 3](prefill-c8192-L32768-rep3-20260824.md) |
+
+| prompt | stock median TTFT | optimized median TTFT | TTFT reduction | stock median throughput | optimized median throughput | uplift |
+|---:|---:|---:|---:|---:|---:|---:|
 | 8192 | 2986.7 ms | 1714.8 ms | 42.6% | 2742.8 tok/s | 4777.3 tok/s | 1.742x |
 | 32768 | 14647.6 ms | 9640.7 ms | 34.2% | 2237.1 tok/s | 3398.9 tok/s | 1.519x |
 
-Raw matched reports are `prefill-{stock,c8192}-L{8192,32768}-rep{1,2,3}-20260824.md`. The retained peak memory was 23.86 GiB at 8K and 29.09 GiB at 32K. A 16K stripe was rejected because it was 4.6% slower at 32K and used 26.4% more peak memory than the 8K stripe.
+The optimized peak memory was 23.86 GiB at 8K and 29.09 GiB at 32K. A 16K stripe was rejected because it was 4.6% slower at 32K and used 26.4% more peak memory than the 8K stripe.
 
 The cause of slow stock prefill is construction geometry: the default 512-token solo stripe fragments long prompts into too many target dispatches. The retained 8192-token stripe is installed once at engine construction. The optimized decode closures route only on logical M; artifact metadata and dtype are not revalidated, and no environment read, engagement counter, or invariant-based stock fallback exists in the measured hot path.
 
