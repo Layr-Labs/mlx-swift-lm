@@ -334,6 +334,10 @@ public struct CBv2EngineLoopConfig: Sendable {
 /// finalization materializes them (the ONE host sync per step, overlapped
 /// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
+    /// Exact scheduler work launched by this step. Scheduler records already
+    /// contain these optimistic advances; deadline projection subtracts them
+    /// to recover confirmed cursors, then charges the full work once.
+    let assignments: [(id: CBv2RequestID, numTokens: Int)]
     /// Every request that computed anything this step (KV release for any of
     /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
     let participants: Set<CBv2RequestID>
@@ -358,11 +362,14 @@ final class CBv2InFlightStep {
     /// KV states whose release is fenced behind this step's completion.
     /// `rollbackOne` scrubs the wasted-token KV tail before release;
     /// `donation` (non-nil for natural finishes with prefix caching on)
-    /// routes the retired state through the donation queue.
+    /// routes the retired state through the donation queue. Normal terminal
+    /// delivery follows retirement so observing it also means the request ID
+    /// is reusable; watchdog terminals remain the explicit exception.
     fileprivate var deferredReleases:
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
-            donation: CBv2DonationIntent?, recurrent: CBv2RecurrentRequestState?
+            donation: CBv2DonationIntent?, recurrent: CBv2RecurrentRequestState?,
+            ownership: CBv2OutputStream?, terminalDelivery: (() -> Void)?
         )] = []
     /// One recurrent transaction per participating row. A normal finalized
     /// step commits it; a one-step-late discarded chained decode rolls it
@@ -376,10 +383,12 @@ final class CBv2InFlightStep {
     var mtpRound: CBv2MTPRoundInFlight?
 
     init(
+        assignments: [(id: CBv2RequestID, numTokens: Int)],
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
         sampledTokens: MLXArray?, evalTargets: [MLXArray],
         wallStartedNanos: UInt64
     ) {
+        self.assignments = assignments
         self.participants = participants
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
@@ -436,6 +445,75 @@ struct CBv2PrefixUsage {
         strategy: nil,
         replayTokens: 0,
         boundarySplits: 0)
+}
+
+enum CBv2FirstTokenDeadlineEnqueueOutcome: Sendable {
+    case admitted(
+        CBv2FirstTokenProjectedWork,
+        admittedAt: ContinuousClock.Instant
+    )
+    case deadlineUnreachable(CBv2FirstTokenProjectedWork)
+    case cancelled
+    case schedulerRejected(CBv2SchedulerError)
+    case capacityRejected
+}
+
+/// Exactly-once handoff for async deadline submission. The engine queue,
+/// caller cancellation, and watchdog/shutdown failure paths can race; the
+/// winner resumes the caller and releases its pending-submit gauge.
+private final class CBv2FirstTokenDeadlineWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation:
+        CheckedContinuation<CBv2FirstTokenDeadlineEnqueueOutcome, Never>?
+    private let onResume: @Sendable () -> Void
+
+    init(
+        _ continuation: CheckedContinuation<CBv2FirstTokenDeadlineEnqueueOutcome, Never>,
+        onResume: @escaping @Sendable () -> Void
+    ) {
+        self.continuation = continuation
+        self.onResume = onResume
+    }
+
+    @discardableResult
+    func resume(returning outcome: CBv2FirstTokenDeadlineEnqueueOutcome) -> Bool {
+        lock.lock()
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        guard let continuation else { return false }
+        onResume()
+        continuation.resume(returning: outcome)
+        return true
+    }
+}
+
+/// Lock-confined ownership state for one asynchronous deadline admission.
+///
+/// Cancellation is a requested transition, not completion: only the engine
+/// queue may acknowledge it after discarding any scheduler/KV state it could
+/// have created. Stream generation ownership stays live until that
+/// acknowledgement, preventing immediate ID reuse from colliding with stale
+/// queued work.
+private final class CBv2FirstTokenDeadlineOperation: @unchecked Sendable {
+    enum Phase: Equatable {
+        case queued
+        case executing
+        case cancellationRequested
+        /// Watchdog/shutdown already resumed the caller, but the engine queue
+        /// still owns cleanup if it later makes progress.
+        case failedExternally
+        case completed
+    }
+
+    let generation: UInt64
+    let waiter: CBv2FirstTokenDeadlineWaiter
+    var phase: Phase = .queued
+
+    init(generation: UInt64, waiter: CBv2FirstTokenDeadlineWaiter) {
+        self.generation = generation
+        self.waiter = waiter
+    }
 }
 
 /// A request's donation intent: which exact token prefix to donate and under
@@ -533,7 +611,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     // Cross-thread state (stateLock).
     private let stateLock = NSLock()
     private var streams: [CBv2RequestID: CBv2OutputStream] = [:]
-    private var pendingCancels: Set<CBv2RequestID> = []
+    private var streamGenerations: [CBv2RequestID: UInt64] = [:]
+    private var nextStreamGeneration: UInt64 = 0
+    /// Cancellation is bound to the monotonic token assigned to the current
+    /// stream. An id may be reused after that stream retires; a late callback
+    /// from the old stream must never cancel the new generation.
+    private var pendingCancels: [CBv2RequestID: UInt64] = [:]
+    private var deadlineAdmissionOperations:
+        [CBv2RequestID: CBv2FirstTokenDeadlineOperation] = [:]
     private var stepStartedNanos: UInt64 = 0
     private var wedgeReported = false
     private var _healthy = true
@@ -551,6 +636,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// itself, and when it never fires the digest call throws rather than
     /// reporting a capability.
     private var prefillFrontierCaptureHook: (@Sendable (CBv2RequestID, MLXArray) -> Void)?
+    /// One-shot deterministic seam fired after a deadline closure has claimed
+    /// its operation but before enqueue/adoption. Tests use it to place a
+    /// cancellation in the exact formerly-orphaning window.
+    private var deadlineAdmissionInitialGuardHookForTesting:
+        (@Sendable (CBv2RequestID) -> Void)?
+    /// One-shot seam after commit has made the scheduler row authoritative
+    /// but before the admission waiter is resumed.
+    private var deadlineAdmissionCommittedHookForTesting:
+        (@Sendable (CBv2RequestID) -> Void)?
 
     // Engine-thread-confined state (internal, not private: the MTP round
     // driver in EngineLoopV2+MTP.swift is part of the loop).
@@ -662,6 +756,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// before enqueue ran) so the regression is deterministic. Zero in
     /// production. Set before submitting.
     var enqueueStartDelayForTesting: TimeInterval = 0
+    /// Engine-queue test gate. Once `stepCount` reaches this value, scheduled
+    /// step callbacks yield through the idle recheck path without finalizing
+    /// or planning more work; admission closures on the same queue still run.
+    /// nil in production. Set and clear only through `onEngineQueueSync`.
+    var suspendStepExecutionAtCountForTesting: Int?
 
     public var isHealthy: Bool {
         stateLock.lock()
@@ -698,10 +797,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         // MTP: the scheduler consults the loop for 1+k decode assignments.
         // `unowned` is safe (and cycle-free): the loop owns the scheduler
         // and both live exactly as long as the engine.
-        if mtp != nil {
+        if let mtp {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
             }
+            scheduler.speculationDraftTokenUpperBound = max(
+                0,
+                mtp.config.fixedDraftTokens
+                    ?? mtp.config.maxDraftTokens)
         }
     }
 
@@ -761,13 +864,24 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func forceFinishStreamsOnShutdownTimeout() {
         stateLock.lock()
         let liveStreams = streams
-        pendingCancels.formUnion(liveStreams.keys)
+        let deadlineOperations = Array(deadlineAdmissionOperations.values)
+        for operation in deadlineOperations where operation.phase != .completed {
+            operation.phase = .failedExternally
+        }
+        for id in liveStreams.keys {
+            if let generation = streamGenerations[id] {
+                pendingCancels[id] = generation
+            }
+        }
         stateLock.unlock()
         for (_, stream) in liveStreams {
             stream.finish(
                 reason: .error(
                     "engine shutdown timed out after \(Int(config.shutdownTimeout))s"),
                 usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+        }
+        for operation in deadlineOperations {
+            operation.waiter.resume(returning: .capacityRejected)
         }
     }
 
@@ -799,24 +913,251 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// scheduler would later reject the duplicate id, and the rejection
     /// path's `takeStream` would tear down the replacement, leaving the
     /// FIRST request's deltas and terminal event with nowhere to go
-    /// (PR#62 review). Ids only become reusable after `takeStream` removes
-    /// the previous stream (request fully finished).
+    /// (PR#62 review). Ids only become reusable after backend ownership
+    /// retirement removes the previous stream generation.
     func register(stream: CBv2OutputStream) -> Bool {
+        registerWithGeneration(stream: stream) != nil
+    }
+
+    func registerWithGeneration(stream: CBv2OutputStream) -> UInt64? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        guard streams[stream.id] == nil else { return false }
+        guard streams[stream.id] == nil else { return nil }
+        nextStreamGeneration &+= 1
+        if nextStreamGeneration == 0 { nextStreamGeneration = 1 }
         streams[stream.id] = stream
-        return true
+        streamGenerations[stream.id] = nextStreamGeneration
+        return nextStreamGeneration
     }
 
     /// Submit-side unwind: remove a stream registered by `submit` whose
     /// request never reached `enqueue` (multimodal materialization failed
     /// after registration — PR#63 review). Only legal BEFORE `enqueue`; a
-    /// live request's stream is removed via `takeStream` at finish.
+    /// live request's stream is removed when backend ownership retires.
     func unregister(_ id: CBv2RequestID) {
         stateLock.lock()
-        streams.removeValue(forKey: id)
+        let stream = streams.removeValue(forKey: id)
+        streamGenerations.removeValue(forKey: id)
         stateLock.unlock()
+        stream?.releaseEngineOwnership()
+    }
+
+    @discardableResult
+    private func registerDeadlineAdmissionOperation(
+        _ operation: CBv2FirstTokenDeadlineOperation,
+        for id: CBv2RequestID
+    ) -> Bool {
+        stateLock.lock()
+        precondition(
+            deadlineAdmissionOperations[id] == nil,
+            "deadline admission operation already registered for \(id)")
+        guard let currentStream = streams[id],
+            streamGenerations[id] == operation.generation
+        else {
+            stateLock.unlock()
+            operation.waiter.resume(returning: .cancelled)
+            return false
+        }
+        if !_healthy {
+            streams.removeValue(forKey: id)
+            streamGenerations.removeValue(forKey: id)
+            if pendingCancels[id] == operation.generation {
+                pendingCancels.removeValue(forKey: id)
+            }
+            stateLock.unlock()
+            currentStream.releaseEngineOwnership()
+            currentStream.finish(
+                reason: .error("engine is unhealthy"),
+                usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+            operation.waiter.resume(returning: .capacityRejected)
+            return false
+        }
+        if pendingCancels[id] == operation.generation {
+            operation.phase = .cancellationRequested
+        } else {
+            // Discard cancellation state left by an older stream generation.
+            pendingCancels.removeValue(forKey: id)
+        }
+        deadlineAdmissionOperations[id] = operation
+        stateLock.unlock()
+        return true
+    }
+
+    private enum DeadlineAdmissionStart: Equatable {
+        case execute
+        case cancellationRequested
+        case failedExternally
+        case notCurrent
+    }
+
+    private func beginDeadlineAdmission(
+        _ operation: CBv2FirstTokenDeadlineOperation,
+        for id: CBv2RequestID
+    ) -> DeadlineAdmissionStart {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard deadlineAdmissionOperations[id] === operation,
+            streamGenerations[id] == operation.generation
+        else {
+            return .notCurrent
+        }
+        switch operation.phase {
+        case .queued:
+            operation.phase = .executing
+            return .execute
+        case .cancellationRequested:
+            return .cancellationRequested
+        case .failedExternally:
+            return .failedExternally
+        case .executing, .completed:
+            return .notCurrent
+        }
+    }
+
+    private enum DeadlineAdmissionCommit {
+        case admitted
+        case cancellationRequested
+        case failedExternally
+        case notCurrent
+    }
+
+    /// Atomically publish admission while retaining stream ownership. If a
+    /// cancellation won the lock first, the engine queue must clean the row
+    /// and acknowledge cancellation instead.
+    private func commitDeadlineAdmission(
+        _ operation: CBv2FirstTokenDeadlineOperation,
+        for id: CBv2RequestID
+    ) -> DeadlineAdmissionCommit {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard deadlineAdmissionOperations[id] === operation,
+            streamGenerations[id] == operation.generation
+        else {
+            return .notCurrent
+        }
+        switch operation.phase {
+        case .executing:
+            operation.phase = .completed
+            deadlineAdmissionOperations.removeValue(forKey: id)
+            return .admitted
+        case .cancellationRequested:
+            return .cancellationRequested
+        case .failedExternally:
+            return .failedExternally
+        case .queued, .completed:
+            return .notCurrent
+        }
+    }
+
+    private func deadlineAdmissionInterruption(
+        _ operation: CBv2FirstTokenDeadlineOperation,
+        for id: CBv2RequestID
+    ) -> DeadlineAdmissionStart? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard deadlineAdmissionOperations[id] === operation,
+            streamGenerations[id] == operation.generation
+        else {
+            return .notCurrent
+        }
+        switch operation.phase {
+        case .executing:
+            return nil
+        case .cancellationRequested:
+            return .cancellationRequested
+        case .failedExternally:
+            return .failedExternally
+        case .queued, .completed:
+            return .notCurrent
+        }
+    }
+
+    /// Complete a non-admitted operation after engine-owned state has already
+    /// been discarded. Cancellation wins over a simultaneous policy outcome.
+    /// Only here are the stream generation and pending-cancel token released.
+    private func completeDeadlineAdmission(
+        _ id: CBv2RequestID,
+        operation: CBv2FirstTokenDeadlineOperation,
+        outcome intendedOutcome: CBv2FirstTokenDeadlineEnqueueOutcome
+    ) {
+        stateLock.lock()
+        guard deadlineAdmissionOperations[id] === operation else {
+            stateLock.unlock()
+            operation.waiter.resume(returning: intendedOutcome)
+            return
+        }
+        let outcome: CBv2FirstTokenDeadlineEnqueueOutcome
+        switch operation.phase {
+        case .cancellationRequested:
+            outcome = .cancelled
+        case .failedExternally:
+            outcome = .capacityRejected
+        case .queued, .executing, .completed:
+            outcome = intendedOutcome
+        }
+        operation.phase = .completed
+        deadlineAdmissionOperations.removeValue(forKey: id)
+        let releasedStream: CBv2OutputStream?
+        if streamGenerations[id] == operation.generation {
+            releasedStream = streams.removeValue(forKey: id)
+            streamGenerations.removeValue(forKey: id)
+        } else {
+            releasedStream = nil
+        }
+        if pendingCancels[id] == operation.generation {
+            pendingCancels.removeValue(forKey: id)
+        }
+        stateLock.unlock()
+        releasedStream?.releaseEngineOwnership()
+        if case .cancelled = outcome {
+            releasedStream?.finish(
+                reason: .cancelled,
+                usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+        } else {
+            // Rejected streams normally have no consumer, but terminal
+            // acknowledgement is still required when task cancellation races
+            // the rejection handoff.
+            releasedStream?.finish(
+                reason: .error("deadline admission rejected"),
+                usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+        }
+        operation.waiter.resume(returning: outcome)
+    }
+
+    func setDeadlineAdmissionInitialGuardHookForTesting(
+        _ hook: (@Sendable (CBv2RequestID) -> Void)?
+    ) {
+        stateLock.lock()
+        deadlineAdmissionInitialGuardHookForTesting = hook
+        stateLock.unlock()
+    }
+
+    func setDeadlineAdmissionCommittedHookForTesting(
+        _ hook: (@Sendable (CBv2RequestID) -> Void)?
+    ) {
+        stateLock.lock()
+        deadlineAdmissionCommittedHookForTesting = hook
+        stateLock.unlock()
+    }
+
+    private func invokeDeadlineAdmissionInitialGuardHookForTesting(
+        _ id: CBv2RequestID
+    ) {
+        stateLock.lock()
+        let hook = deadlineAdmissionInitialGuardHookForTesting
+        deadlineAdmissionInitialGuardHookForTesting = nil
+        stateLock.unlock()
+        hook?(id)
+    }
+
+    private func invokeDeadlineAdmissionCommittedHookForTesting(
+        _ id: CBv2RequestID
+    ) {
+        stateLock.lock()
+        let hook = deadlineAdmissionCommittedHookForTesting
+        deadlineAdmissionCommittedHookForTesting = nil
+        stateLock.unlock()
+        hook?(id)
     }
 
     /// Install (nil clears) the prompt-frontier logit capture. Cross-thread
@@ -935,13 +1276,341 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    /// Atomic first-token deadline admission.
+    ///
+    /// The queue position is load-bearing: enqueue establishes authoritative
+    /// priority/FCFS order. Prefix metadata establishes the replay start for a
+    /// non-materializing projection; paged slabs and KV reservations are
+    /// touched only after that projection is accepted. A reachable row is
+    /// activated before this block returns; an unreachable row is removed
+    /// before any later `engineStep` can plan GPU work for it.
+    func enqueueForFirstTokenDeadline(
+        _ request: CBv2Request,
+        prefixLookup: CBv2PrefixLookup,
+        admission: CBv2FirstTokenDeadlineAdmission
+    ) async -> CBv2FirstTokenDeadlineEnqueueOutcome {
+        guard let submissionGeneration = registeredStreamGeneration(for: request.id) else {
+            releaseAbandonedAdoption(prefixLookup.adoption)
+            gauges.endSubmit()
+            return .cancelled
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let waiter = CBv2FirstTokenDeadlineWaiter(
+                    continuation,
+                    onResume: { [gauges] in gauges.endSubmit() })
+                let operation = CBv2FirstTokenDeadlineOperation(
+                    generation: submissionGeneration,
+                    waiter: waiter)
+                guard registerDeadlineAdmissionOperation(operation, for: request.id) else {
+                    releaseAbandonedAdoption(prefixLookup.adoption)
+                    return
+                }
+
+                engineQueue.async { [self] in
+                    func complete(
+                        _ outcome: CBv2FirstTokenDeadlineEnqueueOutcome
+                    ) {
+                        completeDeadlineAdmission(
+                            request.id,
+                            operation: operation,
+                            outcome: outcome)
+                        // The waiter synchronously retires pendingSubmits
+                        // before resuming its caller. Publish only afterward,
+                        // so a committed scheduler row is never double-counted
+                        // as both pending and waiting.
+                        publishGauges()
+                    }
+
+                    switch beginDeadlineAdmission(operation, for: request.id) {
+                    case .execute:
+                        break
+                    case .cancellationRequested:
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        complete(.cancelled)
+                        return
+                    case .failedExternally, .notCurrent:
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        complete(.capacityRejected)
+                        return
+                    }
+
+                    // The operation is now owned by this closure, but no
+                    // scheduler/prefix state exists yet. Cancellation in this
+                    // exact window used to remove the stream and let a reused
+                    // ID race the stale closure.
+                    invokeDeadlineAdmissionInitialGuardHookForTesting(request.id)
+                    if let interruption = deadlineAdmissionInterruption(
+                        operation, for: request.id)
+                    {
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        complete(
+                            interruption == .cancellationRequested
+                                ? .cancelled : .capacityRejected)
+                        return
+                    }
+
+                    prefixUsageByID[request.id] = CBv2PrefixUsage(
+                        outcome: prefixLookup.outcome,
+                        matchedTokens: prefixLookup.matchedTokens,
+                        prefillTokensSaved: 0,
+                        strategy: nil,
+                        replayTokens: 0,
+                        boundarySplits: 0)
+
+                    guard running, !draining else {
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        stream(for: request.id)?.finish(
+                            reason: .error("engine is shutting down"),
+                            usage: takePrefixUsage(
+                                requestID: request.id,
+                                promptTokens: request.promptTokens.count,
+                                completionTokens: 0))
+                        complete(.capacityRejected)
+                        return
+                    }
+                    if let interruption = deadlineAdmissionInterruption(
+                        operation, for: request.id)
+                    {
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        prefixUsageByID.removeValue(forKey: request.id)
+                        complete(
+                            interruption == .cancellationRequested
+                                ? .cancelled : .capacityRejected)
+                        return
+                    }
+
+                    do {
+                        let record = try scheduler.enqueue(request)
+                        let hasPrefixPreview = prefixLookup.adoption != nil
+                        if let adoption = prefixLookup.adoption {
+                            // Projection needs only immutable plan metadata.
+                            // Installing KV here would wire a deferred paged
+                            // pool even when the deadline verdict rejects.
+                            record.numComputedTokens = adoption.plan.replayStart
+                            record.prefixReusePlan = adoption.plan
+                        }
+
+                        let projection = scheduler.firstTokenWorkProjection(
+                            for: request.id,
+                            inFlightAssignments: inFlight?.assignments ?? [],
+                            inFlightAllowsChainedSuccessor:
+                                inFlight?.mtpRound == nil,
+                            unmaterializedPrefixAdoption: hasPrefixPreview)
+                        let projectedWork = firstTokenProjectedWork(
+                            projection,
+                            admission: admission)
+                        if hasPrefixPreview {
+                            // `applyAdoption` owns the real cursor transition.
+                            // Clear the projection-only view before either
+                            // materializing or discarding the scheduler row.
+                            record.numComputedTokens = 0
+                            record.prefixReusePlan = nil
+                        }
+                        let reachable: Bool
+                        switch projectedWork {
+                        case .bounded(_, let serviceDuration):
+                            // Authoritative monotonic clock read at the atomic
+                            // verdict. Queue wait and projection CPU time have
+                            // consumed the original absolute budget.
+                            let now = config.clock.now()
+                            reachable =
+                                now < admission.deadline
+                                && serviceDuration <= admission.deadline - now
+                        case .unbounded:
+                            reachable = false
+                        }
+
+                        guard reachable else {
+                            releaseAbandonedAdoption(prefixLookup.adoption)
+                            discardDeadlineRejectedRequest(request.id)
+                            complete(.deadlineUnreachable(projectedWork))
+                            return
+                        }
+
+                        if let interruption = deadlineAdmissionInterruption(
+                            operation, for: request.id)
+                        {
+                            releaseAbandonedAdoption(prefixLookup.adoption)
+                            discardDeadlineRejectedRequest(request.id)
+                            complete(
+                                interruption == .cancellationRequested
+                                    ? .cancelled : .capacityRejected)
+                            return
+                        }
+
+                        if let adoption = prefixLookup.adoption,
+                            !applyAdoption(adoption, requestID: request.id)
+                        {
+                            // The deadline verdict was valid for the prefix
+                            // metadata, but the backend could not realize it.
+                            // Do not silently cold-prefill under a work bound
+                            // that no longer describes this request.
+                            discardDeadlineRejectedRequest(request.id)
+                            stream(for: request.id)?.finish(
+                                reason: .error("token_budget_exhausted: prefix adoption failed"),
+                                usage: CBv2Usage(
+                                    promptTokens: request.promptTokens.count,
+                                    completionTokens: 0))
+                            complete(.capacityRejected)
+                            return
+                        }
+
+                        switch commitDeadlineAdmission(operation, for: request.id) {
+                        case .admitted:
+                            let admittedAt = config.clock.now()
+                            invokeDeadlineAdmissionCommittedHookForTesting(request.id)
+                            armLease(for: request)
+                            detokenizers[request.id] =
+                                detokenizerFactory.makeDetokenizer(
+                                    stopStrings: request.stopStrings)
+                            waiter.resume(
+                                returning: .admitted(
+                                    projectedWork,
+                                    admittedAt: admittedAt))
+                            publishGauges()
+                        case .cancellationRequested:
+                            discardDeadlineRejectedRequest(request.id)
+                            complete(.cancelled)
+                        case .failedExternally, .notCurrent:
+                            discardDeadlineRejectedRequest(request.id)
+                            complete(.capacityRejected)
+                        }
+                    } catch let error as CBv2SchedulerError {
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        stream(for: request.id)?.finish(
+                            reason: .error("scheduler rejected request: \(error)"),
+                            usage: takePrefixUsage(
+                                requestID: request.id,
+                                promptTokens: request.promptTokens.count,
+                                completionTokens: 0))
+                        complete(.schedulerRejected(error))
+                    } catch {
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        stream(for: request.id)?.finish(
+                            reason: .error("token_budget_exhausted: request queue full"),
+                            usage: takePrefixUsage(
+                                requestID: request.id,
+                                promptTokens: request.promptTokens.count,
+                                completionTokens: 0))
+                        complete(.capacityRejected)
+                    }
+                }
+
+                if Task.isCancelled {
+                    requestCancel(
+                        request.id,
+                        streamGeneration: submissionGeneration)
+                }
+            }
+        } onCancel: { [weak self] in
+            self?.requestCancel(
+                request.id,
+                streamGeneration: submissionGeneration)
+        }
+    }
+
+    func registeredStreamGeneration(
+        for id: CBv2RequestID
+    ) -> UInt64? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return streamGenerations[id]
+    }
+
+    private func firstTokenProjectedWork(
+        _ projection: CBv2FirstTokenWorkProjection,
+        admission policy: CBv2FirstTokenDeadlineAdmission
+    ) -> CBv2FirstTokenProjectedWork {
+        switch projection {
+        case .bounded(let work, let capacityOperations):
+            guard work.prefillTokens >= 0,
+                work.decodeTokens >= 0,
+                work.scheduledSteps >= 0,
+                work.mixedSteps >= 0,
+                work.mixedSteps <= work.scheduledSteps,
+                work.mixedSteps == 0
+                    || (work.prefillTokens > 0 && work.decodeTokens > 0)
+            else {
+                return .unbounded
+            }
+            if let capacity {
+                guard let admission = capacity as? AdmissionV2,
+                    admission.canGuarantee(
+                        projectedOperations: capacityOperations)
+                else {
+                    return .unbounded
+                }
+            }
+
+            func phaseSeconds(tokens: Int, rate: Double?) -> Double? {
+                guard tokens > 0 else { return 0 }
+                guard let rate, rate.isFinite, rate > 0 else { return nil }
+                let seconds = Double(tokens) / rate
+                guard seconds.isFinite, seconds > 0 else { return nil }
+                return seconds
+            }
+
+            // Serial phase envelope. For a mixed step this charges decode and
+            // prefill independently instead of treating radically different
+            // work as one token currency. Missing either required lower-bound
+            // rate makes the posture unbounded and enforcement fails closed.
+            guard let prefillSeconds = phaseSeconds(
+                tokens: work.prefillTokens,
+                rate: policy.conservativePrefillTokensPerSecond),
+                let decodeSeconds = phaseSeconds(
+                    tokens: work.decodeTokens,
+                    rate: policy.conservativeDecodeTokensPerSecond)
+            else {
+                return .unbounded
+            }
+            let seconds = prefillSeconds + decodeSeconds
+            // Duration.seconds(_:) traps when its scaled Int128 conversion
+            // overflows. Int64.max seconds is a deliberately narrower safe
+            // bound; durations beyond it cannot be useful for admission.
+            guard seconds.isFinite,
+                seconds >= 0,
+                seconds <= Double(Int64.max)
+            else {
+                return .unbounded
+            }
+            let serviceDuration = Duration.seconds(seconds)
+            guard work.scheduledTokens == 0 || serviceDuration > .zero else {
+                return .unbounded
+            }
+            return .bounded(
+                work: work,
+                serviceDuration: serviceDuration)
+        case .unbounded:
+            return .unbounded
+        }
+    }
+
+    /// Undo the limited state installed before a deadline verdict. This path
+    /// runs before activation, so no lease, detokenizer, sampler state, or
+    /// multimodal payload exists and the row cannot participate in `inFlight`.
+    private func discardDeadlineRejectedRequest(_ id: CBv2RequestID) {
+        _ = scheduler.finish(id: id, reason: .cancelled)
+        capacity?.releaseAll(id: id)
+        if let state = kvStates.removeValue(forKey: id) {
+            backend.release(state)
+        }
+        releaseRecurrentState(recurrentStates.removeValue(forKey: id))
+        prefixHitTokens.removeValue(forKey: id)
+        prefixUsageByID.removeValue(forKey: id)
+    }
+
     // MARK: Prefix-cache adoption (engine thread)
 
     /// Adopt a prepared prefix hit into fresh KV state and fast-forward the
     /// scheduler record. Best-effort: any failure (capacity, backend) falls
     /// back to a full prefill — the request itself never fails here. Always
     /// balances the lookup pin.
-    private func applyAdoption(_ adoption: CBv2PrefixAdoption, requestID: CBv2RequestID) {
+    @discardableResult
+    private func applyAdoption(
+        _ adoption: CBv2PrefixAdoption,
+        requestID: CBv2RequestID
+    ) -> Bool {
         defer {
             prefixCache?.endAdoption(
                 requestID: adoption.requestID, tokens: adoption.tokens, matched: adoption.matched,
@@ -949,7 +1618,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         guard let rec = scheduler.record(for: requestID), kvStates[requestID] == nil else {
             markPrefixAdoptionFailed(requestID, outcome: .adoptionFailed)
-            return
+            return false
         }
         if let capacity {
             do {
@@ -962,7 +1631,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                     additionalBytes: adoption.plan.initialAdditionalCapacityBytes)
             } catch {
                 markPrefixAdoptionFailed(requestID, outcome: .skippedCapacity)
-                return  // capacity tight — full prefill with the usual backstops
+                return false  // capacity tight — ordinary submit cold-prefills
             }
         }
         do {
@@ -980,6 +1649,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             prefixUsageByID[requestID]?.prefillTokensSaved = adoption.plan.prefillTokensSaved
             prefixUsageByID[requestID]?.strategy = adoption.plan.strategy
             prefixUsageByID[requestID]?.replayTokens = adoption.plan.replayTokens
+            return true
         } catch {
             capacity?.unreserve(
                 id: requestID,
@@ -992,6 +1662,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 outcome = .adoptionFailed
             }
             markPrefixAdoptionFailed(requestID, outcome: outcome)
+            return false
         }
     }
 
@@ -1025,11 +1696,33 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Cancellation & backpressure (any thread)
 
     /// O(1): marks the request; the row is dropped at the next step boundary.
-    /// Lock-based (not a queue hop) so cancellation works even while the
-    /// engine thread is blocked inside a long step.
-    func requestCancel(_ id: CBv2RequestID) {
+    /// A pending deadline admission is different: cancellation records an
+    /// explicit state transition, but the engine queue retains stream
+    /// generation ownership until it acknowledges and cleans that operation.
+    func requestCancel(
+        _ id: CBv2RequestID,
+        streamGeneration expectedGeneration: UInt64? = nil
+    ) {
         stateLock.lock()
-        pendingCancels.insert(id)
+        guard streams[id] != nil, let currentGeneration = streamGenerations[id] else {
+            stateLock.unlock()
+            return
+        }
+        guard expectedGeneration == nil || expectedGeneration == currentGeneration else {
+            stateLock.unlock()
+            return
+        }
+        pendingCancels[id] = currentGeneration
+        if let operation = deadlineAdmissionOperations[id],
+            operation.generation == currentGeneration
+        {
+            switch operation.phase {
+            case .queued, .executing:
+                operation.phase = .cancellationRequested
+            case .cancellationRequested, .failedExternally, .completed:
+                break
+            }
+        }
         stateLock.unlock()
     }
 
@@ -1060,6 +1753,12 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private func engineStep() {
         guard running else { return }
+        if let suspendedAt = suspendStepExecutionAtCountForTesting,
+            stepCount >= suspendedAt
+        {
+            scheduleIdleRecheck()
+            return
+        }
         let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         markStepStarted()
         defer {
@@ -1151,7 +1850,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                     previous.deferredReleases.append(
                         (
                             id: id, state: state, rollbackOne: false, donation: nil,
-                            recurrent: recurrentStates.removeValue(forKey: id)
+                            recurrent: recurrentStates.removeValue(forKey: id),
+                            ownership: nil, terminalDelivery: nil
                         ))
                 } else {
                     backend.release(state)
@@ -1599,6 +2299,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
         let step = CBv2InFlightStep(
+            assignments: plan.assignments,
             participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
             wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
@@ -1903,6 +2604,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         asyncEval(toEval)
 
         let step = CBv2InFlightStep(
+            assignments: work.map { (id: $0.rec.id, numTokens: $0.count) },
             participants: Set(work.map(\.rec.id)),
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
@@ -2202,12 +2904,18 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
-        for (_, state, rollbackOne, donation, recurrent) in step.deferredReleases {
+        for (id, state, rollbackOne, donation, recurrent, ownership, terminalDelivery) in
+            step.deferredReleases
+        {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
             retire(state: state, donating: donation)
             releaseRecurrentState(recurrent)
+            if let ownership {
+                retireStream(id, matching: ownership)
+            }
+            terminalDelivery?()
         }
         if let mtp {
             for state in step.mtpRound?.deferredAssistantReleases ?? [] {
@@ -2277,11 +2985,19 @@ public final class EngineLoopV2: @unchecked Sendable {
         // go on every finish path.
         mtp?.requestDidFinish(id)
         guard let rec = scheduler.finish(id: id, reason: reason) else {
-            // Unknown to the scheduler (already finished) — make sure no
-            // stream leaks regardless.
+            // A duplicate finish can arrive after the scheduler row was
+            // removed but before an in-flight backend reference retires.
+            // Preserve that generation fence; taking it here would
+            // acknowledge ownership and permit unsafe immediate ID reuse.
+            let ownsDeferredBackendState =
+                inFlight?.deferredReleases.contains {
+                    $0.id == id && $0.ownership != nil
+                } ?? false
+            if ownsDeferredBackendState {
+                return
+            }
             let usage = takePrefixUsage(requestID: id, promptTokens: 0, completionTokens: 0)
-            takeStream(id)?.finish(
-                reason: reason, usage: usage)
+            takeStream(id)?.finish(reason: reason, usage: usage)
             return
         }
         capacity?.releaseAll(id: id)
@@ -2291,6 +3007,40 @@ public final class EngineLoopV2: @unchecked Sendable {
         // RNG progress (PR#62 review).
         sampler.requestDidFinish(id)
 
+        // Keep the stream generation registered until every in-flight
+        // backend reference is fenced. This blocks immediate ID reuse and
+        // separates consumer terminal delivery from engine ownership.
+        let stream = stream(for: id)
+        let detokenizer = detokenizers.removeValue(forKey: id)
+        prefixUsageByID[id]?.boundarySplits = rec.prefixReplayBoundarySplits
+        let usage = takePrefixUsage(
+            requestID: id, promptTokens: rec.request.promptTokens.count,
+            completionTokens: rec.generatedTokenCount)
+        let usesAsyncDetokenization = rec.request.stopStrings.isEmpty
+        let terminalQueue = detokQueue
+        let terminalDelivery: () -> Void = {
+            // Passthrough requests emit deltas on the detok queue; the
+            // trailing flush + terminal MUST ride the same queue so they land
+            // AFTER those deltas (FIFO ordering). Stop-string requests stay
+            // synchronous.
+            if usesAsyncDetokenization {
+                terminalQueue.async {
+                    let trailing = detokenizer?.flush() ?? ""
+                    if !trailing.isEmpty {
+                        stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
+                    }
+                    stream?.finish(reason: reason, usage: usage)
+                }
+            } else {
+                let trailing = detokenizer?.flush() ?? ""
+                if !trailing.isEmpty {
+                    stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
+                }
+                stream?.finish(reason: reason, usage: usage)
+            }
+        }
+
+        var ownershipReleaseDeferred = false
         if let state = kvStates.removeValue(forKey: id) {
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.participants.contains(id) {
@@ -2303,8 +3053,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                         id: id, state: state,
                         rollbackOne: inFlight.sampledRows.contains(id),
                         donation: donation,
-                        recurrent: recurrentStates.removeValue(forKey: id)
+                        recurrent: recurrentStates.removeValue(forKey: id),
+                        ownership: stream,
+                        terminalDelivery: terminalDelivery
                     ))
+                ownershipReleaseDeferred = true
             } else {
                 retire(state: state, donating: donation)
                 releaseRecurrentState(recurrentStates.removeValue(forKey: id))
@@ -2313,30 +3066,11 @@ public final class EngineLoopV2: @unchecked Sendable {
             releaseRecurrentState(recurrentStates.removeValue(forKey: id))
         }
 
-        let detokenizer = detokenizers.removeValue(forKey: id)
-        let stream = takeStream(id)
-        prefixUsageByID[id]?.boundarySplits = rec.prefixReplayBoundarySplits
-        let usage = takePrefixUsage(
-            requestID: id, promptTokens: rec.request.promptTokens.count,
-            completionTokens: rec.generatedTokenCount)
-
-        // Passthrough requests emit deltas on the detok queue; the trailing
-        // flush + terminal MUST ride the same queue so they land AFTER those
-        // deltas (FIFO ordering). Stop-string requests stay synchronous.
-        if rec.request.stopStrings.isEmpty {
-            detokQueue.async {
-                let trailing = detokenizer?.flush() ?? ""
-                if !trailing.isEmpty {
-                    stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
-                }
-                stream?.finish(reason: reason, usage: usage)
-            }
-        } else {
-            let trailing = detokenizer?.flush() ?? ""
-            if !trailing.isEmpty {
-                stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
-            }
-            stream?.finish(reason: reason, usage: usage)
+        if !ownershipReleaseDeferred, let stream {
+            retireStream(id, matching: stream)
+        }
+        if !ownershipReleaseDeferred {
+            terminalDelivery()
         }
     }
 
@@ -2547,27 +3281,26 @@ public final class EngineLoopV2: @unchecked Sendable {
         // an EARLY cancel racing `enqueue` — keep it so the enqueue block
         // refuses to start the request (PR#62 review). A cancel with neither
         // is stale (request already finished) — drop it.
-        var resolved: Set<CBv2RequestID> = []
-        for id in cancels {
+        var resolved: [CBv2RequestID: UInt64] = [:]
+        for (id, cancelledGeneration) in cancels {
+            stateLock.lock()
+            let currentGeneration = streamGenerations[id]
+            stateLock.unlock()
+            guard currentGeneration == cancelledGeneration else {
+                resolved[id] = cancelledGeneration
+                continue
+            }
             if scheduler.record(for: id) != nil {
                 finishRequest(id, reason: .cancelled)
-                resolved.insert(id)
-            } else if !hasRegisteredStream(id) {
-                resolved.insert(id)
+                resolved[id] = cancelledGeneration
             }
         }
         guard !resolved.isEmpty else { return }
         stateLock.lock()
-        pendingCancels.subtract(resolved)
+        for (id, generation) in resolved where pendingCancels[id] == generation {
+            pendingCancels.removeValue(forKey: id)
+        }
         stateLock.unlock()
-    }
-
-    /// True when a stream is still registered for `id` (used to tell a
-    /// racing pre-enqueue cancel from a stale post-finish one).
-    private func hasRegisteredStream(_ id: CBv2RequestID) -> Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return streams[id] != nil
     }
 
     /// Consume a remembered early cancel for `id` at enqueue time. Returns
@@ -2576,7 +3309,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func consumeEarlyCancel(_ id: CBv2RequestID) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return pendingCancels.remove(id) != nil
+        guard let generation = pendingCancels[id],
+            streams[id] != nil,
+            generation == streamGenerations[id]
+        else {
+            pendingCancels.removeValue(forKey: id)
+            return false
+        }
+        pendingCancels.removeValue(forKey: id)
+        return true
     }
 
     // MARK: Deadline leases
@@ -2807,8 +3548,30 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private func takeStream(_ id: CBv2RequestID) -> CBv2OutputStream? {
         stateLock.lock()
-        defer { stateLock.unlock() }
-        return streams.removeValue(forKey: id)
+        streamGenerations.removeValue(forKey: id)
+        let stream = streams.removeValue(forKey: id)
+        stateLock.unlock()
+        stream?.releaseEngineOwnership()
+        return stream
+    }
+
+    /// Remove and acknowledge exactly the stream generation whose backend
+    /// ownership has retired. Identity matching prevents stale deferred work
+    /// from removing a later generation if invariants are violated elsewhere.
+    private func retireStream(
+        _ id: CBv2RequestID,
+        matching expected: CBv2OutputStream
+    ) {
+        stateLock.lock()
+        let retired: CBv2OutputStream?
+        if streams[id] === expected {
+            streamGenerations.removeValue(forKey: id)
+            retired = streams.removeValue(forKey: id)
+        } else {
+            retired = nil
+        }
+        stateLock.unlock()
+        retired?.releaseEngineOwnership()
     }
 
     // MARK: Reconciled-usage snapshots (watchdog-readable)
@@ -2953,12 +3716,20 @@ public final class EngineLoopV2: @unchecked Sendable {
         wedgeReported = true
         _healthy = false
         let liveStreams = streams
+        let deadlineOperations = Array(deadlineAdmissionOperations.values)
+        for operation in deadlineOperations where operation.phase != .completed {
+            operation.phase = .failedExternally
+        }
         // Snapshot the reconciled usage observed before the wedge under the
         // SAME lock, so each terminal carries the tokens generated so far
         // instead of raw zero usage (the engine thread is wedged and cannot
         // reconcile now).
         let usageByID = usageSnapshots
-        pendingCancels.formUnion(liveStreams.keys)
+        for id in liveStreams.keys {
+            if let generation = streamGenerations[id] {
+                pendingCancels[id] = generation
+            }
+        }
         stateLock.unlock()
 
         // Signal BEFORE erroring the streams: a consumer woken by the
@@ -2971,6 +3742,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 reason: .terminal(cause: .watchdog, message: message),
                 usage: usageByID[id]
                     ?? CBv2Usage(promptTokens: 0, completionTokens: 0))
+        }
+        for operation in deadlineOperations {
+            operation.waiter.resume(returning: .capacityRejected)
         }
     }
 }
