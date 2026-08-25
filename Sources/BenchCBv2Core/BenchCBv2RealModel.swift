@@ -1982,8 +1982,8 @@ public enum BenchCBv2Driver {
                         format: "- prefill: %.3fs, %.1f tok/s",
                         metrics.prefillSeconds, metrics.prefillTPS))
                     emit(String(
-                        format: "- decode: %.1f tok/s (99 tokens after first token)",
-                        metrics.decodeTPS))
+                        format: "- decode: %.1f tok/s (%d tokens after first token)",
+                        metrics.decodeTPS, max(0, metrics.generatedTokens - 1)))
                     emit("- generated: \(campaign.result.tokens.count) greedy tokens; finish "
                         + campaign.result.finish)
                     emit("- route: \(routeSummary)")
