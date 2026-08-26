@@ -39,6 +39,7 @@ final class Qwen3VLMoETests: XCTestCase {
                     "hidden_size": 8,
                     "intermediate_size": 16,
                     "out_hidden_size": 8,
+                    "hidden_act": "gelu_pytorch_tanh",
                     "num_heads": 1,
                     "patch_size": 16,
                     "spatial_merge_size": 1,
@@ -68,6 +69,14 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertEqual(reasoning.startDelimiter, "<think>")
         XCTAssertEqual(reasoning.implicitEndDelimiters, ["<tool_call>"])
         XCTAssertNil(reasoning.budgetTransition)
+    }
+
+    func testLegacyModelTypeResolvesThroughPublicRegistry() async throws {
+        let data = try JSONEncoder().encode(legacyConfiguration())
+        let model = try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: "qwen3_vl_moe")
+
+        XCTAssertTrue(model is Qwen3VLMoE)
     }
 
     func testPublishedMoEGeometryDecodes() throws {

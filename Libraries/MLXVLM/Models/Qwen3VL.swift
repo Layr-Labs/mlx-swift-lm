@@ -132,12 +132,10 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     if resizedSize == .zero {
                         let size = processed.extent.size
                         let factor = config.patchSize * config.mergeSize
-                        let requestedMaxPixels =
-                            input.processing.maxPixels
-                            ?? Self.defaultVisionTokenBudgetPixels(
-                                factor: factor, ceiling: config.maxPixels)
                         let maxPixels = min(
-                            requestedMaxPixels, config.maxPixels, Self.maxVideoFramePixels)
+                            input.processing.maxPixels ?? config.maxPixels,
+                            config.maxPixels,
+                            Self.maxVideoFramePixels)
                         let (height, width) = try QwenVL.targetSize(
                             height: Int(size.height),
                             width: Int(size.width),
@@ -226,6 +224,19 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"
         case imageProcessorType = "image_processor_type"
+    }
+}
+
+extension Qwen3VLProcessorConfiguration {
+    init(qwen35VisionConfiguration config: Qwen3VLConfiguration.VisionConfiguration) {
+        self.imageMean = [0.5, 0.5, 0.5]
+        self.imageStd = [0.5, 0.5, 0.5]
+        self._minPixels = 65_536
+        self._maxPixels = 16_777_216
+        self.mergeSize = config.spatialMergeSize
+        self.patchSize = config.patchSize
+        self.temporalPatchSize = config.temporalPatchSize
+        self.imageProcessorType = "Qwen2VLImageProcessorFast"
     }
 }
 
@@ -1633,6 +1644,35 @@ extension Qwen3VLLanguage {
             deltas = MLXArray(mropePositionDeltas.map { Int32($0) })
         }
         return (positionIds, deltas)
+    }
+
+    /// Applies the absolute continuation anchor after computing the regular
+    /// M-RoPE coordinates. A uniform shift preserves each axis's geometry and
+    /// shifts the returned delta into the same coordinate frame.
+    static func getRopeIndex(
+        inputIds: MLXArray,
+        imageGridTHW: [THW]?,
+        videoGridTHW: [THW]?,
+        spatialMergeSize: Int,
+        imageTokenId: Int,
+        videoTokenId: Int,
+        visionStartTokenId: Int,
+        attentionMask: MLXArray? = nil,
+        positionOffset: Int
+    ) -> (MLXArray, MLXArray) {
+        let (positionIds, deltas) = getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: imageGridTHW,
+            videoGridTHW: videoGridTHW,
+            spatialMergeSize: spatialMergeSize,
+            imageTokenId: imageTokenId,
+            videoTokenId: videoTokenId,
+            visionStartTokenId: visionStartTokenId,
+            attentionMask: attentionMask)
+        guard positionOffset != 0 else { return (positionIds, deltas) }
+
+        let offset = MLXArray(Int32(positionOffset))
+        return (positionIds + offset, deltas + offset)
     }
 }
 

@@ -85,13 +85,26 @@ private func create<C: Decodable, P>(
 /// Typically called via ``VLMModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
 public enum VLMTypeRegistry {
 
+    private static func createQwen3VLMoE(configuration: Data) throws -> LanguageModel {
+        let object = try JSONSerialization.jsonObject(with: configuration)
+        let root = object as? [String: Any]
+        let textConfiguration = root?["text_config"] as? [String: Any]
+        let textModelType = textConfiguration?["model_type"] as? String
+
+        if textModelType == "qwen3_vl_moe_text" {
+            return Qwen3VL(try JSONDecoder().decode(Qwen3VLConfiguration.self, from: configuration))
+        }
+        return Qwen3VLMoE(
+            try JSONDecoder().decode(Qwen3VLMoEConfiguration.self, from: configuration))
+    }
+
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "paligemma": create(PaliGemmaConfiguration.self, PaliGemma.init),
         "qwen2_vl": create(Qwen2VLConfiguration.self, Qwen2VL.init),
         "qwen2_5_vl": create(Qwen25VLConfiguration.self, Qwen25VL.init),
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
-        "qwen3_vl_moe": create(Qwen3VLMoEConfiguration.self, Qwen3VLMoE.init),
+        "qwen3_vl_moe": createQwen3VLMoE,
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
@@ -293,6 +306,7 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen2_5VL3BInstruct4Bit,
             qwen3VL4BInstruct4Bit,
             qwen3VL4BInstruct8Bit,
+            qwen3VL30BA3BInstruct4Bit,
             smolvlminstruct4bit,
             gemma3_4B_qat_4bit,
             gemma3_12B_qat_4bit,
