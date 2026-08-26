@@ -16,11 +16,19 @@ private enum Qwen3VLError: Error {
 
 public struct Qwen3VLProcessor: UserInputProcessor {
 
-    /// Uniform linspace sample cap per clip. Unbounded 2 FPS sampling made
-    /// remote-video TTFT miss the OpenRouter-shaped first-content clock.
-    /// Gemma samples 32 frames; Qwen's tower attends over the full T×H×W
-    /// grid, so 16 frames is the serving budget that still describes the clip.
-    public static let maxVideoFrames = 16
+    /// Uniform linspace sample cap per clip. Qwen's tower attends over the full
+    /// T×H×W grid, so tower and prefill work scale with every sampled frame.
+    /// Eight frames preserve whole-clip coverage while fitting the serving
+    /// first-content budget; the previous 16-frame cap still missed it.
+    public static let maxVideoFrames = 8
+
+    /// Per-sampled-frame pixel ceiling for video. Artifact image processors can
+    /// advertise multi-megapixel image limits (16 MP in the Qwen 3.5 serving
+    /// artifact), but the video tower attends over every frame in one sequence:
+    /// keeping a 720p raster for eight frames creates a multi-GiB score tensor
+    /// on Qwen's unfused 72-dim attention heads. A 512² budget preserves useful
+    /// spatial detail while bounding tower memory and first-content latency.
+    public static let maxVideoFramePixels = 512 * 512
 
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
@@ -120,12 +128,13 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     if resizedSize == .zero {
                         let size = processed.extent.size
+                        let maxPixels = min(config.maxPixels, Self.maxVideoFramePixels)
                         let (height, width) = try QwenVL.targetSize(
                             height: Int(size.height),
                             width: Int(size.width),
                             factor: config.patchSize * config.mergeSize,
-                            minPixels: config.minPixels,
-                            maxPixels: config.maxPixels)
+                            minPixels: min(config.minPixels, maxPixels),
+                            maxPixels: maxPixels)
                         resizedSize = CGSize(width: width, height: height)
                     }
                     let finalImage = preprocess(image: processed, resizedSize: resizedSize)
