@@ -61,3 +61,24 @@ as declared by the checkpoint and original Hugging Face implementation, while
 the patch and DeepStack mergers use exact GELU.
 
 Raw case results are in `text-generation.json` and `image-generation.json`.
+
+## 1K / 16K Swift benchmark
+
+This text-only benchmark exercises the language/MoE path, not the vision
+tower. It uses the release build on an Apple M5 Max with 128 GB of unified
+memory, greedy argmax sampling, exactly 1,024 prepared prompt tokens, and a
+forced 16,384-token decode. Stop tokens are deliberately ignored so both runs
+measure the same full decode length.
+
+| Run | Input / output tokens | Prefill tok/s | Decode tok/s | Wall time (s) | Output tok/s, end to end | Peak MLX memory (GiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,024 / 16,384 | 3,991.13 | 60.48 | 271.16 | 60.42 | 18.73 |
+| 2 | 1,024 / 16,384 | 3,661.49 | 61.55 | 266.46 | 61.49 | 18.73 |
+| Mean | 1,024 / 16,384 | 3,826.31 | 61.02 | 268.81 | 60.95 | 18.73 |
+
+The two long decode results differ by 1.76%. Both produced the same 16,384-token
+FNV-1a digest, `e12a32d50e0cf35d`. The source fixture rendered to 15,183 tokens
+with the Qwen3-VL chat template; the benchmark preserved the chat prefix and
+final 32 tokens while removing the middle to construct the exact 1,024-token
+input. Unrounded measurements, prompt provenance, revisions, and the command
+are in `generation-1024x16384.json`.

@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-08-26T00:00:22Z",
+  "benchmark": {
+    "name": "Qwen3-VL Swift text generation 1K / 16K",
+    "path": "text-only language/MoE; vision tower not exercised",
+    "build_configuration": "release",
+    "sampling": "greedy argmax",
+    "prefill_step_size": 512,
+    "stop_policy": "forced length; stop tokens ignored",
+    "warmup_tokens": 16,
+    "measured_runs": 2,
+    "harness": "temporary Qwen3VLBench target; removed after capture"
+  },
+  "source": {
+    "repository": "https://github.com/Layr-Labs/mlx-swift-lm",
+    "revision": "b46a4daf871301aa9a2cb5d8d12471c6f2606d83",
+    "mlx_swift_revision": "6b0505cc790f512ae49d740b21e13f80802946bd"
+  },
+  "model": {
+    "id": "lmstudio-community/Qwen3-VL-30B-A3B-Instruct-MLX-4bit",
+    "revision": "61c11f42d7bc01e00f5ea7f2e667c0a216f48397",
+    "local_snapshot": "/Users/davidtai/.cache/huggingface/qwen3-vl-30b-a3b-mlx-4bit-61c11f42"
+  },
+  "host": {
+    "chip": "Apple M5 Max",
+    "memory_gb": 128,
+    "macos": "26.5.2 (25F84)",
+    "swift": "6.3.3"
+  },
+  "prompt": {
+    "source_file": "benchmarks/qwen36-a3b/contexts/python-coding-context-16384.txt",
+    "source_sha256": "00abbf748514d7ff8609d5871156c8a8dea8e8eb5f355393c94296c846d0d1f9",
+    "raw_prepared_tokens": 15183,
+    "measured_tokens": 1024,
+    "construction": "Qwen3-VL chat template; preserve prefix and final 32 tokens, remove middle"
+  },
+  "command": {
+    "lock_wrapper": "fcntl.flock(open('/tmp/mtplx-gpu-exclusive.lock', 'w'), fcntl.LOCK_EX) held for the child process lifetime",
+    "executable": "/Users/davidtai/projects/OpenSourceWTF/mlx-swift-lm/.build/arm64-apple-macosx/release/Qwen3VLBench",
+    "arguments": [
+      "/Users/davidtai/.cache/huggingface/qwen3-vl-30b-a3b-mlx-4bit-61c11f42",
+      "benchmarks/qwen36-a3b/contexts/python-coding-context-16384.txt",
+      "1024",
+      "16384",
+      "16",
+      "2"
+    ]
+  },
+  "lock": "/tmp/mtplx-gpu-exclusive.lock",
+  "runs": [
+    {
+      "run": 1,
+      "prompt_tokens": 1024,
+      "generated_tokens": 16384,
+      "prefill_seconds": 0.256568708,
+      "prefill_tokens_per_second": 3991.1336342700065,
+      "decode_seconds": 270.903949458,
+      "decode_tokens_per_second": 60.47900015034708,
+      "wall_seconds": 271.160518166,
+      "wall_output_tokens_per_second": 60.42177567299819,
+      "peak_memory_bytes": 20115709537,
+      "output_token_fnv1a64": "e12a32d50e0cf35d",
+      "first_output_tokens": [785, 3897, 49465, 504, 1565, 9194, 79463, 21055],
+      "last_output_tokens": [11, 220, 17, 11, 220, 15, 396, 42198],
+      "stop_reason": "forced-length; stop tokens ignored"
+    },
+    {
+      "run": 2,
+      "prompt_tokens": 1024,
+      "generated_tokens": 16384,
+      "prefill_seconds": 0.279667292,
+      "prefill_tokens_per_second": 3661.4936007604347,
+      "decode_seconds": 266.181910875,
+      "decode_tokens_per_second": 61.55189113393203,
+      "wall_seconds": 266.461578167,
+      "wall_output_tokens_per_second": 61.48728875925077,
+      "peak_memory_bytes": 20115709537,
+      "output_token_fnv1a64": "e12a32d50e0cf35d",
+      "first_output_tokens": [785, 3897, 49465, 504, 1565, 9194, 79463, 21055],
+      "last_output_tokens": [11, 220, 17, 11, 220, 15, 396, 42198],
+      "stop_reason": "forced-length; stop tokens ignored"
+    }
+  ],
+  "aggregate": {
+    "prefill_tokens_per_second_mean": 3826.3136175152204,
+    "prefill_tokens_per_second_spread_percent": 8.61508141937507,
+    "decode_tokens_per_second_mean": 61.015445642139554,
+    "decode_tokens_per_second_spread_percent": 1.7583924402970665,
+    "wall_seconds_mean": 268.8110481665,
+    "wall_output_tokens_per_second_mean": 60.95453221612448,
+    "peak_memory_bytes": 20115709537,
+    "peak_memory_gib": 18.734214396215975,
+    "output_tokens_identical": true
+  }
+}
