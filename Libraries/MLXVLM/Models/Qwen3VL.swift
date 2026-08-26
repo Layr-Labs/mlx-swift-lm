@@ -16,6 +16,12 @@ private enum Qwen3VLError: Error {
 
 public struct Qwen3VLProcessor: UserInputProcessor {
 
+    /// Uniform linspace sample cap per clip. Unbounded 2 FPS sampling made
+    /// remote-video TTFT miss the OpenRouter-shaped first-content clock.
+    /// Gemma samples 32 frames; Qwen's tower attends over the full T×H×W
+    /// grid, so 16 frames is the serving budget that still describes the clip.
+    public static let maxVideoFrames = 16
+
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
 
@@ -108,7 +114,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             for video in input.videos {
                 var resizedSize: CGSize = .zero
                 let sequence = try await MediaProcessing.asProcessedSequence(
-                    video, targetFPS: { _ in Double(2) }
+                    video, targetFPS: { _ in Double(2) },
+                    maxFrames: Qwen3VLProcessor.maxVideoFrames
                 ) { frame in
                     let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
                     if resizedSize == .zero {
