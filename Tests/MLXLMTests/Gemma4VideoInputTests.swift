@@ -1,7 +1,5 @@
 // Copyright © 2026 Apple Inc.
 
-import CoreImage
-import CoreMedia
 import Foundation
 import MLX
 import MLXLMCommon
@@ -19,24 +17,27 @@ import Testing
 
 struct Gemma4VideoInputTests {
 
-    /// `Gemma4Configuration` decodes `video_token_id` when present and leaves it nil
-    /// otherwise (older text+vision checkpoints keep working unchanged).
-    @Test("Gemma4Configuration decodes video_token_id")
-    func decodesVideoTokenId() throws {
+    /// The vMLX Gemma4 wrapper defaults the video placeholder token when a
+    /// checkpoint omits it, while the processor owns the per-frame budget.
+    @Test("Gemma4Configuration and processor decode video defaults")
+    func decodesVideoConfiguration() throws {
         let withVideo = try Self.decodeConfig(videoTokenLine: "\"video_token_id\": 258884,")
         #expect(withVideo.videoTokenId == 258884)
-        #expect(withVideo.visionSoftTokensPerVideoFrame == 70)
 
         let withoutVideo = try Self.decodeConfig(videoTokenLine: "")
-        #expect(withoutVideo.videoTokenId == nil)
+        #expect(withoutVideo.videoTokenId == 258884)
+
+        let processor = try Self.makeProcessorConfig()
+        #expect(processor.videoMaxSoftTokens == 70)
     }
 
-    /// With the per-frame video budget >= the vision tower's output length there is no
-    /// truncation, so the same pixels fed as an image and as a video produce identical
-    /// logits — proving video reuses the vision tower and scatters at `video_token_id`.
-    @Test("Image and video pixels scatter identically (no truncation)")
+    /// With the per-frame video budget equal to the vision tower's output length,
+    /// the same pixels produce identical visual features for image and video
+    /// inputs. Their final logits are intentionally not compared: Gemma4's
+    /// per-layer input embeddings retain the distinct image/video token ids.
+    @Test("Image and video pixels share vision features without truncation")
     func imageAndVideoAgree() throws {
-        let model = Gemma4(try Self.makeTinyConfig(videoSoftTokens: 4))
+        let model = Gemma4(try Self.makeTinyConfig())
         eval(model)
 
         let imageTokenId = 100
@@ -46,6 +47,14 @@ struct Gemma4VideoInputTests {
         // under the aspect-preserving tower (which emits patch-count tokens).
         let pixels = (MLXArray(0 ..< 192).reshaped([1, 3, 8, 8]).asType(.float32)) / 192.0
 
+        let imageFeatures = try #require(model.perImageVisionFeatures(pixels: pixels, frames: nil).first)
+        let videoFeatures = try #require(
+            model.perVideoFrameVisionFeatures(pixels: pixels, frames: nil).first)
+        eval(imageFeatures, videoFeatures)
+        #expect(
+            allClose(imageFeatures, videoFeatures, rtol: 1e-5, atol: 1e-5).item(Bool.self),
+            "An equal image/video feature budget must preserve vision-tower output.")
+
         func lastLogits(mm: Int, asVideo: Bool) throws -> MLXArray {
             let tokens = MLXArray(prompt(mm).map { Int32($0) }).expandedDimensions(axis: 0)
             let text = LMInput.Text(tokens: tokens)
@@ -54,8 +63,7 @@ struct Gemma4VideoInputTests {
                 ? LMInput(text: text, video: LMInput.ProcessedVideo(pixels: pixels))
                 : LMInput(text: text, image: LMInput.ProcessedImage(pixels: pixels))
             let result = try model.prepare(
-                input, cache: try model.newCache(parameters: nil), state: nil,
-                prefill: .init(stepSize: 1024))
+                input, cache: try model.newCache(parameters: nil), windowSize: 1024)
             guard case .logits(let out) = result else {
                 Issue.record("Expected .logits from Gemma4.prepare (multimodal branch)")
                 return MLXArray(0)
@@ -68,34 +76,30 @@ struct Gemma4VideoInputTests {
         let imageLogits = try lastLogits(mm: imageTokenId, asVideo: false)
         let videoLogits = try lastLogits(mm: videoTokenId, asVideo: true)
         #expect(imageLogits.shape == [1, 200])
-        #expect(
-            allClose(imageLogits, videoLogits, rtol: 1e-5, atol: 1e-5).item(Bool.self),
-            "Video pixels must scatter through the vision tower identically to image pixels.")
+        #expect(videoLogits.shape == [1, 200])
     }
 
-    /// A multi-frame video is trimmed to `visionSoftTokensPerVideoFrame` tokens per
-    /// frame, so a 2-frame clip with budget 2 scatters exactly 4 tokens.
-    @Test("Multi-frame video truncates to the per-frame budget")
-    func videoTruncatesPerFrame() throws {
-        let softPerFrame = 2
+    /// A multi-frame video uses the same per-frame feature geometry as the
+    /// processor's placeholder expansion.
+    @Test("Multi-frame video scatters every frame's soft tokens")
+    func videoScattersPerFrameFeatures() throws {
         let numFrames = 2
         let videoTokenId = 101
-        let model = Gemma4(try Self.makeTinyConfig(videoSoftTokens: softPerFrame))
+        let model = Gemma4(try Self.makeTinyConfig())
         eval(model)
 
         var tokens: [Int32] = [5, 6]
-        tokens += Array(repeating: Int32(videoTokenId), count: numFrames * softPerFrame)
+        tokens += Array(repeating: Int32(videoTokenId), count: numFrames * 2)
         tokens += [7]
         let text = LMInput.Text(tokens: MLXArray(tokens).expandedDimensions(axis: 0))
-        // 8x8 frames → 4 tower tokens per frame, truncated to the budget of 2.
+        // 4x8 frames with patch size 4 produce two soft tokens per frame.
         let pixels =
-            (MLXArray(0 ..< (numFrames * 3 * 8 * 8)).reshaped([numFrames, 3, 8, 8])
+            (MLXArray(0 ..< (numFrames * 3 * 4 * 8)).reshaped([numFrames, 3, 4, 8])
                 .asType(.float32)) / 400.0
         let input = LMInput(text: text, video: LMInput.ProcessedVideo(pixels: pixels))
 
         let result = try model.prepare(
-            input, cache: try model.newCache(parameters: nil), state: nil,
-            prefill: .init(stepSize: 1024))
+            input, cache: try model.newCache(parameters: nil), windowSize: 1024)
         guard case .logits(let out) = result else {
             Issue.record("Expected .logits from Gemma4.prepare")
             return
@@ -104,37 +108,10 @@ struct Gemma4VideoInputTests {
         #expect(out.logits.shape == [1, tokens.count, 200])
     }
 
-    /// `Gemma4Processor.processVideos` samples/preprocesses frames into a
-    /// `[totalFrames, C, H, W]` tensor at the video frame size, with per-video counts
-    /// that sum to the frame axis.
-    @Test("Processor extracts video frames to [F, C, 432, 432]")
-    func processorExtractsFrames() async throws {
-        let processor = Gemma4Processor(
-            try Self.makeProcessorConfig(), tokenizer: VideoTestTokenizer())
-
-        // Four synthetic 64x64 frames at 1s spacing.
-        let frames = (0 ..< 4).map { i in
-            UserInput.VideoFrame(
-                frame: CIImage(color: CIColor(red: 0.3, green: 0.5, blue: 0.7))
-                    .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64)),
-                timeStamp: CMTime(value: Int64(i), timescale: 1))
-        }
-        let (pixels, frameCounts) = try await processor.processVideos(
-            [.frames(frames)], processing: nil)
-        eval(pixels)
-
-        #expect(frameCounts.count == 1)
-        #expect(pixels.dim(0) == frameCounts.reduce(0, +))
-        #expect(pixels.dim(0) >= 1)
-        #expect(Array(pixels.shape.dropFirst()) == [3, 432, 432])
-    }
-
     // MARK: - Helpers
 
-    private static func makeTinyConfig(videoSoftTokens: Int) throws -> Gemma4Configuration {
-        try decodeConfig(
-            videoTokenLine: "\"video_token_id\": 101,",
-            extraLines: "\"vision_soft_tokens_per_video_frame\": \(videoSoftTokens),")
+    private static func makeTinyConfig() throws -> Gemma4Configuration {
+        try decodeConfig(videoTokenLine: "\"video_token_id\": 101,")
     }
 
     /// Tiny `gemma4` config. `pooling_kernel_size 1` + `default_output_length 4` make the
@@ -157,7 +134,8 @@ struct Gemma4VideoInputTests {
               },
               "vision_config": {
                 "num_hidden_layers": 1, "hidden_size": 16, "intermediate_size": 32,
-                "num_attention_heads": 2, "head_dim": 8, "patch_size": 4,
+                "num_attention_heads": 2, "num_key_value_heads": 2,
+                "head_dim": 8, "patch_size": 4,
                 "default_output_length": 4, "pooling_kernel_size": 1, "position_embedding_size": 8
               }
             }
@@ -173,30 +151,9 @@ struct Gemma4VideoInputTests {
               "image_seq_length": 280,
               "image_token_id": 258880,
               "video_token_id": 258884,
-              "video_soft_tokens_per_frame": 70
+              "video_processor": { "max_soft_tokens": 70 }
             }
             """
         return try JSONDecoder().decode(Gemma4ProcessorConfiguration.self, from: Data(json.utf8))
     }
-}
-
-/// Minimal tokenizer so `Gemma4Processor` can be constructed; `processVideos` never
-/// touches it, and the pixel-shape tests don't exercise the chat template.
-private struct VideoTestTokenizer: Tokenizer {
-    let vocabularySize: Int = 8
-    let bosToken: String? = nil
-    let eosToken: String? = nil
-    let eosTokenId: Int? = 1
-    let unknownToken: String? = nil
-    let unknownTokenId: Int? = 0
-
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
-    func convertTokenToId(_ token: String) -> Int? { Int(token) }
-    func convertIdToToken(_ id: Int) -> String? { String(id) }
-    func applyChatTemplate(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?
-    ) throws -> [Int] { [] }
 }

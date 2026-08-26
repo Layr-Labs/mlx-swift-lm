@@ -96,6 +96,11 @@ public struct GenerateParameters: Sendable {
     /// Min-p sampling threshold relative to the highest probability token (0 disables)
     public var minP: Float
 
+    /// Optional sampler seed. When supplied, a generation owns an isolated,
+    /// reproducible random stream instead of depending on process-global RNG
+    /// state.
+    public var seed: UInt64?
+
     /// Penalty factor for repeating tokens
     public var repetitionPenalty: Float?
 
@@ -126,6 +131,7 @@ public struct GenerateParameters: Sendable {
         topP: Float = 1.0,
         topK: Int = 0,
         minP: Float = 0.0,
+        seed: UInt64? = nil,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
         presencePenalty: Float? = nil,
@@ -145,6 +151,7 @@ public struct GenerateParameters: Sendable {
         self.topP = topP
         self.topK = topK
         self.minP = minP
+        self.seed = seed
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
         self.presencePenalty = presencePenalty
@@ -163,9 +170,10 @@ public struct GenerateParameters: Sendable {
         if temperature == 0 {
             return ArgMaxSampler()
         } else if usesTopP || usesTopK || usesMinP {
-            return TopPSampler(temperature: temperature, topP: topP, topK: topK, minP: minP)
+            return TopPSampler(
+                temperature: temperature, topP: topP, topK: topK, minP: minP, seed: seed)
         } else {
-            return CategoricalSampler(temperature: temperature)
+            return CategoricalSampler(temperature: temperature, seed: seed)
         }
     }
 
@@ -240,7 +248,10 @@ public struct TopPSampler: LogitSampler {
     let negInf: MLXArray
     let randomState: MLXRandom.RandomState
 
-    public init(temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0) {
+    public init(
+        temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0,
+        seed: UInt64? = nil
+    ) {
         self.temp = MLXArray(temperature)
         if topP > 0 && topP < 1 {
             self.topP = MLXArray(topP)
@@ -250,7 +261,7 @@ public struct TopPSampler: LogitSampler {
         self.topK = topK > 0 ? topK : nil
         self.minP = minP > 0 ? MLXArray(minP) : nil
         self.negInf = MLXArray(-Float.infinity)
-        self.randomState = MLXRandom.RandomState()
+        self.randomState = seed.map(MLXRandom.RandomState.init) ?? MLXRandom.RandomState()
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
@@ -316,9 +327,9 @@ public struct CategoricalSampler: LogitSampler {
     let temp: MLXArray
     let randomState: MLXRandom.RandomState
 
-    public init(temperature: Float) {
+    public init(temperature: Float, seed: UInt64? = nil) {
         self.temp = MLXArray(temperature)
-        self.randomState = MLXRandom.RandomState()
+        self.randomState = seed.map(MLXRandom.RandomState.init) ?? MLXRandom.RandomState()
     }
 
     public func sample(logits: MLXArray) -> MLXArray {
@@ -598,6 +609,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvBits: Int?
     let kvGroupSize: Int
     let quantizedKVStart: Int
+    let kvScheme: String?
 
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
@@ -626,9 +638,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.promptPrefillTime = try measure {
-            try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
+            try prepare(input: .init(text: y), prefill: parameters.prefill)
         }
     }
 
@@ -659,9 +672,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.promptPrefillTime = try measure {
-            try prepare(input: input, windowSize: parameters.prefillStepSize)
+            try prepare(input: input, prefill: parameters.prefill)
         }
     }
 
@@ -692,16 +706,19 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
+        self.kvScheme = nil
 
         self.promptPrefillTime = try measure {
-            try prepare(input: input, windowSize: prefillStepSize)
+            try prepare(
+                input: input,
+                prefill: .init(stepSize: prefillStepSize, chunking: .remainder))
         }
     }
 
-    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+    mutating func prepare(input: LMInput, prefill: PrefillParameters) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, state: nil, windowSize: windowSize) {
+        switch try model.prepare(input, cache: cache, state: nil, prefill: prefill) {
         case .tokens(let tokens):
             y = tokens
 
@@ -709,6 +726,11 @@ public struct TokenIterator: TokenIteratorProtocol {
             let token = step(previous: y)
             y = .init(tokens: token)
             asyncEval(y.tokens)
+            // A `.tokens` model reports submitted prefix chunks; the iterator
+            // owns the final forward and therefore completes the progress
+            // sequence after that remainder has entered the cache.
+            let total = input.text.cacheSequenceLength
+            prefill.progress?(total, total)
 
         case .logits(let result):
             y = .init(tokens: convertToToken(logits: result.logits))
@@ -742,7 +764,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             cache: &cache,
             kvBits: kvBits,
             kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart
+            quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme
         )
 
         return convertToToken(logits: result.logits)
@@ -861,7 +884,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
                 cache: &cache,
                 kvBits: parameters.kvBits,
                 kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart
+                quantizedKVStart: parameters.quantizedKVStart,
+                kvScheme: parameters.kvScheme
             )
         }
 
@@ -1780,7 +1804,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            let iterator = iterator.consume()
+            var iterator = iterator.consume()
             var handler = handler.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
@@ -1793,7 +1817,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            for token in iterator {
+            while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled
@@ -1810,20 +1834,42 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 if token == tokenizer.unknownTokenId || stopTokenIds.contains(token) {
                     if includeStopToken {
                         tokenCount += 1
-                        if !handler.onStopToken(token, emit: continuation.yield) {
+                        switch handler.onStopToken(token, emit: continuation.yield) {
+                        case .more:
+                            break
+                        case .stop:
+                            stopReason = .stop
+                            break
+                        case .cancelled:
                             stopReason = .cancelled
                             break
                         }
+                        if stopReason != nil { break }
                     }
                     stopReason = .stop
                     break
                 }
 
                 tokenCount += 1
-                if !handler.onToken(token, emit: continuation.yield) {
-                    stopReason = .cancelled
+                switch handler.onToken(token, emit: continuation.yield) {
+                case .more:
+                    break
+                case .stop:
+                    stopReason = .stop
+                    break
+                case .cancelled:
+                    // If delivery races the final permitted token, the token
+                    // budget is the externally observable terminal reason.
+                    // This keeps a consumer's stream teardown from relabeling
+                    // a completed max-token generation as cancellation.
+                    if let maxTokens = iterator.maxTokens, iterator.tokenCount >= maxTokens {
+                        stopReason = .length
+                    } else {
+                        stopReason = .cancelled
+                    }
                     break
                 }
+                if stopReason != nil { break }
             }
 
             if stopReason == nil {
@@ -2044,17 +2090,17 @@ public enum TokenGeneration: Sendable {
 private protocol TokenLoopHandler: Sendable {
     associatedtype Output
 
-    /// Return false to stop the loop early.
+    /// Returns why the loop should proceed or stop after a token.
     mutating func onToken(
         _ token: Int,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> Bool
+    ) -> TokenLoopDisposition
 
     /// Called only when includeStopToken == true and a stop token was hit.
     mutating func onStopToken(
         _ token: Int,
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
-    ) -> Bool
+    ) -> TokenLoopDisposition
 
     /// Called after the token loop finishes, before the info event.
     mutating func onGenerationEnd(
@@ -2064,71 +2110,72 @@ private protocol TokenLoopHandler: Sendable {
     func infoEvent(_ info: GenerateCompletionInfo) -> Output
 }
 
+private enum TokenLoopDisposition {
+    case more
+    case stop
+    case cancelled
+}
+
 private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
     typealias Output = Generation
 
-    var detokenizer: NaiveStreamingDetokenizer
-    let toolCallProcessor: ToolCallProcessor
+    var decoder: any TokenStreamDecoder
 
     init(tokenizer: Tokenizer, format: ToolCallFormat, tools: [[String: any Sendable]]? = nil) {
-        detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        // Declared-tool schemas make the parsers reject undeclared function
-        // names (and JSON-looking non-tool output) instead of surfacing them
-        // as tool calls — see `ToolCallProcessor(format:tools:)`.
-        toolCallProcessor = ToolCallProcessor(format: format, tools: tools)
+        decoder = format.makeTokenStreamDecoder(
+            tokenizer: tokenizer, tools: tools, stopStrings: [])
     }
 
     mutating func onToken(
         _ token: Int,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> Bool {
-        detokenizer.append(token: token)
-        if let chunk = detokenizer.next() {
-            // Process chunk through the tool call processor.
-            if let textToYield = toolCallProcessor.processChunk(chunk) {
-                if case .terminated = emit(.chunk(textToYield)) {
-                    return false
-                }
+    ) -> TokenLoopDisposition {
+        var sawSemanticStop = false
+        let delivered = decoder.push(token) { event in
+            if case .stop = event {
+                sawSemanticStop = true
+                return false
             }
-
-            // Emit all complete tool calls in parse order.
-            for toolCall in toolCallProcessor.drainToolCalls() {
-                if case .terminated = emit(.toolCall(toolCall)) {
-                    return false
-                }
-            }
+            return Self.emit(event, yield: emit)
         }
-
-        return true
+        if sawSemanticStop { return .stop }
+        return delivered ? .more : .cancelled
     }
 
     mutating func onStopToken(
         _ token: Int,
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
-    ) -> Bool {
-        true
+    ) -> TokenLoopDisposition {
+        .more
     }
 
     mutating func onGenerationEnd(
         emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
     ) {
-        if let bufferedText = toolCallProcessor.processEOS(returnBufferedText: true),
-            !bufferedText.isEmpty
-        {
-            if case .terminated = emit(.chunk(bufferedText)) {
-                return
-            }
-        }
-
-        for toolCall in toolCallProcessor.drainToolCalls() {
-            if case .terminated = emit(.toolCall(toolCall)) {
-                break
-            }
-        }
+        _ = decoder.finish { event in Self.emit(event, yield: emit) }
     }
 
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
         .info(info)
+    }
+
+    private static func emit(
+        _ event: TokenStreamEvent,
+        yield: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) -> Bool {
+        let generation: Generation?
+        switch event {
+        case .response(let text): generation = .chunk(text)
+        case .toolCall(let call): generation = .toolCall(call)
+        case .rejectedToolCall(let rejection): generation = .rejectedToolCall(rejection)
+        case .reasoning, .protocolError: generation = nil
+        case .stop: return false
+        }
+        guard let generation else { return true }
+        if case .terminated = yield(generation) {
+            return false
+        }
+        return true
     }
 }
 
@@ -2138,21 +2185,21 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
     mutating func onToken(
         _ token: Int,
         emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> Bool {
+    ) -> TokenLoopDisposition {
         if case .terminated = emit(.token(token)) {
-            return false
+            return .cancelled
         }
-        return true
+        return .more
     }
 
     mutating func onStopToken(
         _ token: Int,
         emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
-    ) -> Bool {
+    ) -> TokenLoopDisposition {
         if case .terminated = emit(.token(token)) {
-            return false
+            return .cancelled
         }
-        return true
+        return .more
     }
 
     mutating func onGenerationEnd(

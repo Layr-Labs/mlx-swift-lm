@@ -1913,7 +1913,27 @@ public func loadPromptCache(
 
 /// Load a prompt cache and its associated model state from a file.
 public func loadPromptCacheSnapshot(url: URL) throws -> PromptCacheSnapshot {
-    var (arrays, metadata) = try loadArraysAndMetadata(url: url)
+    let loaded: ([String: MLXArray], [String: String])
+    do {
+        loaded = try loadArraysAndMetadata(url: url)
+    } catch {
+        // A malformed safetensors payload is a corrupt prompt cache from this
+        // API's perspective.  Do not leak MLX's transport error here: callers
+        // use `KVCacheError` to discard an unusable warm cache and rebuild it.
+        throw KVCacheError(message: "Unable to load prompt cache: \(error.localizedDescription)")
+    }
+    var (arrays, metadata) = loaded
+
+    // Safetensors arrays are lazily file-backed. A prompt cache is a value
+    // returned to the caller, not a view that keeps its source file alive;
+    // materialize it while the file is still present. This also ensures that
+    // rejecting corrupt metadata cannot leave an unevaluated array behind for
+    // a later MLX evaluation after a caller removes the bad cache file.
+    do {
+        try withError { eval(Array(arrays.values)) }
+    } catch {
+        throw KVCacheError(message: "Unable to materialize prompt cache: \(error.localizedDescription)")
+    }
 
     // Unflatten metadata using tree_unflatten compatible logic
     let unflattenedMetadata = unflattenMetadata(metadata)

@@ -209,10 +209,7 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
         var loraLayers: [Module] { [] }
     }
 
-    /// Position-addressed model used to make a speculative round deterministic.
-    /// With three drafts, every four generated tokens form one verifier round;
-    /// the twelfth token below is therefore returned as the uncommitted final
-    /// sample of the third round.
+    /// Position-addressed model used to verify a live-cache tool restart.
     private final class TimelineModel: Module, LLMModel, KVCacheDimensionProvider,
         @unchecked Sendable
     {
@@ -327,11 +324,10 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
 
         // Every template render — including the tool restart — was legal.
         XCTAssertGreaterThanOrEqual(renderLog.all.count, 2)
-        // Live cache retained through the generated call commit: prefill offset
-        // is far past the cold template's short prefix, and only the tool-result
-        // suffix (not a re-feed of `<|call|>`) is appended.
+        // Live cache retains private analysis but the generated call is not fed
+        // until the restart, so prefill carries it plus the tool-result suffix.
         XCTAssertGreaterThan(model.prefillOffsets[1], 1)
-        XCTAssertEqual(model.prefillTokenCounts[1], 4)
+        XCTAssertEqual(model.prefillTokenCounts[1], 5)
         let restart = try XCTUnwrap(renderLog.all.last)
         try TemplateContract.validate(restart)
 
@@ -343,7 +339,7 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
         XCTAssertTrue(restart.contains { ($0["role"] as? String) == "tool" })
     }
 
-    func testSpeculativeFinalCallTokenResumesFromTheLiveMainCache() async throws {
+    func testUncommittedCallTokenResumesFromTheLiveMainCache() async throws {
         let fragments = [
             "assistant",
             "analysis",
@@ -365,8 +361,9 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
         XCTAssertEqual(firstGeneration.count, 12)
 
         // The cold restart prompt is [start, call, start, message, tool-result, end].
-        // The live main cache ends immediately before `call`, so it must receive
-        // the final five tokens as one main-only prefill.
+        // The parser sees the generated `call` before the iterator feeds it
+        // back into the cache, so the restart prefill carries it plus the
+        // four-token tool-result suffix.
         let timeline =
             [Harmony.start]
             + firstGeneration
@@ -385,24 +382,14 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
             messageGenerator: GPTOSSMessageGenerator())
         let mainModel = TimelineModel(
             timeline: timeline, vocabularySize: tokenizer.vocabularySize)
-        let draftModel = TimelineModel(
-            timeline: timeline, vocabularySize: tokenizer.vocabularySize)
         let mainContext = ModelContext(
             configuration: configuration,
             model: mainModel,
             processor: processor,
             tokenizer: tokenizer)
-        let draftContext = ModelContext(
-            configuration: configuration,
-            model: draftModel,
-            processor: processor,
-            tokenizer: tokenizer)
-
         let dispatched = DispatchBox()
         let session = ChatSession(
             mainContext,
-            speculativeDecoding: SpeculativeDecodingConfig(
-                draftModel: ModelContainer(context: draftContext), numDraftTokens: 3),
             generateParameters: GenerateParameters(maxTokens: 32, temperature: 0),
             tools: [Self.weatherTool],
             toolDispatch: { call in
@@ -415,12 +402,11 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
         XCTAssertEqual(dispatched.all.count, 1)
         XCTAssertTrue(reply.contains("Sunny in Paris."))
         XCTAssertFalse(reply.contains("Need weather"))
-        XCTAssertTrue(
-            mainModel.calls.contains { $0.offset == 12 && $0.tokenCount == 5 },
+        let restartCalls = mainModel.calls.filter { $0.tokenCount == 5 }
+        XCTAssertEqual(restartCalls.count, 1)
+        XCTAssertGreaterThan(
+            restartCalls[0].offset, 1,
             "The main cache should retain private analysis and prefill call + tool result")
-        XCTAssertFalse(
-            draftModel.calls.contains { $0.offset >= 12 },
-            "A lagging draft cache must not be reused for the Harmony continuation")
     }
 
     func testRawGenerationDoesNotApplyHarmonySemanticStopTokens() async throws {

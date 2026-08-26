@@ -38,9 +38,13 @@ public class ToolCallProcessor {
     private let tools: [[String: any Sendable]]?
     private let allowedToolNames: Set<String>?
     private let supportsBareJSONFallback: Bool
+    /// Auto tool choice must not silently discard malformed model output. This
+    /// is deliberately opt-in: constrained required/named calls remain strict.
+    private let preserveMalformedTaggedText: Bool
     private let maxJSONFallbackBufferLength = 32_768
     private let jsonObjectScanner = JSONLeadingObjectScanner(startCharacter: "{")
     private var state = State.normal
+    private var activeStartTag: String?
     private var toolCallBuffer = ""
     private var hasExplicitInlineMarker = false
     private var emittedToolCallIDs: Set<String> = []
@@ -83,10 +87,15 @@ public class ToolCallProcessor {
     ///   - tools: Optional tool schemas for type-aware parsing and authorization.
     ///     `nil` accepts any parsed function name; a supplied array, including
     ///     an empty one, authorizes only the names it declares.
-    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
+    public init(
+        format: ToolCallFormat = .json,
+        tools: [[String: any Sendable]]? = nil,
+        preserveMalformedTaggedText: Bool = false
+    ) {
         self.format = format
         self.parser = format.createParser()
         self.tools = tools
+        self.preserveMalformedTaggedText = preserveMalformedTaggedText
         self.allowedToolNames = tools.map { tools in
             Set(
                 tools.compactMap { tool in
@@ -106,6 +115,10 @@ public class ToolCallProcessor {
     /// The first character of the start tag for quick detection.
     private var startTagFirstChar: Character? {
         parser.startTag?.first
+    }
+
+    private var toolCallStartTags: [String] {
+        [parser.startTag].compactMap { $0 } + parser.alternateStartTags
     }
 
     // MARK: - Public Methods
@@ -200,6 +213,9 @@ public class ToolCallProcessor {
             let reason = rejectionReasonForResidual(
                 buffered, state: terminalState, explicitInlineMarker: hasExplicitInlineMarker)
         {
+            if reason != .incompleteOutput {
+                parseFailureCount += 1
+            }
             appendRejectedToolCall(
                 reason: reason,
                 rawText: buffered,
@@ -211,9 +227,13 @@ public class ToolCallProcessor {
 
         toolCallBuffer = ""
         state = .normal
+        activeStartTag = nil
         hasExplicitInlineMarker = false
 
-        return returnBufferedText && parsedCalls.isEmpty && !didReject ? buffered : nil
+        let shouldReturnBufferedText =
+            returnBufferedText && parsedCalls.isEmpty
+            && (!didReject || preserveMalformedTaggedText)
+        return shouldReturnBufferedText ? buffered : nil
     }
 
     /// Finishes processing and removes residual output in source order.
@@ -589,8 +609,11 @@ public class ToolCallProcessor {
             fallthrough
 
         case .potentialToolCall:
-            if partialMatch(buffer: toolCallBuffer, tag: startTag) {
-                if toolCallBuffer.starts(with: startTag) {
+            if toolCallStartTags.contains(where: { partialMatch(buffer: toolCallBuffer, tag: $0) }) {
+                if let matchedStartTag = toolCallStartTags.first(where: {
+                    toolCallBuffer.starts(with: $0)
+                }) {
+                    activeStartTag = matchedStartTag
                     state = .collectingToolCall
                     recordResponse(leadingToken ?? "")
                     leadingTokenWasRecorded = true
@@ -603,6 +626,7 @@ public class ToolCallProcessor {
             } else {
                 // Otherwise, return the collected text and reset the state.
                 state = .normal
+                activeStartTag = nil
                 let buffer = toolCallBuffer
                 toolCallBuffer = ""
                 if let attempt = protocolMarkerAttempt(in: buffer, startTag: startTag) {
@@ -639,6 +663,7 @@ public class ToolCallProcessor {
                     }
                     appendToolCall(toolCall, rawText: bufferedToolCall)
                     state = .normal
+                    activeStartTag = nil
                     toolCallBuffer = ""
 
                     // If trailing content may contain another tool call, recurse.
@@ -657,15 +682,29 @@ public class ToolCallProcessor {
                 // A complete tagged payload is unambiguously intended as a tool
                 // call. Report it rather than leaking protocol text as response.
                 state = .normal
+                activeStartTag = nil
                 toolCallBuffer = ""
                 if !leadingTokenWasRecorded {
                     recordResponse(leadingToken ?? "")
                 }
                 let reason = classifyCompletePayload(bufferedToolCall)
+                parseFailureCount += 1
                 appendRejectedToolCall(
                     reason: reason,
                     rawText: bufferedToolCall,
                     detail: reason.diagnosticDetail)
+                if preserveMalformedTaggedText {
+                    recordResponse(bufferedToolCall)
+                    if let trailingToken,
+                        tokenCouldContainToolStart(trailingToken, startChar: startChar)
+                    {
+                        return combine(
+                            leadingToken,
+                            combine(bufferedToolCall, processChunk(trailingToken)))
+                    }
+                    if let trailingToken { recordResponse(trailingToken) }
+                    return combine(leadingToken, combine(bufferedToolCall, trailingToken))
+                }
                 if let trailingToken,
                     tokenCouldContainToolStart(trailingToken, startChar: startChar)
                 {

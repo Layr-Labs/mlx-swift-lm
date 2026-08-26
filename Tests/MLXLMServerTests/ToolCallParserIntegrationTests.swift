@@ -16,11 +16,11 @@ import Testing
 /// model output correctly produces tool calls.
 struct ToolCallParserIntegrationTests {
 
-    // MARK: - BatchedToolStreamHandler: Gemma Format
+    // MARK: - BatchedToolStreamHandler: Gemma 4 Format
 
-    @Test("BatchedToolStreamHandler extracts Gemma tool call from single chunk")
-    func batchedHandlerGemmaSingleChunk() throws {
-        let handler = BatchedToolStreamHandler(format: .gemma, tools: nil)
+    @Test("BatchedToolStreamHandler extracts Gemma4 tool call from single chunk")
+    func batchedHandlerGemma4SingleChunk() throws {
+        let handler = BatchedToolStreamHandler(format: .gemma4, tools: nil)
 
         let result = handler.processChunk(
             "<|tool_call>call:get_weather{city:Paris,units:metric}<tool_call|>"
@@ -37,9 +37,9 @@ struct ToolCallParserIntegrationTests {
         #expect(tc.function.arguments["units"] == .string("metric"))
     }
 
-    @Test("BatchedToolStreamHandler extracts Gemma tool call from multiple chunks")
-    func batchedHandlerGemmaMultipleChunks() throws {
-        let handler = BatchedToolStreamHandler(format: .gemma, tools: nil)
+    @Test("BatchedToolStreamHandler extracts Gemma4 tool call from multiple chunks")
+    func batchedHandlerGemma4MultipleChunks() throws {
+        let handler = BatchedToolStreamHandler(format: .gemma4, tools: nil)
 
         let chunks = [
             "<|tool_call>",
@@ -60,9 +60,9 @@ struct ToolCallParserIntegrationTests {
         #expect(tc.function.arguments["city"] == .string("Paris"))
     }
 
-    @Test("BatchedToolStreamHandler separates visible text from Gemma tool call")
-    func batchedHandlerGemmaWithLeadingText() throws {
-        let handler = BatchedToolStreamHandler(format: .gemma, tools: nil)
+    @Test("BatchedToolStreamHandler separates visible text from Gemma4 tool call")
+    func batchedHandlerGemma4WithLeadingText() throws {
+        let handler = BatchedToolStreamHandler(format: .gemma4, tools: nil)
 
         // First chunk is regular text
         let visible1 = handler.processChunk("Let me check the weather.")
@@ -80,9 +80,9 @@ struct ToolCallParserIntegrationTests {
         #expect(toolCalls[0].function.arguments["city"] == .string("Tokyo"))
     }
 
-    @Test("BatchedToolStreamHandler handles Gemma escaped string arguments")
-    func batchedHandlerGemmaEscapedStrings() throws {
-        let handler = BatchedToolStreamHandler(format: .gemma, tools: nil)
+    @Test("BatchedToolStreamHandler handles Gemma4 escaped string arguments")
+    func batchedHandlerGemma4EscapedStrings() throws {
+        let handler = BatchedToolStreamHandler(format: .gemma4, tools: nil)
 
         _ = handler.processChunk(
             "<|tool_call>call:search{query:<|\"|>hello world<|\"|>}<tool_call|>"
@@ -110,8 +110,8 @@ struct ToolCallParserIntegrationTests {
         #expect(toolCalls[0].function.arguments["location"] == .string("San Francisco"))
     }
 
-    @Test("BatchedToolStreamHandler preserves comma-bearing Gemma string arguments")
-    func batchedHandlerGemmaCommaBearingString() throws {
+    @Test("BatchedToolStreamHandler preserves comma-bearing Gemma4 string arguments")
+    func batchedHandlerGemma4CommaBearingString() throws {
         let tools: [[String: any Sendable]] = [
             [
                 "type": "function",
@@ -127,12 +127,12 @@ struct ToolCallParserIntegrationTests {
                 ] as [String: any Sendable],
             ]
         ]
-        let handler = BatchedToolStreamHandler(format: .gemma, tools: tools)
+        let handler = BatchedToolStreamHandler(format: .gemma4, tools: tools)
 
         for chunk in [
             "<|tool_call>",
-            "call:get_current_weather{location:Boston,",
-            " MA,unit:fahrenheit}",
+            "call:get_current_weather{location:<|\"|>Boston,",
+            " MA<|\"|>,unit:fahrenheit}",
             "<tool_call|>",
         ] {
             _ = handler.processChunk(chunk)
@@ -523,7 +523,7 @@ struct ToolCallParserIntegrationTests {
 
         let handler = BatchedToolStreamHandler(format: format, tools: nil)
         _ = handler.processChunk(
-            "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"
+            "<start_function_call>call:get_weather{city:<escape>Paris<escape>}<end_function_call>"
         )
 
         let toolCalls = handler.finish()
@@ -562,10 +562,10 @@ struct ToolCallParserIntegrationTests {
         #expect(toolCalls[0].function.arguments["location"] == .string("Berlin"))
     }
 
-    @Test("Full pipeline: qwen3_5 model type -> XML Function parser -> streaming extraction")
+    @Test("Full pipeline: qwen3_5 model type -> Qwen3.5 parser -> streaming extraction")
     func fullPipelineQwen35() throws {
         let format = try #require(ToolCallFormat.infer(from: "qwen3_5"))
-        #expect(format == .xmlFunction)
+        #expect(format == .qwen35)
 
         let handler = BatchedToolStreamHandler(format: format, tools: nil)
         _ = handler.processChunk(
@@ -586,8 +586,8 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: "json", modelType: nil) == .json)
         #expect(try ServerToolParser.resolve(requested: "default", modelType: nil) == .json)
         #expect(try ServerToolParser.resolve(requested: "gemma", modelType: nil) == .gemma)
-        #expect(try ServerToolParser.resolve(requested: "gemma4", modelType: nil) == .gemma)
-        #expect(try ServerToolParser.resolve(requested: "gemma_4", modelType: nil) == .gemma)
+        #expect(try ServerToolParser.resolve(requested: "gemma4", modelType: nil) == .gemma4)
+        #expect(try ServerToolParser.resolve(requested: "gemma_4", modelType: nil) == .gemma4)
         #expect(try ServerToolParser.resolve(requested: "harmony", modelType: nil) == .harmony)
         #expect(try ServerToolParser.resolve(requested: "gpt_oss", modelType: nil) == .harmony)
         #expect(
@@ -617,10 +617,10 @@ struct ToolCallParserIntegrationTests {
     @Test("ServerToolParser.resolve auto-detects from model type")
     func serverToolParserResolveAutoDetects() throws {
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma2") == .gemma)
-        #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma)
+        #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma4)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gpt_oss") == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "mistral3") == .mistral)
-        #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_5") == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_5") == .qwen35)
         #expect(
             try ServerToolParser.resolve(requested: nil, modelType: "qwen3_next") == .xmlFunction)
         #expect(
@@ -628,8 +628,8 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "lfm2") == .lfm2)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "glm4") == .glm4)
         #expect(
-            try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .xmlFunction)
-        #expect(try ServerToolParser.resolve(requested: "auto", modelType: "gemma4") == .gemma)
+            try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .qwen35)
+        #expect(try ServerToolParser.resolve(requested: "auto", modelType: "gemma4") == .gemma4)
     }
 
     @Test("ServerToolParser.resolve falls back to JSON for unknown model types")
@@ -672,8 +672,8 @@ struct ToolCallParserIntegrationTests {
         // Gemma family
         #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
         #expect(ToolCallFormat.infer(from: "gemma2") == .gemma)
-        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma)
-        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma4)
+        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma4)
         #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
 
         // GPT-OSS / Harmony
@@ -684,9 +684,9 @@ struct ToolCallParserIntegrationTests {
         #expect(ToolCallFormat.infer(from: "mistral3_text") == .mistral)
         #expect(ToolCallFormat.infer(from: "MISTRAL3") == .mistral)
 
-        // Qwen3.5 / Qwen3-Next / Nemotron -> xmlFunction
-        #expect(ToolCallFormat.infer(from: "qwen3_5") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
+        // Qwen3.5 accepts its XML template and legacy framed JSON payloads.
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
         #expect(ToolCallFormat.infer(from: "qwen3_next") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
 
@@ -746,15 +746,21 @@ struct ToolCallParserIntegrationTests {
                 #expect(parser.startTag == "<|tool_call_start|>")
                 #expect(parser.endTag == "<|tool_call_end|>")
             case .gemma:
+                #expect(parser.startTag == "<start_function_call>")
+                #expect(parser.endTag == "<end_function_call>")
+            case .gemma4:
                 #expect(parser.startTag == "<|tool_call>")
                 #expect(parser.endTag == "<tool_call|>")
-            case .harmony:
+            case .gptOSS:
                 #expect(parser.startTag == "<|start|>assistant to=functions.")
                 #expect(parser.endTag == "<|call|>")
             case .mistral:
                 #expect(parser.startTag == "[TOOL_CALLS]")
                 #expect(parser.endTag == nil)  // Mistral uses EOS, no end tag
             case .xmlFunction:
+                #expect(parser.startTag == "<tool_call>")
+                #expect(parser.endTag == "</tool_call>")
+            case .qwen35:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
             case .glm4:
@@ -766,6 +772,9 @@ struct ToolCallParserIntegrationTests {
             case .minimaxM2:
                 #expect(parser.startTag == "<minimax:tool_call>")
                 #expect(parser.endTag == "</minimax:tool_call>")
+            case .atem:
+                #expect(parser.startTag == "<atem:function_calls>")
+                #expect(parser.endTag == "</atem:function_calls>")
             case .llama3:
                 #expect(parser.startTag == nil)  // Llama 3 uses inline format
                 #expect(parser.endTag == nil)
@@ -777,7 +786,7 @@ struct ToolCallParserIntegrationTests {
 
     @Test("BatchedToolStreamHandler handles tag split across chunk boundaries")
     func batchedHandlerPartialTagBoundary() throws {
-        let handler = BatchedToolStreamHandler(format: .gemma, tools: nil)
+        let handler = BatchedToolStreamHandler(format: .gemma4, tools: nil)
 
         // "<|tool_call>" split across two chunks
         _ = handler.processChunk("<|tool")
@@ -803,9 +812,9 @@ struct ToolCallParserIntegrationTests {
 
     // MARK: - Edge Cases: Complex Arguments
 
-    @Test("BatchedToolStreamHandler handles Gemma with nested JSON arguments")
-    func batchedHandlerGemmaNestedJSON() throws {
-        let handler = BatchedToolStreamHandler(format: .gemma, tools: nil)
+    @Test("BatchedToolStreamHandler handles Gemma4 with nested JSON arguments")
+    func batchedHandlerGemma4NestedJSON() throws {
+        let handler = BatchedToolStreamHandler(format: .gemma4, tools: nil)
 
         _ = handler.processChunk(
             "<|tool_call>call:search{query:<|\"|>swift, mlx<|\"|>,filters:{\"limit\":5,\"active\":true}}<tool_call|>"

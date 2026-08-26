@@ -8,6 +8,12 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// Keep M-RoPE continuation state request-owned. A model instance is shared by
+// concurrent sessions, so storing it on the module would cross-contaminate
+// independently warmed KV caches.
+private let positionIdsKey = LMOutput.Key<MLXArray>("qwen2vl.positionIds")
+private let ropeDeltasKey = LMOutput.Key<MLXArray>("qwen2vl.ropeDeltas")
+
 // MARK: - Language
 
 private enum Language {
@@ -46,6 +52,8 @@ private enum Language {
         let headDim: Int
         let scale: Float
         let mropeSection: [Int]
+        let mropeSectionRaw: [Int]
+        private let _invFreq: MLXArray
 
         @ModuleInfo(key: "q_proj") var wq: Linear
         @ModuleInfo(key: "k_proj") var wk: Linear
@@ -67,6 +75,7 @@ private enum Language {
             self._wo.wrappedValue = Linear(heads * headDim, dim, bias: false)
 
             if let v = args.ropeScaling?["mrope_section"], let array = v.asInts() {
+                self.mropeSectionRaw = array
                 // mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
                 self.mropeSection = sequence(state: (0, array.makeIterator())) { state in
                     if let v = state.1.next() {
@@ -81,12 +90,36 @@ private enum Language {
                 fatalError("rope_scaling['mrope_section'] must be an array of integers")
             }
 
+            let frequencyIndices = MLXArray(stride(from: 0, to: headDim, by: 2))
+                .asType(.float32)
+            self._invFreq = 1.0 / pow(
+                MLXArray(args.ropeTheta), frequencyIndices / Float(headDim))
+
             self._rotaryEmbedding.wrappedValue = RoPE(
                 dimensions: headDim, traditional: args.ropeTraditional, base: args.ropeTheta)
         }
 
+        private func mropeCosSin(positionIds: MLXArray) -> (MLXArray, MLXArray) {
+            let inverseFrequency = _invFreq.reshaped(1, 1, -1, 1)
+            let positions = positionIds[0..., 0..., .newAxis, 0...].asType(.float32)
+            var frequencies = matmul(inverseFrequency, positions).transposed(0, 1, 3, 2)
+
+            var temporalFrequencies = frequencies[0]
+            var offset = mropeSectionRaw[0]
+            for dimension in 1 ..< mropeSectionRaw.count {
+                let length = mropeSectionRaw[dimension]
+                temporalFrequencies[0..., 0..., offset ..< (offset + length)] =
+                    frequencies[dimension][0..., 0..., offset ..< (offset + length)]
+                offset += length
+            }
+
+            let embedding = concatenated([temporalFrequencies, temporalFrequencies], axis: -1)
+            return (MLX.cos(embedding), MLX.sin(embedding))
+        }
+
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+            positionIds: MLXArray? = nil
         ) -> MLXArray {
             let (B, L) = (x.dim(0), x.dim(1))
 
@@ -99,9 +132,17 @@ private enum Language {
             keys = keys.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
             values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
 
-            let offset = cache?.offset ?? 0
-            queries = rotaryEmbedding(queries, offset: offset)
-            keys = rotaryEmbedding(keys, offset: offset)
+            if let positionIds {
+                let (cosine, sine) = mropeCosSin(positionIds: positionIds)
+                let cos = cosine[.newAxis, 0..., 0..., 0...]
+                let sin = sine[.newAxis, 0..., 0..., 0...]
+                queries = (queries * cos) + (QwenVL.rotateHalf(queries) * sin)
+                keys = (keys * cos) + (QwenVL.rotateHalf(keys) * sin)
+            } else {
+                let offset = cache?.offset ?? 0
+                queries = rotaryEmbedding(queries, offset: offset)
+                keys = rotaryEmbedding(keys, offset: offset)
+            }
 
             let output = attentionWithCacheUpdate(
                 queries: queries,
@@ -153,9 +194,11 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+            positionIds: MLXArray? = nil
         ) -> MLXArray {
-            var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+            var r = attention(
+                inputLayerNorm(x), mask: mask, cache: cache, positionIds: positionIds)
             let h = x + r
             r = mlp(postAttentionLayerNorm(h))
             let out = h + r
@@ -184,7 +227,8 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
+            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil,
+            positionIds: MLXArray? = nil
         ) -> MLXArray {
             var h: MLXArray
             if let inputEmbedding {
@@ -198,7 +242,7 @@ private enum Language {
             let mask = createAttentionMask(h: h, cache: cache?.first)
 
             for (i, layer) in layers.enumerated() {
-                h = layer(h, mask: mask, cache: cache?[i])
+                h = layer(h, mask: mask, cache: cache?[i], positionIds: positionIds)
             }
 
             return norm(h)
@@ -222,15 +266,37 @@ private enum Language {
         }
 
         public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
+            _ inputs: MLXArray?, cache: [KVCache]? = nil, state: LMOutput.State? = nil,
+            inputEmbedding: MLXArray? = nil, positionIds: MLXArray? = nil
         ) -> LMOutput {
-            var out = model(inputs, cache: cache, inputEmbedding: inputEmbedding)
+            var state = state ?? .init()
+            var effectivePositionIds = positionIds ?? state[positionIdsKey]
+            state[positionIdsKey] = nil
+
+            if effectivePositionIds == nil, let ropeDeltas = state[ropeDeltasKey],
+                let cache, let input = inputs ?? inputEmbedding
+            {
+                let batch = input.dim(0)
+                let sequenceLength = input.dim(1)
+                var delta = MLXArray(cache.first?.offset ?? 0).asType(.int32)
+                    + ropeDeltas.asType(.int32)
+                var base = MLXArray(0 ..< sequenceLength).asType(.int32)[.newAxis, 0...]
+                base = broadcast(base, to: [batch, sequenceLength])
+                if delta.dim(0) == 1 && batch > 1 {
+                    delta = repeated(delta, count: batch, axis: 0)
+                }
+                effectivePositionIds = broadcast(
+                    (base + delta)[.newAxis, 0..., 0...], to: [3, batch, sequenceLength])
+            }
+
+            var out = model(
+                inputs, cache: cache, inputEmbedding: inputEmbedding, positionIds: effectivePositionIds)
             if let lmHead {
                 out = lmHead(out)
             } else {
                 out = model.embedTokens.asLinear(out)
             }
-            return LMOutput(logits: out)
+            return LMOutput(logits: out, state: state)
         }
     }
 }
@@ -667,36 +733,8 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         self._languageModel.wrappedValue = Language.LanguageModel(config.textConfiguration)
     }
 
-    private func inputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, frames: [THW]?)
-        -> MLXArray
-    {
-        guard let pixelValues, let frames else {
-            return languageModel.model.embedTokens(inputIds[.newAxis, .ellipsis])
-        }
-
-        // Get the input embeddings from the language model
-        let inputEmbeds = languageModel.model.embedTokens(inputIds)
-
-        // Get the ouptut hidden states from the vision model
-        var hiddenStates = self.visionModel(pixelValues, frames: frames)
-
-        if hiddenStates.ndim == 2 {
-            hiddenStates = hiddenStates[.newAxis, 0..., 0...]
-        }
-
-        // Insert special image tokens in the input_ids
-        return QwenVL.mergeInputIdsWithImageFeatures(
-            inputIds: inputIds, inputEmbeds: inputEmbeds, imageFeatures: hiddenStates,
-            imageTokenId: config.baseConfiguration.imageTokenId,
-            videoTokenId: config.baseConfiguration.videoTokenId)
-    }
-
-    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
-        -> PrepareResult
-    {
+    private func gatherVisionInputs(_ input: LMInput) -> (pixels: MLXArray?, frames: [THW]?) {
         let dtype = visionModel.patchEmbed.proj.weight.dtype
-
-        // Process both images and videos together
         var allPixels: MLXArray?
         var allFrames: [THW] = []
 
@@ -714,25 +752,119 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
             allFrames.append(contentsOf: videoFrames)
         }
 
-        let inputEmbeddings = self.inputEmbeddings(
-            inputIds: input.text.tokens, pixelValues: allPixels,
-            frames: allFrames.isEmpty ? nil : allFrames)
+        return (allPixels, allFrames.isEmpty ? nil : allFrames)
+    }
 
-        let prefillStepSize = windowSize ?? 512
-        let totalPositions = inputEmbeddings.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
-            _ = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings[0..., range, 0...])
-            asyncEval(cache)
-            processed += chunkLength
+    private func mergedVisionEmbeds(inputIds: MLXArray, pixelValues: MLXArray, frames: [THW])
+        -> MLXArray
+    {
+        let inputEmbeds = languageModel.model.embedTokens(inputIds)
+        var hiddenStates = visionModel(pixelValues, frames: frames)
+        if hiddenStates.ndim == 2 {
+            hiddenStates = hiddenStates[.newAxis, 0..., 0...]
         }
-        eval(cache)
-        let result = languageModel(
-            nil, cache: cache, inputEmbedding: inputEmbeddings[0..., processed..., 0...])
+        return QwenVL.mergeInputIdsWithImageFeatures(
+            inputIds: inputIds, inputEmbeds: inputEmbeds, imageFeatures: hiddenStates,
+            imageTokenId: config.baseConfiguration.imageTokenId,
+            videoTokenId: config.baseConfiguration.videoTokenId)
+    }
 
+    private func cacheOffset(_ cache: [any KVCache]) -> Int {
+        cache.first?.offset ?? 0
+    }
+
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let inputIds = input.text.tokens
+        let stepSize = prefill.resolvedStepSize()
+        if inputIds.ndim == 2, inputIds.dim(0) == 1, inputIds.dim(-1) > 0,
+            cacheOffset(cache) > 0 || inputIds.dim(-1) > stepSize
+        {
+            return try prepareContinuation(input, cache: cache, state: state, prefill: prefill)
+        }
+
+        let inputIds2D = inputIds.ndim == 1 ? inputIds[.newAxis, 0...] : inputIds
+        let (pixels, frames) = gatherVisionInputs(input)
+        var state = LMOutput.State()
+        var embeddings: MLXArray?
+        if let pixels, let frames {
+            embeddings = mergedVisionEmbeds(inputIds: inputIds2D, pixelValues: pixels, frames: frames)
+            let (positionIds, ropeDeltas) = Qwen25VL.getRopeIndex(
+                inputIds: inputIds2D,
+                imageGridTHW: input.image?.frames,
+                videoGridTHW: input.video?.frames,
+                spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+                imageTokenId: config.baseConfiguration.imageTokenId,
+                videoTokenId: config.baseConfiguration.videoTokenId,
+                visionStartTokenId: config.baseConfiguration.visionStartTokenId ?? -1,
+                attentionMask: input.text.mask)
+            state[positionIdsKey] = positionIds
+            state[ropeDeltasKey] = ropeDeltas
+        }
+
+        let result = languageModel(
+            embeddings == nil ? inputIds2D : nil, cache: cache, state: state,
+            inputEmbedding: embeddings)
+        let total = inputIds2D.dim(-1)
+        prefill.progress?(total, total)
         return .logits(result)
+    }
+
+    private func prepareContinuation(
+        _ input: LMInput, cache: [any KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let inputIds = input.text.tokens.ndim == 1
+            ? input.text.tokens[.newAxis, 0...]
+            : input.text.tokens
+        let total = inputIds.dim(-1)
+        precondition(total > 0, "prepareContinuation needs a non-empty remainder")
+
+        let offset = cacheOffset(cache)
+        let carriedDelta = state?[ropeDeltasKey]?.asType(.int32).item(Int.self) ?? 0
+        let (pixels, frames) = gatherVisionInputs(input)
+        let embeddings = (pixels.flatMap { pixels in
+            frames.map { mergedVisionEmbeds(inputIds: inputIds, pixelValues: pixels, frames: $0) }
+        })
+        let (positionIds, ropeDeltas) = Qwen25VL.getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: input.image?.frames,
+            videoGridTHW: input.video?.frames,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.baseConfiguration.imageTokenId,
+            videoTokenId: config.baseConfiguration.videoTokenId,
+            visionStartTokenId: config.baseConfiguration.visionStartTokenId ?? -1,
+            attentionMask: input.text.mask,
+            positionOffset: offset + carriedDelta)
+
+        let processed = try prefill.forEachChunk(total: total) { range in
+            _ = languageModel(
+                embeddings == nil ? inputIds[0..., range] : nil,
+                cache: cache, inputEmbedding: embeddings?[0..., range, 0...],
+                positionIds: positionIds[0..., 0..., range])
+            asyncEval(cache)
+        }
+        if processed > 0 { eval(cache) }
+
+        let tailRange = processed ..< total
+        let logits = languageModel(
+            embeddings == nil ? inputIds[0..., tailRange] : nil,
+            cache: cache, inputEmbedding: embeddings?[0..., tailRange, 0...],
+            positionIds: positionIds[0..., 0..., tailRange]).logits
+        prefill.progress?(total, total)
+
+        var resumeState = LMOutput.State()
+        resumeState[ropeDeltasKey] = ropeDeltas - MLXArray(Int32(offset))
+        return .logits(LMOutput(logits: logits, state: resumeState))
+    }
+
+    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        try prepare(
+            input, cache: cache, state: nil,
+            prefill: .init(stepSize: windowSize, chunking: .remainder))
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
@@ -839,6 +971,7 @@ public struct Qwen2VLConfiguration: Codable, Sendable {
         public let vocabularySize: Int
         public let imageTokenId: Int
         public let videoTokenId: Int
+        public let visionStartTokenId: Int?
         public let hiddenSize: Int
 
         enum CodingKeys: String, CodingKey {
@@ -846,6 +979,7 @@ public struct Qwen2VLConfiguration: Codable, Sendable {
             case vocabularySize = "vocab_size"
             case imageTokenId = "image_token_id"
             case videoTokenId = "video_token_id"
+            case visionStartTokenId = "vision_start_token_id"
             case hiddenSize = "hidden_size"
         }
     }
@@ -868,6 +1002,14 @@ public struct Qwen2VLConfiguration: Codable, Sendable {
         // these are overlaid in the top level
         self.textConfiguration = try TextConfiguration(from: decoder)
         self.baseConfiguration = try BaseConfiguration(from: decoder)
+    }
+}
+
+extension Qwen2VLConfiguration: ModelConfigurationValidating {
+    public func validateModelConfiguration() throws {
+        try validateMROPESection(
+            textConfiguration.ropeScaling,
+            context: "Qwen2VLConfiguration.text_config.rope_scaling")
     }
 }
 

@@ -420,12 +420,20 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 512) == 8_216)
         let state = QwenMTPFixtureState()
         state.materializedBytes = 1_234
-        driver.restoreAssistantState(state, for: CBv2RequestID(403))
-        #expect(driver.materializedAssistantBytes() == 1_234)
         let detached = QwenMTPFixtureState()
         detached.materializedBytes = 321
-        #expect(driver.materializedAssistantBytes(detachedStates: [state, detached]) == 1_555)
-        driver.invalidateCarry(CBv2RequestID(403))
+        let assistantBytes = engine.loopForTesting.onEngineQueueSync {
+            driver.restoreAssistantState(state, for: CBv2RequestID(403))
+            return driver.materializedAssistantBytes()
+        }
+        #expect(assistantBytes == 1_234)
+        let assistantBytesWithDetached = engine.loopForTesting.onEngineQueueSync {
+            driver.materializedAssistantBytes(detachedStates: [state, detached])
+        }
+        #expect(assistantBytesWithDetached == 1_555)
+        engine.loopForTesting.onEngineQueueSync {
+            driver.invalidateCarry(CBv2RequestID(403))
+        }
         let id = CBv2RequestID(404)
         try engine.admissionForTesting.reserve(id: id, additionalTokens: 3)
         engine.loopForTesting.onEngineQueueSync {

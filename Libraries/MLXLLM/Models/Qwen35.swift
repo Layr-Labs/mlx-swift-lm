@@ -1713,6 +1713,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             if layer.isLinear {
                 return MambaCache()
             }
+            if let maxKVSize = parameters?.maxKVSize {
+                return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+            }
             return KVCacheSimple()
         }
     }
@@ -1816,6 +1819,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
 extension Qwen35TextModel: CBv2PositionAxisProviding {
     public var cbv2PositionAxisCount: Int? { 3 }
+}
+
+// MARK: - Chat conventions
+
+extension Qwen35TextModel {
+    public var toolCallFormat: ToolCallFormat? { .qwen35 }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }
 
 extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,

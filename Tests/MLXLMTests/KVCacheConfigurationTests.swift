@@ -351,28 +351,24 @@ struct KVCacheConfigurationTests {
         #expect(storage.cache[0] is QuantizedKVCache)
     }
 
-    @Test func modelCacheOwnsHybridProgressAcrossPrefillAndDecode() throws {
+    @Test func modelCachePreservesHybridProgressAcrossPrefillAndDecode() throws {
         let model = HybridProgressModel()
-        let storage = KVCacheStorage(try model.newCache(parameters: nil), plan: .disabled)
+        let cache = try model.newCache(parameters: nil)
         var iterator = try TokenIterator(
             input: LMInput(tokens: MLXArray([1, 2, 3])),
             model: model,
-            cacheStorage: storage,
+            cache: cache,
             parameters: GenerateParameters(maxTokens: 2, temperature: 0))
 
-        #expect(storage.processedTokenCount == 3)
-        let recurrent = try #require(storage.cache[0] as? MambaCache)
-        let attention = try #require(storage.cache[1] as? KVCacheSimple)
+        let recurrent = try #require(cache[0] as? MambaCache)
+        let attention = try #require(cache[1] as? KVCacheSimple)
         #expect(recurrent.offset == 0)
         #expect(attention.offset == 3)
-        #expect(storage.nativeAttentionOffsetsAreAligned)
 
         _ = iterator.next()
 
-        #expect(storage.processedTokenCount == 4)
         #expect(recurrent.offset == 0)
         #expect(attention.offset == 4)
-        #expect(storage.nativeAttentionOffsetsAreAligned)
     }
 
     @Test func modelCacheCopyAndTrimPreserveOneTimeline() throws {

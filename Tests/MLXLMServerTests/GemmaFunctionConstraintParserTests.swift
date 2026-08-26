@@ -7,7 +7,7 @@ struct GemmaFunctionConstraintParserTests {
     @Test("parser accepts recursive values emitted by the pinned template grammar")
     func recursiveGemmaValues() throws {
         let handler = BatchedToolStreamHandler(
-            format: .gemma,
+            format: .gemma4,
             tools: [
                 [
                     "type": "function",
@@ -41,37 +41,39 @@ struct GemmaFunctionConstraintParserTests {
                 ]))
     }
 
-    @Test("malformed tagged auto output is visible instead of silently dropped")
-    func malformedTaggedOutputFallsBackToText() {
+    @Test("malformed Gemma4 tagged auto output is visible instead of silently dropped")
+    func malformedGemma4TaggedOutputFallsBackToText() {
         let malformed =
             #"<|tool_call>call:bad{payload:[}<tool_call|>"#
         let handler = BatchedToolStreamHandler(
-            format: .gemma,
+            format: .gemma4,
             tools: [
                 [
                     "type": "function",
                     "function": ["name": "submit"] as [String: any Sendable],
                 ]
-            ])
+            ],
+            preserveMalformedTaggedText: true)
         #expect(handler.processChunk(malformed) == malformed)
         #expect(handler.finish().isEmpty)
         #expect(handler.parseFailureCount == 1)
     }
 
-    @Test("malformed auto output is preserved before a subsequent valid call")
-    func malformedThenValidCall() throws {
+    @Test("malformed Gemma4 auto output is preserved before a subsequent valid call")
+    func malformedGemma4ThenValidCall() throws {
         let malformed =
             #"<|tool_call>call:bad{payload:[}<tool_call|>"#
         let valid =
             #"<|tool_call>call:submit{payload:<|"|>ok<|"|>}<tool_call|>"#
         let handler = BatchedToolStreamHandler(
-            format: .gemma,
+            format: .gemma4,
             tools: [
                 [
                     "type": "function",
                     "function": ["name": "submit"] as [String: any Sendable],
                 ]
-            ])
+            ],
+            preserveMalformedTaggedText: true)
         #expect(handler.processChunk(malformed + valid) == malformed)
         let call = try #require(handler.finish().first)
         #expect(call.function.name == "submit")

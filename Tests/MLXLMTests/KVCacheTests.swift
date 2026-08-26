@@ -21,6 +21,18 @@ private func tempURL() -> URL {
         .appendingPathExtension("safetensors")
 }
 
+/// Raw safetensors loads are intentionally lazy. These fixtures frequently
+/// overwrite or remove their temporary source files, so materialize the test
+/// data before that lifetime ends instead of leaving an array graph that can
+/// fail in an unrelated later test.
+private func loadMaterializedArraysAndMetadata(url: URL) throws -> (
+    [String: MLXArray], [String: String]
+) {
+    let loaded = try loadArraysAndMetadata(url: url)
+    try withError { eval(Array(loaded.0.values)) }
+    return loaded
+}
+
 private struct SerializedCacheFixture {
     let className: String
     let arrayCount: Int
@@ -248,7 +260,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     #expect(restoredPositions.shape == positions.shape)
     #expect(allClose(restoredPositions, positions, rtol: 0, atol: 0).item(Bool.self))
 
-    let (storedArrays, storedMetadata) = try loadArraysAndMetadata(url: url)
+    let (storedArrays, storedMetadata) = try loadMaterializedArraysAndMetadata(url: url)
     #expect(storedArrays["__mlx_lm_state_tensor_0"] != nil)
     #expect(storedArrays["__mlx_lm_state_tensor_1"] != nil)
     #expect(
@@ -275,7 +287,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     try savePromptCache(url: url, cache: [cache])
     let snapshot = try loadPromptCacheSnapshot(url: url)
     let (legacyCache, legacyMetadata) = try loadPromptCache(url: url)
-    let (arrays, metadata) = try loadArraysAndMetadata(url: url)
+    let (arrays, metadata) = try loadMaterializedArraysAndMetadata(url: url)
 
     #expect(snapshot.cache.count == 1)
     #expect(snapshot.state == nil)
@@ -302,8 +314,8 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     try savePromptCache(url: emptyStateURL, cache: [cache], state: LMOutput.State())
     let snapshot = try loadPromptCacheSnapshot(url: emptyStateURL)
     let (legacyCache, _) = try loadPromptCache(url: emptyStateURL)
-    let (legacyArrays, legacyMetadata) = try loadArraysAndMetadata(url: legacyURL)
-    let (emptyStateArrays, emptyStateMetadata) = try loadArraysAndMetadata(url: emptyStateURL)
+    let (legacyArrays, legacyMetadata) = try loadMaterializedArraysAndMetadata(url: legacyURL)
+    let (emptyStateArrays, emptyStateMetadata) = try loadMaterializedArraysAndMetadata(url: emptyStateURL)
 
     #expect(snapshot.state == nil)
     #expect(legacyCache.count == 1)
@@ -355,7 +367,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     defer { try? FileManager.default.removeItem(at: url) }
 
     try savePromptCache(url: url, cache: [cache], state: state)
-    let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    let (arrays, savedMetadata) = try loadMaterializedArraysAndMetadata(url: url)
     var malformedMetadata = savedMetadata
     malformedMetadata["1.__mlx_lm_state_count"] = "2"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -377,7 +389,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     defer { try? FileManager.default.removeItem(at: url) }
 
     try savePromptCache(url: url, cache: [cache], state: state)
-    let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    let (arrays, savedMetadata) = try loadMaterializedArraysAndMetadata(url: url)
     var malformedMetadata = savedMetadata
     malformedMetadata["1.__mlx_lm_state_version"] = "999"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -401,7 +413,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     defer { try? FileManager.default.removeItem(at: url) }
 
     try savePromptCache(url: url, cache: [cache], state: state)
-    let (arrays, savedMetadata) = try loadArraysAndMetadata(url: url)
+    let (arrays, savedMetadata) = try loadMaterializedArraysAndMetadata(url: url)
     var malformedMetadata = savedMetadata
     malformedMetadata["1.__mlx_lm_state_1_key"] = "test.first"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -423,7 +435,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     defer { try? FileManager.default.removeItem(at: url) }
 
     try savePromptCache(url: url, cache: [cache], state: state)
-    let (storedArrays, metadata) = try loadArraysAndMetadata(url: url)
+    let (storedArrays, metadata) = try loadMaterializedArraysAndMetadata(url: url)
     var malformedArrays = storedArrays
     malformedArrays["__mlx_lm_state_tensor_99"] = MLXArray([Int32(99)])
     try save(arrays: malformedArrays, metadata: metadata, url: url)
@@ -445,7 +457,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     defer { try? FileManager.default.removeItem(at: url) }
 
     try savePromptCache(url: url, cache: [cache], state: state)
-    let (arrays, storedMetadata) = try loadArraysAndMetadata(url: url)
+    let (arrays, storedMetadata) = try loadMaterializedArraysAndMetadata(url: url)
     var malformedMetadata = storedMetadata
     malformedMetadata["2.0"] = "KVCache"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)
@@ -464,7 +476,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
     defer { try? FileManager.default.removeItem(at: url) }
 
     try savePromptCache(url: url, cache: [cache])
-    let (arrays, storedMetadata) = try loadArraysAndMetadata(url: url)
+    let (arrays, storedMetadata) = try loadMaterializedArraysAndMetadata(url: url)
     var malformedMetadata = storedMetadata
     malformedMetadata["2.0"] = "__mlx_lm_state_v1__:KVCache"
     try save(arrays: arrays, metadata: malformedMetadata, url: url)

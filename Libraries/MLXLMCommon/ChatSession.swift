@@ -409,31 +409,72 @@ public final class ChatSession {
                         SendableBox(context.model)
                     }.consume()
 
+                    let replaysTranscript = modelConfiguration.toolCallFormat != .gptOSS
                     var kvCache: [KVCache]
+                    // A cache created by this session has a recoverable prompt
+                    // transcript; a caller-provided raw cache does not.  Tool
+                    // restarts must preserve that distinction so templates see
+                    // earlier user turns without replaying raw-cache tokens.
+                    var replayHistory: [Chat.Message]?
                     switch cache {
                     case .empty:
                         kvCache = try model.newCache(parameters: generateParameters)
                         cache = .kvcache(kvCache)
+                        replayHistory = replaysTranscript ? [] : nil
 
                     case .kvcache(let array):
                         kvCache = array
+                        replayHistory = nil
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = try model.newCache(parameters: generateParameters)
                         cache = .kvcache(kvCache)
                         messages.append(contentsOf: history)
+                        replayHistory = replaysTranscript ? history : nil
                     }
 
                     // prepare the input
-                    messages.append(contentsOf: initialMessages.consume())
+                    let initial = initialMessages.consume()
+                    messages.append(contentsOf: initial)
+                    replayHistory?.append(contentsOf: initial)
+
+                    // A Harmony tool call is surfaced before its final control
+                    // token is fed back into the cache.  Its restart must carry
+                    // that one token with the tool-result suffix.
+                    var harmonyCallNeedsPrefill = false
 
                     // loop can restart on tool calls
                     restart: while !messages.isEmpty {
                         let userInput = UserInput(
                             chat: messages, processing: processing,
                             tools: tools, additionalContext: additionalContext)
-                        let input = try await processor.prepare(input: userInput)
+                        var input = try await processor.prepare(input: userInput)
+                        if modelConfiguration.toolCallFormat == .gptOSS,
+                            messages.contains(where: {
+                                $0.role == .assistant && $0.tool?.calls?.isEmpty == false
+                            }),
+                            let callToken = tokenizer.convertTokenToId("<|call|>")
+                        {
+                            // Harmony's rendered tool-result transcript starts
+                            // with a cold `[start, call]` prefix, but the live
+                            // cache already contains the generated call (and its
+                            // private analysis).  Refeeding that prefix would
+                            // diverge from the cache and expose the protocol's
+                            // control frames as user-visible output.  Append
+                            // only the result suffix after the last call commit.
+                            let tokens = input.text.tokens.asArray(Int.self)
+                            if let callIndex = tokens.lastIndex(of: callToken)
+                            {
+                                let suffixStart = harmonyCallNeedsPrefill ? callIndex : callIndex + 1
+                                if suffixStart < tokens.count {
+                                    let suffix = MLXArray(Array(tokens[suffixStart...]))
+                                        .expandedDimensions(axis: 0)
+                                    input = LMInput(text: .init(tokens: suffix))
+                                }
+                                harmonyCallNeedsPrefill = false
+                            }
+                        }
                         messages.removeAll()
 
                         // generate output
@@ -461,6 +502,15 @@ public final class ChatSession {
                             // the transform (streamDetails path)
                             if let toolCall = item.toolCall, toolDispatch != nil {
                                 pendingToolCalls.append(toolCall)
+                                if modelConfiguration.toolCallFormat == .gptOSS {
+                                    // Harmony commits one tool call per turn.
+                                    // Stop before the next iterator step feeds
+                                    // `<|call|>` into the cache; the restart
+                                    // splices that token with the result below.
+                                    harmonyCallNeedsPrefill = true
+                                    task.cancel()
+                                    break
+                                }
                             } else if let value = transform(item) {
                                 if case .terminated = continuation.yield(value) {
                                     break
@@ -477,9 +527,30 @@ public final class ChatSession {
                         if let toolDispatch, !pendingToolCalls.isEmpty,
                             !Task.isCancelled
                         {
+                            // The generated call is already resident in the live
+                            // cache, but a restarted chat template still needs a
+                            // structured assistant turn to associate each result
+                            // with its call.  Do not replay generated text here:
+                            // that would duplicate tokens in a raw KV cache and
+                            // leaks Harmony control frames into cold transcripts.
+                            let assistant = Chat.Message.assistant("", toolCalls: pendingToolCalls)
+                            if replayHistory != nil {
+                                replayHistory!.append(assistant)
+                            } else {
+                                messages.append(assistant)
+                            }
                             for toolCall in pendingToolCalls {
                                 let toolResult = try await toolDispatch(toolCall)
-                                messages.append(.tool(toolResult))
+                                let result = Chat.Message.tool(
+                                    toolResult, id: toolCall.id, name: toolCall.function.name)
+                                if replayHistory != nil {
+                                    replayHistory!.append(result)
+                                } else {
+                                    messages.append(result)
+                                }
+                            }
+                            if let replayHistory {
+                                messages = replayHistory
                             }
                             continue restart
                         }

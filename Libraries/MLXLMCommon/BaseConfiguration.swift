@@ -202,9 +202,13 @@ public struct BaseConfiguration: Codable, Sendable {
     /// EOS token IDs from config.json. Can be a single Int or an array of Ints.
     public var eosTokenIds: IntOrIntArray?
 
+    /// EOS token IDs inherited from a nested text configuration when the root
+    /// config does not declare its own value.
+    private var nestedEOSTokenIds: IntOrIntArray?
+
     /// EOS token IDs in the set form consumed by generation configuration.
     public var effectiveEOSTokenIds: Set<Int> {
-        Set(eosTokenIds?.values ?? [])
+        Set((eosTokenIds ?? nestedEOSTokenIds)?.values ?? [])
     }
 
     /// The default quantization settings.
@@ -223,6 +227,15 @@ public struct BaseConfiguration: Codable, Sendable {
         case quantizationContainer = "quantization"
         case quantizationConfiguration = "quantization_config"
         case eosTokenIds = "eos_token_id"
+        case textConfiguration = "text_config"
+    }
+
+    private struct TextConfiguration: Decodable {
+        let eosTokenIds: IntOrIntArray?
+
+        enum CodingKeys: String, CodingKey {
+            case eosTokenIds = "eos_token_id"
+        }
     }
 
     public init(from decoder: any Decoder) throws {
@@ -233,7 +246,10 @@ public struct BaseConfiguration: Codable, Sendable {
                 QuantizationContainer.self, forKey: .quantizationContainer)
             ?? container.decodeIfPresent(
                 QuantizationContainer.self, forKey: .quantizationConfiguration)
+        let nestedTextConfiguration = try container.decodeIfPresent(
+            TextConfiguration.self, forKey: .textConfiguration)
         eosTokenIds = try container.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
+        nestedEOSTokenIds = nestedTextConfiguration?.eosTokenIds
     }
 
     public func encode(to encoder: any Encoder) throws {

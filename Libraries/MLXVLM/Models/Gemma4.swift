@@ -614,10 +614,63 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        let prepared = try preparedInputs(input)
+        let out = languageModel(
+            prepared.tokens, inputEmbedding: prepared.embeddings, cache: castCache(cache),
+            imageTokenMask: prepared.visualTokenMask)
+        return .logits(.init(logits: out))
+    }
+
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let prepared = try preparedInputs(input)
+        let total = prepared.tokens.dim(-1)
+
+        // Gemma's visual-token spans use blockwise bidirectional attention.
+        // Splitting one of those spans would change its visibility, so preserve
+        // the single-forward semantics for multimodal prompts. Text-only
+        // prompts are causal and can safely use bounded chunked prefill.
+        guard prepared.visualTokenMask == nil else {
+            let out = languageModel(
+                prepared.tokens, inputEmbedding: prepared.embeddings, cache: castCache(cache),
+                imageTokenMask: nil)
+            prefill.progress?(total, total)
+            return .logits(.init(logits: out))
+        }
+
+        let typedCache = castCache(cache)
+        let processed = try prefill.forEachChunk(total: total) { range in
+            _ = languageModel(
+                prepared.tokens[0..., range],
+                inputEmbedding: prepared.embeddings[0..., range, 0...],
+                cache: typedCache,
+                imageTokenMask: nil)
+            asyncEval(cache)
+        }
+        if processed > 0 { eval(cache) }
+
+        let out = languageModel(
+            prepared.tokens[0..., processed...],
+            inputEmbedding: prepared.embeddings[0..., processed..., 0...],
+            cache: typedCache,
+            imageTokenMask: nil)
+        prefill.progress?(total, total)
+        return .logits(.init(logits: out))
+    }
+
+    private func preparedInputs(_ input: LMInput) throws -> (
+        tokens: MLXArray, embeddings: MLXArray, visualTokenMask: MLXArray?
+    ) {
         // Gemma4 VLM does not implement audio. Our `LMInput` carries no audio
         // field, and the `sanitize` path drops `audio_tower.*` / `embed_audio.*`
         // weights, so there is nothing to guard here.
-        var emb = languageModel.scaledInputEmbeddings(input.text.tokens)
+        var tokens = input.text.tokens
+        if tokens.ndim == 1 {
+            tokens = tokens.expandedDimensions(axis: 0)
+        }
+        var emb = languageModel.scaledInputEmbeddings(tokens)
 
         // Accumulate the image+video soft-token positions so the text tower can
         // apply Gemma4's blockwise bidirectional attention over those spans. nil
@@ -627,7 +680,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         if let pixels = input.image?.pixels {
             let imgFeatures = encodeVisionFeatures(
                 pixels: pixels, frames: input.image?.frames, dtype: emb.dtype)
-            let imgMask = MLX.equal(input.text.tokens, MLXArray(Int32(config.imageTokenId)))
+            let imgMask = MLX.equal(tokens, MLXArray(Int32(config.imageTokenId)))
             let imgMaskExp = MLX.broadcast(expandedDimensions(imgMask, axis: -1), to: emb.shape)
             emb = try maskedScatter(input: emb, mask: imgMaskExp, source: imgFeatures)
             visualTokenMask = imgMask
@@ -638,16 +691,13 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         if let videoPixels = input.video?.pixels, let videoTokenId = config.videoTokenId {
             let vidFeatures = encodeVisionFeatures(
                 pixels: videoPixels, frames: input.video?.frames, dtype: emb.dtype, isVideo: true)
-            let vidMask = MLX.equal(input.text.tokens, MLXArray(Int32(videoTokenId)))
+            let vidMask = MLX.equal(tokens, MLXArray(Int32(videoTokenId)))
             let vidMaskExp = MLX.broadcast(expandedDimensions(vidMask, axis: -1), to: emb.shape)
             emb = try maskedScatter(input: emb, mask: vidMaskExp, source: vidFeatures)
             visualTokenMask = visualTokenMask.map { logicalOr($0, vidMask) } ?? vidMask
         }
 
-        let out = languageModel(
-            input.text.tokens, inputEmbedding: emb, cache: castCache(cache),
-            imageTokenMask: visualTokenMask)
-        return .logits(.init(logits: out))
+        return (tokens, emb, visualTokenMask)
     }
 
     /// Encode one batch of images / video frames through the vision tower and

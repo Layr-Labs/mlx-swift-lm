@@ -19,6 +19,11 @@ public protocol ToolCallParser: Sendable {
     /// Returns `nil` for inline formats that don't use wrapper tags.
     var endTag: String? { get }
 
+    /// Additional complete start tags accepted by the same parser. This keeps
+    /// streaming recognition aligned with parsers that support more than one
+    /// valid framing variant, such as Harmony's commentary channel form.
+    var alternateStartTags: [String] { get }
+
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
     ///   - content: The text content to parse (may include tags)
@@ -35,6 +40,8 @@ public protocol ToolCallParser: Sendable {
 }
 
 extension ToolCallParser {
+    public var alternateStartTags: [String] { [] }
+
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if let startTag {
             return
@@ -161,7 +168,7 @@ public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
         case .llama3:
             return Llama3ToolCallParser()
         case .gptOSS:
-            return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+            return HarmonyToolCallParser()
         }
     }
 

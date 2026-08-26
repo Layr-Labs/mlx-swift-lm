@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 import Testing
@@ -12,7 +13,7 @@ import Testing
 //
 // Gemma 4's tail layers (`layer_idx >= num_hidden_layers - num_kv_shared_layers`)
 // reuse an earlier same-type layer's K/V and own no `k_proj` / `v_proj` / `k_norm`.
-// `Gemma4TextLanguageModel.sanitize` drops those tensors from the checkpoint, and
+// `Gemma4TextModel.sanitize` drops those tensors from the checkpoint, and
 // the runtime forward feeds the shared layers a `sharedKV` instead of computing
 // their own. If the module tree still *constructs* those projections (the default
 // `kvSharedOnly: false`), loading any real Gemma 4 checkpoint fails under the
@@ -33,7 +34,7 @@ struct Gemma4KVSharedLoadTests {
     @Test("KV-shared layers own no local k_proj/v_proj/k_norm")
     func kvSharedLayersOwnNoLocalKVProjections() {
         // 4 layers, 2 KV-shared → layers 0,1 own K/V; layers 2,3 share it.
-        let model = Gemma4TextLanguageModel(Self.textConfig(numKVSharedLayers: 2))
+        let model = Gemma4TextModel(Self.textConfig(numKVSharedLayers: 2))
         let keys = Set(model.parameters().flattened().map(\.0))
 
         // Head (KV-owning) layers keep their projections.
@@ -59,7 +60,7 @@ struct Gemma4KVSharedLoadTests {
     func sanitizedCheckpointLoadsWithoutKeyNotFound() throws {
         // A "dense" sibling (no KV sharing) supplies weights for every layer,
         // independent of how the KV-sharing model constructs its own tree.
-        let dense = Gemma4TextLanguageModel(Self.textConfig(numKVSharedLayers: 0))
+        let dense = Gemma4TextModel(Self.textConfig(numKVSharedLayers: 0))
         eval(dense)
 
         let firstKVSharedLayer = 4 - 2
@@ -75,7 +76,7 @@ struct Gemma4KVSharedLoadTests {
             checkpoint[key] = value
         }
 
-        let model = Gemma4TextLanguageModel(Self.textConfig(numKVSharedLayers: 2))
+        let model = Gemma4TextModel(Self.textConfig(numKVSharedLayers: 2))
         // `[.all]` is what `MLXLMCommon.loadWeights` applies — it throws on any
         // module parameter that has no matching weight (the original bug).
         try model.update(

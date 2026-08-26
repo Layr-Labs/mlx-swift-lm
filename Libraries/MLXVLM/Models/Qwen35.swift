@@ -17,6 +17,11 @@ private enum Qwen35VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
 }
 
+/// Request-owned M-RoPE state for Qwen3.5-VL.  Keep this distinct from the
+/// Qwen3-VL key: prompt-cache snapshots must describe the exact model that
+/// produced them.
+private let ropeDeltasKey = LMOutput.Key<MLXArray>("qwen35.ropeDeltas")
+
 // MARK: - Gated Delta Helpers
 //
 // The gated-delta (GDN) recurrence is shared with the LLM Qwen3.5 / Qwen3-Next
@@ -1472,64 +1477,84 @@ public class Qwen35: Module, VLMModel {
         cache: [any KVCache],
         windowSize _: Int?
     ) throws -> PrepareResult {
-        let inputIds = input.text.tokens
+        try prepare(
+            input, cache: cache, state: nil,
+            prefill: .init(stepSize: nil, chunking: .unchunked))
+    }
 
-        var pixelValues: MLXArray?
-        var imageFrames: [THW]?
-        var videoFrames: [THW]?
+    public func prepare(
+        _ input: LMInput,
+        cache: [any KVCache],
+        state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let inputIds = input.text.tokens.ndim == 1
+            ? input.text.tokens[.newAxis, 0...]
+            : input.text.tokens
+        // Qwen3.5 interleaves Mamba and full-attention layers.  The first
+        // cache belongs to Mamba and does not carry the attention timeline;
+        // the final layer is full attention and advances with M-RoPE tokens.
+        let cacheOffset = cache.last?.offset ?? 0
+        let positionOffset = try QwenVL.continuationAnchor(
+            model: "Qwen35", key: ropeDeltasKey, cacheOffset: cacheOffset,
+            batchSize: inputIds.dim(0), state: state)
 
-        let visionDType = visionModel.patchEmbed.proj.weight.dtype
-        var pixelParts: [MLXArray] = []
-
-        if let image = input.image {
-            pixelParts.append(image.pixels.asType(visionDType))
-            imageFrames = image.frames
-        }
-        if let video = input.video {
-            pixelParts.append(video.pixels.asType(visionDType))
-            videoFrames = video.frames
-        }
-        if !pixelParts.isEmpty {
-            pixelValues = concatenated(pixelParts)
-        }
-
+        let imageFrames = input.image?.frames
+        let videoFrames = input.video?.frames
         var inputEmbeddings: MLXArray?
-
-        if pixelValues != nil,
-            combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames).nilIfEmpty != nil
-        {
+        if combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames).nilIfEmpty != nil {
             let textEmbeds = languageModel.model.embedTokens(inputIds)
             let features = try visionFeatures(
                 imagePixels: input.image?.pixels,
                 imageGrids: imageFrames,
                 videoPixels: input.video?.pixels,
                 videoGrids: videoFrames)
-
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
                 imageFeatures: features.flattenedFeatures,
                 inputEmbeds: textEmbeds,
                 inputIds: inputIds,
                 imageTokenIndex: config.imageTokenIndex,
-                videoTokenIndex: config.videoTokenIndex
-            )
+                videoTokenIndex: config.videoTokenIndex)
             inputEmbeddings = mergedEmbeds
-        } else {
-            languageModel.resetPositionState()
         }
 
-        let typedCache = castCache(cache)
-        let output = languageModel(
-            inputIds,
-            inputsEmbeds: inputEmbeddings,
-            cache: typedCache,
-            mask: input.text.mask,
-            positionIds: nil,
-            pixelValues: pixelValues,
+        let (positionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputIds,
             imageGridTHW: imageFrames,
-            videoGridTHW: videoFrames
-        )
+            videoGridTHW: videoFrames,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            attentionMask: input.text.mask,
+            positionOffset: positionOffset)
+        let typedCache = castCache(cache)
+        let total = inputIds.dim(-1)
 
-        return .logits(output)
+        func forward(_ range: Range<Int>) -> LMOutput {
+            languageModel(
+                inputIds[0..., range],
+                inputsEmbeds: inputEmbeddings?[0..., range, 0...],
+                cache: typedCache,
+                mask: nil,
+                positionIds: positionIds[0..., 0..., range],
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil)
+        }
+
+        let processed = try prefill.forEachChunk(total: total) { range in
+            _ = forward(range)
+            if let typedCache { asyncEval(typedCache) }
+        }
+        if processed > 0, let typedCache { eval(typedCache) }
+        let lastLogits = forward(processed ..< total).logits
+        prefill.progress?(total, total)
+        return .logits(
+            LMOutput(
+                logits: lastLogits,
+                state: QwenVL.continuationResumeState(
+                    ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)))
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
@@ -1628,4 +1653,11 @@ extension Qwen35 {
         guard let cache else { return nil }
         return castCache(cache)
     }
+}
+
+// MARK: - Chat conventions
+
+extension Qwen35 {
+    public var toolCallFormat: ToolCallFormat? { .qwen35 }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }

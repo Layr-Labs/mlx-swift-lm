@@ -34,8 +34,10 @@ public enum ServerToolParser {
             return .xmlFunction
         case "glm4", "glm_4":
             return .glm4
-        case "gemma", "gemma4", "gemma_4":
+        case "gemma":
             return .gemma
+        case "gemma4", "gemma_4":
+            return .gemma4
         case "kimi_k2", "kimi":
             return .kimiK2
         case "minimax_m2", "minimax":

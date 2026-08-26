@@ -513,37 +513,25 @@ public class SampleTests: XCTestCase {
         var original = StatefulStructProcessor()
         original.prompt(MLXArray([1, 2]))
 
-        var copy = original.copy()
+        var copy = original
         copy.didSample(token: MLXArray([3]))
 
         XCTAssertEqual(original.seenTokens, [1, 2])
         XCTAssertEqual(copy.seenTokens, [1, 2, 3])
     }
 
-    func testClassLogitProcessorCopyWithExplicitImplementation() {
-        let original = StatefulClassProcessorWithCopy(seenTokens: [1, 2])
-        let copy = original.copy()
-
-        XCTAssertFalse(original === copy, "copy() must return a distinct instance")
-        copy.didSample(token: MLXArray([3]))
-
-        XCTAssertEqual(original.seenTokens, [1, 2])
-        XCTAssertEqual(copy.seenTokens, [1, 2, 3])
-    }
-
-    func testChainedLogitProcessorCopyClonesNestedProcessors() {
-        let classProcessor = StatefulClassProcessorWithCopy(seenTokens: [10])
+    func testChainedLogitProcessorPreservesValueProcessorStateOnAssignment() {
         var structProcessor = StatefulStructProcessor()
         structProcessor.prompt(MLXArray([20]))
 
-        let chained = ChainedLogitProcessor(processors: [classProcessor, structProcessor])
-        var clonedChained = chained.copy()
+        let chained = ChainedLogitProcessor(processors: [structProcessor])
+        var copiedChained = chained
 
-        clonedChained.didSample(token: MLXArray([99]))
+        copiedChained.didSample(token: MLXArray([99]))
 
         XCTAssertEqual(
-            classProcessor.seenTokens, [10],
-            "Original class processor should not be modified by clone's didSample")
+            structProcessor.seenTokens, [20],
+            "Assignment must not mutate the source processor value")
         let origLogits = MLXArray([1.0 as Float, 2.0 as Float])[.newAxis, .ellipsis]
         _ = chained.process(logits: origLogits)
     }

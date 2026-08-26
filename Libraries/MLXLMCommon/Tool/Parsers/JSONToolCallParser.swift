@@ -13,6 +13,19 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         self.endTag = endTag
     }
 
+    private struct Payload: Decodable {
+        struct FunctionPayload: Decodable {
+            let id: String?
+            let name: String
+            let arguments: JSONValue?
+        }
+
+        let id: String?
+        let name: String?
+        let arguments: JSONValue?
+        let function: FunctionPayload?
+    }
+
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         guard let start = startTag, let end = endTag else { return nil }
 
@@ -30,8 +43,15 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard let data = jsonStr.data(using: .utf8),
-            let function = try? JSONDecoder().decode(ToolCall.Function.self, from: data)
+            let payload = try? JSONDecoder().decode(Payload.self, from: data)
         else { return nil }
+
+        let functionPayload = payload.function
+        guard let name = functionPayload?.name ?? payload.name,
+            let arguments = normalizedArguments(functionPayload?.arguments ?? payload.arguments)
+        else { return nil }
+
+        let function = ToolCall.Function(name: name, arguments: arguments)
 
         // If tool schemas are provided, only accept calls to declared tools.
         // Bare JSON objects that merely look like {"name":..,"arguments":..}
@@ -51,6 +71,21 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
             }
         }
 
-        return ToolCall(function: function)
+        return ToolCall(function: function, id: payload.id ?? functionPayload?.id)
+    }
+
+    /// OpenAI serializes `function.arguments` as a JSON string, while the
+    /// native tool dialect uses an object. Accept both wire-compatible forms.
+    private func normalizedArguments(_ value: JSONValue?) -> [String: JSONValue]? {
+        guard let value else { return nil }
+        switch value {
+        case .object(let arguments):
+            return arguments
+        case .string(let encoded):
+            guard let data = encoded.data(using: .utf8) else { return nil }
+            return try? JSONDecoder().decode([String: JSONValue].self, from: data)
+        default:
+            return nil
+        }
     }
 }

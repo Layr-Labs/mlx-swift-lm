@@ -82,14 +82,42 @@ extension ToolCallFormat {
 extension ToolCallFormat {
 
     /// Infer the parser family from a model architecture name.
-    public static func infer(from modelType: String) -> ToolCallFormat? {
+    ///
+    /// `configData` retains the pre-merge Llama 3 detection contract: the
+    /// architecture alone covers Llama 1/2/3, so its parser is selected only
+    /// from an unambiguous vocabulary or RoPE signal.
+    public static func infer(from modelType: String, configData: Data? = nil) -> ToolCallFormat? {
         let normalized = modelType.lowercased().replacingOccurrences(of: "-", with: "_")
-        if normalized.contains("gpt_oss") { return .gptOSS }
-        if normalized.contains("gemma4") { return .gemma4 }
-        if normalized.contains("qwen3_5") { return .qwen35 }
-        if normalized.contains("qwen") { return .json }
-        if normalized.contains("mistral") { return .mistral }
-        if normalized.contains("llama") { return .llama3 }
+
+        if normalized == "llama" {
+            guard
+                let configData,
+                let configuration = try? JSONSerialization.jsonObject(with: configData)
+                    as? [String: Any]
+            else { return nil }
+
+            if let vocabularySize = configuration["vocab_size"] as? Int,
+                vocabularySize >= 128_000
+            {
+                return .llama3
+            }
+            if let ropeScaling = configuration["rope_scaling"] as? [String: Any],
+                (ropeScaling["rope_type"] as? String)?.lowercased() == "llama3"
+            {
+                return .llama3
+            }
+            return nil
+        }
+
+        if normalized.hasPrefix("lfm2") { return .lfm2 }
+        if normalized.hasPrefix("glm4") { return .glm4 }
+        if normalized.hasPrefix("gemma4") { return .gemma4 }
+        if normalized.hasPrefix("gemma") { return .gemma }
+        if normalized.hasPrefix("nemotron") { return .xmlFunction }
+        if normalized.hasPrefix("qwen3_5") { return .qwen35 }
+        if normalized.hasPrefix("qwen3_next") { return .xmlFunction }
+        if normalized == "gpt_oss" { return .gptOSS }
+        if normalized.hasPrefix("mistral3") { return .mistral }
         return nil
     }
 

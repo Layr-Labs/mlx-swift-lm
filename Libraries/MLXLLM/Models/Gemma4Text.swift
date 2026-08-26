@@ -913,6 +913,18 @@ private class Gemma4Attention: Module {
 
         let keys: MLXArray
         let values: MLXArray
+        // Keep the quantized representation through the attention path while
+        // also materializing an unquantized view for a following KV-shared
+        // Gemma layer. KV sharing is an intra-forward dependency: the next
+        // layer consumes the source layer's full history, not just this
+        // token's K/V. Returning dequantized K/V here preserves that contract
+        // without routing a QuantizedKVCache through its unsupported
+        // `update(keys:values:)` API.
+        var quantizedKV: (
+            keys: (MLXArray, MLXArray, MLXArray?),
+            values: (MLXArray, MLXArray, MLXArray?),
+            cache: any QuantizedKVCacheProtocol
+        )?
         let activePositionOffset = positionOffset ?? gemma4CapturePositionOffset(from: cache)
 
         if let (sharedK, sharedV) = sharedKV {
@@ -942,7 +954,24 @@ private class Gemma4Attention: Module {
             v = vNorm(v)
             v = v.transposed(0, 2, 1, 3)
 
-            if let cache {
+            if let quantizedCache = cache as? any QuantizedKVCacheProtocol {
+                let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
+                    keys: k, values: v)
+                quantizedKV = (quantizedKeys, quantizedValues, quantizedCache)
+
+                // `kvPair` is propagated to Gemma4's shared-KV tail. Its
+                // legacy interface is intentionally MLXArray-based, so retain
+                // the exact full-history shape by dequantizing only for that
+                // hand-off. Attention below keeps using the quantized tuples.
+                keys = dequantized(
+                    quantizedKeys.0, scales: quantizedKeys.1, biases: quantizedKeys.2,
+                    groupSize: quantizedCache.groupSize, bits: quantizedCache.bits,
+                    mode: quantizedCache.mode)
+                values = dequantized(
+                    quantizedValues.0, scales: quantizedValues.1, biases: quantizedValues.2,
+                    groupSize: quantizedCache.groupSize, bits: quantizedCache.bits,
+                    mode: quantizedCache.mode)
+            } else if let cache {
                 let (updatedK, updatedV) = cache.update(keys: k, values: v)
                 keys = updatedK
                 values = updatedV
@@ -1003,6 +1032,16 @@ private class Gemma4Attention: Module {
                 values: attentionValues,
                 scale: scale,
                 mask: adjustedMask ?? .none)
+        } else if let quantizedKV {
+            attentionRaw = quantizedScaledDotProductAttention(
+                queries: attentionQueries,
+                quantizedKeys: quantizedKV.keys,
+                quantizedValues: quantizedKV.values,
+                scale: scale,
+                mask: adjustedMask ?? .none,
+                groupSize: quantizedKV.cache.groupSize,
+                bits: quantizedKV.cache.bits,
+                mode: quantizedKV.cache.mode)
         } else {
             attentionRaw = MLXFast.scaledDotProductAttention(
                 queries: attentionQueries,

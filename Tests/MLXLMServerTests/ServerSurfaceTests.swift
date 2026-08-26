@@ -209,10 +209,10 @@ struct ServerSurfaceTests {
     func serverToolParserResolverSupportsNamedAndAutoFormats() throws {
         #expect(try ServerToolParser.resolve(requested: "mistral", modelType: nil) == .mistral)
         #expect(try ServerToolParser.resolve(requested: "llama3_json", modelType: nil) == .llama3)
-        #expect(try ServerToolParser.resolve(requested: "gemma4", modelType: nil) == .gemma)
-        #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma)
+        #expect(try ServerToolParser.resolve(requested: "gemma4", modelType: nil) == .gemma4)
+        #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma4)
         #expect(
-            try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .xmlFunction)
+            try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .qwen35)
         #expect(try ServerToolParser.resolve(requested: "gpt_oss", modelType: nil) == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gpt_oss") == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "lfm2") == .lfm2)
