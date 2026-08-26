@@ -2,8 +2,9 @@
 
 import Foundation
 import MLXLMCommon
-@testable import MLXLMServer
 import Testing
+
+@testable import MLXLMServer
 
 // MARK: - BatchedToolStreamHandler Integration Tests
 
@@ -111,19 +112,21 @@ struct ToolCallParserIntegrationTests {
 
     @Test("BatchedToolStreamHandler preserves comma-bearing Gemma string arguments")
     func batchedHandlerGemmaCommaBearingString() throws {
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": [
-                "name": "get_current_weather",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "location": ["type": "string"] as [String: any Sendable],
-                        "unit": ["type": "string"] as [String: any Sendable],
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_current_weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": ["type": "string"] as [String: any Sendable],
+                            "unit": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
                     ] as [String: any Sendable],
                 ] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+            ]
+        ]
         let handler = BatchedToolStreamHandler(format: .gemma, tools: tools)
 
         for chunk in [
@@ -587,7 +590,8 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: "gemma_4", modelType: nil) == .gemma)
         #expect(try ServerToolParser.resolve(requested: "harmony", modelType: nil) == .harmony)
         #expect(try ServerToolParser.resolve(requested: "gpt_oss", modelType: nil) == .harmony)
-        #expect(try ServerToolParser.resolve(requested: "openai_harmony", modelType: nil) == .harmony)
+        #expect(
+            try ServerToolParser.resolve(requested: "openai_harmony", modelType: nil) == .harmony)
         #expect(try ServerToolParser.resolve(requested: "mistral", modelType: nil) == .mistral)
         #expect(try ServerToolParser.resolve(requested: "mistral_v11", modelType: nil) == .mistral)
         #expect(try ServerToolParser.resolve(requested: "llama3", modelType: nil) == .llama3)
@@ -597,7 +601,8 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: "lfm2_5", modelType: nil) == .lfm2)
         #expect(try ServerToolParser.resolve(requested: "lfm25", modelType: nil) == .lfm2)
         #expect(try ServerToolParser.resolve(requested: "xml", modelType: nil) == .xmlFunction)
-        #expect(try ServerToolParser.resolve(requested: "xml_function", modelType: nil) == .xmlFunction)
+        #expect(
+            try ServerToolParser.resolve(requested: "xml_function", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "qwen_xml", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "hermes", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "nemotron", modelType: nil) == .xmlFunction)
@@ -616,11 +621,14 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gpt_oss") == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "mistral3") == .mistral)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_5") == .xmlFunction)
-        #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_next") == .xmlFunction)
-        #expect(try ServerToolParser.resolve(requested: nil, modelType: "nemotron_h") == .xmlFunction)
+        #expect(
+            try ServerToolParser.resolve(requested: nil, modelType: "qwen3_next") == .xmlFunction)
+        #expect(
+            try ServerToolParser.resolve(requested: nil, modelType: "nemotron_h") == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "lfm2") == .lfm2)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "glm4") == .glm4)
-        #expect(try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .xmlFunction)
+        #expect(
+            try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "auto", modelType: "gemma4") == .gemma)
     }
 
@@ -644,7 +652,8 @@ struct ToolCallParserIntegrationTests {
     func serverToolParserResolveNormalizesHyphens() throws {
         #expect(try ServerToolParser.resolve(requested: "kimi-k2", modelType: nil) == .kimiK2)
         #expect(try ServerToolParser.resolve(requested: "minimax-m2", modelType: nil) == .minimaxM2)
-        #expect(try ServerToolParser.resolve(requested: "xml-function", modelType: nil) == .xmlFunction)
+        #expect(
+            try ServerToolParser.resolve(requested: "xml-function", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "llama3-json", modelType: nil) == .llama3)
     }
 
@@ -808,10 +817,12 @@ struct ToolCallParserIntegrationTests {
         let tc = try #require(toolCalls.first)
         #expect(tc.function.name == "search")
         #expect(tc.function.arguments["query"] == .string("swift, mlx"))
-        #expect(tc.function.arguments["filters"] == .object([
-            "limit": .int(5),
-            "active": .bool(true),
-        ]))
+        #expect(
+            tc.function.arguments["filters"]
+                == .object([
+                    "limit": .int(5),
+                    "active": .bool(true),
+                ]))
     }
 
     @Test("BatchedToolStreamHandler handles Harmony with nested JSON arguments")

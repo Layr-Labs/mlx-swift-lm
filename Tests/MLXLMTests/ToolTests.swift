@@ -473,30 +473,34 @@ struct ToolTests {
 
         #expect(toolCall.function.name == "search")
         #expect(toolCall.function.arguments["query"] == .string("swift, mlx"))
-        #expect(toolCall.function.arguments["filters"] == .object([
-            "limit": .int(2),
-            "fresh": .bool(true),
-        ]))
+        #expect(
+            toolCall.function.arguments["filters"]
+                == .object([
+                    "limit": .int(2),
+                    "fresh": .bool(true),
+                ]))
     }
 
     @Test("Test Gemma 4 Tool Call Parser - OpenRouter weather arguments")
     func testGemma4ToolCallParserOpenRouterWeatherArguments() throws {
         let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": [
-                "name": "get_current_weather",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "location": ["type": "string"] as [String: any Sendable],
-                        "unit": [
-                            "type": "string", "enum": ["celsius", "fahrenheit"] as [String],
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_current_weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": ["type": "string"] as [String: any Sendable],
+                            "unit": [
+                                "type": "string", "enum": ["celsius", "fahrenheit"] as [String],
+                            ] as [String: any Sendable],
                         ] as [String: any Sendable],
                     ] as [String: any Sendable],
                 ] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+            ]
+        ]
 
         for content in [
             #"<|tool_call>call:get_current_weather{location:Boston, MA,unit:fahrenheit}<tool_call|>"#,
@@ -513,10 +517,12 @@ struct ToolTests {
     @Test("Test Gemma 4 Tool Call Parser - recovers uniquely identifiable tool names")
     func testGemma4ToolCallParserRecoversToolNameCorruption() throws {
         let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": ["name": "get_current_weather"] as [String: any Sendable],
-        ]]
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": ["name": "get_current_weather"] as [String: any Sendable],
+            ]
+        ]
 
         for rawName in ["getpsum_current_weather", "get_current_weather tedavi"] {
             let content = "<|tool_call>call:\(rawName){unit:fahrenheit}<tool_call|>"
@@ -542,10 +548,12 @@ struct ToolTests {
     @Test("Test Gemma 4 Tool Call Parser - rejects unrelated short tool names")
     func testGemma4ToolCallParserRejectsShortNameFuzzyMatch() {
         let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": ["name": "sum"] as [String: any Sendable],
-        ]]
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": ["name": "sum"] as [String: any Sendable],
+            ]
+        ]
 
         let content = "<|tool_call>call:run{value:1}<tool_call|>"
         #expect(parser.parse(content: content, tools: tools) == nil)
@@ -556,19 +564,21 @@ struct ToolTests {
     @Test("Test Gemma 4 Tool Call Parser - preserves allowed additional arguments")
     func testGemma4ToolCallParserPreservesAdditionalArguments() throws {
         let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": [
-                "name": "search",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "query": ["type": "string"] as [String: any Sendable]
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "search",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "query": ["type": "string"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "additionalProperties": true,
                     ] as [String: any Sendable],
-                    "additionalProperties": true,
                 ] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+            ]
+        ]
 
         let content = "<|tool_call>call:search{query:swift,sort:recent}<tool_call|>"
         let toolCall = try #require(parser.parse(content: content, tools: tools))
@@ -579,20 +589,22 @@ struct ToolTests {
     @Test("Test Gemma 4 Tool Call Parser - rejects unknown strict-schema arguments")
     func testGemma4ToolCallParserRejectsUnknownStrictArgument() {
         let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": [
-                "name": "weather",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "location": ["type": "string"] as [String: any Sendable],
-                        "unit": ["type": "string"] as [String: any Sendable],
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": ["type": "string"] as [String: any Sendable],
+                            "unit": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "additionalProperties": false,
                     ] as [String: any Sendable],
-                    "additionalProperties": false,
                 ] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+            ]
+        ]
 
         let content =
             "<|tool_call>call:weather{location:Paris,country:FR,unit:celsius}<tool_call|>"

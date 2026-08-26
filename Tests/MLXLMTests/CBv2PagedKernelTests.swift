@@ -478,8 +478,9 @@ struct CBv2PagedKernelTests {
             return (q, k, v)
         }
         func logits(_ attnOut: MLXArray) -> MLXArray {
-            matmul(attnOut.reshaped([1, queryHeads * headDim]).asType(.float32),
-                   unembed.asType(.float32))
+            matmul(
+                attnOut.reshaped([1, queryHeads * headDim]).asType(.float32),
+                unembed.asType(.float32))
         }
 
         var pagedToken = 1
@@ -717,7 +718,8 @@ struct CBv2PagedKernelTests {
             }
             return (
                 keys[0..., start ..< t, 0...].expandedDimensions(axis: 0),
-                values[0..., start ..< t, 0...].expandedDimensions(axis: 0))
+                values[0..., start ..< t, 0...].expandedDimensions(axis: 0)
+            )
         }
 
         /// fp32 attention for one row's `[queryHeads, 1, headDim]` query,

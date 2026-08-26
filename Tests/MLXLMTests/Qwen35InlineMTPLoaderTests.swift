@@ -94,7 +94,9 @@ private func withInlineMTPDirectory(
         .write(to: directory.appendingPathComponent("config.json"))
     let shardName = "model-00001-of-00001.safetensors"
     try save(arrays: weights, url: directory.appendingPathComponent(shardName))
-    let index = ["weight_map": Dictionary(uniqueKeysWithValues: weights.keys.map { ($0, shardName) })]
+    let index = [
+        "weight_map": Dictionary(uniqueKeysWithValues: weights.keys.map { ($0, shardName) })
+    ]
     try JSONSerialization.data(withJSONObject: index)
         .write(to: directory.appendingPathComponent("model.safetensors.index.json"))
     try body(directory)

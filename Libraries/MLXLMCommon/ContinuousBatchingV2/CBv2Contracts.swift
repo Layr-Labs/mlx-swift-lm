@@ -184,7 +184,8 @@ public struct CBv2PositionState: @unchecked Sendable {
             precondition(cacheOffset >= 0, "CBv2 cache offset must be non-negative")
             let delta: Int32
             if let state {
-                precondition(state.axisCount == axes, "CBv2 position axes differ across decode rows")
+                precondition(
+                    state.axisCount == axes, "CBv2 position axes differ across decode rows")
                 delta = state.decodeDeltas[0]
             } else {
                 delta = 0
@@ -548,10 +549,11 @@ extension CBv2KVBackend {
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
             backend: prefixReuseBackend)
-        guard let plan = capability.compatibilityPlan(
-            adoptedOffset: adoptedOffset,
-            exactStagedFullKVBytes: exactBytes,
-            maximumSequenceLength: maxLength)
+        guard
+            let plan = capability.compatibilityPlan(
+                adoptedOffset: adoptedOffset,
+                exactStagedFullKVBytes: exactBytes,
+                maximumSequenceLength: maxLength)
         else {
             throw CBv2KVError.backendIneligible(
                 reason:
@@ -631,14 +633,14 @@ public protocol CBv2AttendingLayerCache: AnyObject {
 
 public enum CBv2RequestStatus: Sendable, Equatable {
     case waiting
-    case running        // numComputedTokens < numTokens ⇒ still prefilling
+    case running  // numComputedTokens < numTokens ⇒ still prefilling
     case preempted
     case finished(CBv2FinishReason)
 }
 
 public enum CBv2FinishReason: Sendable, Equatable {
-    case stop           // stop token or stop string
-    case length         // maxTokens or context limit
+    case stop  // stop token or stop string
+    case length  // maxTokens or context limit
     case cancelled
     case error(String)
     /// A typed platform/engine terminal: a monotonic deadline lease

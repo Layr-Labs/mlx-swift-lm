@@ -6,7 +6,7 @@ import MLXHuggingFace
 import MLXLMCommon
 import Tokenizers
 
-/// Single-request server engine backed by ``ModelContainer``'s serial actor.
+/// Single-request server engine backed by `ModelContainer`'s serial actor.
 /// Concurrent ``streamChatCompletion(request:)`` calls serialise; batched
 /// concurrent serving lives downstream in the Darkbloom provider's
 /// ContinuousBatchingV2 bridge, not in this CLI engine.
@@ -204,9 +204,9 @@ public enum MLXServerModelLoader {
         try await #huggingFaceLoadModelContainer(configuration: configuration)
     }
 
-    /// Load a model and return the raw ``ModelContext`` (bypasses the
-    /// serial-access container so ``MLXBatchedEngineServerEngine`` can drive
-    /// ``BatchedEngine`` directly).
+    /// Load a model and return the raw `ModelContext`, bypassing the
+    /// serial-access container so downstream batched engines can drive the
+    /// model directly.
     public static func loadContext(
         configuration: ModelConfiguration
     ) async throws -> sending ModelContext {

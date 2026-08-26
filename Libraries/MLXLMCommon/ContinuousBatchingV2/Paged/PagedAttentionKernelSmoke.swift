@@ -47,8 +47,8 @@ public struct PagedAttentionKernelSmokeShape: Hashable, Sendable {
             let queryHeads = Int(fields[2]),
             let sinks = Int(fields[3]),
             let write = Int(fields[4]),
-            (sinks == 0 || sinks == 1),
-            (write == 0 || write == 1)
+            sinks == 0 || sinks == 1,
+            write == 0 || write == 1
         else {
             throw PagedAttentionKernelSmokeError.invalidShape(argumentValue)
         }
@@ -98,14 +98,17 @@ extension PagedAttentionKernel {
     public static func smokeShapes(
         layerKinds: [CBv2LayerKind]
     ) -> [PagedAttentionKernelSmokeShape] {
-        Array(Set(layerKinds.map {
-            PagedAttentionKernelSmokeShape(
-                headDim: $0.headDim,
-                kvHeads: $0.kvHeads,
-                queryHeads: $0.queryHeads,
-                hasSinks: $0.hasSinks,
-                hasWrite: $0.sharesKVWithLayer == nil)
-        })).sorted {
+        Array(
+            Set(
+                layerKinds.map {
+                    PagedAttentionKernelSmokeShape(
+                        headDim: $0.headDim,
+                        kvHeads: $0.kvHeads,
+                        queryHeads: $0.queryHeads,
+                        hasSinks: $0.hasSinks,
+                        hasWrite: $0.sharesKVWithLayer == nil)
+                })
+        ).sorted {
             (
                 $0.headDim,
                 $0.kvHeads,
@@ -309,7 +312,8 @@ extension PagedAttentionKernel {
             let decodeTile = MLXArray.zeros(
                 [1, shape.kvHeads, shape.headDim],
                 dtype: .float16)
-            let sinks = shape.hasSinks
+            let sinks =
+                shape.hasSinks
                 ? MLXRandom.normal(
                     [max(shape.queryHeads, 8)],
                     dtype: .float32)

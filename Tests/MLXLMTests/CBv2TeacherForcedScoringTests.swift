@@ -357,10 +357,12 @@ struct CBv2TeacherForcedScoringTests {
             })
 
         #expect(throws: (any Error).self) {
-            _ = try harness.engine.teacherForcedTop1(promptTokens: [1, 2, 3], continuation: [4, 5])
+            _ = try harness.engine.teacherForcedTop1(
+                promptTokens: [1, 2, 3], continuation: [4, 5])
         }
         do {
-            _ = try harness.engine.teacherForcedTop1(promptTokens: [1, 2, 3], continuation: [4, 5])
+            _ = try harness.engine.teacherForcedTop1(
+                promptTokens: [1, 2, 3], continuation: [4, 5])
             Issue.record("a busy engine must refuse")
         } catch let error as CBv2TeacherForcingError {
             guard case .engineBusy(let scheduled) = error else {

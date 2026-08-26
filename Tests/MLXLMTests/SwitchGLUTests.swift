@@ -103,30 +103,30 @@ struct SwitchGLUTests {
             activation: { $0 + 0.25 },
             bias: false)
 
-        glu.update(parameters: ModuleParameters.unflattened([
-            "gate_proj.weight": values(
-                numExperts * hiddenDims * inputDims, offset: 1000
-            ).reshaped(numExperts, hiddenDims, inputDims).asType(.bfloat16),
-            "up_proj.weight": values(
-                numExperts * hiddenDims * inputDims, offset: 5000
-            ).reshaped(numExperts, hiddenDims, inputDims).asType(.bfloat16),
-            "down_proj.weight": values(
-                numExperts * inputDims * hiddenDims, offset: 9000
-            ).reshaped(numExperts, inputDims, hiddenDims).asType(.bfloat16),
-        ]))
+        glu.update(
+            parameters: ModuleParameters.unflattened([
+                "gate_proj.weight": values(
+                    numExperts * hiddenDims * inputDims, offset: 1000
+                ).reshaped(numExperts, hiddenDims, inputDims).asType(.bfloat16),
+                "up_proj.weight": values(
+                    numExperts * hiddenDims * inputDims, offset: 5000
+                ).reshaped(numExperts, hiddenDims, inputDims).asType(.bfloat16),
+                "down_proj.weight": values(
+                    numExperts * inputDims * hiddenDims, offset: 9000
+                ).reshaped(numExperts, inputDims, hiddenDims).asType(.bfloat16),
+            ]))
 
         resetWeightedExpertUnsortStats()
-        let cases: [
-            (name: String, rows: Int, enabled: Bool, productionPrefill: Bool, dtype: DType)
-        ] = [
-            ("disabled-sorted", 8, false, true, .bfloat16),
-            ("decode-b1", 1, true, false, .bfloat16),
-            ("decode-b2", 2, true, false, .bfloat16),
-            ("decode-b4", 4, true, false, .bfloat16),
-            ("decode-b8-sorted-size", 8, true, false, .bfloat16),
-            ("custom-near-geometry", 8, true, true, .bfloat16),
-            ("unsupported-dtype", 8, true, true, .float32),
-        ]
+        let cases:
+            [(name: String, rows: Int, enabled: Bool, productionPrefill: Bool, dtype: DType)] = [
+                ("disabled-sorted", 8, false, true, .bfloat16),
+                ("decode-b1", 1, true, false, .bfloat16),
+                ("decode-b2", 2, true, false, .bfloat16),
+                ("decode-b4", 4, true, false, .bfloat16),
+                ("decode-b8-sorted-size", 8, true, false, .bfloat16),
+                ("custom-near-geometry", 8, true, true, .bfloat16),
+                ("unsupported-dtype", 8, true, true, .float32),
+            ]
         for testCase in cases {
             let x = values(testCase.rows * inputDims, offset: 13000)
                 .reshaped(testCase.rows, inputDims).asType(testCase.dtype)
@@ -158,7 +158,6 @@ struct SwitchGLUTests {
         #expect(!provenance.engaged)
         #expect(provenance.missingExpectedEngagement)
     }
-
 
     /// Regression for the removed runtime fused gate+up cache: SwitchGLU must
     /// retain NO weight copies beyond its parameters. The removed cache

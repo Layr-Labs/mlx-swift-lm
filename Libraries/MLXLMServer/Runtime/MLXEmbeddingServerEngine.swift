@@ -26,7 +26,9 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
         [.init(id: modelID)]
     }
 
-    public func createEmbedding(request: OpenAIEmbeddingRequest) async throws -> OpenAIEmbeddingResponse {
+    public func createEmbedding(request: OpenAIEmbeddingRequest) async throws
+        -> OpenAIEmbeddingResponse
+    {
         let texts = request.input.texts
         let normalize = request.normalize ?? true
         let embeddings = await model.perform { context in
@@ -72,7 +74,9 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
 }
 
 public enum MLXServerEmbedderLoader {
-    public static func load(configuration: ModelConfiguration) async throws -> EmbedderModelContainer {
+    public static func load(configuration: ModelConfiguration) async throws
+        -> EmbedderModelContainer
+    {
         try await EmbedderModelFactory.shared.loadContainer(
             from: #hubDownloader(),
             using: #huggingFaceTokenizerLoader(),

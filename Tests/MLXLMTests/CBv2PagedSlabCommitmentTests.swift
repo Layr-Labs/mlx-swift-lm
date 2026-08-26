@@ -148,7 +148,8 @@ struct CBv2PagedSlabCommitmentTests {
             capacity: backend.bytesCapacity,
             physical: backend.bytesPhysical,
             inUse: backend.bytesInUse,
-            reserved: backend.bytesReserved)
+            reserved: backend.bytesReserved
+        )
 
         try backend.commitSlabs()
 

@@ -493,7 +493,8 @@ struct CBv2PagedPoolGuardTests {
             let fixed = threadgroups(PagedAttentionKernel.partitionTokens, length)
             #expect(
                 threadgroups(ptok, length) >= fixed,
-                "B=8 length \(length): PTOK \(ptok) launches fewer threadgroups than the fixed partition")
+                "B=8 length \(length): PTOK \(ptok) launches fewer threadgroups than the fixed partition"
+            )
             guard fixed >= PagedAttentionKernel.partitionTargetThreadgroups else { continue }
             #expect(
                 ptok == PagedAttentionKernel.partitionTokens,

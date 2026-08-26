@@ -455,7 +455,7 @@ public final class VLMModelFactory: GenericModelFactory {
         // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
         // to handle spatial merging correctly
         let processorTypeOverrides: [String: String] = [
-            "mistral3": "Mistral3Processor",
+            "mistral3": "Mistral3Processor"
         ]
         let processorType =
             processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass

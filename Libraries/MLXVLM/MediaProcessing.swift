@@ -473,7 +473,8 @@ public enum MediaProcessing {
             return try await owner.withAsset { asset in
                 try await Self.validateAsset(asset)
                 return try await _asProcessedSequence(
-                    asset, maxFrames: maxFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
+                    asset, maxFrames: maxFrames, targetFPS: targetFPS,
+                    frameProcessing: frameProcessing)
             }
 
         case .url(let url):

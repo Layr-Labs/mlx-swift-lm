@@ -14,11 +14,13 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
         case .responseNotFound(let id):
             return "Response '\(id)' was not found"
         case .embeddingsNotConfigured:
-            return "Embeddings require an embedding model engine; this server instance was started without one."
+            return
+                "Embeddings require an embedding model engine; this server instance was started without one."
         case .invalidResponseFormatOutput(let message):
             return "Generated output did not satisfy response_format: \(message)"
         case .multipleToolCallsNotAllowed:
-            return "Generated output contained multiple tool calls while parallel_tool_calls was false"
+            return
+                "Generated output contained multiple tool calls while parallel_tool_calls was false"
         }
     }
 }
@@ -127,7 +129,9 @@ public struct MLXOpenAIService: Sendable {
                         case .content(let text):
                             for parsed in reasoningParser.parse(text) {
                                 let content = parsed.content.isEmpty ? nil : parsed.content
-                                guard content != nil || parsed.reasoningContent != nil else { continue }
+                                guard content != nil || parsed.reasoningContent != nil else {
+                                    continue
+                                }
                                 continuation.yield(
                                     try ServerSentEventEncoder.encode(
                                         OpenAIChatCompletionChunk(
@@ -370,9 +374,12 @@ public struct MLXOpenAIService: Sendable {
         request: OpenAIChatCompletionRequest,
         output: CollectedChatOutput
     ) throws -> OpenAIChatCompletionResponse {
-        let parsed = ReasoningParser(format: request.reasoningParser ?? defaultReasoningParser ?? .none)
-            .parse(output.content)
-        let content = output.toolCalls.isEmpty
+        let parsed = ReasoningParser(
+            format: request.reasoningParser ?? defaultReasoningParser ?? .none
+        )
+        .parse(output.content)
+        let content =
+            output.toolCalls.isEmpty
             ? try OpenAIResponseFormatSupport.normalizedContent(
                 parsed.content,
                 for: request.responseFormat
@@ -399,8 +406,10 @@ public struct MLXOpenAIService: Sendable {
         request: OpenAIResponseRequest,
         output: CollectedChatOutput
     ) -> OpenAIResponse {
-        let parsed = ReasoningParser(format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
-            .parse(output.content)
+        let parsed = ReasoningParser(
+            format: request.reasoning?.parser ?? defaultReasoningParser ?? .none
+        )
+        .parse(output.content)
         var outputItems: [OpenAIResponseOutputItem] = []
         if let reasoningContent = parsed.reasoningContent, !reasoningContent.isEmpty {
             outputItems.append(.reasoning(id: idProvider("rs"), text: reasoningContent))

@@ -46,7 +46,8 @@ struct CBv2PagedSafetyTests {
     @Test("missing package layout throws instead of trapping in Bundle.module")
     func missingBundleIsCatchable() throws {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("paged-resource-missing-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                "paged-resource-missing-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
@@ -69,7 +70,8 @@ struct CBv2PagedSafetyTests {
     @Test("packaged lookup ignores an unsigned external bundle")
     func packagedLookupCannotEscapeApp() throws {
         let base = FileManager.default.temporaryDirectory
-            .appendingPathComponent("paged-resource-adversarial-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                "paged-resource-adversarial-\(UUID().uuidString)", isDirectory: true)
         let app = base.appendingPathComponent("Darkbloom.app", isDirectory: true)
         let executable = app.appendingPathComponent("Contents/MacOS/darkbloom")
         let sealed = app.appendingPathComponent("Contents/Resources", isDirectory: true)
@@ -97,7 +99,8 @@ struct CBv2PagedSafetyTests {
     @Test("symlinked invocation still resolves the sealed app resources")
     func symlinkedInvocationFindsSealedResource() throws {
         let base = FileManager.default.temporaryDirectory
-            .appendingPathComponent("paged-resource-symlink-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                "paged-resource-symlink-\(UUID().uuidString)", isDirectory: true)
         let app = base.appendingPathComponent("Darkbloom.app", isDirectory: true)
         let executable = app.appendingPathComponent("Contents/MacOS/darkbloom")
         let sealed = app.appendingPathComponent("Contents/Resources", isDirectory: true)

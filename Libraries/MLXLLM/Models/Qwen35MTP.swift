@@ -35,7 +35,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .invalidConfiguration(let detail):
             return "Invalid inline Qwen MTP configuration: \(detail)."
         case .incompatibleTarget(let field, let artifact, let target):
-            return "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
+            return
+                "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
         case .invalidWeightIndex(let detail):
             return "Invalid inline Qwen MTP weight index: \(detail)."
         case .missingWeights:
@@ -43,7 +44,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .duplicateWeight(let key):
             return "The inline Qwen MTP tensor \(key) appears more than once."
         case .missingQuantization(let path):
-            return "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
+            return
+                "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
         }
     }
 }
@@ -381,10 +383,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             blockSize: metadata.blockSize,
             target: target)
 
-        let scaledPaths = Set(indexed.keys.compactMap { key -> String? in
-            guard key.hasSuffix(".scales") else { return nil }
-            return String(key.dropLast(".scales".count))
-        })
+        let scaledPaths = Set(
+            indexed.keys.compactMap { key -> String? in
+                guard key.hasSuffix(".scales") else { return nil }
+                return String(key.dropLast(".scales".count))
+            })
         for path in scaledPaths
         where metadata.quantizationByPath[path] == nil && metadata.defaultQuantization == nil {
             throw Qwen35InlineMTPError.missingQuantization(path)
@@ -446,15 +449,16 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             }
             prefix = ""
             blockSize = (root["block_size"] as? NSNumber)?.intValue ?? 3
-            guard let quantization = (root["quantization"] ?? root["quantization_config"])
-                as? [String: Any]
+            guard
+                let quantization = (root["quantization"] ?? root["quantization_config"])
+                    as? [String: Any]
             else {
                 throw Qwen35InlineMTPError.invalidConfiguration(
                     "standalone MTP quantization is required")
             }
             rawQuantization = quantization
         }
-        guard (2...8).contains(blockSize) else {
+        guard (2 ... 8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
                 "block_size \(blockSize) is outside 2...8")
         }
@@ -557,9 +561,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         do {
             urls = try FileManager.default.contentsOfDirectory(
                 at: directory, includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles])
-                .filter { $0.pathExtension == "safetensors" }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
         } catch {
             throw Qwen35InlineMTPError.invalidWeightIndex(String(describing: error))
         }

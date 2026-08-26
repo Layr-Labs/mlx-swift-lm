@@ -50,7 +50,8 @@ func consumeSafePrefix(
         return output
     }
 
-    let suffixLength = markers
+    let suffixLength =
+        markers
         .map { potentialMarkerPrefixSuffixLength(in: buffer, marker: $0) }
         .max() ?? 0
     guard suffixLength > 0 else {

@@ -228,10 +228,11 @@ public struct PagedBackendBenchmark {
             let dense = measureDenseBatch(scenario)
             for m in [paged, perRow, dense] {
                 all.append(m)
-                lines.append(String(
-                    format: "| %d | %d | %@ | %.3f | %.1f | %.0f |",
-                    m.scenario.batch, m.scenario.context, m.engine,
-                    m.msPerStep, m.kvGBPerSec, m.tokensPerSec))
+                lines.append(
+                    String(
+                        format: "| %d | %d | %@ | %.3f | %.1f | %.0f |",
+                        m.scenario.batch, m.scenario.context, m.engine,
+                        m.msPerStep, m.kvGBPerSec, m.tokensPerSec))
             }
             Memory.clearCache()
         }

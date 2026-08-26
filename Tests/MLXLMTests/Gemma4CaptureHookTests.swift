@@ -2,9 +2,10 @@
 
 import Foundation
 import MLX
-@testable import MLXLLM
 import MLXLMCommon
 import Testing
+
+@testable import MLXLLM
 
 @Suite("Gemma4TextModelInner shared-KV capture hook")
 struct Gemma4CaptureHookTests {
@@ -17,26 +18,26 @@ struct Gemma4CaptureHookTests {
         //            sliding, sliding, sliding, sliding, full].
         // Last non-shared full-attn = layer 4; last non-shared sliding = 3.
         let json = """
-        {
-            "model_type": "gemma4_text",
-            "hidden_size": 64,
-            "num_hidden_layers": 10,
-            "intermediate_size": 128,
-            "num_attention_heads": 2,
-            "head_dim": 32,
-            "global_head_dim": 32,
-            "num_key_value_heads": 1,
-            "num_kv_shared_layers": 5,
-            "sliding_window": 16,
-            "sliding_window_pattern": 5,
-            "final_logit_softcapping": 30.0,
-            "tie_word_embeddings": true,
-            "vocab_size": 32,
-            "vocab_size_per_layer_input": 32,
-            "rms_norm_eps": 1e-6,
-            "hidden_size_per_layer_input": 0
-        }
-        """
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 10,
+                "intermediate_size": 128,
+                "num_attention_heads": 2,
+                "head_dim": 32,
+                "global_head_dim": 32,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 5,
+                "sliding_window": 16,
+                "sliding_window_pattern": 5,
+                "final_logit_softcapping": 30.0,
+                "tie_word_embeddings": true,
+                "vocab_size": 32,
+                "vocab_size_per_layer_input": 32,
+                "rms_norm_eps": 1e-6,
+                "hidden_size_per_layer_input": 0
+            }
+            """
         let data = Data(json.utf8)
         return try JSONDecoder.json5().decode(Gemma4TextConfiguration.self, from: data)
     }

@@ -4,7 +4,9 @@ import Foundation
 import MLXLMCommon
 
 enum OpenAIResponseFormatSupport {
-    static func preparedRequest(_ request: OpenAIChatCompletionRequest) throws -> OpenAIChatCompletionRequest {
+    static func preparedRequest(_ request: OpenAIChatCompletionRequest) throws
+        -> OpenAIChatCompletionRequest
+    {
         guard let responseFormat = request.responseFormat,
             responseFormat.requiresJSONOutput
         else {
@@ -28,7 +30,8 @@ enum OpenAIResponseFormatSupport {
             return content
         }
 
-        let decoded = try decodeJSONCandidate(from: content, rootMustBeObject: responseFormat.type == .jsonObject)
+        let decoded = try decodeJSONCandidate(
+            from: content, rootMustBeObject: responseFormat.type == .jsonObject)
         switch responseFormat.type {
         case .text:
             return content
@@ -67,7 +70,8 @@ enum OpenAIResponseFormatSupport {
                 )
             }
             let schemaText = try schema.schema.encodedJSONString()
-            let strictText = schema.strict == true
+            let strictText =
+                schema.strict == true
                 ? " The output must strictly conform to the schema."
                 : ""
             let description = schema.description.map { " Description: \($0)" } ?? ""
@@ -247,28 +251,28 @@ private struct JSONSchemaSubsetValidator {
     }
 }
 
-private extension JSONValue {
-    var objectValue: [String: JSONValue]? {
+extension JSONValue {
+    fileprivate var objectValue: [String: JSONValue]? {
         if case .object(let value) = self { return value }
         return nil
     }
 
-    var stringValue: String? {
+    fileprivate var stringValue: String? {
         if case .string(let value) = self { return value }
         return nil
     }
 
-    var stringArrayValue: [String]? {
+    fileprivate var stringArrayValue: [String]? {
         guard case .array(let values) = self else { return nil }
         return values.compactMap(\.stringValue)
     }
 
-    var intValue: Int? {
+    fileprivate var intValue: Int? {
         if case .int(let value) = self { return value }
         return nil
     }
 
-    var doubleCompatibleValue: Double? {
+    fileprivate var doubleCompatibleValue: Double? {
         switch self {
         case .int(let value):
             return Double(value)
@@ -279,14 +283,16 @@ private extension JSONValue {
         }
     }
 
-    func encodedJSONString() throws -> String {
+    fileprivate func encodedJSONString() throws -> String {
         let data = try JSONEncoder.openAIServer.encode(self)
         return String(decoding: data, as: UTF8.self)
     }
 }
 
-private extension Array where Element == OpenAIChatMessage {
-    func insertingResponseFormatInstruction(_ instruction: String) -> [OpenAIChatMessage] {
+extension Array where Element == OpenAIChatMessage {
+    fileprivate func insertingResponseFormatInstruction(_ instruction: String)
+        -> [OpenAIChatMessage]
+    {
         let message = OpenAIChatMessage(
             role: .system,
             content: .text(instruction)
@@ -298,15 +304,15 @@ private extension Array where Element == OpenAIChatMessage {
     }
 }
 
-private extension Array where Element: Hashable {
-    func uniqued() -> [Element] {
+extension Array where Element: Hashable {
+    fileprivate func uniqued() -> [Element] {
         var seen = Set<Element>()
         return filter { seen.insert($0).inserted }
     }
 }
 
-private extension String {
-    func unfencedMarkdownJSON() -> String? {
+extension String {
+    fileprivate func unfencedMarkdownJSON() -> String? {
         guard hasPrefix("```") else {
             return nil
         }
@@ -322,11 +328,13 @@ private extension String {
         return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    func firstBalancedJSONValue(rootMustBeObject: Bool) -> String? {
+    fileprivate func firstBalancedJSONValue(rootMustBeObject: Bool) -> String? {
         let scalars = Array(unicodeScalars)
-        guard let start = scalars.firstIndex(where: { scalar in
-            rootMustBeObject ? scalar == "{" : (scalar == "{" || scalar == "[")
-        }) else {
+        guard
+            let start = scalars.firstIndex(where: { scalar in
+                rootMustBeObject ? scalar == "{" : (scalar == "{" || scalar == "[")
+            })
+        else {
             return nil
         }
 
@@ -334,7 +342,7 @@ private extension String {
         var inString = false
         var escaped = false
 
-        for index in start..<scalars.endIndex {
+        for index in start ..< scalars.endIndex {
             let scalar = scalars[index]
             if inString {
                 if escaped {
@@ -360,7 +368,7 @@ private extension String {
                 }
                 stack.removeLast()
                 if stack.isEmpty {
-                    let substring = String(String.UnicodeScalarView(scalars[start...index]))
+                    let substring = String(String.UnicodeScalarView(scalars[start ... index]))
                     return substring.trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             default:

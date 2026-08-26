@@ -21,7 +21,8 @@ public enum PagedAttentionReference {
     ///
     /// - Parameters:
     ///   - queries: `[B, queryHeads, L, headDim]`
-    ///   - keys/values: `[B, kvHeads, T, headDim]`
+    ///   - keys: key tensor `[B, kvHeads, T, headDim]`
+    ///   - values: value tensor `[B, kvHeads, T, headDim]`
     ///   - scale: query scale
     ///   - boolMask: optional `[L, T]`-broadcastable bool mask, true = attend
     ///   - sinks: optional `[queryHeads]` sink logits (denominator-only)

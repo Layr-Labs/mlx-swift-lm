@@ -202,7 +202,8 @@ final class CBv2FrozenReplayCounterexampleTests: XCTestCase {
             return (
                 snapshot.keys[.ellipsis, 0 ..< matched, 0...],
                 snapshot.values[.ellipsis, 0 ..< matched, 0...],
-                matched)
+                matched
+            )
         }
         let backend = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 1 << 30))
@@ -242,7 +243,8 @@ final class CBv2FrozenReplayCounterexampleTests: XCTestCase {
             let left = try XCTUnwrap(lhs[index]?.snapshot(), file: file, line: line)
             let right = try XCTUnwrap(rhs[index]?.snapshot(), file: file, line: line)
             XCTAssertEqual(left.offset, right.offset, file: file, line: line)
-            XCTAssertEqual(maxAbsDiff(left.keys, right.keys), 0, accuracy: 0, file: file, line: line)
+            XCTAssertEqual(
+                maxAbsDiff(left.keys, right.keys), 0, accuracy: 0, file: file, line: line)
             XCTAssertEqual(
                 maxAbsDiff(left.values, right.values), 0, accuracy: 0,
                 file: file, line: line)
@@ -336,11 +338,12 @@ final class CBv2FrozenReplayCounterexampleTests: XCTestCase {
                 let cold = try coldRun(model: model, prompt: prompt)
                 let matched = ((prompt.count - 1) / 256) * 256
                 coldRuns.append(cold)
-                frozenRuns.append(try frozenResume(
-                    model: model,
-                    prompt: prompt,
-                    donor: cold.state,
-                    matched: matched))
+                frozenRuns.append(
+                    try frozenResume(
+                        model: model,
+                        prompt: prompt,
+                        donor: cold.state,
+                        matched: matched))
             }
 
             let next = coldRuns.map { token($0.logits) }

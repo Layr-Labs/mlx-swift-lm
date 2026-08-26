@@ -19,7 +19,8 @@ final class Qwen35VisionCBv2SemanticsTests: XCTestCase {
 
         XCTAssertEqual(resolved.blocks, [])
         XCTAssertNil(resolved.chunkContext(start: 0, count: 4))
-        XCTAssertEqual(resolved.spansInChunk(start: 0, count: 4).first?.span,
+        XCTAssertEqual(
+            resolved.spansInChunk(start: 0, count: 4).first?.span,
             CBv2ImageSpan(tokenOffset: 2, length: 2))
 
         var request = CBv2Request(

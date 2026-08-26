@@ -207,7 +207,8 @@ struct CBv2PagedGatherRangeGuardTests {
 
         let lpFirst = start / s
         let lpLast = (start + count - 1) / s
-        #expect(lpLast - lpFirst + 1 == ringPages + 1, "the range spans one page more than the ring")
+        #expect(
+            lpLast - lpFirst + 1 == ringPages + 1, "the range spans one page more than the ring")
         #expect(lpFirst % ringPages == lpLast % ringPages, "first and last page share a ring slot")
         #expect(
             row.table[lpFirst % ringPages] == row.table[lpLast % ringPages],
@@ -364,7 +365,8 @@ struct CBv2PagedGatherRangeGuardTests {
         let where_ = firstExact.map(String.init) ?? "never"
         #expect(
             firstExact == row.oldestValidPosition,
-            "data becomes exact at \(where_), guard says \(row.oldestValidPosition) (rolled back \(rolledBack))")
+            "data becomes exact at \(where_), guard says \(row.oldestValidPosition) (rolled back \(rolledBack))"
+        )
     }
 
     // MARK: - Caller sweep

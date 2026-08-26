@@ -80,12 +80,13 @@ extension EngineLoopV2 {
             return sampled
         }
 
-        var useRectangular = switch mtp.config.verificationMode {
-        case .serialTarget: false
-        case .rectangular: true
-        case .automatic:
-            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
-        }
+        var useRectangular =
+            switch mtp.config.verificationMode {
+            case .serialTarget: false
+            case .rectangular: true
+            case .automatic:
+                columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+            }
 
         // A recurrent target may only verify rectangularly through the
         // captured-window seam. Stateful production never falls back to
@@ -95,7 +96,8 @@ extension EngineLoopV2 {
         {
             if mtp.usesRequestStatefulDrafter {
                 preconditionFailure(
-                    "CBv2 production request-stateful MTP requires captured rectangular verification")
+                    "CBv2 production request-stateful MTP requires captured rectangular verification"
+                )
             }
             mtp.recordControllerFallback("captured_verify_unsupported")
             useRectangular = false
@@ -124,7 +126,8 @@ extension EngineLoopV2 {
             if serializingCaches.count != caches.count {
                 if mtp.usesRequestStatefulDrafter, recurrentModel != nil {
                     preconditionFailure(
-                        "CBv2 production request-stateful MTP cache lacks rectangular serialization")
+                        "CBv2 production request-stateful MTP cache lacks rectangular serialization"
+                    )
                 }
                 mtp.recordControllerFallback("rectangular_cache_unsupported")
                 useRectangular = false
@@ -238,7 +241,8 @@ extension EngineLoopV2 {
                 let topTwo = provider.cbv2MTPTopTwo(flat)
                 policyTopTwo = (
                     topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
-                    topTwo.values.reshaped([batch, width, 2]).asType(.float32))
+                    topTwo.values.reshaped([batch, width, 2]).asType(.float32)
+                )
             }
             if useTargetPrefix {
                 scores = scoreColumns(output.logits, columnOffset: 0)
@@ -262,7 +266,8 @@ extension EngineLoopV2 {
 
         return (
             scores, hidden, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, recurrent)
+            eagerCacheInnerState(caches) + capturedInnerState, recurrent
+        )
     }
 
     /// Top-`size` token ids per verify position plus their probability mass

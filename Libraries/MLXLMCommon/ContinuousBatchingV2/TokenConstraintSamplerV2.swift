@@ -36,8 +36,9 @@ final class CBv2TokenConstraintSampler {
                 consumed: 0,
                 failure: nil)
             for token in row.outputTokens {
-                guard let next = constraint.nextState(
-                    state: rebuilt.state, tokenID: token)
+                guard
+                    let next = constraint.nextState(
+                        state: rebuilt.state, tokenID: token)
                 else {
                     rebuilt.failure = CBv2TokenConstraintFailure.impossibleState
                     break
@@ -64,7 +65,8 @@ final class CBv2TokenConstraintSampler {
                 continue
             }
             let remaining = max(0, row.constraint.maxTokens - row.consumed)
-            var allowed = row.failure == nil
+            var allowed =
+                row.failure == nil
                 ? row.constraint.allowedTokenIDs(
                     state: row.state, remainingTokens: remaining)
                 : []

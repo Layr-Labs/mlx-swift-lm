@@ -121,7 +121,8 @@ public enum CBv2LayerKindDerivation {
 
     @available(
         *, deprecated,
-        message: "attentionKeqV does not affect Gemma 4 KV geometry; use isBidirectional")
+        message: "attentionKeqV does not affect Gemma 4 KV geometry; use isBidirectional"
+    )
     public static func gemma4LayerKinds(
         layerTypes: [String],
         slidingWindow: Int,

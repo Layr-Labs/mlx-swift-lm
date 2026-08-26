@@ -50,7 +50,8 @@ struct Qwen35FusedGateUpTests {
             let maxErr = (actual - expected).abs().max().item(Float.self)
             #expect(
                 actual.allClose(expected, rtol: 1e-5, atol: 1e-6).item(Bool.self),
-                Comment(rawValue: "fused/split divergence at tokens=\(tokens): max abs err \(maxErr)"))
+                Comment(
+                    rawValue: "fused/split divergence at tokens=\(tokens): max abs err \(maxErr)"))
         }
     }
 
@@ -380,7 +381,8 @@ struct Qwen35FusedGateUpTests {
         // MTP trees stay split and get no aliases; unrelated paths get none.
         #expect(
             aliasing.quantizationPathAliases(
-                for: "mtp.layers.0.mlp.switch_mlp.gate_up_proj").isEmpty)
+                for: "mtp.layers.0.mlp.switch_mlp.gate_up_proj"
+            ).isEmpty)
         #expect(aliasing.quantizationPathAliases(for: "model.layers.0.mlp.gate").isEmpty)
     }
 
@@ -438,8 +440,11 @@ struct Qwen35FusedGateUpTests {
         #expect(keptSplit == [mixed])
         #expect(sanitized["\(mixed).gate_up_proj.weight"] == nil)
         for suffix in ["weight", "scales", "biases"] {
-            #expect(sanitized["\(mixed).gate_proj.\(suffix)"] === original["\(mixed).gate_proj.\(suffix)"])
-            #expect(sanitized["\(mixed).up_proj.\(suffix)"] === original["\(mixed).up_proj.\(suffix)"])
+            #expect(
+                sanitized["\(mixed).gate_proj.\(suffix)"]
+                    === original["\(mixed).gate_proj.\(suffix)"])
+            #expect(
+                sanitized["\(mixed).up_proj.\(suffix)"] === original["\(mixed).up_proj.\(suffix)"])
         }
         // Uniform layer: still fused (regression guard on the fusion win).
         #expect(sanitized["\(uniform).gate_up_proj.weight"] != nil)
@@ -1100,6 +1105,7 @@ struct Qwen35FusedGateUpTests {
         let maxErr = (phase3 - phase1).abs().max().item(Float.self)
         #expect(
             phase3.allClose(phase1, rtol: 0, atol: 0).item(Bool.self),
-            Comment(rawValue: "re-fused forward diverged from first fused load: max abs err \(maxErr)"))
+            Comment(
+                rawValue: "re-fused forward diverged from first fused load: max abs err \(maxErr)"))
     }
 }

@@ -250,7 +250,8 @@ final class TinyBenchModel: Module {
 func percentile(_ sorted: [Double], _ q: Double) -> Double {
     guard !sorted.isEmpty else { return 0 }
     let rank = q * Double(sorted.count - 1)
-    let lo = Int(rank.rounded(.down)), hi = Int(rank.rounded(.up))
+    let lo = Int(rank.rounded(.down))
+    let hi = Int(rank.rounded(.up))
     if lo == hi { return sorted[lo] }
     let w = rank - Double(lo)
     return sorted[lo] * (1 - w) + sorted[hi] * w
@@ -492,4 +493,3 @@ struct CBv2Benchmark {
         }
     }
 }
-

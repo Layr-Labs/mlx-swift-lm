@@ -327,15 +327,17 @@ final class CBv2MTPRoundDriver {
         let recurrent =
             (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
         let captureLayers = mtpModel.mtpCaptureLayers
-        guard (stateful && recurrent && mtpModel.supportsRequestStatefulMTP)
-            || (!stateful && !recurrent && captureLayers != nil)
+        guard
+            (stateful && recurrent && mtpModel.supportsRequestStatefulMTP)
+                || (!stateful && !recurrent && captureLayers != nil)
         else { return nil }
         guard let modelTarget = mtpModel.mtpTargetIdentity,
             let drafterTarget = drafter.mtpTargetIdentity,
             modelTarget == drafterTarget
         else { return nil }
         var config = config
-        let effectiveVerification = drafter.requiredVerificationMode
+        let effectiveVerification =
+            drafter.requiredVerificationMode
             ?? config.verificationMode
         if stateful, effectiveVerification != .serialTarget,
             !supportsRectangularCacheBank
@@ -455,7 +457,6 @@ final class CBv2MTPRoundDriver {
     func roundMark(for id: CBv2RequestID) -> Int? { roundMarks[id] }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
 
-
     func forceSynchronizedSeed() {
         forceSeedPlan = true
     }
@@ -539,7 +540,6 @@ final class CBv2MTPRoundDriver {
         config.maxDraftTokens > 0
             && usesRequestStatefulDrafter && config.fixedDraftTokens == nil
     }
-
 
     var shouldApplyMarginalPolicyToPlan: Bool {
         usesMarginalPolicy && !planDecision.isExploration

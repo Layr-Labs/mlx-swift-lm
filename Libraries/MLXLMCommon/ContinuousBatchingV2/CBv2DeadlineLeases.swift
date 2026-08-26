@@ -98,7 +98,8 @@ public enum CBv2TerminalCause: Sendable, Equatable {
         case .prefillStall: return "prefill made no confirmed progress within the prefill lease"
         case .decodeStall: return "decode made no confirmed token progress within the decode lease"
         case .safetyDeadline: return "request exceeded its absolute safety ceiling"
-        case .backpressureTimeout: return "request paused on backpressure past the backpressure lease"
+        case .backpressureTimeout:
+            return "request paused on backpressure past the backpressure lease"
         case .watchdog: return "engine step exceeded the watchdog timeout"
         case .legacyRequestTimeout: return "request exceeded the legacy total-lifetime deadline"
         }

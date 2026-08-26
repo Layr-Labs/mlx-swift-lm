@@ -2,8 +2,9 @@
 
 import Foundation
 import MLXLMCommon
-@testable import MLXLLM
 import Testing
+
+@testable import MLXLLM
 
 @Suite("Gemma4AssistantConfiguration decoding")
 struct Gemma4AssistantConfigurationTests {
@@ -110,9 +111,10 @@ struct Gemma4AssistantConfigurationTests {
                 loadFixture(named: fixture))
             let assistant = document.config
             let text = assistant.textConfig
-            let globalHeads = text.numGlobalKeyValueHeads.map {
-                "\"num_global_key_value_heads\": \($0),"
-            } ?? ""
+            let globalHeads =
+                text.numGlobalKeyValueHeads.map {
+                    "\"num_global_key_value_heads\": \($0),"
+                } ?? ""
             let targetJSON = """
                 {
                     "model_type": "gemma4_text",
@@ -151,16 +153,21 @@ struct Gemma4AssistantConfigurationTests {
             ("negative layers", tinyConfig(layers: "-1"), "textConfig.numHiddenLayers"),
             ("wrong model type", tinyConfig(modelType: "gemma4_text"), "modelType"),
             ("over-cap file", overCap, "config.json"),
-            ("overflowing doubled backbone", tinyConfig(backbone: "9223372036854775807"), "backboneHiddenSize"),
+            (
+                "overflowing doubled backbone", tinyConfig(backbone: "9223372036854775807"),
+                "backboneHiddenSize"
+            ),
             (
                 "huge finite rotary factor",
                 tinyConfig(fullPartialRotaryFactor: "1e30"),
-                "textConfig.fullPartialRotaryFactor"),
+                "textConfig.fullPartialRotaryFactor"
+            ),
             ("wrong scalar type", tinyConfig(hidden: "\"64\""), "config.json"),
             (
                 "invalid quantization",
                 tinyConfig(quantization: ", \"quantization\": {\"group_size\": -1, \"bits\": 4}"),
-                "quantization.groupSize"),
+                "quantization.groupSize"
+            ),
         ]
 
         for (name, data, expectedField) in cases {
@@ -177,29 +184,29 @@ struct Gemma4AssistantConfigurationTests {
         // Synthetic config: text_config omits num_kv_shared_layers; the
         // post-init should set it to num_hidden_layers = 4.
         let json = """
-        {
-            "model_type": "gemma4_assistant",
-            "backbone_hidden_size": 256,
-            "use_ordered_embeddings": true,
-            "num_centroids": 16,
-            "centroid_intermediate_top_k": 4,
-            "text_config": {
-                "model_type": "gemma4_text",
-                "hidden_size": 256,
-                "num_hidden_layers": 4,
-                "intermediate_size": 512,
-                "num_attention_heads": 2,
-                "head_dim": 32,
-                "global_head_dim": 32,
-                "num_key_value_heads": 1,
-                "sliding_window": 64,
-                "tie_word_embeddings": true,
-                "vocab_size": 1024,
-                "vocab_size_per_layer_input": 1024,
-                "rms_norm_eps": 1e-6
+            {
+                "model_type": "gemma4_assistant",
+                "backbone_hidden_size": 256,
+                "use_ordered_embeddings": true,
+                "num_centroids": 16,
+                "centroid_intermediate_top_k": 4,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 256,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 512,
+                    "num_attention_heads": 2,
+                    "head_dim": 32,
+                    "global_head_dim": 32,
+                    "num_key_value_heads": 1,
+                    "sliding_window": 64,
+                    "tie_word_embeddings": true,
+                    "vocab_size": 1024,
+                    "vocab_size_per_layer_input": 1024,
+                    "rms_norm_eps": 1e-6
+                }
             }
-        }
-        """
+            """
         let data = Data(json.utf8)
         let config = try JSONDecoder.json5().decode(
             Gemma4AssistantConfiguration.self, from: data)
@@ -208,30 +215,30 @@ struct Gemma4AssistantConfigurationTests {
 
     @Test func clampsNumKvSharedLayersWhenZero() throws {
         let json = """
-        {
-            "model_type": "gemma4_assistant",
-            "backbone_hidden_size": 256,
-            "use_ordered_embeddings": false,
-            "num_centroids": 16,
-            "centroid_intermediate_top_k": 4,
-            "text_config": {
-                "model_type": "gemma4_text",
-                "hidden_size": 256,
-                "num_hidden_layers": 4,
-                "intermediate_size": 512,
-                "num_attention_heads": 2,
-                "head_dim": 32,
-                "global_head_dim": 32,
-                "num_key_value_heads": 1,
-                "num_kv_shared_layers": 0,
-                "sliding_window": 64,
-                "tie_word_embeddings": true,
-                "vocab_size": 1024,
-                "vocab_size_per_layer_input": 1024,
-                "rms_norm_eps": 1e-6
+            {
+                "model_type": "gemma4_assistant",
+                "backbone_hidden_size": 256,
+                "use_ordered_embeddings": false,
+                "num_centroids": 16,
+                "centroid_intermediate_top_k": 4,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 256,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 512,
+                    "num_attention_heads": 2,
+                    "head_dim": 32,
+                    "global_head_dim": 32,
+                    "num_key_value_heads": 1,
+                    "num_kv_shared_layers": 0,
+                    "sliding_window": 64,
+                    "tie_word_embeddings": true,
+                    "vocab_size": 1024,
+                    "vocab_size_per_layer_input": 1024,
+                    "rms_norm_eps": 1e-6
+                }
             }
-        }
-        """
+            """
         let data = Data(json.utf8)
         let config = try JSONDecoder.json5().decode(
             Gemma4AssistantConfiguration.self, from: data)

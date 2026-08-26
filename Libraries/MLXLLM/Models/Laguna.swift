@@ -561,7 +561,8 @@ public struct LagunaConfiguration: Codable, Sendable {
         self.mlpLayerTypes = try c.decodeIfPresent([String].self, forKey: .mlpLayerTypes)
         self.mlpOnlyLayers = try c.decodeIfPresent([Int].self, forKey: .mlpOnlyLayers) ?? [0]
         self.ropeParametersByType =
-            try c.decodeIfPresent([String: [String: StringOrNumber]].self, forKey: .ropeParametersByType)
+            try c.decodeIfPresent(
+                [String: [String: StringOrNumber]].self, forKey: .ropeParametersByType)
 
         self.gating = try c.decodeIfPresent(LagunaGating.self, forKey: .gating) ?? .perHead
 
@@ -579,7 +580,8 @@ public struct LagunaConfiguration: Codable, Sendable {
             try c.decodeIfPresent(Float.self, forKey: .moeRouterLogitSoftcapping) ?? 0.0
 
         if let q = try decoder.container(keyedBy: LagunaQuantizationCodingKeys.self)
-            .decodeIfPresent(LagunaQuantizationBlock.self, forKey: .quantization) {
+            .decodeIfPresent(LagunaQuantizationBlock.self, forKey: .quantization)
+        {
             self.quantGroupSize = q.groupSize
             self.quantBits = q.bits
             self.quantMode = q.mode

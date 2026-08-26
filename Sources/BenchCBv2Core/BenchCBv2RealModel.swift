@@ -80,7 +80,8 @@ func syntheticPrompt(length: Int, seed: UInt64, vocabSize: Int) -> [Int] {
 func percentile(_ sorted: [Double], _ q: Double) -> Double {
     guard !sorted.isEmpty else { return 0 }
     let rank = q * Double(sorted.count - 1)
-    let lo = Int(rank.rounded(.down)), hi = Int(rank.rounded(.up))
+    let lo = Int(rank.rounded(.down))
+    let hi = Int(rank.rounded(.up))
     if lo == hi { return sorted[lo] }
     let w = rank - Double(lo)
     return sorted[lo] * (1 - w) + sorted[hi] * w
@@ -370,9 +371,11 @@ func logprobDetail(_ r: RunResult, at index: Int, label: String) -> String {
         .joined(separator: " ")
     var gap = ""
     if lp.topLogprobs.count >= 2 {
-        gap = String(format: " gap(top1-top2)=%.5f", lp.topLogprobs[0].logprob - lp.topLogprobs[1].logprob)
+        gap = String(
+            format: " gap(top1-top2)=%.5f", lp.topLogprobs[0].logprob - lp.topLogprobs[1].logprob)
     }
-    return String(format: "%@: chose %d (logprob %.4f) top=[%@]%@", label, lp.token, lp.logprob, alts, gap)
+    return String(
+        format: "%@: chose %d (logprob %.4f) top=[%@]%@", label, lp.token, lp.logprob, alts, gap)
 }
 
 // MARK: - Perf cells
@@ -454,7 +457,6 @@ struct SafeR1Provenance: Codable, Sendable, Equatable {
             + fallbackTopology + fallbackAssignmentCount + fallbackGeometry
             + fallbackMetallibUnavailable
     }
-
 
     var guardFailure: String? {
         guard armed else {
@@ -718,8 +720,9 @@ func runV2Cell(
 
     let optimizationProvenance: CellOptimizationProvenance?
     if trackOptimizationProvenance {
-        let layer18Submissions = CBv2StepProfiler.snapshotAndDisarmEvents()[
-            "v2.gemma4.prefill.chunk_eval"] ?? 0
+        let layer18Submissions =
+            CBv2StepProfiler.snapshotAndDisarmEvents()[
+                "v2.gemma4.prefill.chunk_eval"] ?? 0
         let weighted = weightedExpertUnsortProvenance(
             requested: hooks.optimizations.weightedUnsortEffective)
         let r1 = SafeR1Provenance(
@@ -871,7 +874,9 @@ func runCorrectness(
         await burstEngine.shutdown()
         let burstTarget = burst[2]
         let burstDiv = firstDivergence(soloTokens, burstTarget.tokens)
-        log("[invariance] burst target tokens=\(burstTarget.tokens.count) divergence=\(String(describing: burstDiv))")
+        log(
+            "[invariance] burst target tokens=\(burstTarget.tokens.count) divergence=\(String(describing: burstDiv))"
+        )
         if let d = burstDiv {
             log("[invariance] " + logprobDetail(solo, at: d, label: "solo @\(d)"))
             log("[invariance] " + logprobDetail(burstTarget, at: d, label: "burst @\(d)"))
@@ -1145,7 +1150,8 @@ func parsePositiveInt(_ raw: String, option: String) throws -> Int {
 /// Comma-separated positive integers. Every element must be valid; an empty
 /// element (or an empty list) is an error rather than a silent omission.
 func parsePositiveIntList(_ raw: String, option: String) throws -> [Int] {
-    let elements = raw
+    let elements =
+        raw
         .split(separator: ",", omittingEmptySubsequences: false)
         .map { $0.trimmingCharacters(in: .whitespaces) }
     return try elements.map { try parsePositiveInt($0, option: option) }
@@ -1201,7 +1207,8 @@ struct BenchOptions: Equatable {
                 options.mode = mode
             case "--engines":
                 let raw = try value(for: argument)
-                let names = raw
+                let names =
+                    raw
                     .split(separator: ",", omittingEmptySubsequences: false)
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                 guard names.allSatisfy({ !$0.isEmpty }) else {
@@ -1223,8 +1230,9 @@ struct BenchOptions: Equatable {
                 options.steps = try parsePositiveInt(
                     try value(for: argument), option: argument)
             case "--kv-gb":
-                options.kvBytes = try parsePositiveInt(
-                    try value(for: argument), option: argument) << 30
+                options.kvBytes =
+                    try parsePositiveInt(
+                        try value(for: argument), option: argument) << 30
             case "--label": options.label = try value(for: argument)
             case "--out": options.outPath = try value(for: argument)
             case "--print-revision": options.printRevisionOnly = true
@@ -1335,11 +1343,14 @@ public enum BenchCBv2Driver {
         let contention = hostContentionSummary()
         print("== BenchCBv2RealModel ==")
         print("model: \(options.modelPath)")
-        print("mode: \(options.mode)  engines: \(options.engines)"
-            + "  batches: \(options.batches)  steps: \(options.steps)")
-        print("prompt lengths: "
-            + (options.promptLengths.isEmpty ? "default mix" : options.promptLengths.description)
-            + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
+        print(
+            "mode: \(options.mode)  engines: \(options.engines)"
+                + "  batches: \(options.batches)  steps: \(options.steps)")
+        print(
+            "prompt lengths: "
+                + (options.promptLengths.isEmpty
+                    ? "default mix" : options.promptLengths.description)
+                + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
         print("host: \(contention.line)")
         if contention.contended {
             print("WARNING: host is contended — eager decode is CPU-bound, results will be skewed")
@@ -1351,8 +1362,9 @@ public enum BenchCBv2Driver {
             // that may carry a vision tower (see file header).
             let container = try await LLMModelFactory.shared.loadContainer(
                 from: directory, using: #huggingFaceTokenizerLoader())
-            print(String(
-                format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
+            print(
+                String(
+                    format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
 
             let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy) =
                 (options.mode, options.engines, options.batches, options.steps, options.kvBytes)
@@ -1379,13 +1391,12 @@ public enum BenchCBv2Driver {
                     safeR1Effective:
                         hooks.optimizations.safeR1GeometryEligible
                         && runR1.requested && runR1.aotAvailable && !runR1.naxAvailable)
-                emit("- optimization model: \(hooks.optimizations.markdown); "
-                    + "safeR1(requested=\(runR1.requested), "
-                    + "effective=\(runOptimizations.safeR1Effective), "
-                    + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
+                emit(
+                    "- optimization model: \(hooks.optimizations.markdown); "
+                        + "safeR1(requested=\(runR1.requested), "
+                        + "effective=\(runOptimizations.safeR1Effective), "
+                        + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
                 emit("- optimization-run-json: \(try benchmarkJSONString(runOptimizations))")
-
-
 
                 // Vocab probe ([1,1] cache-less forward) for synthetic prompts.
                 // Use the exact model EngineV2 will drive so Gemma 4 VLM
@@ -1427,8 +1438,9 @@ public enum BenchCBv2Driver {
                     emit("\n## Decode-step profile (B=1, maxTokens \(stepsCopy))\n")
                     for engineName in enginesCopy {
                         guard resolveEngine(engineName) == .run(.contiguous) else {
-                            emit("- \(engineName): not profilable — "
-                                + "the phase timers only instrument v2 (contiguous)")
+                            emit(
+                                "- \(engineName): not profilable — "
+                                    + "the phase timers only instrument v2 (contiguous)")
                             continue
                         }
                         _ = try? await runV2Cell(
@@ -1443,8 +1455,9 @@ public enum BenchCBv2Driver {
                             vocabSize: vocabSize, kvBytes: kvBytesCopy,
                             trackOptimizationProvenance: true)
                         CBv2StepProfiler.enabled = false
-                        emit("### v2 (contiguous) B=1 — decodeTPS "
-                            + String(format: "%.1f", cell.decodeTPSPerRequest) + "\n")
+                        emit(
+                            "### v2 (contiguous) B=1 — decodeTPS "
+                                + String(format: "%.1f", cell.decodeTPSPerRequest) + "\n")
                         emit(CBv2StepProfiler.summaryTable())
                         for line in try optimizationProvenanceLines(
                             cell, scope: "profile/v2/B1")
@@ -1488,8 +1501,9 @@ public enum BenchCBv2Driver {
                                 batch: 1, promptLengths: [100], steps: 8,
                                 vocabSize: vocabSize, kvBytes: kvBytesCopy)
                         } catch {
-                            tableRows.append(refusalRow(
-                                engine: engineName, reason: "skipped: \(error)"))
+                            tableRows.append(
+                                refusalRow(
+                                    engine: engineName, reason: "skipped: \(error)"))
                             continue
                         }
 
@@ -1504,18 +1518,21 @@ public enum BenchCBv2Driver {
                             provenanceLines.append(
                                 contentsOf: try optimizationProvenanceLines(
                                     cell, scope: "perf/\(engineName)/B\(batch)"))
-                            details.append(String(
-                                format: "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
-                                cell.engine, batch,
-                                Double(MLX.GPU.activeMemory) / Double(1 << 30),
-                                Double(MLX.GPU.peakMemory) / Double(1 << 30)))
+                            details.append(
+                                String(
+                                    format:
+                                        "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
+                                    cell.engine, batch,
+                                    Double(MLX.GPU.activeMemory) / Double(1 << 30),
+                                    Double(MLX.GPU.peakMemory) / Double(1 << 30)))
                             details.append(
                                 "  \(cell.engine) B=\(batch):\n"
                                     + cell.perRequest.joined(separator: "\n"))
                         }
                     }
-                    emit(performanceMarkdown(
-                        rows: tableRows, provenanceLines: provenanceLines))
+                    emit(
+                        performanceMarkdown(
+                            rows: tableRows, provenanceLines: provenanceLines))
                     emit("\nPer-request detail:\n" + details.joined(separator: "\n"))
                 }
                 return out

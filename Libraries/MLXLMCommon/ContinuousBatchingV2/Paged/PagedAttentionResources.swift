@@ -21,7 +21,8 @@ public enum PagedAttentionResourceError: Error, Equatable, CustomStringConvertib
         case .missing(let resource, let roots):
             return "missing SwiftPM resource \(resource); searched \(roots.joined(separator: ", "))"
         case .ambiguous(let resource, let matches):
-            return "ambiguous SwiftPM resource \(resource); matches \(matches.joined(separator: ", "))"
+            return
+                "ambiguous SwiftPM resource \(resource); matches \(matches.joined(separator: ", "))"
         case .unreadable(let path):
             return "unable to read paged-attention resource at \(path)"
         case .invalid(let path):
@@ -148,8 +149,9 @@ enum PagedAttentionResources {
                 fileManager: fileManager)
         }
         return try loadSource(
-            roots: developmentSearchRoots ?? developmentRoots(
-                executableURL: executableURL),
+            roots: developmentSearchRoots
+                ?? developmentRoots(
+                    executableURL: executableURL),
             fileManager: fileManager)
     }
 

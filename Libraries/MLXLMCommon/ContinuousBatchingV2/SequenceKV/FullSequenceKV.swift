@@ -91,7 +91,9 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     ///   - promptLength: expected prompt length, used to size the initial
     ///     allocation (`promptLength + 256`, capped at `maxLength`).
     ///   - maxLength: maximum total tokens this sequence may ever hold.
-    ///   - kvHeads/headDim: from the layer's `CBv2LayerKind`; validated
+    ///   - kvHeads: KV head count from the layer's `CBv2LayerKind`; validated
+    ///     against the arrays passed to `update`.
+    ///   - headDim: per-head width from the layer's `CBv2LayerKind`; validated
     ///     against the arrays passed to `update`.
     public init(promptLength: Int, maxLength: Int, kvHeads: Int, headDim: Int) {
         precondition(maxLength > 0, "CBv2FullSequenceKV: maxLength must be > 0")
@@ -110,11 +112,14 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let n = newKeys.dim(2)
-        precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
+        precondition(
+            newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2FullSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
-        precondition(newKeys.dim(1) == kvHeads,
+        precondition(
+            newKeys.dim(1) == kvHeads,
             "CBv2FullSequenceKV: kvHeads mismatch (\(newKeys.dim(1)) != \(kvHeads))")
-        precondition(newValues.dim(2) == n,
+        precondition(
+            newValues.dim(2) == n,
             "CBv2FullSequenceKV: keys/values token count mismatch")
         precondition(
             absoluteOffset + n <= maxLength,

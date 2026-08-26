@@ -61,16 +61,14 @@ Applications that need a hard total-context cap and compression should omit
 cache capacity, use `.requireAtLeastOneLayer`, and enforce the total token budget
 before inference. A bounded compressed ring cache is not currently implemented.
 
-``ChatSession/cacheStatus()`` is the unified diagnostic surface for legacy and
-typed configuration. It reports the normalized request, request source,
-planned or realized phase, flattened cache topology, per-layer capacity source,
-strategy state, skip reason, and the container-owned `processedTokenCount`.
-Aggregate compressed, pending, skipped, and capacity-application counts are
-available on the same value.
 ``LanguageModel/cacheStatus(parameters:)`` and
 ``ModelContainer/cacheStatus(parameters:)`` provide the same shape for planned
-caches. The lower-level ``kvCacheRuntimeReport(cache:configuration:)`` remains
-available when directly applying a typed configuration to a raw cache array.
+caches. The status reports the normalized request, request source, planned or
+realized phase, flattened cache topology, per-layer capacity source, strategy
+state, skip reason, and aggregate compressed, pending, skipped, and
+capacity-application counts. The lower-level
+``kvCacheRuntimeReport(cache:configuration:)`` remains available when directly
+applying a typed configuration to a raw cache array.
 
 A realized `ChatSession` cache is bound to its configuration. When parameters
 change, a session with a structured transcript rebuilds automatically on the

@@ -92,7 +92,8 @@ struct Gemma4VLMMTPSpikeTests {
         print("\n=== VLM multi-token forward consistency ===")
         print("single-token next: [\(s1), \(s2), \(s3)]")
         print("multi-token  pred: \(m)")
-        #expect(m == [s1, s2, s3],
+        #expect(
+            m == [s1, s2, s3],
             """
             VLM multi-token verify forward != sequential single-token decode. \
             The K-token-at-offset forward (mask/rope/attention) is the bug, not \
@@ -109,7 +110,10 @@ struct Gemma4VLMMTPSpikeTests {
     @Test func vlm_rollback_consistency() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["VLM_MTP_SPIKE"] == "1", let targetDir = env["VLM_MTP_TARGET_DIR"]
-        else { print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR"); return }
+        else {
+            print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR")
+            return
+        }
         let prompt = loadPrompt(env)
         let K = 3
         let steps = 28
@@ -152,7 +156,8 @@ struct Gemma4VLMMTPSpikeTests {
         print("ref: \(ref.prefix(20))")
         print("got: \(got.prefix(20))")
         print("matched: \(matched)/\(n)")
-        #expect(matched >= n - 1,
+        #expect(
+            matched >= n - 1,
             """
             VLM rollback corrupts the cache: verify+trim does not reproduce \
             clean greedy. matched=\(matched)/\(n)
@@ -168,7 +173,10 @@ struct Gemma4VLMMTPSpikeTests {
     @Test func mlxllm_rollback_consistency() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["VLM_MTP_SPIKE"] == "1", let targetDir = env["VLM_MTP_TARGET_DIR"]
-        else { print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR"); return }
+        else {
+            print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR")
+            return
+        }
         let prompt = loadPrompt(env)
         let K = 3
         let steps = 28
@@ -180,7 +188,8 @@ struct Gemma4VLMMTPSpikeTests {
         print("ref: \(ref.prefix(20))")
         print("got: \(got.prefix(20))")
         print("matched: \(matched)/\(n)")
-        #expect(matched >= n - 1,
+        #expect(
+            matched >= n - 1,
             "MLXLLM rollback also diverges ⇒ SHARED rollback bug. matched=\(matched)/\(n)")
     }
 
@@ -192,9 +201,13 @@ struct Gemma4VLMMTPSpikeTests {
     @Test func vlm_acceptall_consistency() async throws {
         let env = ProcessInfo.processInfo.environment
         guard env["VLM_MTP_SPIKE"] == "1", let targetDir = env["VLM_MTP_TARGET_DIR"]
-        else { print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR"); return }
+        else {
+            print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR")
+            return
+        }
         let prompt = loadPrompt(env)
-        let K = 3, steps = 28
+        let K = 3
+        let steps = 28
         let vlm = try loadRealTargetAsVLM(from: URL(fileURLWithPath: targetDir))
         eval(vlm)
 
@@ -217,7 +230,8 @@ struct Gemma4VLMMTPSpikeTests {
         _ = vlm.forwardForMTP(MLXArray(prompt)[.newAxis, .ellipsis], cache: cSingle)
         var singleTop2: [Int: (Int, Float, Float)] = [:]  // refIndex -> (argmax, top1, top2)
         for i in 0 ..< (ref.count - 1) {
-            let out = vlm.forwardForMTP(MLXArray([Int32(ref[i])])[.newAxis, .ellipsis], cache: cSingle)
+            let out = vlm.forwardForMTP(
+                MLXArray([Int32(ref[i])])[.newAxis, .ellipsis], cache: cSingle)
             let lg = out.logits[0..., -1, 0...].asType(.float32).squeezed()
             let sorted = MLX.sorted(lg)
             eval(sorted)
@@ -246,7 +260,8 @@ struct Gemma4VLMMTPSpikeTests {
                     let ms = MLX.sorted(row)
                     eval(ms)
                     let mv = ms.asArray(Float.self)
-                    let mTop1 = mv[mv.count - 1], mTop2 = mv[mv.count - 2]
+                    let mTop1 = mv[mv.count - 1]
+                    let mTop2 = mv[mv.count - 2]
                     let s = singleTop2[firstMismatch]
                     gapReport = """
                         multi argmax=\(pred[j]) top1=\(mTop1) top2=\(mTop2) gap=\(mTop1 - mTop2)
@@ -259,10 +274,14 @@ struct Gemma4VLMMTPSpikeTests {
             pos += K
         }
         print("\n=== VLM accept-all (chunked forward, no trim) ===")
-        print("first multi-vs-single mismatch at: \(firstMismatch) (>= ~22 ⇒ verify-at-scale, not trim)")
+        print(
+            "first multi-vs-single mismatch at: \(firstMismatch) (>= ~22 ⇒ verify-at-scale, not trim)"
+        )
         print(gapReport)
-        #expect(firstMismatch == -1 || firstMismatch >= steps,
-            "VLM chunked multi-token forward diverges from single-token at \(firstMismatch) — verify-at-scale numerical difference")
+        #expect(
+            firstMismatch == -1 || firstMismatch >= steps,
+            "VLM chunked multi-token forward diverges from single-token at \(firstMismatch) — verify-at-scale numerical difference"
+        )
     }
 
     /// Run forced-rejection MTP-style rounds against any tower; return matched
@@ -306,7 +325,10 @@ struct Gemma4VLMMTPSpikeTests {
         let env = ProcessInfo.processInfo.environment
         guard env["VLM_MTP_SPIKE"] == "1", let targetDir = env["VLM_MTP_TARGET_DIR"],
             let drafterDir = env["VLM_MTP_DRAFTER_DIR"]
-        else { print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR, VLM_MTP_DRAFTER_DIR"); return }
+        else {
+            print("Skipping: set VLM_MTP_SPIKE=1, VLM_MTP_TARGET_DIR, VLM_MTP_DRAFTER_DIR")
+            return
+        }
         let prompt = loadPrompt(env)
         let maxTokens = Int(env["VLM_MTP_MAXTOK"] ?? "128") ?? 128
         let K = Int(env["VLM_MTP_K"] ?? "3") ?? 3
@@ -398,8 +420,9 @@ struct Gemma4VLMMTPSpikeTests {
         print("mtp         (MLXVLM, drafter):    \(mtpTokens.prefix(20))")
         print("llm-greedy  (MLXLLM ref):         \(llmGreedy.prefix(20))")
         print("CORRECTNESS  MTP==VLM-greedy: \(matchMtpVsVlm)/\(n)")
-        print("DIAGNOSTIC   VLM-greedy==LLM-greedy (tower equiv): "
-            + "\(matchVlmVsLlm)/\(Swift.min(vlmGreedy.count, llmGreedy.count))")
+        print(
+            "DIAGNOSTIC   VLM-greedy==LLM-greedy (tower equiv): "
+                + "\(matchVlmVsLlm)/\(Swift.min(vlmGreedy.count, llmGreedy.count))")
 
         // CHARACTERIZATION (not the strict correctness gate — see the
         // `vlm_multitoken_forward_consistency`, `mlxllm_rollback_consistency`,
@@ -410,7 +433,8 @@ struct Gemma4VLMMTPSpikeTests {
         // "similar answer, not exact" tolerance. A real logic regression craters
         // this to near-zero, so the floor catches gross breakage; the isolation
         // tests catch the rest.
-        #expect(matchMtpVsVlm >= 10,
+        #expect(
+            matchMtpVsVlm >= 10,
             """
             VLM-MTP regressed: MTP diverges from the VLM tower's greedy decode \
             far earlier than the known bf16-tie point. Likely a real logic bug — \
@@ -527,8 +551,9 @@ struct Gemma4VLMMTPSpikeTests {
 
         var weights = [String: MLXArray]()
         let scanDir = modelDir.resolvingSymlinksInPath()
-        let shardURLs = (try? FileManager.default.contentsOfDirectory(
-            at: scanDir, includingPropertiesForKeys: nil)) ?? []
+        let shardURLs =
+            (try? FileManager.default.contentsOfDirectory(
+                at: scanDir, includingPropertiesForKeys: nil)) ?? []
         for url in shardURLs where url.pathExtension == "safetensors" {
             let (w, _) = try loadArraysAndMetadata(url: url)
             for (k, v) in w { weights[k] = v }
@@ -562,8 +587,9 @@ struct Gemma4VLMMTPSpikeTests {
 
         var weights = [String: MLXArray]()
         let scanDir = modelDir.resolvingSymlinksInPath()
-        let shardURLs = (try? FileManager.default.contentsOfDirectory(
-            at: scanDir, includingPropertiesForKeys: nil)) ?? []
+        let shardURLs =
+            (try? FileManager.default.contentsOfDirectory(
+                at: scanDir, includingPropertiesForKeys: nil)) ?? []
         for url in shardURLs where url.pathExtension == "safetensors" {
             let (w, _) = try loadArraysAndMetadata(url: url)
             for (k, v) in w { weights[k] = v }

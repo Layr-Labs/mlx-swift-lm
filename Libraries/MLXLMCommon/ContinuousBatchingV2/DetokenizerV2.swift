@@ -72,7 +72,7 @@ public final class DetokenizerV2 {
         // until the holdback clears (PR#62 review).
         if stable.count == decoded.count,
             stable.count == emittedBytes,
-            (decoded.last == UInt8(ascii: "\n") || segmentTokens.count >= maxSegmentTokens)
+            decoded.last == UInt8(ascii: "\n") || segmentTokens.count >= maxSegmentTokens
         {
             startNewSegment()
         }

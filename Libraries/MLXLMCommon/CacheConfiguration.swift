@@ -87,8 +87,8 @@ public enum CacheLayerKind: Sendable, Hashable {
 
 /// Authoritative planned or realized state of a model's KV / recurrent cache.
 ///
-/// Obtain this through ``LanguageModel/cacheStatus(parameters:)``,
-/// ``ModelContainer/cacheStatus(parameters:)``, or ``ChatSession/cacheStatus()``.
+/// Obtain this through ``LanguageModel/cacheStatus(parameters:)`` or
+/// ``ModelContainer/cacheStatus(parameters:)``.
 /// The same value describes topology, capacity, strategy application, and
 /// model-wide progress for both legacy and typed configuration entry points.
 public struct KVCacheStatus: Sendable, Hashable {

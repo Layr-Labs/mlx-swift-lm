@@ -10,6 +10,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 /// History serializer for GPT-OSS Harmony conversations.
 ///
@@ -36,7 +37,6 @@ public struct GPTOSSMessageGenerator: MessageGenerator {
         return dictionary
     }
 }
-import MLXNN
 
 // MARK: - Configuration
 

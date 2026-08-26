@@ -90,7 +90,8 @@ private func referenceTransform(
         let history = row.promptTokens + row.outputTokens
         let window = Set(history.suffix(p.repetitionContextSize))
         for token in window where token >= 0 && token < x.count {
-            x[token] = x[token] > 0 ? x[token] / p.repetitionPenalty : x[token] * p.repetitionPenalty
+            x[token] =
+                x[token] > 0 ? x[token] / p.repetitionPenalty : x[token] * p.repetitionPenalty
         }
     }
 

@@ -325,13 +325,9 @@ public let mtpSharedKVSourceIndicesKey =
 /// The iterator value lives inside `generateLoopTask` and never escapes the
 /// stream, so its per-stream draft proposal and acceptance counters are not
 /// reachable through the high-level `generate(...)` API. Conforming the
-/// iterator to this protocol lets `generateLoopTask` downcast and thread the
-/// counters through the emitted `.info` event's
-/// ``GenerateCompletionInfo/proposedDraftTokens``,
-/// ``GenerateCompletionInfo/acceptedDraftTokens``, and
-/// ``GenerateCompletionInfo/passthroughReason`` fields. Non-MTP iterators do
-/// not conform; the downcast returns nil and the fields default to nil for
-/// non-MTP streams.
+/// iterator to this protocol gives lower-level callers a common way to inspect
+/// proposal, acceptance, and passthrough state after generation. Non-MTP
+/// iterators do not expose this surface.
 public protocol MTPStatsCollecting {
     /// Total tokens proposed across all speculation rounds in the stream.
     var proposedDraftTokens: Int { get }

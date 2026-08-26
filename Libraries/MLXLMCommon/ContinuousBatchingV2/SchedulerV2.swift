@@ -95,7 +95,8 @@ public final class CBv2ScheduledRequest {
         self.arrivalSeq = arrivalSeq
         self.submittedAt = submittedAt
         self.tokens = request.promptTokens
-        self.multimodalBlocks = request.multimodal?.attention == .bidirectionalSpans
+        self.multimodalBlocks =
+            request.multimodal?.attention == .bidirectionalSpans
             ? CBv2MultimodalPlan.coalescedBlocks(spans: request.multimodal?.spans ?? [])
             : []
     }
@@ -507,12 +508,14 @@ public final class SchedulerV2 {
             // gate, so re-snapping is a no-op and the shrink cannot split a
             // multimodal block.
             var striped = soloStripeTokens != nil && n > config.prefillChunkSize
-            var reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-                start: rec.numComputedTokens,
-                count: n) ?? n
-            var reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                start: rec.numComputedTokens,
-                count: n) ?? 0
+            var reservationTokens =
+                rec.prefixReusePlan?.capacityTokensForChunk(
+                    start: rec.numComputedTokens,
+                    count: n) ?? n
+            var reservationBytes =
+                rec.prefixReusePlan?.capacityBytesForChunk(
+                    start: rec.numComputedTokens,
+                    count: n) ?? 0
             var reserved =
                 capacity == nil || (reservationTokens == 0 && reservationBytes == 0)
             while !reserved {
@@ -526,12 +529,14 @@ public final class SchedulerV2 {
                     if striped {
                         striped = false
                         n = min(n, config.prefillChunkSize)
-                        reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-                            start: rec.numComputedTokens,
-                            count: n) ?? n
-                        reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                            start: rec.numComputedTokens,
-                            count: n) ?? 0
+                        reservationTokens =
+                            rec.prefixReusePlan?.capacityTokensForChunk(
+                                start: rec.numComputedTokens,
+                                count: n) ?? n
+                        reservationBytes =
+                            rec.prefixReusePlan?.capacityBytesForChunk(
+                                start: rec.numComputedTokens,
+                                count: n) ?? 0
                         continue
                     }
                     // Speculative slack must never trigger the preemption
@@ -539,12 +544,14 @@ public final class SchedulerV2 {
                     if speculated {
                         n = 1
                         speculated = false
-                        reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-                            start: rec.numComputedTokens,
-                            count: n) ?? n
-                        reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                            start: rec.numComputedTokens,
-                            count: n) ?? 0
+                        reservationTokens =
+                            rec.prefixReusePlan?.capacityTokensForChunk(
+                                start: rec.numComputedTokens,
+                                count: n) ?? n
+                        reservationBytes =
+                            rec.prefixReusePlan?.capacityBytesForChunk(
+                                start: rec.numComputedTokens,
+                                count: n) ?? 0
                         speculationFallbacks[rec.id] = .kvHeadroom
                         continue
                     }
@@ -630,7 +637,8 @@ public final class SchedulerV2 {
                 // surplus: they are bounded by what remains of the ORDINARY
                 // step limit. The armed row itself (admission-path solo
                 // striping) keeps the raised budget.
-                let normalHeadroom = soloStripe?.id == rec.id
+                let normalHeadroom =
+                    soloStripe?.id == rec.id
                     ? budget
                     : max(0, config.maxBatchedTokensPerStep - totalAssignedTokens)
                 var chunk = min(
@@ -657,12 +665,14 @@ public final class SchedulerV2 {
                     var striped = soloStripeTokens != nil && chunk > config.prefillChunkSize
                     var reservedAdmission = false
                     while !reservedAdmission {
-                        let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-                            start: rec.numComputedTokens,
-                            count: chunk) ?? chunk
-                        let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                            start: rec.numComputedTokens,
-                            count: chunk) ?? 0
+                        let reservationTokens =
+                            rec.prefixReusePlan?.capacityTokensForChunk(
+                                start: rec.numComputedTokens,
+                                count: chunk) ?? chunk
+                        let reservationBytes =
+                            rec.prefixReusePlan?.capacityBytesForChunk(
+                                start: rec.numComputedTokens,
+                                count: chunk) ?? 0
                         do {
                             if reservationTokens > 0 || reservationBytes > 0 {
                                 try capacity.reserve(
@@ -723,12 +733,14 @@ public final class SchedulerV2 {
             start: rec.numComputedTokens, proposed: chunk, budget: budget)
         guard chunk > 0 else { return nil }
         if let capacity {
-            let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-                start: rec.numComputedTokens,
-                count: chunk) ?? chunk
-            let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                start: rec.numComputedTokens,
-                count: chunk) ?? 0
+            let reservationTokens =
+                rec.prefixReusePlan?.capacityTokensForChunk(
+                    start: rec.numComputedTokens,
+                    count: chunk) ?? chunk
+            let reservationBytes =
+                rec.prefixReusePlan?.capacityBytesForChunk(
+                    start: rec.numComputedTokens,
+                    count: chunk) ?? 0
             do {
                 if reservationTokens > 0 || reservationBytes > 0 {
                     try capacity.reserve(
@@ -761,12 +773,14 @@ public final class SchedulerV2 {
         for (id, n) in plan.assignments {
             guard let rec = byID[id] else { continue }
             let start = max(0, rec.numComputedTokens - n)
-            let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-                start: start,
-                count: n) ?? n
-            let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-                start: start,
-                count: n) ?? 0
+            let reservationTokens =
+                rec.prefixReusePlan?.capacityTokensForChunk(
+                    start: start,
+                    count: n) ?? n
+            let reservationBytes =
+                rec.prefixReusePlan?.capacityBytesForChunk(
+                    start: start,
+                    count: n) ?? 0
             rec.numComputedTokens = start
             capacity?.unreserve(
                 id: id, tokens: reservationTokens, bytes: reservationBytes)
@@ -808,12 +822,14 @@ public final class SchedulerV2 {
     public func rollbackComputed(id: CBv2RequestID, tokens n: Int) {
         guard let rec = byID[id] else { return }
         let start = max(0, rec.numComputedTokens - n)
-        let reservationTokens = rec.prefixReusePlan?.capacityTokensForChunk(
-            start: start,
-            count: n) ?? n
-        let reservationBytes = rec.prefixReusePlan?.capacityBytesForChunk(
-            start: start,
-            count: n) ?? 0
+        let reservationTokens =
+            rec.prefixReusePlan?.capacityTokensForChunk(
+                start: start,
+                count: n) ?? n
+        let reservationBytes =
+            rec.prefixReusePlan?.capacityBytesForChunk(
+                start: start,
+                count: n) ?? 0
         rec.numComputedTokens = start
         capacity?.unreserve(
             id: id, tokens: reservationTokens, bytes: reservationBytes)

@@ -156,7 +156,8 @@ struct Qwen35MTPDraftTrimTests {
     ) -> Int32 {
         drafterResult(
             assistant, state: state, seedToken: seedToken,
-            carryHidden: carryHidden, shortlist: shortlist).token
+            carryHidden: carryHidden, shortlist: shortlist
+        ).token
     }
 
     private func emptyTokens() -> MLXArray {
@@ -582,7 +583,6 @@ struct Qwen35MTPDraftTrimTests {
             #expect(caches.allSatisfy { $0.offset == 0 })
         }
     }
-
 
     @Test("full-coverage shortlist reproduces the full-head draft (float path)")
     func shortlistMatchesFullHeadFloat() throws {

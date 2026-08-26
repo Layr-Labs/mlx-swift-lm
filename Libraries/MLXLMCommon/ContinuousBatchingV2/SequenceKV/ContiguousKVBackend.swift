@@ -129,7 +129,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         guard plan.backend == prefixReuseBackend else {
             throw CBv2KVError.backendIneligible(
                 reason:
-                    "prefix plan backend \(plan.backend.rawValue) != \(prefixReuseBackend.rawValue)")
+                    "prefix plan backend \(plan.backend.rawValue) != \(prefixReuseBackend.rawValue)"
+            )
         }
         guard plan.matchedBoundary <= maxLength,
             plan.replayStart >= 0,
@@ -183,7 +184,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             }
             guard entry.keys.dim(2) == entry.offset, entry.values.dim(2) == entry.offset else {
                 throw CBv2KVError.backendIneligible(
-                    reason: "full prefix snapshot at layer \(index) does not exactly cover its offset")
+                    reason:
+                        "full prefix snapshot at layer \(index) does not exactly cover its offset")
             }
         }
         guard sawOwningFull else {

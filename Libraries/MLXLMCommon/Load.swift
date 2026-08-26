@@ -27,15 +27,16 @@ public func safetensorWeightURLs(
     let present =
         (try? FileManager.default.contentsOfDirectory(
             at: modelDirectory, includingPropertiesForKeys: nil))?.filter {
-                $0.pathExtension == "safetensors"
-            }.sorted { $0.lastPathComponent < $1.lastPathComponent } ?? []
+            $0.pathExtension == "safetensors"
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent } ?? []
 
     let selected: [URL]
     switch selection {
     case .allFilesPresent:
         selected = present
     case .automatic:
-        selected = try indexedWeightURLs(in: modelDirectory)
+        selected =
+            try indexedWeightURLs(in: modelDirectory)
             ?? conventionalWeightURLs(in: present)
     }
 
@@ -94,7 +95,7 @@ private func prefetchShards(_ urls: [URL]) {
     }
 }
 #else
-private func prefetchShards(_ urls: [URL]) { }
+private func prefetchShards(_ urls: [URL]) {}
 #endif
 
 /// Lock-protected scratch space used by the parallel shard reader. Wrapped in
@@ -169,7 +170,7 @@ public func resolveQuantization(
 /// such pairs split (and reshape the module tree accordingly) whenever the
 /// halves' effective policies differ.
 ///
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)``
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)``
 /// stages the checkpoint's resolved policy here before calling `sanitize`;
 /// a uniform `quantization` is staged as a table with only a default.
 public protocol QuantizationPolicyReceiving: AnyObject {
@@ -197,8 +198,9 @@ public func loadWeights(
         if bench {
             let now = CFAbsoluteTimeGetCurrent()
             FileHandle.standardError.write(
-                Data("    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
-                    .utf8))
+                Data(
+                    "    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
+                        .utf8))
             t = now
         }
     }

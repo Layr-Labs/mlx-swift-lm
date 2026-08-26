@@ -98,10 +98,11 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
         XCTAssertEqual(
             kinds.compactMap(\.modelLayerIndex),
             Array(stride(from: 3, to: 64, by: 4)))
-        XCTAssertTrue(kinds.allSatisfy {
-            $0.attention == .full && $0.headDim == 256 && $0.kvHeads == 4
-                && $0.queryHeads == 24
-        })
+        XCTAssertTrue(
+            kinds.allSatisfy {
+                $0.attention == .full && $0.headDim == 256 && $0.kvHeads == 4
+                    && $0.queryHeads == 24
+            })
 
         // 16 full rows × 2(K+V) × 4 KV heads × 256 dims × fp16.
         XCTAssertEqual(
@@ -154,7 +155,8 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
     }
 
     func testCacheConstructionUsesCompactStorageAndOriginalLayerIndices() throws {
-        let config = try configuration(hiddenLayers: 8, valueHeads: 2, keyHeads: 1,
+        let config = try configuration(
+            hiddenLayers: 8, valueHeads: 2, keyHeads: 1,
             keyHeadDim: 4, valueHeadDim: 4)
         let model = Qwen35TextModel(config)
         var originalIndices: [Int] = []
@@ -229,7 +231,8 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
             offset: scalarPositions.flattened()
         ).reshaped([1, 2, 1, 8]).transposed(0, 2, 1, 3)
         let actual = mrope.apply(
-            queries: value, keys: value, positionIds: positions).0
+            queries: value, keys: value, positionIds: positions
+        ).0
         eval(expected, actual)
         XCTAssertTrue(allClose(expected, actual, rtol: 0, atol: 0).item(Bool.self))
     }
@@ -251,7 +254,8 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
 
         let exponents = MLXArray(stride(from: 0, to: 8, by: 2)).asType(.float32) / 8
         let invFreq = 1 / pow(MLXArray(Float(10_000)), exponents)
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+        let all =
+            positions.asType(.float32)[0..., 0..., 0..., .newAxis]
             * invFreq[.newAxis, .newAxis, .newAxis, 0...]
         var selected: [MLXArray] = []
         for index in 0 ..< 4 {
@@ -266,9 +270,10 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
             }
             selected.append(all[axis, 0..., 0..., index])
         }
-        let angles = concatenated([
-            stacked(selected, axis: -1), stacked(selected, axis: -1),
-        ], axis: -1)
+        let angles = concatenated(
+            [
+                stacked(selected, axis: -1), stacked(selected, axis: -1),
+            ], axis: -1)
         let cosine = cos(angles).expandedDimensions(axis: 1)
         let sine = sin(angles).expandedDimensions(axis: 1)
         let rotatedHalf = concatenated(

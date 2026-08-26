@@ -50,7 +50,7 @@ struct StreamingGemma4ReasoningParser: Sendable {
     ) {
         if let openRange = buffer.range(of: openTag) {
             appendContent(String(buffer[..<openRange.lowerBound]), to: &output)
-            buffer.removeSubrange(buffer.startIndex..<openRange.upperBound)
+            buffer.removeSubrange(buffer.startIndex ..< openRange.upperBound)
             state = .thinking
             strippedThoughtPrefix = false
             return
@@ -98,7 +98,7 @@ struct StreamingGemma4ReasoningParser: Sendable {
 
         if let closeRange = buffer.range(of: closeTag) {
             appendReasoning(String(buffer[..<closeRange.lowerBound]), to: &output)
-            buffer.removeSubrange(buffer.startIndex..<closeRange.upperBound)
+            buffer.removeSubrange(buffer.startIndex ..< closeRange.upperBound)
             state = .content
             return
         }

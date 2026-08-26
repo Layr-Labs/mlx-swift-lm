@@ -379,11 +379,12 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
         let matched = 24
         let replayStart = 8
         let exactFullBytesPerToken = 64
-        let plan = try XCTUnwrap(capability.plan(
-            matchedBoundary: matched,
-            exactStagedFullKVBytes: matched * exactFullBytesPerToken,
-            maximumSequenceLength: 40,
-            nominalFullKVBytesPerToken: admission.fullKVBytesPerToken))
+        let plan = try XCTUnwrap(
+            capability.plan(
+                matchedBoundary: matched,
+                exactStagedFullKVBytes: matched * exactFullBytesPerToken,
+                maximumSequenceLength: 40,
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken))
         XCTAssertEqual(plan.strategy, .tailReplay)
         XCTAssertEqual(plan.replayStart, replayStart)
         // The fixed sliding ring is charged ONCE, inside the token
@@ -407,11 +408,12 @@ final class CBv2FrozenReplayPlanTests: XCTestCase {
                 maxBatchedTokensPerStep: 32,
                 prefillChunkSize: 16),
             capacity: admission)
-        let rec = try scheduler.enqueue(CBv2Request(
-            id: CBv2RequestID(777),
-            promptTokens: makePromptTokens(length: 25, seed: 777),
-            sampling: .init(temperature: 0),
-            maxTokens: 4))
+        let rec = try scheduler.enqueue(
+            CBv2Request(
+                id: CBv2RequestID(777),
+                promptTokens: makePromptTokens(length: 25, seed: 777),
+                sampling: .init(temperature: 0),
+                maxTokens: 4))
         rec.prefixReusePlan = plan
         rec.numComputedTokens = replayStart
         let replay = scheduler.plan()

@@ -65,7 +65,9 @@ public struct OpenAIErrorResponse: Codable, Sendable, Equatable {
 
     public var error: Payload
 
-    public init(message: String, type: String = "server_error", param: String? = nil, code: String? = nil) {
+    public init(
+        message: String, type: String = "server_error", param: String? = nil, code: String? = nil
+    ) {
         self.error = .init(message: message, type: type, param: param, code: code)
     }
 }

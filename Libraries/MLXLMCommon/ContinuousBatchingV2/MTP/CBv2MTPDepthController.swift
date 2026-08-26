@@ -605,7 +605,7 @@ enum CBv2MTPMarginalDepthPolicy {
     ) -> Double {
         guard acceptanceProbability.isFinite else { return 0 }
         var probability = min(max(acceptanceProbability, 0), 1)
-        guard (position == 0 || position == 1),
+        guard position == 0 || position == 1,
             let margin = previousMargin, margin.isFinite
         else { return probability }
 

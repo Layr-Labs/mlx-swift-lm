@@ -9,15 +9,15 @@ public protocol VLMModel: LanguageModel, LoRAModel {
     func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult
 }
 
-public extension VLMModel {
-    func prepare(
+extension VLMModel {
+    public func prepare(
         _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
         try prepare(input, cache: cache, windowSize: prefill.stepSize)
     }
 
-    func prepare(
+    public func prepare(
         _ input: LMInput, cache: [any KVCache], windowSize: Int?
     ) throws -> PrepareResult {
         try prepare(input, cache: cache, state: nil, prefill: .init(stepSize: windowSize))

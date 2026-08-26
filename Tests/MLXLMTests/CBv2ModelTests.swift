@@ -15,10 +15,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLLM
 import MLXLMCommon
 import MLXNN
 import Testing
+
+@testable import MLXLLM
 
 // MARK: - Mocks
 
@@ -199,11 +200,11 @@ private final class CBv2ModelMockLayerCache: CBv2AttendingLayerCache, KVCache {
 
     var state: [MLXArray] {
         get { [] }
-        set { }
+        set {}
     }
     var metaState: [String] {
         get { [] }
-        set { }
+        set {}
     }
     var isTrimmable: Bool { false }
 
@@ -907,7 +908,8 @@ struct CBv2Gemma4ScheduledPrefillTests {
         #expect(scheduled.shape == [1, 64])
         #expect(
             submissionCount() == expectedSubmissionCount,
-            "\(layerCount) layers must submit once per effective interval, including zero submissions when the interval is disabled or above the layer count")
+            "\(layerCount) layers must submit once per effective interval, including zero submissions when the interval is disabled or above the layer count"
+        )
 
         let ordinaryCaches: [KVCache] = try caches(for: model)
         let ordinary = model(inputs, cache: ordinaryCaches)
@@ -936,7 +938,6 @@ struct CBv2Gemma4ScheduledPrefillTests {
         #expect(submissionCount() == 0, "MTP verification must not use scheduled prefill")
     }
 }
-
 
 // MARK: - GPT-OSS forward smoke tests (v2 branch)
 

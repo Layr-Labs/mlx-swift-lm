@@ -1287,9 +1287,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         positionIds: MLXArray? = nil,
         inputEmbeddings: MLXArray? = nil,
         requirement: CBv2PrefillRequirement? = nil
-    ) -> (logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
-        innerState: [MLXArray])
-    {
+    ) -> (
+        logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
+        innerState: [MLXArray]
+    ) {
         guard let recurrentModel = model as? any CBv2RecurrentSteppableModel,
             recurrentModel.recurrentStateSpec != nil
         else {
@@ -1301,12 +1302,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                     tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
                 return (
                     requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
-                    [:], [])
+                    [:], []
+                )
             }
             let logits = model.forward(tokens: tokens, caches: caches)
             return (
                 requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
-                [:], [])
+                [:], []
+            )
         }
         let evaluations = ids.map { id -> CBv2RecurrentStateEvaluation in
             guard let state = recurrentStates[id] else {
@@ -1367,9 +1370,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// (DAR-325).
     private func decodeLogits(
         rowStates: [[CBv2SequenceKV?]], tokens: MLXArray, ids: [CBv2RequestID]
-    ) -> (logits: MLXArray, cacheInnerState: [MLXArray],
-        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation])
-    {
+    ) -> (
+        logits: MLXArray, cacheInnerState: [MLXArray],
+        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation]
+    ) {
         let caches = eagerCaches(rowStates: rowStates)
         let positionIds = CBv2PositionState.decodePositionIds(
             states: ids.map { scheduler.record(for: $0)?.request.positionState },
@@ -1379,7 +1383,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         return (
             forward.logits[0..., -1, 0...],
             eagerCacheInnerState(caches) + forward.innerState,
-            forward.recurrent)
+            forward.recurrent
+        )
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
@@ -1714,7 +1719,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // solo path rather than requiring stacked per-row positions.
                 if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil,
                     hasSpan || row.rec.request.positionState != nil
-                { continue }
+                {
+                    continue
+                }
                 if let index = groups.firstIndex(where: {
                     $0.count == row.count && $0.samples == row.samples
                 }) {
@@ -1962,7 +1969,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             chunkStart: start,
             spans: multimodal.spansInChunk(start: start, count: count))
         let spanContext = multimodal.chunkContext(start: start, count: count)
-        let bindables = spanContext != nil && count > 1
+        let bindables =
+            spanContext != nil && count > 1
             ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
         for bindable in bindables { bindable.bindSpanContext(spanContext) }
         defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
@@ -1975,7 +1983,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 prefillOutput(
                     tokens: tokens, inputEmbeddings: spliced, caches: caches,
                     requirement: requirement),
-                [:], [])
+                [:], []
+            )
         }
         let forward = targetForward(
             tokens: tokens, caches: caches, ids: [id],
@@ -2488,7 +2497,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             var cacheable = kind.sharesKVWithLayer == nil
             if case .slidingWindow = kind.attention { cacheable = false }
             guard cacheable else { continue }
-            guard let sequence = state[i], sequence.absoluteOffset >= tokenCount else { return false }
+            guard let sequence = state[i], sequence.absoluteOffset >= tokenCount else {
+                return false
+            }
             cacheableLayers += 1
         }
         return cacheableLayers > 0
@@ -2735,7 +2746,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                         throw CBv2KVError.capacityExhausted(
                             needed: recurrent.byteCount,
                             available: max(
-                                0, backend.bytesCapacity - backend.bytesReserved
+                                0,
+                                backend.bytesCapacity - backend.bytesReserved
                                     - existingRecurrentBytes))
                     }
                     recurrentStates[rec.id] = recurrent
@@ -2859,8 +2871,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             (inFlight?.mtpRound?.verify?.rows.compactMap(\.assistantState) ?? [])
             + (inFlight?.mtpRound?.committedObservationRows.map(\.assistantState) ?? [])
             + (inFlight?.mtpRound?.deferredAssistantReleases ?? [])
-        let assistantBytes = mtp?.materializedAssistantBytes(
-            detachedStates: detachedAssistantStates) ?? 0
+        let assistantBytes =
+            mtp?.materializedAssistantBytes(
+                detachedStates: detachedAssistantStates) ?? 0
         let reservedBytes: Int
         if let admission = capacity as? AdmissionV2 {
             let target = admission.targetBytesReserved(

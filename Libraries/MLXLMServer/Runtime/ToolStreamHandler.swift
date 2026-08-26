@@ -3,7 +3,7 @@
 import Foundation
 import MLXLMCommon
 
-/// Sendable wrapper around the non-Sendable ``ToolCallProcessor`` for
+/// Sendable wrapper around the non-Sendable `ToolCallProcessor` for
 /// capture in a streaming-completion Task closure. Only touched from
 /// that single Task.
 ///

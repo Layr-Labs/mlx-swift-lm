@@ -1157,7 +1157,8 @@ public class Qwen35: Module, VLMModel {
             guard attentionMask.ndim == 1 || attentionMask.ndim == 2 else {
                 throw Qwen35PositionSeamError.invalidAttentionMaskRank(attentionMask.ndim)
             }
-            mask = attentionMask.ndim == 1
+            mask =
+                attentionMask.ndim == 1
                 ? attentionMask.expandedDimensions(axis: 0) : attentionMask
             guard mask?.shape == tokens.shape else {
                 throw Qwen35PositionSeamError.attentionMaskShapeMismatch
@@ -1166,7 +1167,7 @@ public class Qwen35: Module, VLMModel {
 
         let imageGrids = imageGrids?.nilIfEmpty
         let videoGrids = videoGrids?.nilIfEmpty
-        if (imageGrids != nil || videoGrids != nil), tokens.dim(0) != 1 {
+        if imageGrids != nil || videoGrids != nil, tokens.dim(0) != 1 {
             throw Qwen35PositionSeamError.multimodalBatchUnsupported(tokens.dim(0))
         }
 
@@ -1226,7 +1227,7 @@ public class Qwen35: Module, VLMModel {
             let grids = kind == "image" ? imageGrids : videoGrids
             var end = cursor + 1
             while end < values.count,
-                (maskValues.map { $0[end] == 1 } ?? true), values[end] == token
+                maskValues.map { $0[end] == 1 } ?? true, values[end] == token
             {
                 end += 1
             }

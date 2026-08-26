@@ -800,8 +800,7 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
 
     // MARK: Legacy path (`LanguageModel`, old engine)
 
-    func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult
-    {
+    func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws -> PrepareResult {
         .tokens(input.text)
     }
 

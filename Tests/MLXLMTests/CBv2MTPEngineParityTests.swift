@@ -5,11 +5,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 final class CBv2ParityScriptCursor: CBv2MTPPreparedCapture {
     let baseIndices: [Int]
@@ -53,9 +53,10 @@ final class CBv2ParityScriptedDrafter: CBv2MTPDrafter {
         let ids = cursor.baseIndices.map { base -> Int32 in
             let index = base + cursor.step
             let value = index < script.count ? script[index] : 0
-            let stepOffset = offsetsByStep.flatMap {
-                cursor.step < $0.count ? $0[cursor.step] : nil
-            } ?? offset
+            let stepOffset =
+                offsetsByStep.flatMap {
+                    cursor.step < $0.count ? $0[cursor.step] : nil
+                } ?? offset
             return Int32((value + stepOffset) % vocabSize)
         }
         return (MLXArray(ids), hidden)
