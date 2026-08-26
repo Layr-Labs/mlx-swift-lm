@@ -109,6 +109,25 @@ struct CBv2PagedKernelTests {
 
         @discardableResult
         func addRow(tokens: Int, maxLength: Int = 2048) throws -> Int {
+            try addRow(tokens: tokens, maxLength: maxLength) { shape in
+                MLXRandom.normal(shape, dtype: .float16)
+            }
+        }
+
+        @discardableResult
+        func addRow(
+            tokens: Int, maxLength: Int = 2048, rng: inout KeyedRandom
+        ) throws -> Int {
+            try addRow(tokens: tokens, maxLength: maxLength) { shape in
+                rng.normal(shape)
+            }
+        }
+
+        @discardableResult
+        private func addRow(
+            tokens: Int, maxLength: Int = 2048,
+            drawNormal: ([Int]) -> MLXArray
+        ) throws -> Int {
             let state = try backend.makeSequenceState(
                 layerKinds: [kind], promptLength: tokens, maxLength: maxLength)
             let row = state[0] as! PagedSequenceKV
@@ -119,8 +138,8 @@ struct CBv2PagedKernelTests {
             var remaining = tokens
             while remaining > 0 {
                 let n = min(remaining, writeChunk)
-                let ck = MLXRandom.normal([kind.kvHeads, n, kind.headDim], dtype: .float16)
-                let cv = MLXRandom.normal([kind.kvHeads, n, kind.headDim], dtype: .float16)
+                let ck = drawNormal([kind.kvHeads, n, kind.headDim])
+                let cv = drawNormal([kind.kvHeads, n, kind.headDim])
                 row.write(keys: ck, values: cv)
                 k = concatenated([k, ck], axis: 1)
                 v = concatenated([v, cv], axis: 1)
@@ -255,7 +274,6 @@ struct CBv2PagedKernelTests {
     // MARK: - Batch-composition invariance
 
     @Test func decodeBatchCompositionInvariance() throws {
-        MLXRandom.seed(11)
         let kind = CBv2LayerKind(
             attention: .full, headDim: 64, kvHeads: 2, queryHeads: 8)
         let scale: Float = 0.125
@@ -269,23 +287,23 @@ struct CBv2PagedKernelTests {
         let solo = try Fixture(kind: kind)
         let batched = try Fixture(kind: kind)
 
-        MLXRandom.seed(100)
-        try solo.addRow(tokens: 37)
-        MLXRandom.seed(100)
-        try batched.addRow(tokens: 37)
-        try batched.addRow(tokens: 600)
-        try batched.addRow(tokens: 90)
+        var soloRNG = KeyedRandom(seed: 100)
+        try solo.addRow(tokens: 37, rng: &soloRNG)
+        var batchedRNG = KeyedRandom(seed: 100)
+        try batched.addRow(tokens: 37, rng: &batchedRNG)
+        try batched.addRow(tokens: 600, rng: &batchedRNG)
+        try batched.addRow(tokens: 90, rng: &batchedRNG)
 
-        MLXRandom.seed(200)
-        let q = MLXRandom.normal([1, 8, 1, 64], dtype: .float16)
-        let k = MLXRandom.normal([1, 2, 1, 64], dtype: .float16)
-        let v = MLXRandom.normal([1, 2, 1, 64], dtype: .float16)
+        var queryRNG = KeyedRandom(seed: 200)
+        let q = queryRNG.normal([1, 8, 1, 64])
+        let k = queryRNG.normal([1, 2, 1, 64])
+        let v = queryRNG.normal([1, 2, 1, 64])
         let qB = concatenated(
-            [q, MLXRandom.normal([2, 8, 1, 64], dtype: .float16)], axis: 0)
+            [q, queryRNG.normal([2, 8, 1, 64])], axis: 0)
         let kB = concatenated(
-            [k, MLXRandom.normal([2, 2, 1, 64], dtype: .float16)], axis: 0)
+            [k, queryRNG.normal([2, 2, 1, 64])], axis: 0)
         let vB = concatenated(
-            [v, MLXRandom.normal([2, 2, 1, 64], dtype: .float16)], axis: 0)
+            [v, queryRNG.normal([2, 2, 1, 64])], axis: 0)
 
         let outSolo = solo.cache.updateAndAttend(
             queries: q, keys: k, values: v, scale: scale, sinks: nil)
