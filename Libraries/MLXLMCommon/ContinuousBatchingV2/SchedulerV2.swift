@@ -19,7 +19,7 @@ import Foundation
 
 /// Submit-side scheduler contract violations (distinct from
 /// `CBv2KVError.capacityExhausted`, which is transient back-off).
-public enum CBv2SchedulerError: Error, Equatable {
+public enum CBv2SchedulerError: Error, Equatable, Sendable {
     /// A request with this id is already live (waiting or running). Request
     /// ids are engine-scoped: reusing one is only legal after the previous
     /// request carrying it has fully finished. Without this rejection a
@@ -160,6 +160,11 @@ public final class SchedulerV2 {
     /// prefill chunks, or waiting admission. nil ⇒ planning is byte-identical
     /// to plain decode.
     public var speculationPlanner: ((CBv2ScheduledRequest) -> Int)?
+    /// Pure upper bound for `1+k` deadline projection. The live planner has
+    /// engine-state side effects and cannot be called from a non-mutating
+    /// projection; this bound keeps speculative false rejection capped at the
+    /// configured/tested MTP width instead of charging the whole step budget.
+    var speculationDraftTokenUpperBound: Int?
 
     /// OPT-IN mixed-step prefill quota (nil ⇒ disabled, byte-identical to the
     /// unguarded vLLM-V1 behavior).

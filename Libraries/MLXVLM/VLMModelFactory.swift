@@ -184,6 +184,11 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let qwen3VL30BA3BInstruct4Bit = ModelConfiguration(
+        id: "lmstudio-community/Qwen3-VL-30B-A3B-Instruct-MLX-4bit",
+        defaultPrompt: "Describe the image in English"
+    )
+
     static public let smolvlminstruct4bit = ModelConfiguration(
         id: "mlx-community/SmolVLM-Instruct-4bit",
         defaultPrompt: "Describe the image in English"

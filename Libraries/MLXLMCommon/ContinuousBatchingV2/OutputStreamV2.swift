@@ -22,6 +22,13 @@ public final class CBv2OutputStream: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer: [CBv2Event] = []
     private var waiter: CheckedContinuation<CBv2Event?, Never>?
+    /// Non-consuming engine-ownership acknowledgements. This is deliberately
+    /// independent of `finished`: the watchdog may terminate a consumer stream
+    /// while a wedged engine row still owns KV. Atomic admission cancellation
+    /// must retain process-global resources until the engine queue removes the
+    /// row and explicitly releases ownership.
+    private var engineOwnershipReleased = false
+    private var engineOwnershipWaiters: [CheckedContinuation<Void, Never>] = []
     /// Terminal event has been enqueued (or delivered); further emits no-op.
     private var finished = false
     /// Terminal event has been handed to the consumer; `next()` returns nil.
@@ -93,7 +100,9 @@ public final class CBv2OutputStream: @unchecked Sendable {
             lock.unlock()
             return
         }
-        if case .finished = event { finished = true }
+        if case .finished = event {
+            finished = true
+        }
         if let waiter {
             self.waiter = nil
             if case .finished = event { terminalDelivered = true }
@@ -130,6 +139,49 @@ public final class CBv2OutputStream: @unchecked Sendable {
         return finished
     }
 
+    /// Engine-queue acknowledgement that no scheduler row, capacity
+    /// reservation, or backend state remains owned by this stream generation.
+    /// Idempotent; forced consumer termination does not call this method.
+    func releaseEngineOwnership() {
+        var completedWaiters: [CheckedContinuation<Void, Never>] = []
+        lock.lock()
+        guard !engineOwnershipReleased else {
+            lock.unlock()
+            return
+        }
+        engineOwnershipReleased = true
+        completedWaiters = engineOwnershipWaiters
+        engineOwnershipWaiters.removeAll(keepingCapacity: false)
+        lock.unlock()
+        for completed in completedWaiters {
+            completed.resume()
+        }
+    }
+
+    /// Wait for engine ownership release without consuming the terminal
+    /// event. This deliberately ignores caller cancellation: returning early
+    /// would let provider-global KV/SSD accounting race a still-live row.
+    func waitUntilEngineOwnershipReleased() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if engineOwnershipReleased {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                engineOwnershipWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    /// Test visibility for the distinction between consumer termination and
+    /// engine-row retirement.
+    var isEngineOwnershipReleased: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return engineOwnershipReleased
+    }
+
     // MARK: Consumer
 
     /// Single-consumer stream of events, ending after `.finished`.
@@ -144,10 +196,9 @@ public final class CBv2OutputStream: @unchecked Sendable {
     /// Cancelling the consuming task fires `onAbandoned` (client
     /// disconnect ⇒ engine cancels the request).
     ///
-    /// The closures capture `self` STRONGLY on purpose: the engine drops its
-    /// reference the moment it enqueues the terminal event (`takeStream`), so
-    /// the returned sequence is what keeps this buffer alive until the
-    /// consumer has drained it. A weak capture here would race consumer pulls
+    /// The closures capture `self` STRONGLY on purpose: backend ownership can
+    /// retire and drop the engine's reference before the consumer drains its
+    /// buffered terminal event. A weak capture here would race consumer pulls
     /// against deallocation and silently drop buffered events. No cycle:
     /// `self` never references the returned AsyncStream.
     public func makeStream() -> AsyncStream<CBv2Event> {

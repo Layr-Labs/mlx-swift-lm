@@ -1096,6 +1096,13 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Throws CBv2KVError.capacityExhausted when admission fails (the
     /// provider maps this to 429/503 exactly as today).
     func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event>
+    /// Atomically enqueue and admit against a caller-owned first-token
+    /// deadline. The authoritative projection and verdict run on the engine
+    /// queue after prefix adoption and before this request enters a GPU step.
+    func submit(
+        _ request: CBv2Request,
+        firstTokenDeadline: CBv2FirstTokenDeadlineAdmission
+    ) async throws -> CBv2FirstTokenDeadlineResult
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
@@ -1167,6 +1174,14 @@ extension CBv2Engine {
     /// An engine with no packed-prefill path reports neither capability nor
     /// execution.
     public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
+    /// Engines without an authoritative serialized-prefill projection fail
+    /// closed rather than manufacturing a deadline verdict.
+    public func submit(
+        _ request: CBv2Request,
+        firstTokenDeadline: CBv2FirstTokenDeadlineAdmission
+    ) async throws -> CBv2FirstTokenDeadlineResult {
+        .deadlineUnreachable(projectedWork: .unbounded)
+    }
 }
 
 // MARK: - Teacher-forced top-1 scoring (backend parity measurement)

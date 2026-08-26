@@ -13,6 +13,7 @@
 
 import Foundation
 import MLX
+import MLXNN
 import MLXRandom
 import XCTest
 
@@ -333,6 +334,31 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         return try JSONDecoder.json5().decode(Qwen35TextConfiguration.self, from: json)
     }
 
+    private func exactW4G64GDNConfiguration() throws -> Qwen35TextConfiguration {
+        let json = Data(
+            """
+            {
+              "model_type": "qwen3_5_moe",
+              "hidden_size": 512,
+              "num_hidden_layers": 4,
+              "intermediate_size": 512,
+              "num_attention_heads": 8,
+              "num_key_value_heads": 1,
+              "linear_num_value_heads": 16,
+              "linear_num_key_heads": 2,
+              "linear_key_head_dim": 32,
+              "linear_value_head_dim": 32,
+              "linear_conv_kernel_dim": 4,
+              "vocab_size": 512,
+              "head_dim": 64,
+              "full_attention_interval": 4,
+              "num_experts": 0,
+              "num_experts_per_tok": 0
+            }
+            """.utf8)
+        return try JSONDecoder.json5().decode(Qwen35TextConfiguration.self, from: json)
+    }
+
     private func gdnSpec(_ config: Qwen35TextConfiguration) -> CBv2RecurrentStateSpec {
         let keyDim = config.linearNumKeyHeads * config.linearKeyHeadDim
         let valueDim = config.linearNumValueHeads * config.linearValueHeadDim
@@ -353,20 +379,27 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// the state of a control that never speculated (only consumed the seed
     /// column); after an ACCEPTED draft the captured commit at keep=2 must
     /// match a control that decoded the same two tokens serially. Outputs
-    /// are compared within distributional tolerance (batched projections
-    /// change accumulation geometry; bitwise parity is NOT the contract —
-    /// see Qwen35MTP.swift NUMERICS POLICY).
-    func testGDNCapturedWindowMatchesSerialOracle() throws {
+    /// use the installed W4/g64 exact projection geometry.
+    func testExactGDNCapturedWindowMatchesSerialOracle() throws {
+        func assertExact(_ actual: MLXArray, _ expected: MLXArray) {
+            let difference = max(abs(
+                actual.asType(.float32) - expected.asType(.float32)))
+            eval(difference)
+            XCTAssertEqual(difference.item(Float.self), 0)
+        }
+
         MLXRandom.seed(4711)
-        let config = try smallGDNConfiguration()
+        let config = try exactW4G64GDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
+        quantize(model: layer, groupSize: 64, bits: 4)
         eval(layer)
 
         let hidden = config.hiddenSize
         MLXRandom.seed(90210)
         let x0 = MLXRandom.normal([1, 1, hidden])
         let x1 = MLXRandom.normal([1, 1, hidden])
-        let window = concatenated([x0, x1], axis: 1)
+        let x2 = MLXRandom.normal([1, 1, hidden])
+        let window = concatenated([x0, x1, x2], axis: 1)
 
         // Warm history so the states are non-trivial before the window.
         let history = MLXRandom.normal([1, 3, hidden])
@@ -393,15 +426,20 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let y1 = layer.cbv2Forward(x1, modelLayerIndex: 0, recurrentState: [serial1])
         _ = try serial1.evaluate()
         try serial1.commit()
+        let serial2 = try serialState.bind()
+        let y2 = layer.cbv2Forward(x2, modelLayerIndex: 0, recurrentState: [serial2])
+        _ = try serial2.evaluate()
+        try serial2.commit()
         let afterDraft = serialState.state(modelLayerIndex: 0)!
-        eval(y0, y1, afterSeedConv, afterSeedSSM, afterDraft.conv!, afterDraft.ssm!)
+        eval(y0, y1, y2, afterSeedConv, afterSeedSSM, afterDraft.conv!, afterDraft.ssm!)
 
         // Rejected draft: captured window, keep 1 → state == control that
         // never consumed the draft.
         let rejectedState = try freshState()
         let rejected = try rejectedState.bind()
         let rejectedOut = layer.cbv2ForwardCaptured(
-            window, modelLayerIndex: 0, recurrentState: [rejected])
+            window, modelLayerIndex: 0, recurrentState: [rejected],
+            exactTargetVerify: true)
         XCTAssertTrue(rejected.isCaptured)
         _ = try rejected.evaluate()
         eval(rejectedOut)
@@ -409,35 +447,25 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let rejectedFinal = rejectedState.state(modelLayerIndex: 0)!
         XCTAssertEqual(rejectedFinal.conv!.shape, afterSeedConv.shape)
         XCTAssertEqual(rejectedFinal.ssm!.shape, afterSeedSSM.shape)
-        XCTAssertTrue(
-            allClose(rejectedFinal.conv!, afterSeedConv, rtol: 1e-4, atol: 1e-5)
-                .item(Bool.self))
-        XCTAssertTrue(
-            allClose(rejectedFinal.ssm!, afterSeedSSM, rtol: 1e-4, atol: 1e-5)
-                .item(Bool.self))
+        assertExact(rejectedFinal.conv!, afterSeedConv)
+        assertExact(rejectedFinal.ssm!, afterSeedSSM)
 
-        // Accepted draft: captured window, keep 2 → state == control that
-        // decoded both tokens serially; window outputs match the serial
+        // Accepted draft: captured window, keep 3 → state == control that
+        // decoded all three tokens serially; window outputs match the serial
         // column outputs.
         let acceptedState = try freshState()
         let accepted = try acceptedState.bind()
         let acceptedOut = layer.cbv2ForwardCaptured(
-            window, modelLayerIndex: 0, recurrentState: [accepted])
+            window, modelLayerIndex: 0, recurrentState: [accepted],
+            exactTargetVerify: true)
         _ = try accepted.evaluate()
         eval(acceptedOut)
-        try accepted.commit(keepPositions: 2)
+        try accepted.commit(keepPositions: 3)
         let acceptedFinal = acceptedState.state(modelLayerIndex: 0)!
-        XCTAssertTrue(
-            allClose(acceptedFinal.conv!, afterDraft.conv!, rtol: 1e-4, atol: 1e-5)
-                .item(Bool.self))
-        XCTAssertTrue(
-            allClose(acceptedFinal.ssm!, afterDraft.ssm!, rtol: 1e-4, atol: 1e-5)
-                .item(Bool.self))
-        XCTAssertTrue(acceptedOut.shape == [1, 2, hidden])
-        XCTAssertTrue(
-            allClose(
-                acceptedOut, concatenated([y0, y1], axis: 1), rtol: 1e-3, atol: 1e-4
-            ).item(Bool.self))
+        assertExact(acceptedFinal.conv!, afterDraft.conv!)
+        assertExact(acceptedFinal.ssm!, afterDraft.ssm!)
+        XCTAssertTrue(acceptedOut.shape == [1, 3, hidden])
+        assertExact(acceptedOut, concatenated([y0, y1, y2], axis: 1))
         for value in [rejectedOut, acceptedOut] {
             XCTAssertTrue(isFinite(value).all().item(Bool.self))
         }

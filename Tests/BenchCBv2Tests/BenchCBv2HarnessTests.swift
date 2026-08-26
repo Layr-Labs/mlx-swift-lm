@@ -13,6 +13,7 @@
 // Model-free by construction: nothing here loads weights or touches Metal.
 
 import Foundation
+import MLXLMCommon
 import Testing
 
 @testable import BenchCBv2Core
@@ -109,6 +110,349 @@ struct BenchCBv2HarnessTests {
     }
 
     // MARK: - Option parsing
+
+    @Test("Qwen campaign options are strict and construction scoped")
+    func qwenCampaignOptionsAreStrictAndConstructionScoped() throws {
+        let options = try BenchOptions.parse([
+            "--model", "/m",
+            "--profile", "prefill",
+            "--prompt-file", "/p",
+            "--steps", "1024",
+            "--prefill-chunk", "2048",
+            "--solo-stripe", "2048",
+            "--model-revision", "model-sha",
+            "--mlx-swift-revision", "mlx-sha",
+            "--gpu-lock-owner", "campaign-owner",
+            "--receipt", "/r.json",
+        ])
+
+        #expect(options.profile == .prefill)
+        #expect(options.promptFile == "/p")
+        #expect(options.steps == 1_024)
+        #expect(options.prefillChunk == 2_048)
+        #expect(options.soloStripe == 2_048)
+        #expect(options.mtpDepth == 0)
+        #expect(options.modelRevision == "model-sha")
+        #expect(options.mlxSwiftRevision == "mlx-sha")
+        #expect(options.gpuLockOwner == "campaign-owner")
+        #expect(options.receiptPath == "/r.json")
+
+        #expect(throws: BenchOptionError.self) {
+            _ = try BenchOptions.parse([
+                "--model", "/m", "--profile", "stock", "--prompt-file", "/p",
+                "--steps", "1024", "--prefill-chunk", "2048",
+                "--model-revision", "m", "--mlx-swift-revision", "s",
+                "--gpu-lock-owner", "o", "--receipt", "/r.json",
+            ])
+        }
+        #expect(throws: BenchOptionError.self) {
+            _ = try BenchOptions.parse([
+                "--model", "/m", "--profile", "prefill", "--prompt-file", "/p",
+                "--steps", "1024", "--mtp-depth", "1",
+                "--model-revision", "m", "--mlx-swift-revision", "s",
+                "--gpu-lock-owner", "o", "--receipt", "/r.json",
+            ])
+        }
+    }
+
+    @Test("output parity defaults to fast and parses byte exact")
+    func outputParityParsesStrictly() throws {
+        let defaults = try BenchOptions.parse(["--model", "/m"])
+        #expect(defaults.outputParity == .fast)
+        #expect(defaults.outputParityWasSpecified == false)
+
+        let exact = try BenchOptions.parse([
+            "--model", "/m", "--profile", "decode", "--mtp-depth", "2",
+            "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
+        ])
+        #expect(exact.outputParity == .byteExact)
+        #expect(exact.outputParityWasSpecified)
+
+        #expect(throws: BenchOptionError.self) {
+            _ = try BenchOptions.parse([
+                "--model", "/m", "--profile", "decode", "--mtp-depth", "2",
+                "--output-parity", "approximate",
+            ])
+        }
+    }
+
+    @Test("explicit output parity requires a decode capable MTP route")
+    func outputParityRejectsMeaninglessRoutes() {
+        for arguments in [
+            ["--model", "/m", "--profile", "stock", "--output-parity", "fast"],
+            ["--model", "/m", "--profile", "prefill", "--output-parity", "byte-exact"],
+            [
+                "--model", "/m", "--profile", "decode", "--mtp-depth", "0",
+                "--output-parity", "byte-exact",
+            ],
+        ] {
+            #expect(throws: BenchOptionError.self) { _ = try BenchOptions.parse(arguments) }
+        }
+    }
+
+    @Test("optimization flags require the one-prompt campaign route")
+    func optimizationFlagsRejectOrdinaryMatrixRuns() {
+        for arguments in [
+            ["--model", "/m", "--profile", "prefill"],
+            ["--model", "/m", "--profile", "decode", "--mtp-depth", "2"],
+            ["--model", "/m", "--profile", "full", "--mtp-depth", "2"],
+        ] {
+            #expect(throws: BenchOptionError.self) {
+                _ = try BenchOptions.parse(arguments)
+            }
+        }
+    }
+
+    @Test("campaign receipts accept the realistic 1024-token coding decode")
+    func campaignReceiptModeIsExact() throws {
+        #expect(throws: BenchOptionError.self) {
+            _ = try BenchOptions.parse([
+                "--model", "/m", "--steps", "100", "--prompt-file", "/p",
+                "--model-revision", "m", "--mlx-swift-revision", "s",
+                "--gpu-lock-owner", "o", "--receipt", "/r.json",
+            ])
+        }
+        let options = try BenchOptions.parse([
+            "--model", "/m", "--steps", "1024", "--prompt-file", "/p",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o", "--receipt", "/r.json",
+        ])
+        #expect(options.steps == 1024)
+        #expect(throws: BenchOptionError.self) {
+            _ = try BenchOptions.parse([
+                "--model", "/m", "--steps", "100", "--receipt", "/r.json",
+            ])
+        }
+        for missing in ["--model-revision", "--mlx-swift-revision", "--gpu-lock-owner"] {
+            var arguments = [
+                "--model", "/m", "--steps", "100", "--prompt-file", "/p",
+                "--model-revision", "m", "--mlx-swift-revision", "s",
+                "--gpu-lock-owner", "o", "--receipt", "/r.json",
+            ]
+            let index = try #require(arguments.firstIndex(of: missing))
+            arguments.removeSubrange(index ... index + 1)
+            #expect(throws: BenchOptionError.self) { _ = try BenchOptions.parse(arguments) }
+        }
+    }
+
+    @Test("campaign scheduler geometry is fixed at construction")
+    func campaignSchedulerGeometryIsConstructionScoped() throws {
+        let stock = try BenchOptions.parse(["--model", "/m"])
+        let stockConfig = campaignSchedulerConfig(stock)
+        #expect(stockConfig.maxConcurrentRequests == 1)
+        #expect(stockConfig.prefillChunkSize == 512)
+        #expect(stockConfig.soloPrefillStripeTokens == nil)
+
+        var prefill = stock
+        prefill.profile = .prefill
+        prefill.prefillChunk = 2_048
+        prefill.soloStripe = 2_048
+        let tuned = campaignSchedulerConfig(prefill)
+        #expect(tuned.maxConcurrentRequests == 1)
+        #expect(tuned.maxBatchedTokensPerStep == 2_048)
+        #expect(tuned.prefillChunkSize == 2_048)
+        #expect(tuned.soloPrefillStripeTokens == 2_048)
+    }
+
+    @Test("campaign MTP depth is fixed at construction")
+    func campaignMTPDepthIsConstructionScoped() throws {
+        var stock = try BenchOptions.parse(["--model", "/m"])
+        let disabled = campaignMTPConfig(stock)
+        #expect(disabled.enabled == false)
+        #expect(disabled.fixedDraftTokens == nil)
+
+        stock.profile = .decode
+        stock.mtpDepth = 3
+        let decode = campaignMTPConfig(stock)
+        #expect(decode.enabled)
+        #expect(decode.maxDraftTokens == 3)
+        #expect(decode.fixedDraftTokens == 3)
+        #expect(decode.maxSpeculativeBatch == 1)
+        #expect(decode.verificationMode == .rectangular)
+
+        stock.outputParity = .byteExact
+        let exact = campaignMTPConfig(stock)
+        #expect(exact.verificationMode == .rectangularExact)
+        #expect(BenchOutputParity.fast.verificationRoute
+            == "rectangular-target-authoritative")
+        #expect(BenchOutputParity.byteExact.verificationRoute
+            == "rectangular-timewise-byte-exact")
+    }
+
+    @Test("byte exact preserves the installed fast construction profile")
+    func byteExactStartsFromFastConstruction() throws {
+        let fast = try BenchOptions.parse([
+            "--model", "/m/qwen", "--profile", "full", "--mtp-depth", "2",
+            "--output-parity", "fast",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r-fast.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
+        ])
+        let exactFull = try BenchOptions.parse([
+            "--model", "/m/qwen", "--profile", "full", "--mtp-depth", "2",
+            "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r-full.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
+        ])
+        let exactDecode = try BenchOptions.parse([
+            "--model", "/m/qwen", "--profile", "decode", "--mtp-depth", "2",
+            "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r-decode.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
+        ])
+
+        #expect(qwen35CampaignConstructionProfile(fast) == .full)
+        #expect(qwen35CampaignConstructionProfile(exactFull) == .full)
+        #expect(qwen35CampaignConstructionProfile(exactDecode) == .decode)
+    }
+
+    @Test("campaign construction rejects installed verification drift")
+    func campaignConstructionRejectsVerificationDrift() {
+        let config = CBv2MTPConfig(
+            enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1,
+            fixedDraftTokens: 2, verificationMode: .serialTarget)
+        var installed = CBv2MTPMetrics()
+        installed.verificationMode = .rectangular
+
+        #expect(throws: CampaignExecutionError.self) {
+            try validateCampaignMTPInstallation(config: config, metrics: installed)
+        }
+    }
+
+    @Test("campaign construction rejects a drafter-clamped fixed depth")
+    func campaignConstructionRejectsDepthDrift() {
+        #expect(throws: CampaignExecutionError.self) {
+            try validateCampaignMTPDepth(requested: 2, drafterMaximum: 1)
+        }
+        #expect(throws: Never.self) {
+            try validateCampaignMTPDepth(requested: 2, drafterMaximum: 4)
+        }
+    }
+
+    @Test("campaign prompt loading preserves text bytes and records SHA-256")
+    func campaignPromptIsExact() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("python.txt")
+        let text = "Write a Python function that returns the nth Fibonacci number.\n"
+        try Data(text.utf8).write(to: url)
+
+        let prompt = try CampaignPrompt.load(from: url)
+        #expect(prompt.text == text)
+        #expect(prompt.sha256 == "cfcd09297db017afcada064c952b4625d20d1275dab4d58264cfd8f7bfa3a147")
+    }
+
+    @Test("campaign receipt records its requested decode length and accepts long contexts")
+    func campaignReceiptIsStrict() throws {
+        let metrics = PhaseMetrics(
+            promptTokens: 65_536, submittedAt: 10, firstTokenAt: 10.1,
+            lastTokenAt: 15.215, generatedTokens: 1_024)
+        let receipt = CampaignReceipt(
+            modelPath: "/models/qwen",
+            modelRevision: String(repeating: "a", count: 40),
+            sourceRevision: "abcdef0",
+            mlxSwiftRevision: String(repeating: "b", count: 40),
+            profile: .decode, promptSHA256: String(repeating: "c", count: 64),
+            promptTokenIDs: Array(repeating: 7, count: 65_536),
+            generatedTokenIDs: Array(0 ..< 1_024), requestedGeneratedTokens: 1_024,
+            generatedText: "output", phaseMetrics: metrics, prefillChunk: 512,
+            soloStripe: nil, mtpDepth: 2, outputParity: .byteExact,
+            verificationRoute: BenchOutputParity.byteExact.verificationRoute,
+            routeSummary: [
+                "target": "optimized", "outputParity": "byte-exact",
+                "verificationRoute": "rectangular-timewise-byte-exact",
+                "mtp": "inline-fixed-k2,verify=rectangular_exact,rounds=35",
+            ],
+            gpuLockOwner: "owner", peakMemoryBytes: 123)
+
+        try receipt.validate()
+        var unsupported = receipt
+        unsupported.schemaVersion = 999
+        #expect(throws: CampaignReceiptError.self) { try unsupported.validate() }
+        let json = try benchmarkJSONString(receipt)
+        for key in [
+            "modelRevision", "sourceRevision", "mlxSwiftRevision", "promptSHA256",
+            "promptTokenIDs", "generatedTokenIDs", "phaseMetrics", "routeSummary",
+            "gpuLockOwner", "peakMemoryBytes", "outputParity", "verificationRoute",
+            "requestedGeneratedTokens",
+        ] {
+            #expect(json.contains("\"\(key)\""), "missing receipt key \(key)")
+        }
+        #expect(json.contains("\"outputParity\":\"byte-exact\""))
+        #expect(json.contains(
+            "\"verificationRoute\":\"rectangular-timewise-byte-exact\""))
+
+        let mislabeled = CampaignReceipt(
+            modelPath: receipt.modelPath, modelRevision: receipt.modelRevision,
+            sourceRevision: receipt.sourceRevision, mlxSwiftRevision: receipt.mlxSwiftRevision,
+            profile: receipt.profile, promptSHA256: receipt.promptSHA256,
+            promptTokenIDs: receipt.promptTokenIDs,
+            generatedTokenIDs: receipt.generatedTokenIDs,
+            requestedGeneratedTokens: receipt.requestedGeneratedTokens,
+            generatedText: receipt.generatedText, phaseMetrics: metrics,
+            prefillChunk: receipt.prefillChunk, soloStripe: receipt.soloStripe,
+            mtpDepth: receipt.mtpDepth, outputParity: .byteExact,
+            verificationRoute: "serial-byte-exact",
+            routeSummary: [
+                "outputParity": "byte-exact", "verificationRoute": "serial-byte-exact",
+                "mtp": "inline-fixed-k2,verify=rectangular,rounds=34",
+            ],
+            gpuLockOwner: receipt.gpuLockOwner, peakMemoryBytes: receipt.peakMemoryBytes)
+        #expect(throws: CampaignReceiptError.self) { try mislabeled.validate() }
+
+        let prefixCollision = CampaignReceipt(
+            modelPath: receipt.modelPath, modelRevision: receipt.modelRevision,
+            sourceRevision: receipt.sourceRevision, mlxSwiftRevision: receipt.mlxSwiftRevision,
+            profile: receipt.profile, promptSHA256: receipt.promptSHA256,
+            promptTokenIDs: receipt.promptTokenIDs,
+            generatedTokenIDs: receipt.generatedTokenIDs,
+            requestedGeneratedTokens: receipt.requestedGeneratedTokens,
+            generatedText: receipt.generatedText, phaseMetrics: metrics,
+            prefillChunk: receipt.prefillChunk, soloStripe: receipt.soloStripe,
+            mtpDepth: receipt.mtpDepth, outputParity: .fast,
+            verificationRoute: BenchOutputParity.fast.verificationRoute,
+            routeSummary: [
+                "outputParity": "fast",
+                "verificationRoute": BenchOutputParity.fast.verificationRoute,
+                "mtp": "inline-fixed-k2,verify=rectangular_exact,rounds=34",
+            ],
+            gpuLockOwner: receipt.gpuLockOwner, peakMemoryBytes: receipt.peakMemoryBytes)
+        #expect(throws: CampaignReceiptError.self) { try prefixCollision.validate() }
+
+        let short = CampaignReceipt(
+            modelPath: receipt.modelPath, modelRevision: receipt.modelRevision,
+            sourceRevision: receipt.sourceRevision, mlxSwiftRevision: receipt.mlxSwiftRevision,
+            profile: receipt.profile, promptSHA256: receipt.promptSHA256,
+            promptTokenIDs: receipt.promptTokenIDs,
+            generatedTokenIDs: Array(receipt.generatedTokenIDs.dropLast()),
+            requestedGeneratedTokens: receipt.requestedGeneratedTokens,
+            generatedText: receipt.generatedText, phaseMetrics: metrics,
+            prefillChunk: receipt.prefillChunk, soloStripe: receipt.soloStripe,
+            mtpDepth: receipt.mtpDepth, outputParity: receipt.outputParity,
+            verificationRoute: receipt.verificationRoute, routeSummary: receipt.routeSummary,
+            gpuLockOwner: receipt.gpuLockOwner, peakMemoryBytes: receipt.peakMemoryBytes)
+        #expect(throws: CampaignReceiptError.self) { try short.validate() }
+    }
+
+    @Test("phase metrics exclude the first token from decode")
+    func phaseMetricsExcludeFirstTokenFromDecode() {
+        let metrics = PhaseMetrics(
+            promptTokens: 100,
+            submittedAt: 10,
+            firstTokenAt: 10.2,
+            lastTokenAt: 10.695,
+            generatedTokens: 100)
+
+        #expect(abs(metrics.prefillSeconds - 0.2) < 1e-12)
+        #expect(abs(metrics.decodeTPS - 200.0) < 0.001)
+    }
 
     @Test("malformed prompt-length lists are rejected, never silently dropped")
     func malformedPromptLengthsAreRejected() {
@@ -265,6 +609,26 @@ struct BenchCBv2HarnessTests {
         #expect(header.contains("| Label | a b |"))
     }
 
+    @Test("the report records the installed output parity route")
+    func headerRecordsOutputParityRoute() throws {
+        let argv = [
+            "BenchCBv2", "--model", "/m/qwen", "--profile", "decode",
+            "--mtp-depth", "2", "--output-parity", "byte-exact",
+            "--prompt-file", "/p", "--steps", "1024", "--receipt", "/r.json",
+            "--model-revision", "m", "--mlx-swift-revision", "s",
+            "--gpu-lock-owner", "o",
+        ]
+        let options = try BenchOptions.parse(Array(argv.dropFirst()))
+        let header = reportHeader(
+            options: options, argv: argv, chip: "Apple M5 Max", ramGB: 128,
+            osVersion: "Version 26.0", hostLine: "load avg (1m) 0.4 / 16 cores",
+            revision: "abc1234", date: Date(timeIntervalSince1970: 0))
+
+        #expect(header.contains("| Output parity | byte-exact |"))
+        #expect(header.contains(
+            "| Verification route | rectangular-timewise-byte-exact |"))
+    }
+
     // MARK: - Build revision provenance
 
     @Test("the report stamps the injected build revision verbatim")
@@ -299,5 +663,40 @@ struct BenchCBv2HarnessTests {
         defer { FileManager.default.changeCurrentDirectoryPath(original) }
         #expect(FileManager.default.changeCurrentDirectoryPath("/tmp"))
         #expect(buildRevision() == revision)
+    }
+
+    @Test("Qwen campaign evidence does not publish a macOS operator home")
+    func qwenEvidenceScrubsOperatorHomePaths() throws {
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let roots = [
+            repository.appendingPathComponent("benchmarks/qwen36-a3b"),
+            repository.appendingPathComponent("docs/plans"),
+            repository.appendingPathComponent("docs/specs"),
+            repository.appendingPathComponent("scripts"),
+        ]
+        let plainPrefix = Data("/Users/".utf8)
+        let escapedPrefix = Data("\\/Users\\/".utf8)
+        for root in roots {
+            guard let files = FileManager.default.enumerator(
+                at: root, includingPropertiesForKeys: [.isRegularFileKey])
+            else { continue }
+            for case let file as URL in files {
+                guard try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
+                else { continue }
+                if root.lastPathComponent != "qwen36-a3b",
+                    !file.lastPathComponent.lowercased().contains("qwen36")
+                {
+                    continue
+                }
+                let data = try Data(contentsOf: file, options: .mappedIfSafe)
+                #expect(
+                    data.range(of: plainPrefix) == nil
+                        && data.range(of: escapedPrefix) == nil,
+                    "operator home path leaked in \(file.path)")
+            }
+        }
     }
 }
