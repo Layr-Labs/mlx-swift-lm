@@ -103,7 +103,9 @@ public protocol CBv2MultimodalSteppableModel: CBv2SteppableModel {
 }
 /// Attention-only models whose request positions cannot be recovered from a
 /// batch-wide scalar cache offset (Qwen M-RoPE).
-public protocol CBv2PositionedSteppableModel: CBv2SteppableModel {
+public protocol CBv2PositionedSteppableModel:
+    CBv2SteppableModel, CBv2PositionedForwardingCapabilityProviding
+{
     func forward(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         positionIds: MLXArray?

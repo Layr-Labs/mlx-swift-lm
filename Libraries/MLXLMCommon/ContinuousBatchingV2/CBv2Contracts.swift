@@ -206,6 +206,20 @@ public struct CBv2PositionState: @unchecked Sendable {
 public protocol CBv2PositionAxisProviding {
     var cbv2PositionAxisCount: Int? { get }
 }
+/// Runtime positioned-forwarding capability used by request admission.
+///
+/// Positioned steppable protocols provide `true` by default. Generic
+/// adapters over arbitrary language models override this with the wrapped
+/// model's actual forwarding seam so structural adapter conformance cannot
+/// admit a request that would trap during execution.
+public protocol CBv2PositionedForwardingCapabilityProviding {
+    var supportsPositionedForwarding: Bool { get }
+}
+
+extension CBv2PositionedForwardingCapabilityProviding {
+    public var supportsPositionedForwarding: Bool { true }
+}
+
 
 // MARK: - Multimodal input (vision prefill; additive)
 

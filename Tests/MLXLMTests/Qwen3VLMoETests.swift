@@ -63,17 +63,83 @@ final class Qwen3VLMoETests: XCTestCase {
         assertApproximation(model.blocks[0].mlp.activation, is: .fast)
     }
 
-    func testSparseParameterTreeMatchesPublishedSplitCheckpointLayout() throws {
+    func testSparseParameterTreeUsesFusedGateUpProjection() throws {
         let config = try decodeConfiguration(tinyAllMoEConfigurationJSON)
         let model = Qwen3VLLanguage.Model(config.textConfiguration)
         let keys = Set(model.parameters().flattened().map(\.0))
 
         XCTAssertTrue(keys.contains("layers.0.mlp.gate.weight"))
-        XCTAssertTrue(keys.contains("layers.0.mlp.switch_mlp.gate_proj.weight"))
-        XCTAssertTrue(keys.contains("layers.0.mlp.switch_mlp.up_proj.weight"))
+        XCTAssertTrue(keys.contains("layers.0.mlp.switch_mlp.gate_up_proj.weight"))
         XCTAssertTrue(keys.contains("layers.0.mlp.switch_mlp.down_proj.weight"))
         XCTAssertFalse(keys.contains { $0.contains("shared_expert") })
-        XCTAssertFalse(keys.contains { $0.contains("gate_up_proj") })
+        XCTAssertFalse(keys.contains("layers.0.mlp.switch_mlp.gate_proj.weight"))
+        XCTAssertFalse(keys.contains("layers.0.mlp.switch_mlp.up_proj.weight"))
+    }
+
+
+    func testSplitCheckpointMigratesToFusedKeysAndStrictLoads() throws {
+        let model = Qwen3VL(try decodeConfiguration(tinyAllMoEConfigurationJSON))
+        let checkpoint = splitExpertCheckpoint(from: model, rawLanguagePrefix: true)
+        let rawBase = "model.language_model.layers.0.mlp.switch_mlp"
+        let w4 = BaseConfiguration.Quantization(groupSize: 64, bits: 4)
+        let policy = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(rawBase).gate_proj": .quantize(w4),
+                "\(rawBase).up_proj": .quantize(w4),
+            ])
+        model.checkpointPerLayerQuantization = policy
+        let sanitized = model.sanitize(weights: checkpoint)
+        let base = "language_model.model.layers.0.mlp.switch_mlp"
+
+        XCTAssertNotNil(sanitized["\(base).gate_up_proj.weight"])
+        XCTAssertNil(sanitized["\(base).gate_proj.weight"])
+        XCTAssertNil(sanitized["\(base).up_proj.weight"])
+        let block = model.languageModel.model.layers[0].mlp
+            as? Qwen3VLLanguage.SparseMoeBlock
+        XCTAssertTrue(block?.switchMLP.hasFusedGateUp == true)
+        XCTAssertEqual(
+            resolveQuantization(
+                path: "\(base).gate_up_proj",
+                perLayerQuantization: policy,
+                aliasing: model),
+            w4)
+        XCTAssertNoThrow(
+            try model.update(
+                parameters: ModuleParameters.unflattened(sanitized), verify: [.all]))
+    }
+
+    func testIncompatibleQuantizationStaysSplitStrictLoadsAndMatchesLogits() throws {
+        let config = try decodeConfiguration(tinyAllMoEConfigurationJSON)
+        let fusedModel = Qwen3VL(config)
+        let model = Qwen3VL(config)
+        let checkpoint = splitExpertCheckpoint(from: fusedModel, rawLanguagePrefix: true)
+        let rawBase = "model.language_model.layers.0.mlp.switch_mlp"
+        model.checkpointPerLayerQuantization = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(rawBase).gate_proj": .quantize(.init(groupSize: 64, bits: 4)),
+                "\(rawBase).up_proj": .quantize(.init(groupSize: 64, bits: 8)),
+            ])
+
+        let sanitized = model.sanitize(weights: checkpoint)
+        let base = "language_model.model.layers.0.mlp.switch_mlp"
+        XCTAssertNotNil(sanitized["\(base).gate_proj.weight"])
+        XCTAssertNotNil(sanitized["\(base).up_proj.weight"])
+        XCTAssertNil(sanitized["\(base).gate_up_proj.weight"])
+        let block = model.languageModel.model.layers[0].mlp
+            as? Qwen3VLLanguage.SparseMoeBlock
+        XCTAssertTrue(block?.switchMLP.hasFusedGateUp == false)
+        XCTAssertNoThrow(
+            try model.update(
+                parameters: ModuleParameters.unflattened(sanitized), verify: [.all]))
+        let tokens = MLXArray([Int32(1), Int32(2)]).reshaped([1, 2])
+        let fusedLogits = fusedModel(tokens, cache: nil)
+        let splitLogits = model(tokens, cache: nil)
+        eval(fusedLogits, splitLogits)
+        XCTAssertEqual(splitLogits.shape, fusedLogits.shape)
+        XCTAssertTrue(
+            splitLogits.allClose(fusedLogits, rtol: 1e-5, atol: 1e-6).item(Bool.self))
     }
 
     func testMoEModelTypeResolvesThroughPublicRegistry() async throws {
@@ -110,17 +176,19 @@ final class Qwen3VLMoETests: XCTestCase {
             experts * dimensions * hiddenDimensions, scale: 0.043, offset: 11)
         let inputValues = deterministicValues(rows * dimensions, scale: 0.113, offset: 5)
 
+        let expertGate = MLXArray(
+            expertGateWeights, [experts, hiddenDimensions, dimensions])
+        let expertUp = MLXArray(
+            expertUpWeights, [experts, hiddenDimensions, dimensions])
         block.update(parameters: ModuleParameters.unflattened([
             "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
-            "switch_mlp.gate_proj.weight": MLXArray(
-                expertGateWeights, [experts, hiddenDimensions, dimensions]),
-            "switch_mlp.up_proj.weight": MLXArray(
-                expertUpWeights, [experts, hiddenDimensions, dimensions]),
+            "switch_mlp.gate_up_proj.weight": concatenated(
+                [expertGate, expertUp], axis: -2),
             "switch_mlp.down_proj.weight": MLXArray(
                 expertDownWeights, [experts, dimensions, hiddenDimensions]),
         ]))
 
-        let input = MLXArray(inputValues, [rows, dimensions])
+        let input = MLXArray(inputValues, [1, rows, dimensions])
         let (indices, scores) = block.route(input)
         let output = block(input)
         eval(indices, scores, output)
@@ -150,6 +218,27 @@ final class Qwen3VLMoETests: XCTestCase {
         for (actual, expected) in zip(actualOutput, reference.output) {
             XCTAssertEqual(actual, expected, accuracy: 2e-5)
         }
+
+        let splitBlock = Qwen3VLLanguage.SparseMoeBlock(config.textConfiguration)
+        setSwitchGLUGateUpFused(false, at: "switch_mlp", in: splitBlock)
+        splitBlock.update(parameters: ModuleParameters.unflattened([
+            "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
+            "switch_mlp.gate_proj.weight": expertGate,
+            "switch_mlp.up_proj.weight": expertUp,
+            "switch_mlp.down_proj.weight": MLXArray(
+                expertDownWeights, [experts, dimensions, hiddenDimensions]),
+        ]))
+        let (splitIndices, splitScores) = splitBlock.route(input)
+        let splitOutput = splitBlock(input)
+        eval(splitIndices, splitScores, splitOutput)
+
+        XCTAssertEqual(splitIndices.dtype, indices.dtype)
+        XCTAssertEqual(splitScores.dtype, scores.dtype)
+        XCTAssertEqual(
+            splitIndices.asType(.int32).asArray(Int32.self),
+            indices.asType(.int32).asArray(Int32.self))
+        XCTAssertTrue(splitScores.allClose(scores, rtol: 0, atol: 0).item(Bool.self))
+        XCTAssertTrue(splitOutput.allClose(output, rtol: 1e-5, atol: 1e-6).item(Bool.self))
     }
 
     func testCBv2LayerKindsAndCapabilitiesAreConservative() throws {
@@ -260,6 +349,29 @@ final class Qwen3VLMoETests: XCTestCase {
 
         XCTAssertEqual(actual.shape, expected.shape)
         XCTAssertEqual(actual.asArray(Float.self), expected.asArray(Float.self))
+    }
+
+    private func splitExpertCheckpoint(
+        from model: Qwen3VL,
+        rawLanguagePrefix: Bool
+    ) -> [String: MLXArray] {
+        let reference = Dictionary(uniqueKeysWithValues: model.parameters().flattened())
+        var checkpoint: [String: MLXArray] = [:]
+        for (key, value) in reference {
+            guard key.hasSuffix(".switch_mlp.gate_up_proj.weight") else {
+                checkpoint[key] = value
+                continue
+            }
+            var base = String(key.dropLast("gate_up_proj.weight".count))
+            if rawLanguagePrefix {
+                base = base.replacingOccurrences(
+                    of: "language_model.model.", with: "model.language_model.")
+            }
+            let halves = split(value, parts: 2, axis: -2)
+            checkpoint["\(base)gate_proj.weight"] = halves[0]
+            checkpoint["\(base)up_proj.weight"] = halves[1]
+        }
+        return checkpoint
     }
 
     private func decodeConfiguration(_ json: String) throws -> Qwen3VLConfiguration {

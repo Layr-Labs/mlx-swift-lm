@@ -648,7 +648,9 @@ public protocol CBv2RecurrentSteppableModel: CBv2SteppableModel, CBv2ModelCapabi
 }
 
 /// Optional recurrent forward with explicit request-owned model positions.
-public protocol CBv2PositionedRecurrentSteppableModel: CBv2RecurrentSteppableModel {
+public protocol CBv2PositionedRecurrentSteppableModel:
+    CBv2RecurrentSteppableModel, CBv2PositionedForwardingCapabilityProviding
+{
     func forward(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?

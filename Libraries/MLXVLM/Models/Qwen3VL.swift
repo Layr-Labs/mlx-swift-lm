@@ -1217,7 +1217,8 @@ enum Qwen3VLLanguage {
             _switchMLP.wrappedValue = SwitchGLU(
                 inputDims: config.hiddenSize,
                 hiddenDims: config.moeIntermediateSize,
-                numExperts: config.numExperts)
+                numExperts: config.numExperts,
+                fuseGateUp: true)
         }
 
         func route(_ x: MLXArray) -> (indices: MLXArray, scores: MLXArray) {
@@ -1233,8 +1234,36 @@ enum Qwen3VLLanguage {
 
         override func callAsFunction(_ x: MLXArray) -> MLXArray {
             let (indices, scores) = route(x)
-            let expertOutput = switchMLP(x, indices)
-            return (expertOutput * expandedDimensions(scores, axis: -1)).sum(axis: -2)
+            let canFlatten: Bool
+            if x.ndim == 2 {
+                canFlatten =
+                    indices.ndim == 2 && scores.ndim == 2
+                    && indices.dim(0) == x.dim(0) && scores.dim(0) == x.dim(0)
+                    && indices.dim(1) == topK && scores.dim(1) == topK
+            } else if x.ndim == 3 {
+                canFlatten =
+                    indices.ndim == 3 && scores.ndim == 3
+                    && indices.dim(0) == x.dim(0) && scores.dim(0) == x.dim(0)
+                    && indices.dim(1) == x.dim(1) && scores.dim(1) == x.dim(1)
+                    && indices.dim(2) == topK && scores.dim(2) == topK
+            } else {
+                canFlatten = false
+            }
+            guard canFlatten else {
+                return weightedExpertSum(switchMLP(x, indices), scores)
+            }
+
+            // Gather kernels operate on one contiguous token axis. Reshaping
+            // does not reorder tokens, selected experts, or scores.
+            let flatX = x.ndim == 2 ? x : x.reshaped(-1, x.dim(-1))
+            let flatIndices = indices.ndim == 2 ? indices : indices.reshaped(-1, topK)
+            let flatScores = scores.ndim == 2 ? scores : scores.reshaped(-1, topK)
+            let reduced = switchMLP.callAndWeightedReduce(
+                flatX, flatIndices, weights: flatScores,
+                fuseSortedReduction: false)
+            return x.ndim == 2
+                ? reduced
+                : reduced.reshaped(x.dim(0), x.dim(1), x.dim(2))
         }
     }
 
@@ -1735,6 +1764,53 @@ extension Qwen3VLLanguage {
     }
 }
 
+private func qwen3VLPolicyPathCandidates(for path: String) -> [String] {
+    let prefixes = [
+        "language_model.model.", "model.language_model.", "language_model.", "model.",
+    ]
+    var suffix = path
+    for prefix in prefixes where path.hasPrefix(prefix) {
+        suffix = String(path.dropFirst(prefix.count))
+        break
+    }
+
+    var candidates = [path]
+    for candidate in [
+        "language_model.model." + suffix,
+        "model.language_model." + suffix,
+        "model." + suffix,
+        "language_model." + suffix,
+        suffix,
+    ] where !candidates.contains(candidate) {
+        candidates.append(candidate)
+    }
+    return candidates
+}
+
+private func qwen3VLGateUpQuantizationAliases(for path: String) -> [String] {
+    var aliases: [String] = []
+    func appendCandidates(for name: String) {
+        for candidate in qwen3VLPolicyPathCandidates(for: name)
+        where candidate != path && !aliases.contains(candidate) {
+            aliases.append(candidate)
+        }
+    }
+
+    let fusedSuffix = ".gate_up_proj"
+    if path.hasSuffix(fusedSuffix) {
+        let base = String(path.dropLast(fusedSuffix.count))
+        appendCandidates(for: path)
+        appendCandidates(for: "\(base).gate_proj")
+        appendCandidates(for: "\(base).up_proj")
+    } else if path.hasSuffix(".switch_mlp.gate_proj")
+        || path.hasSuffix(".switch_mlp.up_proj")
+        || path.hasSuffix(".switch_mlp.down_proj")
+    {
+        appendCandidates(for: path)
+    }
+    return aliases
+}
+
 // MARK: - Model
 
 public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
@@ -1743,6 +1819,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "language_model") var languageModel: Qwen3VLLanguage.LanguageModel
 
     public let config: Qwen3VLConfiguration
+    public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
 
     public init(_ config: Qwen3VLConfiguration) {
         self.config = config
@@ -2206,10 +2283,27 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             adjusted[newKey] = value
         }
 
-        let sanitized = visionModel.sanitize(weights: adjusted)
-        return sanitized
+        let fused = fuseSwitchGLUGateUpWeights(
+            weights: adjusted,
+            perLayerQuantization: checkpointPerLayerQuantization,
+            quantizationAliases: qwen3VLGateUpQuantizationAliases,
+            setFused: { path, fused in
+                setSwitchGLUGateUpFused(
+                    fused, at: path,
+                    aliases: qwen3VLPolicyPathCandidates(for: path),
+                    in: self)
+            })
+        return visionModel.sanitize(weights: fused)
     }
 }
+
+extension Qwen3VL: QuantizationPathAliasing {
+    public func quantizationPathAliases(for path: String) -> [String] {
+        qwen3VLGateUpQuantizationAliases(for: path)
+    }
+}
+
+extension Qwen3VL: QuantizationPolicyReceiving {}
 
 extension Array where Element == THW {
     fileprivate var nilIfEmpty: [THW]? { isEmpty ? nil : self }

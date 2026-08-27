@@ -275,6 +275,146 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
     case qwen35ProductionSwiGLU
 }
 
+
+/// Safely row-concatenates split SwitchGLU gate/up checkpoint tensors.
+///
+/// This is the model-neutral core of the Qwen3.5 gate/up load-time fusion:
+/// every tensor suffix must match in shape and dtype, and both module paths
+/// must resolve to one quantization policy. An incompatible pair is left
+/// byte-for-byte split and reported through `setFused`, allowing the caller to
+/// install a split ``SwitchGLU`` before strict parameter verification.
+public func fuseSwitchGLUGateUpWeights(
+    weights: [String: MLXArray],
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    quantizationAliases: (String) -> [String] = { _ in [] },
+    shouldProcess: (String) -> Bool = { _ in true },
+    setFused: ((String, Bool) -> Void)? = nil
+) -> [String: MLXArray] {
+    var weights = weights
+    let splitMarker = ".switch_mlp.gate_proj."
+    var bases = Set<String>()
+    for key in weights.keys where key.contains(splitMarker) {
+        let range = key.range(of: splitMarker)!
+        let base = String(key[..<range.lowerBound]) + ".switch_mlp."
+        if shouldProcess(String(base.dropLast())) {
+            bases.insert(base)
+        }
+    }
+
+    func resolvedQuantization(
+        for path: String,
+        in table: BaseConfiguration.PerLayerQuantization
+    ) -> BaseConfiguration.Quantization? {
+        var candidates = [path]
+        for alias in quantizationAliases(path) where !candidates.contains(alias) {
+            candidates.append(alias)
+        }
+        for candidate in candidates {
+            guard let option = table.perLayerQuantization[candidate] else { continue }
+            switch option {
+            case .skip:
+                return nil
+            case .quantize(let quantization):
+                return quantization
+            }
+        }
+        return table.quantization
+    }
+
+    func suffixes(_ half: String, base: String) -> Set<String> {
+        let prefix = "\(base)\(half)."
+        return Set(
+            weights.keys.compactMap {
+                $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : nil
+            })
+    }
+
+    for base in bases.sorted() {
+        let modulePath = String(base.dropLast())
+        let gateSuffixes = suffixes("gate_proj", base: base)
+        let upSuffixes = suffixes("up_proj", base: base)
+        guard !upSuffixes.isEmpty else {
+            // Leave malformed half-pairs untouched so strict update reports a
+            // catchable missing/unhandled-parameter error.
+            continue
+        }
+
+        var blocker: String?
+        if let table = perLayerQuantization {
+            let gate = resolvedQuantization(for: "\(base)gate_proj", in: table)
+            let up = resolvedQuantization(for: "\(base)up_proj", in: table)
+            if gate != up {
+                blocker = "gate and up resolve to different quantization policies"
+            }
+        }
+        if blocker == nil, gateSuffixes != upSuffixes {
+            blocker = "gate and up carry different tensor sets"
+        }
+        if blocker == nil {
+            for suffix in gateSuffixes.sorted() {
+                guard let gate = weights["\(base)gate_proj.\(suffix)"],
+                    let up = weights["\(base)up_proj.\(suffix)"]
+                else { continue }
+                if gate.shape != up.shape || gate.dtype != up.dtype {
+                    blocker = "\(suffix) tensors differ in shape or dtype"
+                    break
+                }
+            }
+        }
+
+        if let blocker {
+            print("[INFO] fuseSwitchGLUGateUpWeights: keeping \(modulePath) split — \(blocker)")
+            setFused?(modulePath, false)
+            continue
+        }
+
+        for suffix in gateSuffixes.sorted() {
+            guard let gate = weights.removeValue(forKey: "\(base)gate_proj.\(suffix)"),
+                let up = weights.removeValue(forKey: "\(base)up_proj.\(suffix)")
+            else { continue }
+            let axis = suffix == "bias" ? -1 : -2
+            weights["\(base)gate_up_proj.\(suffix)"] = concatenated([gate, up], axis: axis)
+        }
+    }
+
+    if let setFused {
+        let fusedMarker = ".switch_mlp.gate_up_proj."
+        var fusedPaths = Set<String>()
+        for key in weights.keys where key.contains(fusedMarker) {
+            let range = key.range(of: fusedMarker)!
+            let path = String(key[..<range.lowerBound]) + ".switch_mlp"
+            if shouldProcess(path) {
+                fusedPaths.insert(path)
+            }
+        }
+        for path in fusedPaths.sorted() {
+            setFused(path, true)
+        }
+    }
+    return weights
+}
+
+/// Replaces the SwitchGLU at a checkpoint path with its fused or split twin.
+/// Aliases bridge checkpoint and module-tree namespaces.
+public func setSwitchGLUGateUpFused(
+    _ fused: Bool,
+    at path: String,
+    aliases: [String] = [],
+    in root: Module
+) {
+    let candidates = [path] + aliases.filter { $0 != path }
+    for (modulePath, module) in root.namedModules() {
+        guard candidates.contains(modulePath), let glu = module as? SwitchGLU else {
+            continue
+        }
+        if glu.hasFusedGateUp != fused {
+            let twin = fused ? glu.fusingGateUp() : glu.splittingGateUp()
+            root.update(modules: ModuleChildren.unflattened([(modulePath, twin)]))
+        }
+        return
+    }
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
