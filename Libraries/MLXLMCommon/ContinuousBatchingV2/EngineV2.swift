@@ -120,6 +120,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let gauges: CBv2EngineGauges
     private let layerKinds: [CBv2LayerKind]
     private let requiredPositionAxisCount: Int?
+    private let supportsPositionedForwarding: Bool
     private let samplerSupportsTokenConstraints: Bool
     /// Non-nil only when active (instance supplied AND
     /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
@@ -196,6 +197,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.layerKinds = layerKinds
         self.requiredPositionAxisCount =
             (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
+        self.supportsPositionedForwarding = Self.modelSupportsPositionedForwarding(model)
         self.backend = backend
         self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints
         let modelCapabilities =
@@ -406,6 +408,29 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         }
     }
 
+    /// A positioned multimodal request exercises two seams: embedding
+    /// prefill and token decode. Structural conformance must prove both, and
+    /// runtime-capability adapters must additionally confirm that their
+    /// wrapped model implements both. This makes the execution guards
+    /// invariant assertions rather than request-dependent fatal paths.
+    private static func modelSupportsPositionedForwarding(
+        _ model: CBv2SteppableModel
+    ) -> Bool {
+        guard
+            (model as? any CBv2PositionedForwardingCapabilityProviding)?
+                .supportsPositionedForwarding == true
+        else { return false }
+
+        if let recurrent = model as? any CBv2RecurrentSteppableModel,
+            recurrent.recurrentStateSpec != nil
+        {
+            return model is any CBv2PositionedRecurrentSteppableModel
+                && model is any CBv2PositionedMultimodalSteppableModel
+        }
+        return model is any CBv2PositionedSteppableModel
+            && model is any CBv2PositionedEmbeddingSteppableModel
+    }
+
     private func validateRequest(_ request: CBv2Request) throws {
         if let positions = request.positionState {
             guard positions.promptLength == request.promptTokens.count else {
@@ -422,6 +447,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             {
                 throw CBv2MultimodalError.invalidSpans(
                     "position axes \(positions.axisCount) != model axes \(requiredAxes)")
+            }
+            guard supportsPositionedForwarding else {
+                throw CBv2MultimodalError.unsupportedModel(
+                    "request-owned positions require positioned model forwarding")
             }
         }
         if request.multimodal?.attention == .causal, request.positionState == nil {

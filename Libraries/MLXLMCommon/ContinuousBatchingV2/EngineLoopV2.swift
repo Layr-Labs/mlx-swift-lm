@@ -1994,6 +1994,21 @@ public final class EngineLoopV2: @unchecked Sendable {
             recurrentModel.recurrentStateSpec != nil
         else {
             if let inputEmbeddings {
+                if positionIds != nil {
+                    guard
+                        let positioned = model as? any CBv2PositionedEmbeddingSteppableModel
+                    else {
+                        preconditionFailure(
+                            "CBv2 positioned embedding forward reached an unsupported model")
+                    }
+                    let logits = positioned.forward(
+                        tokens: tokens, inputEmbeddings: inputEmbeddings,
+                        caches: caches, positionIds: positionIds)
+                    return (
+                        requirement.map { narrowPrefillOutput(logits, requirement: $0) }
+                            ?? logits,
+                        [:], [])
+                }
                 guard let multimodal = model as? any CBv2MultimodalSteppableModel else {
                     preconditionFailure("CBv2 embedding forward reached an unsupported model")
                 }
@@ -2001,6 +2016,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                     tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
                 return (
                     requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
+                    [:], [])
+            }
+            if positionIds != nil {
+                guard let positioned = model as? CBv2PositionedSteppableModel else {
+                    preconditionFailure(
+                        "CBv2 positioned attention forward reached an unsupported model")
+                }
+                let logits = positioned.forward(
+                    tokens: tokens, caches: caches, positionIds: positionIds)
+                return (
+                    requirement.map { narrowPrefillOutput(logits, requirement: $0) }
+                        ?? logits,
                     [:], [])
             }
             let logits = model.forward(tokens: tokens, caches: caches)
@@ -2534,11 +2561,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
                 cacheInnerState.append(contentsOf: forward.innerState)
             } else {
-                if let recurrentModel = model as? any CBv2RecurrentSteppableModel,
-                    recurrentModel.recurrentStateSpec != nil
+                let positions = rec.request.positionState?.promptSlice(
+                    row.start ..< row.start + row.count)
+                if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+                    || positions != nil
                 {
-                    let positions = rec.request.positionState?.promptSlice(
-                        row.start ..< row.start + row.count)
                     let forward = targetForward(
                         tokens: inputs, caches: caches, ids: [rec.id],
                         positionIds: positions, requirement: requirement)
@@ -2670,6 +2697,27 @@ public final class EngineLoopV2: @unchecked Sendable {
         defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
         let positions = scheduler.record(for: id)?.request.positionState?.promptSlice(
             start ..< start + count)
+        let deepstack = multimodal.deepstackInChunk(
+            start: start, count: count, hidden: spliced.dim(-1), dtype: spliced.dtype)
+        if !deepstack.isEmpty {
+            precondition(
+                (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
+                "CBv2 DeepStack currently supports attention-only models")
+            guard let deepstackModel = model as? CBv2DeepstackMultimodalSteppableModel
+            else {
+                preconditionFailure(
+                    "CBv2 DeepStack embeddings reached an unsupported model")
+            }
+            let full = deepstackModel.forward(
+                tokens: tokens,
+                inputEmbeddings: spliced,
+                deepstackEmbeddings: deepstack,
+                caches: caches,
+                positionIds: positions)
+            return (
+                narrowPrefillOutput(full, requirement: requirement),
+                [:], [])
+        }
         if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
             positions == nil
         {

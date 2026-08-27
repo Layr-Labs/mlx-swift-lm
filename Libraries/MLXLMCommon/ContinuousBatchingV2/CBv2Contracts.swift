@@ -206,6 +206,20 @@ public struct CBv2PositionState: @unchecked Sendable {
 public protocol CBv2PositionAxisProviding {
     var cbv2PositionAxisCount: Int? { get }
 }
+/// Runtime positioned-forwarding capability used by request admission.
+///
+/// Positioned steppable protocols provide `true` by default. Generic
+/// adapters over arbitrary language models override this with the wrapped
+/// model's actual forwarding seam so structural adapter conformance cannot
+/// admit a request that would trap during execution.
+public protocol CBv2PositionedForwardingCapabilityProviding {
+    var supportsPositionedForwarding: Bool { get }
+}
+
+extension CBv2PositionedForwardingCapabilityProviding {
+    public var supportsPositionedForwarding: Bool { true }
+}
+
 
 // MARK: - Multimodal input (vision prefill; additive)
 
@@ -261,16 +275,22 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     public var positionState: CBv2PositionState?
     /// Embeddings provider — one array per span, same order as `spans`.
     public var embeddings: () throws -> [MLXArray]
+    /// Optional Qwen DeepStack provider. The outer array is ordered by
+    /// language-layer injection point; each inner array is one embedding per
+    /// span, in the same order as `spans`.
+    public var deepstackEmbeddings: (() throws -> [[MLXArray]])?
 
     public init(
         spans: [CBv2ImageSpan],
         attention: CBv2MultimodalAttention = .bidirectionalSpans,
         positionState: CBv2PositionState? = nil,
+        deepstackEmbeddings: (() throws -> [[MLXArray]])? = nil,
         embeddings: @escaping () throws -> [MLXArray]
     ) {
         self.spans = spans
         self.attention = attention
         self.positionState = positionState
+        self.deepstackEmbeddings = deepstackEmbeddings
         self.embeddings = embeddings
     }
 }
