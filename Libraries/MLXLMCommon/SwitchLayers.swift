@@ -343,7 +343,18 @@ public func fuseSwitchGLUGateUpWeights(
         if let table = perLayerQuantization {
             let gate = resolvedQuantization(for: "\(base)gate_proj", in: table)
             let up = resolvedQuantization(for: "\(base)up_proj", in: table)
-            if gate != up {
+            let sameEffectivePolicy: Bool
+            switch (gate, up) {
+            case (nil, nil):
+                sameEffectivePolicy = true
+            case (let gate?, let up?):
+                sameEffectivePolicy =
+                    gate.groupSize == up.groupSize && gate.bits == up.bits
+                    && gate.mode == up.mode
+            default:
+                sameEffectivePolicy = false
+            }
+            if !sameEffectivePolicy {
                 blocker = "gate and up resolve to different quantization policies"
             }
         }

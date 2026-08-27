@@ -541,6 +541,38 @@ struct Qwen35FusedGateUpTests {
         #expect(fused["\(prefix).gate_proj.weight"] == nil)
     }
 
+    @Test func implicitAndExplicitAffinePoliciesFuse() {
+        let prefix = "model.layers.0.mlp.switch_mlp"
+        let implicitAffine = BaseConfiguration.Quantization(groupSize: 32, bits: 4)
+        let explicitAffine =
+            BaseConfiguration.Quantization(groupSize: 32, bits: 4, mode: .affine)
+        #expect(implicitAffine.mode == explicitAffine.mode)
+        #expect(implicitAffine != explicitAffine)
+
+        let table = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(prefix).gate_proj": .quantize(implicitAffine),
+                "\(prefix).up_proj": .quantize(explicitAffine),
+            ])
+        let source = MLXRandom.normal([4, 64, 128]).asType(.bfloat16)
+        let half = quantized(source, groupSize: 32, bits: 4, mode: .affine)
+        let fused = qwen35FuseSwitchMLPGateUp(
+            weights: [
+                "\(prefix).gate_proj.weight": half.wq,
+                "\(prefix).gate_proj.scales": half.scales,
+                "\(prefix).gate_proj.biases": half.biases!,
+                "\(prefix).up_proj.weight": half.wq,
+                "\(prefix).up_proj.scales": half.scales,
+                "\(prefix).up_proj.biases": half.biases!,
+            ],
+            perLayerQuantization: table)
+
+        #expect(fused["\(prefix).gate_up_proj.weight"] != nil)
+        #expect(fused["\(prefix).gate_proj.weight"] == nil)
+        #expect(fused["\(prefix).up_proj.weight"] == nil)
+    }
+
     /// PR #107 P2 comment scenario, end to end: a Qwen35TextModel loading a
     /// mixed checkpoint (layer 0 heterogeneous 4-bit gate / 8-bit up, layer 1
     /// homogeneous 4-bit) reshapes ONLY layer 0's SwitchGLU to split modules,
