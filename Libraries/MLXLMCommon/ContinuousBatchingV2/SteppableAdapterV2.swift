@@ -48,6 +48,19 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
         (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
     }
 }
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionedSteppableModel {
+    public func forward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let positioned = model as? CBv2PositionedLanguageModelForwardable else {
+            preconditionFailure(
+                "CBv2 positioned attention forward reached an unsupported model")
+        }
+        return positioned.cbv2Forward(
+            tokens, cache: asKVCaches(caches), positionIds: positionIds)
+    }
+}
 
 // MARK: - Request-owned recurrent state
 
@@ -246,6 +259,49 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
         }
         return embeddable.embeddingForward(
             tokens, inputEmbedding: inputEmbeddings, cache: asKVCaches(caches))
+    }
+}
+extension CBv2SteppableLanguageModelAdapter: CBv2DeepstackMultimodalSteppableModel {
+    public var deepstackLayerCount: Int {
+        (model as? CBv2DeepstackEmbeddingForwardable)?.deepstackLayerCount ?? 0
+    }
+
+    public func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        deepstackEmbeddings: [MLXArray],
+        caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let deepstack = model as? CBv2DeepstackEmbeddingForwardable else {
+            preconditionFailure(
+                "CBv2 DeepStack forward reached a model without DeepStack support")
+        }
+        return deepstack.embeddingForward(
+            tokens,
+            inputEmbedding: inputEmbeddings,
+            deepstackEmbeddings: deepstackEmbeddings,
+            cache: asKVCaches(caches),
+            positionIds: positionIds)
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionedEmbeddingSteppableModel {
+    public func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let positioned = model as? CBv2PositionedEmbeddingForwardable else {
+            preconditionFailure(
+                "CBv2 positioned embedding forward reached an unsupported model")
+        }
+        return positioned.embeddingForward(
+            tokens,
+            inputEmbedding: inputEmbeddings,
+            cache: asKVCaches(caches),
+            positionIds: positionIds)
     }
 }
 

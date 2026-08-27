@@ -261,16 +261,22 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     public var positionState: CBv2PositionState?
     /// Embeddings provider — one array per span, same order as `spans`.
     public var embeddings: () throws -> [MLXArray]
+    /// Optional Qwen DeepStack provider. The outer array is ordered by
+    /// language-layer injection point; each inner array is one embedding per
+    /// span, in the same order as `spans`.
+    public var deepstackEmbeddings: (() throws -> [[MLXArray]])?
 
     public init(
         spans: [CBv2ImageSpan],
         attention: CBv2MultimodalAttention = .bidirectionalSpans,
         positionState: CBv2PositionState? = nil,
+        deepstackEmbeddings: (() throws -> [[MLXArray]])? = nil,
         embeddings: @escaping () throws -> [MLXArray]
     ) {
         self.spans = spans
         self.attention = attention
         self.positionState = positionState
+        self.deepstackEmbeddings = deepstackEmbeddings
         self.embeddings = embeddings
     }
 }

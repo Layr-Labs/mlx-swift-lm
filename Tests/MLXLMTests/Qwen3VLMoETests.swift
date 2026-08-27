@@ -4,6 +4,8 @@ import MLXNN
 import XCTest
 
 @testable import MLXVLM
+@testable import MLXLMCommon
+
 
 final class Qwen3VLMoETests: XCTestCase {
     func testPublishedMoEGeometryDecodes() throws {
@@ -148,6 +150,116 @@ final class Qwen3VLMoETests: XCTestCase {
         for (actual, expected) in zip(actualOutput, reference.output) {
             XCTAssertEqual(actual, expected, accuracy: 2e-5)
         }
+    }
+
+    func testCBv2LayerKindsAndCapabilitiesAreConservative() throws {
+        let model = Qwen3VL(try decodeConfiguration(tinyDenseConfigurationJSON))
+
+        XCTAssertEqual(
+            model.cbv2LayerKinds,
+            [
+                CBv2LayerKind(
+                    attention: .full, headDim: 8, kvHeads: 1, queryHeads: 1,
+                    modelLayerIndex: 0)
+            ])
+        XCTAssertEqual(
+            model.cbv2Capabilities,
+            CBv2ModelCapabilities(
+                supportsPrefixReuse: false,
+                supportsPagedKV: false,
+                supportsCompiledDecode: false,
+                supportsPackedPrefill: false,
+                supportsMTP: false))
+        XCTAssertEqual(model.cbv2PositionAxisCount, 3)
+        XCTAssertEqual(model.imagePlaceholderTokenId, model.config.imageTokenIndex)
+        XCTAssertEqual(model.videoPlaceholderTokenId, model.config.videoTokenIndex)
+    }
+
+    func testPositionResultRejectsImageGridWithoutMatchingPlaceholderRun() throws {
+        let model = Qwen3VL(try decodeConfiguration(tinyDenseConfigurationJSON))
+
+        XCTAssertThrowsError(
+            try model.positionResult(
+                tokens: MLXArray([Int32(1), 2, 3]),
+                imageGrids: [THW(1, 2, 2)])
+        ) { error in
+            XCTAssertEqual(
+                error as? Qwen35PositionSeamError,
+                .visualTokenRunMismatch(
+                    kind: "image", gridIndex: 0, expected: 4, actual: 0))
+        }
+    }
+
+    func testImageFeatureSeamRejectsWrongFlattenedPatchShape() throws {
+        let model = Qwen3VL(try decodeConfiguration(tinyDenseConfigurationJSON))
+
+        XCTAssertThrowsError(
+            try model.cbv2VisionFeatures(
+                imagePixels: MLXArray.zeros([4, 11]),
+                imageGrids: [THW(1, 2, 2)]))
+    }
+
+    func testQuantizedImageFeaturesUseEmbeddingActivationDType() throws {
+        let quantizableJSON = tinyDenseConfigurationJSON
+            .replacingOccurrences(of: "\"hidden_size\": 8", with: "\"hidden_size\": 32")
+            .replacingOccurrences(of: "\"out_hidden_size\": 8", with: "\"out_hidden_size\": 32")
+            .replacingOccurrences(of: "\"head_dim\": 8", with: "\"head_dim\": 32")
+        let model = Qwen3VL(try decodeConfiguration(quantizableJSON))
+        let embedding = model.languageModel.model.embedTokens
+        quantize(
+            model: model, groupSize: 32, bits: 4,
+            filter: { _, layer in layer === embedding })
+        XCTAssertTrue(model.languageModel.model.embedTokens is QuantizedEmbedding)
+
+        let activationDType = model.scaledInputEmbeddings(
+            MLXArray([Int32(0)]).reshaped([1, 1])
+        ).dtype
+        let vision = try model.cbv2VisionFeatures(
+            imagePixels: MLXArray.zeros([4, 12]),
+            imageGrids: [THW(1, 2, 2)])
+
+        XCTAssertEqual(vision.features.map(\.dtype), [activationDType])
+        XCTAssertNotEqual(model.languageModel.model.embedTokens.weight.dtype, activationDType)
+    }
+
+    func testCBv2DecodePositionsUseEveryRowsOffsetAndDelta() {
+        let first = CBv2PositionState(
+            promptPositionIds: MLXArray.zeros([3, 1, 1], dtype: .int32),
+            decodeDeltas: [-2])
+        let second = CBv2PositionState(
+            promptPositionIds: MLXArray.zeros([3, 1, 1], dtype: .int32),
+            decodeDeltas: [5])
+
+        let positions = CBv2PositionState.decodePositionIds(
+            states: [first, second], cacheOffsets: [10, 20], length: 2)!
+        eval(positions)
+
+        XCTAssertEqual(positions.shape, [3, 2, 2])
+        XCTAssertEqual(
+            positions.asArray(Int32.self),
+            [8, 9, 25, 26, 8, 9, 25, 26, 8, 9, 25, 26])
+    }
+
+    func testDenseOrdinaryForwardRetainsLegacyPath() throws {
+        let model = Qwen3VL(try decodeConfiguration(tinyDenseConfigurationJSON))
+        let tokens = MLXArray([Int32(1), Int32(2), Int32(3)]).reshaped([1, 3])
+
+        let actual = model(tokens, cache: nil)
+        let expected = model.languageModel(
+            tokens,
+            cache: nil,
+            inputEmbeddings: nil,
+            mask: nil,
+            positionIds: nil,
+            visualMask: nil,
+            deepstackEmbeds: nil,
+            pixelValues: nil,
+            imageGridTHW: nil,
+            videoGridTHW: nil).logits
+        eval(actual, expected)
+
+        XCTAssertEqual(actual.shape, expected.shape)
+        XCTAssertEqual(actual.asArray(Float.self), expected.asArray(Float.self))
     }
 
     private func decodeConfiguration(_ json: String) throws -> Qwen3VLConfiguration {

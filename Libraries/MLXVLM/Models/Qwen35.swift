@@ -317,7 +317,7 @@ public struct Qwen35PositionState: Sendable, Equatable {
     public let deltas: [Int32]
     public var batchSize: Int { deltas.count }
 
-    fileprivate init(deltas: [Int32]) {
+    public init(deltas: [Int32]) {
         self.deltas = deltas
     }
 
@@ -347,7 +347,7 @@ public struct Qwen35PositionResult: @unchecked Sendable {
     public let decodeState: Qwen35PositionState
     public let promptLength: Int
 
-    fileprivate init(
+    public init(
         promptPositionIds: MLXArray,
         decodeState: Qwen35PositionState,
         promptLength: Int
