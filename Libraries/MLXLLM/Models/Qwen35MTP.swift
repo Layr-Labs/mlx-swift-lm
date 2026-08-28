@@ -4,6 +4,7 @@
 //   patches/mlx_lm_mtp/qwen35_model.py  (MTPDecoderLayer, MTPModule)
 //   patches/mlx_lm_mtp/__init__.py        (is_mtp_active / set_mtp_active)
 
+import CoreFoundation
 import Foundation
 import MLX
 import MLXLMCommon
@@ -55,8 +56,13 @@ struct Qwen35InlineMTPMetadata: Sendable {
     let textConfiguration: Qwen35TextConfiguration
     let prefix: String
     let blockSize: Int
-    let defaultQuantization: BaseConfiguration.Quantization?
-    let quantizationByPath: [String: BaseConfiguration.Quantization]
+    let quantization: BaseConfiguration.PerLayerQuantization?
+
+    func resolvedQuantization(
+        for path: String
+    ) -> BaseConfiguration.Quantization? {
+        quantization?.quantization(layer: path)
+    }
 }
 
 // MARK: - MTP history KV
@@ -407,13 +413,13 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             return String(key.dropLast(".scales".count))
         })
         for path in scaledPaths
-        where metadata.quantizationByPath[path] == nil && metadata.defaultQuantization == nil {
+        where metadata.resolvedQuantization(for: path) == nil {
             throw Qwen35InlineMTPError.missingQuantization(path)
         }
         if !scaledPaths.isEmpty {
             quantize(model: assistant.mtp) { path, _ in
                 guard scaledPaths.contains(path) else { return nil }
-                return (metadata.quantizationByPath[path] ?? metadata.defaultQuantization)?.asTuple
+                return metadata.resolvedQuantization(for: path)?.asTuple
             }
         }
 
@@ -432,6 +438,56 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             "target type \(String(describing: type(of: target))) is not Qwen3.5/3.6")
     }
 
+    private static let globalQuantizationKeys: Set<String> = [
+        "group_size", "bits", "mode"
+    ]
+
+    /// Scalar keys understood or deliberately ignored by
+    /// `BaseConfiguration.QuantizationContainer`; all other keys name modules.
+    private static let quantizationMetadataKeys =
+        globalQuantizationKeys.union([
+            "quant_method", "linear_class", "quantization_mode"
+        ])
+
+    private static func decodeQuantization(
+        _ rawQuantization: [String: Any]
+    ) throws -> BaseConfiguration.PerLayerQuantization {
+        var perLayer = [String: BaseConfiguration.QuantizationOption]()
+        for (path, raw) in rawQuantization
+        where !quantizationMetadataKeys.contains(path) {
+            if CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
+                guard (raw as? Bool) == false else {
+                    throw Qwen35InlineMTPError.invalidConfiguration(
+                        "quantization entry \(path) must be false or an object")
+                }
+                perLayer[path] = .skip
+            } else {
+                guard let object = raw as? [String: Any] else {
+                    throw Qwen35InlineMTPError.invalidConfiguration(
+                        "quantization entry \(path) must be false or an object")
+                }
+                let data = try JSONSerialization.data(withJSONObject: object)
+                perLayer[path] = .quantize(
+                    try JSONDecoder().decode(
+                        BaseConfiguration.Quantization.self, from: data))
+            }
+        }
+
+        let hasGlobalQuantization = rawQuantization.keys.contains {
+            globalQuantizationKeys.contains($0)
+        }
+        let global: BaseConfiguration.Quantization?
+        if hasGlobalQuantization {
+            let data = try JSONSerialization.data(withJSONObject: rawQuantization)
+            global = try JSONDecoder().decode(
+                BaseConfiguration.Quantization.self, from: data)
+        } else {
+            global = nil
+        }
+        return BaseConfiguration.PerLayerQuantization(
+            quantization: global, perLayerQuantization: perLayer)
+    }
+
     static func loadMetadata(from directory: URL) throws -> Qwen35InlineMTPMetadata {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -443,7 +499,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 
         let prefix: String
         let blockSize: Int
-        let rawQuantization: [String: Any]
+        let rawQuantization: [String: Any]?
         if let inline = root["mtplx_mtp"] as? [String: Any],
             inline["included"] as? Bool == true
         {
@@ -467,13 +523,15 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             }
             prefix = ""
             blockSize = (root["block_size"] as? NSNumber)?.intValue ?? 3
-            guard let quantization = (root["quantization"] ?? root["quantization_config"])
-                as? [String: Any]
-            else {
-                throw Qwen35InlineMTPError.invalidConfiguration(
-                    "standalone MTP quantization is required")
+            if let raw = root["quantization"] ?? root["quantization_config"] {
+                guard let quantization = raw as? [String: Any] else {
+                    throw Qwen35InlineMTPError.invalidConfiguration(
+                        "standalone MTP quantization must be an object")
+                }
+                rawQuantization = quantization
+            } else {
+                rawQuantization = nil
             }
-            rawQuantization = quantization
         }
         guard (2...8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
@@ -489,36 +547,17 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 "mtp_num_hidden_layers must be within 1...4")
         }
 
-        var quantizationByPath: [String: BaseConfiguration.Quantization] = [:]
-        let defaultKeys = ["group_size", "bits", "mode"]
-        let defaultObject = Dictionary(
-            uniqueKeysWithValues: defaultKeys.compactMap { key in
-                rawQuantization[key].map { (key, $0) }
-            })
-        let defaultQuantization: BaseConfiguration.Quantization?
-        if defaultObject.isEmpty {
-            defaultQuantization = nil
+        let quantization: BaseConfiguration.PerLayerQuantization?
+        if let rawQuantization, !rawQuantization.isEmpty {
+            quantization = try decodeQuantization(rawQuantization)
         } else {
-            let data = try JSONSerialization.data(withJSONObject: defaultObject)
-            defaultQuantization = try JSONDecoder().decode(
-                BaseConfiguration.Quantization.self, from: data)
-        }
-        for (path, raw) in rawQuantization {
-            guard path.contains(".") else { continue }
-            guard let object = raw as? [String: Any] else {
-                throw Qwen35InlineMTPError.invalidConfiguration(
-                    "quantization entry \(path) is not an object")
-            }
-            let quantizationData = try JSONSerialization.data(withJSONObject: object)
-            quantizationByPath[path] = try JSONDecoder().decode(
-                BaseConfiguration.Quantization.self, from: quantizationData)
+            quantization = nil
         }
         return Qwen35InlineMTPMetadata(
             textConfiguration: configuration,
             prefix: prefix,
             blockSize: blockSize,
-            defaultQuantization: defaultQuantization,
-            quantizationByPath: quantizationByPath)
+            quantization: quantization)
     }
 
     private struct WeightIndex: Decodable {
@@ -571,7 +610,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         return weights
     }
 
-    private static func loadStandaloneWeights(
+    static func loadStandaloneWeights(
         from directory: URL
     ) throws -> [String: MLXArray] {
         let urls: [URL]

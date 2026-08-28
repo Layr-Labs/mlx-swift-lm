@@ -81,6 +81,55 @@ private func qwenStandaloneMTPConfig(blockSize: Int = 3) -> Data {
         """.utf8)
 }
 
+private func qwenStandaloneMTPConfig(quantization: Any?) throws -> Data {
+    var root = try #require(
+        try JSONSerialization.jsonObject(with: qwenStandaloneMTPConfig()) as? [String: Any])
+    if let quantization {
+        root["quantization"] = quantization
+    } else {
+        root.removeValue(forKey: "quantization")
+    }
+    return try JSONSerialization.data(withJSONObject: root)
+}
+
+private func qwenSmallStandaloneMTPConfig(quantization: Any?) throws -> Data {
+    var root = try #require(
+        try JSONSerialization.jsonObject(with: qwenInlineMTPConfig()) as? [String: Any])
+    var text = try #require(root["text_config"] as? [String: Any])
+    text["model_type"] = "qwen3_5_text"
+    root["model_type"] = "qwen3_5_mtp"
+    root["block_size"] = 3
+    root["text_config"] = text
+    root.removeValue(forKey: "mtplx_mtp")
+    root.removeValue(forKey: "mtplx_mtp_quantization")
+    if let quantization {
+        root["quantization"] = quantization
+    }
+    return try JSONSerialization.data(withJSONObject: root)
+}
+
+private func qwenTextConfiguration(from data: Data) throws -> Qwen35TextConfiguration {
+    let root = try #require(
+        try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    return try JSONDecoder.json5().decode(
+        Qwen35TextConfiguration.self,
+        from: try JSONSerialization.data(withJSONObject: root["text_config"]!))
+}
+
+private func withStandaloneMTPDirectory(
+    config: Data,
+    weights: [String: MLXArray],
+    _ body: (URL) throws -> Void
+) throws {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("qwen-standalone-mtp-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    try config.write(to: directory.appendingPathComponent("config.json"))
+    try save(arrays: weights, url: directory.appendingPathComponent("model.safetensors"))
+    try body(directory)
+}
+
 private func withInlineMTPDirectory(
     blockSize: Int = 3,
     weights: [String: MLXArray] = ["mtp.unexpected.weight": MLXArray([Float(1)])],
@@ -177,10 +226,88 @@ struct Qwen35InlineMTPLoaderTests {
     func defaultQuantization() throws {
         try withInlineMTPDirectory { directory in
             let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
-            #expect(metadata.defaultQuantization?.groupSize == 32)
-            #expect(metadata.defaultQuantization?.bits == 8)
-            #expect(metadata.defaultQuantization?.mode == .mxfp8)
-            #expect(metadata.quantizationByPath["layers.0.self_attn.q_proj"] != nil)
+            let fallback = metadata.resolvedQuantization(for: "fc")
+            #expect(fallback?.groupSize == 32)
+            #expect(fallback?.bits == 8)
+            #expect(fallback?.mode == .mxfp8)
+            #expect(
+                metadata.resolvedQuantization(
+                    for: "layers.0.self_attn.q_proj")?.mode == .mxfp8)
+        }
+    }
+
+    @Test("per-layer-only quantization resolves without a global fallback")
+    func perLayerOnlyQuantization() throws {
+        let path = "layers.0.self_attn.q_proj"
+        var root = try #require(
+            try JSONSerialization.jsonObject(with: qwenInlineMTPConfig())
+                as? [String: Any])
+        root["mtplx_mtp_quantization"] = [
+            "quant_method": "mlx",
+            "linear_class": "QuantizedLinear",
+            "quantization_mode": "mixed",
+            path: [
+                "group_size": 32,
+                "bits": 8,
+                "mode": "mxfp8",
+            ],
+        ]
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen-inline-mtp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try JSONSerialization.data(withJSONObject: root)
+            .write(to: directory.appendingPathComponent("config.json"))
+
+        let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+        #expect(metadata.quantization?.quantization == nil)
+        #expect(
+            metadata.resolvedQuantization(for: path)
+                == BaseConfiguration.Quantization(
+                    groupSize: 32, bits: 8, mode: .mxfp8))
+        #expect(metadata.resolvedQuantization(for: "fc") == nil)
+    }
+
+    @Test("per-layer quantization overrides the global fallback")
+    func perLayerQuantizationOverridesGlobal() throws {
+        let path = "layers.0.self_attn.q_proj"
+        let config = try qwenStandaloneMTPConfig(quantization: [
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            path: [
+                "group_size": 32,
+                "bits": 8,
+                "mode": "mxfp8",
+            ],
+        ])
+        try withStandaloneMTPDirectory(
+            config: config, weights: ["placeholder": MLXArray([Float(0)])]
+        ) { directory in
+            let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+            let override = metadata.resolvedQuantization(for: path)
+            #expect(override?.groupSize == 32)
+            #expect(override?.bits == 8)
+            #expect(override?.mode == .mxfp8)
+        }
+    }
+
+    @Test("incomplete global quantization metadata is rejected")
+    func incompleteGlobalQuantizationIsRejected() throws {
+        let incomplete: [[String: Any]] = [
+            ["group_size": 64],
+            ["bits": 4],
+            ["mode": "mxfp8"],
+        ]
+        for quantization in incomplete {
+            let config = try qwenStandaloneMTPConfig(quantization: quantization)
+            try withStandaloneMTPDirectory(
+                config: config, weights: ["placeholder": MLXArray([Float(0)])]
+            ) { directory in
+                #expect(throws: (any Error).self) {
+                    _ = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+                }
+            }
         }
     }
 
@@ -196,12 +323,232 @@ struct Qwen35InlineMTPLoaderTests {
         let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
         #expect(metadata.prefix.isEmpty)
         #expect(metadata.blockSize == 3)
-        #expect(metadata.defaultQuantization?.groupSize == 64)
-        #expect(metadata.defaultQuantization?.bits == 4)
-        #expect(metadata.defaultQuantization?.mode == .affine)
+        let fallback = metadata.quantization?.quantization(layer: "fc")
+        #expect(fallback?.groupSize == 64)
+        #expect(fallback?.bits == 4)
+        #expect(fallback?.mode == .affine)
         #expect(metadata.textConfiguration.modelType == "qwen3_5_text")
         #expect(metadata.textConfiguration.hiddenLayers == 64)
         #expect(metadata.textConfiguration.mtpNumHiddenLayers == 1)
+    }
+
+    @Test("dotted false quantization entries suppress the global fallback")
+    func dottedFalseQuantizationEntryIsSkip() throws {
+        let path = "layers.0.self_attn.q_norm"
+        let config = try qwenStandaloneMTPConfig(quantization: [
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            path: false,
+        ])
+        try withStandaloneMTPDirectory(
+            config: config, weights: ["placeholder": MLXArray([Float(0)])]
+        ) { directory in
+            let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+            #expect(metadata.resolvedQuantization(for: path) == nil)
+            let fallback = metadata.resolvedQuantization(for: "fc")
+            #expect(fallback?.groupSize == 64)
+            #expect(fallback?.bits == 4)
+            #expect(fallback?.mode == .affine)
+        }
+    }
+
+    @Test("undotted false quantization entries suppress the global fallback")
+    func undottedFalseQuantizationEntryIsSkip() throws {
+        let config = try qwenStandaloneMTPConfig(quantization: [
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            "fc": false,
+        ])
+        try withStandaloneMTPDirectory(
+            config: config, weights: ["placeholder": MLXArray([Float(0)])]
+        ) { directory in
+            let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+            #expect(metadata.resolvedQuantization(for: "fc") == nil)
+            let fallback = metadata.resolvedQuantization(
+                for: "layers.0.self_attn.q_proj")
+            #expect(fallback?.groupSize == 64)
+            #expect(fallback?.bits == 4)
+            #expect(fallback?.mode == .affine)
+        }
+    }
+
+    @Test("dotted true, string, and number quantization entries are rejected")
+    func malformedDottedQuantizationEntriesAreRejected() throws {
+        let path = "layers.0.self_attn.q_norm"
+        for malformed in [true as Any, "false" as Any, 0 as Any] {
+            let config = try qwenStandaloneMTPConfig(quantization: [
+                "group_size": 64,
+                "bits": 4,
+                path: malformed,
+            ])
+            try withStandaloneMTPDirectory(
+                config: config, weights: ["placeholder": MLXArray([Float(0)])]
+            ) { directory in
+                #expect(throws: (any Error).self) {
+                    _ = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+                }
+            }
+        }
+    }
+
+    @Test("undotted fc true, string, number, array, and null are rejected")
+    func malformedUndottedFCQuantizationEntriesAreRejected() throws {
+        let malformed: [Any] = [true, "false", 0, [false], NSNull()]
+        for value in malformed {
+            let config = try qwenStandaloneMTPConfig(quantization: [
+                "group_size": 64,
+                "bits": 4,
+                "fc": value,
+            ])
+            try withStandaloneMTPDirectory(
+                config: config, weights: ["placeholder": MLXArray([Float(0)])]
+            ) { directory in
+                do {
+                    _ = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+                    Issue.record("malformed fc quantization entry was accepted")
+                } catch let error as Qwen35InlineMTPError {
+                    #expect(
+                        error == .invalidConfiguration(
+                            "quantization entry fc must be false or an object"))
+                } catch {
+                    Issue.record("unexpected error: \(error)")
+                }
+            }
+        }
+    }
+
+    @Test("absent and empty standalone quantization mean unquantized")
+    func standaloneQuantizationMayBeAbsentOrEmpty() throws {
+        let configurations = [
+            try qwenStandaloneMTPConfig(quantization: nil),
+            try qwenStandaloneMTPConfig(quantization: [String: Any]()),
+        ]
+        for config in configurations {
+            try withStandaloneMTPDirectory(
+                config: config, weights: ["placeholder": MLXArray([Float(0)])]
+            ) { directory in
+                let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+                #expect(metadata.quantization == nil)
+            }
+        }
+    }
+
+    @Test("standalone BF16 tensors load without quantization metadata")
+    func standaloneBF16LoadsWithoutQuantization() throws {
+        let configData = try qwenSmallStandaloneMTPConfig(quantization: nil)
+        let configuration = try qwenTextConfiguration(from: configData)
+        let donor = Qwen35MTPModule(configuration)
+        let weights = Dictionary(
+            uniqueKeysWithValues: donor.parameters().flattened().map {
+                ($0.0, $0.1.asType(.bfloat16))
+            })
+
+        try withStandaloneMTPDirectory(config: configData, weights: weights) { directory in
+            let target = Qwen35TextModel(configuration)
+            _ = try Qwen35InlineMTPAssistant.load(from: directory, target: target)
+        }
+    }
+
+    @Test("scaled standalone tensors require quantization metadata")
+    func scaledStandaloneWithoutQuantizationIsRejected() throws {
+        let configurations = [
+            try qwenSmallStandaloneMTPConfig(quantization: nil),
+            try qwenSmallStandaloneMTPConfig(quantization: [String: Any]()),
+        ]
+        let weights = [
+            "fc.weight": MLXArray([UInt32(0)]),
+            "fc.scales": MLXArray([Float(1)]),
+            "fc.biases": MLXArray([Float(0)]),
+        ]
+        for configData in configurations {
+            let configuration = try qwenTextConfiguration(from: configData)
+            try withStandaloneMTPDirectory(config: configData, weights: weights) { directory in
+                let target = Qwen35TextModel(configuration)
+                do {
+                    _ = try Qwen35InlineMTPAssistant.load(from: directory, target: target)
+                    Issue.record("scaled standalone artifact loaded without quantization metadata")
+                } catch let error as Qwen35InlineMTPError {
+                    #expect(error == .missingQuantization("fc"))
+                }
+            }
+        }
+    }
+
+    @Test("scaled tensors on explicitly skipped paths are rejected")
+    func scaledStandaloneOnSkippedPathIsRejected() throws {
+        let configData = try qwenSmallStandaloneMTPConfig(quantization: [
+            "group_size": 64,
+            "bits": 4,
+            "mode": "affine",
+            "fc": false,
+        ])
+        let configuration = try qwenTextConfiguration(from: configData)
+        let weights = [
+            "fc.weight": MLXArray([UInt32(0)]),
+            "fc.scales": MLXArray([Float(1)]),
+            "fc.biases": MLXArray([Float(0)]),
+        ]
+        try withStandaloneMTPDirectory(config: configData, weights: weights) { directory in
+            let target = Qwen35TextModel(configuration)
+            do {
+                _ = try Qwen35InlineMTPAssistant.load(from: directory, target: target)
+                Issue.record("scaled standalone artifact loaded on an explicitly skipped path")
+            } catch let error as Qwen35InlineMTPError {
+                #expect(error == .missingQuantization("fc"))
+            }
+        }
+    }
+
+    @Test("the published 31-key quantized path layout maps unchanged")
+    func standaloneQuantizedPathLayoutMapsUnchanged() throws {
+        let paths: Set<String> = [
+            "pre_fc_norm_hidden.weight",
+            "pre_fc_norm_embedding.weight",
+            "fc.weight", "fc.scales", "fc.biases",
+            "layers.0.input_layernorm.weight",
+            "layers.0.post_attention_layernorm.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.self_attn.q_proj.scales",
+            "layers.0.self_attn.q_proj.biases",
+            "layers.0.self_attn.k_proj.weight",
+            "layers.0.self_attn.k_proj.scales",
+            "layers.0.self_attn.k_proj.biases",
+            "layers.0.self_attn.v_proj.weight",
+            "layers.0.self_attn.v_proj.scales",
+            "layers.0.self_attn.v_proj.biases",
+            "layers.0.self_attn.o_proj.weight",
+            "layers.0.self_attn.o_proj.scales",
+            "layers.0.self_attn.o_proj.biases",
+            "layers.0.self_attn.q_norm.weight",
+            "layers.0.self_attn.k_norm.weight",
+            "layers.0.mlp.gate_proj.weight",
+            "layers.0.mlp.gate_proj.scales",
+            "layers.0.mlp.gate_proj.biases",
+            "layers.0.mlp.up_proj.weight",
+            "layers.0.mlp.up_proj.scales",
+            "layers.0.mlp.up_proj.biases",
+            "layers.0.mlp.down_proj.weight",
+            "layers.0.mlp.down_proj.scales",
+            "layers.0.mlp.down_proj.biases",
+            "norm.weight",
+        ]
+        #expect(paths.count == 31)
+        let sortedPaths = paths.sorted()
+        let weights = Dictionary(
+            uniqueKeysWithValues: sortedPaths.enumerated().map {
+                ($0.element, MLXArray([Float($0.offset)]))
+            })
+        try withStandaloneMTPDirectory(
+            config: qwenStandaloneMTPConfig(), weights: weights
+        ) { directory in
+            let loaded = try Qwen35InlineMTPAssistant.loadStandaloneWeights(from: directory)
+            #expect(Set(loaded.keys) == paths)
+            for (offset, path) in sortedPaths.enumerated() {
+                #expect(loaded[path]?.item(Float.self) == Float(offset))
+            }
+        }
     }
 
     @Test("assistant state accounting includes KV, target hidden, and token storage")
