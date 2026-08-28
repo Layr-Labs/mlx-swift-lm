@@ -4,6 +4,7 @@
 //   patches/mlx_lm_mtp/qwen35_model.py  (MTPDecoderLayer, MTPModule)
 //   patches/mlx_lm_mtp/__init__.py        (is_mtp_active / set_mtp_active)
 
+import CoreFoundation
 import Foundation
 import MLX
 import MLXLMCommon
@@ -55,8 +56,13 @@ struct Qwen35InlineMTPMetadata: Sendable {
     let textConfiguration: Qwen35TextConfiguration
     let prefix: String
     let blockSize: Int
-    let defaultQuantization: BaseConfiguration.Quantization?
-    let quantizationByPath: [String: BaseConfiguration.Quantization]
+    let quantization: BaseConfiguration.PerLayerQuantization?
+
+    func resolvedQuantization(
+        for path: String
+    ) -> BaseConfiguration.Quantization? {
+        quantization?.quantization(layer: path)
+    }
 }
 
 // MARK: - MTP history KV
@@ -369,8 +375,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         return logits
     }
 
-    /// Strictly load the inline assistant declared by a combined checkpoint.
-    /// Only indexed keys below the declared prefix are read and retained.
+    /// Strictly load either an inline assistant declared by a combined
+    /// checkpoint or a standalone `qwen3_5_mtp` artifact. Inline artifacts
+    /// read only indexed keys below their declared prefix; standalone
+    /// artifacts read every tensor from their bounded safetensors directory.
     public static func load(
         from modelDirectory: URL,
         target: any LanguageModel,
@@ -387,8 +395,13 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         let metadata = try loadMetadata(from: modelDirectory)
         try validate(metadata.textConfiguration, against: target.configuration)
 
-        let indexed = try loadIndexedWeights(
-            from: modelDirectory, prefix: metadata.prefix)
+        let indexed: [String: MLXArray]
+        if metadata.prefix.isEmpty {
+            indexed = try loadStandaloneWeights(from: modelDirectory)
+        } else {
+            indexed = try loadIndexedWeights(
+                from: modelDirectory, prefix: metadata.prefix)
+        }
         let assistant = Qwen35InlineMTPAssistant(
             configuration: metadata.textConfiguration,
             blockSize: metadata.blockSize,
@@ -400,13 +413,13 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             return String(key.dropLast(".scales".count))
         })
         for path in scaledPaths
-        where metadata.quantizationByPath[path] == nil && metadata.defaultQuantization == nil {
+        where metadata.resolvedQuantization(for: path) == nil {
             throw Qwen35InlineMTPError.missingQuantization(path)
         }
         if !scaledPaths.isEmpty {
             quantize(model: assistant.mtp) { path, _ in
                 guard scaledPaths.contains(path) else { return nil }
-                return (metadata.quantizationByPath[path] ?? metadata.defaultQuantization)?.asTuple
+                return metadata.resolvedQuantization(for: path)?.asTuple
             }
         }
 
@@ -425,22 +438,112 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             "target type \(String(describing: type(of: target))) is not Qwen3.5/3.6")
     }
 
+    private static let globalQuantizationKeys: Set<String> = [
+        "group_size", "bits", "mode"
+    ]
+
+    /// Scalar keys understood or deliberately ignored by
+    /// `BaseConfiguration.QuantizationContainer`; all other keys name modules.
+    private static let quantizationMetadataKeys =
+        globalQuantizationKeys.union([
+            "quant_method", "linear_class", "quantization_mode"
+        ])
+
+    private static func selectedJSONObject(
+        in root: [String: Any],
+        primaryKey: String,
+        fallbackKey: String
+    ) throws -> [String: Any]? {
+        for key in [primaryKey, fallbackKey] {
+            guard let raw = root[key], !(raw is NSNull) else { continue }
+            guard let object = raw as? [String: Any] else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "standalone MTP quantization must be an object")
+            }
+            return object
+        }
+        return nil
+    }
+
+    private static func decodeQuantization(
+        _ rawQuantization: [String: Any]
+    ) throws -> BaseConfiguration.PerLayerQuantization {
+        var perLayer = [String: BaseConfiguration.QuantizationOption]()
+        for (path, raw) in rawQuantization
+        where !quantizationMetadataKeys.contains(path) {
+            if CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
+                guard (raw as? Bool) == false else {
+                    throw Qwen35InlineMTPError.invalidConfiguration(
+                        "quantization entry \(path) must be false or an object")
+                }
+                perLayer[path] = .skip
+            } else {
+                guard let object = raw as? [String: Any] else {
+                    throw Qwen35InlineMTPError.invalidConfiguration(
+                        "quantization entry \(path) must be false or an object")
+                }
+                let data = try JSONSerialization.data(withJSONObject: object)
+                perLayer[path] = .quantize(
+                    try JSONDecoder().decode(
+                        BaseConfiguration.Quantization.self, from: data))
+            }
+        }
+
+        let hasGlobalQuantization = rawQuantization.keys.contains {
+            globalQuantizationKeys.contains($0)
+        }
+        let global: BaseConfiguration.Quantization?
+        if hasGlobalQuantization {
+            let data = try JSONSerialization.data(withJSONObject: rawQuantization)
+            global = try JSONDecoder().decode(
+                BaseConfiguration.Quantization.self, from: data)
+        } else {
+            global = nil
+        }
+        return BaseConfiguration.PerLayerQuantization(
+            quantization: global, perLayerQuantization: perLayer)
+    }
+
     static func loadMetadata(from directory: URL) throws -> Qwen35InlineMTPMetadata {
         let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let inline = root["mtplx_mtp"] as? [String: Any],
-            inline["included"] as? Bool == true,
             let text = root["text_config"] as? [String: Any]
         else {
             throw Qwen35InlineMTPError.invalidConfiguration(
-                "mtplx_mtp.included and text_config are required")
+                "text_config is required")
         }
-        let prefix = (inline["prefix"] as? String) ?? "mtp."
-        guard prefix == "mtp." else {
-            throw Qwen35InlineMTPError.invalidConfiguration(
-                "only the mtp. prefix is supported")
+
+        let prefix: String
+        let blockSize: Int
+        let rawQuantization: [String: Any]?
+        if let inline = root["mtplx_mtp"] as? [String: Any],
+            inline["included"] as? Bool == true
+        {
+            prefix = (inline["prefix"] as? String) ?? "mtp."
+            guard prefix == "mtp." else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "only the mtp. prefix is supported")
+            }
+            blockSize = (inline["block_size"] as? NSNumber)?.intValue ?? 3
+            guard let quantization = root["mtplx_mtp_quantization"] as? [String: Any]
+            else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "mtplx_mtp_quantization is required")
+            }
+            rawQuantization = quantization
+        } else {
+            guard (root["model_type"] as? String)?.lowercased() == "qwen3_5_mtp"
+            else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "mtplx_mtp.included=true or model_type=qwen3_5_mtp is required")
+            }
+            prefix = ""
+            blockSize = (root["block_size"] as? NSNumber)?.intValue ?? 3
+            rawQuantization = try selectedJSONObject(
+                in: root,
+                primaryKey: "quantization",
+                fallbackKey: "quantization_config")
         }
-        let blockSize = (inline["block_size"] as? NSNumber)?.intValue ?? 3
         guard (2...8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
                 "block_size \(blockSize) is outside 2...8")
@@ -455,41 +558,17 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 "mtp_num_hidden_layers must be within 1...4")
         }
 
-        guard let rawQuantization = root["mtplx_mtp_quantization"] as? [String: Any]
-        else {
-            throw Qwen35InlineMTPError.invalidConfiguration(
-                "mtplx_mtp_quantization is required")
-        }
-        var quantizationByPath: [String: BaseConfiguration.Quantization] = [:]
-        let defaultKeys = ["group_size", "bits", "mode"]
-        let defaultObject = Dictionary(
-            uniqueKeysWithValues: defaultKeys.compactMap { key in
-                rawQuantization[key].map { (key, $0) }
-            })
-        let defaultQuantization: BaseConfiguration.Quantization?
-        if defaultObject.isEmpty {
-            defaultQuantization = nil
+        let quantization: BaseConfiguration.PerLayerQuantization?
+        if let rawQuantization, !rawQuantization.isEmpty {
+            quantization = try decodeQuantization(rawQuantization)
         } else {
-            let data = try JSONSerialization.data(withJSONObject: defaultObject)
-            defaultQuantization = try JSONDecoder().decode(
-                BaseConfiguration.Quantization.self, from: data)
-        }
-        for (path, raw) in rawQuantization {
-            guard path.contains(".") else { continue }
-            guard let object = raw as? [String: Any] else {
-                throw Qwen35InlineMTPError.invalidConfiguration(
-                    "quantization entry \(path) is not an object")
-            }
-            let quantizationData = try JSONSerialization.data(withJSONObject: object)
-            quantizationByPath[path] = try JSONDecoder().decode(
-                BaseConfiguration.Quantization.self, from: quantizationData)
+            quantization = nil
         }
         return Qwen35InlineMTPMetadata(
             textConfiguration: configuration,
             prefix: prefix,
             blockSize: blockSize,
-            defaultQuantization: defaultQuantization,
-            quantizationByPath: quantizationByPath)
+            quantization: quantization)
     }
 
     private struct WeightIndex: Decodable {
@@ -539,6 +618,40 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 }
             }
         }
+        return weights
+    }
+
+    static func loadStandaloneWeights(
+        from directory: URL
+    ) throws -> [String: MLXArray] {
+        let urls: [URL]
+        do {
+            urls = try FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles])
+                .filter { $0.pathExtension == "safetensors" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        } catch {
+            throw Qwen35InlineMTPError.invalidWeightIndex(String(describing: error))
+        }
+        guard !urls.isEmpty, urls.count <= 64 else {
+            throw Qwen35InlineMTPError.missingWeights
+        }
+
+        var weights: [String: MLXArray] = [:]
+        for url in urls {
+            let (shard, _) = try loadArraysAndMetadata(url: url)
+            for (key, value) in shard {
+                guard !key.isEmpty, key.utf8.count <= 1024 else {
+                    throw Qwen35InlineMTPError.invalidWeightIndex(
+                        "standalone tensor key is empty or oversized")
+                }
+                guard weights.updateValue(value, forKey: key) == nil else {
+                    throw Qwen35InlineMTPError.duplicateWeight(key)
+                }
+            }
+        }
+        guard !weights.isEmpty else { throw Qwen35InlineMTPError.missingWeights }
         return weights
     }
 
