@@ -82,12 +82,26 @@ private func qwenStandaloneMTPConfig(blockSize: Int = 3) -> Data {
 }
 
 private func qwenStandaloneMTPConfig(quantization: Any?) throws -> Data {
+    try qwenStandaloneMTPConfig(
+        quantization: quantization,
+        quantizationConfig: nil)
+}
+
+private func qwenStandaloneMTPConfig(
+    quantization: Any?,
+    quantizationConfig: Any?
+) throws -> Data {
     var root = try #require(
         try JSONSerialization.jsonObject(with: qwenStandaloneMTPConfig()) as? [String: Any])
     if let quantization {
         root["quantization"] = quantization
     } else {
         root.removeValue(forKey: "quantization")
+    }
+    if let quantizationConfig {
+        root["quantization_config"] = quantizationConfig
+    } else {
+        root.removeValue(forKey: "quantization_config")
     }
     return try JSONSerialization.data(withJSONObject: root)
 }
@@ -416,6 +430,88 @@ struct Qwen35InlineMTPLoaderTests {
                     Issue.record("unexpected error: \(error)")
                 }
             }
+        }
+    }
+
+    @Test("null primary quantization selects quantization_config")
+    func nullPrimaryQuantizationUsesFallback() throws {
+        let config = try qwenStandaloneMTPConfig(
+            quantization: NSNull(),
+            quantizationConfig: [
+                "group_size": 32,
+                "bits": 8,
+                "mode": "mxfp8",
+            ])
+        try withStandaloneMTPDirectory(
+            config: config, weights: ["placeholder": MLXArray([Float(0)])]
+        ) { directory in
+            let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+            let fallback = metadata.resolvedQuantization(for: "fc")
+            #expect(fallback?.groupSize == 32)
+            #expect(fallback?.bits == 8)
+            #expect(fallback?.mode == .mxfp8)
+        }
+    }
+
+    @Test("null primary and fallback quantization mean unquantized")
+    func nullStandaloneQuantizationIsUnquantized() throws {
+        let config = try qwenStandaloneMTPConfig(
+            quantization: NSNull(),
+            quantizationConfig: NSNull())
+        try withStandaloneMTPDirectory(
+            config: config, weights: ["placeholder": MLXArray([Float(0)])]
+        ) { directory in
+            let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+            #expect(metadata.quantization == nil)
+        }
+    }
+
+    @Test("malformed primary quantization does not select a valid fallback")
+    func malformedPrimaryQuantizationIsRejectedBeforeFallback() throws {
+        let config = try qwenStandaloneMTPConfig(
+            quantization: "invalid",
+            quantizationConfig: [
+                "group_size": 32,
+                "bits": 8,
+                "mode": "mxfp8",
+            ])
+        try withStandaloneMTPDirectory(
+            config: config, weights: ["placeholder": MLXArray([Float(0)])]
+        ) { directory in
+            do {
+                _ = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+                Issue.record("malformed primary quantization selected the fallback")
+            } catch let error as Qwen35InlineMTPError {
+                #expect(
+                    error == .invalidConfiguration(
+                        "standalone MTP quantization must be an object"))
+            } catch {
+                Issue.record("unexpected error: \(error)")
+            }
+        }
+    }
+
+    @Test("valid primary quantization takes precedence over fallback")
+    func validPrimaryQuantizationTakesPrecedence() throws {
+        let config = try qwenStandaloneMTPConfig(
+            quantization: [
+                "group_size": 64,
+                "bits": 4,
+                "mode": "affine",
+            ],
+            quantizationConfig: [
+                "group_size": 32,
+                "bits": 8,
+                "mode": "mxfp8",
+            ])
+        try withStandaloneMTPDirectory(
+            config: config, weights: ["placeholder": MLXArray([Float(0)])]
+        ) { directory in
+            let metadata = try Qwen35InlineMTPAssistant.loadMetadata(from: directory)
+            let primary = metadata.resolvedQuantization(for: "fc")
+            #expect(primary?.groupSize == 64)
+            #expect(primary?.bits == 4)
+            #expect(primary?.mode == .affine)
         }
     }
 

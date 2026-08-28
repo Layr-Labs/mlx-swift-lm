@@ -449,6 +449,22 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             "quant_method", "linear_class", "quantization_mode"
         ])
 
+    private static func selectedJSONObject(
+        in root: [String: Any],
+        primaryKey: String,
+        fallbackKey: String
+    ) throws -> [String: Any]? {
+        for key in [primaryKey, fallbackKey] {
+            guard let raw = root[key], !(raw is NSNull) else { continue }
+            guard let object = raw as? [String: Any] else {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "standalone MTP quantization must be an object")
+            }
+            return object
+        }
+        return nil
+    }
+
     private static func decodeQuantization(
         _ rawQuantization: [String: Any]
     ) throws -> BaseConfiguration.PerLayerQuantization {
@@ -523,15 +539,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             }
             prefix = ""
             blockSize = (root["block_size"] as? NSNumber)?.intValue ?? 3
-            if let raw = root["quantization"] ?? root["quantization_config"] {
-                guard let quantization = raw as? [String: Any] else {
-                    throw Qwen35InlineMTPError.invalidConfiguration(
-                        "standalone MTP quantization must be an object")
-                }
-                rawQuantization = quantization
-            } else {
-                rawQuantization = nil
-            }
+            rawQuantization = try selectedJSONObject(
+                in: root,
+                primaryKey: "quantization",
+                fallbackKey: "quantization_config")
         }
         guard (2...8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
