@@ -310,6 +310,7 @@ public enum PagedAttentionKernel {
     ///   - batch: rows in this dispatch.
     ///   - kvHeads: KV heads of the layer.
     ///   - headSplits: threadgroups per kv head (`gqa / headsPerThreadgroup`).
+    ///   - pageSize: number of tokens stored in each KV page.
     public static func partitionTokensForDispatch(
         maxAttendLength: Int, batch: Int, kvHeads: Int, headSplits: Int, pageSize: Int
     ) -> Int {
@@ -599,13 +600,16 @@ public enum PagedAttentionKernel {
     /// - Parameters:
     ///   - queries: `[B, queryHeads, 1, headDim]` or `[B, queryHeads, headDim]`,
     ///     any float dtype (converted to the slab dtype if needed).
-    ///   - newKeys/newValues: this step's K/V tiles `[B, kvHeads, headDim]`
+    ///   - newKeys: this step's key tile `[B, kvHeads, headDim]`
     ///     (any float dtype). When non-nil the kernel writes them IN PLACE
     ///     into the slabs at each row's `{writePage, writeSlot}` (seqinfo
     ///     fields 3/4) before attending — the fused decode write. Pass nil
     ///     for KV-borrowing dispatches (the rows were written by their
     ///     owning layer).
-    ///   - kSlab/vSlab: pool slabs `[P, kvHeads, pageSize, headDim]`.
+    ///   - newValues: this step's value tile `[B, kvHeads, headDim]`; it must
+    ///     be present exactly when `newKeys` is present.
+    ///   - kSlab: key pool slab `[P, kvHeads, pageSize, headDim]`.
+    ///   - vSlab: value pool slab `[P, kvHeads, pageSize, headDim]`.
     ///   - tables: `[B, maxPages]` int32, `maxPages >= 8`.
     ///   - seqinfo: `[B, 8]` int32 rows — build it with `SeqInfoRow` and
     ///     `PagedAttentionKernel.seqinfo(_:)` rather than packing the layout
@@ -616,10 +620,13 @@ public enum PagedAttentionKernel {
     ///   - params: `[8]` float32 `{softcap, scale, 0…}` (cache it per layer —
     ///     it is constant across steps).
     ///   - softcap: whether params[0] is an active softcap.
+    ///   - pageSize: number of tokens stored in each KV page.
     ///   - writeFence: the slab group's write fence (`[1]` int32,
     ///     `PagedKVGroup.writeFence`). The graph edge orders this dispatch
     ///     after every prior in-place write of the group (see
     ///     pagedattention.metal, "In-place slab writes").
+    ///   - kernelSource: Metal source containing the paged-attention kernel.
+    ///   - stream: stream or device on which to dispatch the kernel.
     /// - Returns: attention `[B, queryHeads, headDim]` in the slab dtype,
     ///   plus — when the fused write ran — the group's NEXT write fence,
     ///   which the caller MUST store back into the group.

@@ -2,8 +2,9 @@
 
 import Foundation
 import MLX
-@testable import MLXLLM
 import Testing
+
+@testable import MLXLLM
 
 @Suite("Gemma4MaskedEmbedder")
 struct MaskedEmbedderTests {

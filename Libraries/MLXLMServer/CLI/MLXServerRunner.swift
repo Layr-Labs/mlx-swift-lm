@@ -66,12 +66,15 @@ public enum MLXServer {
         try await app.runService()
     }
 
-    static func modelConfiguration(for idOrPath: String, revision: String = "main") -> ModelConfiguration {
+    static func modelConfiguration(for idOrPath: String, revision: String = "main")
+        -> ModelConfiguration
+    {
         let expandedPath: String
         if idOrPath == "~" {
             expandedPath = FileManager.default.homeDirectoryForCurrentUser.path
         } else if idOrPath.hasPrefix("~/") {
-            expandedPath = FileManager.default.homeDirectoryForCurrentUser
+            expandedPath =
+                FileManager.default.homeDirectoryForCurrentUser
                 .appending(path: String(idOrPath.dropFirst(2)))
                 .path
         } else {

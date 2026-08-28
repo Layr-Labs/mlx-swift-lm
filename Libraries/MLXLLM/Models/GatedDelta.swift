@@ -143,6 +143,16 @@ func gatedDeltaKernel(
     let inputType = q.dtype
     let stateType = state.dtype
 
+    // The fused kernel distributes one 32-wide key slice to each SIMD lane
+    // (`n_per_t = Dk / 32`). It is only valid when Dk is a positive multiple
+    // of 32; instantiating it for smaller dimensions emits a zero-length local
+    // Metal array, which newer Apple compilers reject. Keep the generic MLX
+    // formulation as the correct path for compact/test configurations and
+    // nonstandard checkpoints rather than allowing a JIT compile fatal.
+    guard Dk >= 32, Dk.isMultiple(of: 32) else {
+        return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
+
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
     if let mask {
@@ -310,7 +320,7 @@ public func gatedDeltaUpdate(
         state = state.asType(.float32)
     }
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    if Dk >= 32, Dk.isMultiple(of: 32), GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 

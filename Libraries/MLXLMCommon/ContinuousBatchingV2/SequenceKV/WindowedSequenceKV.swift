@@ -95,6 +95,8 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     /// - Parameters:
     ///   - window: sliding window in tokens (> 0).
+    ///   - kvHeads: number of KV heads stored by the layer.
+    ///   - headDim: width of each KV head.
     ///   - initialOffset: absolute position this sequence starts at. Non-zero
     ///     when a prefix-cache hit starts finite-window replay at C. The row
     ///     starts empty at C while owning full rows may retain immutable K/V
@@ -118,11 +120,14 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let n = newKeys.dim(2)
-        precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
+        precondition(
+            newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2WindowedSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
-        precondition(newKeys.dim(1) == kvHeads,
+        precondition(
+            newKeys.dim(1) == kvHeads,
             "CBv2WindowedSequenceKV: kvHeads mismatch (\(newKeys.dim(1)) != \(kvHeads))")
-        precondition(newValues.dim(2) == n,
+        precondition(
+            newValues.dim(2) == n,
             "CBv2WindowedSequenceKV: keys/values token count mismatch")
         precondition(n > 0, "CBv2WindowedSequenceKV: empty update")
 
@@ -233,7 +238,8 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             staged = (
                 concatenated([existingKeys, newKeys], axis: 2),
                 concatenated([existingValues, newValues], axis: 2),
-                existing.basePosition)
+                existing.basePosition
+            )
         } else {
             staged = (newKeys, newValues, absoluteOffset)
         }

@@ -1,12 +1,11 @@
 import Foundation
 import MLX
 import MLXFast
-
-@testable import MLXLMCommon
 import MLXNN
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 /// Contract tests pinning the deleted inline VLM text tower's semantics onto
@@ -97,7 +96,7 @@ struct Gemma4SharedTowerContractTests {
     @Test("rank-1 multimodal tuple normalizes tokens, embeddings, and mask")
     func rankOneMultimodalNormalization() throws {
         let config = try tinyConfig(extraFields: [
-            "\"use_bidirectional_attention\": \"vision\"",
+            "\"use_bidirectional_attention\": \"vision\""
         ])
         let model = tinyModel(config)
         let ids = MLXArray([Int32(3), 5, 7, 11])
@@ -185,7 +184,7 @@ struct Gemma4SharedTowerContractTests {
     @Test("short and empty layer_types lists are normalized")
     func shortLayerTypesNormalized() throws {
         let short = try tinyConfig(extraFields: [
-            "\"layer_types\": [\"full_attention\"]",
+            "\"layer_types\": [\"full_attention\"]"
         ])
         #expect(short.layerTypes == ["full_attention", "sliding_attention"])
         _ = tinyModel(short)  // must not trap
@@ -198,7 +197,7 @@ struct Gemma4SharedTowerContractTests {
     @Test("oversized layer_types is truncated to the declared layer count")
     func oversizedLayerTypesNormalized() throws {
         let config = try tinyConfig(extraFields: [
-            "\"layer_types\": [\"full_attention\", \"sliding_attention\", \"full_attention\"]",
+            "\"layer_types\": [\"full_attention\", \"sliding_attention\", \"full_attention\"]"
         ])
         #expect(config.layerTypes == ["full_attention", "sliding_attention"])
         #expect(config.cbv2LayerKinds.count == config.numHiddenLayers)
@@ -228,12 +227,14 @@ struct Gemma4SharedTowerContractTests {
     @Test("all-mode Gemma rejects chunked CBv2 prefill")
     func allModeCBv2PrefillRejection() throws {
         let config = try tinyConfig(extraFields: [
-            "\"use_bidirectional_attention\": \"all\"",
+            "\"use_bidirectional_attention\": \"all\""
         ])
         let model = tinyModel(config)
         let kinds = config.cbv2LayerKinds
         #expect(kinds.map(\.isBidirectional) == [true, true])
-        #expect(throws: Gemma4TextModel.CBv2CompatibilityError.fullyBidirectionalAttentionUnsupported) {
+        #expect(
+            throws: Gemma4TextModel.CBv2CompatibilityError.fullyBidirectionalAttentionUnsupported
+        ) {
             try model.newCacheV2 { index, kind in
                 CBv2LayerCache(layerIndex: index, kind: kind)
             }
@@ -244,19 +245,22 @@ struct Gemma4SharedTowerContractTests {
     func allModeLegacyPrefillIsNotChunked() throws {
         let tokens = MLXArray([Int32(1), 2, 3, 4])
         let input = LMInput(tokens: tokens)
-        let allMode = tinyModel(try tinyConfig(extraFields: [
-            "\"use_bidirectional_attention\": \"all\"",
-        ]))
+        let allMode = tinyModel(
+            try tinyConfig(extraFields: [
+                "\"use_bidirectional_attention\": \"all\""
+            ]))
         let ordinary = tinyModel(try tinyConfig())
 
-        guard case .tokens(let allTokens) = try allMode.prepare(
-            input, cache: allMode.newCache(parameters: nil), windowSize: 2)
+        guard
+            case .tokens(let allTokens) = try allMode.prepare(
+                input, cache: allMode.newCache(parameters: nil), windowSize: 2)
         else {
             Issue.record("all-mode prepare unexpectedly returned logits")
             return
         }
-        guard case .tokens(let ordinaryTokens) = try ordinary.prepare(
-            input, cache: ordinary.newCache(parameters: nil), windowSize: 2)
+        guard
+            case .tokens(let ordinaryTokens) = try ordinary.prepare(
+                input, cache: ordinary.newCache(parameters: nil), windowSize: 2)
         else {
             Issue.record("ordinary prepare unexpectedly returned logits")
             return
@@ -316,7 +320,9 @@ struct Gemma4SharedTowerContractTests {
         var fp16: [String: MLXArray] = [:]
         for (key, value) in model.parameters().flattened() {
             var value = value.asType(.float16)
-            if key.hasSuffix(".self_attn.q_norm.weight") || key.hasSuffix(".self_attn.k_norm.weight") {
+            if key.hasSuffix(".self_attn.q_norm.weight")
+                || key.hasSuffix(".self_attn.k_norm.weight")
+            {
                 value = (value.asType(.float32) * 600).asType(.float16)
             }
             fp16[key] = value
@@ -338,7 +344,9 @@ struct Gemma4SharedTowerContractTests {
         var fp16: [String: MLXArray] = [:]
         for (key, value) in model.parameters().flattened() {
             var value = value.asType(.float16)
-            if key.hasSuffix(".self_attn.q_norm.weight") || key.hasSuffix(".self_attn.k_norm.weight") {
+            if key.hasSuffix(".self_attn.q_norm.weight")
+                || key.hasSuffix(".self_attn.k_norm.weight")
+            {
                 value = (value.asType(.float32) * 600).asType(.float16)
             }
             fp16[key] = value
@@ -406,9 +414,12 @@ struct Gemma4SharedTowerContractTests {
         let encoder = JSONEncoder()
 
         let first = try decoder.decode(
-            MLXVLM.Gemma4Configuration.self, from: Data(vlmJSON(
-                textQuantization: "{\"bits\": 4, \"group_size\": 64}",
-                rootQuantization: nil).utf8))
+            MLXVLM.Gemma4Configuration.self,
+            from: Data(
+                vlmJSON(
+                    textQuantization: "{\"bits\": 4, \"group_size\": 64}",
+                    rootQuantization: nil
+                ).utf8))
         #expect(first.quantization == nil)
         #expect(first.textConfig.quantizationBits == 4)
         #expect(first.textConfig.quantizationGroupSize == 64)
@@ -435,10 +446,13 @@ struct Gemma4SharedTowerContractTests {
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         let first = try decoder.decode(
-            MLXVLM.Gemma4Configuration.self, from: Data(vlmJSON(
-                textQuantization:
-                    "{\"bits\": 4, \"group_size\": 64, \"mode\": \"mxfp4\"}",
-                rootQuantization: nil).utf8))
+            MLXVLM.Gemma4Configuration.self,
+            from: Data(
+                vlmJSON(
+                    textQuantization:
+                        "{\"bits\": 4, \"group_size\": 64, \"mode\": \"mxfp4\"}",
+                    rootQuantization: nil
+                ).utf8))
         #expect(first.textConfig.quantizationMode == .mxfp4)
         #expect(!gemma4SupportsSafeExpertQMMQuantization(first.textConfig))
 
@@ -455,9 +469,13 @@ struct Gemma4SharedTowerContractTests {
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
         let first = try decoder.decode(
-            MLXVLM.Gemma4Configuration.self, from: Data(vlmJSON(
-                textQuantization: "{\"bits\": 8, \"group_size\": 128}",
-                rootQuantization: "{\"quant_method\": \"affine\", \"bits\": 4, \"group_size\": 64}").utf8))
+            MLXVLM.Gemma4Configuration.self,
+            from: Data(
+                vlmJSON(
+                    textQuantization: "{\"bits\": 8, \"group_size\": 128}",
+                    rootQuantization:
+                        "{\"quant_method\": \"affine\", \"bits\": 4, \"group_size\": 64}"
+                ).utf8))
         // Root metadata overlays nested text config at decode.
         #expect(first.textConfig.quantizationBits == 4)
         #expect(first.textConfig.quantizationGroupSize == 64)
@@ -476,10 +494,12 @@ struct Gemma4SharedTowerContractTests {
         let path = "model.layers.0.experts.switch_glu.gate_proj"
         let first = try decoder.decode(
             MLXVLM.Gemma4Configuration.self,
-            from: Data(vlmJSON(
-                textQuantization: nil,
-                rootQuantization:
-                    "{\"bits\": 4, \"group_size\": 64, \"\(path)\": false}").utf8))
+            from: Data(
+                vlmJSON(
+                    textQuantization: nil,
+                    rootQuantization:
+                        "{\"bits\": 4, \"group_size\": 64, \"\(path)\": false}"
+                ).utf8))
         #expect(first.textConfig.hasExpertQuantizationOverrides)
 
         let second = try decoder.decode(

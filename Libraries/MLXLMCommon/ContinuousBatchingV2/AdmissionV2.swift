@@ -321,8 +321,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 by: self.auxiliaryTokenGranularity)
         let (totalPerToken, auxiliaryOverflow) = perToken.addingReportingOverflow(
             maximumAuxiliaryGrowth)
-        self.maxPerTokenBytes = accountingOverflow || auxiliaryOverflow
-            || auxiliaryGrowthOverflow
+        self.maxPerTokenBytes =
+            accountingOverflow || auxiliaryOverflow
+                || auxiliaryGrowthOverflow
             ? Int.max : totalPerToken
         self.fullKVBytesPerToken = accountingOverflow ? Int.max : fullPerToken
     }
@@ -676,7 +677,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let new = max(0, old - tokens)
         let oldExact = reservedExactBytes[id] ?? 0
         let newExact = max(0, oldExact - bytes)
-        ledgerBytes += allocatedBytes(forTokens: new) - allocatedBytes(forTokens: old)
+        ledgerBytes +=
+            allocatedBytes(forTokens: new) - allocatedBytes(forTokens: old)
             + newExact - oldExact
         if new == 0 {
             reservedTokens.removeValue(forKey: id)

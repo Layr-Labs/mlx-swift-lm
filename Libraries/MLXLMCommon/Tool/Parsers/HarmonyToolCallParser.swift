@@ -22,16 +22,22 @@ public struct HarmonyToolCallParser: ToolCallParser, Sendable {
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         var text = content
 
-        if let startRange = firstRange(ofAny: acceptedStartTags, in: text) {
+        if let startRange = firstRange(
+            ofAny: [startTag].compactMap { $0 } + alternateStartTags, in: text)
+        {
             text = String(text[startRange.upperBound...])
-        } else if let functionsRange = text.range(of: "to=functions.") ?? text.range(of: "functions.") {
+        } else if let functionsRange = text.range(of: "to=functions.")
+            ?? text.range(of: "functions.")
+        {
             text = String(text[functionsRange.upperBound...])
         }
 
-        guard let nameEnd = firstRange(
-            ofAny: ["<|channel|>commentary", "<|constrain|>", "<|message|>", " "],
-            in: text
-        ) else {
+        guard
+            let nameEnd = firstRange(
+                ofAny: ["<|channel|>commentary", "<|constrain|>", "<|message|>", " "],
+                in: text
+            )
+        else {
             return nil
         }
 
@@ -44,7 +50,7 @@ public struct HarmonyToolCallParser: ToolCallParser, Sendable {
         }
 
         var argumentsText = String(text[messageRange.upperBound...])
-        for marker in acceptedEndTags {
+        for marker in [endTag].compactMap({ $0 }) + alternateEndTags {
             if let markerRange = argumentsText.range(of: marker) {
                 argumentsText = String(argumentsText[..<markerRange.lowerBound])
             }

@@ -124,7 +124,8 @@ extension EngineLoopV2 {
             return false
         }
         let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
-        let canSpeculate = withinBatchGate && rows.count == ids.count
+        let canSpeculate =
+            withinBatchGate && rows.count == ids.count
             && mtpRowsCanSpeculate(rows)
         let decision = mtp.previewDecision(
             plannedDecodeRows: ids.count, canSpeculate: canSpeculate)
@@ -171,7 +172,6 @@ extension EngineLoopV2 {
             return Self.mtpStorageEligible(state)
         }
 
-
         if mtp.shouldApplyMarginalPolicyToPlan, mtp.planDepth > 0,
             !eligibleRows.isEmpty
         {
@@ -192,10 +192,11 @@ extension EngineLoopV2 {
         }
         if mtp.planDepth > 0 {
             let depth = mtp.planDepth
-            let tailDepth = eligibleRows.map { rec in
-                let remaining = rec.request.maxTokens - rec.generatedTokenCount
-                return mtp.hasValidCarry(for: rec) ? remaining : max(0, remaining - 1)
-            }.min() ?? 0
+            let tailDepth =
+                eligibleRows.map { rec in
+                    let remaining = rec.request.maxTokens - rec.generatedTokenCount
+                    return mtp.hasValidCarry(for: rec) ? remaining : max(0, remaining - 1)
+                }.min() ?? 0
             if tailDepth < depth {
                 mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
             }
@@ -243,10 +244,11 @@ extension EngineLoopV2 {
     }
 
     private func mtpRowsCanSpeculate(_ rows: [CBv2ScheduledRequest]) -> Bool {
-        !rows.isEmpty && rows.allSatisfy { rec in
-            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state)
-        }
+        !rows.isEmpty
+            && rows.allSatisfy { rec in
+                guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+                return Self.mtpStorageEligible(state)
+            }
     }
 
     /// True when this scheduler plan carries seed or verify work.

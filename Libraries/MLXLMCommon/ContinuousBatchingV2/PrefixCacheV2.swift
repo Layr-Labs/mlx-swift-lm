@@ -461,7 +461,8 @@ public final class PrefixCacheV2: CBv2PrefixCache, @unchecked Sendable {
         // the KV is resident. Repointing to the longest such heir preserves
         // the shorter prefix as a slice of the longer entry.
         for (blockIndex, hash) in entry.chainHashes.enumerated() where index[hash] == entry.id {
-            if let heir = longestHeirLocked(forHash: hash, blockIndex: blockIndex, excluding: entry.id)
+            if let heir = longestHeirLocked(
+                forHash: hash, blockIndex: blockIndex, excluding: entry.id)
             {
                 index[hash] = heir.id
                 heir.liveKeys += 1

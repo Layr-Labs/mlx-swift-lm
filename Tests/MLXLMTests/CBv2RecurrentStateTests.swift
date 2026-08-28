@@ -402,7 +402,8 @@ final class CBv2RecurrentStateTests: XCTestCase {
                 state: inputState?.ssm)
             // The transaction treats conv and SSM tensors uniformly. The
             // conv sentinel advances independently of the recurrence.
-            let conv = (inputState?.conv ?? MLXArray.zeros([1, 3, 64], dtype: .bfloat16))
+            let conv =
+                (inputState?.conv ?? MLXArray.zeros([1, 3, 64], dtype: .bfloat16))
                 + Float(count)
             try evaluation.stage(modelLayerIndex: 0, conv: conv, ssm: newSSM)
             _ = try evaluation.evaluate()

@@ -20,14 +20,14 @@ func runChecksum(directory: URL) async {
             let sorted = params.sorted { $0.0 < $1.0 }
 
             // Deterministic combination of per-tensor (key, shape, dtype, sum).
-            var combinedHash: UInt64 = 0xcbf29ce484222325  // FNV-1a basis
+            var combinedHash: UInt64 = 0xcbf2_9ce4_8422_2325  // FNV-1a basis
             var totalElements: Int64 = 0
             for (key, array) in sorted {
                 let s = sum(array.asType(.float32)).item(Float.self)
                 let shape = array.shape.map { String($0) }.joined(separator: "x")
                 let line = "\(key)|\(shape)|\(array.dtype)|\(s)"
                 for b in line.utf8 {
-                    combinedHash = (combinedHash ^ UInt64(b)) &* 0x100000001b3
+                    combinedHash = (combinedHash ^ UInt64(b)) &* 0x100_0000_01b3
                 }
                 totalElements += Int64(array.size)
             }
@@ -40,7 +40,6 @@ func runChecksum(directory: URL) async {
     }
 }
 
-@main
 struct BenchLoad {
     static func main() async {
         let args = CommandLine.arguments
@@ -72,8 +71,9 @@ struct BenchLoad {
         }
 
         // Report what's on disk.
-        let weightFiles = (try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
+        let weightFiles =
+            (try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         let shards = weightFiles.filter { $0.pathExtension == "safetensors" }
         let totalBytes = shards.reduce(Int64(0)) { acc, url in
             // attributesOfItem follows symlinks (resourceValues does not).
@@ -93,7 +93,7 @@ struct BenchLoad {
         do {
             // Warmup runs (page cache warming, JIT-ish overhead, etc.)
             if warmup > 0 {
-                for i in 1...warmup {
+                for i in 1 ... warmup {
                     let start = CFAbsoluteTimeGetCurrent()
                     _ = try await loadModelContainer(from: directory, using: tokenizerLoader)
                     let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
@@ -104,7 +104,7 @@ struct BenchLoad {
 
             // Timed runs
             var times: [Double] = []
-            for i in 1...runs {
+            for i in 1 ... runs {
                 let start = CFAbsoluteTimeGetCurrent()
                 _ = try await loadModelContainer(from: directory, using: tokenizerLoader)
                 let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000
@@ -124,3 +124,5 @@ struct BenchLoad {
         }
     }
 }
+
+await BenchLoad.main()

@@ -56,7 +56,7 @@ struct SpeculativeDecodingTests {
         let modelInput = try await processor.prepare(input: input)
         let parameters = GenerateParameters(
             maxTokens: 32,
-            temperature: 0.0,  // Use greedy decoding for deterministic output
+            temperature: 0.0,
             repetitionPenalty: withLogitProcessor ? 1.5 : nil,
             presencePenalty: withLogitProcessor ? 0.5 : nil,
             frequencyPenalty: withLogitProcessor ? 0.2 : nil,

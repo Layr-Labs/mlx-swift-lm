@@ -436,22 +436,25 @@ private enum TinyGemma {
 /// straddle the threshold and the expectations track any override.
 private enum PrefillKnobs {
     static let tailRows: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS"], let value = Int(raw)
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS"], let value = Int(raw)
         else { return 1 }
         return max(0, value)
     }()
 
     static let minChunk: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_PREFILL_TAIL_MIN_CHUNK"], let value = Int(raw)
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_PREFILL_TAIL_MIN_CHUNK"], let value = Int(raw)
         else { return 128 }
         return max(2, value)
     }()
 
     static let lastQueryEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY"]
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY"]
         else { return true }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()

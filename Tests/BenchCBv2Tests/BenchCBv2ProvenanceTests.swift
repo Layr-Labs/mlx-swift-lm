@@ -59,26 +59,34 @@ struct BenchCBv2ProvenanceTests {
     }
 
     @Test func geometryGuardRecognizesOnlyEligibleExactPrefillChunks() {
-        #expect(!safeR1ExactGeometryExpected(
-            modelEligible: true, promptLengths: [500], prefillChunkSize: 512))
-        #expect(safeR1ExactGeometryExpected(
-            modelEligible: true, promptLengths: [100, 1500], prefillChunkSize: 512))
-        #expect(safeR1ExactGeometryExpected(
-            modelEligible: true, promptLengths: [2048], prefillChunkSize: 2048))
-        #expect(safeR1ExactGeometryExpected(
-            modelEligible: true, promptLengths: [256, 256], prefillChunkSize: 512))
-        #expect(!safeR1ExactGeometryExpected(
-            modelEligible: true, promptLengths: [512, 512, 512], prefillChunkSize: 512))
-        #expect(safeR1ExactGeometryExpected(
-            modelEligible: true,
-            promptLengths: [512, 1500, 2000],
-            prefillChunkSize: 512))
-        #expect(safeR1ExactGeometryExpected(
-            modelEligible: true,
-            promptLengths: [512, 512, 512, 512],
-            prefillChunkSize: 512))
-        #expect(!safeR1ExactGeometryExpected(
-            modelEligible: false, promptLengths: [2048], prefillChunkSize: 2048))
+        #expect(
+            !safeR1ExactGeometryExpected(
+                modelEligible: true, promptLengths: [500], prefillChunkSize: 512))
+        #expect(
+            safeR1ExactGeometryExpected(
+                modelEligible: true, promptLengths: [100, 1500], prefillChunkSize: 512))
+        #expect(
+            safeR1ExactGeometryExpected(
+                modelEligible: true, promptLengths: [2048], prefillChunkSize: 2048))
+        #expect(
+            safeR1ExactGeometryExpected(
+                modelEligible: true, promptLengths: [256, 256], prefillChunkSize: 512))
+        #expect(
+            !safeR1ExactGeometryExpected(
+                modelEligible: true, promptLengths: [512, 512, 512], prefillChunkSize: 512))
+        #expect(
+            safeR1ExactGeometryExpected(
+                modelEligible: true,
+                promptLengths: [512, 1500, 2000],
+                prefillChunkSize: 512))
+        #expect(
+            safeR1ExactGeometryExpected(
+                modelEligible: true,
+                promptLengths: [512, 512, 512, 512],
+                prefillChunkSize: 512))
+        #expect(
+            !safeR1ExactGeometryExpected(
+                modelEligible: false, promptLengths: [2048], prefillChunkSize: 2048))
     }
 
     @Test func layerAndWeightedEngagementAreRequiredOnlyWhenEffective() {
@@ -169,7 +177,8 @@ struct BenchCBv2ProvenanceTests {
         let rendered = performanceMarkdown(
             rows: rows, provenanceLines: provenance)
         let lines = rendered.split(
-            separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            separator: "\n", omittingEmptySubsequences: false
+        ).map(String.init)
 
         #expect(Array(lines[2 ..< 5]) == rows)
         #expect(lines[5].isEmpty)

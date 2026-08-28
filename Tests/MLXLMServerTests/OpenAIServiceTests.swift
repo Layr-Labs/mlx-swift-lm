@@ -4,8 +4,9 @@ import Foundation
 import Hummingbird
 import HummingbirdTesting
 import MLXLMCommon
-@testable import MLXLMServer
 import Testing
+
+@testable import MLXLMServer
 
 struct OpenAIServiceTests {
     @Test("responses API enforces parallel_tool_calls false")
@@ -191,7 +192,8 @@ struct OpenAIServiceTests {
         for try await frame in stream {
             frames.append(frame)
         }
-        let reasoningIndex = try #require(frames.firstIndex { $0.contains("\"reasoning_content\":\"call weather\"") })
+        let reasoningIndex = try #require(
+            frames.firstIndex { $0.contains("\"reasoning_content\":\"call weather\"") })
         let toolIndex = try #require(frames.firstIndex { $0.contains("\"tool_calls\"") })
 
         #expect(reasoningIndex < toolIndex)
@@ -355,9 +357,10 @@ struct OpenAIServiceTests {
         #expect(response.choices.first?.message.content == .text(#"{"city":"San Francisco"}"#))
 
         let lastRequest = await engine.lastChatRequest
-        #expect(lastRequest?.messages.contains {
-            $0.role == .system && $0.textContent.contains("single valid JSON object")
-        } == true)
+        #expect(
+            lastRequest?.messages.contains {
+                $0.role == .system && $0.textContent.contains("single valid JSON object")
+            } == true)
     }
 
     @Test("JSON schema response format validates required properties")
@@ -538,7 +541,9 @@ struct OpenAIServiceTests {
         let tokenized = try await service.tokenize(.init(model: "local-model", prompt: "hello"))
         let detokenized = try await service.detokenize(.init(model: "local-model", tokens: [1, 2]))
         let templated = try await service.applyTemplate(
-            .init(model: "local-model", messages: [.init(role: .user, content: .text("hello"))], tools: nil)
+            .init(
+                model: "local-model", messages: [.init(role: .user, content: .text("hello"))],
+                tools: nil)
         )
 
         #expect(tokenized.tokens == [1, 2])
@@ -585,7 +590,8 @@ struct OpenAIServiceTests {
             engine: engine,
             embeddingEngine: ScriptedEmbeddingEngine()
         )
-        let app = MLXServerApplication.buildApplication(service: service, host: "127.0.0.1", port: 8080)
+        let app = MLXServerApplication.buildApplication(
+            service: service, host: "127.0.0.1", port: 8080)
 
         try await app.test(.router) { client in
             try await client.execute(uri: "/health", method: .get) { response in
@@ -643,7 +649,8 @@ struct OpenAIServiceTests {
             .info(.init(promptTokens: 1, completionTokens: 2)),
         ])
         let service = MLXOpenAIService(engine: engine)
-        let app = MLXServerApplication.buildApplication(service: service, host: "127.0.0.1", port: 8080)
+        let app = MLXServerApplication.buildApplication(
+            service: service, host: "127.0.0.1", port: 8080)
 
         try await app.test(.router) { client in
             let chatBody = ByteBuffer(
@@ -663,9 +670,10 @@ struct OpenAIServiceTests {
 
         let lastRequest = await engine.lastChatRequest
         #expect(lastRequest?.responseFormat?.type == .jsonObject)
-        #expect(lastRequest?.messages.contains {
-            $0.role == .system && $0.textContent.contains("single valid JSON object")
-        } == true)
+        #expect(
+            lastRequest?.messages.contains {
+                $0.role == .system && $0.textContent.contains("single valid JSON object")
+            } == true)
     }
 }
 
@@ -723,8 +731,8 @@ private struct ScriptedEmbeddingEngine: MLXEmbeddingServerEngine {
     }
 }
 
-private extension ServerGenerationInfo {
-    init(promptTokens: Int, completionTokens: Int) {
+extension ServerGenerationInfo {
+    fileprivate init(promptTokens: Int, completionTokens: Int) {
         self.init(
             promptTokens: promptTokens,
             completionTokens: completionTokens,
@@ -735,8 +743,8 @@ private extension ServerGenerationInfo {
     }
 }
 
-private extension OpenAIChatCompletionRequest {
-    static func test(
+extension OpenAIChatCompletionRequest {
+    fileprivate static func test(
         model: String = "local-model",
         messages: [OpenAIChatMessage] = [.init(role: .user, content: .text("hello"))],
         tools: [OpenAITool]? = nil,
@@ -768,14 +776,14 @@ private extension OpenAIChatCompletionRequest {
     }
 }
 
-private extension OpenAIChatMessage {
-    init(role: OpenAIRole, content: OpenAIMessageContent) {
+extension OpenAIChatMessage {
+    fileprivate init(role: OpenAIRole, content: OpenAIMessageContent) {
         self.init(role: role, content: content, name: nil, toolCallID: nil, toolCalls: nil)
     }
 }
 
-private extension OpenAITool {
-    static let weatherTool = OpenAITool(
+extension OpenAITool {
+    fileprivate static let weatherTool = OpenAITool(
         type: "function",
         function: .init(
             name: "get_weather",

@@ -34,8 +34,10 @@ public enum ServerToolParser {
             return .xmlFunction
         case "glm4", "glm_4":
             return .glm4
-        case "gemma", "gemma4", "gemma_4":
+        case "gemma":
             return .gemma
+        case "gemma4", "gemma_4":
+            return .gemma4
         case "kimi_k2", "kimi":
             return .kimiK2
         case "minimax_m2", "minimax":
@@ -45,7 +47,7 @@ public enum ServerToolParser {
         case "llama3", "llama3_json", "llama_3":
             return .llama3
         case "harmony", "gpt_oss", "openai_harmony":
-            return .harmony
+            return .gptOSS
         case .some(let name):
             throw ServerToolParserError.unsupported(name)
         case .none:

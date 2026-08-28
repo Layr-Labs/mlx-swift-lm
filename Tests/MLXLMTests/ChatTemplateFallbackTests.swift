@@ -105,7 +105,9 @@ struct ChatTemplateFallbackTests {
         #expect(try prepare(dir: dir) == NoInlineTemplateTokenizer.encodeTokens)
     }
 
-    @Test("a PRESENT but malformed chat_template.jinja surfaces the render error, never the content-join")
+    @Test(
+        "a PRESENT but malformed chat_template.jinja surfaces the render error, never the content-join"
+    )
     func malformedJinjaSurfacesError() throws {
         // Regression (Codex, follow-up round): with `try?` around the jinja
         // render, a present-but-malformed template was silently treated as

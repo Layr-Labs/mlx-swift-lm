@@ -92,7 +92,8 @@ enum CBv2VisionReference {
         var h = model.embed(MLXArray(tokens.map(Int32.init)).reshaped(1, T))
         h = splice(h, images: images)
 
-        var kvByLayer = [(keys: MLXArray, values: MLXArray)?](repeating: nil, count: model.blocks.count)
+        var kvByLayer = [(keys: MLXArray, values: MLXArray)?](
+            repeating: nil, count: model.blocks.count)
         for (i, block) in model.blocks.enumerated() {
             let kind = model.layerKinds[i]
             let window: Int?
@@ -216,7 +217,9 @@ final class CBv2VisionDriver {
             layerKinds: layerKinds, promptLength: prompt.count,
             maxLength: prompt.count + maxTokens + 1)
         let soloCaches = layerKinds.enumerated().map { index, kind in
-            CBv2LayerCache(layerIndex: index, kind: kind, rows: kind.sharesKVWithLayer == nil ? [kv[index]!] : [])
+            CBv2LayerCache(
+                layerIndex: index, kind: kind,
+                rows: kind.sharesKVWithLayer == nil ? [kv[index]!] : [])
         }
 
         let prefillLen = prompt.count - 1
@@ -877,8 +880,10 @@ final class CBv2MultimodalTests: XCTestCase {
             textEmbeddings: text, chunkStart: 0, spans: [(span: span, embedding: embedding)])
         eval(spliced)
         // Rows 0,1,4,5 unchanged; rows 2,3 == -1.
-        XCTAssertTrue(allClose(spliced[0..., 0 ..< 2, 0...], text[0..., 0 ..< 2, 0...]).item(Bool.self))
-        XCTAssertTrue(allClose(spliced[0..., 4 ..< 6, 0...], text[0..., 4 ..< 6, 0...]).item(Bool.self))
+        XCTAssertTrue(
+            allClose(spliced[0..., 0 ..< 2, 0...], text[0..., 0 ..< 2, 0...]).item(Bool.self))
+        XCTAssertTrue(
+            allClose(spliced[0..., 4 ..< 6, 0...], text[0..., 4 ..< 6, 0...]).item(Bool.self))
         XCTAssertTrue(
             allClose(spliced[0..., 2 ..< 4, 0...], embedding).item(Bool.self),
             "span rows must be replaced verbatim")
@@ -909,10 +914,12 @@ final class CBv2MultimodalTests: XCTestCase {
             CBv2ImageSpan(tokenOffset: 5, length: 4),  // adjacent to previous
             CBv2ImageSpan(tokenOffset: 12, length: 2),  // gap ⇒ separate
         ])
-        XCTAssertEqual(merged, [
-            CBv2ImageSpan(tokenOffset: 2, length: 7),
-            CBv2ImageSpan(tokenOffset: 12, length: 2),
-        ])
+        XCTAssertEqual(
+            merged,
+            [
+                CBv2ImageSpan(tokenOffset: 2, length: 7),
+                CBv2ImageSpan(tokenOffset: 12, length: 2),
+            ])
     }
 
     func testSnappedChunkTokens() {
@@ -1034,7 +1041,8 @@ final class CBv2MultimodalTests: XCTestCase {
     }
 
     private func makeRecord(spans: [CBv2ImageSpan]) -> CBv2ScheduledRequest {
-        var request = CBv2Request(id: CBv2RequestID(1), promptTokens: [Int](repeating: 0, count: 64), maxTokens: 8)
+        var request = CBv2Request(
+            id: CBv2RequestID(1), promptTokens: [Int](repeating: 0, count: 64), maxTokens: 8)
         if !spans.isEmpty {
             request.multimodal = CBv2MultimodalInput(spans: spans) { [] }
         }
@@ -1056,7 +1064,8 @@ final class CBv2MultimodalTests: XCTestCase {
             [MLXArray.zeros([5, model.config.hiddenSize])]
         }
         assertResolveThrows(oob, model: model, bank: bank, promptCount: 10) {
-            if case .invalidSpans = $0 { return true }; return false
+            if case .invalidSpans = $0 { return true }
+            return false
         }
         // Overlapping / out of order.
         let overlap = CBv2MultimodalInput(spans: [
@@ -1064,12 +1073,14 @@ final class CBv2MultimodalTests: XCTestCase {
             CBv2ImageSpan(tokenOffset: 6, length: 2),
         ]) { [MLXArray.zeros([4, 1]), MLXArray.zeros([2, 1])] }
         assertResolveThrows(overlap, model: model, bank: bank, promptCount: 20) {
-            if case .invalidSpans = $0 { return true }; return false
+            if case .invalidSpans = $0 { return true }
+            return false
         }
         // Empty spans.
         let empty = CBv2MultimodalInput(spans: []) { [] }
         assertResolveThrows(empty, model: model, bank: bank, promptCount: 20) {
-            if case .invalidSpans = $0 { return true }; return false
+            if case .invalidSpans = $0 { return true }
+            return false
         }
     }
 
@@ -1093,7 +1104,8 @@ final class CBv2MultimodalTests: XCTestCase {
         let plainModel = CBv2PlainSteppable(model)
         let bank = makeCacheProvider(model)
         let input = CBv2VisionFixtures.input([
-            .init(span: CBv2ImageSpan(tokenOffset: 0, length: 2),
+            .init(
+                span: CBv2ImageSpan(tokenOffset: 0, length: 2),
                 embedding: MLXArray.zeros([1, 2, model.config.hiddenSize]))
         ])
         XCTAssertThrowsError(
@@ -1110,7 +1122,8 @@ final class CBv2MultimodalTests: XCTestCase {
     func testRejectUnsupportedBackend() {
         let model = TinyTestModel.make(seed: 0xC0FFEE)
         let input = CBv2VisionFixtures.input([
-            .init(span: CBv2ImageSpan(tokenOffset: 0, length: 2),
+            .init(
+                span: CBv2ImageSpan(tokenOffset: 0, length: 2),
                 embedding: MLXArray.zeros([1, 2, model.config.hiddenSize]))
         ])
         // A provider that does not vend span-mask-capable caches.
@@ -1135,21 +1148,24 @@ final class CBv2MultimodalTests: XCTestCase {
             []
         }
         assertResolveThrows(wrongCount, model: model, bank: bank, promptCount: 10) {
-            if case .embeddingMismatch = $0 { return true }; return false
+            if case .embeddingMismatch = $0 { return true }
+            return false
         }
         // Wrong length.
         let wrongLen = CBv2MultimodalInput(spans: [CBv2ImageSpan(tokenOffset: 0, length: 3)]) {
             [MLXArray.zeros([2, hidden])]
         }
         assertResolveThrows(wrongLen, model: model, bank: bank, promptCount: 10) {
-            if case .embeddingMismatch = $0 { return true }; return false
+            if case .embeddingMismatch = $0 { return true }
+            return false
         }
         // Wrong hidden dim.
         let wrongHidden = CBv2MultimodalInput(spans: [CBv2ImageSpan(tokenOffset: 0, length: 3)]) {
             [MLXArray.zeros([3, hidden + 1])]
         }
         assertResolveThrows(wrongHidden, model: model, bank: bank, promptCount: 10) {
-            if case .embeddingMismatch = $0 { return true }; return false
+            if case .embeddingMismatch = $0 { return true }
+            return false
         }
     }
 

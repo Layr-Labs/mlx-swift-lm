@@ -184,7 +184,9 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
     func testWindowedReservationPlateaus() throws {
         // Sliding window 4 → per-request bytes stop growing past 4 tokens,
         // so long decodes on windowed layers do not exhaust the ledger.
-        let kinds = [CBv2LayerKind(attention: .slidingWindow(4), headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let kinds = [
+            CBv2LayerKind(attention: .slidingWindow(4), headDim: 1, kvHeads: 1, queryHeads: 1)
+        ]
         let admission = AdmissionV2(
             layerKinds: kinds, bytesCapacity: 64, config: .init(watermarkFraction: 0))
         try admission.reserve(id: id(1), additionalTokens: 4)  // 16 B (at the plateau)
@@ -242,7 +244,8 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         // ~107 MB for ONE such request.
         XCTAssertEqual(admission.estimatedBytes(forTokens: tokens), 25 * tokens * 8192 + fullBytes)
         XCTAssertEqual(
-            admission.allocatedBytes(forTokens: tokens) - admission.estimatedBytes(forTokens: tokens),
+            admission.allocatedBytes(forTokens: tokens)
+                - admission.estimatedBytes(forTokens: tokens),
             try XCTUnwrap(admission.fixedWindowBytesShortfall(afterReservingTokens: tokens)))
 
         // Past the window the two agree, and the ring is never charged twice:
@@ -542,8 +545,10 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
     }
 
     func testTargetReservationsPartitionMaterializedAndWaitingRows() throws {
-        let kinds = [CBv2LayerKind(
-            attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let kinds = [
+            CBv2LayerKind(
+                attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
+        ]
         let admission = AdmissionV2(
             layerKinds: kinds, bytesCapacity: 1_000,
             config: .init(
@@ -615,8 +620,9 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         }
         XCTAssertEqual(paged.allocatedBytes(forTokens: 1), 16 * bytesPerToken)
         XCTAssertEqual(paged.allocatedBytes(forTokens: 500), 512 * bytesPerToken)
-        let ringRows = PagedKVPool.ringPageCount(
-            window: 1024, config: gemmaPagedConfig) * gemmaPagedConfig.pageSize
+        let ringRows =
+            PagedKVPool.ringPageCount(
+                window: 1024, config: gemmaPagedConfig) * gemmaPagedConfig.pageSize
         XCTAssertEqual(paged.allocatedBytes(forTokens: 2000), ringRows * bytesPerToken)
         XCTAssertGreaterThanOrEqual(
             ringRows, 1024,
@@ -686,7 +692,8 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         // has usable pages — every one of which the old charge refused.
         XCTAssertEqual(backendAware.allocatedBytes(forTokens: 1), pageBytes)
         var admitted = 0
-        while (try? backendAware.reserve(id: id(UInt64(admitted + 1)), additionalTokens: 1)) != nil {
+        while (try? backendAware.reserve(id: id(UInt64(admitted + 1)), additionalTokens: 1)) != nil
+        {
             admitted += 1
             if admitted > capacity / pageBytes { break }
         }
@@ -697,8 +704,9 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         // fixture's 40 pages under either sizing it has had (65 now, 97
         // before WS-1.2), so both the ledger and the pool say no.
         XCTAssertFalse(backendAware.canEverFit(promptTokens: 2000, maxTokens: 0))
-        XCTAssertThrowsError(try (backend as! PagedKVBackend).reserve(
-            layerKinds: kinds, maxLength: 2000))
+        XCTAssertThrowsError(
+            try (backend as! PagedKVBackend).reserve(
+                layerKinds: kinds, maxLength: 2000))
     }
 
     /// The ledger's paged charge is DERIVED from `PagedKVPool.pageDemand`,

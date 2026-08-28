@@ -102,7 +102,6 @@ extension CBv2LanguageModelPrefillForwardable {
     public var cbv2SupportsPackedMultimodalPrefill: Bool { false }
 }
 
-
 /// Recurrent twin of `CBv2PrefillSteppableModel`: the prompt-forward seam for
 /// models whose chunks carry request-owned recurrent state and positions
 /// (Qwen3.x hybrids). The engine binds `recurrentState` BEFORE calling (state

@@ -61,7 +61,7 @@ final class CBv2FrozenReplayGemmaClassTests: XCTestCase {
         let config = try JSONDecoder.json5().decode(
             Gemma4TextConfiguration.self,
             from: Data(json.utf8))
-        MLXRandom.seed(0x47454D4D41)
+        MLXRandom.seed(0x47_454D_4D41)
         let gemma = Gemma4TextModel(config)
         eval(gemma)
         let model = CBv2SteppableLanguageModelAdapter(gemma)
@@ -128,7 +128,8 @@ final class CBv2FrozenReplayGemmaClassTests: XCTestCase {
             return (
                 snapshot.keys[.ellipsis, 0 ..< matched, 0...],
                 snapshot.values[.ellipsis, 0 ..< matched, 0...],
-                matched)
+                matched
+            )
         }
         let frozenBackend = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 1 << 28))
@@ -146,11 +147,12 @@ final class CBv2FrozenReplayGemmaClassTests: XCTestCase {
         XCTAssertGreaterThan(maxAbsDiff(coldLogits, oldLogits), 0)
         XCTAssertEqual(maxAbsDiff(coldLogits, frozenLogits), 0, accuracy: 0)
 
-        let fullLayer = try XCTUnwrap(kinds.firstIndex { kind in
-            guard kind.sharesKVWithLayer == nil else { return false }
-            if case .full = kind.attention { return true }
-            return false
-        })
+        let fullLayer = try XCTUnwrap(
+            kinds.firstIndex { kind in
+                guard kind.sharesKVWithLayer == nil else { return false }
+                if case .full = kind.attention { return true }
+                return false
+            })
         let coldFull = try XCTUnwrap(coldState[fullLayer]?.snapshot())
         let oldFull = try XCTUnwrap(oldState[fullLayer]?.snapshot())
         let frozenFull = try XCTUnwrap(frozenState[fullLayer]?.snapshot())

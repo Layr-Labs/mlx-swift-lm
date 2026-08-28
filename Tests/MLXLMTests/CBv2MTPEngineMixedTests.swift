@@ -216,7 +216,8 @@ struct CBv2MTPEngineMixedTests {
         loopConfig: CBv2EngineLoopConfig? = nil
     ) throws -> EngineV2 {
         let kinds = fixture.target.cbv2LayerKinds
-        let backend = backend
+        let backend =
+            backend
             ?? CBv2ContiguousKVBackend(config: .init(bytesCapacity: bytesCapacity))
         let provider = cacheProvider ?? CBv2LayerCacheBank(layerKinds: kinds)
         let drafter: (any CBv2MTPDrafter)?
@@ -455,8 +456,9 @@ struct CBv2MTPEngineMixedTests {
         let expectedA = try await baseline(fixture, requestA)
         let expectedB = try await baseline(fixture, requestB)
         let probe = admissionProbe(fixture)
-        let shrunk = 2 * (
-            probe.estimatedBytes(forTokens: promptA.count + requestA.maxTokens)
+        let shrunk =
+            2
+            * (probe.estimatedBytes(forTokens: promptA.count + requestA.maxTokens)
                 + probe.estimatedBytes(forTokens: promptB.count + requestB.maxTokens))
 
         let engine = try makeEngine(fixture, mtp: true)
@@ -509,7 +511,8 @@ struct CBv2MTPEngineMixedTests {
         for await event in stream {
             if case .delta(_, let delta, let reports) = event {
                 tokens.append(contentsOf: delta)
-                allHaveLogprobs = allHaveLogprobs
+                allHaveLogprobs =
+                    allHaveLogprobs
                     && reports?.count == delta.count
                     && reports?.allSatisfy { $0.topLogprobs.count == 3 } == true
             }
@@ -611,7 +614,8 @@ struct CBv2MTPEngineMixedTests {
 
         #expect(
             repaired,
-            "a rejected MTP round must mark the eager composition stale, and the next eager bind must rebuild it")
+            "a rejected MTP round must mark the eager composition stale, and the next eager bind must rebuild it"
+        )
     }
 
     @Test func terminalDonationAfterSynchronizedRollbackReplaysExactly() async throws {
@@ -660,8 +664,8 @@ struct CBv2MTPEngineMixedTests {
             let engine = try makeEngine(
                 fixture, mtp: mtp,
                 loopConfig: CBv2EngineLoopConfig(
-                    admissionLease: 120,               // 40s/step ⇒ admits first
-                    decodeProgressLease: 120,          // 40s gap ≪ 120 ⇒ never stalls
+                    admissionLease: 120,  // 40s/step ⇒ admits first
+                    decodeProgressLease: 120,  // 40s gap ≪ 120 ⇒ never stalls
                     safetyCeilingDecodeFloorTPS: 1_000_000,  // ~180s absolute ceiling
                     clock: clock.clock))
             let collected = await cbv2SchedCollect(

@@ -146,7 +146,7 @@ final class CBv2DeadlineLeaseTests: XCTestCase {
         // killed.
         var lease = makeLease(decode: 120, safety: 100_000)
         lease.markAdmitted(now: at(0))
-        for i in 1...100 {
+        for i in 1 ... 100 {
             let now = at(Double(i) * 100)
             lease.recordProgress(now: now, computedTokens: i + 4, generatedTokens: i)
             XCTAssertNil(
@@ -168,7 +168,7 @@ final class CBv2DeadlineLeaseTests: XCTestCase {
         // ceiling still catches a pathological request that dribbles forever.
         var lease = makeLease(decode: 120, safety: 500)
         lease.markAdmitted(now: at(0))
-        for i in 1...5 {
+        for i in 1 ... 5 {
             lease.recordProgress(
                 now: at(Double(i) * 100), computedTokens: i + 4, generatedTokens: i)
         }

@@ -500,13 +500,15 @@ struct Gemma4AssistantConfigurationDocument {
     static func read(from url: URL) throws -> Self {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        let data = try handle.read(
-            upToCount: Gemma4AssistantConfigurationValidator.maximumConfigBytes + 1) ?? Data()
+        let data =
+            try handle.read(
+                upToCount: Gemma4AssistantConfigurationValidator.maximumConfigBytes + 1) ?? Data()
         guard data.count <= Gemma4AssistantConfigurationValidator.maximumConfigBytes else {
             throw Gemma4MTPError.invalidConfiguration(
                 field: "config.json",
                 reason:
-                    "exceeds \(Gemma4AssistantConfigurationValidator.maximumConfigBytes)-byte limit")
+                    "exceeds \(Gemma4AssistantConfigurationValidator.maximumConfigBytes)-byte limit"
+            )
         }
         return try decode(data)
     }

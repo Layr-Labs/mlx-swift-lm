@@ -1,8 +1,9 @@
 // Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
-@testable import MLXLMServer
 import Testing
+
+@testable import MLXLMServer
 
 // MARK: - Helper
 

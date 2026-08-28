@@ -63,8 +63,7 @@ struct CBv2PagedPackedSpanTests {
     /// signature: two rows with different tags hold different numbers at
     /// every one of their shared positions, so reading a batchmate's key is
     /// numerically loud rather than statistically improbable.
-    private func codedKV(_ positions: Range<Int>, tag: Int, dtype: DType) -> (MLXArray, MLXArray)
-    {
+    private func codedKV(_ positions: Range<Int>, tag: Int, dtype: DType) -> (MLXArray, MLXArray) {
         let n = positions.count
         var kflat = [Float](repeating: 0, count: kvHeads * n * headDim)
         var vflat = [Float](repeating: 0, count: kvHeads * n * headDim)
@@ -377,7 +376,8 @@ struct CBv2PagedPackedSpanTests {
             .max().item(Float.self)
         #expect(
             batchmateDelta > 1e-3,
-            "premise: swapping row 1's content must change row 1's own output (max |delta| = \(batchmateDelta))")
+            "premise: swapping row 1's content must change row 1's own output (max |delta| = \(batchmateDelta))"
+        )
     }
 
     // MARK: - WS-2.2: vision span masks
@@ -445,7 +445,8 @@ struct CBv2PagedPackedSpanTests {
                 queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
             contiguous.bindSpanContext(nil)
 
-            assertClose(got, want, "paged vs contiguous span chunk (window \(String(describing: window)))")
+            assertClose(
+                got, want, "paged vs contiguous span chunk (window \(String(describing: window)))")
 
             // And term for term against the contiguous mask builder itself.
             assertClose(
@@ -635,7 +636,8 @@ struct CBv2PagedPackedSpanTests {
         let closed = CBv2LayerCacheBank(caches: [refusing])
         #expect(
             !closed.supportsPackedPrefill,
-            "the same class answering false must close the gate — so the gate is the value, not the conformance and not the type")
+            "the same class answering false must close the gate — so the gate is the value, not the conformance and not the type"
+        )
         #expect(!closed.supportsMultimodalSpans)
 
         // Mixed with a real paged cache: one refusal closes the whole bank.

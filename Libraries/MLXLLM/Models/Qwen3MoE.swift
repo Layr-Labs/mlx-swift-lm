@@ -76,8 +76,9 @@ class Qwen3MoEAttention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let offset = cache?.ropeOffset
+        queries = applyRotaryPosition(rope, to: queries, offset: offset)
+        keys = applyRotaryPosition(rope, to: keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -142,7 +143,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
         }
 
         let y = switchMLP(x, inds)
-        return (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        return weightedExpertSum(y, scores)
     }
 }
 
@@ -253,9 +254,8 @@ public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitizedWeights = weights
 
-        if configuration.tieWordEmbeddings {
-            sanitizedWeights["lm_head.weight"] = nil
-        }
+        sanitizedWeights = filterLMHeadWeights(
+            from: sanitizedWeights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         if sanitizedWeights["model.layers.0.mlp.experts.0.up_proj.weight"] == nil {
             return sanitizedWeights
@@ -350,10 +350,22 @@ public struct Qwen3MoEConfiguration: Codable, Sendable {
     }
 }
 
+extension Qwen3MoEConfiguration: ModelConfigurationValidating {
+    public func validateModelConfiguration() throws {
+        try validateRoPEConfiguration(ropeScaling, context: "Qwen3MoEConfiguration.rope_scaling")
+    }
+}
+
 // MARK: - LoRA
 
 extension Qwen3MoEModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension Qwen3MoEModel {
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.qwen3 }
 }

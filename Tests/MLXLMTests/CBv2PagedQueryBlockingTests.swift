@@ -29,8 +29,8 @@ import MLX
 import MLXRandom
 import Testing
 
-@testable import MLXLMCommon
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 @Suite("CBv2PagedQueryBlocking")
 struct CBv2PagedQueryBlockingTests {
@@ -228,7 +228,8 @@ struct CBv2PagedQueryBlockingTests {
         let dtype = DType.float32
         let backend = try PagedKVBackend(
             layerKinds: [layer], config: config(maxPrefillChunk: chunk, dtype: dtype))
-        let ring = PagedKVPool.ringPageCount(window: window, config: backend.pool.config)
+        let ring =
+            PagedKVPool.ringPageCount(window: window, config: backend.pool.config)
             * backend.pool.config.pageSize
         #expect(
             ring >= window - 1,
@@ -592,7 +593,8 @@ struct CBv2PagedQueryBlockingTests {
         columns.mtpSerializesRectangularAttention = false
         #expect(
             columns.tablesRebuildCount > 0,
-            "premise: the per-column path DOES build block tables, so the check above discriminates the two routes rather than being vacuous")
+            "premise: the per-column path DOES build block tables, so the check above discriminates the two routes rather than being vacuous"
+        )
 
         // Both routes advanced every row by the full chunk.
         #expect(promptRows.allSatisfy { $0.absoluteOffset == chunk })

@@ -70,3 +70,18 @@ public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: 
     }
     return rope(x, offset: cache?.offset ?? 0)
 }
+
+/// Compatibility overload for model ports that already resolved their cache
+/// offset before calling the shared helper.
+public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, offset: RoPEOffset?)
+    -> MLXArray
+{
+    switch offset {
+    case .none:
+        return rope(x, offset: 0)
+    case .scalar(let value):
+        return rope(x, offset: value)
+    case .batch(let value):
+        return rope(x, offset: value)
+    }
+}

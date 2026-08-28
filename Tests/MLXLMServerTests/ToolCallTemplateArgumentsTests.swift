@@ -2,8 +2,9 @@
 
 import Foundation
 import MLXLMCommon
-@testable import MLXLMServer
 import Testing
+
+@testable import MLXLMServer
 
 /// Regression tests for issue #249 at the MLXLMServer translation boundary.
 ///

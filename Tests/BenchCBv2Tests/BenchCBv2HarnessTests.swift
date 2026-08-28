@@ -30,7 +30,8 @@ struct BenchCBv2HarnessTests {
     /// fields produced by the outer pipes.
     private func cells(_ row: String) -> [String] {
         let escapedPipe = "\u{FFFF}"
-        return row
+        return
+            row
             .replacingOccurrences(of: "\\|", with: escapedPipe)
             .components(separatedBy: "|")
             .dropFirst().dropLast()
@@ -91,8 +92,10 @@ struct BenchCBv2HarnessTests {
 
     @Test("retired and unknown engines both refuse rather than fall through")
     func retiredEnginesRefuse() {
-        #expect(resolveEngine("legacy") == .refuse(
-            reason: "refused: the legacy engine was removed in v0.8.0 — use v2"))
+        #expect(
+            resolveEngine("legacy")
+                == .refuse(
+                    reason: "refused: the legacy engine was removed in v0.8.0 — use v2"))
         #expect(resolveEngine("nonsense") == .refuse(reason: "refused: unknown engine"))
         #expect(resolveEngine("v2") == .run(.contiguous))
         #expect(resolveEngine("v2-paged") == .run(.paged))
@@ -456,7 +459,9 @@ struct BenchCBv2HarnessTests {
         // `100O0` is the review's example: a capital O for a zero. The old
         // compactMap/filter pair dropped it and ran the default 500/1500 mix
         // under a header that still claimed the requested axis.
-        for raw in ["100O0", "0", "-5", "", "500,", ",500", "500,,1500", "500,abc", "1 000", "1_000"] {
+        for raw in [
+            "100O0", "0", "-5", "", "500,", ",500", "500,,1500", "500,abc", "1 000", "1_000",
+        ] {
             #expect(throws: BenchOptionError.self) {
                 _ = try BenchOptions.parse(["--model", "/tmp/m", "--prompt-lengths", raw])
             }
@@ -580,8 +585,9 @@ struct BenchCBv2HarnessTests {
 
     @Test("plain arguments stay unquoted so the common report is readable")
     func plainArgumentsAreNotQuoted() {
-        #expect(shellQuotedInvocation(["BenchCBv2", "--steps", "128"])
-            == "BenchCBv2 --steps 128")
+        #expect(
+            shellQuotedInvocation(["BenchCBv2", "--steps", "128"])
+                == "BenchCBv2 --steps 128")
         #expect(shellQuote("/tmp/models/gemma-4-e4b") == "/tmp/models/gemma-4-e4b")
         #expect(shellQuote("") == "''")
     }

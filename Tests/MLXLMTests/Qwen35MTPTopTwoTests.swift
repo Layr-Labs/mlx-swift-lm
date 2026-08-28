@@ -80,14 +80,15 @@ struct Qwen35MTPTopTwoTests {
         #expect(result.ids.shape == [2, 3, 2])
         #expect(result.values.shape == [2, 3, 2])
         eval(result.ids, result.values)
-        #expect(result.ids.asArray(Int32.self) == [
-            1, 2,
-            0, 2,
-            1, 2,
-            3, 0,
-            2, 0,
-            1, 0,
-        ])
+        #expect(
+            result.ids.asArray(Int32.self) == [
+                1, 2,
+                0, 2,
+                1, 2,
+                3, 0,
+                2, 0,
+                1, 0,
+            ])
     }
 
     @Test("exact ties choose lower token ids")

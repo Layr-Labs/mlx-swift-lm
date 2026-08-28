@@ -83,9 +83,9 @@ struct Gemma4SharedKVTests {
         #expect(snap.fullAttention.0.dim(2) == 8)
         #expect(snap.slidingAttention.0.dim(2) == 6)
         // Values round-trip (verifies the snapshot isn't zeroing anything).
-        #expect(snap.fullAttention.0.sum().item(Float.self) == 64.0)       // 1*2*8*4
-        #expect(snap.fullAttention.1.sum().item(Float.self) == 128.0)      // 2*2*8*4
-        #expect(snap.slidingAttention.0.sum().item(Float.self) == 144.0)   // 3*2*6*4
-        #expect(snap.slidingAttention.1.sum().item(Float.self) == 192.0)   // 4*2*6*4
+        #expect(snap.fullAttention.0.sum().item(Float.self) == 64.0)  // 1*2*8*4
+        #expect(snap.fullAttention.1.sum().item(Float.self) == 128.0)  // 2*2*8*4
+        #expect(snap.slidingAttention.0.sum().item(Float.self) == 144.0)  // 3*2*6*4
+        #expect(snap.slidingAttention.1.sum().item(Float.self) == 192.0)  // 4*2*6*4
     }
 }

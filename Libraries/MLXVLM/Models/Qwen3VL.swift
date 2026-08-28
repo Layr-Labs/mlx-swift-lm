@@ -8,6 +8,12 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// Keep the continuation anchor request-owned: one Qwen3-VL module can serve
+// several warm caches, and a module-global delta lets one request reposition
+// another request's text continuation. Retain the established key so existing
+// prompt-cache snapshots remain readable.
+private let qwen3VLRopeDeltasKey = LMOutput.Key<MLXArray>("qwen35vl.ropeDeltas")
+
 private enum Qwen3VLError: Error {
     case featureTokenMismatch(expected: Int, actual: Int)
     case missingImageGrid
@@ -124,18 +130,25 @@ public struct Qwen3VLProcessor: UserInputProcessor {
             for video in input.videos {
                 var resizedSize: CGSize = .zero
                 let sequence = try await MediaProcessing.asProcessedSequence(
-                    video, targetFPS: { _ in Double(2) },
+                    video,
+                    processing: input.processing.video,
+                    targetFPS: { _ in Double(2) },
                     maxFrames: Qwen3VLProcessor.maxVideoFrames
                 ) { frame in
-                    let processed = MediaProcessing.apply(frame.frame, processing: input.processing)
+                    let processed = MediaProcessing.apply(
+                        try frame.image.asCIImage(), processing: input.processing)
                     if resizedSize == .zero {
                         let size = processed.extent.size
-                        let maxPixels = min(config.maxPixels, Self.maxVideoFramePixels)
+                        let factor = config.patchSize * config.mergeSize
+                        let maxPixels = min(
+                            input.processing.maxPixels ?? config.maxPixels,
+                            config.maxPixels,
+                            Self.maxVideoFramePixels)
                         let (height, width) = try QwenVL.targetSize(
                             height: Int(size.height),
                             width: Int(size.width),
-                            factor: config.patchSize * config.mergeSize,
-                            minPixels: min(config.minPixels, maxPixels),
+                            factor: factor,
+                            minPixels: min(input.processing.minPixels ?? config.minPixels, maxPixels),
                             maxPixels: maxPixels)
                         resizedSize = CGSize(width: width, height: height)
                     }
@@ -219,6 +232,19 @@ public struct Qwen3VLProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case temporalPatchSize = "temporal_patch_size"
         case imageProcessorType = "image_processor_type"
+    }
+}
+
+extension Qwen3VLProcessorConfiguration {
+    init(qwen35VisionConfiguration config: Qwen3VLConfiguration.VisionConfiguration) {
+        self.imageMean = [0.5, 0.5, 0.5]
+        self.imageStd = [0.5, 0.5, 0.5]
+        self._minPixels = 65_536
+        self._maxPixels = 16_777_216
+        self.mergeSize = config.spatialMergeSize
+        self.patchSize = config.patchSize
+        self.temporalPatchSize = config.temporalPatchSize
+        self.imageProcessorType = "Qwen2VLImageProcessorFast"
     }
 }
 
@@ -1448,8 +1474,6 @@ enum Qwen3VLLanguage {
         let textConfig: Qwen3VLConfiguration.TextConfiguration
         var kvHeads: [Int]
 
-        private var ropeDeltas: MLXArray? = nil
-
         init(_ config: Qwen3VLConfiguration) {
             self.config = config
             self.textConfig = config.textConfiguration
@@ -1469,6 +1493,7 @@ enum Qwen3VLLanguage {
         func callAsFunction(
             _ inputIds: MLXArray?,
             cache: [KVCache]?,
+            state: LMOutput.State?,
             inputEmbeddings: MLXArray?,
             mask: MLXArray?,
             positionIds providedPositionIds: MLXArray?,
@@ -1478,14 +1503,17 @@ enum Qwen3VLLanguage {
             imageGridTHW: [THW]?,
             videoGridTHW: [THW]?
         ) -> LMOutput {
+            var state = state ?? .init()
             if pixelValues != nil {
-                ropeDeltas = nil
+                state[qwen3VLRopeDeltasKey] = nil
             }
 
             var positionIds = providedPositionIds
 
             if positionIds == nil && (mask == nil || mask?.ndim == 2) {
-                if (cache?.first?.offset ?? 0) == 0 || ropeDeltas == nil || cache == nil {
+                if (cache?.first?.offset ?? 0) == 0 || state[qwen3VLRopeDeltasKey] == nil
+                    || cache == nil
+                {
                     if let inputIds {
                         let (computed, deltas) = Qwen3VLLanguage.getRopeIndex(
                             inputIds: inputIds,
@@ -1498,8 +1526,8 @@ enum Qwen3VLLanguage {
                             attentionMask: mask)
 
                         positionIds = computed
-                        ropeDeltas = deltas
-                    } else if let cache, ropeDeltas == nil {
+                        state[qwen3VLRopeDeltasKey] = deltas
+                    } else if let cache, state[qwen3VLRopeDeltasKey] == nil {
                         let batch = inputEmbeddings!.dim(0)
                         let seqLength = inputEmbeddings!.dim(1)
                         let currentOffset = cache.first?.offset ?? 0
@@ -1512,7 +1540,7 @@ enum Qwen3VLLanguage {
                         positionIds = base[.newAxis, 0..., 0...]
                         positionIds = tiled(positionIds!, repetitions: [3, batch, seqLength])
                     }
-                } else if let cache, let ropeDeltas {
+                } else if let cache, let ropeDeltas = state[qwen3VLRopeDeltasKey] {
                     let batch = (inputIds ?? inputEmbeddings!).dim(0)
                     let seqLength = (inputIds ?? inputEmbeddings!).dim(1)
 
@@ -1550,7 +1578,7 @@ enum Qwen3VLLanguage {
                 output = model.embedTokens.asLinear(output)
             }
 
-            return LMOutput(logits: output)
+            return LMOutput(logits: output, state: state)
         }
 
         func cbv2Forward(
@@ -1761,6 +1789,35 @@ extension Qwen3VLLanguage {
             deltas = MLXArray(mropePositionDeltas.map { Int32($0) })
         }
         return (positionIds, deltas)
+    }
+
+    /// Applies the absolute continuation anchor after computing the regular
+    /// M-RoPE coordinates. A uniform shift preserves each axis's geometry and
+    /// shifts the returned delta into the same coordinate frame.
+    static func getRopeIndex(
+        inputIds: MLXArray,
+        imageGridTHW: [THW]?,
+        videoGridTHW: [THW]?,
+        spatialMergeSize: Int,
+        imageTokenId: Int,
+        videoTokenId: Int,
+        visionStartTokenId: Int,
+        attentionMask: MLXArray? = nil,
+        positionOffset: Int
+    ) -> (MLXArray, MLXArray) {
+        let (positionIds, deltas) = getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: imageGridTHW,
+            videoGridTHW: videoGridTHW,
+            spatialMergeSize: spatialMergeSize,
+            imageTokenId: imageTokenId,
+            videoTokenId: videoTokenId,
+            visionStartTokenId: visionStartTokenId,
+            attentionMask: attentionMask)
+        guard positionOffset != 0 else { return (positionIds, deltas) }
+
+        let offset = MLXArray(Int32(positionOffset))
+        return (positionIds + offset, deltas + offset)
     }
 }
 
@@ -2168,9 +2225,26 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(
         _ input: LMInput,
         cache: [any KVCache],
-        windowSize _: Int?
+        windowSize: Int?
     ) throws -> PrepareResult {
-        let inputIds = input.text.tokens
+        try prepare(
+            input, cache: cache, state: nil,
+            prefill: .init(stepSize: windowSize, chunking: .remainder))
+    }
+
+    public func prepare(
+        _ input: LMInput,
+        cache: [any KVCache],
+        state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let inputIds = input.text.tokens.ndim == 1
+            ? input.text.tokens.expandedDimensions(axis: 0)
+            : input.text.tokens
+        let cacheOffset = cache.last?.offset ?? 0
+        let positionOffset = try QwenVL.continuationAnchor(
+            model: "Qwen3VL", key: qwen3VLRopeDeltasKey,
+            cacheOffset: cacheOffset, batchSize: inputIds.dim(0), state: state)
 
         var pixelValues: MLXArray?
         var imageFrames: [THW]? = nil
@@ -2218,21 +2292,72 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             deepstackEmbeds = bundle.deepstack.isEmpty ? nil : bundle.deepstack
         }
 
+        let (positionIds, ropeDeltas) = Qwen3VLLanguage.getRopeIndex(
+            inputIds: inputIds,
+            imageGridTHW: imageFrames,
+            videoGridTHW: videoFrames,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            imageTokenId: config.imageTokenIndex,
+            videoTokenId: config.videoTokenIndex,
+            visionStartTokenId: config.visionStartTokenId,
+            attentionMask: input.text.mask,
+            positionOffset: positionOffset)
         let typedCache = castCache(cache)
+        let total = inputIds.dim(-1)
 
-        let languageOutput = languageModel(
-            inputIds,
-            cache: typedCache,
-            inputEmbeddings: inputEmbeddings,
+        func forward(_ range: Range<Int>) -> LMOutput {
+            languageModel(
+                inputIds[0..., range],
+                cache: typedCache,
+                state: nil,
+                inputEmbeddings: inputEmbeddings?[0..., range, 0...],
+                mask: nil,
+                positionIds: positionIds[0..., 0..., range],
+                visualMask: visualMask,
+                deepstackEmbeds: deepstackEmbeds,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil)
+        }
+
+        let logits: MLXArray
+        if inputEmbeddings != nil {
+            // Vision features and deepstack rows are indexed by visual-token
+            // count, not text position; a generic text chunk would split that
+            // alignment. Keep multimodal prefill as one exact forward.
+            logits = forward(0 ..< total).logits
+        } else {
+            let processed = try prefill.forEachChunk(total: total) { range in
+                _ = forward(range)
+                if let typedCache { asyncEval(typedCache) }
+            }
+            if processed > 0, let typedCache { eval(typedCache) }
+            logits = forward(processed ..< total).logits
+        }
+        prefill.progress?(total, total)
+        return .logits(
+            LMOutput(
+                logits: logits,
+                state: QwenVL.continuationResumeState(
+                    ropeDeltas: ropeDeltas, cacheOffset: cacheOffset,
+                    key: qwen3VLRopeDeltasKey)))
+    }
+
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        languageModel(
+            input.tokens,
+            cache: castCacheOptional(cache),
+            state: state,
+            inputEmbeddings: nil,
             mask: nil,
             positionIds: nil,
-            visualMask: visualMask,
-            deepstackEmbeds: deepstackEmbeds,
-            pixelValues: pixelValues,
-            imageGridTHW: imageFrames,
-            videoGridTHW: videoFrames)
-
-        return .logits(languageOutput)
+            visualMask: nil,
+            deepstackEmbeds: nil,
+            pixelValues: nil,
+            imageGridTHW: nil,
+            videoGridTHW: nil)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
@@ -2245,6 +2370,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         let result = languageModel(
             inputs,
             cache: typedCache,
+            state: nil,
             inputEmbeddings: nil,
             mask: nil,
             positionIds: nil,

@@ -422,6 +422,27 @@ public enum MediaProcessing {
 
     static public func asProcessedSequence(
         _ video: UserInput.Video,
+        processing: UserInput.VideoProcessing = .init(),
+        targetFPS: ((CMTime) -> Double)? = nil,
+        maxFrames: Int = Int.max,
+        frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
+    ) async throws -> ProcessedFrames {
+        let sampler: (CMTime) -> Double = { duration in
+            if let targetFrames = processing.targetFrames {
+                return Double(targetFrames) / max(duration.seconds, 1e-6)
+            }
+            if let framesPerSecond = processing.targetFramesPerSecond {
+                return framesPerSecond
+            }
+            return targetFPS?(duration) ?? 1
+        }
+        let frameLimit = min(maxFrames, processing.targetFrames ?? Int.max)
+        return try await asProcessedSequence(
+            video, targetFPS: sampler, maxFrames: frameLimit, frameProcessing: frameProcessing)
+    }
+
+    static public func asProcessedSequence(
+        _ video: UserInput.Video,
         samplesPerSecond: Int,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
@@ -450,9 +471,7 @@ public enum MediaProcessing {
 
         case .memoryBacked(let owner):
             return try await owner.withAsset { asset in
-                try Task.checkCancellation()
                 try await Self.validateAsset(asset)
-                try Task.checkCancellation()
                 return try await _asProcessedSequence(
                     asset, maxFrames: maxFrames, targetFPS: targetFPS,
                     frameProcessing: frameProcessing)

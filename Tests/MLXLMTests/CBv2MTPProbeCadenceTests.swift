@@ -237,10 +237,12 @@ struct CBv2MTPProbeCadenceTests {
 
         let seedInflatedEstimate = drive(
             costRatio: seedInflatedDepthOne / Double(baselineNanos),
-            steps: 200, baselineNanos: baselineNanos).outcome
+            steps: 200, baselineNanos: baselineNanos
+        ).outcome
         let steadyStateTruth = drive(
             costRatio: steadyStateDepthOne / Double(baselineNanos),
-            steps: 200, baselineNanos: baselineNanos).outcome
+            steps: 200, baselineNanos: baselineNanos
+        ).outcome
 
         // What the engine does today: collapse to the probe cadence.
         #expect(seedInflatedEstimate.rounds == 5)

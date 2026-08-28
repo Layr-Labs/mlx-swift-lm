@@ -3,7 +3,6 @@ import MLX
 import MLXLMCommon
 import Testing
 
-
 @Suite(.serialized)
 struct QwenDirectExpertReductionPerfTests {
     @Test func pairedDirectReductionVersusLegacy() throws {
@@ -32,7 +31,10 @@ struct QwenDirectExpertReductionPerfTests {
             weightedExpertUnsort(
                 sortedOutputs: sorted, inverseOrder: inverse, weights: weights)
         }
-        for _ in 0 ..< 5 { eval(legacy()); eval(direct()) }
+        for _ in 0 ..< 5 {
+            eval(legacy())
+            eval(direct())
+        }
         var legacyTimes: [Double] = []
         var directTimes: [Double] = []
         for i in 0 ..< 25 {
@@ -52,9 +54,12 @@ struct QwenDirectExpertReductionPerfTests {
                 legacyTimes.append(Double(DispatchTime.now().uptimeNanoseconds - t) / 1e6)
             }
         }
-        legacyTimes.sort(); directTimes.sort()
-        print(String(format:
-            "[qwen-direct-reduction-perf] legacy=%.4fms direct=%.4fms speedup=%.3fx",
-            legacyTimes[12], directTimes[12], legacyTimes[12] / directTimes[12]))
+        legacyTimes.sort()
+        directTimes.sort()
+        print(
+            String(
+                format:
+                    "[qwen-direct-reduction-perf] legacy=%.4fms direct=%.4fms speedup=%.3fx",
+                legacyTimes[12], directTimes[12], legacyTimes[12] / directTimes[12]))
     }
 }

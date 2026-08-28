@@ -90,15 +90,19 @@ final class Qwen35VisionSeamTests: XCTestCase {
 
         XCTAssertEqual(result.flattenedFeatures.shape, [7, 8])
         XCTAssertEqual(result.ordered.count, 4)
-        XCTAssertEqual(result.ordered.map(\.kind), [
-            .image(index: 0),
-            .image(index: 1),
-            .videoFrame(videoIndex: 0, frameIndex: 0),
-            .videoFrame(videoIndex: 0, frameIndex: 1),
-        ])
-        XCTAssertEqual(result.ordered.map { $0.features.shape }, [
-            [1, 1, 8], [1, 2, 8], [1, 2, 8], [1, 2, 8],
-        ])
+        XCTAssertEqual(
+            result.ordered.map(\.kind),
+            [
+                .image(index: 0),
+                .image(index: 1),
+                .videoFrame(videoIndex: 0, frameIndex: 0),
+                .videoFrame(videoIndex: 0, frameIndex: 1),
+            ])
+        XCTAssertEqual(
+            result.ordered.map { $0.features.shape },
+            [
+                [1, 1, 8], [1, 2, 8], [1, 2, 8], [1, 2, 8],
+            ])
 
         let reconstructed = concatenated(result.ordered.map(\.features), axis: 1)
             .squeezed(axis: 0)
@@ -118,7 +122,8 @@ final class Qwen35VisionSeamTests: XCTestCase {
                 imagePixels: imagePixels,
                 imageGrids: [THW(1, 1, 2)],
                 videoPixels: videoPixels,
-                videoGrids: [THW(1, 1, 4)])) { error in
+                videoGrids: [THW(1, 1, 4)])
+        ) { error in
             XCTAssertEqual(
                 error as? Qwen35VisionSeamError,
                 .pixelCountMismatch(kind: "image", expected: 2, actual: 3))
@@ -128,7 +133,8 @@ final class Qwen35VisionSeamTests: XCTestCase {
                 imagePixels: MLXArray([Float(1), 2]).reshaped(2, 1),
                 imageGrids: [THW(1, 1, 2)],
                 videoPixels: videoPixels,
-                videoGrids: [THW(1, 1, 4)])) { error in
+                videoGrids: [THW(1, 1, 4)])
+        ) { error in
             XCTAssertEqual(
                 error as? Qwen35VisionSeamError,
                 .pixelCountMismatch(kind: "video", expected: 4, actual: 3))
@@ -155,7 +161,8 @@ final class Qwen35VisionSeamTests: XCTestCase {
         ]).reshaped(1, 20)
         let input = LMInput(text: .init(tokens: tokens), image: image, video: video)
 
-        let prepared = try model.prepare(input, cache: model.newCache(parameters: nil), windowSize: nil)
+        let prepared = try model.prepare(
+            input, cache: try model.newCache(parameters: nil), windowSize: nil)
         guard case .logits(let output) = prepared else {
             return XCTFail("Qwen35 legacy prepare must continue returning logits")
         }

@@ -50,7 +50,8 @@ public struct OpenAIResponseFormat: Codable, Sendable, Equatable {
         .init(type: .jsonObject)
     }
 
-    public static func jsonSchema(_ schema: OpenAIJSONSchemaResponseFormat) -> OpenAIResponseFormat {
+    public static func jsonSchema(_ schema: OpenAIJSONSchemaResponseFormat) -> OpenAIResponseFormat
+    {
         .init(type: .jsonSchema, jsonSchema: schema)
     }
 

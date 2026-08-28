@@ -1,7 +1,8 @@
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import Testing
+
+@testable import MLXLMCommon
 
 private final class FixedTokenConstraint: CBv2TokenConstraint, @unchecked Sendable {
     let mode: CBv2TokenConstraintMode
@@ -94,8 +95,9 @@ struct CBv2TokenConstraintSamplingTests {
             requestIDs: [id],
             stepIndex: 0,
             pendingSampledTokens: nil,
-            rowContext: { [row] })
-            .asArray(Int32.self)
+            rowContext: { [row] }
+        )
+        .asArray(Int32.self)
 
         #expect(token == [1])
     }
@@ -121,8 +123,9 @@ struct CBv2TokenConstraintSamplingTests {
             requestIDs: [id],
             stepIndex: 0,
             pendingSampledTokens: nil,
-            rowContext: { [row] })
-            .asArray(Int32.self)
+            rowContext: { [row] }
+        )
+        .asArray(Int32.self)
 
         #expect(token == [30])
     }
@@ -146,15 +149,17 @@ struct CBv2TokenConstraintSamplingTests {
                 id: ordinaryID, params: params[1], promptTokens: [0], maxTokens: 2),
         ]
 
-        let logits = MLXArray([
-            Float(0), 1, 2, 10,
-            Float(0), 1, 2, 10,
-        ], [2, 4])
+        let logits = MLXArray(
+            [
+                Float(0), 1, 2, 10,
+                Float(0), 1, 2, 10,
+            ], [2, 4])
         let first = sampler.sample(
             logits: logits, params: params,
             requestIDs: [constrainedID, ordinaryID],
             stepIndex: 0, pendingSampledTokens: nil,
-            rowContext: { rows }).asArray(Int32.self)
+            rowContext: { rows }
+        ).asArray(Int32.self)
         #expect(first == [1, 3])
         let raw = try #require(sampler.takeStepLogprobs())
         eval(raw.evalTargets)
@@ -172,7 +177,8 @@ struct CBv2TokenConstraintSamplingTests {
             logits: logits, params: params,
             requestIDs: [constrainedID, ordinaryID],
             stepIndex: 1, pendingSampledTokens: nil,
-            rowContext: { rows }).asArray(Int32.self)
+            rowContext: { rows }
+        ).asArray(Int32.self)
         #expect(second == [2, 3])
     }
 
@@ -191,7 +197,8 @@ struct CBv2TokenConstraintSamplingTests {
         let first = sampler.sample(
             logits: logits, params: params, requestIDs: [id],
             stepIndex: 0, pendingSampledTokens: nil,
-            rowContext: { [row] }).asArray(Int32.self)
+            rowContext: { [row] }
+        ).asArray(Int32.self)
         #expect(first == [1])
         sampler.confirmSampledTokens(first.map(Int.init), requestIDs: [id])
         sampler.requestDidFinish(id)
@@ -199,7 +206,8 @@ struct CBv2TokenConstraintSamplingTests {
         let reused = sampler.sample(
             logits: logits, params: params, requestIDs: [id],
             stepIndex: 1, pendingSampledTokens: nil,
-            rowContext: { [row] }).asArray(Int32.self)
+            rowContext: { [row] }
+        ).asArray(Int32.self)
         #expect(reused == [1])
     }
 
@@ -302,8 +310,9 @@ struct CBv2TokenConstraintSamplingTests {
         let token = sampler.sample(
             logits: MLXArray([Float(0), 10, 20], [1, 3]),
             params: params, requestIDs: [id], stepIndex: 0,
-            pendingSampledTokens: nil, rowContext: { [row] })
-            .asArray(Int32.self)
+            pendingSampledTokens: nil, rowContext: { [row] }
+        )
+        .asArray(Int32.self)
         #expect(token == [0])
         #expect(
             sampler.tokenConstraintFailure(for: id)
@@ -317,7 +326,7 @@ struct CBv2TokenConstraintSamplingTests {
         let id = CBv2RequestID(88)
         let params = [
             CBv2SamplingParams(
-                temperature: 1, topP: 1, topK: 1, seed: 3),
+                temperature: 1, topP: 1, topK: 1, seed: 3)
         ]
         let row = CBv2SamplerRow(
             id: id, params: params[0], promptTokens: [0],
@@ -325,8 +334,9 @@ struct CBv2TokenConstraintSamplingTests {
         let sampled = sampler.sample(
             logits: MLXArray([Float(0), 1, 2, 100], [1, 4]),
             params: params, requestIDs: [id], stepIndex: 0,
-            pendingSampledTokens: nil, rowContext: { [row] })
-            .asArray(Int32.self)
+            pendingSampledTokens: nil, rowContext: { [row] }
+        )
+        .asArray(Int32.self)
         #expect(sampled == [1])
     }
 
@@ -341,7 +351,7 @@ struct CBv2TokenConstraintSamplingTests {
                 topP: 1,
                 topK: 1,
                 repetitionPenalty: -1,
-                repetitionContextSize: 64),
+                repetitionContextSize: 64)
         ]
         let row = CBv2SamplerRow(
             id: id, params: params[0], promptTokens: [3],
@@ -349,8 +359,9 @@ struct CBv2TokenConstraintSamplingTests {
         let sampled = sampler.sample(
             logits: MLXArray([Float(0), 1, 2, 100], [1, 4]),
             params: params, requestIDs: [id], stepIndex: 0,
-            pendingSampledTokens: nil, rowContext: { [row] })
-            .asArray(Int32.self)
+            pendingSampledTokens: nil, rowContext: { [row] }
+        )
+        .asArray(Int32.self)
         #expect(sampled == [1])
     }
 }

@@ -13,11 +13,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 @Suite("CBv2MTPModelSeam", .serialized)
 struct CBv2MTPModelSeamTests {

@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 import XCTest
 
@@ -8,6 +9,78 @@ import XCTest
 
 
 final class Qwen3VLMoETests: XCTestCase {
+    private func legacyConfiguration() throws -> Qwen3VLMoEConfiguration {
+        let json = """
+            {
+                "model_type": "qwen3_vl_moe",
+                "text_config": {
+                    "model_type": "qwen3_vl_moe",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "decoder_sparse_step": 1,
+                    "mlp_only_layers": [],
+                    "moe_intermediate_size": 12,
+                    "rms_norm_eps": 0.000001,
+                    "vocab_size": 32,
+                    "head_dim": 8,
+                    "rope_theta": 1000000,
+                    "max_position_embeddings": 32768,
+                    "rope_scaling": {
+                        "rope_type": "default",
+                        "mrope_section": [24, 20, 20]
+                    }
+                },
+                "vision_config": {
+                    "model_type": "qwen3_vl_moe",
+                    "depth": 1,
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "out_hidden_size": 8,
+                    "hidden_act": "gelu_pytorch_tanh",
+                    "num_heads": 1,
+                    "patch_size": 16,
+                    "spatial_merge_size": 1,
+                    "temporal_patch_size": 1,
+                    "num_position_embeddings": 8
+                }
+            }
+            """
+        return try JSONDecoder().decode(Qwen3VLMoEConfiguration.self, from: Data(json.utf8))
+    }
+
+    func testLegacyConfigurationDecodesMRoPEAndMoEFields() throws {
+        let config = try legacyConfiguration()
+
+        XCTAssertEqual(config.modelType, "qwen3_vl_moe")
+        XCTAssertEqual(config.textConfiguration.ropeScaling?.mropeSection, [24, 20, 20])
+        XCTAssertEqual(config.textConfiguration.numExperts, 2)
+        XCTAssertEqual(config.textConfiguration.numExpertsPerTok, 1)
+        XCTAssertEqual(config.textConfiguration.decoderSparseStep, 1)
+        XCTAssertEqual(config.textConfiguration.moeIntermediateSize, 12)
+    }
+
+    func testLegacyModelUsesTaggedQwenReasoningProtocol() throws {
+        let reasoning = try XCTUnwrap(Qwen3VLMoE(try legacyConfiguration()).reasoningConfig)
+
+        XCTAssertEqual(reasoning, QwenReasoningProtocol.tagged)
+        XCTAssertEqual(reasoning.startDelimiter, "<think>")
+        XCTAssertEqual(reasoning.implicitEndDelimiters, ["<tool_call>"])
+        XCTAssertNil(reasoning.budgetTransition)
+    }
+
+    func testLegacyModelTypeResolvesThroughPublicRegistry() async throws {
+        let data = try JSONEncoder().encode(legacyConfiguration())
+        let model = try await VLMTypeRegistry.shared.createModel(
+            configuration: data, modelType: "qwen3_vl_moe")
+
+        XCTAssertTrue(model is Qwen3VLMoE)
+    }
+
     func testPublishedMoEGeometryDecodes() throws {
         let config = try decodeConfiguration(realShapeConfigurationJSON)
 

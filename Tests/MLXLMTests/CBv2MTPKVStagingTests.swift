@@ -214,7 +214,8 @@ struct CBv2MTPKVStagingEquivalenceTests {
                             let staged = stagedRow.update(keys: keys, values: values)
                             let plain = viewReference.update(keys: keys, values: values)
                             expectExact(staged.0, plain.0, "intermediate keys \(label) i=\(index)")
-                            expectExact(staged.1, plain.1, "intermediate values \(label) i=\(index)")
+                            expectExact(
+                                staged.1, plain.1, "intermediate values \(label) i=\(index)")
                         }
                         stagedRow.rollback(m)
                         stagedRow.commitSpeculativeWrite()
@@ -228,8 +229,10 @@ struct CBv2MTPKVStagingEquivalenceTests {
                                 keys: positionCoded(from: baseFill + index, count: 1),
                                 values: positionCoded(from: 5000 + baseFill + index, count: 1))
                         }
-                        #expect(stagedRow.absoluteOffset == plainRow.absoluteOffset, "offset \(label)")
-                        #expect(stagedRow.retainedCount == plainRow.retainedCount, "retained \(label)")
+                        #expect(
+                            stagedRow.absoluteOffset == plainRow.absoluteOffset, "offset \(label)")
+                        #expect(
+                            stagedRow.retainedCount == plainRow.retainedCount, "retained \(label)")
                         expectExact(
                             stagedRow.snapshot().keys, plainRow.snapshot().keys,
                             "committed keys \(label)")
@@ -515,7 +518,9 @@ struct CBv2MTPKVStagingAttentionParityTests {
     }
 
     /// Two identical row sets (batch + solo) fed the same K/V content.
-    private func makeRowPairs(kind: CBv2LayerKind) -> (batch: [CBv2SequenceKV], solo: [CBv2SequenceKV]) {
+    private func makeRowPairs(kind: CBv2LayerKind) -> (
+        batch: [CBv2SequenceKV], solo: [CBv2SequenceKV]
+    ) {
         var batch: [CBv2SequenceKV] = []
         var solo: [CBv2SequenceKV] = []
         for (index, length) in lengths.enumerated() {

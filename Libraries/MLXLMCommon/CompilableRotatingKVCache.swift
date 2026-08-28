@@ -118,7 +118,9 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     }
 
     /// Static promote helper for symmetry with `CompilableKVCache.promote`.
-    public static func promote(from cache: RotatingKVCache, maxLength: Int) -> CompilableRotatingKVCache {
+    public static func promote(from cache: RotatingKVCache, maxLength: Int)
+        -> CompilableRotatingKVCache
+    {
         // maxLength is unused here because RotatingKVCache already has maxCacheSize,
         // but the parameter keeps the API symmetric with CompilableKVCache.promote.
         return CompilableRotatingKVCache(from: cache)

@@ -59,11 +59,11 @@ struct StreamingHarmonyReasoningParser: Sendable {
         if let marker = firstRange(
             ofAny: outsideControlMarkers,
             in: buffer,
-            range: buffer.startIndex..<buffer.endIndex
+            range: buffer.startIndex ..< buffer.endIndex
         ) {
             appendContent(String(buffer[..<marker.lowerBound]), to: &output)
             let matchedMarker = String(buffer[marker])
-            buffer.removeSubrange(buffer.startIndex..<marker.upperBound)
+            buffer.removeSubrange(buffer.startIndex ..< marker.upperBound)
             if matchedMarker == channelMarker {
                 channel.removeAll(keepingCapacity: true)
                 state = .channel
@@ -83,7 +83,7 @@ struct StreamingHarmonyReasoningParser: Sendable {
     private mutating func drainChannel(final: Bool, shouldContinue: inout Bool) {
         if let messageStart = buffer.range(of: messageMarker) {
             channel += String(buffer[..<messageStart.lowerBound])
-            buffer.removeSubrange(buffer.startIndex..<messageStart.upperBound)
+            buffer.removeSubrange(buffer.startIndex ..< messageStart.upperBound)
             state = .message
             return
         }
@@ -108,11 +108,11 @@ struct StreamingHarmonyReasoningParser: Sendable {
         if let marker = firstRange(
             ofAny: messageControlMarkers,
             in: buffer,
-            range: buffer.startIndex..<buffer.endIndex
+            range: buffer.startIndex ..< buffer.endIndex
         ) {
             appendMessage(String(buffer[..<marker.lowerBound]), to: &output)
             let matchedMarker = String(buffer[marker])
-            buffer.removeSubrange(buffer.startIndex..<marker.upperBound)
+            buffer.removeSubrange(buffer.startIndex ..< marker.upperBound)
             if matchedMarker != roleMarker {
                 channel.removeAll(keepingCapacity: true)
                 state = .outside

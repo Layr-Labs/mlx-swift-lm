@@ -71,7 +71,6 @@ public class ChatSessionTests: XCTestCase {
     }
 
     func testChatSessionAsyncInterrupt() async throws {
-        // interrupt the streamResponse and continue with another request
         let model = model()
         let session = ChatSession(model, generateParameters: generationParameters)
 
@@ -82,9 +81,6 @@ public class ChatSessionTests: XCTestCase {
                 break
             }
 
-            // at this point the performStreaming/generate code may still be running.
-            // the next call can corrupt the state if not thread safe
-
             var result2 = ""
             for try await part in session.streamResponse(to: "hello again") {
                 result2 += part
@@ -94,9 +90,6 @@ public class ChatSessionTests: XCTestCase {
             }
         }
 
-        // since we are interrupting we need to wait for everything to finish
-        // (avoids shutdown issues if this is the last/only test). because the
-        // streaming task is not a synchronous shutdown
         await session.synchronize()
     }
 
@@ -128,7 +121,6 @@ public class ChatSessionTests: XCTestCase {
         let result = try await session.respond(to: "What is the weather in SF?")
         XCTAssertGreaterThan(result.count, targetLength, result)
 
-        // second turn to verify tools persist through cache
         let result2 = try await session.respond(to: "How about NYC?")
         XCTAssertGreaterThan(result2.count, targetLength, result2)
     }
@@ -177,7 +169,6 @@ public class ChatSessionTests: XCTestCase {
     }
 
     func testInitWithKVCache() async throws {
-        // build a cache from an initial session
         let container = ModelContainer(context: model())
         let initial = ChatSession(container, generateParameters: generationParameters)
         _ = try await initial.respond(to: "hello")
@@ -186,7 +177,6 @@ public class ChatSessionTests: XCTestCase {
             XCTAssertNotNil(cache)
 
             if let cache {
-                // restore the cache into a new session and verify generation continues
                 let restored = ChatSession(
                     container,
                     cache: cache.map { $0.copy() },
@@ -228,7 +218,6 @@ public class ChatSessionTests: XCTestCase {
     }
 
     func testCurrentCacheNilForHistorySessionBeforeGeneration() async throws {
-        // .history state should behave like .empty: no cache until first generation
         let history: [Chat.Message] = [.user("hello"), .assistant("hi")]
         let session = ChatSession(
             model(), history: history, generateParameters: generationParameters)
@@ -238,7 +227,6 @@ public class ChatSessionTests: XCTestCase {
     }
 
     func testCurrentCacheNonNilForHistorySessionAfterGeneration() async throws {
-        // after generation from .history state, cache transitions to .kvcache
         let history: [Chat.Message] = [.user("hello"), .assistant("hi")]
         let session = ChatSession(
             model(),
@@ -251,7 +239,6 @@ public class ChatSessionTests: XCTestCase {
     }
 
     func testCurrentCacheNilAfterClear() async throws {
-        // clear() resets to .empty; currentCache() should return nil again
         let session = ChatSession(model(), generateParameters: generationParameters)
         _ = try await session.respond(to: "hello")
         await session.withCache { cache in
@@ -263,7 +250,6 @@ public class ChatSessionTests: XCTestCase {
         }
     }
 
-    /// something that looks like a view model
     @MainActor class ChatModel {
         let session: ChatSession
 
@@ -308,18 +294,14 @@ public class ChatSessionTests: XCTestCase {
     func testViewModel() async throws {
         let model = ChatModel(model: model())
 
-        // start producing a response but interrupt it
-        // triggers https://github.com/ml-explore/mlx-swift/pull/323
         model.respond("message1")
         try await Task.sleep(for: .milliseconds(50))
         model.cancel()
 
-        // wait for it to finish
         while model.isBusy {
             try await Task.sleep(for: .milliseconds(10))
         }
 
-        // try another message, wait for full completion (but cap the length)
         model.session.generateParameters = self.generationParameters
         model.respond("message2")
         while model.isBusy {

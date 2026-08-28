@@ -46,10 +46,10 @@ import MLX
 import MLXLLM
 import MLXNN
 import MLXRandom
-@testable import MLXVLM
 import XCTest
 
 @testable import MLXLMCommon
+@testable import MLXVLM
 
 // MARK: - Stub tokenizer (drives the REAL Gemma4Processor deterministically)
 
@@ -587,7 +587,8 @@ final class CBv2VideoSeamTests: XCTestCase {
             var json = Self.tinyVLMConfigJSON.replacingOccurrences(
                 of: "\"model_type\": \"gemma4\",",
                 with:
-                    "\"model_type\": \"gemma4\", \"\(rootKey)\": {\"bits\": 4, \"group_size\": 64},")
+                    "\"model_type\": \"gemma4\", \"\(rootKey)\": {\"bits\": 4, \"group_size\": 64},"
+            )
             json = json.replacingOccurrences(
                 of: "\"hidden_size\": 32", with: "\"hidden_size\": 1536")
             json = json.replacingOccurrences(
@@ -607,7 +608,6 @@ final class CBv2VideoSeamTests: XCTestCase {
                 policy.strategy(forBatchSize: 4), .singleStream(blockSize: 3))
         }
     }
-
 
     /// Nested Gemma4 VLM configs predate the canonical text-only defaults.
     /// Omitting fields must retain the former VLM topology rather than silently
@@ -658,14 +658,14 @@ final class CBv2VideoSeamTests: XCTestCase {
         }
     }
 
-
     /// Alias-only quantization must reach BaseConfiguration and the real
     /// loadWeights quantization pass before strict parameter verification.
     func testQuantizationConfigAliasStrictLoadsQuantizedVLMWeights() throws {
         let json = Self.tinyVLMConfigJSON.replacingOccurrences(
             of: "\"model_type\": \"gemma4\",",
             with:
-                "\"model_type\": \"gemma4\", \"quantization_config\": {\"bits\": 4, \"group_size\": 32},")
+                "\"model_type\": \"gemma4\", \"quantization_config\": {\"bits\": 4, \"group_size\": 32},"
+        )
         let data = Data(json.utf8)
         let config = try JSONDecoder().decode(
             MLXVLM.Gemma4Configuration.self, from: data)

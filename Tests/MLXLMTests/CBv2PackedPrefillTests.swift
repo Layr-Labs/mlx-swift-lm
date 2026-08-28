@@ -386,7 +386,8 @@ final class CBv2PackedPrefillTests: XCTestCase {
         _ packed: [CBv2SequenceKV?], _ singleton: [CBv2SequenceKV?],
         row: String, file: StaticString = #filePath, line: UInt = #line
     ) {
-        XCTAssertFalse(packed.isEmpty, "\(row): test premise — the model has layers",
+        XCTAssertFalse(
+            packed.isEmpty, "\(row): test premise — the model has layers",
             file: file, line: line)
         XCTAssertEqual(
             packed.count, singleton.count, "\(row): layer count", file: file, line: line)

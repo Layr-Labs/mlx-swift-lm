@@ -108,7 +108,8 @@ final class Qwen35PositionStateTests: XCTestCase {
         XCTAssertThrowsError(
             try model.positionResult(
                 tokens: MLXArray([Int32(9), 10, 10, 10, 14]),
-                imageGrids: [THW(1, 4, 4)])) { error in
+                imageGrids: [THW(1, 4, 4)])
+        ) { error in
             XCTAssertEqual(
                 error as? Qwen35PositionSeamError,
                 .visualTokenRunMismatch(
@@ -117,7 +118,8 @@ final class Qwen35PositionStateTests: XCTestCase {
         XCTAssertThrowsError(
             try model.positionResult(
                 tokens: MLXArray([Int32(1), 2, 3]),
-                imageGrids: [THW(1, 4, 4)])) { error in
+                imageGrids: [THW(1, 4, 4)])
+        ) { error in
             XCTAssertEqual(
                 error as? Qwen35PositionSeamError,
                 .visualTokenRunMismatch(
@@ -125,7 +127,8 @@ final class Qwen35PositionStateTests: XCTestCase {
         }
         XCTAssertThrowsError(
             try model.positionResult(
-                tokens: MLXArray([Int32(9), 10, 10, 10, 10, 14]))) { error in
+                tokens: MLXArray([Int32(9), 10, 10, 10, 10, 14]))
+        ) { error in
             XCTAssertEqual(
                 error as? Qwen35PositionSeamError,
                 .visualTokenRunMismatch(
@@ -138,7 +141,8 @@ final class Qwen35PositionStateTests: XCTestCase {
                     9, 11, 14,
                 ]),
                 imageGrids: [THW(1, 4, 4)],
-                videoGrids: [THW(2, 2, 2)])) { error in
+                videoGrids: [THW(2, 2, 2)])
+        ) { error in
             XCTAssertEqual(
                 error as? Qwen35PositionSeamError,
                 .visualTokenRunMismatch(

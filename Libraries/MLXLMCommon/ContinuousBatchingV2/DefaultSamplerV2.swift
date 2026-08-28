@@ -84,10 +84,11 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         let output = pipeline.process(
             logits,
             rawLogprobsFrom: logits,
-            hardMask: constraintSampler.hasRows ? { [constraintSampler] transformed in
-                constraintSampler.mask(
-                    transformed, requestIDs: requestIDs)
-            } : nil)
+            hardMask: constraintSampler.hasRows
+                ? { [constraintSampler] transformed in
+                    constraintSampler.mask(
+                        transformed, requestIDs: requestIDs)
+                } : nil)
         let tokens = sampler.sample(from: output.sampling)
         pipeline.commit(sampledTokens: tokens)
         sampler.commit()

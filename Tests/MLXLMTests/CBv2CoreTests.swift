@@ -47,7 +47,8 @@ private func expectClose(
     _ a: MLXArray, _ b: MLXArray, rtol: Double = 1e-5, atol: Double = 1e-6,
     _ label: String = "", sourceLocation: Testing.SourceLocation = #_sourceLocation
 ) {
-    #expect(a.shape == b.shape, "shape mismatch \(label): \(a.shape) vs \(b.shape)",
+    #expect(
+        a.shape == b.shape, "shape mismatch \(label): \(a.shape) vs \(b.shape)",
         sourceLocation: sourceLocation)
     let close = allClose(a, b, rtol: rtol, atol: atol).item(Bool.self)
     #expect(close, "values differ \(label)", sourceLocation: sourceLocation)

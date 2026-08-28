@@ -270,7 +270,8 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 // Compact S>=3 replay instead needs one extra generation of
                 // headroom while a strict-prefix tape survives into its
                 // successor. S<=2 uses the captured path and needs no extra.
-                let extraGenerations = compactContinuationHeadroom
+                let extraGenerations =
+                    compactContinuationHeadroom
                     ? 1 : max(0, recurrentDepth - 1)
                 let (extraBytes, multiplyOverflow) =
                     perGeneration.multipliedReportingOverflow(by: extraGenerations)

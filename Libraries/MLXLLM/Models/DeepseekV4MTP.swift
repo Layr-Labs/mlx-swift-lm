@@ -78,10 +78,10 @@ final class DeepseekV4MTPBlock: Module {
         cache: KVCache?
     ) -> MLXArray {
         // 1. Norm and project the embedding of the next token.
-        let e = enorm(embedTokens(inputIds))              // [B, S, D]
+        let e = enorm(embedTokens(inputIds))  // [B, S, D]
 
         // 2. Norm the 4D hidden state (RMSNorm operates on last dim).
-        let hNorm = hnorm(h)                              // [B, S, hc, D]
+        let hNorm = hnorm(h)  // [B, S, hc, D]
 
         // 3. Fuse: broadcast projected embedding to [B, S, 1, D] then add.
         //    h_proj maps [B, S, hc, D] → [B, S, hc, D] (Linear on last dim).
@@ -136,7 +136,10 @@ extension DeepseekV4Model: MTPCapable {
         var h = hidden  // [B, S, hc, D]
 
         // Build attention mask from the collapsed [B, S, hc*D] representation.
-        let B = h.dim(0), S = h.dim(1), hc = h.dim(2), D = h.dim(3)
+        let B = h.dim(0)
+        let S = h.dim(1)
+        let hc = h.dim(2)
+        let D = h.dim(3)
         let maskInput = h.reshaped([B, S, hc * D])
         let firstCache: (any KVCache)? = cache.isEmpty ? nil : cache[0]
         let mask = createAttentionMask(

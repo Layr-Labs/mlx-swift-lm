@@ -47,6 +47,95 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
             Qwen35TextConfiguration.self, from: Data(json.utf8))
     }
 
+    /// Exact text configuration published by the Qwen3.8-27B target and
+    /// standalone MTP artifacts. Keep this fixture dense (`qwen3_5`) so the
+    /// production adapter cannot accidentally exercise only the MoE subclass.
+    private func qwen38Configuration() throws -> Qwen35TextConfiguration {
+        let json = """
+            {
+              "model_type": "qwen3_5_text",
+              "hidden_size": 5120,
+              "num_hidden_layers": 64,
+              "intermediate_size": 17408,
+              "num_attention_heads": 24,
+              "num_key_value_heads": 4,
+              "head_dim": 256,
+              "linear_num_value_heads": 48,
+              "linear_num_key_heads": 16,
+              "linear_key_head_dim": 128,
+              "linear_value_head_dim": 128,
+              "linear_conv_kernel_dim": 4,
+              "vocab_size": 248320,
+              "full_attention_interval": 4,
+              "max_position_embeddings": 262144,
+              "mtp_num_hidden_layers": 1,
+              "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "rope_type": "default"
+              }
+            }
+            """
+        return try JSONDecoder().decode(
+            Qwen35TextConfiguration.self, from: Data(json.utf8))
+    }
+
+    func testQwen38DenseTopologyAndResidency() throws {
+        let config = try qwen38Configuration()
+
+        XCTAssertEqual(config.modelType, "qwen3_5_text")
+        XCTAssertEqual(config.hiddenLayers, 64)
+        XCTAssertEqual(config.maxPositionEmbeddings, 262_144)
+        XCTAssertEqual(config.mtpNumHiddenLayers, 1)
+        XCTAssertEqual(config.linearKeyHeadDim, 128)
+        XCTAssertEqual(config.linearNumValueHeads, 48)
+        XCTAssertEqual(config.linearNumKeyHeads, 16)
+
+        let kinds = config.cbv2LayerKinds
+        XCTAssertEqual(kinds.count, 16)
+        XCTAssertEqual(
+            kinds.compactMap(\.modelLayerIndex),
+            Array(stride(from: 3, to: 64, by: 4)))
+        XCTAssertTrue(
+            kinds.allSatisfy {
+                $0.attention == .full && $0.headDim == 256 && $0.kvHeads == 4
+                    && $0.queryHeads == 24
+            })
+
+        // 16 full rows × 2(K+V) × 4 KV heads × 256 dims × fp16.
+        XCTAssertEqual(
+            kinds.reduce(0) { partial, kind in
+                partial + 2 * kind.kvHeads * kind.headDim * MemoryLayout<UInt16>.size
+            },
+            65_536)
+
+        let recurrent = config.cbv2RecurrentStateSpec(activationDType: .bfloat16)
+        XCTAssertEqual(recurrent.layers.count, 48)
+        XCTAssertTrue(recurrent.layers.allSatisfy { $0.convShape == [1, 3, 10_240] })
+        XCTAssertTrue(recurrent.layers.allSatisfy { $0.ssmShape == [1, 48, 128, 128] })
+        XCTAssertEqual(try recurrent.fixedBytesPerRequest(), 153_944_064)
+        XCTAssertEqual(try recurrent.peakBytesPerRequest(), 461_832_192)
+    }
+
+    func testQwen38DenseModelBuildsCompactCBv2Caches() throws {
+        let config = try qwen38Configuration()
+        let model = Qwen35TextModel(config)
+        var modelLayerIndices: [Int] = []
+
+        let caches = model.newCacheV2 { index, kind in
+            modelLayerIndices.append(index)
+            return CBv2LayerCache(layerIndex: index, kind: kind)
+        }
+
+        XCTAssertEqual(caches.count, 16)
+        XCTAssertEqual(modelLayerIndices, Array(stride(from: 3, to: 64, by: 4)))
+        XCTAssertEqual(model.cbv2PositionAxisCount, 3)
+        XCTAssertTrue(model.cbv2SupportsPackedPrefill)
+        XCTAssertTrue(model.cbv2Capabilities.supportsMTP)
+    }
+
     func testConcreteArtifactFixedBytesAndLayerMapping() throws {
         let config = try configuration()
         let spec = config.cbv2RecurrentStateSpec(activationDType: .bfloat16)
@@ -66,7 +155,8 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
     }
 
     func testCacheConstructionUsesCompactStorageAndOriginalLayerIndices() throws {
-        let config = try configuration(hiddenLayers: 8, valueHeads: 2, keyHeads: 1,
+        let config = try configuration(
+            hiddenLayers: 8, valueHeads: 2, keyHeads: 1,
             keyHeadDim: 4, valueHeadDim: 4)
         let model = Qwen35TextModel(config)
         var originalIndices: [Int] = []
@@ -141,7 +231,8 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
             offset: scalarPositions.flattened()
         ).reshaped([1, 2, 1, 8]).transposed(0, 2, 1, 3)
         let actual = mrope.apply(
-            queries: value, keys: value, positionIds: positions).0
+            queries: value, keys: value, positionIds: positions
+        ).0
         eval(expected, actual)
         XCTAssertTrue(allClose(expected, actual, rtol: 0, atol: 0).item(Bool.self))
     }
@@ -163,7 +254,8 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
 
         let exponents = MLXArray(stride(from: 0, to: 8, by: 2)).asType(.float32) / 8
         let invFreq = 1 / pow(MLXArray(Float(10_000)), exponents)
-        let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
+        let all =
+            positions.asType(.float32)[0..., 0..., 0..., .newAxis]
             * invFreq[.newAxis, .newAxis, .newAxis, 0...]
         var selected: [MLXArray] = []
         for index in 0 ..< 4 {
@@ -178,9 +270,10 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
             }
             selected.append(all[axis, 0..., 0..., index])
         }
-        let angles = concatenated([
-            stacked(selected, axis: -1), stacked(selected, axis: -1),
-        ], axis: -1)
+        let angles = concatenated(
+            [
+                stacked(selected, axis: -1), stacked(selected, axis: -1),
+            ], axis: -1)
         let cosine = cos(angles).expandedDimensions(axis: 1)
         let sine = sin(angles).expandedDimensions(axis: 1)
         let rotatedHalf = concatenated(

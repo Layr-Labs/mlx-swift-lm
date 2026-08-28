@@ -221,7 +221,6 @@ extension CBv2EmbeddingForwardable {
     public var supportsCausalVisionPrefill: Bool { false }
 }
 
-
 /// Model-level embedding forward with request-owned recurrent state and
 /// explicit positions. Recurrent hybrids use this; Gemma remains legacy.
 public protocol CBv2PositionedRecurrentEmbeddingForwardable: CBv2EmbeddingForwardable {
@@ -300,7 +299,8 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
             let relativeHi = hi - span.tokenOffset
             return (
                 CBv2ImageSpan(tokenOffset: lo, length: hi - lo),
-                embedding[0..., relativeLo ..< relativeHi, 0...])
+                embedding[0..., relativeLo ..< relativeHi, 0...]
+            )
         }
     }
 
@@ -401,7 +401,8 @@ enum CBv2MultimodalPlan {
             previousEnd = span.end
         }
 
-        let blocks = input.attention == .bidirectionalSpans
+        let blocks =
+            input.attention == .bidirectionalSpans
             ? coalescedBlocks(spans: spans) : []
         if let oversized = blocks.first(where: { $0.length > maxBatchedTokensPerStep }) {
             throw CBv2MultimodalError.spanTooLong(

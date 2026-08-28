@@ -12,6 +12,32 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// History serializer for GPT-OSS Harmony conversations.
+///
+/// Harmony uses the structured tool metadata carried by `Chat.Message` rather
+/// than reconstructing calls from assistant text. The template consumes one
+/// call per assistant turn, so clamp histories assembled by other callers to
+/// the first call.
+public struct GPTOSSMessageGenerator: MessageGenerator {
+    public init() {}
+
+    public func generate(messages: [Chat.Message]) -> [Message] {
+        messages.map { generate(message: $0) }
+    }
+
+    public func generate(message: Chat.Message) -> Message {
+        var dictionary: Message = [
+            "role": message.role.rawValue,
+            "content": message.content,
+        ]
+        addToolMetadata(to: &dictionary, for: message)
+        if let calls = dictionary["tool_calls"] as? [[String: any Sendable]], calls.count > 1 {
+            dictionary["tool_calls"] = [calls[0]]
+        }
+        return dictionary
+    }
+}
+
 // MARK: - Configuration
 
 public struct GPTOSSConfiguration: Codable, Sendable {

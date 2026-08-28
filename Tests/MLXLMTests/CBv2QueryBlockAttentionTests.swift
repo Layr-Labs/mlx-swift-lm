@@ -256,8 +256,9 @@ private struct ChunkFixture {
 
     /// A fresh row with the chunk already committed, plus the views that
     /// commit returned (what the attention path attends).
-    func committedRow() -> (row: CBv2SequenceKV, keys: MLXArray, values: MLXArray, offsetBefore: Int)
-    {
+    func committedRow() -> (
+        row: CBv2SequenceKV, keys: MLXArray, values: MLXArray, offsetBefore: Int
+    ) {
         let row = freshRow()
         let offsetBefore = row.absoluteOffset
         let (k, v) = row.update(keys: keys, values: values)
@@ -754,10 +755,13 @@ struct CBv2QueryBlockAttentionWindowTests {
         // Probes inside the first block, straddling a block edge, and deep in
         // a later block: `visibleStart` is recomputed per block, so a wrong
         // floor can appear in one block and not another.
-        let probes = Array(Set([
-            window, window + 1, liveBlock - 1, liveBlock, liveBlock + 1,
-            2 * liveBlock, n - 1,
-        ].filter { $0 - window >= 0 && $0 < n })).sorted()
+        let probes = Array(
+            Set(
+                [
+                    window, window + 1, liveBlock - 1, liveBlock, liveBlock + 1,
+                    2 * liveBlock, n - 1,
+                ].filter { $0 - window >= 0 && $0 < n })
+        ).sorted()
         for history in [0, 512] {
             for p in probes {
                 seed &+= 1
@@ -884,7 +888,8 @@ struct CBv2QueryBlockAttentionBorrowTests {
             "window=\(windowLabel(window)) n=\(n) history=\(history) kL=\(kL) b=\(serialize ? 1 : liveBlock)"
         let dSingle = maxAbsDiff(produced, single)
         let dAbsolute = maxAbsDiff(produced, absolute)
-        print("[cbv2-query-block borrow] \(label) dVsSingleCall=\(dSingle) dVsAbsolute=\(dAbsolute)")
+        print(
+            "[cbv2-query-block borrow] \(label) dVsSingleCall=\(dSingle) dVsAbsolute=\(dAbsolute)")
         #expect(
             produced.shape == [1, queryHeads, n, headDim], "borrow output shape — \(label)")
         #expect(dSingle < 2e-5, "borrowed blocked attention must match single-call — \(label)")

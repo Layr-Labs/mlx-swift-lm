@@ -158,10 +158,10 @@ final class CBv2SoloStripeEngineTests: XCTestCase {
             "striped arm must run the whole prompt in one chunk: \(striped.model.forwardShapes)")
         XCTAssertFalse(
             striped.model.forwardShapes.contains([1, 16]),
-            "striped solo prefill must not fall back to plain chunks: \(striped.model.forwardShapes)")
+            "striped solo prefill must not fall back to plain chunks: \(striped.model.forwardShapes)"
+        )
     }
 }
-
 
 // MARK: - Mean-TTFT prefill serialization (maxConcurrentPartialPrefills)
 
@@ -197,7 +197,6 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
             "A decodes alongside B's remaining prefill")
     }
 
-
     func testNonpositiveCapIsTreatedAsUnlimited() throws {
         for cap in [0, -1] {
             let scheduler = makeScheduler(cap: cap)
@@ -210,7 +209,6 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
                 "cap \(cap) must fail open to the unlimited interleave, never starve")
         }
     }
-
 
     func testSuccessorAdmittedInFinalStripedStepTakesPlainChunk() throws {
         // A = 2,500 tokens: one 2,048 stripe, then a 452 remainder that
@@ -229,7 +227,6 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
             p2.assignments.map(\.numTokens).sorted(), [452, 512],
             "successor must admit at the PLAIN chunk beside A's final remainder")
     }
-
 
     func testPausedPartialHoldsNoSlotButResumeReserializesWork() throws {
         // A pauses mid-prefill: B must still admit (a stalled consumer must
@@ -262,7 +259,6 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
         }
     }
 
-
     func testStripeSurplusNeverLeaksToSuccessorBeyondStepBudget() throws {
         // Non-default posture: stripe (2048) > step budget (512). The raise
         // exists only for the armed row; the successor beside A's final
@@ -278,7 +274,8 @@ final class CBv2PartialPrefillCapTests: XCTestCase {
         try scheduler.enqueue(CBv2SchedFixtures.request(prompt: Array(0 ..< 4096), maxTokens: 2))
 
         let p1 = scheduler.plan()
-        XCTAssertEqual(p1.assignments.map(\.numTokens), [2048], "armed row may exceed the step budget")
+        XCTAssertEqual(
+            p1.assignments.map(\.numTokens), [2048], "armed row may exceed the step budget")
         _ = CBv2SchedSim.confirm(scheduler, plan: p1)
         let p2 = scheduler.plan()
         XCTAssertEqual(

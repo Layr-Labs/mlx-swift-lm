@@ -217,7 +217,10 @@ final class CBv2SchedulerSpeculationTests: XCTestCase {
 
     func testCapacityHardFailMatchesPlainDecodePreemption() throws {
         func runScenario(planner: ((CBv2ScheduledRequest) -> Int)?) throws
-            -> (plan: CBv2StepPlan, scheduler: SchedulerV2, capacity: SpecScriptedCapacity, id: CBv2RequestID)
+            -> (
+                plan: CBv2StepPlan, scheduler: SchedulerV2, capacity: SpecScriptedCapacity,
+                id: CBv2RequestID
+            )
         {
             let capacity = SpecScriptedCapacity()
             let scheduler = makeScheduler(capacity: capacity)

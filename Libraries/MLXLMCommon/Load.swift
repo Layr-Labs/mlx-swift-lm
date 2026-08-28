@@ -4,6 +4,76 @@ import Foundation
 import MLX
 import MLXNN
 
+private struct SafetensorsIndex: Decodable {
+    let weightMap: [String: String]
+
+    enum CodingKeys: String, CodingKey {
+        case weightMap = "weight_map"
+    }
+}
+
+/// How the safetensors files holding a model's weights are chosen.
+public enum WeightFileSelection: Sendable, Equatable {
+    case automatic
+    case allFilesPresent
+}
+
+/// Return the safetensors files selected for a model load.
+public func safetensorWeightURLs(
+    in modelDirectory: URL,
+    selection: WeightFileSelection = .automatic,
+    additionalFiles: [String] = []
+) throws -> [URL] {
+    let present =
+        (try? FileManager.default.contentsOfDirectory(
+            at: modelDirectory, includingPropertiesForKeys: nil))?.filter {
+            $0.pathExtension == "safetensors"
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent } ?? []
+
+    let selected: [URL]
+    switch selection {
+    case .allFilesPresent:
+        selected = present
+    case .automatic:
+        selected =
+            try indexedWeightURLs(in: modelDirectory)
+            ?? conventionalWeightURLs(in: present)
+    }
+
+    var seen = Set(selected.map(\.standardizedFileURL.path))
+    var urls = selected
+    for name in additionalFiles {
+        let url = modelDirectory.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: url.path),
+            seen.insert(url.standardizedFileURL.path).inserted
+        else { continue }
+        urls.append(url)
+    }
+    return urls
+}
+
+private func indexedWeightURLs(in modelDirectory: URL) throws -> [URL]? {
+    let indexURL = modelDirectory.appendingPathComponent("model.safetensors.index.json")
+    guard FileManager.default.fileExists(atPath: indexURL.path) else { return nil }
+    let index = try JSONDecoder().decode(
+        SafetensorsIndex.self, from: Data(contentsOf: indexURL))
+    let urls = Set(index.weightMap.values).sorted().map {
+        modelDirectory.appendingPathComponent($0)
+    }
+    guard !urls.isEmpty,
+        urls.allSatisfy({ FileManager.default.fileExists(atPath: $0.path) })
+    else { return nil }
+    return urls
+}
+
+private func conventionalWeightURLs(in present: [URL]) -> [URL] {
+    for prefix in ["model", "weight"] {
+        let matches = present.filter { $0.lastPathComponent.hasPrefix(prefix) }
+        if !matches.isEmpty { return matches }
+    }
+    return present
+}
+
 #if canImport(Darwin)
 import Darwin
 
@@ -25,7 +95,7 @@ private func prefetchShards(_ urls: [URL]) {
     }
 }
 #else
-private func prefetchShards(_ urls: [URL]) { }
+private func prefetchShards(_ urls: [URL]) {}
 #endif
 
 /// Lock-protected scratch space used by the parallel shard reader. Wrapped in
@@ -61,7 +131,7 @@ private final class ParallelShardState: @unchecked Sendable {
 /// checkpoint's module paths. When a sanitizer renames a module (e.g. fusing
 /// split `gate_proj`/`up_proj` experts into one `gate_up_proj`), the new path
 /// no longer matches its explicit overrides, and
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)``
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)``
 /// would fall back to the default quantization — or to none at all for
 /// mixed-precision configs without a default — and the subsequent strict
 /// update would reject the renamed `.scales`/`.biases` tensors. Aliases
@@ -100,7 +170,7 @@ public func resolveQuantization(
 /// such pairs split (and reshape the module tree accordingly) whenever the
 /// halves' effective policies differ.
 ///
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)``
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)``
 /// stages the checkpoint's resolved policy here before calling `sanitize`;
 /// a uniform `quantization` is staged as a table with only a default.
 public protocol QuantizationPolicyReceiving: AnyObject {
@@ -112,14 +182,15 @@ public protocol QuantizationPolicyReceiving: AnyObject {
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
-/// This function loads all `safetensor` files in the given `modelDirectory`,
+/// This function loads the selected `safetensor` files in the given `modelDirectory`,
 /// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
 /// applies optional quantization, and
 /// updates the model with the weights.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
-    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    weightFileSelection: WeightFileSelection = .automatic
 ) throws {
     let bench = ProcessInfo.processInfo.environment["BENCH_VERBOSE"] != nil
     var t = CFAbsoluteTimeGetCurrent()
@@ -127,20 +198,19 @@ public func loadWeights(
         if bench {
             let now = CFAbsoluteTimeGetCurrent()
             FileHandle.standardError.write(
-                Data("    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
-                    .utf8))
+                Data(
+                    "    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
+                        .utf8))
             t = now
         }
     }
 
-    // Gather the shard URLs first so we can fan them out concurrently.
-    var shardURLs: [URL] = []
-    let enumerator = FileManager.default.enumerator(
-        at: modelDirectory, includingPropertiesForKeys: nil)!
-    for case let url as URL in enumerator where url.pathExtension == "safetensors" {
-        shardURLs.append(url)
-    }
-    shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
+    // Gather the selected shard URLs first so we can fan them out concurrently.
+    let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
+    let shardURLs = try safetensorWeightURLs(
+        in: modelDirectory,
+        selection: weightFileSelection,
+        additionalFiles: additionalFiles ?? [])
 
     // Hand the kernel a head start on every shard. F_RDADVISE is Darwin's
     // async-prefetch primitive — it issues a non-blocking advisory read into

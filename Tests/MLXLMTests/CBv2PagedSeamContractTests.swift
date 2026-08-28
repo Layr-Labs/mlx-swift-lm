@@ -257,7 +257,8 @@ struct CBv2PagedSeamContractRingFormulaTests {
         let span = CBv2PagedSpeculation.maxSpeculativeSpan
 
         #expect(CBv2PagedRingGeometry.attendableTokens(window: window) == 1024)
-        #expect(CBv2PagedRingGeometry.requiredTokens(window: window, maxPrefillChunk: chunk) == 1032)
+        #expect(
+            CBv2PagedRingGeometry.requiredTokens(window: window, maxPrefillChunk: chunk) == 1032)
         let landed = CBv2PagedRingGeometry.ringPageCount(
             window: window, pageSize: pageSize, maxPrefillChunk: chunk)
         #expect(landed == 65, "gemma-4's windowed layers ring at 65 pages (1,040 tokens)")

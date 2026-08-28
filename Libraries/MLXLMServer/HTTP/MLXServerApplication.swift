@@ -51,7 +51,8 @@ public enum MLXServerApplication {
             try jsonResponse(ServerPropsResponse())
         }
         router.get("/metrics") { _, _ async -> Response in
-            textResponse(await service.prometheusMetrics(), contentType: "text/plain; charset=utf-8")
+            textResponse(
+                await service.prometheusMetrics(), contentType: "text/plain; charset=utf-8")
         }
         router.get("/models") { _, _ async throws -> Response in
             try jsonResponse(try await service.availableModels())
@@ -88,8 +89,7 @@ public enum MLXServerApplication {
         _ router: Router<BasicRequestContext>,
         service: MLXOpenAIService
     ) {
-        let handler:
-            @Sendable (Request, BasicRequestContext) async throws -> Response =
+        let handler: @Sendable (Request, BasicRequestContext) async throws -> Response =
             { request, context in
                 let chatRequest = try await request.decode(
                     as: OpenAIChatCompletionRequest.self,
@@ -99,7 +99,8 @@ public enum MLXServerApplication {
                     let frames = try await service.streamChatCompletionFrames(request: chatRequest)
                     return sseResponse(frames)
                 }
-                return try jsonResponse(try await service.createChatCompletion(request: chatRequest))
+                return try jsonResponse(
+                    try await service.createChatCompletion(request: chatRequest))
             }
 
         router.post("/v1/chat/completions", use: handler)
@@ -121,8 +122,7 @@ public enum MLXServerApplication {
         _ router: Router<BasicRequestContext>,
         service: MLXOpenAIService
     ) {
-        let handler:
-            @Sendable (Request, BasicRequestContext) async throws -> Response =
+        let handler: @Sendable (Request, BasicRequestContext) async throws -> Response =
             { request, context in
                 let completionRequest = try await request.decode(
                     as: OpenAICompletionRequest.self,
@@ -146,8 +146,7 @@ public enum MLXServerApplication {
         _ router: Router<BasicRequestContext>,
         service: MLXOpenAIService
     ) {
-        let create:
-            @Sendable (Request, BasicRequestContext) async throws -> Response =
+        let create: @Sendable (Request, BasicRequestContext) async throws -> Response =
             { request, context in
                 let responseRequest = try await request.decode(
                     as: OpenAIResponseRequest.self,
@@ -202,8 +201,7 @@ public enum MLXServerApplication {
         _ router: Router<BasicRequestContext>,
         service: MLXOpenAIService
     ) {
-        let handler:
-            @Sendable (Request, BasicRequestContext) async throws -> Response =
+        let handler: @Sendable (Request, BasicRequestContext) async throws -> Response =
             { request, context in
                 let embeddingRequest = try await request.decode(
                     as: OpenAIEmbeddingRequest.self,
@@ -216,7 +214,8 @@ public enum MLXServerApplication {
                 } catch MLXOpenAIServiceError.embeddingsNotConfigured {
                     return try jsonResponse(
                         OpenAIErrorResponse(
-                            message: MLXOpenAIServiceError.embeddingsNotConfigured.localizedDescription,
+                            message: MLXOpenAIServiceError.embeddingsNotConfigured
+                                .localizedDescription,
                             type: "unsupported_endpoint",
                             code: "embeddings_not_configured"
                         ),

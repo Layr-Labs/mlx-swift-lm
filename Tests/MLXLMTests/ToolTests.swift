@@ -429,7 +429,7 @@ struct ToolTests {
 
     @Test("Test Gemma Function Parser")
     func testGemmaParser() throws {
-        let parser = GemmaFunctionParser()
+        let parser = ToolCallFormat.gemma4.createParser()
         let content =
             "<|tool_call>call:get_weather{location:Paris,unit:celsius}<tool_call|>"
 
@@ -442,7 +442,7 @@ struct ToolTests {
 
     @Test("Test Gemma Function Parser - Escaped Strings")
     func testGemmaParserEscapedStrings() throws {
-        let parser = GemmaFunctionParser()
+        let parser = ToolCallFormat.gemma4.createParser()
         let content =
             "<|tool_call>call:search{query:<|\"|>hello, world!<|\"|>}<tool_call|>"
 
@@ -454,7 +454,7 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Tool Call Parser")
     func testGemma4ToolCallParser() throws {
-        let parser = GemmaFunctionParser()
+        let parser = ToolCallFormat.gemma4.createParser()
         let content = "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"
 
         let toolCall = try #require(parser.parse(content: content, tools: nil))
@@ -465,7 +465,7 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Tool Call Parser - Nested JSON")
     func testGemma4ToolCallParserNestedJSON() throws {
-        let parser = GemmaFunctionParser()
+        let parser = ToolCallFormat.gemma4.createParser()
         let content =
             "<|tool_call>call:search{query:<|\"|>swift, mlx<|\"|>,filters:{\"limit\":2,\"fresh\":true}}<tool_call|>"
 
@@ -473,30 +473,34 @@ struct ToolTests {
 
         #expect(toolCall.function.name == "search")
         #expect(toolCall.function.arguments["query"] == .string("swift, mlx"))
-        #expect(toolCall.function.arguments["filters"] == .object([
-            "limit": .int(2),
-            "fresh": .bool(true),
-        ]))
+        #expect(
+            toolCall.function.arguments["filters"]
+                == .object([
+                    "limit": .int(2),
+                    "fresh": .bool(true),
+                ]))
     }
 
     @Test("Test Gemma 4 Tool Call Parser - OpenRouter weather arguments")
     func testGemma4ToolCallParserOpenRouterWeatherArguments() throws {
-        let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": [
-                "name": "get_current_weather",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "location": ["type": "string"] as [String: any Sendable],
-                        "unit": [
-                            "type": "string", "enum": ["celsius", "fahrenheit"] as [String],
+        let parser = ToolCallFormat.gemma4.createParser()
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_current_weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": ["type": "string"] as [String: any Sendable],
+                            "unit": [
+                                "type": "string", "enum": ["celsius", "fahrenheit"] as [String],
+                            ] as [String: any Sendable],
                         ] as [String: any Sendable],
                     ] as [String: any Sendable],
                 ] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+            ]
+        ]
 
         for content in [
             #"<|tool_call>call:get_current_weather{location:Boston, MA,unit:fahrenheit}<tool_call|>"#,
@@ -512,11 +516,13 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Tool Call Parser - recovers uniquely identifiable tool names")
     func testGemma4ToolCallParserRecoversToolNameCorruption() throws {
-        let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": ["name": "get_current_weather"] as [String: any Sendable],
-        ]]
+        let parser = ToolCallFormat.gemma4.createParser()
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": ["name": "get_current_weather"] as [String: any Sendable],
+            ]
+        ]
 
         for rawName in ["getpsum_current_weather", "get_current_weather tedavi"] {
             let content = "<|tool_call>call:\(rawName){unit:fahrenheit}<tool_call|>"
@@ -527,7 +533,7 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Tool Call Parser - rejects ambiguous undeclared tool names")
     func testGemma4ToolCallParserRejectsAmbiguousToolName() {
-        let parser = GemmaFunctionParser()
+        let parser = ToolCallFormat.gemma4.createParser()
         let tools: [[String: any Sendable]] = ["get_current_weather", "calculate"].map { name in
             [
                 "type": "function",
@@ -541,11 +547,13 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Tool Call Parser - rejects unrelated short tool names")
     func testGemma4ToolCallParserRejectsShortNameFuzzyMatch() {
-        let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": ["name": "sum"] as [String: any Sendable],
-        ]]
+        let parser = ToolCallFormat.gemma4.createParser()
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": ["name": "sum"] as [String: any Sendable],
+            ]
+        ]
 
         let content = "<|tool_call>call:run{value:1}<tool_call|>"
         #expect(parser.parse(content: content, tools: tools) == nil)
@@ -555,20 +563,22 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Tool Call Parser - preserves allowed additional arguments")
     func testGemma4ToolCallParserPreservesAdditionalArguments() throws {
-        let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": [
-                "name": "search",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "query": ["type": "string"] as [String: any Sendable]
+        let parser = ToolCallFormat.gemma4.createParser()
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "search",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "query": ["type": "string"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "additionalProperties": true,
                     ] as [String: any Sendable],
-                    "additionalProperties": true,
                 ] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+            ]
+        ]
 
         let content = "<|tool_call>call:search{query:swift,sort:recent}<tool_call|>"
         let toolCall = try #require(parser.parse(content: content, tools: tools))
@@ -578,21 +588,23 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Tool Call Parser - rejects unknown strict-schema arguments")
     func testGemma4ToolCallParserRejectsUnknownStrictArgument() {
-        let parser = GemmaFunctionParser()
-        let tools: [[String: any Sendable]] = [[
-            "type": "function",
-            "function": [
-                "name": "weather",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "location": ["type": "string"] as [String: any Sendable],
-                        "unit": ["type": "string"] as [String: any Sendable],
+        let parser = ToolCallFormat.gemma4.createParser()
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": ["type": "string"] as [String: any Sendable],
+                            "unit": ["type": "string"] as [String: any Sendable],
+                        ] as [String: any Sendable],
+                        "additionalProperties": false,
                     ] as [String: any Sendable],
-                    "additionalProperties": false,
                 ] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+            ]
+        ]
 
         let content =
             "<|tool_call>call:weather{location:Paris,country:FR,unit:celsius}<tool_call|>"
@@ -601,7 +613,7 @@ struct ToolTests {
 
     @Test("Test Gemma Format via ToolCallProcessor")
     func testGemmaFormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .gemma)
+        let processor = ToolCallProcessor(format: .gemma4)
         let content = "<|tool_call>call:calculator{expression:2+2}<tool_call|>"
 
         _ = processor.processChunk(content)
@@ -733,7 +745,7 @@ struct ToolTests {
         let toolCall4 = try #require(parser.parse(content: content4, tools: nil))
         #expect(toolCall4.function.name == "calculate")
         #expect(toolCall4.function.arguments["expression"] == .string("2 + 2"))
-        #expect(toolCall4.function.arguments["precision"] == .string("4"))
+        #expect(toolCall4.function.arguments["precision"] == .int(4))
 
         // Multiple JSON list format via parseEOS
         let content5 = """
@@ -803,17 +815,17 @@ struct ToolTests {
         // Gemma models
         #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
         #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
-        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma)
-        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma4)
+        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma4)
 
         // Nemotron models (prefix matching)
         #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .xmlFunction)
 
         // Qwen3.5 models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "qwen3_5") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .qwen35)
 
         // Qwen3-Next models (prefix matching)
         #expect(ToolCallFormat.infer(from: "qwen3_next") == .xmlFunction)

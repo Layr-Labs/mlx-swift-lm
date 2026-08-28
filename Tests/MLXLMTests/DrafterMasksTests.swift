@@ -70,7 +70,8 @@ struct DrafterMasksTests {
         let slidingV = MLXArray.zeros([1, 1, 10, 4], dtype: .float32)
         // Actually we don't have Gemma4SharedKV in scope without MLXLLM import;
         // use the free-function form with explicit kvLen.
-        let full = Gemma4DrafterMaskBuilder.bidirectionalFull(queryLen: 1, kvLen: 10, dtype: .float32)
+        let full = Gemma4DrafterMaskBuilder.bidirectionalFull(
+            queryLen: 1, kvLen: 10, dtype: .float32)
         let sliding = Gemma4DrafterMaskBuilder.bidirectionalSWA(
             queryLen: 1, queryOffset: 10, kvLen: 10, window: 64, dtype: .float32)
         _ = (fullK, fullV, slidingK, slidingV)

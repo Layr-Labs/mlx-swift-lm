@@ -17,11 +17,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 @Suite("CBv2MTPRoundSmoke", .serialized)
 struct CBv2MTPRoundSmokeTests {
@@ -256,7 +256,8 @@ struct CBv2MTPRoundSmokeTests {
         for (index, prompt) in [promptA, promptB].enumerated() {
             let off = try makeEngine(fixture, mtp: false)
             baselines.append(
-                try await run(off, greedyRequest(id: UInt64(index + 1), prompt: prompt, maxTokens: 24)))
+                try await run(
+                    off, greedyRequest(id: UInt64(index + 1), prompt: prompt, maxTokens: 24)))
             await off.shutdown()
         }
         let expectedA = cbv2MTPExpectedGreedyCycle(

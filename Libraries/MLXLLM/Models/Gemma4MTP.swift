@@ -138,19 +138,21 @@ public struct Gemma4SharedKV: @unchecked Sendable {
     /// SDPA/attention computation sees zeros, which contribute nothing
     /// to the softmax when multiplied by queries.
     ///
-    /// - Parameter keepLengths: int array of shape `[B]`. For row `b`,
-    ///   slots `[0, keepLengths[b])` are preserved; slots
-    ///   `[keepLengths[b], T)` are zeroed.
+    /// - Parameters:
+    ///   - shared: Shared full- and sliding-attention K/V tensors to update.
+    ///   - keepLengths: int array of shape `[B]`. For row `b`, slots
+    ///     `[0, keepLengths[b])` are preserved; slots `[keepLengths[b], T)`
+    ///     are zeroed.
     public static func zeroTailPerRow(
         from shared: Gemma4SharedKV, keepLengths: MLXArray
     ) -> Gemma4SharedKV {
         func zero(_ kv: (MLXArray, MLXArray)) -> (MLXArray, MLXArray) {
             let T = kv.0.dim(2)
             let positions = MLXArray(Int32(0) ..< Int32(T))
-                .reshaped([1, 1, T, 1])                        // [1, 1, T, 1]
+                .reshaped([1, 1, T, 1])  // [1, 1, T, 1]
             let keep = keepLengths.asType(.int32)
-                .reshaped([-1, 1, 1, 1])                       // [B, 1, 1, 1]
-            let keepMask = positions .< keep                   // [B, 1, T, 1]
+                .reshaped([-1, 1, 1, 1])  // [B, 1, 1, 1]
+            let keepMask = positions .< keep  // [B, 1, T, 1]
             let maskK = keepMask.asType(kv.0.dtype)
             let maskV = keepMask.asType(kv.1.dtype)
             return (kv.0 * maskK, kv.1 * maskV)
@@ -820,9 +822,11 @@ public func gemma4SpeculativeSampleRound(
 ) -> Gemma4SpeculativeSampleResult {
     precondition(temperature > 0, "stochastic path requires temperature > 0")
     let K = draftTokens.count
-    precondition(verifyLogits.dim(0) == K + 1,
+    precondition(
+        verifyLogits.dim(0) == K + 1,
         "verifyLogits must have K+1 positions")
-    precondition(draftLogits.dim(0) == K,
+    precondition(
+        draftLogits.dim(0) == K,
         "draftLogits must have K positions")
 
     // Apply temperature + identical filters on both p and q, once.
@@ -847,7 +851,8 @@ public func gemma4SpeculativeSampleRound(
         let qc = qi[c].item(Float.self)
         let alpha = min(Float(1), qc > 0 ? pc / qc : 0)
         let r = MLXRandom.uniform(
-            low: Float(0), high: Float(1), key: keys[i]).item(Float.self)
+            low: Float(0), high: Float(1), key: keys[i]
+        ).item(Float.self)
         if r < alpha {
             emitted.append(c)
             accepted += 1
@@ -1127,7 +1132,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
             default:
                 preconditionFailure(
                     "Gemma4AssistantDraftModel: unexpected layerType '\(layerType)' at "
-                    + "layer \(i). Compat validation should have rejected this."
+                        + "layer \(i). Compat validation should have rejected this."
                 )
             }
             let (out, _, _) = layer(
@@ -1256,8 +1261,9 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         // shards, and `loadArraysAndMetadata` follows the per-file blob symlinks.
         var weights = [String: MLXArray]()
         let scanDir = directory.resolvingSymlinksInPath()
-        let shardURLs = (try? FileManager.default.contentsOfDirectory(
-            at: scanDir, includingPropertiesForKeys: nil)) ?? []
+        let shardURLs =
+            (try? FileManager.default.contentsOfDirectory(
+                at: scanDir, includingPropertiesForKeys: nil)) ?? []
         for url in shardURLs where url.pathExtension == "safetensors" {
             let (shardWeights, _) = try loadArraysAndMetadata(url: url)
             for (k, v) in shardWeights {
@@ -1385,7 +1391,7 @@ internal func runGemma4MTPGreedyRound(
     eval(mainTokens, draftConcat)
     let mainInts = mainTokens.squeezed(axis: 0).asArray(Int.self)
     let draftTokens = draftConcat.squeezed(axis: 0).asArray(Int32.self)
-                                 .map { Int($0) }
+        .map { Int($0) }
     let (accepted, newTokens) = Gemma4SpeculativeWalk.single(
         draft: draftTokens, main: mainInts)
 
@@ -1692,7 +1698,8 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
             let mStart = bi * tIn + (p - 1)
             let mainRow = mainFlat[mStart ..< mStart + kRow + 1].map { Int($0) }
             let dStart = bi * draftSteps
-            let draftRow = draftSteps > 0
+            let draftRow =
+                draftSteps > 0
                 ? draftFlat[dStart ..< dStart + kRow].map { Int($0) }
                 : []
             var (a, e) = Gemma4SpeculativeWalk.single(draft: draftRow, main: mainRow)
@@ -1752,30 +1759,32 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
         sharedKV = Gemma4SharedKV(
             fullAttention: (
                 MLX.take(sharedKV.fullAttention.0, keepIdx, axis: 0),
-                MLX.take(sharedKV.fullAttention.1, keepIdx, axis: 0)),
+                MLX.take(sharedKV.fullAttention.1, keepIdx, axis: 0)
+            ),
             slidingAttention: (
                 MLX.take(sharedKV.slidingAttention.0, keepIdx, axis: 0),
-                MLX.take(sharedKV.slidingAttention.1, keepIdx, axis: 0)))
+                MLX.take(sharedKV.slidingAttention.1, keepIdx, axis: 0)
+            ))
     }
 
     /// Emit the accumulated per-phase profile (no-op unless `profile`).
     public func printProfile() {
         guard profile, rounds > 0 else { return }
         let n = Double(rounds)
-        print(String(
-            format: "[MTP-B prof] rounds=%d emit/round=%.2f tIn=%.2f draftSteps=%.2f "
-                + "| draft=%.1fms verify=%.1fms walk=%.1fms update=%.1fms per round",
-            rounds, Double(emitTotal) / n, Double(tInTotal) / n,
-            Double(draftStepsTotal) / n,
-            draftMs / n, verifyMs / n, walkMs / n, updateMs / n))
+        print(
+            String(
+                format: "[MTP-B prof] rounds=%d emit/round=%.2f tIn=%.2f draftSteps=%.2f "
+                    + "| draft=%.1fms verify=%.1fms walk=%.1fms update=%.1fms per round",
+                rounds, Double(emitTotal) / n, Double(tInTotal) / n,
+                Double(draftStepsTotal) / n,
+                draftMs / n, verifyMs / n, walkMs / n, updateMs / n))
     }
 }
 
 // MARK: - Token Iterator
 
 /// Single-batch (B=1) greedy MTP token iterator. Conforms to
-/// ``TokenIteratorProtocol`` so callers can use the existing
-/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:wiredMemoryTicket:)``
+/// `TokenIteratorProtocol` so callers can use the existing `generateTask`
 /// entry point.
 ///
 /// Usage:
@@ -1861,7 +1870,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         rngSeed: UInt64 = 0
     ) throws {
         let policy = Gemma4MTPAutomaticPolicy.automatic(forTarget: target)
-        let resolvedBlockSize = blockSize
+        let resolvedBlockSize =
+            blockSize
             ?? policy.strategy(forBatchSize: 1).blockSize
         guard resolvedBlockSize >= 2 && resolvedBlockSize <= 16 else {
             throw Gemma4MTPError.invalidBlockSize(resolvedBlockSize)
@@ -1878,7 +1888,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         self.topP = parameters.topP
         self.topK = parameters.topK
         self.minP = parameters.minP
-        self.rngKey = rngSeed == 0
+        self.rngKey =
+            rngSeed == 0
             ? MLXRandom.key(UInt64(Date().timeIntervalSince1970 * 1e6))
             : MLXRandom.key(rngSeed)
 
@@ -1911,8 +1922,9 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
             self.rngKey = keys[1]
         }
         self.bonus = firstBonus
-        self.hidden = prefillOut.lastHidden[
-            0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
+        self.hidden =
+            prefillOut.lastHidden[
+                0..., -1 ..< prefillOut.lastHidden.dim(1), 0...]
         self.sharedKV = prefillOut.capturedSharedKV
         self.promptPrefillTime = -prefillStart.timeIntervalSinceNow
 
@@ -1932,6 +1944,12 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
     ///   - prefill: seed produced by the caller's multimodal forward (logits,
     ///     pre-norm last hidden, shared-KV snapshot).
     ///   - cache: the caches the caller already advanced over the prompt.
+    ///   - target: target model that verifies the drafter's proposals.
+    ///   - drafter: assistant model that proposes speculative tokens.
+    ///   - parameters: sampling and generation limits for the iterator.
+    ///   - blockSize: optional proposal width; the automatic policy supplies
+    ///     the value when omitted.
+    ///   - rngSeed: random-number seed, or `0` to derive one from the clock.
     public init(
         prefill: Gemma4MTPForward,
         cache: [KVCache],
@@ -1942,7 +1960,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         rngSeed: UInt64 = 0
     ) throws {
         let policy = Gemma4MTPAutomaticPolicy.automatic(forTarget: target)
-        let resolvedBlockSize = blockSize
+        let resolvedBlockSize =
+            blockSize
             ?? policy.strategy(forBatchSize: 1).blockSize
         guard resolvedBlockSize >= 2 && resolvedBlockSize <= 16 else {
             throw Gemma4MTPError.invalidBlockSize(resolvedBlockSize)
@@ -1959,7 +1978,8 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         self.topP = parameters.topP
         self.topK = parameters.topK
         self.minP = parameters.minP
-        self.rngKey = rngSeed == 0
+        self.rngKey =
+            rngSeed == 0
             ? MLXRandom.key(UInt64(Date().timeIntervalSince1970 * 1e6))
             : MLXRandom.key(rngSeed)
 
@@ -1981,8 +2001,9 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
             self.rngKey = keys[1]
         }
         self.bonus = firstBonus
-        self.hidden = prefill.lastHidden[
-            0..., -1 ..< prefill.lastHidden.dim(1), 0...]
+        self.hidden =
+            prefill.lastHidden[
+                0..., -1 ..< prefill.lastHidden.dim(1), 0...]
         self.sharedKV = prefill.capturedSharedKV
         self.promptPrefillTime = 0
 
@@ -2032,8 +2053,9 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         // All drained - run one MTP round to refill.
         pendingTokens.removeAll(keepingCapacity: true)
         pendingIndex = 0
-        let action = automaticPolicy?.singleStreamAction(
-            generatedTokens: tokenCount, maxTokens: maxTokens)
+        let action =
+            automaticPolicy?.singleStreamAction(
+                generatedTokens: tokenCount, maxTokens: maxTokens)
             ?? .mtp(blockSize: configuredBlockSize)
         if action == .targetOnly {
             return nextTargetOnlyToken()
@@ -2129,7 +2151,7 @@ public struct Gemma4MTPTokenIterator: TokenIteratorProtocol {
         eval(mainTokens, draftConcat)
         let mainInts = mainTokens.squeezed(axis: 0).asArray(Int.self)
         let draftTokens = draftConcat.squeezed(axis: 0).asArray(Int32.self)
-                                     .map { Int($0) }
+            .map { Int($0) }
 
         // Walk: greedy or rejection-based depending on temperature.
         let accepted: Int
