@@ -108,6 +108,33 @@ struct Gemma4VideoInputTests {
         #expect(out.logits.shape == [1, tokens.count, 200])
     }
 
+    @Test("Stateful Gemma4 multimodal prefill keeps the visual attention mask")
+    func statefulMultimodalPrefillMatchesLegacyMasking() throws {
+        let model = Gemma4(try Self.makeTinyConfig())
+        eval(model)
+
+        let tokens = MLXArray([Int32(5), 6, 100, 100, 100, 100, 7, 8])
+            .expandedDimensions(axis: 0)
+        let pixels = (MLXArray(0 ..< 192).reshaped([1, 3, 8, 8]).asType(.float32)) / 192.0
+        let input = LMInput(
+            text: .init(tokens: tokens), image: LMInput.ProcessedImage(pixels: pixels))
+
+        let legacy = try model.prepare(
+            input, cache: try model.newCache(parameters: nil), windowSize: 1024)
+        let stateful = try model.prepare(
+            input, cache: try model.newCache(parameters: nil), state: nil, prefill: .init())
+        guard case .logits(let legacyOutput) = legacy,
+            case .logits(let statefulOutput) = stateful
+        else {
+            Issue.record("Expected logits from both Gemma4 prefill entry points")
+            return
+        }
+        eval(legacyOutput.logits, statefulOutput.logits)
+        #expect(
+            allClose(legacyOutput.logits, statefulOutput.logits, rtol: 1e-5, atol: 1e-5)
+                .item(Bool.self))
+    }
+
     // MARK: - Helpers
 
     private static func makeTinyConfig() throws -> Gemma4Configuration {

@@ -596,6 +596,7 @@ protocol GenerationFinalizingTokenIterator: TokenIteratorProtocol {
 public struct TokenIterator: TokenIteratorProtocol {
     let model: any LanguageModel
     var state: LMOutput.State?
+    let onStateChange: ((LMOutput.State?) -> Void)?
 
     var y: LMInput.Text
     var cache: [KVCache]
@@ -628,6 +629,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         parameters: GenerateParameters
     ) throws {
         self.model = model
+        self.state = nil
+        self.onStateChange = nil
         self.y = .init(tokens: prompt)
         self.cache = try (cache ?? model.newCache(parameters: parameters))
 
@@ -659,9 +662,13 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - parameters: the generation parameters
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
-        parameters: GenerateParameters
+        parameters: GenerateParameters,
+        initialState: LMOutput.State? = nil,
+        onStateChange: ((LMOutput.State?) -> Void)? = nil
     ) throws {
         self.model = model
+        self.state = initialState
+        self.onStateChange = onStateChange
         self.y = input.text
         self.cache = try (cache ?? model.newCache(parameters: parameters))
 
@@ -695,6 +702,8 @@ public struct TokenIterator: TokenIteratorProtocol {
         maxTokens: Int? = nil
     ) throws {
         self.model = model
+        self.state = nil
+        self.onStateChange = nil
         self.y = input.text
         self.cache = try (cache ?? model.newCache(parameters: nil))
 
@@ -718,7 +727,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, prefill: PrefillParameters) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, state: nil, prefill: prefill) {
+        switch try model.prepare(input, cache: cache, state: state, prefill: prefill) {
         case .tokens(let tokens):
             y = tokens
 
@@ -733,6 +742,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             prefill.progress?(total, total)
 
         case .logits(let result):
+            state = result.state
+            onStateChange?(state)
             y = .init(tokens: convertToToken(logits: result.logits))
             asyncEval(y.tokens)
 
@@ -758,6 +769,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
+        onStateChange?(state)
 
         // Apply dynamic cache quantization after each step
         maybeQuantizeKVCache(

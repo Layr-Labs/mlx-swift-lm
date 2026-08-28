@@ -27,6 +27,7 @@ private let toolScriptFragments: [Int: String] = [
 /// The model's scripted output: a JSON-format tool call to `other_fn`.
 private let toolScript = [1, 2, 3]
 private let scriptVocabSize = 8
+private let sessionContinuationKey = LMOutput.Key<Int>("tests.chatSession.continuation")
 
 /// Deterministic model: emits `toolScript` via one-hot logits (argmax under
 /// temperature 0 reproduces the script exactly).
@@ -51,6 +52,39 @@ private final class ScriptedToolCallModel: Module, LanguageModel {
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         nextLogits()
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+}
+
+/// Emits state from both prefill and decode so a second ChatSession turn can
+/// assert that the cache and its continuation state travel as one unit.
+private final class StatefulSessionModel: Module, LanguageModel {
+    private(set) var prefillStates: [Int?] = []
+
+    private func output() -> LMOutput {
+        var state = LMOutput.State()
+        state[sessionContinuationKey] = 17
+        let logits = MLXArray([Float](repeating: 0, count: scriptVocabSize))
+            .reshaped([1, 1, scriptVocabSize])
+        return .init(logits: logits, state: state)
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        prefillStates.append(state?[sessionContinuationKey])
+        return .logits(output())
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        output()
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        output().logits
     }
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
@@ -103,6 +137,23 @@ struct ChatSessionToolFilterTests {
             }
         }
         return calls
+    }
+
+    @Test("ChatSession retains model continuation state with its live cache")
+    func retainsContinuationStateAcrossTurns() async throws {
+        let model = StatefulSessionModel()
+        let context = ModelContext(
+            configuration: ModelConfiguration(id: "test/stateful-session"),
+            model: model,
+            processor: ScriptInputProcessor(),
+            tokenizer: ScriptFragmentTokenizer())
+        let session = ChatSession(
+            context, generateParameters: GenerateParameters(maxTokens: 1, temperature: 0))
+
+        _ = try await session.respond(to: "first")
+        _ = try await session.respond(to: "second")
+
+        #expect(model.prefillStates == [nil, 17])
     }
 
     @Test("ChatSession does not surface a call to an UNDECLARED function as a tool call")

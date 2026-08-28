@@ -358,6 +358,21 @@ private func legacyStatus(cache: [KVCache], maxKVSize: Int) throws -> KVCacheSta
     #expect(status.capacityDisposition == .fullyApplied)
     #expect(status.isHybrid)
 
+    // Small legacy limits must clamp the preserved prefix below capacity, and
+    // typed capacities must take the same unified construction path.
+    let tiny = try model.newCache(parameters: GenerateParameters(maxKVSize: 1))
+    let tinyAttention = try #require(tiny.first { !($0 is MambaCache) } as? RotatingKVCache)
+    #expect(tinyAttention.maxSize == 1)
+    #expect(tinyAttention.keepCount == 0)
+
+    let typedCapacity = try KVCacheConfiguration.Capacity(
+        maxTokens: 3, preservedPrefixTokens: 1)
+    let typed = try model.newCache(
+        parameters: GenerateParameters(kvCache: KVCacheConfiguration(capacity: typedCapacity)))
+    let typedAttention = try #require(typed.first { !($0 is MambaCache) } as? RotatingKVCache)
+    #expect(typedAttention.maxSize == 3)
+    #expect(typedAttention.keepCount == 1)
+
     // Without a limit, attention layers stay unbounded.
     let unbounded = try model.newCache(parameters: nil)
     for cache in unbounded where !(cache is MambaCache) {

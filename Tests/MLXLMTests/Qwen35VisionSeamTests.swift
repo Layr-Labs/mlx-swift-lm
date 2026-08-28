@@ -162,7 +162,7 @@ final class Qwen35VisionSeamTests: XCTestCase {
         let input = LMInput(text: .init(tokens: tokens), image: image, video: video)
 
         let prepared = try model.prepare(
-            input, cache: model.newCache(parameters: nil), windowSize: nil)
+            input, cache: try model.newCache(parameters: nil), windowSize: nil)
         guard case .logits(let output) = prepared else {
             return XCTFail("Qwen35 legacy prepare must continue returning logits")
         }

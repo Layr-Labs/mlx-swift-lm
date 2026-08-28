@@ -22,8 +22,16 @@ public final class ChatSession {
 
     enum Cache {
         case empty
-        case kvcache([KVCache])
+        case kvcache([KVCache], LMOutput.State?)
         case history([Chat.Message])
+    }
+
+    private final class ContinuationStateBox: @unchecked Sendable {
+        var value: LMOutput.State?
+
+        init(_ value: LMOutput.State?) {
+            self.value = value
+        }
     }
 
     private let model: ModelContainer
@@ -193,7 +201,7 @@ public final class ChatSession {
     ) {
         self.model = model
         self.instructions = instructions
-        self.cache = .init(.kvcache(cache))
+        self.cache = .init(.kvcache(cache, nil))
         self.processing = processing
         self.generateParameters = generateParameters
         self.tools = tools
@@ -235,7 +243,7 @@ public final class ChatSession {
     ) {
         self.model = ModelContainer(context: model)
         self.instructions = instructions
-        self.cache = .init(.kvcache(cache))
+        self.cache = .init(.kvcache(cache, nil))
         self.processing = processing
         self.generateParameters = generateParameters
         self.tools = tools
@@ -411,6 +419,7 @@ public final class ChatSession {
 
                     let replaysTranscript = modelConfiguration.toolCallFormat != .gptOSS
                     var kvCache: [KVCache]
+                    var continuationState: LMOutput.State?
                     // A cache created by this session has a recoverable prompt
                     // transcript; a caller-provided raw cache does not.  Tool
                     // restarts must preserve that distinction so templates see
@@ -419,20 +428,23 @@ public final class ChatSession {
                     switch cache {
                     case .empty:
                         kvCache = try model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache)
+                        continuationState = nil
                         replayHistory = replaysTranscript ? [] : nil
 
-                    case .kvcache(let array):
+                    case .kvcache(let array, let state):
                         kvCache = array
+                        continuationState = state
                         replayHistory = nil
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
                         kvCache = try model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache)
+                        continuationState = nil
                         messages.append(contentsOf: history)
                         replayHistory = replaysTranscript ? history : nil
                     }
+                    let stateBox = ContinuationStateBox(continuationState)
+                    defer { cache = .kvcache(kvCache, stateBox.value) }
 
                     // prepare the input
                     let initial = initialMessages.consume()
@@ -480,7 +492,9 @@ public final class ChatSession {
                         // generate output
                         let iterator = try TokenIterator(
                             input: input, model: model, cache: kvCache,
-                            parameters: generateParameters)
+                            parameters: generateParameters,
+                            initialState: stateBox.value,
+                            onStateChange: { stateBox.value = $0 })
 
                         // Declared tools flow into the streaming parser too
                         // (not just the prompt template): with schemas
@@ -550,6 +564,13 @@ public final class ChatSession {
                                 }
                             }
                             if let replayHistory {
+                                // This template must be re-prefilled from a cold
+                                // cache. The live cache already includes the
+                                // original prompt and generated tool call, while
+                                // `replayHistory` is the complete transcript.
+                                // Replaying both would duplicate that prefix.
+                                kvCache = try model.newCache(parameters: generateParameters)
+                                stateBox.value = nil
                                 messages = replayHistory
                             }
                             continue restart
@@ -612,7 +633,7 @@ public final class ChatSession {
     {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache):
+            case .kvcache(let cache, _):
                 return try await body(cache)
             default:
                 return try await body(nil)
@@ -631,8 +652,8 @@ public final class ChatSession {
     public func saveCache(to url: URL) async throws {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache):
-                try savePromptCache(url: url, cache: cache)
+            case .kvcache(let cache, let state):
+                try savePromptCache(url: url, cache: cache, state: state)
             default:
                 throw ChatSessionError.noCacheAvailable
             }

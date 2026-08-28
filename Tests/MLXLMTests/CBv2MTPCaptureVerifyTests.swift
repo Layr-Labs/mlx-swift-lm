@@ -616,8 +616,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
 
     // MARK: - 3. Compact recurrent prefix replay
 
-    private func legacyCaches(_ model: Qwen35TextModel) -> [any KVCache] {
-        model.newCache(parameters: nil).map { $0 as any KVCache }
+    private func legacyCaches(_ model: Qwen35TextModel) throws -> [any KVCache] {
+        try model.newCache(parameters: nil).map { $0 as any KVCache }
     }
 
     private func copiedCaches(_ caches: [any KVCache]) -> [any KVCache] {
@@ -669,7 +669,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
-        let base = legacyCaches(model)
+        let base = try legacyCaches(model)
         _ = legacyForward(
             model, tokens: [1, 2, 3], caches: base, nConfirmed: 0)
         let baseAttentionOffsets = base.map(\.offset)
@@ -731,7 +731,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
-        let caches = legacyCaches(model)
+        let caches = try legacyCaches(model)
         _ = legacyForward(
             model, tokens: [1, 2, 3, 4], caches: caches, nConfirmed: 1)
         let recurrent = caches.compactMap { $0 as? MambaCache }
@@ -774,7 +774,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
-        let base = legacyCaches(model)
+        let base = try legacyCaches(model)
         let accepted = copiedCaches(base)
         _ = legacyForward(
             model, tokens: [1, 2, 3], caches: accepted, nConfirmed: 1)

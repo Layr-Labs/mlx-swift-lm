@@ -635,7 +635,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         guard prepared.visualTokenMask == nil else {
             let out = languageModel(
                 prepared.tokens, inputEmbedding: prepared.embeddings, cache: castCache(cache),
-                imageTokenMask: nil)
+                imageTokenMask: prepared.visualTokenMask)
             prefill.progress?(total, total)
             return .logits(.init(logits: out))
         }
