@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "workload": {
+    "promptID": "python_modules_long_high_acceptance",
+    "promptTokens": 16384,
+    "promptTokenSHA256": "54dc60803239651979a16f9ab0e89bb7012b50b680f473dafca558edcb0c163d",
+    "promptTokenHashEncoding": "comma-joined ASCII decimal token IDs",
+    "promptTokenFile": "python-modules-long-16384.tokens.json",
+    "conditionerMode": "same_prompt",
+    "conditionerOutputTokens": 1024,
+    "measuredOutputTokens": 1024,
+    "dflashPhysicalWidth": 8,
+    "temperature": 1.0,
+    "topP": 0.95,
+    "topK": 20,
+    "seed": 42
+  },
+  "environment": {
+    "gpuLock": "/tmp/mtplx-gpu-exclusive.lock",
+    "commandBufferMegabytes": 512,
+    "commandBufferOperations": 50,
+    "mlxSwiftRevision": "713cf35cdd86e219b69a56bafaeeec6607934218",
+    "mlxRevision": "734241bbff26467bb33eff8adc65b82d17b33578"
+  },
+  "order": [
+    "custom",
+    "native",
+    "native",
+    "custom"
+  ],
+  "variants": {
+    "custom": {
+      "swiftPortRevision": "de3f308",
+      "route": "per-head grouped GQA for widths 6 through 8 at cached lengths 16384 through 32767",
+      "runs": [
+        {
+          "decodeTokensPerSecond": 66.55487525727742,
+          "tokenSHA256": "c2394ef07b6a7f276dc91782001b38b38387d5d6096128be144b038e554a5226",
+          "receipt": "mlx0322-gqa16k-custom-run-1.json"
+        },
+        {
+          "decodeTokensPerSecond": 69.61225276390098,
+          "tokenSHA256": "c2394ef07b6a7f276dc91782001b38b38387d5d6096128be144b038e554a5226",
+          "receipt": "mlx0322-gqa16k-custom-run-2.json"
+        }
+      ],
+      "meanDecodeTokensPerSecond": 68.0835640105892
+    },
+    "native": {
+      "swiftPortRevision": "9200d85",
+      "controlDiff": "Qwen38DFlashGQARoute.usesPerHead returns false; no other production code differs from de3f308",
+      "runs": [
+        {
+          "decodeTokensPerSecond": 61.21163425255547,
+          "tokenSHA256": "1f250391ea0c7afcfcb711d26780161ccaf842e884d986399d0ff53c4ca0f569",
+          "receipt": "mlx0322-gqa16k-native-run-1.json"
+        },
+        {
+          "decodeTokensPerSecond": 60.45722204072014,
+          "tokenSHA256": "1f250391ea0c7afcfcb711d26780161ccaf842e884d986399d0ff53c4ca0f569",
+          "receipt": "mlx0322-gqa16k-native-run-2.json"
+        }
+      ],
+      "meanDecodeTokensPerSecond": 60.834428146637805
+    }
+  },
+  "summary": {
+    "customImprovementPercent": 11.916173267015484,
+    "customOutputDeterministic": true,
+    "nativeOutputDeterministic": true,
+    "crossVariantTokenExact": false,
+    "crossVariantTokenExactRequired": false,
+    "numericGate": "production-shape parity remains within 0.000244140625 maximum absolute error",
+    "promotion": "retain custom GQA route"
+  }
+}
