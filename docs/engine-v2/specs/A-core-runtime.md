@@ -58,4 +58,4 @@ You own the heart of v2: per-request KV storage and the v1 attention dispatch.
   your own sync points; do not modify MLX).
 
 ## References
-Report 10 §4 invariants 1–6, 9 (`/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/10-gemma4-gptoss-model-study.md`), report 04 (MLX primitives: donation, strided SDPA views, RoPE array offsets).
+Report 10 §4 invariants 1–6, 9 (`~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/10-gemma4-gptoss-model-study.md`), report 04 (MLX primitives: donation, strided SDPA views, RoPE array offsets).

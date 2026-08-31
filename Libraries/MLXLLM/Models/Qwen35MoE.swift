@@ -98,143 +98,30 @@ public func qwen35FuseSwitchMLPGateUp(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
     setFused: ((String, Bool) -> Void)? = nil
 ) -> [String: MLXArray] {
-    var weights = weights
+    var adjusted = weights
 
     // Raw HF stacked exports: already fused, just re-keyed.
     let rawSuffix = ".experts.gate_up_proj"
-    for key in Array(weights.keys)
+    for key in Array(adjusted.keys)
     where key.hasSuffix(rawSuffix) && !key.contains("mtp.") {
-        guard let gateUp = weights.removeValue(forKey: key) else { continue }
+        guard let gateUp = adjusted.removeValue(forKey: key) else { continue }
         let prefix = String(key.dropLast(rawSuffix.count))
-        weights["\(prefix).switch_mlp.gate_up_proj.weight"] = gateUp
-        if let downProj = weights.removeValue(forKey: "\(prefix).experts.down_proj") {
-            weights["\(prefix).switch_mlp.down_proj.weight"] = downProj
+        adjusted["\(prefix).switch_mlp.gate_up_proj.weight"] = gateUp
+        if let downProj = adjusted.removeValue(forKey: "\(prefix).experts.down_proj") {
+            adjusted["\(prefix).switch_mlp.down_proj.weight"] = downProj
         }
     }
 
-    // MLX split checkpoints (float or quantized): concatenate gate then up,
-    // one gate/up pair at a time so the fuse decision is per layer.
-    let splitMarker = ".switch_mlp.gate_proj."
-    var bases = Set<String>()  // "<mlp path>.switch_mlp."
-    for key in weights.keys where key.contains(splitMarker) && !key.contains("mtp.") {
-        let range = key.range(of: splitMarker)!
-        bases.insert(String(key[..<range.lowerBound]) + ".switch_mlp.")
-    }
-
-    for base in bases.sorted() {
-        func suffixes(_ half: String) -> Set<String> {
-            let prefix = "\(base)\(half)."
-            return Set(
-                weights.keys.compactMap {
-                    $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : nil
-                })
-        }
-        let gateSuffixes = suffixes("gate_proj")
-        let upSuffixes = suffixes("up_proj")
-        guard !upSuffixes.isEmpty else {
-            // Corrupt/partial checkpoint. Leave the orphaned tensors for the
-            // strict update to reject with a catchable error naming them —
-            // trapping here would kill the host process from inside the
-            // throwing loadWeights API.
-            print(
-                "[WARNING] qwen35FuseSwitchMLPGateUp: \(base)gate_proj.* has no "
-                    + "matching \(base)up_proj.*; leaving the half-split expert "
-                    + "projection for strict verification to reject")
-            continue
-        }
-
-        if let reason = qwen35GateUpFuseBlocker(
-            base: base, gateSuffixes: gateSuffixes, upSuffixes: upSuffixes,
-            weights: weights, perLayerQuantization: perLayerQuantization)
-        {
-            let modulePath = String(base.dropLast())
-            print("[INFO] qwen35FuseSwitchMLPGateUp: keeping \(modulePath) split — \(reason)")
-            setFused?(modulePath, false)
-            continue
-        }
-
-        for suffix in gateSuffixes.sorted() {
-            guard let gate = weights.removeValue(forKey: "\(base)gate_proj.\(suffix)"),
-                let up = weights.removeValue(forKey: "\(base)up_proj.\(suffix)")
-            else { continue }
-            // Quantized tensors are [E, rows, packed-cols]; the row axis is -2.
-            // An unquantized per-row bias is [E, rows]; its row axis is -1.
-            let axis = suffix == "bias" ? -1 : -2
-            weights["\(base)gate_up_proj.\(suffix)"] = concatenated([gate, up], axis: axis)
-        }
-    }
-
-    // Report every fused pair — freshly concatenated, re-keyed raw exports,
-    // and checkpoints that already carry fused tensors — so a split twin
-    // installed by an earlier heterogeneous load is restored to the fused
-    // layout when the current load is homogeneous.
-    if let setFused {
-        let fusedMarker = ".switch_mlp.gate_up_proj."
-        var fusedBases = Set<String>()
-        for key in weights.keys where key.contains(fusedMarker) && !key.contains("mtp.") {
-            let range = key.range(of: fusedMarker)!
-            fusedBases.insert(String(key[..<range.lowerBound]) + ".switch_mlp")
-        }
-        for base in fusedBases.sorted() {
-            setFused(base, true)
-        }
-    }
-
-    return weights
+    return fuseSwitchGLUGateUpWeights(
+        weights: adjusted,
+        perLayerQuantization: perLayerQuantization,
+        quantizationAliases: {
+            Array(qwen35PolicyPathCandidates(for: $0).dropFirst())
+        },
+        shouldProcess: { !$0.contains("mtp.") },
+        setFused: setFused)
 }
 
-/// The reason the gate/up pair rooted at `base` must NOT be fused, or `nil`
-/// when row-concatenation is exact.
-private func qwen35GateUpFuseBlocker(
-    base: String,
-    gateSuffixes: Set<String>,
-    upSuffixes: Set<String>,
-    weights: [String: MLXArray],
-    perLayerQuantization: BaseConfiguration.PerLayerQuantization?
-) -> String? {
-    // Policy check: a fused projection has a single bits/group_size/mode, so
-    // both halves must resolve to the same policy. This is the only check
-    // able to catch same-shape mismatches (e.g. differing modes).
-    if let table = perLayerQuantization {
-        let gate = qwen35ResolvedQuantization(for: "\(base)gate_proj", in: table)
-        let up = qwen35ResolvedQuantization(for: "\(base)up_proj", in: table)
-        let samePolicy: Bool
-        switch (gate, up) {
-        case (nil, nil):
-            samePolicy = true
-        case (let gate?, let up?):
-            samePolicy =
-                gate.groupSize == up.groupSize && gate.bits == up.bits
-                && gate.mode == up.mode
-        default:
-            samePolicy = false
-        }
-        if !samePolicy {
-            func describe(_ quantization: BaseConfiguration.Quantization?) -> String {
-                quantization.map { "\($0.bits)-bit/g\($0.groupSize)/\($0.mode)" }
-                    ?? "unquantized"
-            }
-            return "gate resolves to \(describe(gate)) but up to \(describe(up))"
-        }
-    }
-
-    // Tensor backstop: catches bits/group_size mismatches even without a
-    // policy table (packed columns and scale columns depend on both).
-    if gateSuffixes != upSuffixes {
-        return "halves carry different tensor sets "
-            + "(gate \(gateSuffixes.sorted()) vs up \(upSuffixes.sorted()))"
-    }
-    for suffix in gateSuffixes.sorted() {
-        guard let gate = weights["\(base)gate_proj.\(suffix)"],
-            let up = weights["\(base)up_proj.\(suffix)"]
-        else { continue }
-        if gate.shape != up.shape || gate.dtype != up.dtype {
-            return "\(suffix) tensors differ: gate \(gate.shape)/\(gate.dtype) "
-                + "vs up \(up.shape)/\(up.dtype)"
-        }
-    }
-    return nil
-}
 
 /// Config-table path candidates for one checkpoint module path, bridging
 /// every key space the sanitizers and configs are known to use:
@@ -270,23 +157,6 @@ private func qwen35PolicyPathCandidates(for path: String) -> [String] {
     return candidates
 }
 
-/// Effective quantization policy for one module path: the first explicit
-/// per-layer entry among the path's key-space candidates, else the table's
-/// default. `nil` means the module loads unquantized (explicit skip, or no
-/// entry and no default).
-private func qwen35ResolvedQuantization(
-    for path: String, in table: BaseConfiguration.PerLayerQuantization
-) -> BaseConfiguration.Quantization? {
-    for candidate in qwen35PolicyPathCandidates(for: path) {
-        if let option = table.perLayerQuantization[candidate] {
-            switch option {
-            case .skip: return nil
-            case .quantize(let quantization): return quantization
-            }
-        }
-    }
-    return table.quantization
-}
 
 /// Reshape the `SwitchGLU` at `path` (checkpoint key space) to the fused or
 /// split gate/up topology, whichever the current load requires. Intended as
@@ -297,22 +167,11 @@ private func qwen35ResolvedQuantization(
 /// swap goes through `Module.update(modules:)` so the module cache sees the
 /// new children.
 public func qwen35SetSwitchGLUGateUpFused(_ fused: Bool, at path: String, in root: Module) {
-    let candidates = qwen35PolicyPathCandidates(for: path)
-    for (modulePath, module) in root.namedModules() {
-        guard candidates.contains(modulePath), let glu = module as? SwitchGLU else {
-            continue
-        }
-        if glu.hasFusedGateUp != fused {
-            if fused {
-                print(
-                    "[INFO] qwen35SetSwitchGLUGateUpFused: restoring fused gate_up "
-                        + "topology at \(modulePath)")
-            }
-            let twin = fused ? glu.fusingGateUp() : glu.splittingGateUp()
-            root.update(modules: ModuleChildren.unflattened([(modulePath, twin)]))
-        }
-        return
-    }
+    setSwitchGLUGateUpFused(
+        fused,
+        at: path,
+        aliases: Array(qwen35PolicyPathCandidates(for: path).dropFirst()),
+        in: root)
 }
 
 /// Per-layer quantization aliases for the routed-expert projections, across

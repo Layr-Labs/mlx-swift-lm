@@ -82,7 +82,7 @@ extension EngineLoopV2 {
 
         var useRectangular = switch mtp.config.verificationMode {
         case .serialTarget: false
-        case .rectangular: true
+        case .rectangular, .rectangularExact: true
         case .automatic:
             columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
         }

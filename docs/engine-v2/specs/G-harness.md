@@ -47,4 +47,4 @@ executable — integration flips them on.
 ## References
 Report 10 §4 (the 11 invariants — your primary source), report 12
 (critique items 4, 5, 18), plan §7 Phase 0.4. Corpus:
-`/Users/gaj/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+`~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.

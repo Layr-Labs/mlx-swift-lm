@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Model | /Users/gaj/.cache/huggingface/hub/models--mlx-community--gpt-oss-20b-MXFP4-Q8/snapshots/773a7da77e569019bb0fd17a554b263738d669a3/ |
+| Model | ~/.cache/huggingface/hub/models--mlx-community--gpt-oss-20b-MXFP4-Q8/snapshots/773a7da77e569019bb0fd17a554b263738d669a3/ |
 | Chip | Apple M4 Max |
 | RAM | 128 GB |
 | OS | Version 26.5 (Build 25F71) |

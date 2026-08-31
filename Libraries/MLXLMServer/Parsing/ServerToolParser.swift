@@ -26,11 +26,12 @@ public enum ServerToolParser {
         }
 
         switch normalized {
-        case "json", "default":
+        case "json", "default", "qwen3":
             return .json
         case "lfm2", "lfm2_5", "lfm25":
             return .lfm2
-        case "xml", "xml_function", "qwen_xml", "hermes", "nemotron":
+        case "xml", "xml_function", "qwen_xml", "qwen3_coder", "qwen3_5",
+            "hermes", "nemotron":
             return .xmlFunction
         case "glm4", "glm_4":
             return .glm4

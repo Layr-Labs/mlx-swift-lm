@@ -466,7 +466,8 @@ public enum MediaProcessing {
 
         case .frames(let videoFrames):
             return try await _asProcessedSequence(
-                videoFrames, targetFPS: targetFPS, frameProcessing: frameProcessing)
+                videoFrames, maxFrames: maxFrames, targetFPS: targetFPS,
+                frameProcessing: frameProcessing)
         }
     }
 
@@ -549,7 +550,7 @@ public enum MediaProcessing {
     }
 
     static private func _asProcessedSequence(
-        _ videoFrames: [VideoFrame],
+        _ videoFrames: [VideoFrame], maxFrames: Int,
         targetFPS: (CMTime) -> Double,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
@@ -567,7 +568,7 @@ public enum MediaProcessing {
         try Task.checkCancellation()
         // Note: the round was not present in `asCIImageSequence`, so we may now be passing 1 more frame to Qwen depending on video duration.
         let estimatedFrames = Int(round(fps * duration.seconds))
-        let desiredFrames = min(estimatedFrames, videoFrames.count)
+        let desiredFrames = min(min(estimatedFrames, videoFrames.count), maxFrames)
         let finalFrameCount = max(desiredFrames, 1)
 
         let sampledTimeValues = MLXArray.linspace(

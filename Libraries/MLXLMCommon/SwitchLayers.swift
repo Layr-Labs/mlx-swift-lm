@@ -147,10 +147,11 @@ public func weightedExpertUnsort(
     inverseOrder: MLXArray,
     weights: MLXArray
 ) -> MLXArray {
+    let hidden = sortedOutputs.dim(1)
     precondition(
-        sortedOutputs.ndim == 2 && sortedOutputs.dim(1) == 2816
+        sortedOutputs.ndim == 2 && (hidden % 64 == 0)
             && sortedOutputs.dtype == .bfloat16,
-        "weightedExpertUnsort outputs must be bfloat16 [assignments, 2816]")
+        "weightedExpertUnsort outputs must be bfloat16 [assignments, hidden] with hidden % 64 == 0")
     precondition(
         inverseOrder.ndim == 1 && inverseOrder.dtype == .uint32,
         "weightedExpertUnsort inverse order must be flat uint32")
@@ -170,9 +171,9 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (2816, tokens, 1),
+        grid: (hidden, tokens, 1),
         threadGroup: (64, 4, 1),
-        outputShapes: [[tokens, 2816]],
+        outputShapes: [[tokens, hidden]],
         outputDTypes: [.bfloat16]
     )[0]
 }
@@ -257,6 +258,12 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+private let qwenDirectExpertReductionEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_QWEN_DIRECT_EXPERT_REDUCTION"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return raw == "1" || raw == "true" || raw == "on"
+}()
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -265,6 +272,158 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 public enum SwitchGLUWeightedReductionProfile: Sendable {
     case generic
     case gemma4ProductionGeGLU
+    case qwen35ProductionSwiGLU
+}
+
+
+/// Safely row-concatenates split SwitchGLU gate/up checkpoint tensors.
+///
+/// This is the model-neutral core of the Qwen3.5 gate/up load-time fusion:
+/// every tensor suffix must match in shape and dtype, and both module paths
+/// must resolve to one quantization policy. An incompatible pair is left
+/// byte-for-byte split and reported through `setFused`, allowing the caller to
+/// install a split ``SwitchGLU`` before strict parameter verification.
+public func fuseSwitchGLUGateUpWeights(
+    weights: [String: MLXArray],
+    perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    quantizationAliases: (String) -> [String] = { _ in [] },
+    shouldProcess: (String) -> Bool = { _ in true },
+    setFused: ((String, Bool) -> Void)? = nil
+) -> [String: MLXArray] {
+    var weights = weights
+    let splitMarker = ".switch_mlp.gate_proj."
+    var bases = Set<String>()
+    for key in weights.keys where key.contains(splitMarker) {
+        let range = key.range(of: splitMarker)!
+        let base = String(key[..<range.lowerBound]) + ".switch_mlp."
+        if shouldProcess(String(base.dropLast())) {
+            bases.insert(base)
+        }
+    }
+
+    func resolvedQuantization(
+        for path: String,
+        in table: BaseConfiguration.PerLayerQuantization
+    ) -> BaseConfiguration.Quantization? {
+        var candidates = [path]
+        for alias in quantizationAliases(path) where !candidates.contains(alias) {
+            candidates.append(alias)
+        }
+        for candidate in candidates {
+            guard let option = table.perLayerQuantization[candidate] else { continue }
+            switch option {
+            case .skip:
+                return nil
+            case .quantize(let quantization):
+                return quantization
+            }
+        }
+        return table.quantization
+    }
+
+    func suffixes(_ half: String, base: String) -> Set<String> {
+        let prefix = "\(base)\(half)."
+        return Set(
+            weights.keys.compactMap {
+                $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : nil
+            })
+    }
+
+    for base in bases.sorted() {
+        let modulePath = String(base.dropLast())
+        let gateSuffixes = suffixes("gate_proj", base: base)
+        let upSuffixes = suffixes("up_proj", base: base)
+        guard !upSuffixes.isEmpty else {
+            // Leave malformed half-pairs untouched so strict update reports a
+            // catchable missing/unhandled-parameter error.
+            continue
+        }
+
+        var blocker: String?
+        if let table = perLayerQuantization {
+            let gate = resolvedQuantization(for: "\(base)gate_proj", in: table)
+            let up = resolvedQuantization(for: "\(base)up_proj", in: table)
+            let sameEffectivePolicy: Bool
+            switch (gate, up) {
+            case (nil, nil):
+                sameEffectivePolicy = true
+            case (let gate?, let up?):
+                sameEffectivePolicy =
+                    gate.groupSize == up.groupSize && gate.bits == up.bits
+                    && gate.mode == up.mode
+            default:
+                sameEffectivePolicy = false
+            }
+            if !sameEffectivePolicy {
+                blocker = "gate and up resolve to different quantization policies"
+            }
+        }
+        if blocker == nil, gateSuffixes != upSuffixes {
+            blocker = "gate and up carry different tensor sets"
+        }
+        if blocker == nil {
+            for suffix in gateSuffixes.sorted() {
+                guard let gate = weights["\(base)gate_proj.\(suffix)"],
+                    let up = weights["\(base)up_proj.\(suffix)"]
+                else { continue }
+                if gate.shape != up.shape || gate.dtype != up.dtype {
+                    blocker = "\(suffix) tensors differ in shape or dtype"
+                    break
+                }
+            }
+        }
+
+        if let blocker {
+            print("[INFO] fuseSwitchGLUGateUpWeights: keeping \(modulePath) split — \(blocker)")
+            setFused?(modulePath, false)
+            continue
+        }
+
+        for suffix in gateSuffixes.sorted() {
+            guard let gate = weights.removeValue(forKey: "\(base)gate_proj.\(suffix)"),
+                let up = weights.removeValue(forKey: "\(base)up_proj.\(suffix)")
+            else { continue }
+            let axis = suffix == "bias" ? -1 : -2
+            weights["\(base)gate_up_proj.\(suffix)"] = concatenated([gate, up], axis: axis)
+        }
+    }
+
+    if let setFused {
+        let fusedMarker = ".switch_mlp.gate_up_proj."
+        var fusedPaths = Set<String>()
+        for key in weights.keys where key.contains(fusedMarker) {
+            let range = key.range(of: fusedMarker)!
+            let path = String(key[..<range.lowerBound]) + ".switch_mlp"
+            if shouldProcess(path) {
+                fusedPaths.insert(path)
+            }
+        }
+        for path in fusedPaths.sorted() {
+            setFused(path, true)
+        }
+    }
+    return weights
+}
+
+/// Replaces the SwitchGLU at a checkpoint path with its fused or split twin.
+/// Aliases bridge checkpoint and module-tree namespaces.
+public func setSwitchGLUGateUpFused(
+    _ fused: Bool,
+    at path: String,
+    aliases: [String] = [],
+    in root: Module
+) {
+    let candidates = [path] + aliases.filter { $0 != path }
+    for (modulePath, module) in root.namedModules() {
+        guard candidates.contains(modulePath), let glu = module as? SwitchGLU else {
+            continue
+        }
+        if glu.hasFusedGateUp != fused {
+            let twin = fused ? glu.fusingGateUp() : glu.splittingGateUp()
+            root.update(modules: ModuleChildren.unflattened([(modulePath, twin)]))
+        }
+        return
+    }
 }
 
 public class SwitchGLU: Module {
@@ -489,27 +648,45 @@ public class SwitchGLU: Module {
     private func supportsWeightedExpertUnsort(
         _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
     ) -> Bool {
-        // Exact Gemma 4 26B-A4B production contract. The explicit semantic
-        // profile keeps generic SwitchGLU/custom activations on the established
-        // implementation.
-        guard weightedReductionProfile == .gemma4ProductionGeGLU else { return false }
-        return inputDims == 2816
-            && hiddenDims == 704
-            && numExperts == 128
-            && gateUpProj == nil
-            && activationProduct == nil
-            && isGeluActivation
-            && x.ndim == 2
-            && x.dim(1) == 2816
-            && x.dtype == .bfloat16
-            && indices.ndim == 2
-            && indices.dim(0) == x.dim(0)
-            && indices.dim(1) == 8
-            && indices.dtype == .uint32
-            && weights.ndim == 2
-            && weights.shape == indices.shape
-            && weights.dtype == .bfloat16
-            && indices.size >= 64
+        switch weightedReductionProfile {
+        case .generic:
+            return false
+        case .gemma4ProductionGeGLU:
+            return inputDims == 2816
+                && hiddenDims == 704
+                && numExperts == 128
+                && gateUpProj == nil
+                && activationProduct == nil
+                && isGeluActivation
+                && x.ndim == 2
+                && x.dim(1) == 2816
+                && x.dtype == .bfloat16
+                && indices.ndim == 2
+                && indices.dim(0) == x.dim(0)
+                && indices.dim(1) == 8
+                && indices.dtype == .uint32
+                && weights.ndim == 2
+                && weights.shape == indices.shape
+                && weights.dtype == .bfloat16
+                && indices.size >= 64
+        case .qwen35ProductionSwiGLU:
+            return qwenDirectExpertReductionEnabled
+                && inputDims == 2048
+                && hiddenDims == 512
+                && numExperts == 256
+                && isSiluActivation
+                && x.ndim == 2
+                && x.dim(1) == 2048
+                && x.dtype == .bfloat16
+                && indices.ndim == 2
+                && indices.dim(0) == x.dim(0)
+                && indices.dim(1) == 8
+                && indices.dtype == .uint32
+                && weights.ndim == 2
+                && weights.shape == indices.shape
+                && weights.dtype == .bfloat16
+                && indices.size >= 64
+        }
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
@@ -546,7 +723,7 @@ public class SwitchGLU: Module {
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,
             projected.output.dim(-2) == 1,
-            projected.output.dim(-1) == 2816,
+            (projected.output.dim(-1) == 2816 || projected.output.dim(-1) == inputDims),
             projected.output.dtype == .bfloat16
         else {
             return legacyWeightedReduction(projected, indices: indices, weights: weights)

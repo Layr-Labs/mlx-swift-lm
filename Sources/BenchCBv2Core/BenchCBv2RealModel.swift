@@ -47,6 +47,7 @@
 // package. Every `@Test` in mlx-swift-lm went dark that way. Tests
 // `@testable import BenchCBv2Core`; nothing may depend on the executable.
 
+import CryptoKit
 import Foundation
 import MLX
 import MLXHuggingFace
@@ -157,6 +158,36 @@ func v2Hooks(for model: any LanguageModel) -> V2ModelHooks? {
             try m.newCacheV2(makeLayerCache: mk)
         }
     }
+    if let m = model as? Qwen35Model {
+        return V2ModelHooks(
+            model: m,
+            layerKinds: m.cbv2LayerKinds,
+            optimizations: ModelOptimizationProvenance(
+                layer18Requested: false,
+                layer18Effective: false,
+                layer18Interval: nil,
+                weightedUnsortRequested: false,
+                weightedUnsortEffective: false,
+                safeR1GeometryEligible: false)
+        ) { mk in
+            try m.newCacheV2(makeLayerCache: mk)
+        }
+    }
+    if let m = model as? Qwen35TextModel {
+        return V2ModelHooks(
+            model: m,
+            layerKinds: m.cbv2LayerKinds,
+            optimizations: ModelOptimizationProvenance(
+                layer18Requested: false,
+                layer18Effective: false,
+                layer18Interval: nil,
+                weightedUnsortRequested: false,
+                weightedUnsortEffective: false,
+                safeR1GeometryEligible: false)
+        ) { mk in
+            try m.newCacheV2(makeLayerCache: mk)
+        }
+    }
     if let m = model as? GPTOSSModel {
         return V2ModelHooks(
             model: m,
@@ -246,7 +277,9 @@ func markdownCellEscaped(_ text: String) -> String {
 /// model/hardware — callers skip gracefully.
 func makeV2Engine(
     context: ModelContext, hooks: V2ModelHooks, backend: V2Backend,
-    schedulerConfig: CBv2SchedulerConfig, kvBytes: Int
+    schedulerConfig: CBv2SchedulerConfig, kvBytes: Int,
+    mtpDrafter: (any CBv2MTPDrafter)? = nil,
+    mtpConfig: CBv2MTPConfig = .init()
 ) throws -> EngineV2 {
     let kvBackend: CBv2KVBackend
     let caches: [any CBv2AttendingLayerCache]
@@ -273,14 +306,20 @@ func makeV2Engine(
         caches = try hooks.buildCaches { index, _ in pagedCaches[index] }
         kvBackend = paged
     }
-    return EngineV2(
+    let engine = EngineV2(
         model: CBv2SteppableLanguageModelAdapter(hooks.model),
         layerKinds: hooks.layerKinds,
         backend: kvBackend,
         cacheProvider: CBv2LayerCacheBank(caches: caches),
         sampler: CBv2DefaultSampler(),
         detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: context.tokenizer),
-        schedulerConfig: schedulerConfig)
+        schedulerConfig: schedulerConfig,
+        mtpDrafter: mtpDrafter,
+        mtpConfig: mtpConfig)
+    try validateCampaignMTPInstallation(
+        config: mtpConfig, metrics: engine.mtpMetricsSnapshot(),
+        inactiveReason: engine.mtpInactiveReason)
+    return engine
 }
 
 // MARK: - Request runners
@@ -304,6 +343,236 @@ struct RunResult: Sendable {
     var decodeTPS: Double {
         guard tokens.count > 1, lastTokenAt > firstTokenAt else { return 0 }
         return Double(tokens.count - 1) / (lastTokenAt - firstTokenAt)
+    }
+}
+
+/// Phase-separated timing for one campaign request.
+///
+/// The first emitted token closes prompt evaluation and opens decode. Decode
+/// throughput therefore counts the remaining `generatedTokens - 1` tokens;
+/// including the first token would silently fold prefill into the headline.
+struct PhaseMetrics: Codable, Equatable, Sendable {
+    let promptTokens: Int
+    let submittedAt: Double
+    let firstTokenAt: Double
+    let lastTokenAt: Double
+    let generatedTokens: Int
+
+    var prefillSeconds: Double {
+        max(0, firstTokenAt - submittedAt)
+    }
+
+    var prefillTPS: Double {
+        guard promptTokens > 0, prefillSeconds > 0 else { return 0 }
+        return Double(promptTokens) / prefillSeconds
+    }
+
+    var decodeTPS: Double {
+        let seconds = lastTokenAt - firstTokenAt
+        guard generatedTokens > 1, seconds > 0 else { return 0 }
+        return Double(generatedTokens - 1) / seconds
+    }
+}
+
+enum CampaignPromptError: Error, Equatable, CustomStringConvertible {
+    case invalidUTF8(path: String)
+
+    var description: String {
+        switch self {
+        case .invalidUTF8(let path):
+            return "campaign prompt is not UTF-8: \(path)"
+        }
+    }
+}
+
+/// Exact prompt bytes used by a campaign run. Loading is deliberately outside
+/// the model hot path; the digest makes a receipt reproducible without
+/// embedding the user-authored prompt itself.
+struct CampaignPrompt: Equatable, Sendable {
+    let text: String
+    let sha256: String
+
+    static func load(from url: URL) throws -> CampaignPrompt {
+        let data = try Data(contentsOf: url)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw CampaignPromptError.invalidUTF8(path: url.path)
+        }
+        let digest = SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return CampaignPrompt(text: text, sha256: digest)
+    }
+}
+
+enum CampaignReceiptError: Error, Equatable, CustomStringConvertible {
+    case unsupportedSchema(actual: Int)
+    case invalidProvenance(field: String, value: String)
+    case expectedGeneratedTokens(expected: Int, actual: Int)
+    case generatedMetricMismatch(expected: Int, actual: Int)
+    case promptMetricMismatch(expected: Int, actual: Int)
+    case promptLengthOutsideCampaign(actual: Int)
+    case parityMetadataMismatch(String)
+
+    var description: String {
+        switch self {
+        case .unsupportedSchema(let actual):
+            return "unsupported campaign receipt schema \(actual)"
+        case .invalidProvenance(let field, let value):
+            return "campaign receipt has invalid \(field): \(value)"
+        case .expectedGeneratedTokens(let expected, let actual):
+            return "campaign requires \(expected) generated tokens, received \(actual)"
+        case .generatedMetricMismatch(let expected, let actual):
+            return "generated token receipt/metric mismatch: \(expected) != \(actual)"
+        case .promptMetricMismatch(let expected, let actual):
+            return "prompt token receipt/metric mismatch: \(expected) != \(actual)"
+        case .promptLengthOutsideCampaign(let actual):
+            return "campaign prompt must tokenize to 80...70000 tokens, received \(actual)"
+        case .parityMetadataMismatch(let detail):
+            return "campaign output-parity metadata mismatch: \(detail)"
+        }
+    }
+}
+
+/// Machine-readable evidence for the one-prompt optimization campaign.
+/// Runtime route metadata is captured once after construction; no engagement
+/// counters or eligibility checks are inserted into measured token steps.
+struct CampaignReceipt: Codable, Equatable, Sendable {
+    var schemaVersion = 2
+    let modelPath: String
+    let modelRevision: String
+    let sourceRevision: String
+    let mlxSwiftRevision: String
+    let profile: BenchProfile
+    let promptSHA256: String
+    let promptTokenIDs: [Int]
+    let generatedTokenIDs: [Int]
+    let requestedGeneratedTokens: Int
+    let generatedText: String
+    let phaseMetrics: PhaseMetrics
+    let prefillChunk: Int
+    let soloStripe: Int?
+    let mtpDepth: Int
+    let outputParity: BenchOutputParity?
+    let verificationRoute: String?
+    let routeSummary: [String: String]
+    let gpuLockOwner: String
+    let peakMemoryBytes: UInt64
+
+    func validate() throws {
+        guard schemaVersion == 2 else {
+            throw CampaignReceiptError.unsupportedSchema(actual: schemaVersion)
+        }
+        func requireHexRevision(
+            _ field: String, _ value: String, lengths: ClosedRange<Int>
+        ) throws {
+            let isHex = !value.isEmpty && value.utf8.allSatisfy {
+                (48 ... 57).contains($0) || (97 ... 102).contains($0)
+            }
+            guard lengths.contains(value.count), isHex else {
+                throw CampaignReceiptError.invalidProvenance(field: field, value: value)
+            }
+        }
+        try requireHexRevision("modelRevision", modelRevision, lengths: 40 ... 64)
+        try requireHexRevision("sourceRevision", sourceRevision, lengths: 7 ... 64)
+        try requireHexRevision("mlxSwiftRevision", mlxSwiftRevision, lengths: 40 ... 64)
+        guard promptSHA256.count == 64,
+            promptSHA256.utf8.allSatisfy({
+                (48 ... 57).contains($0) || (97 ... 102).contains($0)
+            })
+        else {
+            throw CampaignReceiptError.invalidProvenance(
+                field: "promptSHA256", value: promptSHA256)
+        }
+        guard !gpuLockOwner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CampaignReceiptError.invalidProvenance(
+                field: "gpuLockOwner", value: gpuLockOwner)
+        }
+        guard (80 ... 70_000).contains(promptTokenIDs.count) else {
+            throw CampaignReceiptError.promptLengthOutsideCampaign(actual: promptTokenIDs.count)
+        }
+        guard generatedTokenIDs.count == requestedGeneratedTokens else {
+            throw CampaignReceiptError.expectedGeneratedTokens(
+                expected: requestedGeneratedTokens, actual: generatedTokenIDs.count)
+        }
+        guard phaseMetrics.generatedTokens == generatedTokenIDs.count else {
+            throw CampaignReceiptError.generatedMetricMismatch(
+                expected: generatedTokenIDs.count, actual: phaseMetrics.generatedTokens)
+        }
+        guard phaseMetrics.promptTokens == promptTokenIDs.count else {
+            throw CampaignReceiptError.promptMetricMismatch(
+                expected: promptTokenIDs.count, actual: phaseMetrics.promptTokens)
+        }
+        if mtpDepth > 0 {
+            guard let outputParity, let verificationRoute else {
+                throw CampaignReceiptError.parityMetadataMismatch(
+                    "MTP receipt requires outputParity and verificationRoute")
+            }
+            guard verificationRoute == outputParity.verificationRoute,
+                routeSummary["outputParity"] == outputParity.rawValue,
+                routeSummary["verificationRoute"] == verificationRoute
+            else {
+                throw CampaignReceiptError.parityMetadataMismatch(
+                    "top-level values do not match the construction route summary")
+            }
+            let installedMode = routeSummary["mtp"]?
+                .split(separator: ",")
+                .first { $0.hasPrefix("verify=") }?
+                .dropFirst("verify=".count)
+            guard installedMode == Substring(outputParity.verificationMode.rawValue) else {
+                throw CampaignReceiptError.parityMetadataMismatch(
+                    "runtime MTP route does not contain exact verifier "
+                        + outputParity.verificationMode.rawValue)
+            }
+        } else if outputParity != nil || verificationRoute != nil {
+            throw CampaignReceiptError.parityMetadataMismatch(
+                "non-MTP receipt cannot claim an output-parity route")
+        }
+    }
+}
+
+enum CampaignExecutionError: Error, Equatable, CustomStringConvertible {
+    case profileNotInstalled(BenchProfile)
+    case mtpNotInstalled(String)
+    case mtpVerificationMismatch(
+        expected: CBv2MTPVerificationMode, actual: CBv2MTPVerificationMode)
+    case mtpDepthMismatch(requested: Int, maximum: Int)
+
+    var description: String {
+        switch self {
+        case .profileNotInstalled(let profile):
+            return "campaign profile \(profile.rawValue) has no installed construction route"
+        case .mtpNotInstalled(let reason):
+            return "campaign MTP route was not installed: \(reason)"
+        case .mtpVerificationMismatch(let expected, let actual):
+            return "campaign MTP verifier mismatch: requested \(expected.rawValue), installed "
+                + actual.rawValue
+        case .mtpDepthMismatch(let requested, let maximum):
+            return "campaign MTP depth \(requested) exceeds installed drafter maximum \(maximum)"
+        }
+    }
+}
+
+func validateCampaignMTPDepth(requested: Int, drafterMaximum: Int?) throws {
+    if let drafterMaximum, requested > drafterMaximum {
+        throw CampaignExecutionError.mtpDepthMismatch(
+            requested: requested, maximum: drafterMaximum)
+    }
+}
+
+/// Construction-boundary proof that the engine installed the requested MTP
+/// verifier. A drafter may publish a stronger requirement than the caller's
+/// config, so checking only the input config can mislabel a measured receipt.
+func validateCampaignMTPInstallation(
+    config: CBv2MTPConfig, metrics: CBv2MTPMetrics?, inactiveReason: String? = nil
+) throws {
+    guard config.enabled else { return }
+    guard let metrics else {
+        throw CampaignExecutionError.mtpNotInstalled(
+            inactiveReason ?? "the constructed engine has no MTP driver")
+    }
+    guard metrics.verificationMode == config.verificationMode else {
+        throw CampaignExecutionError.mtpVerificationMismatch(
+            expected: config.verificationMode, actual: metrics.verificationMode)
     }
 }
 
@@ -357,6 +626,93 @@ func runV2Request(
             sampling: CBv2SamplingParams(temperature: 0, topLogprobs: topLogprobs),
             maxTokens: maxTokens, stopTokens: stopTokens))
     return await collectV2(stream, submittedAt: submittedAt)
+}
+
+func qwen35CampaignConstructionProfile(
+    _ options: BenchOptions
+) -> Qwen35A3BOptimizationProfile {
+    Qwen35A3BOptimizationProfile(rawValue: options.profile.rawValue)!
+}
+
+/// One warm run followed by a fresh measured engine over the exact campaign
+/// prompt. Warmup and measurement use identical construction-time geometry;
+/// the measured engine has no eligibility branch or fallback route.
+func runCampaignRequest(
+    context: ModelContext, hooks: V2ModelHooks, promptTokens: [Int],
+    options: BenchOptions, kvBytes: Int,
+    mtpDrafter: (any CBv2MTPDrafter)?
+) async throws -> (result: RunResult, routeSummary: [String: String]) {
+    guard options.profile == .stock || options.profile == .prefill
+        || options.profile == .decode || options.profile == .full
+    else {
+        throw CampaignExecutionError.profileNotInstalled(options.profile)
+    }
+    let schedulerConfig = campaignSchedulerConfig(options)
+    let mtpConfig = campaignMTPConfig(options)
+    if mtpConfig.enabled, mtpDrafter == nil {
+        throw CampaignExecutionError.mtpNotInstalled(
+            "the selected profile did not construct an inline assistant")
+    }
+
+    let warmup = try makeV2Engine(
+        context: context, hooks: hooks, backend: .contiguous,
+        schedulerConfig: schedulerConfig, kvBytes: kvBytes,
+        mtpDrafter: mtpDrafter, mtpConfig: mtpConfig)
+    do {
+        _ = try await runV2Request(
+            engine: warmup, id: 9_000, promptTokens: promptTokens,
+            maxTokens: 4, stopTokens: [])
+    } catch {
+        await warmup.shutdown()
+        throw error
+    }
+    await warmup.shutdown()
+
+    let measured = try makeV2Engine(
+        context: context, hooks: hooks, backend: .contiguous,
+        schedulerConfig: schedulerConfig, kvBytes: kvBytes,
+        mtpDrafter: mtpDrafter, mtpConfig: mtpConfig)
+    MLX.Memory.peakMemory = 0
+    let result: RunResult
+    let mtpMetrics: CBv2MTPMetrics?
+    do {
+        result = try await runV2Request(
+            engine: measured, id: 9_001, promptTokens: promptTokens,
+            maxTokens: options.steps, stopTokens: [])
+        mtpMetrics = measured.mtpMetricsSnapshot()
+    } catch {
+        await measured.shutdown()
+        throw error
+    }
+    await measured.shutdown()
+
+    let prefillRoute = options.soloStripe.map {
+        "chunk=\(options.prefillChunk),solo-stripe=\($0)"
+    } ?? "chunk=\(options.prefillChunk),solo-stripe=off"
+    let mtpRoute: String
+    if let metrics = mtpMetrics {
+        mtpRoute = "inline-fixed-k\(options.mtpDepth),verify=\(metrics.verificationMode.rawValue),"
+            + "rounds=\(metrics.rounds),proposed=\(metrics.proposedTokens),"
+            + "accepted=\(metrics.acceptedTokens),emitted=\(metrics.emittedTokens)"
+    } else {
+        mtpRoute = "disabled"
+    }
+    let targetRoute = options.profile == .decode || options.profile == .full
+        ? "row-owned-E256-K8+main-direct-expert-reduction"
+        : "pinned-default"
+    var routeSummary = [
+        "engine": "v2-contiguous",
+        "target": targetRoute,
+        "prefill": prefillRoute,
+        "decode": options.mtpDepth > 0 ? "inline-mtp" : "pinned-default",
+        "mtp": mtpRoute,
+        "modelOptimizations": hooks.optimizations.markdown,
+    ]
+    if mtpConfig.enabled {
+        routeSummary["outputParity"] = options.outputParity.rawValue
+        routeSummary["verificationRoute"] = options.outputParity.verificationRoute
+    }
+    return (result, routeSummary)
 }
 
 /// Human-readable dump of one side's logprob record at the divergence index:
@@ -677,14 +1033,18 @@ func promptMix(batch: Int, lengths: [Int] = []) -> [Int] {
 func runV2Cell(
     context: ModelContext, hooks: V2ModelHooks, backend: V2Backend,
     batch: Int, promptLengths: [Int], steps: Int, vocabSize: Int, kvBytes: Int,
+    prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
     trackOptimizationProvenance: Bool = false
 ) async throws -> CellResult {
-    let prefillChunkSize = 512
     let engine = try makeV2Engine(
         context: context, hooks: hooks, backend: backend,
         schedulerConfig: CBv2SchedulerConfig(
-            maxConcurrentRequests: batch, maxBatchedTokensPerStep: 2048,
-            prefillChunkSize: prefillChunkSize, maxWaiting: 16),
+            maxConcurrentRequests: batch,
+            maxBatchedTokensPerStep: max(
+                2_048, prefillChunkSize, soloPrefillStripeTokens ?? 0),
+            prefillChunkSize: prefillChunkSize,
+            soloPrefillStripeTokens: soloPrefillStripeTokens,
+            maxWaiting: 16),
         kvBytes: kvBytes)
 
     // One shared measured boundary after all warmup. Performance cells arm
@@ -1153,7 +1513,33 @@ func parsePositiveIntList(_ raw: String, option: String) throws -> [Int] {
 
 /// Parsed command line. Kept separate from `main` so the parse is testable
 /// without a model on disk.
-struct BenchOptions: Equatable {
+enum BenchProfile: String, Codable, CaseIterable, Sendable {
+    case stock
+    case prefill
+    case decode
+    case full
+}
+
+enum BenchOutputParity: String, Codable, CaseIterable, Sendable {
+    case fast
+    case byteExact = "byte-exact"
+
+    var verificationMode: CBv2MTPVerificationMode {
+        switch self {
+        case .fast: .rectangular
+        case .byteExact: .rectangularExact
+        }
+    }
+
+    var verificationRoute: String {
+        switch self {
+        case .fast: "rectangular-target-authoritative"
+        case .byteExact: "rectangular-timewise-byte-exact"
+        }
+    }
+}
+
+struct BenchOptions: Equatable, Sendable {
     var modelPath = ""
     var mode = "all"
     var engines = ["v2", "v2-paged"]
@@ -1164,6 +1550,17 @@ struct BenchOptions: Equatable {
     var kvBytes = 16 << 30
     var promptLengths: [Int] = []
     var maxSeqLen: Int?
+    var profile: BenchProfile = .stock
+    var promptFile: String?
+    var prefillChunk = 512
+    var soloStripe: Int?
+    var mtpDepth = 0
+    var outputParity = BenchOutputParity.fast
+    var outputParityWasSpecified = false
+    var modelRevision = ""
+    var mlxSwiftRevision = ""
+    var gpuLockOwner = ""
+    var receiptPath: String?
     /// `--print-revision`: print the build stamp and exit, without a model.
     var printRevisionOnly = false
 
@@ -1174,6 +1571,12 @@ struct BenchOptions: Equatable {
                [--engines v2,v2-paged] [--batches 1,2,4]
                [--steps N] [--label tag] [--kv-gb N] [--out report.md]
                [--prompt-lengths 500,10000] [--max-seq-len N]
+               [--profile stock|prefill|decode|full] [--prompt-file path]
+               [--prefill-chunk N] [--solo-stripe N] [--mtp-depth 0...4]
+               [--output-parity fast|byte-exact]
+               [--model-revision sha] [--mlx-swift-revision sha]
+               [--gpu-lock-owner name]
+               [--receipt path]
                [--print-revision]
         """
 
@@ -1219,6 +1622,45 @@ struct BenchOptions: Equatable {
             case "--max-seq-len":
                 options.maxSeqLen = try parsePositiveInt(
                     try value(for: argument), option: argument)
+            case "--profile":
+                let raw = try value(for: argument)
+                guard let profile = BenchProfile(rawValue: raw) else {
+                    throw BenchOptionError.invalidValue(
+                        option: argument, value: raw,
+                        requirement: "expected one of "
+                            + BenchProfile.allCases.map(\.rawValue).joined(separator: "|"))
+                }
+                options.profile = profile
+            case "--prompt-file":
+                options.promptFile = try value(for: argument)
+            case "--prefill-chunk":
+                options.prefillChunk = try parsePositiveInt(
+                    try value(for: argument), option: argument)
+            case "--solo-stripe":
+                options.soloStripe = try parsePositiveInt(
+                    try value(for: argument), option: argument)
+            case "--mtp-depth":
+                let raw = try value(for: argument)
+                guard let depth = Int(raw), (0 ... 4).contains(depth) else {
+                    throw BenchOptionError.invalidValue(
+                        option: argument, value: raw,
+                        requirement: "expected an integer in 0...4")
+                }
+                options.mtpDepth = depth
+            case "--output-parity":
+                let raw = try value(for: argument)
+                guard let outputParity = BenchOutputParity(rawValue: raw) else {
+                    throw BenchOptionError.invalidValue(
+                        option: argument, value: raw,
+                        requirement: "expected one of "
+                            + BenchOutputParity.allCases.map(\.rawValue)
+                                .joined(separator: "|"))
+                }
+                options.outputParity = outputParity
+                options.outputParityWasSpecified = true
+            case "--model-revision": options.modelRevision = try value(for: argument)
+            case "--mlx-swift-revision": options.mlxSwiftRevision = try value(for: argument)
+            case "--gpu-lock-owner": options.gpuLockOwner = try value(for: argument)
             case "--steps":
                 options.steps = try parsePositiveInt(
                     try value(for: argument), option: argument)
@@ -1227,6 +1669,7 @@ struct BenchOptions: Equatable {
                     try value(for: argument), option: argument) << 30
             case "--label": options.label = try value(for: argument)
             case "--out": options.outPath = try value(for: argument)
+            case "--receipt": options.receiptPath = try value(for: argument)
             case "--print-revision": options.printRevisionOnly = true
             default:
                 throw BenchOptionError.unknownOption(argument)
@@ -1234,6 +1677,75 @@ struct BenchOptions: Equatable {
         }
         guard options.printRevisionOnly || !options.modelPath.isEmpty else {
             throw BenchOptionError.missingModel
+        }
+        if options.outputParityWasSpecified {
+            guard options.profile == .decode || options.profile == .full else {
+                throw BenchOptionError.invalidValue(
+                    option: "--output-parity", value: options.outputParity.rawValue,
+                    requirement: "requires profile decode or full")
+            }
+            guard options.mtpDepth > 0 else {
+                throw BenchOptionError.invalidValue(
+                    option: "--output-parity", value: options.outputParity.rawValue,
+                    requirement: "requires --mtp-depth greater than zero")
+            }
+        }
+        if options.promptFile == nil,
+            options.profile != .stock || options.mtpDepth > 0 || options.outputParityWasSpecified
+        {
+            throw BenchOptionError.invalidValue(
+                option: "--prompt-file", value: "",
+                requirement: "optimization profiles and MTP flags require campaign mode")
+        }
+        if options.promptFile != nil, options.receiptPath == nil {
+            throw BenchOptionError.invalidValue(
+                option: "--prompt-file", value: options.promptFile ?? "",
+                requirement: "campaign prompt requires --receipt")
+        }
+        if options.receiptPath != nil {
+            guard options.promptFile != nil else {
+                throw BenchOptionError.invalidValue(
+                    option: "--receipt", value: options.receiptPath ?? "",
+                    requirement: "requires --prompt-file")
+            }
+            guard options.steps == 1_024 else {
+                throw BenchOptionError.invalidValue(
+                    option: "--steps", value: String(options.steps),
+                    requirement: "campaign receipts require exactly 1024 generated tokens")
+            }
+            for (option, value) in [
+                ("--model-revision", options.modelRevision),
+                ("--mlx-swift-revision", options.mlxSwiftRevision),
+                ("--gpu-lock-owner", options.gpuLockOwner),
+            ] where value.isEmpty {
+                throw BenchOptionError.invalidValue(
+                    option: option, value: value,
+                    requirement: "required for campaign receipt provenance")
+            }
+            switch options.profile {
+            case .stock:
+                guard options.prefillChunk == 512, options.soloStripe == nil,
+                    options.mtpDepth == 0
+                else {
+                    throw BenchOptionError.invalidValue(
+                        option: "--profile", value: options.profile.rawValue,
+                        requirement: "stock requires prefillChunk=512, no solo stripe, and mtpDepth=0")
+                }
+            case .prefill:
+                guard options.mtpDepth == 0 else {
+                    throw BenchOptionError.invalidValue(
+                        option: "--mtp-depth", value: String(options.mtpDepth),
+                        requirement: "prefill profile does not install a decode drafter")
+                }
+            case .decode:
+                guard options.prefillChunk == 512, options.soloStripe == nil else {
+                    throw BenchOptionError.invalidValue(
+                        option: "--profile", value: options.profile.rawValue,
+                        requirement: "decode profile keeps the stock prefill route")
+                }
+            case .full:
+                break
+            }
         }
         return options
     }
@@ -1253,10 +1765,40 @@ struct BenchOptions: Equatable {
     }
 
     var promptAxisDescription: String {
-        promptLengths.isEmpty
+        if let promptFile {
+            return "campaign file \(promptFile) (measured tokens and SHA-256 below)"
+        }
+        return promptLengths.isEmpty
             ? "default mix (B=1 500; B=2 100,1500; B=4 100,500,1500,500; else 500 x B)"
             : promptLengths.map(String.init).joined(separator: ",")
     }
+}
+
+/// Scheduler geometry is selected once, before engine construction. A profile
+/// cannot change these values during a request or silently fall back after a
+/// failed optimized dispatch.
+func campaignSchedulerConfig(_ options: BenchOptions) -> CBv2SchedulerConfig {
+    CBv2SchedulerConfig(
+        maxConcurrentRequests: 1,
+        maxBatchedTokensPerStep: max(
+            2_048, options.prefillChunk, options.soloStripe ?? 0),
+        prefillChunkSize: options.prefillChunk,
+        soloPrefillStripeTokens: options.soloStripe,
+        maxWaiting: 1)
+}
+
+/// The exact speculative width and verification order are construction-time
+/// routes. The benchmark installs one fixed K and the selected verifier, then
+/// never consults an adaptive controller in the measured request.
+func campaignMTPConfig(_ options: BenchOptions) -> CBv2MTPConfig {
+    guard options.mtpDepth > 0 else { return CBv2MTPConfig() }
+    return CBv2MTPConfig(
+        enabled: true,
+        maxDraftTokens: options.mtpDepth,
+        maxSpeculativeBatch: 1,
+        fixedDraftTokens: options.mtpDepth,
+        verificationMode: options.outputParity.verificationMode,
+        maxAutomaticRectangularTokens: 0)
 }
 
 // MARK: - Report header
@@ -1273,17 +1815,28 @@ func reportHeader(
     var rows = [row("Model", options.modelPath)]
     if !options.label.isEmpty { rows.append(row("Label", options.label)) }
     rows += [
+        row("Profile", options.profile.rawValue),
+        row("Prefill construction", "chunk=\(options.prefillChunk), soloStripe="
+            + (options.soloStripe.map(String.init) ?? "off")),
         row("Chip", chip),
         row("RAM", "\(ramGB) GB"),
         row("OS", osVersion),
         row("Host at start", hostLine),
         row("Invocation", "`\(shellQuotedInvocation(argv))`"),
         row("Prompt lengths", options.promptAxisDescription),
-        row("Paged nominalMaxSeqLen", "\(options.pagedNominalMaxSequenceLength)"),
+        row(
+            "Paged nominalMaxSeqLen",
+            options.promptFile == nil
+                ? "\(options.pagedNominalMaxSequenceLength)"
+                : "not used by one-prompt contiguous campaign"),
         // The revision the *binary* was built from — see `buildRevision()`.
         row("mlx-swift-lm (build)", revision),
         row("Date", ISO8601DateFormatter().string(from: date)),
     ]
+    if options.mtpDepth > 0 {
+        rows.insert(row("Output parity", options.outputParity.rawValue), at: 2)
+        rows.insert(row("Verification route", options.outputParity.verificationRoute), at: 3)
+    }
     return """
         # BenchCBv2RealModel report
 
@@ -1337,6 +1890,12 @@ public enum BenchCBv2Driver {
         print("model: \(options.modelPath)")
         print("mode: \(options.mode)  engines: \(options.engines)"
             + "  batches: \(options.batches)  steps: \(options.steps)")
+        if options.promptFile != nil {
+            print("campaign profile: \(options.profile.rawValue)"
+                + "  prefillChunk: \(options.prefillChunk)"
+                + "  soloStripe: \(options.soloStripe.map(String.init) ?? "off")"
+                + "  mtpDepth: \(options.mtpDepth)")
+        }
         print("prompt lengths: "
             + (options.promptLengths.isEmpty ? "default mix" : options.promptLengths.description)
             + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
@@ -1346,17 +1905,44 @@ public enum BenchCBv2Driver {
         }
 
         do {
+            let campaignPrompt = try options.promptFile.map {
+                try CampaignPrompt.load(from: URL(fileURLWithPath: $0))
+            }
+            let campaignContract = try campaignPrompt.map { _ in
+                try Qwen35A3BArtifactContract.inspect(
+                    configurationURL: directory.appendingPathComponent("config.json"))
+            }
+            let campaignInstallation = try campaignContract.map {
+                try Qwen35A3BConstructionInstallation.install(
+                    contract: $0,
+                    profile: qwen35CampaignConstructionProfile(options),
+                    targetVerifyArithmetic: options.outputParity == .byteExact
+                        ? .exactM1 : .rectangular)
+            }
             let loadStart = CFAbsoluteTimeGetCurrent()
             // Explicitly the LLM factory: text-only benchmarking of checkpoints
             // that may carry a vision tower (see file header).
-            let container = try await LLMModelFactory.shared.loadContainer(
-                from: directory, using: #huggingFaceTokenizerLoader())
+            let container: ModelContainer
+            if let campaignInstallation {
+                container = try await Qwen35A3BConstructionContext.withInstallation(
+                    campaignInstallation
+                ) {
+                    try await LLMModelFactory.shared.loadContainer(
+                        from: directory, using: #huggingFaceTokenizerLoader())
+                }
+            } else {
+                container = try await LLMModelFactory.shared.loadContainer(
+                    from: directory, using: #huggingFaceTokenizerLoader())
+            }
             print(String(
                 format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
 
             let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy) =
                 (options.mode, options.engines, options.batches, options.steps, options.kvBytes)
             let promptLengthsCopy = options.promptLengths
+            let prefillChunkCopy = options.prefillChunk
+            let soloStripeCopy = options.soloStripe
+            let campaignOptions = options
             let report: String = try await container.perform {
                 (context: ModelContext) async throws -> String in
                 var out = ""
@@ -1385,6 +1971,18 @@ public enum BenchCBv2Driver {
                     + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
                 emit("- optimization-run-json: \(try benchmarkJSONString(runOptimizations))")
 
+                if campaignOptions.outputParity == .byteExact,
+                    let campaignContract
+                {
+                    guard let qwenTarget = hooks.model as? Qwen35TextModel else {
+                        throw Qwen35A3BArtifactError.mismatch(
+                            field: "loaded.target_type", expected: "Qwen35TextModel",
+                            actual: String(describing: type(of: hooks.model)))
+                    }
+                    try qwen35A3BValidateLoadedExactTarget(
+                        qwenTarget, contract: campaignContract)
+                }
+
 
 
                 // Vocab probe ([1,1] cache-less forward) for synthetic prompts.
@@ -1403,6 +2001,93 @@ public enum BenchCBv2Driver {
                         messages: [["role": "user", "content": question]],
                         tools: nil, additionalContext: nil))
                         ?? context.tokenizer.encode(text: question, addSpecialTokens: true)
+                }
+
+                // Exact one-prompt campaign ---------------------------------
+                // This route is exclusive: a receipt invocation cannot drift
+                // into the synthetic correctness/perf matrix below.
+                if let campaignPrompt {
+                    let promptTokenIDs = try context.tokenizer.applyChatTemplate(
+                        messages: [["role": "user", "content": campaignPrompt.text]],
+                        tools: nil, additionalContext: nil)
+                    guard (80 ... 70_000).contains(promptTokenIDs.count) else {
+                        throw CampaignReceiptError.promptLengthOutsideCampaign(
+                            actual: promptTokenIDs.count)
+                    }
+                    let mtpAssistant: Qwen35InlineMTPAssistant? =
+                        campaignOptions.mtpDepth > 0
+                        ? try Qwen35InlineMTPAssistant.load(
+                            from: directory, target: hooks.model,
+                            verificationMode: campaignOptions.outputParity.verificationMode)
+                        : nil
+                    try validateCampaignMTPDepth(
+                        requested: campaignOptions.mtpDepth,
+                        drafterMaximum: mtpAssistant?.maximumDraftTokens)
+                    let campaign = try await runCampaignRequest(
+                        context: context, hooks: hooks, promptTokens: promptTokenIDs,
+                        options: campaignOptions, kvBytes: kvBytesCopy,
+                        mtpDrafter: mtpAssistant)
+                    let metrics = PhaseMetrics(
+                        promptTokens: promptTokenIDs.count,
+                        submittedAt: campaign.result.submittedAt,
+                        firstTokenAt: campaign.result.firstTokenAt,
+                        lastTokenAt: campaign.result.lastTokenAt,
+                        generatedTokens: campaign.result.tokens.count)
+                    var routeSummary = campaign.routeSummary
+                    if let campaignContract {
+                        routeSummary["artifactContract"] = campaignContract.summary
+                    }
+                    let receipt = CampaignReceipt(
+                        modelPath: campaignOptions.modelPath,
+                        modelRevision: campaignOptions.modelRevision,
+                        sourceRevision: buildRevision(),
+                        mlxSwiftRevision: campaignOptions.mlxSwiftRevision,
+                        profile: campaignOptions.profile,
+                        promptSHA256: campaignPrompt.sha256,
+                        promptTokenIDs: promptTokenIDs,
+                        generatedTokenIDs: campaign.result.tokens,
+                        requestedGeneratedTokens: campaignOptions.steps,
+                        generatedText: campaign.result.text,
+                        phaseMetrics: metrics,
+                        prefillChunk: campaignOptions.prefillChunk,
+                        soloStripe: campaignOptions.soloStripe,
+                        mtpDepth: campaignOptions.mtpDepth,
+                        outputParity: campaignOptions.mtpDepth > 0
+                            ? campaignOptions.outputParity : nil,
+                        verificationRoute: campaignOptions.mtpDepth > 0
+                            ? campaignOptions.outputParity.verificationRoute : nil,
+                        routeSummary: routeSummary,
+                        gpuLockOwner: campaignOptions.gpuLockOwner,
+                        peakMemoryBytes: UInt64(max(0, MLX.Memory.peakMemory)))
+                    try receipt.validate()
+                    guard let receiptPath = campaignOptions.receiptPath else {
+                        preconditionFailure("validated campaign options lost receipt path")
+                    }
+                    let receiptJSON = try benchmarkJSONString(receipt)
+                    try receiptJSON.write(
+                        to: URL(fileURLWithPath: receiptPath), atomically: true,
+                        encoding: .utf8)
+
+                    emit("\n## Exact Qwen campaign\n")
+                    emit("- profile: \(campaignOptions.profile.rawValue)")
+                    if campaignOptions.mtpDepth > 0 {
+                        emit("- output parity: \(campaignOptions.outputParity.rawValue)")
+                        emit("- verification route: "
+                            + campaignOptions.outputParity.verificationRoute)
+                    }
+                    emit("- prompt: \(promptTokenIDs.count) tokens; sha256 "
+                        + campaignPrompt.sha256)
+                    emit(String(
+                        format: "- prefill: %.3fs, %.1f tok/s",
+                        metrics.prefillSeconds, metrics.prefillTPS))
+                    emit(String(
+                        format: "- decode: %.1f tok/s (%d tokens after first token)",
+                        metrics.decodeTPS, max(0, metrics.generatedTokens - 1)))
+                    emit("- generated: \(campaign.result.tokens.count) greedy tokens; finish "
+                        + campaign.result.finish)
+                    emit("- route: \(routeSummary)")
+                    emit("- receipt: \(receiptPath)")
+                    return out
                 }
 
                 // Correctness ------------------------------------------------
@@ -1434,13 +2119,17 @@ public enum BenchCBv2Driver {
                         _ = try? await runV2Cell(
                             context: context, hooks: hooks, backend: .contiguous,
                             batch: 1, promptLengths: [100], steps: 8,
-                            vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                            vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                            prefillChunkSize: prefillChunkCopy,
+                            soloPrefillStripeTokens: soloStripeCopy)
                         CBv2StepProfiler.reset()
                         CBv2StepProfiler.enabled = true
                         let cell = try await runV2Cell(
                             context: context, hooks: hooks, backend: .contiguous,
                             batch: 1, promptLengths: [500], steps: stepsCopy,
                             vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                            prefillChunkSize: prefillChunkCopy,
+                            soloPrefillStripeTokens: soloStripeCopy,
                             trackOptimizationProvenance: true)
                         CBv2StepProfiler.enabled = false
                         emit("### v2 (contiguous) B=1 — decodeTPS "
@@ -1486,7 +2175,9 @@ public enum BenchCBv2Driver {
                             _ = try await runV2Cell(
                                 context: context, hooks: hooks, backend: backend,
                                 batch: 1, promptLengths: [100], steps: 8,
-                                vocabSize: vocabSize, kvBytes: kvBytesCopy)
+                                vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                                prefillChunkSize: prefillChunkCopy,
+                                soloPrefillStripeTokens: soloStripeCopy)
                         } catch {
                             tableRows.append(refusalRow(
                                 engine: engineName, reason: "skipped: \(error)"))
@@ -1499,6 +2190,8 @@ public enum BenchCBv2Driver {
                                 context: context, hooks: hooks, backend: backend,
                                 batch: batch, promptLengths: mix, steps: stepsCopy,
                                 vocabSize: vocabSize, kvBytes: kvBytesCopy,
+                                prefillChunkSize: prefillChunkCopy,
+                                soloPrefillStripeTokens: soloStripeCopy,
                                 trackOptimizationProvenance: true)
                             tableRows.append(cell.markdownRow)
                             provenanceLines.append(

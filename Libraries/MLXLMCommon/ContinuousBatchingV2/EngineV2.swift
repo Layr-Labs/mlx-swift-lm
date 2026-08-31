@@ -14,6 +14,13 @@ import os
 
 private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
 
+/// Breaks the stream-initializer cycle while preserving the exact stream
+/// generation in its abandonment callback. The identifier is installed
+/// before the stream escapes `registerSubmission`.
+private final class CBv2StreamGenerationBox: @unchecked Sendable {
+    var generation: UInt64?
+}
+
 // MARK: - Shared gauges (submit-side admission ⇄ engine-thread truth)
 
 /// Lock-protected counters bridging the caller-thread `submit`/`capacity`
@@ -113,6 +120,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let gauges: CBv2EngineGauges
     private let layerKinds: [CBv2LayerKind]
     private let requiredPositionAxisCount: Int?
+    private let supportsPositionedForwarding: Bool
     private let samplerSupportsTokenConstraints: Bool
     /// Non-nil only when active (instance supplied AND
     /// `schedulerConfig.enablePrefixCache`). Lookup + prefix slicing run on
@@ -189,6 +197,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         self.layerKinds = layerKinds
         self.requiredPositionAxisCount =
             (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
+        self.supportsPositionedForwarding = Self.modelSupportsPositionedForwarding(model)
         self.backend = backend
         self.samplerSupportsTokenConstraints = sampler.supportsTokenConstraints
         let modelCapabilities =
@@ -382,37 +391,47 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         return "EngineV2: model capability vetoes paged KV for request-owned recurrent state"
     }
 
-    // MARK: CBv2Engine
+    // MARK: Submission preparation
 
-    /// Submit a request; events stream until `.finished`. Throws
-    /// `CBv2KVError.capacityExhausted` when truthful admission fails (worst
-    /// case could never fit), the waiting queue is full, or the engine is
-    /// shutting down — the provider maps this to 429/503 exactly as today.
-    /// Throws `CBv2SchedulerError.duplicateRequestID` when the id is still
-    /// live: the duplicate is rejected BEFORE any stream registration, so
-    /// the original request's stream is never touched (PR#62 review).
-    public func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
+    private func normalizedRequest(_ request: CBv2Request) -> CBv2Request {
         var request = request
         if request.positionState == nil {
             request.positionState = request.multimodal?.positionState
         }
-        stateLock.lock()
-        let rejecting = rejectingSubmissions
-        stateLock.unlock()
+        return request
+    }
+
+    private func requireAcceptingSubmissions() throws {
+        let rejecting = stateLock.withLock { rejectingSubmissions }
         guard !rejecting else {
             throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
         }
-        // Degenerate requests: uniform event surface, no engine round-trip.
-        if request.maxTokens <= 0 {
-            return Self.immediateStream(
-                reason: .length,
-                usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+    }
+
+    /// A positioned multimodal request exercises two seams: embedding
+    /// prefill and token decode. Structural conformance must prove both, and
+    /// runtime-capability adapters must additionally confirm that their
+    /// wrapped model implements both. This makes the execution guards
+    /// invariant assertions rather than request-dependent fatal paths.
+    private static func modelSupportsPositionedForwarding(
+        _ model: CBv2SteppableModel
+    ) -> Bool {
+        guard
+            (model as? any CBv2PositionedForwardingCapabilityProviding)?
+                .supportsPositionedForwarding == true
+        else { return false }
+
+        if let recurrent = model as? any CBv2RecurrentSteppableModel,
+            recurrent.recurrentStateSpec != nil
+        {
+            return model is any CBv2PositionedRecurrentSteppableModel
+                && model is any CBv2PositionedMultimodalSteppableModel
         }
-        if request.promptTokens.isEmpty {
-            return Self.immediateStream(
-                reason: .error("empty prompt"),
-                usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
-        }
+        return model is any CBv2PositionedSteppableModel
+            && model is any CBv2PositionedEmbeddingSteppableModel
+    }
+
+    private func validateRequest(_ request: CBv2Request) throws {
         if let positions = request.positionState {
             guard positions.promptLength == request.promptTokens.count else {
                 throw CBv2MultimodalError.invalidSpans(
@@ -429,12 +448,15 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 throw CBv2MultimodalError.invalidSpans(
                     "position axes \(positions.axisCount) != model axes \(requiredAxes)")
             }
+            guard supportsPositionedForwarding else {
+                throw CBv2MultimodalError.unsupportedModel(
+                    "request-owned positions require positioned model forwarding")
+            }
         }
         if request.multimodal?.attention == .causal, request.positionState == nil {
             throw CBv2MultimodalError.invalidSpans(
                 "causal multimodal input requires request-owned position state")
         }
-
         if let constraint = request.tokenConstraint {
             guard samplerSupportsTokenConstraints else {
                 throw CBv2SchedulerError.tokenConstraintUnsupportedBySampler
@@ -445,6 +467,78 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                     constraint: constraint.maxTokens)
             }
         }
+    }
+
+    private func validatedMultimodalBlocks(
+        for request: CBv2Request
+    ) throws -> [CBv2ImageSpan] {
+        guard let input = request.multimodal else { return [] }
+        return try CBv2MultimodalPlan.validate(
+            input,
+            promptTokenCount: request.promptTokens.count,
+            model: loop.model,
+            cacheProvider: loop.cacheProvider,
+            maxBatchedTokensPerStep: schedulerConfig.maxBatchedTokensPerStep)
+    }
+
+    private func requireRequestCanEverFit(_ request: CBv2Request) throws {
+        guard
+            admission.canEverFit(
+                promptTokens: request.promptTokens.count,
+                maxTokens: request.maxTokens)
+        else {
+            throw CBv2KVError.capacityExhausted(
+                needed: admission.allocatedBytes(
+                    forTokens: request.promptTokens.count + request.maxTokens),
+                available: admission.admissibleBytesCapacity)
+        }
+    }
+
+    private func registerSubmission(_ request: CBv2Request) throws -> CBv2OutputStream {
+        guard gauges.beginSubmit(maxWaiting: schedulerConfig.maxWaiting) else {
+            throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
+        }
+        let generation = CBv2StreamGenerationBox()
+        let stream = CBv2OutputStream(
+            id: request.id,
+            capacity: loopConfig.eventBufferCapacity,
+            onBackpressure: { [loop] id, paused in loop.setPaused(id, paused) },
+            onAbandoned: { [loop, generation] id in
+                guard let token = generation.generation else { return }
+                loop.requestCancel(id, streamGeneration: token)
+            })
+        guard let streamGeneration = loop.registerWithGeneration(stream: stream) else {
+            gauges.endSubmit()
+            throw CBv2SchedulerError.duplicateRequestID(request.id)
+        }
+        generation.generation = streamGeneration
+        return stream
+    }
+
+    // MARK: CBv2Engine
+
+    /// Submit a request; events stream until `.finished`. Throws
+    /// `CBv2KVError.capacityExhausted` when truthful admission fails (worst
+    /// case could never fit), the waiting queue is full, or the engine is
+    /// shutting down — the provider maps this to 429/503 exactly as today.
+    /// Throws `CBv2SchedulerError.duplicateRequestID` when the id is still
+    /// live: the duplicate is rejected BEFORE any stream registration, so
+    /// the original request's stream is never touched (PR#62 review).
+    public func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
+        let request = normalizedRequest(request)
+        try requireAcceptingSubmissions()
+        // Degenerate requests: uniform event surface, no engine round-trip.
+        if request.maxTokens <= 0 {
+            return Self.immediateStream(
+                reason: .length,
+                usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0))
+        }
+        if request.promptTokens.isEmpty {
+            return Self.immediateStream(
+                reason: .error("empty prompt"),
+                usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+        }
+        try validateRequest(request)
 
         // Vision requests, CHEAP half only: span structure, model/backend
         // capability, block-vs-budget — no provider call, no MLX graphs.
@@ -454,46 +548,17 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // is always counted in `pendingSubmits` (PR#63 review). All
         // multimodal failures remain submit-time throws
         // (`CBv2MultimodalError`); nothing reaches the scheduler.
-        var multimodalBlocks: [CBv2ImageSpan] = []
-        if let input = request.multimodal {
-            multimodalBlocks = try CBv2MultimodalPlan.validate(
-                input,
-                promptTokenCount: request.promptTokens.count,
-                model: loop.model,
-                cacheProvider: loop.cacheProvider,
-                maxBatchedTokensPerStep: schedulerConfig.maxBatchedTokensPerStep)
-        }
+        let multimodalBlocks = try validatedMultimodalBlocks(for: request)
 
         // Truthful admission: reject what could NEVER fit; everything else
         // is admitted optimistically (preemption is the backstop).
-        guard
-            admission.canEverFit(
-                promptTokens: request.promptTokens.count, maxTokens: request.maxTokens)
-        else {
-            throw CBv2KVError.capacityExhausted(
-                needed: admission.allocatedBytes(
-                    forTokens: request.promptTokens.count + request.maxTokens),
-                available: admission.admissibleBytesCapacity)
-        }
-        guard gauges.beginSubmit(maxWaiting: schedulerConfig.maxWaiting) else {
-            throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
-        }
-
-        let loop = self.loop
-        let stream = CBv2OutputStream(
-            id: request.id,
-            capacity: loopConfig.eventBufferCapacity,
-            onBackpressure: { id, paused in loop.setPaused(id, paused) },
-            onAbandoned: { id in loop.requestCancel(id) })
+        try requireRequestCanEverFit(request)
         // Registration doubles as the duplicate-id gate: it refuses to
         // replace a live stream, so the FIRST request keeps delivering and
         // the duplicate fails here — before the scheduler ever sees it.
         // (The scheduler's own `duplicateRequestID` rejection remains the
         // engine-thread backstop.)
-        guard loop.register(stream: stream) else {
-            gauges.endSubmit()
-            throw CBv2SchedulerError.duplicateRequestID(request.id)
-        }
+        let stream = try registerSubmission(request)
 
         // Vision requests, HEAVY half: materialize the image embeddings ONCE,
         // here on the submit thread (the one provider call per request —
@@ -515,6 +580,97 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         loop.enqueue(
             request, prefixLookup: makePrefixLookup(for: request), multimodal: multimodal)
         return stream.makeStream()
+    }
+
+    /// Submit only when the authoritative engine-queue projection can reach
+    /// this request's first token by the absolute monotonic deadline.
+    ///
+    /// The caller owns the anchored deadline and conservative phase rates; the
+    /// verdict subtracts elapsed time only inside the serialized engine-queue
+    /// closure, so waiting for that closure never resets the budget.
+    /// Multimodal requests fail closed before image materialization because
+    /// image-tower work is not representable by scheduled token count.
+    public func submit(
+        _ request: CBv2Request,
+        firstTokenDeadline: CBv2FirstTokenDeadlineAdmission
+    ) async throws -> CBv2FirstTokenDeadlineResult {
+        let request = normalizedRequest(request)
+        try requireAcceptingSubmissions()
+
+        let zeroWork = CBv2FirstTokenProjectedWork.bounded(
+            work: CBv2FirstTokenScheduledWork(
+                prefillTokens: 0,
+                decodeTokens: 0,
+                scheduledSteps: 0,
+                mixedSteps: 0),
+            serviceDuration: .zero)
+        if request.maxTokens <= 0 {
+            return .admitted(
+                stream: Self.immediateStream(
+                    reason: .length,
+                    usage: CBv2Usage(
+                        promptTokens: request.promptTokens.count,
+                        completionTokens: 0)),
+                projectedWork: zeroWork,
+                admittedAt: .now,
+                retirement: .acknowledged)
+        }
+        if request.promptTokens.isEmpty {
+            return .admitted(
+                stream: Self.immediateStream(
+                    reason: .error("empty prompt"),
+                    usage: CBv2Usage(promptTokens: 0, completionTokens: 0)),
+                projectedWork: zeroWork,
+                admittedAt: .now,
+                retirement: .acknowledged)
+        }
+        try validateRequest(request)
+
+        if request.multimodal != nil {
+            _ = try validatedMultimodalBlocks(for: request)
+            return .deadlineUnreachable(projectedWork: .unbounded)
+        }
+        guard loop.isHealthy else {
+            throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
+        }
+
+        try requireRequestCanEverFit(request)
+        let stream = try registerSubmission(request)
+
+        let outcome = await loop.enqueueForFirstTokenDeadline(
+            request,
+            prefixLookup: makePrefixLookup(for: request),
+            admission: firstTokenDeadline)
+        return try await withTaskCancellationHandler {
+            switch outcome {
+            case .admitted(let projectedWork, let admittedAt):
+                let retirement = CBv2RequestRetirement(stream: stream)
+                if Task.isCancelled {
+                    loop.requestCancel(request.id)
+                    throw CBv2FirstTokenAdmissionCancellation(
+                        stream: stream.makeStream(),
+                        retirement: retirement)
+                }
+                return .admitted(
+                    stream: stream.makeStream(),
+                    projectedWork: projectedWork,
+                    admittedAt: admittedAt,
+                    retirement: retirement)
+            case .deadlineUnreachable(let projectedWork):
+                return .deadlineUnreachable(projectedWork: projectedWork)
+            case .cancelled:
+                throw CancellationError()
+            case .schedulerRejected(let error):
+                throw error
+            case .capacityRejected:
+                throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
+            }
+        } onCancel: {
+            // Never block a Swift cancellation handler: a permanently wedged
+            // engine queue may never retire the row. The operation returns a
+            // typed ownership-transfer error if commit already won.
+            loop.requestCancel(request.id)
+        }
     }
 
     /// Prefix-cache lookup on the SUBMIT thread (SHA-256 hashing is host

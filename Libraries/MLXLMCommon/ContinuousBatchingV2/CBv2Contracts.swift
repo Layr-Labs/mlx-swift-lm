@@ -206,6 +206,20 @@ public struct CBv2PositionState: @unchecked Sendable {
 public protocol CBv2PositionAxisProviding {
     var cbv2PositionAxisCount: Int? { get }
 }
+/// Runtime positioned-forwarding capability used by request admission.
+///
+/// Positioned steppable protocols provide `true` by default. Generic
+/// adapters over arbitrary language models override this with the wrapped
+/// model's actual forwarding seam so structural adapter conformance cannot
+/// admit a request that would trap during execution.
+public protocol CBv2PositionedForwardingCapabilityProviding {
+    var supportsPositionedForwarding: Bool { get }
+}
+
+extension CBv2PositionedForwardingCapabilityProviding {
+    public var supportsPositionedForwarding: Bool { true }
+}
+
 
 // MARK: - Multimodal input (vision prefill; additive)
 
@@ -261,16 +275,22 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     public var positionState: CBv2PositionState?
     /// Embeddings provider — one array per span, same order as `spans`.
     public var embeddings: () throws -> [MLXArray]
+    /// Optional Qwen DeepStack provider. The outer array is ordered by
+    /// language-layer injection point; each inner array is one embedding per
+    /// span, in the same order as `spans`.
+    public var deepstackEmbeddings: (() throws -> [[MLXArray]])?
 
     public init(
         spans: [CBv2ImageSpan],
         attention: CBv2MultimodalAttention = .bidirectionalSpans,
         positionState: CBv2PositionState? = nil,
+        deepstackEmbeddings: (() throws -> [[MLXArray]])? = nil,
         embeddings: @escaping () throws -> [MLXArray]
     ) {
         self.spans = spans
         self.attention = attention
         self.positionState = positionState
+        self.deepstackEmbeddings = deepstackEmbeddings
         self.embeddings = embeddings
     }
 }
@@ -1094,6 +1114,13 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Throws CBv2KVError.capacityExhausted when admission fails (the
     /// provider maps this to 429/503 exactly as today).
     func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event>
+    /// Atomically enqueue and admit against a caller-owned first-token
+    /// deadline. The authoritative projection and verdict run on the engine
+    /// queue after prefix adoption and before this request enters a GPU step.
+    func submit(
+        _ request: CBv2Request,
+        firstTokenDeadline: CBv2FirstTokenDeadlineAdmission
+    ) async throws -> CBv2FirstTokenDeadlineResult
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
@@ -1165,6 +1192,14 @@ extension CBv2Engine {
     /// An engine with no packed-prefill path reports neither capability nor
     /// execution.
     public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
+    /// Engines without an authoritative serialized-prefill projection fail
+    /// closed rather than manufacturing a deadline verdict.
+    public func submit(
+        _ request: CBv2Request,
+        firstTokenDeadline: CBv2FirstTokenDeadlineAdmission
+    ) async throws -> CBv2FirstTokenDeadlineResult {
+        .deadlineUnreachable(projectedWork: .unbounded)
+    }
 }
 
 // MARK: - Teacher-forced top-1 scoring (backend parity measurement)

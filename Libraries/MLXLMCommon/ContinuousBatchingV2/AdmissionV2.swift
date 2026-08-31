@@ -492,6 +492,135 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         return bytes <= admissibleBytesCapacity
     }
 
+    /// Non-mutating replay of the exact reserve/unreserve/release timeline a
+    /// deadline projection expects before the target's first sample. The
+    /// snapshot is taken under the same lock as `reserve`, so paused rows and
+    /// unrelated live ledger owners remain charged. Speculative suffixes are
+    /// unreserved only after their full step-width peak has been checked, and
+    /// a row is released only after the projected step that retires it.
+    func canGuarantee(
+        projectedOperations: [CBv2ProjectedCapacityOperation]
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var simulatedTokens = reservedTokens
+        var simulatedExactBytes = reservedExactBytes
+        var simulatedLedgerBytes = ledgerBytes
+
+        /// nil means malformed/unrepresentable; false means a valid
+        /// reservation that cannot fit and was left unapplied.
+        func applyReservation(
+            _ reservation: CBv2ProjectedCapacityReservation
+        ) -> Bool? {
+            guard reservation.additionalTokens >= 0,
+                reservation.additionalBytes >= 0
+            else {
+                return nil
+            }
+            let oldTokens = simulatedTokens[reservation.id] ?? 0
+            let oldExactBytes = simulatedExactBytes[reservation.id] ?? 0
+            let (newTokens, tokenOverflow) = oldTokens.addingReportingOverflow(
+                reservation.additionalTokens)
+            let (newExactBytes, exactOverflow) = oldExactBytes.addingReportingOverflow(
+                reservation.additionalBytes)
+            guard !tokenOverflow, !exactOverflow,
+                let oldTokenBytes = allocatedBytesChecked(forTokens: oldTokens),
+                let newTokenBytes = allocatedBytesChecked(forTokens: newTokens)
+            else {
+                return nil
+            }
+            let (tokenDelta, tokenDeltaOverflow) =
+                newTokenBytes.subtractingReportingOverflow(oldTokenBytes)
+            let (delta, deltaOverflow) = tokenDelta.addingReportingOverflow(
+                reservation.additionalBytes)
+            let (after, ledgerOverflow) =
+                simulatedLedgerBytes.addingReportingOverflow(delta)
+            guard !tokenDeltaOverflow, !deltaOverflow, !ledgerOverflow else {
+                return nil
+            }
+            guard after <= reserveCeiling else {
+                return false
+            }
+            simulatedTokens[reservation.id] = newTokens
+            simulatedExactBytes[reservation.id] = newExactBytes
+            simulatedLedgerBytes = after
+            return true
+        }
+
+        for operation in projectedOperations {
+            switch operation {
+            case .reserve(let reservation):
+                guard applyReservation(reservation) == true else { return false }
+
+            case .reserveIfAvailable(let reservation):
+                // Chained decode probes headroom before planning. Capacity
+                // refusal skips that optional chain, so a valid-but-full
+                // simulation continues without mutating the ledger.
+                guard applyReservation(reservation) != nil else { return false }
+
+            case .unreserve(let reservation):
+                guard reservation.additionalTokens >= 0,
+                    reservation.additionalBytes >= 0
+                else {
+                    return false
+                }
+                let oldTokens = simulatedTokens[reservation.id] ?? 0
+                let oldExactBytes = simulatedExactBytes[reservation.id] ?? 0
+                let newTokens = max(0, oldTokens - reservation.additionalTokens)
+                let newExactBytes = max(
+                    0, oldExactBytes - reservation.additionalBytes)
+                guard let oldTokenBytes = allocatedBytesChecked(forTokens: oldTokens),
+                    let newTokenBytes = allocatedBytesChecked(forTokens: newTokens)
+                else {
+                    return false
+                }
+                let (releasedTokenBytes, tokenOverflow) =
+                    oldTokenBytes.subtractingReportingOverflow(newTokenBytes)
+                let (releasedExactBytes, exactOverflow) =
+                    oldExactBytes.subtractingReportingOverflow(newExactBytes)
+                let (releasedBytes, releaseOverflow) =
+                    releasedTokenBytes.addingReportingOverflow(releasedExactBytes)
+                let (after, ledgerOverflow) =
+                    simulatedLedgerBytes.subtractingReportingOverflow(releasedBytes)
+                guard !tokenOverflow, !exactOverflow, !releaseOverflow,
+                    !ledgerOverflow, after >= 0
+                else {
+                    return false
+                }
+                if newTokens == 0 {
+                    simulatedTokens.removeValue(forKey: reservation.id)
+                } else {
+                    simulatedTokens[reservation.id] = newTokens
+                }
+                if newExactBytes == 0 {
+                    simulatedExactBytes.removeValue(forKey: reservation.id)
+                } else {
+                    simulatedExactBytes[reservation.id] = newExactBytes
+                }
+                simulatedLedgerBytes = after
+
+            case .release(let id):
+                let oldTokens = simulatedTokens.removeValue(forKey: id) ?? 0
+                let oldExactBytes =
+                    simulatedExactBytes.removeValue(forKey: id) ?? 0
+                guard let tokenBytes = allocatedBytesChecked(forTokens: oldTokens)
+                else {
+                    return false
+                }
+                let (releasedBytes, releaseOverflow) =
+                    tokenBytes.addingReportingOverflow(oldExactBytes)
+                let (after, ledgerOverflow) =
+                    simulatedLedgerBytes.subtractingReportingOverflow(releasedBytes)
+                guard !releaseOverflow, !ledgerOverflow, after >= 0 else {
+                    return false
+                }
+                simulatedLedgerBytes = after
+            }
+        }
+        return true
+    }
+
     // MARK: CBv2StepCapacity
 
     public func reserve(id: CBv2RequestID, additionalTokens: Int) throws {
