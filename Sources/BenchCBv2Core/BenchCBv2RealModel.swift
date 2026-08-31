@@ -290,6 +290,21 @@ func makeV2Engine(
             CBv2LayerCache(layerIndex: index, kind: kind)
         }
     case .paged:
+        // Model-capability veto FIRST, mirroring the production factory:
+        // a model whose capabilities refuse paged KV (hybrid recurrent
+        // trunks — Qwen3.5/3.6 — set `supportsPagedKV: false`) would pass
+        // kernel eligibility (d256 is in the kernel's supported set) and
+        // then hit EngineV2.init's capability PRECONDITION — a process
+        // trap, not the graceful skip this function promises. Throw the
+        // same catchable ineligibility the kernel path uses.
+        let benchCapabilities =
+            (hooks.model as? any CBv2ModelCapabilityProviding)?.cbv2Capabilities
+            ?? .attentionOnly
+        guard benchCapabilities.supportsPagedKV else {
+            throw CBv2KVError.backendIneligible(
+                reason: "model capabilities refuse paged KV "
+                    + "(hybrid recurrent trunk; supportsPagedKV=false)")
+        }
         // Static kernel eligibility (head dims + the part kernel's
         // threadgroup-memory budget) is validated inside
         // `PagedKVBackend.init` — it throws `backendIneligible` before any
