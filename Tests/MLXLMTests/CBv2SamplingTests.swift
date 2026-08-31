@@ -585,6 +585,48 @@ private struct ByteStubTokenizer: Tokenizer {
     ) throws -> [Int] { throw TokenizerError.missingChatTemplate }
 }
 
+/// String-piece tokenizer stub whose decode is NOT append-only: any run of
+/// two or more spaces immediately before a comma collapses to a single space
+/// (idempotent), mirroring the SentencePiece whitespace normalization that
+/// Gemma's real tokenizer performs at an append boundary
+/// (`decode([\n, "  "]) == "\n  "` but `decode([\n, "  ", ","]) == "\n ,"`).
+private struct CollapsingStubTokenizer: Tokenizer {
+    let pieces: [Int: String]
+
+    static func collapse(_ text: String) -> String {
+        text.replacingOccurrences(of: " {2,},", with: " ,", options: .regularExpression)
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        Self.collapse(tokenIds.compactMap { pieces[$0] }.joined())
+    }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { throw TokenizerError.missingChatTemplate }
+}
+
+/// Deterministic PRNG (SplitMix64) so a fuzz failure reproduces from its seed.
+private struct SplitMix64: RandomNumberGenerator {
+    var state: UInt64
+    init(seed: UInt64) { state = seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        return z ^ (z >> 31)
+    }
+}
+
 final class CBv2SamplingDetokenizerTests: XCTestCase {
 
     func testEmojiSplitAcrossTwoTokensNeverEmitsReplacementChar() {
@@ -717,6 +759,112 @@ final class CBv2SamplingDetokenizerTests: XCTestCase {
         text += detok.append(1)
         XCTAssertEqual(text, "ok ", "incomplete bytes never emitted mid-stream")
         XCTAssertEqual(detok.flush(), "\u{fffd}")
+    }
+
+    /// Gemma-class regression: a SentencePiece decode that collapses
+    /// whitespace at the append boundary makes the new decode NO LONGER than
+    /// the already-emitted prefix. The old byte-count delta
+    /// (`stable[emittedBytes...]` behind `stable.count > emittedBytes`)
+    /// computed an empty chunk and the newly decoded character — here a
+    /// structural comma — silently vanished from the streamed output.
+    func testWhitespaceCollapseAtAppendBoundaryDoesNotDropCharacter() {
+        let tokenizer = CollapsingStubTokenizer(pieces: [0: "\n", 1: "  ", 2: ",", 3: "x"])
+        let detok = DetokenizerV2(tokenizer: tokenizer)
+        var chunks = [String]()
+        for token in [0, 1, 2, 3] { chunks.append(detok.append(token)) }
+        chunks.append(detok.flush())
+
+        let joined = chunks.joined()
+        XCTAssertTrue(joined.contains(","), "collapse-at-boundary dropped the comma: \(chunks)")
+        XCTAssertTrue(joined.hasSuffix(",x"), "post-collapse deltas must resynchronize: \(chunks)")
+        // Already-streamed bytes cannot be retracted, so the stream still
+        // carries the superseded double space; re-applying the tokenizer's
+        // own normalization must recover the exact full decode (nothing
+        // dropped, duplicated, or reordered).
+        XCTAssertEqual(
+            CollapsingStubTokenizer.collapse(joined),
+            tokenizer.decode(tokenIds: [0, 1, 2, 3], skipSpecialTokens: false))
+    }
+
+    /// A decode that SHRINKS below the emitted byte count must neither drop
+    /// the new character nor trap. Pre-fix, `append` returned an empty delta
+    /// (dropping the comma) and `flush()` then sliced
+    /// `decoded[emittedBytes...]` past the end of the shrunken decode — an
+    /// out-of-range trap on the Array slice.
+    func testDecodeShrinkingBelowEmittedBytesEmitsDeltaAndFlushDoesNotTrap() {
+        let tokenizer = CollapsingStubTokenizer(pieces: [1: "  ", 2: ","])
+        let detok = DetokenizerV2(tokenizer: tokenizer)
+        var joined = detok.append(1)  // "  "
+        joined += detok.append(1)  // "    " — four spaces emitted
+        joined += detok.append(2)  // decode collapses to " ," (2 bytes < 4 emitted)
+        joined += detok.flush()
+        XCTAssertTrue(
+            joined.contains(","),
+            "comma dropped when the decode shrank: \(joined.debugDescription)")
+        XCTAssertEqual(CollapsingStubTokenizer.collapse(joined), " ,")
+    }
+
+    /// Fuzz: random token streams against a collapsing (non-append-only)
+    /// decode, including newline segment restarts and small segment caps.
+    /// Exact byte equality between concatenated deltas and the final decode
+    /// is impossible for ANY non-retracting streamer once a collapse
+    /// rewrites bytes that were already emitted, so the invariant asserted
+    /// is: normalizing the concatenated stream with the tokenizer's own
+    /// collapse rule reproduces the final decode exactly — which holds iff
+    /// no character was dropped, duplicated, or reordered.
+    func testFuzzCollapsingDecodeStreamLosesNothing() {
+        let pieces: [Int: String] = [0: "\n", 1: "  ", 2: ",", 3: "a", 4: "中", 5: "\""]
+        let tokenizer = CollapsingStubTokenizer(pieces: pieces)
+        var rng = SplitMix64(seed: 0xC0FF_EE01)
+        for iteration in 0 ..< 300 {
+            let length = Int.random(in: 1 ... 40, using: &rng)
+            let tokens = (0 ..< length).map { _ in Int.random(in: 0 ... 5, using: &rng) }
+            // Small caps force mid-stream segment restarts to interleave
+            // with collapse events.
+            let maxSegment = [4, 8, 256].randomElement(using: &rng)!
+            let detok = DetokenizerV2(tokenizer: tokenizer, maxSegmentTokens: maxSegment)
+            var joined = ""
+            for token in tokens { joined += detok.append(token) }
+            joined += detok.flush()
+            let full = tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+            let normalized = CollapsingStubTokenizer.collapse(joined)
+            XCTAssertEqual(
+                normalized, full,
+                "iteration \(iteration), tokens \(tokens), maxSegmentTokens \(maxSegment): "
+                    + "streamed \(joined.debugDescription) vs decode \(full.debugDescription)")
+            if normalized != full { break }
+        }
+    }
+
+    /// Fuzz: for an append-only byte-table decode (byte-level BPE) the
+    /// stream must remain strictly BYTE-EXACT — concatenated deltas plus
+    /// flush equal the full decode — with multi-byte characters split at
+    /// hostile token boundaries, genuine U+FFFD pieces, and forced segment
+    /// restarts in the mix. Guards the common-prefix delta against ever
+    /// regressing the exactness promise for well-behaved tokenizers.
+    func testFuzzAppendOnlyByteStreamStaysByteExact() {
+        let table: [Int: [UInt8]] = [
+            0: Array("ab".utf8), 1: Array(" ".utf8), 2: Array("\n".utf8),
+            3: [0xF0, 0x9F], 4: [0xA6, 0x84],  // 🦄 split 2+2
+            5: [0xE4], 6: [0xB8, 0xAD],  // 中 split 1+2
+            7: [0xEF, 0xBF, 0xBD],  // genuine U+FFFD
+        ]
+        let tokenizer = ByteStubTokenizer(table: table)
+        var rng = SplitMix64(seed: 0xDECA_F42)
+        for iteration in 0 ..< 300 {
+            let length = Int.random(in: 1 ... 48, using: &rng)
+            let tokens = (0 ..< length).map { _ in Int.random(in: 0 ... 7, using: &rng) }
+            let maxSegment = [2, 5, 256].randomElement(using: &rng)!
+            let detok = DetokenizerV2(tokenizer: tokenizer, maxSegmentTokens: maxSegment)
+            var joined = ""
+            for token in tokens { joined += detok.append(token) }
+            joined += detok.flush()
+            let full = tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false)
+            XCTAssertEqual(
+                Array(joined.utf8), Array(full.utf8),
+                "iteration \(iteration), tokens \(tokens), maxSegmentTokens \(maxSegment)")
+            if Array(joined.utf8) != Array(full.utf8) { break }
+        }
     }
 }
 
