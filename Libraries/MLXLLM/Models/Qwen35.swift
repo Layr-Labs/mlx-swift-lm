@@ -1238,6 +1238,10 @@ final class Qwen35MRoPE {
     private let rotaryDim: Int
     private let defaultInvFreq: MLXArray?
     private let sections: [Int]
+    // Which of the three position planes (t/h/w) owns each frequency,
+    // precomputed as [1, 1, 1, rotaryDim/2] so the default path interleaves
+    // with one takeAlong instead of a per-frequency slice loop.
+    private let mropeIndices: MLXArray
 
     init(
         rope: RoPELayer, dim: Int, base: Float,
@@ -1260,7 +1264,17 @@ final class Qwen35MRoPE {
         } else {
             self.defaultInvFreq = nil
         }
-        self.sections = sections.count >= 3 ? sections : [11, 11, 10]
+        let resolvedSections = sections.count >= 3 ? sections : [11, 11, 10]
+        self.sections = resolvedSections
+        let frequencyCount = max(1, self.rotaryDim / 2)
+        var indices = [Int32](repeating: 0, count: frequencyCount)
+        for (dimension, offset) in [(1, 1), (2, 2)] {
+            let end = min(resolvedSections[dimension] * 3, frequencyCount)
+            for index in stride(from: offset, to: end, by: 3) {
+                indices[index] = Int32(dimension)
+            }
+        }
+        self.mropeIndices = MLXArray(indices).reshaped(1, 1, 1, -1)
     }
 
     private func axis(forFrequency index: Int, frequencyCount: Int) -> Int {
@@ -1288,15 +1302,7 @@ final class Qwen35MRoPE {
         if let defaultInvFreq {
             let all = positions.asType(.float32)[0..., 0..., 0..., .newAxis]
                 * defaultInvFreq[.newAxis, .newAxis, .newAxis, 0...]
-            var selected: [MLXArray] = []
-            let frequencyCount = rotaryDim / 2
-            selected.reserveCapacity(frequencyCount)
-            for index in 0 ..< frequencyCount {
-                selected.append(
-                    all[axis(forFrequency: index, frequencyCount: frequencyCount),
-                        0..., 0..., index])
-            }
-            let frequency = stacked(selected, axis: -1)
+            let frequency = takeAlong(all, mropeIndices, axis: 0).squeezed(axis: 0)
             let angles = concatenated([frequency, frequency], axis: -1)
             let cosine = cos(angles).asType(queries.dtype).expandedDimensions(axis: 1)
             let sine = sin(angles).asType(queries.dtype).expandedDimensions(axis: 1)
