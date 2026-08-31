@@ -303,7 +303,28 @@ func makeV2Engine(
                 nominalMaxSequenceLength: benchPagedNominalMaxSequenceLength))
         let pagedCaches = paged.makeLayerCaches()
         // Route through newCacheV2 so GPT-OSS primes its sinks probe.
-        caches = try hooks.buildCaches { index, _ in pagedCaches[index] }
+        // newCacheV2 hands the MODEL layer index (kind.modelLayerIndex ??
+        // storage position — see Qwen35TextModel.newCacheV2), while
+        // pagedCaches is dense per STORAGE slot. On a hybrid trunk
+        // (Qwen3.5/3.6: 40 model layers, 10 attending) the model index
+        // runs past the dense array — subscripting it directly was an
+        // out-of-range trap that killed the whole perf run before the
+        // buffered table ever emitted. Map model index → storage slot;
+        // identity for non-hybrid models (modelLayerIndex nil).
+        var storageForModelIndex: [Int: Int] = [:]
+        for (storage, kind) in hooks.layerKinds.enumerated() {
+            storageForModelIndex[kind.modelLayerIndex ?? storage] = storage
+        }
+        caches = try hooks.buildCaches { index, _ in
+            guard let storage = storageForModelIndex[index],
+                storage < pagedCaches.count
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged cache storage mapping missing model layer \(index) "
+                        + "(hybrid trunk layout; \(pagedCaches.count) storage slots)")
+            }
+            return pagedCaches[storage]
+        }
         kvBackend = paged
     }
     let engine = EngineV2(
