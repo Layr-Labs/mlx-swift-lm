@@ -30,9 +30,14 @@ public enum ServerToolParser {
             return .json
         case "lfm2", "lfm2_5", "lfm25":
             return .lfm2
-        case "xml", "xml_function", "qwen_xml", "qwen3_coder", "qwen3_5",
+        case "xml", "xml_function", "qwen_xml", "qwen3_coder",
             "hermes", "nemotron":
             return .xmlFunction
+        // Qwen 3.5 gets its dual-dialect parser (XML first, framed
+        // Hermes-JSON fallback), not the pure XML one: the model sporadically
+        // emits its older JSON dialect inside the same <tool_call> frame.
+        case "qwen3_5", "qwen35":
+            return .qwen35
         case "glm4", "glm_4":
             return .glm4
         case "gemma", "gemma4", "gemma_4":

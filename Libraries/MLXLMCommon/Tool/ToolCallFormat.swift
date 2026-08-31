@@ -92,9 +92,17 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
     case lfm2
 
-    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3.5, and similar models.
+    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3 Next, and similar models.
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
+
+    /// Qwen 3.5's XML function format with a framed Hermes-JSON compatibility dialect.
+    ///
+    /// Qwen 3.5 is prompted to emit `xmlFunction`, but can sporadically emit the
+    /// Qwen/Hermes JSON dialect used by earlier Qwen models instead. Both dialects
+    /// use the same `<tool_call>` frame; this format accepts either payload without
+    /// enabling bare JSON recovery. Upstream 3260260.
+    case qwen35 = "qwen3_5"
 
     /// GLM4 format with arg_key/arg_value tags.
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
@@ -141,6 +149,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .qwen35:
+            return Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
@@ -216,9 +226,14 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .xmlFunction
         }
 
-        // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.)
+        // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.). Resolves to `.qwen35`,
+        // not `.xmlFunction`: the model is prompted for the XML dialect but
+        // sporadically emits its older Hermes-JSON dialect inside the same
+        // <tool_call> frame; a pure XML parser returns nil on those and the
+        // call is lost as plain text. `.qwen35` tries XML first (existing
+        // behavior unchanged) and falls back to framed JSON.
         if type.hasPrefix("qwen3_5") {
-            return .xmlFunction
+            return .qwen35
         }
 
         // Qwen3-Next family (qwen3_next, etc.)

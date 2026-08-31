@@ -324,6 +324,79 @@ struct ToolCallParserIntegrationTests {
         #expect(toolCalls[0].function.arguments.isEmpty)
     }
 
+    // MARK: - BatchedToolStreamHandler: Qwen3.5 Dual Dialect
+
+    @Test("BatchedToolStreamHandler parses Qwen3.5 XML dialect with .qwen35 format")
+    func batchedHandlerQwen35XMLStreaming() throws {
+        let handler = BatchedToolStreamHandler(format: .qwen35, tools: nil)
+
+        let chunks = [
+            "<tool_call>\n<function=get_weather>\n",
+            "<parameter=location>Tokyo</parameter>\n",
+            "</function>\n</tool_call>",
+        ]
+
+        for chunk in chunks {
+            _ = handler.processChunk(chunk)
+        }
+
+        let toolCalls = handler.finish()
+        #expect(toolCalls.count == 1)
+        let tc = try #require(toolCalls.first)
+        #expect(tc.function.name == "get_weather")
+        #expect(tc.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    /// Regression for the lost-call failure mode: with the pure XML parser,
+    /// a Hermes-JSON payload inside <tool_call> returned nil from parse()
+    /// and the whole call fell through as plain text on the serving path.
+    @Test("BatchedToolStreamHandler recovers Qwen3.5 Hermes-JSON fallback dialect")
+    func batchedHandlerQwen35JSONFallbackStreaming() throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_weather",
+                    "parameters": ["type": "object"],
+                ] as [String: any Sendable],
+            ]
+        ]
+        let handler = BatchedToolStreamHandler(format: .qwen35, tools: tools)
+
+        let chunks = [
+            "<tool_call>{\"name\":\"get_weather\",",
+            "\"arguments\":{\"location\":\"Tokyo\",\"days\":1}}",
+            "</tool_call>",
+        ]
+
+        for chunk in chunks {
+            _ = handler.processChunk(chunk)
+        }
+
+        let toolCalls = handler.finish()
+        #expect(toolCalls.count == 1)
+        let tc = try #require(toolCalls.first)
+        #expect(tc.function.name == "get_weather")
+        #expect(tc.function.arguments["location"] == .string("Tokyo"))
+        // NSNumber bridging: a JSON 1 must arrive as integer 1, not true.
+        #expect(tc.function.arguments["days"] == .int(1))
+    }
+
+    @Test("BatchedToolStreamHandler surfaces malformed Qwen3.5 payloads as text, not calls")
+    func batchedHandlerQwen35MalformedDegradesToText() throws {
+        let handler = BatchedToolStreamHandler(format: .qwen35, tools: nil)
+
+        // Truncated JSON inside a closed frame: parse fails, and the exact
+        // withheld buffer must come back as visible text (never a crash,
+        // never a silent drop, never an executable call).
+        let visible = handler.processChunk("<tool_call>{\"name\":\"broken\",</tool_call>")
+        #expect(visible?.contains("broken") == true)
+
+        let toolCalls = handler.finish()
+        #expect(toolCalls.isEmpty)
+        #expect(handler.parseFailureCount == 1)
+    }
+
     // MARK: - BatchedToolStreamHandler: JSON Format
 
     @Test("BatchedToolStreamHandler extracts JSON tool call with fine-grained chunks")
@@ -559,10 +632,10 @@ struct ToolCallParserIntegrationTests {
         #expect(toolCalls[0].function.arguments["location"] == .string("Berlin"))
     }
 
-    @Test("Full pipeline: qwen3_5 model type -> XML Function parser -> streaming extraction")
+    @Test("Full pipeline: qwen3_5 model type -> dual-dialect parser -> streaming extraction")
     func fullPipelineQwen35() throws {
         let format = try #require(ToolCallFormat.infer(from: "qwen3_5"))
-        #expect(format == .xmlFunction)
+        #expect(format == .qwen35)
 
         let handler = BatchedToolStreamHandler(format: format, tools: nil)
         _ = handler.processChunk(
@@ -601,7 +674,8 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: "qwen_xml", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "qwen3_coder", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "qwen3", modelType: nil) == .json)
-        #expect(try ServerToolParser.resolve(requested: "qwen3_5", modelType: nil) == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: "qwen3_5", modelType: nil) == .qwen35)
+        #expect(try ServerToolParser.resolve(requested: "qwen35", modelType: nil) == .qwen35)
         #expect(try ServerToolParser.resolve(requested: "hermes", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "nemotron", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "glm4", modelType: nil) == .glm4)
@@ -618,12 +692,12 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gpt_oss") == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "mistral3") == .mistral)
-        #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_5") == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_5") == .qwen35)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_next") == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "nemotron_h") == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "lfm2") == .lfm2)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "glm4") == .glm4)
-        #expect(try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .qwen35)
         #expect(try ServerToolParser.resolve(requested: "auto", modelType: "gemma4") == .gemma)
     }
 
@@ -678,9 +752,9 @@ struct ToolCallParserIntegrationTests {
         #expect(ToolCallFormat.infer(from: "mistral3_text") == .mistral)
         #expect(ToolCallFormat.infer(from: "MISTRAL3") == .mistral)
 
-        // Qwen3.5 / Qwen3-Next / Nemotron -> xmlFunction
-        #expect(ToolCallFormat.infer(from: "qwen3_5") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
+        // Qwen3.5 -> dual-dialect qwen35; Qwen3-Next / Nemotron -> xmlFunction
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
         #expect(ToolCallFormat.infer(from: "qwen3_next") == .xmlFunction)
         #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
 
@@ -749,6 +823,9 @@ struct ToolCallParserIntegrationTests {
                 #expect(parser.startTag == "[TOOL_CALLS]")
                 #expect(parser.endTag == nil)  // Mistral uses EOS, no end tag
             case .xmlFunction:
+                #expect(parser.startTag == "<tool_call>")
+                #expect(parser.endTag == "</tool_call>")
+            case .qwen35:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
             case .glm4:

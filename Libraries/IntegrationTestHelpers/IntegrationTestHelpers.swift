@@ -758,8 +758,8 @@ public enum ToolCallTests {
     public static func qwen35FormatAutoDetection(container: LLModelContainer) async throws {
         let config = await container.configuration
         try check(
-            config.toolCallFormat == ToolCallFormat.xmlFunction,
-            "Expected .xmlFunction tool call format, got: \(String(describing: config.toolCallFormat))"
+            config.toolCallFormat == ToolCallFormat.qwen35,
+            "Expected .qwen35 tool call format, got: \(String(describing: config.toolCallFormat))"
         )
     }
 
