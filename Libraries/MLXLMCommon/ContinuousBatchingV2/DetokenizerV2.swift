@@ -7,15 +7,25 @@
 // Guarantee: emitted chunks never contain a replacement character caused by
 // a multi-byte UTF-8 sequence split across tokens (byte-fallback BPE,
 // emoji, CJK). Bytes are held back until the tokenizer produces a valid
-// UTF-8 boundary, and the concatenation of all emitted chunks plus `flush`
-// is byte-exact with `tokenizer.decode(allTokens)` segment by segment.
+// UTF-8 boundary. For append-only decodes (byte-level BPE: appending a
+// token only ever extends the decoded text) the concatenation of all
+// emitted chunks plus `flush` is byte-exact with
+// `tokenizer.decode(allTokens)` segment by segment. SentencePiece decodes
+// are NOT append-only — appending a token can rewrite earlier whitespace
+// (Gemma: decode([\n, "  "]) == "\n  " but decode([\n, "  ", ","]) ==
+// "\n ,") — and already-streamed bytes cannot be retracted; there the
+// guarantee weakens to: no decoded character is ever dropped or reordered,
+// and the stream may carry the superseded whitespace bytes as a small
+// excess at the rewrite point (the full decode remains recoverable by
+// re-applying the tokenizer's own normalization).
 //
 // Mechanism (mlx-lm-style): decode the current token segment, strip any
 // trailing U+FFFD run (the tokenizer's marker for incomplete byte
-// sequences), and emit only the bytes past the previously emitted prefix.
-// When the pending token later completes the character, the re-decode
-// yields the real bytes and the suffix is released. A genuine U+FFFD in
-// model output is only ever delayed by one token, never dropped.
+// sequences), and emit only the bytes past the longest common prefix with
+// the decode prefix already accounted for. When the pending token later
+// completes the character, the re-decode yields the real bytes and the
+// suffix is released. A genuine U+FFFD in model output is only ever
+// delayed by one token, never dropped.
 //
 // The segment is periodically restarted (on newline boundaries, or after
 // `maxSegmentTokens` when at a clean boundary) so per-token decode cost
@@ -34,9 +44,14 @@ public final class DetokenizerV2 {
 
     /// Tokens of the current decode segment.
     private var segmentTokens: [Int] = []
-    /// UTF-8 byte count of the current segment's decode output that has
-    /// already been emitted.
-    private var emittedBytes = 0
+    /// The prefix of the current segment's decode output already accounted
+    /// for in emitted text. Byte-identical to what was actually streamed for
+    /// this segment, EXCEPT after a non-append-only decode rewrote bytes
+    /// that were already streamed: the superseded bytes are sunk (they were
+    /// sent and cannot be retracted) and this tracks the NEW decode from the
+    /// divergence onward, so future deltas follow the tokenizer's current
+    /// decode trajectory instead of re-emitting rewritten text.
+    private var emittedPrefix: [UInt8] = []
 
     /// - Parameters:
     ///   - tokenizer: tokenizer used for decoding.
@@ -65,13 +80,13 @@ public final class DetokenizerV2 {
         // bounded. BOTH triggers (newline, maxSegmentTokens) sit inside the
         // clean-boundary guard: the first two conditions require that no
         // bytes are held back (`stable == decoded`) and everything stable
-        // was emitted — a restart while a multi-byte sequence straddles the
-        // boundary would record its U+FFFD decode as "already emitted" and
-        // the completing token's real bytes would never be released. The
-        // `maxSegmentTokens` cap is therefore SOFT: it defers past the limit
-        // until the holdback clears (PR#62 review).
+        // was accounted for — a restart while a multi-byte sequence
+        // straddles the boundary would record its U+FFFD decode as "already
+        // emitted" and the completing token's real bytes would never be
+        // released. The `maxSegmentTokens` cap is therefore SOFT: it defers
+        // past the limit until the holdback clears (PR#62 review).
         if stable.count == decoded.count,
-            stable.count == emittedBytes,
+            stable == emittedPrefix,
             (decoded.last == UInt8(ascii: "\n") || segmentTokens.count >= maxSegmentTokens)
         {
             startNewSegment()
@@ -83,10 +98,7 @@ public final class DetokenizerV2 {
     /// incomplete character (the model stopped mid-sequence) decodes to
     /// U+FFFD here — that is end-of-stream, not mid-stream.
     public func flush() -> String {
-        let decoded = decodeSegment()
-        let emitted = String(decoding: decoded[emittedBytes...], as: UTF8.self)
-        emittedBytes = decoded.count
-        return emitted
+        emit(upTo: decodeSegment())
     }
 
     // MARK: - Internals
@@ -97,11 +109,41 @@ public final class DetokenizerV2 {
             tokenizer.decode(tokenIds: segmentTokens, skipSpecialTokens: skipSpecialTokens).utf8)
     }
 
-    /// Emit the bytes of `stable` past the already-emitted prefix.
+    /// Emit the bytes of `stable` past its longest common prefix with the
+    /// decode prefix already accounted for.
+    ///
+    /// A byte-count suffix (`stable[emittedBytes...]` behind a
+    /// `stable.count > emittedBytes` guard) assumes decoding is append-only.
+    /// SentencePiece decoding is not: appending a token can rewrite earlier
+    /// whitespace (Gemma decodes [\n, "  "] as "\n  " but [\n, "  ", ","]
+    /// as "\n ,", collapsing a space). The count-based suffix then computed
+    /// an empty delta and silently DROPPED the newly decoded character —
+    /// and a decode that shrank below `emittedBytes` trapped `flush()`'s
+    /// out-of-range slice. Diffing by common prefix never drops characters:
+    /// when the decode rewrites bytes that were already streamed, the old
+    /// bytes cannot be retracted, so they remain in the stream as a small
+    /// excess and the delta re-synchronizes on the new decode.
     private func emit(upTo stable: [UInt8]) -> String {
-        guard stable.count > emittedBytes else { return "" }
-        let chunk = String(decoding: stable[emittedBytes...], as: UTF8.self)
-        emittedBytes = stable.count
+        var common = 0
+        let limit = min(stable.count, emittedPrefix.count)
+        while common < limit, stable[common] == emittedPrefix[common] { common += 1 }
+        // Never start a chunk mid-character: if the divergence point lands
+        // inside a multi-byte sequence of the new decode, back off to its
+        // lead byte and re-emit the rewritten character whole rather than
+        // leaking bare continuation bytes (which would decode as U+FFFD
+        // garbage). For append-only decodes the fully-matched prefix ends on
+        // a character boundary, so this loop never fires.
+        while common > 0, common < stable.count, stable[common] & 0xC0 == 0x80 { common -= 1 }
+        guard common < stable.count else {
+            // Nothing new. When the decode shrank to a strict prefix of what
+            // was already accounted (pure retraction, no replacement bytes
+            // yet), keep the longer prefix: those bytes were streamed, and
+            // keeping them prevents re-emitting them should a later decode
+            // re-extend over the same bytes.
+            return ""
+        }
+        let chunk = String(decoding: stable[common...], as: UTF8.self)
+        emittedPrefix = stable
         return chunk
     }
 
@@ -110,7 +152,7 @@ public final class DetokenizerV2 {
     private func startNewSegment() {
         guard let last = segmentTokens.last else { return }
         segmentTokens = [last]
-        emittedBytes = decodeSegment().count
+        emittedPrefix = decodeSegment()
     }
 
     /// Drop the trailing run of U+FFFD (EF BF BD) from `bytes`. Trailing
