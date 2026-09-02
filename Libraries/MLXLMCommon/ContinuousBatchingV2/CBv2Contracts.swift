@@ -340,6 +340,9 @@ public struct CBv2LayerKind: Sendable, Equatable {
     public var headDim: Int
     public var kvHeads: Int
     public var queryHeads: Int
+    /// Explicit model architecture identity for attention execution policy.
+    /// nil is fail-closed; automatic hardware approval lives on the policy.
+    public var attentionExecutionQualification: CBv2AttentionExecutionQualification?
     /// Original transformer-layer index when the CBv2 storage layout is a
     /// compact subset of the model layers (for example, hybrid recurrent +
     /// full-attention trunks). nil preserves the historical identity mapping:
@@ -349,7 +352,8 @@ public struct CBv2LayerKind: Sendable, Equatable {
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
         isBidirectional: Bool = false,
-        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil
+        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil,
+        attentionExecutionQualification: CBv2AttentionExecutionQualification? = nil
     ) {
         self.attention = attention
         self.sharesKVWithLayer = sharesKVWithLayer
@@ -359,6 +363,7 @@ public struct CBv2LayerKind: Sendable, Equatable {
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
         self.modelLayerIndex = modelLayerIndex
+        self.attentionExecutionQualification = attentionExecutionQualification
     }
 }
 

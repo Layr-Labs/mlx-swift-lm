@@ -121,11 +121,16 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     /// (KV-shared layers get a rowless borrowing cache), with the
     /// construction-time attention softcap threaded identically to the
     /// paged backend.
-    public convenience init(layerKinds: [CBv2LayerKind], attentionSoftcap: Float? = nil) {
+    public convenience init(
+        layerKinds: [CBv2LayerKind],
+        attentionSoftcap: Float? = nil,
+        attentionExecutionPolicy: CBv2AttentionExecutionPolicy = .production
+    ) {
         self.init(
             caches: layerKinds.enumerated().map { index, kind in
                 CBv2LayerCache(
-                    layerIndex: index, kind: kind, attentionSoftcap: attentionSoftcap)
+                    layerIndex: index, kind: kind, attentionSoftcap: attentionSoftcap,
+                    attentionExecutionPolicy: attentionExecutionPolicy)
             })
     }
 

@@ -58,15 +58,26 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// the same parameter); never part of the per-call contract surface.
     public let attentionSoftcap: Float?
 
+    /// Construction-time attention route control. The default reads the
+    /// process kill-switch/A-B setting and fails closed to fallback.
+    public let attentionExecutionPolicy: CBv2AttentionExecutionPolicy
+
     /// Optional vision span context for each CURRENT prefill row. The engine
     /// binds this array immediately before graph construction and clears it
     /// immediately after. nil outside that window; nil entries are ordinary
     /// text rows sharing a rectangular call.
     private(set) var boundSpanContexts: [CBv2SpanChunkContext?]?
 
+    /// Internal route observation seam for focused cache-level tests.
+    var attentionExecutionObserver: ((CBv2AttentionExecutionObservation) -> Void)?
+    /// Fires inside the isolated forced-fused wrapper, immediately before its
+    /// dependency call. Tests use this to distinguish routing from execution.
+    var forcedFusedExecutionObserver: (() -> Void)?
+
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
-        attentionSoftcap: Float? = nil
+        attentionSoftcap: Float? = nil,
+        attentionExecutionPolicy: CBv2AttentionExecutionPolicy = .production
     ) {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
@@ -75,6 +86,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
+        self.attentionExecutionPolicy = attentionExecutionPolicy
         self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
     }
 
@@ -117,7 +129,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            executionPolicy: attentionExecutionPolicy,
+            executionObserver: attentionExecutionObserver,
+            forcedFusedExecutionObserver: forcedFusedExecutionObserver)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -141,7 +156,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         let output = CBv2AttentionV1.updateAndAttendLastQuery(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+            scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            executionObserver: attentionExecutionObserver)
         cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
         return output
     }
@@ -161,7 +177,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             sourceRows: source.rows, sourceKind: source.kind, kind: kind,
             queries: queries, scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            executionPolicy: attentionExecutionPolicy,
+            executionObserver: attentionExecutionObserver)
     }
 
     // MARK: - Private
