@@ -560,7 +560,11 @@ extension EngineLoopV2 {
         // false everywhere else, so contiguous stays byte-identical.
         guard backend.requiresMaterializedSnapshots else { return }
         let unfenceable = CBv2MTPCaptureFence.publish(captured)
-        if !unfenceable.isEmpty { eval(unfenceable) }
+        if !unfenceable.isEmpty {
+            // The fence contract's blunt fallback: one host sync, counted.
+            eval(unfenceable)
+            CBv2CoreInstrumentation.recordHostSync()
+        }
     }
 
 }

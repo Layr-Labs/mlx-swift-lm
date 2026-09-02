@@ -232,9 +232,12 @@ struct CBv2MTPRoundSmokeTests {
         // its ONE finalize readback; an MTP-round finalize adds up to three
         // more (seed policy margin, acceptance packet, verify policy margin);
         // serial target verification adds one blocking eval per verify
-        // column at launch; a logprob segment adds three readbacks (none
-        // here — no row asks for logprobs). So
-        //   steps ≤ syncs ≤ steps + seedSteps + 2 × rounds + serialColumns.
+        // column at launch; a round whose capture could not be fenced adds
+        // one blocking eval (never on the contiguous/paged backends that
+        // exist today); a logprob segment adds three readbacks (none here —
+        // no row asks for logprobs). So
+        //   steps ≤ syncs ≤ steps + seedSteps + 2 × rounds + serialColumns
+        //                  + captureFallbackRounds.
         // Only the lower bound is asserted here: the counter is
         // process-global and swift-testing runs other engine suites
         // concurrently (the exact per-step equality is asserted by the

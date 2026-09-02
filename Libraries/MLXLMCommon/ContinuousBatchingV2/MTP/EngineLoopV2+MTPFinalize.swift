@@ -65,7 +65,9 @@ extension EngineLoopV2 {
         // margin above, acceptance packet, verify policy margin). Serial
         // target verification adds one blocking eval per column at launch
         // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
-        // three readbacks (`CBv2Logprobs.assemble`).
+        // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
+        // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
+        // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
