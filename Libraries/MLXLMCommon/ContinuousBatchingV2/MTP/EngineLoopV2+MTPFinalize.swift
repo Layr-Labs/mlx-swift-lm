@@ -39,6 +39,7 @@ extension EngineLoopV2 {
         if let seedHidden = round.seedHidden {
             let seedPolicyTopTwo =
                 round.seedPolicyTopTwoValues?.asArray(Float.self)
+            if seedPolicyTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
                     let rec = scheduler.record(for: id)
@@ -59,8 +60,13 @@ extension EngineLoopV2 {
 
         guard let verify = round.verify else { return }
         let k = verify.k
+        // Host readbacks of the MTP round, each counted: an MTP-round
+        // finalize adds up to three syncs to the step's one (seed policy
+        // margin above, acceptance packet, verify policy margin).
         let host = verify.acceptancePacket.asArray(Int32.self)
+        CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+        if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -263,7 +269,7 @@ extension EngineLoopV2 {
             rec.recordMTPRound(drafted: k, accepted: observedAccepted)
             if confirmed > 0 {
                 rec.timing.decodeSteps &+= 1
-                decodeRowsTotal &+= 1
+                decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
             mtp.recordRound(
                 drafted: k, accepted: observedAccepted, emitted: confirmed)

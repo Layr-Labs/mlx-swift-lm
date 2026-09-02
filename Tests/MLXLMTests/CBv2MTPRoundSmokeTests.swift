@@ -219,9 +219,22 @@ struct CBv2MTPRoundSmokeTests {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 24, seed: 12, vocabSize: vocabSize)
         let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
+        let syncsBefore = CBv2CoreInstrumentation.hostSyncs
         let speculative = try await run(on, greedyRequest(id: 1, prompt: prompt, maxTokens: 40))
         let metrics = try #require(on.mtpMetricsSnapshot())
-        await on.shutdown()
+        await on.shutdown()  // the drain completes only with no step in flight
+        let syncs = CBv2CoreInstrumentation.hostSyncs - syncsBefore
+        let stepsExecuted = on.capacity().stepsExecuted
+
+        // Host-sync multiplier on the MTP path: every executed step performs
+        // its ONE finalize readback, and an MTP-round finalize adds up to
+        // three more (seed policy margin, acceptance packet, verify policy
+        // margin), so   steps ≤ syncs ≤ steps + seedSteps + 2 × rounds.
+        // Only the lower bound is asserted here: the counter is
+        // process-global and swift-testing runs other engine suites
+        // concurrently (the exact per-step equality is asserted by the
+        // serial XCTest timing suite).
+        #expect(syncs >= stepsExecuted, "one finalize readback per executed step")
 
         #expect(speculative.finishReason == .length)
         let t = try #require(speculative.usage).timing

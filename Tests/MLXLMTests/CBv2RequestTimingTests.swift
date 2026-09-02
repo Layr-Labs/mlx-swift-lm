@@ -131,8 +131,7 @@ final class CBv2RequestTimingTests: XCTestCase {
             for await (index, out) in group { byIndex[index] = out }
             collected = (0 ..< streams.count).map { byIndex[$0]! }
         }
-        // Timing is always on; the step loop performed no CBv2 host syncs.
-        XCTAssertEqual(CBv2CoreInstrumentation.hostSyncs - syncsBefore, 0)
+        // Host-sync accounting is asserted below, once every step is fenced.
 
         var totalDecodeSteps: UInt64 = 0
         var widestBatch: UInt32 = 0
@@ -167,6 +166,13 @@ final class CBv2RequestTimingTests: XCTestCase {
         let released = await cbv2SchedWait { harness.backend.liveStates == 0 }
         XCTAssertTrue(released)
         let snapshot = harness.engine.capacity()
+        // Timing is always on and adds no host sync: the step loop's ONLY
+        // CBv2 sync is the finalize readback — exactly one per executed step
+        // (every launched step is finalized once; all fenced by now). Any
+        // sync introduced later breaks this equality.
+        XCTAssertEqual(
+            CBv2CoreInstrumentation.hostSyncs - syncsBefore, snapshot.stepsExecuted,
+            "one host sync per executed step")
         XCTAssertEqual(
             snapshot.decodeRowsTotal, totalDecodeSteps,
             "decodeRowsTotal == Σ per-request decodeSteps")
@@ -335,6 +341,10 @@ final class CBv2RequestTimingTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(t.pauseCount, 1)
         XCTAssertGreaterThanOrEqual(t.pausedNanos, 10_000_000, "≥ 10 ms of the 20 ms hold")
         XCTAssertEqual(try timing(fastOut, "fast").pauseCount, 0)
+        // Let the last chained step finalize before the next test measures
+        // the process-global host-sync counter.
+        let released = await cbv2SchedWait { harness.backend.liveStates == 0 }
+        XCTAssertTrue(released)
     }
 
     // MARK: Prefix cache

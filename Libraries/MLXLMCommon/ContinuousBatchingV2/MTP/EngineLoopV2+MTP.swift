@@ -40,30 +40,18 @@ extension EngineLoopV2 {
             return nil
         }
         // Timing stamps mirror `executeMixed`: admission was stamped in
-        // `mtpPrepareRoundWork` (before `ensureKVState`, like the mixed
-        // path); here one stamp per solo prefill chunk (MTP rounds never
-        // pack).
-        for row in work {
-            if row.isDecode {
-                // Decode-shaped one-token prompt chunk (see `executeMixed`).
-                if row.start < row.rec.request.promptTokens.count {
-                    row.rec.stampPrefillChunkLaunch(
-                        tokens: 1, packed: false, vision: false, stripe: false,
-                        launchNanos: wallStartedNanos)
-                }
-            } else if row.carry == nil {
-                let visionChunk =
-                    multimodalByID[row.rec.id].map {
-                        !$0.spansInChunk(start: row.start, count: row.count).isEmpty
-                    } ?? false
-                row.rec.stampPrefillChunkLaunch(
-                    tokens: row.count, packed: false, vision: visionChunk,
-                    stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
-                    launchNanos: wallStartedNanos)
-            }
+        // `mtpPrepareRoundWork` (before `ensureKVState`); solo prefill
+        // chunks are stamped inside `mtpBuildRoundGraph`, where each row's
+        // multimodal input is already bound (MTP rounds never pack). Only
+        // the decode-shaped one-token prompt chunk is stamped here: one
+        // compare per decode row, no lookup, no allocation.
+        for row in work where row.isDecode && row.start < row.rec.request.promptTokens.count {
+            row.rec.stampPrefillChunkLaunch(
+                tokens: 1, packed: false, vision: false, stripe: false,
+                launchNanos: wallStartedNanos)
         }
 
-        let graph = mtpBuildRoundGraph(work, driver: mtp)
+        let graph = mtpBuildRoundGraph(work, driver: mtp, launchNanos: wallStartedNanos)
         scheduler.markPendingSamples(ids: graph.sampledRows)
         if let verify = graph.verify {
             scheduler.markPendingSamples(

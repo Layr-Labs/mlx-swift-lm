@@ -918,6 +918,10 @@ struct CBv2CoreLayerCacheTests {
             asyncEval(outputs.last!, cache.innerState())
         }
 
+        // The instrumented CBv2 sync points are the engine's finalize
+        // readbacks (one per executed engine step, plus the MTP-round
+        // readbacks); this cache-only loop executes zero engine steps, so
+        // the exact expectation is zero.
         #expect(CBv2CoreInstrumentation.hostSyncs - syncsBefore == 0)
         #expect(cache.positionOffsetsHostRebuilds - rebuildsBefore == 0)
 

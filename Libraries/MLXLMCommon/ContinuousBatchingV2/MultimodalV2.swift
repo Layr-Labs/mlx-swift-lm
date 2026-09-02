@@ -315,6 +315,14 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
         }
     }
 
+    /// True when any span intersects `[start, start + count)` — the same
+    /// test `spansInChunk` applies, without building the array or slicing
+    /// embeddings. For per-row-per-step classification on the engine thread.
+    func hasSpans(start: Int, count: Int) -> Bool {
+        let end = start + count
+        return spans.contains { $0.tokenOffset < end && start < $0.end }
+    }
+
     /// True when `position` lies inside a coalesced image block. Used by the
     /// engine's decode-row classification: a length-1 span landing on the
     /// FINAL prompt token produces an assignment shaped exactly like a decode
