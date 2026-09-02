@@ -31,17 +31,19 @@ extension EngineLoopV2 {
 
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let work = mtpPrepareRoundWork(
-            plan, driver: mtp, demoteAllRounds: demoteAllRounds)
+            plan, driver: mtp, demoteAllRounds: demoteAllRounds,
+            launchNanos: wallStartedNanos)
         guard !work.isEmpty else {
             // Undo optimistic scheduler advances before pending samples can
             // block waiting admission.
             scheduler.rollback(plan)
             return nil
         }
-        // Timing stamps mirror `executeMixed`: admission at first launch,
-        // one stamp per solo prefill chunk (MTP rounds never pack).
+        // Timing stamps mirror `executeMixed`: admission was stamped in
+        // `mtpPrepareRoundWork` (before `ensureKVState`, like the mixed
+        // path); here one stamp per solo prefill chunk (MTP rounds never
+        // pack).
         for row in work {
-            row.rec.stampAdmission(launchNanos: wallStartedNanos)
             if row.isDecode {
                 // Decode-shaped one-token prompt chunk (see `executeMixed`).
                 if row.start < row.rec.request.promptTokens.count {

@@ -1656,7 +1656,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Once per adoption (not per step): the reserve + backend adoption
         // duration, success or fallback alike. A successful adoption IS the
         // row's KV allocation (`ensureKVState` finds it), stamped from the
-        // same read.
+        // same read — and raised to the admission instant by
+        // `stampAdmission` at first launch, since adoption precedes the
+        // first plan and the exported contract requires
+        // `admitted <= kvAllocated`.
         defer {
             let adoptionEndedNanos = DispatchTime.now().uptimeNanoseconds
             rec.timing.prefixAdoptionNanos = max(
@@ -3523,14 +3526,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         readmittedFrom waitingBefore: Set<CBv2RequestID>
     ) {
         for (id, _) in plan.assignments {
-            // Timing: a waiting→running crossing AFTER the first launch stamp
-            // is a re-admission (preemption / capacity requeue). The first
-            // admission itself is stamped at launch from `wallStartedNanos`.
-            if waitingBefore.contains(id), let rec = scheduler.record(for: id),
-                rec.timing.admittedNanos != 0
-            {
-                rec.timing.readmissions &+= 1
-            }
             guard var lease = leasesByID[id] else { continue }
             if !lease.isAdmitted {
                 lease.markAdmitted(now: now)
@@ -3538,6 +3533,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             } else if waitingBefore.contains(id) {
                 lease.markReadmitted(now: now)
                 leasesByID[id] = lease
+                // Timing: a waiting→running crossing AFTER the first launch
+                // stamp is a re-admission (preemption / capacity requeue).
+                // The first admission itself is stamped at launch from
+                // `wallStartedNanos`. Only this (rare) branch looks the
+                // record up — the steady path adds no per-row lookup.
+                if let rec = scheduler.record(for: id), rec.timing.admittedNanos != 0 {
+                    rec.timing.readmissions &+= 1
+                }
             }
         }
     }

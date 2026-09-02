@@ -22,10 +22,19 @@ extension CBv2ScheduledRequest {
     /// First step whose plan included this row (`wallStartedNanos` of that
     /// step). Idempotent: re-admissions after preemption / capacity requeue
     /// keep the first stamp and are counted in `readmissions` instead.
+    ///
+    /// A prefix-cache hit allocates KV at enqueue-time adoption, BEFORE any
+    /// plan includes the row; the exported contract requires
+    /// `admitted <= kvAllocated`, so an earlier allocation stamp is raised
+    /// to the admission instant here (once, on the first admission only).
+    /// The adoption itself stays evidenced by `prefixAdoptionNanos > 0`.
     @inline(__always)
     func stampAdmission(launchNanos: UInt64) {
         if timing.admittedNanos == 0 {
             timing.admittedNanos = timingOffset(launchNanos)
+            if timing.kvAllocatedNanos != 0, timing.kvAllocatedNanos < timing.admittedNanos {
+                timing.kvAllocatedNanos = timing.admittedNanos
+            }
         }
     }
 

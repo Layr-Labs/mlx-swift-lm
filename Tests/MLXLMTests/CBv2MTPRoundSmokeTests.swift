@@ -213,6 +213,34 @@ struct CBv2MTPRoundSmokeTests {
         #expect(1 + metrics.seedSteps + metrics.emittedTokens <= 40)
     }
 
+    // MARK: - (1b) Per-request timing sees the rounds
+
+    @Test func perRequestTimingCountsRounds() async throws {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 24, seed: 12, vocabSize: vocabSize)
+        let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
+        let speculative = try await run(on, greedyRequest(id: 1, prompt: prompt, maxTokens: 40))
+        let metrics = try #require(on.mtpMetricsSnapshot())
+        await on.shutdown()
+
+        #expect(speculative.finishReason == .length)
+        let t = try #require(speculative.usage).timing
+        #expect(t.mtpRounds > 0, "the round loop must be visible per request")
+        #expect(t.mtpAccepted <= t.mtpProposed)
+        // Alone in the engine, the per-request tallies ARE the engine's
+        // cumulative round metrics (both recorded in the same verify walk).
+        #expect(t.mtpRounds == UInt32(metrics.rounds))
+        #expect(t.mtpProposed == UInt32(metrics.draftedTokens))
+        #expect(t.mtpAccepted == UInt32(metrics.acceptedTokens))
+        // The exported phase order holds on the MTP launch path too.
+        #expect(t.admittedNanos > 0)
+        #expect(t.admittedNanos <= t.kvAllocatedNanos)
+        #expect(t.kvAllocatedNanos <= t.prefillFirstLaunchNanos)
+        #expect(t.prefillFirstLaunchNanos <= t.promptComputedNanos)
+        #expect(t.promptComputedNanos <= t.firstTokenNanos)
+        #expect(t.firstTokenNanos <= t.finishedNanos)
+    }
+
     // MARK: - (2) Mixed batch: verify rows + a prefilling neighbor
 
     @Test func mixedBatchWithPrefillNeighborStaysTokenExact() async throws {

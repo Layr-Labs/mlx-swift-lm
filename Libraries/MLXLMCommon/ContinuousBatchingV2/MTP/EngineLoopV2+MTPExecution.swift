@@ -60,13 +60,19 @@ extension EngineLoopV2 {
     func mtpPrepareRoundWork(
         _ plan: CBv2StepPlan,
         driver mtp: CBv2MTPRoundDriver,
-        demoteAllRounds: Bool
+        demoteAllRounds: Bool,
+        launchNanos: UInt64
     ) -> [CBv2MTPRowWork] {
         var work: [CBv2MTPRowWork] = []
         work.reserveCapacity(plan.assignments.count)
 
         for (id, assignedTokens) in plan.assignments {
             guard let rec = scheduler.record(for: id) else { continue }
+            // Admission stamp BEFORE `ensureKVState`, mirroring
+            // `executeMixed`: a capacity-requeued row is then already
+            // stamped, so its next waiting→running crossing counts as a
+            // re-admission on both launch paths (same `readmissions`).
+            rec.stampAdmission(launchNanos: launchNanos)
             guard ensureKVState(rec) != nil else { continue }
             var count = assignedTokens
             var preserveHistorySeed = false

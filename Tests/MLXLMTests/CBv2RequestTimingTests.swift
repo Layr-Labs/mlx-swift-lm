@@ -23,13 +23,21 @@ final class CBv2RequestTimingTests: XCTestCase {
         return usage.timing
     }
 
-    /// The phase stamps every finished request must satisfy, in order.
+    /// The phase stamps every finished request must satisfy, in order —
+    /// the chain the coordinator validates on the exported profile:
+    /// admitted ≤ kvAllocated ≤ prefillFirstLaunch ≤ promptComputed ≤
+    /// firstToken ≤ finished.
     private func assertPhaseOrdering(_ t: CBv2RequestTiming, _ label: String) {
         XCTAssertGreaterThan(t.admittedNanos, 0, "\(label): admitted")
         // KV is allocated at first launch (`ensureKVState`) or, for a prefix
-        // hit, at enqueue-time adoption — either way before the prompt is
-        // confirmed computed.
+        // hit, at enqueue-time adoption — which `stampAdmission` raises to
+        // the admission instant, so the stamp never precedes admission and
+        // always precedes the prompt being confirmed computed.
         XCTAssertGreaterThan(t.kvAllocatedNanos, 0, "\(label): kv allocated")
+        XCTAssertLessThanOrEqual(
+            t.admittedNanos, t.kvAllocatedNanos, "\(label): admitted ≤ kv")
+        XCTAssertLessThanOrEqual(
+            t.kvAllocatedNanos, t.prefillFirstLaunchNanos, "\(label): kv ≤ prefill launch")
         XCTAssertLessThanOrEqual(
             t.kvAllocatedNanos, t.promptComputedNanos, "\(label): kv ≤ promptComputed")
         XCTAssertGreaterThanOrEqual(
@@ -221,6 +229,54 @@ final class CBv2RequestTimingTests: XCTestCase {
         XCTAssertEqual(t.detokDelayFirstNanos, 0)
     }
 
+    // MARK: Terminal before first token
+
+    func testCancelDuringPrefillLeavesFirstTokenUnobserved() async throws {
+        // Ten [1, 16] prefill chunks, one per step, each held ~50 ms inside
+        // the scripted forward: the cancel lands after the first chunk
+        // launched and long before the sampling chunk could finalize.
+        let harness = CBv2SchedHarness(
+            schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 64, prefillChunkSize: 16,
+                maxWaiting: 8))
+        harness.model.forwardDelay = 0.05
+        let request = CBv2SchedFixtures.request(prompt: Array(0 ..< 160), maxTokens: 4)
+        let stream = try harness.engine.submit(request)
+        let collector = Task { await cbv2SchedCollect(stream) }
+        let launched = await cbv2SchedWait { harness.engine.stepCount >= 1 }
+        XCTAssertTrue(launched, "first prefill chunk must launch")
+        harness.engine.cancel(request.id)
+        let collected = await collector.value
+
+        XCTAssertEqual(collected.finishReason, .cancelled)
+        XCTAssertTrue(collected.tokens.isEmpty, "cancelled mid-prefill: no tokens")
+        let t = try timing(collected, "cancel-in-prefill")
+
+        // Never observed: the prompt was not computed through and no token
+        // was confirmed or detokenized.
+        XCTAssertEqual(t.promptComputedNanos, 0)
+        XCTAssertEqual(t.firstTokenNanos, 0)
+        XCTAssertEqual(t.decodeSteps, 0)
+        XCTAssertEqual(t.detokDelayFirstNanos, 0)
+
+        // Observed and ordered: admitted ≤ kvAllocated ≤ prefillFirstLaunch
+        // ≤ finished (the coordinator validates every PRESENT pair).
+        XCTAssertGreaterThan(t.admittedNanos, 0)
+        XCTAssertGreaterThan(t.kvAllocatedNanos, 0)
+        XCTAssertGreaterThan(t.prefillFirstLaunchNanos, 0)
+        XCTAssertGreaterThan(t.finishedNanos, 0)
+        XCTAssertLessThanOrEqual(t.admittedNanos, t.kvAllocatedNanos)
+        XCTAssertLessThanOrEqual(t.kvAllocatedNanos, t.prefillFirstLaunchNanos)
+        XCTAssertLessThanOrEqual(t.prefillFirstLaunchNanos, t.finishedNanos)
+
+        XCTAssertGreaterThanOrEqual(t.prefillChunks, 1, "at least the launched chunk")
+        XCTAssertLessThan(t.prefillChunks, 10, "cancelled before the prompt was through")
+        XCTAssertEqual(t.prefillChunkTokensMax, 16)
+
+        let released = await cbv2SchedWait { harness.backend.liveStates == 0 }
+        XCTAssertTrue(released, "cancelled request's KV must be freed")
+    }
+
     // MARK: Re-admission, preemption, backpressure
 
     func testPreemptedRequestCountsPreemptionAndReadmission() async throws {
@@ -296,8 +352,12 @@ final class CBv2RequestTimingTests: XCTestCase {
         assertPhaseOrdering(t, "prefix hit")
         XCTAssertGreaterThan(t.prefixLookupNanos, 0, "submit-thread lookup timed")
         XCTAssertGreaterThan(t.prefixAdoptionNanos, 0, "applyAdoption timed")
-        XCTAssertLessThan(
-            t.kvAllocatedNanos, t.admittedNanos, "adoption allocates KV before the first plan")
+        // Adoption allocates KV at enqueue, before the first plan; the
+        // exported stamp is raised to the admission instant so the
+        // coordinator's `admitted ≤ kvAllocated` order holds. The adoption
+        // itself is evidenced by `prefixAdoptionNanos > 0` above.
+        XCTAssertEqual(
+            t.kvAllocatedNanos, t.admittedNanos, "adopted KV stamp raised to admission")
         XCTAssertEqual(t.prefillChunks, 1, "only the un-adopted tail is prefilled")
     }
 
