@@ -680,6 +680,17 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// The lookup pin travels with the adoption; the loop balances it in
     /// every outcome.
     private func makePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
+        // Submit-thread duration of hashing + lookup + plan derivation
+        // (`CBv2RequestTiming.prefixLookupNanos`); rides the lookup into
+        // `enqueue` so no engine-queue clock read is needed.
+        guard prefixCache != nil else { return resolvePrefixLookup(for: request) }
+        let started = DispatchTime.now().uptimeNanoseconds
+        var lookup = resolvePrefixLookup(for: request)
+        lookup.lookupNanos = max(1, DispatchTime.now().uptimeNanoseconds &- started)
+        return lookup
+    }
+
+    private func resolvePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
         guard let prefixCache else {
             return CBv2PrefixLookup(adoption: nil, outcome: .disabled, matchedTokens: 0)
         }

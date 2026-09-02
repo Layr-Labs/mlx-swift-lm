@@ -257,6 +257,14 @@ extension EngineLoopV2 {
             }
 
             let observedAccepted = min(accepted, confirmed)
+            // Per-request timing: this verify row confirmed at the step's
+            // readback-done instant (already read by `finalize`).
+            rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
+            rec.recordMTPRound(drafted: k, accepted: observedAccepted)
+            if confirmed > 0 {
+                rec.timing.decodeSteps &+= 1
+                decodeRowsTotal &+= 1
+            }
             mtp.recordRound(
                 drafted: k, accepted: observedAccepted, emitted: confirmed)
             let rejectionObserved = accepted < k && confirmed > accepted

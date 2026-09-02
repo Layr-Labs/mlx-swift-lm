@@ -15,6 +15,8 @@ extension EngineLoopV2 {
     func executeMTPRound(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         guard let mtp else { return executeMixed(plan) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
+        launchClockNanos = wallStartedNanos
+        defer { launchClockNanos = 0 }
 
         // A per-row reserve retry can demote a round after the step-global
         // preflight. Demote all round rows so the target still sees one L=1
@@ -35,6 +37,28 @@ extension EngineLoopV2 {
             // block waiting admission.
             scheduler.rollback(plan)
             return nil
+        }
+        // Timing stamps mirror `executeMixed`: admission at first launch,
+        // one stamp per solo prefill chunk (MTP rounds never pack).
+        for row in work {
+            row.rec.stampAdmission(launchNanos: wallStartedNanos)
+            if row.isDecode {
+                // Decode-shaped one-token prompt chunk (see `executeMixed`).
+                if row.start < row.rec.request.promptTokens.count {
+                    row.rec.stampPrefillChunkLaunch(
+                        tokens: 1, packed: false, vision: false, stripe: false,
+                        launchNanos: wallStartedNanos)
+                }
+            } else if row.carry == nil {
+                let visionChunk =
+                    multimodalByID[row.rec.id].map {
+                        !$0.spansInChunk(start: row.start, count: row.count).isEmpty
+                    } ?? false
+                row.rec.stampPrefillChunkLaunch(
+                    tokens: row.count, packed: false, vision: visionChunk,
+                    stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
+                    launchNanos: wallStartedNanos)
+            }
         }
 
         let graph = mtpBuildRoundGraph(work, driver: mtp)
