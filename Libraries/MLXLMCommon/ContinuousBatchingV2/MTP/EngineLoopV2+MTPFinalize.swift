@@ -62,7 +62,10 @@ extension EngineLoopV2 {
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
         // finalize adds up to three syncs to the step's one (seed policy
-        // margin above, acceptance packet, verify policy margin).
+        // margin above, acceptance packet, verify policy margin). Serial
+        // target verification adds one blocking eval per column at launch
+        // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
+        // three readbacks (`CBv2Logprobs.assemble`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)

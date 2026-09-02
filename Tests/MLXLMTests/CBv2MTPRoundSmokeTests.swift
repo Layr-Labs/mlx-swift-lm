@@ -229,9 +229,12 @@ struct CBv2MTPRoundSmokeTests {
         let stepsExecuted = on.capacity().stepsExecuted
 
         // Host-sync multiplier on the MTP path: every executed step performs
-        // its ONE finalize readback, and an MTP-round finalize adds up to
-        // three more (seed policy margin, acceptance packet, verify policy
-        // margin), so   steps ≤ syncs ≤ steps + seedSteps + 2 × rounds.
+        // its ONE finalize readback; an MTP-round finalize adds up to three
+        // more (seed policy margin, acceptance packet, verify policy margin);
+        // serial target verification adds one blocking eval per verify
+        // column at launch; a logprob segment adds three readbacks (none
+        // here — no row asks for logprobs). So
+        //   steps ≤ syncs ≤ steps + seedSteps + 2 × rounds + serialColumns.
         // Only the lower bound is asserted here: the counter is
         // process-global and swift-testing runs other engine suites
         // concurrently (the exact per-step equality is asserted by the

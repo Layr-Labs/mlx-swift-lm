@@ -888,10 +888,13 @@ public final class EngineLoopV2: @unchecked Sendable {
                     return
                 }
                 draining = true
-                // One read for every waiting row the drain cancels.
+                // One read (per clock domain) for every waiting row the
+                // drain cancels.
                 let drainNanos = DispatchTime.now().uptimeNanoseconds
+                let drainNow = config.clock.now()
                 for rec in scheduler.waiting {
-                    finishRequest(rec.id, reason: .cancelled, nowNanos: drainNanos)
+                    finishRequest(
+                        rec.id, reason: .cancelled, nowNanos: drainNanos, now: drainNow)
                 }
                 publishGauges()
                 drainWaiters.append(waiter)
@@ -1843,7 +1846,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // exactly one step apart (never widened by extra clock reads).
         let stepNow = config.clock.now()
         boundaryClockNanos = 0  // see `boundaryFinishNanos`
-        processCancellations()
+        processCancellations(now: stepNow)
         processLeaseExpiry(now: stepNow)
 
         // Chained decode fast path: build step N+1 on step N's lazy tokens.
@@ -2516,6 +2519,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // A multimodal request's text-only chunks remain packable.
                 // A span-bearing chunk needs explicit rectangular embedding
                 // and row-mask capability from both model and cache provider.
+                // KNOWN LIMITATION (pre-existing; not changed by the timing
+                // series): `chunkContext` is nil for `.causal` multimodal
+                // input, so a causal span chunk classifies as text here —
+                // packed without embedding splicing — and its launch stamp
+                // records the path taken (`vision: false`). The shipped
+                // causal model (Qwen) never reaches the packed cohort: the
+                // recurrent/position gate below forces its solo path. Span
+                // PRESENCE is `hasSpans(start:count:)` if this is revisited.
                 let hasSpan =
                     multimodalByID[row.rec.id]?.chunkContext(
                         start: row.start, count: row.count) != nil
@@ -3139,9 +3150,13 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `nowNanos`: the caller's already-taken timing instant (a step
     /// boundary finishing several rows shares ONE read). Absent, the
     /// in-progress finalize / launch read is reused; a fresh read is the
-    /// last resort (direct callers outside any step).
+    /// last resort (direct callers outside any step). `now`: the step's
+    /// boundary `ContinuousClock` read (`stepNow`), used only to close a
+    /// paused row's backpressure interval — absent, one read per paused
+    /// finish.
     func finishRequest(
-        _ id: CBv2RequestID, reason: CBv2FinishReason, nowNanos: UInt64? = nil
+        _ id: CBv2RequestID, reason: CBv2FinishReason, nowNanos: UInt64? = nil,
+        now: ContinuousClock.Instant? = nil
     ) {
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
@@ -3196,18 +3211,21 @@ public final class EngineLoopV2: @unchecked Sendable {
         // in-progress launch's wall-start read (allocation failure), and
         // only for direct callers outside any step a fresh read.
         // Cost model: the `usage.timing` setter boxes the struct — ONE
-        // `CBv2RequestTimingBox` allocation per request lifetime, here at
-        // finish only, never on the step path.
-        if rec.pausedSince != nil { rec.recordResumed(now: config.clock.now()) }
-        usage.timing = rec.exportTiming(
+        // `CBv2RequestTimingBox` allocation per request lifetime, at the
+        // single assignment on whichever delivery path runs (synchronous
+        // below, or async at delivery once the detok delay is folded in);
+        // never on the step path. The raw value travels unboxed until then.
+        if rec.pausedSince != nil { rec.recordResumed(now: now ?? config.clock.now()) }
+        let exportedTiming = rec.exportTiming(
             finishedNanos: nowNanos
                 ?? (finalizeClockNanos != 0
                     ? finalizeClockNanos
                     : launchClockNanos != 0
                         ? launchClockNanos : DispatchTime.now().uptimeNanoseconds))
         let usesAsyncDetokenization = rec.request.stopStrings.isEmpty
+        if !usesAsyncDetokenization { usage.timing = exportedTiming }  // the ONE box
         let terminalQueue = detokQueue
-        let terminalDelivery: () -> Void = { [usage] in
+        let terminalDelivery: () -> Void = { [usage, exportedTiming] in
             // Passthrough requests emit deltas on the detok queue; the
             // trailing flush + terminal MUST ride the same queue so they land
             // AFTER those deltas (FIFO ordering). Stop-string requests stay
@@ -3220,8 +3238,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                     if !trailing.isEmpty {
                         stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
                     }
+                    var timing = exportedTiming
+                    timing.detokDelayFirstNanos = stream?.firstEmissionDelayNanos ?? 0
                     var delivered = usage
-                    delivered.timing.detokDelayFirstNanos = stream?.firstEmissionDelayNanos ?? 0
+                    delivered.timing = timing  // the ONE box
                     stream?.finish(reason: reason, usage: delivered)
                 }
             } else {
@@ -3464,7 +3484,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Boundary housekeeping
 
-    private func processCancellations() {
+    private func processCancellations(now: ContinuousClock.Instant) {
         stateLock.lock()
         let cancels = pendingCancels
         stateLock.unlock()
@@ -3484,7 +3504,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 continue
             }
             if scheduler.record(for: id) != nil {
-                finishRequest(id, reason: .cancelled, nowNanos: boundaryFinishNanos())
+                finishRequest(
+                    id, reason: .cancelled, nowNanos: boundaryFinishNanos(), now: now)
                 resolved[id] = cancelledGeneration
             }
         }
@@ -3602,7 +3623,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         for (id, cause) in expired {
             finishRequest(
-                id, reason: leaseFinishReason(for: cause), nowNanos: boundaryFinishNanos())
+                id, reason: leaseFinishReason(for: cause), nowNanos: boundaryFinishNanos(),
+                now: now)
         }
     }
 

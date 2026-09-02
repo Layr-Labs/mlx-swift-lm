@@ -320,7 +320,10 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
     /// embeddings. For per-row-per-step classification on the engine thread.
     func hasSpans(start: Int, count: Int) -> Bool {
         let end = start + count
-        return spans.contains { $0.tokenOffset < end && start < $0.end }
+        // Exactly `spansInChunk`'s non-empty test (`lo < hi`), so degenerate
+        // ranges agree: an empty chunk never intersects and a zero-length
+        // span never counts.
+        return spans.contains { max(start, $0.tokenOffset) < min(end, $0.end) }
     }
 
     /// True when `position` lies inside a coalesced image block. Used by the

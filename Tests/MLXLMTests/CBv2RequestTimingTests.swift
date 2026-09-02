@@ -180,8 +180,10 @@ final class CBv2RequestTimingTests: XCTestCase {
         let snapshot = harness.engine.capacity()
         // Timing is always on and adds no host sync: the step loop's ONLY
         // CBv2 sync is the finalize readback — exactly one per executed step
-        // (every launched step is finalized once; all fenced by now). Any
-        // sync introduced later breaks this equality.
+        // (every launched step is finalized once; all fenced by now). No
+        // row asks for logprobs (three readbacks per segment) and MTP is
+        // off, so the per-step formula is exactly 1. Any sync introduced
+        // later breaks this equality.
         XCTAssertEqual(
             CBv2CoreInstrumentation.hostSyncs - syncsBefore, snapshot.stepsExecuted,
             "one host sync per executed step")
