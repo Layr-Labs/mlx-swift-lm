@@ -16,6 +16,18 @@ import XCTest
 
 final class CBv2RequestTimingTests: XCTestCase {
 
+    // Host-sync counting is gated off on the step path; this suite (serial
+    // XCTest) switches it on per test and asserts one sync per step.
+    override func setUp() {
+        super.setUp()
+        CBv2CoreInstrumentation.countingEnabled = true
+    }
+
+    override func tearDown() {
+        CBv2CoreInstrumentation.countingEnabled = false
+        super.tearDown()
+    }
+
     private func timing(_ collected: CBv2SchedCollected, _ label: String) throws
         -> CBv2RequestTiming
     {

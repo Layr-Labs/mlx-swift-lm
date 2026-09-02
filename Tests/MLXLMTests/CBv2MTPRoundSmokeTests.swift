@@ -219,6 +219,8 @@ struct CBv2MTPRoundSmokeTests {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 24, seed: 12, vocabSize: vocabSize)
         let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
+        CBv2CoreInstrumentation.countingEnabled = true
+        defer { CBv2CoreInstrumentation.countingEnabled = false }
         let syncsBefore = CBv2CoreInstrumentation.hostSyncs
         let speculative = try await run(on, greedyRequest(id: 1, prompt: prompt, maxTokens: 40))
         let metrics = try #require(on.mtpMetricsSnapshot())

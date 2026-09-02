@@ -39,7 +39,15 @@ public enum CBv2CoreInstrumentation {
         return _positionOffsetsHostRebuilds
     }
 
+    /// Gate for `recordHostSync`: the engine's finalize readbacks count
+    /// only while a test has switched counting on. Off (the default) the
+    /// step path pays one static bool read per readback and never touches
+    /// the lock — the same pattern as the engine's signposter gate. Tests
+    /// flip it on before stepping and reset it afterwards.
+    nonisolated(unsafe) static var countingEnabled = false
+
     static func recordHostSync() {
+        guard countingEnabled else { return }
         lock.lock()
         defer { lock.unlock() }
         _hostSyncs += 1
