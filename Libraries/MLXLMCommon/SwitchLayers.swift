@@ -1159,6 +1159,59 @@ private let qwenDirectExpertReductionEnabled: Bool = {
 /// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE` set to
 /// `0`/`false`/`no`/`off` leaves the split arrays as loaded and restores the
 /// two split gathers. Engage mark: `prefill-gateup-fuse`.
+/// GATEUP-FUSE-DECODE admission, factored out for a device-free test.
+///
+/// The fused decode gather replaces the two split ones exactly when the
+/// layer is on the UNSORTED road (`SwitchGLU.projectExperts` sets
+/// `doSort = indices.size >= 64`, so top-8 routing sorts only from eight
+/// rows up), no left-hand index table was built, and the activation plane is
+/// the `[..., 1, inputDims]` shape a gathered decode row has.
+@inline(__always)
+public func switchGateUpFuseDecodeAdmits(
+    enabled: Bool, doSort: Bool, hasLhsIndices: Bool,
+    rowLength: Int, lastDim: Int, inputDims: Int
+) -> Bool {
+    enabled && !doSort && !hasLhsIndices && rowLength == 1 && lastDim == inputDims
+}
+
+/// The `gather_qmv` tier predicate the exactness argument rests on.
+///
+/// `gather_qmv` builds its kernel name from mode, dtype, group size and bits
+/// -- never from N -- and picks its fast variant on `N % 8 == 0 && K %
+/// alignment == 0` (`backend/metal/quantized.cpp`). Concatenating gate and up
+/// along the output axis changes only N, so both widths must land on the same
+/// answer for the fused dispatch to be the split ones' bit-exact replacement.
+@inline(__always)
+public func switchGatherQMVSelectsFastTier(
+    outputWidth n: Int, contractionWidth k: Int, kAlignment: Int
+) -> Bool {
+    n % 8 == 0 && k % kAlignment == 0
+}
+
+/// GATEUP-FUSE-DECODE. `switchGateUpFusePrefillEnabled` above admits the
+/// SORTED right-hand-side plane only (`x.dim(0) >= 16` and at least four rows
+/// per expert), which is the production prefill. Every batch below eight
+/// takes a different road entirely: `SwitchGLU.projectExperts` sets
+/// `doSort = indices.size >= 64`, so a one-row decode step with top-8 routing
+/// has eight keys, never sorts, and issues two unsorted `gather_qmv`
+/// dispatches per MoE layer over the split views.
+///
+/// Those two dispatches read the same gathered activations and produce two
+/// halves of the same 1408-wide product, so one gather over the concatenated
+/// storage replaces them -- one dispatch per layer instead of two, and the
+/// kernel is handed the contiguous `[128, 1408, 352]` plane rather than the
+/// axis-1 views the prefill arm's storage relayout leaves behind.
+///
+/// `DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE=0` restores the two split gathers.
+/// Default ON, and inert unless `switchGateUpFusePrefillEnabled` built the
+/// storage in the first place. Engage mark: `decode-gateup-fuse`.
+public let switchGateUpFuseDecodeEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 public let switchGateUpFusePrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
@@ -1717,6 +1770,55 @@ public class SwitchGLU: Module {
                     bits: fused.bits,
                     mode: fused.mode,
                     sortedIndices: true
+                )
+                xGate = xGateUp[.ellipsis, ..<hiddenDims]
+                xUp = xGateUp[.ellipsis, hiddenDims...]
+            } else if switchGateUpFuseDecodeAdmits(
+                enabled: switchGateUpFuseDecodeEnabled,
+                doSort: doSort, hasLhsIndices: lhsIndices != nil,
+                rowLength: x.dim(-2), lastDim: x.dim(-1),
+                inputDims: inputDims),
+                x.dtype == .bfloat16,
+                let fused = fusedGateUpDispatch()
+            {
+                // GATEUP-FUSE-DECODE. The UNSORTED gathered geometry -- one
+                // activation row broadcast over its top-k experts, which is
+                // what `SwitchGLU` builds whenever `indices.size < 64`, i.e.
+                // at every batch below eight. Two `gather_qmv` dispatches
+                // (N = 704 each) become one over the concatenated gate|up
+                // storage (N = 1408).
+                //
+                // This also removes the arm's only decode-side exposure. The
+                // switch is named PREFILL but its storage relayout is
+                // permanent: after it, `gate_proj` / `up_proj` are axis-1
+                // slices of a `[128, 1408, 352]` plane, so every decode
+                // gather reads through a non-row-contiguous view. That is
+                // why a prefill switch moves decode at all. Dispatching the
+                // concatenated storage directly hands the kernel the
+                // contiguous array instead.
+                //
+                // Exactness, the same argument the prefill arm makes: the
+                // selected kernel is `gather_qmv` in both cases -- its name
+                // is built from mode, dtype, group size and bits, never from
+                // N, and its `fast` predicate is `N % 8 == 0 && K %
+                // alignment == 0`, which 704 and 1408 satisfy identically --
+                // and every output column owns an independent K-chain. The
+                // concatenated weight, scales and biases are a pure copy of
+                // the split ones along the output axis, and the consumer
+                // receives the identical gate / up columns through views.
+                CBv2EngageMark.once("decode-gateup-fuse")
+                let xGateUp = MLX.gatherQuantizedMM(
+                    x,
+                    fused.storage.weight,
+                    scales: fused.storage.scales,
+                    biases: fused.storage.biases,
+                    lhsIndices: nil,
+                    rhsIndices: idx,
+                    transpose: true,
+                    groupSize: fused.groupSize,
+                    bits: fused.bits,
+                    mode: fused.mode,
+                    sortedIndices: false
                 )
                 xGate = xGateUp[.ellipsis, ..<hiddenDims]
                 xUp = xGateUp[.ellipsis, hiddenDims...]

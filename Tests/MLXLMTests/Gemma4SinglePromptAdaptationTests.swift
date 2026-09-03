@@ -288,4 +288,60 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
         XCTAssertFalse(CBv2ParallelArgMaxV1.admitsRows(3, minimumRows: 4))
         XCTAssertTrue(CBv2ParallelArgMaxV1.admitsRows(4, minimumRows: 4))
     }
+
+    // MARK: - GATEUP-FUSE-DECODE
+
+    /// The unsorted gathered decode plane is admitted; the sorted prefill
+    /// road, the eight-row cohort's left-hand-index road, and any plane that
+    /// is not one activation row per gathered index are not.
+    func testGateUpDecodeFuseAdmission() {
+        // Batch one, top-8: eight keys, so `doSort` is false.
+        XCTAssertTrue(
+            switchGateUpFuseDecodeAdmits(
+                enabled: true, doSort: false, hasLhsIndices: false,
+                rowLength: 1, lastDim: 2816, inputDims: 2816))
+        // The sorted prefill plane keeps the prefill arm.
+        XCTAssertFalse(
+            switchGateUpFuseDecodeAdmits(
+                enabled: true, doSort: true, hasLhsIndices: false,
+                rowLength: 1, lastDim: 2816, inputDims: 2816))
+        // The eight-row cohort builds left-hand indices; leave it alone.
+        XCTAssertFalse(
+            switchGateUpFuseDecodeAdmits(
+                enabled: true, doSort: true, hasLhsIndices: true,
+                rowLength: 1, lastDim: 2816, inputDims: 2816))
+        // Multi-token rows and mismatched widths fail closed.
+        XCTAssertFalse(
+            switchGateUpFuseDecodeAdmits(
+                enabled: true, doSort: false, hasLhsIndices: false,
+                rowLength: 4, lastDim: 2816, inputDims: 2816))
+        XCTAssertFalse(
+            switchGateUpFuseDecodeAdmits(
+                enabled: true, doSort: false, hasLhsIndices: false,
+                rowLength: 1, lastDim: 2112, inputDims: 2816))
+        // Kill switch.
+        XCTAssertFalse(
+            switchGateUpFuseDecodeAdmits(
+                enabled: false, doSort: false, hasLhsIndices: false,
+                rowLength: 1, lastDim: 2816, inputDims: 2816))
+    }
+
+    /// The exactness claim: concatenating gate and up along the output axis
+    /// changes only N, and both widths select the same `gather_qmv` tier at
+    /// the production contraction (K = 2816, 4-bit alignment 512 and the
+    /// permissive 32 alike). A future `hiddenDims` not divisible by 8 would
+    /// break the equivalence and must fail here first.
+    func testGateUpDecodeFuseKeepsTheSameQMVTier() {
+        for kAlignment in [32, 64, 512] {
+            let split = switchGatherQMVSelectsFastTier(
+                outputWidth: 704, contractionWidth: 2816, kAlignment: kAlignment)
+            let fused = switchGatherQMVSelectsFastTier(
+                outputWidth: 1408, contractionWidth: 2816, kAlignment: kAlignment)
+            XCTAssertEqual(split, fused, "kAlignment \(kAlignment)")
+        }
+        // A width that would change the tier is caught.
+        XCTAssertFalse(
+            switchGatherQMVSelectsFastTier(
+                outputWidth: 700, contractionWidth: 2816, kAlignment: 32))
+    }
 }
