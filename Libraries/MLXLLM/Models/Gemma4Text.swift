@@ -42,6 +42,31 @@ private let gemma4DecodeAsyncEvalLadderEnabled =
         ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_DECODE_ASYNC_EVAL_LADDER"])
 
+/// B1-LADDER. The ladder's mechanism is host/device OVERLAP, not cohort
+/// bookkeeping: submitting after layers 0..3 starts GPU work while Swift is
+/// still building the remaining layers. Nothing in it reads a row index, a
+/// per-row length, or a batch-shaped buffer, so the `batchSize == 8` term in
+/// the policy below is a statement about which geometry was scored, not a
+/// correctness requirement.
+///
+/// At one prompt the overlap argument is STRONGER, not weaker: a single-row
+/// decode step submits the same ~30-layer chain with roughly an eighth of the
+/// per-kernel device work, so the host build is a larger fraction of the step
+/// and starting the device earlier hides more of it.
+///
+/// This admits any positive batch. `DARKBLOOM_GEMMA4_DECODE_LADDER_ANY_BATCH=0`
+/// restores the `batchSize == 8` pin exactly. Default ON.
+@inline(__always)
+internal func resolveGemma4DecodeLadderAnyBatchEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let gemma4DecodeLadderAnyBatchEnabled =
+    resolveGemma4DecodeLadderAnyBatchEnabled(
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DECODE_LADDER_ANY_BATCH"])
+
 /// Pure, fail-closed policy for the Gemma 4 decode submission ladder.
 ///
 /// Layer indices name boundaries AFTER a complete decoder layer. In
@@ -55,9 +80,11 @@ internal func gemma4ShouldSubmitDecodeAsyncEvalLadder(
     isCBv2: Bool,
     batchSize: Int,
     inputLength: Int,
-    layerIndex: Int
+    layerIndex: Int,
+    anyBatch: Bool = gemma4DecodeLadderAnyBatchEnabled
 ) -> Bool {
-    guard enabled, isCBv2, !schedulePrefill, batchSize == 8, inputLength == 1
+    guard enabled, isCBv2, !schedulePrefill, inputLength == 1,
+        anyBatch ? batchSize > 0 : batchSize == 8
     else { return false }
 
     if let set = gemma4DecodeAsyncEvalLadderSet {
