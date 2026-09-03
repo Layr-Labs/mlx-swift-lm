@@ -2615,6 +2615,21 @@ private enum Gemma4FusedRouterTop8 {
     }
 }
 
+/// ROUTER-B1 admission arithmetic, factored out for a device-free test.
+///
+/// The finalists kernels launch one 128-thread threadgroup per flattened row
+/// of 128 scores, so a `[B, L, 128]` plane carries `B * L` rows however those
+/// rows were produced. `anyRows == false` reproduces the original prompt
+/// rectangle pin (`B == 8 && L > 1`) exactly.
+@inline(__always)
+internal func gemma4RouterAdmittedRows(
+    batch: Int, length: Int, anyRows: Bool
+) -> Int? {
+    guard batch > 0, length > 0 else { return nil }
+    guard anyRows || (batch == 8 && length > 1) else { return nil }
+    return batch * length
+}
+
 /// ROUTER-FINALISTS-017: selection only, within the existing ZIP stage.
 /// Keep the stable ascending argsort tail: each 32-entry subset retains its
 /// largest eight, then one SIMD group sorts the 32 survivors. A discarded
@@ -2734,15 +2749,42 @@ private enum Gemma4RouterFinalistsV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// ROUTER-B1. `applyPrefill` already proved the row-genericity of this
+    /// kernel: one 128-thread threadgroup per flattened row of 128 scores,
+    /// addressed by `threadgroup_position_in_grid.x`, with `rows = b * l`.
+    /// Its `scores.dim(0) == 8, scores.dim(1) > 1` gate names the prompt
+    /// rectangle it was scored on -- it is not a property of the kernel.
+    ///
+    /// A batch-one decode step is `[1, 1, 128]`: it matches neither that gate
+    /// nor the `[8, 1, 128]` decode gate above, so it falls through to the
+    /// stock `argPartition` + slice pair in every MoE layer. This admits any
+    /// `[B, L, 128]` row count. `DARKBLOOM_GEMMA4_ROUTER_ANY_ROWS=0` restores
+    /// both original gates exactly. Default ON.
+    static let anyRowsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_ROUTER_ANY_ROWS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The row count `[B, L, 128]` scores flatten to, or nil outside the pin.
+    static func admittedRows(_ scores: MLXArray, topK: Int, kth: Int) -> Int? {
+        guard topK == 8, kth == 120,
+            scores.ndim == 3, scores.dim(2) == 128,
+            scores.dtype == .bfloat16,
+            scores.size == scores.dim(0) * scores.dim(1) * 128
+        else { return nil }
+        return gemma4RouterAdmittedRows(
+            batch: scores.dim(0), length: scores.dim(1),
+            anyRows: anyRowsEnabled)
+    }
+
     static func applyPrefill(_ scores: MLXArray, topK: Int, kth: Int) -> MLXArray? {
-        guard prefillEnabled, topK == 8, kth == 120,
-            scores.ndim == 3, scores.dim(0) == 8,
-            scores.dim(1) > 1, scores.dim(2) == 128,
-            scores.dtype == .bfloat16
+        guard prefillEnabled,
+            let rows = admittedRows(scores, topK: topK, kth: kth)
         else { return nil }
         let b = scores.dim(0)
         let l = scores.dim(1)
-        let rows = b * l
         CBv2EngageMark.once("router-finalists32-prefill")
         return kernel(
             [scores],
@@ -2985,18 +3027,20 @@ private enum Gemma4RouterFinalistsWeightsV1 {
     static func applyPrefill(
         _ scores: MLXArray, perExpertScale: MLXArray, topK: Int, kth: Int
     ) -> (indices: MLXArray, weights: MLXArray)? {
+        // ROUTER-B1: same row-generic launch as the selection twin. The
+        // kernel writes `weights[row * 8 + slot]` and `indices[row * 8 +
+        // slot]`, so the flattened row count is the only thing the grid
+        // needs; `DARKBLOOM_GEMMA4_ROUTER_ANY_ROWS=0` restores the
+        // `[8, L>1, 128]` pin for both twins together.
         guard prefillEnabled, Gemma4RouterFinalistsV1.enabled,
             Gemma4RouterFinalistsV1.prefillEnabled,
-            topK == 8, kth == 120,
-            scores.ndim == 3, scores.dim(0) == 8,
-            scores.dim(1) > 1, scores.dim(2) == 128,
-            scores.dtype == .bfloat16,
+            let rows = Gemma4RouterFinalistsV1.admittedRows(
+                scores, topK: topK, kth: kth),
             perExpertScale.ndim == 1, perExpertScale.dim(0) == 128,
             perExpertScale.dtype == .bfloat16
         else { return nil }
         let b = scores.dim(0)
         let l = scores.dim(1)
-        let rows = b * l
         CBv2EngageMark.once("router-weights32-prefill")
         let outs = kernel(
             [scores, perExpertScale],

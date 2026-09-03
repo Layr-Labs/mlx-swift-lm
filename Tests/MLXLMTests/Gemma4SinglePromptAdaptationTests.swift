@@ -115,4 +115,45 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
                 "rows \(rows) would alias inside the table")
         }
     }
+
+    // MARK: - ROUTER-B1: finalists admission
+
+    /// The scored prompt rectangle is admitted in both modes and keeps the
+    /// same flattened row count.
+    func testRouterCohortRectangleUnchanged() {
+        for anyRows in [false, true] {
+            XCTAssertEqual(
+                gemma4RouterAdmittedRows(batch: 8, length: 1024, anyRows: anyRows),
+                8192)
+            XCTAssertEqual(
+                gemma4RouterAdmittedRows(batch: 8, length: 2, anyRows: anyRows), 16)
+        }
+    }
+
+    /// The batch-one decode cell is admitted only with the switch on, and
+    /// carries exactly one row.
+    func testRouterBatchOneDecodeCell() {
+        XCTAssertEqual(
+            gemma4RouterAdmittedRows(batch: 1, length: 1, anyRows: true), 1)
+        XCTAssertNil(
+            gemma4RouterAdmittedRows(batch: 1, length: 1, anyRows: false))
+        // The eight-row decode cell was excluded by `L > 1` before; with the
+        // switch on it flattens to eight rows like any other plane.
+        XCTAssertEqual(
+            gemma4RouterAdmittedRows(batch: 8, length: 1, anyRows: true), 8)
+        XCTAssertNil(
+            gemma4RouterAdmittedRows(batch: 8, length: 1, anyRows: false))
+    }
+
+    /// Degenerate planes never produce a launch in either mode.
+    func testRouterEmptyPlanesFailClosed() {
+        for anyRows in [false, true] {
+            XCTAssertNil(
+                gemma4RouterAdmittedRows(batch: 0, length: 4, anyRows: anyRows))
+            XCTAssertNil(
+                gemma4RouterAdmittedRows(batch: 4, length: 0, anyRows: anyRows))
+            XCTAssertNil(
+                gemma4RouterAdmittedRows(batch: -1, length: 1, anyRows: anyRows))
+        }
+    }
 }
