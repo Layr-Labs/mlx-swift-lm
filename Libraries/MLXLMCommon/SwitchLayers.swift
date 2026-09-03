@@ -258,6 +258,87 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+/// When the expert gather groups its `(row, expert)` assignments by expert
+/// before issuing them, instead of visiting them row by row.
+///
+/// Grouping is what makes a multi-row expert pass read each SELECTED expert's
+/// weight block once for every row that chose it, rather than once per row.
+/// On a 128-expert / top-8 model that is the difference between a rectangular
+/// pass costing `rows * 8` weight reads and it costing the size of the
+/// expert UNION across those rows — under uniform routing
+/// `128 * (1 - (1 - 8/128)^rows)`, so 15.5 experts at 2 rows and 51.6 at 8,
+/// against 16 and 64 ungrouped.
+///
+/// REDUCTION ORDER IS UNCHANGED, and that is the whole exactness argument.
+/// Grouping permutes only the order in which `(row, expert)` products are
+/// COMPUTED. Every caller unsorts back to row-major
+/// (`scatterUnsort(..., shape: indices.shape)`) before the per-row weighted
+/// sum runs, so each row's K terms are still summed in slot order 0...K-1,
+/// with the same operands, whether or not the gather was grouped. No partial
+/// sum is ever accumulated across rows, and no row's terms are reassociated.
+///
+/// What that argument does NOT cover is the two MLX gather kernels
+/// themselves: `sortedIndices: true` and `sortedIndices: false` are different
+/// dispatches, and whether their per-dot-product accumulation is bit-identical
+/// is a property of MLX, not of this file. The sorted dispatch is already the
+/// production prompt path, so it is trusted at prompt shapes and merely
+/// uncertified at verify shapes. Treat that as the measured gate it is.
+///
+/// [engage] MTPLX_MTP_UNION_VERIFY
+public enum SwitchGLUExpertGrouping {
+    /// `MTPLX_MTP_UNION_VERIFY=0` restores the historic rule exactly, so the
+    /// grouped and per-row costs can be measured against each other in one
+    /// window. Default on.
+    public static let unionAcrossRows: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_UNION_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+
+    /// Token rows in an assignment tensor of ANY rank: `[rows, K]`,
+    /// `[B, S, K]`, or anything else whose last axis is the per-row expert
+    /// slot. Derived, never assumed from a particular caller's layout.
+    public static func rowCount(_ indices: MLXArray) -> Int {
+        let slots = max(1, indices.dim(-1))
+        return indices.size / slots
+    }
+
+    /// Whether to group, as a pure function of the two counts — testable
+    /// with no array and no device at all.
+    ///
+    /// The historic rule was `indices.size >= 64` alone. That number is a
+    /// proxy for "this is a prompt pass", and it is the only thing that stood
+    /// between an MTP rectangular verify and the grouping it wants: a
+    /// `[1, 1+k]` verify at batch 1 produces `(1+k) * 8` assignments, so
+    /// widths 1 through 7 fell under it and width 8 landed exactly on it —
+    /// the verify silently changed algorithm at one width.
+    ///
+    /// The added rule is a property of the work, not of a size: grouping can
+    /// only ever save reads when more than one row is choosing experts. One
+    /// row has no collisions to exploit and is left byte-identical, which is
+    /// what keeps ordinary decode untouched. Two or more rows have them, at
+    /// every width, every batch size and every context length.
+    public static func shouldGroup(
+        assignments: Int, rows: Int, unionAcrossRows: Bool
+    ) -> Bool {
+        if assignments >= historicGroupingThreshold { return true }
+        guard unionAcrossRows else { return false }
+        return rows > 1
+    }
+
+    /// The historic rule, kept exactly so `MTPLX_MTP_UNION_VERIFY=0` restores
+    /// the previous behaviour bit for bit.
+    public static let historicGroupingThreshold = 64
+
+    public static func shouldGroup(_ indices: MLXArray) -> Bool {
+        shouldGroup(
+            assignments: indices.size,
+            rows: rowCount(indices),
+            unionAcrossRows: unionAcrossRows)
+    }
+}
+
 private let qwenDirectExpertReductionEnabled: Bool = {
     let raw = ProcessInfo.processInfo.environment["MLX_QWEN_DIRECT_EXPERT_REDUCTION"]?
         .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -596,7 +677,7 @@ public class SwitchGLU: Module {
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = indices.size >= 64
+        let doSort = SwitchGLUExpertGrouping.shouldGroup(indices)
 
         var idx = indices
         var inverseOrder = MLXArray()
