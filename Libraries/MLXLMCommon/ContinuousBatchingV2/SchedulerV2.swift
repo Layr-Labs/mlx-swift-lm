@@ -53,6 +53,16 @@ public final class CBv2ScheduledRequest {
     /// Monotonic admission sequence — FCFS tie-break within a priority class.
     public let arrivalSeq: UInt64
     public let submittedAt: Date
+    /// Engine enqueue instant (`DispatchTime.now().uptimeNanoseconds`, ONE
+    /// read in `SchedulerV2.enqueue`). Every `CBv2RequestTiming` offset is
+    /// measured from here using the step's existing clock reads.
+    public internal(set) var enqueuedNanos: UInt64
+    /// Per-request timing stamps and step-participation counters. Engine
+    /// thread only; exported once on the terminal usage (see
+    /// `CBv2RequestTiming+Stamps.swift`).
+    internal var timing = CBv2RequestTiming()
+    /// Backpressure pause start (monotonic), nil while running.
+    internal var pausedSince: ContinuousClock.Instant?
 
     /// Prompt + confirmed generated tokens.
     public internal(set) var tokens: [Int]
@@ -90,10 +100,14 @@ public final class CBv2ScheduledRequest {
     /// bidirectional attention needs all of its keys in one forward.
     public let multimodalBlocks: [CBv2ImageSpan]
 
-    init(request: CBv2Request, arrivalSeq: UInt64, submittedAt: Date) {
+    init(
+        request: CBv2Request, arrivalSeq: UInt64, submittedAt: Date,
+        enqueuedNanos: UInt64 = 0
+    ) {
         self.request = request
         self.arrivalSeq = arrivalSeq
         self.submittedAt = submittedAt
+        self.enqueuedNanos = enqueuedNanos
         self.tokens = request.promptTokens
         self.multimodalBlocks = request.multimodal?.attention == .bidirectionalSpans
             ? CBv2MultimodalPlan.coalescedBlocks(spans: request.multimodal?.spans ?? [])
@@ -265,8 +279,10 @@ public final class SchedulerV2 {
         guard waiting.count < config.maxWaiting else {
             throw CBv2KVError.capacityExhausted(needed: 1, available: 0)
         }
+        // ONE monotonic read per enqueue: the origin of every timing offset.
         let record = CBv2ScheduledRequest(
-            request: request, arrivalSeq: nextArrivalSeq, submittedAt: now)
+            request: request, arrivalSeq: nextArrivalSeq, submittedAt: now,
+            enqueuedNanos: DispatchTime.now().uptimeNanoseconds)
         nextArrivalSeq += 1
         byID[request.id] = record
         insertWaiting(record, preemptedRequeue: false)

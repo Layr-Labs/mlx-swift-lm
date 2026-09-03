@@ -339,11 +339,12 @@ struct ToolTests {
         #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
     }
 
-    // MARK: - Qwen3.5 Format Tests (XML Function with tool_call wrapper)
+    // MARK: - Qwen3.5 Format Tests (XML Function with tool_call wrapper,
+    // framed Hermes-JSON fallback)
 
     @Test("Test Qwen3.5 XML Function Parser - With tool_call Tags")
     func testQwen35Parser() throws {
-        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let parser = Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         let content = """
             <tool_call>
             <function=get_weather>
@@ -366,7 +367,7 @@ struct ToolTests {
 
     @Test("Test Qwen3.5 Format via ToolCallProcessor")
     func testQwen35FormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .xmlFunction)
+        let processor = ToolCallProcessor(format: .qwen35)
         let chunks: [String] = [
             "<tool", "_call>", "\n<function=get_weather>\n",
             "<parameter=location>\nTokyo\n</parameter>",
@@ -385,7 +386,7 @@ struct ToolTests {
 
     @Test("Test Qwen3.5 Format - No Arguments")
     func testQwen35FormatNoArgs() throws {
-        let processor = ToolCallProcessor(format: .xmlFunction)
+        let processor = ToolCallProcessor(format: .qwen35)
         let content = "<tool_call>\n<function=get_current_datetime>\n</function>\n</tool_call>"
 
         _ = processor.processChunk(content)
@@ -394,6 +395,159 @@ struct ToolTests {
         let toolCall = try #require(processor.toolCalls.first)
         #expect(toolCall.function.name == "get_current_datetime")
         #expect(toolCall.function.arguments.isEmpty)
+    }
+
+    @Test("Qwen3.5 accepts framed Qwen/Hermes JSON fallback")
+    func testQwen35JSONFallback() throws {
+        let processor = ToolCallProcessor(format: .qwen35, tools: Self.qwen35Tools)
+        let content =
+            #"<tool_call>{"name":"lampo_mcp_call_tool","arguments":{"action":"start","instructions":"Initialize interactive coding session","title":"filo server start","worker":"default"}}</tool_call>"#
+
+        #expect(processor.processChunk(content) == nil)
+        let call = try #require(processor.toolCalls.first)
+        #expect(processor.toolCalls.count == 1)
+        #expect(call.function.name == "lampo_mcp_call_tool")
+        #expect(call.function.arguments["action"] == .string("start"))
+        #expect(call.function.arguments["worker"] == .string("default"))
+    }
+
+    @Test("Qwen3.5 JSON fallback is streaming-boundary invariant")
+    func testQwen35JSONFallbackEverySplitBoundary() throws {
+        let content =
+            #"<tool_call>{"name":"lampo_mcp_call_tool","arguments":{"message":"a } brace, a quote: \"ok\", and <function=fake>"}}</tool_call>"#
+        let characters = Array(content)
+
+        for split in 1 ..< characters.count {
+            let processor = ToolCallProcessor(format: .qwen35, tools: Self.qwen35Tools)
+            let first = String(characters[..<split])
+            let second = String(characters[split...])
+
+            #expect(processor.processChunk(first) == nil, "split at \(split)")
+            #expect(processor.processChunk(second) == nil, "split at \(split)")
+            #expect(processor.toolCalls.count == 1, "split at \(split)")
+            #expect(
+                processor.toolCalls.first?.function.name == "lampo_mcp_call_tool",
+                "split at \(split)")
+        }
+    }
+
+    @Test("Qwen3.5 commits a complete JSON body at EOS without a closing frame")
+    func testQwen35JSONFallbackAtEOS() throws {
+        let processor = ToolCallProcessor(format: .qwen35, tools: Self.qwen35Tools)
+        let content =
+            #"<tool_call>{"name":"lampo_mcp_call_tool","arguments":{"action":"start"}}"#
+
+        #expect(processor.processChunk(content) == nil)
+        #expect(processor.toolCalls.isEmpty)
+        processor.processEOS()
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(processor.toolCalls.count == 1)
+        #expect(call.function.name == "lampo_mcp_call_tool")
+        #expect(call.function.arguments["action"] == .string("start"))
+    }
+
+    @Test("Qwen3.5 applies the declared-tool boundary to canonical XML too")
+    func testQwen35XMLRejectsUndeclaredTool() {
+        let parser = Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content =
+            "<tool_call><function=erase_everything></function></tool_call>"
+
+        #expect(parser.parse(content: content, tools: Self.qwen35Tools) == nil)
+    }
+
+    @Test("Qwen3.5 fallback never authorizes undeclared JSON tools")
+    func testQwen35JSONFallbackRejectsUndeclaredTool() {
+        let parser = Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = #"<tool_call>{"name":"erase_everything","arguments":{}}</tool_call>"#
+
+        #expect(parser.parse(content: content, tools: Self.qwen35Tools) == nil)
+    }
+
+    @Test("Qwen3.5 fallback rejects malformed and mixed-dialect payloads")
+    func testQwen35JSONFallbackRejectsMalformedPayloads() {
+        let parser = Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let malformed = [
+            #"<tool_call>{"name":"lampo_mcp_call_tool","arguments":{}</tool_call>"#,
+            #"<tool_call>prefix {"name":"lampo_mcp_call_tool","arguments":{}}</tool_call>"#,
+            #"<tool_call><function=lampo_mcp_call_tool>{"arguments":{}}</function></tool_call>"#,
+            "<tool_call><function=lampo_mcp_call_tool><parameter=action>start</parameter>garbage</function></tool_call>",
+            #"<tool_call>{"name":"lampo_mcp_call_tool","arguments":{}}</tool_call>trailing"#,
+        ]
+
+        for content in malformed {
+            #expect(parser.parse(content: content, tools: Self.qwen35Tools) == nil)
+        }
+    }
+
+    private static let qwen35Tools: [[String: any Sendable]] = [
+        [
+            "type": "function",
+            "function": [
+                "name": "lampo_mcp_call_tool",
+                "parameters": ["type": "object"],
+            ] as [String: any Sendable],
+        ]
+    ]
+
+    // MARK: - JSONValue NSNumber bridging
+
+    /// `JSONSerialization` boxes every scalar as `NSNumber`, and an NSNumber
+    /// holding 0 or 1 bridges to `Bool`, so a `case let bool as Bool` tested
+    /// first rewrote every decoded 0/1 as a boolean: `{"limit": 1}` arrived
+    /// at the tool as `{"limit": true}`. The boolean case must key on the
+    /// boxed type (CFBoolean), keeping 0/1 integers AND true/false booleans.
+    @Test("JSONValue.from keeps decoded 0/1 integers and true/false booleans")
+    func testJSONValueNSNumberBridging() throws {
+        let json = #"{"limit": 1, "zero": 0, "flag": true, "off": false, "ratio": 0.5}"#
+        let object =
+            try #require(
+                try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+
+        let value = JSONValue.from(object)
+        #expect(value == .object([
+            "limit": .int(1),
+            "zero": .int(0),
+            "flag": .bool(true),
+            "off": .bool(false),
+            "ratio": .double(0.5),
+        ]))
+    }
+
+    @Test("XML function parser keeps integer 0/1 inside object-typed arguments")
+    func testXMLFunctionObjectArgumentKeepsIntegerLimits() throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "search",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "filters": ["type": "object"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+        let parser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content = """
+            <tool_call>
+            <function=search>
+            <parameter=filters>
+            {"city": "Paris", "limit": 1, "zero": 0, "active": true}
+            </parameter>
+            </function>
+            </tool_call>
+            """
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+        #expect(toolCall.function.arguments["filters"] == .object([
+            "city": .string("Paris"),
+            "limit": .int(1),
+            "zero": .int(0),
+            "active": .bool(true),
+        ]))
     }
 
     // MARK: - GLM4 Format Tests
@@ -769,6 +923,7 @@ struct ToolTests {
         #expect(ToolCallFormat.json.rawValue == "json")
         #expect(ToolCallFormat.lfm2.rawValue == "lfm2")
         #expect(ToolCallFormat.xmlFunction.rawValue == "xml_function")
+        #expect(ToolCallFormat.qwen35.rawValue == "qwen3_5")
         #expect(ToolCallFormat.glm4.rawValue == "glm4")
         #expect(ToolCallFormat.gemma.rawValue == "gemma")
         #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
@@ -811,9 +966,9 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .xmlFunction)
 
         // Qwen3.5 models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "qwen3_5") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .qwen35)
 
         // Qwen3-Next models (prefix matching)
         #expect(ToolCallFormat.infer(from: "qwen3_next") == .xmlFunction)

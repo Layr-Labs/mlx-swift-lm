@@ -825,9 +825,46 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         self.freeze()
     }
 
+    /// The `sortedIndices` hint is forwarded only when `x` is index-aligned:
+    /// when it already carries one row per gathered index. Otherwise it is
+    /// withheld. That is a correctness constraint, not a tuning choice.
+    ///
+    /// THE CAUSE, in the MLX this package pins. `GatherQMM::eval_gpu` computes
+    /// `M = x.size() / K` from the array it was HANDED, then passes that `M`
+    /// into `gather_qmm_rhs`. `gather_qmm_rhs` broadcasts `x` up to one row per
+    /// index when it is not already that shape, and never recomputes `M`; the
+    /// dispatch grid and the kernel's row bound both keep using the stale
+    /// value. Only the first `x.size() / K` rows of the output are written and
+    /// the rest keeps whatever was in the pool. That memory is wrong from the
+    /// first call, carries no NaN, and repeats exactly on reuse, so the fault
+    /// reads as a stable wrong answer rather than as noise.
+    ///
+    /// So the fault needs a broadcast, and a broadcast is exactly what the
+    /// condition below excludes. It mirrors the vendor's own test for whether
+    /// the broadcast is needed.
+    ///
+    /// The non-quantized `gather_mm` is not exposed to any of this, and the
+    /// reason is structural: `GatherMM::eval_gpu` derives its own shapes
+    /// inside `gather_mm_rhs`, while only `GatherQMM::eval_gpu` carries a
+    /// precomputed row count across the broadcast.
+    ///
+    /// WHAT IS AT STAKE EITHER WAY. The hint only reaches a different kernel
+    /// when `M == 1 && B >= 16 && B / E >= 4`, and on that route it is worth
+    /// worth 2.6x to 4.1x on the gather across runs, measured at the
+    /// production geometry.
+    /// Every caller in this package sorts through
+    /// `gatherSort` before it hints, which produces one row per index, so the
+    /// aligned branch is the one production takes and the fault is out of
+    /// reach. Withholding the hint from that branch as well would surrender
+    /// the speed, and the opt-in Gemma 4 expert-QMM tile route inside
+    /// `gather_qmm_rhs` with it, for nothing.
+    ///
+    /// `QuantizedSwitchLinearSortedHintTests` holds both legs and the
+    /// reproducer.
     override public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
+        let indexAligned = x.size == indices.size * x.dim(-2) * x.dim(-1)
         var result = MLX.gatherQuantizedMM(
             x,
             self.weight,
@@ -838,7 +875,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             groupSize: self.groupSize,
             bits: self.bits,
             mode: mode,
-            sortedIndices: sortedIndices
+            sortedIndices: sortedIndices && indexAligned
         )
 
         if let bias = self.bias {

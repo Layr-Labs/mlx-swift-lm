@@ -512,10 +512,15 @@ public enum CBv2Logprobs {
     public static func assemble(
         _ gathered: Gathered, sampledTokens: [Int], topLogprobsPerRow: [Int]
     ) -> [CBv2TokenLogprob?] {
+        // Three host readbacks per logprob segment, each counted (gated
+        // like every CBv2 sync point; the arrays are already evaluated).
         let chosen = gathered.chosen.asArray(Float.self)
+        CBv2CoreInstrumentation.recordHostSync()
         let k = gathered.topValues.dim(-1)
         let values = gathered.topValues.asArray(Float.self)
+        CBv2CoreInstrumentation.recordHostSync()
         let indices = gathered.topIndices.asArray(Int32.self)
+        CBv2CoreInstrumentation.recordHostSync()
         var out = [CBv2TokenLogprob?]()
         out.reserveCapacity(sampledTokens.count)
         for row in 0 ..< sampledTokens.count {
