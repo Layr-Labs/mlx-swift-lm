@@ -556,6 +556,36 @@ public enum CBv2MTPRoundSwitches {
         return CBv2MTPTreeShape.parse(raw)
     }()
 
+    /// [engage] MTPLX_MTP_FUSED_VERIFY_ATTENTION
+    ///
+    /// Score the whole verify rectangle in ONE attention call per layer
+    /// instead of one call per column.
+    ///
+    /// Rectangular verification currently sets
+    /// `mtpSerializesRectangularAttention`, which sends a `[1, 1+k]` verify
+    /// through `CBv2AttentionV1.attendQueryBlocks` at `blockSize: 1`: `1+k`
+    /// separate SDPA calls, each slicing `keys[visibleStart ..< historyCount
+    /// + offset + 1]`. On a full-attention layer `visibleStart` is 0, so
+    /// EVERY column re-reads the entire retained KV. The round therefore
+    /// pays the target's long-context attention `1+k` times, and the per-
+    /// draft cost `c` grows with context instead of being amortised across
+    /// the rectangle — the opposite of what a rectangular verify is for.
+    ///
+    /// With this on, the verify takes the ordinary `L > 1` path, whose
+    /// `maskMode` is `.causal` for a full layer and the existing
+    /// causal-and-window array mask for a windowed one. That is the SAME
+    /// visibility per column, computed once: mathematically identical, and
+    /// the reason it is a switch rather than the default is that it is a
+    /// different KERNEL, so it is not bit-identical to the serialized path
+    /// the M5 rectangular envelope was certified on. Greedy parity is the
+    /// gate; run it with the benchmark's parity recording before promoting.
+    ///
+    /// Contiguous storage only. `PagedLayerCache` branches on the same flag
+    /// and its non-serialized `L > 1` path is packed-prefill masking over
+    /// gathered pages, which is a separate certification; a paged bank keeps
+    /// serializing whatever this says.
+    public static let fusedVerifyAttention = flag("MTPLX_MTP_FUSED_VERIFY_ATTENTION")
+
     private static func flag(_ key: String) -> Bool {
         guard let raw = ProcessInfo.processInfo.environment[key] else { return false }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())

@@ -182,9 +182,23 @@ extension EngineLoopV2 {
             hidden = concatenated(hiddenColumns, axis: 1)
 
         } else {
-            for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }
+            // [engage] MTPLX_MTP_FUSED_VERIFY_ATTENTION: leave the flag off
+            // so the rectangle is scored in one attention call per layer
+            // rather than one per column. See the switch for why the
+            // serialized default makes the per-draft cost grow with context,
+            // and why contiguous storage is the only place this is offered.
+            let serializes =
+                !CBv2MTPRoundSwitches.fusedVerifyAttention
+                || backend.requiresMaterializedSnapshots
+            if serializes {
+                for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }
+            }
             defer {
-                for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
+                if serializes {
+                    for cache in serializingCaches {
+                        cache.mtpSerializesRectangularAttention = false
+                    }
+                }
             }
             let tokens = concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)

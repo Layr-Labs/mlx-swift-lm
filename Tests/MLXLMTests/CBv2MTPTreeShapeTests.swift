@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import Testing
 
 @testable import MLXLMCommon
@@ -388,7 +389,37 @@ struct CBv2MTPTreeShapeTests {
 
     @Test func switchIsOffUnlessTheEnvironmentNamesAShape() {
         // Nothing in the process environment for a test run, so the shipped
-        // chain is what every round gets.
+        // chain is what every round gets, scored the shipped way.
         #expect(CBv2MTPRoundSwitches.treeDraft == nil)
+        #expect(!CBv2MTPRoundSwitches.fusedVerifyAttention)
+    }
+
+    // MARK: - Equivalence with the shipped verify
+
+    /// A chain shape's adjacency must be the SAME visibility the target
+    /// already applies to a `[1, 1+k]` rectangle. If this ever diverges,
+    /// "tree" has stopped generalizing the shipped verify and has become a
+    /// second, unverified attention rule.
+    @Test func chainAdjacencyMatchesTheTargetsOwnCausalMask() throws {
+        for k in 1 ... 7 {
+            let shape = CBv2MTPTreeShape.chain(k)
+            let columns = shape.columnCount
+            let history = 37
+            let mask = try #require(
+                CBv2AttentionV1.boolMask(
+                    L: columns, kL: history + columns, window: nil))
+            let adjacency = shape.ancestorMask()
+            let flat = mask.asArray(Bool.self)
+            for query in 0 ..< columns {
+                for key in 0 ..< (history + columns) {
+                    let shipped = flat[query * (history + columns) + key]
+                    if key < history {
+                        #expect(shipped, "retained history is always visible")
+                    } else {
+                        #expect(shipped == adjacency[query][key - history])
+                    }
+                }
+            }
+        }
     }
 }
