@@ -22,6 +22,18 @@ import MLX
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
 
+    /// Kill switch for the fused full-ring decode write (see
+    /// `CBv2RaggedTwoPassDecodeAttentionV1.attendRingWriting`).
+    /// `0`/`false`/`no`/`off` restores the established `decodeRingWrite` +
+    /// `attendRing` pair, which also stays the fallback for every input the
+    /// fused path refuses.
+    private static let fusedRingWriteEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
     /// work and hold a smaller score tensor, but cost one dispatch set each;
@@ -38,6 +50,270 @@ enum CBv2AttentionV1 {
             let value = Int(raw), value >= 0
         else { return 128 }
         return value
+    }()
+
+    /// Query-block width used when a prompt pass is already on the blocked
+    /// path and the layer's heads are wide (head dim 256 or 512). Wide heads
+    /// do not enter the fused SDPA path, so a blocked prompt pass materializes
+    /// one score rectangle per block; a narrower block holds a smaller
+    /// rectangle. Only the grouping of the query rows changes: every row's
+    /// softmax reduction still runs over the whole key axis, in the same
+    /// order, so the produced values are unchanged.
+    ///
+    /// `0` disables the specialization (the block width falls back to
+    /// `queryBlockSize`), which is the kill switch.
+    ///
+    /// The default is 128: with `effectiveQueryBlockSize` requiring a width
+    /// strictly below `queryBlockSize` (128) to engage the specialization,
+    /// a default of 128 makes that guard fail, so every blocked prompt call
+    /// — wide-head or not — takes the same 128-row grouping every other
+    /// layer already uses. `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE=64` restores
+    /// the narrower rectangles.
+    static let wideHeadQueryBlockSize: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK_WIDE"],
+            let value = Int(raw), value >= 0
+        else { return 128 }
+        return value
+    }()
+
+    /// Block width for one attention call: the wide-head width when the call
+    /// is on the blocked-query prompt path (`L > queryBlockSize`) and the
+    /// layer's head dim is 256 or 512; the configured width otherwise. Decode
+    /// has `L == 1` and can never enter. An explicit
+    /// `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK` override that moves the configured
+    /// width off its default also returns the configured width.
+    @inline(__always)
+    private static func effectiveQueryBlockSize(
+        kind: CBv2LayerKind, queryLength: Int
+    ) -> Int {
+        guard queryBlockSize == 128,
+            wideHeadQueryBlockSize > 0,
+            wideHeadQueryBlockSize < queryBlockSize,
+            queryLength > queryBlockSize,
+            kind.headDim == 256 || kind.headDim == 512
+        else { return queryBlockSize }
+        return wideHeadQueryBlockSize
+    }
+
+    /// Ceiling, in MiB, on the K+V a PACKED prefill may restack on the batch
+    /// axis for one batched SDPA (`batchedPackedAttention`).
+    ///
+    /// Batching the rows is a strict dispatch win — 8 rows x 8 query blocks
+    /// becomes 8 dispatches — but `concatenated` materializes a second copy
+    /// of the rows' committed K/V. That copy is bounded by this budget so a
+    /// long-context packed continuation falls back to the per-row
+    /// decomposition instead of doubling a multi-GiB KV footprint the
+    /// provider's `UnifiedMemoryCap` never reserved for it. A fresh 8 x 1024
+    /// prompt pass is ~32 MiB and always batches.
+    ///
+    /// `0` disables batching entirely — the kill switch back to the pinned
+    /// per-row path if this is ever implicated in a regression.
+    static let packedBatchKVBudgetBytes: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_ATTN_BATCH_KV_BUDGET_MB"],
+            let value = Int(raw), value >= 0
+        else { return 512 << 20 }
+        return value << 20
+    }()
+
+    /// PREFILL-PACKED-KV-ALIAS. When every row of a packed prefill was FRESH
+    /// (no committed history), the per-row views `update` hands back are
+    /// byte-for-byte the incoming batched K/V rectangles, and the
+    /// `concatenated` restack in `batchedPackedAttention` re-materializes a
+    /// copy of tensors the caller already holds batched. Attend the original
+    /// rectangles instead. `0`/`false`/`no`/`off` restores the established
+    /// restack, which also stays the path for every input the alias refuses.
+    static let packedKVAliasEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_PACKED_KV_ALIAS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PREFILL-KV-BATCH. When EVERY row of a packed prefill chunk would
+    /// take FRESH-RING-ADOPT for it, pack all rows' q4 mirror planes in ONE
+    /// batched dispatch (8 rows x 25 sliding layers: 200 pack dispatches per
+    /// ranked prefill become 25) and hand each row its packed mirror through
+    /// the batched adopt entry. The per-(plane, head, token) arithmetic and
+    /// the per-row state transitions are the per-row path's; only the grid
+    /// decomposition carries the row index. `0`/`false`/`no`/`off` restores
+    /// the per-row commit loop, which also stays the path whenever any row
+    /// would not adopt fresh.
+    static let prefillBatchKVCommitEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_BATCH_KV_COMMIT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PREFILL-FULLKV-ADOPT. The rectangular road's per-row commit for
+    /// FULL-attention rows materializes, per row and per K/V, a zero-filled
+    /// capacity buffer plus one copy-on-write SliceUpdate into it — 32
+    /// dispatches per full layer at the ranked 8 x 1024 geometry, every one
+    /// of which reproduces bytes the caller already holds batched. When
+    /// EVERY row is a strictly fresh `CBv2FullSequenceKV`, each row's first
+    /// update can instead ADOPT its `[1, kvHeads, n, headDim]` slice of the
+    /// chunk rectangle as its storage (see `adoptFreshFullChunks` for the
+    /// state-equivalence argument). `0`/`false`/`no`/`off` restores the
+    /// per-row commit loop, which also stays the path for every input the
+    /// adoption refuses.
+    static let prefillFullKVAdoptEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_FULLKV_ADOPT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Join prompt attention blocks directly into the token-major layout that
+    /// the following output projection consumes. The returned value remains a
+    /// head-major view, so callers keep the same typed interface while their
+    /// existing transpose restores the contiguous token-major buffer.
+    static let tokenMajorJoinEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_TOKENMAJOR_JOIN"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// PREFILL-JOIN-KERNEL. One dispatch writes the token-major prompt
+    /// attention rectangle from all of a chunk's query-block outputs. The
+    /// established token-major join materializes the same rectangle through
+    /// one strided `concatenated` copy per block; this kernel moves the same
+    /// words to the same positions in a single pass whose threads read and
+    /// write whole head rows. Pure data movement: every output element is
+    /// the bit pattern of exactly one input element, no arithmetic. Refuses
+    /// (nil) anything but a uniform prompt-plane block set, and the caller
+    /// keeps the established join for everything it refuses.
+    /// Kill switch: `DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL=0`.
+    static let joinKernelEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PREFILL_JOIN_KERNEL"]
+        // Attribution: default-on join selection and 16-head grouping below
+        // are adapted from newjordan's public, parity-passed submissions
+        // `c4557ca8-e1a2-4569-8d96-95061f6d1eef` and
+        // `1e63caf5-c028-4c38-abc7-6b5f5c2b5bb6`.
+        // Off-cadence retest: the first clean stack passed parity at
+        // 1.151572s prefill / 2.089284s decode, but its serial prefill control
+        // shifted 73.768ms faster than the stored record run.
+        // Final cadence draw: the second run held 2.086433s decode and missed
+        // promotion by 0.30%; only ~10ms of serial-prefill control movement
+        // separated its sealed components from the stored threshold.
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Upper bound on the number of query blocks one join dispatch binds
+    /// (Metal binds each block as its own buffer argument).
+    private static let maxJoinKernelBlocks = 30
+
+    nonisolated(unsafe) private static var joinKernels: [Int: MLXFast.MLXFastKernel] = [:]
+    private static let joinKernelLock = NSLock()
+
+    /// The join kernel for `blockCount` query blocks, built once per count.
+    /// Thread (lane, head, batch*token) copies one 16-byte segment of one
+    /// head row from the block that owns the token into the token-major
+    /// rectangle `[B, L, H, D]`.
+    private static func joinKernel(blockCount: Int) -> MLXFast.MLXFastKernel {
+        joinKernelLock.lock()
+        defer { joinKernelLock.unlock() }
+        if let hit = joinKernels[blockCount] { return hit }
+        let inputNames = (0 ..< blockCount).map { "in\($0)" }
+        let cases = (0 ..< blockCount)
+            .map { "                case \($0): src = in\($0); break;" }
+            .joined(separator: "\n")
+        let source = """
+            const uint lanes = uint(D) / 8u;
+            const uint L_ = uint(L);
+            const uint H_ = uint(H);
+            const uint BS_ = uint(BS);
+            const uint D_ = uint(D);
+            const uint dv = thread_position_in_grid.x;
+            const uint h = thread_position_in_grid.y;
+            const uint bt = thread_position_in_grid.z;
+            if (dv >= lanes || h >= H_ || bt >= uint(B) * L_) {
+                return;
+            }
+            const uint b = bt / L_;
+            const uint t = bt - b * L_;
+            const uint blk = t / BS_;
+            const uint tt = t - blk * BS_;
+            const device T* src;
+            switch (blk) {
+            \(cases)
+                default: return;
+            }
+            const device uint4* s =
+                (const device uint4*)(src + (((b * H_ + h) * BS_ + tt) * D_)) + dv;
+            device uint4* o =
+                (device uint4*)(out + (((b * L_ + t) * H_ + h) * D_)) + dv;
+            *o = *s;
+            """
+        let kernel = MLXFast.metalKernel(
+            name: "cbv2_prefill_join_v1_nb\(blockCount)",
+            inputNames: inputNames,
+            outputNames: ["out"],
+            source: source,
+            header: "#include <metal_stdlib>\nusing namespace metal;\n")
+        joinKernels[blockCount] = kernel
+        return kernel
+    }
+
+    /// The token-major rectangle `[B, L, H, D]` of `blocks` (each
+    /// `[B, H, count, D]`, in token order), or nil when the set is not one
+    /// this kernel handles: fewer than two blocks, more than
+    /// `maxJoinKernelBlocks`, unequal block lengths, a head dim that is not
+    /// a multiple of eight, a mismatched shape or dtype, or an element width
+    /// other than 16 bits.
+    private static func joinTokenMajor(_ blocks: [MLXArray]) -> MLXArray? {
+        guard joinKernelEnabled, blocks.count >= 2, blocks.count <= maxJoinKernelBlocks
+        else { return nil }
+        let head = blocks[0]
+        guard head.ndim == 4, head.dtype == .bfloat16 || head.dtype == .float16
+        else { return nil }
+        let (B, H, BS, D) = (head.dim(0), head.dim(1), head.dim(2), head.dim(3))
+        guard B >= 1, H >= 1, BS >= 1, D >= 8, D % 8 == 0 else { return nil }
+        for block in blocks {
+            guard block.ndim == 4, block.dtype == head.dtype,
+                block.dim(0) == B, block.dim(1) == H,
+                block.dim(2) == BS, block.dim(3) == D
+            else { return nil }
+        }
+        let L = BS * blocks.count
+        let lanes = D / 8
+        guard lanes <= 1024, B * L * H * D < (1 << 31) else { return nil }
+        var headsPerGroup = 1
+        for candidate in [16, 8, 4, 2]
+        where H % candidate == 0 && lanes * candidate <= 1024 {
+            headsPerGroup = candidate
+            break
+        }
+        let joined = joinKernel(blockCount: blocks.count)(
+            blocks.map { $0 as any ScalarOrArray },
+            template: [
+                ("T", head.dtype), ("L", L), ("BS", BS), ("H", H), ("D", D), ("B", B),
+            ],
+            grid: (lanes, H, B * L),
+            threadGroup: (lanes, headsPerGroup, 1),
+            outputShapes: [[B, L, H, D]],
+            outputDTypes: [head.dtype]
+        )[0]
+        CBv2EngageMark.once("prefill-join-kernel")
+        return joined
+    }
+
+    /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
+    /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
+    /// DEFAULT OFF: three counterbalanced local B=8 probe pairs measured the
+    /// consolidation at +0.27 ms/round (+1.2%) — the concurrent Metal
+    /// encoder already overlaps the per-row dispatches it removes. Kept
+    /// selectable because the mechanism is parity-proven bit-exact and the
+    /// balance could differ on other hardware.
+    static let batchedFullDecodeEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION"]
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
     }()
 
     /// Whether a chunk of `L` queries should be split into blocks. Single
@@ -186,7 +462,9 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        decodeRingWriteFence: CBv2DecodeRingWriteFence? = nil,
+        allowFusedRingWrite: Bool = false
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -223,6 +501,237 @@ enum CBv2AttentionV1 {
         }
 
         if L == 1 {
+            if canUseRaggedTwoPassDecode(
+                batch: B, cacheKind: kind, queryKind: kind,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                var cachedKeyRows: [MLXArray] = []
+                var cachedValueRows: [MLXArray] = []
+                cachedKeyRows.reserveCapacity(B)
+                cachedValueRows.reserveCapacity(B)
+                let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
+                    // Q4-LIVE-WRITE: admit all rows before any host state
+                    // mutation. Pass A writes only the live q4 mirror slot;
+                    // the established BF16 SliceUpdates and counters remain
+                    // on their incumbent path below.
+                    if CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
+                        allowFusedRingWrite, let decodeRingWriteFence
+                    {
+                        let preWrite = ringRows.compactMap {
+                            $0.decodeRingQuantViewBeforeWrite
+                        }
+                        if preWrite.count == B,
+                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingQuantWriting(
+                                    queries: queries,
+                                    mirrors: preWrite.map(\.mirror),
+                                    starts: preWrite.map(\.start),
+                                    newKeys: keys, newValues: values,
+                                    previousWriteFence: decodeRingWriteFence.value,
+                                    scale: scale,
+                                    slidingWindowLength: ringRows[0].window)
+                        {
+                            // Q4-BF16-ELIDE: the fused pass already stored
+                            // the mirror slot and served this step's live
+                            // token from the new K/V arrays; on the
+                            // quant-authoritative road the BF16 SliceUpdates
+                            // are dead graph work, so advance counters only.
+                            // Kill switch restores the incumbent writes.
+                            if CBv2WindowedSequenceKV.q4BF16RingElideEnabled {
+                                CBv2EngageMark.once("kvq4-bf16-elide")
+                                for row in ringRows {
+                                    row.advanceDecodeRingAfterQuantWrite()
+                                }
+                            } else {
+                                for (index, row) in ringRows.enumerated() {
+                                    row.decodeRingWriteBF16Only(
+                                        keys: keys[index ..< (index + 1)],
+                                        values: values[index ..< (index + 1)])
+                                }
+                            }
+                            // The next pass-A consumes this fence; this
+                            // step's pass-B output also consumes pass-A's
+                            // first three outputs, so the live store remains
+                            // rooted both in observable output and cache state.
+                            decodeRingWriteFence.value = fused.nextWriteFence
+                            return fused.output
+                        }
+                    }
+                    // WRITE-016: fold this step's one-token ring write into
+                    // ring pass A. The separate `decodeRingWrite` below is a
+                    // `SliceUpdate` over a 4 MiB allocation the direct-ring
+                    // attention graph still retains, so it cannot generally
+                    // donate: 4 KiB of new K/V costs a full-ring copy, 25
+                    // sliding layers x 8 rows x K/V per forward. The fused
+                    // pass A stores the same bytes into the same evicted slot
+                    // in place and serves logical token 1023 from the new K/V
+                    // arrays, so no block reads the slot it writes and the
+                    // accumulation order is unchanged. Refused (and skipped
+                    // entirely, write included) unless the storage-owning
+                    // layer has no K/V borrower that must keep observing the
+                    // pre-write allocation.
+                    // KVQ-PORT: the fused road owns the write AND the read.
+                    // This revision moves only the read to the mirror, so the
+                    // fused road must stand down for the quant path to be
+                    // reachable at all. It is restored the moment the mirror
+                    // is unavailable (kill switch, or any row without one).
+                    let portQuantActive = CBv2WindowedSequenceKV.quantEnabled
+                        && ringRows.allSatisfy { $0.decodeRingQuantView != nil }
+                    if !portQuantActive, fusedRingWriteEnabled, allowFusedRingWrite,
+                        let decodeRingWriteFence
+                    {
+                        let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
+                        if preWrite.count == B,
+                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
+                                .attendRingWriting(
+                                    queries: queries,
+                                    newKeys: keys, newValues: values,
+                                    keys: preWrite.map(\.keys),
+                                    values: preWrite.map(\.values),
+                                    starts: preWrite.map(\.start),
+                                    previousWriteFence: decodeRingWriteFence.value,
+                                    scale: scale,
+                                    slidingWindowLength: ringRows[0].window)
+                        {
+                            for row in ringRows {
+                                row.advanceDecodeRingAfterFusedWrite()
+                            }
+                            decodeRingWriteFence.value = fused.nextWriteFence
+                            CBv2EngageMark.once("write016")
+                            return fused.output
+                        }
+                    }
+
+                    for (index, row) in ringRows.enumerated() {
+                        row.decodeRingWrite(
+                            keys: keys[index ..< (index + 1)],
+                            values: values[index ..< (index + 1)])
+                    }
+                    let views = ringRows.compactMap { $0.decodeRingView }
+                    // KVQ-PORT: the ring write above is the promoted stock
+                    // mechanism's; only the READ moves to the 8-bit mirror,
+                    // and its pass A is consumed by pass B exactly as the
+                    // bf16 road consumes it. All-or-nothing: unless every
+                    // row exposes a mirror the established road runs.
+                    let portMirrors = ringRows.compactMap { $0.decodeRingQuantView }
+                    if views.count == B, portMirrors.count == B,
+                        let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
+                            .attendRingQuant(
+                                queries: queries, mirrors: portMirrors,
+                                starts: views.map(\.start), scale: scale,
+                                slidingWindowLength: ringRows[0].window)
+                    {
+                        return quantOutput
+                    }
+                    if views.count == B, !ringRows.contains(where: \.bf16RingStale),
+                        let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
+                            queries: queries, keys: views.map(\.keys),
+                            values: views.map(\.values), starts: views.map(\.start),
+                            scale: scale, slidingWindowLength: ringRows[0].window)
+                    {
+                        return output
+                    }
+                    for row in ringRows {
+                        let view = row.snapshot()
+                        cachedKeyRows.append(view.keys)
+                        cachedValueRows.append(view.values)
+                    }
+                } else {
+                    for (index, row) in rows.enumerated() {
+                        let (cachedKeys, cachedValues) = row.update(
+                            keys: keys[index ..< (index + 1)],
+                            values: values[index ..< (index + 1)])
+                        cachedKeyRows.append(cachedKeys)
+                        cachedValueRows.append(cachedValues)
+                    }
+                }
+                if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
+                    queries: queries, keys: cachedKeyRows, values: cachedValueRows,
+                    scale: scale)
+                {
+                    return output
+                }
+
+                // Before every row's sliding ring reaches 1024 entries, retain
+                // the established row-local SDPA path over the views just
+                // returned by the updates above.
+                var outputs: [MLXArray] = []
+                outputs.reserveCapacity(B)
+                for index in 0 ..< B {
+                    outputs.append(
+                        attend(
+                            queries: queries[index ..< (index + 1)],
+                            keys: cachedKeyRows[index], values: cachedValueRows[index],
+                            scale: scale, L: 1, kL: cachedKeyRows[index].dim(2),
+                            window: nil, sinks: effectiveSinks, softcap: softcap))
+                }
+                return concatenated(outputs, axis: 0)
+            }
+
+            // WRITE-016-D512: the D512 chain with the new token's K/V stored
+            // in place by the QK dispatch (fence-chained like WRITE-016)
+            // instead of 16 copy-on-write slice appends. Fails closed to the
+            // append-then-attend call below (kill switch:
+            // DARKBLOOM_GEMMA4_D512_FUSED_WRITE=0).
+            // WRITE-022: the append as its own fenced store dispatch ahead of
+            // the byte-for-byte stock D512 chain (samfenwick's db4ef5e design,
+            // re-implemented with credit) — removes the same copies as the v2
+            // fold below without its inner-loop addressing cost.
+            if let decodeRingWriteFence, allowFusedRingWrite,
+                let fused = CBv2RaggedComposedD512DecodeAttentionV1
+                    .updateAndAttendWriting22(
+                        rows: rows, kind: kind,
+                        queries: queries, keys: keys, values: values,
+                        previousWriteFence: decodeRingWriteFence.value,
+                        scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                decodeRingWriteFence.value = fused.nextWriteFence
+                CBv2EngageMark.once("write022d512")
+                return fused.output
+            }
+
+            if let decodeRingWriteFence, allowFusedRingWrite,
+                let fused = CBv2RaggedComposedD512DecodeAttentionV1
+                    .updateAndAttendWriting(
+                        rows: rows, kind: kind,
+                        queries: queries, keys: keys, values: values,
+                        previousWriteFence: decodeRingWriteFence.value,
+                        scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                decodeRingWriteFence.value = fused.nextWriteFence
+                CBv2EngageMark.once("write016d512")
+                return fused.output
+            }
+
+            // D512-SDPA: batched 3-dispatch full-attention decode with the
+            // unfused chain's exact numerics (kill switch:
+            // DARKBLOOM_GEMMA4_D512_DECODE_SDPA=0). Precedes ATT-008 so rows
+            // stay unpooled; pooled rows fail its gate closed.
+            if let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
+                rows: rows, kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                CBv2EngageMark.once("d512sdpa")
+                return output
+            }
+
+            // ATT-008: batch-wide FULL-attention decode. One pooled append +
+            // one batched call replaces 8 per-row appends + 8 row-local
+            // composed SDPA graphs, with bit-identical per-row numerics (see
+            // `batchedFullDecodeUpdateAndAttend`). Fails closed to the
+            // established per-row loop below, which stays correct on pooled
+            // and unpooled rows alike.
+            if let output = batchedFullDecodeUpdateAndAttend(
+                rows: rows, kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
+            {
+                CBv2EngageMark.once("att008")
+                return output
+            }
+
             // Batched decode: split queries per row, per-row update + SDPA
             // against that row's own KV, then concatenate. No masks — each row
             // sees exactly its own KV, so batch-composition invariance holds by
@@ -247,19 +756,333 @@ enum CBv2AttentionV1 {
         // takes the same per-row path as a singleton chunk and attends
         // exactly its own KV. Serialized queries remain MTP-only; ordinary
         // packed prefill keeps q-blocking and optional row-local span masks.
-        return packedPerRow(batch: B) { index, slice in
-            if serializeQueries {
-                return updateAndAttendRowSerialQueries(
+        if serializeQueries {
+            return packedPerRow(batch: B) { index, slice in
+                updateAndAttendRowSerialQueries(
                     row: rows[index], kind: kind,
                     queries: slice(queries), keys: slice(keys), values: slice(values),
                     scale: scale, sinks: effectiveSinks, softcap: softcap)
             }
-            return updateAndAttendRow(
-                row: rows[index], kind: kind,
-                queries: slice(queries), keys: slice(keys), values: slice(values),
-                scale: scale, sinks: effectiveSinks, softcap: softcap,
+        }
+
+        // Commit every row's K/V FIRST, in row order. `update` appends to that
+        // row's own ring and hands back that row's own view; it reads nothing
+        // from any other row and nothing from the attention that used to sit
+        // between two commits. Hoisting the commits above the attention loop
+        // therefore leaves each row seeing exactly the view it saw before, and
+        // it is what lets the uniform case below see all B views at once.
+        var cachedKeys: [MLXArray] = []
+        var cachedValues: [MLXArray] = []
+        cachedKeys.reserveCapacity(B)
+        cachedValues.reserveCapacity(B)
+        // PREFILL-KV-BATCH: when every row would take FRESH-RING-ADOPT for
+        // this chunk, commit all rows through one batched mirror pack (see
+        // `batchedFreshChunkAdoption`); any other composition falls through
+        // to the established per-row loop below, unchanged.
+        if let batched = batchedFreshChunkAdoption(rows: rows, keys: keys, values: values) {
+            cachedKeys = batched.keys
+            cachedValues = batched.values
+        // PREFILL-FULLKV-ADOPT: the all-rows-fresh case commits every row by
+        // adoption (zero dispatches for a row-contiguous producer). Any
+        // refusal — a non-fresh row, a non-full row, the kill switch — keeps
+        // the per-row loop below, and that loop also serves every non-fresh
+        // continuation chunk.
+        } else if let adopted = adoptFreshFullChunks(rows: rows, keys: keys, values: values) {
+            cachedKeys = adopted.keys
+            cachedValues = adopted.values
+        } else {
+            for (index, row) in rows.enumerated() {
+                let (rowKeys, rowValues) = row.update(
+                    keys: keys[index ..< (index + 1)],
+                    values: values[index ..< (index + 1)])
+                cachedKeys.append(rowKeys)
+                cachedValues.append(rowValues)
+            }
+        }
+
+        if let batched = batchedPackedAttention(
+            kind: kind, queries: queries,
+            cachedKeys: cachedKeys, cachedValues: cachedValues,
+            window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, spanContexts: spanContexts,
+            newKeys: keys, newValues: values)
+        {
+            return batched
+        }
+
+        return packedPerRow(batch: B) { index, slice in
+            attendCommittedRow(
+                kind: kind, queries: slice(queries),
+                cachedKeys: cachedKeys[index], cachedValues: cachedValues[index],
+                window: window(of: kind), scale: scale,
+                sinks: effectiveSinks, softcap: softcap,
                 spanContext: spanContexts?[index])
         }
+    }
+
+    /// PREFILL-KV-BATCH: all-rows-fresh admission for the rectangular
+    /// road's commit stage. When every row is a `CBv2WindowedSequenceKV`
+    /// whose next `update` with this chunk would take FRESH-RING-ADOPT
+    /// (`canAdoptFreshFullWindowChunk` — `update`'s own gate, row for row),
+    /// pack ALL rows' mirror planes in ONE batched dispatch and adopt per
+    /// row with the pre-packed mirror. Each row ends in exactly the state
+    /// its own `update` would leave — same ring storage (the chunk slice),
+    /// same `absoluteOffset`/`oldestValidPosition` advance, same
+    /// `borrowableChunkViews` — and the mirror holds the same bytes the
+    /// per-row pack would have written (the batched packer is the per-row
+    /// kernel with a row-prefixed grid index; see
+    /// `quantPackPairChunkBatchGPU`). The returned per-row cached views are
+    /// the chunk slices themselves, identical to what the per-row loop
+    /// collects. Returns nil — leaving the per-row commit loop to run
+    /// untouched — when the gate is off, the batch exceeds the batched
+    /// packer's eight row outputs, or ANY row would not adopt fresh.
+    private static func batchedFreshChunkAdoption(
+        rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
+    ) -> (keys: [MLXArray], values: [MLXArray])? {
+        guard prefillBatchKVCommitEnabled else { return nil }
+        let B = rows.count
+        guard B > 1, B <= 8 else { return nil }
+        guard keys.ndim == 4, values.ndim == 4,
+            keys.dim(0) == B, values.dim(0) == B,
+            keys.dim(2) == values.dim(2)
+        else { return nil }
+        let windowed = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
+        guard windowed.count == B else { return nil }
+        for (index, row) in windowed.enumerated()
+        where !row.canAdoptFreshFullWindowChunk(
+            keys: keys[index ..< (index + 1)], values: values[index ..< (index + 1)])
+        {
+            return nil
+        }
+        let mirrors = CBv2WindowedSequenceKV.quantPackPairChunkBatchGPU(
+            keys: keys, values: values)
+        var cachedKeys: [MLXArray] = []
+        var cachedValues: [MLXArray] = []
+        cachedKeys.reserveCapacity(B)
+        cachedValues.reserveCapacity(B)
+        for (index, row) in windowed.enumerated() {
+            let (rowKeys, rowValues) = row.adoptFreshFullWindowChunk(
+                keys: keys[index ..< (index + 1)],
+                values: values[index ..< (index + 1)],
+                packedMirror: mirrors[index])
+            cachedKeys.append(rowKeys)
+            cachedValues.append(rowValues)
+        }
+        CBv2EngageMark.once("prefill-batch-kv-commit")
+        return (cachedKeys, cachedValues)
+    }
+
+    /// PREFILL-FULLKV-ADOPT: the all-rows-fresh batched commit for a packed
+    /// `[B > 1, L > 1]` FULL-attention pass. Admitted only when EVERY row is
+    /// a strictly fresh `CBv2FullSequenceKV` (`canAdoptFreshChunk`: no
+    /// committed keys, no pool, offset 0 — a state a speculatively armed row
+    /// cannot present, since a full row's begin/commit are no-ops and it has
+    /// no storage to stage). Each row then ADOPTS the row-contiguous view of
+    /// its `[..., n, ...]` slice of the caller's chunk rectangle as its K/V
+    /// storage (`contiguous()` is zero-cost for the row-contiguous producers
+    /// — every fused QKV-norm output — and one copy otherwise, never more
+    /// than the per-row loop's zero-fill + SliceUpdate for the same input).
+    ///
+    /// State equivalence with the per-row loop, for every later consumer:
+    /// a fresh row's committed prefix is EXACTLY the chunk, and no view this
+    /// class ever hands out reaches past `absoluteOffset`, so the values
+    /// every reader sees are the per-row path's by construction. The per-row
+    /// `keys`/`values` buffers (shape `[1, kvHeads, capacity, headDim]`, the
+    /// committed prefix at `[0, n)`) become the adopted buffers with
+    /// `capacity == n` — identical bytes, identical `absoluteOffset`,
+    /// identical return-view shapes, `cbv2InnerState()` still exactly two
+    /// arrays, `cohortPool` still nil (the LASTQ-D512 / D512 admissions that
+    /// require `cohortPool == nil` keep passing). `capacity == offset` makes
+    /// the adopted storage read-only for its lifetime: plain appends always
+    /// exceed it and grow by `ensureCapacity`'s doubling reallocation into a
+    /// private buffer, and the fused in-place decode writers (WRITE-022 /
+    /// WRITE-016-D512) refuse rows without `dim(2) >= keyLength` headroom —
+    /// on the first decode step such a row fails closed to D512-SDPA, whose
+    /// per-row `update` performs that same growth; from the next step the
+    /// row is back on the fused path with headroom to spare. ATT-008 pool
+    /// formation reads the rows' buffers and concatenates, unchanged.
+    /// `snapshot`/`rollback`/borrow views are counter- and view-exact. The
+    /// only observable difference anywhere is WHEN the first capacity growth
+    /// happens (first append after the prompt, not `initialSlack` appends
+    /// later) and the truthful `byteCount` in between — which the contiguous
+    /// backend bills as `max(byteCount, reservation)`, so admission never
+    /// sees headroom the row does not hold.
+    ///
+    /// Returns nil — BEFORE touching any row — when any row is not a fresh
+    /// full row, the rectangles do not match the batch, or the kill switch
+    /// (`DARKBLOOM_CBV2_PREFILL_FULLKV_ADOPT=0`) is set; the caller keeps
+    /// the per-row loop.
+    private static func adoptFreshFullChunks(
+        rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
+    ) -> (keys: [MLXArray], values: [MLXArray])? {
+        guard prefillFullKVAdoptEnabled,
+            keys.ndim == 4, values.ndim == 4,
+            keys.dim(0) == rows.count, values.dim(0) == rows.count,
+            keys.dim(2) == values.dim(2)
+        else { return nil }
+        var fullRows: [CBv2FullSequenceKV] = []
+        fullRows.reserveCapacity(rows.count)
+        for row in rows {
+            guard let full = row as? CBv2FullSequenceKV, full.canAdoptFreshChunk
+            else { return nil }
+            fullRows.append(full)
+        }
+        var adoptedKeys: [MLXArray] = []
+        var adoptedValues: [MLXArray] = []
+        adoptedKeys.reserveCapacity(rows.count)
+        adoptedValues.reserveCapacity(rows.count)
+        for (index, row) in fullRows.enumerated() {
+            let (rowKeys, rowValues) = row.adoptFreshChunk(
+                keys: contiguous(keys[index ..< (index + 1)]),
+                values: contiguous(values[index ..< (index + 1)]))
+            adoptedKeys.append(rowKeys)
+            adoptedValues.append(rowValues)
+        }
+        CBv2EngageMark.once("prefill-fullkv-adopt")
+        return (adoptedKeys, adoptedValues)
+    }
+
+    /// One batched SDPA for a packed `[B > 1, L > 1]` pass whose rows all hold
+    /// the SAME committed K/V length and carry no span overlay.
+    ///
+    /// Why this is the same computation, not an approximation of it:
+    /// `maskMode` is a pure function of `(L, kL, window)` and
+    /// `attendQueryBlocks` derives each block's key span from
+    /// `(historyCount, offset, count, window)` alone — `historyCount` being
+    /// `kL - L`. Equal `kL` across rows therefore means every row would be
+    /// handed the IDENTICAL mask and slice the IDENTICAL key columns, so the
+    /// only thing separating B one-row calls from one B-row call is the batch
+    /// extent. SDPA reduces independently per `(batch, head, query)`, so no
+    /// row's sum acquires a term from a batchmate and none of them is
+    /// re-ordered. What it buys is dispatches: an 8-row, 8-block prompt layer
+    /// goes from 64 SDPA launches to 8.
+    ///
+    /// Returns nil — and the caller keeps the per-row decomposition — when the
+    /// rows are NOT interchangeable this way: unequal committed lengths (mixed
+    /// prefix reuse or continuation offsets), a mismatched head count/head dim
+    /// /dtype, any bound span context, or a restack that would exceed
+    /// ``packedBatchKVBudgetBytes``.
+    ///
+    /// PREFILL-PACKED-KV-ALIAS. `newKeys`/`newValues` are the caller's
+    /// ALREADY-BATCHED `[B, kvHeads, n, headDim]` rectangles for the chunk the
+    /// per-row `update` calls just committed (nil on the borrow path, which
+    /// commits nothing). When every row's returned view spans exactly `n`
+    /// tokens, every row was fresh, and the restack below rebuilds a
+    /// byte-identical copy of those rectangles:
+    ///   * both contiguous backends return `history ++ chunk` - the windowed
+    ///     ring returns the chunk tensor ITSELF when `historyCount == 0`
+    ///     (`kParts == [newKeys]`), and the full buffer returns
+    ///     `storage[..., ..<offset, :]`, which after a fresh append holds
+    ///     exactly the chunk's bytes;
+    ///   * `kL == n` forces `historyCount == 0` on every row (returned length
+    ///     is always `history + n`), so `concatenated(cachedKeys, axis: 0)`
+    ///     reassembles the row slices of `newKeys` in row order - `newKeys`.
+    /// Attending the original rectangles therefore feeds the SAME bytes to
+    /// the same kernels and deletes the restack's full K+V round trip - at
+    /// the ranked 8 x 1024 seed geometry, ~134 MB of copy traffic per sliding
+    /// layer on the critical path (attention cannot start before the copy).
+    /// `contiguous()` pins the layout contract: a row-contiguous rectangle
+    /// (every fused QKV-norm kernel output) shares its buffer at zero cost,
+    /// and anything else (a transposed-view fallback producer) materializes
+    /// ONE copy - the exact cost of the restack this replaces - so no
+    /// downstream q-block GEMM ever sees a layout the restacked path would
+    /// not have produced. Kill switch:
+    /// `DARKBLOOM_CBV2_PREFILL_PACKED_KV_ALIAS=0`.
+    private static func batchedPackedAttention(
+        kind: CBv2LayerKind, queries: MLXArray,
+        cachedKeys: [MLXArray], cachedValues: [MLXArray],
+        window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContexts: [CBv2SpanChunkContext?]?,
+        newKeys: MLXArray? = nil, newValues: MLXArray? = nil
+    ) -> MLXArray? {
+        guard packedBatchKVBudgetBytes > 0 else { return nil }
+        guard spanContexts?.allSatisfy({ $0 == nil }) ?? true else { return nil }
+        guard let headKeys = cachedKeys.first, let headValues = cachedValues.first,
+            cachedKeys.count == cachedValues.count, cachedKeys.count > 1
+        else { return nil }
+        guard headKeys.ndim == 4, headValues.ndim == 4 else { return nil }
+        let kL = headKeys.dim(2)
+        guard headValues.dim(2) == kL else { return nil }
+        for index in cachedKeys.indices {
+            let rowKeys = cachedKeys[index]
+            let rowValues = cachedValues[index]
+            guard rowKeys.ndim == 4, rowValues.ndim == 4,
+                rowKeys.dim(0) == 1, rowValues.dim(0) == 1,
+                rowKeys.dim(2) == kL, rowValues.dim(2) == kL,
+                rowKeys.dim(1) == headKeys.dim(1), rowKeys.dim(3) == headKeys.dim(3),
+                rowValues.dim(1) == headValues.dim(1),
+                rowValues.dim(3) == headValues.dim(3),
+                rowKeys.dtype == headKeys.dtype, rowValues.dtype == headValues.dtype
+            else { return nil }
+        }
+        let restackedBytes =
+            (headKeys.nbytes + headValues.nbytes) * cachedKeys.count
+        guard restackedBytes <= packedBatchKVBudgetBytes else { return nil }
+
+        // PREFILL-PACKED-KV-ALIAS: every-row-fresh admission (see the doc
+        // comment above). Anything short of the exact identity - a committed
+        // history on any row (`kL > n`), a batch/head/dim/dtype mismatch, or
+        // no rectangles at all (borrow path) - falls through to the
+        // established restack.
+        if packedKVAliasEnabled,
+            let newKeys, let newValues,
+            newKeys.ndim == 4, newValues.ndim == 4,
+            newKeys.dim(2) == kL, newValues.dim(2) == kL,
+            newKeys.dim(0) == cachedKeys.count,
+            newValues.dim(0) == cachedKeys.count,
+            newKeys.dim(1) == headKeys.dim(1),
+            newKeys.dim(3) == headKeys.dim(3),
+            newValues.dim(1) == headValues.dim(1),
+            newValues.dim(3) == headValues.dim(3),
+            newKeys.dtype == headKeys.dtype,
+            newValues.dtype == headValues.dtype
+        {
+            CBv2EngageMark.once("prefill-packedkv-alias")
+            return attendCommittedRow(
+                kind: kind, queries: queries,
+                cachedKeys: contiguous(newKeys),
+                cachedValues: contiguous(newValues),
+                window: window, scale: scale, sinks: sinks, softcap: softcap,
+                spanContext: nil)
+        }
+
+        return attendCommittedRow(
+            kind: kind, queries: queries,
+            cachedKeys: concatenated(cachedKeys, axis: 0),
+            cachedValues: concatenated(cachedValues, axis: 0),
+            window: window, scale: scale, sinks: sinks, softcap: softcap,
+            spanContext: nil)
+    }
+
+    /// Attention for K/V that is ALREADY committed — verbatim the tail of
+    /// `updateAndAttendRow`, so a batched call and a per-row call select the
+    /// same path from the same `(L, kL, window)` and differ only in how many
+    /// rows ride the batch axis.
+    private static func attendCommittedRow(
+        kind: CBv2LayerKind, queries: MLXArray,
+        cachedKeys: MLXArray, cachedValues: MLXArray,
+        window: Int?, scale: Float, sinks: MLXArray?, softcap: Float?,
+        spanContext: CBv2SpanChunkContext?
+    ) -> MLXArray {
+        let L = queries.dim(2)
+        let blockSize = effectiveQueryBlockSize(kind: kind, queryLength: L)
+        if blockSize > 0 && L > blockSize && !kind.isBidirectional {
+            return attendQueryBlocks(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                newTokenCount: L, window: window, scale: scale,
+                sinks: sinks, softcap: softcap, blockSize: blockSize,
+                spanContext: spanContext)
+        }
+        if let spanContext {
+            return attendSpanChunk(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                L: L, kL: cachedKeys.dim(2), window: window,
+                context: spanContext, sinks: sinks, softcap: softcap)
+        }
+        return attend(
+            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+            L: L, kL: cachedKeys.dim(2), window: window,
+            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional)
     }
 
     /// The batch-axis decomposition of a PACKED `[B, ...]` prompt pass —
@@ -337,17 +1160,44 @@ enum CBv2AttentionV1 {
 
         let effectiveSinks = dispatchSinks(
             sinks, kind: kind, queries: queries, softcap: softcap)
-        var outputs: [MLXArray] = []
-        outputs.reserveCapacity(batch)
+        // Commit every row's FULL chunk first — the byte-identical `update`
+        // calls, in the same row order, the per-row loop below has always
+        // made — so every row's cache ends in exactly the state it reached
+        // before this function existed (absoluteOffset advanced by the
+        // chunk length). Only the attends may differ, below.
+        var committed: [(keys: MLXArray, values: MLXArray)] = []
+        committed.reserveCapacity(batch)
         for (index, row) in rows.enumerated() {
             let (cachedKeys, cachedValues) = row.update(
                 keys: keys[index ..< index + 1],
                 values: values[index ..< index + 1])
+            committed.append((cachedKeys, cachedValues))
+        }
+        // LASTQ-D512: when every row is a private `CBv2FullSequenceKV` in
+        // lockstep at the committed length (the scored 8×1024 prompt prefill:
+        // kL = 1024, inside the transcribed [4, 4095] window), ONE batched
+        // D512 3-dispatch chain replaces the 8 unfused per-row op graphs.
+        // Decode already runs that chain — with the same bit-exactness
+        // claim, verified at kL = 1024 — on exactly this query shape
+        // [8, 16, 1, 512] against exactly this kind of committed buffer. It
+        // performs no append of its own, so the commits above stand alone.
+        // Any admission miss fails closed to the per-row loop (kill switch:
+        // DARKBLOOM_GEMMA4_LASTQ_D512=0).
+        if let batched = CBv2RaggedComposedD512DecodeAttentionV1.attendCommitted(
+            rows: rows, kind: kind, queries: queries,
+            scale: scale, sinks: effectiveSinks, softcap: softcap)
+        {
+            CBv2EngageMark.once("lastqd512")
+            return batched
+        }
+        var outputs: [MLXArray] = []
+        outputs.reserveCapacity(batch)
+        for (index, cached) in committed.enumerated() {
             outputs.append(
                 attend(
                     queries: queries[index ..< index + 1],
-                    keys: cachedKeys, values: cachedValues,
-                    scale: scale, L: 1, kL: cachedKeys.dim(2), window: nil,
+                    keys: cached.keys, values: cached.values,
+                    scale: scale, L: 1, kL: cached.keys.dim(2), window: nil,
                     sinks: effectiveSinks, softcap: softcap))
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
@@ -362,25 +1212,12 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?
     ) -> MLXArray {
-        let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if shouldBlockQueries(L) && !kind.isBidirectional {
-            return attendQueryBlocks(
-                queries: queries, keys: cachedKeys, values: cachedValues,
-                newTokenCount: L, window: window(of: kind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
-                spanContext: spanContext)
-        }
-        if let spanContext {
-            return attendSpanChunk(
-                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-                L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-                context: spanContext, sinks: sinks, softcap: softcap)
-        }
-        return attend(
-            queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
-            L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional)
+        return attendCommittedRow(
+            kind: kind, queries: queries,
+            cachedKeys: cachedKeys, cachedValues: cachedValues,
+            window: window(of: kind), scale: scale,
+            sinks: sinks, softcap: softcap, spanContext: spanContext)
     }
 
     private static func updateAndAttendRowSerialQueries(
@@ -455,6 +1292,32 @@ enum CBv2AttentionV1 {
             }
             // Rectangular [B > 1, L > 1] packed prefill / MTP verify:
             // independently borrow each source row's current chunk views.
+            // Borrowing mutates nothing, so when those views are uniform the
+            // same batch-axis stacking the storage-owning path uses applies
+            // here unchanged (`batchedPackedAttention` explains why that is
+            // the same computation). Gemma 4's KV-sharing layers are the
+            // majority of the tower, so this is where most of the dispatch
+            // collapse lands.
+            if !serializeQueries {
+                var borrowedKeys: [MLXArray] = []
+                var borrowedValues: [MLXArray] = []
+                borrowedKeys.reserveCapacity(B)
+                borrowedValues.reserveCapacity(B)
+                for row in sourceRows {
+                    let (rowKeys, rowValues) = chunkBorrowViews(of: row)
+                    borrowedKeys.append(rowKeys)
+                    borrowedValues.append(rowValues)
+                }
+                if let batched = batchedPackedAttention(
+                    kind: sourceKind, queries: queries,
+                    cachedKeys: borrowedKeys, cachedValues: borrowedValues,
+                    window: window(of: sourceKind), scale: scale,
+                    sinks: effectiveSinks, softcap: softcap,
+                    spanContexts: spanContexts)
+                {
+                    return batched
+                }
+            }
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in sourceRows.enumerated() {
@@ -474,6 +1337,45 @@ enum CBv2AttentionV1 {
                         scale: scale, sinks: effectiveSinks, softcap: softcap,
                         spanContext: spanContexts?[index]))
                 }
+            }
+            return concatenated(outputs, axis: 0)
+        }
+
+        if canUseRaggedTwoPassDecode(
+            batch: B, cacheKind: sourceKind, queryKind: kind,
+            scale: scale, sinks: effectiveSinks, softcap: softcap)
+        {
+            var cachedKeyRows: [MLXArray] = []
+            var cachedValueRows: [MLXArray] = []
+            cachedKeyRows.reserveCapacity(B)
+            cachedValueRows.reserveCapacity(B)
+            for row in sourceRows {
+                let cachedKeys: MLXArray
+                let cachedValues: MLXArray
+                if let windowed = row as? CBv2WindowedSequenceKV {
+                    (cachedKeys, cachedValues) = windowed.decodeBorrowableViews()
+                } else {
+                    (cachedKeys, cachedValues, _) = row.snapshot()
+                }
+                cachedKeyRows.append(cachedKeys)
+                cachedValueRows.append(cachedValues)
+            }
+            if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
+                queries: queries, keys: cachedKeyRows, values: cachedValueRows,
+                scale: scale)
+            {
+                return output
+            }
+
+            var outputs: [MLXArray] = []
+            outputs.reserveCapacity(B)
+            for index in 0 ..< B {
+                outputs.append(
+                    attend(
+                        queries: queries[index ..< (index + 1)],
+                        keys: cachedKeyRows[index], values: cachedValueRows[index],
+                        scale: scale, L: 1, kL: cachedKeyRows[index].dim(2), window: nil,
+                        sinks: effectiveSinks, softcap: softcap))
             }
             return concatenated(outputs, axis: 0)
         }
@@ -511,11 +1413,12 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        if shouldBlockQueries(L) && !sourceKind.isBidirectional {
+        let blockSize = effectiveQueryBlockSize(kind: sourceKind, queryLength: L)
+        if blockSize > 0 && L > blockSize && !sourceKind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
-                sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
+                sinks: sinks, softcap: softcap, blockSize: blockSize,
                 spanContext: spanContext)
         }
         if let spanContext {
@@ -545,6 +1448,116 @@ enum CBv2AttentionV1 {
     }
 
     // MARK: - Private
+
+    /// ATT-008: one batched update + attend for the exact Gemma 4
+    /// full-attention decode cohort (B=8, 16 query heads, 2 KV heads, D=512,
+    /// bf16, scale 1.0, no sinks/softcap, mask-free L=1).
+    ///
+    /// D=512 has NO fused SDPA kernel (`sdpa_vector` supports 64/96/128/256),
+    /// so `MLXFast.scaledDotProductAttention` always lowers these calls to
+    /// the fast.cpp fallback graph: scale-multiply → GQA unflatten →
+    /// `matmul` QKᵀ (gemv) → precise softmax → `matmul` scores·V (gemv_t).
+    /// That graph is shape-generic in the batch extent, and for these M=1
+    /// shapes every Metal dispatch decision it reaches — the gemv/gemv_t
+    /// block configuration, the `gemv_al` alignment gate (requires
+    /// `batch_size_out == 1`, never true here), the softmax variant and
+    /// threadgroup size (functions of the key length only), and the
+    /// `check_transpose` no-copy branches — depends only on
+    /// (M, N, K, dtype, last-two-dim strides), never on the batch extent,
+    /// which only scales `grid.z` / the row count. Issuing ONE B=8 call over
+    /// the pooled `[8, 2, kL, 512]` views therefore reproduces each row's
+    /// per-output add order bit-exactly BY CONSTRUCTION (verified uint16-
+    /// identical against the per-row chain at kL ∈ {1024, 1025, 1100, 1152}
+    /// and across simulated append steps).
+    ///
+    /// Per full layer per decode step this replaces 8×2 per-row cache slice
+    /// assignments + 8 row-local 4-dispatch attention graphs + 1 output
+    /// concat (~49 dispatches) with 2 slice assignments + 1 batched 4-dispatch
+    /// graph (~6), with zero per-step copies (the pool is written in place;
+    /// rows migrate once per cohort).
+    ///
+    /// Fails closed (returns nil, caller keeps the pinned per-row loop) on
+    /// any other batch size, geometry, dtype, scale, sinks, softcap,
+    /// bidirectional kind, non-`CBv2FullSequenceKV` row, unpoolable rows, or
+    /// rows whose offsets are not in lockstep (e.g. after a speculative
+    /// rollback of a subset). The per-row loop remains bit-identical on
+    /// pooled storage, so falling back mid-stream is always safe.
+    private static func batchedFullDecodeUpdateAndAttend(
+        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> MLXArray? {
+        guard batchedFullDecodeEnabled,
+            rows.count == 8,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !kind.isBidirectional,
+            kind.kvHeads == 2,
+            kind.headDim == 512,
+            kind.queryHeads == 16,
+            queries.dtype == .bfloat16,
+            keys.dtype == .bfloat16,
+            values.dtype == .bfloat16,
+            queries.shape == [8, 16, 1, 512],
+            keys.shape == [8, 2, 1, 512],
+            values.shape == [8, 2, 1, 512]
+        else { return nil }
+        guard case .full = kind.attention else { return nil }
+
+        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
+        guard fullRows.count == 8 else { return nil }
+
+        // Lockstep gate: one pooled append writes ONE slot for all rows, so
+        // every row must be at the same committed offset with headroom.
+        let offset = fullRows[0].absoluteOffset
+        guard offset > 0,
+            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
+            fullRows.allSatisfy({ offset + 1 <= $0.maxLength })
+        else { return nil }
+
+        guard let pool = CBv2FullSequenceKV.cohortPool(binding: fullRows) else {
+            return nil
+        }
+
+        pool.batchAppend(keys: keys, values: values, at: offset)
+        for row in fullRows {
+            row.confirmPooledBatchAppend(1)
+        }
+
+        let (cachedKeys, cachedValues) = pool.batchViews(upTo: offset + 1)
+        return attend(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            scale: scale, L: 1, kL: offset + 1, window: nil,
+            sinks: nil, softcap: nil)
+    }
+
+    /// The only shape for which the custom batch-wide dispatch is a literal
+    /// transcription of the row-local MLX two-pass kernels. All other models,
+    /// phases, masks, sequence lengths, and dtypes fail closed in the custom
+    /// helper and retain the established dispatch below.
+    @inline(__always)
+    private static func canUseRaggedTwoPassDecode(
+        batch: Int, cacheKind: CBv2LayerKind, queryKind: CBv2LayerKind,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> Bool {
+        guard batch == 8,
+            scale == 1.0,
+            sinks == nil,
+            softcap == nil,
+            !cacheKind.isBidirectional,
+            !queryKind.isBidirectional,
+            cacheKind.kvHeads == 8,
+            cacheKind.headDim == 256,
+            queryKind.queryHeads == 16,
+            queryKind.headDim == 256
+        else { return false }
+
+        guard case .slidingWindow(let window) = cacheKind.attention else {
+            return false
+        }
+        return window == 1024
+    }
 
     private static func window(of kind: CBv2LayerKind) -> Int? {
         switch kind.attention {
@@ -598,6 +1611,19 @@ enum CBv2AttentionV1 {
         precondition(historyCount >= 0)
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
+        // PREFILL-QSCALE-ELIDE: split the query head axis ONCE on the
+        // row-contiguous chunk (a pure view) so no q-block has to be
+        // materialized for the composed path. nil keeps every block on the
+        // established `MLXFast.scaledDotProductAttention` call.
+        // `blockSize <= 8` is the pinned MTP serial-query path (and any other
+        // narrow verify block): those calls never reach the composed arm, so
+        // build no graph nodes for them at all.
+        let queryPlane: MLXArray? =
+            (blockSize > 8 && newTokenCount > 8)
+            ? CBv2ComposedPrefillSDPAV1.queryPlane(
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: sinks, softcap: softcap)
+            : nil
         var offset = 0
         while offset < newTokenCount {
             let count = min(blockSize, newTokenCount - offset)
@@ -641,15 +1667,49 @@ enum CBv2AttentionV1 {
                         window: window, blocks: blocks,
                         sinks: sinks, softcap: softcap))
             } else {
+                let planeSlice = queryPlane.map {
+                    $0[0..., 0..., 0..., offset ..< (offset + count), 0...]
+                }
                 outputs.append(
                     attend(
                         queries: querySlice, keys: keySlice, values: valueSlice,
                         scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap))
+                        window: window, sinks: sinks, softcap: softcap,
+                        queryPlaneSlice: planeSlice))
             }
             offset += count
         }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        if outputs.count == 1 { return outputs[0] }
+        // PREFILL-JOIN-KERNEL: the token-major rectangle in one dispatch.
+        // Same prompt-plane guard as the join below; the returned view keeps
+        // this function's `[B, H, L, D]` contract exactly as that join does.
+        if blockSize > 8, newTokenCount > 8,
+            let joined = joinTokenMajor(outputs)
+        {
+            return joined.transposed(0, 2, 1, 3)
+        }
+        // PREFILL-TOKENMAJOR-JOIN. The established head-major join is
+        // immediately transposed and reshaped by Gemma4Attention, forcing a
+        // second full pass over the prompt attention output. Permuting each
+        // block before concatenation writes the final token-major rectangle
+        // directly. Returning its inverse-transposed view preserves this
+        // function's `[B, H, L, D]` contract; the caller's existing transpose
+        // composes to identity and its reshape can share the buffer.
+        //
+        // `blockSize > 8 && newTokenCount > 8` is the prompt-only composed
+        // attention plane. Decode is L=1 and MTP serial verification uses
+        // blockSize=1, so neither can enter this branch.
+        if tokenMajorJoinEnabled,
+            blockSize > 8,
+            newTokenCount > 8,
+            outputs[0].ndim == 4
+        {
+            CBv2EngageMark.once("prefill-tokenmajor-join")
+            let tokenMajor = concatenated(
+                outputs.map { $0.transposed(0, 2, 1, 3) }, axis: 1)
+            return tokenMajor.transposed(0, 2, 1, 3)
+        }
+        return concatenated(outputs, axis: 2)
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
@@ -672,7 +1732,7 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false
+        bidirectional: Bool = false, queryPlaneSlice: MLXArray? = nil
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
@@ -687,6 +1747,19 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
+            // PREFILL-QSCALE-ELIDE: on the prompt plane MLX takes its unfused
+            // fallback (head dim 256/512, L > 8) whose first op is an identity
+            // `scale * q` at Gemma 4's `scale == 1.0`. The transcription below
+            // is that fallback with the identity deleted; it refuses every
+            // input it cannot prove is the same graph.
+            if let composed = CBv2ComposedPrefillSDPAV1.attend(
+                queries: queries, keys: attentionKeys, values: attentionValues,
+                scale: scale, L: L, kL: kL, window: window,
+                bidirectional: bidirectional, sinks: sinks,
+                queryPlaneSlice: queryPlaneSlice)
+            {
+                return composed
+            }
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: maskMode(
