@@ -499,6 +499,15 @@ extension EngineLoopV2 {
             for _ in 0 ..< k {
                 let (next, nextHidden) = mtp.drafter.draftStep(
                     tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                // [engage] MTPLX_MTP_PIPELINED_DRAFT_SUBMIT: start this
+                // forward on the GPU while the host builds the next one and
+                // the verify graph, instead of leaving the whole round
+                // unsubmitted until executeMTPRound's single asyncEval.
+                // Nonblocking; the same arrays still ride the round's
+                // finalize fence, so the emitted stream is unchanged.
+                if CBv2MTPRoundSwitches.pipelinedDraftSubmit {
+                    asyncEval([next, nextHidden])
+                }
                 draftSteps.append(next)
                 draftInput = next.reshaped([batch, 1])
                 draftHidden = nextHidden

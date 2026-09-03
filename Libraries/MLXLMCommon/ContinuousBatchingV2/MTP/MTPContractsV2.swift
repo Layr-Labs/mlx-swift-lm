@@ -468,6 +468,35 @@ public struct CBv2MTPCostInput: Sendable, Equatable {
 /// Cumulative MTP counters (engine-thread mutated, snapshot under the
 /// engine's stats lock). Per-position acceptance is the tuning signal for
 /// `maxDraftTokens`.
+/// Round-cost switches. Each is one behaviour, off by default, readable at
+/// process start so a stack test can enable exactly the arms it is measuring.
+///
+/// [engage] MTPLX_MTP_PIPELINED_DRAFT_SUBMIT
+public enum CBv2MTPRoundSwitches {
+    /// Submit each stateless draft step as it is built instead of leaving the
+    /// whole round unsubmitted until `executeMTPRound`'s single `asyncEval`.
+    ///
+    /// The stateless path (Gemma 4) builds k drafter forwards AND the
+    /// rectangular verify graph with nothing queued for the GPU, then submits
+    /// once. Every one of those builds is host time the GPU spends idle. The
+    /// request-stateful path already publishes its first generation mid-build
+    /// for a related reason ("nonblocking and joins the round's sole finalize
+    /// fence"); this is the same move, per step, for the stateless drafter.
+    ///
+    /// Safety: `asyncEval` is non-blocking and the same arrays still ride the
+    /// round's finalize fence, so the emitted stream is unchanged. Evaluating
+    /// the drafter early can only materialize the pre-write KV capture views
+    /// EARLIER than the verify's writes, never later, and on contiguous
+    /// storage the capture (`..<absoluteOffset`) and the verify's writes
+    /// (`absoluteOffset...`) are disjoint ranges of the same buffer.
+    public static let pipelinedDraftSubmit = flag("MTPLX_MTP_PIPELINED_DRAFT_SUBMIT")
+
+    private static func flag(_ key: String) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[key] else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+}
+
 /// Per-stage HOST timing for MTP rounds, summed over every round in the run.
 ///
 /// The stages are cut where the GPU's view of the round changes, because the
