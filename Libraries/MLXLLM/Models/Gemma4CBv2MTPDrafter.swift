@@ -122,6 +122,55 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         return (next, newHidden)
     }
 
+    /// This head scores the full vocabulary every step, so its runners-up
+    /// are already computed: a tree's alternate columns cost ONE extra
+    /// argmax over the same logits, not another forward. That is the whole
+    /// reason a tree can be cheaper than a deeper chain here.
+    ///
+    /// Rank 0 is taken with the SAME `argMax` the chain uses, and each
+    /// further rank masks the ranks already taken and argmaxes again, so a
+    /// tie can never make column 0 disagree with `draftStep`. A sort over
+    /// the top-k would be shorter and is deliberately not used: MLX's sort
+    /// is not specified to be stable, and the chain must stay bit-identical
+    /// whether or not this switch is on.
+    public var maximumDraftCandidates: Int { 4 }
+
+    public func draftStepCandidates(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture,
+        candidates: Int
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        precondition(
+            candidates >= 1 && candidates <= maximumDraftCandidates,
+            "Gemma4CBv2MTPDrafter.draftStepCandidates: \(candidates) outside 1...\(maximumDraftCandidates)"
+        )
+        guard let prepared = prepared as? Prepared else {
+            preconditionFailure(
+                "Gemma4CBv2MTPDrafter.draftStepCandidates: prepared capture "
+                    + "\(type(of: prepared)) was not built by prepare(rows:)")
+        }
+        let inputsEmbeds = concatenated(
+            [target.embedTokensForDrafter(tokens), hidden], axis: -1)
+        let (newHidden, logits) = drafter(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: prepared.sharedKV,
+            positionOffset: prepared.positionOffset,
+            masks: prepared.masks)
+        let flat = logits.squeezed(axis: 1)
+        var ranked: [MLXArray] = [flat.argMax(axis: -1).asType(.int32)]
+        if candidates > 1 {
+            let vocabulary = flat.dim(-1)
+            let positions = MLXArray(Int32(0) ..< Int32(vocabulary)).reshaped([1, vocabulary])
+            let excluded = MLXArray(-Float.infinity).asType(flat.dtype)
+            var remaining = flat
+            for _ in 1 ..< candidates {
+                let taken = ranked[ranked.count - 1].reshaped([-1, 1])
+                remaining = MLX.where(positions .== taken, excluded, remaining)
+                ranked.append(remaining.argMax(axis: -1).asType(.int32))
+            }
+        }
+        return (stacked(ranked, axis: 1), newHidden)
+    }
+
     // MARK: - Padding + masks (B > 1)
 
     /// Right-pad per-row `[1, kvHeads, T_r, headDim]` captures to

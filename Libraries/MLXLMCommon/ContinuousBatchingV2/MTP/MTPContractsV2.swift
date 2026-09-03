@@ -256,9 +256,44 @@ public protocol CBv2MTPDrafter: AnyObject {
     func draftStep(
         tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
     ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// How many DISTINCT candidates one drafter forward can return at a
+    /// position. 1 means argmax only, which is what a chain needs and what
+    /// every drafter supports; a tree shape asking for rank `r` requires
+    /// `maximumDraftCandidates > r`. See `CBv2MTPTreeShape`.
+    var maximumDraftCandidates: Int { get }
+    /// One draft-chain step that also returns the runners-up of the SAME
+    /// forward. `candidates` is the number of ranks wanted (>= 1).
+    ///  - Returns `tokens` `[B, candidates]` int32 (lazy), column 0 being
+    ///    the greedy argmax so `tokens[.., 0]` is bit-identical to
+    ///    `draftStep`'s result, and the drafter's output hidden `[B, 1, H]`
+    ///    for chaining the ARGMAX branch (a tree's alternates are leaves of
+    ///    the forward they came from; nothing chains from a runner-up).
+    func draftStepCandidates(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture,
+        candidates: Int
+    ) -> (tokens: MLXArray, hidden: MLXArray)
 }
 
 extension CBv2MTPDrafter {
+    /// Default: argmax only. A drafter that does not override this cannot
+    /// carry a tree, and `CBv2MTPTreeShape.maximumCandidateRank` is the
+    /// number the caller must check against.
+    public var maximumDraftCandidates: Int { 1 }
+
+    /// Default: satisfy a rank-1 request from `draftStep`, refuse anything
+    /// deeper rather than inventing a candidate.
+    public func draftStepCandidates(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture,
+        candidates: Int
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        precondition(
+            candidates == 1,
+            "CBv2MTPDrafter: \(type(of: self)) returns only its argmax; "
+                + "a tree shape needs draftStepCandidates")
+        let step = draftStep(tokens: tokens, hidden: hidden, prepared: prepared)
+        return (step.tokens.reshaped([-1, 1]), step.hidden)
+    }
+
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
     public var requiredVerificationMode: CBv2MTPVerificationMode? { nil }
     public var maximumDraftTokens: Int? { nil }
@@ -500,6 +535,26 @@ public enum CBv2MTPRoundSwitches {
     /// storage the capture (`..<absoluteOffset`) and the verify's writes
     /// (`absoluteOffset...`) are disjoint ranges of the same buffer.
     public static let pipelinedDraftSubmit = flag("MTPLX_MTP_PIPELINED_DRAFT_SUBMIT")
+
+    /// [engage] MTPLX_MTP_TREE_DRAFT=<shape>
+    ///
+    /// Spend part of the rectangular WIDTH budget on siblings of the draft
+    /// chain instead of on more chain. nil (unset, `off`) keeps the shipped
+    /// chain exactly. See `CBv2MTPTreeShape` for the grammar, the column
+    /// order and — before enabling this — the arithmetic that says an
+    /// alternate only beats one more chain column when per-position
+    /// acceptance is at or below roughly 0.72.
+    ///
+    /// SHAPE, NOT LENGTH. The value names a tree, never a prompt size. A
+    /// shape too wide for the plan's width budget is SHORTENED
+    /// (`CBv2MTPTreeShape.clamped`), never silently widened: the rectangular
+    /// cap is a correctness certification.
+    public static let treeDraft: CBv2MTPTreeShape? = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_TREE_DRAFT"] else {
+            return nil
+        }
+        return CBv2MTPTreeShape.parse(raw)
+    }()
 
     private static func flag(_ key: String) -> Bool {
         guard let raw = ProcessInfo.processInfo.environment[key] else { return false }
