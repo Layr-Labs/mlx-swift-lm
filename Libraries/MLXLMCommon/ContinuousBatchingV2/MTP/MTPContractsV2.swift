@@ -516,6 +516,18 @@ public struct CBv2MTPMetrics: Sendable {
     public var costInputs: [CBv2MTPCostInput] = []
     /// Sum of measured wall time for cost-eligible speculative rounds.
     public var totalRoundWallTimeNanos: UInt64 = 0
+    /// Per-VERIFY-round acceptance/rollback audit records, in finalize order,
+    /// bounded at [`CBv2MTPRoundAuditRecord.retainedRecordCap`] (oldest
+    /// dropped first). Observability seam (2026-08-25): lets a provider's
+    /// session diagnostics OBSERVE, per round, the exact accept-walk inputs
+    /// (draft ids vs target ids), the chosen acceptance boundary, and the
+    /// post-rollback scheduler/KV accounting — so an on-box token-exactness
+    /// divergence can be attributed to a wrong per-token reference (targets
+    /// not matching the serial model) versus a wrong rollback boundary
+    /// (accept/discard off-by-one), instead of assuming either. Snapshot-only
+    /// like every other field; populated at the same finalize host-sync
+    /// boundary as the counters above, so it adds no MLX evaluation.
+    public var roundAudits: [CBv2MTPRoundAuditRecord] = []
 
     public init() {}
 
@@ -526,5 +538,71 @@ public struct CBv2MTPMetrics: Sendable {
     /// Mean accepted drafts per round (nil before any round).
     public var meanAcceptedPerRound: Double? {
         rounds > 0 ? Double(acceptedTokens) / Double(rounds) : nil
+    }
+}
+
+/// One finalized VERIFY round's acceptance/rollback audit, captured at the
+/// finalize host-sync boundary (`EngineLoopV2+MTPFinalize.swift`) from values
+/// already on the host — no extra readback. The record states, for one row:
+/// what was drafted, what the target's authoritative per-column argmaxes
+/// were, where the accept walk stopped, how many staged KV/scheduler
+/// positions were rolled back, and the row's post-round accounting.
+public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
+    /// Bound on `CBv2MTPMetrics.roundAudits` (oldest dropped first). Sized
+    /// so a full benchmark window's audits always fit with headroom: the
+    /// widest admitted cohort (B=8) over a 128-token window finalizes at
+    /// most ~8 x 128 verify-row records; consumers that RECONCILE audits
+    /// against committed streams (the cohort assembler) refuse when the
+    /// count reaches this cap, because a truncated head means coverage can
+    /// no longer be proven.
+    public static let retainedRecordCap = 8192
+
+    /// The row's request id raw value (B > 1 disambiguation).
+    public var requestID: UInt64
+    /// Draft depth k this round.
+    public var k: Int
+    /// The k draft ids fed as verify input columns 1...k.
+    public var draftTokens: [Int]
+    /// The 1+k target argmaxes (verify outputs; `targets[i]` is the
+    /// authoritative next token after input column i).
+    public var targetTokens: [Int]
+    /// Accept-walk result: number of leading drafts with
+    /// `drafts[i] == targets[i]`.
+    public var accepted: Int
+    /// Tokens actually committed this round (`kept.count`): the accepted
+    /// prefix plus the correction/bonus, clamped by the cross-row common
+    /// width, stop tokens, and max_tokens.
+    public var confirmed: Int
+    /// Staged KV entries rolled back (`(1 + k) - confirmed`).
+    public var rejected: Int
+    /// `rec.tokens.count` AFTER this round's commits (prompt + emitted).
+    public var tokensCountAfter: Int
+    /// `rec.numComputedTokens` AFTER the rollback. Boundary invariant: must
+    /// equal `tokensCountAfter - 1` (every token computed except the new
+    /// carry).
+    public var numComputedAfter: Int
+    /// `rec.generatedTokenCount` AFTER this round's commits.
+    public var generatedAfter: Int
+    /// Terminal reason when this round finished the row ("stop"/"length"),
+    /// else nil.
+    public var finishReason: String?
+
+    public init(
+        requestID: UInt64, k: Int, draftTokens: [Int], targetTokens: [Int],
+        accepted: Int, confirmed: Int, rejected: Int,
+        tokensCountAfter: Int, numComputedAfter: Int, generatedAfter: Int,
+        finishReason: String?
+    ) {
+        self.requestID = requestID
+        self.k = k
+        self.draftTokens = draftTokens
+        self.targetTokens = targetTokens
+        self.accepted = accepted
+        self.confirmed = confirmed
+        self.rejected = rejected
+        self.tokensCountAfter = tokensCountAfter
+        self.numComputedAfter = numComputedAfter
+        self.generatedAfter = generatedAfter
+        self.finishReason = finishReason
     }
 }

@@ -1157,6 +1157,22 @@ private class Gemma4Attention: Module {
 
 // MARK: - MoE (26B-A4B)
 
+/// Width-probe observability sink (exactness round three, 2026-08-25).
+///
+/// Armed ONLY by the operator-driven `width-probe` diagnostic verb so it can
+/// record every MoE router's expert scores and top-K selection per forward;
+/// nil in production (one optional check per MoE layer per forward — no
+/// tensor work, no graph change when disarmed). The recorder receives the
+/// PRE-selection expert scores `[.., E]` and the selected `topKIndices`
+/// `[.., K]`, in layer execution order — the width-divergence localization
+/// needs exactly this seam to decide whether a forward-width numeric flip
+/// first enters the network at a router selection (unfixable-by-kernel
+/// design) or only at the final logits (width-stable head candidate).
+public enum Gemma4RouterProbe {
+    nonisolated(unsafe) public static var recorder:
+        ((_ expertScores: MLXArray, _ topKIndices: MLXArray) -> Void)?
+}
+
 /// Expert router. Norms `x` with a learnable scale, projects to expert
 /// scores, and returns top-K (indices, weights) where weights are
 /// softmax-normalized and scaled by a per-expert scalar.
@@ -1196,6 +1212,11 @@ private class Gemma4Router: Module {
         var topKWeights = MLX.takeAlong(expertScores, topKIndices, axis: -1)
         topKWeights = MLX.softmax(topKWeights, axis: -1, precise: true)
         topKWeights = topKWeights * perExpertScale[topKIndices]
+
+        // Diagnostic-only observability (nil in production; see
+        // `Gemma4RouterProbe`). Recording the PRE-selection scores and the
+        // selection itself, never altering either.
+        Gemma4RouterProbe.recorder?(expertScores, topKIndices)
 
         return (topKIndices, topKWeights)
     }
@@ -1999,6 +2020,20 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// when building its drafter-step input `[target_embed(last_token), last_hidden]`.
     public func embedTokensForDrafter(_ tokens: MLXArray) -> MLXArray {
         model.embedTokens(tokens) * Float(config.hiddenSize).squareRoot()
+    }
+
+    /// Width-probe diagnostic forward (exactness round three): full logits
+    /// plus the per-layer K/V capture hook — the layer-by-layer seam the
+    /// operator-only `width-probe` verb bit-compares across forward widths.
+    /// Identical compute to the plain forward (`applyLMHead` over the same
+    /// trunk); the hook only observes the per-layer K/V pairs the trunk
+    /// already produced.
+    public func widthProbeForward(
+        _ inputs: MLXArray,
+        cache: [KVCache],
+        captureHook: @escaping (Int, (MLXArray, MLXArray)) -> Void
+    ) -> MLXArray {
+        applyLMHead(model(inputs, cache: cache, captureHook: captureHook))
     }
 
     /// Internal helper for Gemma4CaptureHookTests. Not part of the public API.
