@@ -605,4 +605,54 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
                 inDim: 2816, groupSize: 64, bits: 4,
                 fusedPackedColumns: 352, fusedScaleGroups: 44))
     }
+
+    // MARK: - RESIDENCY-001 (C6): MTL residency-set budget
+
+    /// The switch parses to three states and never to a surprise.
+    func testResidencySetSettingParse() {
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: nil), .deviceMaximum)
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: ""), .deviceMaximum)
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "   "), .deviceMaximum)
+        for off in ["0", "false", "no", "off", "OFF", " Off "] {
+            XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: off), .off, off)
+        }
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.setting(from: "4096"), .bytes(4096 * 1024 * 1024))
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "1"), .bytes(1024 * 1024))
+        // Non-numeric, negative and absurd values fall back to the default
+        // rather than wiring something arbitrary.
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "yes"), .deviceMaximum)
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "-8"), .deviceMaximum)
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.setting(from: "\(Int.max)"), .deviceMaximum)
+    }
+
+    /// The budget is always clamped to the device maximum, because
+    /// `metal::set_wired_limit` throws above it — and a device that reports no
+    /// maximum keeps the stock behaviour in every state.
+    func testResidencySetBudgetClamps() {
+        let deviceMax = 96 * 1024 * 1024 * 1024
+        XCTAssertNil(
+            CBv2MetalResidencySetV1.budget(for: .off, deviceMaximumBytes: deviceMax))
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.budget(
+                for: .deviceMaximum, deviceMaximumBytes: deviceMax),
+            deviceMax)
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.budget(
+                for: .bytes(16 * 1024 * 1024 * 1024), deviceMaximumBytes: deviceMax),
+            16 * 1024 * 1024 * 1024)
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.budget(
+                for: .bytes(deviceMax * 2), deviceMaximumBytes: deviceMax),
+            deviceMax)
+        for setting: CBv2MetalResidencySetV1.Setting in [
+            .off, .deviceMaximum, .bytes(1024),
+        ] {
+            XCTAssertNil(
+                CBv2MetalResidencySetV1.budget(for: setting, deviceMaximumBytes: nil))
+            XCTAssertNil(
+                CBv2MetalResidencySetV1.budget(for: setting, deviceMaximumBytes: 0))
+        }
+    }
 }
