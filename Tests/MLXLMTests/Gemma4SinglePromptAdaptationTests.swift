@@ -344,4 +344,315 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
             switchGatherQMVSelectsFastTier(
                 outputWidth: 700, contractionWidth: 2816, kAlignment: 32))
     }
+
+    // MARK: - LGH-B1 (C3): fused tied head + argmax at one row
+
+    /// The tied head's own geometry at one activation row.
+    private func lghTiedHeadGeometry(
+        rows: Int = 1, k: Int = 2816, n: Int = 262_144
+    ) -> CBv2TiedLMHeadArgmaxB1V1.Geometry {
+        CBv2TiedLMHeadArgmaxB1V1.Geometry(
+            rows: rows,
+            k: k,
+            n: n,
+            weightPackedColumns: k * 4 / 32,
+            scaleRows: n,
+            scaleGroups: k / 64,
+            biasRows: n,
+            biasGroups: k / 64,
+            groupSize: 64,
+            bits: 4,
+            singlePosition: true,
+            bf16Activations: true,
+            bf16ScalesAndBiases: true,
+            uint32Weight: true,
+            hasBiases: true)
+    }
+
+    /// The production one-row tail is admitted; the kill switch removes it.
+    func testLogitslessB1AdmitsTheOneRowTiedHead() {
+        XCTAssertTrue(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry()))
+        XCTAssertFalse(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: false, lghTiedHeadGeometry()))
+    }
+
+    /// The eight-row cohort is refused on purpose: this body serves one
+    /// activation row per x-group, so a cohort plane would stream the whole
+    /// vocabulary once per row. `Gemma4MMAQuantizedGEMV` keeps that road.
+    func testLogitslessB1RefusesTheCohort() {
+        for rows in [0, 2, 4, 8, 16] {
+            XCTAssertFalse(
+                CBv2TiedLMHeadArgmaxB1V1.admits(
+                    enabled: true, lghTiedHeadGeometry(rows: rows)),
+                "rows \(rows)")
+        }
+    }
+
+    /// Every structural pin fails closed one at a time.
+    func testLogitslessB1FailsClosedOnEveryPin() {
+        var g = lghTiedHeadGeometry()
+        g.hasBiases = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "no biases")
+
+        g = lghTiedHeadGeometry()
+        g.singlePosition = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "multi position")
+
+        g = lghTiedHeadGeometry()
+        g.bf16Activations = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "fp32 activations")
+
+        g = lghTiedHeadGeometry()
+        g.bf16ScalesAndBiases = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "fp32 scales")
+
+        g = lghTiedHeadGeometry()
+        g.uint32Weight = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "unpacked weight")
+
+        g = lghTiedHeadGeometry()
+        g.bits = 8
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "8-bit")
+
+        g = lghTiedHeadGeometry()
+        g.groupSize = 32
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "group 32")
+
+        // N must be a whole number of 8-column tiles so `used_out_row` never
+        // moves a tile back and the partial count is exactly N / 8.
+        g = lghTiedHeadGeometry(n: 262_140)
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "N % 8")
+
+        // K must be whole affine groups, whole uint32 words, and at least one
+        // 256-value block deep.
+        XCTAssertFalse(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry(k: 2848)),
+            "K % 64")
+        XCTAssertFalse(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry(k: 128)),
+            "K below one block")
+        XCTAssertTrue(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry(k: 256)),
+            "K exactly one block")
+
+        // Sidecar planes must describe the same weight.
+        g = lghTiedHeadGeometry()
+        g.weightPackedColumns = 351
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "packed columns")
+
+        g = lghTiedHeadGeometry()
+        g.scaleGroups = 43
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "scale groups")
+
+        g = lghTiedHeadGeometry()
+        g.biasRows = 1
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "bias rows")
+    }
+
+    /// The engine seam: greedy, unconstrained, position-free, non-recurrent,
+    /// and both capabilities present.
+    func testLogitslessGreedyStepAdmission() {
+        XCTAssertTrue(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        // A grammar mask can move the argmax, so a constrained row refuses.
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: true, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        // The fused forward carries neither explicit positions nor recurrent
+        // bindings.
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: true,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: true, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        // Either capability missing, or the kill switch, restores the
+        // logits-then-sample road.
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: false,
+                samplerAdmitsFusedGreedy: true))
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: false))
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: false, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+    }
+
+    // MARK: - GATEUP-DENSE-CONCAT (C4): dense MLP gate|up load-time concat
+
+    /// The exactness claim: concatenating gate and up along the OUTPUT axis
+    /// changes only N, and `qmv`'s tier choice depends on N only through
+    /// `N % 8`. The dense pair is N = 2112 -> 4224 over K = 2816, whose 8-bit
+    /// alignment is 256; the 4-bit alignment of 512 is checked too because a
+    /// tier that answered differently at the two widths would break the
+    /// argument whatever the checkpoint's bit width.
+    func testDenseGateUpConcatKeepsTheSameQMVTier() {
+        for kAlignment in [32, 256, 512] {
+            let split = gemma4DenseQMVSelectsFastTier(
+                outputWidth: 2112, contractionWidth: 2816, kAlignment: kAlignment)
+            let fused = gemma4DenseQMVSelectsFastTier(
+                outputWidth: 4224, contractionWidth: 2816, kAlignment: kAlignment)
+            XCTAssertEqual(split, fused, "kAlignment \(kAlignment)")
+        }
+        // The 8-bit dense contraction does reach the fast tier at both widths.
+        XCTAssertTrue(
+            gemma4DenseQMVSelectsFastTier(
+                outputWidth: 4224, contractionWidth: 2816, kAlignment: 256))
+        // A width that would change the tier is caught.
+        XCTAssertFalse(
+            gemma4DenseQMVSelectsFastTier(
+                outputWidth: 2110, contractionWidth: 2816, kAlignment: 256))
+    }
+
+    /// The production one-row dense cell (K = 2816, 8-bit group 64, so the
+    /// packed plane is 704 uint32 columns over 44 groups).
+    func testDenseGateUpConcatAdmitsTheOneRowCell() {
+        XCTAssertTrue(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 44))
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: false, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 44))
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: false, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 44))
+    }
+
+    /// The eight-row cohort keeps `CBv2DenseMLPQMVV1`, and a multi-position
+    /// rectangle keeps the split projections: in both, slicing the fused
+    /// output along the last axis would leave NON-contiguous halves.
+    func testDenseGateUpConcatRefusesEveryOtherRectangle() {
+        for rows in [0, 2, 8, 64] {
+            XCTAssertFalse(
+                gemma4DenseGateUpConcatAdmits(
+                    enabled: true, hasStorage: true, ndim: 3, rows: rows, positions: 1,
+                    inDim: 2816, groupSize: 64, bits: 8,
+                    fusedPackedColumns: 704, fusedScaleGroups: 44),
+                "rows \(rows)")
+        }
+        for positions in [0, 2, 9, 1024] {
+            XCTAssertFalse(
+                gemma4DenseGateUpConcatAdmits(
+                    enabled: true, hasStorage: true, ndim: 3, rows: 1,
+                    positions: positions,
+                    inDim: 2816, groupSize: 64, bits: 8,
+                    fusedPackedColumns: 704, fusedScaleGroups: 44),
+                "positions \(positions)")
+        }
+        for ndim in [1, 2, 4] {
+            XCTAssertFalse(
+                gemma4DenseGateUpConcatAdmits(
+                    enabled: true, hasStorage: true, ndim: ndim, rows: 1, positions: 1,
+                    inDim: 2816, groupSize: 64, bits: 8,
+                    fusedPackedColumns: 704, fusedScaleGroups: 44),
+                "ndim \(ndim)")
+        }
+    }
+
+    /// The storage is built before `quantize(model:)`, so the dispatch is what
+    /// checks it against the live policy. A plane that does not describe this
+    /// contraction fails closed.
+    func testDenseGateUpConcatChecksTheLiveQuantizationPolicy() {
+        // Packed columns must be K * bits / 32 …
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 352, fusedScaleGroups: 44),
+            "4-bit plane under an 8-bit policy")
+        // … and scale groups must be K / groupSize.
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 22),
+            "group 128 sidecar under a group-64 policy")
+        // A contraction that is not whole groups is refused outright.
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2800, groupSize: 64, bits: 8,
+                fusedPackedColumns: 700, fusedScaleGroups: 43),
+            "K % groupSize")
+        // The 4-bit tower's own head geometry stays consistent, so the
+        // predicate is not silently 8-bit-only.
+        XCTAssertTrue(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 4,
+                fusedPackedColumns: 352, fusedScaleGroups: 44))
+    }
+
+    // MARK: - RESIDENCY-001 (C6): MTL residency-set budget
+
+    /// The switch parses to three states and never to a surprise.
+    func testResidencySetSettingParse() {
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: nil), .deviceMaximum)
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: ""), .deviceMaximum)
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "   "), .deviceMaximum)
+        for off in ["0", "false", "no", "off", "OFF", " Off "] {
+            XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: off), .off, off)
+        }
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.setting(from: "4096"), .bytes(4096 * 1024 * 1024))
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "1"), .bytes(1024 * 1024))
+        // Non-numeric, negative and absurd values fall back to the default
+        // rather than wiring something arbitrary.
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "yes"), .deviceMaximum)
+        XCTAssertEqual(CBv2MetalResidencySetV1.setting(from: "-8"), .deviceMaximum)
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.setting(from: "\(Int.max)"), .deviceMaximum)
+    }
+
+    /// The budget is always clamped to the device maximum, because
+    /// `metal::set_wired_limit` throws above it — and a device that reports no
+    /// maximum keeps the stock behaviour in every state.
+    func testResidencySetBudgetClamps() {
+        let deviceMax = 96 * 1024 * 1024 * 1024
+        XCTAssertNil(
+            CBv2MetalResidencySetV1.budget(for: .off, deviceMaximumBytes: deviceMax))
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.budget(
+                for: .deviceMaximum, deviceMaximumBytes: deviceMax),
+            deviceMax)
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.budget(
+                for: .bytes(16 * 1024 * 1024 * 1024), deviceMaximumBytes: deviceMax),
+            16 * 1024 * 1024 * 1024)
+        XCTAssertEqual(
+            CBv2MetalResidencySetV1.budget(
+                for: .bytes(deviceMax * 2), deviceMaximumBytes: deviceMax),
+            deviceMax)
+        for setting: CBv2MetalResidencySetV1.Setting in [
+            .off, .deviceMaximum, .bytes(1024),
+        ] {
+            XCTAssertNil(
+                CBv2MetalResidencySetV1.budget(for: setting, deviceMaximumBytes: nil))
+            XCTAssertNil(
+                CBv2MetalResidencySetV1.budget(for: setting, deviceMaximumBytes: 0))
+        }
+    }
 }
