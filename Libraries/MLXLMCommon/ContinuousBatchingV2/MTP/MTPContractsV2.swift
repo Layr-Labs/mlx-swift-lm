@@ -743,8 +743,23 @@ public struct CBv2MTPMetrics: Sendable {
     /// unprofitable depth zero, batch gate, token/KV headroom, and so on).
     public var controllerFallbacks: [String: Int] = [:]
     /// Conditional acceptance rate at each draft position: P(position i is
-    /// accepted | every earlier draft position was accepted).
+    /// accepted | every earlier draft position was accepted). This is `q`,
+    /// the number that decides whether tree drafting can ever pay — see
+    /// `CBv2MTPTreeShape`.
     public var conditionalAcceptance: [Double] = []
+    /// Rounds in which the chain was REJECTED at a real divergence (not cut
+    /// short by a stop token or the output budget) and the drafter's
+    /// runner-up at that position was therefore comparable with the target.
+    /// The denominator of `r`.
+    public var runnerUpObservations: Int = 0
+    /// Of those, the rounds where the runner-up WAS the target's token — the
+    /// rounds a tree's alternate column would have converted from one
+    /// committed token into two or more. The numerator of `r`.
+    public var runnerUpHits: Int = 0
+    /// Per draft position (0-based), the same two counts, so a tree shape can
+    /// be chosen by depth rather than from one pooled number.
+    public var perPositionRunnerUpObservations: [Int] = []
+    public var perPositionRunnerUpHits: [Int] = []
     /// Outlier-clamped wall-cost EWMAs and raw cumulative inputs, sorted by
     /// decode-row bucket then depth in snapshots.
     public var costInputs: [CBv2MTPCostInput] = []
@@ -762,5 +777,26 @@ public struct CBv2MTPMetrics: Sendable {
     /// Mean accepted drafts per round (nil before any round).
     public var meanAcceptedPerRound: Double? {
         rounds > 0 ? Double(acceptedTokens) / Double(rounds) : nil
+    }
+
+    /// `r`: P(the drafter's rank-2 token is the target's token | its rank-1
+    /// token is not). nil before any round was rejected at a real divergence.
+    ///
+    /// Paired with `conditionalAcceptance` (`q`) this decides tree drafting
+    /// outright: an alternate column is worth its place only when
+    /// `(1 - q) * r / committed(k*) > c_alt / round(k*)`, which at
+    /// `q = 0.82` needs `r > 1.37` and is therefore impossible. The full
+    /// table of required `r` per `q` is in `CBv2MTPTreeShape`.
+    public var runnerUpHitRate: Double? {
+        runnerUpObservations > 0
+            ? Double(runnerUpHits) / Double(runnerUpObservations) : nil
+    }
+
+    /// `r` per draft position, nil-padded where nothing was observed.
+    public var runnerUpHitRateByPosition: [Double?] {
+        zip(perPositionRunnerUpHits, perPositionRunnerUpObservations).map {
+            hits, observations in
+            observations > 0 ? Double(hits) / Double(observations) : nil
+        }
     }
 }

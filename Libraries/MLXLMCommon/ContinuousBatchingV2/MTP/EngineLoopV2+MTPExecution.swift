@@ -452,6 +452,8 @@ extension EngineLoopV2 {
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
+        var runnerUpSteps: [MLXArray] = []
+        runnerUpSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
@@ -494,11 +496,37 @@ extension EngineLoopV2 {
             }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
+            // Runner-up INSTRUMENTATION, not a second draft. This head scores
+            // the whole vocabulary every step, so its rank-2 token is already
+            // paid for; asking for it costs one masked argmax over logits the
+            // forward produced anyway. Nothing in the round branches on it —
+            // it rides the acceptance packet and is counted at finalize, so
+            // the emitted stream is bit-identical with or without it. It
+            // answers the one question tree drafting turns on: when the chain
+            // is rejected, how often WAS the runner-up the target's token
+            // (`CBv2MTPMetrics.runnerUpHitRate`, and see `CBv2MTPTreeShape`).
+            let wantsRunnerUps = k > 0 && mtp.drafter.maximumDraftCandidates >= 2
             var draftInput = seedColumn
             var draftHidden = concatenated(carryHiddens, axis: 0)
             for _ in 0 ..< k {
-                let (next, nextHidden) = mtp.drafter.draftStep(
-                    tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                let next: MLXArray
+                let nextHidden: MLXArray
+                var runnerUp: MLXArray? = nil
+                if wantsRunnerUps {
+                    let step = mtp.drafter.draftStepCandidates(
+                        tokens: draftInput, hidden: draftHidden, prepared: prepared,
+                        candidates: 2)
+                    // Rank 0 is the drafter's own `argMax`, so this column is
+                    // the same token `draftStep` would have returned.
+                    next = step.tokens[0..., 0 ..< 1].reshaped([-1])
+                    runnerUp = step.tokens[0..., 1 ..< 2].reshaped([-1])
+                    nextHidden = step.hidden
+                } else {
+                    let step = mtp.drafter.draftStep(
+                        tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                    next = step.tokens
+                    nextHidden = step.hidden
+                }
                 // [engage] MTPLX_MTP_PIPELINED_DRAFT_SUBMIT: start this
                 // forward on the GPU while the host builds the next one and
                 // the verify graph, instead of leaving the whole round
@@ -506,9 +534,10 @@ extension EngineLoopV2 {
                 // Nonblocking; the same arrays still ride the round's
                 // finalize fence, so the emitted stream is unchanged.
                 if CBv2MTPRoundSwitches.pipelinedDraftSubmit {
-                    asyncEval([next, nextHidden])
+                    asyncEval([next, nextHidden] + (runnerUp.map { [$0] } ?? []))
                 }
                 draftSteps.append(next)
+                if let runnerUp { runnerUpSteps.append(runnerUp) }
                 draftInput = next.reshaped([batch, 1])
                 draftHidden = nextHidden
             }
@@ -537,14 +566,24 @@ extension EngineLoopV2 {
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
         timing.verifyBuildNanos = CBv2MTPRoundTiming.since(verifyBuildStart)
+        // Segment order is append-only; `CBv2MTPAcceptancePacketLayout` owns
+        // the offsets both this builder and `finalizeMTPRound` read.
+        let layout = CBv2MTPAcceptancePacketLayout(
+            rows: batch, draftDepth: k,
+            hasShortlistMass: target.shortlist != nil,
+            hasRunnerUps: runnerUpSteps.count == k && k > 0)
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
+        }
+        if layout.runnerUpsBase != nil {
+            packetParts.append(stacked(runnerUpSteps, axis: 1).reshaped([-1]))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         return CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
+            layout: layout,
             acceptancePacket: acceptancePacket,
             draftIDs: draftIDs,
             lastHidden: target.hidden,

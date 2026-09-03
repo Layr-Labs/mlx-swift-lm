@@ -71,8 +71,8 @@ extension EngineLoopV2 {
             mtp.recordRoundTiming(round.timing)
             mtp.lastRoundFinalizeEndNanos = CBv2MTPRoundTiming.now()
         }
-        let draftCount = verify.rows.count * k
-        let targetWidth = 1 + k
+        let layout = verify.layout
+        let targetWidth = layout.targetWidth
         var anyRejected = false
 
         struct RowOutcome {
@@ -107,9 +107,11 @@ extension EngineLoopV2 {
                 continue
             }
             let rec = scheduler.record(for: id)!
-            let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
+            let drafts = (0 ..< k).map {
+                Int(host[layout.draftIndex(row: batchIndex, position: $0)])
+            }
             let targets = (0 ..< targetWidth).map {
-                Int(host[draftCount + batchIndex * targetWidth + $0])
+                Int(host[layout.targetIndex(row: batchIndex, column: $0)])
             }
 
             var accepted = 0
@@ -273,6 +275,18 @@ extension EngineLoopV2 {
             mtp.recordRound(
                 drafted: k, accepted: observedAccepted, emitted: confirmed)
             let rejectionObserved = accepted < k && confirmed > accepted
+            // Instrumentation for tree drafting: the divergence is at draft
+            // position `accepted`, where `drafts[accepted] != targets[accepted]`.
+            // Ask whether the drafter's runner-up from that same forward WAS
+            // the target's token. Gated on `rejectionObserved` so a round cut
+            // short by a stop token or the output budget — which never reached
+            // the comparison — cannot bias `r` toward zero.
+            if rejectionObserved, layout.runnerUpsBase != nil {
+                let runnerUp = Int(
+                    host[layout.runnerUpIndex(row: batchIndex, position: accepted)])
+                mtp.recordRunnerUp(
+                    position: accepted, hit: runnerUp == outcome.targets[accepted])
+            }
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k
             mtp.observeRequestAcceptance(
@@ -306,8 +320,8 @@ extension EngineLoopV2 {
                 // head for that round.
                 var carryShortlist: MLXArray?
                 if let shortlistIDs = verify.shortlistIDs {
-                    let massBase = draftCount + verify.rows.count * targetWidth
-                    let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
+                    let mass = host[
+                        layout.shortlistMassIndex(row: batchIndex, column: hiddenColumn)]
                     if mass >= Self.mtpShortlistMassThresholdPPM {
                         carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
                     }
