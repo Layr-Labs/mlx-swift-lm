@@ -476,6 +476,16 @@ public enum CBv2MTPRoundSwitches {
     /// Submit each stateless draft step as it is built instead of leaving the
     /// whole round unsubmitted until `executeMTPRound`'s single `asyncEval`.
     ///
+    /// UNCONDITIONAL BY DESIGN. It submits at every depth, every batch size and
+    /// every context length, because the thing that decides whether the extra
+    /// submission pays — how expensive one drafter forward is — is not
+    /// something a prompt length can be used to guess. This drafter attends the
+    /// target's retained KV, so its forward does grow with context, and it
+    /// would be easy to "help" by gating the submit on prompt length. Do not.
+    /// A length-gated submit makes every measurement a measurement of the gate
+    /// and mis-serves every length nobody tuned. If it loses somewhere, the
+    /// answer is to turn the switch off, not to add a threshold.
+    ///
     /// The stateless path (Gemma 4) builds k drafter forwards AND the
     /// rectangular verify graph with nothing queued for the GPU, then submits
     /// once. Every one of those builds is host time the GPU spends idle. The
@@ -536,8 +546,27 @@ public struct CBv2MTPRoundTiming: Sendable, Equatable {
     public var packetWaitNanos: UInt64 = 0
     public var acceptWalkNanos: UInt64 = 0
     public var rowFinalizeNanos: UInt64 = 0
+    /// Smallest and largest accounted round wall clock seen, so a reader can
+    /// tell a single-shape run from one that mixed prompt lengths. The sums
+    /// above are means-in-waiting, and a mean over a run whose rounds span a
+    /// 64-token prompt and a full-context one describes neither. Zero means
+    /// no round has been recorded.
+    public var minRoundNanos: UInt64 = 0
+    public var maxRoundNanos: UInt64 = 0
 
     public init() {}
+
+    /// This round's accounted wall clock. Only meaningful on a single-round
+    /// value (the per-round struct the engine fills in), not on a sum.
+    var accountedWallNanos: UInt64 {
+        hostGapNanos &+ packetWaitNanos &+ acceptWalkNanos &+ rowFinalizeNanos
+    }
+
+    /// Mean accounted round wall clock (nil before any round).
+    public var meanRoundNanos: Double? {
+        guard rounds > 0 else { return nil }
+        return Double(accountedWallNanos) / Double(rounds)
+    }
 
     /// Host time per round that is NOT the GPU waiting on the verify: the
     /// number a 200 tok/s target has to drive to zero.
@@ -571,6 +600,11 @@ public struct CBv2MTPRoundTiming: Sendable, Equatable {
     }
 
     mutating func add(_ other: CBv2MTPRoundTiming) {
+        if other.rounds > 0 {
+            let wall = other.accountedWallNanos
+            minRoundNanos = minRoundNanos == 0 ? wall : Swift.min(minRoundNanos, wall)
+            maxRoundNanos = Swift.max(maxRoundNanos, wall)
+        }
         rounds &+= other.rounds
         hostGapNanos &+= other.hostGapNanos
         captureNanos &+= other.captureNanos
