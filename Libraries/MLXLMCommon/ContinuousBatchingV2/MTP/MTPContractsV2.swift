@@ -468,6 +468,92 @@ public struct CBv2MTPCostInput: Sendable, Equatable {
 /// Cumulative MTP counters (engine-thread mutated, snapshot under the
 /// engine's stats lock). Per-position acceptance is the tuning signal for
 /// `maxDraftTokens`.
+/// Per-stage HOST timing for MTP rounds, summed over every round in the run.
+///
+/// The stages are cut where the GPU's view of the round changes, because the
+/// thing that decides whether speculation pays is not the total round wall
+/// clock but how much of it the GPU spent idle. MTP rounds never chain (see
+/// `CBv2InFlightStep.mtpRound`), so unlike plain decode there is no successor
+/// step queued while the host finalizes: every nanosecond between the
+/// acceptance readback and the next round's submit is dead GPU time.
+///
+///   hostGapNanos    previous round's finalize end -> this round's submit.
+///                   The dead window. Contains plan, capture, draft build,
+///                   verify build, and submit — those are broken out below so
+///                   the residue (scheduling, leases, gauges, dispatch) is
+///                   what is left over.
+///   captureNanos    pre-write KV snapshots handed to the drafter.
+///   draftBuildNanos k drafter forwards, GRAPH BUILD only (lazy).
+///   verifyBuildNanos rectangular target verification graph build.
+///   submitNanos     `asyncEval` of the whole round.
+///   packetWaitNanos the blocking `asArray` on the acceptance packet: the
+///                   round's GPU time as the host sees it. Not overlapped.
+///   acceptWalkNanos target-authoritative prefix resolution for every row.
+///   rowFinalizeNanos KV rollback/commit, streaming handoff, carry store,
+///                   controller bookkeeping.
+///
+/// A round's accounted wall clock is
+/// `hostGap + packetWait + acceptWalk + rowFinalize`, and the speculation
+/// budget is everything in it that is not `packetWait`.
+public struct CBv2MTPRoundTiming: Sendable, Equatable {
+    /// Rounds these sums cover (verify rounds only; seed-only steps do not
+    /// produce an acceptance packet and are counted by `seedSteps`).
+    public var rounds: UInt64 = 0
+    public var hostGapNanos: UInt64 = 0
+    public var captureNanos: UInt64 = 0
+    public var draftBuildNanos: UInt64 = 0
+    public var verifyBuildNanos: UInt64 = 0
+    public var submitNanos: UInt64 = 0
+    public var packetWaitNanos: UInt64 = 0
+    public var acceptWalkNanos: UInt64 = 0
+    public var rowFinalizeNanos: UInt64 = 0
+
+    public init() {}
+
+    /// Host time per round that is NOT the GPU waiting on the verify: the
+    /// number a 200 tok/s target has to drive to zero.
+    public var meanFixedCostNanos: Double? {
+        guard rounds > 0 else { return nil }
+        let fixed = hostGapNanos &+ acceptWalkNanos &+ rowFinalizeNanos
+        return Double(fixed) / Double(rounds)
+    }
+
+    /// Timers are `DispatchTime.now()` reads on the engine thread — about
+    /// eight per round against a round measured in milliseconds. On by
+    /// default; `MTPLX_MTP_ROUND_TIMING=0` takes even that off a control run.
+    public static let enabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_ROUND_TIMING"]
+        guard let raw else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    @inline(__always)
+    public static func now() -> UInt64 {
+        enabled ? DispatchTime.now().uptimeNanoseconds : 0
+    }
+
+    /// Elapsed since `start`, or zero when timing is off or the clock went
+    /// backwards (never trusted into a sum).
+    @inline(__always)
+    public static func since(_ start: UInt64) -> UInt64 {
+        guard enabled, start != 0 else { return 0 }
+        let now = DispatchTime.now().uptimeNanoseconds
+        return now > start ? now &- start : 0
+    }
+
+    mutating func add(_ other: CBv2MTPRoundTiming) {
+        rounds &+= other.rounds
+        hostGapNanos &+= other.hostGapNanos
+        captureNanos &+= other.captureNanos
+        draftBuildNanos &+= other.draftBuildNanos
+        verifyBuildNanos &+= other.verifyBuildNanos
+        submitNanos &+= other.submitNanos
+        packetWaitNanos &+= other.packetWaitNanos
+        acceptWalkNanos &+= other.acceptWalkNanos
+        rowFinalizeNanos &+= other.rowFinalizeNanos
+    }
+}
+
 public struct CBv2MTPMetrics: Sendable {
     /// True for every non-nil `EngineV2.mtpMetricsSnapshot()`. Kept explicit
     /// so provider telemetry can serialize one stable shape.
@@ -516,6 +602,8 @@ public struct CBv2MTPMetrics: Sendable {
     public var costInputs: [CBv2MTPCostInput] = []
     /// Sum of measured wall time for cost-eligible speculative rounds.
     public var totalRoundWallTimeNanos: UInt64 = 0
+    /// Per-stage host timing, summed over rounds. See `CBv2MTPRoundTiming`.
+    public var roundTiming = CBv2MTPRoundTiming()
 
     public init() {}
 

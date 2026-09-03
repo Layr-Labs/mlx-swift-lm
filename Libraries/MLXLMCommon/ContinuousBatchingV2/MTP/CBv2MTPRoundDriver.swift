@@ -131,6 +131,9 @@ final class CBv2MTPRoundInFlight {
     var finalizedSeedIDs: Set<CBv2RequestID> = []
     var finalizedVerifyIDs: Set<CBv2RequestID> = []
     var claimedSeedCostNanos: UInt64 = 0
+    /// Launch-side stage times, completed at finalize and folded into the
+    /// driver's metrics there. See `CBv2MTPRoundTiming`.
+    var timing = CBv2MTPRoundTiming()
     /// Cancellation-owned assistant states released only after the target KV
     /// and recurrent deferred-release fence has retired.
     var deferredAssistantReleases: [any CBv2MTPRequestState] = []
@@ -701,6 +704,19 @@ final class CBv2MTPRoundDriver {
     func recordControllerFallback(_ reason: String) {
         metricsLock.lock()
         metrics.controllerFallbacks[reason, default: 0] += 1
+        metricsLock.unlock()
+    }
+
+    /// Uptime nanoseconds at which the previous round's finalize returned.
+    /// Engine-thread only (never read under the metrics lock): the next
+    /// round's `hostGapNanos` is measured from here, and that gap is dead GPU
+    /// time because MTP rounds do not chain.
+    var lastRoundFinalizeEndNanos: UInt64 = 0
+
+    func recordRoundTiming(_ timing: CBv2MTPRoundTiming) {
+        guard CBv2MTPRoundTiming.enabled else { return }
+        metricsLock.lock()
+        metrics.roundTiming.add(timing)
         metricsLock.unlock()
     }
 

@@ -59,8 +59,18 @@ extension EngineLoopV2 {
 
         guard let verify = round.verify else { return }
         let k = verify.k
+        // THE round's host sync. Nothing is queued behind it — MTP rounds do
+        // not chain — so this wait is the round's GPU time as the host sees
+        // it, and everything after it is the fixed cost.
+        let packetWaitStart = CBv2MTPRoundTiming.now()
         let host = verify.acceptancePacket.asArray(Int32.self)
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+        round.timing.packetWaitNanos = CBv2MTPRoundTiming.since(packetWaitStart)
+        let acceptWalkStart = CBv2MTPRoundTiming.now()
+        defer {
+            mtp.recordRoundTiming(round.timing)
+            mtp.lastRoundFinalizeEndNanos = CBv2MTPRoundTiming.now()
+        }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -139,6 +149,9 @@ extension EngineLoopV2 {
                 observedDrafts: observedDrafts,
                 decodeRowBucket: mtp.planDecodeRowBucket)
         }
+
+        round.timing.acceptWalkNanos = CBv2MTPRoundTiming.since(acceptWalkStart)
+        let rowFinalizeStart = CBv2MTPRoundTiming.now()
 
         for outcome in outcomes {
             let batchIndex = outcome.batchIndex
@@ -329,5 +342,6 @@ extension EngineLoopV2 {
         if anyRejected {
             eagerCompositionStale = true
         }
+        round.timing.rowFinalizeNanos = CBv2MTPRoundTiming.since(rowFinalizeStart)
     }
 }

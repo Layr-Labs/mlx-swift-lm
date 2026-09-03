@@ -117,7 +117,8 @@ extension EngineLoopV2 {
     }
 
     func mtpBuildRoundGraph(
-        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
+        timing: inout CBv2MTPRoundTiming
     ) -> CBv2MTPGraphBuild {
         var cacheInnerState: [MLXArray] = []
         var logprobSegments: [CBv2StepLogprobs] = []
@@ -322,7 +323,8 @@ extension EngineLoopV2 {
 
         let verifyRows = work.filter { $0.carry != nil }
         let verify = mtpBuildVerifyGraph(
-            verifyRows, driver: mtp, cacheInnerState: &cacheInnerState)
+            verifyRows, driver: mtp, cacheInnerState: &cacheInnerState,
+            timing: &timing)
 
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
@@ -384,9 +386,12 @@ extension EngineLoopV2 {
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
-        cacheInnerState: inout [MLXArray]
+        cacheInnerState: inout [MLXArray],
+        timing: inout CBv2MTPRoundTiming
     ) -> CBv2MTPRoundInFlight.Verify? {
         guard !verifyRows.isEmpty else { return nil }
+        timing.rounds = 1
+        let captureStart = CBv2MTPRoundTiming.now()
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
@@ -442,6 +447,8 @@ extension EngineLoopV2 {
         }
 
         mtpFreezeCaptures(captured)
+        timing.captureNanos = CBv2MTPRoundTiming.since(captureStart)
+        let draftBuildStart = CBv2MTPRoundTiming.now()
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
@@ -498,6 +505,7 @@ extension EngineLoopV2 {
             }
         }
         let draftIDs = stacked(draftSteps, axis: 1)
+        timing.draftBuildNanos = CBv2MTPRoundTiming.since(draftBuildStart)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -506,6 +514,7 @@ extension EngineLoopV2 {
         // Windowed rows stage provisional writes; other supported storage
         // backends implement the transaction hooks as exact no-ops/rollback.
         let verifyStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let verifyBuildStart = CBv2MTPRoundTiming.now()
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
@@ -518,6 +527,7 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
+        timing.verifyBuildNanos = CBv2MTPRoundTiming.since(verifyBuildStart)
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
