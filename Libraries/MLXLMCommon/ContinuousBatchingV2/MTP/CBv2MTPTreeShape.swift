@@ -16,23 +16,30 @@
 //
 // WHEN IT IS WORTH IT — read this before enabling the switch. Let `q` be
 // the drafter's per-position acceptance and `r` the chance its rank-2
-// candidate is the target's argmax GIVEN rank-1 is not. One more spine
-// column at depth k is worth `q^k` committed tokens; one alternate at
-// depth d is worth `q^(d-1) * (1 - q) * r`. An alternate needs no extra
-// drafter forward (its token is rank 2 of a forward the spine already
-// ran), so it costs roughly the verify-column share of the marginal round
-// cost, not the whole of it. The trade is therefore
+// candidate is the target's argmax GIVEN rank-1 is not. One alternate at
+// depth d adds `q^(d-1) * (1 - q) * r` committed tokens. It needs no extra
+// drafter forward (its token is rank 2 of a forward the spine already ran),
+// so it costs `c_alt`: the verify-column share of the marginal round cost,
+// not the whole of it. A column is worth adding only when it raises
+// committed tokens by a larger FRACTION than it raises the round, so at the
+// chain's own optimum depth k*
 //
-//        alternate wins  <=>  (1 - q) * r  >  (c_alt / c) * q^k
+//      alternate wins  <=>  (1 - q) * r / committed(k*)  >  c_alt / round(k*)
+//
+// which is a threshold on `r` for each `q`:
+//
+//      q     0.82  0.80  0.78  0.75  0.72  0.70  0.68  0.65  0.60
+//      k*       4     4     3     3     3     3     2     2     2
+//      r >   1.37  1.18  1.04  0.87  0.74  0.67  0.62  0.54  0.45
 //
 // At the acceptance this drafter actually shows on the 64-token control
 // matrix (`q ~= 0.82`, fitted against committed/round 3.5 at k=4 and 4.2 at
-// k=7) the right-hand side at the measured optimum k=4-5 is ~0.24 and the
-// left-hand side cannot exceed 0.18. NO TREE BEATS THE CHAIN AT q = 0.82.
-// The crossover is near `q <= 0.72`. That number is measured per context
-// length, not assumed: a long technical continuation is not three short
-// chat turns, and this switch exists so the arm can be run the moment a
-// width matrix at the production shape reports `q` there.
+// k=7) an alternate would need `r > 1.37`. NO TREE BEATS THE CHAIN AT
+// q = 0.82, and none can. With a plausible `r ~= 0.5` the crossover is near
+// `q <= 0.63`; even a PERFECT runner-up needs `q <= 0.77`. Both `q` and `r`
+// are measured per context length, not assumed — a long technical
+// continuation is not three short chat turns — and this switch exists so
+// the arm can be run the moment they are measured at the production shape.
 //
 // SHAPE-GENERIC BY CONSTRUCTION. Nothing here reads a prompt length, a
 // prefill size, a ring size or a chunk size. A shape is (spine depth,
