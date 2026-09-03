@@ -27,7 +27,35 @@ import MLX
 /// layer with rows matching batch rows. Returns logits [B, L, vocab].
 public protocol CBv2SteppableModel: AnyObject {
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray
+
+    /// Optional decode-only proof surface. A model may return the minimal
+    /// roots that force all cache mutations represented by `forwardOutput`.
+    /// nil keeps the established full cache-inner-state evaluation.
+    func compactDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]?
 }
+
+extension CBv2SteppableModel {
+    public func compactDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        nil
+    }
+}
+
+/// CBV2-COMPACT-DECODE-ROOTS kill switch. Compaction is ON by default (the
+/// ranked runner sets no environment); `DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS`
+/// set to `0`/`false`/`no`/`off` restores the full cache-inner-state root
+/// list for attribution and emergency bisection.
+@inline(__always)
+internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}
+
+private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
+    ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
@@ -676,6 +704,47 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var inFlight: CBv2InFlightStep?
     private var running = false
     private var draining = false
+
+    // MARK: ADMIT-COALESCE-001 (bounded admission coalescing)
+
+    /// Width of the bounded admission-coalescing wait, in milliseconds, from
+    /// `DARKBLOOM_ADMIT_COALESCE_MS`. `0` disables the wait entirely, which
+    /// restores byte-identical planning to the stock loop. Values above
+    /// `admitCoalesceWindowCapMS` are clamped: the wait is a latency cost
+    /// paid by every cohort, so it must stay small and bounded by
+    /// construction, never tunable into an unbounded hold.
+    ///
+    /// Why it exists: a closed cohort is submitted as N independent
+    /// `enqueue` calls from the caller thread, each of which hops onto the
+    /// serial engine queue, while `engineStep` re-arms itself every
+    /// `idleRecheckInterval` (1 ms). The idle re-check therefore races the
+    /// tail of the submission burst and the first planned step frequently
+    /// admits a RAGGED subset (1 of 8, 2 of 8, ...). The remainder then
+    /// costs a second prefill pass over the same weights plus a mixed step
+    /// at a batch width below capacity. This wait is the scheduler-side
+    /// realisation of the closed-cohort intent already documented by the
+    /// caller ("one planned step admits every stream's whole seed",
+    /// `Gemma4RuntimeCohortDriver.swift`). It is prompt-independent,
+    /// cohort-size-independent, and hard-bounded.
+    static let admitCoalesceWindowCapMS = 25
+    static let admitCoalesceWindowMS: Int = {
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_ADMIT_COALESCE_MS"],
+            let value = Int(raw), value >= 0
+        else { return 3 }
+        return Swift.min(value, admitCoalesceWindowCapMS)
+    }()
+
+    /// Monotonic origin of the current waiting batch: stamped by `enqueue`
+    /// when a request arrives at a COMPLETELY IDLE engine (nothing running,
+    /// nothing else waiting) and never re-stamped by the arrivals that
+    /// follow it, so the wait below is measured from the FIRST of them and
+    /// cannot be extended by a stream of late arrivals. Engine-thread
+    /// confined. `nil` means "no origin known" and disables the wait
+    /// (fail-open: an unstamped batch is never delayed).
+    private var admitBatchFirstEnqueue: ContinuousClock.Instant?
+
     private var drainWaiters: [CBv2DrainWaiter] = []
     /// True after a rejecting MTP round advanced rows OUTSIDE the eager
     /// provider's caches' host truth: the next eager bind must be forced to
@@ -797,7 +866,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         // MTP: the scheduler consults the loop for 1+k decode assignments.
         // `unowned` is safe (and cycle-free): the loop owns the scheduler
         // and both live exactly as long as the engine.
-        if let mtp {
+        // Left nil under a target-only controller policy: the hook would
+        // return 0 for every row, so not installing it keeps the scheduler on
+        // its plain-decode path with no per-row call.
+        if let mtp, !mtp.isTargetOnlyPolicy {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
             }
@@ -1237,6 +1309,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             do {
                 try scheduler.enqueue(request)
+                // ADMIT-COALESCE-001: remember when a fresh waiting batch
+                // began. Only the arrival that finds the engine completely
+                // idle stamps; later arrivals of the same burst do not, so
+                // the coalescing wait in `engineStep` is anchored to the
+                // FIRST submission and is bounded from that instant.
+                if scheduler.runningCount == 0, scheduler.waitingCount == 1 {
+                    admitBatchFirstEnqueue = config.clock.now()
+                }
                 armLease(for: request)
                 detokenizers[request.id] =
                     detokenizerFactory.makeDetokenizer(stopStrings: request.stopStrings)
@@ -1887,6 +1967,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // rebind, pinning dead KV on an idle engine (PR#62 review).
             // No-op after the first call while idle.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            admitBatchFirstEnqueue = nil
             publishGauges()
             if draining {
                 completeDrainIfReady()
@@ -1895,6 +1976,31 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduleIdleRecheck()
             return
         }
+
+        // ADMIT-COALESCE-001: bounded admission coalescing. When the engine
+        // holds NO running work and the waiting set is still below the
+        // configured concurrency, a plan taken right now would admit only
+        // the submissions that happened to win the race against this
+        // re-check; the rest would pay a second prefill pass and a
+        // below-capacity mixed step. Re-arm the ordinary idle re-check
+        // instead, until either the waiting set reaches capacity or the
+        // bounded window since the batch's first arrival elapses --
+        // whichever comes first. The wait NEVER applies while any request is
+        // running (a live decode is never delayed by a late arrival), never
+        // exceeds `admitCoalesceWindowMS`, and never inspects the request
+        // contents or the cohort size.
+        if Self.admitCoalesceWindowMS > 0,
+            let batchStart = admitBatchFirstEnqueue,
+            scheduler.runningCount == 0,
+            scheduler.waitingCount > 0,
+            scheduler.waitingCount < scheduler.config.maxConcurrentRequests,
+            stepNow - batchStart < .milliseconds(Self.admitCoalesceWindowMS)
+        {
+            publishGauges()
+            scheduleIdleRecheck()
+            return
+        }
+        admitBatchFirstEnqueue = nil
 
         beginMTPPlan()
         // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
@@ -2088,6 +2194,22 @@ public final class EngineLoopV2: @unchecked Sendable {
         return (logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)), arrays)
     }
 
+    /// Decode-only counterpart to `eagerCacheInnerState`. The MODEL, not just
+    /// the cache provider, must affirm that its output graph consumes every
+    /// cache mutation. This matters because `CBv2SteppableModel` permits
+    /// custom/scripted forwards that ignore their caches entirely.
+    func eagerDecodeEvaluationRoots(
+        _ caches: [CBv2AttendingLayerCache], logitsRoot: MLXArray
+    ) -> [MLXArray] {
+        if cbv2CompactDecodeRootsEnabled,
+            let compact = model.compactDecodeEvaluationRoots(
+                forwardOutput: logitsRoot, caches: caches)
+        {
+            return compact
+        }
+        return eagerCacheInnerState(caches)
+    }
+
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
     /// batch. The second tuple element is the eager caches' inner state
     /// (offset chain + KV buffers) that must ride the step's `asyncEval`
@@ -2103,9 +2225,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             cacheOffsets: rowStates.map(Self.positionOffset))
         let forward = targetForward(
             tokens: tokens, caches: caches, ids: ids, positionIds: positionIds)
+        let last = forward.logits[0..., -1, 0...]
         return (
-            forward.logits[0..., -1, 0...],
-            eagerCacheInnerState(caches) + forward.innerState,
+            last,
+            eagerDecodeEvaluationRoots(caches, logitsRoot: last) + forward.innerState,
             forward.recurrent)
     }
 
@@ -2388,9 +2511,13 @@ public final class EngineLoopV2: @unchecked Sendable {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let decodeIDs = decodeRows.map(\.rec.id)
-            let (last, decodeInnerState, recurrent) = decodeLogits(
-                rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
-                ids: decodeIDs)
+            // SOFTCAP-SKIP: same declaration on the mixed-step decode rows.
+            let (last, decodeInnerState, recurrent) = CBv2OrderOnlyLogits
+                .withOrderOnly(decodeRows.map(\.rec.request.sampling)) {
+                    decodeLogits(
+                        rowStates: decodeRows.map { kvStates[$0.rec.id]! },
+                        tokens: inputs, ids: decodeIDs)
+                }
             cacheInnerState.append(contentsOf: decodeInnerState)
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
