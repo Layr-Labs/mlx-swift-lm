@@ -76,4 +76,43 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
                 resolveGemma4DecodeLadderAnyBatchEnabled(off), "value \(off)")
         }
     }
+
+    // MARK: - GLUE-B1: fused layer glue tiling arithmetic
+
+    /// One 704-thread threadgroup per row, four values per thread, covers
+    /// `rows * 2816` exactly once with nothing out of range -- for every row
+    /// count, which is what makes `rows` a grid extent rather than a tiling
+    /// constant.
+    func testGluePlaneCoverageIsExactAtEveryRowCount() {
+        for rows in [1, 2, 3, 7, 8, 16, 33] {
+            let plan = gemma4GluePlaneCoverage(rows: rows)
+            XCTAssertEqual(plan.covered, rows * 2816, "rows \(rows)")
+            XCTAssertEqual(plan.outOfRange, 0, "rows \(rows)")
+            XCTAssertEqual(plan.duplicates, 0, "rows \(rows)")
+        }
+    }
+
+    /// Regression guard for the one index that is NOT row-generic. The
+    /// activation-sum store is `xSums[lid * 8 + row]` with the cohort's
+    /// eight frozen in the kernel text. Below eight rows it runs off the end
+    /// of the buffer; above eight it stays in range but aliases, so the table
+    /// would silently carry the wrong sums. Only eight is a bijection, which
+    /// is why `attentionBranchPrefix` and `dualPreNorm`'s sums arm stay
+    /// pinned and the no-sums body carries the fusion everywhere else.
+    func testGlueXSumsLayoutOnlyFitsTheCohort() {
+        let cohort = gemma4GlueXSumsHazards(rows: 8)
+        XCTAssertEqual(cohort.outOfRange, 0)
+        XCTAssertEqual(cohort.collisions, 0)
+
+        for rows in [1, 2, 3, 4, 7] {
+            XCTAssertGreaterThan(
+                gemma4GlueXSumsHazards(rows: rows).outOfRange, 0,
+                "rows \(rows) would store past the table")
+        }
+        for rows in [9, 16, 33] {
+            XCTAssertGreaterThan(
+                gemma4GlueXSumsHazards(rows: rows).collisions, 0,
+                "rows \(rows) would alias inside the table")
+        }
+    }
 }

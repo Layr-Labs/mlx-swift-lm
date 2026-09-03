@@ -3241,6 +3241,86 @@ public final class Gemma4GlueChainBox {
 /// `metal::precise::rsqrt(acc/2816 + 1e-6)`), the output cast order is the
 /// stock `w * static_cast<T>(x * inv)`, and the adds are single bfloat adds
 /// exactly as the binary kernel performs them.
+/// GLUE-B1 tiling arithmetic, factored out so it can be checked without a
+/// Metal device.
+///
+/// Every kernel in ``Gemma4FusedLayerGlue`` launches one 704-thread
+/// threadgroup per row and has each thread own four contiguous values at
+/// `row * axis + lid * 4`. `gemma4GluePlaneCoverage` replays exactly that
+/// addressing and reports whether the launch covers `rows * axis` elements
+/// once each with no address outside the buffer.
+@inline(__always)
+internal func gemma4GluePlaneCoverage(
+    rows: Int, axis: Int = 2816, threadsPerRow: Int = 704, valuesPerThread: Int = 4
+) -> (covered: Int, outOfRange: Int, duplicates: Int) {
+    guard rows > 0, axis > 0, threadsPerRow > 0, valuesPerThread > 0 else {
+        return (0, 0, 0)
+    }
+    var seen = [Bool](repeating: false, count: rows * axis)
+    var covered = 0
+    var outOfRange = 0
+    var duplicates = 0
+    for row in 0 ..< rows {
+        for lid in 0 ..< threadsPerRow {
+            for i in 0 ..< valuesPerThread {
+                let index = row * axis + lid * valuesPerThread + i
+                if index < 0 || index >= seen.count {
+                    outOfRange += 1
+                    continue
+                }
+                if seen[index] {
+                    duplicates += 1
+                } else {
+                    seen[index] = true
+                    covered += 1
+                }
+            }
+        }
+    }
+    return (covered, outOfRange, duplicates)
+}
+
+/// The activation-sum table's address, `xSums[lid * BATCH + row]`, with the
+/// cohort's eight frozen into the kernel text as `BATCH`.
+///
+/// This is the ONE index in the glue family that is a layout constant rather
+/// than a grid extent, and the reason `attentionBranchPrefix` and the
+/// sums-emitting `dualPreNorm` body stay pinned to eight rows. The buffer is
+/// sized `(axis / 128) * 32 * rows`, so the frozen stride is a bijection onto
+/// it at exactly one row count:
+///
+///   * fewer than eight rows -- stores run past the end of the buffer;
+///   * more than eight rows  -- stores stay in range but ALIAS, because two
+///     `(lid, row)` pairs eight rows apart land on the same slot, so the
+///     table would silently carry the wrong sums.
+///
+/// Both are fatal, and only `rows == 8` avoids both.
+@inline(__always)
+internal func gemma4GlueXSumsHazards(
+    rows: Int, frozenBatch: Int = 8, axis: Int = 2816, threadsPerRow: Int = 704
+) -> (outOfRange: Int, collisions: Int) {
+    guard rows > 0 else { return (0, 0) }
+    let capacity = (axis / 128) * 32 * rows
+    var outOfRange = 0
+    var collisions = 0
+    var seen = [Bool](repeating: false, count: capacity)
+    for row in 0 ..< rows {
+        for lid in 0 ..< threadsPerRow {
+            let slot = lid * frozenBatch + row
+            if slot >= capacity {
+                outOfRange += 1
+                continue
+            }
+            if seen[slot] {
+                collisions += 1
+            } else {
+                seen[slot] = true
+            }
+        }
+    }
+    return (outOfRange, collisions)
+}
+
 private enum Gemma4FusedLayerGlue {
     /// Kill switch: DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE=0 restores the stock
     /// per-op chain. Default ON.
@@ -3262,6 +3342,36 @@ private enum Gemma4FusedLayerGlue {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// GLUE-B1. Every kernel in this enum is a PER-ROW program: the body
+    /// derives its row from `threadgroup_position_in_grid.x` and addresses
+    /// memory as `row * 2816 + lid * 4`, one 704-thread threadgroup per row.
+    /// No lane, barrier, shared slot, reduction tree or output index depends
+    /// on how many rows the grid carries, so `rows` below is a GRID EXTENT,
+    /// not a tiling constant -- the same fact `Gemma4RouterFinalistsV1`
+    /// already relies on when it re-admits its own decode kernel at `[8, L,
+    /// 128]` by recomputing `rows = b * l`.
+    ///
+    /// Why this matters at one prompt. The decode twin pins `[8, 1, 2816]`
+    /// and the prefill twin (`Gemma4PrefillGlueV1.planeRows`) pins `L >= 2`,
+    /// so a batch-one decode step falls between them and runs the STOCK
+    /// nine-dispatch norm/residual chain in every MoE layer. This enum's own
+    /// argument -- these ops sit on the layer's DEPENDENT chain and cannot
+    /// hide under the expert branch -- holds verbatim at one row, where each
+    /// tensor is 5.6 KB and the chain is pure launch latency.
+    ///
+    /// `DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE_ANY_ROWS=0` restores the exact
+    /// `x.dim(0) == 8` pin. Default ON. The master switch
+    /// `DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE=0` still removes the fusion.
+    private static let anyRowsEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE_ANY_ROWS"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The scored cohort row count; the pin restored when `anyRowsEnabled`
+    /// is off, and the shape the deferred-expert variants still require
+    /// (their `[64, axis]` sorted plane is produced only at that cohort).
     private static let rows = 8
     private static let axis = 2816
     private static let eps: Float = 1e-6
@@ -3504,6 +3614,47 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
+    /// GLUE-B1 dual pre-norm without the activation-sum table.
+    ///
+    /// The table above is laid out `xSums[lid * 8 + row]` -- `lid * BATCH +
+    /// row`, matching the standalone DMLP table's `[k_block][lane][row]`
+    /// order with the cohort's eight as the innermost stride. That literal
+    /// eight is the ONE place in this enum where the row count is a layout
+    /// constant rather than a grid extent, so the sums-emitting bodies stay
+    /// pinned to the cohort. Its only consumer, `CBv2DenseMLPQMVV1`, is
+    /// itself pinned to eight input rows, so at any other row count the
+    /// table would be written for no reader.
+    ///
+    /// This body is `dualPreNormKernel` with the `xsum` accumulation and its
+    /// store deleted and nothing else changed: same reduction tree, same
+    /// `(float)x * inv` widening, same `w * nx` bf16 rounding, same store
+    /// order. It carries the fusion (two dependent full-width norm passes
+    /// over one input collapse to one dispatch) to every other row count.
+    private static let dualPreNormNoSumsKernel: MLXFast.MLXFastKernel =
+        MLXFast.metalKernel(
+            name: "gemma4_glue_dual_prenorm_2816_bf16_v2_nosums",
+            inputNames: ["x", "w1", "w2"],
+            outputNames: ["out1", "out2"],
+            source: """
+                const uint row = threadgroup_position_in_grid.x;
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                threadgroup float local_inv[1];
+                threadgroup float local_sums[32];
+                const uint base = row * 2816 + lid * 4;
+                const uint wbase = lid * 4;
+            \(rmsReduce("x", into: "local_inv[0]"))
+                const float inv = local_inv[0];
+                for (int i = 0; i < 4; i++) {
+                    const T nx = static_cast<T>((float)x[base + i] * inv);
+                    out1[base + i] = w1[wbase + i] * nx;
+                    out2[base + i] = w2[wbase + i] * nx;
+                }
+            """,
+            ensureRowContiguous: true
+        )
+
     private static let tailSource = """
             const uint row = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -3556,20 +3707,31 @@ private enum Gemma4FusedLayerGlue {
         ensureRowContiguous: true
     )
 
-    private static func admits(_ x: MLXArray, weight: MLXArray, eps: Float) -> Bool {
-        enabled
-            && eps == Self.eps
-            && x.ndim == 3
-            && x.dim(0) == rows && x.dim(1) == 1 && x.dim(2) == axis
-            && x.dtype == .bfloat16
-            && weight.ndim == 1 && weight.dim(0) == axis
-            && weight.dtype == .bfloat16
+    /// The admitted row count for `x`, or nil when this is not the fused
+    /// cell. With `anyRowsEnabled` off the only admitted count is the scored
+    /// cohort's eight, which reproduces the previous `x.dim(0) == rows` gate
+    /// exactly.
+    private static func admittedRows(
+        _ x: MLXArray, weight: MLXArray, eps: Float
+    ) -> Int? {
+        guard enabled,
+            eps == Self.eps,
+            x.ndim == 3,
+            x.dim(1) == 1, x.dim(2) == axis,
+            x.dtype == .bfloat16,
+            weight.ndim == 1, weight.dim(0) == axis,
+            weight.dtype == .bfloat16
+        else { return nil }
+        let n = x.dim(0)
+        guard n > 0, x.size == n * axis else { return nil }
+        guard anyRowsEnabled || n == rows else { return nil }
+        return n
     }
 
     static func normResidual(
         x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
     ) -> MLXArray? {
-        guard admits(x, weight: weight, eps: eps),
+        guard let rows = admittedRows(x, weight: weight, eps: eps),
             residual.shape == x.shape, residual.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-norm-residual")
@@ -3588,7 +3750,8 @@ private enum Gemma4FusedLayerGlue {
     static func inputNormWithQKVRunsum(
         x: MLXArray, weight: MLXArray, eps: Float
     ) -> (normed: MLXArray, qkvRunsumTable: MLXArray)? {
-        guard admits(x, weight: weight, eps: eps) else { return nil }
+        guard let rows = admittedRows(x, weight: weight, eps: eps)
+        else { return nil }
         let outs = inputNormRunsumKernel(
             [x, weight],
             template: [("T", x.dtype)],
@@ -3626,7 +3789,12 @@ private enum Gemma4FusedLayerGlue {
     ) -> AttentionBranchPrefix? {
         guard CBv2DenseMLPQMVV1.enabled,
             CBv2DenseMLPQMVV1.activationSumsEnabled,
-            admits(attn, weight: postAttentionWeight, eps: eps),
+            // PREFIX-001 emits the batch-strided `xSums[lid * 8 + row]`
+            // table, so it stays pinned to the cohort row count; its
+            // consumers (`CBv2DenseMLPQMVV1`, `Gemma4ZipRouterV1.run`) are
+            // pinned to the same eight rows anyway.
+            let rows = admittedRows(attn, weight: postAttentionWeight, eps: eps),
+            rows == Self.rows,
             residual.shape == attn.shape, residual.dtype == .bfloat16,
             denseWeight.ndim == 1, denseWeight.dim(0) == axis,
             denseWeight.dtype == .bfloat16,
@@ -3669,10 +3837,24 @@ private enum Gemma4FusedLayerGlue {
     static func dualPreNorm(
         x: MLXArray, w1: MLXArray, w2: MLXArray, eps: Float
     ) -> (MLXArray, MLXArray, CBv2DenseMLPQMVV1.ActivationSums?)? {
-        guard admits(x, weight: w1, eps: eps),
+        guard let rows = admittedRows(x, weight: w1, eps: eps),
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16
         else { return nil }
         CBv2EngageMark.once("glue-dual-prenorm")
+        guard rows == Self.rows else {
+            // The sums table's layout is batch-strided and has no reader
+            // away from the cohort; take the identical fusion without it.
+            CBv2EngageMark.once("glue-dual-prenorm-nosums")
+            let outs = dualPreNormNoSumsKernel(
+                [x, w1, w2],
+                template: [("T", x.dtype)],
+                grid: (rows * tgThreads, 1, 1),
+                threadGroup: (tgThreads, 1, 1),
+                outputShapes: [[rows, 1, axis], [rows, 1, axis]],
+                outputDTypes: [.bfloat16, .bfloat16]
+            )
+            return (outs[0], outs[1], nil)
+        }
         let outs = dualPreNormKernel(
             [x, w1, w2],
             template: [("T", x.dtype)],
@@ -3896,14 +4078,21 @@ private enum Gemma4FusedLayerGlue {
             ensureRowContiguous: true
         )
 
+    /// The deferred-expert bodies index `inverse[row * 8 + slot]` and
+    /// `sorted[sorted_rows[slot] * 2816 + ...]`, so their sorted plane is
+    /// `[rows * topK, axis]` for whatever row count the grid carries. The
+    /// literal 64 the pinned decode cell used is `rows * 8` at rows == 8.
+    /// (The producer, `SwitchGLU.callAndDeferWeightedReduce`, is itself
+    /// pinned to the eight-row cohort, so this parameterization is
+    /// consistency, not a new reachable shape.)
     private static func admitsDeferred(
-        _ expertRows: DeferredWeightedExpertRows
+        _ expertRows: DeferredWeightedExpertRows, rows: Int
     ) -> Bool {
         expertRows.sortedOutputs.dtype == .bfloat16
-            && expertRows.sortedOutputs.shape == [64, axis]
+            && expertRows.sortedOutputs.shape == [rows * 8, axis]
             && expertRows.inverseOrder.dtype == .uint32
             && expertRows.inverseOrder.ndim == 1
-            && expertRows.inverseOrder.size == 64
+            && expertRows.inverseOrder.size == rows * 8
             && expertRows.weights.dtype == .bfloat16
             && expertRows.weights.shape == [rows, 8]
     }
@@ -3919,8 +4108,8 @@ private enum Gemma4FusedLayerGlue {
         nextInputNormWeight: MLXArray,
         eps: Float
     ) -> (out: MLXArray, normedNext: MLXArray, rs: MLXArray)? {
-        guard admits(mlpOut, weight: w1, eps: eps),
-            admitsDeferred(expertRows),
+        guard let rows = admittedRows(mlpOut, weight: w1, eps: eps),
+            admitsDeferred(expertRows, rows: rows),
             residual.shape == mlpOut.shape,
             residual.dtype == .bfloat16,
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
@@ -3956,8 +4145,8 @@ private enum Gemma4FusedLayerGlue {
         layerScalar: MLXArray,
         eps: Float
     ) -> MLXArray? {
-        guard admits(mlpOut, weight: w1, eps: eps),
-            admitsDeferred(expertRows),
+        guard let rows = admittedRows(mlpOut, weight: w1, eps: eps),
+            admitsDeferred(expertRows, rows: rows),
             residual.shape == mlpOut.shape,
             residual.dtype == .bfloat16,
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
@@ -3983,7 +4172,7 @@ private enum Gemma4FusedLayerGlue {
         w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
         nextInputNormWeight: MLXArray, eps: Float
     ) -> (out: MLXArray, normedNext: MLXArray)? {
-        guard admits(mlpOut, weight: w1, eps: eps),
+        guard let rows = admittedRows(mlpOut, weight: w1, eps: eps),
             expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
             residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
@@ -4011,7 +4200,7 @@ private enum Gemma4FusedLayerGlue {
         w1: MLXArray, w2: MLXArray, w3: MLXArray, layerScalar: MLXArray,
         eps: Float
     ) -> MLXArray? {
-        guard admits(mlpOut, weight: w1, eps: eps),
+        guard let rows = admittedRows(mlpOut, weight: w1, eps: eps),
             expertOut.shape == mlpOut.shape, expertOut.dtype == .bfloat16,
             residual.shape == mlpOut.shape, residual.dtype == .bfloat16,
             w2.ndim == 1, w2.dim(0) == axis, w2.dtype == .bfloat16,
