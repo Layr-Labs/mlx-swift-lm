@@ -331,6 +331,50 @@ public enum SwitchGLUExpertGrouping {
     /// the previous behaviour bit for bit.
     public static let historicGroupingThreshold = 64
 
+    /// D3, staged for an A/B and OFF by default.
+    ///
+    /// The fused reduction (`weightedExpertUnsort`) folds the unsort into the
+    /// weighted sum and writes `[tokens, hidden]` directly, skipping the
+    /// scatter. Its precondition is that the gather was grouped — which, since
+    /// the grouping rule above, is now true at verify shapes too. Its
+    /// eligibility check nonetheless still demanded the `>= 64` prompt size,
+    /// so the verify could group and then not be allowed to use the reduction
+    /// that grouping unlocks.
+    ///
+    /// Unlike the grouping itself, this one REASSOCIATES: it sums each row's
+    /// terms in sorted order rather than in slot order, so it is a numerics
+    /// change, not a scheduling change. The suite that covers it at prompt
+    /// shapes matches the legacy path to a tolerance, not bit for bit. That is
+    /// why it is default off and why its arm needs a token-parity read, not
+    /// just a tok/s read.
+    ///
+    /// [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION
+    public static let fusedReductionOnGroupedRows: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_FUSED_VERIFY_REDUCTION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw)
+    }()
+
+    /// Whether the direct weighted unsort may be used for this assignment
+    /// tensor. Pure counts again, and the historic answer unless D3 is on.
+    public static func allowsFusedReduction(
+        assignments: Int, rows: Int, unionAcrossRows: Bool, fusedOnGroupedRows: Bool
+    ) -> Bool {
+        if assignments >= historicGroupingThreshold { return true }
+        guard fusedOnGroupedRows else { return false }
+        return shouldGroup(
+            assignments: assignments, rows: rows, unionAcrossRows: unionAcrossRows)
+    }
+
+    public static func allowsFusedReduction(_ indices: MLXArray) -> Bool {
+        allowsFusedReduction(
+            assignments: indices.size,
+            rows: rowCount(indices),
+            unionAcrossRows: unionAcrossRows,
+            fusedOnGroupedRows: fusedReductionOnGroupedRows)
+    }
+
     public static func shouldGroup(_ indices: MLXArray) -> Bool {
         shouldGroup(
             assignments: indices.size,
@@ -749,7 +793,7 @@ public class SwitchGLU: Module {
                 && weights.ndim == 2
                 && weights.shape == indices.shape
                 && weights.dtype == .bfloat16
-                && indices.size >= 64
+                && SwitchGLUExpertGrouping.allowsFusedReduction(indices)
         case .qwen35ProductionSwiGLU:
             return qwenDirectExpertReductionEnabled
                 && inputDims == 2048
@@ -766,7 +810,7 @@ public class SwitchGLU: Module {
                 && weights.ndim == 2
                 && weights.shape == indices.shape
                 && weights.dtype == .bfloat16
-                && indices.size >= 64
+                && SwitchGLUExpertGrouping.allowsFusedReduction(indices)
         }
     }
 

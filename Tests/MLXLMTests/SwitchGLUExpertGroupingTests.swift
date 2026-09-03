@@ -89,6 +89,33 @@ struct SwitchGLUExpertGroupingTests {
         }
     }
 
+    @Test("the fused reduction stays on prompt shapes until D3 is engaged")
+    func fusedReductionIsOptInOnGroupedRows() {
+        func allows(rows: Int, slots: Int, fused: Bool) -> Bool {
+            SwitchGLUExpertGrouping.allowsFusedReduction(
+                assignments: rows * slots, rows: rows,
+                unionAcrossRows: true, fusedOnGroupedRows: fused)
+        }
+        // Off: exactly the historic prompt-size rule, at every shape.
+        for rows in [1, 2, 5, 7, 8, 9, 64] {
+            for slots in [1, 8, 64] {
+                #expect(
+                    allows(rows: rows, slots: slots, fused: false)
+                        == (rows * slots >= SwitchGLUExpertGrouping.historicGroupingThreshold))
+            }
+        }
+        // On: a verify at widths 2...7 becomes eligible, and a single-row
+        // decode still does not — the reduction needs a grouped gather, and
+        // one row is never grouped. That is what keeps production decode on
+        // the legacy reduction whatever this switch says.
+        for width in 1...8 {
+            #expect(allows(rows: width, slots: 8, fused: true) == (width >= 2))
+            #expect(allows(rows: width, slots: 8, fused: false) == (width >= 8))
+        }
+        #expect(!allows(rows: 1, slots: 8, fused: true))
+        #expect(!allows(rows: 1, slots: 63, fused: true))
+    }
+
     @Test("row counting is rank-agnostic")
     func rowCountIsRankAgnostic() {
         // Shape metadata only: these arrays are never evaluated.
