@@ -3138,11 +3138,20 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    private static let batch = 8
+    /// The scored decode cohort. `updateAndAttendWriting`/`...Writing22`
+    /// stay pinned to it; the plain chain also admits ONE row (COMPOSED-B1).
+    private static let cohortBatch = 8
     private static let queryHeads = 16
     private static let kvHeads = 2
     private static let gqa = 8
     private static let headDim = 512
+
+    /// The QK/AV kernels carry a fixed `k0…k7` / `v0…v7` input list and pick
+    /// a plane with `switch (row)`. `row` is derived from the z extent, so at
+    /// `B < 8` the high slots are never dereferenced — they are bound to
+    /// buffer 0 so the kernel TEXT, and therefore the pipeline, is the one
+    /// the cohort already runs.
+    static let kernelKeySlots = 8
 
     /// kL bounds that keep every frozen-host kernel decision inside the
     /// transcribed geometry: `gemv` bm=4 requires kL < 4096
@@ -3150,7 +3159,126 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// a ≤1024-thread group (softmax.cpp:53,64-68), and the gemv tail shift
     /// requires kL ≥ TM = 4.
     private static let minKeyLength = 4
-    private static let maxKeyLength = 4095
+    private static let cohortMaxKeyLength = 4095
+
+    /// COMPOSED-B1 (C1 rung 1). At ONE row the chain is not a cohort
+    /// optimisation, it is the GQA-broadcast fix: MLX's unfused fallback
+    /// (`fast.cpp` `scaled_dot_product_attention` fallback) lowers
+    /// `matmul(q[1,2,8,1,512], kᵀ[1,2,1,512,kL])` to a BATCHED gemv over 16
+    /// batch entries against 2 distinct key planes, so each key plane is
+    /// streamed EIGHT times per layer, and likewise each value plane in the
+    /// AV matmul. The chain's QK/AV kernels stage the 4×4 key/value tile once
+    /// per simdgroup and apply all 8 heads of the GQA group to it (`KTILE` /
+    /// `VTILE`), so the plane is streamed once.
+    ///
+    /// Exactness at one row. The three kernels are unchanged; only the z
+    /// extent shrinks, and every index the kernels compute is derived from
+    /// `threadgroup_position_in_grid.z` and `params[2 + row]`, never from a
+    /// batch constant. So a row computed alone is bit-identical to the same
+    /// row inside the cohort. Against STOCK the claim survives the longer key
+    /// length too, because the two gemv selections do not move:
+    ///
+    /// * QKᵀ (`transpose_mat == false`, out_vector_len = kL): stock picks
+    ///   `bm = out_vector_len >= 4096 ? 8 : 4` (matmul.cpp:1165) — `bm` is the
+    ///   count of gemv threadgroup output ROWS, not a reduction term. `sm`
+    ///   stays 1, `sn` 32, `tm`/`tn` 4, and neither `K <= 64` nor
+    ///   `K >= 16 * out_vector_len` fires at K = 512. Each score keeps the
+    ///   same 32-lane × 16-product fp32 chain and the same butterfly.
+    /// * probs·V (`transpose_mat == true`, in_vector_len = kL,
+    ///   out_vector_len = 512): `sm = 4, sn = 8` needs
+    ///   `in_vector_len >= 8192 && out_vector_len >= 2048`
+    ///   (matmul.cpp:1142-1145). 512 < 2048, so `sm = 8, sn = 4` holds at
+    ///   EVERY kL — the enum header's "kL < 8192" reading of that condition
+    ///   was incomplete. `bn = 4` (out ≥ 512), `tm`/`tn` = 4.
+    /// * softmax is the one selection that DOES move: stock switches to
+    ///   `looped_softmax_precise_*` above `SOFTMAX_LOOPED_LIMIT = 4096`
+    ///   (softmax.cpp:13,55). `loopedSoftmaxKernel` below transcribes that
+    ///   body, so the chain follows stock across the boundary instead of
+    ///   pinning kL at 4095.
+    ///
+    /// Kill switch: `DARKBLOOM_GEMMA4_D512_DECODE_COMPOSED` set to
+    /// `0`/`false`/`no`/`off` restores the stock per-row unfused graph.
+    /// Default ON — but rung 2 wins when both are on (see
+    /// `composedBatchOneAdmitted`), so measuring rung 1 means
+    /// `DARKBLOOM_GEMMA4_D512_DECODE_2PASS=0`.
+    static let batchOneEnabled: Bool = composedBatchOneAdmitted(
+        composedRaw: ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_DECODE_COMPOSED"],
+        twoPassRaw: ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_D512_DECODE_2PASS"])
+
+    /// Pure policy for `batchOneEnabled`, exposed for the CPU tests.
+    ///
+    /// Both switches default ON. They are mutually exclusive by construction:
+    /// rung 2 puts the D=512 vector cell inside MLX's own fused dispatch, so
+    /// leaving this chain admitted on top would measure a stack, not an arm.
+    /// Rung 2 therefore wins, and rung 1 is reached with
+    /// `DARKBLOOM_GEMMA4_D512_DECODE_2PASS=0`.
+    static func composedBatchOneAdmitted(
+        composedRaw: String?, twoPassRaw: String?
+    ) -> Bool {
+        func off(_ raw: String?) -> Bool {
+            guard let raw else { return false }
+            return ["0", "false", "no", "off"].contains(raw.lowercased())
+        }
+        if !off(twoPassRaw) { return false }
+        return !off(composedRaw)
+    }
+
+    /// Row counts the plain chain admits. Eight is the scored cohort; one is
+    /// COMPOSED-B1. Nothing between is admitted — 2–7 rows have never been
+    /// dispatched by any arm and would be a new, unmeasured geometry.
+    static func admits(rowCount: Int) -> Bool {
+        rowCount == cohortBatch || (rowCount == 1 && batchOneEnabled)
+    }
+
+    /// Longest key length the chain may serve at `rowCount` rows.
+    ///
+    /// The cohort keeps its transcribed 4095 ceiling byte for byte. At one
+    /// row the ceiling is the SOFTMAX one, and the looped body removes it:
+    /// every remaining index (`n_chunks = ceil(kL/64)`, `virtual_groups =
+    /// ceil(kL/16)`, the `n_iter`/leftover split, the scratch plane) is a
+    /// runtime function of kL with no upper constant, so the bound is the
+    /// grid extent itself. There is no prompt-length constant anywhere here.
+    static func maxKeyLength(rowCount: Int) -> Int {
+        rowCount == 1 ? Int.max : cohortMaxKeyLength
+    }
+
+    /// `SOFTMAX_LOOPED_LIMIT` (softmax.cpp:13). At or below it stock runs
+    /// `block_softmax_precise_*` with one thread per `SOFTMAX_N_READS = 4`
+    /// elements; above it, `looped_softmax_precise_*` at the pipeline's
+    /// `maxTotalThreadsPerThreadgroup`.
+    static let softmaxLoopedLimit = 4096
+
+    /// Threadgroup width the looped transcription launches with.
+    ///
+    /// Stock sizes the looped launch as `kernel->maxTotalThreadsPerThreadgroup()`
+    /// (softmax.cpp:71-74), a pipeline property no `metal_kernel` caller can
+    /// read back. 1024 is the Metal maximum and the value a body with two
+    /// 32-float threadgroup arrays and ~8 live registers compiles to; it is
+    /// also the only value for which stock's own `local_max[simd_lane_id]`
+    /// read over all 32 SIMD slots is fully initialised, so any smaller
+    /// choice would make the STOCK kernel read uninitialised threadgroup
+    /// memory. Verify once on the GPU with
+    /// `MTLComputePipelineState.maxTotalThreadsPerThreadgroup` for
+    /// `looped_softmax_precise_bfloat16_t`; if it ever came back below 1024
+    /// the transcription would stay a correct softmax but stop being stock's
+    /// reduction order, and the arm would fall back to the parity bar.
+    static let loopedSoftmaxThreads = 1024
+
+    /// Launch geometry for dispatch 2 at `rows` score rows of `keyLength`.
+    /// Returns the threadgroup width and whether the LOOPED body is selected,
+    /// reproducing softmax.cpp:55 and :64-74 exactly.
+    static func softmaxLaunch(keyLength: Int, rows: Int)
+        -> (threads: Int, looped: Bool, gridThreads: Int)
+    {
+        if keyLength > softmaxLoopedLimit {
+            return (loopedSoftmaxThreads, true, loopedSoftmaxThreads * rows)
+        }
+        // 32 * ceil(ceil(kL / N_READS) / 32), N_READS = 4.
+        let threads = ((keyLength + 3) / 4 + 31) / 32 * 32
+        return (threads, false, threads * rows)
+    }
 
     /// LASTQ-D512 kill switch: `DARKBLOOM_GEMMA4_LASTQ_D512` set to
     /// `0`/`false`/`no`/`off` restores the per-row last-query attend loop in
@@ -3583,6 +3711,119 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
                 for (int i = 0; i < 4; i++) {
                     if ((lid * 4 + i) < axis_size) {
                         out_row[i] = static_cast<T>(ld[i] * inv_normalizer);
+                    }
+                }
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// COMPOSED-B1 dispatch 2 above `SOFTMAX_LOOPED_LIMIT`. A verbatim
+    /// transcription of `softmax_looped<bfloat16_t, float, N_READS = 4>`
+    /// (kernels/softmax.h) — the body stock selects for an axis longer than
+    /// 4096 (softmax.cpp:55). Same three-stage reduction (per-thread running
+    /// max with the `normalizer *= exp(prevmax - maxval)` rescale, a
+    /// simdgroup fold, then a 32-slot cross-simdgroup fold), same
+    /// `Limits<float>::min == -INFINITY` padding, same `fast::exp`, same
+    /// second pass that RE-READS the input row instead of keeping it in
+    /// registers, same `T(exp(x - maxval) * normalizer)` store expression.
+    ///
+    /// `lsize` is `threads_per_threadgroup.x`, exactly as in stock, so the
+    /// only thing this transcription assumes about the host is that both
+    /// launch it at the same width — see `loopedSoftmaxThreads`.
+    ///
+    /// params[0] = kL. The row stride is kL, matching the `[B, 16, 1, kL]`
+    /// scratch plane the QK dispatch wrote and the flattened `n_rows =
+    /// data_size / axis_size` stock computes for the same plane.
+    private static let loopedSoftmaxKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ragged8_sdpa_d512_softmax_looped_bf16_v1",
+        inputNames: ["scores", "params"],
+        outputNames: ["probs"],
+        source: """
+            const int axis_size = int(params[0]);
+            const int gid = int(threadgroup_position_in_grid.x);
+            const int lid = int(thread_position_in_threadgroup.x);
+            const int lsize = int(threads_per_threadgroup.x);
+            const int simd_lane_id = int(thread_index_in_simdgroup);
+            const int simd_group_id = int(simdgroup_index_in_threadgroup);
+
+            constexpr int N_READS = 4;
+
+            threadgroup float local_max[32];
+            threadgroup float local_normalizer[32];
+
+            const device T* in = scores + size_t(gid) * axis_size;
+
+            const int n_rounds = (axis_size + N_READS * lsize - 1)
+                / (N_READS * lsize);
+
+            float prevmax;
+            float maxval = -3.402823466e+38F;
+            float normalizer = 0.0f;
+            for (int r = 0; r < n_rounds; r++) {
+                const int offset = r * lsize * N_READS + lid * N_READS;
+                float vals[N_READS];
+                if (offset + N_READS <= axis_size) {
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < N_READS; i++) {
+                        vals[i] = static_cast<float>(in[offset + i]);
+                    }
+                } else {
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < N_READS; i++) {
+                        vals[i] = (offset + i < axis_size)
+                            ? static_cast<float>(in[offset + i]) : -INFINITY;
+                    }
+                }
+                prevmax = maxval;
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < N_READS; i++) {
+                    maxval = (maxval < vals[i]) ? vals[i] : maxval;
+                }
+                normalizer *= fast::exp(prevmax - maxval);
+                #pragma clang loop unroll(full)
+                for (int i = 0; i < N_READS; i++) {
+                    normalizer += fast::exp(vals[i] - maxval);
+                }
+            }
+
+            prevmax = maxval;
+            maxval = simd_max(maxval);
+            normalizer *= fast::exp(prevmax - maxval);
+            normalizer = simd_sum(normalizer);
+
+            prevmax = maxval;
+            if (simd_lane_id == 0) {
+                local_max[simd_group_id] = maxval;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maxval = simd_max(local_max[simd_lane_id]);
+            normalizer *= fast::exp(prevmax - maxval);
+            if (simd_lane_id == 0) {
+                local_normalizer[simd_group_id] = normalizer;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            normalizer = simd_sum(local_normalizer[simd_lane_id]);
+            normalizer = 1 / normalizer;
+
+            device T* out_row = probs + size_t(gid) * axis_size;
+            for (int r = 0; r < n_rounds; r++) {
+                const int offset = r * lsize * N_READS + lid * N_READS;
+                if (offset + N_READS <= axis_size) {
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < N_READS; i++) {
+                        out_row[offset + i] = static_cast<T>(
+                            fast::exp(static_cast<float>(in[offset + i])
+                                - maxval) * normalizer);
+                    }
+                } else {
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < N_READS; i++) {
+                        if (offset + i < axis_size) {
+                            out_row[offset + i] = static_cast<T>(
+                                fast::exp(static_cast<float>(in[offset + i])
+                                    - maxval) * normalizer);
+                        }
                     }
                 }
             }
@@ -4612,7 +4853,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
         guard storeDispatchEnabled,
             enabled,
-            rows.count == batch,
+            rows.count == cohortBatch,
             scale == 1.0,
             sinks == nil,
             softcap == nil,
@@ -4625,20 +4866,20 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             values.dtype == .bfloat16,
             previousWriteFence.dtype == .int32,
             previousWriteFence.shape == [1],
-            queries.shape == [batch, queryHeads, 1, headDim],
-            keys.shape == [batch, kvHeads, 1, headDim],
+            queries.shape == [cohortBatch, queryHeads, 1, headDim],
+            keys.shape == [cohortBatch, kvHeads, 1, headDim],
             values.shape == keys.shape
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
         let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
+        guard fullRows.count == cohortBatch else { return nil }
 
         let offset = fullRows[0].absoluteOffset
         let keyLength = offset + 1
         guard offset > 0,
             keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
+            keyLength <= cohortMaxKeyLength,
             fullRows.allSatisfy({ $0.cohortPool == nil }),
             fullRows.allSatisfy({ $0.absoluteOffset == offset }),
             fullRows.allSatisfy({ keyLength <= $0.maxLength })
@@ -4646,10 +4887,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
-        keyBuffers.reserveCapacity(batch)
-        valueBuffers.reserveCapacity(batch)
+        keyBuffers.reserveCapacity(cohortBatch)
+        valueBuffers.reserveCapacity(cohortBatch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
+        params.reserveCapacity(cohortBatch + 2)
         for row in fullRows {
             let state = row.cbv2InnerState()
             guard state.count == 2,
@@ -4672,13 +4913,13 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        let scratchShape = [cohortBatch, queryHeads, 1, keyLength]
 
         let storeFence = ringStoreKernel(
             keyBuffers + valueBuffers
                 + [paramsArray, keys, values, previousWriteFence],
             template: template,
-            grid: (128, 1, batch * kvHeads),
+            grid: (128, 1, cohortBatch * kvHeads),
             threadGroup: (128, 1, 1),
             outputShapes: [[1]],
             outputDTypes: [.int32]
@@ -4688,7 +4929,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let scores = qkFencedKernel(
             [queries] + keyBuffers + [paramsArray, storeFence],
             template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
+            grid: (32, 4, cohortBatch * kvHeads * chunks),
             threadGroup: (32, 4, 1),
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
@@ -4698,7 +4939,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let probs = softmaxActive(
             [scores, paramsArray],
             template: template,
-            grid: (softmaxThreads * batch * queryHeads, 1, 1),
+            grid: (softmaxThreads * cohortBatch * queryHeads, 1, 1),
             threadGroup: (softmaxThreads, 1, 1),
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
@@ -4707,9 +4948,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = avActive(
             [probs] + valueBuffers + [paramsArray],
             template: template,
-            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+            grid: (32, avSimdgroups, cohortBatch * kvHeads * avColumnTiles),
             threadGroup: (32, avSimdgroups, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
+            outputShapes: [[cohortBatch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
 
@@ -4736,7 +4977,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     ) -> (output: MLXArray, nextWriteFence: MLXArray)? {
         guard enabled,
             fusedWriteEnabled,
-            rows.count == batch,
+            rows.count == cohortBatch,
             scale == 1.0,
             sinks == nil,
             softcap == nil,
@@ -4749,14 +4990,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             values.dtype == .bfloat16,
             previousWriteFence.dtype == .int32,
             previousWriteFence.shape == [1],
-            queries.shape == [batch, queryHeads, 1, headDim],
-            keys.shape == [batch, kvHeads, 1, headDim],
+            queries.shape == [cohortBatch, queryHeads, 1, headDim],
+            keys.shape == [cohortBatch, kvHeads, 1, headDim],
             values.shape == keys.shape
         else { return nil }
         guard case .full = kind.attention else { return nil }
 
         let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == batch else { return nil }
+        guard fullRows.count == cohortBatch else { return nil }
 
         // Lockstep + storage gates, ALL before any write. The extra gate
         // over the unfused path: the backing buffers must already have room
@@ -4766,7 +5007,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let keyLength = offset + 1
         guard offset > 0,
             keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
+            keyLength <= cohortMaxKeyLength,
             fullRows.allSatisfy({ $0.cohortPool == nil }),
             fullRows.allSatisfy({ $0.absoluteOffset == offset }),
             fullRows.allSatisfy({ keyLength <= $0.maxLength })
@@ -4774,10 +5015,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
         var keyBuffers: [MLXArray] = []
         var valueBuffers: [MLXArray] = []
-        keyBuffers.reserveCapacity(batch)
-        valueBuffers.reserveCapacity(batch)
+        keyBuffers.reserveCapacity(cohortBatch)
+        valueBuffers.reserveCapacity(cohortBatch)
         var params: [UInt32] = [UInt32(keyLength), UInt32(headDim)]
-        params.reserveCapacity(batch + 2)
+        params.reserveCapacity(cohortBatch + 2)
         for row in fullRows {
             let state = row.cbv2InnerState()
             guard state.count == 2,
@@ -4800,14 +5041,14 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let template: [(String, any KernelTemplateArg)] = [
             ("T", queries.dtype)
         ]
-        let scratchShape = [batch, queryHeads, 1, keyLength]
+        let scratchShape = [cohortBatch, queryHeads, 1, keyLength]
 
         let chunks = (keyLength + 63) / 64
         let passQK = fusedQkKernel(
             [queries] + keyBuffers + valueBuffers
                 + [paramsArray, keys, values, previousWriteFence],
             template: template,
-            grid: (32, 4, batch * kvHeads * chunks),
+            grid: (32, 4, cohortBatch * kvHeads * chunks),
             threadGroup: (32, 4, 1),
             outputShapes: [scratchShape, [1]],
             outputDTypes: [.bfloat16, .int32]
@@ -4819,7 +5060,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let probs = softmaxActive(
             [scores, paramsArray],
             template: template,
-            grid: (softmaxThreads * batch * queryHeads, 1, 1),
+            grid: (softmaxThreads * cohortBatch * queryHeads, 1, 1),
             threadGroup: (softmaxThreads, 1, 1),
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
@@ -4828,9 +5069,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let output = fusedAvActive(
             [probs] + valueBuffers + [paramsArray, values],
             template: template,
-            grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
+            grid: (32, avSimdgroups, cohortBatch * kvHeads * avColumnTiles),
             threadGroup: (32, avSimdgroups, 1),
-            outputShapes: [[batch, queryHeads, 1, headDim]],
+            outputShapes: [[cohortBatch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
 
@@ -4847,8 +5088,9 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
+        let batch = rows.count
         guard enabled,
-            rows.count == batch,
+            admits(rowCount: batch),
             scale == 1.0,
             sinks == nil,
             softcap == nil,
@@ -4875,7 +5117,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         let keyLength = offset + 1
         guard offset > 0,
             keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
+            keyLength <= maxKeyLength(rowCount: batch),
             fullRows.allSatisfy({ $0.cohortPool == nil }),
             fullRows.allSatisfy({ $0.absoluteOffset == offset }),
             fullRows.allSatisfy({ keyLength <= $0.maxLength })
@@ -4948,9 +5190,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> MLXArray? {
+        let batch = rows.count
         guard enabled,
             lastQueryPrefillEnabled,
-            rows.count == batch,
+            admits(rowCount: batch),
             scale == 1.0,
             sinks == nil,
             softcap == nil,
@@ -4971,7 +5214,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
         // backing layout is the pool's batch axis.
         let keyLength = fullRows[0].absoluteOffset
         guard keyLength >= minKeyLength,
-            keyLength <= maxKeyLength,
+            keyLength <= maxKeyLength(rowCount: batch),
             fullRows.allSatisfy({ $0.cohortPool == nil }),
             fullRows.allSatisfy({ $0.absoluteOffset == keyLength })
         else { return nil }
@@ -5009,10 +5252,17 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// always dispatched it. `params` = [kL, D, per-row KV buffer
     /// capacities...]. Shared by the decode append path and the last-query
     /// attend-only path so the two cannot drift.
+    ///
+    /// The row count is `keyBuffers.count`; only the z extent of dispatches 1
+    /// and 3, the softmax row count and the two output shapes carry it. The
+    /// kernels' fixed `k0…k7` / `v0…v7` slots are bound by
+    /// `paddedKernelPlanes`, which repeats plane 0 into the slots no `row`
+    /// value can select — so the SAME pipeline serves 1 row and 8.
     private static func dispatchChain(
         queries: MLXArray, keyBuffers: [MLXArray], valueBuffers: [MLXArray],
         params: [UInt32], keyLength: Int
     ) -> MLXArray {
+        let batch = keyBuffers.count
         let paramsArray = MLXArray(params)
 
         let template: [(String, any KernelTemplateArg)] = [
@@ -5022,7 +5272,7 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
 
         let chunks = (keyLength + 63) / 64
         let scores = qkKernel(
-            [queries] + keyBuffers + [paramsArray],
+            [queries] + paddedKernelPlanes(keyBuffers) + [paramsArray],
             template: template,
             grid: (32, 4, batch * kvHeads * chunks),
             threadGroup: (32, 4, 1),
@@ -5030,24 +5280,45 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
             outputDTypes: [.bfloat16]
         )[0]
 
-        // Threadgroup sizing verbatim from softmax.cpp:64-68.
-        let softmaxThreads = ((keyLength + 3) / 4 + 31) / 32 * 32
-        let probs = softmaxActive(
+        // Threadgroup sizing and body selection verbatim from
+        // softmax.cpp:55 and :64-74.
+        let launch = softmaxLaunch(keyLength: keyLength, rows: batch * queryHeads)
+        let softmaxForLaunch: MLXFast.MLXFastKernel =
+            launch.looped ? loopedSoftmaxKernel : softmaxActive
+        let probs = softmaxForLaunch(
             [scores, paramsArray],
             template: template,
-            grid: (softmaxThreads * batch * queryHeads, 1, 1),
-            threadGroup: (softmaxThreads, 1, 1),
+            grid: (launch.gridThreads, 1, 1),
+            threadGroup: (launch.threads, 1, 1),
             outputShapes: [scratchShape],
             outputDTypes: [.bfloat16]
         )[0]
 
         return avActive(
-            [probs] + valueBuffers + [paramsArray],
+            [probs] + paddedKernelPlanes(valueBuffers) + [paramsArray],
             template: template,
             grid: (32, avSimdgroups, batch * kvHeads * avColumnTiles),
             threadGroup: (32, avSimdgroups, 1),
             outputShapes: [[batch, queryHeads, 1, headDim]],
             outputDTypes: [.bfloat16]
         )[0]
+    }
+
+    /// Bind `planes` to the kernels' fixed eight plane slots.
+    ///
+    /// `row` in both kernels is `(z / n_chunks) / 2` (QK) and
+    /// `(z / tiles) / 2` (AV), and z runs over `batch * kvHeads * …`, so
+    /// `row < batch`. Slots at or above `batch` are therefore selected by no
+    /// thread and are bound to plane 0 purely to satisfy the argument list:
+    /// no byte of them is read, and repeating an already-committed array adds
+    /// no copy (`ensureRowContiguous` sees a contiguous array) and no new
+    /// graph node.
+    private static func paddedKernelPlanes(_ planes: [MLXArray]) -> [MLXArray] {
+        precondition(
+            !planes.isEmpty && planes.count <= kernelKeySlots,
+            "CBv2RaggedComposedD512DecodeAttentionV1: \(planes.count) planes "
+                + "does not fit \(kernelKeySlots) kernel slots")
+        if planes.count == kernelKeySlots { return planes }
+        return planes + Array(repeating: planes[0], count: kernelKeySlots - planes.count)
     }
 }

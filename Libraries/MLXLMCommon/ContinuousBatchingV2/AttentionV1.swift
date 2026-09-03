@@ -1212,6 +1212,29 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?
     ) -> MLXArray {
+        // COMPOSED-B1 (C1 rung 1): the D=512 full-attention decode cell.
+        // MLX has no fused vector SDPA at head dim 512
+        // (`scaled_dot_product_attention.cpp` `has_fused_kernel`, vector
+        // branch), so `attend` below lowers this call to the unfused
+        // `scale·q → matmul → softmax → matmul` graph, whose QKᵀ and probs·V
+        // matmuls are BATCHED gemvs over 16 GQA-expanded batch entries and
+        // therefore stream each of the 2 key planes and each of the 2 value
+        // planes EIGHT times. The composed chain streams them once. It
+        // performs the row's `update` itself — byte-identical to the call
+        // below — so it must be tried BEFORE that append, exactly as the
+        // cohort site does. Any admission miss returns nil having touched
+        // nothing (kill switch:
+        // DARKBLOOM_GEMMA4_D512_DECODE_COMPOSED=0; also stands down when
+        // rung 2's DARKBLOOM_GEMMA4_D512_DECODE_2PASS is on).
+        if queries.dim(2) == 1, spanContext == nil,
+            let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
+                rows: [row], kind: kind,
+                queries: queries, keys: keys, values: values,
+                scale: scale, sinks: sinks, softcap: softcap)
+        {
+            CBv2EngageMark.once("d512sdpa-b1")
+            return output
+        }
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         return attendCommittedRow(
             kind: kind, queries: queries,
