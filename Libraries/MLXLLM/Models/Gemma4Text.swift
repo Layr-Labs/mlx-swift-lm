@@ -4555,10 +4555,165 @@ private class Gemma4Experts: Module {
 
 // MARK: - MLP
 
+/// GATEUP-DENSE-CONCAT (C4). The always-on dense MLP runs in all 30 layers and
+/// is 8-bit, so it is 568.7 MB of the 2,990 MB a decode token reads --- the
+/// second largest component after the routed experts. At ONE activation row it
+/// issues THREE plain `quantizedMatmul` dispatches per layer (gate, up, down):
+/// `CBv2DenseMLPQMVV1` is pinned to the eight-row cohort and
+/// `Gemma4PrefillDeqGEMMV1` needs 1,024 rows, so both fail closed and the
+/// stock `QuantizedLinear` road runs.
+///
+/// Gate and up read the same activation and produce two halves of the same
+/// 2 x 2112-wide product, so one dispatch over a concatenated `[4224, 2816]`
+/// plane replaces them: 30 dispatches per token become 30 fewer.
+///
+/// `DARKBLOOM_GEMMA4_DENSE_GATEUP_CONCAT=0` leaves the split arrays exactly as
+/// loaded and restores the two dispatches. Engage mark: `dense-gateup-concat`.
+let gemma4DenseGateUpConcatEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_DENSE_GATEUP_CONCAT"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(
+        raw.trimmingCharacters(in: .whitespaces).lowercased())
+}()
+
+/// The `qmv` tier predicate the C4 exactness argument rests on.
+///
+/// `dispatch_qmv` routes M = 1 past `qmv_quad` (K is neither 64 nor 128) and
+/// past `qmv_wide` (which needs M >= 2) to `qmv`, whose kernel name is built
+/// from mode, dtype, group size, bits and `results_per_simdgroup` --- never
+/// from N --- and whose `fast` predicate is `N % bn == 0 && K % alignment == 0`
+/// with `bn = 8`. Concatenating gate and up along the OUTPUT axis changes only
+/// N, so both widths must land on the same answer for the fused dispatch to be
+/// the split ones' bit-exact replacement.
+@inline(__always)
+internal func gemma4DenseQMVSelectsFastTier(
+    outputWidth n: Int, contractionWidth k: Int, kAlignment: Int
+) -> Bool {
+    n % 8 == 0 && k % kAlignment == 0
+}
+
+/// GATEUP-DENSE-CONCAT dispatch admission.
+///
+/// ONE activation row, and one position in it. Two reasons, both structural:
+///
+///   * that is exactly where the two promoted dense hosts fail closed and
+///     stock issues two plain `quantizedMatmul`s, so the fused dispatch
+///     replaces two dispatches rather than displacing a better kernel. At
+///     eight rows `CBv2DenseMLPQMVV1` owns the plane and its `liveShape` pin
+///     names the split widths;
+///   * the fused output is split back with two slices, and a slice along the
+///     LAST axis is row-contiguous only when every leading dimension is 1
+///     (`shared_buffer_slice` computes contiguity from the sliced strides).
+///     At `[1, 1, 4224]` both halves are contiguous views --- no copy, no
+///     dispatch. At `[8, 1, 4224]` or `[1, 9, 4224]` they would not be.
+///
+/// The last three terms re-derive the storage's geometry from the LIVE
+/// quantization policy. The storage is built during `sanitize`, which runs
+/// BEFORE `quantize(model:)`, so group size and bit width are not knowable
+/// then; they are checked here instead, against the plane the layer is
+/// actually bound to.
+@inline(__always)
+internal func gemma4DenseGateUpConcatAdmits(
+    enabled: Bool, hasStorage: Bool, ndim: Int, rows: Int, positions: Int,
+    inDim: Int, groupSize: Int, bits: Int,
+    fusedPackedColumns: Int, fusedScaleGroups: Int
+) -> Bool {
+    guard enabled, hasStorage, ndim == 3, rows == 1, positions == 1 else { return false }
+    guard inDim > 0, groupSize > 0, bits > 0, 32 % bits == 0 else { return false }
+    guard inDim % groupSize == 0, inDim % (32 / bits) == 0 else { return false }
+    return fusedPackedColumns == inDim * bits / 32
+        && fusedScaleGroups == inDim / groupSize
+}
+
+/// Load-time concatenated gate|up storage for the dense MLP.
+///
+/// The output axis is axis 0 of a two-dimensional plane, so `gate_proj` and
+/// `up_proj` become row-slices `[0..<N]` and `[N..<2N]` of it --- and a
+/// leading-axis slice IS row-contiguous, which is what separates this from
+/// GATEUP-FUSE-PREFILL. That arm concatenates the routed experts along axis 1
+/// of a `[128, 704, 352]` plane, leaving the split parameters as
+/// NON-row-contiguous views, and that exposure cost 1.6% of decode until
+/// GATEUP-FUSE-DECODE dispatched the fused plane directly (8bdc907). Here the
+/// split views are byte-identical reads of the same rows they were, so the
+/// eight-row cohort's `CBv2DenseMLPQMVV1` road is unaffected whether or not
+/// the fused dispatch ever fires.
+final class Gemma4DenseGateUpFusedStorage {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let gateWeight: MLXArray
+    let gateScales: MLXArray
+    let gateBiases: MLXArray
+    let upWeight: MLXArray
+    let upScales: MLXArray
+    let upBiases: MLXArray
+    /// Rows one half owns; also the split point of the fused output.
+    let halfOutputDim: Int
+    /// `weight.dim(1)` and `scales.dim(1)` of ONE half, re-checked against the
+    /// live quantization policy at dispatch (see
+    /// `gemma4DenseGateUpConcatAdmits`).
+    let packedColumns: Int
+    let scaleGroups: Int
+
+    /// Two packed affine planes of identical shape and dtype. Anything else
+    /// returns nil and leaves the split storage exactly as loaded.
+    init?(
+        gateWeight: MLXArray, gateScales: MLXArray, gateBiases: MLXArray,
+        upWeight: MLXArray, upScales: MLXArray, upBiases: MLXArray
+    ) {
+        guard gateWeight.ndim == 2, gateScales.ndim == 2, gateBiases.ndim == 2,
+            gateWeight.shape == upWeight.shape,
+            gateScales.shape == upScales.shape,
+            gateBiases.shape == upBiases.shape,
+            gateScales.shape == gateBiases.shape,
+            gateWeight.dtype == .uint32, upWeight.dtype == .uint32,
+            gateScales.dtype == upScales.dtype,
+            gateBiases.dtype == upBiases.dtype,
+            gateScales.dtype == gateBiases.dtype
+        else { return nil }
+        let n = gateWeight.dim(0)
+        // N must stay a whole number of 8-column QMV tiles at BOTH widths
+        // (2N is then trivially a multiple of 8 too), and the sidecars must
+        // describe this exact plane.
+        guard n > 0, n % 8 == 0,
+            gateWeight.dim(1) > 0,
+            gateScales.dim(0) == n, gateScales.dim(1) > 0
+        else { return nil }
+        // Output axis (axis 0 of [out, packed-in]): gate rows 0..<N followed
+        // by up rows N..<2N, for weight, scales and biases alike. Pure copies
+        // of the loaded planes; the split parameters below are contiguous
+        // slices sharing this storage, not copies.
+        let weight = concatenated([gateWeight, upWeight], axis: 0)
+        let scales = concatenated([gateScales, upScales], axis: 0)
+        let biases = concatenated([gateBiases, upBiases], axis: 0)
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.gateWeight = weight[0 ..< n]
+        self.gateScales = scales[0 ..< n]
+        self.gateBiases = biases[0 ..< n]
+        self.upWeight = weight[n ..< 2 * n]
+        self.upScales = scales[n ..< 2 * n]
+        self.upBiases = biases[n ..< 2 * n]
+        self.halfOutputDim = n
+        self.packedColumns = weight.dim(1)
+        self.scaleGroups = scales.dim(1)
+    }
+}
+
 private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
+
+    /// GATEUP-DENSE-CONCAT storage, bound at load. Not a `Module` and not an
+    /// `MLXArray`, so parameter reflection never sees it.
+    fileprivate private(set) var fusedGateUp: Gemma4DenseGateUpFusedStorage?
+
+    fileprivate func bindFusedGateUpStorage(_ storage: Gemma4DenseGateUpFusedStorage) {
+        fusedGateUp = storage
+    }
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
@@ -4597,10 +4752,66 @@ private class Gemma4MLP: Module {
         return tight
     }
 
+    /// GATEUP-DENSE-CONCAT: one dispatch over the concatenated gate|up plane.
+    /// Returns nil unless every pin holds; the caller then keeps the two
+    /// split projections byte for byte.
+    @inline(__always)
+    private func fusedGateUpProduct(_ x: MLXArray) -> MLXArray? {
+        guard let fused = fusedGateUp,
+            let quantized = gateProj as? QuantizedLinear,
+            let upQuantized = upProj as? QuantizedLinear,
+            quantized.bias == nil, upQuantized.bias == nil,
+            quantized.mode == .affine, upQuantized.mode == .affine,
+            quantized.groupSize == upQuantized.groupSize,
+            quantized.bits == upQuantized.bits,
+            x.dtype == .bfloat16,
+            x.ndim == 3,
+            // The concatenated plane must still BE the layer's storage. It is
+            // built during `sanitize`, and `convertToBFloat16` runs after the
+            // parameter update; a checkpoint whose scales arrive as fp16 would
+            // leave the module holding converted copies while this plane keeps
+            // the originals. Matching dtypes and half-shapes is what rules that
+            // out, and it fails closed if it ever happens.
+            fused.weight.dtype == quantized.weight.dtype,
+            fused.scales.dtype == quantized.scales.dtype,
+            fused.biases.dtype == (quantized.biases?.dtype ?? .float32),
+            quantized.weight.dim(0) == fused.halfOutputDim,
+            quantized.weight.dim(1) == fused.packedColumns,
+            quantized.scales.dim(1) == fused.scaleGroups,
+            upQuantized.weight.dim(0) == fused.halfOutputDim,
+            gemma4DenseGateUpConcatAdmits(
+                enabled: gemma4DenseGateUpConcatEnabled,
+                hasStorage: true,
+                ndim: x.ndim,
+                rows: x.dim(0),
+                positions: x.dim(1),
+                inDim: x.dim(2),
+                groupSize: quantized.groupSize,
+                bits: quantized.bits,
+                fusedPackedColumns: fused.packedColumns,
+                fusedScaleGroups: fused.scaleGroups)
+        else { return nil }
+        CBv2EngageMark.once("dense-gateup-concat")
+        let gateUp = quantizedMatmul(
+            x, fused.weight,
+            scales: fused.scales, biases: fused.biases,
+            transpose: true,
+            groupSize: quantized.groupSize, bits: quantized.bits,
+            mode: quantized.mode)
+        let n = fused.halfOutputDim
+        // Both halves are row-contiguous views of one buffer (leading dims are
+        // 1), and `slice_gpu` is `shared_buffer_slice` --- no copy, no
+        // dispatch. See `gemma4DenseGateUpConcatAdmits`.
+        return gemma4GeluProduct(gateUp[.ellipsis, ..<n], gateUp[.ellipsis, n...])
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         activationSums producerSums: CBv2DenseMLPQMVV1.ActivationSums? = nil
     ) -> MLXArray {
+        if let activated = fusedGateUpProduct(x) {
+            return denseProjection(downProj, activated)
+        }
         // DMLP-002: one exact activation-sum prepass feeds both fallback
         // projections. If either projection is not the pinned affine8 cell,
         // the candidate arrays remain unevaluated and stock takes over.
@@ -6492,7 +6703,51 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             sanitized[k] = v
         }
         fuseExpertGateUpStorage(&sanitized)
+        fuseDenseGateUpStorage(&sanitized)
         return sanitized
+    }
+
+    /// GATEUP-DENSE-CONCAT (C4): make the concatenated gate|up plane the
+    /// primary storage of every layer's DENSE MLP at load. The layer's
+    /// `gate_proj` / `up_proj` weight, scales and biases become zero-copy ROW
+    /// slices of it (`Gemma4DenseGateUpFusedStorage`), so the bound split
+    /// parameters read the identical bytes with no second copy and stay
+    /// row-contiguous, and the one-row decode step dispatches one qmv over
+    /// the whole plane instead of two.
+    ///
+    /// Runs during `sanitize`, i.e. BEFORE `quantize(model:)`, so the group
+    /// size and bit width are not knowable here; the storage validates only
+    /// what the arrays themselves say and the dispatch re-checks the rest
+    /// against the live `QuantizedLinear`.
+    ///
+    /// Layers or checkpoints outside the geometry, and the arm's off-state,
+    /// leave the loaded split arrays untouched.
+    private func fuseDenseGateUpStorage(_ sanitized: inout [String: MLXArray]) {
+        guard gemma4DenseGateUpConcatEnabled else { return }
+        let gateWeightSuffix = ".mlp.gate_proj.weight"
+        for key in Array(sanitized.keys) where key.hasSuffix(gateWeightSuffix) {
+            let base = String(key.dropLast(gateWeightSuffix.count))
+            guard let layerIdx = extractLayerIdx(from: key),
+                layerIdx < model.layers.count,
+                let gateWeight = sanitized["\(base).mlp.gate_proj.weight"],
+                let gateScales = sanitized["\(base).mlp.gate_proj.scales"],
+                let gateBiases = sanitized["\(base).mlp.gate_proj.biases"],
+                let upWeight = sanitized["\(base).mlp.up_proj.weight"],
+                let upScales = sanitized["\(base).mlp.up_proj.scales"],
+                let upBiases = sanitized["\(base).mlp.up_proj.biases"],
+                let storage = Gemma4DenseGateUpFusedStorage(
+                    gateWeight: gateWeight, gateScales: gateScales,
+                    gateBiases: gateBiases,
+                    upWeight: upWeight, upScales: upScales, upBiases: upBiases)
+            else { continue }
+            sanitized["\(base).mlp.gate_proj.weight"] = storage.gateWeight
+            sanitized["\(base).mlp.gate_proj.scales"] = storage.gateScales
+            sanitized["\(base).mlp.gate_proj.biases"] = storage.gateBiases
+            sanitized["\(base).mlp.up_proj.weight"] = storage.upWeight
+            sanitized["\(base).mlp.up_proj.scales"] = storage.upScales
+            sanitized["\(base).mlp.up_proj.biases"] = storage.upBiases
+            model.layers[layerIdx].mlp.bindFusedGateUpStorage(storage)
+        }
     }
 
     /// GATEUP-FUSE-PREFILL: make the concatenated gate|up right-hand side the

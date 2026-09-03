@@ -494,4 +494,115 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
                 isRecurrent: false, modelAdmitsArgmaxDecode: true,
                 samplerAdmitsFusedGreedy: true))
     }
+
+    // MARK: - GATEUP-DENSE-CONCAT (C4): dense MLP gate|up load-time concat
+
+    /// The exactness claim: concatenating gate and up along the OUTPUT axis
+    /// changes only N, and `qmv`'s tier choice depends on N only through
+    /// `N % 8`. The dense pair is N = 2112 -> 4224 over K = 2816, whose 8-bit
+    /// alignment is 256; the 4-bit alignment of 512 is checked too because a
+    /// tier that answered differently at the two widths would break the
+    /// argument whatever the checkpoint's bit width.
+    func testDenseGateUpConcatKeepsTheSameQMVTier() {
+        for kAlignment in [32, 256, 512] {
+            let split = gemma4DenseQMVSelectsFastTier(
+                outputWidth: 2112, contractionWidth: 2816, kAlignment: kAlignment)
+            let fused = gemma4DenseQMVSelectsFastTier(
+                outputWidth: 4224, contractionWidth: 2816, kAlignment: kAlignment)
+            XCTAssertEqual(split, fused, "kAlignment \(kAlignment)")
+        }
+        // The 8-bit dense contraction does reach the fast tier at both widths.
+        XCTAssertTrue(
+            gemma4DenseQMVSelectsFastTier(
+                outputWidth: 4224, contractionWidth: 2816, kAlignment: 256))
+        // A width that would change the tier is caught.
+        XCTAssertFalse(
+            gemma4DenseQMVSelectsFastTier(
+                outputWidth: 2110, contractionWidth: 2816, kAlignment: 256))
+    }
+
+    /// The production one-row dense cell (K = 2816, 8-bit group 64, so the
+    /// packed plane is 704 uint32 columns over 44 groups).
+    func testDenseGateUpConcatAdmitsTheOneRowCell() {
+        XCTAssertTrue(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 44))
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: false, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 44))
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: false, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 44))
+    }
+
+    /// The eight-row cohort keeps `CBv2DenseMLPQMVV1`, and a multi-position
+    /// rectangle keeps the split projections: in both, slicing the fused
+    /// output along the last axis would leave NON-contiguous halves.
+    func testDenseGateUpConcatRefusesEveryOtherRectangle() {
+        for rows in [0, 2, 8, 64] {
+            XCTAssertFalse(
+                gemma4DenseGateUpConcatAdmits(
+                    enabled: true, hasStorage: true, ndim: 3, rows: rows, positions: 1,
+                    inDim: 2816, groupSize: 64, bits: 8,
+                    fusedPackedColumns: 704, fusedScaleGroups: 44),
+                "rows \(rows)")
+        }
+        for positions in [0, 2, 9, 1024] {
+            XCTAssertFalse(
+                gemma4DenseGateUpConcatAdmits(
+                    enabled: true, hasStorage: true, ndim: 3, rows: 1,
+                    positions: positions,
+                    inDim: 2816, groupSize: 64, bits: 8,
+                    fusedPackedColumns: 704, fusedScaleGroups: 44),
+                "positions \(positions)")
+        }
+        for ndim in [1, 2, 4] {
+            XCTAssertFalse(
+                gemma4DenseGateUpConcatAdmits(
+                    enabled: true, hasStorage: true, ndim: ndim, rows: 1, positions: 1,
+                    inDim: 2816, groupSize: 64, bits: 8,
+                    fusedPackedColumns: 704, fusedScaleGroups: 44),
+                "ndim \(ndim)")
+        }
+    }
+
+    /// The storage is built before `quantize(model:)`, so the dispatch is what
+    /// checks it against the live policy. A plane that does not describe this
+    /// contraction fails closed.
+    func testDenseGateUpConcatChecksTheLiveQuantizationPolicy() {
+        // Packed columns must be K * bits / 32 …
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 352, fusedScaleGroups: 44),
+            "4-bit plane under an 8-bit policy")
+        // … and scale groups must be K / groupSize.
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 8,
+                fusedPackedColumns: 704, fusedScaleGroups: 22),
+            "group 128 sidecar under a group-64 policy")
+        // A contraction that is not whole groups is refused outright.
+        XCTAssertFalse(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2800, groupSize: 64, bits: 8,
+                fusedPackedColumns: 700, fusedScaleGroups: 43),
+            "K % groupSize")
+        // The 4-bit tower's own head geometry stays consistent, so the
+        // predicate is not silently 8-bit-only.
+        XCTAssertTrue(
+            gemma4DenseGateUpConcatAdmits(
+                enabled: true, hasStorage: true, ndim: 3, rows: 1, positions: 1,
+                inDim: 2816, groupSize: 64, bits: 4,
+                fusedPackedColumns: 352, fusedScaleGroups: 44))
+    }
 }
