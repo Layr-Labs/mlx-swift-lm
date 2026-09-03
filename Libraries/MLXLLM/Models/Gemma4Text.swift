@@ -6360,22 +6360,31 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             outDim: config.vocabSize)
     }
 
+    /// The head projection WITHOUT the final softcap. Split out so the
+    /// logitsless verify arm can report the peak |logit| its
+    /// softcap-elision argument rests on at any row count; the shipped path
+    /// is `applyLMHead` below, which is this plus the cap.
+    func rawLMHeadLogits(
+        _ hidden: MLXArray,
+        activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
+    ) -> MLXArray {
+        if let lmHead {
+            return lmHead(hidden)
+        }
+        if let mma = tiedLMHeadMMA(hidden, activationSums: activationSums) {
+            return mma
+        }
+        if let tight = tiedLMHeadTightGrid(hidden) {
+            return tight
+        }
+        return model.embedTokens.asLinear(hidden)
+    }
+
     func applyLMHead(
         _ hidden: MLXArray,
         activationSums: Gemma4MMAQuantizedGEMV.ActivationSums? = nil
     ) -> MLXArray {
-        var out: MLXArray
-        if let lmHead {
-            out = lmHead(hidden)
-        } else if let mma = tiedLMHeadMMA(
-            hidden, activationSums: activationSums)
-        {
-            out = mma
-        } else if let tight = tiedLMHeadTightGrid(hidden) {
-            out = tight
-        } else {
-            out = model.embedTokens.asLinear(hidden)
-        }
+        var out = rawLMHeadLogits(hidden, activationSums: activationSums)
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.
         //
@@ -6763,8 +6772,22 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
             let quantized = model.embedTokens as? QuantizedEmbedding,
             quantized.mode == .affine
         else { return false }
-        return Gemma4MMAQuantizedGEMV.admitsArgmax(
-            x: [tokens.dim(0), 1, config.hiddenSize],
+        let shape = [tokens.dim(0), 1, config.hiddenSize]
+        // The cohort's matrix-unit head first; the one-row body only where it
+        // fails closed, so the eight-row road is byte-for-byte untouched.
+        if Gemma4MMAQuantizedGEMV.admitsArgmax(
+            x: shape,
+            xDType: .bfloat16,
+            w: quantized.weight,
+            scales: quantized.scales,
+            biases: quantized.biases,
+            groupSize: quantized.groupSize,
+            bits: quantized.bits)
+        {
+            return true
+        }
+        return CBv2TiedLMHeadArgmaxB1V1.admits(
+            x: shape,
             xDType: .bfloat16,
             w: quantized.weight,
             scales: quantized.scales,
@@ -6802,8 +6825,15 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
         let rows = tokens.dim(0)
         guard lmHead == nil,
             let quantized = model.embedTokens as? QuantizedEmbedding,
-            quantized.mode == .affine,
-            let fused = Gemma4MMAQuantizedGEMV.applyArgmax(
+            quantized.mode == .affine
+        else {
+            return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
+        }
+        // Cohort head first. LGH-B1 (C3) picks up the ONE-row step, where the
+        // matrix-unit head and the tight-grid QMV host both fail closed and
+        // the tail was still logits -> softcap -> ArgReduce.
+        let fusedCandidate =
+            Gemma4MMAQuantizedGEMV.applyArgmax(
                 x: hidden,
                 w: quantized.weight,
                 scales: quantized.scales,
@@ -6811,7 +6841,18 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
                 groupSize: quantized.groupSize,
                 bits: quantized.bits,
                 activationSums: carriedSums)
-        else {
+            ?? CBv2TiedLMHeadArgmaxB1V1.argmax(
+                x: hidden,
+                w: quantized.weight,
+                scales: quantized.scales,
+                biases: quantized.biases,
+                groupSize: quantized.groupSize,
+                bits: quantized.bits)
+                .map { fused -> MLXArray in
+                    CBv2EngageMark.once("logitsless-greedy-head-b1")
+                    return fused
+                }
+        guard let fused = fusedCandidate else {
             return applyLMHead(hidden).argMax(axis: -1).asType(.int32).reshaped([rows])
         }
         CBv2EngageMark.once("logitsless-greedy-head")
@@ -6822,10 +6863,7 @@ extension Gemma4TextModel: CBv2ArgmaxDecodeForwardable {
             // that maps two DISTINCT stored bf16 logits onto one float; that
             // needs |logit| in the hundreds, so the observed peak is the
             // margin. Reported alongside every verified step.
-            let raw = Gemma4MMAQuantizedGEMV.apply(
-                x: hidden, w: quantized.weight, scales: quantized.scales,
-                biases: quantized.biases, groupSize: quantized.groupSize,
-                bits: quantized.bits)!
+            let raw = rawLMHeadLogits(hidden, activationSums: carriedSums)
             let peak = max(abs(raw.asType(.float32))).item(Float.self)
             let report =
                 "[lgh] verify mismatch=\(disagreements) max_abs_logit=\(peak)"

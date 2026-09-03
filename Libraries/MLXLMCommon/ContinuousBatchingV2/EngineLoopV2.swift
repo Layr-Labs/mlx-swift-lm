@@ -2409,12 +2409,74 @@ public final class EngineLoopV2: @unchecked Sendable {
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
         var params: [CBv2SamplingParams] = []
         params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        var anyTokenConstraint = false
+        for id in ids {
+            let rec = scheduler.record(for: id)!
+            params.append(rec.request.sampling)
+            anyTokenConstraint = anyTokenConstraint || rec.request.tokenConstraint != nil
+        }
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let (last, cacheInnerState, recurrent) = decodeLogits(
-            rowStates: rowStates, tokens: inputs, ids: ids)  // [B, vocab]
+
+        // LGH-001 seam. When the model can end its decode forward in a fused
+        // top-1 and the sampler's own `sample` would collapse to
+        // `argMax(logits, axis: -1)` for every row, the step never needs the
+        // `[B, vocab]` plane: the head returns tokens and the softcap, the
+        // logits store and the argmax pass all leave the token-serial tail.
+        //
+        // Two guards beyond the two protocols:
+        //   * a row carrying a TOKEN CONSTRAINT is refused. A grammar mask
+        //     sends forbidden ids to -infinity, which CAN move the argmax
+        //     (the un-masked winner may be forbidden), so this step's tokens
+        //     are not `argMax` of the raw logits and the seam is invalid.
+        //   * positioned (vision M-RoPE) and recurrent models are refused:
+        //     `CBv2ArgmaxDecodeSteppableModel.decodeArgmax` carries neither
+        //     explicit position ids nor recurrent bindings, so the fused
+        //     forward would not be the same forward.
+        //
+        // `CBv2PositionState.decodePositionIds` returns nil exactly when no
+        // row carries explicit position state, so the term below is the same
+        // predicate `decodeLogits` computes — asked without building the array.
+        let anyPositionState = ids.contains {
+            scheduler.record(for: $0)?.request.positionState != nil
+        }
+        let isRecurrent =
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+        var fusedTokens: MLXArray?
+        var fusedInnerState: [MLXArray] = []
+        if let argmaxModel = model as? CBv2ArgmaxDecodeSteppableModel,
+            let greedySampler = sampler as? CBv2FusedGreedySampler,
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: CBv2TiedLMHeadArgmaxB1V1.enabled,
+                anyTokenConstraint: anyTokenConstraint,
+                anyPositionState: anyPositionState,
+                isRecurrent: isRecurrent,
+                modelAdmitsArgmaxDecode: argmaxModel.admitsArgmaxDecode(tokens: inputs),
+                samplerAdmitsFusedGreedy: greedySampler.admitsFusedGreedy(params: params))
+        {
+            let caches = eagerCaches(rowStates: rowStates)
+            let tokens = argmaxModel.decodeArgmax(tokens: inputs, caches: caches)
+            fusedTokens = tokens
+            fusedInnerState = eagerDecodeEvaluationRoots(caches, logitsRoot: tokens)
+            // The sampler never saw this step; drop its configured
+            // fingerprint so the next `sample` rebuilds per-row penalty
+            // counts and RNG step indices from confirmed history.
+            greedySampler.noteFusedGreedySample()
+            CBv2EngageMark.once("cbv2-logitsless-greedy-step")
+        }
+
+        let last: MLXArray
+        let cacheInnerState: [MLXArray]
+        let recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation]
+        if let fusedTokens {
+            last = fusedTokens
+            cacheInnerState = fusedInnerState
+            recurrent = [:]
+        } else {
+            (last, cacheInnerState, recurrent) = decodeLogits(
+                rowStates: rowStates, tokens: inputs, ids: ids)  // [B, vocab]
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
@@ -2422,12 +2484,20 @@ public final class EngineLoopV2: @unchecked Sendable {
         // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
         // one launched-but-unconfirmed sample here (the chain invariant).
         let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let sampled = sampler.sample(
-            logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
-            pendingSampledTokens: lazyTokens,
-            rowContext: { [scheduler] in
-                ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
-            })
+        let sampled: MLXArray
+        if fusedTokens != nil {
+            sampled = last
+        } else {
+            sampled = sampler.sample(
+                logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
+                pendingSampledTokens: lazyTokens,
+                rowContext: { [scheduler] in
+                    ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
+                })
+        }
+        // Nil on the fused road: `admitsFusedGreedy` requires
+        // `topLogprobs == 0` on every row, and `noteFusedGreedySample` clears
+        // any pending capture.
         let stepLogprobs = sampler.takeStepLogprobs()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
