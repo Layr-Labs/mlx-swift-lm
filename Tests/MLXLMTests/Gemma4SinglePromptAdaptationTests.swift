@@ -261,4 +261,31 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
     func testKVQuantMirrorReaderBatchMatchesTheRaggedPin() {
         XCTAssertEqual(CBv2WindowedSequenceKV.mirrorReaderBatch, 8)
     }
+
+    // MARK: - ARGMAX-B1: parallel greedy argmax admission
+
+    /// The cohort rows keep the decomposition; one row falls back to stock.
+    func testParallelArgMaxDefaultAdmission() {
+        XCTAssertFalse(CBv2ParallelArgMaxV1.admitsRows(1))
+        for rows in 2 ... 8 {
+            XCTAssertTrue(CBv2ParallelArgMaxV1.admitsRows(rows), "rows \(rows)")
+        }
+        XCTAssertFalse(CBv2ParallelArgMaxV1.admitsRows(9))
+        XCTAssertFalse(CBv2ParallelArgMaxV1.admitsRows(0))
+    }
+
+    /// `MIN_ROWS=1` restores the previous admission exactly, so the arm can
+    /// be re-measured without a rebuild.
+    func testParallelArgMaxMinimumRowsOverride() {
+        for rows in 1 ... 8 {
+            XCTAssertTrue(
+                CBv2ParallelArgMaxV1.admitsRows(rows, minimumRows: 1),
+                "rows \(rows)")
+        }
+        XCTAssertFalse(CBv2ParallelArgMaxV1.admitsRows(9, minimumRows: 1))
+        XCTAssertFalse(CBv2ParallelArgMaxV1.admitsRows(0, minimumRows: 1))
+        // A narrower override drops the rows below it and nothing else.
+        XCTAssertFalse(CBv2ParallelArgMaxV1.admitsRows(3, minimumRows: 4))
+        XCTAssertTrue(CBv2ParallelArgMaxV1.admitsRows(4, minimumRows: 4))
+    }
 }

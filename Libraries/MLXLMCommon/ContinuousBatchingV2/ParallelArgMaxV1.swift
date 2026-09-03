@@ -31,6 +31,44 @@ enum CBv2ParallelArgMaxV1 {
             raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }()
 
+    /// ARGMAX-B1. Smallest row count this decomposition is used for; below
+    /// it the stock single-kernel `argMax` runs.
+    ///
+    /// The decomposition costs a SECOND dispatch. At `rows == 1` the finalize
+    /// launch is 32 threads in one threadgroup reducing 64 tile winners, and
+    /// it is the last thing in the decode command buffer before the host
+    /// consumes the token, so its launch and drain sit on the token-serial
+    /// tail with nothing to overlap them. At eight rows the same tail is
+    /// amortised over eight times the useful work; at one row it is not.
+    ///
+    /// Measured at the single-prompt shape (17,408 prompt tokens, 1,024
+    /// output, batch 1, 40 C, M5 Max): enabling this arm cost 3.3% of decode
+    /// (94.85 -> 91.72 tok/s). That is far larger than the dispatch
+    /// accounting above predicts -- stock's `ArgReduce` launches exactly one
+    /// 1024-thread threadgroup for a one-row plane
+    /// (`backend/metal/primitives.cpp`), so the whole scan it replaces is on
+    /// the order of tens of microseconds against a 10.5 ms token -- and the
+    /// residual has not been root-caused. The default therefore follows the
+    /// measurement rather than the model: two rows and up keep the arm,
+    /// where stock's one-threadgroup-per-row grid genuinely starves.
+    ///
+    /// `DARKBLOOM_CBV2_PARALLEL_ARGMAX_MIN_ROWS=1` restores the previous
+    /// admission so the arm can be re-measured; a larger value narrows it
+    /// further. `DARKBLOOM_CBV2_PARALLEL_ARGMAX=0` still removes it.
+    static let minimumRows: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_CBV2_PARALLEL_ARGMAX_MIN_ROWS"],
+            let value = Int(raw.trimmingCharacters(in: .whitespaces)),
+            value >= 1
+        else { return 2 }
+        return value
+    }()
+
+    /// Pure admission predicate, exposed for a device-free test.
+    static func admitsRows(_ rows: Int, minimumRows: Int = Self.minimumRows) -> Bool {
+        rows >= minimumRows && rows <= 8
+    }
+
     private static let metalAvailable: Bool = {
         var available = false
         return mlx_metal_is_available(&available) == 0 && available
@@ -160,7 +198,7 @@ enum CBv2ParallelArgMaxV1 {
         else { return nil }
         let rows = logits.dim(0)
         let vocab = logits.dim(1)
-        guard rows > 0, rows <= 8,
+        guard admitsRows(rows),
             vocab >= 65536, vocab <= 1_048_576,
             vocab % tileSize == 0
         else { return nil }
