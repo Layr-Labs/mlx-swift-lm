@@ -220,4 +220,45 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
             XCTAssertEqual(seenValue.count, batch * keyHeads)
         }
     }
+
+    // MARK: - KVQ-CONSUMER-GATE: q4 KV mirror capacity
+
+    /// An unpublished capacity keeps the mirror (previous behaviour), a
+    /// capacity that cannot assemble the reader's eight-row batch drops it,
+    /// and any capacity that can keeps it.
+    func testKVQuantMirrorCapacityPredicate() {
+        XCTAssertTrue(CBv2WindowedSequenceKV.mirrorReachable(capacity: nil))
+        for capacity in [1, 2, 4, 7] {
+            XCTAssertFalse(
+                CBv2WindowedSequenceKV.mirrorReachable(capacity: capacity),
+                "capacity \(capacity)")
+        }
+        for capacity in [8, 9, 16, 64] {
+            XCTAssertTrue(
+                CBv2WindowedSequenceKV.mirrorReachable(capacity: capacity),
+                "capacity \(capacity)")
+        }
+    }
+
+    /// The published capacity is monotonic, so a second, smaller engine in
+    /// the same process cannot turn the mirror off underneath the first.
+    func testKVQuantCapacityPublicationIsMonotonic() {
+        let restore = CBv2WindowedSequenceKV.decodeBatchCapacity
+        defer { CBv2WindowedSequenceKV.publishDecodeBatchCapacity(restore ?? 0) }
+
+        CBv2WindowedSequenceKV.publishDecodeBatchCapacity(16)
+        XCTAssertEqual(CBv2WindowedSequenceKV.decodeBatchCapacity, 16)
+        CBv2WindowedSequenceKV.publishDecodeBatchCapacity(1)
+        XCTAssertEqual(CBv2WindowedSequenceKV.decodeBatchCapacity, 16)
+        CBv2WindowedSequenceKV.publishDecodeBatchCapacity(0)
+        XCTAssertEqual(CBv2WindowedSequenceKV.decodeBatchCapacity, 16)
+        CBv2WindowedSequenceKV.publishDecodeBatchCapacity(32)
+        XCTAssertEqual(CBv2WindowedSequenceKV.decodeBatchCapacity, 32)
+    }
+
+    /// The reader's admitted batch is the one `canUseRaggedTwoPassDecode`
+    /// pins; if that ever changes the gate must change with it.
+    func testKVQuantMirrorReaderBatchMatchesTheRaggedPin() {
+        XCTAssertEqual(CBv2WindowedSequenceKV.mirrorReaderBatch, 8)
+    }
 }

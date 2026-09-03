@@ -138,8 +138,91 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
+    /// KVQ-CONSUMER-GATE. The q4 mirror is maintained ALONGSIDE the bf16
+    /// ring, which stays the source of truth for every logical view, borrow,
+    /// staging and rollback path. Its ONLY reader is the batch-wide ragged
+    /// pass A in `CBv2RaggedTwoPassDecodeAttentionV1`, reached from
+    /// `CBv2AttentionV1.updateAndAttend` -- and that method returns from its
+    /// `if B == 1` branch, into the per-row road, before any mirror consumer
+    /// is consulted. `canUseRaggedTwoPassDecode` then pins `batch == 8` on
+    /// top of that.
+    ///
+    /// So on a run that never decodes eight rows at once, the mirror is
+    /// written on every ring write and read by nothing. Worse, it is a live
+    /// stored property, so each mirror `SliceUpdate` has a retained input and
+    /// cannot donate its buffer: by KVQ-PAIRWRITE's own accounting,
+    /// "depositing 520 bytes per head copies the full ring". That is the
+    /// entire cost of the quantized road with none of its benefit, per
+    /// sliding layer per token.
+    ///
+    /// The gate is a PROCESS-level capacity question -- "can a mirror reader
+    /// ever exist here?" -- not a per-step one. A per-step answer would be
+    /// wrong in both directions: every row's first update is a prefill chunk,
+    /// which is `B == 1` by contract, and the mirror must be allocated before
+    /// the first ring write or it can never be made consistent with the slots
+    /// already written. `EngineV2` therefore publishes its scheduler's
+    /// concurrency cap once at construction, and callers that publish nothing
+    /// keep the previous unconditional behaviour.
+    ///
+    /// `MLX_KV_QUANT_CONSUMER_GATE=0` restores the unconditional mirror.
+    static let consumerGateEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "MLX_KV_QUANT_CONSUMER_GATE"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// Explicit capacity override, for harnesses that drive the model
+    /// directly instead of through `EngineV2` and therefore publish nothing.
+    /// `MLX_KV_QUANT_MAX_DECODE_BATCH=1` is the single-prompt answer; any
+    /// value >= 8 leaves the mirror on. Unset means "no opinion".
+    static let decodeBatchCapacityOverride: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "MLX_KV_QUANT_MAX_DECODE_BATCH"],
+            let value = Int(raw.trimmingCharacters(in: .whitespaces)),
+            value > 0
+        else { return nil }
+        return value
+    }()
+
+    /// The largest decode batch this process can ever assemble, or nil when
+    /// nothing has published one (in which case the gate stays open).
+    /// Published by `EngineV2.init` from `CBv2SchedulerConfig`.
+    public private(set) nonisolated(unsafe) static var decodeBatchCapacity: Int? = nil
+
+    /// Publish the process's decode concurrency cap. Monotonic: the largest
+    /// cap any engine in the process declares wins, so a second, smaller
+    /// engine can never switch the mirror off underneath the first.
+    public static func publishDecodeBatchCapacity(_ capacity: Int) {
+        guard capacity > 0 else { return }
+        if let existing = decodeBatchCapacity, existing >= capacity { return }
+        decodeBatchCapacity = capacity
+    }
+
+    /// True unless a published capacity proves no reachable batch can read a
+    /// mirror. `CBv2AttentionV1.updateAndAttend` peels `B == 1` off to the
+    /// per-row road first, and `canUseRaggedTwoPassDecode` admits only eight,
+    /// so a cap below eight can never reach the reader.
+    static var mirrorConsumerReachable: Bool {
+        guard consumerGateEnabled else { return true }
+        return mirrorReachable(
+            capacity: decodeBatchCapacityOverride ?? decodeBatchCapacity)
+    }
+
+    /// Pure predicate, exposed for a device-free test: an unpublished
+    /// capacity keeps the mirror (no opinion, previous behaviour), and a
+    /// published one keeps it only if it can reach the reader's batch.
+    static func mirrorReachable(capacity: Int?) -> Bool {
+        guard let capacity else { return true }
+        return capacity >= mirrorReaderBatch
+    }
+
+    /// The single batch size `canUseRaggedTwoPassDecode` admits.
+    static let mirrorReaderBatch = 8
+
     private var quantEligible: Bool {
-        Self.quantEnabled && headDim == 256 && window > 0
+        Self.quantEnabled && Self.mirrorConsumerReachable
+            && headDim == 256 && window > 0
             && (window & (window - 1)) == 0
     }
 
