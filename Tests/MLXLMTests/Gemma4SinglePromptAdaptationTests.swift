@@ -156,4 +156,68 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
                 gemma4RouterAdmittedRows(batch: -1, length: 1, anyRows: anyRows))
         }
     }
+
+    // MARK: - QKVNORM-B1: fused decode Q/K/V norm + RoPE row plan
+
+    /// The cohort plan is unchanged: 128 query rows, 64 key rows, 64 value
+    /// rows for the sliding geometry, 64 threads per row at D = 256.
+    func testQKVNormCohortRowPlanUnchanged() {
+        let plan = gemma4FusedQKVNormRowPlan(
+            batch: 8, queryHeads: 16, keyHeads: 8, dimension: 256,
+            keyValueShared: false)
+        XCTAssertEqual(plan.queryRows, 128)
+        XCTAssertEqual(plan.keyRows, 64)
+        XCTAssertEqual(plan.normRows, 256)
+        XCTAssertEqual(plan.threadsPerRow, 64)
+
+        let shared = gemma4FusedQKVNormRowPlan(
+            batch: 8, queryHeads: 16, keyHeads: 2, dimension: 512,
+            keyValueShared: true)
+        XCTAssertEqual(shared.queryRows, 128)
+        XCTAssertEqual(shared.keyRows, 16)
+        XCTAssertEqual(shared.normRows, 144)
+        XCTAssertEqual(shared.threadsPerRow, 128)
+    }
+
+    /// The kernel recovers a row's batch index as `local_row / heads`, so the
+    /// plan must lay query, key and value rows out batch-major within each
+    /// segment. Replay that inverse for every row of several batches and
+    /// check it lands on the right (segment, batch, head).
+    func testQKVNormRowPlanInvertsToBatchAndHead() {
+        for batch in [1, 2, 3, 8] {
+            let queryHeads = 16
+            let keyHeads = 8
+            let plan = gemma4FusedQKVNormRowPlan(
+                batch: batch, queryHeads: queryHeads, keyHeads: keyHeads,
+                dimension: 256, keyValueShared: false)
+            XCTAssertEqual(
+                plan.normRows, batch * (queryHeads + 2 * keyHeads),
+                "batch \(batch)")
+
+            var seenQuery = Set<Int>()
+            var seenKey = Set<Int>()
+            var seenValue = Set<Int>()
+            for row in 0 ..< plan.normRows {
+                if row < plan.queryRows {
+                    let heads = queryHeads
+                    let b = row / heads
+                    XCTAssertLessThan(b, batch, "query row \(row)")
+                    XCTAssertTrue(seenQuery.insert(row).inserted)
+                } else if row < plan.queryRows + plan.keyRows {
+                    let local = row - plan.queryRows
+                    let b = local / keyHeads
+                    XCTAssertLessThan(b, batch, "key row \(row)")
+                    XCTAssertTrue(seenKey.insert(local).inserted)
+                } else {
+                    let local = row - plan.queryRows - plan.keyRows
+                    let b = local / keyHeads
+                    XCTAssertLessThan(b, batch, "value row \(row)")
+                    XCTAssertTrue(seenValue.insert(local).inserted)
+                }
+            }
+            XCTAssertEqual(seenQuery.count, batch * queryHeads)
+            XCTAssertEqual(seenKey.count, batch * keyHeads)
+            XCTAssertEqual(seenValue.count, batch * keyHeads)
+        }
+    }
 }

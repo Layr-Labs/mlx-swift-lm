@@ -1467,21 +1467,65 @@ private func gemma4FusedQKVNormHeadMajorSliding(
     return (outputs[0], outputs[1], outputs[2], fusedRope)
 }
 
+/// QKVNORM-B1 row plan, factored out for a device-free test.
+///
+/// The fused decode kernel enumerates one row per (batch, head) triple:
+/// `Q_ROWS` query rows first, then `K_ROWS` key rows, then -- unless the
+/// layer shares K and V -- `K_ROWS` value rows, with one `D / 4`-thread
+/// threadgroup per row. `batch = local_row / heads` inside the kernel is the
+/// inverse of this layout, so it holds for any batch.
+@inline(__always)
+internal func gemma4FusedQKVNormRowPlan(
+    batch: Int, queryHeads: Int, keyHeads: Int, dimension: Int,
+    keyValueShared: Bool
+) -> (queryRows: Int, keyRows: Int, normRows: Int, threadsPerRow: Int) {
+    let queryRows = batch * queryHeads
+    let keyRows = batch * keyHeads
+    let normRows = queryRows + keyRows + (keyValueShared ? 0 : keyRows)
+    return (queryRows, keyRows, normRows, dimension / 4)
+}
+
+/// QKVNORM-B1 kill switch. `DARKBLOOM_GEMMA4_QKV_NORM_ANY_BATCH=0` restores
+/// the `q.dim(0) == 8` pin on the fused decode Q/K/V norm + RoPE kernel.
+/// Default ON. The kernel itself is unchanged; only the host's row counts,
+/// position-offset length and fused output shapes stop being literals.
+private let gemma4QKVNormAnyBatchEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_QKV_NORM_ANY_BATCH"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private func gemma4FusedQKVNorm(
     q: MLXArray, k: MLXArray, v: MLXArray,
     qWeight: MLXArray, kWeight: MLXArray, eps: Float,
     keyValueShared: Bool, positionOffsets: MLXArray,
     ropeParameters: Gemma4QKVRopeParameters, applyRope: Bool
 ) -> (q: MLXArray, k: MLXArray, v: MLXArray, appliedRope: Bool)? {
+    // QKVNORM-B1. The kernel below is already fully parameterized over its
+    // row decomposition -- `Q_ROWS`, `K_ROWS`, `Q_HEADS`, `K_HEADS`, and
+    // `batch = local_row / heads` -- so no eight is baked into the kernel
+    // text. The literal eights were in this HOST only: the row counts, the
+    // position-offset length and the fused output shapes. They named the
+    // scored cohort, not a tiling constraint.
+    //
+    // A batch-one decode step is `[1, 1, 16, D]`. The prefill twin above is
+    // batch-generic but requires `batch * max(lq, lk) >= 1024` rows to be
+    // worth its launch, which one decode row is not, so batch one previously
+    // fell through both and ran the stock three-norm plus separate RoPE
+    // chain. `DARKBLOOM_GEMMA4_QKV_NORM_ANY_BATCH=0` restores the
+    // `q.dim(0) == 8` pin.
+    let batch = q.dim(0)
     guard eps == 1.0e-6,
+        gemma4QKVNormAnyBatchEnabled || batch == 8,
         q.dtype == .bfloat16, k.dtype == .bfloat16, v.dtype == .bfloat16,
         qWeight.dtype == .bfloat16, kWeight.dtype == .bfloat16,
-        positionOffsets.dtype == .int32, positionOffsets.shape == [8],
+        positionOffsets.dtype == .int32, positionOffsets.shape == [batch],
         ropeParameters.log2Base.dtype == .float32, ropeParameters.log2Base.size == 1,
         ropeParameters.frequencies.dtype == .float32,
         q.ndim == 4, k.ndim == 4, v.ndim == 4,
-        q.dim(0) == 8, q.dim(1) == 1, q.dim(2) == 16,
-        k.dim(0) == 8, k.dim(1) == 1, v.shape == k.shape,
+        batch >= 1, q.dim(1) == 1, q.dim(2) == 16,
+        k.dim(0) == batch, k.dim(1) == 1, v.shape == k.shape,
         q.dim(3) == k.dim(3),
         (q.dim(3) == 256 && k.dim(2) == 8) || (q.dim(3) == 512 && k.dim(2) == 2),
         qWeight.shape == [q.dim(3)], kWeight.shape == [q.dim(3)],
@@ -1491,11 +1535,14 @@ private func gemma4FusedQKVNorm(
     else { return nil }
 
     let dimension = q.dim(3)
-    let qRows = 8 * 16
-    let kRows = 8 * k.dim(2)
-    let threads = dimension / 4
     let fusedRope = gemma4QKVNormRopeEnabled && applyRope
-    let normRows = qRows + kRows + (keyValueShared ? 0 : kRows)
+    let plan = gemma4FusedQKVNormRowPlan(
+        batch: batch, queryHeads: 16, keyHeads: k.dim(2),
+        dimension: dimension, keyValueShared: keyValueShared)
+    let qRows = plan.queryRows
+    let kRows = plan.keyRows
+    let threads = plan.threadsPerRow
+    let normRows = plan.normRows
     let outputs = gemma4QKVNormKernel(
         [q, k, v, qWeight, kWeight, positionOffsets,
          ropeParameters.log2Base, ropeParameters.frequencies],
@@ -1507,7 +1554,7 @@ private func gemma4FusedQKVNorm(
         ],
         grid: (normRows * threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: fusedRope
-            ? [[8, 16, 1, dimension], [8, k.dim(2), 1, dimension], v.shape]
+            ? [[batch, 16, 1, dimension], [batch, k.dim(2), 1, dimension], v.shape]
             : [q.shape, k.shape, v.shape],
         outputDTypes: [q.dtype, k.dtype, v.dtype]
     )
