@@ -54,7 +54,14 @@ import MLX
 public enum CBv2MetalResidencySetV1 {
 
     /// Parsed once; the switch is a process-level decision.
-    public enum Setting: Equatable {
+    ///
+    /// `Sendable` is spelled out rather than inferred: a PUBLIC type never
+    /// gets the implicit conformance, and without it the immutable
+    /// `configured` global below is a strict-concurrency error
+    /// (`#MutableGlobalVariable`). The conformance is sound on its own terms
+    /// --- a frozen-in-practice value type whose only payload is an `Int`,
+    /// with no reference storage to share.
+    public enum Setting: Equatable, Sendable {
         case off
         /// Explicit budget in bytes.
         case bytes(Int)
