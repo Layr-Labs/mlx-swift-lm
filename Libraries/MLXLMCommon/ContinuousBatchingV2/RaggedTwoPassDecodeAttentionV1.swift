@@ -2905,6 +2905,164 @@ public enum CBv2RaggedTwoPassDecodeAttentionV1 {
             extraInputs: [startArray], scale: scale)
     }
 
+    /// RING-READ-FOLD-B1: `attendRing` for a SINGLE row (B=1 decode). A
+    /// one-buffer transcription of `ringPassAKernel` — same modular temporal
+    /// walk (`slot = (start + block + i*BLOCKS) & ring_mask`), same online-
+    /// softmax reduction order, same `passBActive` combine — so it is bit-for-bit
+    /// the B=8 `attendRing` for `batch_index == 0`. That two-pass is a NEAR-TIE
+    /// (not bitwise) match to `MLXFast.scaledDotProductAttention` — MLX's own
+    /// decode SDPA the pre-fold B=1 path called over the `temporalOrder` concat —
+    /// because the two reduce the key axis in different block partitions, so one
+    /// greedy argmax in ~6,000 tokens flips (HumanEval-gated, the D512-two-pass
+    /// class). The READ is bitwise identical (unit-tested); only the reduction
+    /// order differs. Reads the ring K/V IN PLACE via the modular walk; no window
+    /// materialisation. Returns nil (no work) on any gate miss so the caller
+    /// keeps the concat+SDPA path.
+    static func attendRingB1(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        start: Int, scale: Float, slidingWindowLength: Int
+    ) -> MLXArray? {
+        guard enabled,
+            blocks > 0,
+            sequenceLength.isMultiple(of: blocks),
+            scale == 1.0,
+            slidingWindowLength == sequenceLength,
+            queries.dtype == .bfloat16,
+            queries.shape == [1, queryHeads, 1, headDim],
+            keys.dtype == .bfloat16,
+            values.dtype == .bfloat16,
+            keys.shape == [1, kvHeads, sequenceLength, headDim],
+            values.shape == keys.shape,
+            0 <= start, start < sequenceLength
+        else { return nil }
+
+        let startArray = MLXArray([UInt32(start)], [1])
+        let partialShape = [1, queryHeads, 1, blocks, headDim]
+        let summaryShape = [1, queryHeads, 1, blocks]
+        let passA = ringPassAB1Kernel(
+            [queries, keys, values, startArray],
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("N", sequenceLength),
+                ("GQA", gqa),
+                ("BLOCKS", blocks),
+            ],
+            grid: (kvHeads * 32, gqa, blocks),
+            threadGroup: (32, gqa, 1),
+            outputShapes: [partialShape, summaryShape, summaryShape],
+            outputDTypes: [.bfloat16, .float32, .float32]
+        )
+        return passBActive(
+            passA,
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("BLOCKS", blocks),
+                ("COLS", combineColumns),
+            ],
+            grid: (queryHeads * combineThreads, 1, 1),
+            threadGroup: (combineThreads, 1, 1),
+            outputShapes: [[1, queryHeads, 1, headDim]],
+            outputDTypes: [.bfloat16]
+        )[0]
+    }
+
+    /// Whether `attendRingB1` would run for these inputs — every guard except
+    /// the runtime `start` range (always valid for a full ring). The caller
+    /// checks this BEFORE the ring write so the post-write attend cannot fail.
+    static func ringB1Eligible(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, slidingWindowLength: Int
+    ) -> Bool {
+        enabled
+            && blocks > 0
+            && sequenceLength.isMultiple(of: blocks)
+            && slidingWindowLength == sequenceLength
+            && queries.dtype == .bfloat16
+            && queries.shape == [1, queryHeads, 1, headDim]
+            && keys.dtype == .bfloat16
+            && values.dtype == .bfloat16
+            && keys.shape == [1, kvHeads, sequenceLength, headDim]
+            && values.shape == keys.shape
+    }
+
+    /// One-row (`batch_index == 0`) transcription of `ringPassAKernel`: a
+    /// single K/V buffer, no batch switch. Every other line is identical to the
+    /// B=8 kernel, so row 0's arithmetic — the modular walk and the online
+    /// softmax — is bit-for-bit the B=8 kernel's.
+    private static let ringPassAB1Kernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "cbv2_ring_2pass_a_b1_bf16_d256_g\(gqa)_b\(blocks)_v1",
+        inputNames: ["queries", "k0", "v0", "starts"],
+        outputNames: ["partials", "sums", "maxs"],
+        source: """
+            constexpr int simd_width = 32;
+            constexpr int values_per_lane = D / simd_width;
+            static_assert((N & (N - 1)) == 0, "ring length must be a power of two");
+            constexpr int ring_mask = N - 1;
+
+            const int kv_head = int(threadgroup_position_in_grid.x);
+            const int block = int(threadgroup_position_in_grid.z);
+            const int query_head_in_group = int(thread_position_in_threadgroup.y);
+            const int query_head = GQA * kv_head + query_head_in_group;
+            const int batch_head = query_head;   // batch_index == 0
+            const int lane = int(thread_index_in_simdgroup);
+
+            const device T* keys = k0;
+            const device T* values = v0;
+            const uint start = starts[0];
+
+            const device T* query =
+                queries + batch_head * D + lane * values_per_lane;
+            keys += kv_head * N * D + lane * values_per_lane;
+            values += kv_head * N * D + lane * values_per_lane;
+            int slot = int((start + uint(block)) & uint(ring_mask));
+            device T* partial = partials
+                + batch_head * BLOCKS * D + block * D + lane * values_per_lane;
+            device float* sum_out = sums + batch_head * BLOCKS + block;
+            device float* max_out = maxs + batch_head * BLOCKS + block;
+
+            thread float q[values_per_lane];
+            thread float accumulator[values_per_lane];
+            for (int element = 0; element < values_per_lane; ++element) {
+                q[element] = 1.0f * float(query[element]);
+                accumulator[element] = 0.0f;
+            }
+
+            float max_score = -3.402823466e+38F;
+            float sum_exp_score = 0.0f;
+            for (int token = block; token < N; token += BLOCKS) {
+                const device T* k = keys + slot * D;
+                const device T* v = values + slot * D;
+                float score = 0.0f;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    score += q[element] * float(k[element]);
+                }
+                score = simd_sum(score);
+
+                const float new_max = max(max_score, score);
+                const float old_factor = fast::exp(max_score - new_max);
+                const float score_factor = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp_score = sum_exp_score * old_factor + score_factor;
+                for (int element = 0; element < values_per_lane; ++element) {
+                    accumulator[element] = accumulator[element] * old_factor
+                        + score_factor * float(v[element]);
+                }
+
+                slot = (slot + BLOCKS) & ring_mask;
+            }
+
+            if (lane == 0) {
+                sum_out[0] = sum_exp_score;
+                max_out[0] = max_score;
+            }
+            for (int element = 0; element < values_per_lane; ++element) {
+                partial[element] = T(accumulator[element]);
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
     /// `attendRing` with this step's one-token ring write fused into pass A.
     ///
     /// `keys`/`values` are the rows' RETAINED ring allocations and `starts`
