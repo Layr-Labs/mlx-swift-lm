@@ -381,9 +381,21 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let sinB = sinRows.reshaped(sinBroadcastShape)
         let aRot = a * cosB - b * sinB
         let bRot = a * sinB + b * cosB
+        // `leadShape`, not `prefixLead`: the tail below is sliced out of
+        // `flat`, which keeps the query axis, so the rotated prefix has to keep
+        // it too. Reshaping to `prefixLead + [rotaryPrefix]` dropped that axis
+        // and handed `concatenated` a rank-2 array beside a rank-3 one, which
+        // MLX rejects outright ("got arrays with dimensions 2 and 3"). The
+        // branch is unreachable whenever the drafter's query position is one
+        // BEFORE the table's anchor -- the reference semantics this stack
+        // ships -- so the defect only surfaces where that does not hold: with
+        // `MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS=0`, or at anchor 0 where
+        // `draftQueryPosition` clamps back onto the anchor. The trimmed base
+        // PR predates the reference-semantics correction and takes this branch
+        // on every round, which is why its MTP seam suite aborted.
         let rotatedPrefix = MLX.stacked([aRot, bRot], axis: -1)
             .reshaped(Array(prefixShape))
-            .reshaped(Array(prefixLead) + [rotaryPrefix])
+            .reshaped(leadShape + [rotaryPrefix])
         let tail = flat[.ellipsis, rotaryPrefix ..< featureDim]
         return MLX.concatenated([rotatedPrefix, tail], axis: -1)
     }

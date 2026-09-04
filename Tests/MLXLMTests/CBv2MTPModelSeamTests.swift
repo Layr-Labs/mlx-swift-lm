@@ -507,4 +507,52 @@ struct CBv2MTPModelSeamTests {
             targetOutputIndex: 2, draftDepth: depth)
         #expect(hidden[1, column, 0].item(Int32.self) == 6)
     }
+
+    // MARK: - (e) Cached drafter RoPE: rank of the rejoined hidden
+
+    /// The rotary prefix and the pass-through tail must rejoin at the SAME
+    /// rank.
+    ///
+    /// `applyCachedDrafterRoPE` slices its tail out of the query-axis-carrying
+    /// `flat`, so a prefix reshaped without that axis met the tail as a rank-2
+    /// array beside a rank-3 one and MLX aborted the process outright
+    /// ("[concatenate] ... got arrays with dimensions 2 and 3"). It is an
+    /// abort, not a failure: it takes the whole test binary with it, which is
+    /// why a suite that hit it reported zero tests run.
+    ///
+    /// This stack does not reach that branch — the drafter's query position is
+    /// one BEFORE the table's anchor under reference semantics, so the range
+    /// guard returns early — but two live inputs do: an anchor of 0, where
+    /// `draftQueryPosition` clamps back onto the anchor, and
+    /// `MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS=0`. The table is built with an
+    /// identity rotation so the assertion is exact rather than approximate.
+    @Test("the cached drafter RoPE returns the hidden at its own rank")
+    func cachedDrafterRoPEKeepsTheQueryAxis() {
+        let halfDim = 2
+        let windowAhead = 3
+        let start = 10
+        let table = DrafterRoPETable(
+            cos: MLXArray.ones([windowAhead, halfDim], dtype: .float32),
+            sin: MLXArray.zeros([windowAhead, halfDim], dtype: .float32),
+            dims: halfDim * 2,
+            startPosition: start,
+            windowAhead: windowAhead,
+            base: 10_000)
+
+        for rows in [1, 2] {
+            let hidden = MLXArray((0 ..< (rows * 8)).map(Float.init))
+                .reshaped([rows, 1, 8])
+            let offsets = MLXArray(
+                (0 ..< rows).map { Int32(start + $0) })
+            let rotated = Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE(
+                hidden: hidden, table: table, positionOffset: .batch(offsets))
+            eval(rotated)
+            #expect(rotated.shape == [rows, 1, 8], "rows \(rows)")
+            // cos == 1, sin == 0 is the identity, so the values must survive
+            // the split and the rejoin unchanged.
+            #expect(
+                rotated.asArray(Float.self) == hidden.asArray(Float.self),
+                "rows \(rows)")
+        }
+    }
 }
