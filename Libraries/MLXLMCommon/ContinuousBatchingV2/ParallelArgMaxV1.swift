@@ -19,18 +19,6 @@ enum CBv2ParallelArgMaxV1 {
     private static let tileSize = 4096
     private static let tileThreads = 256
     private static let finalThreads = 32
-
-    /// Independent fallback for attribution and emergency bisection.
-    /// An absent setting enables the implementation; an explicit off value
-    /// restores the stock argMax + int32 conversion.
-    private static let enabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_PARALLEL_ARGMAX"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(
-            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-    }()
-
     /// ARGMAX-B1. Smallest row count this decomposition is used for; below
     /// it the stock single-kernel `argMax` runs.
     ///
@@ -54,7 +42,7 @@ enum CBv2ParallelArgMaxV1 {
     ///
     /// `DARKBLOOM_CBV2_PARALLEL_ARGMAX_MIN_ROWS=1` restores the previous
     /// admission so the arm can be re-measured; a larger value narrows it
-    /// further. `DARKBLOOM_CBV2_PARALLEL_ARGMAX=0` still removes it.
+    /// further, and a value above 8 disables the arm entirely (kill switch).
     static let minimumRows: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PARALLEL_ARGMAX_MIN_ROWS"],
@@ -193,7 +181,7 @@ enum CBv2ParallelArgMaxV1 {
     /// row-contiguous storage via MLX's eval-time ensureRowContiguous check;
     /// a strided input is bit-copied before the kernel, never misindexed.
     static func apply(_ logits: MLXArray) -> MLXArray? {
-        guard enabled, logits.ndim == 2,
+        guard logits.ndim == 2,
             logits.dtype == .bfloat16 || logits.dtype == .float32
         else { return nil }
         let rows = logits.dim(0)
