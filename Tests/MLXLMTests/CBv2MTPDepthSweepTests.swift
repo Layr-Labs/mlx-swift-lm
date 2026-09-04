@@ -246,6 +246,63 @@ struct CBv2MTPDepthSweepTests {
         }
     }
 
+    // MARK: - Opening at the ceiling
+
+    /// The first decision a fresh bucket makes is the deepest arm of its
+    /// envelope, not depth 0.
+    ///
+    /// The tested default for this envelope is its ceiling, so the controller
+    /// starts there and requires evidence to come DOWN. Before this it opened
+    /// with a depth-0 baseline and explored upward under
+    /// `limit = frontier + 1`, and because the frontier only moves after a
+    /// position has `acceptanceMinSamples` observations, the first rounds of
+    /// every stream ran at depth 0, 1 and 2 before reaching the depth the
+    /// envelope was tested at.
+    @Test("a fresh controller opens at the ceiling")
+    func opensAtTheCeiling() {
+        let controller = CBv2MTPDepthController(maxDepth: 3, fixedDepth: nil)
+        let first = controller.select(plannedDecodeRows: 1, canSpeculate: true)
+        #expect(first.depth == 3)
+        #expect(first.reason == "open_ceiling")
+        #expect(first.isExploration)
+        // The frontier is 0 on a fresh bucket. It must not cap the opening.
+        #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).depth == 3)
+    }
+
+    /// Opening high must not become staying high. Acceptance that collapses has
+    /// to pull the controller down, or the ceiling default is a one-way door.
+    @Test("collapsing acceptance still backs the controller off the ceiling")
+    func collapsingAcceptanceBacksOff() {
+        // Cost rises with depth and nothing is ever accepted, so every
+        // speculative round pays more and commits the same one token.
+        let cost = [11e6, 16e6, 21e6, 26e6]
+        let controller = CBv2MTPDepthController(maxDepth: 3, fixedDepth: nil)
+        var depths: [Int] = []
+        for _ in 0 ..< 400 {
+            let decision = controller.select(plannedDecodeRows: 1, canSpeculate: true)
+            let depth = min(max(decision.depth, 0), cost.count - 1)
+            if depth > 0 {
+                controller.observeAcceptance(
+                    decodeRowBucket: Self.bucket, drafted: depth, accepted: 0)
+            }
+            controller.recordFinalizedStep(
+                decision: decision,
+                actualDepth: depth,
+                wallTimeNanos: UInt64(cost[depth]),
+                costEligible: true,
+                chained: false,
+                finalizedPlainWork: depth == 0,
+                finalizedVerification: depth > 0)
+            depths.append(depth)
+        }
+        #expect(depths.first == 3, "it must still OPEN at the ceiling")
+        let tail = depths.suffix(200)
+        #expect(
+            tail.allSatisfy { $0 == 0 },
+            "a collapsed acceptance must settle at depth 0, saw \(Set(tail).sorted())")
+        #expect(controller.activeDepthForTesting(decodeRowBucket: Self.bucket) == 0)
+    }
+
     @Test("a fixed pin overrides the sweep entirely")
     func fixedPinWins() {
         let controller = CBv2MTPDepthController(maxDepth: 7, fixedDepth: 4)

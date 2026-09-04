@@ -258,19 +258,41 @@ struct CBv2MTPProbeCadenceTests {
         #expect(justProfitable.outcome.rounds >= justUnprofitable.outcome.rounds * 7)
     }
 
-    /// A depth-zero baseline must exist before any comparison is possible, and
-    /// it may only be measured on a NON-chained step. If that probe stopped
-    /// being requested the controller would never leave warmup and MTP would be
-    /// silently off — the failure mode the paged `kv_unsupported` no-op already
-    /// produced once this wave.
-    @Test("the depth-zero baseline is demanded before any depth is selected")
+    /// A depth-zero baseline must still be measured, and it may only be
+    /// measured on a NON-chained step. What changed is WHEN: the controller now
+    /// opens at the ceiling and prices the envelope downward, so the baseline
+    /// is the last rung of the opening scan instead of the first decision. It
+    /// is not optional — `goodput(0)` is zero without a cost sample, so a
+    /// controller that never priced depth 0 could never decline to speculate.
+    @Test("the depth-zero baseline is still demanded, after the ceiling opening")
     func warmupBaselineIsRequiredBeforeSelection() {
-        let controller = CBv2MTPDepthController(
-            maxDepth: CBv2MTPConfig.testedMaxDraftTokens, fixedDepth: nil)
+        let maxDepth = CBv2MTPConfig.testedMaxDraftTokens
+        let controller = CBv2MTPDepthController(maxDepth: maxDepth, fixedDepth: nil)
 
-        let first = controller.select(plannedDecodeRows: 1, canSpeculate: true)
+        // The opening decision is the ceiling, and it does not break the chain:
+        // only a depth-zero probe does.
+        let opening = controller.select(plannedDecodeRows: 1, canSpeculate: true)
+        #expect(opening.depth == maxDepth)
+        #expect(opening.reason == "open_ceiling")
+        #expect(!controller.requiresNonChainedDepthZeroProbe(opening))
+        controller.recordFinalizedStep(
+            decision: opening, actualDepth: maxDepth, wallTimeNanos: 30_000_000,
+            costEligible: true, chained: false,
+            finalizedPlainWork: false, finalizedVerification: true)
+
+        // The downward scan reaches depth 0 last. Walk it there.
+        var first = controller.select(plannedDecodeRows: 1, canSpeculate: true)
+        var guard_ = 0
+        while first.depth != 0, guard_ < maxDepth + 2 {
+            controller.recordFinalizedStep(
+                decision: first, actualDepth: first.depth,
+                wallTimeNanos: 30_000_000, costEligible: true, chained: false,
+                finalizedPlainWork: false, finalizedVerification: true)
+            first = controller.select(plannedDecodeRows: 1, canSpeculate: true)
+            guard_ += 1
+        }
         #expect(first.depth == 0)
-        #expect(first.reason == "warmup_baseline")
+        #expect(first.reason == "explore_cost")
         #expect(controller.requiresNonChainedDepthZeroProbe(first))
 
         // A CHAINED depth-zero step cannot satisfy it: its interval overlaps
@@ -287,10 +309,10 @@ struct CBv2MTPProbeCadenceTests {
             finalizedPlainWork: true, finalizedVerification: false)
         #expect(!controller.requiresNonChainedDepthZeroProbe(first))
 
-        // With a baseline in hand the controller immediately costs depth 1.
+        // With every rung priced, the controller leaves the opening scan.
         let second = controller.select(plannedDecodeRows: 1, canSpeculate: true)
-        #expect(second.depth == 1)
-        #expect(second.reason == "explore_cost")
+        #expect(second.reason != "explore_cost")
+        #expect(second.reason != "open_ceiling")
     }
 
     /// The field case, at the wall-clock costs actually measured on gemma-4,

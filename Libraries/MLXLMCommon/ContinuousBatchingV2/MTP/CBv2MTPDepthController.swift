@@ -158,7 +158,8 @@ final class CBv2MTPDepthController {
         /// `observeTransitionCost`.
         var transitionCost = CostState()
         var acceptance = AcceptanceState()
-        var activeDepth = 0
+        /// nil until a non-exploration round completes. See `decide`.
+        var activeDepth: Int?
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
         var roundsSinceProbe = 0
         /// Depth of the most recent exploration, and the acceptance-sample
@@ -311,8 +312,13 @@ final class CBv2MTPDepthController {
         return true
     }
 
+    /// The depth this bucket is serving at. A bucket that has not completed a
+    /// non-exploration round reports 0, as it did before the incumbent became
+    /// optional.
     func activeDepthForTesting(decodeRowBucket: Int) -> Int {
-        buckets[decodeRowBucket]?.activeDepth ?? 0
+        guard let state = buckets[decodeRowBucket], let depth = state.activeDepth
+        else { return 0 }
+        return depth
     }
 
     func probeIntervalForTesting(decodeRowBucket: Int) -> Int {
@@ -370,19 +376,42 @@ final class CBv2MTPDepthController {
         }
 
         let state = buckets[bucket] ?? BucketState()
-        let limit = min(maxDepth, state.acceptance.frontier + 1)
+        // The acceptance frontier caps the envelope only once it has started to
+        // move. On a fresh bucket the frontier is 0, and capping there would
+        // hold the opening decisions at depth 0 or 1 while the stream climbs
+        // back to a depth the envelope was already tested at.
+        let limit =
+            state.acceptance.frontier > 0
+            ? min(maxDepth, state.acceptance.frontier + 1)
+            : maxDepth
         let decision: CBv2MTPDepthDecision
 
-        if state.costs[0] == nil {
+        if state.costs.isEmpty {
+            // OPEN AT THE CEILING. The tested default for this envelope is its
+            // deepest arm, so start there and require evidence to come DOWN,
+            // rather than starting at 0 and requiring evidence to go up. The
+            // depth-0 baseline is still sampled — it is the last rung of the
+            // downward scan below — because `goodput(0)` is zero without a cost
+            // sample and a controller that cannot price depth 0 can never
+            // decline to speculate.
             decision = CBv2MTPDepthDecision(
-                depth: 0, decodeRowBucket: bucket, reason: "warmup_baseline",
+                depth: maxDepth, decodeRowBucket: bucket, reason: "open_ceiling",
                 isExploration: true)
-        } else if let unsampled = (0 ... limit).first(where: { state.costs[$0] == nil }) {
+        } else if let unsampled = stride(from: limit, through: 0, by: -1)
+            .first(where: { state.costs[$0] == nil })
+        {
+            // Downward, so the envelope is priced from the ceiling to the
+            // floor. The depth-0 baseline is the last rung, not the first.
             decision = CBv2MTPDepthDecision(
                 depth: unsampled, decodeRowBucket: bucket, reason: "explore_cost",
                 isExploration: true)
         } else {
-            let current = min(state.activeDepth, limit)
+            // An unset bucket's incumbent is the ceiling, so hysteresis
+            // protects the opening depth and the controller must be SHOWN a
+            // reason to come down. Starting the incumbent at 0 would make
+            // hysteresis argue for depth 0 on a bucket that has never served a
+            // round.
+            let current = min(state.activeDepth ?? maxDepth, limit)
             let currentGoodput = goodput(depth: current, state: state)
             var best = current
             var bestGoodput = currentGoodput
@@ -507,6 +536,8 @@ final class CBv2MTPDepthController {
         } else {
             state.roundsSinceProbe += 1
         }
+        // `activeDepth` is non-nil from here on, so the ceiling default in
+        // `decide` applies only until the bucket has served one round.
     }
 
     private func goodput(depth: Int, state: BucketState) -> Double {
