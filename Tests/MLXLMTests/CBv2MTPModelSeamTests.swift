@@ -364,11 +364,19 @@ struct CBv2MTPModelSeamTests {
         // Mirror runGemma4MTPGreedyRound's draft chain exactly (that round
         // loop does not expose the raw draft ids).
         let driveOffset = legacyCache[0].offset
-        let positionOffset = Gemma4.PositionOffset.scalar(driveOffset)
+        // Mirror runGemma4MTPGreedyRound exactly, INCLUDING its split between
+        // the drafter's RoPE position (the last real key, under reference
+        // semantics) and the mask's offset (the true KV offset, always). This
+        // leg is a hand-rolled copy of that round because the round does not
+        // expose raw draft ids, so it has to track the same rule or it stops
+        // testing CBv2-vs-v1 parity and starts testing the copy.
+        let positionOffset = Gemma4.PositionOffset.scalar(
+            Gemma4MTPDrafterSemantics.draftQueryPosition(kvOffset: driveOffset))
         var v1Hidden = lastHiddenSlice(prefill.lastHidden)
         let masks = drafter.makeMasks(
             queryLen: 1, sharedKV: v1SharedKV,
-            positionOffset: positionOffset, dtype: v1Hidden.dtype)
+            positionOffset: Gemma4.PositionOffset.scalar(driveOffset),
+            dtype: v1Hidden.dtype)
         var v1Tok = MLXArray([Int32(v1Bonus)])[.newAxis, .ellipsis]
         var v1Drafts: [Int] = []
         for _ in 0 ..< k {
@@ -466,7 +474,7 @@ struct CBv2MTPModelSeamTests {
 
     // MARK: - (e) Official target-hidden and accepted-index semantics
 
-    @Test func targetConditioningHiddenIsPreFinalNorm() throws {
+    @Test func targetConditioningHiddenMatchesReferenceSemantics() throws {
         MLXRandom.seed(0xA55157)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
@@ -483,12 +491,22 @@ struct CBv2MTPModelSeamTests {
             tokens, caches: rig.kvCaches([seamRow]))
         eval(postNorm, preNorm, conditioningHidden)
 
+        // The mlx-vlm reference feeds the drafter `speculative_draft_hidden(h)
+        // = model.norm(h)` (language.py:671-672, used at mtp.py:664/585), so
+        // under reference semantics the conditioning slot is the POST-norm
+        // hidden. This test previously asserted pre-norm, which encoded the
+        // engine's own claim that the `pre_projection` was trained against
+        // HF's `hidden_states` capture point — the cross-check falsified it.
+        // Both legs are pinned so the A/B switch cannot silently stop working.
+        let expectPostNorm = Gemma4MTPDrafterSemantics.referenceSemantics
+        let expected = expectPostNorm ? postNorm : preNorm
+        let rejected = expectPostNorm ? preNorm : postNorm
         #expect(
-            allClose(conditioningHidden, preNorm, rtol: 0, atol: 0).item(Bool.self),
-            "the assistant conditioning slot must be the decoder output before model.norm")
+            allClose(conditioningHidden, expected, rtol: 0, atol: 0).item(Bool.self),
+            "the assistant conditioning slot must match reference semantics")
         #expect(
-            !allClose(conditioningHidden, postNorm, rtol: 0, atol: 0).item(Bool.self),
-            "a post-final-norm hidden would silently change official assistant inputs")
+            !allClose(conditioningHidden, rejected, rtol: 0, atol: 0).item(Bool.self),
+            "the two hidden capture points must remain distinguishable")
     }
 
     @Test func lastAcceptedTokenUsesAcceptedDraftHiddenColumn() {

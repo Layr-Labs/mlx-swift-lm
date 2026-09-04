@@ -187,14 +187,66 @@ public final class Gemma4SharedKVCapture: @unchecked Sendable {
 }
 
 /// Result of `Gemma4TextModel.forwardForMTP`. Carries both the LM head
+/// Gemma 4 drafter semantics, against the mlx-vlm reference implementation.
+///
+/// A cross-check of `mlx_vlm/models/gemma4` and `mlx_vlm/speculative/mtp.py`
+/// found exactly two places where this engine's drafter differs from the
+/// reference, both uniform across context and both affecting only what the
+/// DRAFTER sees — never a committed token, because the target verifies
+/// everything the drafter proposes. So they cost acceptance and nothing else,
+/// which is the shape of the measured gap.
+///
+/// 1. SEED HIDDEN. The reference feeds the drafter the POST-final-norm target
+///    hidden (`speculative_draft_hidden(h) = model.norm(h)`,
+///    `language.py:671-672`, applied at `mtp.py:664` and `:585`). This engine
+///    fed the PRE-norm hidden. Same weights on both sides, so exactly one is
+///    right, and an RMSNorm cannot be folded into the drafter's linear
+///    pre-projection — it rescales per row by a quantity that depends on the
+///    row. The engine's own comment asserted pre-norm was what the
+///    `pre_projection` was trained against; the reference says otherwise, and
+///    the reference is the implementation the weights shipped with.
+/// 2. QUERY POSITION. The reference drafts at RoPE position
+///    `max(kv_offset - 1, 0)` — the position of the LAST REAL KEY
+///    (`mtp.py:587-593, 714-720`). This engine drafted at `kv_offset`, one
+///    past it, so every drafter query saw every shared key at relative
+///    position +1. Constant across draft steps, so it shifts the whole
+///    conditional-acceptance curve rather than any single position.
+///
+/// The sliding-window MASK is unchanged and stays keyed on `anchor`: it was
+/// already arithmetically equal to the reference's (the reference clamps its
+/// offset to the ring length, absorbing the same one), and only the RoPE
+/// angle was wrong.
+///
+/// [engage] MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS — default ON. `=0` restores
+/// the previous behaviour so the acceptance delta can be measured as an A/B
+/// against the same build.
+public enum Gemma4MTPDrafterSemantics {
+    public static let referenceSemantics: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw)
+    }()
+
+    /// The RoPE position a drafter query is evaluated at, given the target's
+    /// KV offset. Pure arithmetic so it can be pinned without a model.
+    public static func draftQueryPosition(kvOffset: Int) -> Int {
+        guard referenceSemantics else { return kvOffset }
+        return max(kvOffset - 1, 0)
+    }
+}
+
 /// output and the pre-head trunk hidden, plus the shared-KV snapshot the
 /// drafter needs for its next round.
 public struct Gemma4MTPForward: @unchecked Sendable {
     /// `[B, L, vocab]` - softcap applied.
     public let logits: MLXArray
-    /// `[B, L, hidden_size]` - last decoder-layer output BEFORE the final
-    /// `model.norm`. This matches HF's `hidden_states` capture point and is
-    /// what the MTP drafter's `pre_projection` was trained against.
+    /// `[B, L, hidden_size]` - the trunk hidden handed to the MTP drafter.
+    /// Under `Gemma4MTPDrafterSemantics.referenceSemantics` (the default) this
+    /// is the POST-`model.norm` hidden, matching the reference's
+    /// `speculative_draft_hidden`; with the switch off it is the pre-norm
+    /// decoder-layer output this engine used to feed.
     public let lastHidden: MLXArray
     /// Per-layer-type K/V from the last non-shared layers of the target.
     public let capturedSharedKV: Gemma4SharedKV
@@ -403,7 +455,7 @@ extension Gemma4TextModel {
         let logits = applyLMHead(postNorm)
         return Gemma4MTPForward(
             logits: logits,
-            lastHidden: preNorm,
+            lastHidden: Gemma4MTPDrafterSemantics.referenceSemantics ? postNorm : preNorm,
             capturedSharedKV: capture.snapshot()
         )
     }
@@ -1342,12 +1394,19 @@ internal func runGemma4MTPGreedyRound(
     blockSize: Int
 ) -> Gemma4MTPGreedyRoundResult {
     let k = blockSize - 1
-    let driveOffset = cache[0].offset
-    let positionOffset = Gemma4.PositionOffset.scalar(driveOffset)
+    let kvOffset = cache[0].offset
+    // Reference drafts at the LAST REAL KEY's position, not one past it. Only
+    // the RoPE angle moves: the MASK keeps the true KV offset, matching the
+    // CBv2 path (whose sliding mask stays keyed on `anchor`) and the
+    // reference, which clamps its mask offset to the ring length and so
+    // absorbs the same one. Shifting both would change which keys the drafter
+    // may see, which is a different change and not the one measured.
+    let positionOffset = Gemma4.PositionOffset.scalar(
+        Gemma4MTPDrafterSemantics.draftQueryPosition(kvOffset: kvOffset))
     let masks = drafter.makeMasks(
         queryLen: 1,
         sharedKV: sharedKV,
-        positionOffset: positionOffset,
+        positionOffset: Gemma4.PositionOffset.scalar(kvOffset),
         dtype: hidden.dtype)
 
     var tok = MLXArray([Int32(bonus)])[.newAxis, .ellipsis]

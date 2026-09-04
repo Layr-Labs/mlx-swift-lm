@@ -4522,8 +4522,16 @@ private class Gemma4Experts: Module {
             weights: topKWeights.reshaped(B * S, K),
             fuseSortedReduction: fuseWeightedUnsort,
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
-            // Rectangular MTP verification explicitly passes false.
-            isProductionPrefill: isExpertPrefill,
+            // Rectangular MTP verification passes false — it is not a prefill.
+            //
+            // [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION (D3, default off)
+            // opens the same door for a pass the gather actually GROUPED,
+            // which since the union-verify change includes the rectangular
+            // verify. Eligibility still runs through
+            // `SwitchGLUExpertGrouping.allowsFusedReduction`, which refuses an
+            // ungrouped pass, so a `[B, 1]` decode stays on the legacy reduction.
+            isProductionPrefill: isExpertPrefill
+                || SwitchGLUExpertGrouping.fusedReductionOnGroupedRows,
             // PRENORM-GATHER: the prefill producer of the sorted plane.
             sortedPlane: sortedPlane)
         return Output(
@@ -6978,7 +6986,13 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         _ tokens: MLXArray, caches: [KVCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
-        return (applyLMHead(postNorm), preNorm)
+        // The drafter's seed hidden. Reference semantics hand it the
+        // post-norm hidden (`speculative_draft_hidden`); the switch restores
+        // the pre-norm hidden this engine used to feed. Logits are unaffected
+        // either way — they always come from `postNorm`.
+        return (
+            applyLMHead(postNorm),
+            Gemma4MTPDrafterSemantics.referenceSemantics ? postNorm : preNorm)
     }
 }
 

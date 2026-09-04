@@ -27,6 +27,11 @@ extension EngineLoopV2 {
             mtpRecordSchedulerDemotions(plan)
         }
 
+        // Everything from the previous round's finalize to this round's
+        // submit is a window in which nothing is queued for the GPU — MTP
+        // rounds never chain, so this is dead time, not overlapped host cost.
+        var timing = CBv2MTPRoundTiming()
+        let gapStart = mtp.lastRoundFinalizeEndNanos
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let work = mtpPrepareRoundWork(
             plan, driver: mtp, demoteAllRounds: demoteAllRounds)
@@ -37,7 +42,7 @@ extension EngineLoopV2 {
             return nil
         }
 
-        let graph = mtpBuildRoundGraph(work, driver: mtp)
+        let graph = mtpBuildRoundGraph(work, driver: mtp, timing: &timing)
         scheduler.markPendingSamples(ids: graph.sampledRows)
         if let verify = graph.verify {
             scheduler.markPendingSamples(
@@ -45,7 +50,10 @@ extension EngineLoopV2 {
         }
         mtp.recordSeedSteps(graph.seedRows.count)
 
+        let submitStart = CBv2MTPRoundTiming.now()
         asyncEval(graph.asyncEvalTargets)
+        timing.submitNanos = CBv2MTPRoundTiming.since(submitStart)
+        timing.hostGapNanos = CBv2MTPRoundTiming.since(gapStart)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
@@ -63,12 +71,14 @@ extension EngineLoopV2 {
         if graph.verify != nil || !graph.seedRows.isEmpty
             || !graph.committedObservationRows.isEmpty
         {
-            step.mtpRound = CBv2MTPRoundInFlight(
+            let round = CBv2MTPRoundInFlight(
                 verify: graph.verify,
                 seedRows: graph.seedRows,
                 seedHidden: graph.seedHidden,
                 seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
                 committedObservationRows: graph.committedObservationRows)
+            round.timing = timing
+            step.mtpRound = round
         }
         return step
     }

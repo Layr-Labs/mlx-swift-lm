@@ -256,9 +256,44 @@ public protocol CBv2MTPDrafter: AnyObject {
     func draftStep(
         tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
     ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// How many DISTINCT candidates one drafter forward can return at a
+    /// position. 1 means argmax only, which is what a chain needs and what
+    /// every drafter supports; a tree shape asking for rank `r` requires
+    /// `maximumDraftCandidates > r`. See `CBv2MTPTreeShape`.
+    var maximumDraftCandidates: Int { get }
+    /// One draft-chain step that also returns the runners-up of the SAME
+    /// forward. `candidates` is the number of ranks wanted (>= 1).
+    ///  - Returns `tokens` `[B, candidates]` int32 (lazy), column 0 being
+    ///    the greedy argmax so `tokens[.., 0]` is bit-identical to
+    ///    `draftStep`'s result, and the drafter's output hidden `[B, 1, H]`
+    ///    for chaining the ARGMAX branch (a tree's alternates are leaves of
+    ///    the forward they came from; nothing chains from a runner-up).
+    func draftStepCandidates(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture,
+        candidates: Int
+    ) -> (tokens: MLXArray, hidden: MLXArray)
 }
 
 extension CBv2MTPDrafter {
+    /// Default: argmax only. A drafter that does not override this cannot
+    /// carry a tree, and `CBv2MTPTreeShape.maximumCandidateRank` is the
+    /// number the caller must check against.
+    public var maximumDraftCandidates: Int { 1 }
+
+    /// Default: satisfy a rank-1 request from `draftStep`, refuse anything
+    /// deeper rather than inventing a candidate.
+    public func draftStepCandidates(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture,
+        candidates: Int
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        precondition(
+            candidates == 1,
+            "CBv2MTPDrafter: \(type(of: self)) returns only its argmax; "
+                + "a tree shape needs draftStepCandidates")
+        let step = draftStep(tokens: tokens, hidden: hidden, prepared: prepared)
+        return (step.tokens.reshaped([-1, 1]), step.hidden)
+    }
+
     public var mtpTargetIdentity: ObjectIdentifier? { nil }
     public var requiredVerificationMode: CBv2MTPVerificationMode? { nil }
     public var maximumDraftTokens: Int? { nil }
@@ -468,6 +503,219 @@ public struct CBv2MTPCostInput: Sendable, Equatable {
 /// Cumulative MTP counters (engine-thread mutated, snapshot under the
 /// engine's stats lock). Per-position acceptance is the tuning signal for
 /// `maxDraftTokens`.
+/// Round-cost switches. Each is one behaviour, off by default, readable at
+/// process start so a stack test can enable exactly the arms it is measuring.
+///
+/// [engage] MTPLX_MTP_PIPELINED_DRAFT_SUBMIT
+public enum CBv2MTPRoundSwitches {
+    /// Submit each stateless draft step as it is built instead of leaving the
+    /// whole round unsubmitted until `executeMTPRound`'s single `asyncEval`.
+    ///
+    /// UNCONDITIONAL BY DESIGN. It submits at every depth, every batch size and
+    /// every context length, because the thing that decides whether the extra
+    /// submission pays — how expensive one drafter forward is — is not
+    /// something a prompt length can be used to guess. This drafter attends the
+    /// target's retained KV, so its forward does grow with context, and it
+    /// would be easy to "help" by gating the submit on prompt length. Do not.
+    /// A length-gated submit makes every measurement a measurement of the gate
+    /// and mis-serves every length nobody tuned. If it loses somewhere, the
+    /// answer is to turn the switch off, not to add a threshold.
+    ///
+    /// The stateless path (Gemma 4) builds k drafter forwards AND the
+    /// rectangular verify graph with nothing queued for the GPU, then submits
+    /// once. Every one of those builds is host time the GPU spends idle. The
+    /// request-stateful path already publishes its first generation mid-build
+    /// for a related reason ("nonblocking and joins the round's sole finalize
+    /// fence"); this is the same move, per step, for the stateless drafter.
+    ///
+    /// Safety: `asyncEval` is non-blocking and the same arrays still ride the
+    /// round's finalize fence, so the emitted stream is unchanged. Evaluating
+    /// the drafter early can only materialize the pre-write KV capture views
+    /// EARLIER than the verify's writes, never later, and on contiguous
+    /// storage the capture (`..<absoluteOffset`) and the verify's writes
+    /// (`absoluteOffset...`) are disjoint ranges of the same buffer.
+    public static let pipelinedDraftSubmit = flag("MTPLX_MTP_PIPELINED_DRAFT_SUBMIT")
+
+    /// [engage] MTPLX_MTP_TREE_DRAFT=<shape>
+    ///
+    /// Spend part of the rectangular WIDTH budget on siblings of the draft
+    /// chain instead of on more chain. nil (unset, `off`) keeps the shipped
+    /// chain exactly. See `CBv2MTPTreeShape` for the grammar, the column
+    /// order and — before enabling this — the arithmetic that says an
+    /// alternate only beats one more chain column when per-position
+    /// acceptance is at or below roughly 0.72.
+    ///
+    /// SHAPE, NOT LENGTH. The value names a tree, never a prompt size. A
+    /// shape too wide for the plan's width budget is SHORTENED
+    /// (`CBv2MTPTreeShape.clamped`), never silently widened: the rectangular
+    /// cap is a correctness certification.
+    public static let treeDraft: CBv2MTPTreeShape? = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_TREE_DRAFT"] else {
+            return nil
+        }
+        return CBv2MTPTreeShape.parse(raw)
+    }()
+
+    /// [engage] MTPLX_MTP_FUSED_VERIFY_ATTENTION
+    ///
+    /// Score the whole verify rectangle in ONE attention call per layer
+    /// instead of one call per column.
+    ///
+    /// Rectangular verification currently sets
+    /// `mtpSerializesRectangularAttention`, which sends a `[1, 1+k]` verify
+    /// through `CBv2AttentionV1.attendQueryBlocks` at `blockSize: 1`: `1+k`
+    /// separate SDPA calls, each slicing `keys[visibleStart ..< historyCount
+    /// + offset + 1]`. On a full-attention layer `visibleStart` is 0, so
+    /// EVERY column re-reads the entire retained KV. The round therefore
+    /// pays the target's long-context attention `1+k` times, and the per-
+    /// draft cost `c` grows with context instead of being amortised across
+    /// the rectangle — the opposite of what a rectangular verify is for.
+    ///
+    /// With this on, the verify takes the ordinary `L > 1` path, whose
+    /// `maskMode` is `.causal` for a full layer and the existing
+    /// causal-and-window array mask for a windowed one. That is the SAME
+    /// visibility per column, computed once: mathematically identical, and
+    /// the reason it is a switch rather than the default is that it is a
+    /// different KERNEL, so it is not bit-identical to the serialized path
+    /// the M5 rectangular envelope was certified on. Greedy parity is the
+    /// gate; run it with the benchmark's parity recording before promoting.
+    ///
+    /// Contiguous storage only. `PagedLayerCache` branches on the same flag
+    /// and its non-serialized `L > 1` path is packed-prefill masking over
+    /// gathered pages, which is a separate certification; a paged bank keeps
+    /// serializing whatever this says.
+    public static let fusedVerifyAttention = flag("MTPLX_MTP_FUSED_VERIFY_ATTENTION")
+
+    /// Ask the drafter for its rank-2 token at every draft step so the round
+    /// can report `runnerUpHitRate` — the number tree drafting turns on.
+    ///
+    /// OFF by default, and it must stay off for any throughput arm. It is one
+    /// extra masked argmax per draft step, which is cheap in FLOPs and is NOT
+    /// cheap on the round's critical path: MTP rounds do not chain, so every
+    /// host millisecond spent building it is GPU idle time, multiplied by k.
+    /// Measuring it changed arm A's round from ~18 ms to ~35 ms at k=1 and
+    /// from ~32 ms to ~108 ms at k=4 — a ~20 ms per-drafted-token tax on a
+    /// number nothing in the round branches on.
+    ///
+    /// [engage] MTPLX_MTP_RUNNER_UP_INSTRUMENT
+    public static let runnerUpInstrument = flag("MTPLX_MTP_RUNNER_UP_INSTRUMENT")
+
+    private static func flag(_ key: String) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[key] else { return false }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+}
+
+/// Per-stage HOST timing for MTP rounds, summed over every round in the run.
+///
+/// The stages are cut where the GPU's view of the round changes, because the
+/// thing that decides whether speculation pays is not the total round wall
+/// clock but how much of it the GPU spent idle. MTP rounds never chain (see
+/// `CBv2InFlightStep.mtpRound`), so unlike plain decode there is no successor
+/// step queued while the host finalizes: every nanosecond between the
+/// acceptance readback and the next round's submit is dead GPU time.
+///
+///   hostGapNanos    previous round's finalize end -> this round's submit.
+///                   The dead window. Contains plan, capture, draft build,
+///                   verify build, and submit — those are broken out below so
+///                   the residue (scheduling, leases, gauges, dispatch) is
+///                   what is left over.
+///   captureNanos    pre-write KV snapshots handed to the drafter.
+///   draftBuildNanos k drafter forwards, GRAPH BUILD only (lazy).
+///   verifyBuildNanos rectangular target verification graph build.
+///   submitNanos     `asyncEval` of the whole round.
+///   packetWaitNanos the blocking `asArray` on the acceptance packet: the
+///                   round's GPU time as the host sees it. Not overlapped.
+///   acceptWalkNanos target-authoritative prefix resolution for every row.
+///   rowFinalizeNanos KV rollback/commit, streaming handoff, carry store,
+///                   controller bookkeeping.
+///
+/// A round's accounted wall clock is
+/// `hostGap + packetWait + acceptWalk + rowFinalize`, and the speculation
+/// budget is everything in it that is not `packetWait`.
+public struct CBv2MTPRoundTiming: Sendable, Equatable {
+    /// Rounds these sums cover (verify rounds only; seed-only steps do not
+    /// produce an acceptance packet and are counted by `seedSteps`).
+    public var rounds: UInt64 = 0
+    public var hostGapNanos: UInt64 = 0
+    public var captureNanos: UInt64 = 0
+    public var draftBuildNanos: UInt64 = 0
+    public var verifyBuildNanos: UInt64 = 0
+    public var submitNanos: UInt64 = 0
+    public var packetWaitNanos: UInt64 = 0
+    public var acceptWalkNanos: UInt64 = 0
+    public var rowFinalizeNanos: UInt64 = 0
+    /// Smallest and largest accounted round wall clock seen, so a reader can
+    /// tell a single-shape run from one that mixed prompt lengths. The sums
+    /// above are means-in-waiting, and a mean over a run whose rounds span a
+    /// 64-token prompt and a full-context one describes neither. Zero means
+    /// no round has been recorded.
+    public var minRoundNanos: UInt64 = 0
+    public var maxRoundNanos: UInt64 = 0
+
+    public init() {}
+
+    /// This round's accounted wall clock. Only meaningful on a single-round
+    /// value (the per-round struct the engine fills in), not on a sum.
+    var accountedWallNanos: UInt64 {
+        hostGapNanos &+ packetWaitNanos &+ acceptWalkNanos &+ rowFinalizeNanos
+    }
+
+    /// Mean accounted round wall clock (nil before any round).
+    public var meanRoundNanos: Double? {
+        guard rounds > 0 else { return nil }
+        return Double(accountedWallNanos) / Double(rounds)
+    }
+
+    /// Host time per round that is NOT the GPU waiting on the verify: the
+    /// number a 200 tok/s target has to drive to zero.
+    public var meanFixedCostNanos: Double? {
+        guard rounds > 0 else { return nil }
+        let fixed = hostGapNanos &+ acceptWalkNanos &+ rowFinalizeNanos
+        return Double(fixed) / Double(rounds)
+    }
+
+    /// Timers are `DispatchTime.now()` reads on the engine thread — about
+    /// eight per round against a round measured in milliseconds. On by
+    /// default; `MTPLX_MTP_ROUND_TIMING=0` takes even that off a control run.
+    public static let enabled: Bool = {
+        let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_ROUND_TIMING"]
+        guard let raw else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    @inline(__always)
+    public static func now() -> UInt64 {
+        enabled ? DispatchTime.now().uptimeNanoseconds : 0
+    }
+
+    /// Elapsed since `start`, or zero when timing is off or the clock went
+    /// backwards (never trusted into a sum).
+    @inline(__always)
+    public static func since(_ start: UInt64) -> UInt64 {
+        guard enabled, start != 0 else { return 0 }
+        let now = DispatchTime.now().uptimeNanoseconds
+        return now > start ? now &- start : 0
+    }
+
+    mutating func add(_ other: CBv2MTPRoundTiming) {
+        if other.rounds > 0 {
+            let wall = other.accountedWallNanos
+            minRoundNanos = minRoundNanos == 0 ? wall : Swift.min(minRoundNanos, wall)
+            maxRoundNanos = Swift.max(maxRoundNanos, wall)
+        }
+        rounds &+= other.rounds
+        hostGapNanos &+= other.hostGapNanos
+        captureNanos &+= other.captureNanos
+        draftBuildNanos &+= other.draftBuildNanos
+        verifyBuildNanos &+= other.verifyBuildNanos
+        submitNanos &+= other.submitNanos
+        packetWaitNanos &+= other.packetWaitNanos
+        acceptWalkNanos &+= other.acceptWalkNanos
+        rowFinalizeNanos &+= other.rowFinalizeNanos
+    }
+}
+
 public struct CBv2MTPMetrics: Sendable {
     /// True for every non-nil `EngineV2.mtpMetricsSnapshot()`. Kept explicit
     /// so provider telemetry can serialize one stable shape.
@@ -509,8 +757,23 @@ public struct CBv2MTPMetrics: Sendable {
     /// unprofitable depth zero, batch gate, token/KV headroom, and so on).
     public var controllerFallbacks: [String: Int] = [:]
     /// Conditional acceptance rate at each draft position: P(position i is
-    /// accepted | every earlier draft position was accepted).
+    /// accepted | every earlier draft position was accepted). This is `q`,
+    /// the number that decides whether tree drafting can ever pay — see
+    /// `CBv2MTPTreeShape`.
     public var conditionalAcceptance: [Double] = []
+    /// Rounds in which the chain was REJECTED at a real divergence (not cut
+    /// short by a stop token or the output budget) and the drafter's
+    /// runner-up at that position was therefore comparable with the target.
+    /// The denominator of `r`.
+    public var runnerUpObservations: Int = 0
+    /// Of those, the rounds where the runner-up WAS the target's token — the
+    /// rounds a tree's alternate column would have converted from one
+    /// committed token into two or more. The numerator of `r`.
+    public var runnerUpHits: Int = 0
+    /// Per draft position (0-based), the same two counts, so a tree shape can
+    /// be chosen by depth rather than from one pooled number.
+    public var perPositionRunnerUpObservations: [Int] = []
+    public var perPositionRunnerUpHits: [Int] = []
     /// Outlier-clamped wall-cost EWMAs and raw cumulative inputs, sorted by
     /// decode-row bucket then depth in snapshots.
     public var costInputs: [CBv2MTPCostInput] = []
@@ -529,6 +792,9 @@ public struct CBv2MTPMetrics: Sendable {
     /// boundary as the counters above, so it adds no MLX evaluation.
     public var roundAudits: [CBv2MTPRoundAuditRecord] = []
 
+    /// Per-stage host timing, summed over rounds. See `CBv2MTPRoundTiming`.
+    public var roundTiming = CBv2MTPRoundTiming()
+
     public init() {}
 
     /// Preferred proposal-count spelling. `draftedTokens` remains stored for
@@ -538,6 +804,27 @@ public struct CBv2MTPMetrics: Sendable {
     /// Mean accepted drafts per round (nil before any round).
     public var meanAcceptedPerRound: Double? {
         rounds > 0 ? Double(acceptedTokens) / Double(rounds) : nil
+    }
+
+    /// `r`: P(the drafter's rank-2 token is the target's token | its rank-1
+    /// token is not). nil before any round was rejected at a real divergence.
+    ///
+    /// Paired with `conditionalAcceptance` (`q`) this decides tree drafting
+    /// outright: an alternate column is worth its place only when
+    /// `(1 - q) * r / committed(k*) > c_alt / round(k*)`, which at
+    /// `q = 0.82` needs `r > 1.37` and is therefore impossible. The full
+    /// table of required `r` per `q` is in `CBv2MTPTreeShape`.
+    public var runnerUpHitRate: Double? {
+        runnerUpObservations > 0
+            ? Double(runnerUpHits) / Double(runnerUpObservations) : nil
+    }
+
+    /// `r` per draft position, nil-padded where nothing was observed.
+    public var runnerUpHitRateByPosition: [Double?] {
+        zip(perPositionRunnerUpHits, perPositionRunnerUpObservations).map {
+            hits, observations in
+            observations > 0 ? Double(hits) / Double(observations) : nil
+        }
     }
 }
 

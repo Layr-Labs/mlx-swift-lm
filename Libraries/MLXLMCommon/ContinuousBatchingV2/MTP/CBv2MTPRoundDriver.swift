@@ -84,11 +84,13 @@ final class CBv2MTPRoundInFlight {
         let k: Int
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
-        /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
-        /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
-        /// all [B, 1+k] shortlist probability masses in parts-per-million.
-        /// One `asArray` at finalize reads everything, preserving the single
-        /// host-sync boundary.
+        /// Segment offsets into `acceptancePacket`. Built once on the launch
+        /// side and read at finalize, so the two sides cannot drift.
+        let layout: CBv2MTPAcceptancePacketLayout
+        /// Lazy flattened int32 packet whose segments are described by
+        /// `layout`: draft ids, target tokens, then the optional shortlist
+        /// masses and drafter runner-ups. One `asArray` at finalize reads
+        /// everything, preserving the single host-sync boundary.
         let acceptancePacket: MLXArray
         /// Lazy [B,k] draft ids retained for exact accepted-prefix slicing
         /// into stateful assistant finalization.
@@ -131,6 +133,9 @@ final class CBv2MTPRoundInFlight {
     var finalizedSeedIDs: Set<CBv2RequestID> = []
     var finalizedVerifyIDs: Set<CBv2RequestID> = []
     var claimedSeedCostNanos: UInt64 = 0
+    /// Launch-side stage times, completed at finalize and folded into the
+    /// driver's metrics there. See `CBv2MTPRoundTiming`.
+    var timing = CBv2MTPRoundTiming()
     /// Cancellation-owned assistant states released only after the target KV
     /// and recurrent deferred-release fence has retired.
     var deferredAssistantReleases: [any CBv2MTPRequestState] = []
@@ -743,6 +748,19 @@ final class CBv2MTPRoundDriver {
         metricsLock.unlock()
     }
 
+    /// Uptime nanoseconds at which the previous round's finalize returned.
+    /// Engine-thread only (never read under the metrics lock): the next
+    /// round's `hostGapNanos` is measured from here, and that gap is dead GPU
+    /// time because MTP rounds do not chain.
+    var lastRoundFinalizeEndNanos: UInt64 = 0
+
+    func recordRoundTiming(_ timing: CBv2MTPRoundTiming) {
+        guard CBv2MTPRoundTiming.enabled else { return }
+        metricsLock.lock()
+        metrics.roundTiming.add(timing)
+        metricsLock.unlock()
+    }
+
     func recordSeedSteps(_ count: Int) {
         guard count > 0 else { return }
         metricsLock.lock()
@@ -775,6 +793,30 @@ final class CBv2MTPRoundDriver {
             metrics.perPositionAccepted[position] += 1
         }
         refreshControllerMetricsLocked()
+        metricsLock.unlock()
+    }
+
+    /// One rejected round's runner-up observation: at the position where the
+    /// chain's draft was NOT the target's token, was the drafter's rank-2
+    /// token? Counted only for a real divergence — a round cut short by a
+    /// stop token or the output budget never saw the comparison, and
+    /// including it would bias `r` toward zero.
+    func recordRunnerUp(position: Int, hit: Bool) {
+        precondition(position >= 0, "CBv2 MTP: runner-up position must be >= 0")
+        metricsLock.lock()
+        if metrics.perPositionRunnerUpObservations.count <= position {
+            let missing = position + 1 - metrics.perPositionRunnerUpObservations.count
+            metrics.perPositionRunnerUpObservations.append(
+                contentsOf: Array(repeating: 0, count: missing))
+            metrics.perPositionRunnerUpHits.append(
+                contentsOf: Array(repeating: 0, count: missing))
+        }
+        metrics.runnerUpObservations += 1
+        metrics.perPositionRunnerUpObservations[position] += 1
+        if hit {
+            metrics.runnerUpHits += 1
+            metrics.perPositionRunnerUpHits[position] += 1
+        }
         metricsLock.unlock()
     }
 

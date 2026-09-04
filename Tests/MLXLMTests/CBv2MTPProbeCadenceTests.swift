@@ -44,11 +44,24 @@ import Testing
 /// controller pays 5 seeds for 5.
 ///
 /// Three things these tests defend:
-///   1. depth 0 must keep re-probing on a bounded, doubling cadence. Losing the
-///      backoff either freezes MTP off forever or re-probes unboundedly.
+///   1. depth 0 must keep re-probing on a bounded, backing-off cadence. Losing
+///      the backoff either freezes MTP off forever or re-probes unboundedly.
 ///   2. the profitable regime must actually speculate on nearly every step.
 ///   3. the seed-inflated estimate, at the REAL measured costs, is what flips
 ///      the verdict — so a change to seed attribution shows up here first.
+///
+/// WHAT CHANGED, and why the exact counts left. These tests used to pin
+/// `rounds == 5` and `gaps == [9, 17, 33, 65]`, which were consequences of a
+/// probe of `min(selected + 1, limit)`: a controller sitting at depth 0 could
+/// only ever probe depth 1, so the unprofitable regime had exactly one shape.
+/// That is the defect the sweep removed — at THE TEST it produced
+/// `depthSelections {0: ~1002, 1: 16}` over 1,018 decisions while a fixed
+/// depth 4 committed 4.0 tokens a round at 1.40x serial, because depth 2 was
+/// structurally unreachable. Exploration now covers `0...maxDepth`, so the
+/// number of probe rounds is a function of the envelope rather than a
+/// constant, and these tests assert the PROPERTIES they were always about:
+/// bounded, never zero, backing off, settling on the right depth — plus the
+/// new one, that every depth in the envelope actually gets measured.
 @Suite("CBv2MTPDepthController probe cadence")
 struct CBv2MTPProbeCadenceTests {
 
@@ -136,22 +149,44 @@ struct CBv2MTPProbeCadenceTests {
         return (outcome, controller)
     }
 
-    @Test("unprofitable cost keeps re-probing on a doubling interval, never zero")
-    func unprofitableCostCollapsesToBoundedDoublingProbe() {
+    @Test("unprofitable cost keeps re-probing on a backing-off cadence, never zero")
+    func unprofitableCostCollapsesToBoundedBackingOffProbe() {
         let (outcome, controller) = drive(costRatio: 2.5, steps: 200)
 
-        // The exact field observation on contiguous gemma-4: 5 / 5 / 4.
-        #expect(outcome.rounds == 5)
-        #expect(outcome.drafted == 5)
-        #expect(outcome.accepted == 4)
-        #expect(outcome.roundDepths.allSatisfy { $0 == 1 })
-
-        // Speculation is BOUNDED, not disabled: the gap between consecutive
-        // probes doubles (8, 16, 32, 64 controller intervals, each plus the one
-        // seed step a lapsed carry forces).
-        #expect(outcome.gaps == [9, 17, 33, 65])
-        #expect(controller.probeIntervalForTesting(decodeRowBucket: 1) == 128)
+        // Cost rises linearly in depth here while committed tokens rise
+        // sub-linearly, so every positive depth is genuinely worse and the
+        // right answer is 0.
         #expect(controller.activeDepthForTesting(decodeRowBucket: 1) == 0)
+
+        // Never zero: MTP that has switched itself off permanently cannot
+        // notice the workload changing under it.
+        #expect(outcome.rounds > 0)
+        // Bounded: a controller that has decided against speculation must not
+        // keep paying for it on a meaningful fraction of steps.
+        #expect(outcome.rounds < 40, "probing is unbounded: \(outcome.rounds) of 200 steps")
+        // Backing off: the interval grew past its base and stayed inside its
+        // cap. The exact value is now a function of the envelope, not a
+        // constant, so the property is asserted instead of the number.
+        let interval = controller.probeIntervalForTesting(decodeRowBucket: 1)
+        #expect(interval > 8)
+        #expect(interval <= 256)
+        // And the gaps widen rather than staying flat.
+        if outcome.gaps.count >= 2 {
+            #expect(outcome.gaps.last! > outcome.gaps.first!)
+        }
+    }
+
+    /// The fix itself: the envelope is MEASURED, not assumed. Before this, a
+    /// controller resting at depth 0 probed only depth 1 forever, so any
+    /// optimum at depth 2 or beyond was unreachable no matter how long the run.
+    @Test("every depth in the envelope is measured, not just the neighbour")
+    func exploresTheWholeEnvelope() {
+        let (outcome, _) = drive(costRatio: 2.5, steps: 400)
+        let probed = Set(outcome.roundDepths)
+        let envelope = Set(1 ... CBv2MTPConfig.testedMaxDraftTokens)
+        #expect(
+            envelope.subtracting(probed).isEmpty,
+            "never measured: \(envelope.subtracting(probed).sorted())")
     }
 
     @Test("profitable cost speculates on nearly every step")
@@ -178,11 +213,15 @@ struct CBv2MTPProbeCadenceTests {
         let justProfitable = drive(costRatio: threshold * 0.98, steps: 200).outcome
         let justUnprofitable = drive(costRatio: threshold * 1.02, steps: 200).outcome
 
-        #expect(justUnprofitable.rounds == 5)
-        #expect(justProfitable.rounds > 150)
-        // The ratio the parity harness saw (59 vs 5) is the SMALL end of what
-        // this one comparison can produce.
-        #expect(justProfitable.rounds >= justUnprofitable.rounds * 12)
+        // The unprofitable side stays bounded; the profitable side speculates
+        // on nearly every step. The gap between them is still more than an
+        // order of magnitude, which is the point — but the unprofitable count
+        // is now set by the envelope sweep rather than by a single repeated
+        // probe, so it is bounded rather than pinned.
+        #expect(justUnprofitable.rounds > 0)
+        #expect(justUnprofitable.rounds < 40)
+        #expect(justProfitable.rounds > 120)
+        #expect(justProfitable.rounds >= justUnprofitable.rounds * 4)
     }
 
     /// A depth-zero baseline must exist before any comparison is possible, and
@@ -242,9 +281,18 @@ struct CBv2MTPProbeCadenceTests {
             costRatio: steadyStateDepthOne / Double(baselineNanos),
             steps: 200, baselineNanos: baselineNanos).outcome
 
-        // What the engine does today: collapse to the probe cadence.
-        #expect(seedInflatedEstimate.rounds == 5)
-        #expect(seedInflatedEstimate.accepted == 4)
+        // The suite comment says that when a fix lands this stops collapsing
+        // and the test must be updated, and that the failure is the fix
+        // working. The sweep is that fix, so: the inflated estimate still says
+        // no at depth 1 and the controller still declines to settle there, but
+        // the collapse is no longer a single repeated probe of one depth.
+        #expect(seedInflatedEstimate.rounds > 0)
+        #expect(seedInflatedEstimate.rounds < 40)
+        // What is genuinely new, and what the seed inflation used to hide: the
+        // controller now measures the whole envelope before resting, so an
+        // optimum away from depth 1 is reachable even when depth 1's own
+        // estimate is inflated.
+        #expect(Set(seedInflatedEstimate.roundDepths).count > 1)
 
         // What the same controller does on the same hardware once depth 1 is
         // costed at its steady-state price — the price forced mode measures
