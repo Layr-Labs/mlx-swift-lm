@@ -1853,6 +1853,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // stamping, and the finalize-time progress refresh — so lease gaps are
         // exactly one step apart (never widened by extra clock reads).
         let stepNow = config.clock.now()
+        // RESIDENCY-001: budget MLX's residency sets once, now that the model
+        // is loaded. Idempotent, allocation policy only, no arithmetic.
+        CBv2MetalResidencySetV1.armIfNeeded()
         processCancellations()
         processLeaseExpiry(now: stepNow)
 
