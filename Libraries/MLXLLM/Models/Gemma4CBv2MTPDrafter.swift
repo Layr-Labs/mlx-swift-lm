@@ -67,8 +67,14 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepare: rows must be non-empty")
+        // RoPE at the LAST REAL KEY's position under reference semantics.
+        // The sliding mask below deliberately keeps using `anchor` itself:
+        // it was already arithmetically equal to the reference's window, and
+        // only the query's RoPE angle was off by one.
         let positionOffset = Gemma4.PositionOffset.batch(
-            MLXArray(rows.map { Int32($0.anchor) }))
+            MLXArray(rows.map {
+                Int32(Gemma4MTPDrafterSemantics.draftQueryPosition(kvOffset: $0.anchor))
+            }))
 
         let slidingWindow = drafter.config.textConfig.slidingWindow
         if rows.count == 1 {

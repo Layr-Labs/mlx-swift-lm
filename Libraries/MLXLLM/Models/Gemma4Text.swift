@@ -2267,6 +2267,12 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         _ tokens: MLXArray, caches: [KVCache]
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
-        return (applyLMHead(postNorm), preNorm)
+        // The drafter's seed hidden. Reference semantics hand it the
+        // post-norm hidden (`speculative_draft_hidden`); the switch restores
+        // the pre-norm hidden this engine used to feed. Logits are unaffected
+        // either way — they always come from `postNorm`.
+        return (
+            applyLMHead(postNorm),
+            Gemma4MTPDrafterSemantics.referenceSemantics ? postNorm : preNorm)
     }
 }
