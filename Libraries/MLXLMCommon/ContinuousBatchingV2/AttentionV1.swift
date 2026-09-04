@@ -22,18 +22,6 @@ import MLX
 /// Namespace for the v1 (per-row SDPA) attention dispatch.
 enum CBv2AttentionV1 {
 
-    /// Kill switch for the fused full-ring decode write (see
-    /// `CBv2RaggedTwoPassDecodeAttentionV1.attendRingWriting`).
-    /// `0`/`false`/`no`/`off` restores the established `decodeRingWrite` +
-    /// `attendRing` pair, which also stays the fallback for every input the
-    /// fused path refuses.
-    private static let fusedRingWriteEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_FUSED_RING_WRITE"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     /// Query-block width for multi-token prompt attention (see
     /// `attendQueryBlocks`). Smaller blocks execute strictly less attention
     /// work and hold a smaller score tensor, but cost one dispatch set each;
@@ -302,20 +290,6 @@ enum CBv2AttentionV1 {
         return joined
     }
 
-    /// ATT-008 opt-in switch: batch-wide FULL-attention decode over pooled
-    /// KV (`DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION=1` enables it).
-    /// DEFAULT OFF: three counterbalanced local B=8 probe pairs measured the
-    /// consolidation at +0.27 ms/round (+1.2%) — the concurrent Metal
-    /// encoder already overlaps the per-row dispatches it removes. Kept
-    /// selectable because the mechanism is parity-proven bit-exact and the
-    /// balance could differ on other hardware.
-    static let batchedFullDecodeEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_GEMMA4_BATCHED_FULL_ATTENTION"]
-        else { return false }
-        return ["1", "true", "yes", "on"].contains(raw.lowercased())
-    }()
-
     /// Whether a chunk of `L` queries should be split into blocks. Single
     /// queries (decode) and chunks already at or below the block width take
     /// the unchanged single-call path, so decode is provably untouched.
@@ -501,236 +475,6 @@ enum CBv2AttentionV1 {
         }
 
         if L == 1 {
-            if canUseRaggedTwoPassDecode(
-                batch: B, cacheKind: kind, queryKind: kind,
-                scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                var cachedKeyRows: [MLXArray] = []
-                var cachedValueRows: [MLXArray] = []
-                cachedKeyRows.reserveCapacity(B)
-                cachedValueRows.reserveCapacity(B)
-                let ringRows = rows.compactMap { $0 as? CBv2WindowedSequenceKV }
-                if ringRows.count == B && ringRows.allSatisfy({ $0.decodeRingView != nil }) {
-                    // Q4-LIVE-WRITE: admit all rows before any host state
-                    // mutation. Pass A writes only the live q4 mirror slot;
-                    // the established BF16 SliceUpdates and counters remain
-                    // on their incumbent path below.
-                    if CBv2WindowedSequenceKV.q4FusedMirrorWriteEnabled,
-                        allowFusedRingWrite, let decodeRingWriteFence
-                    {
-                        let preWrite = ringRows.compactMap {
-                            $0.decodeRingQuantViewBeforeWrite
-                        }
-                        if preWrite.count == B,
-                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
-                                .attendRingQuantWriting(
-                                    queries: queries,
-                                    mirrors: preWrite.map(\.mirror),
-                                    starts: preWrite.map(\.start),
-                                    newKeys: keys, newValues: values,
-                                    previousWriteFence: decodeRingWriteFence.value,
-                                    scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
-                        {
-                            // Q4-BF16-ELIDE: the fused pass already stored
-                            // the mirror slot and served this step's live
-                            // token from the new K/V arrays; on the
-                            // quant-authoritative road the BF16 SliceUpdates
-                            // are dead graph work, so advance counters only.
-                            // Kill switch restores the incumbent writes.
-                            if CBv2WindowedSequenceKV.q4BF16RingElideEnabled {
-                                CBv2EngageMark.once("kvq4-bf16-elide")
-                                for row in ringRows {
-                                    row.advanceDecodeRingAfterQuantWrite()
-                                }
-                            } else {
-                                for (index, row) in ringRows.enumerated() {
-                                    row.decodeRingWriteBF16Only(
-                                        keys: keys[index ..< (index + 1)],
-                                        values: values[index ..< (index + 1)])
-                                }
-                            }
-                            // The next pass-A consumes this fence; this
-                            // step's pass-B output also consumes pass-A's
-                            // first three outputs, so the live store remains
-                            // rooted both in observable output and cache state.
-                            decodeRingWriteFence.value = fused.nextWriteFence
-                            return fused.output
-                        }
-                    }
-                    // WRITE-016: fold this step's one-token ring write into
-                    // ring pass A. The separate `decodeRingWrite` below is a
-                    // `SliceUpdate` over a 4 MiB allocation the direct-ring
-                    // attention graph still retains, so it cannot generally
-                    // donate: 4 KiB of new K/V costs a full-ring copy, 25
-                    // sliding layers x 8 rows x K/V per forward. The fused
-                    // pass A stores the same bytes into the same evicted slot
-                    // in place and serves logical token 1023 from the new K/V
-                    // arrays, so no block reads the slot it writes and the
-                    // accumulation order is unchanged. Refused (and skipped
-                    // entirely, write included) unless the storage-owning
-                    // layer has no K/V borrower that must keep observing the
-                    // pre-write allocation.
-                    // KVQ-PORT: the fused road owns the write AND the read.
-                    // This revision moves only the read to the mirror, so the
-                    // fused road must stand down for the quant path to be
-                    // reachable at all. It is restored the moment the mirror
-                    // is unavailable (kill switch, or any row without one).
-                    let portQuantActive = CBv2WindowedSequenceKV.quantEnabled
-                        && ringRows.allSatisfy { $0.decodeRingQuantView != nil }
-                    if !portQuantActive, fusedRingWriteEnabled, allowFusedRingWrite,
-                        let decodeRingWriteFence
-                    {
-                        let preWrite = ringRows.compactMap { $0.decodeRingViewBeforeWrite }
-                        if preWrite.count == B,
-                            let fused = CBv2RaggedTwoPassDecodeAttentionV1
-                                .attendRingWriting(
-                                    queries: queries,
-                                    newKeys: keys, newValues: values,
-                                    keys: preWrite.map(\.keys),
-                                    values: preWrite.map(\.values),
-                                    starts: preWrite.map(\.start),
-                                    previousWriteFence: decodeRingWriteFence.value,
-                                    scale: scale,
-                                    slidingWindowLength: ringRows[0].window)
-                        {
-                            for row in ringRows {
-                                row.advanceDecodeRingAfterFusedWrite()
-                            }
-                            decodeRingWriteFence.value = fused.nextWriteFence
-                            CBv2EngageMark.once("write016")
-                            return fused.output
-                        }
-                    }
-
-                    for (index, row) in ringRows.enumerated() {
-                        row.decodeRingWrite(
-                            keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
-                    }
-                    let views = ringRows.compactMap { $0.decodeRingView }
-                    // KVQ-PORT: the ring write above is the promoted stock
-                    // mechanism's; only the READ moves to the 8-bit mirror,
-                    // and its pass A is consumed by pass B exactly as the
-                    // bf16 road consumes it. All-or-nothing: unless every
-                    // row exposes a mirror the established road runs.
-                    let portMirrors = ringRows.compactMap { $0.decodeRingQuantView }
-                    if views.count == B, portMirrors.count == B,
-                        let quantOutput = CBv2RaggedTwoPassDecodeAttentionV1
-                            .attendRingQuant(
-                                queries: queries, mirrors: portMirrors,
-                                starts: views.map(\.start), scale: scale,
-                                slidingWindowLength: ringRows[0].window)
-                    {
-                        return quantOutput
-                    }
-                    if views.count == B, !ringRows.contains(where: \.bf16RingStale),
-                        let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRing(
-                            queries: queries, keys: views.map(\.keys),
-                            values: views.map(\.values), starts: views.map(\.start),
-                            scale: scale, slidingWindowLength: ringRows[0].window)
-                    {
-                        return output
-                    }
-                    for row in ringRows {
-                        let view = row.snapshot()
-                        cachedKeyRows.append(view.keys)
-                        cachedValueRows.append(view.values)
-                    }
-                } else {
-                    for (index, row) in rows.enumerated() {
-                        let (cachedKeys, cachedValues) = row.update(
-                            keys: keys[index ..< (index + 1)],
-                            values: values[index ..< (index + 1)])
-                        cachedKeyRows.append(cachedKeys)
-                        cachedValueRows.append(cachedValues)
-                    }
-                }
-                if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
-                    queries: queries, keys: cachedKeyRows, values: cachedValueRows,
-                    scale: scale)
-                {
-                    return output
-                }
-
-                // Before every row's sliding ring reaches 1024 entries, retain
-                // the established row-local SDPA path over the views just
-                // returned by the updates above.
-                var outputs: [MLXArray] = []
-                outputs.reserveCapacity(B)
-                for index in 0 ..< B {
-                    outputs.append(
-                        attend(
-                            queries: queries[index ..< (index + 1)],
-                            keys: cachedKeyRows[index], values: cachedValueRows[index],
-                            scale: scale, L: 1, kL: cachedKeyRows[index].dim(2),
-                            window: nil, sinks: effectiveSinks, softcap: softcap))
-                }
-                return concatenated(outputs, axis: 0)
-            }
-
-            // WRITE-016-D512: the D512 chain with the new token's K/V stored
-            // in place by the QK dispatch (fence-chained like WRITE-016)
-            // instead of 16 copy-on-write slice appends. Fails closed to the
-            // append-then-attend call below (kill switch:
-            // DARKBLOOM_GEMMA4_D512_FUSED_WRITE=0).
-            // WRITE-022: the append as its own fenced store dispatch ahead of
-            // the byte-for-byte stock D512 chain (samfenwick's db4ef5e design,
-            // re-implemented with credit) — removes the same copies as the v2
-            // fold below without its inner-loop addressing cost.
-            if let decodeRingWriteFence, allowFusedRingWrite,
-                let fused = CBv2RaggedComposedD512DecodeAttentionV1
-                    .updateAndAttendWriting22(
-                        rows: rows, kind: kind,
-                        queries: queries, keys: keys, values: values,
-                        previousWriteFence: decodeRingWriteFence.value,
-                        scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                decodeRingWriteFence.value = fused.nextWriteFence
-                CBv2EngageMark.once("write022d512")
-                return fused.output
-            }
-
-            if let decodeRingWriteFence, allowFusedRingWrite,
-                let fused = CBv2RaggedComposedD512DecodeAttentionV1
-                    .updateAndAttendWriting(
-                        rows: rows, kind: kind,
-                        queries: queries, keys: keys, values: values,
-                        previousWriteFence: decodeRingWriteFence.value,
-                        scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                decodeRingWriteFence.value = fused.nextWriteFence
-                CBv2EngageMark.once("write016d512")
-                return fused.output
-            }
-
-            // D512-SDPA: batched 3-dispatch full-attention decode with the
-            // unfused chain's exact numerics (kill switch:
-            // DARKBLOOM_GEMMA4_D512_DECODE_SDPA=0). Precedes ATT-008 so rows
-            // stay unpooled; pooled rows fail its gate closed.
-            if let output = CBv2RaggedComposedD512DecodeAttentionV1.updateAndAttend(
-                rows: rows, kind: kind,
-                queries: queries, keys: keys, values: values,
-                scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                CBv2EngageMark.once("d512sdpa")
-                return output
-            }
-
-            // ATT-008: batch-wide FULL-attention decode. One pooled append +
-            // one batched call replaces 8 per-row appends + 8 row-local
-            // composed SDPA graphs, with bit-identical per-row numerics (see
-            // `batchedFullDecodeUpdateAndAttend`). Fails closed to the
-            // established per-row loop below, which stays correct on pooled
-            // and unpooled rows alike.
-            if let output = batchedFullDecodeUpdateAndAttend(
-                rows: rows, kind: kind,
-                queries: queries, keys: keys, values: values,
-                scale: scale, sinks: effectiveSinks, softcap: softcap)
-            {
-                CBv2EngageMark.once("att008")
-                return output
-            }
 
             // Batched decode: split queries per row, per-row update + SDPA
             // against that row's own KV, then concatenate. No masks — each row
@@ -825,17 +569,13 @@ enum CBv2AttentionV1 {
     /// whose next `update` with this chunk would take FRESH-RING-ADOPT
     /// (`canAdoptFreshFullWindowChunk` — `update`'s own gate, row for row),
     /// pack ALL rows' mirror planes in ONE batched dispatch and adopt per
-    /// row with the pre-packed mirror. Each row ends in exactly the state
-    /// its own `update` would leave — same ring storage (the chunk slice),
-    /// same `absoluteOffset`/`oldestValidPosition` advance, same
-    /// `borrowableChunkViews` — and the mirror holds the same bytes the
-    /// per-row pack would have written (the batched packer is the per-row
-    /// kernel with a row-prefixed grid index; see
-    /// `quantPackPairChunkBatchGPU`). The returned per-row cached views are
-    /// the chunk slices themselves, identical to what the per-row loop
-    /// collects. Returns nil — leaving the per-row commit loop to run
-    /// untouched — when the gate is off, the batch exceeds the batched
-    /// packer's eight row outputs, or ANY row would not adopt fresh.
+    /// row. Each row ends in exactly the state its own `update` would leave —
+    /// same ring storage (the chunk slice), same
+    /// `absoluteOffset`/`oldestValidPosition` advance, same
+    /// `borrowableChunkViews`. The returned per-row cached views are the chunk
+    /// slices themselves, identical to what the per-row loop collects. Returns
+    /// nil — leaving the per-row commit loop to run untouched — when the gate
+    /// is off, the batch exceeds eight rows, or ANY row would not adopt fresh.
     private static func batchedFreshChunkAdoption(
         rows: [CBv2SequenceKV], keys: MLXArray, values: MLXArray
     ) -> (keys: [MLXArray], values: [MLXArray])? {
@@ -854,8 +594,6 @@ enum CBv2AttentionV1 {
         {
             return nil
         }
-        let mirrors = CBv2WindowedSequenceKV.quantPackPairChunkBatchGPU(
-            keys: keys, values: values)
         var cachedKeys: [MLXArray] = []
         var cachedValues: [MLXArray] = []
         cachedKeys.reserveCapacity(B)
@@ -863,8 +601,7 @@ enum CBv2AttentionV1 {
         for (index, row) in windowed.enumerated() {
             let (rowKeys, rowValues) = row.adoptFreshFullWindowChunk(
                 keys: keys[index ..< (index + 1)],
-                values: values[index ..< (index + 1)],
-                packedMirror: mirrors[index])
+                values: values[index ..< (index + 1)])
             cachedKeys.append(rowKeys)
             cachedValues.append(rowValues)
         }
@@ -1173,23 +910,6 @@ enum CBv2AttentionV1 {
                 values: values[index ..< index + 1])
             committed.append((cachedKeys, cachedValues))
         }
-        // LASTQ-D512: when every row is a private `CBv2FullSequenceKV` in
-        // lockstep at the committed length (the scored 8×1024 prompt prefill:
-        // kL = 1024, inside the transcribed [4, 4095] window), ONE batched
-        // D512 3-dispatch chain replaces the 8 unfused per-row op graphs.
-        // Decode already runs that chain — with the same bit-exactness
-        // claim, verified at kL = 1024 — on exactly this query shape
-        // [8, 16, 1, 512] against exactly this kind of committed buffer. It
-        // performs no append of its own, so the commits above stand alone.
-        // Any admission miss fails closed to the per-row loop (kill switch:
-        // DARKBLOOM_GEMMA4_LASTQ_D512=0).
-        if let batched = CBv2RaggedComposedD512DecodeAttentionV1.attendCommitted(
-            rows: rows, kind: kind, queries: queries,
-            scale: scale, sinks: effectiveSinks, softcap: softcap)
-        {
-            CBv2EngageMark.once("lastqd512")
-            return batched
-        }
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(batch)
         for (index, cached) in committed.enumerated() {
@@ -1341,44 +1061,6 @@ enum CBv2AttentionV1 {
             return concatenated(outputs, axis: 0)
         }
 
-        if canUseRaggedTwoPassDecode(
-            batch: B, cacheKind: sourceKind, queryKind: kind,
-            scale: scale, sinks: effectiveSinks, softcap: softcap)
-        {
-            var cachedKeyRows: [MLXArray] = []
-            var cachedValueRows: [MLXArray] = []
-            cachedKeyRows.reserveCapacity(B)
-            cachedValueRows.reserveCapacity(B)
-            for row in sourceRows {
-                let cachedKeys: MLXArray
-                let cachedValues: MLXArray
-                if let windowed = row as? CBv2WindowedSequenceKV {
-                    (cachedKeys, cachedValues) = windowed.decodeBorrowableViews()
-                } else {
-                    (cachedKeys, cachedValues, _) = row.snapshot()
-                }
-                cachedKeyRows.append(cachedKeys)
-                cachedValueRows.append(cachedValues)
-            }
-            if let output = CBv2RaggedTwoPassDecodeAttentionV1.attend(
-                queries: queries, keys: cachedKeyRows, values: cachedValueRows,
-                scale: scale)
-            {
-                return output
-            }
-
-            var outputs: [MLXArray] = []
-            outputs.reserveCapacity(B)
-            for index in 0 ..< B {
-                outputs.append(
-                    attend(
-                        queries: queries[index ..< (index + 1)],
-                        keys: cachedKeyRows[index], values: cachedValueRows[index],
-                        scale: scale, L: 1, kL: cachedKeyRows[index].dim(2), window: nil,
-                        sinks: effectiveSinks, softcap: softcap))
-            }
-            return concatenated(outputs, axis: 0)
-        }
 
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(B)
@@ -1449,115 +1131,6 @@ enum CBv2AttentionV1 {
 
     // MARK: - Private
 
-    /// ATT-008: one batched update + attend for the exact Gemma 4
-    /// full-attention decode cohort (B=8, 16 query heads, 2 KV heads, D=512,
-    /// bf16, scale 1.0, no sinks/softcap, mask-free L=1).
-    ///
-    /// D=512 has NO fused SDPA kernel (`sdpa_vector` supports 64/96/128/256),
-    /// so `MLXFast.scaledDotProductAttention` always lowers these calls to
-    /// the fast.cpp fallback graph: scale-multiply → GQA unflatten →
-    /// `matmul` QKᵀ (gemv) → precise softmax → `matmul` scores·V (gemv_t).
-    /// That graph is shape-generic in the batch extent, and for these M=1
-    /// shapes every Metal dispatch decision it reaches — the gemv/gemv_t
-    /// block configuration, the `gemv_al` alignment gate (requires
-    /// `batch_size_out == 1`, never true here), the softmax variant and
-    /// threadgroup size (functions of the key length only), and the
-    /// `check_transpose` no-copy branches — depends only on
-    /// (M, N, K, dtype, last-two-dim strides), never on the batch extent,
-    /// which only scales `grid.z` / the row count. Issuing ONE B=8 call over
-    /// the pooled `[8, 2, kL, 512]` views therefore reproduces each row's
-    /// per-output add order bit-exactly BY CONSTRUCTION (verified uint16-
-    /// identical against the per-row chain at kL ∈ {1024, 1025, 1100, 1152}
-    /// and across simulated append steps).
-    ///
-    /// Per full layer per decode step this replaces 8×2 per-row cache slice
-    /// assignments + 8 row-local 4-dispatch attention graphs + 1 output
-    /// concat (~49 dispatches) with 2 slice assignments + 1 batched 4-dispatch
-    /// graph (~6), with zero per-step copies (the pool is written in place;
-    /// rows migrate once per cohort).
-    ///
-    /// Fails closed (returns nil, caller keeps the pinned per-row loop) on
-    /// any other batch size, geometry, dtype, scale, sinks, softcap,
-    /// bidirectional kind, non-`CBv2FullSequenceKV` row, unpoolable rows, or
-    /// rows whose offsets are not in lockstep (e.g. after a speculative
-    /// rollback of a subset). The per-row loop remains bit-identical on
-    /// pooled storage, so falling back mid-stream is always safe.
-    private static func batchedFullDecodeUpdateAndAttend(
-        rows: [CBv2SequenceKV], kind: CBv2LayerKind,
-        queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
-    ) -> MLXArray? {
-        guard batchedFullDecodeEnabled,
-            rows.count == 8,
-            scale == 1.0,
-            sinks == nil,
-            softcap == nil,
-            !kind.isBidirectional,
-            kind.kvHeads == 2,
-            kind.headDim == 512,
-            kind.queryHeads == 16,
-            queries.dtype == .bfloat16,
-            keys.dtype == .bfloat16,
-            values.dtype == .bfloat16,
-            queries.shape == [8, 16, 1, 512],
-            keys.shape == [8, 2, 1, 512],
-            values.shape == [8, 2, 1, 512]
-        else { return nil }
-        guard case .full = kind.attention else { return nil }
-
-        let fullRows = rows.compactMap { $0 as? CBv2FullSequenceKV }
-        guard fullRows.count == 8 else { return nil }
-
-        // Lockstep gate: one pooled append writes ONE slot for all rows, so
-        // every row must be at the same committed offset with headroom.
-        let offset = fullRows[0].absoluteOffset
-        guard offset > 0,
-            fullRows.allSatisfy({ $0.absoluteOffset == offset }),
-            fullRows.allSatisfy({ offset + 1 <= $0.maxLength })
-        else { return nil }
-
-        guard let pool = CBv2FullSequenceKV.cohortPool(binding: fullRows) else {
-            return nil
-        }
-
-        pool.batchAppend(keys: keys, values: values, at: offset)
-        for row in fullRows {
-            row.confirmPooledBatchAppend(1)
-        }
-
-        let (cachedKeys, cachedValues) = pool.batchViews(upTo: offset + 1)
-        return attend(
-            queries: queries, keys: cachedKeys, values: cachedValues,
-            scale: scale, L: 1, kL: offset + 1, window: nil,
-            sinks: nil, softcap: nil)
-    }
-
-    /// The only shape for which the custom batch-wide dispatch is a literal
-    /// transcription of the row-local MLX two-pass kernels. All other models,
-    /// phases, masks, sequence lengths, and dtypes fail closed in the custom
-    /// helper and retain the established dispatch below.
-    @inline(__always)
-    private static func canUseRaggedTwoPassDecode(
-        batch: Int, cacheKind: CBv2LayerKind, queryKind: CBv2LayerKind,
-        scale: Float, sinks: MLXArray?, softcap: Float?
-    ) -> Bool {
-        guard batch == 8,
-            scale == 1.0,
-            sinks == nil,
-            softcap == nil,
-            !cacheKind.isBidirectional,
-            !queryKind.isBidirectional,
-            cacheKind.kvHeads == 8,
-            cacheKind.headDim == 256,
-            queryKind.queryHeads == 16,
-            queryKind.headDim == 256
-        else { return false }
-
-        guard case .slidingWindow(let window) = cacheKind.attention else {
-            return false
-        }
-        return window == 1024
-    }
 
     private static func window(of kind: CBv2LayerKind) -> Int? {
         switch kind.attention {

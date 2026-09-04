@@ -193,13 +193,6 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig()
     ) {
         self.schedulerConfig = schedulerConfig
-        // KVQ-CONSUMER-GATE: the q4 KV mirror's only reader is the batch-wide
-        // ragged decode pass A, which admits exactly eight rows. Publish this
-        // engine's concurrency cap so a process that can never assemble that
-        // batch stops paying for a mirror nothing will read. Monotonic, so a
-        // second smaller engine cannot switch it off under the first.
-        CBv2WindowedSequenceKV.publishDecodeBatchCapacity(
-            schedulerConfig.maxConcurrentRequests)
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
         self.requiredPositionAxisCount =
