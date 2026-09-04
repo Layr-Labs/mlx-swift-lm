@@ -2178,7 +2178,21 @@ public class SwitchGLU: Module {
         // and smaller serving cohorts remain on their established reduction.
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
-        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
+        // [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION (D3, default off): a
+        // NON-prefill pass that the gather actually grouped — which since
+        // union-verify includes the rectangular MTP verify. Expressed here
+        // rather than by forcing `isProductionPrefill` true at the call site,
+        // because on this branch that flag carries a second meaning: it also
+        // decides whether an unsort CARRIER is produced for the fused
+        // layer-tail consumer. Conflating the two would hand a carrier to
+        // decode and verify passes that the tail path does not expect, and
+        // would defeat the exactness of the eight-row decode gate above.
+        let isGroupedNonPrefill =
+            !isProductionPrefill
+            && SwitchGLUExpertGrouping.fusedReductionOnGroupedRows
+            && SwitchGLUExpertGrouping.shouldGroup(indices)
+        guard fuseSortedReduction
+                && (isProductionPrefill || isEightRowDecode || isGroupedNonPrefill),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
             return (

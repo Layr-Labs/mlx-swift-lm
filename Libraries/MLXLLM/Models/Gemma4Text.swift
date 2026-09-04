@@ -4524,14 +4524,12 @@ private class Gemma4Experts: Module {
             // Ordinary/direct VLM and CBv2 prompt entry points may engage.
             // Rectangular MTP verification passes false — it is not a prefill.
             //
-            // [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION (D3, default off)
-            // opens the same door for a pass the gather actually GROUPED,
-            // which since the union-verify change includes the rectangular
-            // verify. Eligibility still runs through
-            // `SwitchGLUExpertGrouping.allowsFusedReduction`, which refuses an
-            // ungrouped pass, so a `[B, 1]` decode stays on the legacy reduction.
-            isProductionPrefill: isExpertPrefill
-                || SwitchGLUExpertGrouping.fusedReductionOnGroupedRows,
+            // D3 is NOT expressed here. On this branch `isProductionPrefill`
+            // also gates the unsort carrier and the exact eight-row decode
+            // cohort, so forcing it true would change two things it was never
+            // asked to change. `callAndWeightedReduceWithUnsortCarrier` opens
+            // the grouped-pass door itself, under the same switch.
+            isProductionPrefill: isExpertPrefill,
             // PRENORM-GATHER: the prefill producer of the sorted plane.
             sortedPlane: sortedPlane)
         return Output(
