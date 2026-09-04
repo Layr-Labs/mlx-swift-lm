@@ -1135,14 +1135,23 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 ///
 /// [engage] MTPLX_MTP_UNION_VERIFY
 public enum SwitchGLUExpertGrouping {
-    /// `MTPLX_MTP_UNION_VERIFY=0` restores the historic rule exactly, so the
-    /// grouped and per-row costs can be measured against each other in one
-    /// window. Default on.
+    /// DEFAULT OFF, because every measurement this stack reports ran with
+    /// `MTPLX_MTP_UNION_VERIFY=0`.
+    ///
+    /// The union rule changes WHICH experts the verify rectangle gathers, so it
+    /// changes the arithmetic the rectangle performs. The 165.2 tok/s arm and
+    /// all of its parity data were produced with the rule off; "measured flat"
+    /// is a statement about throughput, not about output equivalence, and it
+    /// does not license shipping a different gather than the one whose tokens
+    /// were checked.
+    ///
+    /// `MTPLX_MTP_UNION_VERIFY=1` arms the grouped rule so the two costs can be
+    /// measured against each other in one window.
     public static let unionAcrossRows: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_UNION_VERIFY"]?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw)
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw)
     }()
 
     /// Token rows in an assignment tensor of ANY rank: `[rows, K]`,

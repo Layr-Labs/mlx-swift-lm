@@ -144,4 +144,19 @@ struct CBv2MeasuredStackDefaultsTests {
             "DARKBLOOM_CBV2_RING_READ_FOLD_B1",
             CBv2RingReadFoldB1.enabled, true)
     }
+
+    /// The union rule is OFF, and this one is not a throughput decision.
+    ///
+    /// It changes WHICH experts the verify rectangle gathers, so it changes the
+    /// arithmetic. Every number this stack reports, including the 165.2 tok/s
+    /// arm and all of its parity data, was measured with the rule off. "Flat"
+    /// was a throughput result; it says nothing about output equivalence, so it
+    /// cannot license shipping a different gather than the one whose tokens
+    /// were checked.
+    @Test("the union verify rule is off by default")
+    func unionVerifyDefaultsOff() {
+        pin(
+            "MTPLX_MTP_UNION_VERIFY",
+            SwitchGLUExpertGrouping.unionAcrossRows, false)
+    }
 }
