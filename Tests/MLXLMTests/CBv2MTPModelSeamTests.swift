@@ -526,81 +526,71 @@ struct CBv2MTPModelSeamTests {
         #expect(hidden[1, column, 0].item(Int32.self) == 6)
     }
 
-    // MARK: - (e) Cached drafter RoPE: rank of the rejoined hidden
+    // MARK: - (e) The round carries the hidden through unmodified
 
-    /// The rotary prefix and the pass-through tail must rejoin at the SAME
-    /// rank.
+    /// `draftStep` may do exactly one thing to the carried hidden: concatenate
+    /// the target embedding onto it. Nothing else.
     ///
-    /// `applyCachedDrafterRoPE` slices its tail out of the query-axis-carrying
-    /// `flat`, so a prefix reshaped without that axis met the tail as a rank-2
-    /// array beside a rank-3 one and MLX aborted the process outright
-    /// ("[concatenate] ... got arrays with dimensions 2 and 3"). It is an
-    /// abort, not a failure: it takes the whole test binary with it, which is
-    /// why a suite that hit it reported zero tests run.
-    ///
-    /// This stack does not reach that branch — the drafter's query position is
-    /// one BEFORE the table's anchor under reference semantics, so the range
-    /// guard returns early — but two live inputs do: an anchor of 0, where
-    /// `draftQueryPosition` clamps back onto the anchor, and
-    /// `MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS=0`. The table is built with an
-    /// identity rotation so the assertion is exact rather than approximate.
-    @Test("the cached drafter RoPE returns the hidden at its own rank")
-    func cachedDrafterRoPEKeepsTheQueryAxis() {
-        let halfDim = 2
-        let windowAhead = 3
-        let start = 10
-        let table = DrafterRoPETable(
-            cos: MLXArray.ones([windowAhead, halfDim], dtype: .float32),
-            sin: MLXArray.zeros([windowAhead, halfDim], dtype: .float32),
-            dims: halfDim * 2,
-            startPosition: start,
-            windowAhead: windowAhead,
-            base: 10_000)
+    /// A per-round cos/sin table used to be built by `prepare(rows:)` and
+    /// consumed here by a pre-rotation of the hidden. It never ran — the range
+    /// guard compares the drafter's query position against the table's anchor,
+    /// and under the reference semantics this stack ships the query sits one
+    /// position BEFORE that anchor — and on the two inputs that did reach it
+    /// (anchor 0, or `MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS=0`) it aborted the
+    /// process on a rank mismatch. It is deleted, and this is what stops it
+    /// coming back: rebuild the step through the drafter's own public entry
+    /// point with the hidden handed over untouched, and require the id and the
+    /// new hidden to match bit for bit. Any pre-transformation inside
+    /// `draftStep` moves both.
+    @Test("the drafter round carries the hidden through unmodified")
+    func drafterRoundCarriesTheHiddenThroughUnmodified() throws {
+        fixtureSeed(0xB0BA)
+        let config = try targetConfig()
+        let target = Gemma4TextModel(config)
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        eval(target, drafter)
 
-        for rows in [1, 2] {
-            let hidden = MLXArray((0 ..< (rows * 8)).map(Float.init))
-                .reshaped([rows, 1, 8])
-            let offsets = MLXArray(
-                (0 ..< rows).map { Int32(start + $0) })
-            let rotated = Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE(
-                hidden: hidden, table: table, positionOffset: .batch(offsets))
-            eval(rotated)
-            #expect(rotated.shape == [rows, 1, 8], "rows \(rows)")
-            // cos == 1, sin == 0 is the identity, so the values must survive
-            // the split and the rejoin unchanged.
-            #expect(
-                rotated.asArray(Float.self) == hidden.asArray(Float.self),
-                "rows \(rows)")
-        }
-    }
+        let prompt = makePromptTokens(length: 19, seed: 41, vocabSize: vocabSize)
+        let rig = CBv2Rig(config: config)
+        let rowState = try rig.newRow(promptLength: prompt.count)
+        let (logits, lastHidden) = target.cbv2ForwardWithHidden(
+            tokens2d(prompt), caches: rig.kvCaches([rowState]))
+        let bonus = greedyToken(logits)
+        let hidden = lastHiddenSlice(lastHidden)
 
-    /// The reason the shipping configuration never reaches the branch above:
-    /// the query position the round asks for is one before the position the
-    /// table starts at, so the range guard hands the hidden straight back.
-    /// This is a documented consequence of reference semantics, not a
-    /// coincidence, and it means the per-round cos/sin table is currently
-    /// materialized without being read.
-    @Test("reference semantics leaves the cached rotation unreached")
-    func referenceSemanticsSkipsTheCachedRotation() {
-        let anchor = 24
-        #expect(
-            Gemma4MTPDrafterSemantics.draftQueryPosition(kvOffset: anchor)
-                == anchor - 1)
-        let table = DrafterRoPETable(
-            cos: MLXArray.ones([4, 2], dtype: .float32),
-            sin: MLXArray.zeros([4, 2], dtype: .float32),
-            dims: 4, startPosition: anchor, windowAhead: 4, base: 10_000)
-        let hidden = MLXArray((0 ..< 8).map(Float.init)).reshaped([1, 1, 8])
-        let out = Gemma4CBv2MTPDrafter.applyCachedDrafterRoPE(
-            hidden: hidden, table: table,
-            positionOffset: .batch(
+        let captureLayers = try #require(target.cbv2MTPCaptureLayers)
+        let capture = try rowCapture(rowState: rowState, captureLayers: captureLayers)
+        let cbDrafter = try Gemma4CBv2MTPDrafter(drafter: drafter, target: target)
+        let prepared = cbDrafter.prepare(rows: [capture])
+
+        let tokens = MLXArray([Int32(bonus)]).reshaped([1, 1])
+        let (stepTokens, stepHidden) = cbDrafter.draftStep(
+            tokens: tokens, hidden: hidden, prepared: prepared)
+
+        let inputsEmbeds = concatenated(
+            [target.embedTokensForDrafter(tokens), hidden], axis: -1)
+        let (referenceHidden, referenceLogits) = drafter(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: Gemma4SharedKV(
+                fullAttention: (capture.fullKeys, capture.fullValues),
+                slidingAttention: (capture.slidingKeys, capture.slidingValues)),
+            positionOffset: Gemma4.PositionOffset.batch(
                 MLXArray([
                     Int32(
                         Gemma4MTPDrafterSemantics.draftQueryPosition(
-                            kvOffset: anchor))
+                            kvOffset: capture.anchor))
                 ])))
-        #expect(out.shape == hidden.shape)
-        #expect(out.asArray(Float.self) == hidden.asArray(Float.self))
-    }
+        let referenceTokens = referenceLogits.squeezed(axis: 1)
+            .argMax(axis: -1).asType(.int32)
+        eval(stepTokens, stepHidden, referenceTokens, referenceHidden)
 
+        #expect(
+            stepTokens.asArray(Int32.self) == referenceTokens.asArray(Int32.self),
+            "draftStep drafted a different id than the untransformed chain")
+        #expect(stepHidden.shape == referenceHidden.shape)
+        #expect(
+            stepHidden.asType(.float32).asArray(Float.self)
+                == referenceHidden.asType(.float32).asArray(Float.self),
+            "draftStep transformed the carried hidden")
+    }
 }
