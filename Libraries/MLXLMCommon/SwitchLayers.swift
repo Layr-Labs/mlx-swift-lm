@@ -957,30 +957,8 @@ public struct SwitchRouteTable {
 public func gatherSort(
     x: MLXArray, indices: MLXArray, numExperts: Int = Int.max
 ) -> (MLXArray, MLXArray, MLXArray) {
-    if routeSimdRank64Enabled,
-        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
-        indices.dtype == .uint32
-    {
-        let flat = indices.flattened()
-        let outputs = routeSimdRank64Kernel(
-            [flat],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
-        )
-        return (
-            x.flattened(start: 0, end: -3)[outputs[0]],
-            outputs[1],
-            outputs[2]
-        )
-    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
-    routeCsortShapeLog.note {
-        "gatherSort n=\(indices.size) m=\(m) E=\(numExperts) "
-            + "dtype=\(indices.dtype)"
-    }
     // PREFILL-CSORT-128: three dispatches with byte-identical outputs.
     if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
         return (
@@ -1037,45 +1015,13 @@ public func gatherSortIndices(
     indices: MLXArray, numExperts: Int = Int.max,
     expertPrefixBounds: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray) {
-    if routeSimdRank64Enabled,
-        (indices.shape == [8, 8] || (indices.ndim == 1 && indices.size == 64)),
-        indices.dtype == .uint32
-    {
-        if expertPrefixBounds {
-            CBv2EngageMark.once("expert-prefix-bounds")
-        }
-        let flat = indices.flattened()
-        let kernel = expertPrefixBounds
-            ? routeSimdRank64PrefixBoundsKernel : routeSimdRank64Kernel
-        let outputs = kernel(
-            [flat],
-            grid: (64, 1, 1),
-            threadGroup: (64, 1, 1),
-            outputShapes: [[64], [64], [64]],
-            outputDTypes: [.uint32, .uint32, .uint32]
-        )
-        return (outputs[0], outputs[1], outputs[2])
-    }
     let m = indices.dim(-1)
     let indices = indices.flattened()
-    routeCsortShapeLog.note {
-        "gatherSortIndices n=\(indices.size) m=\(m) E=\(numExperts) "
-            + "dtype=\(indices.dtype)"
-    }
-    if numExperts <= routeCountingSortKeyBound {
-        // PREFILL-CSORT-128 owns everything wider than the retiled decode
-        // cohort; ROUTE-CSORT-64 keeps the exact n = 64 geometry it was built
-        // for (one threadgroup, no histogram/scan round trip).
-        if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
-            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
-        }
-        // ROUTE-CSORT-64: one fused dispatch with byte-identical outputs
-        // (default ON; see routeCountingSort64Enabled above).
-        if let fused = routeCountingSortFusedT64(
-            indices, m: m, expertPrefixBounds: expertPrefixBounds)
-        {
-            return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
-        }
+    // PREFILL-CSORT-128 owns everything wider than the retiled decode cohort.
+    if numExperts <= routeCountingSortKeyBound,
+        let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts)
+    {
+        return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
     }
     let order = argSort(indices)
     return (order.floorDivide(m), indices[order], argSort(order))
@@ -1648,72 +1594,15 @@ public class SwitchGLU: Module {
         sortedPlane: SwitchSortedPlaneProducer? = nil,
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
-        let useLhsIndices =
-            indices.size == 64 && indices.ndim == 2 && indices.shape == [8, 8]
-            && x.ndim == 2 && x.shape == [8, inputDims]
-        let useExpertPrefixBounds =
-            expertPrefixBoundsEnabled && useLhsIndices
-            && indices.dtype == .uint32 && x.dtype == .bfloat16
-            && expertPrefixBoundsProjectionsEligible
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
 
         var idx = indices
-        // ROUTE-LAZY-INVERSE-ORDER: the sentinel `MLXArray()` this variable
-        // used to hold is dead at every site -- under `doSort` a real producer
-        // overwrites it, and without it the optional return already carries
-        // nil. Holding the optional avoids one throwaway C++ array handle per
-        // layer per forward.
-        var inverseOrder: MLXArray?
-        var lhsIndices: MLXArray?
+        var inverseOrder: MLXArray? = nil
+        let lhsIndices: MLXArray? = nil
         if doSort {
-            if useLhsIndices {
-                x = x.flattened(start: 0, end: -3)
-                // GLUE-FOLD: an upstream producer already emitted the exact
-                // route table beside the top-8 selection; consume it and the
-                // standalone `mlx_lm_route_simd_rank_scatter` dispatch never
-                // enters the chain. Any mismatch -- including the raw-key
-                // contract (prefix-bounds tagging wants tagged keys) or a
-                // disabled incumbent rank path -- re-issues the incumbent
-                // chain, which produces byte-identical arrays.
-                if let table = routeTable,
-                    !useExpertPrefixBounds,
-                    routeSimdRank64Enabled,
-                    numExperts == 128,
-                    table.rowOrder.dtype == .uint32,
-                    table.rowOrder.ndim == 1, table.rowOrder.size == 64,
-                    table.sortedKeys.dtype == .uint32,
-                    table.sortedKeys.ndim == 1, table.sortedKeys.size == 64,
-                    table.inverseOrder.dtype == .uint32,
-                    table.inverseOrder.ndim == 1, table.inverseOrder.size == 64
-                {
-                    (lhsIndices, idx, inverseOrder) = (
-                        table.rowOrder, table.sortedKeys, table.inverseOrder
-                    )
-                } else {
-                    (lhsIndices, idx, inverseOrder) = gatherSortIndices(
-                        indices: indices, numExperts: numExperts,
-                        expertPrefixBounds: useExpertPrefixBounds)
-                }
-            } else if let sortedPlane {
-                // PRENORM-GATHER: the producer writes the sorted plane from
-                // the inverse order; `x` is only read if it declines.
-                let order = gatherSortOrder(indices: indices, numExperts: numExperts)
-                if let plane = sortedPlane(order.inverseOrder),
-                    plane.ndim == 3, plane.dim(0) == indices.size,
-                    plane.dim(1) == 1, plane.dim(2) == inputDims,
-                    plane.dtype == x.dtype
-                {
-                    x = plane
-                } else {
-                    x = x.flattened(start: 0, end: -3)[order.rowOrder]
-                }
-                idx = order.sortedKeys
-                inverseOrder = order.inverseOrder
-            } else {
-                (x, idx, inverseOrder) = gatherSort(
-                    x: x, indices: indices, numExperts: numExperts)
-            }
+            (x, idx, inverseOrder) = gatherSort(
+                x: x, indices: indices, numExperts: numExperts)
         }
 
         let xGate: MLXArray
@@ -1727,87 +1616,8 @@ public class SwitchGLU: Module {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            // GATEUP-FUSE-PREFILL: the sorted right-hand-side plane (the
-            // production prefill) reads its gathered activations once through
-            // one gather over the concatenated gate|up storage. Same kernel
-            // pipeline, same per-column K-chains; the halves are views. The
-            // admission mirrors the host's sorted right-hand-side selection
-            // exactly, so the split views never meet that kernel.
-            if doSort, !useLhsIndices, lhsIndices == nil,
-                x.ndim == 3, x.dim(-2) == 1, x.dim(-1) == inputDims,
-                x.dim(0) >= 16, x.dim(0) / numExperts >= 4,
-                x.dtype == .bfloat16,
-                let fused = fusedGateUpDispatch()
-            {
-                CBv2EngageMark.once("prefill-gateup-fuse")
-                let xGateUp = MLX.gatherQuantizedMM(
-                    x,
-                    fused.storage.weight,
-                    scales: fused.storage.scales,
-                    biases: fused.storage.biases,
-                    lhsIndices: nil,
-                    rhsIndices: idx,
-                    transpose: true,
-                    groupSize: fused.groupSize,
-                    bits: fused.bits,
-                    mode: fused.mode,
-                    sortedIndices: true
-                )
-                xGate = xGateUp[.ellipsis, ..<hiddenDims]
-                xUp = xGateUp[.ellipsis, hiddenDims...]
-            } else if switchGateUpFuseDecodeAdmits(
-                enabled: switchGateUpFuseDecodeEnabled,
-                doSort: doSort, hasLhsIndices: lhsIndices != nil,
-                rowLength: x.dim(-2), lastDim: x.dim(-1),
-                inputDims: inputDims),
-                x.dtype == .bfloat16,
-                let fused = fusedGateUpDispatch()
-            {
-                // GATEUP-FUSE-DECODE. The UNSORTED gathered geometry -- one
-                // activation row broadcast over its top-k experts, which is
-                // what `SwitchGLU` builds whenever `indices.size < 64`, i.e.
-                // at every batch below eight. Two `gather_qmv` dispatches
-                // (N = 704 each) become one over the concatenated gate|up
-                // storage (N = 1408).
-                //
-                // This also removes the arm's only decode-side exposure. The
-                // switch is named PREFILL but its storage relayout is
-                // permanent: after it, `gate_proj` / `up_proj` are axis-1
-                // slices of a `[128, 1408, 352]` plane, so every decode
-                // gather reads through a non-row-contiguous view. That is
-                // why a prefill switch moves decode at all. Dispatching the
-                // concatenated storage directly hands the kernel the
-                // contiguous array instead.
-                //
-                // Exactness, the same argument the prefill arm makes: the
-                // selected kernel is `gather_qmv` in both cases -- its name
-                // is built from mode, dtype, group size and bits, never from
-                // N, and its `fast` predicate is `N % 8 == 0 && K %
-                // alignment == 0`, which 704 and 1408 satisfy identically --
-                // and every output column owns an independent K-chain. The
-                // concatenated weight, scales and biases are a pure copy of
-                // the split ones along the output axis, and the consumer
-                // receives the identical gate / up columns through views.
-                CBv2EngageMark.once("decode-gateup-fuse")
-                let xGateUp = MLX.gatherQuantizedMM(
-                    x,
-                    fused.storage.weight,
-                    scales: fused.storage.scales,
-                    biases: fused.storage.biases,
-                    lhsIndices: nil,
-                    rhsIndices: idx,
-                    transpose: true,
-                    groupSize: fused.groupSize,
-                    bits: fused.bits,
-                    mode: fused.mode,
-                    sortedIndices: false
-                )
-                xGate = xGateUp[.ellipsis, ..<hiddenDims]
-                xUp = xGateUp[.ellipsis, hiddenDims...]
-            } else {
-                xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-                xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
-            }
+            xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
         }
 
         let activated: MLXArray
