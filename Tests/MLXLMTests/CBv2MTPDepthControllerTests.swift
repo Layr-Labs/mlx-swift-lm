@@ -140,10 +140,17 @@ struct CBv2MTPDepthControllerTests {
         let seedCost = driver.claimPendingSeedCost(
             decodeRowBucket: 1, finalizedVerifyIDs: [row])
         #expect(seedCost == 20)
+        // 250 ns of ISOLATED verify against a 100 ns baseline. The seed is no
+        // longer folded in, so the verify cost has to be unprofitable on its
+        // own: depth 1 needs `cost1 / cost0 < 2 / (1 + hysteresisFraction)`,
+        // i.e. under 190 ns. (Before the seed fix this read 190 + 20 = 210 and
+        // the 20 ns seed was doing the deciding.)
         record(
             driver, decision: verify, actualDepth: 1,
-            wallTimeNanos: 190, finalizedVerification: true,
+            wallTimeNanos: 250, finalizedVerification: true,
             claimedSeedCostNanos: seedCost)
+        // The seed cost is recorded, just not against depth 1.
+        #expect(driver.transitionCostNanosForTesting(decodeRowBucket: 1) == 20)
 
         let targetOnly = begin(driver)
         #expect(targetOnly.depth == 0)
@@ -189,7 +196,13 @@ struct CBv2MTPDepthControllerTests {
             driver.metricsSnapshot().costInputs.first {
                 $0.decodeRowBucket == 1 && $0.depth == 1
             })
-        #expect(depthOne.totalWallTimeNanos == 50)
+        // The seed still BINDS to this verify -- that is what the cohort match
+        // in `CBv2MTPSeedCostLedger` is for, and it is why the claim has to
+        // happen before verify-row completion retires the request ids. What
+        // changed is where the 30 ns lands: on the bucket's transition cost,
+        // not on depth 1's steady-state sample, which is the isolated 20 ns.
+        #expect(depthOne.totalWallTimeNanos == 20)
+        #expect(driver.transitionCostNanosForTesting(decodeRowBucket: 1) == 30)
         #expect(driver.activeDepthForTesting(decodeRowBucket: 1) == 0)
 
         let transition = begin(driver)

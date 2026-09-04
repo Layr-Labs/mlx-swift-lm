@@ -88,7 +88,7 @@ private func fillWindowed(_ row: CBv2WindowedSequenceKV, count: Int) {
 
 // MARK: - (a) Staged == plain equivalence
 
-@Suite("CBv2MTPKVStaging: staged == plain equivalence", .serialized)
+@Suite("CBv2MTPKVStaging: staged == plain equivalence", .serialized, .fixtureRandomState)
 struct CBv2MTPKVStagingEquivalenceTests {
 
     /// One geometry: base fill via plain decode updates, then
@@ -245,7 +245,7 @@ struct CBv2MTPKVStagingEquivalenceTests {
 
 // MARK: - (b) Mid-flight staged views
 
-@Suite("CBv2MTPKVStaging: mid-flight staged views", .serialized)
+@Suite("CBv2MTPKVStaging: mid-flight staged views", .serialized, .fixtureRandomState)
 struct CBv2MTPKVStagingMidFlightTests {
 
     @Test func borrowableViewsMatchStagedViewsAndRollbackInvalidates() {
@@ -286,7 +286,7 @@ struct CBv2MTPKVStagingMidFlightTests {
 
 // MARK: - (c) Full-attention speculative rounds
 
-@Suite("CBv2MTPKVStaging: full rounds", .serialized)
+@Suite("CBv2MTPKVStaging: full rounds", .serialized, .fixtureRandomState)
 struct CBv2MTPKVStagingFullRoundTests {
 
     @Test func fullSequenceRoundEqualsPlain() {
@@ -381,7 +381,7 @@ struct CBv2MTPKVStagingFullRoundTests {
 
 // MARK: - (d) Paged speculative eligibility follows from HEADROOM
 
-@Suite("CBv2MTPKVStaging: paged flags")
+@Suite("CBv2MTPKVStaging: paged flags", .fixtureRandomState)
 struct CBv2MTPKVStagingPagedFlagTests {
 
     /// This suite used to assert `state[1]?.supportsSpeculativeWrites == false`
@@ -491,7 +491,7 @@ struct CBv2MTPKVStagingPagedFlagTests {
 
 // MARK: - (e) Rectangular attention parity
 
-@Suite("CBv2MTPKVStaging: rectangular attention parity", .serialized)
+@Suite("CBv2MTPKVStaging: rectangular attention parity", .serialized, .fixtureRandomState)
 struct CBv2MTPKVStagingAttentionParityTests {
 
     private let queryHeads = 4
@@ -519,7 +519,7 @@ struct CBv2MTPKVStagingAttentionParityTests {
         var batch: [CBv2SequenceKV] = []
         var solo: [CBv2SequenceKV] = []
         for (index, length) in lengths.enumerated() {
-            MLXRandom.seed(UInt64(9100 + index))
+            fixtureSeed(UInt64(9100 + index))
             let keys = MLXRandom.normal([1, kvHeads, length, headDim]).asType(.float16)
             let values = MLXRandom.normal([1, kvHeads, length, headDim]).asType(.float16)
             let batchRow = makeRow(kind: kind, length: length)
@@ -533,7 +533,7 @@ struct CBv2MTPKVStagingAttentionParityTests {
     }
 
     private func verifyBatchQKV() -> (q: MLXArray, k: MLXArray, v: MLXArray) {
-        MLXRandom.seed(31337)
+        fixtureSeed(31337)
         let B = lengths.count
         return (
             q: MLXRandom.normal([B, queryHeads, verifyTokens, headDim]).asType(.float16),
@@ -598,7 +598,7 @@ struct CBv2MTPKVStagingAttentionParityTests {
     }
 
     @Test func windowedWithSinksRectangularParity() {
-        MLXRandom.seed(4321)
+        fixtureSeed(4321)
         let sinks = MLXRandom.normal([queryHeads]).asType(.float16)
         runParity(
             kind: CBv2LayerKind(
@@ -632,7 +632,7 @@ struct CBv2MTPKVStagingAttentionParityTests {
         let batchSource = CBv2LayerCache(layerIndex: 0, kind: sourceKind, rows: batchRows)
         _ = batchSource.updateAndAttend(queries: q, keys: k, values: v, scale: scale, sinks: nil)
 
-        MLXRandom.seed(7331)
+        fixtureSeed(7331)
         let borrowQ = MLXRandom.normal(
             [lengths.count, queryHeads, verifyTokens, headDim]
         ).asType(.float16)
@@ -683,7 +683,7 @@ struct CBv2MTPKVStagingAttentionParityTests {
         let plainShared = CBv2LayerCache(layerIndex: 5, kind: sharedKind)
 
         for index in 0 ..< 2 {
-            MLXRandom.seed(UInt64(8100 + index))
+            fixtureSeed(UInt64(8100 + index))
             let q = MLXRandom.normal([1, queryHeads, 1, headDim]).asType(.float16)
             let k = MLXRandom.normal([1, kvHeads, 1, headDim]).asType(.float16)
             let v = MLXRandom.normal([1, kvHeads, 1, headDim]).asType(.float16)
@@ -692,7 +692,7 @@ struct CBv2MTPKVStagingAttentionParityTests {
             _ = plainSource.updateAndAttend(
                 queries: q, keys: k, values: v, scale: scale, sinks: nil)
 
-            MLXRandom.seed(UInt64(8200 + index))
+            fixtureSeed(UInt64(8200 + index))
             let borrowQ = MLXRandom.normal([1, queryHeads, 1, headDim]).asType(.float16)
             let stagedOutput = stagedShared.attendBorrowing(
                 source: stagedSource, queries: borrowQ, scale: scale, sinks: nil)
@@ -766,7 +766,7 @@ struct CBv2MTPKVStagingAttentionParityTests {
 
 // MARK: - (f) Speculative arm/disarm lifecycle
 
-@Suite("CBv2MTPKVStaging: speculative lifecycle")
+@Suite("CBv2MTPKVStaging: speculative lifecycle", .fixtureRandomState)
 struct CBv2MTPKVStagingSpeculativeLifecycleTests {
 
     /// `speculativePendingViolationTracksStagedLifecycle` lived here and

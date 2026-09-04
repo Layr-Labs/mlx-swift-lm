@@ -19,7 +19,7 @@ import Testing
 
 @testable import MLXLLM
 
-@Suite("CBv2MTPModelSeam", .serialized)
+@Suite("CBv2MTPModelSeam", .serialized, .fixtureRandomState)
 struct CBv2MTPModelSeamTests {
 
     // MARK: - Config fixtures
@@ -246,7 +246,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (a) Capture indices
 
     @Test func captureLayerIndices() throws {
-        MLXRandom.seed(0x517)
+        fixtureSeed(0x517)
         let model = Gemma4TextModel(try targetConfig())
         let layers = try #require(model.cbv2MTPCaptureLayers)
         #expect(layers.full == 2)
@@ -254,13 +254,13 @@ struct CBv2MTPModelSeamTests {
     }
 
     @Test func captureLayersNilWithoutSlidingLayer() throws {
-        MLXRandom.seed(0x517)
+        fixtureSeed(0x517)
         let model = Gemma4TextModel(try fullOnlyConfig())
         #expect(model.cbv2MTPCaptureLayers == nil)
     }
 
     @Test func adapterAnswersCaptureLayersAtRuntime() throws {
-        MLXRandom.seed(0x517)
+        fixtureSeed(0x517)
         let gemma = Gemma4TextModel(try targetConfig())
         let gemmaAdapter = CBv2SteppableLanguageModelAdapter(gemma)
         #expect(gemmaAdapter.mtpCaptureLayers == gemma.cbv2MTPCaptureLayers)
@@ -274,7 +274,7 @@ struct CBv2MTPModelSeamTests {
     }
 
     @Test func driverRejectsDrafterBoundToDifferentTargetInstance() throws {
-        MLXRandom.seed(0x518)
+        fixtureSeed(0x518)
         let boundTarget = Gemma4TextModel(try targetConfig())
         let engineTarget = Gemma4TextModel(try targetConfig())
         let assistant = try Gemma4AssistantDraftModel(config: drafterConfig())
@@ -292,7 +292,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (b) Logits parity: cbv2ForwardWithHidden vs plain forward
 
     @Test func forwardWithHiddenLogitsParity() throws {
-        MLXRandom.seed(0xBEEF)
+        fixtureSeed(0xBEEF)
         let config = try targetConfig()
         let model = Gemma4TextModel(config)
         eval(model)
@@ -344,7 +344,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (c) Drafter chain parity vs the v1 greedy chain
 
     @Test func drafterChainParityVsV1() throws {
-        MLXRandom.seed(0xD0D0)
+        fixtureSeed(0xD0D0)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
@@ -419,7 +419,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (d) Batch invariance (padding + masks)
 
     @Test func batchedDraftsMatchSoloDrafts() throws {
-        MLXRandom.seed(0xFACE)
+        fixtureSeed(0xFACE)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
@@ -475,7 +475,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (e) Official target-hidden and accepted-index semantics
 
     @Test func targetConditioningHiddenMatchesReferenceSemantics() throws {
-        MLXRandom.seed(0xA55157)
+        fixtureSeed(0xA55157)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
         eval(target)

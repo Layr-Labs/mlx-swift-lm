@@ -114,7 +114,7 @@ private final class MTPStalenessTrackingCacheProvider: CBv2LayerCacheProvider,
     }
 }
 
-@Suite("CBv2MTPEngineMixed", .serialized)
+@Suite("CBv2MTPEngineMixed", .serialized, .fixtureRandomState)
 struct CBv2MTPEngineMixedTests {
     private let vocabSize = 256
     private let hiddenSize = 64
@@ -194,7 +194,7 @@ struct CBv2MTPEngineMixedTests {
     private func makeFixture(
         seed: UInt64 = 0x5EED, deterministicTarget: Bool = false
     ) throws -> Fixture {
-        MLXRandom.seed(seed)
+        fixtureSeed(seed)
         let target = Gemma4TextModel(
             try targetConfig(tieWordEmbeddings: !deterministicTarget))
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())

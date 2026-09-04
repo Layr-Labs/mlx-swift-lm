@@ -124,7 +124,7 @@ extension CBv2NonSerializingLayerCache: KVCache {
 
 // MARK: - Suite
 
-@Suite("CBv2MTPRectangularDegrade", .serialized)
+@Suite("CBv2MTPRectangularDegrade", .serialized, .fixtureRandomState)
 struct CBv2MTPRectangularDegradeTests {
 
     private let vocabSize = 256
@@ -206,7 +206,7 @@ struct CBv2MTPRectangularDegradeTests {
     }
 
     private func makeFixture(seed: UInt64 = 0x5EED) throws -> Fixture {
-        MLXRandom.seed(seed)
+        fixtureSeed(seed)
         let target = Gemma4TextModel(try targetConfig())
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
         eval(target, drafter)

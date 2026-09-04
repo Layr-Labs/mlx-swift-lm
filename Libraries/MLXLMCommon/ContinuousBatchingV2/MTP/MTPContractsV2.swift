@@ -586,6 +586,44 @@ public enum CBv2MTPRoundSwitches {
     /// serializing whatever this says.
     public static let fusedVerifyAttention = flag("MTPLX_MTP_FUSED_VERIFY_ATTENTION")
 
+    /// Narrowest verify width at which fusing the attention actually pays.
+    ///
+    /// Fusing trades GPU work for host work: it removes the per-column KV
+    /// re-reads but adds a flat ~1.6-2.3 ms of extra graph build per round
+    /// (one fused mask, one wider call). Measured on M5 Max at 17,408 tokens
+    /// of real text, arm C against arm B — per-round means from `roundTiming`:
+    ///
+    ///     w2  verify build +1.74  submit +0.39  wait  0.00  ->  +2.17 ms  (-11% tok/s)
+    ///     w4  verify build +2.26  submit -0.58  wait -0.42  ->  +1.26 ms  ( -8%)
+    ///     w5  verify build +1.64  submit -1.85  wait -0.76  ->  -0.97 ms  ( +5%)
+    ///
+    /// so the crossover sits between 4 and 5. The mechanism is that the
+    /// two-pass vector SDPA cannot take M > 1: at M = 2-4 the fused global
+    /// layers fall to the matmul path, which at 17k keys is slower than 2-4
+    /// vector calls, and only by M = 5 do the saved re-reads overtake it.
+    ///
+    /// This is a WIDTH threshold, not a prompt-shape one — width is the
+    /// quantity being traded, and the decision reads nothing about the prompt,
+    /// the context or the KV length. `MTPLX_MTP_FUSED_VERIFY_MIN_WIDTH=1`
+    /// restores the old always-on behaviour for a control arm; a larger value
+    /// raises the bar. Re-derive it whenever the attention kernel changes: on
+    /// a stack whose GPU-side attention is cheaper the saving shrinks and the
+    /// crossover moves OUT.
+    public static let fusedVerifyMinWidth: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "MTPLX_MTP_FUSED_VERIFY_MIN_WIDTH"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            let value = Int(raw), value >= 1
+        else { return 5 }
+        return value
+    }()
+
+    /// Whether to fuse the verify attention for a rectangle of this width.
+    /// Pure arithmetic on the width, so it is testable without a model.
+    public static func fusesVerifyAttention(width: Int) -> Bool {
+        fusedVerifyAttention && width >= fusedVerifyMinWidth
+    }
+
     /// Ask the drafter for its rank-2 token at every draft step so the round
     /// can report `runnerUpHitRate` — the number tree drafting turns on.
     ///

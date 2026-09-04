@@ -187,8 +187,11 @@ extension EngineLoopV2 {
             // rather than one per column. See the switch for why the
             // serialized default makes the per-draft cost grow with context,
             // and why contiguous storage is the only place this is offered.
+            // Fusing only pays from a measured width up: below it the extra
+            // host graph build costs more than the per-column KV re-reads it
+            // removes. `columns.count` is the verify width (1 + k).
             let serializes =
-                !CBv2MTPRoundSwitches.fusedVerifyAttention
+                !CBv2MTPRoundSwitches.fusesVerifyAttention(width: columns.count)
                 || backend.requiresMaterializedSnapshots
             if serializes {
                 for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }

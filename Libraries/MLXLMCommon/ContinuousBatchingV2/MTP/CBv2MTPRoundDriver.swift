@@ -842,6 +842,28 @@ final class CBv2MTPRoundDriver {
                 nanos: wallTimeNanos)
             return
         }
+        // A seed is the price of the TRANSITION out of depth zero, not a
+        // recurring cost of the depth that follows it. `beginMTPPlan`
+        // invalidates every carry only when `planDepth == 0`, and
+        // `EngineLoopV2+MTPFinalize` calls `storeCarry` on every verify round
+        // that confirmed a token -- a PARTIAL rejection keeps its carry. So a
+        // settled positive depth never re-seeds, and charging the seed to that
+        // depth's steady-state sample answers a question nobody asked.
+        //
+        // It also answered it self-servingly: choosing depth zero forces the
+        // next probe to seed, the seed inflates that probe's sample, and the
+        // inflated sample re-chooses depth zero. Cost in, token out.
+        // `CBv2MTPRawCostEstimator` already refuses seed-attributed input for
+        // exactly this reason; the goodput controller was the outlier.
+        //
+        // The cost is not discarded: it is recorded as the bucket's transition
+        // cost, and `metrics.totalRoundWallTimeNanos` below still counts it, so
+        // no measured wall time disappears.
+        if claimedSeedCostNanos > 0 {
+            depthController.observeTransitionCost(
+                decodeRowBucket: decision.decodeRowBucket,
+                nanos: claimedSeedCostNanos)
+        }
         let rawCostEligible =
             usesMarginalPolicy
             && measurement.costEligible && !measurement.chained
@@ -870,7 +892,7 @@ final class CBv2MTPRoundDriver {
         let recorded = depthController.recordFinalizedStep(
             decision: decision,
             actualDepth: measurement.actualDepth,
-            wallTimeNanos: attributed,
+            wallTimeNanos: wallTimeNanos,
             costEligible: measurement.costEligible,
             chained: measurement.chained,
             finalizedPlainWork: finalizedPlainWork,
@@ -892,6 +914,10 @@ final class CBv2MTPRoundDriver {
 
     func probeIntervalForTesting(decodeRowBucket: Int) -> Int {
         depthController.probeIntervalForTesting(decodeRowBucket: decodeRowBucket)
+    }
+
+    func transitionCostNanosForTesting(decodeRowBucket: Int) -> UInt64 {
+        depthController.transitionCostNanosForTesting(decodeRowBucket: decodeRowBucket)
     }
 
     func metricsSnapshot() -> CBv2MTPMetrics {
