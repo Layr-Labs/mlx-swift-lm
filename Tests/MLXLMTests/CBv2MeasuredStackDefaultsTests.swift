@@ -157,6 +157,13 @@ struct CBv2MeasuredStackDefaultsTests {
         pin(
             "DARKBLOOM_CBV2_RING_READ_FOLD_B1",
             CBv2RingReadFoldB1.enabled, true)
+        // Verify-work lever 2 (kept): the hidden-1024 drafter fuses
+        // post-attention norm+residual through a 1024-shaped kernel. Measured
+        // bit-exact (identical opaqueTokenDigest vs control) and decode-positive
+        // (+0.5%, -0.1 ms/round) at THE TEST. Default ON; a control arm re-arms.
+        pin(
+            "DARKBLOOM_GEMMA4_DRAFTER_NORM_RESIDUAL_FUSE",
+            gemma4DrafterNormResidualFuseEnabled, true)
     }
 
     /// The union rule is OFF, and this one is not a throughput decision.

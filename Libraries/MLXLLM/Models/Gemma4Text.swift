@@ -3412,6 +3412,18 @@ internal func gemma4GlueXSumsHazards(
     return (outOfRange, collisions)
 }
 
+/// [engage] Lever 2. `DARKBLOOM_GEMMA4_DRAFTER_NORM_RESIDUAL_FUSE=0` restores the
+/// stock post-attention norm+residual on the hidden-1024 drafter. Default ON.
+/// Only the drafter's `normResidual` fuse is made axis-generic (a 1024-shaped
+/// twin of the 2816 kernel); no other glue kernel is touched.
+let gemma4DrafterNormResidualFuseEnabled: Bool = {
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_DRAFTER_NORM_RESIDUAL_FUSE"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
 private enum Gemma4FusedLayerGlue {
     /// Kill switch: DARKBLOOM_GEMMA4_FUSED_LAYER_GLUE=0 restores the stock
     /// per-op chain. Default ON.
@@ -3471,7 +3483,9 @@ private enum Gemma4FusedLayerGlue {
 
     /// Shared reduction preamble: the exact rms_single_row tree at 704x4.
     /// `PREFIX` names the array to reduce; `SLOT` the shared slot written.
-    private static func rmsReduce(_ src: String, into slot: String) -> String {
+    private static func rmsReduce(
+        _ src: String, into slot: String, axis: Int = 2816, simdGroups: Int = 22
+    ) -> String {
         """
             {
                 float acc = 0;
@@ -3484,9 +3498,9 @@ private enum Gemma4FusedLayerGlue {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (simd_group_id == 0) {
                     acc = simd_sum(
-                        simd_lane_id < 22 ? local_sums[simd_lane_id] : 0.0f);
+                        simd_lane_id < \(simdGroups) ? local_sums[simd_lane_id] : 0.0f);
                     if (simd_lane_id == 0) {
-                        \(slot) = metal::precise::rsqrt(acc / 2816.0f + 1e-06f);
+                        \(slot) = metal::precise::rsqrt(acc / \(axis).0f + 1e-06f);
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3584,6 +3598,35 @@ private enum Gemma4FusedLayerGlue {
             const uint base = row * 2816 + lid * 4;
             const uint wbase = lid * 4;
         \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                // The stock chain rounds the norm's output to T in memory
+                // before the residual add reads it; reproduce both roundings.
+                const T normed = static_cast<T>(
+                    w[wbase + i] * static_cast<T>((float)x[base + i] * inv));
+                out[base + i] = res[base + i] + normed;
+            }
+        """,
+        ensureRowContiguous: true
+    )
+
+    /// [engage] Lever 2. The 1024-hidden twin of `normResidualKernel`: identical
+    /// body, axis (and its rms mean divisor + simdgroup fold width) re-derived
+    /// for the drafter's hidden size. 1024 / 4 = 256 threads = 8 simdgroups.
+    private static let normResidualKernel1024: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "gemma4_glue_norm_residual_1024_bf16_v1_nb1",
+        inputNames: ["x", "res", "w"],
+        outputNames: ["out"],
+        source: """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 1024 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]", axis: 1024, simdGroups: 8))
             const float inv = local_inv[0];
             for (int i = 0; i < 4; i++) {
                 // The stock chain rounds the norm's output to T in memory
@@ -3822,16 +3865,37 @@ private enum Gemma4FusedLayerGlue {
     static func normResidual(
         x: MLXArray, residual: MLXArray, weight: MLXArray, eps: Float
     ) -> MLXArray? {
-        guard let rows = admittedRows(x, weight: weight, eps: eps),
+        if let rows = admittedRows(x, weight: weight, eps: eps),
+            residual.shape == x.shape, residual.dtype == .bfloat16
+        {
+            CBv2EngageMark.once("glue-norm-residual")
+            return normResidualKernel(
+                [x, residual, weight],
+                template: [("T", x.dtype)],
+                grid: (rows * tgThreads, 1, 1),
+                threadGroup: (tgThreads, 1, 1),
+                outputShapes: [[rows, 1, axis]],
+                outputDTypes: [.bfloat16]
+            )[0]
+        }
+        // [engage] Lever 2: the hidden-1024 drafter takes the same fuse through
+        // a 1024-shaped kernel. Gated + default ON. The 2816 path above is
+        // untouched; nothing else in the glue is made axis-generic.
+        guard gemma4DrafterNormResidualFuseEnabled, enabled,
+            eps == Self.eps, x.ndim == 3, x.dim(1) == 1, x.dim(2) == 1024,
+            x.dtype == .bfloat16, weight.ndim == 1, weight.dim(0) == 1024,
+            weight.dtype == .bfloat16,
             residual.shape == x.shape, residual.dtype == .bfloat16
         else { return nil }
-        CBv2EngageMark.once("glue-norm-residual")
-        return normResidualKernel(
+        let n = x.dim(0)
+        guard n > 0, x.size == n * 1024 else { return nil }
+        CBv2EngageMark.once("glue-norm-residual-drafter-1024")
+        return normResidualKernel1024(
             [x, residual, weight],
             template: [("T", x.dtype)],
-            grid: (rows * tgThreads, 1, 1),
-            threadGroup: (tgThreads, 1, 1),
-            outputShapes: [[rows, 1, axis]],
+            grid: (n * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[n, 1, 1024]],
             outputDTypes: [.bfloat16]
         )[0]
     }
