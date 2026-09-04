@@ -71,6 +71,31 @@ struct CBv2MTPNearTieCriterionTests {
         #expect(realContentMargins.contains { !argmaxSurvives(margin: $0, epsilon: ulp) })
     }
 
+    @Test("fused verify engages only from its measured crossover width up")
+    func fusedVerifyHasAWidthFloor() {
+        // Fusing trades GPU work for host work. Measured on M5 Max at 17,408
+        // tokens of real text (arm C vs arm B, per-round roundTiming means):
+        // w2 +2.17 ms/round, w4 +1.26, w5 -0.97 — so it pays from width 5.
+        // The predicate reads the WIDTH and nothing else: no prompt length, no
+        // context size, no KV length.
+        let floor = CBv2MTPRoundSwitches.fusedVerifyMinWidth
+        #expect(floor >= 1)
+        for width in 1...8 {
+            let fused = CBv2MTPRoundSwitches.fusesVerifyAttention(width: width)
+            // The master switch still gates everything; when it is off nothing
+            // fuses at any width.
+            #expect(fused == (CBv2MTPRoundSwitches.fusedVerifyAttention && width >= floor))
+        }
+        // Monotone in width: a wider rectangle never loses the fusion a
+        // narrower one had.
+        var seenFused = false
+        for width in 1...8 {
+            let fused = CBv2MTPRoundSwitches.fusesVerifyAttention(width: width)
+            if seenFused { #expect(fused) }
+            seenFused = seenFused || fused
+        }
+    }
+
     @Test("the margin band is what a run should report, and it is depth-free")
     func reportableBand() {
         // The number that decides whether a task eval can pass is not "did it
