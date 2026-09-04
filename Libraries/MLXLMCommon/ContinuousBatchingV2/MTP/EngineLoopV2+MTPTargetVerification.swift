@@ -285,12 +285,24 @@ extension EngineLoopV2 {
         // explicit root because it leaves the round on the carry, not through
         // `scores`. Anything the compaction declines falls back to the full
         // list unchanged.
+        // The shared `compact-decode-roots` mark cannot tell the MTP verify apart from
+        // a plain decode step: at batch 1 both produce rows=1, layers=30 and the same
+        // root count, so `CBv2EngageMark.once` dedupes them to one line and the decode
+        // path (compaction default ON) always wins the race. This mark carries the
+        // verify width, so an armed run shows engagement per width.
         let verifyRoots: [MLXArray]
-        if cbv2MTPCompactRootsEnabled,
-            let compact = model.compactDecodeEvaluationRoots(
+        if cbv2MTPCompactRootsEnabled {
+            if let compact = model.compactDecodeEvaluationRoots(
                 forwardOutput: scores, caches: caches)
-        {
-            verifyRoots = compact + [hidden]
+            {
+                CBv2EngageMark.once(
+                    "mtp-compact-roots ENGAGED T=\(columns.count) "
+                        + "layers=\(caches.count) roots=\(compact.count + 1)")
+                verifyRoots = compact + [hidden]
+            } else {
+                CBv2EngageMark.once("mtp-compact-roots DECLINED T=\(columns.count)")
+                verifyRoots = eagerCacheInnerState(caches)
+            }
         } else {
             verifyRoots = eagerCacheInnerState(caches)
         }
