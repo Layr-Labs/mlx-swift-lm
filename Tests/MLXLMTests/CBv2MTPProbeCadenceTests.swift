@@ -177,35 +177,30 @@ struct CBv2MTPProbeCadenceTests {
         // The verdict never changes: this workload is not worth speculating on
         // and the controller never settles on a positive depth.
         #expect(controller.activeDepthForTesting(decodeRowBucket: 1) == 0)
-        #expect(outcome.rounds == 84)
+        #expect(outcome.rounds == 52)
 
-        // The learning phase walks the envelope one position at a time, each
-        // position held until it carries `acceptanceMinSamples` observations.
-        // It is a monotone climb 1 -> maxDepth, not a hill-climb that stalls.
         let maxDepth = CBv2MTPConfig.testedMaxDraftTokens
         #expect(Set(outcome.roundDepths) == Set(1 ... maxDepth))
-        let climb = Array(outcome.roundDepths.prefix(78))
-        #expect(climb == climb.sorted())
-        #expect(climb.first == 1)
-        #expect(climb.last == maxDepth)
-        for depth in 1 ... maxDepth {
-            #expect(
-                climb.filter { $0 == depth }.count >= 10,
-                "depth \(depth) never reached acceptanceMinSamples")
-        }
 
-        // Once every position carries evidence the probe ROTATES the envelope
-        // instead of climbing it, so a depth that measured badly once stays
-        // revisitable.
-        #expect(Array(outcome.roundDepths.suffix(6)) == [1, 2, 3, 4, 5, 6])
+        // The opening prices the envelope from the CEILING DOWN. That is the
+        // first seven rounds, 7 through 1, and it is why this suite no longer
+        // asserts a monotone climb from 1: the climb was the symptom of an
+        // opening that started at depth 0 and could not get past its own
+        // acceptance frontier.
+        #expect(Array(outcome.roundDepths.prefix(7)) == [7, 6, 5, 4, 3, 2, 1])
+
+        // Once every position carries evidence the probe ROTATES the envelope,
+        // so a depth that measured badly once stays revisitable.
+        #expect(Array(outcome.roundDepths.suffix(6)) == [2, 3, 4, 5, 6, 7])
 
         // And the ORIGINAL doubling resumes and saturates: the last probes are
         // 257 steps apart, one round in 257, and the interval is at its cap.
-        #expect(Array(outcome.gaps.suffix(6)) == [17, 33, 65, 129, 257, 257])
+        #expect(Array(outcome.gaps.suffix(6)) == [33, 65, 129, 257, 257, 257])
         #expect(controller.probeIntervalForTesting(decodeRowBucket: 1) == 256)
 
-        // Bounded by construction: `maxDepth * acceptanceMinSamples` productive
-        // probes is the whole budget, and it is paid once per bucket.
+        // Bounded by construction, and CHEAPER than before: 52 rounds against
+        // the 84 the upward opening spent, because pricing the envelope once
+        // from the top replaces ten probes per rung.
         #expect(outcome.rounds <= maxDepth * 10 + 16)
     }
 
@@ -215,13 +210,17 @@ struct CBv2MTPProbeCadenceTests {
     func unprofitableLearningPhaseStaysCheap() {
         let (outcome, controller) = drive(costRatio: 2.5, steps: 200)
 
-        #expect(outcome.rounds == 23)
-        #expect(outcome.drafted == 38)
-        #expect(outcome.accepted == 34)
+        #expect(outcome.rounds == 27)
+        #expect(outcome.drafted == 110)
+        #expect(outcome.accepted == 90)
         #expect(controller.activeDepthForTesting(decodeRowBucket: 1) == 0)
-        // 23 speculative rounds in 200 steps. The old rule spent 5 and learned
-        // nothing past depth 1; these 23 have priced depths 1, 2 and 3.
-        #expect(Set(outcome.roundDepths) == [1, 2, 3])
+        // 27 speculative rounds in 200 steps, and they price the WHOLE
+        // envelope rather than the first three rungs. That is the cost of the
+        // ceiling opening on a workload where MTP does not pay: 110 drafted
+        // tokens against 38, because the opening scan starts at depth 7. The
+        // verdict is unchanged -- `activeDepth` is still 0 -- and the scan is
+        // paid once per bucket.
+        #expect(Set(outcome.roundDepths) == Set(1 ... CBv2MTPConfig.testedMaxDraftTokens))
         #expect(Double(outcome.rounds) / 200.0 < 0.15)
     }
 
@@ -249,13 +248,17 @@ struct CBv2MTPProbeCadenceTests {
         let justProfitable = drive(costRatio: threshold * 0.98, steps: 200)
         let justUnprofitable = drive(costRatio: threshold * 1.02, steps: 200)
 
-        #expect(justUnprofitable.outcome.rounds == 23)
+        #expect(justUnprofitable.outcome.rounds == 34)
         #expect(justProfitable.outcome.rounds > 150)
         // The regimes are still separated by the one comparison — the sharpest
         // reading is that only one of them SETTLES on speculation.
         #expect(justUnprofitable.controller.activeDepthForTesting(decodeRowBucket: 1) == 0)
         #expect(justProfitable.controller.activeDepthForTesting(decodeRowBucket: 1) == 1)
-        #expect(justProfitable.outcome.rounds >= justUnprofitable.outcome.rounds * 7)
+        // The separation narrows to about 5x, from 7x, because the ceiling
+        // opening makes the unprofitable arm price the whole envelope before it
+        // declines. It still declines, and it still never settles above 0,
+        // which is what the comparison is for.
+        #expect(justProfitable.outcome.rounds >= justUnprofitable.outcome.rounds * 5)
     }
 
     /// A depth-zero baseline must still be measured, and it may only be
@@ -343,8 +346,8 @@ struct CBv2MTPProbeCadenceTests {
 
         // What the controller was fed before the fix: decline, and spend only
         // the bounded learning budget finding that out.
-        #expect(folded.outcome.rounds == 23)
-        #expect(folded.outcome.accepted == 34)
+        #expect(folded.outcome.rounds == 27)
+        #expect(folded.outcome.accepted == 90)
         #expect(folded.controller.activeDepthForTesting(decodeRowBucket: 1) == 0)
 
         // What it is fed now — the isolated round, 14.195 ms against forced

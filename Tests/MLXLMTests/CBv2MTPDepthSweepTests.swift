@@ -296,10 +296,16 @@ struct CBv2MTPDepthSweepTests {
             depths.append(depth)
         }
         #expect(depths.first == 3, "it must still OPEN at the ceiling")
+        // SERVING depth is 0. The tail is not uniformly 0 and must not be
+        // asserted so: the bounded probe cadence keeps re-checking the envelope
+        // every few rounds, which is the behaviour `unprofitableCostLearns...`
+        // exists to defend. What backing off means is that the controller
+        // SERVES at 0 and only visits a deeper rung to re-measure it.
         let tail = depths.suffix(200)
+        let served = tail.filter { $0 == 0 }.count
         #expect(
-            tail.allSatisfy { $0 == 0 },
-            "a collapsed acceptance must settle at depth 0, saw \(Set(tail).sorted())")
+            served >= 180,
+            "a collapsed acceptance must serve depth 0, saw \(served)/200")
         #expect(controller.activeDepthForTesting(decodeRowBucket: Self.bucket) == 0)
     }
 
