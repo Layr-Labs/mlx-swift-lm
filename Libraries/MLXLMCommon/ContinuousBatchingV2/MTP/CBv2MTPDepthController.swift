@@ -89,6 +89,15 @@ final class CBv2MTPDepthController {
             }
         }
 
+        /// Raw observation count at one draft position. `rate(at:)` hides this
+        /// behind the trusted-sample gate; the probe cadence needs the count
+        /// itself, to tell a probe that bought new evidence from one that did
+        /// not.
+        func samples(at position: Int) -> Int {
+            guard position > 0, position < seen.count else { return 0 }
+            return seen[position]
+        }
+
         func rate(at position: Int) -> Double {
             if position > 0, position < seen.count,
                 seen[position] >= CBv2MTPDepthController.acceptanceMinSamples
@@ -148,6 +157,11 @@ final class CBv2MTPDepthController {
         var activeDepth = 0
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
         var roundsSinceProbe = 0
+        /// Depth of the most recent exploration, and the acceptance-sample
+        /// count that depth carried at the time. Together they answer "did the
+        /// last probe buy new evidence?", which is what gates the backoff.
+        var lastProbedDepth = 0
+        var lastProbeEvidence = 0
     }
 
     let maxDepth: Int
@@ -350,11 +364,50 @@ final class CBv2MTPDepthController {
             var explore = false
             let nextRounds = state.roundsSinceProbe + 1
             if nextRounds >= state.probeInterval {
-                let probe = min(selected + 1, limit)
-                if probe > selected {
-                    selected = probe
-                    reason = "explore_deeper"
-                    explore = true
+                if state.acceptance.frontier >= maxDepth {
+                    // Every position in the envelope carries real acceptance
+                    // evidence. Rotate through the depths so a depth that
+                    // measured badly once stays revisitable and drift is seen
+                    // in both directions. Depth zero is excluded: a depth-zero
+                    // exploration on a chained step is rejected by
+                    // `recordFinalizedStep`, which would stall the cadence.
+                    let rotated =
+                        state.lastProbedDepth >= maxDepth
+                        ? 1 : max(state.lastProbedDepth + 1, 1)
+                    if rotated != selected {
+                        selected = rotated
+                        reason = "explore_rotate"
+                        explore = true
+                    }
+                } else {
+                    // Probe the FRONTIER, not the neighbour of the current
+                    // selection. The old rule was `min(selected + 1, limit)`,
+                    // and `limit` is itself `frontier + 1`, so with `selected`
+                    // resting at 0 the probe was always 1 and depth 2 was
+                    // unreachable however long the run: at THE TEST the
+                    // controller spent 1,018 decisions as
+                    // `{0: 1002, 1: 16}` while a fixed depth 4 ran 1.40x
+                    // serial on the same prompt.
+                    //
+                    // The frontier only advances once a position has been
+                    // DRAFTED `acceptanceMinSamples` times, so declining to
+                    // explore deeper was also declining to gather the evidence
+                    // that would justify it. Probing `limit` is what MAKES
+                    // that evidence, and the ratchet unwinds one position at a
+                    // time until the whole envelope is measured.
+                    //
+                    // This is only sound because goodput is NOT monotone in
+                    // depth: a round pays a fixed setup + verify overhead that
+                    // amortizes over the tokens it commits, so depth 1 can be
+                    // a genuine loss while depth 4 is the best arm on the
+                    // board. A hill-climb that stops at the first losing step
+                    // never learns that. See `CBv2MTPDepthSweepTests`.
+                    let probe = min(max(limit, selected + 1), maxDepth)
+                    if probe > selected {
+                        selected = probe
+                        reason = "explore_deeper"
+                        explore = true
+                    }
                 }
             }
             decision = CBv2MTPDepthDecision(
@@ -371,10 +424,34 @@ final class CBv2MTPDepthController {
     ) {
         if decision.isExploration {
             state.roundsSinceProbe = 0
-            if decision.reason == "explore_deeper" {
-                state.probeInterval = min(
-                    state.probeInterval * 2, Self.maxProbeInterval)
+            if decision.reason == "explore_deeper" || decision.reason == "explore_rotate" {
+                // Back off from a probe that taught us nothing new, not from
+                // every probe. While the acceptance frontier is short of the
+                // envelope and each probe is still buying a sample at its own
+                // position, doubling would starve the evidence the frontier
+                // waits on: ten samples per position at 8, 16, 32 ... 256 is
+                // thousands of rounds, i.e. never, inside one request.
+                //
+                // The budget this holds open is bounded by construction --
+                // `maxDepth * acceptanceMinSamples` productive probes, after
+                // which the frontier is complete and the original geometric
+                // backoff resumes to its 256 cap. A probe that adds no sample
+                // at its own position (acceptance died shallower) backs off
+                // immediately.
+                let position = decision.depth
+                let evidence = state.acceptance.samples(at: position)
+                let advancing =
+                    state.acceptance.frontier < maxDepth
+                    && position > 0
+                    && (position != state.lastProbedDepth
+                        || evidence > state.lastProbeEvidence)
+                state.probeInterval =
+                    advancing
+                    ? Self.baseProbeInterval
+                    : min(state.probeInterval * 2, Self.maxProbeInterval)
             }
+            state.lastProbedDepth = decision.depth
+            state.lastProbeEvidence = state.acceptance.samples(at: decision.depth)
             return
         }
         if decision.depth != state.activeDepth {
