@@ -49,21 +49,6 @@ final class CBv2MTPDepthController {
     /// observations, never tokens or context.
     private static let minCostSamples = 3
 
-    /// PARTICIPANT POLICY LEVER (editable; the participant contract names
-    /// this controller as the adaptive policy a submission may change).
-    ///
-    /// This submission runs TARGET-ONLY: the controller never selects a
-    /// positive draft depth, so no seed step, no verify step, and no cost
-    /// probe is ever planned. The sealed verification mode for this track is
-    /// `.serialTarget`, where a depth-k round costs 1+k FULL target forwards;
-    /// the adaptive policy therefore converges to depth 0 on its own, but it
-    /// keeps re-proving that at every probe cadence (a seed step plus a
-    /// 1+k verify step) — pure loss on this arm. Pinning the policy at 0
-    /// removes those rounds. Every committed token is still produced by an
-    /// ordinary target decode step, so the emitted stream stays bit-identical
-    /// to serial decode.
-    static let speculationEnabled = false
-
     private struct CostState {
         var samples = 0
         var ewmaNanos = 0.0
@@ -176,6 +161,14 @@ final class CBv2MTPDepthController {
 
     let maxDepth: Int
     let fixedDepth: Int?
+
+    /// True when this controller can never return a positive depth, whatever
+    /// the plan looks like: the trusted envelope is zero, or the integrator
+    /// pinned a fixed depth of zero. Both are configuration, fixed for the
+    /// controller's lifetime. NOT a policy switch — a positive envelope with
+    /// no fixed pin always adapts, and there is no constant that turns
+    /// speculation off for a configuration that asked for it.
+    var isTargetOnly: Bool { maxDepth == 0 || fixedDepth == 0 }
     private var buckets: [Int: BucketState] = [:]
     private var lastDecision = CBv2MTPDepthDecision(
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
@@ -224,9 +217,10 @@ final class CBv2MTPDepthController {
     /// required per bucket; ordinary target-only steps may keep chaining
     /// after the baseline exists.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
-        // Target-only policy: the baseline this probe would establish is only
-        // ever compared against a verify step that can never be selected.
-        guard Self.speculationEnabled else { return false }
+        // A controller that can never select a positive depth has nothing to
+        // compare the baseline against, so the probe would cost a broken
+        // decode chain for a number no decision reads.
+        guard !isTargetOnly else { return false }
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
     }
@@ -317,13 +311,6 @@ final class CBv2MTPDepthController {
             return finish(
                 CBv2MTPDepthDecision(
                     depth: 0, decodeRowBucket: 0, reason: "no_decode_rows",
-                    isExploration: false),
-                mutate: mutate)
-        }
-        guard Self.speculationEnabled else {
-            return finish(
-                CBv2MTPDepthDecision(
-                    depth: 0, decodeRowBucket: bucket, reason: "policy_target_only",
                     isExploration: false),
                 mutate: mutate)
         }
