@@ -4792,7 +4792,7 @@ private class Gemma4MLP: Module {
                 fusedScaleGroups: fused.scaleGroups)
         else { return nil }
         CBv2EngageMark.once("dense-gateup-concat")
-        let gateUp = quantizedMatmul(
+        let gateUp = quantizedMM(
             x, fused.weight,
             scales: fused.scales, biases: fused.biases,
             transpose: true,
