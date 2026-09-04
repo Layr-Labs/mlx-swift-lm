@@ -387,11 +387,10 @@ struct CBv2MTPTreeShapeTests {
         #expect(CBv2MTPTreeShape.parse("spine") == nil)
     }
 
-    @Test func switchIsOffUnlessTheEnvironmentNamesAShape() {
+    @Test func treeDraftIsOffUnlessTheEnvironmentNamesAShape() {
         // Nothing in the process environment for a test run, so the shipped
-        // chain is what every round gets, scored the shipped way.
+        // chain is what every round gets.
         #expect(CBv2MTPRoundSwitches.treeDraft == nil)
-        #expect(!CBv2MTPRoundSwitches.fusedVerifyAttention)
     }
 
     // MARK: - Equivalence with the shipped verify

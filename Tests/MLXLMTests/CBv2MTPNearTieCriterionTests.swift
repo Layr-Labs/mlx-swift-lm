@@ -105,6 +105,24 @@ struct CBv2MTPNearTieCriterionTests {
     ///
     /// The default is pinned because it is now part of the measured
     /// configuration. A build that loses it loses about 10% with no error.
+    /// DEFAULT ON, and it must be read together with `fusedVerifyMinWidth`.
+    ///
+    /// `fusesVerifyAttention(width:)` ANDs the two. Build5 shipped with the
+    /// crossover moved to 2 and this switch still OFF, so nothing fused and the
+    /// defaults arm read 152.0 tok/s at width 4 instead of about 165. The two
+    /// assertions below are therefore one contract, not two: the master switch
+    /// is armed AND the narrowest rectangle takes the fused path.
+    @Test("the fused verify is armed by default at every width this branch runs")
+    func fusedVerifyDefaultsOn() {
+        guard ProcessInfo.processInfo.environment[
+            "MTPLX_MTP_FUSED_VERIFY_ATTENTION"] == nil,
+            ProcessInfo.processInfo.environment[
+                "MTPLX_MTP_FUSED_VERIFY_MIN_WIDTH"] == nil
+        else { return }
+        #expect(CBv2MTPRoundSwitches.fusedVerifyAttention)
+        #expect(CBv2MTPRoundSwitches.fusesVerifyAttention(width: 2))
+    }
+
     @Test("pipelined draft submit is on by default")
     func pipelinedDraftSubmitDefaultsOn() {
         if ProcessInfo.processInfo.environment["MTPLX_MTP_PIPELINED_DRAFT_SUBMIT"] == nil {

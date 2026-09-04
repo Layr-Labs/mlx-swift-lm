@@ -182,10 +182,11 @@ extension EngineLoopV2 {
             hidden = concatenated(hiddenColumns, axis: 1)
 
         } else {
-            // [engage] MTPLX_MTP_FUSED_VERIFY_ATTENTION: leave the flag off
-            // so the rectangle is scored in one attention call per layer
-            // rather than one per column. See the switch for why the
-            // serialized default makes the per-draft cost grow with context,
+            // [engage] MTPLX_MTP_FUSED_VERIFY_ATTENTION: ON by default on
+            // this branch, so the rectangle is scored in one attention call
+            // per layer rather than one per column. Set the variable to `0`
+            // for a serialized control arm. See the switch for why the
+            // serialized path makes the per-draft cost grow with context,
             // and why contiguous storage is the only place this is offered.
             // Fusing only pays from a measured width up: below it the extra
             // host graph build costs more than the per-column KV re-reads it

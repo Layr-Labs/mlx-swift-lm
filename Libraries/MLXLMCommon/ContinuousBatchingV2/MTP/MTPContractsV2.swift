@@ -586,17 +586,32 @@ public enum CBv2MTPRoundSwitches {
     /// With this on, the verify takes the ordinary `L > 1` path, whose
     /// `maskMode` is `.causal` for a full layer and the existing
     /// causal-and-window array mask for a windowed one. That is the SAME
-    /// visibility per column, computed once: mathematically identical, and
-    /// the reason it is a switch rather than the default is that it is a
-    /// different KERNEL, so it is not bit-identical to the serialized path
-    /// the M5 rectangular envelope was certified on. Greedy parity is the
-    /// gate; run it with the benchmark's parity recording before promoting.
+    /// visibility per column, computed once: mathematically identical, but a
+    /// different KERNEL, so it is not bit-identical to the serialized path the
+    /// M5 rectangular envelope was certified on. Greedy parity is the gate.
+    ///
+    /// DEFAULT ON on this branch. Measured on the serial stack, S1 unfused
+    /// against S2 fused, tok/s: w2 115.0 -> 119.0, w3 134.4 -> 143.3,
+    /// w4 138.5 -> 153.7, w5 138.1 -> 147.7. `fusedVerifyMinWidth` then decides
+    /// the narrowest width that takes the fused path; on this branch that is 2,
+    /// so every rectangle fuses.
+    ///
+    /// This switch and `fusedVerifyMinWidth` are ANDed in
+    /// `fusesVerifyAttention(width:)`. Both must be armed. Moving the crossover
+    /// to 2 while this stayed OFF shipped a build that never fused: the build5
+    /// defaults arm read 152.0 tok/s at width 4, which is the pipelined-only
+    /// number, against 165 with fusing. A width threshold cannot arm a master
+    /// switch.
+    ///
+    /// `MTPLX_MTP_FUSED_VERIFY_ATTENTION=0` restores the serialized path for a
+    /// control arm.
     ///
     /// Contiguous storage only. `PagedLayerCache` branches on the same flag
     /// and its non-serialized `L > 1` path is packed-prefill masking over
     /// gathered pages, which is a separate certification; a paged bank keeps
     /// serializing whatever this says.
-    public static let fusedVerifyAttention = flag("MTPLX_MTP_FUSED_VERIFY_ATTENTION")
+    public static let fusedVerifyAttention = flagDefaultOn(
+        "MTPLX_MTP_FUSED_VERIFY_ATTENTION")
 
     /// Narrowest verify width at which fusing the attention actually pays.
     ///
