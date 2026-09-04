@@ -702,6 +702,140 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
     return x
 }
 
+/// When the expert gather groups its `(row, expert)` assignments by expert
+/// before issuing them, instead of visiting them row by row.
+///
+/// Grouping is what makes a multi-row expert pass read each SELECTED expert's
+/// weight block once for every row that chose it, rather than once per row.
+/// On a 128-expert / top-8 model that is the difference between a rectangular
+/// pass costing `rows * 8` weight reads and it costing the size of the
+/// expert UNION across those rows — under uniform routing
+/// `128 * (1 - (1 - 8/128)^rows)`, so 15.5 experts at 2 rows and 51.6 at 8,
+/// against 16 and 64 ungrouped.
+///
+/// REDUCTION ORDER IS UNCHANGED, and that is the whole exactness argument.
+/// Grouping permutes only the order in which `(row, expert)` products are
+/// COMPUTED. Every caller unsorts back to row-major
+/// (`scatterUnsort(..., shape: indices.shape)`) before the per-row weighted
+/// sum runs, so each row's K terms are still summed in slot order 0...K-1,
+/// with the same operands, whether or not the gather was grouped. No partial
+/// sum is ever accumulated across rows, and no row's terms are reassociated.
+///
+/// What that argument does NOT cover is the two MLX gather kernels
+/// themselves: `sortedIndices: true` and `sortedIndices: false` are different
+/// dispatches, and whether their per-dot-product accumulation is bit-identical
+/// is a property of MLX, not of this file. The sorted dispatch is already the
+/// production prompt path, so it is trusted at prompt shapes and merely
+/// uncertified at verify shapes. Treat that as the measured gate it is.
+///
+/// [engage] MTPLX_MTP_UNION_VERIFY
+public enum SwitchGLUExpertGrouping {
+    /// DEFAULT OFF, because every measurement this stack reports ran with
+    /// `MTPLX_MTP_UNION_VERIFY=0`.
+    ///
+    /// The union rule changes WHICH experts the verify rectangle gathers, so it
+    /// changes the arithmetic the rectangle performs. The 165.2 tok/s arm and
+    /// all of its parity data were produced with the rule off; "measured flat"
+    /// is a statement about throughput, not about output equivalence, and it
+    /// does not license shipping a different gather than the one whose tokens
+    /// were checked.
+    ///
+    /// `MTPLX_MTP_UNION_VERIFY=1` arms the grouped rule so the two costs can be
+    /// measured against each other in one window.
+    public static let unionAcrossRows: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_UNION_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw)
+    }()
+
+    /// Token rows in an assignment tensor of ANY rank: `[rows, K]`,
+    /// `[B, S, K]`, or anything else whose last axis is the per-row expert
+    /// slot. Derived, never assumed from a particular caller's layout.
+    public static func rowCount(_ indices: MLXArray) -> Int {
+        let slots = max(1, indices.dim(-1))
+        return indices.size / slots
+    }
+
+    /// Whether to group, as a pure function of the two counts — testable
+    /// with no array and no device at all.
+    ///
+    /// The historic rule was `indices.size >= 64` alone. That number is a
+    /// proxy for "this is a prompt pass", and it is the only thing that stood
+    /// between an MTP rectangular verify and the grouping it wants: a
+    /// `[1, 1+k]` verify at batch 1 produces `(1+k) * 8` assignments, so
+    /// widths 1 through 7 fell under it and width 8 landed exactly on it —
+    /// the verify silently changed algorithm at one width.
+    ///
+    /// The added rule is a property of the work, not of a size: grouping can
+    /// only ever save reads when more than one row is choosing experts. One
+    /// row has no collisions to exploit and is left byte-identical, which is
+    /// what keeps ordinary decode untouched. Two or more rows have them, at
+    /// every width, every batch size and every context length.
+    public static func shouldGroup(
+        assignments: Int, rows: Int, unionAcrossRows: Bool
+    ) -> Bool {
+        if assignments >= historicGroupingThreshold { return true }
+        guard unionAcrossRows else { return false }
+        return rows > 1
+    }
+
+    /// The historic rule, kept exactly so `MTPLX_MTP_UNION_VERIFY=0` restores
+    /// the previous behaviour bit for bit.
+    public static let historicGroupingThreshold = 64
+
+    /// D3, staged for an A/B and OFF by default.
+    ///
+    /// The fused reduction (`weightedExpertUnsort`) folds the unsort into the
+    /// weighted sum and writes `[tokens, hidden]` directly, skipping the
+    /// scatter. Its precondition is that the gather was grouped — which, since
+    /// the grouping rule above, is now true at verify shapes too. Its
+    /// eligibility check nonetheless still demanded the `>= 64` prompt size,
+    /// so the verify could group and then not be allowed to use the reduction
+    /// that grouping unlocks.
+    ///
+    /// Unlike the grouping itself, this one REASSOCIATES: it sums each row's
+    /// terms in sorted order rather than in slot order, so it is a numerics
+    /// change, not a scheduling change. The suite that covers it at prompt
+    /// shapes matches the legacy path to a tolerance, not bit for bit. That is
+    /// why it is default off and why its arm needs a token-parity read, not
+    /// just a tok/s read.
+    ///
+    /// [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION
+    public static let fusedReductionOnGroupedRows: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_FUSED_VERIFY_REDUCTION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw)
+    }()
+
+    /// Whether the direct weighted unsort may be used for this assignment
+    /// tensor. Pure counts again, and the historic answer unless D3 is on.
+    public static func allowsFusedReduction(
+        assignments: Int, rows: Int, unionAcrossRows: Bool, fusedOnGroupedRows: Bool
+    ) -> Bool {
+        if assignments >= historicGroupingThreshold { return true }
+        guard fusedOnGroupedRows else { return false }
+        return shouldGroup(
+            assignments: assignments, rows: rows, unionAcrossRows: unionAcrossRows)
+    }
+
+    public static func allowsFusedReduction(_ indices: MLXArray) -> Bool {
+        allowsFusedReduction(
+            assignments: indices.size,
+            rows: rowCount(indices),
+            unionAcrossRows: unionAcrossRows,
+            fusedOnGroupedRows: fusedReductionOnGroupedRows)
+    }
+
+    public static func shouldGroup(_ indices: MLXArray) -> Bool {
+        shouldGroup(
+            assignments: indices.size,
+            rows: rowCount(indices),
+            unionAcrossRows: unionAcrossRows)
+    }
+}
+
 private let qwenDirectExpertReductionEnabled: Bool = {
     let raw = ProcessInfo.processInfo.environment["MLX_QWEN_DIRECT_EXPERT_REDUCTION"]?
         .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1051,7 +1185,7 @@ public class SwitchGLU: Module {
         routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = indices.size >= 64
+        let doSort = SwitchGLUExpertGrouping.shouldGroup(indices)
 
         var idx = indices
         var inverseOrder: MLXArray? = nil
@@ -1135,7 +1269,7 @@ public class SwitchGLU: Module {
                 && weights.ndim == 2
                 && weights.shape == indices.shape
                 && weights.dtype == .bfloat16
-                && indices.size >= 64
+                && SwitchGLUExpertGrouping.allowsFusedReduction(indices)
         case .qwen35ProductionSwiGLU:
             return qwenDirectExpertReductionEnabled
                 && inputDims == 2048
@@ -1152,7 +1286,7 @@ public class SwitchGLU: Module {
                 && weights.ndim == 2
                 && weights.shape == indices.shape
                 && weights.dtype == .bfloat16
-                && indices.size >= 64
+                && SwitchGLUExpertGrouping.allowsFusedReduction(indices)
         }
     }
 
@@ -1242,7 +1376,21 @@ public class SwitchGLU: Module {
         // and smaller serving cohorts remain on their established reduction.
         let isEightRowDecode =
             !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
-        guard fuseSortedReduction && (isProductionPrefill || isEightRowDecode),
+        // [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION (D3, default off): a
+        // NON-prefill pass that the gather actually grouped — which since
+        // union-verify includes the rectangular MTP verify. Expressed here
+        // rather than by forcing `isProductionPrefill` true at the call site,
+        // because on this branch that flag carries a second meaning: it also
+        // decides whether an unsort CARRIER is produced for the fused
+        // layer-tail consumer. Conflating the two would hand a carrier to
+        // decode and verify passes that the tail path does not expect, and
+        // would defeat the exactness of the eight-row decode gate above.
+        let isGroupedNonPrefill =
+            !isProductionPrefill
+            && SwitchGLUExpertGrouping.fusedReductionOnGroupedRows
+            && SwitchGLUExpertGrouping.shouldGroup(indices)
+        guard fuseSortedReduction
+                && (isProductionPrefill || isEightRowDecode || isGroupedNonPrefill),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
             return (

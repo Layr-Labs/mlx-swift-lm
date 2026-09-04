@@ -22,6 +22,20 @@ import XCTest
 
 final class CBv2MTPCaptureVerifyTests: XCTestCase {
 
+    /// XCTest's equivalent of the `.fixtureRandomState` trait the swift-testing
+    /// suites carry: bind a PRNG private to this test around the whole
+    /// invocation, so `fixtureSeed` re-seeds that instead of the process-global
+    /// state seven other suites are also writing in parallel. See
+    /// `CBv2TestRandomState.swift`.
+    override func invokeTest() {
+        let state = MLXRandom.RandomState(seed: CBv2FixtureRandom.baseSeed)
+        CBv2FixtureRandom.$current.withValue(state) {
+            withRandomState(state) {
+                super.invokeTest()
+            }
+        }
+    }
+
     // MARK: - 1. Captured transaction lifecycle
 
     private var scalarSpec: CBv2RecurrentStateSpec {
@@ -388,14 +402,14 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             XCTAssertEqual(difference.item(Float.self), 0)
         }
 
-        MLXRandom.seed(4711)
+        fixtureSeed(4711)
         let config = try exactW4G64GDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
         quantize(model: layer, groupSize: 64, bits: 4)
         eval(layer)
 
         let hidden = config.hiddenSize
-        MLXRandom.seed(90210)
+        fixtureSeed(90210)
         let x0 = MLXRandom.normal([1, 1, hidden])
         let x1 = MLXRandom.normal([1, 1, hidden])
         let x2 = MLXRandom.normal([1, 1, hidden])
@@ -472,7 +486,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     }
 
     func testGDNWideWindowUsesCompactReplayAndMatchesEverySerialPrefix() throws {
-        MLXRandom.seed(0xC0FFEE)
+        fixtureSeed(0xC0FFEE)
         let config = try smallGDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
         eval(layer)
@@ -665,7 +679,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// compact tape, while attention remains at the speculative offset until
     /// the caller trims exactly the rejected suffix.
     func testRecurrentPrefixReplayMatchesSerialPrefixAndAttentionTrim() throws {
-        MLXRandom.seed(61_337)
+        fixtureSeed(61_337)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -727,7 +741,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// Shape-incompatible tapes fail closed before recurrent state mutation and
     /// release every layer's verify-only arrays for the fallback path.
     func testIneligibleRecurrentReplayCleansAllTapesWithoutStateMutation() throws {
-        MLXRandom.seed(61_338)
+        fixtureSeed(61_338)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -770,7 +784,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// Full acceptance explicitly discards the tape without touching state;
     /// an ordinary next forward and a direct cache reset also cannot retain it.
     func testRecurrentReplayTapeCleanupOnTerminalPaths() throws {
-        MLXRandom.seed(61_339)
+        fixtureSeed(61_339)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -825,7 +839,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let row = CBv2SamplerRow(
             id: id, params: params, promptTokens: [1, 2, 3], outputTokens: [])
 
-        MLXRandom.seed(5)
+        fixtureSeed(5)
         let logits0 = MLXRandom.normal([1, vocab])
         let logits1 = MLXRandom.normal([1, vocab])
         eval(logits0, logits1)

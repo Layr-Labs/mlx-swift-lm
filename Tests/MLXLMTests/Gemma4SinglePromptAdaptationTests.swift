@@ -248,6 +248,156 @@ final class Gemma4SinglePromptAdaptationTests: XCTestCase {
         XCTAssertTrue(CBv2ParallelArgMaxV1.admitsRows(4, minimumRows: 4))
     }
 
+    // MARK: - LGH-B1 (C3): fused tied head + argmax at one row
+
+    /// The tied head's own geometry at one activation row.
+    private func lghTiedHeadGeometry(
+        rows: Int = 1, k: Int = 2816, n: Int = 262_144
+    ) -> CBv2TiedLMHeadArgmaxB1V1.Geometry {
+        CBv2TiedLMHeadArgmaxB1V1.Geometry(
+            rows: rows,
+            k: k,
+            n: n,
+            weightPackedColumns: k * 4 / 32,
+            scaleRows: n,
+            scaleGroups: k / 64,
+            biasRows: n,
+            biasGroups: k / 64,
+            groupSize: 64,
+            bits: 4,
+            singlePosition: true,
+            bf16Activations: true,
+            bf16ScalesAndBiases: true,
+            uint32Weight: true,
+            hasBiases: true)
+    }
+
+    /// The production one-row tail is admitted; the kill switch removes it.
+    func testLogitslessB1AdmitsTheOneRowTiedHead() {
+        XCTAssertTrue(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry()))
+        XCTAssertFalse(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: false, lghTiedHeadGeometry()))
+    }
+
+    /// The eight-row cohort is refused on purpose: this body serves one
+    /// activation row per x-group, so a cohort plane would stream the whole
+    /// vocabulary once per row. `Gemma4MMAQuantizedGEMV` keeps that road.
+    func testLogitslessB1RefusesTheCohort() {
+        for rows in [0, 2, 4, 8, 16] {
+            XCTAssertFalse(
+                CBv2TiedLMHeadArgmaxB1V1.admits(
+                    enabled: true, lghTiedHeadGeometry(rows: rows)),
+                "rows \(rows)")
+        }
+    }
+
+    /// Every structural pin fails closed one at a time.
+    func testLogitslessB1FailsClosedOnEveryPin() {
+        var g = lghTiedHeadGeometry()
+        g.hasBiases = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "no biases")
+
+        g = lghTiedHeadGeometry()
+        g.singlePosition = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "multi position")
+
+        g = lghTiedHeadGeometry()
+        g.bf16Activations = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "fp32 activations")
+
+        g = lghTiedHeadGeometry()
+        g.bf16ScalesAndBiases = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "fp32 scales")
+
+        g = lghTiedHeadGeometry()
+        g.uint32Weight = false
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "unpacked weight")
+
+        g = lghTiedHeadGeometry()
+        g.bits = 8
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "8-bit")
+
+        g = lghTiedHeadGeometry()
+        g.groupSize = 32
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "group 32")
+
+        // N must be a whole number of 8-column tiles so `used_out_row` never
+        // moves a tile back and the partial count is exactly N / 8.
+        g = lghTiedHeadGeometry(n: 262_140)
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "N % 8")
+
+        // K must be whole affine groups, whole uint32 words, and at least one
+        // 256-value block deep.
+        XCTAssertFalse(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry(k: 2848)),
+            "K % 64")
+        XCTAssertFalse(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry(k: 128)),
+            "K below one block")
+        XCTAssertTrue(
+            CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, lghTiedHeadGeometry(k: 256)),
+            "K exactly one block")
+
+        // Sidecar planes must describe the same weight.
+        g = lghTiedHeadGeometry()
+        g.weightPackedColumns = 351
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "packed columns")
+
+        g = lghTiedHeadGeometry()
+        g.scaleGroups = 43
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "scale groups")
+
+        g = lghTiedHeadGeometry()
+        g.biasRows = 1
+        XCTAssertFalse(CBv2TiedLMHeadArgmaxB1V1.admits(enabled: true, g), "bias rows")
+    }
+
+    /// The engine seam: greedy, unconstrained, position-free, non-recurrent,
+    /// and both capabilities present.
+    func testLogitslessGreedyStepAdmission() {
+        XCTAssertTrue(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        // A grammar mask can move the argmax, so a constrained row refuses.
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: true, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        // The fused forward carries neither explicit positions nor recurrent
+        // bindings.
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: true,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: true, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+        // Either capability missing, or the kill switch, restores the
+        // logits-then-sample road.
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: false,
+                samplerAdmitsFusedGreedy: true))
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: true, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: false))
+        XCTAssertFalse(
+            cbv2LogitslessGreedyStepAdmits(
+                enabled: false, anyTokenConstraint: false, anyPositionState: false,
+                isRecurrent: false, modelAdmitsArgmaxDecode: true,
+                samplerAdmitsFusedGreedy: true))
+    }
+
     // MARK: - GATEUP-DENSE-CONCAT (C4): dense MLP gate|up load-time concat
 
     /// The exactness claim: concatenating gate and up along the OUTPUT axis

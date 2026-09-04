@@ -84,11 +84,13 @@ final class CBv2MTPRoundInFlight {
         let k: Int
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
-        /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
-        /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
-        /// all [B, 1+k] shortlist probability masses in parts-per-million.
-        /// One `asArray` at finalize reads everything, preserving the single
-        /// host-sync boundary.
+        /// Segment offsets into `acceptancePacket`. Built once on the launch
+        /// side and read at finalize, so the two sides cannot drift.
+        let layout: CBv2MTPAcceptancePacketLayout
+        /// Lazy flattened int32 packet whose segments are described by
+        /// `layout`: draft ids, target tokens, then the optional shortlist
+        /// masses and drafter runner-ups. One `asArray` at finalize reads
+        /// everything, preserving the single host-sync boundary.
         let acceptancePacket: MLXArray
         /// Lazy [B,k] draft ids retained for exact accepted-prefix slicing
         /// into stateful assistant finalization.
@@ -131,6 +133,9 @@ final class CBv2MTPRoundInFlight {
     var finalizedSeedIDs: Set<CBv2RequestID> = []
     var finalizedVerifyIDs: Set<CBv2RequestID> = []
     var claimedSeedCostNanos: UInt64 = 0
+    /// Launch-side stage times, completed at finalize and folded into the
+    /// driver's metrics there. See `CBv2MTPRoundTiming`.
+    var timing = CBv2MTPRoundTiming()
     /// Cancellation-owned assistant states released only after the target KV
     /// and recurrent deferred-release fence has retired.
     var deferredAssistantReleases: [any CBv2MTPRequestState] = []
@@ -211,29 +216,6 @@ struct CBv2MTPSeedCostLedger {
 
 /// Engine-side MTP state: drafter binding, carries, plan marks, metrics.
 final class CBv2MTPRoundDriver {
-
-    /// PARTICIPANT DRAFT-DEPTH LEVER (editable). The maximum MTP draft depth this
-    /// submission's adaptive controller uses per decode round. This is a CEILING,
-    /// not a fixed depth. The controller selects a depth from 0 to this ceiling
-    /// each round. A higher value widens the adaptive range. It does not force
-    /// speculation. The trusted MTP envelope (`config.maxDraftTokens`, ceiling 3
-    /// at batch 8) also bounds it, so the effective cap is
-    /// `min(envelope, submissionDraftDepth)`. Compiled at the envelope.
-    ///
-    /// UNIFORM WITH DFLASH. `DFlashDraftModel.submissionDraftDepth` is the DFlash
-    /// counterpart. It has the same name, the same meaning, and the same default
-    /// 1. The per-arm behaviour differs. MTP adapts up to this ceiling each round.
-    /// DFlash proposes a fixed block of this size, because block diffusion drafts
-    /// a whole block at once. The constant you edit is the same on both arms.
-    static let submissionDraftDepth = 3
-
-    /// The effective adaptive-depth ceiling: the trusted envelope's max, bounded
-    /// by the participant's `submissionDraftDepth`. Pure and static so the cap is
-    /// unit-testable without a full driver. It is a CEILING the controller adapts
-    /// under, never a fixed pin.
-    static func effectiveDraftCeiling(envelopeMax: Int) -> Int {
-        min(envelopeMax, submissionDraftDepth)
-    }
 
     let config: CBv2MTPConfig
     let drafter: any CBv2MTPDrafter
@@ -330,11 +312,10 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
-        // The adaptive controller's CEILING: the trusted envelope cap
-        // (`config.maxDraftTokens`), further bounded by the participant's
-        // `submissionDraftDepth`. `fixedDepth` stays `config.fixedDraftTokens`
-        // (adaptive) — submissionDraftDepth is a ceiling, NEVER a fixed pin, so
-        // the controller keeps choosing 0…this per round.
+        // The adaptive controller's CEILING is the trusted envelope cap
+        // (`config.maxDraftTokens`); `fixedDepth` is the integrator's optional
+        // deterministic pin. Nil `fixedDraftTokens` means the controller keeps
+        // choosing 0…ceiling per round from measured acceptance and cost.
         self.depthController = CBv2MTPDepthController(
             maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens)
         self.metrics.verificationMode = self.config.verificationMode
@@ -427,15 +408,15 @@ final class CBv2MTPRoundDriver {
             plannedDecodeRows: plannedDecodeRows)
     }
 
+    /// The largest draft depth automatic verification may plan for this many
+    /// decode rows. The rectangular envelope is a WIDTH budget
+    /// (`plannedDecodeRows * (1 + k) <= maxAutomaticRectangularTokens`).
     func maximumAutomaticDepth(plannedDecodeRows: Int) -> Int {
-        // The envelope cap, bounded by the participant's submissionDraftDepth —
-        // the same ceiling the depth controller was built with above.
-        let cap = Self.effectiveDraftCeiling(envelopeMax: config.maxDraftTokens)
         guard config.verificationMode == .automatic, plannedDecodeRows > 0 else {
-            return cap
+            return config.maxDraftTokens
         }
         let maxWidth = config.maxAutomaticRectangularTokens / plannedDecodeRows
-        return min(cap, max(0, maxWidth - 1))
+        return min(config.maxDraftTokens, max(0, maxWidth - 1))
     }
 
     private func verificationLimitedDecision(
@@ -456,9 +437,14 @@ final class CBv2MTPRoundDriver {
     /// controller's policy is target-only or its ceiling is zero. Fixed for
     /// the driver's lifetime, so the engine loop can skip its per-step MTP
     /// bookkeeping outright instead of re-deriving a zero depth every round.
-    var isTargetOnlyPolicy: Bool {
-        !CBv2MTPDepthController.speculationEnabled || depthController.maxDepth == 0
-    }
+    /// True only when the CONFIGURED envelope can never carry a positive
+    /// depth. The engine's fast paths (`beginMTPPlan`, `mtpWantsStep`, the
+    /// scheduler hook) skip their per-step bookkeeping on this, so it must
+    /// mean "speculation is impossible", never "speculation is switched off":
+    /// while it was `!speculationEnabled || ...` it was ALWAYS true, which
+    /// left `planDecision` at its inactive default (depth 0, bucket 0) for
+    /// every plan and disabled MTP outright.
+    var isTargetOnlyPolicy: Bool { depthController.isTargetOnly }
 
     var planDepth: Int { planDecision.depth }
     var planDecodeRowBucket: Int { planDecision.decodeRowBucket }
@@ -743,6 +729,19 @@ final class CBv2MTPRoundDriver {
         metricsLock.unlock()
     }
 
+    /// Uptime nanoseconds at which the previous round's finalize returned.
+    /// Engine-thread only (never read under the metrics lock): the next
+    /// round's `hostGapNanos` is measured from here, and that gap is dead GPU
+    /// time because MTP rounds do not chain.
+    var lastRoundFinalizeEndNanos: UInt64 = 0
+
+    func recordRoundTiming(_ timing: CBv2MTPRoundTiming) {
+        guard CBv2MTPRoundTiming.enabled else { return }
+        metricsLock.lock()
+        metrics.roundTiming.add(timing)
+        metricsLock.unlock()
+    }
+
     func recordSeedSteps(_ count: Int) {
         guard count > 0 else { return }
         metricsLock.lock()
@@ -775,6 +774,30 @@ final class CBv2MTPRoundDriver {
             metrics.perPositionAccepted[position] += 1
         }
         refreshControllerMetricsLocked()
+        metricsLock.unlock()
+    }
+
+    /// One rejected round's runner-up observation: at the position where the
+    /// chain's draft was NOT the target's token, was the drafter's rank-2
+    /// token? Counted only for a real divergence — a round cut short by a
+    /// stop token or the output budget never saw the comparison, and
+    /// including it would bias `r` toward zero.
+    func recordRunnerUp(position: Int, hit: Bool) {
+        precondition(position >= 0, "CBv2 MTP: runner-up position must be >= 0")
+        metricsLock.lock()
+        if metrics.perPositionRunnerUpObservations.count <= position {
+            let missing = position + 1 - metrics.perPositionRunnerUpObservations.count
+            metrics.perPositionRunnerUpObservations.append(
+                contentsOf: Array(repeating: 0, count: missing))
+            metrics.perPositionRunnerUpHits.append(
+                contentsOf: Array(repeating: 0, count: missing))
+        }
+        metrics.runnerUpObservations += 1
+        metrics.perPositionRunnerUpObservations[position] += 1
+        if hit {
+            metrics.runnerUpHits += 1
+            metrics.perPositionRunnerUpHits[position] += 1
+        }
         metricsLock.unlock()
     }
 
@@ -819,6 +842,28 @@ final class CBv2MTPRoundDriver {
                 nanos: wallTimeNanos)
             return
         }
+        // A seed is the price of the TRANSITION out of depth zero, not a
+        // recurring cost of the depth that follows it. `beginMTPPlan`
+        // invalidates every carry only when `planDepth == 0`, and
+        // `EngineLoopV2+MTPFinalize` calls `storeCarry` on every verify round
+        // that confirmed a token -- a PARTIAL rejection keeps its carry. So a
+        // settled positive depth never re-seeds, and charging the seed to that
+        // depth's steady-state sample answers a question nobody asked.
+        //
+        // It also answered it self-servingly: choosing depth zero forces the
+        // next probe to seed, the seed inflates that probe's sample, and the
+        // inflated sample re-chooses depth zero. Cost in, token out.
+        // `CBv2MTPRawCostEstimator` already refuses seed-attributed input for
+        // exactly this reason; the goodput controller was the outlier.
+        //
+        // The cost is not discarded: it is recorded as the bucket's transition
+        // cost, and `metrics.totalRoundWallTimeNanos` below still counts it, so
+        // no measured wall time disappears.
+        if claimedSeedCostNanos > 0 {
+            depthController.observeTransitionCost(
+                decodeRowBucket: decision.decodeRowBucket,
+                nanos: claimedSeedCostNanos)
+        }
         let rawCostEligible =
             usesMarginalPolicy
             && measurement.costEligible && !measurement.chained
@@ -847,7 +892,7 @@ final class CBv2MTPRoundDriver {
         let recorded = depthController.recordFinalizedStep(
             decision: decision,
             actualDepth: measurement.actualDepth,
-            wallTimeNanos: attributed,
+            wallTimeNanos: wallTimeNanos,
             costEligible: measurement.costEligible,
             chained: measurement.chained,
             finalizedPlainWork: finalizedPlainWork,
@@ -869,6 +914,10 @@ final class CBv2MTPRoundDriver {
 
     func probeIntervalForTesting(decodeRowBucket: Int) -> Int {
         depthController.probeIntervalForTesting(decodeRowBucket: decodeRowBucket)
+    }
+
+    func transitionCostNanosForTesting(decodeRowBucket: Int) -> UInt64 {
+        depthController.transitionCostNanosForTesting(decodeRowBucket: decodeRowBucket)
     }
 
     func metricsSnapshot() -> CBv2MTPMetrics {

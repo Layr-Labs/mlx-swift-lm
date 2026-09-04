@@ -51,27 +51,47 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     public func compactDecodeEvaluationRoots(
         forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
     ) -> [MLXArray]? {
+        // Same conditions, same order, same nil returns as before; each is now its
+        // own guard so an armed run says WHICH one declined. Behaviour is
+        // unchanged when marks are disarmed (the default).
+        func decline(_ reason: String) {
+            guard cbv2CompactDecodeRootMarksArmed else { return }
+            CBv2EngageMark.once("compact-decode-roots DECLINED: \(reason)")
+        }
         guard model is any CBv2LanguageModelDecodeOutputCoversCacheMutations else {
-            return nil
+            decline("model-does-not-affirm-output-covers-mutations"); return nil
         }
         let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
-        guard !contiguous.isEmpty,
-            contiguous.count == caches.count,
-            contiguous.allSatisfy({ $0.kind.sharesKVWithLayer == nil }),
-            let rowCount = contiguous.first?.rows.count,
-            rowCount > 0,
-            contiguous.allSatisfy({ $0.rows.count == rowCount }),
-            contiguous.allSatisfy({ cache in
-                cache.rows.allSatisfy {
-                    $0 is any CBv2DecodeRootCompactionCapableSequenceKV
-                }
-            }),
-            let stateIdentity = contiguous[0].unifiedPositionStateIdentity,
-            let offsets = contiguous[0].unifiedPositionOffsets,
-            contiguous.dropFirst().allSatisfy({
-                $0.unifiedPositionStateIdentity == stateIdentity
-            })
-        else { return nil }
+        guard !contiguous.isEmpty, contiguous.count == caches.count else {
+            decline("not-every-cache-is-CBv2LayerCache"); return nil
+        }
+        guard contiguous.allSatisfy({ $0.kind.sharesKVWithLayer == nil }) else {
+            decline("a-layer-shares-KV"); return nil
+        }
+        guard let rowCount = contiguous.first?.rows.count, rowCount > 0 else {
+            decline("no-rows"); return nil
+        }
+        guard contiguous.allSatisfy({ $0.rows.count == rowCount }) else {
+            decline("ragged-row-counts"); return nil
+        }
+        guard contiguous.allSatisfy({ cache in
+            cache.rows.allSatisfy {
+                $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+            }
+        }) else {
+            decline("a-row-is-not-DecodeRootCompactionCapable"); return nil
+        }
+        guard let stateIdentity = contiguous[0].unifiedPositionStateIdentity else {
+            decline("no-unified-position-state-identity"); return nil
+        }
+        guard let offsets = contiguous[0].unifiedPositionOffsets else {
+            decline("no-unified-position-offsets"); return nil
+        }
+        guard contiguous.dropFirst().allSatisfy({
+            $0.unifiedPositionStateIdentity == stateIdentity
+        }) else {
+            decline("position-state-identity-differs-across-layers"); return nil
+        }
 
         var roots = [forwardOutput, offsets]
         roots.reserveCapacity(2 + contiguous.count)

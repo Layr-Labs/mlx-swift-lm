@@ -91,8 +91,11 @@ struct CBv2MTPDepthControllerTests {
         let controller = CBv2MTPDepthController(maxDepth: 7, fixedDepth: nil)
         controller.observeCost(decodeRowBucket: 1, depth: 0, wallTimeNanos: 10)
         controller.observeCost(decodeRowBucket: 1, depth: 1, wallTimeNanos: 12)
-        #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).reason != "warmup_baseline")
-        #expect(controller.select(plannedDecodeRows: 3, canSpeculate: true).reason == "warmup_baseline")
+        // Bucket 1 has cost samples, so it is past its opening. Bucket 3 has
+        // never been seen and opens at the ceiling. The point is that the two
+        // buckets do not share learning, which is unchanged.
+        #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).reason != "open_ceiling")
+        #expect(controller.select(plannedDecodeRows: 3, canSpeculate: true).reason == "open_ceiling")
     }
 
     @Test func oneWallCostOutlierIsClamped() throws {
@@ -121,29 +124,43 @@ struct CBv2MTPDepthControllerTests {
 
     @Test func chainedDepthZeroElapsedCannotForceFalseSpeculation() throws {
         let driver = try makeDriver(maxDepth: 1)
-        let baseline = begin(driver)
-        #expect(baseline.reason == "warmup_baseline")
-        #expect(driver.requiresNonChainedDepthZeroProbe(baseline))
-        record(
-            driver, decision: baseline, actualDepth: 0,
-            wallTimeNanos: 100, finalizedPlainWork: true)
-
-        let exploration = begin(driver)
-        #expect(exploration.depth == 1)
-        #expect(exploration.reason == "explore_cost")
+        // The controller opens at the ceiling, which at maxDepth 1 is depth 1,
+        // and prices depth 0 on the way down. Only the ORDER moved; the
+        // depth-zero baseline is still required and still non-chained.
+        let opening = begin(driver)
+        #expect(opening.depth == 1)
+        #expect(opening.reason == "open_ceiling")
+        #expect(!driver.requiresNonChainedDepthZeroProbe(opening))
         let row = CBv2RequestID(1)
         record(
-            driver, decision: exploration, actualDepth: 0,
+            driver, decision: opening, actualDepth: 0,
             wallTimeNanos: 20, seedOnly: true,
             finalizedSeedIDs: [row])
         let verify = begin(driver)
         let seedCost = driver.claimPendingSeedCost(
             decodeRowBucket: 1, finalizedVerifyIDs: [row])
         #expect(seedCost == 20)
+        // 250 ns of ISOLATED verify against a 100 ns baseline. The seed is no
+        // longer folded in, so the verify cost has to be unprofitable on its
+        // own: depth 1 needs `cost1 / cost0 < 2 / (1 + hysteresisFraction)`,
+        // i.e. under 190 ns. (Before the seed fix this read 190 + 20 = 210 and
+        // the 20 ns seed was doing the deciding.)
         record(
             driver, decision: verify, actualDepth: 1,
-            wallTimeNanos: 190, finalizedVerification: true,
+            wallTimeNanos: 250, finalizedVerification: true,
             claimedSeedCostNanos: seedCost)
+        // The seed cost is recorded, just not against depth 1.
+        #expect(driver.transitionCostNanosForTesting(decodeRowBucket: 1) == 20)
+
+        // Now the downward scan reaches depth 0, and THIS is the decision that
+        // must break the chain.
+        let baseline = begin(driver)
+        #expect(baseline.depth == 0)
+        #expect(baseline.reason == "explore_cost")
+        #expect(driver.requiresNonChainedDepthZeroProbe(baseline))
+        record(
+            driver, decision: baseline, actualDepth: 0,
+            wallTimeNanos: 100, finalizedPlainWork: true)
 
         let targetOnly = begin(driver)
         #expect(targetOnly.depth == 0)
@@ -164,19 +181,16 @@ struct CBv2MTPDepthControllerTests {
 
     @Test func exploratorySeedBindsToVerifyAndActiveTransitionWaits() throws {
         let driver = try makeDriver(maxDepth: 1)
-        let baseline = begin(driver)
-        record(
-            driver, decision: baseline, actualDepth: 0,
-            wallTimeNanos: 100, finalizedPlainWork: true)
-
-        let exploration = begin(driver)
+        // Seed the ceiling opening; the depth-zero baseline follows it.
+        let opening = begin(driver)
+        #expect(opening.depth == 1)
         let row = CBv2RequestID(7)
         record(
-            driver, decision: exploration, actualDepth: 0,
+            driver, decision: opening, actualDepth: 0,
             wallTimeNanos: 30, seedOnly: true,
             finalizedSeedIDs: [row])
         #expect(driver.pendingSeedCostCountForTesting == 1)
-        #expect(begin(driver).reason == "explore_cost")
+        #expect(begin(driver).reason == "open_ceiling")
 
         let verification = driver.controllerDecision
         let seedCost = driver.claimPendingSeedCost(
@@ -189,8 +203,23 @@ struct CBv2MTPDepthControllerTests {
             driver.metricsSnapshot().costInputs.first {
                 $0.decodeRowBucket == 1 && $0.depth == 1
             })
-        #expect(depthOne.totalWallTimeNanos == 50)
+        // The seed still BINDS to this verify -- that is what the cohort match
+        // in `CBv2MTPSeedCostLedger` is for, and it is why the claim has to
+        // happen before verify-row completion retires the request ids. What
+        // changed is where the 30 ns lands: on the bucket's transition cost,
+        // not on depth 1's steady-state sample, which is the isolated 20 ns.
+        #expect(depthOne.totalWallTimeNanos == 20)
+        #expect(driver.transitionCostNanosForTesting(decodeRowBucket: 1) == 30)
         #expect(driver.activeDepthForTesting(decodeRowBucket: 1) == 0)
+
+        // The scan still owes depth 0. Price it, then the goodput comparison
+        // becomes possible and the transition is a real selection.
+        let baseline = begin(driver)
+        #expect(baseline.depth == 0)
+        #expect(baseline.reason == "explore_cost")
+        record(
+            driver, decision: baseline, actualDepth: 0,
+            wallTimeNanos: 100, finalizedPlainWork: true)
 
         let transition = begin(driver)
         #expect(transition.depth == 1)
@@ -239,16 +268,22 @@ struct CBv2MTPDepthControllerTests {
 
     @Test func noVerificationDoesNotAdvanceProbeBackoff() throws {
         let driver = try makeDriver(maxDepth: 1)
+        // Open at the ceiling, then price depth 0 on the way down. The probe
+        // cadence this test is about only starts once both rungs are costed.
+        let opening = begin(driver)
+        record(
+            driver, decision: opening, actualDepth: 1,
+            wallTimeNanos: 250, finalizedVerification: true)
         let baseline = begin(driver)
+        #expect(baseline.depth == 0)
         record(
             driver, decision: baseline, actualDepth: 0,
             wallTimeNanos: 100, finalizedPlainWork: true)
-        let initialExploration = begin(driver)
-        record(
-            driver, decision: initialExploration, actualDepth: 1,
-            wallTimeNanos: 250, finalizedVerification: true)
 
-        for _ in 0 ..< 7 {
+        // Eight, not seven: the ceiling opening spends one more decision before
+        // the first non-exploration round, and `roundsSinceProbe` only starts
+        // counting from there.
+        for _ in 0 ..< 8 {
             let targetOnly = begin(driver)
             #expect(targetOnly.depth == 0)
             record(
@@ -272,7 +307,21 @@ struct CBv2MTPDepthControllerTests {
         record(
             driver, decision: unchanged, actualDepth: 1,
             wallTimeNanos: 250, finalizedVerification: true)
-        #expect(driver.probeIntervalForTesting(decodeRowBucket: 1) == 16)
+        // This probe is the FIRST to land on depth 1 since the opening scan
+        // priced depth 0, so it is new information at that position and the
+        // cadence stays at base. Before the ceiling opening the depth-0
+        // baseline came first, so the very first probe was already a repeat and
+        // this test saw the doubling one cycle earlier.
+        //
+        // The doubling itself is NOT asserted here any more. It needs a second
+        // probe at the same position with no new acceptance sample, and driving
+        // the driver that far turns this test into a cadence test. The end-to-
+        // end shape -- gaps 33, 65, 129, 257 and the interval at its 256 cap --
+        // is pinned by
+        // `CBv2MTPProbeCadenceTests.unprofitableCostLearnsTheEnvelopeThenBacksOff`.
+        // What THIS test is for is unchanged and still asserted above: a probe
+        // that produced no verification does not advance the backoff.
+        #expect(driver.probeIntervalForTesting(decodeRowBucket: 1) == 8)
     }
 
     @Test func seedCostLedgerIsDepthAgnosticAndRejectsChangedCohorts() {

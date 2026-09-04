@@ -17,7 +17,7 @@ import MLXRandom
 import MLXLLM
 import Testing
 
-@Suite("Gemma4 MTP stochastic sampling", .serialized)
+@Suite("Gemma4 MTP stochastic sampling", .serialized, .fixtureRandomState)
 struct Gemma4MTPStochasticTests {
 
     private func tinyTarget() throws -> Gemma4TextModel {
@@ -87,7 +87,7 @@ struct Gemma4MTPStochasticTests {
     /// Temperature > 0 path runs end-to-end, emits the right count, and
     /// every token is within the vocab range.
     @Test func stochasticIteratorEmitsValidTokens() async throws {
-        MLXRandom.seed(42)
+        fixtureSeed(42)
         let target = try tinyTarget()
         let drafter = try tinyDrafter()
         eval(target, drafter)
@@ -117,7 +117,7 @@ struct Gemma4MTPStochasticTests {
     /// for the same seed (drafter/target distributions become
     /// degenerate point masses at the argmax).
     @Test func lowTempCollapsesToGreedy() async throws {
-        MLXRandom.seed(42)
+        fixtureSeed(42)
         let target = try tinyTarget()
         let drafter = try tinyDrafter()
         eval(target, drafter)
@@ -155,7 +155,7 @@ struct Gemma4MTPStochasticTests {
     /// masks out everything except the argmax, so the rejection sampler
     /// has no choice but to accept that token every time.
     @Test func topKOneCollapsesToGreedy() async throws {
-        MLXRandom.seed(42)
+        fixtureSeed(42)
         let target = try tinyTarget()
         let drafter = try tinyDrafter()
         eval(target, drafter)
@@ -197,7 +197,7 @@ struct Gemma4MTPStochasticTests {
     /// toward the argmax token — repeated samples under topP=0.01 should
     /// be much less varied than topP=1.0 at the same temperature.
     @Test func lowTopPNarrowsOutput() async throws {
-        MLXRandom.seed(42)
+        fixtureSeed(42)
         let target = try tinyTarget()
         let drafter = try tinyDrafter()
         eval(target, drafter)
@@ -238,7 +238,7 @@ struct Gemma4MTPStochasticTests {
     /// Different seeds at temperature > 0 should produce different output
     /// (sanity: the sampler is actually stochastic).
     @Test func differentSeedsProduceDifferentOutput() async throws {
-        MLXRandom.seed(42)
+        fixtureSeed(42)
         let target = try tinyTarget()
         let drafter = try tinyDrafter()
         eval(target, drafter)
