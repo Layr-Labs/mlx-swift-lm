@@ -153,17 +153,6 @@ enum CBv2AttentionV1 {
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
-    /// Join prompt attention blocks directly into the token-major layout that
-    /// the following output projection consumes. The returned value remains a
-    /// head-major view, so callers keep the same typed interface while their
-    /// existing transpose restores the contiguous token-major buffer.
-    static let tokenMajorJoinEnabled: Bool = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_PREFILL_TOKENMAJOR_JOIN"]
-        else { return true }
-        return !["0", "false", "no", "off"].contains(raw.lowercased())
-    }()
-
     /// PREFILL-JOIN-KERNEL. One dispatch writes the token-major prompt
     /// attention rectangle from all of a chunk's query-block outputs. The
     /// established token-major join materializes the same rectangle through
@@ -1260,27 +1249,6 @@ enum CBv2AttentionV1 {
             let joined = joinTokenMajor(outputs)
         {
             return joined.transposed(0, 2, 1, 3)
-        }
-        // PREFILL-TOKENMAJOR-JOIN. The established head-major join is
-        // immediately transposed and reshaped by Gemma4Attention, forcing a
-        // second full pass over the prompt attention output. Permuting each
-        // block before concatenation writes the final token-major rectangle
-        // directly. Returning its inverse-transposed view preserves this
-        // function's `[B, H, L, D]` contract; the caller's existing transpose
-        // composes to identity and its reshape can share the buffer.
-        //
-        // `blockSize > 8 && newTokenCount > 8` is the prompt-only composed
-        // attention plane. Decode is L=1 and MTP serial verification uses
-        // blockSize=1, so neither can enter this branch.
-        if tokenMajorJoinEnabled,
-            blockSize > 8,
-            newTokenCount > 8,
-            outputs[0].ndim == 4
-        {
-            CBv2EngageMark.once("prefill-tokenmajor-join")
-            let tokenMajor = concatenated(
-                outputs.map { $0.transposed(0, 2, 1, 3) }, axis: 1)
-            return tokenMajor.transposed(0, 2, 1, 3)
         }
         return concatenated(outputs, axis: 2)
     }
