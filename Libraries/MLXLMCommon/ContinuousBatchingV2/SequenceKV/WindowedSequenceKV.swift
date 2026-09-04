@@ -426,6 +426,37 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
         oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
     }
 
+    /// RING-READ-FOLD-B1: the ordinary in-place decode ring write, exposed so
+    /// the B=1 sliding fold can write the token itself and then attend the ring
+    /// in place. Identical to the write `update(...)` performs; the q4 KV mirror
+    /// that once rode alongside it was dropped in PR 1, so this is the bf16 ring
+    /// write only.
+    func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
+        allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
+        writeDecodeToken(keys: newKeys, values: newValues)
+    }
+
+    /// The retained ring K/V and the logical temporal start, on a full ring, for
+    /// an in-place attend (RING-READ-FOLD-B1). Nil unless the ring is full and no
+    /// speculative (MTP) transaction is staged.
+    var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        return (keys, values, oldestValidPosition % window)
+    }
+
+    /// The ring view a fold decode step should attend: the SAME allocations and
+    /// the SAME start `decodeRingView` would report AFTER this step's one-token
+    /// `decodeRingWrite`, offered before that write happens. Only defined on an
+    /// already-full ring, where the append evicts exactly one entry so
+    /// `oldestValidPosition` advances by one and the post-write start is
+    /// `(oldestValidPosition + 1) % window`. `CBv2RingReadFoldB1` consults it to
+    /// prove eligibility BEFORE the write, so the post-write attend cannot fail.
+    var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        return (keys, values, (oldestValidPosition + 1) % window)
+    }
+
     /// Views covering absolute positions `[from, to)` in temporal order:
     /// one slice when the modular range does not cross the wrap point,
     /// two slices when it does. `to - from` must be ≤ `window`.

@@ -456,6 +456,30 @@ enum CBv2AttentionV1 {
                     queries: queries, keys: keys, values: values,
                     scale: scale, sinks: effectiveSinks, softcap: softcap)
             }
+            // RING-READ-FOLD-B1: a full sliding ring reads in place (no
+            // `temporalOrder` concat) via a one-row port of the B=8 `attendRing`
+            // two-pass. Eligibility is proven BEFORE the in-place write, so the
+            // post-write attend cannot fail. See `CBv2RingReadFoldB1`.
+            if L == 1,
+                let ring = rows[0] as? CBv2WindowedSequenceKV,
+                CBv2RingReadFoldB1.eligible(
+                    ring: ring, kind: kind, queries: queries, keys: keys,
+                    values: values, scale: scale, sinks: effectiveSinks,
+                    softcap: softcap)
+            {
+                ring.decodeRingWrite(keys: keys, values: values)
+                guard let view = ring.decodeRingView,
+                    let output = CBv2RaggedTwoPassDecodeAttentionV1.attendRingB1(
+                        queries: queries, keys: view.keys, values: view.values,
+                        start: view.start, scale: scale,
+                        slidingWindowLength: ring.window)
+                else {
+                    preconditionFailure(
+                        "RING-READ-FOLD-B1: eligible ring failed to attend after write")
+                }
+                CBv2EngageMark.once("ringreadfoldb1")
+                return output
+            }
             return updateAndAttendRow(
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
