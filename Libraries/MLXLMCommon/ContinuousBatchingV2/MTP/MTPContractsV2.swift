@@ -534,7 +534,19 @@ public enum CBv2MTPRoundSwitches {
     /// EARLIER than the verify's writes, never later, and on contiguous
     /// storage the capture (`..<absoluteOffset`) and the verify's writes
     /// (`absoluteOffset...`) are disjoint ranges of the same buffer.
-    public static let pipelinedDraftSubmit = flag("MTPLX_MTP_PIPELINED_DRAFT_SUBMIT")
+    ///
+    /// DEFAULT ON on this branch. Measured on the serial stack at verify
+    /// width 4: 138.5 -> 151.6 tok/s alone (+9.5%), and 153.7 -> 168.4 with the
+    /// fused verify (+9.6%). The two are close to additive: the separate gains
+    /// sum to +28.3 tok/s and the joint gain is +29.9.
+    ///
+    /// The emitted stream is unchanged, for the reason in the safety note
+    /// above: this moves WHEN the drafter is submitted, never what it computes.
+    ///
+    /// `MTPLX_MTP_PIPELINED_DRAFT_SUBMIT=0` restores the previous behaviour for
+    /// a control arm.
+    public static let pipelinedDraftSubmit = flagDefaultOn(
+        "MTPLX_MTP_PIPELINED_DRAFT_SUBMIT")
 
     /// [engage] MTPLX_MTP_TREE_DRAFT=<shape>
     ///
@@ -686,6 +698,17 @@ public enum CBv2MTPRoundSwitches {
     private static func flag(_ key: String) -> Bool {
         guard let raw = ProcessInfo.processInfo.environment[key] else { return false }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+
+    /// For a switch whose measured configuration is the default. The negative
+    /// spellings are accepted so a control arm can turn it off, and any other
+    /// value leaves it on: an unreadable value must not silently disable a
+    /// measured default.
+    private static func flagDefaultOn(_ key: String) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw)
     }
 }
 

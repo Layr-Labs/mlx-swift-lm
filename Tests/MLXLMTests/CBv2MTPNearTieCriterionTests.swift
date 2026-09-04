@@ -98,6 +98,20 @@ struct CBv2MTPNearTieCriterionTests {
         }
     }
 
+    /// DEFAULT ON. Measured on the serial stack at verify width 4:
+    /// 138.5 -> 151.6 tok/s alone, and 153.7 -> 168.4 with the fused verify.
+    /// The switch moves WHEN the drafter is submitted, never what it computes,
+    /// so the emitted stream is unchanged.
+    ///
+    /// The default is pinned because it is now part of the measured
+    /// configuration. A build that loses it loses about 10% with no error.
+    @Test("pipelined draft submit is on by default")
+    func pipelinedDraftSubmitDefaultsOn() {
+        if ProcessInfo.processInfo.environment["MTPLX_MTP_PIPELINED_DRAFT_SUBMIT"] == nil {
+            #expect(CBv2MTPRoundSwitches.pipelinedDraftSubmit)
+        }
+    }
+
     @Test("fused verify engages only from its measured crossover width up")
     func fusedVerifyHasAWidthFloor() {
         // The predicate reads the WIDTH and nothing else: no prompt length, no

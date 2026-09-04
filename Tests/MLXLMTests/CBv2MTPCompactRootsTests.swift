@@ -17,26 +17,32 @@ struct CBv2MTPCompactRootsTests {
 
     // MARK: the switch itself
 
-    @Test("the switch is DEFAULT OFF on this branch")
-    func defaultOff() {
-        #expect(resolveCBv2MTPCompactRootsEnabled(nil) == false)
+    /// DEFAULT ON. The round arm has run: +1.2% at verify width 4 on the serial
+    /// stack, 7 of 7 completions token-identical. The default is pinned here so
+    /// a build cannot lose the measured configuration in silence.
+    @Test("the switch is DEFAULT ON on this branch")
+    func defaultOn() {
+        #expect(resolveCBv2MTPCompactRootsEnabled(nil) == true)
     }
 
-    @Test("only explicit truthy values arm it")
-    func onlyTruthyArms() {
-        for raw in ["1", "true", "yes", "on", "TRUE", "On"] {
-            #expect(resolveCBv2MTPCompactRootsEnabled(raw) == true, "\(raw) should arm")
+    @Test("only an explicit negative disarms it")
+    func onlyNegativeDisarms() {
+        for raw in ["0", "false", "no", "off", "OFF", "False"] {
+            #expect(resolveCBv2MTPCompactRootsEnabled(raw) == false, "\(raw) should disarm")
         }
-        for raw in ["0", "false", "no", "off", "", "maybe", "2"] {
-            #expect(resolveCBv2MTPCompactRootsEnabled(raw) == false, "\(raw) must not arm")
+        // Anything else leaves the measured default in place. An unreadable
+        // value must not silently turn a measured default off.
+        for raw in ["1", "true", "yes", "on", "", "maybe", "2"] {
+            #expect(resolveCBv2MTPCompactRootsEnabled(raw) == true, "\(raw) must stay armed")
         }
     }
 
     @Test("it is independent of the plain decode-roots switch")
     func independentOfDecodeSwitch() {
-        // The decode switch defaults ON, this one defaults OFF: the verify runs
-        // inside a speculative write transaction the decode path never enters,
-        // so they are armed separately until the round arm has run.
+        // Both default ON now that the round arm has run, but they stay
+        // SEPARATE switches: the verify runs inside a speculative write
+        // transaction the decode path never enters, so each surface must be
+        // disarmable on its own.
         #expect(resolveCBv2CompactDecodeRootsEnabled(nil) == true)
         #expect(resolveCBv2MTPCompactRootsEnabled(nil) == false)
     }

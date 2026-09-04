@@ -70,9 +70,17 @@ private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled
 /// the plain decode path never does, so the two surfaces are armed
 /// independently until the round arm has run.
 @inline(__always)
+/// DEFAULT ON on this branch. Measured +1.2% at verify width 4 on the serial
+/// stack, 7 of 7 completions token-identical. Roots decide what is FORCED,
+/// never what is computed, so the emitted tokens and the acceptance packet are
+/// unchanged by construction; the measurement confirms that rather than
+/// establishing it.
+///
+/// `DARKBLOOM_CBV2_MTP_COMPACT_ROOTS=0` restores the previous behaviour for a
+/// control arm.
 internal func resolveCBv2MTPCompactRootsEnabled(_ raw: String?) -> Bool {
-    guard let raw else { return false }
-    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    guard let raw else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
 }
 
 internal let cbv2MTPCompactRootsEnabled = resolveCBv2MTPCompactRootsEnabled(
