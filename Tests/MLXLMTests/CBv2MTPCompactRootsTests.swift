@@ -53,7 +53,9 @@ struct CBv2MTPCompactRootsTests {
         //
         // A model that declines compaction must fall back, and the fallback is the
         // established full list.
-        struct Decliner: CBv2SteppableModel {
+        // `CBv2SteppableModel` is AnyObject-constrained (EngineLoopV2.swift:28),
+        // so the stand-in must be a class, not a struct.
+        final class Decliner: CBv2SteppableModel {
             func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
                 tokens
             }
