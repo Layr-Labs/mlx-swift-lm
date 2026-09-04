@@ -57,6 +57,10 @@ extension EngineLoopV2 {
             sampledRows: graph.sampledRows,
             sampledTokens: graph.sampledTokens,
             evalTargets: graph.prefillEvalTargets,
+            computedRanges: Dictionary(
+                uniqueKeysWithValues: work.map {
+                    ($0.rec.id, $0.start ..< ($0.start + $0.count))
+                }),
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = graph.logprobSegments
         step.recurrentEvaluations = graph.recurrentEvaluations

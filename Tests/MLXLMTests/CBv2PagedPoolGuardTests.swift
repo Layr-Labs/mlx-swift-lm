@@ -81,6 +81,23 @@ struct CBv2PagedPoolGuardTests {
         #expect(pool.bytesInUse == 0)
     }
 
+    @Test func negativeReservationCannotCorruptTheAdmissionLedger() throws {
+        let pool = try PagedKVPool(layerKinds: [fullKind()], config: config())
+        let initialFreeList = pool.group(key).freeList
+
+        #expect(throws: CBv2KVError.self) { try pool.reserve([key: -1]) }
+        #expect(pool.bytesReserved == 0)
+        #expect(pool.group(key).pagesReserved == 0)
+        #expect(pool.group(key).freeList == initialFreeList)
+
+        // A rejected negative claim must not buy capacity for a later request.
+        let usable = pool.usablePageCount(group: key)
+        try pool.reserve([key: usable])
+        #expect(throws: CBv2KVError.self) { try pool.reserve([key: 1]) }
+        pool.unreserve([key: usable])
+        #expect(pool.bytesReserved == 0)
+    }
+
     /// Repeated allocate/free churn must never work the poison page into the
     /// free list. The free list is a LIFO stack that `freePage` appends to,
     /// so a single mis-accounted release would surface as the poison page

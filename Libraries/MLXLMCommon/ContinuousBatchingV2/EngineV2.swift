@@ -107,8 +107,9 @@ final class CBv2EngineGauges: @unchecked Sendable {
 /// all mutable state is either lock-protected (`stateLock`,
 /// `CBv2EngineGauges`) or confined to the engine's serial dispatch queue
 /// inside `EngineLoopV2`; the only cross-thread surfaces are `submit`
-/// (lock + queue hop), `cancel` (lock), `capacity()` (lock), and
-/// `shutdown()` (queue-synchronized drain).
+/// (lock + queue hop), resident-prefix preflight (index lock, advisory only),
+/// `cancel` (lock), `capacity()` (lock), and `shutdown()`
+/// (queue-synchronized drain).
 public final class EngineV2: CBv2Engine, @unchecked Sendable {
     private let loop: EngineLoopV2
     private let admission: AdmissionV2
@@ -127,6 +128,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// the submit thread (hashing is host work — never on the engine step
     /// thread); adoption and donation are handled by the loop.
     private let prefixCache: CBv2PrefixCache?
+    /// Optional physical-page L1 discovered from the paged backend. Hash
+    /// preparation is submit-thread safe; index lookup/claim stays on the
+    /// serial engine queue.
+    private let residentPrefixBackend: (any CBv2PagedPrefixSharingBackend)?
     public let prefixReuseCapability: CBv2PrefixReuseCapability
     public let modelCapabilities: CBv2ModelCapabilities
     /// Exact fixed per-request charge after recurrent/MTP capability
@@ -217,6 +222,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             schedulerConfig.enablePrefixCache && prefixReuseCapability.isSupported
             ? prefixCache : nil
         self.prefixCache = activePrefixCache
+        let residentCandidate = backend as? any CBv2PagedPrefixSharingBackend
+        self.residentPrefixBackend =
+            schedulerConfig.enablePrefixCache && prefixReuseCapability.isSupported
+                && residentCandidate?.residentPrefixCacheStats != nil
+            ? residentCandidate : nil
         if let violation = Self.prefixCachePairingViolation(
             backend: backend, prefixCache: activePrefixCache)
         {
@@ -346,6 +356,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             scheduler: scheduler,
             capacity: admission,
             prefixCache: activePrefixCache,
+            residentPrefixBackend: residentPrefixBackend,
+            prefixReuseCapability: prefixReuseCapability,
+            nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
             mtp: mtpDriver,
             config: loopConfig,
             gauges: gauges)
@@ -578,7 +591,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         }
 
         loop.enqueue(
-            request, prefixLookup: makePrefixLookup(for: request), multimodal: multimodal)
+            request,
+            prefixLookup: makePrefixLookup(for: request),
+            residentPrefixProbe: makeResidentPrefixProbe(for: request),
+            multimodal: multimodal)
         return stream.makeStream()
     }
 
@@ -680,7 +696,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// The lookup pin travels with the adoption; the loop balances it in
     /// every outcome.
     private func makePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
-        guard let prefixCache else {
+        guard prefixCache != nil || residentPrefixBackend != nil else {
             return CBv2PrefixLookup(adoption: nil, outcome: .disabled, matchedTokens: 0)
         }
         guard request.prefixCacheEnabled else {
@@ -696,6 +712,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // would be silently wrong KV.
         guard request.multimodal == nil else {
             return CBv2PrefixLookup(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
+        }
+        guard let prefixCache else {
+            // The engine-queue resident lookup has not run yet.
+            return CBv2PrefixLookup(adoption: nil, outcome: .miss, matchedTokens: 0)
         }
         let cacheRequestID = request.prefixCacheReceiptID ?? request.id
         guard
@@ -774,6 +794,43 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 requestID: cacheRequestID, tokens: request.promptTokens, matched: hit.matched,
                 plan: plan, prefix: prefix, cacheSalt: request.cacheSalt),
             outcome: .adoptionFailed, matchedTokens: hit.matched)
+    }
+
+    /// Pure submit-thread hash preparation for the resident paged L1. The
+    /// mutable index and physical page refs are intentionally untouched here.
+    private func makeResidentPrefixProbe(for request: CBv2Request) -> CBv2PagedPrefixProbe? {
+        guard let residentPrefixBackend,
+            request.prefixCacheEnabled,
+            cbv2LayerKindsAllowPrefixReuse(layerKinds),
+            request.multimodal == nil
+        else { return nil }
+        return residentPrefixBackend.preparePrefixProbe(
+            tokens: request.promptTokens, cacheSalt: request.cacheSalt)
+    }
+
+    /// Advisory only: no page reference is taken here. A generation-checked
+    /// claim still runs on the serial engine queue after submission, so a page
+    /// recycled in between produces a cold fallback rather than stale KV.
+    public func residentPrefixCandidate(
+        for request: CBv2Request
+    ) -> CBv2ResidentPrefixCandidate? {
+        guard let residentPrefixBackend,
+            let probe = makeResidentPrefixProbe(for: request),
+            let match = residentPrefixBackend.peekResidentPrefix(for: probe)
+        else { return nil }
+        let completionBudget = max(request.maxTokens, 1)
+        let (maxLength, overflow) = request.promptTokens.count.addingReportingOverflow(
+            completionBudget)
+        guard !overflow,
+            let plan = prefixReuseCapability.plan(
+                matchedBoundary: match.matchedTokens,
+                maximumSequenceLength: maxLength,
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken),
+            plan.prefillTokensSaved > 0
+        else { return nil }
+        return CBv2ResidentPrefixCandidate(
+            matchedTokens: match.matchedTokens,
+            prefillTokensSaved: plan.prefillTokensSaved)
     }
 
     /// Cancel promptly: the in-flight step completes, the row is dropped

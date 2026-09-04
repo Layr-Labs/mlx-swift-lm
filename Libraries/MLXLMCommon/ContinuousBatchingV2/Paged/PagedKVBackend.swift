@@ -48,6 +48,10 @@ public final class PagedKVBackend: CBv2KVBackend {
     public let pool: PagedKVPool
     /// The model's per-layer structure this backend was built for.
     public let layerKinds: [CBv2LayerKind]
+    /// Non-owning physical-page prefix index. nil preserves the historical
+    /// paged backend byte-for-byte; the engine discovers the optional native
+    /// capability without changing the snapshot-cache contract.
+    let residentPrefixIndex: PagedPrefixBlockIndex?
     /// WHEN this backend's slabs become MLX-resident. See
     /// PagedKVSlabCommitment.swift — the default defers the commitment past
     /// engine construction so an idle pool does not pre-empt a co-resident
@@ -64,7 +68,8 @@ public final class PagedKVBackend: CBv2KVBackend {
     public init(
         layerKinds: [CBv2LayerKind],
         config: PagedKVPoolConfig,
-        slabCommitment: PagedKVSlabCommitment = .atFirstAdmission
+        slabCommitment: PagedKVSlabCommitment = .atFirstAdmission,
+        residentPrefixCache: CBv2PagedPrefixCacheConfig? = nil
     ) throws {
         for (index, kind) in layerKinds.enumerated() {
             if let source = kind.sharesKVWithLayer {
@@ -105,7 +110,24 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
         self.layerKinds = layerKinds
         self.slabCommitment = slabCommitment
-        self.pool = try PagedKVPool(layerKinds: layerKinds, config: config)
+        var effectiveConfig = config
+        if let residentPrefixCache {
+            if let declared = effectiveConfig.prefixSharingBlockSize,
+                declared != residentPrefixCache.blockSize
+            {
+                throw CBv2KVError.backendIneligible(
+                    reason: "pool prefixSharingBlockSize \(declared) does not match resident "
+                        + "cache block size \(residentPrefixCache.blockSize)")
+            }
+            effectiveConfig.prefixSharingBlockSize = residentPrefixCache.blockSize
+        }
+        self.pool = try PagedKVPool(layerKinds: layerKinds, config: effectiveConfig)
+        if let residentPrefixCache {
+            self.residentPrefixIndex = try PagedPrefixBlockIndex(
+                pool: pool, layerKinds: layerKinds, config: residentPrefixCache)
+        } else {
+            self.residentPrefixIndex = nil
+        }
         if slabCommitment == .atConstruction {
             // An eager commit that cannot fit fails the BUILD (throwing
             // `capacityExhausted`), which is the honest posture for the

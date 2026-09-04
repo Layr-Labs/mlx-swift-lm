@@ -341,6 +341,10 @@ final class CBv2InFlightStep {
     /// Every request that computed anything this step (KV release for any of
     /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
     let participants: Set<CBv2RequestID>
+    /// Exact token ranges whose KV work THIS step launched. Scheduler records
+    /// may already include a chained successor when this step finalizes, so
+    /// prefix publication must use these immutable bounds instead.
+    let computedRanges: [CBv2RequestID: Range<Int>]
     /// Rows that sampled a token, in plan order (== row order of
     /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
@@ -386,10 +390,12 @@ final class CBv2InFlightStep {
         assignments: [(id: CBv2RequestID, numTokens: Int)],
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
         sampledTokens: MLXArray?, evalTargets: [MLXArray],
+        computedRanges: [CBv2RequestID: Range<Int>] = [:],
         wallStartedNanos: UInt64
     ) {
         self.assignments = assignments
         self.participants = participants
+        self.computedRanges = computedRanges
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
         self.evalTargets = evalTargets
@@ -432,6 +438,7 @@ struct CBv2PrefixLookup: @unchecked Sendable {
 
 struct CBv2PrefixUsage {
     var outcome: CBv2PrefixCacheOutcome
+    var tier: CBv2PrefixCacheTier?
     var matchedTokens: Int
     var prefillTokensSaved: Int
     var strategy: CBv2PrefixReuseStrategy?
@@ -440,6 +447,7 @@ struct CBv2PrefixUsage {
 
     static let disabled = CBv2PrefixUsage(
         outcome: .disabled,
+        tier: nil,
         matchedTokens: 0,
         prefillTokensSaved: 0,
         strategy: nil,
@@ -574,6 +582,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Non-nil only when prefix caching is active (instance supplied AND
     /// `CBv2SchedulerConfig.enablePrefixCache`).
     let prefixCache: CBv2PrefixCache?
+    let residentPrefixBackend: (any CBv2PagedPrefixSharingBackend)?
+    let prefixReuseCapability: CBv2PrefixReuseCapability
+    let nominalFullKVBytesPerToken: Int
     /// MTP (speculative decoding) driver state, or nil (byte-identical
     /// plain-decode behavior). Round logic lives in EngineLoopV2+MTP.swift.
     let mtp: CBv2MTPRoundDriver?
@@ -652,9 +663,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
     var recurrentStates: [CBv2RequestID: CBv2RecurrentRequestState] = [:]
     /// Tokens skipped via prefix-cache adoption, reported in usage.
-    private var prefixHitTokens: [CBv2RequestID: Int] = [:]
+    var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
-    private var prefixUsageByID: [CBv2RequestID: CBv2PrefixUsage] = [:]
+    var prefixUsageByID: [CBv2RequestID: CBv2PrefixUsage] = [:]
+    /// Per-request incremental hash/publication state for the page-native L1.
+    /// Entries exist only for eligible text requests and are engine-confined.
+    var residentPrefixCursorByID: [CBv2RequestID: CBv2PagedPrefixCursor] = [:]
     /// Donation work that currently owns a retired backend state. Natural
     /// drain cannot complete until each terminal donation releases its state
     /// back on the engine queue.
@@ -778,6 +792,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler: SchedulerV2,
         capacity: CBv2StepCapacity?,
         prefixCache: CBv2PrefixCache? = nil,
+        residentPrefixBackend: (any CBv2PagedPrefixSharingBackend)? = nil,
+        prefixReuseCapability: CBv2PrefixReuseCapability? = nil,
+        nominalFullKVBytesPerToken: Int? = nil,
         mtp: CBv2MTPRoundDriver? = nil,
         config: CBv2EngineLoopConfig,
         gauges: CBv2EngineGauges
@@ -791,6 +808,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.scheduler = scheduler
         self.capacity = capacity
         self.prefixCache = prefixCache
+        self.residentPrefixBackend = residentPrefixBackend
+        let resolvedPrefixCapability = prefixReuseCapability ?? CBv2PrefixReuseCapability.derive(
+            layerKinds: layerKinds, backend: backend.prefixReuseBackend)
+        self.prefixReuseCapability = resolvedPrefixCapability
+        self.nominalFullKVBytesPerToken =
+            nominalFullKVBytesPerToken ?? resolvedPrefixCapability.fullKVBytesPerToken
         self.mtp = mtp
         self.config = config
         self.gauges = gauges
@@ -1195,6 +1218,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         _ request: CBv2Request,
         prefixLookup: CBv2PrefixLookup = CBv2PrefixLookup(
             adoption: nil, outcome: .disabled, matchedTokens: 0),
+        residentPrefixProbe: CBv2PagedPrefixProbe? = nil,
         multimodal: CBv2ResolvedMultimodal? = nil
     ) {
         engineQueue.async { [self] in
@@ -1207,6 +1231,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             prefixUsageByID[request.id] = CBv2PrefixUsage(
                 outcome: prefixLookup.outcome,
+                tier: nil,
                 matchedTokens: prefixLookup.matchedTokens,
                 prefillTokensSaved: 0,
                 strategy: nil,
@@ -1243,7 +1268,29 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if let multimodal {
                     multimodalByID[request.id] = multimodal
                 }
-                if let adoption = prefixLookup.adoption {
+                if let residentPrefixProbe {
+                    residentPrefixCursorByID[request.id] = CBv2PagedPrefixCursor(
+                        hasher: residentPrefixProbe.hasher,
+                        chainHashes: residentPrefixProbe.chainHashes,
+                        publishedBlockCount: 0)
+                }
+                let residentMatch = residentPrefixProbe.flatMap {
+                    residentPrefixBackend?.longestResidentPrefix(for: $0)
+                }
+                let snapshotMatched = prefixLookup.adoption?.matched ?? 0
+                if let residentMatch, residentMatch.matchedTokens >= snapshotMatched {
+                    switch applyResidentAdoption(residentMatch, requestID: request.id) {
+                    case .adopted:
+                        // The snapshot/SSD lookup may own a staging pin. L1 won
+                        // the tie, so balance the losing tier immediately.
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                    case .refused:
+                        if let adoption = prefixLookup.adoption {
+                            prefixUsageByID[request.id]?.matchedTokens = adoption.matched
+                            applyAdoption(adoption, requestID: request.id)
+                        }
+                    }
+                } else if let adoption = prefixLookup.adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
             } catch let error as CBv2SchedulerError {
@@ -1646,6 +1693,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             rec.prefixReusePlan = adoption.plan
             prefixHitTokens[requestID] = adoption.plan.prefillTokensSaved
             prefixUsageByID[requestID]?.outcome = .hit
+            prefixUsageByID[requestID]?.tier = .snapshot
             prefixUsageByID[requestID]?.prefillTokensSaved = adoption.plan.prefillTokensSaved
             prefixUsageByID[requestID]?.strategy = adoption.plan.strategy
             prefixUsageByID[requestID]?.replayTokens = adoption.plan.replayTokens
@@ -1666,11 +1714,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    private func markPrefixAdoptionFailed(
+    func markPrefixAdoptionFailed(
         _ requestID: CBv2RequestID, outcome: CBv2PrefixCacheOutcome
     ) {
         prefixHitTokens.removeValue(forKey: requestID)
         prefixUsageByID[requestID]?.outcome = outcome
+        prefixUsageByID[requestID]?.tier = nil
         prefixUsageByID[requestID]?.prefillTokensSaved = 0
         prefixUsageByID[requestID]?.strategy = nil
         prefixUsageByID[requestID]?.replayTokens = 0
@@ -1872,6 +1921,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // prefill window and zeroed watermark survive into the re-prefill.
         if !leasePreemptionsPendingFinalize.isEmpty {
             for id in leasePreemptionsPendingFinalize {
+                resetResidentPrefixPublication(id)
                 if var lease = leasesByID[id] {
                     lease.markPreempted(now: stepNow)
                     leasesByID[id] = lease
@@ -2328,6 +2378,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         let step = CBv2InFlightStep(
             assignments: plan.assignments,
             participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            computedRanges: Dictionary(
+                uniqueKeysWithValues: plan.assignments.map { assignment in
+                    let end = scheduler.record(for: assignment.id)!.numComputedTokens
+                    return (assignment.id, (end - assignment.numTokens) ..< end)
+                }),
             wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
         step.recurrentEvaluations = recurrent
@@ -2636,6 +2691,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
             evalTargets: evalTargets,
+            computedRanges: Dictionary(
+                uniqueKeysWithValues: work.map {
+                    ($0.rec.id, $0.start ..< ($0.start + $0.count))
+                }),
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = logprobSegments
         step.recurrentEvaluations = recurrentEvaluations
@@ -2821,6 +2880,24 @@ public final class EngineLoopV2: @unchecked Sendable {
             } catch {
                 preconditionFailure("CBv2 recurrent finalization failed for \(id): \(error)")
             }
+        }
+
+        // Publish only the exact work THIS finalized step launched. In the
+        // chained path scheduler.numComputedTokens already includes N+1 here,
+        // so consulting scheduler state would expose in-flight KV. MTP verify
+        // rows wait for their accept/reject rollback below; every other row is
+        // final after the host sync and recurrent commit above.
+        let mtpVerifyIDs = Set(step.mtpRound?.verify?.rows.map(\.id) ?? [])
+        for (id, range) in step.computedRanges
+        where !step.discard.contains(id) && !mtpVerifyIDs.contains(id) {
+            // A chained-plan preemption may already have detached this row
+            // from `kvStates`, but the finalized step still owns the exact
+            // state through `deferredReleases`. Publish before that fence
+            // releases the pages so the completed prefix remains reusable.
+            let detachedState = step.deferredReleases.first { $0.id == id }?.state
+            publishFinalizedResidentBlocks(
+                requestID: id, safeComputedEnd: range.upperBound,
+                state: detachedState)
         }
 
         // Materialize any lazy logprob gathers at this same boundary (they
@@ -3023,6 +3100,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // attempt tally and its first transient KV-capacity trip
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
+        residentPrefixCursorByID.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
         // Ids are reusable after finish: drop the per-id lease and usage
         // snapshot so a reused id starts fresh (a stale lease would otherwise
@@ -3285,6 +3363,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             promptTokens: promptTokens, completionTokens: completionTokens,
             prefixCacheHitTokens: saved,
             prefixCacheOutcome: prefix.outcome,
+            prefixCacheTier: prefix.tier,
             prefixCacheMatchedTokens: prefix.matchedTokens,
             prefixCachePrefillTokensSaved: saved,
             prefixCacheStrategy: prefix.strategy,
@@ -3481,6 +3560,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // prefix credit no longer describes work that was skipped, so
             // usage.prefixCacheHitTokens must not over-credit at finish.
             invalidateAdoptedPrefix(id)
+            resetResidentPrefixPublication(id)
             // A preempted row's drafter carry no longer describes its KV
             // (the structural fingerprint would catch it; drop eagerly).
             mtp?.invalidateCarry(id)

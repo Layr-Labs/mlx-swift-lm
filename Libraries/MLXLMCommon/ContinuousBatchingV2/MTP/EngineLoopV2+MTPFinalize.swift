@@ -238,6 +238,13 @@ extension EngineLoopV2 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
             }
+            // The speculative suffix is now reconciled in BOTH the page tables
+            // and scheduler record. Publish only the accepted frontier; doing
+            // this before rollback would make a rejected block cache-visible.
+            let launchedEnd = step.computedRanges[id]?.upperBound ?? rec.numComputedTokens
+            publishFinalizedResidentBlocks(
+                requestID: id,
+                safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
             if hasStopStrings {
                 stream(for: id)?.emit(

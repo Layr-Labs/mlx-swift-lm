@@ -745,9 +745,9 @@ public struct CBv2SchedulerConfig: Sendable {
     public var maxConcurrentPartialPrefills: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
-    /// Prefix-cache participation (lookup+adopt on submit, donate on
-    /// finish). Off by default; requires a `CBv2PrefixCache` instance to be
-    /// supplied at engine construction as well.
+    /// Prefix-cache participation (lookup+adopt on submit, publish/donate on
+    /// finalized work). Off by default; requires a resident paged cache, a
+    /// `CBv2PrefixCache` snapshot tier, or both.
     public var enablePrefixCache: Bool
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
@@ -797,9 +797,12 @@ public enum CBv2Event: Sendable {
 public struct CBv2Usage: Sendable {
     public var promptTokens: Int
     public var completionTokens: Int
-    /// Final per-request prefix lookup/adoption result. This describes the
-    /// in-memory engine tier only; SSD staging remains a provider concern.
+    /// Final per-request prefix lookup/adoption result.
     public var prefixCacheOutcome: CBv2PrefixCacheOutcome
+    /// The engine tier that actually supplied an adopted hit. nil for every
+    /// non-hit. Providers may map `.snapshot` to their durable SSD tier when
+    /// that is the snapshot implementation bound to the engine.
+    public var prefixCacheTier: CBv2PrefixCacheTier?
     /// Whole-block tokens matched by lookup before the model-specific
     /// recompute bound and backend adoption are applied.
     public var prefixCacheMatchedTokens: Int
@@ -817,6 +820,7 @@ public struct CBv2Usage: Sendable {
     public init(
         promptTokens: Int, completionTokens: Int, prefixCacheHitTokens: Int = 0,
         prefixCacheOutcome: CBv2PrefixCacheOutcome = .disabled,
+        prefixCacheTier: CBv2PrefixCacheTier? = nil,
         prefixCacheMatchedTokens: Int = 0,
         prefixCachePrefillTokensSaved: Int = 0,
         prefixCacheStrategy: CBv2PrefixReuseStrategy? = nil,
@@ -826,6 +830,7 @@ public struct CBv2Usage: Sendable {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.prefixCacheOutcome = prefixCacheOutcome
+        self.prefixCacheTier = prefixCacheTier
         self.prefixCacheMatchedTokens = prefixCacheMatchedTokens
         self.prefixCachePrefillTokensSaved = prefixCachePrefillTokensSaved
         self.prefixCacheStrategy = prefixCacheStrategy
@@ -833,6 +838,14 @@ public struct CBv2Usage: Sendable {
         self.prefixCacheBoundarySplits = prefixCacheBoundarySplits
         self.prefixCacheHitTokens = prefixCacheHitTokens
     }
+}
+
+/// Physical source of a successful engine-level prefix adoption.
+public enum CBv2PrefixCacheTier: String, Sendable, Equatable {
+    /// Zero-copy physical pages already resident in the paged KV pool.
+    case resident
+    /// Materialized KV snapshots supplied through `CBv2PrefixCache`.
+    case snapshot
 }
 
 /// Engine-local prefix-cache result. The provider maps this to its wire
@@ -1104,6 +1117,19 @@ public struct CBv2PackedPrefillActivity: Sendable, Equatable {
         isSupported: false, rowsExecuted: 0, groupsExecuted: 0)
 }
 
+/// Advisory result from the resident physical-page tier before submission.
+/// It never pins pages: allocator reuse may invalidate it before `submit`, in
+/// which case the engine safely falls back to ordinary prefill.
+public struct CBv2ResidentPrefixCandidate: Sendable, Equatable {
+    public let matchedTokens: Int
+    public let prefillTokensSaved: Int
+
+    public init(matchedTokens: Int, prefillTokensSaved: Int) {
+        self.matchedTokens = matchedTokens
+        self.prefillTokensSaved = prefillTokensSaved
+    }
+}
+
 /// `Sendable`: engine handles cross concurrency domains by design (the
 /// provider submits from request tasks, cancels from disconnect handlers,
 /// and reads capacity from heartbeat timers). Implementations synchronize
@@ -1124,6 +1150,13 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
+    /// Non-mutating, non-pinning resident-prefix preflight. Providers use a
+    /// positive result to avoid reading a slower snapshot/SSD tier before
+    /// submission. nil means absent, ineligible, or unsupported. The real
+    /// lookup and generation-checked claim still happen inside `submit`.
+    func residentPrefixCandidate(
+        for request: CBv2Request
+    ) -> CBv2ResidentPrefixCandidate?
     /// Packed-prefill capability AND cumulative execution evidence. Cheap
     /// (plain counter reads); safe to poll from a benchmark harness or
     /// heartbeat. Fail-closed default: `.none`.
@@ -1189,6 +1222,9 @@ public protocol CBv2Engine: AnyObject, Sendable {
 
 extension CBv2Engine {
     public func updateKVBytesCapacity(_ bytes: Int) {}
+    public func residentPrefixCandidate(
+        for request: CBv2Request
+    ) -> CBv2ResidentPrefixCandidate? { nil }
     /// An engine with no packed-prefill path reports neither capability nor
     /// execution.
     public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
