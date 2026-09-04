@@ -57,6 +57,27 @@ internal func resolveCBv2CompactDecodeRootsEnabled(_ raw: String?) -> Bool {
 private let cbv2CompactDecodeRootsEnabled = resolveCBv2CompactDecodeRootsEnabled(
     ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS"])
 
+/// CBV2-MTP-COMPACT-ROOTS. The MTP verify rectangle forces the FULL
+/// `eagerCacheInnerState` root list, because `mtpBuildTargetVerification`
+/// never consults `compactDecodeEvaluationRoots` the way the plain decode
+/// step does (`eagerDecodeEvaluationRoots`). On the serial step that
+/// compaction was worth +1.7% (A29), and the round pays the uncompacted list
+/// on every verify.
+///
+/// DEFAULT OFF on this branch until it is measured. The switch is separate
+/// from `DARKBLOOM_CBV2_COMPACT_DECODE_ROOTS` on purpose: the verify runs
+/// inside a SPECULATIVE write transaction (`beginSpeculativeWrite`), which
+/// the plain decode path never does, so the two surfaces are armed
+/// independently until the round arm has run.
+@inline(__always)
+internal func resolveCBv2MTPCompactRootsEnabled(_ raw: String?) -> Bool {
+    guard let raw else { return false }
+    return ["1", "true", "yes", "on"].contains(raw.lowercased())
+}
+
+internal let cbv2MTPCompactRootsEnabled = resolveCBv2MTPCompactRootsEnabled(
+    ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP_COMPACT_ROOTS"])
+
 /// Builds per-layer batch-facing cache views for a set of rows
 /// (`rowStates[b][layer]`, row order == batch row order). WS-A's
 /// `LayerCacheV2` conforms; see CONTRACT-ISSUES-B-scheduler.md §1.

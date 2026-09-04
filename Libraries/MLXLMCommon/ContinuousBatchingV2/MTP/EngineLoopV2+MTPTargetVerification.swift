@@ -277,9 +277,26 @@ extension EngineLoopV2 {
             }
         }
 
+        // CBV2-MTP-COMPACT-ROOTS: the plain decode step routes its roots
+        // through `compactDecodeEvaluationRoots`; the verify rectangle did
+        // not. `scores` is downstream of the whole verify forward, so forcing
+        // it forces every column; the compaction adds the unified offset
+        // chain and each layer's ring-write fence. `hidden` is kept as an
+        // explicit root because it leaves the round on the carry, not through
+        // `scores`. Anything the compaction declines falls back to the full
+        // list unchanged.
+        let verifyRoots: [MLXArray]
+        if cbv2MTPCompactRootsEnabled,
+            let compact = model.compactDecodeEvaluationRoots(
+                forwardOutput: scores, caches: caches)
+        {
+            verifyRoots = compact + [hidden]
+        } else {
+            verifyRoots = eagerCacheInnerState(caches)
+        }
         return (
             scores, hidden, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, recurrent)
+            verifyRoots + capturedInnerState, recurrent)
     }
 
     /// Top-`size` token ids per verify position plus their probability mass
