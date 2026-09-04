@@ -136,5 +136,12 @@ struct CBv2MeasuredStackDefaultsTests {
         pin(
             "DARKBLOOM_CBV2_MTP_COMPACT_ROOTS",
             resolveCBv2MTPCompactRootsEnabled(nil), true)
+        // The ring fold's reader arrived with the ringfold merge. Before that
+        // this key was a NO-READER on the shipping branch, so setting it to 1
+        // did nothing at all — the merge is what makes the approved value
+        // reachable, and this pin is what says it stayed reachable.
+        pin(
+            "DARKBLOOM_CBV2_RING_READ_FOLD_B1",
+            CBv2RingReadFoldB1.enabled, true)
     }
 }
