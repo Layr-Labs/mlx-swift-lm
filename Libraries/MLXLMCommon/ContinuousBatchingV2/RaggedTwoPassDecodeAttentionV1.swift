@@ -3283,10 +3283,10 @@ enum CBv2RaggedComposedD512DecodeAttentionV1 {
     /// LASTQ-D512 kill switch: `DARKBLOOM_GEMMA4_LASTQ_D512` set to
     /// `0`/`false`/`no`/`off` restores the per-row last-query attend loop in
     /// `CBv2AttentionV1.updateAndAttendLastQuery`. Default ON.
-    private static let lastQueryPrefillEnabled: Bool = {
+    static let lastQueryPrefillEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_LASTQ_D512"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

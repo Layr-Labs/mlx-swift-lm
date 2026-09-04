@@ -64,7 +64,7 @@ enum CBv2ComposedPrefillSDPAV1 {
     static let maskFuseEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_MASK_FUSE"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -146,7 +146,7 @@ enum CBv2ComposedPrefillSDPAV1 {
     static let maskSynthEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_MASK_SYNTH"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -419,7 +419,7 @@ enum CBv2PrefillSoftmaxVecV1 {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_SOFTMAX_VEC"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

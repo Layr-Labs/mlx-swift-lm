@@ -1333,14 +1333,14 @@ public func switchGatherQMVSelectsFastTier(
 public let switchGateUpFuseDecodeEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_DECODE_GATEUP_FUSE"]
-    else { return true }
+    else { return false }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
 public let switchGateUpFusePrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_GATEUP_FUSE"]
-    else { return true }
+    else { return false }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 

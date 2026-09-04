@@ -123,7 +123,7 @@ public enum CBv2TiedLMHeadArgmaxB1V1 {
     public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_LOGITSLESS_GREEDY_HEAD"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(
             raw.trimmingCharacters(in: .whitespaces).lowercased())
     }()

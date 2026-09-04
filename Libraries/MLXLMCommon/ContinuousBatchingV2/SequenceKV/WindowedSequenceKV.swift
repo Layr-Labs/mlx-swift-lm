@@ -811,7 +811,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// the whole prefill cost of the mirror.
     static let gpuPackEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_GPUPACK"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -821,7 +821,7 @@ public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequen
     /// dispatch and a single `SliceUpdate`.
     static let pairedMirrorWriteEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_KV_QUANT_PAIRWRITE"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

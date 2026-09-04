@@ -77,7 +77,7 @@ public enum Gemma4PrefillGlueV1 {
     public static let branchPrefixEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_PREFILL_BRANCH_PREFIX"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 
@@ -454,7 +454,7 @@ public enum Gemma4PrefillGlueV1 {
     public static let prenormGatherEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_PREFILL_PRENORM_GATHER"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

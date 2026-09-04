@@ -159,11 +159,11 @@ private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
 ///
 /// `0` disables the specialization (the cadence falls back to the configured
 /// value), which is the kill switch.
-private let gemma4LongPrefillChunkEvalLayers: Int = {
+let gemma4LongPrefillChunkEvalLayers: Int = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
         let value = Int(raw), value >= 0
-    else { return 3 }
+    else { return 0 }
     return value
 }()
 
@@ -1210,10 +1210,10 @@ private let gemma4QKVNormPrefillKernel = MLXFast.metalKernel(
     ensureRowContiguous: true
 )
 
-private let gemma4QKVNormPrefillEnabled: Bool = {
+let gemma4QKVNormPrefillEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_QKV_NORM_PREFILL"]
-    else { return true }
+    else { return false }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
@@ -1755,7 +1755,7 @@ private func gemma4AttentionFallback(
 /// `DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM=0` (also `false`/`no`/`off`) restores
 /// the quantized dispatch byte for byte. Engage mark: `prefill-deq-gemm`,
 /// fired at the site that builds the dequantize + GEMM graph.
-private enum Gemma4PrefillDeqGEMMV1 {
+enum Gemma4PrefillDeqGEMMV1 {
     static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_PREFILL_DEQ_GEMM"]
@@ -1768,7 +1768,7 @@ private enum Gemma4PrefillDeqGEMMV1 {
     static let cacheEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_GEMMA4_PREFILL_DEQ_CACHE"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

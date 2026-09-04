@@ -172,7 +172,7 @@ enum CBv2AttentionV1 {
     static let tokenMajorJoinEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PREFILL_TOKENMAJOR_JOIN"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(raw.lowercased())
     }()
 

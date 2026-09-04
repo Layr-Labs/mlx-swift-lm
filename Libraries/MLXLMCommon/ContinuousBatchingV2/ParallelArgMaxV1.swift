@@ -23,10 +23,10 @@ enum CBv2ParallelArgMaxV1 {
     /// Independent fallback for attribution and emergency bisection.
     /// An absent setting enables the implementation; an explicit off value
     /// restores the stock argMax + int32 conversion.
-    private static let enabled: Bool = {
+    static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_PARALLEL_ARGMAX"]
-        else { return true }
+        else { return false }
         return !["0", "false", "no", "off"].contains(
             raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }()
