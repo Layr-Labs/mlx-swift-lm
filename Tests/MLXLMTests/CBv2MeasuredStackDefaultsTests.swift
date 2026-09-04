@@ -113,14 +113,28 @@ struct CBv2MeasuredStackDefaultsTests {
             CBv2WindowedSequenceKV.pairedMirrorWriteEnabled, false)
     }
 
-    /// The admission coalescing window, in milliseconds. The measured stack ran
-    /// 0, so a request is admitted when it arrives rather than after a 3 ms
-    /// wait for company.
-    @Test("the admission coalescing window is 0 ms by default")
+    /// The admission coalescing window stays at 3 ms, unlike the sixteen port
+    /// candidates around it.
+    ///
+    /// It is a CONCURRENT-SERVING knob, not a port candidate, and the arm that
+    /// set it to 0 did not measure it doing harm. Read the gate
+    /// (`EngineLoopV2`, ADMIT-COALESCE-001): the wait applies only when
+    /// `runningCount == 0`, `waitingCount > 0` and
+    /// `waitingCount < maxConcurrentRequests`. At the single-prompt B=1 shape
+    /// that fires exactly once, before the only request starts, and costs at
+    /// most 3 ms of a roughly 6.4 s run -- 0.05%, once, never touching decode.
+    /// A live decode is never delayed by a late arrival.
+    ///
+    /// What it buys at concurrency is real: without it a plan taken the instant
+    /// one submission lands admits only the submissions that won that race, and
+    /// the rest pay a second prefill pass and a below-capacity mixed step.
+    /// Deleting that to save 3 ms once at B=1 would be optimising the benchmark
+    /// against the product.
+    @Test("the admission coalescing window stays 3 ms by default")
     func admitCoalesceDefault() {
         guard ProcessInfo.processInfo.environment["DARKBLOOM_ADMIT_COALESCE_MS"] == nil
         else { return }
-        #expect(EngineLoopV2.admitCoalesceWindowMS == 0)
+        #expect(EngineLoopV2.admitCoalesceWindowMS == 3)
     }
 
     // MARK: - Kept ON, and measured that way
