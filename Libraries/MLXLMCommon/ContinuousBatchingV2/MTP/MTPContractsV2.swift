@@ -586,6 +586,20 @@ public enum CBv2MTPRoundSwitches {
     /// serializing whatever this says.
     public static let fusedVerifyAttention = flag("MTPLX_MTP_FUSED_VERIFY_ATTENTION")
 
+    /// Ask the drafter for its rank-2 token at every draft step so the round
+    /// can report `runnerUpHitRate` — the number tree drafting turns on.
+    ///
+    /// OFF by default, and it must stay off for any throughput arm. It is one
+    /// extra masked argmax per draft step, which is cheap in FLOPs and is NOT
+    /// cheap on the round's critical path: MTP rounds do not chain, so every
+    /// host millisecond spent building it is GPU idle time, multiplied by k.
+    /// Measuring it changed arm A's round from ~18 ms to ~35 ms at k=1 and
+    /// from ~32 ms to ~108 ms at k=4 — a ~20 ms per-drafted-token tax on a
+    /// number nothing in the round branches on.
+    ///
+    /// [engage] MTPLX_MTP_RUNNER_UP_INSTRUMENT
+    public static let runnerUpInstrument = flag("MTPLX_MTP_RUNNER_UP_INSTRUMENT")
+
     private static func flag(_ key: String) -> Bool {
         guard let raw = ProcessInfo.processInfo.environment[key] else { return false }
         return ["1", "true", "yes", "on"].contains(raw.lowercased())

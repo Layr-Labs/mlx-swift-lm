@@ -505,7 +505,12 @@ extension EngineLoopV2 {
             // answers the one question tree drafting turns on: when the chain
             // is rejected, how often WAS the runner-up the target's token
             // (`CBv2MTPMetrics.runnerUpHitRate`, and see `CBv2MTPTreeShape`).
-            let wantsRunnerUps = k > 0 && mtp.drafter.maximumDraftCandidates >= 2
+            // [engage] MTPLX_MTP_RUNNER_UP_INSTRUMENT, default OFF. This is
+            // instrumentation, not drafting, and it sits on the round's
+            // critical path where nothing overlaps it — see the switch.
+            let wantsRunnerUps =
+                CBv2MTPRoundSwitches.runnerUpInstrument
+                && k > 0 && mtp.drafter.maximumDraftCandidates >= 2
             var draftInput = seedColumn
             var draftHidden = concatenated(carryHiddens, axis: 0)
             for _ in 0 ..< k {

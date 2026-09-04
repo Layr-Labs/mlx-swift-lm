@@ -52,6 +52,12 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     private let drafter: Gemma4AssistantDraftModel
     private let target: any Gemma4MTPTarget
+    /// `[1, vocab]` ascending indices, built ONCE. `draftStepCandidates` used
+    /// to build this per call, and at Gemma 4's 262,144-token vocabulary that
+    /// is a megabyte of host-side `Int32` fill and upload on the round's
+    /// critical path, every draft step. Hoisting it is why the instrument can
+    /// be switched on at all without dominating what it measures.
+    private let vocabularyPositions: MLXArray
 
     /// Binds `drafter` to `target` (idempotent on the same target) so
     /// drafter/target compatibility validation runs here.
@@ -59,6 +65,9 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         try drafter.bind(target: target)
         self.drafter = drafter
         self.target = target
+        let vocabulary = drafter.config.textConfig.vocabSize
+        self.vocabularyPositions =
+            MLXArray(Int32(0) ..< Int32(vocabulary)).reshaped([1, vocabulary])
     }
 
     // MARK: - CBv2MTPDrafter
@@ -164,8 +173,11 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let flat = logits.squeezed(axis: 1)
         var ranked: [MLXArray] = [flat.argMax(axis: -1).asType(.int32)]
         if candidates > 1 {
-            let vocabulary = flat.dim(-1)
-            let positions = MLXArray(Int32(0) ..< Int32(vocabulary)).reshaped([1, vocabulary])
+            precondition(
+                flat.dim(-1) == vocabularyPositions.dim(-1),
+                "Gemma4CBv2MTPDrafter: logits vocabulary \(flat.dim(-1)) != configured "
+                    + "\(vocabularyPositions.dim(-1))")
+            let positions = vocabularyPositions
             let excluded = MLXArray(-Float.infinity).asType(flat.dtype)
             var remaining = flat
             for _ in 1 ..< candidates {
