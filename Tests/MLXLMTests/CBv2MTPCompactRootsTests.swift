@@ -44,7 +44,12 @@ struct CBv2MTPCompactRootsTests {
         // transaction the decode path never enters, so each surface must be
         // disarmable on its own.
         #expect(resolveCBv2CompactDecodeRootsEnabled(nil) == true)
-        #expect(resolveCBv2MTPCompactRootsEnabled(nil) == false)
+        #expect(resolveCBv2MTPCompactRootsEnabled(nil) == true)
+        // Independence is what this test is for, so read it off the resolvers
+        // rather than off the defaults: each one answers only its own variable,
+        // and disarming one leaves the other armed.
+        #expect(resolveCBv2MTPCompactRootsEnabled("0") == false)
+        #expect(resolveCBv2CompactDecodeRootsEnabled(nil) == true)
     }
 
     // MARK: the exactness argument, as an executable statement
