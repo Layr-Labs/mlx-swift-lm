@@ -588,35 +588,80 @@ public enum CBv2MTPRoundSwitches {
 
     /// Narrowest verify width at which fusing the attention actually pays.
     ///
+    /// **The crossover is a property of the engine stack, and the two stacks
+    /// measured so far do not agree. This branch carries the SERIAL stack's
+    /// answer, which is 2 — fusing pays at every width it has been measured
+    /// at.** Re-derive it, do not inherit it.
+    ///
     /// Fusing trades GPU work for host work: it removes the per-column KV
     /// re-reads but adds a flat ~1.6-2.3 ms of extra graph build per round
-    /// (one fused mask, one wider call). Measured on M5 Max at 17,408 tokens
-    /// of real text, arm C against arm B — per-round means from `roundTiming`:
+    /// (one fused mask, one wider call). Whether that trade pays therefore
+    /// depends on what the rest of the decode step costs, which is exactly
+    /// what a decode-kernel stack changes.
+    ///
+    /// **Serial stack (this branch), S1 unfused vs S2 fused, tok/s.** The two
+    /// arms differ in exactly one switch, `MTPLX_MTP_FUSED_VERIFY_ATTENTION`:
+    ///
+    ///     w2  115.0 -> 119.0   (+3.5%)
+    ///     w3  134.4 -> 143.3   (+6.6%)
+    ///     w4  138.5 -> 153.7   (+11.0%)
+    ///     w5  138.1 -> 147.7   (+7.0%)
+    ///
+    /// Fused wins at every width, so the floor is 2 — the narrowest width a
+    /// rectangle can have.
+    ///
+    /// **Production pin, M5 Max at 17,408 tokens of real text, arm C against
+    /// arm B — per-round means from `roundTiming`:**
     ///
     ///     w2  verify build +1.74  submit +0.39  wait  0.00  ->  +2.17 ms  (-11% tok/s)
     ///     w4  verify build +2.26  submit -0.58  wait -0.42  ->  +1.26 ms  ( -8%)
     ///     w5  verify build +1.64  submit -1.85  wait -0.76  ->  -0.97 ms  ( +5%)
     ///
-    /// so the crossover sits between 4 and 5. The mechanism is that the
-    /// two-pass vector SDPA cannot take M > 1: at M = 2-4 the fused global
-    /// layers fall to the matmul path, which at 17k keys is slower than 2-4
-    /// vector calls, and only by M = 5 do the saved re-reads overtake it.
+    /// There the crossover sits between 4 and 5, because the two-pass vector
+    /// SDPA cannot take M > 1: at M = 2-4 the fused global layers fall to the
+    /// matmul path, which at 17k keys is slower than 2-4 vector calls, and
+    /// only by M = 5 do the saved re-reads overtake it.
+    ///
+    /// The cost of getting this wrong is not small, and it is not confined to
+    /// the width it mis-gates. Carrying the production 5 onto this stack cost
+    /// **S6 fixed w4 152.5 tok/s against S5's 168.4** (21.7 vs 19.91 ms/round;
+    /// the S6 report's divergence index 60 is the unfused path). It also moved
+    /// the ADAPTIVE answer: with w4 unfused the controller correctly preferred
+    /// depth 4 at 163.4 tok/s, because a fused w5 really did beat an unfused
+    /// w4 — a right decision from a wrong board. With w4 fused, depth 3 is the
+    /// optimum (168.4 against 158.1).
+    ///
+    /// **Why this is a per-branch constant and not a runtime-derived one.**
+    /// The obvious discriminator would be `pipelinedDraftSubmit` — pipelining
+    /// overlaps host build with GPU work, which is exactly the cost fusing
+    /// adds. The data falsifies it: S1 and S2 both leave
+    /// `MTPLX_MTP_PIPELINED_DRAFT_SUBMIT` unset and fused still wins at every
+    /// width. No measured switch predicts the crossover, so keying the default
+    /// on one would be a guess wearing a mechanism's clothes. The honest form
+    /// is a constant per stack, with the measurement beside it and a test that
+    /// fails if a merge changes it silently.
     ///
     /// This is a WIDTH threshold, not a prompt-shape one — width is the
     /// quantity being traded, and the decision reads nothing about the prompt,
     /// the context or the KV length. `MTPLX_MTP_FUSED_VERIFY_MIN_WIDTH=1`
     /// restores the old always-on behaviour for a control arm; a larger value
-    /// raises the bar. Re-derive it whenever the attention kernel changes: on
-    /// a stack whose GPU-side attention is cheaper the saving shrinks and the
-    /// crossover moves OUT.
+    /// raises the bar, and `=5` reproduces the production-pin default for an
+    /// A/B on this branch.
     public static let fusedVerifyMinWidth: Int = {
         guard let raw = ProcessInfo.processInfo.environment[
             "MTPLX_MTP_FUSED_VERIFY_MIN_WIDTH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             let value = Int(raw), value >= 1
-        else { return 5 }
+        else { return measuredFusedVerifyCrossover }
         return value
     }()
+
+    /// The crossover this branch was measured at. Named so the value has one
+    /// home and a test can pin it; see `fusedVerifyMinWidth` for the numbers.
+    /// Production pin measured 5 on the same code — if a merge brings that
+    /// value here, `CBv2MTPNearTieCriterionTests` says so instead of the next
+    /// benchmark quietly losing 10%.
+    static let measuredFusedVerifyCrossover = 2
 
     /// Whether to fuse the verify attention for a rectangle of this width.
     /// Pure arithmetic on the width, so it is testable without a model.

@@ -71,13 +71,38 @@ struct CBv2MTPNearTieCriterionTests {
         #expect(realContentMargins.contains { !argmaxSurvives(margin: $0, epsilon: ulp) })
     }
 
+    /// The DEFAULT is pinned, not just the predicate's shape.
+    ///
+    /// The crossover is a property of the engine stack. On this branch, S1
+    /// unfused against S2 fused — one switch apart — measured
+    /// 115.0→119.0 / 134.4→143.3 / 138.5→153.7 / 138.1→147.7 tok/s at
+    /// w2/w3/w4/w5, so fusing pays at every width and the floor is 2. The
+    /// production pin measured the opposite on the same code (+2.17 ms/round
+    /// at w2, -0.97 at w5) and defaults to 5.
+    ///
+    /// Both values live in this file's history, so a merge between the two
+    /// branches can silently pick either. Carrying 5 onto this stack was
+    /// measured: S6 fixed w4 fell to 152.5 tok/s against S5's 168.4, and the
+    /// adaptive controller settled on depth 4 instead of depth 3. That is a
+    /// ~10% throughput regression with no error message, which is what this
+    /// assertion exists to convert into a test failure.
+    @Test("the fused-verify floor is this stack's measured crossover")
+    func fusedVerifyFloorIsTheMeasuredCrossover() {
+        #expect(CBv2MTPRoundSwitches.measuredFusedVerifyCrossover == 2)
+        // Only assert the resolved value when no operator override is in play;
+        // control arms legitimately run with =1 or =5.
+        if ProcessInfo.processInfo.environment["MTPLX_MTP_FUSED_VERIFY_MIN_WIDTH"] == nil {
+            #expect(
+                CBv2MTPRoundSwitches.fusedVerifyMinWidth
+                    == CBv2MTPRoundSwitches.measuredFusedVerifyCrossover)
+        }
+    }
+
     @Test("fused verify engages only from its measured crossover width up")
     func fusedVerifyHasAWidthFloor() {
-        // Fusing trades GPU work for host work. Measured on M5 Max at 17,408
-        // tokens of real text (arm C vs arm B, per-round roundTiming means):
-        // w2 +2.17 ms/round, w4 +1.26, w5 -0.97 — so it pays from width 5.
         // The predicate reads the WIDTH and nothing else: no prompt length, no
-        // context size, no KV length.
+        // context size, no KV length. See `fusedVerifyMinWidth` for the two
+        // stacks' measurements and why the floor is a per-branch constant.
         let floor = CBv2MTPRoundSwitches.fusedVerifyMinWidth
         #expect(floor >= 1)
         for width in 1...8 {
