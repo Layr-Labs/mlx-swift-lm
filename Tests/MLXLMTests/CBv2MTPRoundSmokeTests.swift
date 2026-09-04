@@ -23,7 +23,7 @@ import Testing
 
 @testable import MLXLLM
 
-@Suite("CBv2MTPRoundSmoke", .serialized)
+@Suite("CBv2MTPRoundSmoke", .serialized, .fixtureRandomState)
 struct CBv2MTPRoundSmokeTests {
 
     private let vocabSize = 256
@@ -108,7 +108,7 @@ struct CBv2MTPRoundSmokeTests {
     private func makeFixture(
         seed: UInt64 = 0x5EED, deterministicTarget: Bool = false
     ) throws -> Fixture {
-        MLXRandom.seed(seed)
+        fixtureSeed(seed)
         let target = Gemma4TextModel(
             try targetConfig(tieWordEmbeddings: !deterministicTarget))
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
