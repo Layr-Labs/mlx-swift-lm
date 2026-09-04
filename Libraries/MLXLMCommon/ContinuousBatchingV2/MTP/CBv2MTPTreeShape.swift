@@ -26,20 +26,30 @@
 //
 //      alternate wins  <=>  (1 - q) * r / committed(k*)  >  c_alt / round(k*)
 //
-// which is a threshold on `r` for each `q`:
+// which is a threshold on `r` for each `q`. Measured at the production
+// shape (17,408-token prompt, 1,024 output, B=1, 3,136 rounds over seven
+// widths): `round_ms(k) = 13.38 + c*k`, `c = 4.70` today and ~2.60 with
+// MTPLX_MTP_FUSED_VERIFY_ATTENTION on, `c_alt = c - 1.0`:
 //
-//      q     0.82  0.80  0.78  0.75  0.72  0.70  0.68  0.65  0.60
-//      k*       4     4     3     3     3     3     2     2     2
-//      r >   1.37  1.18  1.04  0.87  0.74  0.67  0.62  0.54  0.45
+//      q         0.90  0.85  0.82  0.78  0.75  0.70  0.66  0.63  0.60  0.50
+//   today  k*       4     3     3     2     2     2     2     1     1     1
+//          r >   4.71  2.86  2.28  1.76  1.50  1.19  1.00  0.90  0.82  0.61
+//   fused  k*       7     5     4     4     3     3     2     2     2     2
+//          r >   2.89  1.68  1.31  0.99  0.83  0.64  0.53  0.47  0.42  0.30
 //
-// At the acceptance this drafter actually shows on the 64-token control
-// matrix (`q ~= 0.82`, fitted against committed/round 3.5 at k=4 and 4.2 at
-// k=7) an alternate would need `r > 1.37`. NO TREE BEATS THE CHAIN AT
-// q = 0.82, and none can. With a plausible `r ~= 0.5` the crossover is near
-// `q <= 0.63`; even a PERFECT runner-up needs `q <= 0.77`. Both `q` and `r`
-// are measured per context length, not assumed — a long technical
-// continuation is not three short chat turns — and this switch exists so
-// the arm can be run the moment they are measured at the production shape.
+// THE MEASURED `q` AT THAT SHAPE IS 0.63 (0.658 at position 1, ~0.62 flat
+// after), not the 0.82 of the 64-token control. On the measured curve an
+// alternate needs `r > 0.99` today and `r > 0.52` fused — so a tree is
+// live, but ONLY downstream of the fused verify, and it is worth about
+// +2.7 tok/s at r = 0.7 and +10 at a perfect r = 1.0. It is not a road to
+// 200 at any `r`; `c` and `q` are. Best shapes at the measured curve:
+// `spine=2,alt=1` at r >= 0.52 and `spine=2,alt=1,alt=2` at r near 1.
+//
+// The low `q` is itself under audit (the drafter's long-context capture and
+// mask). If it is restored toward 0.9 this whole switch is dead again: the
+// required `r` becomes 2.89 even fused, and the plain chain wins at every
+// `r`. Do not enable this without reading `runnerUpHitRate` (measured by
+// the instrument in `EngineLoopV2+MTPFinalize`) and the `q` of the same run.
 //
 // SHAPE-GENERIC BY CONSTRUCTION. Nothing here reads a prompt length, a
 // prefill size, a ring size or a chunk size. A shape is (spine depth,
