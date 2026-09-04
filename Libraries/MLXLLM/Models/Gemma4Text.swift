@@ -152,38 +152,6 @@ internal func resolveGemma4PrefillChunkEvalLayers(_ raw: String?) -> Int {
 private let gemma4PrefillChunkEvalLayers = resolveGemma4PrefillChunkEvalLayers(
     ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL"])
 
-/// Submission cadence used when a prompt pass is long enough to run on the
-/// blocked-query prefill path. The documented 18-layer serving default, the
-/// zero kill switch and every explicit non-default tuning value are preserved;
-/// only a pass already in that regime takes the narrower cadence.
-///
-/// `0` disables the specialization (the cadence falls back to the configured
-/// value), which is the kill switch.
-private let gemma4LongPrefillChunkEvalLayers: Int = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL_LONG"],
-        let value = Int(raw), value >= 0
-    else { return 3 }
-    return value
-}()
-
-/// The query-row block width above which a prompt pass is blocked by
-/// `CBv2AttentionV1` (`queryBlockSize`). A pass at or below it is not blocked
-/// and keeps the configured cadence.
-private let gemma4BlockedQueryPrefillThreshold = 128
-
-@inline(__always)
-private func gemma4EffectivePrefillChunkEvalLayers(
-    configured: Int, inputLength: Int
-) -> Int {
-    guard configured == 18,
-        gemma4LongPrefillChunkEvalLayers > 0,
-        gemma4LongPrefillChunkEvalLayers < configured,
-        inputLength > gemma4BlockedQueryPrefillThreshold
-    else { return configured }
-    return gemma4LongPrefillChunkEvalLayers
-}
-
 @inline(__always)
 internal func gemma4ShouldSubmitPrefillChunkEval(
     schedulePrefill: Bool,
@@ -6086,9 +6054,7 @@ public class Gemma4TextModelInner: Module {
                 isCBv2: isCBv2,
                 inputLength: inputLength,
                 layerNumber: layerNumber,
-                interval: gemma4EffectivePrefillChunkEvalLayers(
-                    configured: gemma4PrefillChunkEvalLayers,
-                    inputLength: inputLength))
+                interval: gemma4PrefillChunkEvalLayers)
             {
                 asyncEval(h)
                 CBv2StepProfiler.recordEvent("v2.gemma4.prefill.chunk_eval")
