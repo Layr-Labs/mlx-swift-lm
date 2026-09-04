@@ -42,6 +42,12 @@ final class CBv2MTPDepthController {
     private static let hysteresisFraction = 0.05
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
+    /// Cost samples required at a depth before its goodput is trusted. One
+    /// round is a noisy estimate of a round, and acting on a single sample is
+    /// how a depth gets written off for the rest of a run. A statistics
+    /// constant like `acceptanceMinSamples`, not a shape constant: it counts
+    /// observations, never tokens or context.
+    private static let minCostSamples = 3
 
     private struct CostState {
         var samples = 0
@@ -148,6 +154,9 @@ final class CBv2MTPDepthController {
         var activeDepth = 0
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
         var roundsSinceProbe = 0
+        /// Rotation cursor for periodic re-exploration, so revisiting the
+        /// envelope sweeps it instead of always probing the same neighbour.
+        var lastProbedDepth = 0
     }
 
     let maxDepth: Int
@@ -310,23 +319,39 @@ final class CBv2MTPDepthController {
         }
 
         let state = buckets[bucket] ?? BucketState()
-        let limit = min(maxDepth, state.acceptance.frontier + 1)
+        // SELECTION stays bounded by the acceptance frontier: a depth whose
+        // positions have not been observed enough times has no trustworthy
+        // committed-token estimate, so it must not be chosen on one.
+        let selectionLimit = min(maxDepth, state.acceptance.frontier + 1)
+        // EXPLORATION is not, and that is the fix. Bounding exploration by the
+        // frontier is a ratchet: the frontier only advances once a position
+        // has been DRAFTED `acceptanceMinSamples` times, so refusing to
+        // explore deeper is also refusing to gather the evidence that would
+        // justify exploring deeper. Combined with a probe of `selected + 1`,
+        // a controller sitting at depth 0 could only ever see depth 1 —
+        // measured at THE TEST as `depthSelections {0: ~1002, 1: 16}` over
+        // 1,018 decisions, while a fixed depth 4 was committing 4.0 tokens a
+        // round at 1.40x serial. The caller's rectangular envelope already
+        // bounds `maxDepth` per plan, so exploring to it is always legal.
+        let explorationLimit = maxDepth
         let decision: CBv2MTPDepthDecision
 
         if state.costs[0] == nil {
             decision = CBv2MTPDepthDecision(
                 depth: 0, decodeRowBucket: bucket, reason: "warmup_baseline",
                 isExploration: true)
-        } else if let unsampled = (0 ... limit).first(where: { state.costs[$0] == nil }) {
+        } else if let undersampled = (0 ... explorationLimit).first(where: {
+            (state.costs[$0]?.samples ?? 0) < Self.minCostSamples
+        }) {
             decision = CBv2MTPDepthDecision(
-                depth: unsampled, decodeRowBucket: bucket, reason: "explore_cost",
+                depth: undersampled, decodeRowBucket: bucket, reason: "explore_cost",
                 isExploration: true)
         } else {
-            let current = min(state.activeDepth, limit)
+            let current = min(state.activeDepth, selectionLimit)
             let currentGoodput = goodput(depth: current, state: state)
             var best = current
             var bestGoodput = currentGoodput
-            for depth in 0 ... limit {
+            for depth in 0 ... selectionLimit {
                 let candidate = goodput(depth: depth, state: state)
                 if candidate > bestGoodput {
                     best = depth
@@ -349,11 +374,16 @@ final class CBv2MTPDepthController {
 
             var explore = false
             let nextRounds = state.roundsSinceProbe + 1
-            if nextRounds >= state.probeInterval {
-                let probe = min(selected + 1, limit)
-                if probe > selected {
+            if nextRounds >= state.probeInterval, explorationLimit > 0 {
+                // Rotate through the WHOLE envelope rather than probing one
+                // deeper. The optimum moves in both directions — a shape
+                // change, a drafter change, thermal drift — and a depth that
+                // measured badly once has to be revisitable, which a
+                // monotone `selected + 1` probe never allows.
+                let probe = (state.lastProbedDepth + 1) % (explorationLimit + 1)
+                if probe != selected {
                     selected = probe
-                    reason = "explore_deeper"
+                    reason = "explore_rotate"
                     explore = true
                 }
             }
@@ -371,7 +401,8 @@ final class CBv2MTPDepthController {
     ) {
         if decision.isExploration {
             state.roundsSinceProbe = 0
-            if decision.reason == "explore_deeper" {
+            state.lastProbedDepth = decision.depth
+            if decision.reason == "explore_rotate" {
                 state.probeInterval = min(
                     state.probeInterval * 2, Self.maxProbeInterval)
             }
