@@ -30,16 +30,25 @@ import Testing
 ///   forced   : cost1 = 14.214 ms (75 samples, steady state)
 ///              -> ratio 1.302 -> profitable          -> 128.33 tok/s
 ///
-/// The controller's own estimate is 1.77x the steady-state truth, which is
-/// what puts it on the wrong side of the line. The inflation is structural,
+/// The controller's own estimate was 1.77x the steady-state truth, which is
+/// what put it on the wrong side of the line. The inflation was structural,
 /// not noise: a depth-zero plan invalidates every carry
 /// (`EngineLoopV2.beginMTPPlan`), so every probe round must SEED first, and
-/// `CBv2MTPRoundDriver.recordStepCost` folds that seed's wall time into the
-/// round's cost sample (`attributed = wallTimeNanos &+ claimedSeedCostNanos`)
-/// while `expectedCommitted` never credits the token the seed emitted. Cost
-/// in, token out — so choosing depth 0 manufactures the evidence for choosing
-/// depth 0 again. Forced mode needs 3 seeds for 75 rounds; the adaptive
-/// controller pays 5 seeds for 5.
+/// `CBv2MTPRoundDriver.recordStepCost` used to fold that seed's wall time into
+/// the round's cost sample (`attributed = wallTimeNanos &+
+/// claimedSeedCostNanos`) while `expectedCommitted` never credits the token the
+/// seed emitted. Cost in, token out — so choosing depth 0 manufactured the
+/// evidence for choosing depth 0 again. Forced mode needs 3 seeds for 75
+/// rounds; the adaptive controller paid 5 seeds for 5.
+///
+/// That fold is gone. The seed is now recorded as the bucket's TRANSITION cost
+/// (`CBv2MTPDepthController.observeTransitionCost`) and the depth's sample is
+/// the isolated round, because a settled positive depth does not re-seed:
+/// `EngineLoopV2+MTPFinalize` stores a fresh carry on every verify round that
+/// confirmed a token, partial rejections included. On the measured pair that
+/// moves the depth-1 estimate from 25.111 ms to 14.195 ms and the verdict from
+/// "unprofitable" to profitable — see
+/// `theIsolatedVerifyCostIsWhatDecidesAtMeasuredCosts` below.
 ///
 /// ## What changed, and why the counts in these tests moved
 ///
@@ -284,48 +293,46 @@ struct CBv2MTPProbeCadenceTests {
         #expect(second.reason == "explore_cost")
     }
 
-    /// The field case, at the wall-clock costs actually measured on gemma-4.
+    /// The field case, at the wall-clock costs actually measured on gemma-4,
+    /// with the seed fix in place.
     ///
-    /// This is a CHARACTERIZATION test: it pins today's wrong answer together
-    /// with the right one, so the gap cannot widen unnoticed and so anyone who
-    /// changes seed-cost attribution, the innovation clamp, or the hysteresis
-    /// margin is told exactly what those knobs were deciding. If a fix lands,
-    /// `seedInflatedEstimate` stops declining and THIS TEST MUST BE UPDATED —
-    /// that failure is the fix working, not a regression.
+    /// Both arms are the SAME hardware and the same rounds. They differ only in
+    /// which number the controller is handed: the seed-inflated 25.111 ms it
+    /// used to get, or the isolated 14.195 ms it gets now. One arm declines and
+    /// one speculates, so this pins the fix at the exact costs that produced
+    /// the field report — and it will fail loudly if the fold ever comes back.
     ///
-    /// The frontier-probe change did NOT fix it: the seed is folded into every
-    /// positive-depth cost sample, including the deeper probes, so measuring
-    /// depths 2 and 3 does not rescue the comparison. The controller still
-    /// declines. Seed attribution is the remaining defect.
-    @Test("measured gemma-4 costs: the seed-inflated estimate is what says no")
-    func seedInflationFlipsTheVerdictAtMeasuredCosts() {
+    /// 25.111 - 10.916 = 14.195, and forced mode measured 14.214 over 75
+    /// samples. The arithmetic closes on one seed, which is what says the
+    /// inflation was exactly the seed and nothing else.
+    @Test("measured gemma-4 costs: the isolated verify cost is what decides")
+    func theIsolatedVerifyCostIsWhatDecidesAtMeasuredCosts() {
         // contiguous, B=1, 144 tokens, M4 Max. See the suite comment.
         let baselineNanos: UInt64 = 10_916_000
         let seedInflatedDepthOne = 25_111_000.0
-        let steadyStateDepthOne = 14_214_000.0
+        let isolatedDepthOne = seedInflatedDepthOne - Double(baselineNanos)
 
-        let seedInflatedEstimate = drive(
+        let folded = drive(
             costRatio: seedInflatedDepthOne / Double(baselineNanos),
             steps: 200, baselineNanos: baselineNanos)
-        let steadyStateTruth = drive(
-            costRatio: steadyStateDepthOne / Double(baselineNanos),
+        let isolated = drive(
+            costRatio: isolatedDepthOne / Double(baselineNanos),
             steps: 200, baselineNanos: baselineNanos)
 
-        // What the engine does today: decline, and spend only the bounded
-        // learning budget finding that out.
-        #expect(seedInflatedEstimate.outcome.rounds == 23)
-        #expect(seedInflatedEstimate.outcome.accepted == 34)
-        #expect(
-            seedInflatedEstimate.controller.activeDepthForTesting(decodeRowBucket: 1) == 0)
+        // What the controller was fed before the fix: decline, and spend only
+        // the bounded learning budget finding that out.
+        #expect(folded.outcome.rounds == 23)
+        #expect(folded.outcome.accepted == 34)
+        #expect(folded.controller.activeDepthForTesting(decodeRowBucket: 1) == 0)
 
-        // What the same controller does on the same hardware once depth 1 is
-        // costed at its steady-state price — the price forced mode measures
-        // over 75 samples, and the one worth +14.7% decode throughput.
-        #expect(steadyStateTruth.outcome.rounds > 150)
-        #expect(steadyStateTruth.controller.activeDepthForTesting(decodeRowBucket: 1) == 1)
+        // What it is fed now — the isolated round, 14.195 ms against forced
+        // mode's independently measured 14.214 ms steady state.
+        #expect(abs(isolatedDepthOne - 14_195_000.0) < 1_000.0)
+        #expect(abs(isolatedDepthOne - 14_214_000.0) / 14_214_000.0 < 0.005)
+        #expect(isolated.outcome.rounds > 150)
+        #expect(isolated.controller.activeDepthForTesting(decodeRowBucket: 1) == 1)
 
-        // Both sides of the comparison are honest measurements of the same
-        // machine. Only the seed attribution separates them.
-        #expect(seedInflatedDepthOne / steadyStateDepthOne > 1.7)
+        // One seed is the whole difference between the two verdicts.
+        #expect(seedInflatedDepthOne / isolatedDepthOne > 1.7)
     }
 }

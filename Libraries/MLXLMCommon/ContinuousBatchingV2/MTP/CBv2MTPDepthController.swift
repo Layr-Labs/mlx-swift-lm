@@ -153,6 +153,10 @@ final class CBv2MTPDepthController {
 
     private struct BucketState {
         var costs: [Int: CostState] = [:]
+        /// What it costs to LEAVE depth zero: one seed step, claimed by the
+        /// verify round it prepared. Kept out of `costs` on purpose -- see
+        /// `observeTransitionCost`.
+        var transitionCost = CostState()
         var acceptance = AcceptanceState()
         var activeDepth = 0
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
@@ -196,6 +200,36 @@ final class CBv2MTPDepthController {
         var state = buckets[decodeRowBucket] ?? BucketState()
         state.acceptance.observe(drafted: drafted, accepted: accepted)
         buckets[decodeRowBucket] = state
+    }
+
+    /// Record the seed step that a positive-depth round had to run because it
+    /// had no carry.
+    ///
+    /// This is deliberately NOT folded into `costs[depth]`. `goodput(d)`
+    /// answers "what rate will I sustain if I serve at depth d", which is a
+    /// steady-state question, and the steady state of a positive depth does
+    /// not seed: `EngineLoopV2+MTPFinalize` stores a fresh carry on every
+    /// verify round that confirmed a token, partial rejections included, and
+    /// only a depth-zero plan invalidates carries (`beginMTPPlan`). The seed is
+    /// therefore a one-off transition cost, and charging a one-off to a
+    /// recurring rate is both a category error and self-reinforcing: selecting
+    /// depth zero is what forces the next probe to seed.
+    ///
+    /// It is recorded rather than dropped so the transition price stays
+    /// visible, and so the hysteresis margin -- the thing that actually bounds
+    /// how often a transition is paid -- can be argued against a measured
+    /// number instead of an assumed one.
+    func observeTransitionCost(decodeRowBucket: Int, nanos: UInt64) {
+        guard decodeRowBucket > 0, nanos > 0 else { return }
+        var state = buckets[decodeRowBucket] ?? BucketState()
+        state.transitionCost.observe(nanos)
+        buckets[decodeRowBucket] = state
+    }
+
+    func transitionCostNanosForTesting(decodeRowBucket: Int) -> UInt64 {
+        guard let state = buckets[decodeRowBucket], state.transitionCost.samples > 0
+        else { return 0 }
+        return UInt64(max(0, state.transitionCost.ewmaNanos.rounded()))
     }
 
     func observeCost(decodeRowBucket: Int, depth: Int, wallTimeNanos: UInt64) {

@@ -154,6 +154,98 @@ struct CBv2MTPDepthSweepTests {
             "never sampled: \(Set(0 ... maxDepth).subtracting(seen).sorted())")
     }
 
+    // MARK: - The measured case
+
+    /// Deterministic partial acceptance: draft position `i` is rejected on
+    /// every `measuredPeriods[i]`-th round. The periods are derived from the
+    /// measured `committed/round` column (each position's conditional rate is
+    /// `prefix(i) / prefix(i - 1)`), and the wheel reproduces that column to
+    /// within 0.04 at every width — see the table in the test.
+    private static let measuredPeriods = [11, 3, 5, 100, 8]
+
+    private func measuredAccepted(depth: Int, round: Int) -> Int {
+        var accepted = 0
+        for position in 0 ..< min(depth, Self.measuredPeriods.count) {
+            if (round + 7 * position) % Self.measuredPeriods[position] == 0 { break }
+            accepted += 1
+        }
+        return accepted
+    }
+
+    /// The controller against the real Gemma 4 width sweep, cost column and
+    /// acceptance column both measured, nothing interpolated.
+    ///
+    /// Source: `scratchpad/control-mtp-b1-64tok.md` — production pins, B=1, 64
+    /// output tokens, contiguous KV, greedy, M5 Max, target-only baseline
+    /// 126.5 tok/s. The measured throughput column IS the objective
+    /// (`committed per round / ms per round`), so its argmax is not a modelling
+    /// choice:
+    ///
+    ///     k          0      1      2      3      4      5
+    ///     ms/round   8.46  12.78  15.84  18.45  20.38  23.06
+    ///     committed  1.000  1.909  2.520  3.000  3.500  3.938
+    ///     tok/s      118.2  149.4  159.1  162.6 [171.7] 170.8
+    ///
+    /// This is the case the seed fix is for. Every one of those positive-depth
+    /// rounds had to be reached from depth 0 at least once, and while the seed
+    /// was folded into the depth's sample the controller priced k=1 at
+    /// 25.111 ms instead of 14.195 ms and declined the whole column.
+    @Test("the measured gemma-4 width sweep settles on its measured optimum")
+    func settlesOnTheMeasuredOptimum() {
+        let cost: [Double] = [8.460e6, 12.78e6, 15.84e6, 18.45e6, 20.38e6, 23.06e6]
+        let measuredTokensPerSecond = [118.2, 149.4, 159.1, 162.6, 171.7, 170.8]
+        let measuredOptimum = 4
+        #expect(
+            measuredTokensPerSecond.firstIndex(of: measuredTokensPerSecond.max() ?? 0)
+                == measuredOptimum)
+
+        let controller = CBv2MTPDepthController(
+            maxDepth: cost.count - 1, fixedDepth: nil)
+        var depths: [Int] = []
+        for round in 0 ..< 1200 {
+            let decision = controller.select(plannedDecodeRows: 1, canSpeculate: true)
+            let depth = min(max(decision.depth, 0), cost.count - 1)
+            if depth > 0 {
+                controller.observeAcceptance(
+                    decodeRowBucket: Self.bucket, drafted: depth,
+                    accepted: measuredAccepted(depth: depth, round: round))
+            }
+            controller.recordFinalizedStep(
+                decision: decision,
+                actualDepth: depth,
+                wallTimeNanos: UInt64(cost[depth]),
+                costEligible: true,
+                chained: false,
+                finalizedPlainWork: depth == 0,
+                finalizedVerification: depth > 0)
+            depths.append(depth)
+        }
+
+        #expect(controller.activeDepthForTesting(decodeRowBucket: Self.bucket) == measuredOptimum)
+        let firstOptimum = depths.firstIndex(of: measuredOptimum) ?? Int.max
+        #expect(firstOptimum < 100, "reached the optimum only at round \(firstOptimum)")
+        let tail = depths.suffix(200)
+        let atOptimum = tail.filter { $0 == measuredOptimum }.count
+        #expect(atOptimum >= 190, "only \(atOptimum)/200 tail rounds at the optimum")
+    }
+
+    /// The wheel is only worth anything if it reproduces the measured
+    /// acceptance, so state that separately from the controller's behaviour.
+    @Test("the acceptance wheel reproduces the measured committed/round column")
+    func acceptanceWheelMatchesTheMeasuredColumn() {
+        let measured = [1.000, 1.909, 2.520, 3.000, 3.500, 3.938]
+        for depth in 1 ... 5 {
+            let rounds = 2000
+            let total = (0 ..< rounds).reduce(0) {
+                $0 + 1 + measuredAccepted(depth: depth, round: $1)
+            }
+            let realised = Double(total) / Double(rounds)
+            #expect(
+                abs(realised - measured[depth]) < 0.05,
+                "k=\(depth): wheel \(realised) vs measured \(measured[depth])")
+        }
+    }
+
     @Test("a fixed pin overrides the sweep entirely")
     func fixedPinWins() {
         let controller = CBv2MTPDepthController(maxDepth: 7, fixedDepth: 4)
