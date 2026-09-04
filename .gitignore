@@ -47,6 +47,7 @@ Package.resolved
 .swiftpm
 
 .build/
+.build-port/
 
 # CocoaPods
 #
