@@ -301,24 +301,6 @@ private let compiledGeGLUShaped: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
-private let switchGeluShapedFuseEnabled: Bool =
-    ProcessInfo.processInfo.environment["DARKBLOOM_GELU_SHAPED_FUSE"] != "0"
-
-/// Admit only the routed-expert decode rectangles: `[64, 1, N]` / `[64, N]`,
-/// both operands bfloat16 with identical shapes. Prefill's per-prompt row
-/// counts stay on the shapeless closure so the compiler cache cannot grow.
-@inline(__always)
-private func geGLUClaimsPinnedDecode(_ gate: MLXArray, _ up: MLXArray) -> Bool {
-    guard switchGeluShapedFuseEnabled,
-        gate.dtype == .bfloat16, up.dtype == .bfloat16,
-        gate.shape == up.shape
-    else { return false }
-    let s = gate.shape
-    if s.count == 3, s[0] == 64, s[1] == 1 { return true }
-    if s.count == 2, s[0] == 64 { return true }
-    return false
-}
-
 /// GELU-FUSE-PREFILL: a bounded set of additionally admitted shapes.
 ///
 /// GELU-FUSE left prefill on the shapeless closure for one stated reason — a
@@ -383,7 +365,7 @@ private func geGLUClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
 
 @inline(__always)
 private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
-    if geGLUClaimsPinnedDecode(gate, up) || geGLUClaimsPrefill(gate, up) {
+    if geGLUClaimsPrefill(gate, up) {
         return compiledGeGLUShaped(gate, up)
     }
     return compiledGeGLU(gate, up)
