@@ -817,6 +817,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// vend no inner state (mocks). Test hook. (internal(set): MTP round
     /// steps in EngineLoopV2+MTP.swift count here too.)
     public internal(set) var offsetChainEvalSteps = 0
+    /// CFAbsoluteTime (seconds) at which the previous `engineStep` returned,
+    /// used to time the host-side gap between consecutive command buffers
+    /// (`v2.step.gap`). Written and read only under `CBv2StepProfiler.enabled`,
+    /// so a profiler-off step pays one predictable Bool branch and nothing
+    /// else. Zero until the first profiled step ends.
+    private var profilerLastStepEndSeconds: Double = 0
     /// Fired (from the watchdog thread) when a step exceeds `stepTimeout`.
     public var onStepWedge: (@Sendable (TimeInterval) -> Void)?
     /// Test hook: artificial delay at the START of the enqueue engine block,
@@ -1840,12 +1846,24 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
         let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        // Host-side gap since the previous step returned: the interval in which
+        // the engine is off the GPU between two chained command buffers
+        // (engineQueue re-dispatch + any GPU-idle drain). No MTLCommandBuffer
+        // gpuStartTime/gpuEndTime is reachable through mlx-swift/Cmlx — the
+        // Metal surface exposes only start_capture/stop_capture — so this host
+        // interval is the only per-step GPU-idle-gap signal available without
+        // patching MLX's C++ backend.
+        if CBv2StepProfiler.enabled, profilerLastStepEndSeconds > 0 {
+            CBv2StepProfiler.record(
+                "v2.step.gap", seconds: stepStart - profilerLastStepEndSeconds)
+        }
         markStepStarted()
         defer {
             markStepEnded()
             if CBv2StepProfiler.enabled {
-                CBv2StepProfiler.record(
-                    "v2.step.wall", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
+                let stepEnd = CFAbsoluteTimeGetCurrent()
+                CBv2StepProfiler.record("v2.step.wall", seconds: stepEnd - stepStart)
+                profilerLastStepEndSeconds = stepEnd
             }
         }
 
