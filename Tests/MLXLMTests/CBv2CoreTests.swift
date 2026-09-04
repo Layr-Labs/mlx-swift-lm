@@ -930,8 +930,11 @@ struct CBv2CoreLayerCacheTests {
         let cache = CBv2LayerCache(layerIndex: 0, kind: kind)
         cache.appendRow(prefilledRow(3))
         cache.appendRow(prefilledRow(4))
-        // 1 positionOffsets array + 2 arrays (K, V) per row.
-        #expect(cache.innerState().count == 1 + 2 * 2)
+        // 2 fixed lazy chains the engine evals each step (positionOffsets +
+        // decodeRingWriteFence) + 2 arrays (K, V) per row. The decodeRingWriteFence
+        // chain was added to innerState() with the decode-ring write path; the old
+        // expectation (5) predates it.
+        #expect(cache.innerState().count == 2 + 2 * 2)
         #expect(cache.maxSize == nil)
         #expect(cache.isTrimmable == false)
         #expect(cache.trim(5) == 0)
