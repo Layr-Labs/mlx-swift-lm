@@ -109,6 +109,25 @@ public protocol QuantizationPolicyReceiving: AnyObject {
     var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization? { get set }
 }
 
+/// Implemented by models that must keep some checkpoint tensors out of the
+/// load.
+///
+/// The contract:
+///
+/// * ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:)``
+///   asks `shouldLoadWeight(named:)` about every tensor name in every shard.
+/// * The name is the original name on the disk, before `sanitize` renames it.
+/// * The loader asks before it materializes the array. mlx reads the
+///   safetensors header and makes one unevaluated array for each tensor, so
+///   an excluded tensor never reads its bytes.
+/// * An excluded tensor is not in the dictionary that goes to
+///   ``BaseLanguageModel/sanitize(weights:metadata:)``.
+/// * A model that does not conform to this protocol keeps all tensors.
+public protocol WeightNameFiltering {
+    /// Answer `false` to keep the tensor `name` out of the load.
+    func shouldLoadWeight(named name: String) -> Bool
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -142,6 +161,13 @@ public func loadWeights(
     }
     shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
 
+    // Models can exclude tensors by name before they are materialized. The
+    // shard tasks below run the predicate concurrently; it only reads a name
+    // and answers, so `nonisolated(unsafe)` is the correct annotation for the
+    // non-Sendable model reference (same reason `ParallelShardState` above is
+    // `@unchecked Sendable`).
+    nonisolated(unsafe) let weightFilter = model as? WeightNameFiltering
+
     // Hand the kernel a head start on every shard. F_RDADVISE is Darwin's
     // async-prefetch primitive — it issues a non-blocking advisory read into
     // the unified buffer cache, letting the SSD start streaming pages before
@@ -161,7 +187,14 @@ public func loadWeights(
 
     DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
         do {
-            let (w, m) = try loadArraysAndMetadata(url: urls[idx])
+            var (w, m) = try loadArraysAndMetadata(url: urls[idx])
+            // Drop the excluded names BEFORE the eval() below. mlx's
+            // safetensors reader parses only the header and returns one
+            // unevaluated array per tensor, so an array that is dropped here
+            // never reads its bytes.
+            if let weightFilter {
+                w = w.filter { weightFilter.shouldLoadWeight(named: $0.key) }
+            }
             if !w.isEmpty {
                 eval(Array(w.values))
             }

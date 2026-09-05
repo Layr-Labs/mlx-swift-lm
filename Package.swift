@@ -2,7 +2,34 @@
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import CompilerPluginSupport
+import Foundation
 import PackageDescription
+
+/// Depend on a SIBLING `../mlx-swift` checkout when one exists, and on the
+/// remote otherwise.
+///
+/// Track repos and Darkbloom both consume this fork BESIDE an mlx-swift
+/// checkout of their own. With this package naming mlx-swift by URL and the
+/// consumer naming the same package by path, SwiftPM sees two packages
+/// claiming one identity and warns that the conflict "will be escalated to
+/// an error" — and until it does, which of the two trees actually compiles
+/// is a resolution detail rather than a decision. Pointing at the sibling
+/// makes it a decision: one checkout, the one on disk next to this one.
+///
+/// The check is on `Package.swift` inside the sibling, not on the directory:
+/// an empty or half-cloned `../mlx-swift` must fall back to the remote
+/// rather than fail resolution with a confusing "not a package" error.
+let mlxSwiftDependency: Package.Dependency = {
+    let sibling = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("mlx-swift")
+    let manifest = sibling.appendingPathComponent("Package.swift")
+    if FileManager.default.fileExists(atPath: manifest.path) {
+        return .package(path: sibling.path)
+    }
+    return .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main")
+}()
 
 let package = Package(
     name: "mlx-swift-lm",
@@ -31,6 +58,12 @@ let package = Package(
         .library(
             name: "MLXLMServer",
             targets: ["MLXLMServer"]),
+        .library(
+            name: "MLXRunners",
+            targets: ["MLXRunners"]),
+        .executable(
+            name: "bench-worker",
+            targets: ["bench-worker"]),
         .executable(
             name: "mlx-server",
             targets: ["mlx-server"]),
@@ -42,7 +75,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
+        mlxSwiftDependency,
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -130,6 +163,34 @@ let package = Package(
             dependencies: ["MLXLMServer"],
             path: "Executables/mlx-server"
         ),
+        // The runner boundary (Darkbloom runner contract): one model family
+        // per runner, a static manifest, and the CBv2 engine + one-row
+        // stepper built over the same model instance. Darkbloom and
+        // bench-worker are the two consumers; neither carries family code.
+        .target(
+            name: "MLXRunners",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Libraries/MLXRunners"
+        ),
+        // Engine Protocol v1 NDJSON-over-stdio server over `Runner`. ONE
+        // binary for every runner: benchd never links a runner.
+        .executableTarget(
+            name: "bench-worker",
+            dependencies: [
+                "MLXRunners",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Executables/bench-worker",
+            plugins: ["BenchRevisionStamp"]
+        ),
         .target(
             name: "BenchmarkHelpers",
             dependencies: [
@@ -156,6 +217,7 @@ let package = Package(
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
+                .product(name: "Cmlx", package: "mlx-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
@@ -163,6 +225,9 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                // Qwen4ExpRunnerTests drive the runner boundary over the tiny
+                // Qwen 3.8 Flash-Next fixture, which lives here.
+                "MLXRunners",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
@@ -283,6 +348,28 @@ let package = Package(
         ),
         // Harness-integrity tests: option parsing, engine resolution, and
         // report/optimization provenance. Model-free, so they run in CI.
+        .testTarget(
+            name: "MLXRunnersTests",
+            // MLXLLM: the Qwen 3.8 Flash-Next resource tests build the tiny
+            // tower to read the n-gram geometry off its PLE layer.
+            dependencies: [
+                "MLXRunners",
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/MLXRunnersTests",
+            resources: [
+                // The SHARED Engine Protocol v1 conformance fixture, pinned
+                // identically on the benchd side.
+                .process("Resources/engine-wire-v1-adapter.ndjson"),
+                // The mock adapter's own manifest, checked in beside the
+                // fixture: BOTH repos digest these same bytes.
+                .process("Resources/engine-wire-v1-adapter.manifest.json"),
+            ]
+        ),
         .testTarget(
             name: "BenchCBv2Tests",
             dependencies: ["BenchCBv2Core"],

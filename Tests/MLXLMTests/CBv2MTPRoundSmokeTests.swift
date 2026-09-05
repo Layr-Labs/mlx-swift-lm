@@ -213,6 +213,55 @@ struct CBv2MTPRoundSmokeTests {
         #expect(1 + metrics.seedSteps + metrics.emittedTokens <= 40)
     }
 
+    // MARK: - (1b) Per-request timing sees the rounds
+
+    @Test func perRequestTimingCountsRounds() async throws {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 24, seed: 12, vocabSize: vocabSize)
+        let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
+        CBv2CoreInstrumentation.countingEnabled = true
+        defer { CBv2CoreInstrumentation.countingEnabled = false }
+        let syncsBefore = CBv2CoreInstrumentation.hostSyncs
+        let speculative = try await run(on, greedyRequest(id: 1, prompt: prompt, maxTokens: 40))
+        let metrics = try #require(on.mtpMetricsSnapshot())
+        await on.shutdown()  // the drain completes only with no step in flight
+        let syncs = CBv2CoreInstrumentation.hostSyncs - syncsBefore
+        let stepsExecuted = on.capacity().stepsExecuted
+
+        // Host-sync multiplier on the MTP path: every executed step performs
+        // its ONE finalize readback; an MTP-round finalize adds up to three
+        // more (seed policy margin, acceptance packet, verify policy margin);
+        // serial target verification adds one blocking eval per verify
+        // column at launch; a round whose capture could not be fenced adds
+        // one blocking eval (never on the contiguous/paged backends that
+        // exist today); a logprob segment adds three readbacks (none here —
+        // no row asks for logprobs). So
+        //   steps ≤ syncs ≤ steps + seedSteps + 2 × rounds + serialColumns
+        //                  + captureFallbackRounds.
+        // Only the lower bound is asserted here: the counter is
+        // process-global and swift-testing runs other engine suites
+        // concurrently (the exact per-step equality is asserted by the
+        // serial XCTest timing suite).
+        #expect(syncs >= stepsExecuted, "one finalize readback per executed step")
+
+        #expect(speculative.finishReason == .length)
+        let t = try #require(speculative.usage).timing
+        #expect(t.mtpRounds > 0, "the round loop must be visible per request")
+        #expect(t.mtpAccepted <= t.mtpProposed)
+        // Alone in the engine, the per-request tallies ARE the engine's
+        // cumulative round metrics (both recorded in the same verify walk).
+        #expect(t.mtpRounds == UInt32(metrics.rounds))
+        #expect(t.mtpProposed == UInt32(metrics.draftedTokens))
+        #expect(t.mtpAccepted == UInt32(metrics.acceptedTokens))
+        // The exported phase order holds on the MTP launch path too.
+        #expect(t.admittedNanos > 0)
+        #expect(t.admittedNanos <= t.kvAllocatedNanos)
+        #expect(t.kvAllocatedNanos <= t.prefillFirstLaunchNanos)
+        #expect(t.prefillFirstLaunchNanos <= t.promptComputedNanos)
+        #expect(t.promptComputedNanos <= t.firstTokenNanos)
+        #expect(t.firstTokenNanos <= t.finishedNanos)
+    }
+
     // MARK: - (2) Mixed batch: verify rows + a prefilling neighbor
 
     @Test func mixedBatchWithPrefillNeighborStaysTokenExact() async throws {

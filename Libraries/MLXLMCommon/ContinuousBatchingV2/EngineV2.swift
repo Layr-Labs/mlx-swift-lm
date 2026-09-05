@@ -208,6 +208,11 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         {
             preconditionFailure(violation)
         }
+        if let violation = Self.keepMaskViolation(
+            model: model, cacheProvider: cacheProvider)
+        {
+            preconditionFailure(violation)
+        }
         let prefixReuseCapability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
             backend: backend.prefixReuseBackend,
@@ -389,6 +394,21 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             backend.prefixReuseBackend == .pagedFP16
         else { return nil }
         return "EngineV2: model capability vetoes paged KV for request-owned recurrent state"
+    }
+
+    /// Construction-time keep-mask pairing. A model whose attention is sparse
+    /// by construction (Qwen 3.8 Flash-Next QSA) declares
+    /// `cbv2RequiresKeepMask`; serving it on a provider that drops the mask
+    /// would answer with a DIFFERENT model, so the engine refuses to build.
+    public static func keepMaskViolation(
+        model: any CBv2SteppableModel, cacheProvider: CBv2LayerCacheProvider
+    ) -> String? {
+        guard (model as? any CBv2KeepMaskRequiringModel)?.cbv2RequiresKeepMask == true,
+            !cacheProvider.supportsKeepMask
+        else { return nil }
+        return
+            "EngineV2: \(type(of: model)) requires the attention keep mask, but "
+            + "\(type(of: cacheProvider)) does not support it (supportsKeepMask == false)"
     }
 
     // MARK: Submission preparation
@@ -680,6 +700,17 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// The lookup pin travels with the adoption; the loop balances it in
     /// every outcome.
     private func makePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
+        // Submit-thread duration of hashing + lookup + plan derivation
+        // (`CBv2RequestTiming.prefixLookupNanos`); rides the lookup into
+        // `enqueue` so no engine-queue clock read is needed.
+        guard prefixCache != nil else { return resolvePrefixLookup(for: request) }
+        let started = DispatchTime.now().uptimeNanoseconds
+        var lookup = resolvePrefixLookup(for: request)
+        lookup.lookupNanos = max(1, DispatchTime.now().uptimeNanoseconds &- started)
+        return lookup
+    }
+
+    private func resolvePrefixLookup(for request: CBv2Request) -> CBv2PrefixLookup {
         guard let prefixCache else {
             return CBv2PrefixLookup(adoption: nil, outcome: .disabled, matchedTokens: 0)
         }

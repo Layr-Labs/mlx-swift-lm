@@ -748,6 +748,29 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
 
 If the `lmHead` module is created but not used, the parameter load will fail validation because the `lm_head` keys will be missing.
 
+### Excluding Checkpoint Tensors from the Load
+
+Some checkpoints hold tensors that the model does not use, for example large
+tables that the model computes instead of reading. A model can keep them out of
+memory: make the model conform to `WeightNameFiltering` and answer `false` in
+`shouldLoadWeight(named:)` for the names to exclude.
+
+```swift
+extension MyModel: WeightNameFiltering {
+    public func shouldLoadWeight(named name: String) -> Bool {
+        !name.contains(".unused_table.shard_")
+    }
+}
+```
+
+`loadWeights(modelDirectory:model:quantization:perLayerQuantization:)` asks
+about every tensor name in every shard, before it materializes the array. The
+name is the name on the disk, before `sanitize` renames it. mlx reads the
+safetensors header and makes one unevaluated array for each tensor, so an
+excluded tensor never reads its bytes. An excluded tensor is also not in the
+dictionary that goes to `sanitize`. A model that does not conform to the
+protocol keeps all tensors.
+
 ### Pre-computed MLXArrays
 
 In some cases it is convenient to pre-compute some `MLXArray` but not treat it as a loadable parameter. In particular, we do not want the loading of parameters to fail because this MLXArray is "missing".
