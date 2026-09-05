@@ -54,6 +54,12 @@ public protocol CBv2LayerCacheProvider: AnyObject {
     /// rectangular recurrent MTP verification window without cross-column
     /// attention. Stateful Qwen drafting fails closed without this seam.
     var supportsMTPRectangularVerification: Bool { get }
+    /// True only when EVERY cache this provider vends honors the optional
+    /// per-row keep mask on `updateAndAttend`. Sparse-attention families
+    /// (Qwen 3.8 Flash-Next QSA) declare `cbv2RequiresKeepMask` and the
+    /// engine refuses at construction when this is false, so a dense
+    /// fallback can never be served silently. Fail-safe default false.
+    var supportsKeepMask: Bool { get }
 }
 
 extension CBv2LayerCacheProvider {
@@ -61,6 +67,7 @@ extension CBv2LayerCacheProvider {
     public var supportsPackedPrefill: Bool { false }
     public var supportsPackedMultimodalSpans: Bool { false }
     public var supportsMTPRectangularVerification: Bool { false }
+    public var supportsKeepMask: Bool { false }
 }
 
 // MARK: - Sampler interface (WS-E's CBv2DefaultSampler is the production impl)

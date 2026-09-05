@@ -184,6 +184,17 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         caches.allSatisfy { $0 is any CBv2MTPRectangularSerializing }
     }
 
+    /// Keep-mask eligibility: every cache must AFFIRM that it applies the
+    /// mask (`CBv2KeepMaskCapableCache`). A cache that makes no claim keeps
+    /// the refusing protocol default, so an unclaimed layer would trap on
+    /// its first sparse forward; this reports it at engine construction
+    /// instead.
+    public var supportsKeepMask: Bool {
+        caches.allSatisfy {
+            ($0 as? CBv2KeepMaskCapableCache)?.honorsKeepMask ?? false
+        }
+    }
+
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {

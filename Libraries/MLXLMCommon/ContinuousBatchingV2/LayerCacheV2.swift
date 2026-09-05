@@ -109,6 +109,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks,
+            keepMask: nil)
+    }
+
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, keepMask: MLXArray?
+    ) -> MLXArray {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
@@ -117,7 +126,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention,
+            keepMask: keepMask)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -180,6 +190,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 // MARK: - Final-layer last-query prefill
 
 extension CBv2LayerCache: CBv2LastQueryPrefillLayerCache {}
+
+// MARK: - Keep-mask support
+
+/// The contiguous backend composes the keep mask with the causal or window
+/// mask in absolute coordinates, so it is exact on every layer this cache
+/// vends.
+extension CBv2LayerCache: CBv2KeepMaskCapableCache {
+    public var honorsKeepMask: Bool { true }
+}
 
 // MARK: - Vision span-mask binding
 
