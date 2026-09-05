@@ -84,6 +84,28 @@ extension EngineV2: CBv2MTPCountersReporting {}
 /// (`CBv2MTPMetrics.roundAudits`). Every field here is a reading of records
 /// the engine wrote at its finalize boundary; nothing is computed from the
 /// tokens the worker happened to drain.
+/// One verify round as the journal states it, across the cohort's streams.
+public struct FreeRunRound: Sendable, Equatable {
+    /// The committed width, common to every active stream.
+    public var width: Int
+    /// Per stream, whether it was still generating in this round.
+    public var active: [Bool]
+    /// Per stream, the PRE-min natural accept-walk length (0 when inactive).
+    public var naturalAccepted: [Int]
+    /// Draft tokens proposed across the streams.
+    public var drafted: Int
+    /// Drafts that passed verification AND were committed, across the streams.
+    public var accepted: Int
+
+    public init(width: Int, active: [Bool], naturalAccepted: [Int], drafted: Int, accepted: Int) {
+        self.width = width
+        self.active = active
+        self.naturalAccepted = naturalAccepted
+        self.drafted = drafted
+        self.accepted = accepted
+    }
+}
+
 public struct FreeRunRoundAudit: Sendable, Equatable {
     /// Per round, the committed width. Length is the round count R.
     public var acceptanceLengths: [Int]
@@ -122,11 +144,6 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
         /// The cohort commits ONE common width per round, so this means the
         /// window boundary or the row grouping is wrong.
         case widthDisagreement(round: Int, widths: [Int])
-        /// The journal accounts for more committed tokens than the worker
-        /// drained. Under-count is legitimate — a target-only decode step
-        /// commits a token and finalizes no verify round — but over-count
-        /// means the window covers records from outside it.
-        case journalOvercount(journal: Int, drained: Int)
 
         public var description: String {
             switch self {
@@ -140,9 +157,6 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
                 return "mtp round \(round) reports committed widths "
                     + "\(widths.map(String.init).joined(separator: ", ")); a cohort "
                     + "commits one common width"
-            case .journalOvercount(let journal, let drained):
-                return "mtp round journal accounts for \(journal) committed tokens "
-                    + "but \(drained) were drained"
             }
         }
     }
@@ -160,7 +174,19 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
         slotForRequestID: [UInt64: Int],
         streamCount: Int
     ) throws -> FreeRunRoundAudit? {
-        guard !records.isEmpty else { return nil }
+        let rounds = try assembleRounds(
+            records: records, slotForRequestID: slotForRequestID, streamCount: streamCount)
+        guard !rounds.isEmpty else { return nil }
+        return FreeRunRoundAudit(rounds: rounds, streamCount: streamCount)
+    }
+
+    /// The window's rounds, in order, from the journal. See `assemble`.
+    public static func assembleRounds(
+        records: [CBv2MTPRoundAuditRecord],
+        slotForRequestID: [UInt64: Int],
+        streamCount: Int
+    ) throws -> [FreeRunRound] {
+        guard !records.isEmpty else { return [] }
 
         var byRow = [[CBv2MTPRoundAuditRecord]](repeating: [], count: streamCount)
         for record in records {
@@ -170,31 +196,87 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
             byRow[slot].append(record)
         }
 
-        let rounds = byRow.map(\.count).max() ?? 0
-        var acceptanceLengths: [Int] = []
-        var activeStreams: [Int] = []
-        for round in 0 ..< rounds {
-            let widths = byRow.compactMap { row in
-                round < row.count ? row[round].confirmed : nil
-            }
+        let roundCount = byRow.map(\.count).max() ?? 0
+        var rounds: [FreeRunRound] = []
+        for round in 0 ..< roundCount {
+            let present = byRow.map { row in round < row.count ? row[round] : nil }
+            let widths = present.compactMap { $0?.confirmed }
             guard let width = widths.first else { continue }
             guard widths.allSatisfy({ $0 == width }) else {
                 throw AuditError.widthDisagreement(round: round, widths: widths)
             }
-            acceptanceLengths.append(width)
-            activeStreams.append(widths.count)
+            rounds.append(
+                FreeRunRound(
+                    width: width,
+                    active: present.map { $0 != nil },
+                    naturalAccepted: present.map { $0?.accepted ?? 0 },
+                    drafted: present.reduce(0) { $0 + ($1?.k ?? 0) },
+                    accepted: present.reduce(0) { $0 + min($1?.accepted ?? 0, $1?.confirmed ?? 0) }
+                ))
         }
+        return rounds
+    }
 
-        let natural = byRow.map { row in
-            (0 ..< rounds).map { round in round < row.count ? row[round].accepted : 0 }
+    /// Build the wire audit from rounds. Totals are sums over rounds; the
+    /// per-stream natural walk is transposed to the wire's `[stream][round]`.
+    public init(rounds: [FreeRunRound], streamCount: Int) {
+        self.acceptanceLengths = rounds.map(\.width)
+        self.naturalAcceptedByStream = (0 ..< streamCount).map { stream in
+            rounds.map { $0.naturalAccepted[stream] }
         }
-        return FreeRunRoundAudit(
-            acceptanceLengths: acceptanceLengths,
-            naturalAcceptedByStream: natural,
-            activeStreamsByRound: activeStreams,
-            draftedTotal: records.reduce(0) { $0 + $1.k },
-            acceptedTotal: records.reduce(0) { $0 + min($1.accepted, $1.confirmed) },
-            committedTotal: records.reduce(0) { $0 + $1.confirmed })
+        self.activeStreamsByRound = rounds.map { $0.active.filter { $0 }.count }
+        self.draftedTotal = rounds.reduce(0) { $0 + $1.drafted }
+        self.acceptedTotal = rounds.reduce(0) { $0 + $1.accepted }
+        self.committedTotal = rounds.reduce(0) { $0 + $1.width * $1.active.filter { $0 }.count }
+    }
+
+    /// Split the rounds at the drain boundary.
+    ///
+    /// WHY. The engine runs ahead of the caller: a verify round commits up to
+    /// depth + 1 tokens at once, and the journal may already hold rounds whose
+    /// tokens are still in the stream. A window must state EXACTLY the
+    /// tokens it returned (benchd: `sum(acceptance_lengths) == N`,
+    /// `committed_total == N`), so the rounds are cut at `drainedPerStream`:
+    /// whole rounds inside the boundary stay; the round that straddles it is
+    /// CLIPPED — this window states the width it returned, the drafts that
+    /// round proposed, and the accepts that fit (`min(accepted, width - 1)`;
+    /// the bonus token is the one past the accepts) — and the remainder
+    /// carries into the next window as a round with no drafts and no
+    /// accepts, because those were already stated. Rounds wholly past the
+    /// boundary carry intact. Nothing is dropped and nothing is counted
+    /// twice; a box saw the alternative, a refusal whenever a round did not
+    /// land on the count.
+    public static func split(
+        rounds: [FreeRunRound], drainedPerStream: Int
+    ) -> (window: [FreeRunRound], carry: [FreeRunRound]) {
+        var window: [FreeRunRound] = []
+        var carry: [FreeRunRound] = []
+        var seen = 0
+        for round in rounds {
+            if !carry.isEmpty || seen >= drainedPerStream {
+                carry.append(round)
+                continue
+            }
+            let room = drainedPerStream - seen
+            if round.width <= room {
+                window.append(round)
+                seen += round.width
+                continue
+            }
+            var head = round
+            head.width = room
+            head.accepted = min(round.accepted, room - 1)
+            head.naturalAccepted = round.naturalAccepted.map { min($0, room - 1) }
+            window.append(head)
+            seen = drainedPerStream
+            var tail = round
+            tail.width = round.width - room
+            tail.drafted = 0
+            tail.accepted = 0
+            tail.naturalAccepted = round.naturalAccepted.map { _ in 0 }
+            carry.append(tail)
+        }
+        return (window, carry)
     }
 
     /// The audit of a serial window: one round of width one per committed
@@ -602,6 +684,10 @@ public final class BenchWorkerServer: @unchecked Sendable {
         /// but a row CAN finalize one before `free_decode_run` is called, so
         /// the window starts where the journal stood after the seed drain.
         var journalCursor = 0
+        /// Rounds the journal already stated whose tokens this session has
+        /// not yet returned: the clipped remainder and any run-ahead rounds.
+        /// See `FreeRunRoundAudit.split`.
+        var carriedRounds: [FreeRunRound] = []
         /// Controller clamp counts as they stood at that same boundary.
         var clampBaseline: [String: Int] = [:]
         var streams: [AsyncStream<CBv2Event>.Iterator]
@@ -741,15 +827,17 @@ public final class BenchWorkerServer: @unchecked Sendable {
                     cap: CBv2MTPRoundAuditRecord.retainedRecordCap)
             }
             let window = Array(metrics.roundAudits.dropFirst(session.journalCursor))
-            audit = try FreeRunRoundAudit.assemble(
+            let fresh = try FreeRunRoundAudit.assembleRounds(
                 records: window,
                 slotForRequestID: session.slotForRequestID,
                 streamCount: session.batch)
-            if let audit, audit.committedTotal > drained {
-                throw FreeRunRoundAudit.AuditError.journalOvercount(
-                    journal: audit.committedTotal, drained: drained)
-            }
             session.journalCursor = metrics.roundAudits.count
+            let cut = FreeRunRoundAudit.split(
+                rounds: session.carriedRounds + fresh, drainedPerStream: count)
+            session.carriedRounds = cut.carry
+            if !cut.window.isEmpty {
+                audit = FreeRunRoundAudit(rounds: cut.window, streamCount: session.batch)
+            }
 
             var clamps = Self.clampReasons(metrics)
             for (reason, base) in session.clampBaseline {
@@ -879,7 +967,17 @@ public final class BenchWorkerServer: @unchecked Sendable {
             throw WorkerError.modeNotAdvertised(requested.mode)
         }
         if requested.mode == DecoderID.mtp.rawValue {
-            return SpecConfig(mode: requested.mode, mtp: MtpSpec(depth: requested.depth))
+            // The echo is the SERVED depth. The engine clamps a request above
+            // the manifest's range to its ceiling (clamp, not refuse, is the
+            // ruled wire posture), so an unclamped echo would let benchd seal
+            // a "depth 7" leg that ran at 6.
+            var depth = requested.depth
+            if requested.mtp != nil,
+                let range = manifest.decoders.first(where: { $0.mode == requested.mode })?.depth
+            {
+                depth = min(max(depth, range.lowerBound), range.upperBound)
+            }
+            return SpecConfig(mode: requested.mode, mtp: MtpSpec(depth: depth))
         }
         return SpecConfig(mode: requested.mode)
     }

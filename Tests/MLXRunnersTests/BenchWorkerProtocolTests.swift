@@ -432,6 +432,74 @@ struct FreeRunRoundAuditTests {
         #expect(assembled?.naturalAcceptedByStream == [[2, 1, 1], [2, 1, 0]])
     }
 
+    /// The engine runs ahead: a round commits up to depth + 1 tokens, and the
+    /// journal can hold rounds whose tokens are still in the stream. The
+    /// window states exactly the tokens it returned; the rest carries.
+    @Test("A round straddling the drain boundary is clipped, the remainder carries")
+    func straddlingRoundIsClipped() async throws {
+        // Fixture rounds commit 3, 1, 2; drain 5: the third round is cut to 1.
+        let response = try await freeRun(script: .fixtureWindow, count: 5)
+        #expect(response.ok)
+        #expect(response.acceptanceLengths == [3, 1, 1])
+        // Drafts of every round that started are stated now (3 × k=2);
+        // accepts that fit: 2, 1, and min(1, 1 - 1) = 0 for the clipped round.
+        #expect(response.draftedTotal == 6)
+        #expect(response.acceptedTotal == 3)
+        #expect(response.committedTotal == 5)
+    }
+
+    @Test("Rounds past the boundary carry intact into the next window")
+    func runAheadRoundsCarry() async throws {
+        // Two rounds journaled at once (4 then 2 tokens); the caller drains 4,
+        // then 2. Window one is the first round alone; window two is the
+        // second round, drafts and accepts intact — stated once, in the
+        // window that returned its tokens.
+        let script = MockRoundScript(rounds: [
+            MockRoundScript.Round(k: 3, accepted: 3, confirmed: 4),
+            MockRoundScript.Round(k: 3, accepted: 1, confirmed: 2),
+        ])
+        let begin =
+            "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53],"
+            + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":3}}}"
+        let transport = ScriptedTransport(lines: [
+            begin,
+            "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":4}",
+            "{\"id\":3,\"kind\":\"free_decode_run\",\"count\":2}",
+        ])
+        let server = makeServer(runner: MockRunner(script: script), transport: transport)
+        await server.run()
+        let first = try JSONDecoder().decode(
+            WorkerResponse.self, from: Data(transport.written[2].utf8))
+        let second = try JSONDecoder().decode(
+            WorkerResponse.self, from: Data(transport.written[3].utf8))
+        #expect(first.ok && second.ok)
+        #expect(first.acceptanceLengths == [4])
+        #expect(first.draftedTotal == 3)
+        #expect(first.acceptedTotal == 3)
+        #expect(first.committedTotal == 4)
+        #expect(second.acceptanceLengths == [2])
+        #expect(second.draftedTotal == 3)
+        #expect(second.acceptedTotal == 1)
+        #expect(second.committedTotal == 2)
+    }
+
+    /// The echo is the SERVED depth: the engine clamps to the manifest's
+    /// ceiling, so the echo must too, or benchd seals a depth that never ran.
+    @Test("A depth above the manifest range echoes the ceiling")
+    func depthEchoIsClamped() async throws {
+        let begin =
+            "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53],"
+            + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":7}}}"
+        let transport = ScriptedTransport(lines: [begin])
+        let server = makeServer(runner: MockRunner(script: nil), transport: transport)
+        await server.run()
+        let response = try JSONDecoder().decode(
+            WorkerResponse.self, from: Data(transport.written[1].utf8))
+        #expect(response.ok)
+        // The mock adapter manifest serves mtp at depth [1, 3].
+        #expect(response.effectiveSpec?.depth == 3)
+    }
+
     /// A truncated head cannot prove coverage of the window, so the response
     /// is refused rather than assembled from what survived.
     @Test("A journal at its retention cap refuses the response")
