@@ -187,6 +187,7 @@ public enum BenchWorkerUsage {
           bench-worker runtime-worker --weights <dir> [options]
           bench-worker resident       --weights <dir> --socket <path> [options]
           bench-worker manifest       (--runner <id> | --weights <dir>) [--digest]
+          bench-worker diag-parity    --weights <dir> --golden <json> [--steps <n>] [options]
           bench-worker <subcommand> --help
 
         SUBCOMMANDS
@@ -197,6 +198,9 @@ public enum BenchWorkerUsage {
                            socket, serve one connection at a time.
           manifest         Print a runner's canonical manifest, or its sha256. Loads
                            no weights.
+          diag-parity      DIAGNOSTIC. Load once, then teacher-force a golden through
+                           the fork's legacy forward and the CBv2 stepper side by side
+                           and print the first step where they part. Serves nothing.
         """
 
     public static let runtimeWorker = """

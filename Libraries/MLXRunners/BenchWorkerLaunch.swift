@@ -49,6 +49,10 @@ public enum WorkerLaunchError: Error, CustomStringConvertible, Equatable {
     case manifestTargetMissing
     /// `--pidfile` on a subcommand that owns no process for a window.
     case pidfileNotAccepted(String)
+    /// `diag-parity` named no golden.
+    case missingGolden
+    /// `--golden` / `--steps` on a serving subcommand.
+    case goldenNotAccepted(String)
 
     public var description: String {
         switch self {
@@ -71,6 +75,9 @@ public enum WorkerLaunchError: Error, CustomStringConvertible, Equatable {
             return "manifest requires --runner <id> or --weights <dir>"
         case .pidfileNotAccepted(let subcommand):
             return "--pidfile is only accepted by resident, not \(subcommand)"
+        case .missingGolden: return "diag-parity requires --golden <path>"
+        case .goldenNotAccepted(let subcommand):
+            return "--golden and --steps are only accepted by diag-parity, not \(subcommand)"
         }
     }
 }
@@ -82,6 +89,10 @@ public enum BenchWorkerSubcommand: String, Sendable, Equatable {
     case runtimeWorker = "runtime-worker"
     /// One window. Loads ONCE and listens; see `BenchWorkerResident`.
     case resident
+    /// DIAGNOSTIC. Load once, then run the fork's legacy forward and the
+    /// CBv2 stepper side by side, teacher-forced with a golden, and print
+    /// where they part. Serves nothing. See `BenchWorkerLegacyParity`.
+    case diagParity = "diag-parity"
 }
 
 /// One validated invocation.
@@ -111,6 +122,11 @@ public struct BenchWorkerLaunchOptions: Sendable {
     /// Write the load summary to stderr before the hello. Also honoured
     /// through `BENCH_WORKER_VERBOSE=1`.
     public var verbose: Bool
+    /// `diag-parity` only: the golden whose seed and expected tokens drive
+    /// both paths.
+    public var golden: URL?
+    /// `diag-parity` only: how many expected tokens to teacher-force.
+    public var steps: Int
 
     /// Default KV grant when `--kv-bytes` is absent.
     public static let defaultKVBytesCapacity = 8 << 30
@@ -136,6 +152,8 @@ public struct BenchWorkerLaunchOptions: Sendable {
         var subcommand: BenchWorkerSubcommand?
         var socket: String?
         var pidfile: String?
+        var golden: URL?
+        var steps: Int?
 
         var index = 0
         while index < arguments.count {
@@ -149,7 +167,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
                 return arguments[index]
             }
             switch argument {
-            case "runtime-worker", "resident":
+            case "runtime-worker", "resident", "diag-parity":
                 guard subcommand == nil else {
                     throw WorkerLaunchError.ambiguousSubcommand(
                         "\(subcommand!.rawValue) then \(argument)")
@@ -157,6 +175,12 @@ public struct BenchWorkerLaunchOptions: Sendable {
                 subcommand = BenchWorkerSubcommand(rawValue: argument)
             case "--socket": socket = try next("--socket")
             case "--pidfile": pidfile = try next("--pidfile")
+            case "--golden": golden = URL(fileURLWithPath: try next("--golden"))
+            case "--steps":
+                guard let value = Int(try next("--steps")), value > 0 else {
+                    throw WorkerLaunchError.badValue("--steps")
+                }
+                steps = value
             case "--weights": weights = URL(fileURLWithPath: try next("--weights"))
             case "--runner": runnerID = try next("--runner")
             case "--drafter": drafter = URL(fileURLWithPath: try next("--drafter"))
@@ -184,13 +208,20 @@ public struct BenchWorkerLaunchOptions: Sendable {
             guard let socket, !socket.trimmingCharacters(in: .whitespaces).isEmpty else {
                 throw WorkerLaunchError.missingSocket
             }
-        case .runtimeWorker:
+        case .runtimeWorker, .diagParity:
             guard socket == nil else {
                 throw WorkerLaunchError.socketNotAccepted(
                     resolvedSubcommand.rawValue)
             }
             guard pidfile == nil else {
                 throw WorkerLaunchError.pidfileNotAccepted(resolvedSubcommand.rawValue)
+            }
+        }
+        if resolvedSubcommand == .diagParity {
+            guard golden != nil else { throw WorkerLaunchError.missingGolden }
+        } else {
+            guard golden == nil, steps == nil else {
+                throw WorkerLaunchError.goldenNotAccepted(resolvedSubcommand.rawValue)
             }
         }
         if let runnerID {
@@ -213,7 +244,9 @@ public struct BenchWorkerLaunchOptions: Sendable {
             kvBytesCapacity: kvBytesCapacity,
             speculative: speculative,
             resources: resources,
-            verbose: verbose)
+            verbose: verbose,
+            golden: golden,
+            steps: steps ?? 16)
     }
 
     /// The runner this launch names: the explicit `--runner` id, or the one
@@ -248,7 +281,9 @@ public struct BenchWorkerLaunchOptions: Sendable {
         kvBytesCapacity: Int = BenchWorkerLaunchOptions.defaultKVBytesCapacity,
         speculative: Bool = false,
         resources: RunnerResources = RunnerResources(),
-        verbose: Bool = false
+        verbose: Bool = false,
+        golden: URL? = nil,
+        steps: Int = 16
     ) {
         self.subcommand = subcommand
         self.socket = socket
@@ -261,5 +296,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
         self.speculative = speculative
         self.resources = resources
         self.verbose = verbose
+        self.golden = golden
+        self.steps = steps
     }
 }

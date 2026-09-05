@@ -1,0 +1,124 @@
+// Copyright © 2026 Eigen Labs.
+//
+// MLXRunners — `bench-worker diag-parity`.
+//
+// WHY THIS EXISTS. On the 125B the free run and the teacher-forced oracle
+// agree for nine tokens after a one-forward prefill and part at the tenth,
+// on both drivers, while the old engine — which vendors the SAME legacy
+// forward and cache code this fork carries — reproduces the golden past
+// that step. The fixture model does not show it. So the question has to be
+// put to the real weights: does the fork's LEGACY path (`model(ids, cache:)`
+// over `makeCache()`, the code the old engine ran) still match the golden,
+// and does the CBv2 stepper match the legacy path? Whichever pair parts
+// first names the layer the defect lives in: the CBv2 recurrent-state
+// bookkeeping, or something outside it (transform, n-gram reader, config).
+//
+// DIAGNOSTIC ONLY. Loads once, serves nothing, writes plain text to stdout.
+
+import Foundation
+import MLX
+import MLXLLM
+import MLXLMCommon
+
+public enum BenchWorkerLegacyParity {
+
+    /// The subset of a correctness golden this needs.
+    struct Golden: Decodable {
+        var decodeSeedTokens: [Int]
+        var expectedDecodeSeedToken: Int?
+        var expectedDecodeTokens: [Int]
+
+        enum CodingKeys: String, CodingKey {
+            case decodeSeedTokens = "decode_seed_tokens"
+            case expectedDecodeSeedToken = "expected_decode_seed_token"
+            case expectedDecodeTokens = "expected_decode_tokens"
+        }
+    }
+
+    public enum Failure: Error, CustomStringConvertible {
+        case notQwen4Exp(String)
+        public var description: String {
+            switch self {
+            case .notQwen4Exp(let type):
+                return "diag-parity compares the Qwen4Exp legacy path; the loaded model is \(type)"
+            }
+        }
+    }
+
+    public static func run(
+        runner: any Runner, golden goldenURL: URL, steps: Int, output: FileHandle
+    ) throws {
+        let golden = try JSONDecoder().decode(Golden.self, from: Data(contentsOf: goldenURL))
+        guard let model = runner.servingModel as? Qwen4ExpModel else {
+            throw Failure.notQwen4Exp(String(describing: type(of: runner.servingModel)))
+        }
+        func emit(_ line: String) { output.write(Data((line + "\n").utf8)) }
+
+        // The forced chain: the seed, then the golden's expected tokens.
+        // Step 0 is the prefill; step k >= 1 feeds expected[k - 1].
+        let count = min(steps, golden.expectedDecodeTokens.count)
+        var expectedNext: [Int?] = [golden.expectedDecodeSeedToken]
+        expectedNext.append(
+            contentsOf: golden.expectedDecodeTokens.prefix(count).map { Optional($0) })
+        var fed: [[Int]] = [golden.decodeSeedTokens]
+        if let seedToken = golden.expectedDecodeSeedToken { fed.append([seedToken]) }
+        fed.append(
+            contentsOf: golden.expectedDecodeTokens.prefix(
+                count - (golden.expectedDecodeSeedToken == nil ? 0 : 1)
+            ).map { [$0] })
+
+        emit(
+            "diag-parity: seed \(golden.decodeSeedTokens.count) tokens, \(fed.count) forwards, "
+                + "legacy = model(ids, cache: makeCache()) in one forward, cbv2 = runner.makeStepper()"
+        )
+
+        let legacyCaches = model.makeCache()
+        let stepper = try runner.makeStepper()
+        try stepper.begin()
+        guard let raw = stepper as? CBv2SingleRowStepper else {
+            emit("diag-parity: stepper is not CBv2SingleRowStepper; top-k only")
+            return
+        }
+
+        var firstLegacyMiss: Int?
+        var firstPathSplit: Int?
+        for (step, tokens) in fed.enumerated() {
+            let ids = MLXArray(tokens.map { Int32($0) }).reshaped([1, tokens.count])
+            let legacy = model(ids, cache: legacyCaches)[0..., -1, 0...].asType(.float32)
+            let cbv2 = try raw.forwardLogits(tokens).asType(.float32)
+            eval(legacy, cbv2)
+            let lTop = top(legacy, 4)
+            let cTop = top(cbv2, 4)
+            let linf = MLX.abs(legacy - cbv2).max().item(Float.self)
+            let expected = step < expectedNext.count ? expectedNext[step] : nil
+            let legacyOK = expected.map { $0 == lTop[0].token }
+            let cbv2OK = expected.map { $0 == cTop[0].token }
+            if firstLegacyMiss == nil, legacyOK == false { firstLegacyMiss = step }
+            if firstPathSplit == nil, lTop[0].token != cTop[0].token { firstPathSplit = step }
+            emit(
+                "step \(step) fed \(tokens.count == 1 ? String(tokens[0]) : "seed") expected \(expected.map(String.init) ?? "-") "
+                    + "| legacy \(render(lTop)) \(legacyOK.map { $0 ? "OK" : "MISS" } ?? "") "
+                    + "| cbv2 \(render(cTop)) \(cbv2OK.map { $0 ? "OK" : "MISS" } ?? "") "
+                    + "| linf \(String(format: "%.4f", linf))")
+        }
+        emit(
+            "diag-parity: first legacy miss vs golden: \(firstLegacyMiss.map(String.init) ?? "none"); "
+                + "first legacy/cbv2 argmax split: \(firstPathSplit.map(String.init) ?? "none")")
+    }
+
+    private static func top(_ row: MLXArray, _ k: Int) -> [(token: Int, logit: Float)] {
+        let flat = row.reshaped([-1])
+        let n = min(k, flat.dim(0))
+        let ids = argPartition(-flat, kth: n - 1)[..<n]
+        let values = flat[ids]
+        eval(ids, values)
+        return zip(ids.asArray(Int32.self), values.asArray(Float.self))
+            .map { (token: Int($0), logit: $1) }
+            .sorted { $0.logit > $1.logit || ($0.logit == $1.logit && $0.token < $1.token) }
+    }
+
+    private static func render(_ top: [(token: Int, logit: Float)]) -> String {
+        "[" + top.map { "\($0.token) \(String(format: "%.3f", $0.logit))" }.joined(separator: ", ")
+            + "]"
+    }
+}

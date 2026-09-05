@@ -100,9 +100,10 @@ public final class CBv2SingleRowStepper: TeacherForcedStepper {
     public init(
         model: any LanguageModel,
         layerKinds: [CBv2LayerKind],
-        newCaches: @escaping (
-            (_ layerIndex: Int, _ kind: CBv2LayerKind) throws -> any CBv2AttendingLayerCache
-        ) throws -> [any CBv2AttendingLayerCache],
+        newCaches:
+            @escaping (
+                (_ layerIndex: Int, _ kind: CBv2LayerKind) throws -> any CBv2AttendingLayerCache
+            ) throws -> [any CBv2AttendingLayerCache],
         kvBytesCapacity: Int,
         maxLength: Int
     ) {
@@ -136,6 +137,12 @@ public final class CBv2SingleRowStepper: TeacherForcedStepper {
     }
 
     public func forward(_ tokens: [Int]) throws -> StepOutput {
+        Self.stepOutput(lastPositionLogits: try forwardLogits(tokens))
+    }
+
+    /// The last-position logits row `[1, vocab]` of one forward. What
+    /// `forward` reduces to its top-k; exposed for side-by-side diagnostics.
+    public func forwardLogits(_ tokens: [Int]) throws -> MLXArray {
         guard let bank else { throw StepperError.notBegun }
         guard !tokens.isEmpty else { throw StepperError.emptyForward }
 
@@ -157,7 +164,7 @@ public final class CBv2SingleRowStepper: TeacherForcedStepper {
             asyncEval([logits] + innerState(caches))
         }
         forwards += 1
-        return Self.stepOutput(lastPositionLogits: logits)
+        return logits
     }
 
     // MARK: - Internals

@@ -7,8 +7,8 @@
 // byte-identical whether or not it is on, because stdout is the wire.
 
 import Foundation
-import Testing
 import MLXLMCommon
+import Testing
 
 @testable import MLXRunners
 
@@ -105,10 +105,35 @@ struct RunnerLoadSummaryTests {
             }
             #expect(launch.verbose)
         }
-        guard case .serve(let quiet) = try BenchWorkerCommand.parse([
-            "runtime-worker", "--weights", "/nonexistent",
-        ]) else { return }
+        guard
+            case .serve(let quiet) = try BenchWorkerCommand.parse([
+                "runtime-worker", "--weights", "/nonexistent",
+            ])
+        else { return }
         #expect(!quiet.verbose)
+    }
+
+    @Test("diag-parity parses with a golden and refuses without; serving refuses --golden")
+    func diagParityParses() throws {
+        guard
+            case .serve(let launch) = try BenchWorkerCommand.parse([
+                "diag-parity", "--weights", "/nonexistent", "--golden", "/g.json", "--steps", "12",
+            ])
+        else {
+            Issue.record("diag-parity did not parse as a launch")
+            return
+        }
+        #expect(launch.subcommand == .diagParity)
+        #expect(launch.golden?.path == "/g.json")
+        #expect(launch.steps == 12)
+        #expect(throws: WorkerLaunchError.self) {
+            try BenchWorkerCommand.parse(["diag-parity", "--weights", "/nonexistent"])
+        }
+        #expect(throws: WorkerLaunchError.self) {
+            try BenchWorkerCommand.parse([
+                "runtime-worker", "--weights", "/nonexistent", "--golden", "/g.json",
+            ])
+        }
     }
 
     /// The load summary NEVER reaches stdout: the fixture replay is

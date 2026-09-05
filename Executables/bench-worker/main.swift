@@ -197,8 +197,18 @@ if RunnerLoadSummary.isEnabled(flag: launch.verbose, environment: environment) {
     summary.writeToStandardError()
 }
 
-// 5. Serve.
+// 5. Serve — or, for the diagnostic, compare and exit.
 switch launch.subcommand {
+case .diagParity:
+    do {
+        try BenchWorkerLegacyParity.run(
+            runner: runner, golden: launch.golden!, steps: launch.steps,
+            output: FileHandle.standardOutput)
+    } catch {
+        fail(error)
+    }
+    BenchWorkerTeardown.synchronizeMLX()
+    exit(0)
 case .resident:
     // One process, one window. The socket is bound AFTER the load, so a
     // worker that connects successfully knows the weights are already up —
