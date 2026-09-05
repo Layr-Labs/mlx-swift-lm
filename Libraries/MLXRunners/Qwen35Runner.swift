@@ -19,6 +19,7 @@ import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+import MLXVLM
 import Tokenizers
 
 public final class Qwen35Runner: Runner, @unchecked Sendable {
@@ -100,10 +101,20 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
         self.loadedDecoders = drafter == nil ? [.serial] : [.serial, .mtp]
     }
 
-    /// The dense/MoE `Qwen35Model` and the text-only `Qwen35TextModel`
-    /// expose the same CBv2 hooks under different types. Resolved ONCE here
-    /// so `makeEngine` and `makeStepper` never re-switch.
-    static func hooks(of model: any LanguageModel) throws -> (
+    /// The dense/MoE `Qwen35Model`, the text-only `Qwen35TextModel` and the
+    /// MULTIMODAL `MLXVLM.Qwen35` wrapper all resolve here. Resolved ONCE so
+    /// `makeEngine` and `makeStepper` never re-switch.
+    ///
+    /// Unlike Gemma 4, the VLM wrapper does not own an MLXLLM target: it
+    /// carries its own inline text model, so CBv2 needs a separate
+    /// `Qwen35Model` built over the SAME immutable weight arrays. That is
+    /// `QwenVLMTextExtraction`, ported here from the provider — it shares
+    /// arrays, copies nothing, and reads no tensor from disk.
+    static func hooks(
+        of model: any LanguageModel,
+        directory: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (
         serving: any LanguageModel,
         layerKinds: [CBv2LayerKind],
         newCaches: (
@@ -123,6 +134,16 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
                 model, model.cbv2LayerKinds,
                 { make in try model.newCacheV2(makeLayerCache: make) }
             )
+        case is MLXVLM.Qwen35:
+            // Extraction is memoized per WRAPPER INSTANCE, so the target the
+            // engine steps and the target a drafter binds to are the same
+            // object — MTP gates on that identity.
+            let target = try QwenVLMTextExtraction.target(
+                for: model, directory: directory, environment: environment)
+            return (
+                target, target.cbv2LayerKinds,
+                { make in try target.newCacheV2(makeLayerCache: make) }
+            )
         default:
             throw RunnerError.unexpectedModel(String(describing: type(of: model)))
         }
@@ -140,7 +161,8 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
         let modelType = try RunnerCheckpoint.modelType(at: directory)
         let eosTokenIDs = RunnerCheckpoint.eosTokenIDs(
             at: directory, tokenizer: tokenizer)
-        let hooks = try Self.hooks(of: model)
+        let hooks = try Self.hooks(
+            of: model, directory: directory, environment: options.environment)
 
         // The embedded head ships INSIDE the checkpoint, so the provenance
         // of a head loaded from there is the checkpoint's own directory.
@@ -175,7 +197,11 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
         let drafterDirectory = options.drafterDirectory ?? directory
         do {
             return try Qwen35InlineMTPAssistant.load(
-                from: drafterDirectory, target: try Self.hooks(of: target).serving)
+                from: drafterDirectory,
+                target: try Self.hooks(
+                    of: target, directory: directory,
+                    environment: options.environment
+                ).serving)
         } catch {
             // An EXPLICIT drafter directory that fails is a refusal; the
             // implicit in-checkpoint head simply may not be there, and a

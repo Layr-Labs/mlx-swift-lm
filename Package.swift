@@ -349,6 +349,8 @@ let package = Package(
             dependencies: [
                 "MLXRunners",
                 "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
