@@ -132,6 +132,24 @@ variable `MLXFAST_NGRAM_CACHE_LIMIT` sets it. Zero stops the cache. The
 ceiling changes the memory only. It can never change a row that the source
 gives back.
 
+The cache holds hot rows for decode steps only. A gather of 4096 different
+rows or fewer uses the cache. A larger gather is a prefill gather. It reads
+the rows from the memory maps and it does not use the cache. Before a large
+gather the source tests a sample of the rows with `mincore`. If the pages are
+not in memory, the source reads the rows with `pread` first.
+
+At load the source reads part of the table into the page cache. The
+environment variable `MLXFAST_NGRAM_PREWARM` sets this behaviour. The value is
+`auto`, `off` or `on`. The default is `auto`, which reads what the free memory
+allows, less a margin of 6 gibibytes. The value `on` reads the whole table,
+but only on a machine with 160 gibibytes of memory or more. If the model
+directory holds a file `ngram-hotness.npy`, the source reads the rows of that
+file first, in the order of that file. The file holds 64-bit integer row ids,
+and the most used row is first. If the file is absent or unreadable, the
+source reads the start of the table instead. A bad file is never a load
+failure. The read changes the memory only. It can never change a row that the
+source gives back.
+
 The three tests in `Qwen4ExpForwardParityTests` need a full ahead-of-time
 `mlx.metallib`, because a decode through the mixture-of-experts shared expert
 gate uses the `dot_product` kernel that the standard build does not supply.
