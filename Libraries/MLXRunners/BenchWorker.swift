@@ -656,9 +656,9 @@ public final class BenchWorkerServer: @unchecked Sendable {
             kvBytesCapacity: kvBytesCapacity,
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: batch,
-                maxWaiting: batch,
                 prefillChunkSize: Self.diagnosticPrefillChunk
                     ?? CBv2SchedulerConfig().prefillChunkSize,
+                maxWaiting: batch,
                 enablePrefixCache: false),
             loopConfig: CBv2EngineLoopConfig(),
             prefixCache: nil,
