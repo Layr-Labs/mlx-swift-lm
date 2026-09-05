@@ -967,7 +967,15 @@ extension EngineV2 {
     /// `.nothingToScore` for an empty prompt or continuation, and
     /// `CBv2KVError.capacityExhausted` when the pool cannot seat the row.
     public func teacherForcedTop1(promptTokens: [Int], continuation: [Int]) throws -> [Int] {
-        try loop.teacherForcedTop1(promptTokens: promptTokens, continuation: continuation)
+        // Fast-ack shutdown returns from `await shutdown()` while the loop is
+        // still `running` (its drain is detached), so the loop-side
+        // `guard running, !draining` can still read true in that window. Consult
+        // the synchronous rejection flag first — set by `beginRejectingSubmissions()`
+        // BEFORE the fast-ack return — exactly as `submit` does; the loop-side
+        // guard stays as the second line.
+        let rejecting = stateLock.withLock { rejectingSubmissions }
+        guard !rejecting else { throw CBv2TeacherForcingError.engineNotRunning }
+        return try loop.teacherForcedTop1(promptTokens: promptTokens, continuation: continuation)
     }
 
     /// Cumulative evidence that the scoring above drove real engine
