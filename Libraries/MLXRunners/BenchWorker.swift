@@ -214,6 +214,46 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     }
 }
 
+// MARK: - Speculative protocol gate
+
+/// The `--speculative-protocol` argument.
+///
+/// benchd's official spawn always appends `--speculative-protocol v1.1`
+/// (`free_run_spawn_args`), and the flag is what turns the SPECULATIVE
+/// surface on. Absent, the worker speaks plain v1: `capabilities`,
+/// `spec_modes` and `max_batch_size` are all v1.1-or-later additions to a
+/// frozen v1 hello, so a v1-only engine omits them, and a `spec` on a
+/// request is refused rather than honoured. That is not a degraded mode with
+/// speculation quietly disabled — it is a different protocol version, and
+/// answering a `spec` under it would be a worker resolving something the
+/// parent never established it could ask for.
+public enum SpeculativeProtocol: Sendable, Equatable {
+    /// The only accepted value.
+    public static let version = "v1.1"
+
+    /// Refusals from the argument. Before the load, always.
+    public enum ArgumentError: Error, CustomStringConvertible, Equatable {
+        case unsupportedVersion(String)
+
+        public var description: String {
+            switch self {
+            case .unsupportedVersion(let raw):
+                return "--speculative-protocol \(raw) is not \(SpeculativeProtocol.version)"
+            }
+        }
+    }
+
+    /// Whether the speculative surface is enabled. `nil` (flag absent) is
+    /// plain v1; any value other than `v1.1` is a refusal, never a fallback
+    /// to plain v1 — a parent that asked for a version this worker does not
+    /// speak must hear so, not be silently served an older one.
+    public static func isEnabled(_ raw: String?) throws -> Bool {
+        guard let raw else { return false }
+        guard raw == version else { throw ArgumentError.unsupportedVersion(raw) }
+        return true
+    }
+}
+
 // MARK: - Capabilities
 
 /// Capability strings the hello advertises.
@@ -240,6 +280,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
     private let manifest: RunnerManifest
     private let transport: any BenchWorkerTransport
     private let trusted: Bool
+    /// `--speculative-protocol v1.1` was given. See ``SpeculativeProtocol``.
+    private let speculative: Bool
     private let build: String
     private let device: String
     private let kvBytesCapacity: Int
@@ -264,6 +306,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
         runner: any Runner,
         transport: any BenchWorkerTransport,
         trusted: Bool,
+        speculative: Bool = true,
         build: String,
         device: String,
         kvBytesCapacity: Int,
@@ -275,6 +318,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
         self.manifest = type(of: runner).manifest
         self.transport = transport
         self.trusted = trusted
+        self.speculative = speculative
         self.build = build
         self.device = device
         self.kvBytesCapacity = kvBytesCapacity
@@ -295,23 +339,31 @@ public final class BenchWorkerServer: @unchecked Sendable {
         response.backend = manifest.backend
         response.device = device
 
-        var capabilities: [String] = []
-        if manifest.regimes.contains(where: { $0.timing == .freeRun }) {
-            capabilities.append(WorkerCapability.freeRunDecode)
+        // `capabilities`, `spec_modes` and `max_batch_size` are all
+        // v1.1-or-later additions to a frozen v1 hello, so a worker speaking
+        // plain v1 omits the three of them together rather than advertising
+        // an empty capability list — an empty array is a claim ("I support
+        // none of these"), absence is the v1 wire.
+        if speculative {
+            var capabilities: [String] = []
+            if manifest.regimes.contains(where: { $0.timing == .freeRun }) {
+                capabilities.append(WorkerCapability.freeRunDecode)
+            }
+            if manifest.regimes.contains(where: { $0.batch.maxWidth > 1 }) {
+                capabilities.append(WorkerCapability.batchedFreeRunDecode)
+            }
+            if manifest.regimes.contains(where: { $0.perStreamTiming }) {
+                capabilities.append(WorkerCapability.perStreamTiming)
+            }
+            if trusted {
+                capabilities.append(WorkerCapability.cohortReferenceReplay)
+            }
+            response.capabilities = capabilities
+            response.specModes = runner.loadedDecoders.map(\.rawValue)
+            response.maxBatchSize =
+                manifest.regimes.map(\.batch.maxWidth).filter { $0 > 1 }.max()
         }
-        if manifest.regimes.contains(where: { $0.batch.maxWidth > 1 }) {
-            capabilities.append(WorkerCapability.batchedFreeRunDecode)
-        }
-        if manifest.regimes.contains(where: { $0.perStreamTiming }) {
-            capabilities.append(WorkerCapability.perStreamTiming)
-        }
-        if trusted {
-            capabilities.append(WorkerCapability.cohortReferenceReplay)
-        }
-        response.capabilities = capabilities
-        response.specModes = runner.loadedDecoders.map(\.rawValue)
         response.headProvenance = runner.headProvenance.map(WireHeadProvenance.init)
-        response.maxBatchSize = manifest.regimes.map(\.batch.maxWidth).filter { $0 > 1 }.max()
         response.runner = RunnerIdentity(
             id: manifest.runnerID,
             modelType: runner.loadedModelType,
@@ -367,8 +419,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
         case .decodeBegin:
             let seed = try require(request.seedTokens, "seed_tokens")
             response.seedToken = try beginStepper().forward(seed).argmax
-            if request.spec != nil {
-                response.effectiveSpec = try effectiveSpec(request.spec)
+            if let spec = request.spec {
+                response.effectiveSpec = try effectiveSpec(spec)
             }
             completedWork += 1
 
@@ -548,10 +600,15 @@ public final class BenchWorkerServer: @unchecked Sendable {
     }
 
     private func freeDecodeBegin(_ request: WorkerRequest) async throws -> WorkerResponse {
-        guard manifest.regimes.contains(where: { $0.timing == .freeRun }) else {
+        // The `spec` refusal comes FIRST because it is the more specific
+        // answer: under plain v1 the parent asked for a speculative surface
+        // by name, and "free_run_decode is not served" would send it looking
+        // at the manifest instead of at its own spawn.
+        let spec = try effectiveSpec(request.spec)
+        guard speculative, manifest.regimes.contains(where: { $0.timing == .freeRun })
+        else {
             throw WorkerError.capabilityNotAdvertised(WorkerCapability.freeRunDecode)
         }
-        let spec = try effectiveSpec(request.spec)
 
         let seeds: [[Int]]
         let cohort: Bool
@@ -769,6 +826,11 @@ public final class BenchWorkerServer: @unchecked Sendable {
 
     private func effectiveSpec(_ requested: SpecConfig?) throws -> SpecConfig {
         guard let requested else { return SpecConfig(mode: DecoderID.serial.rawValue) }
+        // A `spec` under plain v1 is refused, never honoured and never
+        // ignored: the parent is asking for a surface this worker did not
+        // advertise, and silently running serial while it believes it asked
+        // for mtp is how a leg measures one thing and is scored as another.
+        guard speculative else { throw WorkerError.speculativeProtocolRequired }
         guard runner.loadedDecoders.contains(DecoderID(requested.mode)) else {
             throw WorkerError.modeNotAdvertised(requested.mode)
         }
@@ -800,6 +862,7 @@ public enum WorkerError: Error, CustomStringConvertible, Equatable {
     case noFreeRunSession
     case streamEndedEarly(slot: Int, got: Int, want: Int)
     case badReplayWidth(String)
+    case speculativeProtocolRequired
 
     public var description: String {
         switch self {
@@ -817,6 +880,9 @@ public enum WorkerError: Error, CustomStringConvertible, Equatable {
             return "stream \(slot) produced \(got) of \(want) tokens"
         case .badReplayWidth(let width):
             return "replay_width \(width) is not cohort or canonical"
+        case .speculativeProtocolRequired:
+            return "spec requires --speculative-protocol "
+                + "\(SpeculativeProtocol.version)"
         }
     }
 }
