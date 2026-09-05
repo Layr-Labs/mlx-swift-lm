@@ -78,24 +78,32 @@ public final class GPTOSSRunner: Runner, @unchecked Sendable {
         self.maxSequenceLength = maxSequenceLength
     }
 
-    public static func load(
-        _ directory: URL, options: RunnerLoadOptions
-    ) async throws -> GPTOSSRunner {
+    public static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> GPTOSSRunner {
+        // Checkpoint facts FIRST, module second: these two reads are the
+        // whole of this method's filesystem access.
         let modelType = try RunnerCheckpoint.modelType(at: directory)
-        let context = try await LLMModelFactory.shared.load(
-            from: directory, using: #huggingFaceTokenizerLoader())
-        guard let model = context.model as? GPTOSSModel else {
-            throw RunnerError.unexpectedModel(String(describing: type(of: context.model)))
-        }
-        guard options.drafterDirectory == nil else {
+        let eosTokenIDs = RunnerCheckpoint.eosTokenIDs(
+            at: directory, tokenizer: tokenizer)
+        // A drafter this family cannot use is refused BEFORE the module is
+        // examined: accepting one and ignoring it would advertise serial
+        // while the caller believes it handed over speculation.
+        guard options.drafterDirectory == nil, options.preloadedDrafter == nil else {
             throw RunnerError.drafterUnavailable(
                 "gpt_oss declares no speculative decoder")
         }
+        guard let model = model as? GPTOSSModel else {
+            throw RunnerError.unexpectedModel(String(describing: type(of: model)))
+        }
         return GPTOSSRunner(
             model: model,
-            tokenizer: context.tokenizer,
-            eosTokenIDs: RunnerCheckpoint.eosTokenIDs(
-                at: directory, tokenizer: context.tokenizer),
+            tokenizer: tokenizer,
+            eosTokenIDs: eosTokenIDs,
             loadedModelType: modelType,
             kvBytesCapacity: options.kvBytesCapacity,
             maxSequenceLength: options.maxSequenceLength)
