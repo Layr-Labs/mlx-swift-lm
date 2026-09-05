@@ -76,8 +76,12 @@ public final class Qwen4ExpDecoderLayer: Module {
     @ModuleInfo(key: "attn_hyper_connection") var attnHyperConnection: Qwen4ExpGatedResidual
     @ModuleInfo(key: "mlp_hyper_connection") var mlpHyperConnection: Qwen4ExpGatedResidual
 
-    /// - Parameter pleLayerIndex: index INTO `ple_layer_ids`, not the layer
-    ///   number; `nil` on a layer that carries no PLE block.
+    /// - Parameters:
+    ///   - args: the text tower configuration this layer is built from.
+    ///   - isLinear: build the gated-deltanet recurrence instead of full
+    ///     attention.
+    ///   - pleLayerIndex: index INTO `ple_layer_ids`, not the layer number;
+    ///     `nil` on a layer that carries no PLE block.
     public init(_ args: Qwen4ExpTextConfiguration, isLinear: Bool, pleLayerIndex: Int?) {
         self.isLinear = isLinear
         if isLinear {
@@ -267,10 +271,13 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
         self.init(text: args.textConfig)
     }
 
-    /// - Parameter withMTP: build the native MTP head. On by default: this
-    ///   checkpoint always carries it, and the track's speculative arm is that
-    ///   head. Pass `false` for a serial-only load, which then drops the
-    ///   `mtp.*` tensors at sanitize.
+    /// - Parameters:
+    ///   - args: the text tower configuration.
+    ///   - withMTP: build the native MTP head. On by default: this checkpoint
+    ///     always carries it, and the track's speculative arm is that head.
+    ///     Pass `false` for a serial-only load, which then drops the `mtp.*`
+    ///     tensors at sanitize.
+    ///   - mtpLayerCount: number of layers in the MTP head.
     public init(
         text args: Qwen4ExpTextConfiguration,
         withMTP: Bool = true,
@@ -321,6 +328,7 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
     ///   - multiStream: `multi` from `streams(_:cache:)` on the first step, and
     ///     the `multi` this call returns on every step after that.
     ///   - cache: the MTP head's own caches from ``makeMTPCache()``.
+    ///   - stepIndex: which head layer runs, for a multi-layer head.
     /// - Returns: draft logits and the multi stream for the next step.
     public func mtpStep(
         nextTokenIds: MLXArray,
