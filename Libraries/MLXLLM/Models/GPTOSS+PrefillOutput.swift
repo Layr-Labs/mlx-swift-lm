@@ -2,9 +2,9 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-/// Prompt-only experiment/rollback policy. Decode always uses the ordinary
-/// GPTOSS forward. Keep the final projection geometry in the conservative
-/// default until the final-row arm has passed real-checkpoint parity.
+/// Prompt-output policy. Decode uses the ordinary GPTOSS forward. The
+/// final-position default avoids vocabulary projection of discarded rows;
+/// full/intermediate modes retain the original frontier projection geometry.
 enum GPTOSSPrefillOutputPolicy: String, CaseIterable {
     case full
     case intermediate
@@ -12,7 +12,7 @@ enum GPTOSSPrefillOutputPolicy: String, CaseIterable {
     case lastLayer = "last-layer"
 
     static func resolve(_ raw: String?) -> Self {
-        raw.flatMap(Self.init(rawValue:)) ?? .intermediate
+        raw.flatMap(Self.init(rawValue:)) ?? .last
     }
 
     static let serving = resolve(

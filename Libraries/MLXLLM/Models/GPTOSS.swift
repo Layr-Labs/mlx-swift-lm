@@ -429,7 +429,11 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     private let configuration: GPTOSSConfiguration
     public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
     static let fusedGateUpEnabled =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GPTOSS_FUSED_GATE_UP"] == "1"
+        ProcessInfo.processInfo.environment["DARKBLOOM_GPTOSS_FUSED_GATE_UP"] != "0"
+    private var useFusedGateUp: Bool {
+        Self.fusedGateUpEnabled && configuration.hiddenSize == 2880
+            && configuration.intermediateSize == 2880 && configuration.localExperts == 32
+    }
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
     public init(_ config: GPTOSSConfiguration) {
@@ -450,7 +454,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         var weights = weights
 
         if weights.keys.contains(where: { $0.contains("gate_proj.weight") }) {
-            return fuseGateUpWeights(weights, enabled: Self.fusedGateUpEnabled)
+            return fuseGateUpWeights(weights, enabled: useFusedGateUp)
         }
 
         if weights.keys.contains(where: { $0.contains("gate_up_proj_scales") }) {
@@ -501,7 +505,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
-        return fuseGateUpWeights(finalWeights, enabled: Self.fusedGateUpEnabled)
+        return fuseGateUpWeights(finalWeights, enabled: useFusedGateUp)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {

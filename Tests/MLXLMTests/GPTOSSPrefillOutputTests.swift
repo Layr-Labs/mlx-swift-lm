@@ -189,10 +189,10 @@ struct GPTOSSPrefillOutputTests {
         }
     }
 
-    @Test("policy defaults conservative and retains an explicit full rollback")
+    @Test("policy defaults to final-position output and retains a full rollback")
     func policySelection() {
-        #expect(GPTOSSPrefillOutputPolicy.resolve(nil) == .intermediate)
-        #expect(GPTOSSPrefillOutputPolicy.resolve("invalid") == .intermediate)
+        #expect(GPTOSSPrefillOutputPolicy.resolve(nil) == .last)
+        #expect(GPTOSSPrefillOutputPolicy.resolve("invalid") == .last)
         #expect(GPTOSSPrefillOutputPolicy.resolve("full") == .full)
         #expect(GPTOSSPrefillOutputPolicy.resolve("intermediate") == .intermediate)
         #expect(GPTOSSPrefillOutputPolicy.resolve("last") == .last)

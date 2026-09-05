@@ -103,7 +103,6 @@ class SwiGLUSwitchGLU: Module {
     }
 
     func uncompiledExpertForward(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        let sequenceLength = x.ndim == 3 ? x.dim(1) : 0
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
         let doSort = indices.size >= 64
@@ -115,30 +114,20 @@ class SwiGLUSwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        let useExpanded = GPTOSSDequantizedPrefill.enabled
-            && GPTOSSDequantizedPrefill.eligible(
-                inputDims: inputDims, hiddenDims: hiddenDims, experts: numExperts,
-                assignments: indices.size, sequenceLength: sequenceLength, sorted: doSort)
-        func project(_ projection: SwitchLinear, _ input: MLXArray) -> MLXArray {
-            if useExpanded, let result = GPTOSSDequantizedPrefill.project(
-                projection, input, idx, sortedIndices: doSort) { return result }
-            return projection(input, idx, sortedIndices: doSort)
-        }
-
         let xUp: MLXArray
         let xGate: MLXArray
         if let gateUpProj {
-            let projected = project(gateUpProj, x)
+            let projected = gateUpProj(x, idx, sortedIndices: doSort)
             xGate = projected[.ellipsis, ..<hiddenDims]
             xUp = projected[.ellipsis, hiddenDims...]
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("GPTOSS experts require split or fused gate/up projections")
             }
-            xUp = project(upProj, x)
-            xGate = project(gateProj, x)
+            xUp = upProj(x, idx, sortedIndices: doSort)
+            xGate = gateProj(x, idx, sortedIndices: doSort)
         }
-        x = project(downProj, compiledSwiglu(xUp, xGate))
+        x = downProj(compiledSwiglu(xUp, xGate), idx, sortedIndices: doSort)
 
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
