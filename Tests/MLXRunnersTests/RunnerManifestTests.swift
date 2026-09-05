@@ -55,6 +55,40 @@ struct RunnerManifestTests {
                 == "474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe")
     }
 
+    /// The mock-adapter manifest benchd checked in beside the fixture,
+    /// DECODED here and digested by this repo's own encoder. Both sides load
+    /// the same bytes, so this is a cross-repo agreement on the §6.0
+    /// encodings — the object form of `batch`, the array form of `depth`, the
+    /// declared field order — not two Swift/Rust declarations that happen to
+    /// agree today.
+    @Test("The shared mock-adapter manifest decodes and digests as pinned")
+    func mockAdapterManifestDigest() {
+        let manifest = FixtureManifest.mockAdapter
+        #expect(manifest.runnerID == "layr/mock-adapter")
+        #expect(manifest.backend == "mock")
+        #expect(
+            canonical(manifest) == """
+                {"schemaVersion":1,"runnerID":"layr/mock-adapter","modelTypes":\
+                ["qwen4_exp","qwen4_exp_text"],"backend":"mock","engine":\
+                {"supportsPrefixReuse":false,"supportsPagedKV":false,\
+                "supportsCompiledDecode":false,"supportsPackedPrefill":false,\
+                "supportsMTP":true,"supportsCompactRecurrentMTPReplay":false},\
+                "kvBackends":["contiguous"],"decoders":[{"mode":"serial",\
+                "drafter":"none","state":"stateless","depth":null},{"mode":"mtp",\
+                "drafter":"embeddedHead","state":"requestStateful","depth":[1,3]}],\
+                "regimes":[{"batch":"single","timing":"freeRun","perStreamTiming":false},\
+                {"batch":"single","timing":"teacherForced","perStreamTiming":false}],\
+                "multimodal":false,"recurrentLayers":true,"requiresKeepMask":true}
+                """)
+        #expect(
+            manifest.sha256Digest()
+                == "850ef7df262d03f851a355d1572257b04ade4834d2563c18f01b9cf344a6fffd")
+
+        // It differs from the §11 manifest in exactly two fields, so the two
+        // digests must differ — a decoder that dropped either would collide.
+        #expect(manifest.sha256Digest() != ContractManifests.sectionEleven.sha256Digest())
+    }
+
     @Test("Gemma 4 text manifest")
     func gemma4TextManifest() {
         #expect(

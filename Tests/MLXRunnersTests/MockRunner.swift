@@ -176,16 +176,36 @@ enum ContractManifests {
         requiresKeepMask: true)
 }
 
+/// The mock adapter's manifest, DECODED from the file benchd checked in
+/// beside the fixture (`Resources/engine-wire-v1-adapter.manifest.json`).
+///
+/// Decoded rather than declared in Swift on purpose: both sides load the
+/// SAME bytes, so the hello's `manifest_sha256` is a digest this repo
+/// actually computed over the other repo's file, not two declarations that
+/// happen to agree today.
+enum FixtureManifest {
+    static let mockAdapter: RunnerManifest = {
+        guard
+            let url = Bundle.module.url(
+                forResource: "engine-wire-v1-adapter.manifest", withExtension: "json"),
+            let data = try? Data(contentsOf: url),
+            let manifest = try? JSONDecoder().decode(RunnerManifest.self, from: data)
+        else {
+            fatalError("the shared mock-adapter manifest is missing or undecodable")
+        }
+        return manifest
+    }()
+}
+
 /// The scripted runner the conformance fixture is driven over.
 ///
-/// It carries the section 11 manifest VERBATIM, because the fixture's hello
-/// pins that manifest's digest: `manifest_sha256` must be the digest this
-/// runner's OWN manifest hashes to, and a hello quoting some other
-/// manifest's digest would be exactly the hand-written hello field §6.1
-/// forbids.
+/// Its manifest is the shared mock-adapter file, so `hello.backend` and
+/// `hello.runner.manifest_sha256` are two readings of ONE declaration —
+/// which is what §6.1 requires and what a hand-written hello field would
+/// break.
 final class MockRunner: Runner, @unchecked Sendable {
 
-    static let manifest = ContractManifests.sectionEleven
+    static var manifest: RunnerManifest { FixtureManifest.mockAdapter }
 
     /// The window audit the scripted engine replays.
     let script: MockRoundScript?

@@ -324,7 +324,10 @@ let package = Package(
             resources: [
                 // The SHARED Engine Protocol v1 conformance fixture, pinned
                 // identically on the benchd side.
-                .process("Resources/engine-wire-v1-adapter.ndjson")
+                .process("Resources/engine-wire-v1-adapter.ndjson"),
+                // The mock adapter's own manifest, checked in beside the
+                // fixture: BOTH repos digest these same bytes.
+                .process("Resources/engine-wire-v1-adapter.manifest.json"),
             ]
         ),
         .testTarget(
