@@ -167,9 +167,16 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
         // The embedded head ships INSIDE the checkpoint, so the provenance
         // of a head loaded from there is the checkpoint's own directory.
         // §12c: the one embedded-head rule, in the one shared helper.
+        //
+        // FAIL CLOSED. The provenance is sealed into the hello, so a head
+        // that cannot be hashed must stop the adoption. A checkpoint that
+        // declares `mtp.*` tensors but whose index cannot be read is broken,
+        // and swallowing that error would serve an UNATTRIBUTED head. Only a
+        // checkpoint with no head at all gives nil, which the helper returns
+        // without throwing.
         var provenance: HeadProvenance?
         if options.preloadedDrafter != nil {
-            provenance = try? RunnerCheckpoint.provenance(
+            provenance = try RunnerCheckpoint.provenance(
                 ofEmbeddedHeadAt: options.drafterDirectory ?? directory)
         }
 
