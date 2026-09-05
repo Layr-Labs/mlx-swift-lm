@@ -23,6 +23,8 @@ struct RunnerRegistryTests {
             "qwen3_5_text": "layr/qwen35",
             "qwen3_vl": "layr/qwen3vl",
             "qwen3_vl_moe": "layr/qwen3vl",
+            "qwen4_exp": "layr/qwen4exp-125b-a6b",
+            "qwen4_exp_text": "layr/qwen4exp-125b-a6b",
         ]
         for (modelType, runnerID) in expected {
             #expect(RunnerRegistry.shared.contains(modelType: modelType))
@@ -43,7 +45,12 @@ struct RunnerRegistryTests {
     func manifestListing() {
         let ids = RunnerRegistry.shared.manifests().map(\.runnerID)
         #expect(ids == ids.sorted())
-        #expect(Set(ids).isSuperset(of: ["layr/gemma4-text", "layr/gptoss", "layr/qwen35", "layr/qwen3vl"]))
+        #expect(
+            Set(ids).isSuperset(
+                of: [
+                    "layr/gemma4-text", "layr/gptoss", "layr/qwen35", "layr/qwen3vl",
+                    "layr/qwen4exp-125b-a6b",
+                ]))
         #expect(ids.count == Set(ids).count)
     }
 

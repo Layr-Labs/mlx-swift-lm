@@ -52,6 +52,7 @@ public final class RunnerRegistry: @unchecked Sendable {
             GPTOSSRunner.self,
             Qwen35Runner.self,
             Qwen3VLRunner.self,
+            Qwen4ExpRunner.self,
             // INSERTION POINT: register additional runners here
         ]
     }

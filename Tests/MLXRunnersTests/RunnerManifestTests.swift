@@ -24,39 +24,13 @@ struct RunnerManifestTests {
         String(decoding: manifest.canonicalJSON(), as: UTF8.self)
     }
 
-    /// The contract's §11 manifest for Qwen 3.8 Flash-Next, built here from
-    /// the declaration in the document. No `Qwen4ExpRunner` exists on this
-    /// branch — it lands from `feat/qwen4-exp-cbv2` — but the DIGEST is the
-    /// cross-repo test vector both sides pin, so the encoder is proved
-    /// against it here.
+    /// The Qwen 3.8 Flash-Next runner's own manifest against the contract's
+    /// §11 declaration. The digest is the cross-repo test vector: benchd pins
+    /// the same string, so these bytes are the interface, not an internal
+    /// detail.
     @Test("Section 11 manifest reproduces the cross-repo test vector")
     func sectionElevenVector() {
-        let manifest = RunnerManifest(
-            runnerID: "layr/qwen4exp-125b-a6b",
-            modelTypes: ["qwen4_exp", "qwen4_exp_text"],
-            engine: CBv2ModelCapabilities(
-                supportsPrefixReuse: false,
-                supportsPagedKV: false,
-                supportsCompiledDecode: false,
-                supportsPackedPrefill: false,
-                supportsMTP: true,
-                supportsCompactRecurrentMTPReplay: false),
-            kvBackends: [.contiguous],
-            decoders: [
-                DecoderDeclaration(
-                    mode: "serial", drafter: .none, state: .stateless, depth: nil),
-                DecoderDeclaration(
-                    mode: "mtp", drafter: .embeddedHead, state: .requestStateful,
-                    depth: 1 ... 3),
-            ],
-            regimes: [
-                RegimeDeclaration(batch: .single, timing: .freeRun, perStreamTiming: false),
-                RegimeDeclaration(
-                    batch: .single, timing: .teacherForced, perStreamTiming: false),
-            ],
-            multimodal: false,
-            recurrentLayers: true,
-            requiresKeepMask: true)
+        let manifest = Qwen4ExpRunner.manifest
 
         #expect(
             canonical(manifest) == """

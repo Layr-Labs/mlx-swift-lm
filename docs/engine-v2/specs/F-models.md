@@ -90,6 +90,26 @@ This family serves one row for each call. The QSA indexer scores one tape.
 Packed prefill, paged key-value storage, prefix reuse and compiled decode stay
 off. MTP draft depth is 1 to 3.
 
+### Runner (`Libraries/MLXRunners/Qwen4ExpRunner.swift`)
+
+`Qwen4ExpRunner` puts this family behind the runner contract. It claims the
+`qwen4_exp` and `qwen4_exp_text` model types in `RunnerRegistry`. Its manifest
+declares contiguous key-value storage only, one serial decoder, one MTP decoder
+with the embedded head at depth 1 to 3, single-stream free-run and
+teacher-forced regimes, recurrent layers, and `requiresKeepMask`. The manifest
+digest is `474efd99…`. Both this repo and benchd pin that value.
+
+The runner loads the checkpoint one time. It reads `cbv2LayerKinds` from the
+model. It reports the `mtp` decoder only when the checkpoint holds the `mtp.*`
+head. It builds the engine and the one-row stepper over the same model
+instance, so both drive one forward pass.
+
+The n-gram table is 29.8 GiB and is never model parameters. The table
+implementation lives in the track repo. The caller therefore gives a
+`Qwen4ExpNGramRowSource` in `RunnerLoadOptions.resources`, under the name
+`Qwen4ExpRunner.ngramRowSourceResource`. A checkpoint with PLE layers and no
+row source is refused at load.
+
 The three tests in `Qwen4ExpForwardParityTests` need a full ahead-of-time
 `mlx.metallib`, because a decode through the mixture-of-experts shared expert
 gate uses the `dot_product` kernel that the standard build does not supply.

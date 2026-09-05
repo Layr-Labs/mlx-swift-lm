@@ -197,6 +197,9 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXEmbedders",
+                // Qwen4ExpRunnerTests drive the runner boundary over the tiny
+                // Qwen 3.8 Flash-Next fixture, which lives here.
+                "MLXRunners",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
