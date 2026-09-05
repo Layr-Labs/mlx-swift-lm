@@ -226,7 +226,8 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         // the checkpoint config. The n-gram hash needs ONE id -- the first.
         if let single = try? c.decode(Int.self, forKey: .eosTokenId) {
             self.eosTokenId = single
-        } else if let many = try? c.decode([Int].self, forKey: .eosTokenId), let first = many.first {
+        } else if let many = try? c.decode([Int].self, forKey: .eosTokenId), let first = many.first
+        {
             self.eosTokenId = first
         }
 
@@ -872,7 +873,8 @@ public final class Qwen4ExpGatedResidual: Module {
         var w = silu(mixDown(normed) / Float(hcCount))
         w = sigmoid(mixUp(w))
         let lead = w.shape.dropLast()
-        return (w.reshaped(lead + [hcCount, dimensions])
+        return
+            (w.reshaped(lead + [hcCount, dimensions])
             * normed.reshaped(lead + [hcCount, dimensions])).mean(axis: -2)
     }
 

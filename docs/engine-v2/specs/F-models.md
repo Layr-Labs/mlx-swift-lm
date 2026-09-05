@@ -49,3 +49,43 @@ You own the two production models' integration. EXCLUSIVE ownership of
 ## References
 Report 10 §1 (exact model structures, file:line), §4 invariants 1, 2, 5,
 9, 11. Corpus: `~/Documents/Builds/d-inference/docs/research/batching-engine-2026-07/`.
+
+## Qwen 3.8 Flash-Next (`qwen4_exp`, `qwen4_exp_text`)
+
+This family has 48 layers. 12 layers use full attention. 36 layers use a
+gated-deltanet recurrence. The recurrent layers keep no key-value tape.
+`cbv2LayerKinds` therefore gives 12 rows. Each row has a `modelLayerIndex`
+that points to its decoder layer.
+
+Each full-attention layer has a QSA indexer. The indexer keeps a budget of
+2048 visible tokens. It pools the keys into blocks of 4 tokens. It scores the
+blocks and keeps the best blocks for each query. The result is a keep mask.
+The model sends the mask to attention through the `keepMask` parameter of
+`CBv2AttendingLayerCache.updateAndAttend`. The model declares
+`CBv2KeepMaskRequiringModel`. If the cache provider cannot apply the mask, the
+engine refuses to start.
+
+The indexer keeps its own key tape. `Qwen4ExpCBv2LayerCache` holds this tape
+for each row. Before each append, the cache cuts the tape to the length that
+the row's `absoluteOffset` gives. A rollback of the key-value tape thus also
+moves the indexer tape.
+
+The residual stream is `hc_count` streams side by side. There is no final norm
+tensor. The last mixer does this function. The MTP head reads the stream
+before the last mixer. This stream is `hc_count * hidden` wide.
+`cbv2ForwardWithHidden` gives this stream as `lastHidden`.
+
+### Auxiliary recurrent-state indices
+
+The PLE layer keeps two more pieces of state: a short-convolution state and
+the n-gram token history. These do not belong to a decoder layer. They ride
+the recurrent-state spec under synthetic index values. The values are
+`hiddenLayers + ordinal`, one for each PLE layer. `conv` holds the
+short-convolution state. `ssm` holds the history token ids as `int32`. Read
+the values from `cbv2AuxiliaryStateLayerIndices`. Do not build them again.
+Do not compare a recurrent-state index with the layer count: these indices are
+larger than the last layer index on purpose.
+
+This family serves one row for each call. The QSA indexer scores one tape.
+Packed prefill, paged key-value storage, prefix reuse and compiled decode stay
+off. MTP draft depth is 1 to 3.

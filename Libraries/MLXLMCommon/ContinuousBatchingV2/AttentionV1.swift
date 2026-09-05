@@ -33,8 +33,9 @@ enum CBv2AttentionV1 {
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
     static let queryBlockSize: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
             let value = Int(raw), value >= 0
         else { return 128 }
         return value
@@ -497,10 +498,10 @@ enum CBv2AttentionV1 {
                 } else {
                     outputs.append(
                         borrowAndAttendRow(
-                        sourceRow: row, sourceKind: sourceKind,
-                        queries: queries[index ..< (index + 1)],
-                        scale: scale, sinks: effectiveSinks, softcap: softcap,
-                        spanContext: spanContexts?[index]))
+                            sourceRow: row, sourceKind: sourceKind,
+                            queries: queries[index ..< (index + 1)],
+                            scale: scale, sinks: effectiveSinks, softcap: softcap,
+                            spanContext: spanContexts?[index]))
                 }
             }
             return concatenated(outputs, axis: 0)

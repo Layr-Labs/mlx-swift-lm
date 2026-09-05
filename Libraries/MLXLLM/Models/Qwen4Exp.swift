@@ -38,7 +38,8 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.modelType = try container.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen4_exp"
+        self.modelType =
+            try container.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen4_exp"
 
         if let nested = try container.decodeIfPresent(
             Qwen4ExpTextConfiguration.self, forKey: .textConfig)
