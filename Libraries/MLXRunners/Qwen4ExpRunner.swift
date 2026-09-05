@@ -16,12 +16,12 @@
 //     `requiresKeepMask`, the family owns its own layer cache (a second
 //     per-row indexer tape beside the key-value tape), and the engine refuses
 //     to start over a cache provider that cannot apply the mask.
-//   * The n-gram PLE table. It is 29.8 GiB, it is never held as model
-//     parameters, and the disk-resident implementation lives in the track
-//     repo, not here. The caller passes one in through
-//     `RunnerLoadOptions.resources` under ``ngramRowSourceResource``; without
-//     it a checkpoint that has PLE layers is refused, because the model's
-//     forward pass cannot run.
+//   * The n-gram PLE table. It is 29.8 GiB and it is never held as model
+//     parameters. The caller passes it in through
+//     `RunnerLoadOptions.resources` under ``ngramRowSourceResource``, either
+//     as the PATH of the n-gram shard directory or as an already built
+//     `Qwen4ExpNGramRowSource`; without it a checkpoint that has PLE layers
+//     is refused, because the model's forward pass cannot run.
 //
 // Speculation is the checkpoint's own `mtp.*` head
 // (`Qwen4ExpInlineMTPAssistant`), request-stateful across rounds, depth 1...3.
@@ -38,8 +38,17 @@ import Tokenizers
 
 public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
 
-    /// Name under which the caller passes a `Qwen4ExpNGramRowSource` in
+    /// Name under which the caller passes the n-gram row source in
     /// `RunnerLoadOptions.resources`.
+    ///
+    /// Two value shapes are accepted, and only two:
+    ///
+    ///   * a path, as a `URL` or a `String`, of the n-gram shard DIRECTORY
+    ///     that the offline transform writes. bench-worker passes its
+    ///     `--resource` value in this shape. A path to a single file is
+    ///     refused by name.
+    ///   * an already built `Qwen4ExpNGramRowSource`, for an in-process
+    ///     caller that holds one.
     public static let ngramRowSourceResource = "qwen4exp.ngramRowSource"
 
     public static let manifest = RunnerManifest(
@@ -120,16 +129,9 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
         // that has PLE layers and no source cannot run a forward pass at all,
         // so the load refuses here rather than at the first token.
         if !model.pleEmbeddings.isEmpty {
-            guard
-                let source = options.resources[ngramRowSourceResource]
-                    as? Qwen4ExpNGramRowSource
-            else {
-                throw RunnerError.resourceMissing(
-                    "\(ngramRowSourceResource): this checkpoint has "
-                        + "\(model.pleEmbeddings.count) PLE layers and the n-gram table "
-                        + "is never model parameters")
-            }
-            model.install(ngramRowSource: source)
+            model.install(
+                ngramRowSource: try Self.ngramRowSource(
+                    options.resources[ngramRowSourceResource], for: model))
         }
 
         // The head is a block of the checkpoint, not a separate artifact, so
@@ -161,6 +163,30 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
             headProvenance: provenance,
             kvBytesCapacity: options.kvBytesCapacity,
             maxSequenceLength: options.maxSequenceLength)
+    }
+
+    /// Resolve the n-gram row source from the resource the caller gave.
+    ///
+    /// The runner names the `Qwen4ExpNGramRowSource` seam and one construction
+    /// entry point, `Qwen4ExpNGramRowSourceLoader`, and no conformer. A later
+    /// conformer is chosen inside the loader, so this stays as it is.
+    private static func ngramRowSource(
+        _ resource: AnyObject?, for model: Qwen4ExpModel
+    ) throws -> any Qwen4ExpNGramRowSource {
+        if let source = resource as? Qwen4ExpNGramRowSource {
+            return source
+        }
+        if let url = resource as? URL {
+            return try Qwen4ExpNGramRowSourceLoader.rowSource(at: url, for: model)
+        }
+        if let path = resource as? String {
+            return try Qwen4ExpNGramRowSourceLoader.rowSource(
+                at: URL(fileURLWithPath: path), for: model)
+        }
+        throw RunnerError.resourceMissing(
+            "\(ngramRowSourceResource): this checkpoint has "
+                + "\(model.pleEmbeddings.count) PLE layers and the n-gram table "
+                + "is never model parameters; pass the n-gram shard directory")
     }
 
     /// The family's own caches. `newCacheV2` still runs the vending closure
