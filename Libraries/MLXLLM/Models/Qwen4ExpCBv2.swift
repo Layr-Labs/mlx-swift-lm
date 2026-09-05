@@ -300,7 +300,8 @@ extension Qwen4ExpQSAIndexer {
         q = qwen4ExpRopePartial(
             q, cos: cosQ[0..., 0..., .newAxis, 0...], sin: sinQ[0..., 0..., .newAxis, 0...])
 
-        var scores = MLX.einsum("bshd,bnd->bsnh", q.asType(.float32), pooled.asType(.float32))
+        var scores = qwen4ExpIndexerBlockScores(
+            q: q.asType(.float32), pooled: pooled.asType(.float32))
         scores = maximum(scores, MLXArray(Float(0))).sum(axis: -1) / Foundation.sqrt(Float(headDim))
 
         // Integer block COUNT. See the legacy path for why floor division is

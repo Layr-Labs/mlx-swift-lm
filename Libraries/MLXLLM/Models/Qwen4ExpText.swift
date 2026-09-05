@@ -392,12 +392,33 @@ public func qwen4ExpPositions(offset: Int, count: Int) -> MLXArray {
     MLXArray(Int32(offset) ..< Int32(offset + count))[.newAxis]
 }
 
+/// QSA block scores: `out[b, s, n, h] = sum_d q[b, s, h, d] * pooled[b, n, d]`.
+///
+/// This is `einsum("bshd,bnd->bsnh")` written as one matmul. It is written out
+/// because `MLX.einsum` reaches a `dot_product` kernel that is not present in
+/// every built metallib, and a missing kernel aborts the process. A matmul is
+/// the same contraction over `d` and is always available.
+///
+/// BOTH indexer paths call this -- the legacy `KVCache` one and the
+/// ContinuousBatchingV2 one -- so the two can never disagree about the scores.
+public func qwen4ExpIndexerBlockScores(q: MLXArray, pooled: MLXArray) -> MLXArray {
+    let b = q.dim(0)
+    let s = q.dim(1)
+    let h = q.dim(2)
+    let d = q.dim(3)
+    let n = pooled.dim(1)
+    let flat = q.reshaped(b, s * h, d)
+    let contracted = MLX.matmul(flat, pooled.transposed(0, 2, 1))
+    return contracted.reshaped(b, s, h, n).transposed(0, 1, 3, 2)
+}
+
 // MARK: - QSA indexer
 
 /// Selects, per query, a budget of compressed key blocks.
 ///
 /// The indexer keeps its own untouched key tape (see
-/// ``Qwen4ExpAttentionCache``), pools it into blocks of `compressRatio`
+/// `Qwen4ExpAttentionCache`, which lives in `MLXLMCommon` and so cannot be a
+/// symbol link from here), pools it into blocks of `compressRatio`
 /// tokens, scores every block against the query, and keeps the best
 /// `budget / compressRatio` of them. The result is a boolean keep mask that is
 /// combined with the causal mask.
@@ -479,8 +500,8 @@ public final class Qwen4ExpQSAIndexer: Module {
             q, cos: cosQ[0..., 0..., .newAxis, 0...], sin: sinQ[0..., 0..., .newAxis, 0...])
 
         // Sum over heads of relu(q . k), per block.
-        var scores = MLX.einsum(
-            "bshd,bnd->bsnh", q.asType(.float32), pooled.asType(.float32))
+        var scores = qwen4ExpIndexerBlockScores(
+            q: q.asType(.float32), pooled: pooled.asType(.float32))
         scores = maximum(scores, MLXArray(Float(0))).sum(axis: -1) / Foundation.sqrt(Float(headDim))
 
         // A block is a candidate only when it lies entirely in the query's past.
