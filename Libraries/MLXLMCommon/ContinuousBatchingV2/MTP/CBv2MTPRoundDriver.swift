@@ -712,13 +712,21 @@ final class CBv2MTPRoundDriver {
     }
 
     func recordRound(
-        drafted: Int, accepted: Int, emitted: Int
+        drafted: Int, accepted: Int, emitted: Int,
+        audit: CBv2MTPRoundAuditRecord? = nil
     ) {
         metricsLock.lock()
         metrics.rounds += 1
         metrics.draftedTokens += drafted
         metrics.acceptedTokens += accepted
         metrics.emittedTokens += emitted
+        if let audit {
+            metrics.roundAudits.append(audit)
+            if metrics.roundAudits.count > CBv2MTPRoundAuditRecord.retainedRecordCap {
+                metrics.roundAudits.removeFirst(
+                    metrics.roundAudits.count - CBv2MTPRoundAuditRecord.retainedRecordCap)
+            }
+        }
         if metrics.perPositionAccepted.count < drafted {
             metrics.perPositionAccepted.append(
                 contentsOf: Array(
