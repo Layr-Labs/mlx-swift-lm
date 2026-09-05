@@ -43,6 +43,12 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2KeepMaskRequiringModel {
+    public var cbv2RequiresKeepMask: Bool {
+        (model as? any CBv2KeepMaskRequiringModel)?.cbv2RequiresKeepMask ?? false
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
     public var cbv2PositionAxisCount: Int? {
         (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount

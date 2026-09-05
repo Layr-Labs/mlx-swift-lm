@@ -186,10 +186,22 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false,
+        keepMask: MLXArray? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
+        if keepMask != nil {
+            precondition(
+                B == 1,
+                "CBv2AttentionV1: a keep mask serves one row per call, got batch \(B)")
+            precondition(
+                spanContexts == nil,
+                "CBv2AttentionV1: a keep mask cannot be combined with vision span masks")
+            precondition(
+                window(of: kind) == nil && !kind.isBidirectional,
+                "CBv2AttentionV1: a keep mask serves causal full attention only")
+        }
         precondition(!rows.isEmpty, "CBv2AttentionV1: no rows")
         precondition(
             B == rows.count,
@@ -213,13 +225,14 @@ enum CBv2AttentionV1 {
                 return updateAndAttendRowSerialQueries(
                     row: rows[0], kind: kind,
                     queries: queries, keys: keys, values: values,
-                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+                    scale: scale, sinks: effectiveSinks, softcap: softcap,
+                    keepMask: keepMask)
             }
             return updateAndAttendRow(
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[0])
+                spanContext: spanContexts?[0], keepMask: keepMask)
         }
 
         if L == 1 {
@@ -360,16 +373,23 @@ enum CBv2AttentionV1 {
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContext: CBv2SpanChunkContext?
+        spanContext: CBv2SpanChunkContext?,
+        keepMask: MLXArray? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        if let keepMask {
+            precondition(
+                keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
+                "CBv2AttentionV1: keep mask \(keepMask.shape) does not match "
+                    + "\(L) queries over \(cachedKeys.dim(2)) keys")
+        }
         if shouldBlockQueries(L) && !kind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
                 sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
-                spanContext: spanContext)
+                spanContext: spanContext, keepMask: keepMask)
         }
         if let spanContext {
             return attendSpanChunk(
@@ -380,20 +400,28 @@ enum CBv2AttentionV1 {
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional)
+            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional,
+            keepMask: keepMask)
     }
 
     private static func updateAndAttendRowSerialQueries(
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        keepMask: MLXArray? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        if let keepMask {
+            precondition(
+                keepMask.dim(2) == L && keepMask.dim(3) == cachedKeys.dim(2),
+                "CBv2AttentionV1: keep mask \(keepMask.shape) does not match "
+                    + "\(L) queries over \(cachedKeys.dim(2)) keys")
+        }
         return attendSerialQueries(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
-            sinks: sinks, softcap: softcap)
+            sinks: sinks, softcap: softcap, keepMask: keepMask)
     }
 
     /// Attend against `sourceRows`' KV WITHOUT updating (Gemma-4 cross-layer
@@ -590,9 +618,13 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
         sinks: MLXArray?, softcap: Float?, blockSize: Int,
-        spanContext: CBv2SpanChunkContext? = nil
+        spanContext: CBv2SpanChunkContext? = nil,
+        keepMask: MLXArray? = nil
     ) -> MLXArray {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
+        precondition(
+            keepMask == nil || spanContext == nil,
+            "CBv2AttentionV1: a keep mask cannot be combined with vision span masks")
         let keyCount = keys.dim(2)
         let historyCount = keyCount - newTokenCount
         precondition(historyCount >= 0)
@@ -641,11 +673,19 @@ enum CBv2AttentionV1 {
                         window: window, blocks: blocks,
                         sinks: sinks, softcap: softcap))
             } else {
+                // The block reads keys `[visibleStart, visibleEnd)` and
+                // queries `[offset, offset + count)`, so the mask is sliced
+                // to the same window. Column coordinates are absolute over
+                // the retained tape on both sides.
+                let blockKeepMask = keepMask.map {
+                    $0[0..., 0..., offset ..< (offset + count), visibleStart ..< visibleEnd]
+                }
                 outputs.append(
                     attend(
                         queries: querySlice, keys: keySlice, values: valueSlice,
                         scale: scale, L: count, kL: visibleEnd - visibleStart,
-                        window: window, sinks: sinks, softcap: softcap))
+                        window: window, sinks: sinks, softcap: softcap,
+                        keepMask: blockKeepMask))
             }
             offset += count
         }
@@ -656,12 +696,12 @@ enum CBv2AttentionV1 {
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
-        sinks: MLXArray?, softcap: Float?
+        sinks: MLXArray?, softcap: Float?, keepMask: MLXArray? = nil
     ) -> MLXArray {
         attendQueryBlocks(
             queries: queries, keys: keys, values: values,
             newTokenCount: newTokenCount, window: window, scale: scale,
-            sinks: sinks, softcap: softcap, blockSize: 1)
+            sinks: sinks, softcap: softcap, blockSize: 1, keepMask: keepMask)
     }
 
     /// Single-request attention dispatch. Without a softcap this is MLXFast
@@ -672,13 +712,30 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false
+        bidirectional: Bool = false, keepMask: MLXArray? = nil
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
         let attentionKeys = keys.dtype == queries.dtype ? keys : keys.asType(queries.dtype)
         let attentionValues =
             values.dtype == queries.dtype ? values : values.asType(queries.dtype)
+        if let keepMask {
+            // EXACT: the keep mask can only remove keys the causal/window
+            // mask already admitted, so the composed mask is the AND of the
+            // two. `boolMask` returns nil at L == 1 (the retained KV IS the
+            // visible set), where the keep mask stands alone.
+            let composed =
+                boolMask(L: L, kL: kL, window: window, bidirectional: bidirectional)
+                .map { $0 .&& keepMask } ?? keepMask
+            guard let softcap else {
+                return MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: attentionKeys, values: attentionValues,
+                    scale: scale, mask: .array(composed), sinks: sinks)
+            }
+            return PagedAttentionReference.composedAttention(
+                queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
+                boolMask: composed, sinks: sinks, softcap: softcap)
+        }
         guard let softcap else {
             // Sinks arrive ALREADY normalized to the query dtype: see
             // `sdpaSinks` (MLX aborts the process on a wider sink) and

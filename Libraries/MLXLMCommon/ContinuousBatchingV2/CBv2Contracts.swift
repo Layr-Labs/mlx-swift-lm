@@ -639,12 +639,59 @@ public protocol CBv2AttendingLayerCache: AnyObject {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray
+    /// Same contract as `updateAndAttend(queries:keys:values:scale:sinks:)`
+    /// plus an optional per-row boolean KEEP MASK.
+    ///
+    /// `keepMask` is `[B, 1, L, kL]` (true == attend), stated over the row's
+    /// retained keys AFTER this update, oldest key first. The backend ANDs it
+    /// with the causal or window mask, so it can only REMOVE keys a dense
+    /// forward would have attended. Qwen 3.8 Flash-Next builds it from its
+    /// QSA indexer.
+    ///
+    /// A backend that cannot honor it MUST refuse BY NAME. The default
+    /// implementation below does exactly that, so every existing conformer
+    /// keeps its behavior and gains a truthful refusal.
+    func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, keepMask: MLXArray?
+    ) -> MLXArray
     /// Borrow the source layer's K/V for Gemma-style KV-shared layers.
     /// Only valid when `kind.sharesKVWithLayer != nil`.
     func attendBorrowing(
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
     ) -> MLXArray
+}
+
+extension CBv2AttendingLayerCache {
+    /// Fail-safe default: a cache that does not implement the keep-mask
+    /// overload has no keep-mask semantics, so a non-nil mask is refused by
+    /// name rather than silently dropped into a dense attention.
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, keepMask: MLXArray?
+    ) -> MLXArray {
+        guard keepMask == nil else {
+            preconditionFailure(
+                "\(type(of: self)) does not support keepMask (layer \(layerIndex))")
+        }
+        return updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks)
+    }
+}
+
+/// Affirmative claim that a layer cache HONORS a keep mask. A cache that
+/// makes no claim keeps the refusing default above, and the bank reports
+/// `supportsKeepMask == false` for the whole provider.
+public protocol CBv2KeepMaskCapableCache: AnyObject {
+    var honorsKeepMask: Bool { get }
+}
+
+/// Model-side declaration that this family cannot be served without the keep
+/// mask. `EngineV2` refuses at CONSTRUCTION when the provider does not
+/// support it, so a sparse-attention model can never run dense by accident.
+public protocol CBv2KeepMaskRequiringModel: AnyObject {
+    var cbv2RequiresKeepMask: Bool { get }
 }
 
 // MARK: - Scheduler plan (vLLM-V1 style: no phases)
