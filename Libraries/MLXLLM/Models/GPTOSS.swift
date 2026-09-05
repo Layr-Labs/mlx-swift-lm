@@ -453,7 +453,9 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
-        if weights.keys.contains(where: { $0.contains("gate_proj.weight") }) {
+        if weights.keys.contains(where: {
+            $0.contains("gate_proj.weight") || $0.contains(".experts.gate_up_proj.weight")
+        }) {
             return fuseGateUpWeights(weights, enabled: useFusedGateUp)
         }
 

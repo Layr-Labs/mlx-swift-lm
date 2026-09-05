@@ -12,6 +12,13 @@ struct GPTOSSGateUpFusionTests {
 
     @Test("row concatenation preserves biased GPTOSS SwiGLU for float, affine, and MXFP4")
     func expertParity() throws {
+        let config = try JSONDecoder().decode(GPTOSSConfiguration.self, from: Data("""
+        {"model_type":"gpt_oss","num_hidden_layers":2,"num_local_experts":4,
+         "num_experts_per_tok":2,"vocab_size":64,"rms_norm_eps":0.00001,
+         "hidden_size":64,"intermediate_size":64,"head_dim":16,
+         "num_attention_heads":4,"num_key_value_heads":2,"sliding_window":8}
+        """.utf8))
+        let normalizer = GPTOSSModel(config)
         for mode in [nil, QuantizationMode.affine, .mxfp4] as [QuantizationMode?] {
             MLXRandom.seed(0x475054)
             let split = SwiGLUSwitchGLU(inputDims: 64, hiddenDims: 64, numExperts: 4, bias: true)
@@ -26,6 +33,13 @@ struct GPTOSSGateUpFusionTests {
                 (prefix + "." + $0.0, $0.1)
             })
             let adjusted = fuseSwitchGLUGateUpWeights(weights: source, moduleName: "experts")
+            let restored = normalizer.splitSavedGateUpWeights(adjusted)
+            #expect(restored.keys.sorted() == source.keys.sorted())
+            for (key, expected) in source {
+                let actual = try #require(restored[key])
+                #expect(actual.dtype == expected.dtype && actual.shape == expected.shape)
+                #expect((actual .== expected).all().item(Bool.self))
+            }
             let bare = adjusted.map { (String($0.key.dropFirst(prefix.count + 1)), $0.value) }
             try fused.update(parameters: ModuleParameters.unflattened(bare), verify: [.all])
             eval(fused)
@@ -114,6 +128,23 @@ struct GPTOSSGateUpFusionTests {
         #expect(model.quantizationPathAliases(for: prefix + ".gate_up_proj") == [
             prefix + ".gate_proj", prefix + ".up_proj"
         ])
+        // A saved fused module uses canonical .gate_up_proj.weight keys.
+        // Normalize and reload it without interpreting those contiguous
+        // halves as the upstream interleaved checkpoint representation.
+        let restored = model.sanitize(weights: adjusted)
+        try model.update(parameters: ModuleParameters.unflattened(restored), verify: [.all])
+        for (key, expected) in original {
+            let actual = try #require(restored[key])
+            #expect(actual.shape == expected.shape)
+            #expect((actual .== expected).all().item(Bool.self))
+        }
+        let again = model.fuseGateUpWeights(restored, enabled: true)
+        let rolledBack = model.fuseGateUpWeights(again, enabled: false)
+        try model.update(parameters: ModuleParameters.unflattened(rolledBack), verify: [.all])
+        for (key, expected) in original {
+            let actual = try #require(rolledBack[key])
+            #expect((actual .== expected).all().item(Bool.self))
+        }
         let q = BaseConfiguration.Quantization(groupSize: 32, bits: 4, mode: .affine)
         model.checkpointPerLayerQuantization = .init(quantization: nil, perLayerQuantization: [
             prefix + ".gate_proj": .quantize(q), prefix + ".up_proj": .skip
