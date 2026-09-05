@@ -20,6 +20,7 @@
 
 import CryptoKit
 import Foundation
+import MLX
 import MLXLMCommon
 
 // MARK: - Declaration vocabulary
@@ -443,7 +444,11 @@ public struct RunnerResources: @unchecked Sendable {
 
 /// What the CALLER wants honored at load time. The runner never downloads
 /// and never reads the network (§5 rule 4).
-public struct RunnerLoadOptions: Sendable {
+///
+/// `@unchecked Sendable` because `preloadedDrafter` is a live module the
+/// caller already holds; the options struct is handed across the load
+/// boundary and never mutated after it.
+public struct RunnerLoadOptions: @unchecked Sendable {
     /// Directory holding the drafter artifact (assistant checkpoint or a
     /// standalone embedded-head export). nil means "serial only".
     public var drafterDirectory: URL?
@@ -461,19 +466,86 @@ public struct RunnerLoadOptions: Sendable {
     public var environment: [String: String]
     /// Family resources the caller supplies. See ``RunnerResources``.
     public var resources: RunnerResources
+    /// A drafter the caller ALREADY holds resident.
+    ///
+    /// Darkbloom's slot lifecycle keeps the Gemma 4 assistant loaded across
+    /// engine rebuilds, so handing it in is the difference between binding a
+    /// module and reading its tensors a second time. When set it is used as
+    /// is and `drafterDirectory` is not opened.
+    public var preloadedDrafter: (any CBv2MTPDrafter)?
 
     public init(
         drafterDirectory: URL? = nil,
         kvBytesCapacity: Int = 0,
         maxSequenceLength: Int = 32768,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        resources: RunnerResources = RunnerResources()
+        resources: RunnerResources = RunnerResources(),
+        preloadedDrafter: (any CBv2MTPDrafter)? = nil
     ) {
         self.drafterDirectory = drafterDirectory
         self.kvBytesCapacity = kvBytesCapacity
         self.maxSequenceLength = maxSequenceLength
         self.environment = environment
         self.resources = resources
+        self.preloadedDrafter = preloadedDrafter
+    }
+}
+
+/// Arithmetic the paged pool's pages are stored IN.
+///
+/// This is a MEASUREMENT knob, not a tuning one. An operator who asks for
+/// fp32 and is served fp16 has run a different experiment than they believe,
+/// and a control arm that is secretly a second copy of the baseline looks
+/// exactly like agreement — so a request here is honoured exactly or refused
+/// by name, never quietly downgraded.
+///
+/// Capacity is a real wall at fp32: a page costs
+/// `2 * kvHeads * pageSize * headDim * dtype.size` bytes, so fp32 pages cost
+/// exactly twice as much and the same byte grant buys HALF the pages, while
+/// page DEMAND is unchanged. A configuration that fits at fp16 and refuses
+/// at fp32 is CORRECT — refused rather than quietly served at half the
+/// context.
+public enum PagedPoolDType: String, Sendable, Equatable, Codable {
+    case float16
+    case float32
+
+    public var dtype: DType {
+        switch self {
+        case .float16: return .float16
+        case .float32: return .float32
+        }
+    }
+}
+
+/// The paged pool a caller asks for. Ignored entirely by a contiguous build.
+public struct PagedPoolPlan: Sendable, Equatable {
+    /// Page arithmetic. See ``PagedPoolDType``.
+    public var dtype: PagedPoolDType
+    /// When the slabs are wired: at construction (allocation out of the
+    /// timed region, an idle pool holding unified memory) or at the pool's
+    /// first admission (the production posture, so an unused pool costs a
+    /// co-resident model's headroom measurement nothing).
+    public var slabCommitment: PagedKVSlabCommitment
+    /// Sequence length the pool sizes its groups against.
+    public var nominalMaxSequenceLength: Int
+    /// Byte capacity for the POOL, when it differs from the engine's
+    /// admission ceiling. nil means `EngineBuild.kvBytesCapacity`.
+    public var capacityBytes: Int?
+    /// Device buffer ceiling; nil reads the device's own.
+    public var maxBufferLength: Int?
+
+    public init(
+        dtype: PagedPoolDType = .float16,
+        slabCommitment: PagedKVSlabCommitment = .atFirstAdmission,
+        nominalMaxSequenceLength: Int = RunnerEngineAssembly.nominalMaxSequenceLength,
+        capacityBytes: Int? = nil,
+        maxBufferLength: Int? = nil
+    ) {
+        self.dtype = dtype
+        self.slabCommitment = slabCommitment
+        self.nominalMaxSequenceLength = nominalMaxSequenceLength
+        self.capacityBytes = capacityBytes
+        self.maxBufferLength = maxBufferLength
     }
 }
 
@@ -490,6 +562,9 @@ public struct EngineBuild: Sendable {
     /// Must be in `runner.loadedDecoders`.
     public var decoder: DecoderID
     public var mtpConfig: CBv2MTPConfig
+    /// The paged pool this build asks for. Read only when `kvBackend` is
+    /// `.paged`; a contiguous build has no pages to describe.
+    public var pagedPool: PagedPoolPlan
     public var environment: [String: String]
 
     public init(
@@ -500,6 +575,7 @@ public struct EngineBuild: Sendable {
         prefixCache: (any CBv2PrefixCache)? = nil,
         decoder: DecoderID = .serial,
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig(),
+        pagedPool: PagedPoolPlan = PagedPoolPlan(),
         environment: [String: String] = [:]
     ) {
         self.kvBackend = kvBackend
@@ -509,6 +585,7 @@ public struct EngineBuild: Sendable {
         self.prefixCache = prefixCache
         self.decoder = decoder
         self.mtpConfig = mtpConfig
+        self.pagedPool = pagedPool
         self.environment = environment
     }
 }
@@ -533,6 +610,11 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
     /// A resource the runner cannot build itself was absent from
     /// `RunnerLoadOptions.resources`.
     case resourceMissing(String)
+    /// The paged pool was built with page arithmetic other than the one the
+    /// caller asked for. An explicit paged request is honoured exactly or
+    /// refused BY NAME: serving fp16 under an fp32 label would make a
+    /// control arm a second copy of the baseline.
+    case pagedPoolDTypeUnsupported(requested: String, served: String)
 
     public var description: String {
         switch self {
@@ -550,6 +632,8 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
             return "runner: drafter unavailable (\(detail))"
         case .resourceMissing(let detail):
             return "runner: required resource absent (\(detail))"
+        case .pagedPoolDTypeUnsupported(let requested, let served):
+            return "runner: paged pool requested \(requested) but was built \(served)"
         }
     }
 }
@@ -565,7 +649,45 @@ public protocol Runner: AnyObject, Sendable {
     /// loaded state (§6.1).
     static var manifest: RunnerManifest { get }
 
+    /// Adopt a module the caller ALREADY has resident.
+    ///
+    /// Reads NO tensors. Everything it derives — the serving model after
+    /// tower extraction, the layer kinds, the loaded decoders, the head
+    /// provenance — comes from the module it was handed plus `config.json`
+    /// and the safetensors index under `directory`.
+    ///
+    /// This exists because Darkbloom's slot lifecycle owns a resident
+    /// `ModelContainer`: a runner that could only `load` would read a
+    /// checkpoint the process already holds, and on a 113 GB model that is
+    /// not a slow path, it is a second copy in unified memory.
+    ///
+    /// `configuration` is carried for runners that key on the resolved
+    /// model identity; the authoritative `model_type` is read from
+    /// `config.json`, which is what the hello reports.
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> Self
+
+    /// Load the family's drafter from disk and bind it to `target` (the RAW
+    /// loaded module — the family extracts its own tower).
+    ///
+    /// Separate from `adopt` precisely because it READS TENSORS. Default:
+    /// whatever the caller already handed in, which is nil for a family with
+    /// no drafter.
+    static func loadDrafter(
+        options: RunnerLoadOptions,
+        directory: URL,
+        target: any LanguageModel
+    ) async throws -> (any CBv2MTPDrafter)?
+
     /// Load the checkpoint. Loads weights ONCE. No download. No network.
+    ///
+    /// Defaulted in terms of `adopt`, so construction has ONE path: bring
+    /// the module into memory, then adopt it.
     static func load(_ directory: URL, options: RunnerLoadOptions) async throws -> Self
 
     /// The serving model after tower extraction (VLM text tower, MoE target).
@@ -831,14 +953,31 @@ public enum RunnerEngineAssembly {
                 CBv2LayerCache(layerIndex: index, kind: kind)
             }
         case .paged:
+            let plan = build.pagedPool
             let paged = try PagedKVBackend(
                 layerKinds: layerKinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: build.kvBytesCapacity,
+                    capacityBytes: plan.capacityBytes ?? build.kvBytesCapacity,
+                    dtype: plan.dtype.dtype,
+                    // LOCKSTEP: a windowed-layer update larger than the
+                    // ring's provision traps the process, so the pool is
+                    // sized from the chunk the engine can actually schedule
+                    // — a solo stripe included.
                     maxPrefillChunk: max(
                         build.schedulerConfig.prefillChunkSize,
                         build.schedulerConfig.soloPrefillStripeTokens ?? 0),
-                    nominalMaxSequenceLength: nominalMaxSequenceLength))
+                    nominalMaxSequenceLength: plan.nominalMaxSequenceLength,
+                    maxBufferLength: plan.maxBufferLength
+                        ?? MLX.GPU.deviceInfo().maxBufferSize),
+                slabCommitment: plan.slabCommitment)
+            // Read off the CONSTRUCTED pool, never off the request: this is
+            // the built artifact reporting itself, and it is what separates
+            // "fp32 served" from "fp32 asked for and ignored".
+            guard paged.pool.config.dtype == plan.dtype.dtype else {
+                throw RunnerError.pagedPoolDTypeUnsupported(
+                    requested: plan.dtype.rawValue,
+                    served: "\(paged.pool.config.dtype)")
+            }
             let pagedCaches = paged.makeLayerCaches()
             // `newCacheV2` hands the closure the MODEL layer index
             // (`kind.modelLayerIndex ?? storagePosition`) while

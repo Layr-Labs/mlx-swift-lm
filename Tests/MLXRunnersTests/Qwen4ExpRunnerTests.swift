@@ -41,9 +41,13 @@ private final class Qwen4ExpManifestRunner: Runner, @unchecked Sendable {
     let headProvenance: HeadProvenance? = nil
     let loadedModelType = "qwen4_exp"
 
-    static func load(
-        _ directory: URL, options: RunnerLoadOptions
-    ) async throws -> Qwen4ExpManifestRunner {
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> Qwen4ExpManifestRunner {
         Qwen4ExpManifestRunner(loadedDecoders: [.serial, .mtp])
     }
 

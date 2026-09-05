@@ -349,7 +349,14 @@ let package = Package(
         // report/optimization provenance. Model-free, so they run in CI.
         .testTarget(
             name: "MLXRunnersTests",
-            dependencies: ["MLXRunners", "MLXLMCommon"],
+            dependencies: [
+                "MLXRunners",
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
             path: "Tests/MLXRunnersTests",
             resources: [
                 // The SHARED Engine Protocol v1 conformance fixture, pinned

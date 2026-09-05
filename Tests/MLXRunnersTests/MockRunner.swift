@@ -6,6 +6,7 @@
 // (`Resources/engine-wire-v1-adapter.ndjson`, pinned on both sides).
 
 import Foundation
+import MLX
 import MLXLMCommon
 import MLXRunners
 
@@ -241,8 +242,19 @@ final class MockRunner: Runner, @unchecked Sendable {
         self.script = script
     }
 
-    static func load(_ directory: URL, options: RunnerLoadOptions) async throws -> MockRunner {
-        MockRunner()
+    /// The mock holds no module, so adoption is the whole of its
+    /// construction — but it still reads the two checkpoint facts every real
+    /// runner reads, so a directory holding only those two files is enough
+    /// for it too.
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> MockRunner {
+        _ = try RunnerCheckpoint.modelType(at: directory)
+        return MockRunner()
     }
 
     func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {
@@ -294,9 +306,13 @@ final class CohortMockRunner: Runner, @unchecked Sendable {
     var headProvenance: HeadProvenance? { inner.headProvenance }
     var loadedModelType: String { inner.loadedModelType }
 
-    static func load(
-        _ directory: URL, options: RunnerLoadOptions
-    ) async throws -> CohortMockRunner {
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> CohortMockRunner {
         CohortMockRunner(script: .fixtureWindow)
     }
 
@@ -334,9 +350,13 @@ final class TeacherForcedOnlyMockRunner: Runner, @unchecked Sendable {
     var headProvenance: HeadProvenance? { inner.headProvenance }
     var loadedModelType: String { inner.loadedModelType }
 
-    static func load(
-        _ directory: URL, options: RunnerLoadOptions
-    ) async throws -> TeacherForcedOnlyMockRunner {
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> TeacherForcedOnlyMockRunner {
         TeacherForcedOnlyMockRunner()
     }
 
@@ -375,4 +395,46 @@ struct FixtureMemoryReporter: WorkerMemoryReporter {
     func drain() {}
     func cacheMemoryAfterDrain() -> Int? { nil }
     func peakRAMGB() -> Double? { 18.5 }
+}
+
+// MARK: - Stand-ins for the adoption seam
+
+/// A tokenizer that answers only what adoption asks of it.
+struct StubTokenizer: MLXLMCommon.Tokenizer {
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
+    func convertTokenToId(_ token: String) -> Int? { nil }
+    func convertIdToToken(_ id: Int) -> String? { nil }
+    var bosToken: String? { nil }
+    var eosToken: String? { nil }
+    var unknownToken: String? { nil }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], chatTemplate: String
+    ) throws -> [Int] { [] }
+    func applyChatTemplate(
+        messages: [[String: any Sendable]], chatTemplate: String,
+        tools: [[String: any Sendable]]?, additionalContext: [String: any Sendable]?
+    ) throws -> [Int] { [] }
+}
+
+/// A resident drafter: identity is all the adoption seam needs of it. Every
+/// engine-facing member traps, because adoption binds a drafter and never
+/// drives one.
+final class StubDrafter: CBv2MTPDrafter, @unchecked Sendable {
+    var mtpTargetIdentity: ObjectIdentifier? { nil }
+
+    func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
+        preconditionFailure("the stub drafter never drafts")
+    }
+
+    func draftStep(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        preconditionFailure("the stub drafter never drafts")
+    }
 }

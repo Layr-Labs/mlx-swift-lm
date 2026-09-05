@@ -2,15 +2,21 @@
 //
 // bench-worker — Engine Protocol v1 server over `Runner`.
 //
-// benchd spawns `<engine> runtime-worker --weights <DIR>`. One binary serves
-// every runner: the checkpoint's `config.json` `model_type` picks it out of
-// `RunnerRegistry`, or `--runner <id>` names it.
+// benchd spawns `<engine> runtime-worker --weights <DIR> --speculative-protocol v1.1`.
+// One binary serves every runner: the checkpoint's `config.json` `model_type`
+// picks it out of `RunnerRegistry`, or `--runner <id>` names it.
 //
-// A SHIM. The loop lives in `MLXRunners/BenchWorker.swift` so the
-// conformance test can drive it in process; a test target that depended on
-// this executable would be run by SwiftPM as the swift-testing host and
-// would abort the package's whole `@Test` pass (see Package.swift's
-// BenchCBv2Core/BenchCBv2 note).
+// A SHIM. Argument parsing and validation live in
+// `MLXRunners/BenchWorkerLaunch.swift` and the protocol loop in
+// `MLXRunners/BenchWorker.swift`, so both are testable in process; a test
+// target that depended on this executable would be run by SwiftPM as the
+// swift-testing host and would abort the package's whole `@Test` pass (see
+// Package.swift's BenchCBv2Core/BenchCBv2 note).
+//
+// The ORDER below is load bearing and reads top to bottom: validate argv,
+// then resolve the runner (the first read under `--weights`), then load the
+// weights ONCE, then serve. A checkpoint here can be 113 GB, so a bad flag
+// must be answered from argv alone.
 
 import Foundation
 import MLXLMCommon
@@ -46,112 +52,55 @@ func probeDevice() -> String {
     #endif
 }
 
-struct Options {
-    var weights: URL?
-    var runnerID: String?
-    var drafter: URL?
-    var trusted = false
-    var kvBytesCapacity = 8 << 30
-    /// Raw `--speculative-protocol` value, nil when the flag was absent.
-    var speculativeProtocol: String?
-    /// Raw `<name>=<path>` values, in argv order. Validated once, together,
-    /// AFTER parsing so a duplicate name is reported against the whole
-    /// command rather than against whichever occurrence came second.
-    var resources: [String] = []
+/// One line on stderr and a non-zero status — never a Swift runtime trap.
+/// benchd reads this line to tell an operator what to fix, and a crash
+/// report buries it under a backtrace.
+func fail(_ error: some Error) -> Never {
+    let message: String =
+        (error as? CustomStringConvertible)?.description ?? "\(error)"
+    FileHandle.standardError.write(Data(("bench-worker: " + message + "\n").utf8))
+    exit(2)
 }
 
-func parseOptions(_ arguments: [String]) throws -> Options {
-    var options = Options()
-    var index = 0
-    while index < arguments.count {
-        let argument = arguments[index]
-        index += 1
-        func next(_ name: String) throws -> String {
-            guard index < arguments.count else {
-                throw WorkerLaunchError.missingValue(name)
-            }
-            defer { index += 1 }
-            return arguments[index]
-        }
-        switch argument {
-        case "runtime-worker": continue
-        case "--weights": options.weights = URL(fileURLWithPath: try next("--weights"))
-        case "--runner": options.runnerID = try next("--runner")
-        case "--drafter": options.drafter = URL(fileURLWithPath: try next("--drafter"))
-        case "--trusted": options.trusted = true
-        case "--resource": options.resources.append(try next("--resource"))
-        case "--speculative-protocol":
-            options.speculativeProtocol = try next("--speculative-protocol")
-        case "--kv-bytes":
-            guard let bytes = Int(try next("--kv-bytes")) else {
-                throw WorkerLaunchError.badValue("--kv-bytes")
-            }
-            options.kvBytesCapacity = bytes
-        default: throw WorkerLaunchError.unknownArgument(argument)
-        }
-    }
-    return options
+// 1. ARGV. Every argument refusal happens here, with nothing under
+//    `--weights` read yet.
+let launch: BenchWorkerLaunchOptions
+do {
+    launch = try BenchWorkerLaunchOptions.parse(Array(CommandLine.arguments.dropFirst()))
+} catch {
+    fail(error)
 }
 
-enum WorkerLaunchError: Error, CustomStringConvertible {
-    case missingValue(String)
-    case badValue(String)
-    case unknownArgument(String)
-    case missingWeights
-    case unknownRunner(String)
-
-    var description: String {
-        switch self {
-        case .missingValue(let name): return "\(name) requires a value"
-        case .badValue(let name): return "\(name) has an unusable value"
-        case .unknownArgument(let name): return "unknown argument \(name)"
-        case .missingWeights: return "--weights <dir> is required"
-        case .unknownRunner(let id): return "no runner with id \(id)"
-        }
-    }
-}
-
-let options = try parseOptions(Array(CommandLine.arguments.dropFirst()))
-guard let weights = options.weights else { throw WorkerLaunchError.missingWeights }
-
+// 2. The checkpoint. This is the first read under `--weights`.
 let runnerType: any Runner.Type
-if let runnerID = options.runnerID {
-    guard
-        let match = RunnerRegistry.shared.manifests().first(where: { $0.runnerID == runnerID }),
-        let modelType = match.modelTypes.first
-    else {
-        throw WorkerLaunchError.unknownRunner(runnerID)
-    }
-    runnerType = try RunnerRegistry.shared.resolve(modelType: modelType)
-} else {
-    runnerType = try RunnerRegistry.shared.resolve(checkpoint: weights)
+do {
+    runnerType = try launch.resolveRunner()
+} catch {
+    fail(error)
 }
 
-// Both of these are validated BEFORE the load: a refusal an operator could
-// have been told at argv must not cost a multi-minute weight load first.
-let speculative = try SpeculativeProtocol.isEnabled(options.speculativeProtocol)
+// 3. ONE load, before the hello.
+let runner: any Runner
+do {
+    runner = try await runnerType.load(
+        launch.weights,
+        options: RunnerLoadOptions(
+            drafterDirectory: launch.drafter,
+            kvBytesCapacity: launch.kvBytesCapacity,
+            resources: launch.resources))
+} catch {
+    fail(error)
+}
 
-// Resources are validated BEFORE the load: a bad path discovered after a
-// multi-minute weight load has wasted the box's time to report something
-// argv already knew.
-let resources = try RunnerResourceArguments.parse(options.resources)
-
-// ONE load, before the hello.
-let runner = try await runnerType.load(
-    weights,
-    options: RunnerLoadOptions(
-        drafterDirectory: options.drafter,
-        kvBytesCapacity: options.kvBytesCapacity,
-        resources: resources))
-
+// 4. Serve.
 let server = BenchWorkerServer(
     runner: runner,
     transport: StdioTransport(),
-    trusted: options.trusted,
-    speculative: speculative,
+    trusted: launch.trusted,
+    speculative: launch.speculative,
     // Stamped by the BenchRevisionStamp prebuild plugin: the revision that
     // PRODUCED this binary, not whatever the checkout moved to afterwards.
     build: BenchBuildRevision.value,
     device: probeDevice(),
-    kvBytesCapacity: options.kvBytesCapacity)
+    kvBytesCapacity: launch.kvBytesCapacity)
 await server.run()
