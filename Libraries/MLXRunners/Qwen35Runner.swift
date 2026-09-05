@@ -139,7 +139,9 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
             let assistant = try Qwen35InlineMTPAssistant.load(
                 from: drafterDirectory, target: servingModel)
             drafter = assistant
-            provenance = try RunnerCheckpoint.provenance(ofHeadAt: drafterDirectory)
+            // §12c: the one embedded-head rule, in the one shared helper.
+            provenance = try RunnerCheckpoint.provenance(
+                ofEmbeddedHeadAt: drafterDirectory)
         } catch {
             // An EXPLICIT drafter directory that fails is a refusal; the
             // implicit in-checkpoint head simply may not be there, and a

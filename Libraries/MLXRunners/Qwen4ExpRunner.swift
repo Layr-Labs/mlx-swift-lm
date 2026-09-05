@@ -144,8 +144,12 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
         }
 
         let drafter = Qwen4ExpInlineMTPAssistant(target: model)
+        // §12c: the one embedded-head rule, in the one shared helper. It
+        // hashes the shards carrying the `mtp.*` tensors, not the whole
+        // checkpoint.
         let provenance =
-            drafter == nil ? nil : try RunnerCheckpoint.provenance(ofHeadAt: directory)
+            drafter == nil
+            ? nil : try RunnerCheckpoint.provenance(ofEmbeddedHeadAt: directory)
 
         return Qwen4ExpRunner(
             model: model,

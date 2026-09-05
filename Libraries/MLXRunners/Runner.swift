@@ -672,6 +672,111 @@ public enum RunnerCheckpoint {
             bytes: bytes,
             fileCount: shards.count)
     }
+
+    /// Provenance of an EMBEDDED head — the `mtp.*` block of a checkpoint
+    /// that also carries the target weights (contract §12c).
+    ///
+    /// THE RULE, IN ONE PLACE. Every runner with an embedded head calls this
+    /// and none writes its own:
+    ///
+    /// 1. Find every tensor whose name begins with `mtp.` and the shard file
+    ///    that holds it. The shard map is the checkpoint's
+    ///    `*.safetensors.index.json` `weight_map`; a checkpoint with no index
+    ///    is read from each shard's own safetensors header.
+    /// 2. If there is no such tensor the checkpoint has no head: the result
+    ///    is nil, not a digest of the target weights.
+    /// 3. sha256 over the WHOLE bytes of the shards that carry those tensors,
+    ///    concatenated in index order (shard file name ascending, which is
+    ///    the shard numbering), followed by the sorted index entries, one per
+    ///    line as `<tensor name>\t<shard file name>\n`, ascending by tensor
+    ///    name.
+    /// 4. `bytes` is the sum of those shard sizes and `file_count` is how
+    ///    many shards they are. Neither counts a shard with no `mtp.` tensor.
+    ///
+    /// The entry lines are hashed as well as the bytes because two
+    /// checkpoints can share a shard file and place the head differently in
+    /// it; the digest names WHAT was found, not only where.
+    public static func provenance(ofEmbeddedHeadAt directory: URL) throws -> HeadProvenance? {
+        let entries = try embeddedHeadIndexEntries(at: directory)
+        guard !entries.isEmpty else { return nil }
+
+        let shardNames = Set(entries.map(\.shard)).sorted()
+        var hasher = SHA256()
+        var bytes = 0
+        for name in shardNames {
+            let url = directory.appendingPathComponent(name)
+            guard let handle = try? FileHandle(forReadingFrom: url) else {
+                throw RunnerError.drafterUnavailable("cannot read \(url.path)")
+            }
+            defer { try? handle.close() }
+            while let chunk = try handle.read(upToCount: 8 * 1024 * 1024), !chunk.isEmpty {
+                hasher.update(data: chunk)
+                bytes += chunk.count
+            }
+        }
+        for entry in entries.sorted(by: { $0.tensor < $1.tensor }) {
+            hasher.update(data: Data("\(entry.tensor)\t\(entry.shard)\n".utf8))
+        }
+        return HeadProvenance(
+            sha256: hasher.finalize().map { String(format: "%02x", $0) }.joined(),
+            bytes: bytes,
+            fileCount: shardNames.count)
+    }
+
+    /// `mtp.*` tensor names and the shard file each one lives in.
+    private static func embeddedHeadIndexEntries(
+        at directory: URL
+    ) throws -> [(tensor: String, shard: String)] {
+        let contents =
+            (try? FileManager.default.contentsOfDirectory(
+                at: directory, includingPropertiesForKeys: nil)) ?? []
+
+        if let index = contents.first(where: {
+            $0.lastPathComponent.hasSuffix(".safetensors.index.json")
+        }) {
+            guard let data = try? Data(contentsOf: index),
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let map = object["weight_map"] as? [String: String]
+            else {
+                throw RunnerError.invalidCheckpoint("no weight_map in \(index.path)")
+            }
+            return map
+                .filter { $0.key.hasPrefix("mtp.") }
+                .map { (tensor: $0.key, shard: $0.value) }
+        }
+
+        // No index: one shard per file, and each file names its own tensors.
+        var entries: [(tensor: String, shard: String)] = []
+        for shard in contents.filter({ $0.pathExtension == "safetensors" }) {
+            for tensor in try safetensorsTensorNames(at: shard)
+            where tensor.hasPrefix("mtp.") {
+                entries.append((tensor: tensor, shard: shard.lastPathComponent))
+            }
+        }
+        return entries
+    }
+
+    /// Tensor names of one safetensors file, from its header alone: eight
+    /// little-endian bytes of header length, then that many bytes of JSON
+    /// whose keys are the tensor names plus `__metadata__`.
+    private static func safetensorsTensorNames(at url: URL) throws -> [String] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            throw RunnerError.drafterUnavailable("cannot read \(url.path)")
+        }
+        defer { try? handle.close() }
+        guard let prefix = try handle.read(upToCount: 8), prefix.count == 8 else {
+            throw RunnerError.invalidCheckpoint("\(url.path) is not a safetensors file")
+        }
+        let length = prefix.reversed().reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        guard length > 0, length <= 512 * 1024 * 1024,
+            let header = try handle.read(upToCount: Int(length)),
+            header.count == Int(length),
+            let object = try? JSONSerialization.jsonObject(with: header) as? [String: Any]
+        else {
+            throw RunnerError.invalidCheckpoint("\(url.path) has no safetensors header")
+        }
+        return object.keys.filter { $0 != "__metadata__" }
+    }
 }
 
 // MARK: - Shared engine assembly
