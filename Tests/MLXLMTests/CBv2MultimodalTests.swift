@@ -1042,6 +1042,43 @@ final class CBv2MultimodalTests: XCTestCase {
             request: request, arrivalSeq: 0, submittedAt: Date())
     }
 
+    // MARK: - hasSpans ≡ !spansInChunk.isEmpty on degenerate ranges
+
+    func testHasSpansMatchesSpansInChunkOnDegenerateRanges() {
+        // Direct construction: resolution rejects a zero-length span, but
+        // the engine-thread predicate must agree with `spansInChunk` for
+        // every range shape it can be handed.
+        func resolved(_ spans: [CBv2ImageSpan]) -> CBv2ResolvedMultimodal {
+            CBv2ResolvedMultimodal(
+                spans: spans, attention: .causal, blocks: spans,
+                embeddings: spans.map { MLXArray.zeros([1, $0.length, 4]) },
+                deepstackEmbeddings: [])
+        }
+        let positive = resolved([CBv2ImageSpan(tokenOffset: 4, length: 6)])  // [4, 10)
+        let zeroLength = resolved([CBv2ImageSpan(tokenOffset: 6, length: 0)])
+        let cases: [(multimodal: CBv2ResolvedMultimodal, start: Int, count: Int, label: String)] = [
+            (positive, 6, 0, "empty chunk inside a positive span"),
+            (positive, 4, 0, "empty chunk at the span start"),
+            (zeroLength, 0, 16, "zero-length span inside a chunk"),
+            (zeroLength, 6, 0, "empty chunk at a zero-length span"),
+            (positive, 0, 4, "chunk ending exactly at the span start"),
+            (positive, 10, 6, "chunk starting exactly at the span end"),
+            (positive, 0, 5, "chunk overlapping the span head"),
+            (positive, 9, 8, "chunk overlapping the span tail"),
+            (positive, 0, 16, "chunk containing the span"),
+            (positive, 5, 2, "chunk inside the span"),
+        ]
+        for (multimodal, start, count, label) in cases {
+            XCTAssertEqual(
+                multimodal.hasSpans(start: start, count: count),
+                !multimodal.spansInChunk(start: start, count: count).isEmpty,
+                label)
+        }
+        XCTAssertFalse(positive.hasSpans(start: 6, count: 0), "empty chunk never intersects")
+        XCTAssertFalse(zeroLength.hasSpans(start: 0, count: 16), "zero-length span never counts")
+        XCTAssertTrue(positive.hasSpans(start: 5, count: 2), "genuine overlap")
+    }
+
     // MARK: - (e) Submit-time rejections
 
     private func makeCacheProvider(_ model: TinyTestModel) -> CBv2LayerCacheBank {

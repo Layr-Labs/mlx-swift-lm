@@ -78,83 +78,6 @@ private func mlxTopK(_ a: MLXArray, k: Int, axis: Int = -1) -> (values: MLXArray
     return (topKValues, topKIndices)
 }
 
-private func swiglu(_ xLinear: MLXArray, _ xGlu: MLXArray, alpha: Float = 1.702, limit: Float = 7.0)
-    -> MLXArray
-{
-    var xLinear = xLinear
-    var xGlu = xGlu
-    xGlu = clip(xGlu, max: MLXArray(limit))
-    xLinear = clip(xLinear, min: MLXArray(-limit), max: MLXArray(limit))
-
-    let gluScaled = alpha * xGlu
-    let sig = sigmoid(gluScaled)
-
-    let outGlu = xGlu * sig
-    return outGlu * (xLinear + 1)
-}
-
-private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { xLinear, xGlu in
-    swiglu(xLinear, xGlu)
-}
-
-class SwiGLUSwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
-
-    let inputDims: Int
-    let hiddenDims: Int
-    let numExperts: Int
-
-    init(
-        inputDims: Int,
-        hiddenDims: Int,
-        numExperts: Int,
-        bias: Bool = false
-    ) {
-        self.inputDims = inputDims
-        self.hiddenDims = hiddenDims
-        self.numExperts = numExperts
-
-        _gateProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        _upProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        _downProj.wrappedValue = SwitchLinear(
-            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
-
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
-
-        let doSort = indices.size >= 64
-
-        var idx = indices
-        var inverseOrder = MLXArray()
-
-        if doSort {
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
-        }
-
-        let xUp = upProj(x, idx, sortedIndices: doSort)
-        let xGate = gateProj(x, idx, sortedIndices: doSort)
-        x = downProj(
-            compiledSwiglu(xUp, xGate),
-            idx,
-            sortedIndices: doSort)
-
-        if doSort {
-            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
-        }
-
-        return x.squeezed(axis: -2)
-    }
-}
-
 class AttentionBlock: Module {
     let headDim: Int
     let numAttentionHeads: Int
@@ -399,7 +322,8 @@ public class GPTOSSModelInner: Module {
         _ inputs: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: [KVCache]? = nil,
-        inputEmbeddings: MLXArray? = nil
+        inputEmbeddings: MLXArray? = nil,
+        lastLayerLastQuery: Bool = false
     ) -> MLXArray {
         var x: MLXArray
         if let inputEmbeddings {
@@ -443,7 +367,17 @@ public class GPTOSSModelInner: Module {
                 maskMode = slidingMask!
             }
 
-            x = layer(x, mask: maskMode, cache: cache[i])
+            if lastLayerLastQuery,
+               gptossLastQueryPrefillEligible(
+                    sequenceLength: seqLen,
+                    isFinalFullLayer: i == layers.count - 1 && layerTypes[i] == "full_attention",
+                    cache: cache[i]),
+               let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
+            {
+                x = layer.prefillLastQuery(x, cache: lastQueryCache)
+            } else {
+                x = layer(x, mask: maskMode, cache: cache[i])
+            }
         }
 
         x = norm(x)
@@ -493,6 +427,14 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
     public let model: GPTOSSModelInner
     private let configuration: GPTOSSConfiguration
+    public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
+    var savedFusedExpertPaths = Set<String>()
+    static let fusedGateUpEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GPTOSS_FUSED_GATE_UP"] != "0"
+    private var useFusedGateUp: Bool {
+        Self.fusedGateUpEnabled && configuration.hiddenSize == 2880
+            && configuration.intermediateSize == 2880 && configuration.localExperts == 32
+    }
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
     public init(_ config: GPTOSSConfiguration) {
@@ -512,8 +454,10 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
-        if weights.keys.contains(where: { $0.contains("gate_proj.weight") }) {
-            return weights
+        if weights.keys.contains(where: {
+            $0.contains("gate_proj.weight") || $0.contains(".experts.gate_up_proj.weight")
+        }) {
+            return fuseGateUpWeights(weights, enabled: useFusedGateUp)
         }
 
         if weights.keys.contains(where: { $0.contains("gate_up_proj_scales") }) {
@@ -564,7 +508,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
-        return finalWeights
+        return fuseGateUpWeights(finalWeights, enabled: useFusedGateUp)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {

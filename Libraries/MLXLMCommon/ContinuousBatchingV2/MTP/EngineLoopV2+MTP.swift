@@ -15,6 +15,8 @@ extension EngineLoopV2 {
     func executeMTPRound(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
         guard let mtp else { return executeMixed(plan) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
+        launchClockNanos = wallStartedNanos
+        defer { launchClockNanos = 0 }
 
         // A per-row reserve retry can demote a round after the step-global
         // preflight. Demote all round rows so the target still sees one L=1
@@ -29,15 +31,27 @@ extension EngineLoopV2 {
 
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let work = mtpPrepareRoundWork(
-            plan, driver: mtp, demoteAllRounds: demoteAllRounds)
+            plan, driver: mtp, demoteAllRounds: demoteAllRounds,
+            launchNanos: wallStartedNanos)
         guard !work.isEmpty else {
             // Undo optimistic scheduler advances before pending samples can
             // block waiting admission.
             scheduler.rollback(plan)
             return nil
         }
+        // Timing stamps mirror `executeMixed`: admission was stamped in
+        // `mtpPrepareRoundWork` (before `ensureKVState`); solo prefill
+        // chunks are stamped inside `mtpBuildRoundGraph`, where each row's
+        // multimodal input is already bound (MTP rounds never pack). Only
+        // the decode-shaped one-token prompt chunk is stamped here: one
+        // compare per decode row, no lookup, no allocation.
+        for row in work where row.isDecode && row.start < row.rec.request.promptTokens.count {
+            row.rec.stampPrefillChunkLaunch(
+                tokens: 1, packed: false, vision: false, stripe: false,
+                launchNanos: wallStartedNanos)
+        }
 
-        let graph = mtpBuildRoundGraph(work, driver: mtp)
+        let graph = mtpBuildRoundGraph(work, driver: mtp, launchNanos: wallStartedNanos)
         scheduler.markPendingSamples(ids: graph.sampledRows)
         if let verify = graph.verify {
             scheduler.markPendingSamples(
