@@ -117,4 +117,6 @@ Build the metallib with `cmake -DMLX_METAL_JIT=OFF --target mlx-metallib` (see
 `fetch-metallib.sh` in d-inference), copy it over every `default.metallib`
 under `Build/Products/Debug`, including the copies inside each `.xctest`
 bundle, and then set `MLXLM_FULL_AOT_METALLIB=1`. Without the variable the
-three tests skip.
+three tests skip. For `swift test`, copy the same file to
+`mlx.metallib` in `.build/<triple>/debug/mlx-swift-lmPackageTests.xctest/Contents/MacOS`.
+The same gate holds for `Qwen4ExpRunnerEngineTests`.
