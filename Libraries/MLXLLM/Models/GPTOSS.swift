@@ -428,6 +428,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public let model: GPTOSSModelInner
     private let configuration: GPTOSSConfiguration
     public var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization?
+    var savedFusedExpertPaths = Set<String>()
     static let fusedGateUpEnabled =
         ProcessInfo.processInfo.environment["DARKBLOOM_GPTOSS_FUSED_GATE_UP"] != "0"
     private var useFusedGateUp: Bool {

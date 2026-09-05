@@ -35,6 +35,20 @@ struct GPTOSSGateUpFusionTests {
             let adjusted = fuseSwitchGLUGateUpWeights(weights: source, moduleName: "experts")
             let restored = normalizer.splitSavedGateUpWeights(adjusted)
             #expect(restored.keys.sorted() == source.keys.sorted())
+            if let mode {
+                let policy = BaseConfiguration.Quantization(groupSize: 32, bits: 4, mode: mode)
+                let other = BaseConfiguration.Quantization(groupSize: 64, bits: 8, mode: .affine)
+                let table = BaseConfiguration.PerLayerQuantization(
+                    quantization: other,
+                    perLayerQuantization: [prefix + ".gate_up_proj": .quantize(policy)])
+                for half in ["gate_proj", "up_proj"] {
+                    let resolved = try #require(resolveQuantization(
+                        path: prefix + "." + half,
+                        perLayerQuantization: table, aliasing: normalizer))
+                    #expect(resolved.bits == 4 && resolved.groupSize == 32 && resolved.mode == mode)
+                }
+            }
+
             for (key, expected) in source {
                 let actual = try #require(restored[key])
                 #expect(actual.dtype == expected.dtype && actual.shape == expected.shape)

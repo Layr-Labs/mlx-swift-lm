@@ -7,6 +7,7 @@ extension GPTOSSModel {
     /// interleaved upstream `_blocks` format. Normalize this namespace first
     /// so reloading and the fusion rollback share the validated split path.
     func splitSavedGateUpWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        savedFusedExpertPaths.removeAll()
         var result = weights
         let marker = ".experts.gate_up_proj."
         var paths = Set<String>()
@@ -27,6 +28,7 @@ extension GPTOSSModel {
             result.removeValue(forKey: key)
             paths.insert(String(base.dropLast()))
         }
+        savedFusedExpertPaths = paths
         for path in paths { setExpertGateUpLayout(at: path, fused: false) }
         return result
     }
