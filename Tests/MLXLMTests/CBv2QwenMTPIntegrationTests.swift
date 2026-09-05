@@ -1087,7 +1087,20 @@ struct CBv2QwenMTPIntegrationTests {
                 $0.depth != 1
             })
         recovered.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
-        #expect(recovered.planDecision.depth == 1)
+        // 4, not 1. This expectation encoded the controller's OLD exploration
+        // order, which climbed from zero and so probed depth 1 next. The
+        // controller now opens at the ceiling of the tested envelope and backs
+        // off, so `explore_cost` scans DOWNWARD for the deepest unsampled
+        // depth: with the cold depth-1 sample discarded, only depth 0 has a
+        // cost and the deepest unsampled arm is `maxDraftTokens` (4).
+        //
+        // Nothing about this test's subject moves. It is about a cold head
+        // sample being discarded and the next one being recorded cleanly, and
+        // `record(...)` names its own depth, so the assertions that carry the
+        // subject -- the discard, `samples == 1`, `ewma == 120` -- are
+        // unchanged and still pass.
+        #expect(recovered.planDecision.depth == 4)
+        #expect(recovered.planDecision.reason == "explore_cost")
         #expect(recovered.planDecision.isExploration)
         #expect(!recovered.shouldApplyMarginalPolicyToPlan)
 
