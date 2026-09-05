@@ -298,9 +298,10 @@ struct BenchWorkerProtocolTests {
 
         let line = response.jsonLine()
         // `runner` LAST, per contract §6.0's appended-last convention.
-        #expect(line.hasSuffix(
-            ",\"runner\":{\"id\":\"layr/mock\",\"model_type\":\"mock\","
-                + "\"manifest_sha256\":\"d\",\"build\":\"b\"}}"))
+        #expect(
+            line.hasSuffix(
+                ",\"runner\":{\"id\":\"layr/mock\",\"model_type\":\"mock\","
+                    + "\"manifest_sha256\":\"d\",\"build\":\"b\"}}"))
 
         let decoded = try JSONDecoder().decode(WorkerResponse.self, from: Data(line.utf8))
         #expect(decoded.id == 7)
@@ -346,21 +347,26 @@ struct FreeRunRoundAuditTests {
     }
 
     private func freeRun(
-        script: MockRoundScript?, batch: Int = 1, count: Int = 6
+        script: MockRoundScript?, batch: Int = 1, count: Int = 6, serial: Bool = false
     ) async throws -> WorkerResponse {
+        let spec =
+            serial
+            ? "\"spec\":{\"mode\":\"serial\"}"
+            : "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}"
         let begin: String
         let run: String
         if batch > 1 {
             let seeds = (0 ..< batch).map { "[5\($0),52,53]" }.joined(separator: ",")
             begin =
                 "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens_by_stream\":[\(seeds)],"
-                + "\"batch_size\":\(batch),\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
-            run = "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":\(count),"
+                + "\"batch_size\":\(batch),\(spec)}"
+            run =
+                "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":\(count),"
                 + "\"batch_size\":\(batch)}"
         } else {
             begin =
                 "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53],"
-                + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+                + "\(spec)}"
             run = "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":\(count)}"
         }
         let transport = ScriptedTransport(lines: [begin, run])
@@ -439,7 +445,7 @@ struct FreeRunRoundAuditTests {
         #expect(
             response.error
                 == "mtp round journal truncated at its 8192-record cap "
-                    + "(8192 retained): coverage cannot be proven")
+                + "(8192 retained): coverage cannot be proven")
     }
 
     /// Rows disagreeing on a round's committed width means the grouping or
@@ -464,9 +470,10 @@ struct FreeRunRoundAuditTests {
         }
     }
 
-    /// A serial window journals nothing, so every audit field is absent —
-    /// which is not the same claim as zero.
-    @Test("A window with no journal reports no audit fields")
+    /// An MTP window whose engine journaled nothing reports no audit fields
+    /// — absent is not the same claim as zero, and benchd refuses the reply,
+    /// which is the right outcome for a drafting engine that did not journal.
+    @Test("An MTP window with no journal reports no audit fields")
     func noJournalNoAudit() async throws {
         let response = try await freeRun(script: nil)
         #expect(response.ok)
@@ -477,6 +484,38 @@ struct FreeRunRoundAuditTests {
         #expect(response.specDecoder == nil)
         // `committed_total` is the drained count and is always reported.
         #expect(response.committedTotal == 6)
+    }
+
+    /// A serial window has no verify rounds, but the protocol carries the
+    /// audit triple on EVERY free_decode_run: benchd refused the official
+    /// warmup leg on a reply without `acceptance_lengths`. Serial states
+    /// itself: N rounds of width one, nothing drafted, nothing accepted.
+    @Test("A serial window reports N rounds of width one and zero drafts")
+    func serialWindowStatesItself() async throws {
+        let response = try await freeRun(script: nil, serial: true)
+        #expect(response.ok)
+        #expect(response.acceptanceLengths == Array(repeating: 1, count: 6))
+        #expect(response.draftedTotal == 0)
+        #expect(response.acceptedTotal == 0)
+        #expect(response.committedTotal == 6)
+        // Single-stream form: the cohort trio stays off the wire.
+        #expect(response.rounds == nil)
+        #expect(response.naturalAcceptedByStream == nil)
+        #expect(response.activeStreamsByRound == nil)
+        #expect(response.verifyReplayDisagreements == nil)
+    }
+
+    @Test("A serial cohort window reports the trio with every stream active")
+    func serialCohortStatesItself() async throws {
+        let response = try await freeRun(script: nil, batch: 2, count: 4, serial: true)
+        #expect(response.ok)
+        #expect(response.acceptanceLengths == [1, 1, 1, 1])
+        #expect(response.rounds == 4)
+        #expect(response.activeStreamsByRound == [2, 2, 2, 2])
+        #expect(response.naturalAcceptedByStream == [[0, 0, 0, 0], [0, 0, 0, 0]])
+        #expect(response.draftedTotal == 0)
+        #expect(response.acceptedTotal == 0)
+        #expect(response.committedTotal == 8)
     }
 }
 

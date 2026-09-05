@@ -60,9 +60,10 @@
 // ships.
 
 import Foundation
+import MLX
 
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 #endif
 
 /// Environment names the resident pair reads.
@@ -300,6 +301,23 @@ public final class BenchWorkerResident: @unchecked Sendable {
         }
         finished.wait()
         connection.close()
+    }
+}
+
+/// The last thing a serving process does before `exit`.
+///
+/// WHY. A phase that ends in a protocol fault leaves the engine's MLX graph
+/// half-evaluated: a Metal command encoder is open with work not yet
+/// committed. `exit` then runs the C++ static destructors, MLX's
+/// `CommandEncoder` destructor commits the buffer, and Metal aborts the
+/// process on `commit command buffer with uncommitted encoder` (SIGABRT, the
+/// box's `.ips` after every failed official leg). Synchronizing the default
+/// stream first commits and waits for whatever is pending, so the destructors
+/// find nothing open. A clean window is unaffected: there is nothing to wait
+/// for.
+public enum BenchWorkerTeardown {
+    public static func synchronizeMLX() {
+        MLX.Stream().synchronize()
     }
 }
 

@@ -119,6 +119,9 @@ public struct SpecConfig: Codable, Sendable, Equatable {
     /// Draft depth for the selected mode; 0 for a non-drafting mode.
     public var depth: Int { mtp?.depth ?? 0 }
 
+    /// The wire spelling of the non-drafting mode.
+    public static let serialMode = "serial"
+
     var wire: WireValue {
         var fields: [(String, WireValue)] = [("mode", .string(mode))]
         if let mtp {

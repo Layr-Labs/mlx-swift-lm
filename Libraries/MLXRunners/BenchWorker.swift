@@ -197,6 +197,24 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
             committedTotal: records.reduce(0) { $0 + $1.confirmed })
     }
 
+    /// The audit of a serial window: one round of width one per committed
+    /// token, nothing drafted, nothing accepted. `rounds` is the longest
+    /// stream; a stream that stopped early leaves the later rounds.
+    public static func serial(committedByStream: [[Int]]) -> FreeRunRoundAudit {
+        let rounds = committedByStream.map(\.count).max() ?? 0
+        return FreeRunRoundAudit(
+            acceptanceLengths: Array(repeating: 1, count: rounds),
+            naturalAcceptedByStream: committedByStream.map {
+                Array(repeating: 0, count: $0.count)
+            },
+            activeStreamsByRound: (0 ..< rounds).map { round in
+                committedByStream.filter { round < $0.count }.count
+            },
+            draftedTotal: 0,
+            acceptedTotal: 0,
+            committedTotal: committedByStream.reduce(0) { $0 + $1.count })
+    }
+
     public init(
         acceptanceLengths: [Int],
         naturalAcceptedByStream: [[Int]],
@@ -740,6 +758,19 @@ public final class BenchWorkerServer: @unchecked Sendable {
             clamps = clamps.filter { $0.value > 0 }
             session.clampBaseline = Self.clampReasons(metrics)
             if !clamps.isEmpty { response.depthClampReasons = clamps }
+        }
+
+        // A SERIAL window journals no verify rounds, but the protocol carries
+        // the audit triple on EVERY free_decode_run (PROTOCOL.md: benchd
+        // refuses a reply without `acceptance_lengths`, and the box saw the
+        // official warmup leg fail on exactly that). The serial statement is
+        // a statement, not a guess: each committed token is its own round of
+        // width one, nothing was drafted, nothing was accepted. A non-serial
+        // window with an empty journal stays ABSENT, so an MTP engine that
+        // failed to journal is refused by benchd rather than reported as
+        // zero.
+        if audit == nil, session.spec.mode == SpecConfig.serialMode {
+            audit = FreeRunRoundAudit.serial(committedByStream: byStream)
         }
 
         if let audit {

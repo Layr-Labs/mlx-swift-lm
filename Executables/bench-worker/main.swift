@@ -38,7 +38,7 @@ import MLXLMCommon
 import MLXRunners
 
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 #endif
 
 /// Device identity for the hello.
@@ -49,21 +49,21 @@ import Darwin
 /// "unknown" rather than a guess.
 func probeDevice() -> String {
     #if canImport(Darwin)
-    var size = 0
-    guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 0 else {
-        return "unknown"
-    }
-    var buffer = [CChar](repeating: 0, count: size)
-    guard sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0) == 0 else {
-        return "unknown"
-    }
-    let brand = String(cString: buffer).lowercased()
-    for token in brand.split(separator: " ") where token.count >= 2 && token.hasPrefix("m") {
-        if token.dropFirst().allSatisfy(\.isNumber) { return String(token) }
-    }
-    return brand.isEmpty ? "unknown" : brand
+        var size = 0
+        guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 0 else {
+            return "unknown"
+        }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0) == 0 else {
+            return "unknown"
+        }
+        let brand = String(cString: buffer).lowercased()
+        for token in brand.split(separator: " ") where token.count >= 2 && token.hasPrefix("m") {
+            if token.dropFirst().allSatisfy(\.isNumber) { return String(token) }
+        }
+        return brand.isEmpty ? "unknown" : brand
     #else
-    return "unknown"
+        return "unknown"
     #endif
 }
 
@@ -74,8 +74,9 @@ func failWithUsage(_ error: some Error, topic: BenchWorkerUsage.Topic) -> Never 
     let message: String =
         (error as? CustomStringConvertible)?.description ?? "\(error)"
     FileHandle.standardError.write(
-        Data(("bench-worker: " + message + "\n\n" + BenchWorkerUsage.text(for: topic) + "\n")
-            .utf8))
+        Data(
+            ("bench-worker: " + message + "\n\n" + BenchWorkerUsage.text(for: topic) + "\n")
+                .utf8))
     exit(2)
 }
 
@@ -233,6 +234,9 @@ case .resident:
     // gone before the process exits.
     resident.serve()
     resident.shutDown()
+    // Commit and drain any Metal work a faulted phase left open, BEFORE the
+    // static destructors run. See `BenchWorkerTeardown`.
+    BenchWorkerTeardown.synchronizeMLX()
     exit(0)
 
 case .runtimeWorker:
@@ -248,4 +252,5 @@ case .runtimeWorker:
         device: probeDevice(),
         kvBytesCapacity: launch.kvBytesCapacity)
     await server.run()
+    BenchWorkerTeardown.synchronizeMLX()
 }
