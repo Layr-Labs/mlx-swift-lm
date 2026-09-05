@@ -89,3 +89,12 @@ larger than the last layer index on purpose.
 This family serves one row for each call. The QSA indexer scores one tape.
 Packed prefill, paged key-value storage, prefix reuse and compiled decode stay
 off. MTP draft depth is 1 to 3.
+
+The three tests in `Qwen4ExpForwardParityTests` need a full ahead-of-time
+`mlx.metallib`, because a decode through the mixture-of-experts shared expert
+gate uses the `dot_product` kernel that the standard build does not supply.
+Build the metallib with `cmake -DMLX_METAL_JIT=OFF --target mlx-metallib` (see
+`fetch-metallib.sh` in d-inference), copy it over every `default.metallib`
+under `Build/Products/Debug`, including the copies inside each `.xctest`
+bundle, and then set `MLXLM_FULL_AOT_METALLIB=1`. Without the variable the
+three tests skip.

@@ -7,17 +7,57 @@ import XCTest
 @testable import MLXLMCommon
 
 final class Qwen4ExpForwardParityTests: XCTestCase {
+
+    /// Opt-in switch for the three tests in this file.
+    static let optInVariable = "MLXLM_FULL_AOT_METALLIB"
+
+    /// Skip unless the process runs against a COMPLETE metallib.
+    ///
+    /// WHY THESE THREE NEED ONE. Each drives a single-token decode, and a
+    /// decode through the mixture-of-experts shared expert gate is
+    /// `Linear(hidden, 1)`. MLX lowers that to its `dot_product`
+    /// specialization (`matmul.cpp`, guard `M == 1 && N == 1 &&
+    /// batch_size_out == 1`). mlx-swift's `Cmlx` target does not compile the
+    /// Metal kernels through SwiftPM -- `Package.swift` excludes the kernels
+    /// directory -- so the library the ordinary `xcodebuild` build ships
+    /// carries neither `dot_product` nor `gemm` (459 symbols against 17322 in
+    /// a complete build). A missing kernel does not throw: MLX aborts the
+    /// PROCESS, which would take this whole bundle down rather than fail one
+    /// test.
+    ///
+    /// So the gate is explicit and off by default. It is NOT a statement
+    /// about the code under test, which passes; it is a statement about the
+    /// library the process was linked against.
+    private func requireCompleteMetallib() throws {
+        let raw = ProcessInfo.processInfo.environment[Self.optInVariable]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard ["1", "true", "yes", "on"].contains(raw ?? "") else {
+            throw XCTSkip(
+                "Set \(Self.optInVariable)=1 to run this test. It needs a full "
+                    + "ahead-of-time mlx.metallib carrying the dot_product kernels. "
+                    + "The metallib the standard xcodebuild build produces does not "
+                    + "have them, and MLX aborts the process instead of failing the "
+                    + "test. Build one with cmake -DMLX_METAL_JIT=OFF --target "
+                    + "mlx-metallib, the way d-inference scripts/fetch-metallib.sh "
+                    + "does. Then copy it over every default.metallib under "
+                    + "Build/Products/Debug, including the bundle copies inside each "
+                    + ".xctest. CI has no such step yet, which is why this is opt-in.")
+        }
+    }
+
     // MARK: - (b) CBv2 forward is token-exact against the legacy path
 
     /// Prompt short enough that the visible context stays inside the indexer
     /// budget: the keep mask never fires and attention is plain causal.
     func testCBv2MatchesLegacyBelowTheIndexerBudget() throws {
+        try requireCompleteMetallib()
         try assertCBv2MatchesLegacy(prompt: [3, 9, 14, 2], decodeSteps: 3)
     }
 
     /// Prompt long enough that the tape passes the budget during prefill, so
     /// every full-attention layer runs with a keep mask.
     func testCBv2MatchesLegacyAboveTheIndexerBudget() throws {
+        try requireCompleteMetallib()
         try assertCBv2MatchesLegacy(
             prompt: [3, 9, 14, 2, 21, 6, 11, 30, 4, 17, 25, 8], decodeSteps: 4)
     }
@@ -49,6 +89,7 @@ final class Qwen4ExpForwardParityTests: XCTestCase {
     // MARK: - (c) MTP draft and verify are lossless at depths 1...3
 
     func testMTPRoundsAreLosslessAtEveryPermittedDepth() throws {
+        try requireCompleteMetallib()
         let prompt = [3, 9, 14, 2, 21, 6, 11, 30, 4]
         let steps = 6
 
