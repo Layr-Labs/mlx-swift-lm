@@ -15,8 +15,10 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
+import MLXVLM
 import Testing
 
 @testable import MLXRunners
@@ -217,5 +219,178 @@ struct RunnerAdoptTests {
             directory: checkpoint.directory,
             options: RunnerLoadOptions())
         #expect(adopted.loadedModelType == "qwen4_exp_text")
+    }
+}
+
+// MARK: - Multimodal wrapper adoption
+
+/// Darkbloom's container loads a VLM checkpoint as the MULTIMODAL wrapper,
+/// so `adopt` has to take those types: the contract puts serving-model
+/// derivation — text-tower extraction included — inside adoption, and a
+/// runner that refused the wrapper would be unusable for exactly the
+/// deployment the seam exists for.
+///
+/// These cases assert the TYPE RESOLUTION, which is what the reunification
+/// found broken. Building a real wrapper needs weights and a GPU, so the
+/// resolution is driven through `textTower(of:)` / `hooks(of:)` and through
+/// the refusal each gives a module of the wrong family.
+@Suite("Multimodal wrapper adoption")
+struct MultimodalAdoptionTests {
+
+    private func foreign() -> some LanguageModel { RunnerAdoptTests.ForeignModel() }
+
+    @Test("Gemma 4 resolves its tower from every shape the factories produce")
+    func gemma4TowerShapes() {
+        // The three accepted shapes are named in one place, so a factory
+        // that starts producing a fourth fails HERE rather than at a load.
+        let accepted: [Any.Type] = [
+            Gemma4TextModel.self, MLXLLM.Gemma4Model.self, MLXVLM.Gemma4.self,
+        ]
+        #expect(accepted.count == 3)
+
+        // The refusal is the only branch reachable without weights, and it
+        // must name the module rather than silently pick a tower.
+        #expect(throws: RunnerError.self) {
+            _ = try Gemma4TextRunner.textTower(of: foreign())
+        }
+        do {
+            _ = try Gemma4TextRunner.textTower(of: foreign())
+        } catch let error as RunnerError {
+            guard case .unexpectedModel = error else {
+                Issue.record("refused with \(error), not the module")
+                return
+            }
+        } catch {
+            Issue.record("refused with \(error)")
+        }
+    }
+
+    @Test("Qwen 3.5 refuses a foreign module rather than extracting from it")
+    func qwen35HooksRefuseForeign() {
+        do {
+            _ = try Qwen35Runner.hooks(
+                of: foreign(), directory: URL(fileURLWithPath: "/nonexistent"))
+            Issue.record("hooks accepted a foreign module")
+        } catch let error as RunnerError {
+            guard case .unexpectedModel = error else {
+                Issue.record("refused with \(error), not the module")
+                return
+            }
+        } catch {
+            Issue.record("refused with \(error)")
+        }
+    }
+
+    @Test("The Qwen extraction refuses a wrapper it does not understand")
+    func qwenExtractionRefusesForeign() {
+        #expect(
+            throws: QwenVLMTextExtractionError.unsupportedWrapper("ForeignModel")
+        ) {
+            _ = try QwenVLMTextExtraction.target(
+                for: foreign(), directory: URL(fileURLWithPath: "/nonexistent"))
+        }
+    }
+
+    /// The parity gate is ON unless an operator turns it off, and only the
+    /// documented values turn it off. A typo must not silently disable the
+    /// backstop against architecture drift.
+    @Test("The extraction parity gate defaults on and is disabled only by name")
+    func parityGateDefaults() {
+        #expect(QwenVLMTextExtraction.parityCheckEnabled(environment: [:]))
+        for off in ["0", "false", "no", "off", "OFF", " no "] {
+            #expect(
+                !QwenVLMTextExtraction.parityCheckEnabled(
+                    environment: [QwenVLMTextExtraction.parityCheckFlag: off]))
+        }
+        for on in ["1", "true", "yes", "", "maybe"] {
+            #expect(
+                QwenVLMTextExtraction.parityCheckEnabled(
+                    environment: [QwenVLMTextExtraction.parityCheckFlag: on]))
+        }
+    }
+
+    /// Qwen3-VL is CBv2-adapted directly, so its wrapper IS the serving
+    /// model and no extraction happens at all.
+    @Test("Qwen3-VL adopts its wrapper directly, with no extraction")
+    func qwen3VLTakesItsWrapper() {
+        #expect(Qwen3VLRunner.manifest.multimodal)
+        #expect(Qwen3VLRunner.manifest.modelTypes == ["qwen3_vl", "qwen3_vl_moe"])
+    }
+}
+
+// MARK: - Paged pool fidelity
+
+@Suite("Paged pool plan")
+struct PagedPoolPlanTests {
+
+    @Test("The default plan is the production posture")
+    func defaults() {
+        let plan = PagedPoolPlan()
+        #expect(plan.dtype == .float16)
+        #expect(plan.slabCommitment == .atFirstAdmission)
+        #expect(plan.capacityBytes == nil)
+        #expect(plan.maxBufferLength == nil)
+    }
+
+    @Test("The dtype maps to the pool's own arithmetic")
+    func dtypeMapping() {
+        #expect(PagedPoolDType.float16.dtype == .float16)
+        #expect(PagedPoolDType.float32.dtype == .float32)
+        // The wire vocabulary an operator writes is the one a run reports.
+        #expect(PagedPoolDType.float32.rawValue == "float32")
+    }
+
+    @Test("EngineBuild carries the plan without disturbing a contiguous build")
+    func buildCarriesThePlan() {
+        var build = EngineBuild(kvBackend: .paged, kvBytesCapacity: 1 << 20)
+        #expect(build.pagedPool.dtype == .float16)
+        build.pagedPool = PagedPoolPlan(
+            dtype: .float32, slabCommitment: .atConstruction,
+            nominalMaxSequenceLength: 4096, capacityBytes: 1 << 21)
+        #expect(build.pagedPool.dtype == .float32)
+        #expect(build.pagedPool.capacityBytes == 1 << 21)
+
+        // A contiguous build carries the same field and never reads it.
+        let contiguous = EngineBuild(kvBackend: .contiguous, kvBytesCapacity: 1 << 20)
+        #expect(contiguous.pagedPool == PagedPoolPlan())
+    }
+
+    /// A family whose manifest lists only contiguous refuses a paged build
+    /// BY NAME, before any pool is constructed — which is what keeps an
+    /// fp32 control arm from being served as something else.
+    @Test("A paged build against a contiguous-only manifest is refused by name")
+    func pagedRefusedWhenUndeclared() throws {
+        #expect(Qwen35Runner.manifest.kvBackends == [.contiguous])
+        #expect(Qwen3VLRunner.manifest.kvBackends == [.contiguous])
+        #expect(Gemma4TextRunner.manifest.kvBackends == [.contiguous, .paged])
+        #expect(GPTOSSRunner.manifest.kvBackends == [.contiguous, .paged])
+
+        var build = EngineBuild(kvBackend: .paged, kvBytesCapacity: 1 << 20)
+        build.pagedPool.dtype = .float32
+        #expect(
+            throws: RunnerError.kvBackendRefused(
+                requested: "paged", declared: ["contiguous"])
+        ) {
+            _ = try RunnerEngineAssembly.makeEngine(
+                manifest: Qwen35Runner.manifest,
+                loadedDecoders: [.serial],
+                model: RunnerAdoptTests.ForeignModel(),
+                tokenizer: StubTokenizer(),
+                layerKinds: [],
+                newCaches: { _ in [] },
+                mtpDrafter: nil,
+                build: build)
+        }
+    }
+
+    /// The refusal message names both sides, so an operator reading one line
+    /// knows what they asked for and what they would have got.
+    @Test("The dtype refusal names the request and what was built")
+    func dtypeRefusalMessage() {
+        let error = RunnerError.pagedPoolDTypeUnsupported(
+            requested: "float32", served: "float16")
+        #expect(
+            error.description
+                == "runner: paged pool requested float32 but was built float16")
     }
 }
