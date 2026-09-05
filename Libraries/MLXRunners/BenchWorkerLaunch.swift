@@ -39,6 +39,14 @@ public enum WorkerLaunchError: Error, CustomStringConvertible, Equatable {
     case socketNotAccepted(String)
     /// More than one subcommand, or none.
     case ambiguousSubcommand(String)
+    /// A leading token that is neither a flag nor a subcommand. The caller
+    /// gets the usage screen, not a note about one word.
+    case unknownSubcommand(String)
+    /// `manifest` names both a runner and a checkpoint. Which one wins would
+    /// otherwise be an implementation detail deciding what gets printed.
+    case manifestTargetAmbiguous
+    /// `manifest` names neither, so there is nothing to print.
+    case manifestTargetMissing
 
     public var description: String {
         switch self {
@@ -53,6 +61,12 @@ public enum WorkerLaunchError: Error, CustomStringConvertible, Equatable {
             return "--socket is only accepted by resident, not \(subcommand)"
         case .ambiguousSubcommand(let detail):
             return "expected exactly one subcommand (\(detail))"
+        case .unknownSubcommand(let name):
+            return "unknown subcommand \(name)"
+        case .manifestTargetAmbiguous:
+            return "manifest takes --runner or --weights, not both"
+        case .manifestTargetMissing:
+            return "manifest requires --runner <id> or --weights <dir>"
         }
     }
 }

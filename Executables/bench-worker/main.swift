@@ -4,6 +4,11 @@
 //
 // benchd spawns `<engine> runtime-worker --weights <DIR> --speculative-protocol v1.1`.
 //
+// SUBCOMMANDS: `runtime-worker` (one phase), `resident` (one window), and
+// `manifest`, which prints a runner's canonical declaration and loads no
+// weights — the file benchd's conformance kit reads as `--manifest`.
+// `--help`, alone or after a subcommand, prints one screen and exits 0.
+//
 // RESIDENT MODE (contract §12f). `bench-worker resident --weights <DIR>
 // --socket <PATH>` is one process for one measurement window: it validates
 // argv, loads ONCE, and listens. Each phase's `runtime-worker` attaches when
@@ -62,6 +67,18 @@ func probeDevice() -> String {
     #endif
 }
 
+/// Usage on stderr, then a non-zero status: a mistyped subcommand is
+/// answered with the whole screen, because the caller does not yet know
+/// what the right words are.
+func failWithUsage(_ error: some Error, topic: BenchWorkerUsage.Topic) -> Never {
+    let message: String =
+        (error as? CustomStringConvertible)?.description ?? "\(error)"
+    FileHandle.standardError.write(
+        Data(("bench-worker: " + message + "\n\n" + BenchWorkerUsage.text(for: topic) + "\n")
+            .utf8))
+    exit(2)
+}
+
 /// One line on stderr and a non-zero status — never a Swift runtime trap.
 /// benchd reads this line to tell an operator what to fix, and a crash
 /// report buries it under a backtrace.
@@ -78,11 +95,40 @@ var residentSignalSources: [DispatchSourceSignal] = []
 
 // 1. ARGV. Every argument refusal happens here, with nothing under
 //    `--weights` read yet.
-let launch: BenchWorkerLaunchOptions
+let rawArguments = Array(CommandLine.arguments.dropFirst())
+let command: BenchWorkerCommand
 do {
-    launch = try BenchWorkerLaunchOptions.parse(Array(CommandLine.arguments.dropFirst()))
+    command = try BenchWorkerCommand.parse(rawArguments)
+} catch let error as WorkerLaunchError {
+    if case .unknownSubcommand = error {
+        failWithUsage(error, topic: .general)
+    }
+    failWithUsage(error, topic: BenchWorkerUsage.Topic(subcommand: rawArguments.first))
 } catch {
     fail(error)
+}
+
+// 1a. The two commands that never touch a checkpoint.
+switch command {
+case .help(let topic):
+    print(BenchWorkerUsage.text(for: topic))
+    exit(0)
+case .manifest(let options):
+    // A manifest is static data on the runner TYPE. With `--weights` the
+    // only file read is `config.json`; no weights are loaded, here or
+    // anywhere below.
+    do {
+        FileHandle.standardOutput.write(Data(try options.render().utf8))
+    } catch {
+        fail(error)
+    }
+    exit(0)
+case .serve:
+    break
+}
+
+guard case .serve(let launch) = command else {
+    fatalError("unreachable: the non-serving commands exited above")
 }
 
 // 2. ATTACH, before anything reads the checkpoint. A `runtime-worker` whose
