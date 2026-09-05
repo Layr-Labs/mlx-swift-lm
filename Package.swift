@@ -322,7 +322,9 @@ let package = Package(
         // report/optimization provenance. Model-free, so they run in CI.
         .testTarget(
             name: "MLXRunnersTests",
-            dependencies: ["MLXRunners", "MLXLMCommon"],
+            // MLXLLM: the Qwen 3.8 Flash-Next resource tests build the tiny
+            // tower to read the n-gram geometry off its PLE layer.
+            dependencies: ["MLXRunners", "MLXLMCommon", "MLXLLM"],
             path: "Tests/MLXRunnersTests",
             resources: [
                 // The SHARED Engine Protocol v1 conformance fixture, pinned
