@@ -52,6 +52,8 @@ struct Options {
     var drafter: URL?
     var trusted = false
     var kvBytesCapacity = 8 << 30
+    /// Raw `--speculative-protocol` value, nil when the flag was absent.
+    var speculativeProtocol: String?
     /// Raw `<name>=<path>` values, in argv order. Validated once, together,
     /// AFTER parsing so a duplicate name is reported against the whole
     /// command rather than against whichever occurrence came second.
@@ -78,6 +80,8 @@ func parseOptions(_ arguments: [String]) throws -> Options {
         case "--drafter": options.drafter = URL(fileURLWithPath: try next("--drafter"))
         case "--trusted": options.trusted = true
         case "--resource": options.resources.append(try next("--resource"))
+        case "--speculative-protocol":
+            options.speculativeProtocol = try next("--speculative-protocol")
         case "--kv-bytes":
             guard let bytes = Int(try next("--kv-bytes")) else {
                 throw WorkerLaunchError.badValue("--kv-bytes")
@@ -123,6 +127,10 @@ if let runnerID = options.runnerID {
     runnerType = try RunnerRegistry.shared.resolve(checkpoint: weights)
 }
 
+// Both of these are validated BEFORE the load: a refusal an operator could
+// have been told at argv must not cost a multi-minute weight load first.
+let speculative = try SpeculativeProtocol.isEnabled(options.speculativeProtocol)
+
 // Resources are validated BEFORE the load: a bad path discovered after a
 // multi-minute weight load has wasted the box's time to report something
 // argv already knew.
@@ -140,6 +148,7 @@ let server = BenchWorkerServer(
     runner: runner,
     transport: StdioTransport(),
     trusted: options.trusted,
+    speculative: speculative,
     // Stamped by the BenchRevisionStamp prebuild plugin: the revision that
     // PRODUCED this binary, not whatever the checkout moved to afterwards.
     build: BenchBuildRevision.value,

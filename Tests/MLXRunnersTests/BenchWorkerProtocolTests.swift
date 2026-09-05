@@ -44,6 +44,11 @@ struct BenchWorkerProtocolTests {
         }
     }
 
+    /// The fixture's hello carries `capabilities` and `spec_modes`, which
+    /// are v1.1 additions, so the spawn it records IS the official one —
+    /// `--speculative-protocol v1.1` present. Passed explicitly rather than
+    /// left to the default, because that is a property of the fixture and
+    /// not of this helper.
     private func makeServer(
         runner: any Runner, transport: ScriptedTransport, trusted: Bool = false
     ) -> BenchWorkerServer {
@@ -51,6 +56,7 @@ struct BenchWorkerProtocolTests {
             runner: runner,
             transport: transport,
             trusted: trusted,
+            speculative: true,
             build: "fixture",
             device: "mock",
             kvBytesCapacity: 1 << 20,
@@ -330,6 +336,7 @@ struct FreeRunRoundAuditTests {
             runner: runner,
             transport: transport,
             trusted: false,
+            speculative: true,
             build: "fixture",
             device: "mock",
             kvBytesCapacity: 1 << 20,
@@ -470,5 +477,151 @@ struct FreeRunRoundAuditTests {
         #expect(response.specDecoder == nil)
         // `committed_total` is the drained count and is always reported.
         #expect(response.committedTotal == 6)
+    }
+}
+
+// MARK: - Speculative protocol gate
+
+@Suite("Speculative protocol gate")
+struct SpeculativeProtocolTests {
+
+    private func makeServer(
+        transport: ScriptedTransport, speculative: Bool, trusted: Bool = false
+    ) -> BenchWorkerServer {
+        BenchWorkerServer(
+            runner: MockRunner(),
+            transport: transport,
+            trusted: trusted,
+            speculative: speculative,
+            build: "fixture",
+            device: "mock",
+            kvBytesCapacity: 1 << 20,
+            maxDecodeTokens: 64,
+            memory: FixtureMemoryReporter(),
+            nonce: "fixturenonce")
+    }
+
+    private func responses(
+        _ lines: [String], speculative: Bool
+    ) async throws -> [WorkerResponse] {
+        let transport = ScriptedTransport(lines: lines)
+        let server = makeServer(transport: transport, speculative: speculative)
+        await server.run()
+        let decoder = JSONDecoder()
+        return try transport.written.map {
+            try decoder.decode(WorkerResponse.self, from: Data($0.utf8))
+        }
+    }
+
+    // MARK: Argument
+
+    @Test("Only v1.1 is accepted, and a wrong value refuses rather than degrades")
+    func argumentParsing() throws {
+        #expect(try SpeculativeProtocol.isEnabled("v1.1"))
+        // Absent is plain v1, not a refusal.
+        #expect(try SpeculativeProtocol.isEnabled(nil) == false)
+        for raw in ["v1", "v1.2", "V1.1", "1.1", ""] {
+            #expect(throws: SpeculativeProtocol.ArgumentError.unsupportedVersion(raw)) {
+                _ = try SpeculativeProtocol.isEnabled(raw)
+            }
+        }
+    }
+
+    // MARK: Flag present
+
+    @Test("With the flag, the hello advertises the manifest's speculative surface")
+    func helloWithFlag() async throws {
+        let hello = try await responses([], speculative: true)[0]
+        #expect(hello.specModes == ["serial", "mtp"])
+        #expect(hello.capabilities == ["free_run_decode"])
+    }
+
+    @Test("With the flag, decode_begin echoes the effective spec")
+    func decodeBeginEchoesSpec() async throws {
+        let answers = try await responses(
+            [
+                "{\"id\":1,\"kind\":\"decode_begin\",\"seed_tokens\":[21,22],"
+                    + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+            ],
+            speculative: true)
+        #expect(answers[1].ok)
+        #expect(answers[1].effectiveSpec == SpecConfig(mode: "mtp", mtp: MtpSpec(depth: 2)))
+    }
+
+    // MARK: Flag absent
+
+    @Test("Without the flag, the hello is plain v1")
+    func helloWithoutFlag() async throws {
+        let hello = try await responses([], speculative: false)[0]
+        // Absent, not empty: an empty capability array is the claim "I
+        // support none of these", while absence is the v1 wire.
+        #expect(hello.capabilities == nil)
+        #expect(hello.specModes == nil)
+        #expect(hello.maxBatchSize == nil)
+        // Everything a v1 hello does carry is unchanged.
+        #expect(hello.protocolVersion == 1)
+        #expect(hello.backend == "mock")
+        #expect(hello.runner?.id == "layr/mock-adapter")
+    }
+
+    @Test("Without the flag, a spec on decode_begin is refused by name")
+    func decodeBeginRefusesSpec() async throws {
+        let answers = try await responses(
+            [
+                "{\"id\":1,\"kind\":\"decode_begin\",\"seed_tokens\":[21,22],"
+                    + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+            ],
+            speculative: false)
+        #expect(answers[1].ok == false)
+        #expect(answers[1].error == "spec requires --speculative-protocol v1.1")
+    }
+
+    @Test("Without the flag, decode_begin with no spec still works and echoes nothing")
+    func decodeBeginWithoutSpec() async throws {
+        let answers = try await responses(
+            ["{\"id\":1,\"kind\":\"decode_begin\",\"seed_tokens\":[21,22]}"],
+            speculative: false)
+        #expect(answers[1].ok)
+        #expect(answers[1].seedToken == 200_002)
+        #expect(answers[1].effectiveSpec == nil)
+    }
+
+    @Test("Without the flag, free_decode_begin refuses a spec by name")
+    func freeDecodeBeginRefusesSpec() async throws {
+        let answers = try await responses(
+            [
+                "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53],"
+                    + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+            ],
+            speculative: false)
+        #expect(answers[1].ok == false)
+        // The SPEC refusal, not the capability one: the parent asked for a
+        // speculative surface by name, and pointing it at the manifest would
+        // send it looking in the wrong place.
+        #expect(answers[1].error == "spec requires --speculative-protocol v1.1")
+    }
+
+    @Test("Without the flag, free_decode_begin is not served at all")
+    func freeDecodeBeginUnadvertised() async throws {
+        let answers = try await responses(
+            ["{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53]}"],
+            speculative: false)
+        #expect(answers[1].ok == false)
+        #expect(answers[1].error == "free_run_decode is not served by this adapter")
+    }
+
+    @Test("Without the flag, the teacher-forced verbs are untouched")
+    func teacherForcedVerbsUnaffected() async throws {
+        let answers = try await responses(
+            [
+                "{\"id\":1,\"kind\":\"prefill\",\"prompt_tokens\":[11,12,13]}",
+                "{\"id\":2,\"kind\":\"correctness_begin\",\"prompt_tokens\":[41,42,43]}",
+                "{\"id\":3,\"kind\":\"correctness_step\",\"token\":5001}",
+            ],
+            speculative: false)
+        #expect(answers[1].token == 100_003)
+        #expect(answers[2].token == 100_003)
+        #expect(answers[3].token == 5002)
+        #expect(answers[3].topLogits?.count == 8)
     }
 }
