@@ -1,5 +1,5 @@
 import Foundation
-import MLX
+@_spi(QuantizedConstantCache) import MLX
 import MLXNN
 
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
@@ -286,16 +286,17 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
 public func fuseSwitchGLUGateUpWeights(
     weights: [String: MLXArray],
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
+    moduleName: String = "switch_mlp",
     quantizationAliases: (String) -> [String] = { _ in [] },
     shouldProcess: (String) -> Bool = { _ in true },
     setFused: ((String, Bool) -> Void)? = nil
 ) -> [String: MLXArray] {
     var weights = weights
-    let splitMarker = ".switch_mlp.gate_proj."
+    let splitMarker = ".\(moduleName).gate_proj."
     var bases = Set<String>()
     for key in weights.keys where key.contains(splitMarker) {
         let range = key.range(of: splitMarker)!
-        let base = String(key[..<range.lowerBound]) + ".switch_mlp."
+        let base = String(key[..<range.lowerBound]) + ".\(moduleName)."
         if shouldProcess(String(base.dropLast())) {
             bases.insert(base)
         }
@@ -357,6 +358,28 @@ public func fuseSwitchGLUGateUpWeights(
             if !sameEffectivePolicy {
                 blocker = "gate and up resolve to different quantization policies"
             }
+            // The loader gives an explicit fused-path policy precedence
+            // over aliases. Do not concatenate halves under a policy that
+            // the replacement projection will not actually use. Absence of
+            // a fused entry must still resolve through the split aliases.
+            if sameEffectivePolicy,
+                table.perLayerQuantization["\(base)gate_up_proj"] != nil
+            {
+                let fused = resolvedQuantization(for: "\(base)gate_up_proj", in: table)
+                let fusedMatches: Bool
+                switch (gate, fused) {
+                case (nil, nil):
+                    fusedMatches = true
+                case (let gate?, let fused?):
+                    fusedMatches = gate.groupSize == fused.groupSize
+                        && gate.bits == fused.bits && gate.mode == fused.mode
+                default:
+                    fusedMatches = false
+                }
+                if !fusedMatches {
+                    blocker = "fused projection resolves to a different quantization policy"
+                }
+            }
         }
         if blocker == nil, gateSuffixes != upSuffixes {
             blocker = "gate and up carry different tensor sets"
@@ -389,11 +412,11 @@ public func fuseSwitchGLUGateUpWeights(
     }
 
     if let setFused {
-        let fusedMarker = ".switch_mlp.gate_up_proj."
+        let fusedMarker = ".\(moduleName).gate_up_proj."
         var fusedPaths = Set<String>()
         for key in weights.keys where key.contains(fusedMarker) {
             let range = key.range(of: fusedMarker)!
-            let path = String(key[..<range.lowerBound]) + ".switch_mlp"
+            let path = String(key[..<range.lowerBound]) + ".\(moduleName)"
             if shouldProcess(path) {
                 fusedPaths.insert(path)
             }
@@ -798,6 +821,24 @@ public class SwitchLinear: Module, Quantizable {
 }
 
 public class QuantizedSwitchLinear: SwitchLinear, Quantized {
+    private let scaleCastCache = ConstantArrayCastCache()
+    private let offsetCastCache = ConstantArrayCastCache()
+    private let linearBiasCastCache = ConstantArrayCastCache()
+
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        defer {
+            scaleCastCache.clear()
+            offsetCastCache.clear()
+            linearBiasCastCache.clear()
+        }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
     @ModuleInfo(key: "scales") var scales: MLXArray
     @ModuleInfo(key: "biases") var biases: MLXArray?
 
@@ -865,11 +906,19 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         let indexAligned = x.size == indices.size * x.dim(-2) * x.dim(-1)
+        let scales = mode == .affine
+            ? (scaleCastCache.cachedCast(self.scales, to: x.dtype) ?? self.scales)
+            : self.scales
+        let biases = self.biases.map { offsets in
+            mode == .affine
+                ? (offsetCastCache.cachedCast(offsets, to: x.dtype) ?? offsets)
+                : offsets
+        }
         var result = MLX.gatherQuantizedMM(
             x,
             self.weight,
-            scales: self.scales,
-            biases: self.biases,
+            scales: scales,
+            biases: biases,
             rhsIndices: indices,
             transpose: true,
             groupSize: self.groupSize,
@@ -879,6 +928,9 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         )
 
         if let bias = self.bias {
+            // During transforms cachedCast returns nil, preserving the old
+            // gather-then-promote ordering (including bias gradients).
+            let bias = linearBiasCastCache.cachedCast(bias, to: result.dtype) ?? bias
             result = result + MLX.expandedDimensions(bias[indices], axis: -2)
         }
 

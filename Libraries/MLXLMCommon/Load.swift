@@ -47,6 +47,14 @@ private final class ParallelShardState: @unchecked Sendable {
         results[index] = result
     }
 
+    /// Called only after concurrentPerform joined and aggregation completed.
+    /// Fused-output materialization must not retain all original shard arrays.
+    func releaseResults() {
+        lock.lock()
+        defer { lock.unlock() }
+        results.removeAll(keepingCapacity: false)
+    }
+
     func recordError(_ error: Error) {
         lock.lock()
         defer { lock.unlock() }
@@ -107,6 +115,15 @@ public protocol QuantizationPolicyReceiving: AnyObject {
     /// Quantization policy of the checkpoint currently being loaded, or
     /// `nil` for unquantized checkpoints.
     var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization? { get set }
+}
+
+/// Opt-in load-time materialization for a model whose sanitizer creates
+/// large lazy packed-weight copies. Other models retain the existing load
+/// sequence. The hook runs after strict update and removal of both loader
+/// staging owners, before dtype conversion and the final model eval.
+public protocol IncrementalCheckpointMaterializing: AnyObject {
+    var needsIncrementalCheckpointMaterialization: Bool { get }
+    func materializeCheckpointWeightsIncrementally() throws
 }
 
 /// Load model weights.
@@ -216,13 +233,21 @@ public func loadWeights(
     mark("quantize wire")
 
     // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
+    var parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
     mark("update params")
 
     // Drop the staging dictionary before dtype conversion so we don't keep
     // two copies of safetensor arrays alive during the bf16 pass.
     weights.removeAll(keepingCapacity: false)
+    if let materializing = model as? IncrementalCheckpointMaterializing,
+        materializing.needsIncrementalCheckpointMaterialization
+    {
+        parameters = ModuleParameters()
+        shared.releaseResults()
+        try materializing.materializeCheckpointWeightsIncrementally()
+        mark("incremental checkpoint materialization")
+    }
     MLX.Memory.clearCache()
 
     // Convert fp16 parameters to bf16 to eliminate AsType cascades.
