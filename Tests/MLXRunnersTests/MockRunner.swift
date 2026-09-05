@@ -71,16 +71,57 @@ final class MockStepper: TeacherForcedStepper {
 
 // MARK: - Engine
 
-/// The audit a scripted engine replays for one free-run window.
+/// The per-round journal a scripted engine replays for one free-run window.
+///
+/// Written as records, not as summary numbers: the worker derives every
+/// audit field from `CBv2MTPMetrics.roundAudits`, so the mock has to exercise
+/// that same path or the test proves nothing about it.
 struct MockRoundScript: Sendable {
-    var draftedTotal: Int
-    var acceptedTotal: Int
-    var acceptanceLengths: [Int]
+    /// One round: draft depth, the pre-min accept-walk length, and the
+    /// committed width.
+    struct Round: Sendable {
+        var k: Int
+        var accepted: Int
+        var confirmed: Int
+    }
+
+    var rounds: [Round]
+    /// Rows the rounds are attributed to, in SLOT ORDER. bench-worker submits
+    /// slot s as request id s + 1.
+    var requestIDs: [UInt64] = [1]
+
+    /// The fixture's window: three rounds at depth 2, committing 3, 1 and 2
+    /// tokens, with accept walks of 2, 1 and 1. That gives the fixture's
+    /// `acceptance_lengths [3,1,2]`, `drafted_total 6`, `accepted_total 4`
+    /// (the sum of `min(accepted, confirmed)`) and `committed_total 6`.
+    static let fixtureWindow = MockRoundScript(rounds: [
+        Round(k: 2, accepted: 2, confirmed: 3),
+        Round(k: 2, accepted: 1, confirmed: 1),
+        Round(k: 2, accepted: 1, confirmed: 2),
+    ])
+
+    /// The journal in finalize order: one record per (row, round).
+    var journal: [CBv2MTPRoundAuditRecord] {
+        rounds.enumerated().flatMap { roundIndex, round in
+            requestIDs.map { requestID in
+                CBv2MTPRoundAuditRecord(
+                    requestID: requestID,
+                    k: round.k,
+                    draftTokens: Array(repeating: 0, count: round.k),
+                    targetTokens: Array(repeating: 0, count: 1 + round.k),
+                    accepted: round.accepted,
+                    confirmed: round.confirmed,
+                    rejected: (1 + round.k) - round.confirmed,
+                    tokensCountAfter: roundIndex + 1,
+                    numComputedAfter: roundIndex,
+                    generatedAfter: roundIndex + 1,
+                    finishReason: nil)
+            }
+        }
+    }
 }
 
-final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, CBv2FreeRunRoundAuditing,
-    @unchecked Sendable
-{
+final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, @unchecked Sendable {
     private let script: MockRoundScript?
     private let lock = NSLock()
     private var reads = 0
@@ -119,22 +160,19 @@ final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, CBv2FreeRunRoundAu
     func shutdown() async {}
 
     /// Cumulative and monotonic, like the real engine's: the FIRST read is
-    /// the baseline `free_decode_begin` takes before the window drafts
-    /// anything, and every read after it is the drained window's total.
+    /// the baseline `free_decode_begin` takes after its seed forward, when no
+    /// verify round has finalized yet; every read after it is the drained
+    /// window's journal.
     func mtpMetricsSnapshot() -> CBv2MTPMetrics? {
         guard let script else { return nil }
         lock.lock()
         defer { lock.unlock() }
         defer { reads += 1 }
         var metrics = CBv2MTPMetrics()
-        metrics.draftedTokens = reads == 0 ? 0 : script.draftedTotal
-        metrics.acceptedTokens = reads == 0 ? 0 : script.acceptedTotal
+        guard reads > 0 else { return metrics }
+        metrics.roundAudits = script.journal
+        metrics.rounds = script.rounds.count
         return metrics
-    }
-
-    func freeRunRoundAudit() -> FreeRunRoundAudit? {
-        guard let script else { return nil }
-        return FreeRunRoundAudit(acceptanceLengths: script.acceptanceLengths)
     }
 }
 
@@ -222,10 +260,7 @@ final class MockRunner: Runner, @unchecked Sendable {
     let headProvenance: HeadProvenance? = nil
     let loadedModelType = "qwen4_exp_text"
 
-    init(
-        script: MockRoundScript? = MockRoundScript(
-            draftedTotal: 6, acceptedTotal: 4, acceptanceLengths: [3, 1, 2])
-    ) {
+    init(script: MockRoundScript? = .fixtureWindow) {
         self.script = script
     }
 
@@ -243,6 +278,55 @@ final class MockRunner: Runner, @unchecked Sendable {
     }
 
     func makeStepper() throws -> any TeacherForcedStepper { MockStepper() }
+}
+
+/// The same mock with a COHORT free-run regime added, so the batched verbs
+/// and the cohort-only audit fields can be driven. Its manifest is not the
+/// shared fixture's, and nothing in the byte-for-byte replay uses it.
+final class CohortMockRunner: Runner, @unchecked Sendable {
+
+    static let manifest: RunnerManifest = {
+        let base = MockRunner.manifest
+        return RunnerManifest(
+            schemaVersion: base.schemaVersion,
+            runnerID: "layr/mock-cohort",
+            modelTypes: ["mock-cohort"],
+            backend: base.backend,
+            engine: base.engine,
+            kvBackends: base.kvBackends,
+            decoders: base.decoders,
+            regimes: base.regimes + [
+                RegimeDeclaration(batch: .upTo(8), timing: .freeRun, perStreamTiming: false)
+            ],
+            multimodal: base.multimodal,
+            recurrentLayers: base.recurrentLayers,
+            requiresKeepMask: base.requiresKeepMask)
+    }()
+
+    private let inner: MockRunner
+
+    init(script: MockRoundScript?) {
+        self.inner = MockRunner(script: script)
+    }
+
+    var servingModel: any LanguageModel { inner.servingModel }
+    var tokenizer: any MLXLMCommon.Tokenizer { inner.tokenizer }
+    var eosTokenIDs: Set<Int> { inner.eosTokenIDs }
+    var layerKinds: [CBv2LayerKind] { inner.layerKinds }
+    var loadedDecoders: [DecoderID] { inner.loadedDecoders }
+    var headProvenance: HeadProvenance? { inner.headProvenance }
+    var loadedModelType: String { inner.loadedModelType }
+
+    static func load(
+        _ directory: URL, options: RunnerLoadOptions
+    ) async throws -> CohortMockRunner {
+        CohortMockRunner(script: .fixtureWindow)
+    }
+
+    func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {
+        try inner.makeEngine(build)
+    }
+    func makeStepper() throws -> any TeacherForcedStepper { try inner.makeStepper() }
 }
 
 /// The same mock with every FREE-RUN regime removed. A worker over this one

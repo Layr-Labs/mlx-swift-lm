@@ -421,6 +421,26 @@ enum CanonicalJSON {
 
 // MARK: - Load options and engine build
 
+/// Objects a runner needs at load time and cannot build itself, keyed by a
+/// name the runner declares.
+///
+/// One family needs this today: the Qwen 3.8 Flash-Next n-gram table is 29.8
+/// GiB, is never held as model parameters, and its disk-resident
+/// implementation lives in the track repo rather than the fork. The seam is
+/// deliberately opaque — the runner casts to the protocol it wants — so a
+/// track repo can hand a fork runner an implementation the fork does not
+/// know about.
+public struct RunnerResources: @unchecked Sendable {
+    private var storage: [String: AnyObject] = [:]
+
+    public init() {}
+
+    public subscript(name: String) -> AnyObject? {
+        get { storage[name] }
+        set { storage[name] = newValue }
+    }
+}
+
 /// What the CALLER wants honored at load time. The runner never downloads
 /// and never reads the network (§5 rule 4).
 public struct RunnerLoadOptions: Sendable {
@@ -439,17 +459,21 @@ public struct RunnerLoadOptions: Sendable {
     /// Passed explicitly rather than read from the process so a test can
     /// drive a runner hermetically.
     public var environment: [String: String]
+    /// Family resources the caller supplies. See ``RunnerResources``.
+    public var resources: RunnerResources
 
     public init(
         drafterDirectory: URL? = nil,
         kvBytesCapacity: Int = 0,
         maxSequenceLength: Int = 32768,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        resources: RunnerResources = RunnerResources()
     ) {
         self.drafterDirectory = drafterDirectory
         self.kvBytesCapacity = kvBytesCapacity
         self.maxSequenceLength = maxSequenceLength
         self.environment = environment
+        self.resources = resources
     }
 }
 
@@ -506,6 +530,9 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
     case decoderNotLoaded(requested: String, loaded: [String])
     /// The drafter artifact could not be loaded from the given directory.
     case drafterUnavailable(String)
+    /// A resource the runner cannot build itself was absent from
+    /// `RunnerLoadOptions.resources`.
+    case resourceMissing(String)
 
     public var description: String {
         switch self {
@@ -521,6 +548,8 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
                 + "(loaded: \(loaded.joined(separator: ", ")))"
         case .drafterUnavailable(let detail):
             return "runner: drafter unavailable (\(detail))"
+        case .resourceMissing(let detail):
+            return "runner: required resource absent (\(detail))"
         }
     }
 }

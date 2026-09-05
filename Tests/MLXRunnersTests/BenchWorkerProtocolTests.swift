@@ -11,6 +11,7 @@
 // are all things one side can get wrong while still round-tripping.
 
 import Foundation
+import MLXLMCommon
 import Testing
 
 @testable import MLXRunners
@@ -314,5 +315,160 @@ struct BenchWorkerProtocolTests {
     func omittedNotNull() {
         let line = WorkerResponse(id: 3, ok: true, nonce: "n").jsonLine()
         #expect(line == "{\"id\":3,\"nonce\":\"n\",\"ok\":true}")
+    }
+}
+
+// MARK: - Free-run audit from the engine's round journal
+
+@Suite("Free-run round audit")
+struct FreeRunRoundAuditTests {
+
+    private func makeServer(
+        runner: any Runner, transport: ScriptedTransport
+    ) -> BenchWorkerServer {
+        BenchWorkerServer(
+            runner: runner,
+            transport: transport,
+            trusted: false,
+            build: "fixture",
+            device: "mock",
+            kvBytesCapacity: 1 << 20,
+            maxDecodeTokens: 64,
+            memory: FixtureMemoryReporter(),
+            nonce: "fixturenonce")
+    }
+
+    private func freeRun(
+        script: MockRoundScript?, batch: Int = 1, count: Int = 6
+    ) async throws -> WorkerResponse {
+        let begin: String
+        let run: String
+        if batch > 1 {
+            let seeds = (0 ..< batch).map { "[5\($0),52,53]" }.joined(separator: ",")
+            begin =
+                "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens_by_stream\":[\(seeds)],"
+                + "\"batch_size\":\(batch),\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+            run = "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":\(count),"
+                + "\"batch_size\":\(batch)}"
+        } else {
+            begin =
+                "{\"id\":1,\"kind\":\"free_decode_begin\",\"seed_tokens\":[51,52,53],"
+                + "\"spec\":{\"mode\":\"mtp\",\"mtp\":{\"depth\":2}}}"
+            run = "{\"id\":2,\"kind\":\"free_decode_run\",\"count\":\(count)}"
+        }
+        let transport = ScriptedTransport(lines: [begin, run])
+        let runner: any Runner =
+            batch > 1 ? CohortMockRunner(script: script) : MockRunner(script: script)
+        let server = makeServer(runner: runner, transport: transport)
+        await server.run()
+        return try JSONDecoder().decode(
+            WorkerResponse.self, from: Data(transport.written[2].utf8))
+    }
+
+    /// The journal states the window; the worker only groups it.
+    @Test("A three-round journal yields its own acceptance lengths and totals")
+    func journalDrivesTheAudit() async throws {
+        let response = try await freeRun(script: .fixtureWindow)
+        #expect(response.ok)
+        #expect(response.acceptanceLengths == [3, 1, 2])
+        // drafted: 3 rounds at k = 2. accepted: min(accepted, confirmed) per
+        // round — 2, 1, 1 — which is what the engine's own cumulative
+        // `observedAccepted` counter accumulates.
+        #expect(response.draftedTotal == 6)
+        #expect(response.acceptedTotal == 4)
+        #expect(response.committedTotal == 6)
+        // Single-stream: the v1.2 cohort trio is absent, and
+        // `acceptance_lengths.count` already IS the round count.
+        #expect(response.rounds == nil)
+        #expect(response.naturalAcceptedByStream == nil)
+        #expect(response.activeStreamsByRound == nil)
+        #expect(response.acceptanceLengths?.count == 3)
+    }
+
+    /// The cohort form carries the round count and the per-row pre-min walk.
+    @Test("The cohort form reports rounds, natural accepts and active streams")
+    func cohortAuditFields() async throws {
+        var script = MockRoundScript.fixtureWindow
+        script.requestIDs = [1, 2]
+        let response = try await freeRun(script: script, batch: 2)
+        #expect(response.ok)
+        #expect(response.rounds == 3)
+        #expect(response.acceptanceLengths == [3, 1, 2])
+        #expect(response.activeStreamsByRound == [2, 2, 2])
+        // PRE-min: round 2 committed 1 while the walk accepted 1, and round 1
+        // committed 3 on a walk of 2 — the raw walk, not the clamped count.
+        #expect(response.naturalAcceptedByStream == [[2, 1, 1], [2, 1, 1]])
+        #expect(response.draftedTotal == 12)
+        #expect(response.acceptedTotal == 8)
+    }
+
+    /// A row that finishes early leaves no record past its last round, so the
+    /// active-stream curve falls out of the journal rather than being counted
+    /// somewhere else.
+    @Test("A row that stops early makes active_streams_by_round fall")
+    func stragglerRow() async throws {
+        var script = MockRoundScript.fixtureWindow
+        script.requestIDs = [1, 2]
+        // Drop row 2's last round.
+        var records = script.journal
+        records.removeLast()
+        let assembled = try FreeRunRoundAudit.assemble(
+            records: records, slotForRequestID: [1: 0, 2: 1], streamCount: 2)
+        #expect(assembled?.activeStreamsByRound == [2, 2, 1])
+        #expect(assembled?.acceptanceLengths == [3, 1, 2])
+        #expect(assembled?.naturalAcceptedByStream == [[2, 1, 1], [2, 1, 0]])
+    }
+
+    /// A truncated head cannot prove coverage of the window, so the response
+    /// is refused rather than assembled from what survived.
+    @Test("A journal at its retention cap refuses the response")
+    func cappedJournalRefuses() async throws {
+        let capped = MockRoundScript(
+            rounds: Array(
+                repeating: MockRoundScript.Round(k: 2, accepted: 1, confirmed: 1),
+                count: CBv2MTPRoundAuditRecord.retainedRecordCap))
+        let response = try await freeRun(script: capped, count: 1)
+        #expect(response.ok == false)
+        #expect(
+            response.error
+                == "mtp round journal truncated at its 8192-record cap "
+                    + "(8192 retained): coverage cannot be proven")
+    }
+
+    /// Rows disagreeing on a round's committed width means the grouping or
+    /// the window boundary is wrong; a cohort commits ONE common width.
+    @Test("Disagreeing committed widths in one round are refused")
+    func widthDisagreementRefused() {
+        let wide = CBv2MTPRoundAuditRecord(
+            requestID: 1, k: 2, draftTokens: [], targetTokens: [], accepted: 1,
+            confirmed: 3, rejected: 0, tokensCountAfter: 1, numComputedAfter: 0,
+            generatedAfter: 1, finishReason: nil)
+        let narrow = CBv2MTPRoundAuditRecord(
+            requestID: 2, k: 2, draftTokens: [], targetTokens: [], accepted: 1,
+            confirmed: 2, rejected: 1, tokensCountAfter: 1, numComputedAfter: 0,
+            generatedAfter: 1, finishReason: nil)
+        let records = [wide, narrow]
+        #expect(
+            throws: FreeRunRoundAudit.AuditError.widthDisagreement(
+                round: 0, widths: [3, 2])
+        ) {
+            _ = try FreeRunRoundAudit.assemble(
+                records: records, slotForRequestID: [1: 0, 2: 1], streamCount: 2)
+        }
+    }
+
+    /// A serial window journals nothing, so every audit field is absent —
+    /// which is not the same claim as zero.
+    @Test("A window with no journal reports no audit fields")
+    func noJournalNoAudit() async throws {
+        let response = try await freeRun(script: nil)
+        #expect(response.ok)
+        #expect(response.acceptanceLengths == nil)
+        #expect(response.draftedTotal == nil)
+        #expect(response.acceptedTotal == nil)
+        #expect(response.verifyReplayDisagreements == nil)
+        #expect(response.specDecoder == nil)
+        // `committed_total` is the drained count and is always reported.
+        #expect(response.committedTotal == 6)
     }
 }
