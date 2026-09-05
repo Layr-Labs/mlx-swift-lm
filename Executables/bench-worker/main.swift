@@ -165,6 +165,7 @@ do {
 
 // 4. ONE load. For `resident` this is the window's ONLY load; for an
 //    in-process `runtime-worker` it is this phase's.
+let loadStarted = Date()
 let runner: any Runner
 do {
     runner = try await runnerType.load(
@@ -175,6 +176,24 @@ do {
             resources: launch.resources))
 } catch {
     fail(error)
+}
+let loadSeconds = Date().timeIntervalSince(loadStarted)
+
+// 4a. The load summary, BEFORE the hello and on stderr only — stdout is the
+//     wire and stays byte-identical whether or not this is on. Emitted here
+//     so it is present even when the first verb is what fails, which is the
+//     case that left a box with nothing to read.
+if RunnerLoadSummary.isEnabled(flag: launch.verbose, environment: environment) {
+    var summary = runner.loadSummary(
+        weights: launch.weights,
+        options: RunnerLoadOptions(
+            drafterDirectory: launch.drafter,
+            kvBytesCapacity: launch.kvBytesCapacity,
+            resources: launch.resources))
+    summary.add("mode", launch.subcommand.rawValue)
+    summary.add("speculative_protocol", launch.speculative ? "v1.1" : "v1")
+    summary.add("load", seconds: loadSeconds)
+    summary.writeToStandardError()
 }
 
 // 5. Serve.

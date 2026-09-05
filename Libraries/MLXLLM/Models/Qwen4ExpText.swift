@@ -92,6 +92,17 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
     /// between "the nested block said 0" and "the nested block said
     /// nothing".
     public internal(set) var rmsNormWeightOffsetIsExplicit: Bool = false
+
+    /// WHERE the resolved offset came from, for the `--verbose` load
+    /// summary. The value alone does not say whether the checkpoint spoke,
+    /// and this defect is exactly the case where that mattered.
+    public enum RMSNormWeightOffsetSource: String, Sendable {
+        case textConfig = "text_config"
+        case topLevel = "top_level"
+        case familyDefault = "family_default"
+    }
+    public internal(set) var rmsNormWeightOffsetSource: RMSNormWeightOffsetSource =
+        .familyDefault
     public var layerTypes: [String] = []
     public var fullAttentionInterval: Int = 4
 
@@ -227,6 +238,7 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         let declaredOffset = try c.decodeIfPresent(Float.self, forKey: .rmsNormWeightOffset)
         self.rmsNormWeightOffset = declaredOffset ?? 0
         self.rmsNormWeightOffsetIsExplicit = declaredOffset != nil
+        self.rmsNormWeightOffsetSource = declaredOffset != nil ? .textConfig : .familyDefault
         self.fullAttentionInterval = try int(.fullAttentionInterval, 4)
         self.numExperts = try int(.numExperts, 512)
         self.numExpertsPerTok = try int(.numExpertsPerTok, 10)

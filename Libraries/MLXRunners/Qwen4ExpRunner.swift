@@ -200,6 +200,79 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
             maxSequenceLength: options.maxSequenceLength)
     }
 
+    /// The family half of the `--verbose` load summary.
+    ///
+    /// The RMSNorm offset and its SOURCE lead, because that is the line that
+    /// would have named today's defect on the first run: the value alone
+    /// does not say whether the checkpoint spoke or whether this family's
+    /// default was applied. The validator's own statistic follows, so the
+    /// summary states not just what was configured but what the WEIGHTS say.
+    public func loadSummary(
+        weights: URL, options: RunnerLoadOptions
+    ) -> RunnerLoadSummary {
+        var summary = genericLoadSummary(weights: weights, options: options)
+        let text = model.configuration
+
+        summary.add("rms_norm_weight_offset", text.rmsNormWeightOffset)
+        summary.add("rms_norm_weight_offset_source", text.rmsNormWeightOffsetSource.rawValue)
+        // What the loaded tensors READ AS, next to what was configured.
+        // Reads resident tensors only.
+        if let verdict = Qwen4ExpNormConvention.read(
+            model: model, expectedOffset: text.rmsNormWeightOffset)
+        {
+            summary.add("norm_convention_tensors_read", verdict.inspected)
+            summary.add("norm_convention_disagreements", verdict.disagreements.count)
+            summary.add("norm_convention_implied_offset", verdict.impliedOffset)
+            if let first = Qwen4ExpNormConvention.nonGatedNormWeights(model).first {
+                let measured = Qwen4ExpNormConvention.measure(first.weight)
+                summary.add("norm_convention_sample_path", first.path)
+                summary.add(
+                    "norm_convention_sample_negative_fraction", measured.negativeFraction)
+                summary.add("norm_convention_sample_mean", measured.mean)
+            }
+        }
+
+        summary.add("rms_norm_eps", text.rmsNormEps)
+        summary.add("hidden_size", text.hiddenSize)
+        summary.add("hidden_layers", text.hiddenLayers)
+        summary.add("attention_heads", text.attentionHeads)
+        summary.add("kv_heads", text.kvHeads)
+        summary.add("head_dim", text.headDim)
+        summary.add("vocabulary_size", text.vocabularySize)
+        summary.add("full_attention_interval", text.fullAttentionInterval)
+        summary.add("num_experts", text.numExperts)
+        summary.add("num_experts_per_tok", text.numExpertsPerTok)
+        summary.add("moe_intermediate_size", text.moeIntermediateSize)
+        summary.add("tie_word_embeddings", text.tieWordEmbeddings)
+
+        // Synthetic recurrent slots: the PLE short-conv state and the n-gram
+        // history ride `modelLayerIndex` values PAST the last real layer, so
+        // a reader can tell them from a layer number.
+        let synthetic = model.cbv2RecurrentStateSpec.layers
+            .map { $0.modelLayerIndex }
+            .filter { $0 >= text.hiddenLayers }
+            .sorted()
+        summary.add(
+            "aux_state_synthetic_indices",
+            synthetic.map(String.init).joined(separator: ","))
+        summary.add("ple_layers", model.pleEmbeddings.count)
+
+        // Tensors, counted off the resident tree — no file is reopened.
+        let parameters = model.parameters().flattened()
+        summary.add("tensors_bound", parameters.count)
+        var quantizationCounts: [String: Int] = [:]
+        for (path, _) in parameters where path.hasSuffix(".scales") {
+            quantizationCounts["quantized", default: 0] += 1
+        }
+        summary.add("quantized_projections", quantizationCounts["quantized"] ?? 0)
+
+        summary.add(
+            "resources_accepted",
+            options.resources[Self.ngramRowSourceResource] == nil
+                ? "none" : Self.ngramRowSourceResource)
+        return summary
+    }
+
     /// Refuse a module whose loaded norm weights contradict the offset it
     /// was configured with.
     ///

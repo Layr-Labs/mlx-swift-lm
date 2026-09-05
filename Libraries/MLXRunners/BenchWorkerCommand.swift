@@ -218,15 +218,21 @@ public enum BenchWorkerUsage {
           --resource <name>=<path>     Repeatable. An out-of-checkpoint input the
                                        runner needs; passed through opaque.
           --kv-bytes <n>               KV byte grant.
+          --verbose                    Write a load summary to stderr BEFORE the
+                                       hello: what the load decided, one key=value
+                                       per line. stdout is untouched.
 
         ENVIRONMENT
           BENCH_WORKER_RESIDENT_SOCKET  Attach to the resident at this socket and
-                                        load nothing. Unreachable, refusing or
-                                        wrongly-loaded is a REFUSAL, never a
-                                        fall-through to loading in process.
+                                        load nothing. The hello then carries a
+                                        `resident` block; `backend` is unchanged.
+                                        Unreachable, refusing or wrongly-loaded is
+                                        a REFUSAL, never a fall-through to loading
+                                        in process.
           BENCH_WORKER_RESIDENT_HELLO   Set to 1 to emit the additive `resident`
                                         hello object. Off by default: benchd's
                                         envelope must admit the field first.
+          BENCH_WORKER_VERBOSE          Set to 1 for --verbose.
         """
 
     public static let resident = """
@@ -244,8 +250,10 @@ public enum BenchWorkerUsage {
           --socket <path>              Unix socket to listen on. Required.
           --weights <dir>              Checkpoint directory. Required.
           --runner, --drafter, --trusted, --speculative-protocol, --resource,
-          --kv-bytes                   As for runtime-worker; this process performs
+          --kv-bytes, --verbose        As for runtime-worker; this process performs
                                        the load the phases then share.
+          --pidfile <path>             Written when the resident starts listening
+                                       and removed at teardown.
         """
 
     public static let manifest = """

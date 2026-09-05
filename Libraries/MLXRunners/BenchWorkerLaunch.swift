@@ -108,6 +108,9 @@ public struct BenchWorkerLaunchOptions: Sendable {
     public var speculative: Bool
     /// Validated resource bag, ready for `RunnerLoadOptions`.
     public var resources: RunnerResources
+    /// Write the load summary to stderr before the hello. Also honoured
+    /// through `BENCH_WORKER_VERBOSE=1`.
+    public var verbose: Bool
 
     /// Default KV grant when `--kv-bytes` is absent.
     public static let defaultKVBytesCapacity = 8 << 30
@@ -129,6 +132,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
         var kvBytesCapacity = defaultKVBytesCapacity
         var speculativeProtocol: String?
         var rawResources: [String] = []
+        var verbose = false
         var subcommand: BenchWorkerSubcommand?
         var socket: String?
         var pidfile: String?
@@ -157,6 +161,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
             case "--runner": runnerID = try next("--runner")
             case "--drafter": drafter = URL(fileURLWithPath: try next("--drafter"))
             case "--trusted": trusted = true
+            case "--verbose": verbose = true
             case "--resource": rawResources.append(try next("--resource"))
             case "--speculative-protocol":
                 speculativeProtocol = try next("--speculative-protocol")
@@ -207,7 +212,8 @@ public struct BenchWorkerLaunchOptions: Sendable {
             trusted: trusted,
             kvBytesCapacity: kvBytesCapacity,
             speculative: speculative,
-            resources: resources)
+            resources: resources,
+            verbose: verbose)
     }
 
     /// The runner this launch names: the explicit `--runner` id, or the one
@@ -241,7 +247,8 @@ public struct BenchWorkerLaunchOptions: Sendable {
         trusted: Bool = false,
         kvBytesCapacity: Int = BenchWorkerLaunchOptions.defaultKVBytesCapacity,
         speculative: Bool = false,
-        resources: RunnerResources = RunnerResources()
+        resources: RunnerResources = RunnerResources(),
+        verbose: Bool = false
     ) {
         self.subcommand = subcommand
         self.socket = socket
@@ -253,5 +260,6 @@ public struct BenchWorkerLaunchOptions: Sendable {
         self.kvBytesCapacity = kvBytesCapacity
         self.speculative = speculative
         self.resources = resources
+        self.verbose = verbose
     }
 }

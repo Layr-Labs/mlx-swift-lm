@@ -113,12 +113,12 @@ struct BenchWorkerResidentTests {
                 "relayed response \(index + 1) diverged from the fixture")
         }
 
-        // The hello is the ONE rewritten line: `backend` names where the
-        // work ran, and the resident's own weights path never reaches
-        // benchd. Byte-exact, built from the fixture's own hello.
-        let expectedHello = fixture.hello.replacingOccurrences(
-            of: "\"backend\":\"mock\"", with: "\"backend\":\"mlx-resident\"")
-        #expect(output.written[0] == expectedHello)
+        // The hello too, byte for byte. `backend` is NOT rewritten — it
+        // names the compute backend and the conformance kit checks it
+        // against the manifest's, which refused an `mlx-resident` there —
+        // and the resident's private weights path never reaches benchd, so
+        // with the identity gated off the relayed hello IS the fixture's.
+        #expect(output.written[0] == fixture.hello)
         #expect(!output.written[0].contains("resident_weights"))
         #expect(!output.written[0].contains("\"resident\""))
     }
@@ -136,7 +136,9 @@ struct BenchWorkerResidentTests {
             input: CollectingTransport(lines: []), output: output)
 
         let hello = output.written[0]
-        #expect(hello.contains("\"backend\":\"mlx-resident\""))
+        // The manifest's backend, unchanged by the relay.
+        #expect(hello.contains("\"backend\":\"mock\""))
+        #expect(!hello.contains("mlx-resident"))
         #expect(
             hello.hasSuffix(
                 ",\"resident\":{\"pid\":\(harness.resident.identity.pid),"

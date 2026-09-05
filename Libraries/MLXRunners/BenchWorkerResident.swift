@@ -31,10 +31,16 @@
 //   * the session — a fresh nonce per connection, hello first, and any error
 //     discards that session exactly as in process.
 //
-// Identity on the wire: the attaching worker reports `backend` as
-// `mlx-resident` and appends a `resident` object carrying the resident's pid
-// and `load_epoch`, so an artifact can SHOW that every phase of a window ran
-// against one load rather than assuming it.
+// Identity on the wire: the attaching worker appends a `resident` object
+// carrying the resident's pid and `load_epoch`, so an artifact can SHOW that
+// every phase of a window ran against one load rather than assuming it.
+//
+// `backend` is NOT touched. It names the COMPUTE backend, and the
+// conformance kit compares it to the manifest's own `backend` — an
+// `mlx-resident` there is refused as "not the manifest backend mlx", which
+// is correct: residency is a topology fact about WHERE the weights live, not
+// a different way of computing. The ds4 precedent did label the backend,
+// because it had no `resident` block to put the fact in; this one does.
 //
 // Environment:
 //
@@ -355,12 +361,14 @@ final class BenchWorkerSocketTransport: BenchWorkerTransport {
 
 /// `runtime-worker` attached to a resident: a verb-by-verb relay.
 ///
-/// Every response is forwarded to stdout UNCHANGED except the hello, which
-/// is the only line whose content is a claim about where the work ran. There
-/// `backend` becomes `mlx-resident` and the `resident` identity is appended
-/// last. Nothing else is rewritten — a relay that reformatted responses
-/// would make the socket path and the in-process path differ in bytes for no
-/// reason, and benchd compares bytes.
+/// Every response is forwarded to stdout UNCHANGED except the hello, where
+/// the `resident` identity is appended last and the resident's private
+/// `resident_weights` is dropped. `backend` is left alone: it names the
+/// COMPUTE backend and the conformance kit checks it against the manifest's,
+/// so residency belongs in its own block and not in that field. Nothing else
+/// is rewritten — a relay that reformatted responses would make the socket
+/// path and the in-process path differ in bytes for no reason, and benchd
+/// compares bytes.
 public struct BenchWorkerAttach {
 
     private let socketPath: String
@@ -457,7 +465,7 @@ public struct BenchWorkerAttach {
             }
         }
 
-        hello.backend = "mlx-resident"
+        // `backend` untouched: see the type's doc comment.
         hello.residentWeights = nil
         if !emitResidentIdentity { hello.resident = nil }
         return hello.jsonLine()

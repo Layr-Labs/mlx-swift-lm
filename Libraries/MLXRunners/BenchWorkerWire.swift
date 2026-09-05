@@ -240,7 +240,8 @@ public struct RunnerIdentity: Codable, Sendable, Equatable {
 ///
 /// Identifies the RESIDENT process that actually holds the weights, so every
 /// phase of one measurement window can be shown to have run against one
-/// load. `load_epoch` is constant for a resident's whole life and changes
+/// load. Residency lives HERE and not in `backend`: that field names the
+/// compute backend and the conformance kit checks it against the manifest's. `load_epoch` is constant for a resident's whole life and changes
 /// only when a new resident loads, which is exactly the claim an artifact
 /// needs: the weights did not reload between phases.
 ///

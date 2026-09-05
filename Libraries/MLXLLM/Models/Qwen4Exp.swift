@@ -68,10 +68,16 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
             {
                 text.rmsNormWeightOffset = declared
                 text.rmsNormWeightOffsetIsExplicit = true
+                text.rmsNormWeightOffsetSource = .topLevel
             }
             self.textConfig = text
         } else {
-            self.textConfig = try Qwen4ExpTextConfiguration(from: decoder)
+            var text = try Qwen4ExpTextConfiguration(from: decoder)
+            // Decoded FROM THE ROOT, so an explicit key was a top-level one.
+            if text.rmsNormWeightOffsetIsExplicit {
+                text.rmsNormWeightOffsetSource = .topLevel
+            }
+            self.textConfig = text
         }
 
         // THE ROOT IS NOT READ, AND THAT IS DELIBERATE. `text_config` is the
