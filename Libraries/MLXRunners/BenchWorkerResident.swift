@@ -114,6 +114,10 @@ public final class BenchWorkerResident: @unchecked Sendable {
     private let kvBytesCapacity: Int
     private let maxDecodeTokens: Int
     private let memory: any WorkerMemoryReporter
+    /// One nonce per CONNECTION. Injectable so a conformance test can pin
+    /// the fixture's, which is the only reason a relayed line could differ
+    /// from an in-process one.
+    private let nonceFactory: @Sendable () -> String
     /// The checkpoint this resident holds, so an attaching worker can refuse
     /// a resident loaded from somewhere else.
     private let weightsPath: String
@@ -124,9 +128,22 @@ public final class BenchWorkerResident: @unchecked Sendable {
     /// have happened.
     public let identity: ResidentIdentity
 
-    private let lock = NSLock()
+    /// `NSCondition` rather than a plain lock: a phase that has just
+    /// disconnected leaves its session thread briefly finishing, and a NEW
+    /// phase arriving in that window is a sequential attach, not a
+    /// concurrent one. The doorman waits out that handover before it
+    /// refuses, so the one-connection rule catches a real double attach
+    /// without failing benchd's next phase for a scheduling gap.
+    private let condition = NSCondition()
     private var sessionActive = false
     private var stopped = false
+
+    /// How long a new attach waits for a FINISHING session before it is
+    /// refused. Teardown is microseconds — the client has already closed and
+    /// the session thread only has to notice EOF — so this is three orders
+    /// of magnitude of slack, while a genuine double attach still hears back
+    /// in half a second.
+    public static let sessionHandoverGrace: TimeInterval = 0.5
 
     public init(
         runner: any Runner,
@@ -139,7 +156,8 @@ public final class BenchWorkerResident: @unchecked Sendable {
         kvBytesCapacity: Int,
         maxDecodeTokens: Int = 4096,
         memory: any WorkerMemoryReporter = MLXMemoryReporter(),
-        loadEpoch: UInt64 = DispatchTime.now().uptimeNanoseconds
+        loadEpoch: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        nonceFactory: @escaping @Sendable () -> String = { UUID().uuidString }
     ) {
         self.runner = runner
         self.listener = listener
@@ -151,6 +169,7 @@ public final class BenchWorkerResident: @unchecked Sendable {
         self.kvBytesCapacity = kvBytesCapacity
         self.maxDecodeTokens = maxDecodeTokens
         self.memory = memory
+        self.nonceFactory = nonceFactory
         self.identity = ResidentIdentity(
             pid: ProcessInfo.processInfo.processIdentifier, loadEpoch: loadEpoch)
     }
@@ -158,17 +177,21 @@ public final class BenchWorkerResident: @unchecked Sendable {
     /// Accept until `shutDown()`. Blocks the calling thread.
     public func serve() {
         while true {
-            lock.lock()
+            condition.lock()
             let done = stopped
-            lock.unlock()
+            condition.unlock()
             if done { return }
 
             guard let connection = listener.accept() else { return }
 
-            lock.lock()
+            condition.lock()
+            let deadline = Date().addingTimeInterval(Self.sessionHandoverGrace)
+            while sessionActive, Date() < deadline {
+                _ = condition.wait(until: deadline)
+            }
             let busy = sessionActive
             if !busy { sessionActive = true }
-            lock.unlock()
+            condition.unlock()
 
             guard !busy else {
                 // ONE line, then closed. The refusal is a protocol response
@@ -189,18 +212,20 @@ public final class BenchWorkerResident: @unchecked Sendable {
             Thread.detachNewThread { [weak self] in
                 guard let self else { return }
                 self.runSession(over: session)
-                self.lock.lock()
+                self.condition.lock()
                 self.sessionActive = false
-                self.lock.unlock()
+                self.condition.broadcast()
+                self.condition.unlock()
             }
         }
     }
 
     /// Stop accepting and drop the socket file.
     public func shutDown() {
-        lock.lock()
+        condition.lock()
         stopped = true
-        lock.unlock()
+        condition.broadcast()
+        condition.unlock()
         listener.shutDown()
     }
 
@@ -224,7 +249,8 @@ public final class BenchWorkerResident: @unchecked Sendable {
             maxDecodeTokens: maxDecodeTokens,
             memory: memory,
             residentIdentity: identity,
-            residentWeights: weightsPath)
+            residentWeights: weightsPath,
+            nonce: nonceFactory())
 
         let finished = DispatchSemaphore(value: 0)
         Task {
@@ -283,7 +309,7 @@ public struct BenchWorkerAttach {
     /// hello field, and the explicit opt-in, because benchd's envelope is
     /// closed and rejects a field it does not know. Drop the second gate
     /// once bench-dev admits `resident`.
-    static func emitsResidentIdentity(
+    public static func emitsResidentIdentity(
         speculative: Bool, environment: [String: String]
     ) -> Bool {
         guard speculative else { return false }

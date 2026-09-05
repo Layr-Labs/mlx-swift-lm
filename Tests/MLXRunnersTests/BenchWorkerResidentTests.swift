@@ -27,7 +27,11 @@ struct BenchWorkerResidentTests {
         let socketPath: String
         private let thread: Thread
 
-        init(loadEpoch: UInt64 = 4242, script: MockRoundScript? = .fixtureWindow) throws {
+        init(
+            loadEpoch: UInt64 = 4242,
+            script: MockRoundScript? = .fixtureWindow,
+            nonce: String? = "fixturenonce"
+        ) throws {
             socketPath = FileManager.default.temporaryDirectory
                 .appendingPathComponent("resident-\(UUID().uuidString).sock").path
             let listener = try BenchWorkerSocketListener(path: socketPath)
@@ -42,10 +46,18 @@ struct BenchWorkerResidentTests {
                 kvBytesCapacity: 1 << 20,
                 maxDecodeTokens: 64,
                 memory: FixtureMemoryReporter(),
-                loadEpoch: loadEpoch)
+                loadEpoch: loadEpoch,
+                // Pinned so a relayed line can be compared to the fixture
+                // byte for byte; nil takes the real per-connection UUID.
+                nonceFactory: Harness.nonceFactory(nonce))
             let resident = self.resident
             thread = Thread { resident.serve() }
             thread.start()
+        }
+
+        static func nonceFactory(_ pinned: String?) -> @Sendable () -> String {
+            guard let pinned else { return { UUID().uuidString } }
+            return { pinned }
         }
 
         func cleanUp() {
@@ -207,7 +219,7 @@ struct BenchWorkerResidentTests {
     /// concurrency, not a one-shot resident.
     @Test("A sequential second phase is served, with a fresh nonce")
     func sequentialPhasesAreServed() throws {
-        let harness = try Harness()
+        let harness = try Harness(nonce: nil)
         defer { harness.cleanUp() }
         let prefill =
             "{\"id\":1,\"kind\":\"prefill\",\"prompt_tokens\":[11,12,13]}"

@@ -79,7 +79,7 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
                 return line
             }
             var chunk = [UInt8](repeating: 0, count: 64 * 1024)
-            let count = read(descriptor, &chunk, chunk.count)
+            let count = Darwin.read(descriptor, &chunk, chunk.count)
             if count > 0 {
                 buffer.append(contentsOf: chunk[0 ..< count])
             } else if count == 0 {
@@ -99,8 +99,12 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
         var bytes = Array((line + "\n").utf8)
         var offset = 0
         while offset < bytes.count {
+            // `Darwin.write`, qualified: the unqualified name resolves to
+            // this type's own `write(line:)` inside the class body.
             let written = bytes.withUnsafeBytes { raw -> Int in
-                write(descriptor, raw.baseAddress!.advanced(by: offset), bytes.count - offset)
+                Darwin.write(
+                    descriptor, raw.baseAddress!.advanced(by: offset),
+                    bytes.count - offset)
             }
             if written > 0 {
                 offset += written
