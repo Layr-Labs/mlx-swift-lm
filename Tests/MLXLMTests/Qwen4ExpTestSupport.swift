@@ -104,3 +104,69 @@ final class DeterministicNGramRowSource: Qwen4ExpNGramRowSource {
         return MLX.sin(ids * Float(0.017) * lanes) * Float(0.5)
     }
 }
+
+/// One request's CBv2 state: the family's layer caches bound to contiguous
+/// rows, plus the request-owned recurrent state.
+final class Qwen4ExpCBv2Session {
+    let model: Qwen4ExpModel
+    let backend: CBv2ContiguousKVBackend
+    let caches: [Qwen4ExpCBv2LayerCache]
+    let rows: [CBv2SequenceKV?]
+    let recurrent: CBv2RecurrentRequestState
+
+    init(model: Qwen4ExpModel, maxLength: Int = 256) throws {
+        self.model = model
+        self.backend = CBv2ContiguousKVBackend(
+            config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 26, kvDType: .float32))
+        let kinds = model.cbv2LayerKinds
+        self.rows = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 0, maxLength: maxLength)
+        let caches = model.newCacheV2().map { $0 as! Qwen4ExpCBv2LayerCache }
+        for (index, cache) in caches.enumerated() {
+            guard let row = rows[index] else {
+                throw XCTSkip("contiguous backend vended no row for a full-attention layer")
+            }
+            cache.setRows([row])
+        }
+        self.caches = caches
+        self.recurrent = try CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)
+    }
+
+    var kvCaches: [KVCache] { caches.map { $0 as KVCache } }
+
+    /// One committed forward. Returns the last position's logits and the
+    /// whole window's multi stream.
+    func forward(_ tokens: [Int]) throws -> (logits: MLXArray, multi: MLXArray) {
+        let ids = MLXArray(tokens.map { Int32($0) }).reshaped([1, tokens.count])
+        let evaluation = try recurrent.bind()
+        let out = model.cbv2ForwardWithHidden(
+            ids, caches: kvCaches, recurrentState: [evaluation], positionIds: nil)
+        try evaluation.evaluate()
+        try evaluation.commit()
+        eval(out.logits, out.lastHidden)
+        // `lastHidden` IS the pre-final-mixer multi stream for this family.
+        return (out.logits[0..., -1, 0...], out.lastHidden)
+    }
+
+    /// Greedy next token, lowest id on a tie.
+    func greedy(_ logits: MLXArray) -> Int {
+        argMax(logits, axis: -1).item(Int.self)
+    }
+}
+
+/// Greedy generation through the legacy `LLMModel` + `KVCache` path.
+func qwen4ExpLegacyGreedy(
+    model: Qwen4ExpModel, prompt: [Int], count: Int
+) -> [Int] {
+    let caches = model.makeCache()
+    var ids = MLXArray(prompt.map { Int32($0) }).reshaped([1, prompt.count])
+    var produced: [Int] = []
+    for _ in 0 ..< count {
+        let logits = model(ids, cache: caches)
+        let next = argMax(logits[0..., -1, 0...], axis: -1)
+        eval(next)
+        produced.append(next.item(Int.self))
+        ids = next.reshaped([1, 1]).asType(.int32)
+    }
+    return produced
+}
