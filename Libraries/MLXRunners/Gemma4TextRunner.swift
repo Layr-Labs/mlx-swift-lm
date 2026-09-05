@@ -15,6 +15,7 @@ import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
+import MLXVLM
 import Tokenizers
 
 public final class Gemma4TextRunner: Runner, @unchecked Sendable {
@@ -89,13 +90,21 @@ public final class Gemma4TextRunner: Runner, @unchecked Sendable {
         self.loadedDecoders = drafter == nil ? [.serial] : [.serial, .mtp]
     }
 
-    /// The tower CBv2 serves. The VLM wrapper OWNS this instance, so
-    /// nothing here constructs a second language module or duplicates the
-    /// checkpoint's resident weights.
+    /// The tower CBv2 serves.
+    ///
+    /// Every shape the factories produce for this family resolves here, the
+    /// MULTIMODAL wrapper included: Darkbloom's container loads a Gemma 4
+    /// VLM checkpoint as `MLXVLM.Gemma4`, and refusing that would make the
+    /// runner unusable for exactly the deployment the contract's adopt seam
+    /// exists for. No extraction is needed for this family — each wrapper
+    /// directly OWNS the `Gemma4TextModel` instance, so this is a property
+    /// read and nothing here constructs a second language module or
+    /// duplicates the checkpoint's resident weights.
     static func textTower(of model: any LanguageModel) throws -> Gemma4TextModel {
         switch model {
         case let text as Gemma4TextModel: return text
-        case let wrapper as Gemma4Model: return wrapper.textModel
+        case let wrapper as MLXLLM.Gemma4Model: return wrapper.textModel
+        case let wrapper as MLXVLM.Gemma4: return wrapper.textModel
         default:
             throw RunnerError.unexpectedModel(String(describing: type(of: model)))
         }
