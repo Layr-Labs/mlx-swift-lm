@@ -11,6 +11,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 
 /// `CBv2SequenceKV` for sliding-window attention.
 ///
@@ -51,7 +52,9 @@ import MLX
 /// `commitSpeculativeWrite()`. A final `rollback(m)` is a pure counter move —
 /// nothing was destroyed — so after commit the state is value-exactly what
 /// plain updates of only the confirmed tokens would have produced.
-public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
+public final class CBv2WindowedSequenceKV: CBv2DecodeRootCompactionCapableSequenceKV,
+    CBv2InnerStateProviding
+{
 
     /// Window size in tokens == number of physical ring slots.
     public let window: Int
@@ -70,6 +73,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     private var keys: MLXArray?
     private var values: MLXArray?
+
 
     /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
     /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
@@ -129,21 +133,24 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         if speculativeWriteArmed {
             return stageSpeculativeUpdate(newKeys: newKeys, newValues: newValues, count: n)
         }
-        precondition(
-            staged == nil,
-            "CBv2WindowedSequenceKV: plain update with a staged speculative write pending — commit first"
-        )
+
+        // FRESH-RING-ADOPT: a fresh row receiving exactly one window of tokens
+        // at a window-aligned position. `writeRing` would store token j in
+        // slot j for every slot, so the ring after the write IS the chunk
+        // tensor: adopt the chunk as the ring storage directly, instead of
+        // zero-filling two private buffers and copying the same bytes in.
+        if keys == nil, n == window, absoluteOffset % window == 0,
+            adoptsFreshFullWindowChunk(keyTemplate: newKeys, valueTemplate: newValues)
+        {
+            return adoptFreshFullWindowChunk(keys: newKeys, values: newValues)
+        }
 
         allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
 
         if n == 1 {
             // Decode fast path: one modular slot write, then the retained
             // window in temporal order (1 slice pre-wrap, 2-slice concat after).
-            borrowableChunkViews = nil  // ring == window: snapshot is exact
-            writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
-            writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
-            absoluteOffset += 1
-            oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+            writeDecodeToken(keys: newKeys, values: newValues)
             return (
                 temporalOrder(keys!, from: oldestValidPosition, to: absoluteOffset),
                 temporalOrder(values!, from: oldestValidPosition, to: absoluteOffset)
@@ -411,6 +418,45 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     // MARK: - Ring geometry
 
+    private func writeDecodeToken(keys newKeys: MLXArray, values newValues: MLXArray) {
+        borrowableChunkViews = nil
+        writeRing(keys!, tokens: newKeys, firstPosition: absoluteOffset)
+        writeRing(values!, tokens: newValues, firstPosition: absoluteOffset)
+        absoluteOffset += 1
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+    }
+
+    /// RING-READ-FOLD-B1: the ordinary in-place decode ring write, exposed so
+    /// the B=1 sliding fold can write the token itself and then attend the ring
+    /// in place. Identical to the write `update(...)` performs; the q4 KV mirror
+    /// that once rode alongside it was dropped in PR 1, so this is the bf16 ring
+    /// write only.
+    func decodeRingWrite(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(staged == nil && newKeys.dim(2) == 1 && newValues.dim(2) == 1)
+        allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
+        writeDecodeToken(keys: newKeys, values: newValues)
+    }
+
+    /// The retained ring K/V and the logical temporal start, on a full ring, for
+    /// an in-place attend (RING-READ-FOLD-B1). Nil unless the ring is full and no
+    /// speculative (MTP) transaction is staged.
+    var decodeRingView: (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        return (keys, values, oldestValidPosition % window)
+    }
+
+    /// The ring view a fold decode step should attend: the SAME allocations and
+    /// the SAME start `decodeRingView` would report AFTER this step's one-token
+    /// `decodeRingWrite`, offered before that write happens. Only defined on an
+    /// already-full ring, where the append evicts exactly one entry so
+    /// `oldestValidPosition` advances by one and the post-write start is
+    /// `(oldestValidPosition + 1) % window`. `CBv2RingReadFoldB1` consults it to
+    /// prove eligibility BEFORE the write, so the post-write attend cannot fail.
+    var decodeRingViewBeforeWrite: (keys: MLXArray, values: MLXArray, start: Int)? {
+        guard staged == nil, let keys, let values, retainedCount == window else { return nil }
+        return (keys, values, (oldestValidPosition + 1) % window)
+    }
+
     /// Views covering absolute positions `[from, to)` in temporal order:
     /// one slice when the modular range does not cross the wrap point,
     /// two slices when it does. `to - from` must be ≤ `window`.
@@ -442,7 +488,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     /// Write `tokens` (≤ window of them) into their modular slots, splitting
     /// at the wrap point when needed (at most two slice assignments).
-    private func writeRing(_ buffer: MLXArray, tokens: MLXArray, firstPosition: Int) {
+    private func writeRing(
+        _ buffer: MLXArray, tokens: MLXArray, firstPosition: Int
+    ) {
         let n = tokens.dim(2)
         precondition(n <= window, "writeRing: more tokens than slots")
         let start = firstPosition % window
@@ -453,6 +501,53 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             buffer[.ellipsis, start ..< window, 0...] = tokens[.ellipsis, ..<first, 0...]
             buffer[.ellipsis, 0 ..< (n - first), 0...] = tokens[.ellipsis, first..., 0...]
         }
+    }
+
+    /// FRESH-RING-ADOPT. `MLX_KV_FRESH_CHUNK_ADOPT=0` restores the zero-fill
+    /// plus slice-update materialization of a fresh row's first window.
+    static let freshChunkAdoptionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_KV_FRESH_CHUNK_ADOPT"]
+        else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }()
+
+    /// The adopt path serves a fresh row receiving exactly one window of
+    /// bfloat16 tokens at a window-aligned position; every other configuration
+    /// keeps the incumbent allocate-and-write path.
+    private func adoptsFreshFullWindowChunk(
+        keyTemplate: MLXArray, valueTemplate: MLXArray
+    ) -> Bool {
+        Self.freshChunkAdoptionEnabled
+            && keyTemplate.dtype == .bfloat16 && valueTemplate.dtype == .bfloat16
+            && keyTemplate.shape == [1, kvHeads, window, headDim]
+            && valueTemplate.shape == keyTemplate.shape
+    }
+
+    /// PREFILL-KV-BATCH admission: true when this row's next `update` with
+    /// the given `[1, kvHeads, n, headDim]` chunk would take FRESH-RING-ADOPT
+    /// — `update`'s own gate plus the guard that precedes it there (no open
+    /// speculative transaction). A batch of rows that all pass here would each
+    /// adopt individually on the per-row commit loop.
+    func canAdoptFreshFullWindowChunk(keys newKeys: MLXArray, values newValues: MLXArray) -> Bool {
+        !speculativeWriteArmed && keys == nil
+            && newKeys.dim(2) == window && absoluteOffset % window == 0
+            && adoptsFreshFullWindowChunk(keyTemplate: newKeys, valueTemplate: newValues)
+    }
+
+    /// Slot j of the ring is token j (a full window written at offset 0 of
+    /// the ring), so the chunk tensors are the ring contents byte for byte.
+    /// The offsets, the retained-window bookkeeping and the borrowable views
+    /// end in the state the incumbent allocate-and-write path leaves after the
+    /// same update.
+    func adoptFreshFullWindowChunk(
+        keys newKeys: MLXArray, values newValues: MLXArray
+    ) -> (MLXArray, MLXArray) {
+        keys = newKeys
+        values = newValues
+        absoluteOffset += window
+        oldestValidPosition = max(oldestValidPosition, absoluteOffset - window)
+        borrowableChunkViews = (newKeys, newValues)
+        return (newKeys, newValues)
     }
 
     private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {

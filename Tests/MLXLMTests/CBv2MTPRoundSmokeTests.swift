@@ -23,7 +23,7 @@ import Testing
 
 @testable import MLXLLM
 
-@Suite("CBv2MTPRoundSmoke", .serialized)
+@Suite("CBv2MTPRoundSmoke", .serialized, .fixtureRandomState)
 struct CBv2MTPRoundSmokeTests {
 
     private let vocabSize = 256
@@ -108,7 +108,7 @@ struct CBv2MTPRoundSmokeTests {
     private func makeFixture(
         seed: UInt64 = 0x5EED, deterministicTarget: Bool = false
     ) throws -> Fixture {
-        MLXRandom.seed(seed)
+        fixtureSeed(seed)
         let target = Gemma4TextModel(
             try targetConfig(tieWordEmbeddings: !deterministicTarget))
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
@@ -446,22 +446,37 @@ struct CBv2MTPRoundSmokeTests {
         #expect(engine.loopForTesting.mtp?.requestStateCountForTesting == 0)
     }
 
-    @Test func fixedDepthZeroProbesOnceThenKeepsNormalChaining() async throws {
+    /// A target-only controller neither probes nor breaks the decode chain.
+    ///
+    /// This test used to assert the opposite — one non-chained depth-zero
+    /// baseline probe, `costInputs` carrying exactly one depth-zero sample.
+    /// `0a5f5dd6` deliberately ended that for this configuration by adding
+    /// `CBv2MTPDepthController.isTargetOnly` (`maxDepth == 0 || fixedDepth == 0`)
+    /// and gating `requiresNonChainedDepthZeroProbe` behind it: a controller
+    /// that can never select a positive depth has nothing to compare a baseline
+    /// against, so the probe would break a decode chain to measure a number no
+    /// decision reads.
+    ///
+    /// With `maxDraftTokens: 0` the engine is exactly that, so there is no
+    /// probe and therefore no depth-zero cost sample — the chained branch of
+    /// `recordFinalizedStep` requires `costs[0]` to already exist, which it
+    /// never does. What still has to hold is what the test was really
+    /// defending: MTP stays out of the way, the chain keeps running, and no
+    /// speculative round happens.
+    @Test func fixedDepthZeroNeitherProbesNorBreaksTheChain() async throws {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 16, seed: 73, vocabSize: vocabSize)
         let engine = try makeEngine(fixture, mtp: true, maxDraftTokens: 0)
         let result = try await run(
             engine, greedyRequest(id: 1, prompt: prompt, maxTokens: 20))
         let metrics = try #require(engine.mtpMetricsSnapshot())
-        let baseline = try #require(
-            metrics.costInputs.first {
-                $0.decodeRowBucket == 1 && $0.depth == 0
-            })
         await engine.shutdown()
 
         #expect(result.finishReason == .length)
         #expect(engine.chainedStepCount > 0)
-        #expect(baseline.samples == 1)
         #expect(metrics.rounds == 0)
+        #expect(
+            !metrics.costInputs.contains { $0.decodeRowBucket == 1 && $0.depth == 0 },
+            "a target-only controller must not pay for a baseline it cannot use")
     }
 }

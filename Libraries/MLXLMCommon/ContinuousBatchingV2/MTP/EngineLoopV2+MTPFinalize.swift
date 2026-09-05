@@ -59,10 +59,20 @@ extension EngineLoopV2 {
 
         guard let verify = round.verify else { return }
         let k = verify.k
+        // THE round's host sync. Nothing is queued behind it — MTP rounds do
+        // not chain — so this wait is the round's GPU time as the host sees
+        // it, and everything after it is the fixed cost.
+        let packetWaitStart = CBv2MTPRoundTiming.now()
         let host = verify.acceptancePacket.asArray(Int32.self)
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
-        let draftCount = verify.rows.count * k
-        let targetWidth = 1 + k
+        round.timing.packetWaitNanos = CBv2MTPRoundTiming.since(packetWaitStart)
+        let acceptWalkStart = CBv2MTPRoundTiming.now()
+        defer {
+            mtp.recordRoundTiming(round.timing)
+            mtp.lastRoundFinalizeEndNanos = CBv2MTPRoundTiming.now()
+        }
+        let layout = verify.layout
+        let targetWidth = layout.targetWidth
         var anyRejected = false
 
         struct RowOutcome {
@@ -97,9 +107,11 @@ extension EngineLoopV2 {
                 continue
             }
             let rec = scheduler.record(for: id)!
-            let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
+            let drafts = (0 ..< k).map {
+                Int(host[layout.draftIndex(row: batchIndex, position: $0)])
+            }
             let targets = (0 ..< targetWidth).map {
-                Int(host[draftCount + batchIndex * targetWidth + $0])
+                Int(host[layout.targetIndex(row: batchIndex, column: $0)])
             }
 
             var accepted = 0
@@ -139,6 +151,9 @@ extension EngineLoopV2 {
                 observedDrafts: observedDrafts,
                 decodeRowBucket: mtp.planDecodeRowBucket)
         }
+
+        round.timing.acceptWalkNanos = CBv2MTPRoundTiming.since(acceptWalkStart)
+        let rowFinalizeStart = CBv2MTPRoundTiming.now()
 
         for outcome in outcomes {
             let batchIndex = outcome.batchIndex
@@ -257,9 +272,40 @@ extension EngineLoopV2 {
             }
 
             let observedAccepted = min(accepted, confirmed)
+            // Acceptance/rollback audit record (observability, 2026-08-25):
+            // every value is already on the host at this boundary. The
+            // scheduler fields are read AFTER recordSampled/rollbackComputed
+            // above, so the record states the row's post-round accounting —
+            // the boundary invariant a consumer checks is
+            // `numComputedAfter == tokensCountAfter - 1`.
             mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed)
+                drafted: k, accepted: observedAccepted, emitted: confirmed,
+                audit: CBv2MTPRoundAuditRecord(
+                    requestID: id.raw,
+                    k: k,
+                    draftTokens: Array(
+                        host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
+                    targetTokens: outcome.targets,
+                    accepted: accepted,
+                    confirmed: confirmed,
+                    rejected: rejected,
+                    tokensCountAfter: rec.tokens.count,
+                    numComputedAfter: rec.numComputedTokens,
+                    generatedAfter: rec.generatedTokenCount,
+                    finishReason: finishReason.map { String(describing: $0) }))
             let rejectionObserved = accepted < k && confirmed > accepted
+            // Instrumentation for tree drafting: the divergence is at draft
+            // position `accepted`, where `drafts[accepted] != targets[accepted]`.
+            // Ask whether the drafter's runner-up from that same forward WAS
+            // the target's token. Gated on `rejectionObserved` so a round cut
+            // short by a stop token or the output budget — which never reached
+            // the comparison — cannot bias `r` toward zero.
+            if rejectionObserved, layout.runnerUpsBase != nil {
+                let runnerUp = Int(
+                    host[layout.runnerUpIndex(row: batchIndex, position: accepted)])
+                mtp.recordRunnerUp(
+                    position: accepted, hit: runnerUp == outcome.targets[accepted])
+            }
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k
             mtp.observeRequestAcceptance(
@@ -293,8 +339,8 @@ extension EngineLoopV2 {
                 // head for that round.
                 var carryShortlist: MLXArray?
                 if let shortlistIDs = verify.shortlistIDs {
-                    let massBase = draftCount + verify.rows.count * targetWidth
-                    let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
+                    let mass = host[
+                        layout.shortlistMassIndex(row: batchIndex, column: hiddenColumn)]
                     if mass >= Self.mtpShortlistMassThresholdPPM {
                         carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
                     }
@@ -329,5 +375,6 @@ extension EngineLoopV2 {
         if anyRejected {
             eagerCompositionStale = true
         }
+        round.timing.rowFinalizeNanos = CBv2MTPRoundTiming.since(rowFinalizeStart)
     }
 }

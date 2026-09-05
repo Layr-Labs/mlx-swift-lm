@@ -117,7 +117,8 @@ extension EngineLoopV2 {
     }
 
     func mtpBuildRoundGraph(
-        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
+        timing: inout CBv2MTPRoundTiming
     ) -> CBv2MTPGraphBuild {
         var cacheInnerState: [MLXArray] = []
         var logprobSegments: [CBv2StepLogprobs] = []
@@ -322,7 +323,8 @@ extension EngineLoopV2 {
 
         let verifyRows = work.filter { $0.carry != nil }
         let verify = mtpBuildVerifyGraph(
-            verifyRows, driver: mtp, cacheInnerState: &cacheInnerState)
+            verifyRows, driver: mtp, cacheInnerState: &cacheInnerState,
+            timing: &timing)
 
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
@@ -384,9 +386,12 @@ extension EngineLoopV2 {
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
-        cacheInnerState: inout [MLXArray]
+        cacheInnerState: inout [MLXArray],
+        timing: inout CBv2MTPRoundTiming
     ) -> CBv2MTPRoundInFlight.Verify? {
         guard !verifyRows.isEmpty else { return nil }
+        timing.rounds = 1
+        let captureStart = CBv2MTPRoundTiming.now()
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
@@ -442,9 +447,13 @@ extension EngineLoopV2 {
         }
 
         mtpFreezeCaptures(captured)
+        timing.captureNanos = CBv2MTPRoundTiming.since(captureStart)
+        let draftBuildStart = CBv2MTPRoundTiming.now()
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
+        var runnerUpSteps: [MLXArray] = []
+        runnerUpSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
@@ -487,17 +496,59 @@ extension EngineLoopV2 {
             }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
+            // Runner-up INSTRUMENTATION, not a second draft. This head scores
+            // the whole vocabulary every step, so its rank-2 token is already
+            // paid for; asking for it costs one masked argmax over logits the
+            // forward produced anyway. Nothing in the round branches on it —
+            // it rides the acceptance packet and is counted at finalize, so
+            // the emitted stream is bit-identical with or without it. It
+            // answers the one question tree drafting turns on: when the chain
+            // is rejected, how often WAS the runner-up the target's token
+            // (`CBv2MTPMetrics.runnerUpHitRate`, and see `CBv2MTPTreeShape`).
+            // [engage] MTPLX_MTP_RUNNER_UP_INSTRUMENT, default OFF. This is
+            // instrumentation, not drafting, and it sits on the round's
+            // critical path where nothing overlaps it — see the switch.
+            let wantsRunnerUps =
+                CBv2MTPRoundSwitches.runnerUpInstrument
+                && k > 0 && mtp.drafter.maximumDraftCandidates >= 2
             var draftInput = seedColumn
             var draftHidden = concatenated(carryHiddens, axis: 0)
             for _ in 0 ..< k {
-                let (next, nextHidden) = mtp.drafter.draftStep(
-                    tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                let next: MLXArray
+                let nextHidden: MLXArray
+                var runnerUp: MLXArray? = nil
+                if wantsRunnerUps {
+                    let step = mtp.drafter.draftStepCandidates(
+                        tokens: draftInput, hidden: draftHidden, prepared: prepared,
+                        candidates: 2)
+                    // Rank 0 is the drafter's own `argMax`, so this column is
+                    // the same token `draftStep` would have returned.
+                    next = step.tokens[0..., 0 ..< 1].reshaped([-1])
+                    runnerUp = step.tokens[0..., 1 ..< 2].reshaped([-1])
+                    nextHidden = step.hidden
+                } else {
+                    let step = mtp.drafter.draftStep(
+                        tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                    next = step.tokens
+                    nextHidden = step.hidden
+                }
+                // [engage] MTPLX_MTP_PIPELINED_DRAFT_SUBMIT: start this
+                // forward on the GPU while the host builds the next one and
+                // the verify graph, instead of leaving the whole round
+                // unsubmitted until executeMTPRound's single asyncEval.
+                // Nonblocking; the same arrays still ride the round's
+                // finalize fence, so the emitted stream is unchanged.
+                if CBv2MTPRoundSwitches.pipelinedDraftSubmit {
+                    asyncEval([next, nextHidden] + (runnerUp.map { [$0] } ?? []))
+                }
                 draftSteps.append(next)
+                if let runnerUp { runnerUpSteps.append(runnerUp) }
                 draftInput = next.reshaped([batch, 1])
                 draftHidden = nextHidden
             }
         }
         let draftIDs = stacked(draftSteps, axis: 1)
+        timing.draftBuildNanos = CBv2MTPRoundTiming.since(draftBuildStart)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -506,6 +557,7 @@ extension EngineLoopV2 {
         // Windowed rows stage provisional writes; other supported storage
         // backends implement the transaction hooks as exact no-ops/rollback.
         let verifyStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let verifyBuildStart = CBv2MTPRoundTiming.now()
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
@@ -518,14 +570,25 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
+        timing.verifyBuildNanos = CBv2MTPRoundTiming.since(verifyBuildStart)
+        // Segment order is append-only; `CBv2MTPAcceptancePacketLayout` owns
+        // the offsets both this builder and `finalizeMTPRound` read.
+        let layout = CBv2MTPAcceptancePacketLayout(
+            rows: batch, draftDepth: k,
+            hasShortlistMass: target.shortlist != nil,
+            hasRunnerUps: runnerUpSteps.count == k && k > 0)
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
+        }
+        if layout.runnerUpsBase != nil {
+            packetParts.append(stacked(runnerUpSteps, axis: 1).reshaped([-1]))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         return CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
+            layout: layout,
             acceptancePacket: acceptancePacket,
             draftIDs: draftIDs,
             lastHidden: target.hidden,

@@ -19,7 +19,7 @@ import Testing
 
 @testable import MLXLLM
 
-@Suite("CBv2MTPModelSeam", .serialized)
+@Suite("CBv2MTPModelSeam", .serialized, .fixtureRandomState)
 struct CBv2MTPModelSeamTests {
 
     // MARK: - Config fixtures
@@ -246,7 +246,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (a) Capture indices
 
     @Test func captureLayerIndices() throws {
-        MLXRandom.seed(0x517)
+        fixtureSeed(0x517)
         let model = Gemma4TextModel(try targetConfig())
         let layers = try #require(model.cbv2MTPCaptureLayers)
         #expect(layers.full == 2)
@@ -254,13 +254,13 @@ struct CBv2MTPModelSeamTests {
     }
 
     @Test func captureLayersNilWithoutSlidingLayer() throws {
-        MLXRandom.seed(0x517)
+        fixtureSeed(0x517)
         let model = Gemma4TextModel(try fullOnlyConfig())
         #expect(model.cbv2MTPCaptureLayers == nil)
     }
 
     @Test func adapterAnswersCaptureLayersAtRuntime() throws {
-        MLXRandom.seed(0x517)
+        fixtureSeed(0x517)
         let gemma = Gemma4TextModel(try targetConfig())
         let gemmaAdapter = CBv2SteppableLanguageModelAdapter(gemma)
         #expect(gemmaAdapter.mtpCaptureLayers == gemma.cbv2MTPCaptureLayers)
@@ -274,7 +274,7 @@ struct CBv2MTPModelSeamTests {
     }
 
     @Test func driverRejectsDrafterBoundToDifferentTargetInstance() throws {
-        MLXRandom.seed(0x518)
+        fixtureSeed(0x518)
         let boundTarget = Gemma4TextModel(try targetConfig())
         let engineTarget = Gemma4TextModel(try targetConfig())
         let assistant = try Gemma4AssistantDraftModel(config: drafterConfig())
@@ -292,7 +292,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (b) Logits parity: cbv2ForwardWithHidden vs plain forward
 
     @Test func forwardWithHiddenLogitsParity() throws {
-        MLXRandom.seed(0xBEEF)
+        fixtureSeed(0xBEEF)
         let config = try targetConfig()
         let model = Gemma4TextModel(config)
         eval(model)
@@ -344,7 +344,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (c) Drafter chain parity vs the v1 greedy chain
 
     @Test func drafterChainParityVsV1() throws {
-        MLXRandom.seed(0xD0D0)
+        fixtureSeed(0xD0D0)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
@@ -364,11 +364,19 @@ struct CBv2MTPModelSeamTests {
         // Mirror runGemma4MTPGreedyRound's draft chain exactly (that round
         // loop does not expose the raw draft ids).
         let driveOffset = legacyCache[0].offset
-        let positionOffset = Gemma4.PositionOffset.scalar(driveOffset)
+        // Mirror runGemma4MTPGreedyRound exactly, INCLUDING its split between
+        // the drafter's RoPE position (the last real key, under reference
+        // semantics) and the mask's offset (the true KV offset, always). This
+        // leg is a hand-rolled copy of that round because the round does not
+        // expose raw draft ids, so it has to track the same rule or it stops
+        // testing CBv2-vs-v1 parity and starts testing the copy.
+        let positionOffset = Gemma4.PositionOffset.scalar(
+            Gemma4MTPDrafterSemantics.draftQueryPosition(kvOffset: driveOffset))
         var v1Hidden = lastHiddenSlice(prefill.lastHidden)
         let masks = drafter.makeMasks(
             queryLen: 1, sharedKV: v1SharedKV,
-            positionOffset: positionOffset, dtype: v1Hidden.dtype)
+            positionOffset: Gemma4.PositionOffset.scalar(driveOffset),
+            dtype: v1Hidden.dtype)
         var v1Tok = MLXArray([Int32(v1Bonus)])[.newAxis, .ellipsis]
         var v1Drafts: [Int] = []
         for _ in 0 ..< k {
@@ -411,7 +419,7 @@ struct CBv2MTPModelSeamTests {
     // MARK: - (d) Batch invariance (padding + masks)
 
     @Test func batchedDraftsMatchSoloDrafts() throws {
-        MLXRandom.seed(0xFACE)
+        fixtureSeed(0xFACE)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
@@ -466,8 +474,8 @@ struct CBv2MTPModelSeamTests {
 
     // MARK: - (e) Official target-hidden and accepted-index semantics
 
-    @Test func targetConditioningHiddenIsPreFinalNorm() throws {
-        MLXRandom.seed(0xA55157)
+    @Test func targetConditioningHiddenMatchesReferenceSemantics() throws {
+        fixtureSeed(0xA55157)
         let config = try targetConfig()
         let target = Gemma4TextModel(config)
         eval(target)
@@ -483,12 +491,22 @@ struct CBv2MTPModelSeamTests {
             tokens, caches: rig.kvCaches([seamRow]))
         eval(postNorm, preNorm, conditioningHidden)
 
+        // The mlx-vlm reference feeds the drafter `speculative_draft_hidden(h)
+        // = model.norm(h)` (language.py:671-672, used at mtp.py:664/585), so
+        // under reference semantics the conditioning slot is the POST-norm
+        // hidden. This test previously asserted pre-norm, which encoded the
+        // engine's own claim that the `pre_projection` was trained against
+        // HF's `hidden_states` capture point — the cross-check falsified it.
+        // Both legs are pinned so the A/B switch cannot silently stop working.
+        let expectPostNorm = Gemma4MTPDrafterSemantics.referenceSemantics
+        let expected = expectPostNorm ? postNorm : preNorm
+        let rejected = expectPostNorm ? preNorm : postNorm
         #expect(
-            allClose(conditioningHidden, preNorm, rtol: 0, atol: 0).item(Bool.self),
-            "the assistant conditioning slot must be the decoder output before model.norm")
+            allClose(conditioningHidden, expected, rtol: 0, atol: 0).item(Bool.self),
+            "the assistant conditioning slot must match reference semantics")
         #expect(
-            !allClose(conditioningHidden, postNorm, rtol: 0, atol: 0).item(Bool.self),
-            "a post-final-norm hidden would silently change official assistant inputs")
+            !allClose(conditioningHidden, rejected, rtol: 0, atol: 0).item(Bool.self),
+            "the two hidden capture points must remain distinguishable")
     }
 
     @Test func lastAcceptedTokenUsesAcceptedDraftHiddenColumn() {
@@ -506,5 +524,73 @@ struct CBv2MTPModelSeamTests {
         let column = CBv2MTPHiddenIndex.carryColumn(
             targetOutputIndex: 2, draftDepth: depth)
         #expect(hidden[1, column, 0].item(Int32.self) == 6)
+    }
+
+    // MARK: - (e) The round carries the hidden through unmodified
+
+    /// `draftStep` may do exactly one thing to the carried hidden: concatenate
+    /// the target embedding onto it. Nothing else.
+    ///
+    /// A per-round cos/sin table used to be built by `prepare(rows:)` and
+    /// consumed here by a pre-rotation of the hidden. It never ran — the range
+    /// guard compares the drafter's query position against the table's anchor,
+    /// and under the reference semantics this stack ships the query sits one
+    /// position BEFORE that anchor — and on the two inputs that did reach it
+    /// (anchor 0, or `MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS=0`) it aborted the
+    /// process on a rank mismatch. It is deleted, and this is what stops it
+    /// coming back: rebuild the step through the drafter's own public entry
+    /// point with the hidden handed over untouched, and require the id and the
+    /// new hidden to match bit for bit. Any pre-transformation inside
+    /// `draftStep` moves both.
+    @Test("the drafter round carries the hidden through unmodified")
+    func drafterRoundCarriesTheHiddenThroughUnmodified() throws {
+        fixtureSeed(0xB0BA)
+        let config = try targetConfig()
+        let target = Gemma4TextModel(config)
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+        eval(target, drafter)
+
+        let prompt = makePromptTokens(length: 19, seed: 41, vocabSize: vocabSize)
+        let rig = CBv2Rig(config: config)
+        let rowState = try rig.newRow(promptLength: prompt.count)
+        let (logits, lastHidden) = target.cbv2ForwardWithHidden(
+            tokens2d(prompt), caches: rig.kvCaches([rowState]))
+        let bonus = greedyToken(logits)
+        let hidden = lastHiddenSlice(lastHidden)
+
+        let captureLayers = try #require(target.cbv2MTPCaptureLayers)
+        let capture = try rowCapture(rowState: rowState, captureLayers: captureLayers)
+        let cbDrafter = try Gemma4CBv2MTPDrafter(drafter: drafter, target: target)
+        let prepared = cbDrafter.prepare(rows: [capture])
+
+        let tokens = MLXArray([Int32(bonus)]).reshaped([1, 1])
+        let (stepTokens, stepHidden) = cbDrafter.draftStep(
+            tokens: tokens, hidden: hidden, prepared: prepared)
+
+        let inputsEmbeds = concatenated(
+            [target.embedTokensForDrafter(tokens), hidden], axis: -1)
+        let (referenceHidden, referenceLogits) = drafter(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: Gemma4SharedKV(
+                fullAttention: (capture.fullKeys, capture.fullValues),
+                slidingAttention: (capture.slidingKeys, capture.slidingValues)),
+            positionOffset: Gemma4.PositionOffset.batch(
+                MLXArray([
+                    Int32(
+                        Gemma4MTPDrafterSemantics.draftQueryPosition(
+                            kvOffset: capture.anchor))
+                ])))
+        let referenceTokens = referenceLogits.squeezed(axis: 1)
+            .argMax(axis: -1).asType(.int32)
+        eval(stepTokens, stepHidden, referenceTokens, referenceHidden)
+
+        #expect(
+            stepTokens.asArray(Int32.self) == referenceTokens.asArray(Int32.self),
+            "draftStep drafted a different id than the untransformed chain")
+        #expect(stepHidden.shape == referenceHidden.shape)
+        #expect(
+            stepHidden.asType(.float32).asArray(Float.self)
+                == referenceHidden.asType(.float32).asArray(Float.self),
+            "draftStep transformed the carried hidden")
     }
 }

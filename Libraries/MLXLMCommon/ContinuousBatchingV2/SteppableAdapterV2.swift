@@ -14,6 +14,18 @@
 import Foundation
 import MLX
 
+/// Model-level proof that an ordinary CBv2 decode output transitively
+/// consumes every K/V mutation performed by that forward. This is deliberately
+/// narrower than `LanguageModel`: an adapter cannot infer the dependency from
+/// a cache type alone.
+public protocol CBv2LanguageModelDecodeOutputCoversCacheMutations: AnyObject {}
+
+/// Local engagement diagnostic for the decode-root compaction, armed only by
+/// `MLXFAST_ENGAGE_MARKS` (the ranked runner sets no environment). Reading one
+/// static Bool keeps the disarmed path allocation-free.
+private let cbv2CompactDecodeRootMarksArmed =
+    ProcessInfo.processInfo.environment["MLXFAST_ENGAGE_MARKS"] != nil
+
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
@@ -29,6 +41,67 @@ public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
             !(model is any CBv2RecurrentLanguageModelForwardable),
             "CBv2 recurrent model requires explicit request-owned recurrent state")
         return model(tokens, cache: asKVCaches(caches))
+    }
+
+    /// Initial fail-closed decode compaction: only an affirming model over an
+    /// all-owning, all-contiguous bank with one shared position state. The
+    /// output root forces every K/V mutation; the post-forward position root
+    /// collapses the next-step offset chain; per-layer fences conservatively
+    /// retain explicit ordering for fused in-place sliding-ring writes.
+    public func compactDecodeEvaluationRoots(
+        forwardOutput: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> [MLXArray]? {
+        // Same conditions, same order, same nil returns as before; each is now its
+        // own guard so an armed run says WHICH one declined. Behaviour is
+        // unchanged when marks are disarmed (the default).
+        func decline(_ reason: String) {
+            guard cbv2CompactDecodeRootMarksArmed else { return }
+            CBv2EngageMark.once("compact-decode-roots DECLINED: \(reason)")
+        }
+        guard model is any CBv2LanguageModelDecodeOutputCoversCacheMutations else {
+            decline("model-does-not-affirm-output-covers-mutations"); return nil
+        }
+        let contiguous = caches.compactMap { $0 as? CBv2LayerCache }
+        guard !contiguous.isEmpty, contiguous.count == caches.count else {
+            decline("not-every-cache-is-CBv2LayerCache"); return nil
+        }
+        guard contiguous.allSatisfy({ $0.kind.sharesKVWithLayer == nil }) else {
+            decline("a-layer-shares-KV"); return nil
+        }
+        guard let rowCount = contiguous.first?.rows.count, rowCount > 0 else {
+            decline("no-rows"); return nil
+        }
+        guard contiguous.allSatisfy({ $0.rows.count == rowCount }) else {
+            decline("ragged-row-counts"); return nil
+        }
+        guard contiguous.allSatisfy({ cache in
+            cache.rows.allSatisfy {
+                $0 is any CBv2DecodeRootCompactionCapableSequenceKV
+            }
+        }) else {
+            decline("a-row-is-not-DecodeRootCompactionCapable"); return nil
+        }
+        guard let stateIdentity = contiguous[0].unifiedPositionStateIdentity else {
+            decline("no-unified-position-state-identity"); return nil
+        }
+        guard let offsets = contiguous[0].unifiedPositionOffsets else {
+            decline("no-unified-position-offsets"); return nil
+        }
+        guard contiguous.dropFirst().allSatisfy({
+            $0.unifiedPositionStateIdentity == stateIdentity
+        }) else {
+            decline("position-state-identity-differs-across-layers"); return nil
+        }
+
+        var roots = [forwardOutput, offsets]
+        roots.reserveCapacity(2 + contiguous.count)
+        roots.append(contentsOf: contiguous.map(\.decodeRingWriteFenceEvaluationRoot))
+        if cbv2CompactDecodeRootMarksArmed {
+            CBv2EngageMark.once(
+                "compact-decode-roots rows=\(rowCount) layers=\(contiguous.count) "
+                    + "roots=\(roots.count)")
+        }
+        return roots
     }
 
     private func asKVCaches(_ caches: [CBv2AttendingLayerCache]) -> [KVCache] {
@@ -424,5 +497,29 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
         return forwardable.cbv2ForwardWithHiddenCaptured(
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
             positionIds: positionIds)
+    }
+}
+
+// MARK: - Logitsless greedy head (LGH-001)
+
+/// Answered at RUNTIME like the multimodal/MTP capabilities: only
+/// `CBv2ArgmaxDecodeForwardable` conformers can end a decode step in a fused
+/// top-1, and `admitsArgmaxDecode` gates every call, so a non-conforming model
+/// keeps the full-logits `forward` contract untouched.
+extension CBv2SteppableLanguageModelAdapter: CBv2ArgmaxDecodeSteppableModel {
+
+    public func admitsArgmaxDecode(tokens: MLXArray) -> Bool {
+        (model as? CBv2ArgmaxDecodeForwardable)?.cbv2AdmitsArgmaxDecode(tokens) ?? false
+    }
+
+    public func decodeArgmax(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray {
+        guard let forwardable = model as? CBv2ArgmaxDecodeForwardable else {
+            preconditionFailure(
+                "CBv2 argmax decode: \(type(of: model)) is not CBv2ArgmaxDecodeForwardable "
+                    + "— engine gating failed")
+        }
+        return forwardable.cbv2DecodeArgmax(tokens, caches: asKVCaches(caches))
     }
 }

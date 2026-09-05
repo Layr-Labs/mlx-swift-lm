@@ -89,6 +89,15 @@ final class CBv2MTPDepthController {
             }
         }
 
+        /// Raw observation count at one draft position. `rate(at:)` hides this
+        /// behind the trusted-sample gate; the probe cadence needs the count
+        /// itself, to tell a probe that bought new evidence from one that did
+        /// not.
+        func samples(at position: Int) -> Int {
+            guard position > 0, position < seen.count else { return 0 }
+            return seen[position]
+        }
+
         func rate(at position: Int) -> Double {
             if position > 0, position < seen.count,
                 seen[position] >= CBv2MTPDepthController.acceptanceMinSamples
@@ -144,14 +153,32 @@ final class CBv2MTPDepthController {
 
     private struct BucketState {
         var costs: [Int: CostState] = [:]
+        /// What it costs to LEAVE depth zero: one seed step, claimed by the
+        /// verify round it prepared. Kept out of `costs` on purpose -- see
+        /// `observeTransitionCost`.
+        var transitionCost = CostState()
         var acceptance = AcceptanceState()
-        var activeDepth = 0
+        /// nil until a non-exploration round completes. See `decide`.
+        var activeDepth: Int?
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
         var roundsSinceProbe = 0
+        /// Depth of the most recent exploration, and the acceptance-sample
+        /// count that depth carried at the time. Together they answer "did the
+        /// last probe buy new evidence?", which is what gates the backoff.
+        var lastProbedDepth = 0
+        var lastProbeEvidence = 0
     }
 
     let maxDepth: Int
     let fixedDepth: Int?
+
+    /// True when this controller can never return a positive depth, whatever
+    /// the plan looks like: the trusted envelope is zero, or the integrator
+    /// pinned a fixed depth of zero. Both are configuration, fixed for the
+    /// controller's lifetime. NOT a policy switch — a positive envelope with
+    /// no fixed pin always adapts, and there is no constant that turns
+    /// speculation off for a configuration that asked for it.
+    var isTargetOnly: Bool { maxDepth == 0 || fixedDepth == 0 }
     private var buckets: [Int: BucketState] = [:]
     private var lastDecision = CBv2MTPDepthDecision(
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
@@ -184,6 +211,36 @@ final class CBv2MTPDepthController {
         buckets[decodeRowBucket] = state
     }
 
+    /// Record the seed step that a positive-depth round had to run because it
+    /// had no carry.
+    ///
+    /// This is deliberately NOT folded into `costs[depth]`. `goodput(d)`
+    /// answers "what rate will I sustain if I serve at depth d", which is a
+    /// steady-state question, and the steady state of a positive depth does
+    /// not seed: `EngineLoopV2+MTPFinalize` stores a fresh carry on every
+    /// verify round that confirmed a token, partial rejections included, and
+    /// only a depth-zero plan invalidates carries (`beginMTPPlan`). The seed is
+    /// therefore a one-off transition cost, and charging a one-off to a
+    /// recurring rate is both a category error and self-reinforcing: selecting
+    /// depth zero is what forces the next probe to seed.
+    ///
+    /// It is recorded rather than dropped so the transition price stays
+    /// visible, and so the hysteresis margin -- the thing that actually bounds
+    /// how often a transition is paid -- can be argued against a measured
+    /// number instead of an assumed one.
+    func observeTransitionCost(decodeRowBucket: Int, nanos: UInt64) {
+        guard decodeRowBucket > 0, nanos > 0 else { return }
+        var state = buckets[decodeRowBucket] ?? BucketState()
+        state.transitionCost.observe(nanos)
+        buckets[decodeRowBucket] = state
+    }
+
+    func transitionCostNanosForTesting(decodeRowBucket: Int) -> UInt64 {
+        guard let state = buckets[decodeRowBucket], state.transitionCost.samples > 0
+        else { return 0 }
+        return UInt64(max(0, state.transitionCost.ewmaNanos.rounded()))
+    }
+
     func observeCost(decodeRowBucket: Int, depth: Int, wallTimeNanos: UInt64) {
         guard decodeRowBucket > 0, depth >= 0, depth <= maxDepth, wallTimeNanos > 0 else {
             return
@@ -200,6 +257,10 @@ final class CBv2MTPDepthController {
     /// required per bucket; ordinary target-only steps may keep chaining
     /// after the baseline exists.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
+        // A controller that can never select a positive depth has nothing to
+        // compare the baseline against, so the probe would cost a broken
+        // decode chain for a number no decision reads.
+        guard !isTargetOnly else { return false }
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
     }
@@ -251,8 +312,13 @@ final class CBv2MTPDepthController {
         return true
     }
 
+    /// The depth this bucket is serving at. A bucket that has not completed a
+    /// non-exploration round reports 0, as it did before the incumbent became
+    /// optional.
     func activeDepthForTesting(decodeRowBucket: Int) -> Int {
-        buckets[decodeRowBucket]?.activeDepth ?? 0
+        guard let state = buckets[decodeRowBucket], let depth = state.activeDepth
+        else { return 0 }
+        return depth
     }
 
     func probeIntervalForTesting(decodeRowBucket: Int) -> Int {
@@ -310,19 +376,42 @@ final class CBv2MTPDepthController {
         }
 
         let state = buckets[bucket] ?? BucketState()
-        let limit = min(maxDepth, state.acceptance.frontier + 1)
+        // The acceptance frontier caps the envelope only once it has started to
+        // move. On a fresh bucket the frontier is 0, and capping there would
+        // hold the opening decisions at depth 0 or 1 while the stream climbs
+        // back to a depth the envelope was already tested at.
+        let limit =
+            state.acceptance.frontier > 0
+            ? min(maxDepth, state.acceptance.frontier + 1)
+            : maxDepth
         let decision: CBv2MTPDepthDecision
 
-        if state.costs[0] == nil {
+        if state.costs.isEmpty {
+            // OPEN AT THE CEILING. The tested default for this envelope is its
+            // deepest arm, so start there and require evidence to come DOWN,
+            // rather than starting at 0 and requiring evidence to go up. The
+            // depth-0 baseline is still sampled — it is the last rung of the
+            // downward scan below — because `goodput(0)` is zero without a cost
+            // sample and a controller that cannot price depth 0 can never
+            // decline to speculate.
             decision = CBv2MTPDepthDecision(
-                depth: 0, decodeRowBucket: bucket, reason: "warmup_baseline",
+                depth: maxDepth, decodeRowBucket: bucket, reason: "open_ceiling",
                 isExploration: true)
-        } else if let unsampled = (0 ... limit).first(where: { state.costs[$0] == nil }) {
+        } else if let unsampled = stride(from: limit, through: 0, by: -1)
+            .first(where: { state.costs[$0] == nil })
+        {
+            // Downward, so the envelope is priced from the ceiling to the
+            // floor. The depth-0 baseline is the last rung, not the first.
             decision = CBv2MTPDepthDecision(
                 depth: unsampled, decodeRowBucket: bucket, reason: "explore_cost",
                 isExploration: true)
         } else {
-            let current = min(state.activeDepth, limit)
+            // An unset bucket's incumbent is the ceiling, so hysteresis
+            // protects the opening depth and the controller must be SHOWN a
+            // reason to come down. Starting the incumbent at 0 would make
+            // hysteresis argue for depth 0 on a bucket that has never served a
+            // round.
+            let current = min(state.activeDepth ?? maxDepth, limit)
             let currentGoodput = goodput(depth: current, state: state)
             var best = current
             var bestGoodput = currentGoodput
@@ -350,11 +439,50 @@ final class CBv2MTPDepthController {
             var explore = false
             let nextRounds = state.roundsSinceProbe + 1
             if nextRounds >= state.probeInterval {
-                let probe = min(selected + 1, limit)
-                if probe > selected {
-                    selected = probe
-                    reason = "explore_deeper"
-                    explore = true
+                if state.acceptance.frontier >= maxDepth {
+                    // Every position in the envelope carries real acceptance
+                    // evidence. Rotate through the depths so a depth that
+                    // measured badly once stays revisitable and drift is seen
+                    // in both directions. Depth zero is excluded: a depth-zero
+                    // exploration on a chained step is rejected by
+                    // `recordFinalizedStep`, which would stall the cadence.
+                    let rotated =
+                        state.lastProbedDepth >= maxDepth
+                        ? 1 : max(state.lastProbedDepth + 1, 1)
+                    if rotated != selected {
+                        selected = rotated
+                        reason = "explore_rotate"
+                        explore = true
+                    }
+                } else {
+                    // Probe the FRONTIER, not the neighbour of the current
+                    // selection. The old rule was `min(selected + 1, limit)`,
+                    // and `limit` is itself `frontier + 1`, so with `selected`
+                    // resting at 0 the probe was always 1 and depth 2 was
+                    // unreachable however long the run: at THE TEST the
+                    // controller spent 1,018 decisions as
+                    // `{0: 1002, 1: 16}` while a fixed depth 4 ran 1.40x
+                    // serial on the same prompt.
+                    //
+                    // The frontier only advances once a position has been
+                    // DRAFTED `acceptanceMinSamples` times, so declining to
+                    // explore deeper was also declining to gather the evidence
+                    // that would justify it. Probing `limit` is what MAKES
+                    // that evidence, and the ratchet unwinds one position at a
+                    // time until the whole envelope is measured.
+                    //
+                    // This is only sound because goodput is NOT monotone in
+                    // depth: a round pays a fixed setup + verify overhead that
+                    // amortizes over the tokens it commits, so depth 1 can be
+                    // a genuine loss while depth 4 is the best arm on the
+                    // board. A hill-climb that stops at the first losing step
+                    // never learns that. See `CBv2MTPDepthSweepTests`.
+                    let probe = min(max(limit, selected + 1), maxDepth)
+                    if probe > selected {
+                        selected = probe
+                        reason = "explore_deeper"
+                        explore = true
+                    }
                 }
             }
             decision = CBv2MTPDepthDecision(
@@ -371,10 +499,34 @@ final class CBv2MTPDepthController {
     ) {
         if decision.isExploration {
             state.roundsSinceProbe = 0
-            if decision.reason == "explore_deeper" {
-                state.probeInterval = min(
-                    state.probeInterval * 2, Self.maxProbeInterval)
+            if decision.reason == "explore_deeper" || decision.reason == "explore_rotate" {
+                // Back off from a probe that taught us nothing new, not from
+                // every probe. While the acceptance frontier is short of the
+                // envelope and each probe is still buying a sample at its own
+                // position, doubling would starve the evidence the frontier
+                // waits on: ten samples per position at 8, 16, 32 ... 256 is
+                // thousands of rounds, i.e. never, inside one request.
+                //
+                // The budget this holds open is bounded by construction --
+                // `maxDepth * acceptanceMinSamples` productive probes, after
+                // which the frontier is complete and the original geometric
+                // backoff resumes to its 256 cap. A probe that adds no sample
+                // at its own position (acceptance died shallower) backs off
+                // immediately.
+                let position = decision.depth
+                let evidence = state.acceptance.samples(at: position)
+                let advancing =
+                    state.acceptance.frontier < maxDepth
+                    && position > 0
+                    && (position != state.lastProbedDepth
+                        || evidence > state.lastProbeEvidence)
+                state.probeInterval =
+                    advancing
+                    ? Self.baseProbeInterval
+                    : min(state.probeInterval * 2, Self.maxProbeInterval)
             }
+            state.lastProbedDepth = decision.depth
+            state.lastProbeEvidence = state.acceptance.samples(at: decision.depth)
             return
         }
         if decision.depth != state.activeDepth {
@@ -384,6 +536,8 @@ final class CBv2MTPDepthController {
         } else {
             state.roundsSinceProbe += 1
         }
+        // `activeDepth` is non-nil from here on, so the ceiling default in
+        // `decide` applies only until the bucket has served one round.
     }
 
     private func goodput(depth: Int, state: BucketState) -> Double {

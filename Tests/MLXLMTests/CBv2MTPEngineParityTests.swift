@@ -93,7 +93,7 @@ private final class CBv2MTPNoopConstraint: CBv2TokenConstraint, @unchecked Senda
     }
 }
 
-@Suite("CBv2MTPEngineParity", .serialized)
+@Suite("CBv2MTPEngineParity", .serialized, .fixtureRandomState)
 struct CBv2MTPEngineParityTests {
     private let vocabSize = 256
     private let hiddenSize = 64
@@ -173,7 +173,7 @@ struct CBv2MTPEngineParityTests {
     private func makeFixture(
         seed: UInt64 = 0x9A7E, deterministicTarget: Bool = false
     ) throws -> Fixture {
-        MLXRandom.seed(seed)
+        fixtureSeed(seed)
         let target = Gemma4TextModel(
             try targetConfig(tieWordEmbeddings: !deterministicTarget))
         let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())

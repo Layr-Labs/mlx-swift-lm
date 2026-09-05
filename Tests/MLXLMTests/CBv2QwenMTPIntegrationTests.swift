@@ -413,14 +413,28 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 257) == 5_148)
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 511) == 6_164)
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 512) == 8_216)
+        // `assistantStates` and the round driver's request maps are engine-thread
+        // confined: this engine's loop is live (EngineV2.init calls loop.start())
+        // and every step's publishGauges reads them through
+        // materializedAssistantBytes. Drive the mutators and readers ON the engine
+        // queue — exactly as the publishGauges call below — or the test thread
+        // races the step and tears `Array(assistantStates.values)`, sending
+        // `count` to a freed existential (NSInvalidArgumentException).
         let state = QwenMTPFixtureState()
         state.materializedBytes = 1_234
-        driver.restoreAssistantState(state, for: CBv2RequestID(403))
-        #expect(driver.materializedAssistantBytes() == 1_234)
         let detached = QwenMTPFixtureState()
         detached.materializedBytes = 321
-        #expect(driver.materializedAssistantBytes(detachedStates: [state, detached]) == 1_555)
-        driver.invalidateCarry(CBv2RequestID(403))
+        let (soloBytes, bytesWithDetached) = engine.loopForTesting.onEngineQueueSync {
+            () -> (Int, Int) in
+            driver.restoreAssistantState(state, for: CBv2RequestID(403))
+            let solo = driver.materializedAssistantBytes()
+            let both = driver.materializedAssistantBytes(
+                detachedStates: [state, detached])
+            driver.invalidateCarry(CBv2RequestID(403))
+            return (solo, both)
+        }
+        #expect(soloBytes == 1_234)
+        #expect(bytesWithDetached == 1_555)
         let id = CBv2RequestID(404)
         try engine.admissionForTesting.reserve(id: id, additionalTokens: 3)
         engine.loopForTesting.onEngineQueueSync {
@@ -1087,7 +1101,20 @@ struct CBv2QwenMTPIntegrationTests {
                 $0.depth != 1
             })
         recovered.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
-        #expect(recovered.planDecision.depth == 1)
+        // 4, not 1. This expectation encoded the controller's OLD exploration
+        // order, which climbed from zero and so probed depth 1 next. The
+        // controller now opens at the ceiling of the tested envelope and backs
+        // off, so `explore_cost` scans DOWNWARD for the deepest unsampled
+        // depth: with the cold depth-1 sample discarded, only depth 0 has a
+        // cost and the deepest unsampled arm is `maxDraftTokens` (4).
+        //
+        // Nothing about this test's subject moves. It is about a cold head
+        // sample being discarded and the next one being recorded cleanly, and
+        // `record(...)` names its own depth, so the assertions that carry the
+        // subject -- the discard, `samples == 1`, `ewma == 120` -- are
+        // unchanged and still pass.
+        #expect(recovered.planDecision.depth == 4)
+        #expect(recovered.planDecision.reason == "explore_cost")
         #expect(recovered.planDecision.isExploration)
         #expect(!recovered.shouldApplyMarginalPolicyToPlan)
 

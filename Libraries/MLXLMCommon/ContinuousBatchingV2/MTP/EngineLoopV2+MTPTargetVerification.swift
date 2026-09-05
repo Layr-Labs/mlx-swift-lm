@@ -182,9 +182,27 @@ extension EngineLoopV2 {
             hidden = concatenated(hiddenColumns, axis: 1)
 
         } else {
-            for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }
+            // [engage] MTPLX_MTP_FUSED_VERIFY_ATTENTION: ON by default on
+            // this branch, so the rectangle is scored in one attention call
+            // per layer rather than one per column. Set the variable to `0`
+            // for a serialized control arm. See the switch for why the
+            // serialized path makes the per-draft cost grow with context,
+            // and why contiguous storage is the only place this is offered.
+            // Fusing only pays from a measured width up: below it the extra
+            // host graph build costs more than the per-column KV re-reads it
+            // removes. `columns.count` is the verify width (1 + k).
+            let serializes =
+                !CBv2MTPRoundSwitches.fusesVerifyAttention(width: columns.count)
+                || backend.requiresMaterializedSnapshots
+            if serializes {
+                for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }
+            }
             defer {
-                for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
+                if serializes {
+                    for cache in serializingCaches {
+                        cache.mtpSerializesRectangularAttention = false
+                    }
+                }
             }
             let tokens = concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
@@ -260,9 +278,38 @@ extension EngineLoopV2 {
             }
         }
 
+        // CBV2-MTP-COMPACT-ROOTS: the plain decode step routes its roots
+        // through `compactDecodeEvaluationRoots`; the verify rectangle did
+        // not. `scores` is downstream of the whole verify forward, so forcing
+        // it forces every column; the compaction adds the unified offset
+        // chain and each layer's ring-write fence. `hidden` is kept as an
+        // explicit root because it leaves the round on the carry, not through
+        // `scores`. Anything the compaction declines falls back to the full
+        // list unchanged.
+        // The shared `compact-decode-roots` mark cannot tell the MTP verify apart from
+        // a plain decode step: at batch 1 both produce rows=1, layers=30 and the same
+        // root count, so `CBv2EngageMark.once` dedupes them to one line and the decode
+        // path (compaction default ON) always wins the race. This mark carries the
+        // verify width, so an armed run shows engagement per width.
+        let verifyRoots: [MLXArray]
+        if cbv2MTPCompactRootsEnabled {
+            if let compact = model.compactDecodeEvaluationRoots(
+                forwardOutput: scores, caches: caches)
+            {
+                CBv2EngageMark.once(
+                    "mtp-compact-roots ENGAGED T=\(columns.count) "
+                        + "layers=\(caches.count) roots=\(compact.count + 1)")
+                verifyRoots = compact + [hidden]
+            } else {
+                CBv2EngageMark.once("mtp-compact-roots DECLINED T=\(columns.count)")
+                verifyRoots = eagerCacheInnerState(caches)
+            }
+        } else {
+            verifyRoots = eagerCacheInnerState(caches)
+        }
         return (
             scores, hidden, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, recurrent)
+            verifyRoots + capturedInnerState, recurrent)
     }
 
     /// Top-`size` token ids per verify position plus their probability mass

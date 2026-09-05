@@ -2,6 +2,9 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Identity gather table for the sorted 64-assignment decode geometry.
+nonisolated(unsafe) private let switchDownIdentity64 = MLXArray((0..<64).map { UInt32($0) })
+
 // Port of https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/switch_layers.py
 
 /// Compiled SiLU-gated product (`silu(gate) * up`) for the common MoE GLU path.
@@ -112,25 +115,37 @@ public func resetWeightedExpertUnsortStats() {
 /// permutation and writes `[tokens, hidden]` directly, avoiding that full
 /// `[tokens, topK, hidden]` intermediate.
 private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
+    name: "weighted_expert_unsort_vec8_v3",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
+        typedef vec<T, 8> T8;
+        // One lane owns eight consecutive features (128-bit load/store), so the
+        // grid is an eighth as wide and each row read and store are one
+        // eight-wide vector. The hidden extent is `threads_per_grid.x * 8u`,
+        // which is 2816.
+        uint oct = thread_position_in_grid.x;
         uint token = thread_position_in_grid.y;
+        const uint hidden = threads_per_grid.x * 8u;
 
-        T accumulator = (T)0;
+        T8 accumulator = T8((T)0);
         const uint assignment_base = token * (uint)K;
         for (uint slot = 0; slot < (uint)K; ++slot) {
             const uint assignment = assignment_base + slot;
             const uint sorted_row = (uint)inverse_order[assignment];
+            const device T8* row = reinterpret_cast<const device T8*>(
+                sorted_outputs + sorted_row * hidden);
+            const T8 source = row[oct];
+            const float weight = (float)weights[assignment];
             // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 8; ++j) {
+                const T weighted = (T)((float)source[j] * weight);
+                accumulator[j] = accumulator[j] + weighted;
+            }
         }
-        output[token * threads_per_grid.x + feature] = accumulator;
+        reinterpret_cast<device T8*>(output + token * hidden)[oct] =
+            accumulator;
     """,
     ensureRowContiguous: true
 )
@@ -171,11 +186,43 @@ public func weightedExpertUnsort(
             ("T", sortedOutputs.dtype),
             ("K", 8),
         ],
-        grid: (hidden, tokens, 1),
-        threadGroup: (64, 4, 1),
+        // vec8 kernel: one lane owns eight consecutive features, so the
+        // x extent is hidden / 8 (the kernel derives hidden back as
+        // threads_per_grid.x * 8). Kept generic in `hidden` rather than the
+        // engine's hard-coded 2816 / 352 so non-Gemma callers still work.
+        grid: (hidden / 8, tokens, 1),
+        threadGroup: (32, 4, 1),
         outputShapes: [[tokens, hidden]],
         outputDTypes: [.bfloat16]
     )[0]
+}
+
+/// Exact sorted expert rows whose ordered top-K reduction is intentionally
+/// deferred to a downstream fused consumer.
+///
+/// Keeping this carrier explicit prevents generic callers from mistaking
+/// `[assignments, hidden]` for the already-reduced `[tokens, hidden]` result.
+public struct DeferredWeightedExpertRows {
+    public let sortedOutputs: MLXArray
+    public let inverseOrder: MLXArray
+    public let weights: MLXArray
+
+    init(sortedOutputs: MLXArray, inverseOrder: MLXArray, weights: MLXArray) {
+        self.sortedOutputs = sortedOutputs
+        self.inverseOrder = inverseOrder
+        self.weights = weights
+    }
+}
+
+/// Materialize a deferred carrier through the established reduction. Used only
+/// when a downstream fused consumer declines after the producer was selected.
+public func resolveDeferredWeightedExpertRows(
+    _ rows: DeferredWeightedExpertRows
+) -> MLXArray {
+    weightedExpertUnsort(
+        sortedOutputs: rows.sortedOutputs,
+        inverseOrder: rows.inverseOrder,
+        weights: rows.weights)
 }
 
 
@@ -237,9 +284,360 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     return body
 }()
 
-public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+/// GELU-FUSE: the SAME body, compiled WITHOUT `shapeless`, for the routed
+/// expert's pinned decode signatures only. Shapeless tracing adds broadcast
+/// nodes on every binary op that a shape-specialised trace omits on equal
+/// shapes; those nodes push this expression past MLX's fusion depth limit and
+/// split it into two Metal kernels with a materialised intermediate. The
+/// shape-specialised trace fits and emits one.
+private let compiledGeGLUShaped: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+    let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        (gate: MLXArray, up: MLXArray) -> MLXArray in
+        (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
+    }
+    if MLXHardwareInfo.isCompiledDecodeSupported {
+        return compile(body)
+    }
+    return body
+}()
+
+/// GELU-FUSE-PREFILL: a bounded set of additionally admitted shapes.
+///
+/// GELU-FUSE left prefill on the shapeless closure for one stated reason — a
+/// shape-specialised compile adds a compiler-cache entry per distinct input
+/// shape, the lookup is a linear scan, and prefill row counts vary per prompt,
+/// so an unbounded admission would keep growing the scan the decode hot path
+/// walks. That reason is about the *number* of entries, not about prefill, so a
+/// hard cap answers it directly: at most ``shapedGeluPrefillShapeCap`` distinct
+/// rectangles are ever admitted, and the cap+1st falls open to the shapeless
+/// closure forever after.
+///
+/// The decode signatures are matched before this is consulted, so the decode
+/// plane never takes the lock and never sees a behaviour change.
+public final class ShapedGeluPrefillShapes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var shapes: [[Int]] = []
+    private let cap: Int
+
+    public init(cap: Int) { self.cap = cap }
+
+    @inline(__always)
+    public func admits(_ shape: [Int]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if shapes.contains(shape) { return true }
+        guard shapes.count < cap else { return false }
+        shapes.append(shape)
+        return true
+    }
+}
+
+/// Four is one more than the distinct rectangles a cohort prefill produces (the
+/// full batched step, a short final chunk, and the single-stream local verb).
+public let shapedGeluPrefillShapeCap = 4
+
+/// Smallest rectangle worth a cache entry. The prefill routed-expert plane is
+/// 65,536 rows; every speculative verify width is at most 256, so nothing in
+/// production lands near this floor from either side.
+public let shapedGeluPrefillMinElements = 1 << 20
+
+private let switchGeluPrefillFuseEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GELU_SHAPED_FUSE_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+private let switchGeluPrefillShapes = ShapedGeluPrefillShapes(
+    cap: shapedGeluPrefillShapeCap)
+
+@inline(__always)
+private func geGLUClaimsPrefill(_ gate: MLXArray, _ up: MLXArray) -> Bool {
+    guard switchGeluPrefillFuseEnabled,
+        gate.dtype == .bfloat16, up.dtype == .bfloat16,
+        gate.shape == up.shape,
+        gate.size >= shapedGeluPrefillMinElements,
+        switchGeluPrefillShapes.admits(gate.shape)
+    else { return false }
+    CBv2EngageMark.once("gelu-shaped-prefill-experts")
+    return true
+}
+
+@inline(__always)
+private func geGLUProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    if geGLUClaimsPrefill(gate, up) {
+        return compiledGeGLUShaped(gate, up)
+    }
+    return compiledGeGLU(gate, up)
+}
+
+private let routeSortTile64 = 64
+/// Key-space bound of the fused scatter's 256-entry counter table.
+let routeCountingSortKeyBound = 256
+
+// MARK: - PREFILL-CSORT-128 (general-geometry exact stable counting sort)
+
+/// Exact stable counting sort for the GENERAL MoE route geometry — the
+/// prefill/verification tables that ROUTE-CSORT-64 refuses (it is retiled for
+/// the n = 64 eight-row decode cohort and pays an O(n) rescan per tile).
+///
+/// Where the census puts it: in the packed 8x1024 prefill window MLX's generic
+/// `argSort` over the flattened route table (`partition_mbsort` +
+/// `merge_mbsort`, ~10 dispatches per layer x 30 layers, twice — once for
+/// `order`, once for the inverse) costs 392.6 ms of 5508 ms on the M4 (7.2%).
+/// Sorts are latency/memory bound, so they do not shrink with the ranked box's
+/// NAX GEMM speedup: the same census projects the ROUTE bucket to 19-36% of the
+/// sealed 1.254 s M5 prefill window. This lane deletes the sort, not shrinks it.
+///
+/// Three dispatches, no comparisons:
+///   1. `_hist_v1`    — one threadgroup per 256-key block builds a 256-entry
+///                      threadgroup histogram (commutative integer atomics) and
+///                      writes it to `H[block][key]`.
+///   2. `_scan_v1`    — ONE threadgroup: thread `e` sums `H[.][e]` over blocks
+///                      to get `total[e]`, a simd exclusive prefix over the 256
+///                      totals gives the global bin base `base[e]`, and a second
+///                      pass writes `O[block][e] = base[e] + sum_{b<block} H[b][e]`.
+///   3. `_scatter_v1` — one threadgroup per block stages the block's 256 keys in
+///                      threadgroup memory; thread `k` counts how many earlier
+///                      keys IN ITS OWN BLOCK carry its key (`rank`) and lands at
+///                      `pos = O[block][key] + rank`.
+///
+/// Exactness (why this is `argSort`-identical, not merely equal on tests): for
+/// the key at flat index `idx` in block `b`, `O[b][key] + rank` is by
+/// construction `#{keys with a smaller expert} + #{equal keys at a smaller flat
+/// index}`, which is exactly the rank of `idx` under a STABLE sort by key. The
+/// vendored merge argsort is stable at every stage (thread sort swaps only on
+/// strictly-less, the merge prefers A on ties), so its tie order is input order
+/// too — the two permutations agree for EVERY input, not just tested ones.
+/// At the single write point every downstream index product is already known:
+/// `idx / m` is `order.floorDivide(m)`, the key IS `indices[order]`, and `pos`
+/// is the inverse-permutation entry for `idx` (`argSort(order)`), so three
+/// dispatches replace `argSort` -> `floorDivide` -> take -> `argSort` with
+/// byte-identical integer outputs and every consumer (the `gather_qmm`
+/// `rhsIndices`/`lhsIndices`, `weightedExpertUnsort`, `scatterUnsort`) is
+/// untouched.
+///
+/// The counter table is a fixed 256 entries wide regardless of `numExperts`, so
+/// no expert count is baked into any kernel: bins above `numExperts` simply hold
+/// zero and contribute nothing to the bases. Callers must still prove keys are
+/// below that width via the `numExperts` guard (`routeCountingSortKeyBound`).
+///
+/// Every kernel indexes its inputs linearly, so all three ask MLX for
+/// `ensureRowContiguous` — free for the contiguous route tables production
+/// actually hands us (MLX skips the copy when the flag is already set) and a
+/// hard guarantee for anything else that ever reaches this helper.
+///
+/// Kill switch: `DARKBLOOM_ROUTE_CSORT_PREFILL` set to `0`/`false`/`no`/`off`
+/// restores the `argSort` chain. Engage mark: `route-csort-prefill`.
+private let routeCsortPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_ROUTE_CSORT_PREFILL"]
+    else { return true }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// Keys per histogram/scatter block.
+private let routeCsortPrefillBlock = 256
+/// Counter-table width; must equal ``routeCountingSortKeyBound`` and the 256
+/// threads per threadgroup the three kernels launch with.
+private let routeCsortPrefillWidth = 256
+/// Largest `n` accepted. Positions, block offsets and grid extents are uint32 /
+/// Int32 on the Metal side; this bound keeps every one of them representable
+/// with room to spare and is ~4000x the largest production route table.
+private let routeCsortPrefillMaxKeys = 1 << 28
+
+private let routeCsortPrefillHistKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_hist_v1",
+    inputNames: ["keys"],
+    outputNames: ["block_hist"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        threadgroup atomic_uint tg_count[WIDTH];
+        atomic_store_explicit(&tg_count[k], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint idx = b * BLOCK + k;
+        if (idx < n) {
+            atomic_fetch_add_explicit(
+                &tg_count[keys[idx]], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Integer adds commute, so the table is identical for every
+        // interleaving the hardware picks.
+        block_hist[b * WIDTH + k] =
+            atomic_load_explicit(&tg_count[k], memory_order_relaxed);
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortPrefillScanKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scan_v3",
+    inputNames: ["block_hist"],
+    outputNames: ["block_offset"],
+    source: """
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint e = thread_position_in_threadgroup.x;
+        uint simd_id = e / 32;
+        uint lane = e % 32;
+        uint nblocks = (uint)block_hist_shape[0];
+        uint total = 0u;
+        // Admission proves every key is below NE, so columns at or above it are
+        // zero in every block and cannot contribute to the total. Skipping the
+        // accumulation retires whole SIMD groups at once when the counter table
+        // is wider than the model's expert count.
+        if (e < (uint)NE) {
+            for (uint b = 0; b < nblocks; ++b) {
+                total += block_hist[b * WIDTH + e];
+            }
+        }
+        // Global bin base: exclusive prefix over the 256 expert totals.
+        uint lane_excl = simd_prefix_exclusive_sum(total);
+        threadgroup uint simd_totals[8];
+        if (lane == 31) {
+            simd_totals[simd_id] = lane_excl + total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint running = 0u;
+        for (uint s = 0; s < simd_id; ++s) {
+            running += simd_totals[s];
+        }
+        running += lane_excl;
+        // Exclusive scan over blocks for this expert, offset by the bin base.
+        // Column `e` of `block_offset` is read by the scatter only as
+        // `block_offset[b * WIDTH + key]` for a key that occurs in block `b`,
+        // so a column whose global total is zero is never read and need not be
+        // written. The counter table is 256 wide while the model routes 128
+        // experts, so at minimum half the columns are unconditionally dead.
+        if (total > 0u) {
+            for (uint b = 0; b < nblocks; ++b) {
+                block_offset[b * WIDTH + e] = running;
+                running += block_hist[b * WIDTH + e];
+            }
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+private let routeCsortPrefillScatterKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "mlx_lm_route_csort128_scatter_v1",
+    inputNames: ["keys", "block_offset"],
+    outputNames: ["row_order", "sorted_keys", "inverse_order"],
+    source: """
+        constexpr uint BLOCK = \(routeCsortPrefillBlock);
+        constexpr uint WIDTH = \(routeCsortPrefillWidth);
+        uint b = threadgroup_position_in_grid.x;
+        uint k = thread_position_in_threadgroup.x;
+        uint n = keys_shape[0];
+        uint idx = b * BLOCK + k;
+        // Tail block: the sentinel is outside the proven key space (keys are
+        // below the 256-wide counter table), so it can never tie a real key.
+        uint key = (idx < n) ? keys[idx] : 0xffffffffu;
+        threadgroup uint tg_keys[BLOCK];
+        tg_keys[k] = key;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (idx < n) {
+            // Stable local rank: earlier keys in this block only. Read in
+            // index order from threadgroup memory, so no write position ever
+            // depends on scheduling.
+            uint rank = 0u;
+            for (uint j = 0; j < k; ++j) {
+                rank += (tg_keys[j] == key) ? 1u : 0u;
+            }
+            uint pos = block_offset[b * WIDTH + key] + rank;
+            row_order[pos] = idx / (uint)M;
+            sorted_keys[pos] = key;
+            inverse_order[idx] = pos;
+        }
+        """,
+    ensureRowContiguous: true
+)
+
+/// Exact stable counting sort of a flat uint32 route table. Returns nil (fail
+/// closed onto `argSort`) unless every precondition of the kernels holds.
+private func routeCountingSortPrefill(
+    _ indices: MLXArray, m: Int, numExperts: Int
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray)? {
+    let n = indices.size
+    guard routeCsortPrefillEnabled,
+        indices.dtype == .uint32,
+        indices.ndim == 1,
+        numExperts > 0,
+        numExperts <= routeCsortPrefillWidth,
+        numExperts <= routeCountingSortKeyBound,
+        m >= 1,
+        n > routeSortTile64,
+        n <= routeCsortPrefillMaxKeys
+    else { return nil }
+    CBv2EngageMark.once("route-csort-prefill")
+    let blocks = (n + routeCsortPrefillBlock - 1) / routeCsortPrefillBlock
+    let width = routeCsortPrefillWidth
+    let hist = routeCsortPrefillHistKernel(
+        [indices],
+        grid: (blocks * width, 1, 1),
+        threadGroup: (width, 1, 1),
+        outputShapes: [[blocks, width]],
+        outputDTypes: [.uint32]
+    )[0]
+    let offsets = routeCsortPrefillScanKernel(
+        [hist],
+        template: [("NE", numExperts)],
+        grid: (width, 1, 1),
+        threadGroup: (width, 1, 1),
+        outputShapes: [[blocks, width]],
+        outputDTypes: [.uint32]
+    )[0]
+    let outputs = routeCsortPrefillScatterKernel(
+        [indices, offsets],
+        template: [("M", m)],
+        grid: (blocks * width, 1, 1),
+        threadGroup: (width, 1, 1),
+        outputShapes: [[n], [n], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+/// GLUE-FOLD carrier: the exact decode route table (`row_order`,
+/// `sorted_keys`, `inverse_order`, each `[64]` uint32) computed upstream by a
+/// producer that already holds the router scores, so `projectExperts` never
+/// issues its standalone route-table dispatch. The arrays must be exactly what
+/// `gatherSortIndices` would have produced for the same `[8, 8]` indices --
+/// raw (untagged) sorted expert keys included -- and any shape, dtype or
+/// switch-state mismatch declines the carrier and re-issues the incumbent
+/// chain unchanged.
+public struct SwitchRouteTable {
+    public let rowOrder: MLXArray
+    public let sortedKeys: MLXArray
+    public let inverseOrder: MLXArray
+
+    public init(rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+        self.rowOrder = rowOrder
+        self.sortedKeys = sortedKeys
+        self.inverseOrder = inverseOrder
+    }
+}
+
+/// `numExperts` is the exclusive upper bound of the index key space. Callers
+/// that know it (SwitchGLU) pass it so PREFILL-CSORT-128 can prove its 256-entry
+/// counter table covers every key; the default (`Int.max`) fails closed onto the
+/// established `argSort` chain, which is what the generic MoE models that share
+/// this helper (GPTOSS, NemotronH) keep getting.
+public func gatherSort(
+    x: MLXArray, indices: MLXArray, numExperts: Int = Int.max
+) -> (MLXArray, MLXArray, MLXArray) {
     let m = indices.dim(-1)
     let indices = indices.flattened()
+    // PREFILL-CSORT-128: three dispatches with byte-identical outputs.
+    if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
+        return (
+            x.flattened(start: 0, end: -3)[fused.rowOrder],
+            fused.sortedKeys,
+            fused.inverseOrder
+        )
+    }
     let order = argSort(indices)
     let inverseOrder = argSort(order)
 
@@ -250,12 +648,192 @@ public func gatherSort(x: MLXArray, indices: MLXArray) -> (MLXArray, MLXArray, M
     )
 }
 
+/// PRENORM-GATHER: the sort of `gatherSort` without its gather. Returns the
+/// token row of every sorted position, the sorted expert keys and the inverse
+/// order, derived exactly as `gatherSort` derives them (the PREFILL-CSORT-128
+/// kernels when they admit, the `argSort` chain otherwise), so a producer that
+/// knows the inverse order can emit the sorted plane itself and the standalone
+/// gather of `x` is never issued.
+public func gatherSortOrder(
+    indices: MLXArray, numExperts: Int = Int.max
+) -> (rowOrder: MLXArray, sortedKeys: MLXArray, inverseOrder: MLXArray) {
+    let m = indices.dim(-1)
+    let indices = indices.flattened()
+    if let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts) {
+        return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+    }
+    let order = argSort(indices)
+    let inverseOrder = argSort(order)
+    return (order.floorDivide(m), indices[order], inverseOrder)
+}
+
+/// PRENORM-GATHER: a producer that emits the sorted expert plane
+/// `[assignments, 1, inputDims]` directly from the sort's inverse order, so
+/// `SwitchGLU` never issues its standalone gather of the activations it was
+/// handed. Returning `nil`, or a plane of any other shape or dtype, selects
+/// that gather.
+public typealias SwitchSortedPlaneProducer = (_ inverseOrder: MLXArray) -> MLXArray?
+
+/// `numExperts` is the exclusive upper bound of the index key space; callers
+/// that know it (SwitchGLU) pass it so the counting-sort fast path can prove
+/// its 256-entry counter table covers every key. The default (`Int.max`)
+/// fails closed onto the established `argSort` chain.
+public func gatherSortIndices(
+    indices: MLXArray, numExperts: Int = Int.max,
+    expertPrefixBounds: Bool = false
+) -> (MLXArray, MLXArray, MLXArray) {
+    let m = indices.dim(-1)
+    let indices = indices.flattened()
+    // PREFILL-CSORT-128 owns everything wider than the retiled decode cohort.
+    if numExperts <= routeCountingSortKeyBound,
+        let fused = routeCountingSortPrefill(indices, m: m, numExperts: numExperts)
+    {
+        return (fused.rowOrder, fused.sortedKeys, fused.inverseOrder)
+    }
+    let order = argSort(indices)
+    return (order.floorDivide(m), indices[order], argSort(order))
+}
+
 public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) -> MLXArray {
     var x = x[invOrder]
     if let shape {
         x = unflatten(x, axis: 0, shape: shape)
     }
     return x
+}
+
+/// When the expert gather groups its `(row, expert)` assignments by expert
+/// before issuing them, instead of visiting them row by row.
+///
+/// Grouping is what makes a multi-row expert pass read each SELECTED expert's
+/// weight block once for every row that chose it, rather than once per row.
+/// On a 128-expert / top-8 model that is the difference between a rectangular
+/// pass costing `rows * 8` weight reads and it costing the size of the
+/// expert UNION across those rows — under uniform routing
+/// `128 * (1 - (1 - 8/128)^rows)`, so 15.5 experts at 2 rows and 51.6 at 8,
+/// against 16 and 64 ungrouped.
+///
+/// REDUCTION ORDER IS UNCHANGED, and that is the whole exactness argument.
+/// Grouping permutes only the order in which `(row, expert)` products are
+/// COMPUTED. Every caller unsorts back to row-major
+/// (`scatterUnsort(..., shape: indices.shape)`) before the per-row weighted
+/// sum runs, so each row's K terms are still summed in slot order 0...K-1,
+/// with the same operands, whether or not the gather was grouped. No partial
+/// sum is ever accumulated across rows, and no row's terms are reassociated.
+///
+/// What that argument does NOT cover is the two MLX gather kernels
+/// themselves: `sortedIndices: true` and `sortedIndices: false` are different
+/// dispatches, and whether their per-dot-product accumulation is bit-identical
+/// is a property of MLX, not of this file. The sorted dispatch is already the
+/// production prompt path, so it is trusted at prompt shapes and merely
+/// uncertified at verify shapes. Treat that as the measured gate it is.
+///
+/// [engage] MTPLX_MTP_UNION_VERIFY
+public enum SwitchGLUExpertGrouping {
+    /// DEFAULT OFF, because every measurement this stack reports ran with
+    /// `MTPLX_MTP_UNION_VERIFY=0`.
+    ///
+    /// The union rule changes WHICH experts the verify rectangle gathers, so it
+    /// changes the arithmetic the rectangle performs. The 165.2 tok/s arm and
+    /// all of its parity data were produced with the rule off; "measured flat"
+    /// is a statement about throughput, not about output equivalence, and it
+    /// does not license shipping a different gather than the one whose tokens
+    /// were checked.
+    ///
+    /// `MTPLX_MTP_UNION_VERIFY=1` arms the grouped rule so the two costs can be
+    /// measured against each other in one window.
+    public static let unionAcrossRows: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_UNION_VERIFY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw)
+    }()
+
+    /// Token rows in an assignment tensor of ANY rank: `[rows, K]`,
+    /// `[B, S, K]`, or anything else whose last axis is the per-row expert
+    /// slot. Derived, never assumed from a particular caller's layout.
+    public static func rowCount(_ indices: MLXArray) -> Int {
+        let slots = max(1, indices.dim(-1))
+        return indices.size / slots
+    }
+
+    /// Whether to group, as a pure function of the two counts — testable
+    /// with no array and no device at all.
+    ///
+    /// The historic rule was `indices.size >= 64` alone. That number is a
+    /// proxy for "this is a prompt pass", and it is the only thing that stood
+    /// between an MTP rectangular verify and the grouping it wants: a
+    /// `[1, 1+k]` verify at batch 1 produces `(1+k) * 8` assignments, so
+    /// widths 1 through 7 fell under it and width 8 landed exactly on it —
+    /// the verify silently changed algorithm at one width.
+    ///
+    /// The added rule is a property of the work, not of a size: grouping can
+    /// only ever save reads when more than one row is choosing experts. One
+    /// row has no collisions to exploit and is left byte-identical, which is
+    /// what keeps ordinary decode untouched. Two or more rows have them, at
+    /// every width, every batch size and every context length.
+    public static func shouldGroup(
+        assignments: Int, rows: Int, unionAcrossRows: Bool
+    ) -> Bool {
+        if assignments >= historicGroupingThreshold { return true }
+        guard unionAcrossRows else { return false }
+        return rows > 1
+    }
+
+    /// The historic rule, kept exactly so `MTPLX_MTP_UNION_VERIFY=0` restores
+    /// the previous behaviour bit for bit.
+    public static let historicGroupingThreshold = 64
+
+    /// D3, staged for an A/B and OFF by default.
+    ///
+    /// The fused reduction (`weightedExpertUnsort`) folds the unsort into the
+    /// weighted sum and writes `[tokens, hidden]` directly, skipping the
+    /// scatter. Its precondition is that the gather was grouped — which, since
+    /// the grouping rule above, is now true at verify shapes too. Its
+    /// eligibility check nonetheless still demanded the `>= 64` prompt size,
+    /// so the verify could group and then not be allowed to use the reduction
+    /// that grouping unlocks.
+    ///
+    /// Unlike the grouping itself, this one REASSOCIATES: it sums each row's
+    /// terms in sorted order rather than in slot order, so it is a numerics
+    /// change, not a scheduling change. The suite that covers it at prompt
+    /// shapes matches the legacy path to a tolerance, not bit for bit. That is
+    /// why it is default off and why its arm needs a token-parity read, not
+    /// just a tok/s read.
+    ///
+    /// [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION
+    public static let fusedReductionOnGroupedRows: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["MTPLX_MTP_FUSED_VERIFY_REDUCTION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw)
+    }()
+
+    /// Whether the direct weighted unsort may be used for this assignment
+    /// tensor. Pure counts again, and the historic answer unless D3 is on.
+    public static func allowsFusedReduction(
+        assignments: Int, rows: Int, unionAcrossRows: Bool, fusedOnGroupedRows: Bool
+    ) -> Bool {
+        if assignments >= historicGroupingThreshold { return true }
+        guard fusedOnGroupedRows else { return false }
+        return shouldGroup(
+            assignments: assignments, rows: rows, unionAcrossRows: unionAcrossRows)
+    }
+
+    public static func allowsFusedReduction(_ indices: MLXArray) -> Bool {
+        allowsFusedReduction(
+            assignments: indices.size,
+            rows: rowCount(indices),
+            unionAcrossRows: unionAcrossRows,
+            fusedOnGroupedRows: fusedReductionOnGroupedRows)
+    }
+
+    public static func shouldGroup(_ indices: MLXArray) -> Bool {
+        shouldGroup(
+            assignments: indices.size,
+            rows: rowCount(indices),
+            unionAcrossRows: unionAcrossRows)
+    }
 }
 
 private let qwenDirectExpertReductionEnabled: Bool = {
@@ -426,6 +1004,15 @@ public func setSwitchGLUGateUpFused(
     }
 }
 
+/// Inputs retained from the direct sorted expert reduction so a downstream
+/// prefill kernel can consume the sorted rows without materializing the
+/// intermediate `[tokens, hidden]` reduction.
+public struct WeightedExpertUnsortCarrier {
+    let sortedOutputs: MLXArray
+    let inverseOrder: MLXArray
+    let weights: MLXArray
+}
+
 public class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
@@ -593,29 +1180,34 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray,
+        sortedPlane: SwitchSortedPlaneProducer? = nil,
+        routeTable: SwitchRouteTable? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
-        let doSort = indices.size >= 64
+        let doSort = SwitchGLUExpertGrouping.shouldGroup(indices)
 
         var idx = indices
-        var inverseOrder = MLXArray()
+        var inverseOrder: MLXArray? = nil
+        let lhsIndices: MLXArray? = nil
         if doSort {
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+            (x, idx, inverseOrder) = gatherSort(
+                x: x, indices: indices, numExperts: numExperts)
         }
 
         let xGate: MLXArray
         let xUp: MLXArray
         if let gateUpProj {
-            let xGateUp = gateUpProj(x, idx, sortedIndices: doSort)
+            let xGateUp = gateUpProj(
+                x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            xUp = upProj(x, idx, sortedIndices: doSort)
-            xGate = gateProj(x, idx, sortedIndices: doSort)
+            xUp = upProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
+            xGate = gateProj(x, idx, lhsIndices: lhsIndices, sortedIndices: doSort)
         }
 
         let activated: MLXArray
@@ -624,13 +1216,22 @@ public class SwitchGLU: Module {
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)
         } else if isGeluActivation {
-            activated = compiledGeGLU(xGate, xUp)
+            activated = geGLUProduct(xGate, xUp)
         } else {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
-        return (x, doSort ? inverseOrder : nil, doSort)
+        // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
+        // gathers activation row `assignment` for assignment `assignment`;
+        // hand it that identity table instead of leaving `lhsIndices` nil,
+        // which otherwise materializes the same arange(64) on every call.
+        let downLhs: MLXArray? =
+            (doSort && idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
+        x = downProj(activated, idx, lhsIndices: downLhs, sortedIndices: doSort)
+        // Under `doSort` a producer above always assigned `inverseOrder`;
+        // otherwise it is still nil, which is exactly what the old
+        // `doSort ? inverseOrder : nil` produced.
+        return (x, inverseOrder, doSort)
     }
 
     private func legacyWeightedReduction(
@@ -668,7 +1269,7 @@ public class SwitchGLU: Module {
                 && weights.ndim == 2
                 && weights.shape == indices.shape
                 && weights.dtype == .bfloat16
-                && indices.size >= 64
+                && SwitchGLUExpertGrouping.allowsFusedReduction(indices)
         case .qwen35ProductionSwiGLU:
             return qwenDirectExpertReductionEnabled
                 && inputDims == 2048
@@ -685,12 +1286,15 @@ public class SwitchGLU: Module {
                 && weights.ndim == 2
                 && weights.shape == indices.shape
                 && weights.dtype == .bfloat16
-                && indices.size >= 64
+                && SwitchGLUExpertGrouping.allowsFusedReduction(indices)
         }
     }
 
-    public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var projected = projectExperts(x, indices)
+    public func callAsFunction(
+        _ x: MLXArray, _ indices: MLXArray,
+        sortedPlane: SwitchSortedPlaneProducer? = nil
+    ) -> MLXArray {
+        var projected = projectExperts(x, indices, sortedPlane: sortedPlane)
         if let inverseOrder = projected.inverseOrder {
             projected.output = scatterUnsort(
                 x: projected.output, invOrder: inverseOrder, shape: indices.shape)
@@ -698,13 +1302,48 @@ public class SwitchGLU: Module {
         return MLX.squeezed(projected.output, axis: -2)
     }
 
+    /// Preserve the promoted gathered down projection and defer only its
+    /// inverse-permutation + weighted top-K reduction to a downstream consumer.
+    ///
+    /// This is decode-only and exact-geometry-only. Returning nil leaves
+    /// ``callAndWeightedReduce`` as the complete established fallback.
+    public func callAndDeferWeightedReduce(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true,
+        routeTable: SwitchRouteTable? = nil
+    ) -> DeferredWeightedExpertRows? {
+        let isEightRowDecode =
+            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+        guard fuseSortedReduction && isEightRowDecode,
+            supportsWeightedExpertUnsort(x, indices, weights: weights)
+        else { return nil }
+
+        let projected = projectExperts(x, indices, routeTable: routeTable)
+        guard projected.sorted,
+            let inverseOrder = projected.inverseOrder,
+            projected.output.ndim == 3,
+            projected.output.dim(-2) == 1,
+            projected.output.dim(-1) == 2816,
+            projected.output.dtype == .bfloat16
+        else { return nil }
+
+        weightedExpertUnsortProbe.recordEffective()
+        return DeferredWeightedExpertRows(
+            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+            inverseOrder: inverseOrder,
+            weights: weights)
+    }
+
     /// Always-called expert projection + weighted reduction entry point.
     ///
-    /// When the experiment is enabled, only the exact sorted production Gemma
-    /// prefill contract reduces directly to `[tokens, hidden]`. Disabled,
-    /// decode/small-assignment, generic, custom-activation, dtype/layout, and
-    /// near-geometry calls retain scatter/unsort followed by
-    /// ``weightedExpertSum``.
+    /// When the experiment is enabled, the exact sorted production Gemma
+    /// prefill contract and the exact eight-row decode cohort reduce directly
+    /// to `[tokens, hidden]`. Smaller decode cohorts, rectangular speculative
+    /// verification, generic/custom-activation, dtype/layout, and near-geometry
+    /// calls retain scatter/unsort followed by ``weightedExpertSum``.
     public func callAndWeightedReduce(
         _ x: MLXArray,
         _ indices: MLXArray,
@@ -712,13 +1351,56 @@ public class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
-        guard fuseSortedReduction && isProductionPrefill,
+        callAndWeightedReduceWithUnsortCarrier(
+            x,
+            indices,
+            weights: weights,
+            fuseSortedReduction: fuseSortedReduction,
+            isProductionPrefill: isProductionPrefill
+        ).output
+    }
+
+    /// The direct reduction plus its already-sorted inputs. Generic and decode
+    /// paths return no carrier and preserve the established output graph.
+    public func callAndWeightedReduceWithUnsortCarrier(
+        _ x: MLXArray,
+        _ indices: MLXArray,
+        weights: MLXArray,
+        fuseSortedReduction: Bool,
+        isProductionPrefill: Bool = true,
+        sortedPlane: SwitchSortedPlaneProducer? = nil
+    ) -> (output: MLXArray, carrier: WeightedExpertUnsortCarrier?) {
+        // At B=8 decode there are exactly 64 assignments (8 rows x top-k 8),
+        // which is the sorting threshold and the minimum geometry accepted by
+        // weightedExpertUnsort. Keep the decode gate exact so MTP rectangles
+        // and smaller serving cohorts remain on their established reduction.
+        let isEightRowDecode =
+            !isProductionPrefill && x.dim(0) == 8 && indices.size == 64
+        // [engage] MTPLX_MTP_FUSED_VERIFY_REDUCTION (D3, default off): a
+        // NON-prefill pass that the gather actually grouped — which since
+        // union-verify includes the rectangular MTP verify. Expressed here
+        // rather than by forcing `isProductionPrefill` true at the call site,
+        // because on this branch that flag carries a second meaning: it also
+        // decides whether an unsort CARRIER is produced for the fused
+        // layer-tail consumer. Conflating the two would hand a carrier to
+        // decode and verify passes that the tail path does not expect, and
+        // would defeat the exactness of the eight-row decode gate above.
+        let isGroupedNonPrefill =
+            !isProductionPrefill
+            && SwitchGLUExpertGrouping.fusedReductionOnGroupedRows
+            && SwitchGLUExpertGrouping.shouldGroup(indices)
+        guard fuseSortedReduction
+                && (isProductionPrefill || isEightRowDecode || isGroupedNonPrefill),
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
-            return weightedExpertSum(callAsFunction(x, indices), weights)
+            return (
+                weightedExpertSum(
+                    callAsFunction(x, indices, sortedPlane: sortedPlane), weights),
+                nil
+            )
         }
 
-        let projected = projectExperts(x, indices)
+        let projected = projectExperts(x, indices, sortedPlane: sortedPlane)
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,
@@ -726,13 +1408,25 @@ public class SwitchGLU: Module {
             (projected.output.dim(-1) == 2816 || projected.output.dim(-1) == inputDims),
             projected.output.dtype == .bfloat16
         else {
-            return legacyWeightedReduction(projected, indices: indices, weights: weights)
+            return (
+                legacyWeightedReduction(projected, indices: indices, weights: weights),
+                nil
+            )
         }
 
-        return weightedExpertUnsort(
-            sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+        let sortedOutputs = MLX.squeezed(projected.output, axis: -2)
+        let output = weightedExpertUnsort(
+            sortedOutputs: sortedOutputs,
             inverseOrder: inverseOrder,
             weights: weights)
+        let carrier =
+            isProductionPrefill
+            ? WeightedExpertUnsortCarrier(
+                sortedOutputs: sortedOutputs,
+                inverseOrder: inverseOrder,
+                weights: weights)
+            : nil
+        return (output, carrier)
     }
 }
 
@@ -780,10 +1474,13 @@ public class SwitchLinear: Module, Quantizable {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+        _ x: MLXArray, _ indices: MLXArray, lhsIndices: MLXArray? = nil,
+        sortedIndices: Bool = false
     ) -> MLXArray {
         let weightT = self.weight.swappedAxes(-1, -2)
-        var result = MLX.gatherMM(x, weightT, rhsIndices: indices, sortedIndices: sortedIndices)
+        var result = MLX.gatherMM(
+            x, weightT, lhsIndices: lhsIndices, rhsIndices: indices,
+            sortedIndices: sortedIndices)
 
         if let bias = self.bias {
             result = result + MLX.expandedDimensions(bias[indices], axis: -2)
@@ -862,7 +1559,8 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     /// `QuantizedSwitchLinearSortedHintTests` holds both legs and the
     /// reproducer.
     override public func callAsFunction(
-        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+        _ x: MLXArray, _ indices: MLXArray, lhsIndices: MLXArray? = nil,
+        sortedIndices: Bool = false
     ) -> MLXArray {
         let indexAligned = x.size == indices.size * x.dim(-2) * x.dim(-1)
         var result = MLX.gatherQuantizedMM(
@@ -870,6 +1568,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             self.weight,
             scales: self.scales,
             biases: self.biases,
+            lhsIndices: lhsIndices,
             rhsIndices: indices,
             transpose: true,
             groupSize: self.groupSize,

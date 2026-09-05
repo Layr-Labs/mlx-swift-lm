@@ -32,6 +32,7 @@ import MLXLMCommon
 /// errors surface at construction, not mid-round.
 public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
+
     /// Round-scoped state built by `prepare(rows:)`: the padded/stacked
     /// shared KV, the per-row padding masks, and the constant anchor
     /// positions for the round.
@@ -39,7 +40,6 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         let sharedKV: Gemma4SharedKV
         let masks: Gemma4DrafterMasks
         let positionOffset: Gemma4.PositionOffset
-
         init(
             sharedKV: Gemma4SharedKV, masks: Gemma4DrafterMasks,
             positionOffset: Gemma4.PositionOffset
@@ -52,6 +52,13 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     private let drafter: Gemma4AssistantDraftModel
     private let target: any Gemma4MTPTarget
+    /// `[1, vocab]` ascending indices, built ONCE. `draftStepCandidates` used
+    /// to build this per call, and at Gemma 4's 262,144-token vocabulary that
+    /// is a megabyte of host-side `Int32` fill and upload on the round's
+    /// critical path, every draft step. Hoisting it is why the instrument can
+    /// be switched on at all without dominating what it measures.
+    private let vocabularyPositions: MLXArray
+
 
     /// Binds `drafter` to `target` (idempotent on the same target) so
     /// drafter/target compatibility validation runs here.
@@ -59,18 +66,47 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
         try drafter.bind(target: target)
         self.drafter = drafter
         self.target = target
+        let vocabulary = drafter.config.textConfig.vocabSize
+        self.vocabularyPositions =
+            MLXArray(Int32(0) ..< Int32(vocabulary)).reshaped([1, vocabulary])
     }
 
     // MARK: - CBv2MTPDrafter
 
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
 
+    /// A round precomputes its padded KV and its masks, and nothing else.
+    ///
+    /// There was a per-round cos/sin table here, materialized by every
+    /// `prepare(rows:)` and consumed by a pre-rotation of the carried hidden in
+    /// `draftStep`. It was dead: the pre-rotation's range guard compares the
+    /// drafter's query position against the table's anchor, and under the
+    /// reference semantics this stack ships the query position is one BEFORE
+    /// the anchor, so the guard returned early on every round at every anchor
+    /// above zero. The two inputs that did reach it — an anchor of 0, and
+    /// `MTPLX_MTP_DRAFTER_REFERENCE_SEMANTICS=0` — aborted the process on a
+    /// rank mismatch, so it had never run anywhere.
+    ///
+    /// It is deleted rather than repaired. The pre-rotation was not part of the
+    /// reference algorithm: the reference applies RoPE to the drafter's Q and K
+    /// inside the layer, never to the hidden it carries between steps, and the
+    /// removed code's own comment said it existed "so the per-round cos/sin
+    /// table is exercised on every step rather than left unreferenced" — the
+    /// transformation was there to justify the table, not the other way round.
+    /// `drafterRoundCarriesTheHiddenThroughUnmodified` pins the absence.
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepare: rows must be non-empty")
+        // RoPE at the LAST REAL KEY's position under reference semantics.
+        // The sliding mask below deliberately keeps using `anchor` itself:
+        // it was already arithmetically equal to the reference's window, and
+        // only the query's RoPE angle was off by one.
         let positionOffset = Gemma4.PositionOffset.batch(
-            MLXArray(rows.map { Int32($0.anchor) }))
+            MLXArray(rows.map {
+                Int32(Gemma4MTPDrafterSemantics.draftQueryPosition(kvOffset: $0.anchor))
+            }))
 
         let slidingWindow = drafter.config.textConfig.slidingWindow
+
         if rows.count == 1 {
             let row = rows[0]
             let slidingMask = Self.slidingMask(
@@ -120,6 +156,58 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
             masks: prepared.masks)
         let next = logits.squeezed(axis: 1).argMax(axis: -1).asType(.int32)
         return (next, newHidden)
+    }
+
+    /// This head scores the full vocabulary every step, so its runners-up
+    /// are already computed: a tree's alternate columns cost ONE extra
+    /// argmax over the same logits, not another forward. That is the whole
+    /// reason a tree can be cheaper than a deeper chain here.
+    ///
+    /// Rank 0 is taken with the SAME `argMax` the chain uses, and each
+    /// further rank masks the ranks already taken and argmaxes again, so a
+    /// tie can never make column 0 disagree with `draftStep`. A sort over
+    /// the top-k would be shorter and is deliberately not used: MLX's sort
+    /// is not specified to be stable, and the chain must stay bit-identical
+    /// whether or not this switch is on.
+    public var maximumDraftCandidates: Int { 4 }
+
+    public func draftStepCandidates(
+        tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture,
+        candidates: Int
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        precondition(
+            candidates >= 1 && candidates <= maximumDraftCandidates,
+            "Gemma4CBv2MTPDrafter.draftStepCandidates: \(candidates) outside 1...\(maximumDraftCandidates)"
+        )
+        guard let prepared = prepared as? Prepared else {
+            preconditionFailure(
+                "Gemma4CBv2MTPDrafter.draftStepCandidates: prepared capture "
+                    + "\(type(of: prepared)) was not built by prepare(rows:)")
+        }
+        let inputsEmbeds = concatenated(
+            [target.embedTokensForDrafter(tokens), hidden], axis: -1)
+        let (newHidden, logits) = drafter(
+            inputsEmbeds: inputsEmbeds,
+            sharedKV: prepared.sharedKV,
+            positionOffset: prepared.positionOffset,
+            masks: prepared.masks)
+        let flat = logits.squeezed(axis: 1)
+        var ranked: [MLXArray] = [flat.argMax(axis: -1).asType(.int32)]
+        if candidates > 1 {
+            precondition(
+                flat.dim(-1) == vocabularyPositions.dim(-1),
+                "Gemma4CBv2MTPDrafter: logits vocabulary \(flat.dim(-1)) != configured "
+                    + "\(vocabularyPositions.dim(-1))")
+            let positions = vocabularyPositions
+            let excluded = MLXArray(-Float.infinity).asType(flat.dtype)
+            var remaining = flat
+            for _ in 1 ..< candidates {
+                let taken = ranked[ranked.count - 1].reshaped([-1, 1])
+                remaining = MLX.where(positions .== taken, excluded, remaining)
+                ranked.append(remaining.argMax(axis: -1).asType(.int32))
+            }
+        }
+        return (stacked(ranked, axis: 1), newHidden)
     }
 
     // MARK: - Padding + masks (B > 1)

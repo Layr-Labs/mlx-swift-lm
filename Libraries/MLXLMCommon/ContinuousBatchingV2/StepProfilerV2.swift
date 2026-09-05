@@ -103,30 +103,74 @@ public enum CBv2StepProfiler {
         return eventCounts
     }
 
+    /// Snapshot of all recorded phases in INSERTION order (name → durations,
+    /// seconds), i.e. not sorted. `dropFirst` in `summaryTable` peels warm-up
+    /// steps off the front, so it needs the samples in the order recorded.
+    private static func rawSnapshot() -> [String: [Double]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return samples
+    }
 
-    /// Markdown decomposition table: per phase count, total, mean, p50,
-    /// p95, max (milliseconds), sorted by total descending.
-    public static func summaryTable() -> String {
-        let snap = snapshot()
-        func pct(_ sorted: [Double], _ q: Double) -> Double {
-            guard !sorted.isEmpty else { return 0 }
-            let rank = q * Double(sorted.count - 1)
-            let lo = Int(rank.rounded(.down)), hi = Int(rank.rounded(.up))
-            if lo == hi { return sorted[lo] }
-            let w = rank - Double(lo)
-            return sorted[lo] * (1 - w) + sorted[hi] * w
+    /// Aggregated statistics for one phase's durations (milliseconds).
+    public struct PhaseStat: Sendable, Equatable {
+        public let count: Int
+        public let totalMS: Double
+        public let meanMS: Double
+        public let p50MS: Double
+        public let p95MS: Double
+        public let maxMS: Double
+    }
+
+    /// Linear-interpolated percentile of a sorted sample (`q` in 0...1).
+    /// Rank = q·(n−1), interpolated between the bracketing order statistics.
+    static func percentile(_ sorted: [Double], _ q: Double) -> Double {
+        guard !sorted.isEmpty else { return 0 }
+        let rank = q * Double(sorted.count - 1)
+        let lo = Int(rank.rounded(.down)), hi = Int(rank.rounded(.up))
+        if lo == hi { return sorted[lo] }
+        let w = rank - Double(lo)
+        return sorted[lo] * (1 - w) + sorted[hi] * w
+    }
+
+    /// Pure aggregation of one phase's durations (seconds in, milliseconds
+    /// out): count, total, mean, p50, p95, max. Sorts a local copy for the
+    /// order statistics; the input order is untouched. Empty input yields an
+    /// all-zero, count-0 stat. This is the unit the aggregation tests cover.
+    public static func aggregate(_ samplesSeconds: [Double]) -> PhaseStat {
+        let sorted = samplesSeconds.sorted()
+        let n = sorted.count
+        let total = sorted.reduce(0, +)
+        let mean = n > 0 ? total / Double(n) : 0
+        return PhaseStat(
+            count: n,
+            totalMS: total * 1e3,
+            meanMS: mean * 1e3,
+            p50MS: percentile(sorted, 0.5) * 1e3,
+            p95MS: percentile(sorted, 0.95) * 1e3,
+            maxMS: (sorted.last ?? 0) * 1e3)
+    }
+
+    /// Markdown decomposition table: per phase count, total, mean, p50, p95,
+    /// max (milliseconds), sorted by total descending. `dropFirst` peels that
+    /// many leading (warm-up) samples off each phase before aggregating — pass
+    /// the warm-up step count to report steady-state decode only. A phase with
+    /// no samples left after the drop is omitted.
+    public static func summaryTable(dropFirst n: Int = 0) -> String {
+        let raw = rawSnapshot()
+        let drop = max(0, n)
+        let rows = raw.map {
+            (name: $0.key, stat: aggregate(Array($0.value.dropFirst(drop))))
         }
+        .filter { $0.stat.count > 0 }
+        .sorted { $0.stat.totalMS > $1.stat.totalMS }
         var out = "| phase | n | total ms | mean ms | p50 ms | p95 ms | max ms |\n"
         out += "|---|---|---|---|---|---|---|\n"
-        let rows = snap.map { (name: $0.key, sorted: $0.value) }
-            .sorted { $0.sorted.reduce(0, +) > $1.sorted.reduce(0, +) }
         for row in rows {
-            let s = row.sorted
-            let total = s.reduce(0, +)
+            let s = row.stat
             out += String(
                 format: "| %@ | %d | %.1f | %.3f | %.3f | %.3f | %.3f |\n",
-                row.name, s.count, total * 1e3, total / Double(s.count) * 1e3,
-                pct(s, 0.5) * 1e3, pct(s, 0.95) * 1e3, (s.last ?? 0) * 1e3)
+                row.name, s.count, s.totalMS, s.meanMS, s.p50MS, s.p95MS, s.maxMS)
         }
         return out
     }

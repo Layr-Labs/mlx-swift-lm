@@ -54,6 +54,17 @@ private func maxAbsDiff(_ a: MLXArray, _ b: MLXArray) -> Float {
     return m.item(Float.self)
 }
 
+/// The frontier (qL=1) attention parity bound. `updateAndAttendLastQuery` runs one
+/// query row, so MLX dispatches its VECTOR SDPA kernel; the full-chunk reference
+/// (`updateAndAttend`, qL=chunk) dispatches the MATRIX SDPA. The two compute the same
+/// attention but reduce the key axis in a different bf16 order, so the frontier row is
+/// a near-tie, not bit-exact — the same SDPA kernel-selection near-tie class the D512
+/// two-pass documents (0.2-0.35% rel). Measured max abs diff on these fixtures:
+/// 0.0009-0.0028 (outputs) and ~0.0023-0.0028 (frontier logits), all < 5e-3; the greedy
+/// token is separately asserted bit-exact. The old 2e-6/1e-5 wrongly assumed cross-kernel
+/// bit-exactness. Multi-row tail parity (no qL=1 switch) stays at 1e-5.
+private let sdpaFrontierNearTie: Float = 5e-3
+
 /// Bit-for-bit equality (no tolerance) — used for KV state, which must be
 /// produced by the identical projection graph on every path.
 private func bitIdentical(_ a: MLXArray, _ b: MLXArray) -> Bool {
@@ -164,7 +175,7 @@ struct CBv2LastQueryPrefillAttentionTests {
             specialized.shape == [batch, f.kind.queryHeads, 1, f.kind.headDim],
             "last-query output must be [B, queryHeads, 1, headDim] — \(label)")
         #expect(
-            maxAbsDiff(specialized, referenceLast) < 2e-6,
+            maxAbsDiff(specialized, referenceLast) < sdpaFrontierNearTie,
             "last-query attention must equal the final row of chunk attention — \(label)")
 
         // Both sides must also have committed the SAME cache state.
@@ -933,7 +944,7 @@ struct CBv2LastQueryPrefillLayerParityTests {
         #expect(specialized.output.shape == [1, 1, config.hiddenSize])
         #expect(
             maxAbsDiff(
-                specialized.output, reference.output[0..., (L - 1) ..< L, 0...]) < 1e-5,
+                specialized.output, reference.output[0..., (L - 1) ..< L, 0...]) < sdpaFrontierNearTie,
             "last-query prefill must reproduce the unnarrowed frontier row")
 
         #expect(specialized.offset == L, "the chunk consumed every position")
@@ -959,7 +970,7 @@ struct CBv2LastQueryPrefillLayerParityTests {
 
         #expect(narrowed.output.shape == [1, 1, config.hiddenSize])
         #expect(
-            maxAbsDiff(narrowed.output, reference.output[0..., (L - 1) ..< L, 0...]) < 1e-5,
+            maxAbsDiff(narrowed.output, reference.output[0..., (L - 1) ..< L, 0...]) < sdpaFrontierNearTie,
             "tail narrowing must not change the retained row")
         #expect(narrowed.offset == reference.offset)
         #expect(bitIdentical(narrowed.keys, reference.keys))
@@ -1024,7 +1035,7 @@ struct CBv2LastQueryPrefillLayerParityTests {
         let (narrowOut, narrowK, narrowV, narrowOffset) = run(1)
 
         #expect(narrowOut.shape == [1, 1, config.hiddenSize])
-        #expect(maxAbsDiff(narrowOut, fullOut[0..., (L - 1) ..< L, 0...]) < 1e-5)
+        #expect(maxAbsDiff(narrowOut, fullOut[0..., (L - 1) ..< L, 0...]) < sdpaFrontierNearTie)
         #expect(narrowOffset == fullOffset)
         #expect(narrowOffset == L)
         #expect(bitIdentical(narrowK, fullK))
@@ -1139,7 +1150,7 @@ struct CBv2LastQueryPrefillModelParityTests {
             specialized.frontierLogits.shape == reference.frontierLogits.shape,
             "frontier logits shape — \(label)")
         let logitDiff = maxAbsDiff(specialized.frontierLogits, reference.frontierLogits)
-        #expect(logitDiff < 1e-5, "frontier logits diff \(logitDiff) — \(label)")
+        #expect(logitDiff < sdpaFrontierNearTie, "frontier logits diff \(logitDiff) — \(label)")
         #expect(
             greedyToken(specialized.frontierLogits) == greedyToken(reference.frontierLogits),
             "greedy first token — \(label)")

@@ -22,6 +22,20 @@ import XCTest
 
 final class CBv2MTPCaptureVerifyTests: XCTestCase {
 
+    /// XCTest's equivalent of the `.fixtureRandomState` trait the swift-testing
+    /// suites carry: bind a PRNG private to this test around the whole
+    /// invocation, so `fixtureSeed` re-seeds that instead of the process-global
+    /// state seven other suites are also writing in parallel. See
+    /// `CBv2TestRandomState.swift`.
+    override func invokeTest() {
+        let state = MLXRandom.RandomState(seed: CBv2FixtureRandom.baseSeed)
+        CBv2FixtureRandom.$current.withValue(state) {
+            withRandomState(state) {
+                super.invokeTest()
+            }
+        }
+    }
+
     // MARK: - 1. Captured transaction lifecycle
 
     private var scalarSpec: CBv2RecurrentStateSpec {
@@ -388,14 +402,14 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             XCTAssertEqual(difference.item(Float.self), 0)
         }
 
-        MLXRandom.seed(4711)
+        fixtureSeed(4711)
         let config = try exactW4G64GDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
         quantize(model: layer, groupSize: 64, bits: 4)
         eval(layer)
 
         let hidden = config.hiddenSize
-        MLXRandom.seed(90210)
+        fixtureSeed(90210)
         let x0 = MLXRandom.normal([1, 1, hidden])
         let x1 = MLXRandom.normal([1, 1, hidden])
         let x2 = MLXRandom.normal([1, 1, hidden])
@@ -472,7 +486,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     }
 
     func testGDNWideWindowUsesCompactReplayAndMatchesEverySerialPrefix() throws {
-        MLXRandom.seed(0xC0FFEE)
+        fixtureSeed(0xC0FFEE)
         let config = try smallGDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
         eval(layer)
@@ -517,12 +531,28 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                 "wide production verify must not materialize a full state stack")
             try compact.commit(keepPositions: keep)
             let actual = compactState.state(modelLayerIndex: 0)!
-            XCTAssertTrue(
-                allClose(actual.conv!, oracle[keep - 1].conv, rtol: 1e-4, atol: 1e-5)
-                    .item(Bool.self))
-            XCTAssertTrue(
-                allClose(actual.ssm!, oracle[keep - 1].ssm, rtol: 1e-4, atol: 1e-5)
-                    .item(Bool.self))
+            assertStateClose(
+                actual.conv!, oracle[keep - 1].conv,
+                rtol: 1e-4, atol: capturedConvNearTie,
+                "conv, keep \(keep) of \(columns.count)")
+            assertStateClose(
+                actual.ssm!, oracle[keep - 1].ssm,
+                rtol: 1e-4, atol: capturedSSMNearTie,
+                "ssm, keep \(keep) of \(columns.count)")
+
+            // The bounds above are near-tie bounds, so on their own they could
+            // absorb a commit that kept the wrong number of positions. This
+            // cannot: a shifted commit moves the whole conv window, which is an
+            // activation-scale change. Require the committed state to sit at
+            // least 20x closer to its own prefix than to a neighbouring one.
+            let own = stateDifference(actual.conv!, oracle[keep - 1].conv).abs
+            for neighbour in [keep - 2, keep] where oracle.indices.contains(neighbour) {
+                let other = stateDifference(actual.conv!, oracle[neighbour].conv).abs
+                XCTAssertGreaterThan(
+                    other, own * 20,
+                    "conv at keep \(keep) is not distinguishable from prefix "
+                        + "\(neighbour + 1): own \(own), neighbour \(other)")
+            }
         }
     }
 
@@ -638,6 +668,73 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         return output
     }
 
+    // MARK: - Captured wide-window agreement bounds
+    //
+    // `cbv2ForwardCaptured` runs the whole verify window in ONE pass: one
+    // projection over [B, S, ...], one `conv1d` over the padded window, and for
+    // S >= 3 a CHUNKED `gatedDeltaUpdate`. The serial oracle runs the same
+    // recurrence one column at a time, so it takes the per-step path with S = 1
+    // projections and a per-position conv. Same mathematics, different
+    // association order, so the two states are a NEAR-TIE and not bit-equal.
+    //
+    // The engine says so itself: `cbv2ForwardCaptured` carries an
+    // `exactTargetVerify` flag whose only effect is to replace the single
+    // windowed `conv1d` with per-position slices, precisely because the
+    // one-call form is not bit-identical. These tests do not set it, so they
+    // cannot assert bit-exactness — the previous 1e-5 / 1e-6 absolute floors
+    // asserted an exactness the fast path never offered. This is the same class
+    // as the documented `sdpaFrontierNearTie` bound on the last-query prefill
+    // path, and the same order of magnitude.
+    //
+    // Measured on these fixtures (max ABSOLUTE difference; the max RELATIVE
+    // figures are near-zero-denominator artifacts and are not a bound):
+    //
+    //   conv state [1, 3, 192]      0.00091 .. 0.0021
+    //   ssm state  [1, 4, 16, 32]   0.0000058 .. 0.0000126
+    //
+    // The two states are bounded separately because they are two different
+    // scales: the conv state holds raw projected activations, the ssm state a
+    // normalized accumulator. One bound sized for the former would be ~400x
+    // slack on the latter and would hide a real ssm regression.
+    //
+    // A widened bound must not be able to hide an off-by-one in
+    // `commit(keepPositions:)`, so the wide-window test also asserts that the
+    // committed state is closer to its OWN prefix than to either neighbouring
+    // prefix. A shifted commit moves the whole 3-wide conv window and shows up
+    // at activation scale, orders above these bounds.
+    private let capturedConvNearTie: Double = 5e-3
+    private let capturedSSMNearTie: Double = 5e-5
+
+    /// Max absolute and max relative difference between two arrays.
+    ///
+    /// `allClose(...).item(Bool.self)` collapses to a bare `XCTAssertTrue
+    /// failed` with no numbers, which cannot distinguish a reduction-order
+    /// near-tie from a state-tracking bug. These two failure classes need
+    /// different fixes, so the assertion has to report the magnitude.
+    private func stateDifference(_ lhs: MLXArray, _ rhs: MLXArray) -> (abs: Float, rel: Float) {
+        let a = lhs.asType(.float32)
+        let b = rhs.asType(.float32)
+        let absDiff = MLX.abs(a - b)
+        let scale = MLX.maximum(MLX.abs(b), MLXArray(Float(1e-12)))
+        let maxAbs = absDiff.max().item(Float.self)
+        let maxRel = (absDiff / scale).max().item(Float.self)
+        return (maxAbs, maxRel)
+    }
+
+    private func assertStateClose(
+        _ lhs: MLXArray, _ rhs: MLXArray, rtol: Double, atol: Double, _ label: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let close = allClose(lhs, rhs, rtol: rtol, atol: atol).item(Bool.self)
+        if !close {
+            let d = stateDifference(lhs, rhs)
+            XCTFail(
+                "\(label): max abs \(d.abs), max rel \(d.rel) "
+                    + "(rtol \(rtol), atol \(atol)), shape \(lhs.shape)",
+                file: file, line: line)
+        }
+    }
+
     private func assertRecurrentStateEqual(
         _ lhs: [any KVCache],
         _ rhs: [any KVCache],
@@ -650,13 +747,16 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                   let right = rhs[index] as? MambaCache
             else { continue }
             XCTAssertEqual(left.state.count, right.state.count, file: file, line: line)
-            for (leftArray, rightArray) in zip(left.state, right.state) {
+            for (slot, pair) in zip(left.state, right.state).enumerated() {
+                let (leftArray, rightArray) = pair
                 XCTAssertEqual(leftArray.shape, rightArray.shape, file: file, line: line)
-                XCTAssertTrue(
-                    allClose(leftArray, rightArray, rtol: 1e-5, atol: 1e-6)
-                        .item(Bool.self),
-                    file: file,
-                    line: line)
+                // MambaCache is two slots: 0 is the conv state, 1 the ssm
+                // accumulator. See the bound note above for why they differ.
+                assertStateClose(
+                    leftArray, rightArray, rtol: 1e-5,
+                    atol: slot == 0 ? capturedConvNearTie : capturedSSMNearTie,
+                    "layer \(index) state slot \(slot)",
+                    file: file, line: line)
             }
         }
     }
@@ -665,7 +765,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// compact tape, while attention remains at the speculative offset until
     /// the caller trims exactly the rejected suffix.
     func testRecurrentPrefixReplayMatchesSerialPrefixAndAttentionTrim() throws {
-        MLXRandom.seed(61_337)
+        fixtureSeed(61_337)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -727,7 +827,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// Shape-incompatible tapes fail closed before recurrent state mutation and
     /// release every layer's verify-only arrays for the fallback path.
     func testIneligibleRecurrentReplayCleansAllTapesWithoutStateMutation() throws {
-        MLXRandom.seed(61_338)
+        fixtureSeed(61_338)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -770,7 +870,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// Full acceptance explicitly discards the tape without touching state;
     /// an ordinary next forward and a direct cache reset also cannot retain it.
     func testRecurrentReplayTapeCleanupOnTerminalPaths() throws {
-        MLXRandom.seed(61_339)
+        fixtureSeed(61_339)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -825,7 +925,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let row = CBv2SamplerRow(
             id: id, params: params, promptTokens: [1, 2, 3], outputTokens: [])
 
-        MLXRandom.seed(5)
+        fixtureSeed(5)
         let logits0 = MLXRandom.normal([1, vocab])
         let logits1 = MLXRandom.normal([1, vocab])
         eval(logits0, logits1)

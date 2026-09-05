@@ -192,6 +192,16 @@ let package = Package(
             ],
             path: "Tests/MLXLMServerTests"
         ),
+        // Pure-CPU unit tests for CBv2StepProfiler's aggregation math
+        // (mean/p50/p95/dropFirst). Depends only on MLXLMCommon; loads no
+        // model weights and touches no Metal, so it runs on any host.
+        .testTarget(
+            name: "CBv2StepProfilerTests",
+            dependencies: [
+                "MLXLMCommon",
+            ],
+            path: "Tests/CBv2StepProfilerTests"
+        ),
         .macro(
             name: "MLXHuggingFaceMacros",
             dependencies: [

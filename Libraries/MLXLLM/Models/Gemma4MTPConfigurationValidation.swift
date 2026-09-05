@@ -51,9 +51,10 @@ enum Gemma4AssistantConfigurationValidator {
         static let hiddenSizePerLayerInput = 4_096
         static let slidingWindow = 1_048_576
         static let positionEmbeddings = 4_194_304
-        static let quantizationGroupSize = 65_536
-        static let quantizationEntries = 8_192
-        static let quantizationPathBytes = 1_024
+        // The quantization-declaration bounds this validator used to hold
+        // (group size, per-layer entry count, layer path length) now live in
+        // `MLXLMCommon.QuantizationGeometry`, shared with the DFlash drafter's
+        // loader. See `validateQuantization` below.
         static let tensorElements = 536_870_912
         static let totalRepeatedElements = 1_610_612_736
     }
@@ -351,9 +352,12 @@ enum Gemma4AssistantConfigurationValidator {
         case (nil, nil):
             return
         case (.some(let bits), .some(let groupSize)):
-            try validateQuantization(
-                .init(groupSize: groupSize, bits: bits),
-                field: "textConfig.quantization")
+            if let violation = QuantizationGeometry.violation(
+                in: .init(groupSize: groupSize, bits: bits))
+            {
+                throw invalid(
+                    "textConfig.quantization\(violation.fieldSuffix)", violation.reason)
+            }
         default:
             throw invalid(
                 "textConfig.quantization",
@@ -361,39 +365,20 @@ enum Gemma4AssistantConfigurationValidator {
         }
     }
 
+    /// Bound the head's declared quantization.
+    ///
+    /// The bounds and their wording live in `MLXLMCommon.QuantizationGeometry`
+    /// because the DFlash drafter's loader (Libraries/MLXSpeculative) reads the
+    /// same kind of declaration off its own head's `config.json` and must bound
+    /// it identically. The field paths and reasons this raises are unchanged —
+    /// `QuantizationGeometry.Violation` reports the suffix and the reason, and
+    /// this arm keeps raising `Gemma4MTPError.invalidConfiguration` from them.
     private static func validateQuantization(
         _ quantization: BaseConfiguration.PerLayerQuantization?
     ) throws {
         guard let quantization else { return }
-        if let base = quantization.quantization {
-            try validateQuantization(base, field: "quantization")
-        }
-        guard quantization.perLayerQuantization.count <= Limit.quantizationEntries else {
-            throw invalid(
-                "quantization",
-                "has too many per-layer entries")
-        }
-        for path in quantization.perLayerQuantization.keys.sorted() {
-            guard path.utf8.count <= Limit.quantizationPathBytes else {
-                throw invalid("quantization.\(path)", "layer path is too long")
-            }
-            guard let option = quantization.perLayerQuantization[path] else { continue }
-            if case .quantize(let value) = option {
-                try validateQuantization(value, field: "quantization.\(path)")
-            }
-        }
-    }
-
-    private static func validateQuantization(
-        _ quantization: BaseConfiguration.Quantization,
-        field: String
-    ) throws {
-        try positive(
-            quantization.groupSize,
-            field: "\(field).groupSize",
-            maximum: Limit.quantizationGroupSize)
-        guard (2 ... 8).contains(quantization.bits) else {
-            throw invalid("\(field).bits", "must be between 2 and 8")
+        if let violation = QuantizationGeometry.violation(in: quantization) {
+            throw invalid("quantization\(violation.fieldSuffix)", violation.reason)
         }
     }
 

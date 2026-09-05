@@ -174,6 +174,51 @@ open class BaseKVCache: KVCache {
     }
 }
 
+/// Cache for the unbatched (`lengths`/`leftPadding` free) causal masks, which
+/// are a pure function of `(n, offset, windowSize)`.
+///
+/// This matters at DFlash block decode. A `RotatingKVCache` whose ring has
+/// saturated pins `cappedOffset` at `maxCacheSize - 1` forever, so with `n` and
+/// `windowSize` also constant the sliding-window mask is *byte-identical on
+/// every decode step* — yet the uncached path rebuilds it each time: two
+/// host->device index uploads plus GreaterEqual/Add/Less/And. The DFlash
+/// drafter is worse: all five of its layers are sliding attention with the same
+/// cached length, so it builds the same mask five times per round.
+///
+/// Returning the retained array is safe because every consumer treats the mask
+/// as read-only, and it is bit-identical by construction — this is a memo, not
+/// an approximation.
+private struct CausalMaskKey: Hashable {
+    let n: Int
+    let offset: Int
+    let windowSize: Int
+}
+
+private final class CausalMaskCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [CausalMaskKey: MLXArray] = [:]
+
+    func lookup(_ key: CausalMaskKey) -> MLXArray? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries[key]
+    }
+
+    func store(_ key: CausalMaskKey, _ mask: MLXArray) {
+        lock.lock()
+        defer { lock.unlock() }
+        // Decode reuses one or two keys forever and prefill adds a handful
+        // more; the bound only exists so a pathological caller cannot grow this
+        // without limit.
+        if entries.count >= 32 {
+            entries.removeAll(keepingCapacity: true)
+        }
+        entries[key] = mask
+    }
+}
+
+private let causalMaskCache = CausalMaskCache()
+
 public func createCausalMask(
     n: Int,
     offset: Int,
@@ -181,6 +226,16 @@ public func createCausalMask(
     lengths: MLXArray? = nil,
     leftPadding: MLXArray? = nil
 ) -> MLXArray {
+    // Only the shape-derived masks are memoizable; `lengths`/`leftPadding` make
+    // the result depend on array contents this key cannot see.
+    let key: CausalMaskKey? =
+        lengths == nil && leftPadding == nil
+        ? CausalMaskKey(n: n, offset: offset, windowSize: windowSize ?? -1)
+        : nil
+    if let key, let hit = causalMaskCache.lookup(key) {
+        return hit
+    }
+
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
     linds = linds[0..., .newAxis]
@@ -207,6 +262,9 @@ public func createCausalMask(
         mask = mask & (leftPadding .<= rinds)
     }
 
+    if let key {
+        causalMaskCache.store(key, mask)
+    }
     return mask
 }
 
