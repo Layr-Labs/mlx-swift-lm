@@ -257,8 +257,27 @@ extension EngineLoopV2 {
             }
 
             let observedAccepted = min(accepted, confirmed)
+            // Acceptance/rollback audit record (observability): every value is
+            // already on the host at this boundary. The scheduler fields are
+            // read AFTER recordSampled/rollbackComputed above, so the record
+            // states the row's post-round accounting — the boundary invariant
+            // a consumer checks is
+            // `numComputedAfter == tokensCountAfter - 1`.
             mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed)
+                drafted: k, accepted: observedAccepted, emitted: confirmed,
+                audit: CBv2MTPRoundAuditRecord(
+                    requestID: id.raw,
+                    k: k,
+                    draftTokens: Array(
+                        host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
+                    targetTokens: outcome.targets,
+                    accepted: accepted,
+                    confirmed: confirmed,
+                    rejected: rejected,
+                    tokensCountAfter: rec.tokens.count,
+                    numComputedAfter: rec.numComputedTokens,
+                    generatedAfter: rec.generatedTokenCount,
+                    finishReason: finishReason.map { String(describing: $0) }))
             let rejectionObserved = accepted < k && confirmed > accepted
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k
