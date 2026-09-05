@@ -44,14 +44,14 @@ struct RunnerManifestTests {
                 "supportsMTP":true,"supportsCompactRecurrentMTPReplay":false},\
                 "kvBackends":["contiguous"],"decoders":[{"mode":"serial",\
                 "drafter":"none","state":"stateless","depth":null},{"mode":"mtp",\
-                "drafter":"embeddedHead","state":"requestStateful","depth":[1,3]}],\
+                "drafter":"embeddedHead","state":"requestStateful","depth":[1,6]}],\
                 "regimes":[{"batch":"single","timing":"freeRun","perStreamTiming":false},\
                 {"batch":"single","timing":"teacherForced","perStreamTiming":false}],\
                 "multimodal":false,"recurrentLayers":true,"requiresKeepMask":true}
                 """)
         #expect(
             manifest.sha256Digest()
-                == "474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe")
+                == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180")
     }
 
     /// The mock-adapter manifest benchd checked in beside the fixture,

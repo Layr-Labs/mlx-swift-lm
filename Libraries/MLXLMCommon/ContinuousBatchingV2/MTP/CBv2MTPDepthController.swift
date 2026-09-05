@@ -402,7 +402,12 @@ final class CBv2MTPDepthController {
 /// Request-owned conditional acceptance estimates for the Qwen MTP marginal
 /// depth policy. Hardware cost observations deliberately do not live here.
 struct CBv2MTPRequestAcceptanceState: Equatable {
-    static let maximumDepth = 4
+    /// Positions the marginal policy keeps an acceptance estimate for, and
+    /// so the deepest chain it can ever select. The round driver clamps a
+    /// request-stateful recurrent drafter's `maxDraftTokens` to this, so it
+    /// must reach the deepest served depth (Qwen4Exp: 6) or the manifest
+    /// would promise a depth the engine silently clamps.
+    static let maximumDepth = 6
     private static let alpha = 0.15
 
     private(set) var probabilities: [Double] =
@@ -605,7 +610,7 @@ enum CBv2MTPMarginalDepthPolicy {
     ) -> Double {
         guard acceptanceProbability.isFinite else { return 0 }
         var probability = min(max(acceptanceProbability, 0), 1)
-        guard (position == 0 || position == 1),
+        guard position == 0 || position == 1,
             let margin = previousMargin, margin.isFinite
         else { return probability }
 

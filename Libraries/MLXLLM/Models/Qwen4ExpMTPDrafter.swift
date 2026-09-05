@@ -34,8 +34,13 @@ import MLXNN
 /// Drives the target's own `mtp.*` head as a CBv2 drafter.
 public final class Qwen4ExpInlineMTPAssistant {
 
-    /// The largest draft depth this head is served at.
-    public static let maximumDepth = 3
+    /// The largest draft depth this head is served at. A POLICY bound, not a
+    /// structural one: the head is one layer applied once per draft step
+    /// with its own key-value rows, so the chain length is the number of
+    /// steps the engine asks for. Ruled 6 on both platforms (David: "mtp at
+    /// 6 on both mlx and cuda"); the CUDA track serves the same head at
+    /// depth <= 6 with per-depth oracles.
+    public static let maximumDepth = 6
 
     private let target: Qwen4ExpModel
     private let mtp: Qwen4ExpMTPModule

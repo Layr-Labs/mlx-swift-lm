@@ -129,7 +129,7 @@ struct Qwen4ExpAdoptTests {
         #expect(runner.manifest.engine.supportsPagedKV == false)
         #expect(
             runner.manifest.sha256Digest()
-                == "474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe")
+                == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180")
     }
 
     @Test("mtp is loaded only when the adopted module carries the head")

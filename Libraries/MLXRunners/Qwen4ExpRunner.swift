@@ -24,7 +24,7 @@
 //     is refused, because the model's forward pass cannot run.
 //
 // Speculation is the checkpoint's own `mtp.*` head
-// (`Qwen4ExpInlineMTPAssistant`), request-stateful across rounds, depth 1...3.
+// (`Qwen4ExpInlineMTPAssistant`), request-stateful across rounds, depth 1...6.
 // Paged storage, prefix reuse, compiled decode and packed prefill stay off,
 // and only single-stream regimes are declared: the indexer scores one tape
 // per call.

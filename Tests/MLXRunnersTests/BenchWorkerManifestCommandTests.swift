@@ -58,7 +58,7 @@ struct BenchWorkerManifestCommandTests {
         #expect(bytes == canonical)
 
         let digest = SHA256Hex.of(Data(bytes.utf8))
-        #expect(digest == "474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe")
+        #expect(digest == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180")
         #expect(digest == ContractManifests.sectionEleven.sha256Digest())
     }
 
@@ -69,7 +69,7 @@ struct BenchWorkerManifestCommandTests {
         ])
         #expect(
             printed
-                == "474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe\n")
+                == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180\n")
     }
 
     /// `--weights` reaches the same runner through the registry, reading
@@ -91,7 +91,7 @@ struct BenchWorkerManifestCommandTests {
         let printed = try render(["manifest", "--weights", directory.path, "--digest"])
         #expect(
             printed
-                == "474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe\n")
+                == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180\n")
     }
 
     @Test("Every first-party runner prints its own manifest")
@@ -184,9 +184,11 @@ struct BenchWorkerManifestCommandTests {
             ("manifest", .manifest, "--digest"),
         ]
         for (subcommand, expected, mustMention) in topics {
-            guard case .help(let topic) = try BenchWorkerCommand.parse([
-                subcommand, "--help",
-            ]) else {
+            guard
+                case .help(let topic) = try BenchWorkerCommand.parse([
+                    subcommand, "--help",
+                ])
+            else {
                 Issue.record("\(subcommand) --help did not parse as help")
                 continue
             }
@@ -199,9 +201,11 @@ struct BenchWorkerManifestCommandTests {
     /// this must not first have to get the line right.
     @Test("--help answers even when the rest of the line is wrong")
     func helpBeatsOtherRefusals() throws {
-        guard case .help(let topic) = try BenchWorkerCommand.parse([
-            "resident", "--help", "--socket",
-        ]) else {
+        guard
+            case .help(let topic) = try BenchWorkerCommand.parse([
+                "resident", "--help", "--socket",
+            ])
+        else {
             Issue.record("--help lost to another refusal")
             return
         }
@@ -220,9 +224,11 @@ struct BenchWorkerManifestCommandTests {
     /// The serving subcommands still reach the launch parser unchanged.
     @Test("The serve subcommands still parse as before")
     func serveStillParses() throws {
-        guard case .serve(let launch) = try BenchWorkerCommand.parse([
-            "resident", "--weights", "/nonexistent", "--socket", "/tmp/s",
-        ]) else {
+        guard
+            case .serve(let launch) = try BenchWorkerCommand.parse([
+                "resident", "--weights", "/nonexistent", "--socket", "/tmp/s",
+            ])
+        else {
             Issue.record("resident did not parse as a serve command")
             return
         }

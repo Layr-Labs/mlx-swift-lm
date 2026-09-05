@@ -95,7 +95,7 @@ struct Qwen4ExpRunnerTests {
         #expect(manifest.decoders.map(\.mode) == ["serial", "mtp"])
         #expect(manifest.decoders[1].drafter == .embeddedHead)
         #expect(manifest.decoders[1].state == .requestStateful)
-        #expect(manifest.decoders[1].depth == 1 ... 3)
+        #expect(manifest.decoders[1].depth == 1 ... 6)
         #expect(manifest.regimes.allSatisfy { $0.batch.maxWidth == 1 })
         #expect(manifest.regimes.map(\.timing) == [.freeRun, .teacherForced])
     }
@@ -112,7 +112,7 @@ struct Qwen4ExpRunnerTests {
         #expect(hello.runner?.modelType == "qwen4_exp")
         #expect(
             hello.runner?.manifestSHA256
-                == "474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe")
+                == "0430b22f8325c9c9371910d1e14eb3c78b235932bf35fa6623a4c511dd68e180")
     }
 
     @Test("A checkpoint without the embedded head advertises serial only")
