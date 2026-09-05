@@ -140,13 +140,17 @@ final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, CBv2FreeRunRoundAu
 
 // MARK: - Runner
 
-/// The scripted runner the conformance fixture is driven over.
-final class MockRunner: Runner, @unchecked Sendable {
-
-    static let manifest = RunnerManifest(
-        runnerID: "layr/mock",
-        modelTypes: ["mock"],
-        backend: "mock",
+/// Manifests the CONTRACT itself pins, built here from the document.
+///
+/// The section 11 manifest for Qwen 3.8 Flash-Next is the cross-repo digest
+/// vector, and the shared conformance fixture's hello carries its runner
+/// identity. No `Qwen4ExpRunner` exists on this branch — it lands from
+/// `feat/qwen4-exp-cbv2` — so this is DECLARATION DATA only: nothing here
+/// loads, registers, or serves that family.
+enum ContractManifests {
+    static let sectionEleven = RunnerManifest(
+        runnerID: "layr/qwen4exp-125b-a6b",
+        modelTypes: ["qwen4_exp", "qwen4_exp_text"],
         engine: CBv2ModelCapabilities(
             supportsPrefixReuse: false,
             supportsPagedKV: false,
@@ -157,19 +161,31 @@ final class MockRunner: Runner, @unchecked Sendable {
         kvBackends: [.contiguous],
         decoders: [
             DecoderDeclaration(
-                mode: DecoderID.serial.rawValue, drafter: .none, state: .stateless,
-                depth: nil),
+                mode: "serial", drafter: .none, state: .stateless, depth: nil),
             DecoderDeclaration(
-                mode: DecoderID.mtp.rawValue, drafter: .embeddedHead,
-                state: .requestStateful, depth: 1 ... 3),
+                mode: "mtp", drafter: .embeddedHead, state: .requestStateful,
+                depth: 1 ... 3),
         ],
         regimes: [
             RegimeDeclaration(batch: .single, timing: .freeRun, perStreamTiming: false),
-            RegimeDeclaration(batch: .single, timing: .teacherForced, perStreamTiming: false),
+            RegimeDeclaration(
+                batch: .single, timing: .teacherForced, perStreamTiming: false),
         ],
         multimodal: false,
-        recurrentLayers: false,
-        requiresKeepMask: false)
+        recurrentLayers: true,
+        requiresKeepMask: true)
+}
+
+/// The scripted runner the conformance fixture is driven over.
+///
+/// It carries the section 11 manifest VERBATIM, because the fixture's hello
+/// pins that manifest's digest: `manifest_sha256` must be the digest this
+/// runner's OWN manifest hashes to, and a hello quoting some other
+/// manifest's digest would be exactly the hand-written hello field §6.1
+/// forbids.
+final class MockRunner: Runner, @unchecked Sendable {
+
+    static let manifest = ContractManifests.sectionEleven
 
     /// The window audit the scripted engine replays.
     let script: MockRoundScript?
@@ -184,7 +200,7 @@ final class MockRunner: Runner, @unchecked Sendable {
     let layerKinds: [CBv2LayerKind] = []
     let loadedDecoders: [DecoderID] = [.serial, .mtp]
     let headProvenance: HeadProvenance? = nil
-    let loadedModelType = "mock"
+    let loadedModelType = "qwen4_exp_text"
 
     init(
         script: MockRoundScript? = MockRoundScript(
@@ -217,7 +233,6 @@ final class TeacherForcedOnlyMockRunner: Runner, @unchecked Sendable {
     static let manifest = RunnerManifest(
         runnerID: "layr/mock-teacher-forced",
         modelTypes: ["mock-teacher-forced"],
-        backend: "mock",
         engine: MockRunner.manifest.engine,
         kvBackends: [.contiguous],
         decoders: MockRunner.manifest.decoders,

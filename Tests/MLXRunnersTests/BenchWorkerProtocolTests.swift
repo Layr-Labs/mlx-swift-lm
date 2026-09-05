@@ -69,18 +69,25 @@ struct BenchWorkerProtocolTests {
 
         #expect(transport.written.count == fixture.responses.count + 1)
 
-        // The hello is the ONE line that cannot match the fixture verbatim:
-        // contract §6.0 adds the `runner` block as the last key of the hello,
-        // and this fixture predates it. Assert the exact shape instead of
-        // loosening the comparison — everything before `runner` must be the
-        // fixture's bytes, and the appended block must be the derived
-        // identity.
-        let expectedHello =
-            String(fixture.hello.dropLast())
-            + ",\"runner\":{\"id\":\"layr/mock\",\"model_type\":\"mock\","
-            + "\"manifest_sha256\":\"\(MockRunner.manifest.sha256Digest())\","
-            + "\"build\":\"fixture\"}}"
+        // The hello, byte for byte like every other line — with ONE
+        // substitution, which is a fixture defect rather than a difference of
+        // opinion. The fixture spells `"backend":"mock"` while pinning the
+        // section 11 manifest's digest, and that manifest declares
+        // `"backend":"mlx"`. §6.1 derives `hello.backend` from
+        // `manifest.backend`, so a worker cannot report "mock" and hash to
+        // 474efd99… at the same time: the two bytes are the same fact told
+        // twice, and only one of them can be right. Substituting here keeps
+        // the assertion exact instead of loosening it; the fixture wants
+        // `"backend":"mlx"`, or a mock-backend manifest and its own digest.
+        let expectedHello = fixture.hello.replacingOccurrences(
+            of: "\"backend\":\"mock\"", with: "\"backend\":\"mlx\"")
         #expect(transport.written[0] == expectedHello)
+        #expect(
+            transport.written[0].hasSuffix(
+                ",\"runner\":{\"id\":\"layr/qwen4exp-125b-a6b\","
+                    + "\"model_type\":\"qwen4_exp_text\",\"manifest_sha256\":"
+                    + "\"474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe\","
+                    + "\"build\":\"fixture\"}}"))
 
         for (index, expected) in fixture.responses.enumerated() {
             #expect(
@@ -175,7 +182,8 @@ struct BenchWorkerProtocolTests {
         #expect(hello.ok)
         #expect(hello.nonce == "fixturenonce")
         #expect(hello.protocolVersion == 1)
-        #expect(hello.backend == "mock")
+        // From the manifest, never from a constant here.
+        #expect(hello.backend == "mlx")
         #expect(hello.device == "mock")
         // Every declared regime is single-stream and free-run or
         // teacher-forced, so exactly one capability, and no max_batch_size.
@@ -183,8 +191,8 @@ struct BenchWorkerProtocolTests {
         #expect(hello.maxBatchSize == nil)
         #expect(hello.specModes == ["serial", "mtp"])
         #expect(hello.headProvenance == nil)
-        #expect(hello.runner?.id == "layr/mock")
-        #expect(hello.runner?.modelType == "mock")
+        #expect(hello.runner?.id == "layr/qwen4exp-125b-a6b")
+        #expect(hello.runner?.modelType == "qwen4_exp_text")
         #expect(hello.runner?.manifestSHA256 == MockRunner.manifest.sha256Digest())
         #expect(hello.runner?.build == "fixture")
     }

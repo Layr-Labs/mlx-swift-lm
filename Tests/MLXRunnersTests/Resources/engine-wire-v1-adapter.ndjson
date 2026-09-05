@@ -1,4 +1,4 @@
-{"id":0,"nonce":"fixturenonce","ok":true,"expert_stats":{"expert_cache_hits":0,"expert_cache_misses":0,"expert_cache_evictions":0,"expert_bytes_read":0,"expert_read_seconds":0.0,"expert_peak_cached_tensors":0},"protocol_version":1,"backend":"mock","device":"mock","capabilities":["free_run_decode"],"spec_modes":["serial","mtp"]}
+{"id":0,"nonce":"fixturenonce","ok":true,"expert_stats":{"expert_cache_hits":0,"expert_cache_misses":0,"expert_cache_evictions":0,"expert_bytes_read":0,"expert_read_seconds":0.0,"expert_peak_cached_tensors":0},"protocol_version":1,"backend":"mock","device":"mock","capabilities":["free_run_decode"],"spec_modes":["serial","mtp"],"runner":{"id":"layr/qwen4exp-125b-a6b","model_type":"qwen4_exp_text","manifest_sha256":"474efd9965aef3453e1e8324e99f9711d8e44bb2dceb0366d9c14c7d8e9ecebe","build":"fixture"}}
 {"id":1,"kind":"prefill","prompt_tokens":[11,12,13]}
 {"id":1,"nonce":"fixturenonce","ok":true,"token":100003}
 {"id":2,"kind":"phase_diagnostics"}
