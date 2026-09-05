@@ -48,6 +48,42 @@ struct EmbeddedHeadProvenanceTests {
         return Checkpoint(directory: directory, shardA: a, shardB: b)
     }
 
+    /// The box shape: the flattened text tree writes the head under
+    /// `language_model.mtp.*`. The module binds it after its key remap; the
+    /// scan must accept the same spelling or a bound head reports "none".
+    @Test("Wrapper-prefixed head names are found; a non-head name is not")
+    func acceptsTheCheckpointSpellings() throws {
+        for name in [
+            "mtp.fc_embedding.weight",
+            "model.mtp.layers.0.mlp.down_proj.weight",
+            "language_model.mtp.norm.weight",
+            "model.language_model.mtp.norm.weight",
+        ] {
+            #expect(RunnerCheckpoint.isEmbeddedHeadTensor(name), "\(name)")
+        }
+        for name in [
+            "mtp", "language_model.mtp", "model.layers.0.mtp.weight",
+            "language_model.lm_head.weight", "mtp_head.weight", "",
+        ] {
+            #expect(!RunnerCheckpoint.isEmbeddedHeadTensor(name), "\(name)")
+        }
+    }
+
+    @Test("A language_model.mtp.* head hashes its shard alone")
+    func findsTheWrappedHead() throws {
+        let head = ["language_model.mtp.fc_embedding.weight", "language_model.mtp.norm.weight"]
+        let checkpoint = try makeCheckpoint(
+            headTensors: head,
+            shardA: Data(repeating: 0x11, count: 2048),
+            shardB: Data(repeating: 0x22, count: 1024))
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+
+        let provenance = try #require(
+            try RunnerCheckpoint.provenance(ofEmbeddedHeadAt: checkpoint.directory))
+        #expect(provenance.bytes == 2048)
+        #expect(provenance.fileCount == 1)
+    }
+
     @Test("Only the shards carrying mtp.* are hashed, sized and counted")
     func hashesTheHeadShardAlone() throws {
         let head = ["mtp.fc_embedding.weight", "mtp.layers.0.mlp.down_proj.weight"]

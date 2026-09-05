@@ -717,6 +717,14 @@ public protocol Runner: AnyObject, Sendable {
     /// Provenance of the loaded drafter artifact, if any. Sealed on hello.
     var headProvenance: HeadProvenance? { get }
 
+    /// The `--verbose` load summary. A protocol REQUIREMENT, not only an
+    /// extension default: the worker holds an `any Runner`, and a method that
+    /// lives only in the extension dispatches statically to the generic half
+    /// — a box ran with the family's lines silently missing. The default
+    /// implementation is the generic summary; a family overrides to add its
+    /// own lines.
+    func loadSummary(weights: URL, options: RunnerLoadOptions) -> RunnerLoadSummary
+
     /// The `model_type` string read out of the loaded checkpoint's
     /// `config.json`. Rides the hello's `runner.model_type`.
     var loadedModelType: String { get }
@@ -812,8 +820,15 @@ public enum RunnerCheckpoint {
     /// THE RULE, IN ONE PLACE. Every runner with an embedded head calls this
     /// and none writes its own:
     ///
-    /// 1. Find every tensor whose name begins with `mtp.` and the shard file
-    ///    that holds it. The shard map is the checkpoint's
+    /// 1. Find every head tensor and the shard file that holds it. A head
+    ///    tensor is one whose name is `mtp.<...>` once the checkpoint's
+    ///    wrapper prefixes are stripped: the flattened text tree writes
+    ///    `language_model.mtp.*`, an upstream torch checkpoint
+    ///    `model.language_model.mtp.*` or `model.mtp.*`, and the module key
+    ///    is bare `mtp.*`. The model's own key remap accepts exactly these
+    ///    spellings; the scan must accept the same set or it reports "none"
+    ///    on a checkpoint whose head the module has bound — which is what a
+    ///    box saw (`language_model.mtp.*`, 76 tensors, one shard). The shard map is the checkpoint's
     ///    `*.safetensors.index.json` `weight_map`; a checkpoint with no index
     ///    is read from each shard's own safetensors header.
     /// 2. If there is no such tensor the checkpoint has no head: the result
@@ -856,7 +871,20 @@ public enum RunnerCheckpoint {
             fileCount: shardNames.count)
     }
 
-    /// `mtp.*` tensor names and the shard file each one lives in.
+    /// Whether an ON-DISK tensor name is part of the embedded head. The
+    /// wrapper components the checkpoint may nest the head under are
+    /// dropped first; what remains must start at the `mtp` component. This
+    /// is the same acceptance set as the model's key remap — keep the two
+    /// in step.
+    static func isEmbeddedHeadTensor(_ name: String) -> Bool {
+        var components = name.split(separator: ".", omittingEmptySubsequences: false)[...]
+        while let first = components.first, first == "model" || first == "language_model" {
+            components = components.dropFirst()
+        }
+        return components.count >= 2 && components.first == "mtp"
+    }
+
+    /// Head tensor names and the shard file each one lives in.
     private static func embeddedHeadIndexEntries(
         at directory: URL
     ) throws -> [(tensor: String, shard: String)] {
@@ -874,7 +902,7 @@ public enum RunnerCheckpoint {
                 throw RunnerError.invalidCheckpoint("no weight_map in \(index.path)")
             }
             return map
-                .filter { $0.key.hasPrefix("mtp.") }
+                .filter { isEmbeddedHeadTensor($0.key) }
                 .map { (tensor: $0.key, shard: $0.value) }
         }
 
@@ -882,7 +910,7 @@ public enum RunnerCheckpoint {
         var entries: [(tensor: String, shard: String)] = []
         for shard in contents.filter({ $0.pathExtension == "safetensors" }) {
             for tensor in try safetensorsTensorNames(at: shard)
-            where tensor.hasPrefix("mtp.") {
+            where isEmbeddedHeadTensor(tensor) {
                 entries.append((tensor: tensor, shard: shard.lastPathComponent))
             }
         }

@@ -8,6 +8,7 @@
 
 import Foundation
 import Testing
+import MLXLMCommon
 
 @testable import MLXRunners
 
@@ -40,6 +41,18 @@ struct RunnerLoadSummaryTests {
         // The rule BY NAME: two implementations that disagree on a tie
         // disagree wherever a parity run diverges.
         #expect(value("argmax_tie_break", in: summary) == "lowest_token_id")
+    }
+
+    /// The worker holds an `any Runner`. If `loadSummary` were only an
+    /// extension default, this call would pick the generic half and the
+    /// family's lines would never print — which a box saw. The requirement
+    /// on the protocol makes the override reachable through the existential.
+    @Test("A family override is reached through `any Runner`")
+    func familyOverrideDispatchesDynamically() {
+        let runner: any Runner = FamilySummaryRunner()
+        let summary = summary(for: runner)
+        #expect(value("runner_id", in: summary) == "layr/mock-adapter")
+        #expect(value("family_line", in: summary) == "present")
     }
 
     @Test("Every entry renders as one prefixed key=value line")
@@ -137,5 +150,31 @@ struct RunnerLoadSummaryTests {
         // Not one summary line leaked into the transcript.
         #expect(!verbose.contains { $0.hasPrefix("bench-worker:") })
         #expect(!verbose.contains { $0.contains("runner_id=") })
+    }
+}
+
+/// A mock whose family half adds one line on top of the generic summary.
+private final class FamilySummaryRunner: Runner, @unchecked Sendable {
+    private let base = MockRunner()
+    static var manifest: RunnerManifest { MockRunner.manifest }
+    static func adopt(
+        model: any LanguageModel, tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration, directory: URL, options: RunnerLoadOptions
+    ) throws -> FamilySummaryRunner {
+        throw RunnerError.unexpectedModel("not adopted in tests")
+    }
+    var servingModel: any LanguageModel { base.servingModel }
+    var tokenizer: any MLXLMCommon.Tokenizer { base.tokenizer }
+    var eosTokenIDs: Set<Int> { base.eosTokenIDs }
+    var layerKinds: [CBv2LayerKind] { base.layerKinds }
+    var loadedDecoders: [DecoderID] { base.loadedDecoders }
+    var headProvenance: HeadProvenance? { base.headProvenance }
+    var loadedModelType: String { base.loadedModelType }
+    func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine { try base.makeEngine(build) }
+    func makeStepper() throws -> any TeacherForcedStepper { try base.makeStepper() }
+    func loadSummary(weights: URL, options: RunnerLoadOptions) -> RunnerLoadSummary {
+        var summary = genericLoadSummary(weights: weights, options: options)
+        summary.add("family_line", "present")
+        return summary
     }
 }
