@@ -104,11 +104,33 @@ model. It reports the `mtp` decoder only when the checkpoint holds the `mtp.*`
 head. It builds the engine and the one-row stepper over the same model
 instance, so both drive one forward pass.
 
-The n-gram table is 29.8 GiB and is never model parameters. The table
-implementation lives in the track repo. The caller therefore gives a
-`Qwen4ExpNGramRowSource` in `RunnerLoadOptions.resources`, under the name
-`Qwen4ExpRunner.ngramRowSourceResource`. A checkpoint with PLE layers and no
-row source is refused at load.
+### The n-gram row source
+
+The n-gram table is 29.8 GiB and is never model parameters. The model asks a
+`Qwen4ExpNGramRowSource` for the rows. `Qwen4ExpNGram.swift` holds the
+protocol. `Qwen4ExpNGramTable.swift` holds one conformer, which reads the rows
+from the disk and caches a bounded number of them.
+
+Add a new conformer beside that one. Give it to
+`Qwen4ExpNGramRowSourceLoader`, which is the one construction entry point. Do
+not change the runner: the runner names the protocol and the loader only.
+
+The caller gives the source in `RunnerLoadOptions.resources`, under the name
+`Qwen4ExpRunner.ngramRowSourceResource`. The value has one of two shapes:
+
+- a path, as a `URL` or a `String`. This is the DIRECTORY of n-gram shard
+  files that the offline transform writes. bench-worker gives its
+  `--resource <name>=<path>` value in this shape. A path to one file is
+  refused, and the refusal names the directory shape.
+- an already built `Qwen4ExpNGramRowSource`, for a caller in the same process
+  that holds one.
+
+A checkpoint with PLE layers and no row source is refused at load.
+
+The cache ceiling is a byte count. The default is 1 gibibyte. The environment
+variable `MLXFAST_NGRAM_CACHE_LIMIT` sets it. Zero stops the cache. The
+ceiling changes the memory only. It can never change a row that the source
+gives back.
 
 The three tests in `Qwen4ExpForwardParityTests` need a full ahead-of-time
 `mlx.metallib`, because a decode through the mixture-of-experts shared expert
