@@ -2100,13 +2100,94 @@ extension Gemma4TextModel: LoRAModel {
 
 // MARK: - ContinuousBatchingV2
 
+/// Per-layer attention structure for the Gemma 4 family, moved here from
+/// the engine's `LayerKindDerivation.swift` (Darkbloom runner contract §4:
+/// the engine directory keeps no family name). It mirrors, field for field,
+/// what this file's constructors do — `Gemma4Attention.init` (head-dim
+/// asymmetry, K-eq-V kv-head override) and `Gemma4TextModelInner.init` (the
+/// `previousKvs` shared-KV source map) — so a change to either must be
+/// reflected one screen away rather than in another module.
+public enum Gemma4CBv2LayerKindDerivation {
+
+    /// Shared-KV source map for the trailing `num_kv_shared_layers` block.
+    /// Entry `j` is the index of the layer whose K/V (and captured RoPE
+    /// offsets) layer `j` borrows, or nil when layer `j` owns its KV.
+    ///
+    /// Mirrors `Gemma4TextModelInner.previousKvs`: each shared layer
+    /// references the LAST non-shared layer OF THE SAME TYPE. A shared layer
+    /// whose type has no earlier non-shared layer maps to nil here (the model
+    /// leaves `previousKvs[j] == j`, the identity, which behaves as
+    /// "no source" — that shape only occurs for force-shared drafter trunks,
+    /// which are out of scope for CBv2).
+    public static func sharedKVSources(
+        layerTypes: [String], numKvSharedLayers: Int
+    ) -> [Int?] {
+        let numLayers = layerTypes.count
+        var sources = [Int?](repeating: nil, count: numLayers)
+        guard numKvSharedLayers > 0 else { return sources }
+
+        let firstShared = max(numLayers - numKvSharedLayers, 0)
+        var lastByType = [String: Int]()
+        for i in 0 ..< firstShared {
+            lastByType[layerTypes[i]] = i
+        }
+        for j in firstShared ..< numLayers {
+            sources[j] = lastByType[layerTypes[j]]
+        }
+        return sources
+    }
+
+    /// Derive per-layer attention structure.
+    ///
+    /// Field semantics (mirroring `Gemma4Attention.init`):
+    ///  - sliding layers use `headDim`, full layers use `globalHeadDim`
+    ///    (asymmetric head dims: 256 / 512 on the production configs);
+    ///  - full layers honor `numGlobalKeyValueHeads` whenever it is present,
+    ///    INDEPENDENT of `attention_k_eq_v` (k_eq_v only elides `v_proj` in
+    ///    the model — KV geometry is unaffected);
+    ///  - the trailing `numKvSharedLayers` layers own no KV storage and
+    ///    borrow from the last non-shared layer of the same type;
+    ///  - this family has no attention sinks.
+    public static func layerKinds(
+        layerTypes: [String],
+        slidingWindow: Int,
+        numKvSharedLayers: Int,
+        headDim: Int,
+        globalHeadDim: Int,
+        numAttentionHeads: Int,
+        numKeyValueHeads: Int,
+        numGlobalKeyValueHeads: Int?,
+        isBidirectional: Bool = false
+    ) -> [CBv2LayerKind] {
+        let sources = sharedKVSources(
+            layerTypes: layerTypes, numKvSharedLayers: numKvSharedLayers)
+
+        return layerTypes.enumerated().map { index, layerType in
+            let isSliding = layerType == CBv2LayerKindDerivation.slidingAttentionType
+            let kvHeads =
+                isSliding
+                ? numKeyValueHeads
+                : (numGlobalKeyValueHeads ?? numKeyValueHeads)
+            return CBv2LayerKind(
+                attention: isSliding ? .slidingWindow(slidingWindow) : .full,
+                sharesKVWithLayer: sources[index],
+                hasSinks: false,
+                isBidirectional: isBidirectional,
+                headDim: isSliding ? headDim : globalHeadDim,
+                kvHeads: kvHeads,
+                queryHeads: numAttentionHeads
+            )
+        }
+    }
+}
+
 extension Gemma4TextConfiguration {
     /// Per-layer attention structure for the CBv2 engine, derived purely
     /// from this configuration (invariant 11: model structure is data).
     /// Matches `Gemma4Attention.init` / `Gemma4TextModelInner.previousKvs`
     /// layer for layer.
     public var cbv2LayerKinds: [CBv2LayerKind] {
-        CBv2LayerKindDerivation.gemma4LayerKinds(
+        Gemma4CBv2LayerKindDerivation.layerKinds(
             layerTypes: layerTypes,
             slidingWindow: slidingWindow,
             numKvSharedLayers: numKvSharedLayers,

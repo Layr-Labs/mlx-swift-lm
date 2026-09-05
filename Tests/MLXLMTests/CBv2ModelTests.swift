@@ -347,7 +347,7 @@ struct CBv2ModelLayerKindTests {
             Gemma4TextConfiguration.self, from: Data(json.utf8))
         let model = Gemma4TextModel(config)
 
-        let sources = CBv2LayerKindDerivation.gemma4SharedKVSources(
+        let sources = Gemma4CBv2LayerKindDerivation.sharedKVSources(
             layerTypes: config.layerTypes, numKvSharedLayers: config.numKvSharedLayers)
         #expect(sources.count == model.model.previousKvs.count)
         for (j, prev) in model.model.previousKvs.enumerated() {
@@ -375,7 +375,7 @@ struct CBv2ModelLayerKindTests {
     }
 
     @Test func gemma4KeqVWithoutGlobalHeadsFallsBack() {
-        let kinds = CBv2LayerKindDerivation.gemma4LayerKinds(
+        let kinds = Gemma4CBv2LayerKindDerivation.layerKinds(
             layerTypes: ["sliding_attention", "full_attention"],
             slidingWindow: 512,
             numKvSharedLayers: 0,
@@ -389,24 +389,8 @@ struct CBv2ModelLayerKindTests {
         #expect(kinds[1].kvHeads == 4)
     }
 
-    @Test func gemma4LegacyLayerKindOverloadRemainsSourceCompatible() {
-        let kinds = CBv2LayerKindDerivation.gemma4LayerKinds(
-            layerTypes: ["sliding_attention", "full_attention"],
-            slidingWindow: 512,
-            numKvSharedLayers: 0,
-            headDim: 256,
-            globalHeadDim: 512,
-            numAttentionHeads: 8,
-            numKeyValueHeads: 4,
-            numGlobalKeyValueHeads: 2,
-            attentionKeqV: false)
-
-        #expect(kinds[1].kvHeads == 2)
-        #expect(kinds.allSatisfy { !$0.isBidirectional })
-    }
-
     @Test func gemma4NoSharedLayers() {
-        let sources = CBv2LayerKindDerivation.gemma4SharedKVSources(
+        let sources = Gemma4CBv2LayerKindDerivation.sharedKVSources(
             layerTypes: CBv2LayerKindDerivation.layerTypes(
                 slidingWindowPattern: 5, numLayers: 10),
             numKvSharedLayers: 0)
@@ -451,7 +435,7 @@ struct CBv2ModelLayerKindTests {
     }
 
     @Test func gptossExplicitLayerTypesRespected() {
-        let kinds = CBv2LayerKindDerivation.gptossLayerKinds(
+        let kinds = GPTOSSCBv2LayerKindDerivation.layerKinds(
             layerTypes: ["full_attention", "full_attention", "sliding_attention"],
             numHiddenLayers: 3,
             slidingWindow: 128,

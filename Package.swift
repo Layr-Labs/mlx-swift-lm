@@ -31,6 +31,12 @@ let package = Package(
         .library(
             name: "MLXLMServer",
             targets: ["MLXLMServer"]),
+        .library(
+            name: "MLXRunners",
+            targets: ["MLXRunners"]),
+        .executable(
+            name: "bench-worker",
+            targets: ["bench-worker"]),
         .executable(
             name: "mlx-server",
             targets: ["mlx-server"]),
@@ -129,6 +135,34 @@ let package = Package(
             name: "mlx-server",
             dependencies: ["MLXLMServer"],
             path: "Executables/mlx-server"
+        ),
+        // The runner boundary (Darkbloom runner contract): one model family
+        // per runner, a static manifest, and the CBv2 engine + one-row
+        // stepper built over the same model instance. Darkbloom and
+        // bench-worker are the two consumers; neither carries family code.
+        .target(
+            name: "MLXRunners",
+            dependencies: [
+                "MLXLMCommon",
+                "MLXLLM",
+                "MLXVLM",
+                "MLXHuggingFace",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Libraries/MLXRunners"
+        ),
+        // Engine Protocol v1 NDJSON-over-stdio server over `Runner`. ONE
+        // binary for every runner: benchd never links a runner.
+        .executableTarget(
+            name: "bench-worker",
+            dependencies: [
+                "MLXRunners",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Executables/bench-worker",
+            plugins: ["BenchRevisionStamp"]
         ),
         .target(
             name: "BenchmarkHelpers",
@@ -283,6 +317,16 @@ let package = Package(
         ),
         // Harness-integrity tests: option parsing, engine resolution, and
         // report/optimization provenance. Model-free, so they run in CI.
+        .testTarget(
+            name: "MLXRunnersTests",
+            dependencies: ["MLXRunners", "MLXLMCommon"],
+            path: "Tests/MLXRunnersTests",
+            resources: [
+                // The SHARED Engine Protocol v1 conformance fixture, pinned
+                // identically on the benchd side.
+                .process("Resources/engine-wire-v1-adapter.ndjson")
+            ]
+        ),
         .testTarget(
             name: "BenchCBv2Tests",
             dependencies: ["BenchCBv2Core"],

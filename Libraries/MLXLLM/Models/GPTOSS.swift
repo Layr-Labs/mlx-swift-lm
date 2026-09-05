@@ -592,13 +592,60 @@ extension GPTOSSModel: LoRAModel {
 
 // MARK: - ContinuousBatchingV2
 
+/// Per-layer attention structure for GPT-OSS, moved here from the engine's
+/// `LayerKindDerivation.swift` (Darkbloom runner contract §4: the engine
+/// directory keeps no family name). It mirrors `GPTOSSModelInner.init`'s
+/// alternating sliding/full fallback field for field.
+public enum GPTOSSCBv2LayerKindDerivation {
+
+    /// `layerTypes` is the config's explicit `layer_types` when present;
+    /// otherwise the alternating `[sliding, full]` fallback is derived
+    /// exactly as `GPTOSSModelInner.init` does. Every layer carries learned
+    /// per-head attention sinks (`hasSinks == true`) — a CBv2 backend that
+    /// cannot fold sinks into the softmax denominator must refuse these
+    /// kinds at engine build (contract requirement).
+    public static func layerKinds(
+        layerTypes explicitLayerTypes: [String]?,
+        numHiddenLayers: Int,
+        slidingWindow: Int,
+        headDim: Int,
+        numAttentionHeads: Int,
+        numKeyValueHeads: Int
+    ) -> [CBv2LayerKind] {
+        let types =
+            explicitLayerTypes
+            ?? Array(
+                repeating: [
+                    CBv2LayerKindDerivation.slidingAttentionType,
+                    CBv2LayerKindDerivation.fullAttentionType,
+                ],
+                count: numHiddenLayers / 2
+            ).flatMap { $0 }
+        precondition(
+            types.count == numHiddenLayers,
+            "layer_types count \(types.count) != num_hidden_layers \(numHiddenLayers)")
+
+        return types.map { layerType in
+            CBv2LayerKind(
+                attention: layerType == CBv2LayerKindDerivation.slidingAttentionType
+                    ? .slidingWindow(slidingWindow) : .full,
+                sharesKVWithLayer: nil,
+                hasSinks: true,
+                headDim: headDim,
+                kvHeads: numKeyValueHeads,
+                queryHeads: numAttentionHeads
+            )
+        }
+    }
+}
+
 extension GPTOSSConfiguration {
     /// Per-layer attention structure for the CBv2 engine, derived purely
     /// from this configuration (invariant 11: model structure is data).
     /// Every layer carries learned attention sinks (`hasSinks == true`);
     /// backends that cannot honor sinks must refuse at engine build.
     public var cbv2LayerKinds: [CBv2LayerKind] {
-        CBv2LayerKindDerivation.gptossLayerKinds(
+        GPTOSSCBv2LayerKindDerivation.layerKinds(
             layerTypes: layerTypes,
             numHiddenLayers: hiddenLayers,
             slidingWindow: slidingWindow,
@@ -614,7 +661,7 @@ extension GPTOSSModel {
     /// loaded trunk's resolved `layerTypes` so it is congruent with the
     /// actual layers even when the config omits `layer_types`.
     public var cbv2LayerKinds: [CBv2LayerKind] {
-        CBv2LayerKindDerivation.gptossLayerKinds(
+        GPTOSSCBv2LayerKindDerivation.layerKinds(
             layerTypes: model.layerTypes,
             numHiddenLayers: configuration.hiddenLayers,
             slidingWindow: configuration.slidingWindow,

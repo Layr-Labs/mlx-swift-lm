@@ -10,7 +10,7 @@ import MLX
 /// Explicit model/backend feature gates. Attention-only models inherit the
 /// historical all-enabled defaults; first-generation recurrent adapters opt
 /// out of paths whose state semantics have not been proven.
-public struct CBv2ModelCapabilities: Sendable, Equatable {
+public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
     public var supportsPrefixReuse: Bool
     public var supportsPagedKV: Bool
     public var supportsCompiledDecode: Bool
