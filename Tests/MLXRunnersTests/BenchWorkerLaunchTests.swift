@@ -136,3 +136,114 @@ struct BenchWorkerLaunchTests {
         }
     }
 }
+
+// MARK: - Resident subcommand
+
+@Suite("bench-worker resident arguments")
+struct BenchWorkerResidentLaunchTests {
+
+    private let absentCheckpoint = "/nonexistent"
+
+    private func parse(_ arguments: [String]) throws -> BenchWorkerLaunchOptions {
+        try BenchWorkerLaunchOptions.parse(arguments)
+    }
+
+    @Test("The resident spawn parses, socket carried")
+    func residentSpawn() throws {
+        let launch = try parse([
+            "resident", "--weights", absentCheckpoint,
+            "--socket", "/tmp/window.sock", "--speculative-protocol", "v1.1",
+        ])
+        #expect(launch.subcommand == .resident)
+        #expect(launch.socket == "/tmp/window.sock")
+        #expect(launch.speculative)
+    }
+
+    @Test("No subcommand is the per-phase worker benchd spawns")
+    func defaultSubcommand() throws {
+        #expect(try parse(["--weights", absentCheckpoint]).subcommand == .runtimeWorker)
+        #expect(
+            try parse(["runtime-worker", "--weights", absentCheckpoint]).subcommand
+                == .runtimeWorker)
+    }
+
+    /// Every one of these fires from argv alone: `--weights` points at a
+    /// path that does not exist throughout, so any check that reached the
+    /// checkpoint would report a filesystem error instead.
+    @Test("resident without --socket is refused before the checkpoint is read")
+    func residentRequiresSocket() {
+        #expect(throws: WorkerLaunchError.missingSocket) {
+            _ = try parse(["resident", "--weights", absentCheckpoint])
+        }
+        #expect(throws: WorkerLaunchError.missingSocket) {
+            _ = try parse(["resident", "--weights", absentCheckpoint, "--socket", "  "])
+        }
+    }
+
+    /// The attaching worker is told where the resident is by the
+    /// ENVIRONMENT, so a `--socket` on `runtime-worker` means the caller
+    /// believes something untrue about this process.
+    @Test("--socket on runtime-worker is refused before the checkpoint is read")
+    func runtimeWorkerRejectsSocket() {
+        #expect(throws: WorkerLaunchError.socketNotAccepted("runtime-worker")) {
+            _ = try parse([
+                "runtime-worker", "--weights", absentCheckpoint,
+                "--socket", "/tmp/window.sock",
+            ])
+        }
+        // Including the implicit form.
+        #expect(throws: WorkerLaunchError.socketNotAccepted("runtime-worker")) {
+            _ = try parse(["--weights", absentCheckpoint, "--socket", "/tmp/w.sock"])
+        }
+    }
+
+    @Test("Two subcommands are refused")
+    func ambiguousSubcommand() {
+        #expect(
+            throws: WorkerLaunchError.ambiguousSubcommand("runtime-worker then resident")
+        ) {
+            _ = try parse([
+                "runtime-worker", "resident", "--weights", absentCheckpoint,
+                "--socket", "/tmp/w.sock",
+            ])
+        }
+    }
+
+    @Test("A missing --socket value is refused")
+    func socketNeedsAValue() {
+        #expect(throws: WorkerLaunchError.missingValue("--socket")) {
+            _ = try parse(["resident", "--weights", absentCheckpoint, "--socket"])
+        }
+    }
+
+    /// The resident takes the same load-shaping flags a per-phase worker
+    /// does, because it performs the load the phases then share.
+    @Test("The resident carries the load flags")
+    func residentCarriesLoadFlags() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("resident-launch-\(UUID().uuidString).bin")
+        try Data([0x00]).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        let launch = try parse([
+            "resident", "--weights", absentCheckpoint, "--socket", "/tmp/w.sock",
+            "--drafter", "/nonexistent/assistant", "--trusted",
+            "--resource", "ngram=\(file.path)",
+        ])
+        #expect(launch.trusted)
+        #expect(launch.drafter?.path == "/nonexistent/assistant")
+        #expect((launch.resources["ngram"] as? URL)?.path == file.path)
+    }
+
+    /// Ordering holds for the new subcommand too: parsing a resident launch
+    /// whose checkpoint is absent SUCCEEDS, so nothing in it read the
+    /// checkpoint.
+    @Test("Resident parsing never reads the checkpoint")
+    func residentParsingNeverReadsCheckpoint() throws {
+        let launch = try parse([
+            "resident", "--weights", absentCheckpoint, "--socket", "/tmp/w.sock",
+        ])
+        #expect(launch.weights.path == absentCheckpoint)
+        #expect(throws: RunnerError.self) { _ = try launch.resolveRunner() }
+    }
+}

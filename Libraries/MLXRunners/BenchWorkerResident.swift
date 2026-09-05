@@ -1,0 +1,362 @@
+// Copyright © 2026 Eigen Labs.
+//
+// MLXRunners — the RESIDENT worker (contract §12f) and the attach path.
+//
+// The rule is David's, 2026-08-30: one weight load per measurement window.
+// benchd starts a worker per PHASE — warmup, timed prefill, timed decode,
+// correctness, twice per leg, once per cohort pair — so a worker that loads
+// on startup loads a 113 GB checkpoint a dozen times for one window. The
+// ranked pipeline has twenty minutes. It does not fit.
+//
+// So the weights get an owner. `bench-worker resident` is one process for
+// one window: it validates argv, loads ONCE, and then listens on a Unix
+// socket. Each phase's `bench-worker runtime-worker` attaches, speaks the
+// whole Engine Protocol v1 session over that socket, and loads nothing.
+//
+// Modelled on the CUDA track's `ds4-resident`
+// (cudafast-qwen38-125b-a6b-engine-dev: `harness/protocol-adapter/src/
+// resident.rs`, `ds4_shim/ds4_resident.c`, `docs/ds4-resident.md`), with one
+// deliberate difference. ds4 lets a second connection wait in the listen
+// backlog; here it is REFUSED. A resident serving two attached workers
+// stalls benchd's window, and a queued second phase looks like a slow engine
+// rather than a double attach — the failure names itself this way.
+//
+// What is NOT changed by residency:
+//
+//   * phase isolation — the allocator is drained when a connection is
+//     accepted, before the client's first byte, so a phase can never inherit
+//     the one before it, and the per-phase drain still runs as today;
+//   * the clock — the parent times the round trip, the worker still emits no
+//     timing;
+//   * the session — a fresh nonce per connection, hello first, and any error
+//     discards that session exactly as in process.
+//
+// Identity on the wire: the attaching worker reports `backend` as
+// `mlx-resident` and appends a `resident` object carrying the resident's pid
+// and `load_epoch`, so an artifact can SHOW that every phase of a window ran
+// against one load rather than assuming it.
+//
+// Environment:
+//
+//   BENCH_WORKER_RESIDENT_SOCKET   names the resident's socket; when set,
+//                                  `runtime-worker` attaches instead of
+//                                  serving in process. Absent, behaviour is
+//                                  exactly as today.
+//   BENCH_WORKER_RESIDENT_HELLO=1  emit the `resident` hello object. OFF by
+//                                  default: benchd's envelope is closed, so
+//                                  a benchd that does not yet admit the
+//                                  field rejects the whole hello line. See
+//                                  ``ResidentIdentity``.
+//
+// benchd side (bench-dev): `BENCH_WORKER_` joins the engine child
+// environment allowlist beside `DS4_`, so the socket name reaches the
+// spawned worker, and the closed envelope must admit `resident` before this
+// ships.
+
+import Foundation
+
+#if canImport(Darwin)
+import Darwin
+#endif
+
+/// Environment names the resident pair reads.
+public enum BenchWorkerResidentEnvironment {
+    /// Names the resident's socket. Set by the window's tooling.
+    public static let socket = "BENCH_WORKER_RESIDENT_SOCKET"
+    /// Opt in to the additive `resident` hello object.
+    public static let helloIdentity = "BENCH_WORKER_RESIDENT_HELLO"
+}
+
+/// Refusals from the resident pair. Every one is a REFUSAL: a resident that
+/// is unreachable, busy, or holding different weights must fail the phase,
+/// never fall through to loading the checkpoint in process. A silent
+/// fall-through would load 113 GB inside a timed window and report the
+/// result as if it had not.
+public enum BenchWorkerResidentError: Error, CustomStringConvertible, Equatable {
+    case unreachable(path: String, detail: String)
+    case refused(String)
+    case noHello(path: String)
+    case weightsMismatch(resident: String, requested: String)
+
+    public var description: String {
+        switch self {
+        case .unreachable(let path, let detail):
+            return "resident at \(path) is unreachable (\(detail))"
+        case .refused(let detail):
+            return "resident refused the attach (\(detail))"
+        case .noHello(let path):
+            return "resident at \(path) sent no hello"
+        case .weightsMismatch(let resident, let requested):
+            return "resident holds \(resident) but this phase asked for \(requested)"
+        }
+    }
+}
+
+// MARK: - Resident
+
+/// One process, one load, one window.
+///
+/// `serve()` blocks on the accept loop. A connection is one benchd phase: on
+/// accept the allocator is drained and a fresh `BenchWorkerServer` — new
+/// nonce, new session — speaks the whole protocol over it. Exactly ONE
+/// connection is served at a time; anything that arrives meanwhile gets one
+/// `ok:false` line and is closed, because a resident that quietly serves two
+/// attached workers stalls the window it exists to make fast.
+public final class BenchWorkerResident: @unchecked Sendable {
+
+    /// The one loaded runner, shared by every phase of this window.
+    private let runner: any Runner
+    private let listener: BenchWorkerSocketListener
+    private let trusted: Bool
+    private let speculative: Bool
+    private let build: String
+    private let device: String
+    private let kvBytesCapacity: Int
+    private let maxDecodeTokens: Int
+    private let memory: any WorkerMemoryReporter
+    /// The checkpoint this resident holds, so an attaching worker can refuse
+    /// a resident loaded from somewhere else.
+    private let weightsPath: String
+
+    /// This resident's identity. `loadEpoch` is stamped once, when the load
+    /// finished, and never moves again — so every phase of one window seals
+    /// the same value, and a value that CHANGED is a reload that should not
+    /// have happened.
+    public let identity: ResidentIdentity
+
+    private let lock = NSLock()
+    private var sessionActive = false
+    private var stopped = false
+
+    public init(
+        runner: any Runner,
+        listener: BenchWorkerSocketListener,
+        weightsPath: String,
+        trusted: Bool,
+        speculative: Bool,
+        build: String,
+        device: String,
+        kvBytesCapacity: Int,
+        maxDecodeTokens: Int = 4096,
+        memory: any WorkerMemoryReporter = MLXMemoryReporter(),
+        loadEpoch: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) {
+        self.runner = runner
+        self.listener = listener
+        self.weightsPath = weightsPath
+        self.trusted = trusted
+        self.speculative = speculative
+        self.build = build
+        self.device = device
+        self.kvBytesCapacity = kvBytesCapacity
+        self.maxDecodeTokens = maxDecodeTokens
+        self.memory = memory
+        self.identity = ResidentIdentity(
+            pid: ProcessInfo.processInfo.processIdentifier, loadEpoch: loadEpoch)
+    }
+
+    /// Accept until `shutDown()`. Blocks the calling thread.
+    public func serve() {
+        while true {
+            lock.lock()
+            let done = stopped
+            lock.unlock()
+            if done { return }
+
+            guard let connection = listener.accept() else { return }
+
+            lock.lock()
+            let busy = sessionActive
+            if !busy { sessionActive = true }
+            lock.unlock()
+
+            guard !busy else {
+                // ONE line, then closed. The refusal is a protocol response
+                // so the attaching worker can report it verbatim instead of
+                // guessing at a dropped connection.
+                var response = WorkerResponse(id: -1, ok: false)
+                response.error =
+                    "resident is already serving a phase; one connection at a time"
+                connection.write(line: response.jsonLine())
+                connection.close()
+                continue
+            }
+
+            // Serve OFF the accept loop, so the loop is back at `accept()`
+            // and can refuse a second attach immediately rather than leaving
+            // it in the backlog looking like a slow engine.
+            let session = connection
+            Thread.detachNewThread { [weak self] in
+                guard let self else { return }
+                self.runSession(over: session)
+                self.lock.lock()
+                self.sessionActive = false
+                self.lock.unlock()
+            }
+        }
+    }
+
+    /// Stop accepting and drop the socket file.
+    public func shutDown() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
+        listener.shutDown()
+    }
+
+    /// One phase.
+    func runSession(over connection: BenchWorkerSocketConnection) {
+        // PHASE START: drain before the client's first byte, so a phase
+        // cannot inherit the allocator state of the phase before it. The
+        // worker's own `phase_diagnostics` drain runs too; that is
+        // idempotent and deliberate.
+        memory.drain()
+
+        let transport = BenchWorkerSocketTransport(connection: connection)
+        let server = BenchWorkerServer(
+            runner: runner,
+            transport: transport,
+            trusted: trusted,
+            speculative: speculative,
+            build: build,
+            device: device,
+            kvBytesCapacity: kvBytesCapacity,
+            maxDecodeTokens: maxDecodeTokens,
+            memory: memory,
+            residentIdentity: identity,
+            residentWeights: weightsPath)
+
+        let finished = DispatchSemaphore(value: 0)
+        Task {
+            await server.run()
+            finished.signal()
+        }
+        finished.wait()
+        connection.close()
+    }
+}
+
+/// The protocol loop's transport over one accepted connection.
+final class BenchWorkerSocketTransport: BenchWorkerTransport {
+    private let connection: BenchWorkerSocketConnection
+
+    init(connection: BenchWorkerSocketConnection) {
+        self.connection = connection
+    }
+
+    func readLine() -> String? { connection.readLine() }
+    func write(line: String) { connection.write(line: line) }
+}
+
+// MARK: - Attach
+
+/// `runtime-worker` attached to a resident: a verb-by-verb relay.
+///
+/// Every response is forwarded to stdout UNCHANGED except the hello, which
+/// is the only line whose content is a claim about where the work ran. There
+/// `backend` becomes `mlx-resident` and the `resident` identity is appended
+/// last. Nothing else is rewritten — a relay that reformatted responses
+/// would make the socket path and the in-process path differ in bytes for no
+/// reason, and benchd compares bytes.
+public struct BenchWorkerAttach {
+
+    private let socketPath: String
+    private let weightsPath: String
+    private let speculative: Bool
+    private let emitResidentIdentity: Bool
+
+    public init(
+        socketPath: String,
+        weightsPath: String,
+        speculative: Bool,
+        emitResidentIdentity: Bool
+    ) {
+        self.socketPath = socketPath
+        self.weightsPath = weightsPath
+        self.speculative = speculative
+        self.emitResidentIdentity = emitResidentIdentity
+    }
+
+    /// Whether the `resident` hello object may ride.
+    ///
+    /// BOTH gates: the v1.1 speculative protocol, like every other additive
+    /// hello field, and the explicit opt-in, because benchd's envelope is
+    /// closed and rejects a field it does not know. Drop the second gate
+    /// once bench-dev admits `resident`.
+    static func emitsResidentIdentity(
+        speculative: Bool, environment: [String: String]
+    ) -> Bool {
+        guard speculative else { return false }
+        return environment[BenchWorkerResidentEnvironment.helloIdentity] == "1"
+    }
+
+    /// Relay `input` to the resident and its answers to `output`.
+    ///
+    /// Throws — never falls back to in-process serving — when the resident is
+    /// unreachable, sends no hello, refuses the attach, or holds a different
+    /// checkpoint than this phase asked for.
+    public func relay(
+        input: any BenchWorkerTransport,
+        output: any BenchWorkerTransport
+    ) throws {
+        let connection: BenchWorkerSocketConnection
+        do {
+            connection = try BenchWorkerSocketClient.connect(path: socketPath)
+        } catch {
+            throw BenchWorkerResidentError.unreachable(
+                path: socketPath,
+                detail: (error as? CustomStringConvertible)?.description ?? "\(error)")
+        }
+        defer { connection.close() }
+
+        guard let helloLine = connection.readLine() else {
+            throw BenchWorkerResidentError.noHello(path: socketPath)
+        }
+        output.write(line: try rewriteHello(helloLine))
+
+        // Verb by verb, in order. One request line, one response line; a
+        // resident that closed mid-phase ends the relay rather than letting
+        // the parent wait on a response that will never come.
+        while let request = input.readLine() {
+            if request.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+            connection.write(line: request)
+            guard let response = connection.readLine() else {
+                throw BenchWorkerResidentError.unreachable(
+                    path: socketPath, detail: "the resident closed mid-phase")
+            }
+            output.write(line: response)
+        }
+    }
+
+    /// The one rewritten line.
+    func rewriteHello(_ line: String) throws -> String {
+        var hello: WorkerResponse
+        do {
+            hello = try JSONDecoder().decode(WorkerResponse.self, from: Data(line.utf8))
+        } catch {
+            throw BenchWorkerResidentError.refused(
+                "unreadable hello from the resident: \(line)")
+        }
+        guard hello.ok else {
+            throw BenchWorkerResidentError.refused(
+                hello.error ?? "the resident refused without a reason")
+        }
+        // The weights check is the whole reason the resident states its path:
+        // a window whose phases attach to a resident holding a DIFFERENT
+        // checkpoint would produce numbers for a model nobody asked about,
+        // and every field on the wire would look right.
+        if let residentWeights = hello.residentWeights {
+            let held = URL(fileURLWithPath: residentWeights).standardizedFileURL.path
+            let asked = URL(fileURLWithPath: weightsPath).standardizedFileURL.path
+            guard held == asked else {
+                throw BenchWorkerResidentError.weightsMismatch(
+                    resident: held, requested: asked)
+            }
+        }
+
+        hello.backend = "mlx-resident"
+        hello.residentWeights = nil
+        if !emitResidentIdentity { hello.resident = nil }
+        return hello.jsonLine()
+    }
+}

@@ -3,6 +3,16 @@
 // bench-worker — Engine Protocol v1 server over `Runner`.
 //
 // benchd spawns `<engine> runtime-worker --weights <DIR> --speculative-protocol v1.1`.
+//
+// RESIDENT MODE (contract §12f). `bench-worker resident --weights <DIR>
+// --socket <PATH>` is one process for one measurement window: it validates
+// argv, loads ONCE, and listens. Each phase's `runtime-worker` attaches when
+// `BENCH_WORKER_RESIDENT_SOCKET` names that socket and loads nothing, so a
+// window costs one weight load instead of one per phase. Exactly one
+// connection is served at a time; a second is refused with one line and
+// closed. The attached hello reports `backend` = `mlx-resident` plus the
+// resident's pid and `load_epoch` (gated — see `BenchWorkerResident.swift`
+// for the environment names, the identity fields and the ds4 precedent).
 // One binary serves every runner: the checkpoint's `config.json` `model_type`
 // picks it out of `RunnerRegistry`, or `--runner <id>` names it.
 //
@@ -62,6 +72,10 @@ func fail(_ error: some Error) -> Never {
     exit(2)
 }
 
+/// Retained for the resident's lifetime; a `DispatchSourceSignal` that goes
+/// out of scope stops firing.
+var residentSignalSources: [DispatchSourceSignal] = []
+
 // 1. ARGV. Every argument refusal happens here, with nothing under
 //    `--weights` read yet.
 let launch: BenchWorkerLaunchOptions
@@ -71,7 +85,31 @@ do {
     fail(error)
 }
 
-// 2. The checkpoint. This is the first read under `--weights`.
+// 2. ATTACH, before anything reads the checkpoint. A `runtime-worker` whose
+//    environment names a resident loads NOTHING: the resident holds the
+//    weights for the whole window. An unreachable, busy or wrongly-loaded
+//    resident is a refusal — never a fall-through to loading 113 GB inside a
+//    timed phase and reporting the result as if it had not.
+let environment = ProcessInfo.processInfo.environment
+if launch.subcommand == .runtimeWorker,
+    let socket = environment[BenchWorkerResidentEnvironment.socket],
+    !socket.trimmingCharacters(in: .whitespaces).isEmpty
+{
+    let attach = BenchWorkerAttach(
+        socketPath: socket,
+        weightsPath: launch.weights.path,
+        speculative: launch.speculative,
+        emitResidentIdentity: BenchWorkerAttach.emitsResidentIdentity(
+            speculative: launch.speculative, environment: environment))
+    do {
+        try attach.relay(input: StdioTransport(), output: StdioTransport())
+    } catch {
+        fail(error)
+    }
+    exit(0)
+}
+
+// 3. The checkpoint. This is the first read under `--weights`.
 let runnerType: any Runner.Type
 do {
     runnerType = try launch.resolveRunner()
@@ -79,7 +117,8 @@ do {
     fail(error)
 }
 
-// 3. ONE load, before the hello.
+// 4. ONE load. For `resident` this is the window's ONLY load; for an
+//    in-process `runtime-worker` it is this phase's.
 let runner: any Runner
 do {
     runner = try await runnerType.load(
@@ -92,15 +131,50 @@ do {
     fail(error)
 }
 
-// 4. Serve.
-let server = BenchWorkerServer(
-    runner: runner,
-    transport: StdioTransport(),
-    trusted: launch.trusted,
-    speculative: launch.speculative,
-    // Stamped by the BenchRevisionStamp prebuild plugin: the revision that
-    // PRODUCED this binary, not whatever the checkout moved to afterwards.
-    build: BenchBuildRevision.value,
-    device: probeDevice(),
-    kvBytesCapacity: launch.kvBytesCapacity)
-await server.run()
+// 5. Serve.
+switch launch.subcommand {
+case .resident:
+    // One process, one window. The socket is bound AFTER the load, so a
+    // worker that connects successfully knows the weights are already up —
+    // there is no window where an attach races the load.
+    guard let socketPath = launch.socket else { fail(WorkerLaunchError.missingSocket) }
+    let listener: BenchWorkerSocketListener
+    do {
+        listener = try BenchWorkerSocketListener(path: socketPath)
+    } catch {
+        fail(error)
+    }
+    let resident = BenchWorkerResident(
+        runner: runner,
+        listener: listener,
+        weightsPath: launch.weights.path,
+        trusted: launch.trusted,
+        speculative: launch.speculative,
+        build: BenchBuildRevision.value,
+        device: probeDevice(),
+        kvBytesCapacity: launch.kvBytesCapacity)
+    // The resident must not outlive its window: a stale one holds the
+    // artifact's memory and blocks the box.
+    for signalNumber in [SIGINT, SIGTERM] {
+        signal(signalNumber, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: signalNumber)
+        source.setEventHandler { resident.shutDown(); exit(0) }
+        source.resume()
+        residentSignalSources.append(source)
+    }
+    resident.serve()
+
+case .runtimeWorker:
+    let server = BenchWorkerServer(
+        runner: runner,
+        transport: StdioTransport(),
+        trusted: launch.trusted,
+        speculative: launch.speculative,
+        // Stamped by the BenchRevisionStamp prebuild plugin: the revision
+        // that PRODUCED this binary, not whatever the checkout moved to
+        // afterwards.
+        build: BenchBuildRevision.value,
+        device: probeDevice(),
+        kvBytesCapacity: launch.kvBytesCapacity)
+    await server.run()
+}

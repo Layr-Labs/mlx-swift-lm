@@ -236,6 +236,43 @@ public struct RunnerIdentity: Codable, Sendable, Equatable {
     }
 }
 
+/// `hello.resident`, additive and LAST on the wire — after `runner`.
+///
+/// Identifies the RESIDENT process that actually holds the weights, so every
+/// phase of one measurement window can be shown to have run against one
+/// load. `load_epoch` is constant for a resident's whole life and changes
+/// only when a new resident loads, which is exactly the claim an artifact
+/// needs: the weights did not reload between phases.
+///
+/// GATED. benchd's envelope is closed (`deny_unknown_fields`), so a benchd
+/// that does not yet know this field rejects the whole hello line and the
+/// phase fails. It therefore rides the same `--speculative-protocol v1.1`
+/// gate as the other v1.1 additions AND an explicit
+/// `BENCH_WORKER_RESIDENT_HELLO=1`, until bench-dev admits it.
+public struct ResidentIdentity: Codable, Sendable, Equatable {
+    /// The resident process holding the weights.
+    public var pid: Int32
+    /// Monotonic stamp taken when this resident finished its ONE load.
+    public var loadEpoch: UInt64
+
+    public init(pid: Int32, loadEpoch: UInt64) {
+        self.pid = pid
+        self.loadEpoch = loadEpoch
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case pid
+        case loadEpoch = "load_epoch"
+    }
+
+    var wire: WireValue {
+        .object([
+            ("pid", .int(Int(pid))),
+            ("load_epoch", .int(Int(bitPattern: UInt(loadEpoch)))),
+        ])
+    }
+}
+
 /// The trusted oracle's per-stream reference report.
 public struct CohortReferenceReplayReport: Sendable, Equatable {
     public struct Position: Sendable, Equatable {
@@ -343,6 +380,13 @@ public struct WorkerResponse: Decodable, Sendable {
     public var verifyReplayDisagreements: Int?
     public var cohortReferenceReplay: CohortReferenceReplayReport?
     public var runner: RunnerIdentity?
+    /// See ``ResidentIdentity``. Appended after `runner`.
+    public var resident: ResidentIdentity?
+    /// The resident's own checkpoint path, exchanged ONLY on the socket
+    /// between a resident and the worker attaching to it so the worker can
+    /// refuse a resident holding different weights. Never forwarded to
+    /// benchd.
+    public var residentWeights: String?
 
     public init(id: Int, ok: Bool, nonce: String? = nil) {
         self.id = id
@@ -393,6 +437,8 @@ public struct WorkerResponse: Decodable, Sendable {
         case decodeNsByStream = "decode_ns_by_stream"
         case verifyReplayDisagreements = "verify_replay_disagreements"
         case runner
+        case resident
+        case residentWeights = "resident_weights"
     }
 
     public init(from decoder: Swift.Decoder) throws {
@@ -441,6 +487,8 @@ public struct WorkerResponse: Decodable, Sendable {
         verifyReplayDisagreements = try c.decodeIfPresent(
             Int.self, forKey: .verifyReplayDisagreements)
         runner = try c.decodeIfPresent(RunnerIdentity.self, forKey: .runner)
+        resident = try c.decodeIfPresent(ResidentIdentity.self, forKey: .resident)
+        residentWeights = try c.decodeIfPresent(String.self, forKey: .residentWeights)
         cohortReferenceReplay = nil
     }
 
@@ -504,6 +552,8 @@ public struct WorkerResponse: Decodable, Sendable {
         put("verify_replay_disagreements", verifyReplayDisagreements.map(WireValue.int))
         put("cohort_reference_replay", cohortReferenceReplay?.wire)
         put("runner", runner?.wire)
+        put("resident", resident?.wire)
+        put("resident_weights", residentWeights.map(WireValue.string))
         return WireValue.object(fields).json
     }
 }

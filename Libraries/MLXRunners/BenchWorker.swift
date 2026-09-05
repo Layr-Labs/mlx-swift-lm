@@ -287,6 +287,10 @@ public final class BenchWorkerServer: @unchecked Sendable {
     private let kvBytesCapacity: Int
     private let maxDecodeTokens: Int
     private let memory: any WorkerMemoryReporter
+    /// Non-nil only when this session is served by a RESIDENT. See
+    /// `BenchWorkerResident`.
+    private let residentIdentity: ResidentIdentity?
+    private let residentWeights: String?
     private let nonce: String
     private let decoder: JSONDecoder
 
@@ -312,6 +316,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
         kvBytesCapacity: Int,
         maxDecodeTokens: Int = 4096,
         memory: any WorkerMemoryReporter = MLXMemoryReporter(),
+        residentIdentity: ResidentIdentity? = nil,
+        residentWeights: String? = nil,
         nonce: String = UUID().uuidString
     ) {
         self.runner = runner
@@ -324,6 +330,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
         self.kvBytesCapacity = kvBytesCapacity
         self.maxDecodeTokens = maxDecodeTokens
         self.memory = memory
+        self.residentIdentity = residentIdentity
+        self.residentWeights = residentWeights
         self.nonce = nonce
         self.decoder = JSONDecoder()
     }
@@ -364,6 +372,11 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 manifest.regimes.map(\.batch.maxWidth).filter { $0 > 1 }.max()
         }
         response.headProvenance = runner.headProvenance.map(WireHeadProvenance.init)
+        // Resident identity rides only on the SOCKET, where the attaching
+        // worker reads it, checks the weights path and decides what reaches
+        // benchd. An in-process worker has no resident and emits neither.
+        response.resident = residentIdentity
+        response.residentWeights = residentWeights
         response.runner = RunnerIdentity(
             id: manifest.runnerID,
             modelType: runner.loadedModelType,
