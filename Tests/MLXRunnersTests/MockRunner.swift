@@ -140,36 +140,49 @@ final class MockEngine: CBv2Engine, CBv2MTPCountersReporting, CBv2FreeRunRoundAu
 
 // MARK: - Runner
 
+/// Manifests the CONTRACT itself pins, built here from the document.
+///
+/// The section 11 manifest for Qwen 3.8 Flash-Next is the cross-repo digest
+/// vector, and the shared conformance fixture's hello carries its runner
+/// identity. It is the runner's own manifest: the fixture is driven over the
+/// value the fork serves, not over a copy of it.
+enum ContractManifests {
+    /// The runner's own manifest. One declaration: a test that pins the
+    /// digest and a fixture hello driven over this value cannot drift apart
+    /// from what the fork actually serves.
+    static let sectionEleven = Qwen4ExpRunner.manifest
+}
+
+/// The mock adapter's manifest, DECODED from the file benchd checked in
+/// beside the fixture (`Resources/engine-wire-v1-adapter.manifest.json`).
+///
+/// Decoded rather than declared in Swift on purpose: both sides load the
+/// SAME bytes, so the hello's `manifest_sha256` is a digest this repo
+/// actually computed over the other repo's file, not two declarations that
+/// happen to agree today.
+enum FixtureManifest {
+    static let mockAdapter: RunnerManifest = {
+        guard
+            let url = Bundle.module.url(
+                forResource: "engine-wire-v1-adapter.manifest", withExtension: "json"),
+            let data = try? Data(contentsOf: url),
+            let manifest = try? JSONDecoder().decode(RunnerManifest.self, from: data)
+        else {
+            fatalError("the shared mock-adapter manifest is missing or undecodable")
+        }
+        return manifest
+    }()
+}
+
 /// The scripted runner the conformance fixture is driven over.
+///
+/// Its manifest is the shared mock-adapter file, so `hello.backend` and
+/// `hello.runner.manifest_sha256` are two readings of ONE declaration —
+/// which is what §6.1 requires and what a hand-written hello field would
+/// break.
 final class MockRunner: Runner, @unchecked Sendable {
 
-    static let manifest = RunnerManifest(
-        runnerID: "layr/mock",
-        modelTypes: ["mock"],
-        backend: "mock",
-        engine: CBv2ModelCapabilities(
-            supportsPrefixReuse: false,
-            supportsPagedKV: false,
-            supportsCompiledDecode: false,
-            supportsPackedPrefill: false,
-            supportsMTP: true,
-            supportsCompactRecurrentMTPReplay: false),
-        kvBackends: [.contiguous],
-        decoders: [
-            DecoderDeclaration(
-                mode: DecoderID.serial.rawValue, drafter: .none, state: .stateless,
-                depth: nil),
-            DecoderDeclaration(
-                mode: DecoderID.mtp.rawValue, drafter: .embeddedHead,
-                state: .requestStateful, depth: 1 ... 3),
-        ],
-        regimes: [
-            RegimeDeclaration(batch: .single, timing: .freeRun, perStreamTiming: false),
-            RegimeDeclaration(batch: .single, timing: .teacherForced, perStreamTiming: false),
-        ],
-        multimodal: false,
-        recurrentLayers: false,
-        requiresKeepMask: false)
+    static var manifest: RunnerManifest { FixtureManifest.mockAdapter }
 
     /// The window audit the scripted engine replays.
     let script: MockRoundScript?
@@ -184,7 +197,7 @@ final class MockRunner: Runner, @unchecked Sendable {
     let layerKinds: [CBv2LayerKind] = []
     let loadedDecoders: [DecoderID] = [.serial, .mtp]
     let headProvenance: HeadProvenance? = nil
-    let loadedModelType = "mock"
+    let loadedModelType = "qwen4_exp_text"
 
     init(
         script: MockRoundScript? = MockRoundScript(
@@ -217,7 +230,6 @@ final class TeacherForcedOnlyMockRunner: Runner, @unchecked Sendable {
     static let manifest = RunnerManifest(
         runnerID: "layr/mock-teacher-forced",
         modelTypes: ["mock-teacher-forced"],
-        backend: "mock",
         engine: MockRunner.manifest.engine,
         kvBackends: [.contiguous],
         decoders: MockRunner.manifest.decoders,

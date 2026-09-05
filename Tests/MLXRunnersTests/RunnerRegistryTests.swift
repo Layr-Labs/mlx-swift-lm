@@ -54,11 +54,15 @@ struct RunnerRegistryTests {
         #expect(ids.count == Set(ids).count)
     }
 
+    /// A track repo registers its own runner before resolving; this proves
+    /// the claim lands on every `model_type` the manifest names. The mock
+    /// used here is the teacher-forced one, so nothing in the test suite ever
+    /// registers a model_type a real runner will claim later.
     @Test("A registered runner claims every model_type in its manifest")
     func registrationClaimsAll() throws {
-        RunnerRegistry.shared.register(MockRunner.self)
-        #expect(RunnerRegistry.shared.contains(modelType: "mock"))
-        let resolved = try RunnerRegistry.shared.resolve(modelType: "mock")
-        #expect(resolved.manifest.runnerID == "layr/mock")
+        RunnerRegistry.shared.register(TeacherForcedOnlyMockRunner.self)
+        #expect(RunnerRegistry.shared.contains(modelType: "mock-teacher-forced"))
+        let resolved = try RunnerRegistry.shared.resolve(modelType: "mock-teacher-forced")
+        #expect(resolved.manifest.runnerID == "layr/mock-teacher-forced")
     }
 }

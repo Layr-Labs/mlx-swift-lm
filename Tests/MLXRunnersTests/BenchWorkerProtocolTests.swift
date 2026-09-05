@@ -69,18 +69,11 @@ struct BenchWorkerProtocolTests {
 
         #expect(transport.written.count == fixture.responses.count + 1)
 
-        // The hello is the ONE line that cannot match the fixture verbatim:
-        // contract §6.0 adds the `runner` block as the last key of the hello,
-        // and this fixture predates it. Assert the exact shape instead of
-        // loosening the comparison — everything before `runner` must be the
-        // fixture's bytes, and the appended block must be the derived
-        // identity.
-        let expectedHello =
-            String(fixture.hello.dropLast())
-            + ",\"runner\":{\"id\":\"layr/mock\",\"model_type\":\"mock\","
-            + "\"manifest_sha256\":\"\(MockRunner.manifest.sha256Digest())\","
-            + "\"build\":\"fixture\"}}"
-        #expect(transport.written[0] == expectedHello)
+        // The hello like every other line: no substitution, no special
+        // case. Both sides now derive it from the same checked-in manifest,
+        // so `backend` and `runner.manifest_sha256` are two readings of one
+        // declaration rather than two facts that can disagree.
+        #expect(transport.written[0] == fixture.hello, "the hello diverged from the fixture")
 
         for (index, expected) in fixture.responses.enumerated() {
             #expect(
@@ -175,6 +168,7 @@ struct BenchWorkerProtocolTests {
         #expect(hello.ok)
         #expect(hello.nonce == "fixturenonce")
         #expect(hello.protocolVersion == 1)
+        // From the manifest, never from a constant here.
         #expect(hello.backend == "mock")
         #expect(hello.device == "mock")
         // Every declared regime is single-stream and free-run or
@@ -183,8 +177,8 @@ struct BenchWorkerProtocolTests {
         #expect(hello.maxBatchSize == nil)
         #expect(hello.specModes == ["serial", "mtp"])
         #expect(hello.headProvenance == nil)
-        #expect(hello.runner?.id == "layr/mock")
-        #expect(hello.runner?.modelType == "mock")
+        #expect(hello.runner?.id == "layr/mock-adapter")
+        #expect(hello.runner?.modelType == "qwen4_exp_text")
         #expect(hello.runner?.manifestSHA256 == MockRunner.manifest.sha256Digest())
         #expect(hello.runner?.build == "fixture")
     }
