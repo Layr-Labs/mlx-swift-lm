@@ -352,7 +352,13 @@ let package = Package(
             name: "MLXRunnersTests",
             // MLXLLM: the Qwen 3.8 Flash-Next resource tests build the tiny
             // tower to read the n-gram geometry off its PLE layer.
-            dependencies: ["MLXRunners", "MLXLMCommon", "MLXLLM"],
+            dependencies: [
+                "MLXRunners",
+                "MLXLMCommon",
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
             path: "Tests/MLXRunnersTests",
             resources: [
                 // The SHARED Engine Protocol v1 conformance fixture, pinned

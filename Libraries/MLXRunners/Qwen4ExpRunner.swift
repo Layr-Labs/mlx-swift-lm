@@ -115,28 +115,36 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
         self.loadedDecoders = drafter == nil ? [.serial] : [.serial, .mtp]
     }
 
-    public static func load(
-        _ directory: URL, options: RunnerLoadOptions
-    ) async throws -> Qwen4ExpRunner {
+    /// Adopt a module the caller already holds. Reads NO tensors: the
+    /// embedded head is BOUND to the module in memory, never reloaded, and
+    /// the n-gram rows come from the caller's resource.
+    ///
+    /// The one file read beyond `config.json` is the embedded head's own
+    /// shard, hashed for provenance (§12c). That is a checkpoint fact, not a
+    /// second copy of the weights.
+    public static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> Qwen4ExpRunner {
+        // Checkpoint facts FIRST, module second.
         let modelType = try RunnerCheckpoint.modelType(at: directory)
-        let context = try await LLMModelFactory.shared.load(
-            from: directory, using: #huggingFaceTokenizerLoader())
-        guard let model = context.model as? Qwen4ExpModel else {
-            throw RunnerError.unexpectedModel(String(describing: type(of: context.model)))
-        }
-
-        // The PLE layers read their rows through the injected source. A model
-        // that has PLE layers and no source cannot run a forward pass at all,
-        // so the load refuses here rather than at the first token.
-        if !model.pleEmbeddings.isEmpty {
-            model.install(
-                ngramRowSource: try Self.resolveNGramRowSource(
-                    options.resources[ngramRowSourceResource], for: model))
-        }
+        let eosTokenIDs = RunnerCheckpoint.eosTokenIDs(
+            at: directory, tokenizer: tokenizer)
 
         // The head is a block of the checkpoint, not a separate artifact, so
-        // a caller pointing at another directory is asking for something this
-        // family does not serve.
+        // a caller handing one over — a resident module or another directory
+        // — is asking for something this family does not serve. Refused
+        // BEFORE the module is examined: accepting a drafter and then
+        // binding the checkpoint's own would serve something other than what
+        // the caller handed in.
+        guard options.preloadedDrafter == nil else {
+            throw RunnerError.drafterUnavailable(
+                "qwen4_exp draws its mtp head from the checkpoint; "
+                    + "a preloaded drafter is not served")
+        }
         if let drafterDirectory = options.drafterDirectory,
             drafterDirectory.standardizedFileURL != directory.standardizedFileURL
         {
@@ -145,6 +153,22 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
                     + "\(drafterDirectory.path) is not served")
         }
 
+        guard let model = model as? Qwen4ExpModel else {
+            throw RunnerError.unexpectedModel(String(describing: type(of: model)))
+        }
+
+        // The PLE layers read their rows through the injected source. A model
+        // that has PLE layers and no source cannot run a forward pass at all,
+        // so adoption refuses here rather than at the first token.
+        if !model.pleEmbeddings.isEmpty {
+            model.install(
+                ngramRowSource: try Self.resolveNGramRowSource(
+                    options.resources[ngramRowSourceResource], for: model))
+        }
+
+        // The head is already in memory as part of the module: the drafter
+        // BINDS to it. A checkpoint loaded without the `mtp.*` block has none
+        // and is serial only.
         let drafter = Qwen4ExpInlineMTPAssistant(target: model)
         // §12c: the one embedded-head rule, in the one shared helper. It
         // hashes the shards carrying the `mtp.*` tensors, not the whole
@@ -155,9 +179,8 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
 
         return Qwen4ExpRunner(
             model: model,
-            tokenizer: context.tokenizer,
-            eosTokenIDs: RunnerCheckpoint.eosTokenIDs(
-                at: directory, tokenizer: context.tokenizer),
+            tokenizer: tokenizer,
+            eosTokenIDs: eosTokenIDs,
             loadedModelType: modelType,
             drafter: drafter,
             headProvenance: provenance,

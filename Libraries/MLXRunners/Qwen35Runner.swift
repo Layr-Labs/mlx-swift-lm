@@ -100,48 +100,83 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
         self.loadedDecoders = drafter == nil ? [.serial] : [.serial, .mtp]
     }
 
-    public static func load(
-        _ directory: URL, options: RunnerLoadOptions
-    ) async throws -> Qwen35Runner {
-        let modelType = try RunnerCheckpoint.modelType(at: directory)
-        let context = try await LLMModelFactory.shared.load(
-            from: directory, using: #huggingFaceTokenizerLoader())
-
-        let servingModel: any LanguageModel
-        let layerKinds: [CBv2LayerKind]
-        let newCaches:
-            (
-                (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
-                    any CBv2AttendingLayerCache
-            ) throws -> [any CBv2AttendingLayerCache]
-        switch context.model {
+    /// The dense/MoE `Qwen35Model` and the text-only `Qwen35TextModel`
+    /// expose the same CBv2 hooks under different types. Resolved ONCE here
+    /// so `makeEngine` and `makeStepper` never re-switch.
+    static func hooks(of model: any LanguageModel) throws -> (
+        serving: any LanguageModel,
+        layerKinds: [CBv2LayerKind],
+        newCaches: (
+            (_ layerIndex: Int, _ kind: CBv2LayerKind) throws ->
+                any CBv2AttendingLayerCache
+        ) throws -> [any CBv2AttendingLayerCache]
+    ) {
+        switch model {
         case let model as Qwen35Model:
             // Covers `Qwen35MoEModel`, which subclasses it.
-            servingModel = model
-            layerKinds = model.cbv2LayerKinds
-            newCaches = { make in try model.newCacheV2(makeLayerCache: make) }
+            return (
+                model, model.cbv2LayerKinds,
+                { make in try model.newCacheV2(makeLayerCache: make) }
+            )
         case let model as Qwen35TextModel:
-            servingModel = model
-            layerKinds = model.cbv2LayerKinds
-            newCaches = { make in try model.newCacheV2(makeLayerCache: make) }
+            return (
+                model, model.cbv2LayerKinds,
+                { make in try model.newCacheV2(makeLayerCache: make) }
+            )
         default:
-            throw RunnerError.unexpectedModel(String(describing: type(of: context.model)))
+            throw RunnerError.unexpectedModel(String(describing: type(of: model)))
+        }
+    }
+
+    public static func adopt(
+        model: any LanguageModel,
+        tokenizer: any MLXLMCommon.Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> Qwen35Runner {
+        // Checkpoint facts FIRST, module second: these two reads are the
+        // whole of this method's filesystem access.
+        let modelType = try RunnerCheckpoint.modelType(at: directory)
+        let eosTokenIDs = RunnerCheckpoint.eosTokenIDs(
+            at: directory, tokenizer: tokenizer)
+        let hooks = try Self.hooks(of: model)
+
+        // The embedded head ships INSIDE the checkpoint, so the provenance
+        // of a head loaded from there is the checkpoint's own directory.
+        // §12c: the one embedded-head rule, in the one shared helper.
+        var provenance: HeadProvenance?
+        if options.preloadedDrafter != nil {
+            provenance = try? RunnerCheckpoint.provenance(
+                ofEmbeddedHeadAt: options.drafterDirectory ?? directory)
         }
 
-        // The embedded head ships inside the checkpoint, so the drafter
-        // directory DEFAULTS to the model directory. A caller that wants
-        // serial passes a build with `decoder == .serial`; it does not have
-        // to hide the head.
+        return Qwen35Runner(
+            servingModel: hooks.serving,
+            layerKinds: hooks.layerKinds,
+            newCaches: hooks.newCaches,
+            tokenizer: tokenizer,
+            eosTokenIDs: eosTokenIDs,
+            loadedModelType: modelType,
+            drafter: options.preloadedDrafter,
+            headProvenance: provenance,
+            kvBytesCapacity: options.kvBytesCapacity,
+            maxSequenceLength: options.maxSequenceLength)
+    }
+
+    /// The head ships inside the checkpoint, so the drafter directory
+    /// DEFAULTS to the model directory. Reading it is why this is not part
+    /// of `adopt`.
+    public static func loadDrafter(
+        options: RunnerLoadOptions,
+        directory: URL,
+        target: any LanguageModel
+    ) async throws -> (any CBv2MTPDrafter)? {
+        if let preloaded = options.preloadedDrafter { return preloaded }
         let drafterDirectory = options.drafterDirectory ?? directory
-        var drafter: (any CBv2MTPDrafter)?
-        var provenance: HeadProvenance?
         do {
-            let assistant = try Qwen35InlineMTPAssistant.load(
-                from: drafterDirectory, target: servingModel)
-            drafter = assistant
-            // §12c: the one embedded-head rule, in the one shared helper.
-            provenance = try RunnerCheckpoint.provenance(
-                ofEmbeddedHeadAt: drafterDirectory)
+            return try Qwen35InlineMTPAssistant.load(
+                from: drafterDirectory, target: try Self.hooks(of: target).serving)
         } catch {
             // An EXPLICIT drafter directory that fails is a refusal; the
             // implicit in-checkpoint head simply may not be there, and a
@@ -150,20 +185,8 @@ public final class Qwen35Runner: Runner, @unchecked Sendable {
             if options.drafterDirectory != nil {
                 throw RunnerError.drafterUnavailable("\(error)")
             }
+            return nil
         }
-
-        return Qwen35Runner(
-            servingModel: servingModel,
-            layerKinds: layerKinds,
-            newCaches: newCaches,
-            tokenizer: context.tokenizer,
-            eosTokenIDs: RunnerCheckpoint.eosTokenIDs(
-                at: directory, tokenizer: context.tokenizer),
-            loadedModelType: modelType,
-            drafter: drafter,
-            headProvenance: provenance,
-            kvBytesCapacity: options.kvBytesCapacity,
-            maxSequenceLength: options.maxSequenceLength)
     }
 
     public func makeEngine(_ build: EngineBuild) throws -> any CBv2Engine {

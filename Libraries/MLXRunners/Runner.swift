@@ -443,7 +443,11 @@ public struct RunnerResources: @unchecked Sendable {
 
 /// What the CALLER wants honored at load time. The runner never downloads
 /// and never reads the network (§5 rule 4).
-public struct RunnerLoadOptions: Sendable {
+///
+/// `@unchecked Sendable` because `preloadedDrafter` is a live module the
+/// caller already holds; the options struct is handed across the load
+/// boundary and never mutated after it.
+public struct RunnerLoadOptions: @unchecked Sendable {
     /// Directory holding the drafter artifact (assistant checkpoint or a
     /// standalone embedded-head export). nil means "serial only".
     public var drafterDirectory: URL?
@@ -461,19 +465,28 @@ public struct RunnerLoadOptions: Sendable {
     public var environment: [String: String]
     /// Family resources the caller supplies. See ``RunnerResources``.
     public var resources: RunnerResources
+    /// A drafter the caller ALREADY holds resident.
+    ///
+    /// Darkbloom's slot lifecycle keeps the Gemma 4 assistant loaded across
+    /// engine rebuilds, so handing it in is the difference between binding a
+    /// module and reading its tensors a second time. When set it is used as
+    /// is and `drafterDirectory` is not opened.
+    public var preloadedDrafter: (any CBv2MTPDrafter)?
 
     public init(
         drafterDirectory: URL? = nil,
         kvBytesCapacity: Int = 0,
         maxSequenceLength: Int = 32768,
         environment: [String: String] = ProcessInfo.processInfo.environment,
-        resources: RunnerResources = RunnerResources()
+        resources: RunnerResources = RunnerResources(),
+        preloadedDrafter: (any CBv2MTPDrafter)? = nil
     ) {
         self.drafterDirectory = drafterDirectory
         self.kvBytesCapacity = kvBytesCapacity
         self.maxSequenceLength = maxSequenceLength
         self.environment = environment
         self.resources = resources
+        self.preloadedDrafter = preloadedDrafter
     }
 }
 
@@ -565,7 +578,45 @@ public protocol Runner: AnyObject, Sendable {
     /// loaded state (§6.1).
     static var manifest: RunnerManifest { get }
 
+    /// Adopt a module the caller ALREADY has resident.
+    ///
+    /// Reads NO tensors. Everything it derives — the serving model after
+    /// tower extraction, the layer kinds, the loaded decoders, the head
+    /// provenance — comes from the module it was handed plus `config.json`
+    /// and the safetensors index under `directory`.
+    ///
+    /// This exists because Darkbloom's slot lifecycle owns a resident
+    /// `ModelContainer`: a runner that could only `load` would read a
+    /// checkpoint the process already holds, and on a 113 GB model that is
+    /// not a slow path, it is a second copy in unified memory.
+    ///
+    /// `configuration` is carried for runners that key on the resolved
+    /// model identity; the authoritative `model_type` is read from
+    /// `config.json`, which is what the hello reports.
+    static func adopt(
+        model: any LanguageModel,
+        tokenizer: any Tokenizer,
+        configuration: ModelConfiguration,
+        directory: URL,
+        options: RunnerLoadOptions
+    ) throws -> Self
+
+    /// Load the family's drafter from disk and bind it to `target` (the RAW
+    /// loaded module — the family extracts its own tower).
+    ///
+    /// Separate from `adopt` precisely because it READS TENSORS. Default:
+    /// whatever the caller already handed in, which is nil for a family with
+    /// no drafter.
+    static func loadDrafter(
+        options: RunnerLoadOptions,
+        directory: URL,
+        target: any LanguageModel
+    ) async throws -> (any CBv2MTPDrafter)?
+
     /// Load the checkpoint. Loads weights ONCE. No download. No network.
+    ///
+    /// Defaulted in terms of `adopt`, so construction has ONE path: bring
+    /// the module into memory, then adopt it.
     static func load(_ directory: URL, options: RunnerLoadOptions) async throws -> Self
 
     /// The serving model after tower extraction (VLM text tower, MoE target).
