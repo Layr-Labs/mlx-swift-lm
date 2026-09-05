@@ -56,7 +56,42 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
     /// reference implements, and the engine overrides it from the pinned
     /// checkpoint fact. `MLXFastConstants.RMSNormConvention` carries the
     /// reasoning and the load-time verification.
-    public var rmsNormWeightOffset: Float = 1
+    /// Added to a stored norm weight before it scales the normalized
+    /// activation. See ``Qwen4ExpRMSNorm/weightOffset``.
+    ///
+    /// ZERO IS THIS FAMILY'S DEFAULT, because this checkpoint BAKES the
+    /// offset: its non-gated norm tensors store `1 + w`, so the model must
+    /// compute `y * w`. Nothing in `config.json` says so — the fact was
+    /// measured on the box over all 157 non-gated norm tensors and pinned by
+    /// the previous engine as
+    /// `MLXFastConstants.rmsNormConvention == .offsetBaked`, whose
+    /// `weightOffset` is 0 (mlxfast-qwen38-125b-a6b-engine-dev
+    /// `Sources/MLXFastCore/Constants.swift:139-144,176`).
+    ///
+    /// A `rms_norm_weight_offset` in `config.json` still wins, so a
+    /// zero-centered conversion can say `1` and be served correctly. The
+    /// value is decided HERE, at configuration decode, because the module's
+    /// `weightOffset` is a `let` fixed at init — by the time a container or
+    /// a runner holds the module it is far too late to change it.
+    ///
+    /// Getting this wrong scales every non-gated norm in the tower by about
+    /// one unit and produces incoherent output while every shape and digest
+    /// still checks out, which is why
+    /// `Qwen4ExpNormConvention.validate(model:expectedOffset:)` refuses a
+    /// module whose loaded tensors contradict the configured value.
+    public var rmsNormWeightOffset: Float = 0
+
+    /// True when `rms_norm_weight_offset` was actually present where this
+    /// configuration was decoded from.
+    ///
+    /// The key appears in two places depending on the tree: INSIDE
+    /// `text_config` on the raw HF checkpoint, and at the TOP LEVEL of the
+    /// transformed tree, whose transform flattens `text_config` away
+    /// entirely. `Qwen4ExpConfiguration` reads the root only when the nested
+    /// block did not carry it, and this is how it tells the difference
+    /// between "the nested block said 0" and "the nested block said
+    /// nothing".
+    public internal(set) var rmsNormWeightOffsetIsExplicit: Bool = false
     public var layerTypes: [String] = []
     public var fullAttentionInterval: Int = 4
 
@@ -189,7 +224,9 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         self.headDim = try int(.headDim, 256)
         self.vocabularySize = try int(.vocabularySize, 248_320)
         self.rmsNormEps = try float(.rmsNormEps, 1e-6)
-        self.rmsNormWeightOffset = try float(.rmsNormWeightOffset, 1)
+        let declaredOffset = try c.decodeIfPresent(Float.self, forKey: .rmsNormWeightOffset)
+        self.rmsNormWeightOffset = declaredOffset ?? 0
+        self.rmsNormWeightOffsetIsExplicit = declaredOffset != nil
         self.fullAttentionInterval = try int(.fullAttentionInterval, 4)
         self.numExperts = try int(.numExperts, 512)
         self.numExpertsPerTok = try int(.numExpertsPerTok, 10)

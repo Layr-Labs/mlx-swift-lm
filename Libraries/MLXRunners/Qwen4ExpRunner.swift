@@ -157,6 +157,18 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
             throw RunnerError.unexpectedModel(String(describing: type(of: model)))
         }
 
+        // THE NORM CONVENTION, against the tensors that were actually
+        // loaded. `config.json` does not carry it, so the configuration
+        // decides it from this family's pinned default and the module fixes
+        // it at init — by the time adoption holds a module, the only thing
+        // left to do is prove the choice was right. Wrong, it scales every
+        // non-gated norm in the tower by about one unit and produces
+        // incoherent output while every shape, tensor count and digest still
+        // checks out; that is what the box saw as a step-0 parity failure.
+        //
+        // Reads only resident tensors. See `Qwen4ExpNormConvention`.
+        try Self.validateNormConvention(model)
+
         // The PLE layers read their rows through the injected source. A model
         // that has PLE layers and no source cannot run a forward pass at all,
         // so adoption refuses here rather than at the first token.
@@ -186,6 +198,23 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
             headProvenance: provenance,
             kvBytesCapacity: options.kvBytesCapacity,
             maxSequenceLength: options.maxSequenceLength)
+    }
+
+    /// Refuse a module whose loaded norm weights contradict the offset it
+    /// was configured with.
+    ///
+    /// Ported from the previous engine's `validateLoadedNormConvention`
+    /// (mlxfast-qwen38-125b-a6b-engine-dev
+    /// `Sources/MLXFastHarness/Qwen4ExpNormConventionBind.swift:162-230`),
+    /// thresholds and gated/non-gated split unchanged.
+    static func validateNormConvention(_ model: Qwen4ExpModel) throws {
+        let expected = model.configuration.rmsNormWeightOffset
+        guard
+            let mismatch = Qwen4ExpNormConvention.mismatch(
+                model: model, expectedOffset: expected)
+        else { return }
+        throw RunnerError.normConventionMismatch(
+            expectedOffset: expected, observed: mismatch.observed)
     }
 
     /// Resolve the n-gram row source from the resource the caller gave.

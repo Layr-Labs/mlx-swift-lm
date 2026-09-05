@@ -610,6 +610,12 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
     /// A resource the runner cannot build itself was absent from
     /// `RunnerLoadOptions.resources`.
     case resourceMissing(String)
+    /// The loaded norm weights contradict the configured RMSNorm weight
+    /// offset. Applying the wrong convention scales every non-gated norm in
+    /// the tower by about one unit and produces incoherent output while
+    /// every shape and digest still checks out, so this REFUSES rather than
+    /// runs.
+    case normConventionMismatch(expectedOffset: Float, observed: String)
     /// The paged pool was built with page arithmetic other than the one the
     /// caller asked for. An explicit paged request is honoured exactly or
     /// refused BY NAME: serving fp16 under an fp32 label would make a
@@ -632,6 +638,11 @@ public enum RunnerError: Error, CustomStringConvertible, Equatable {
             return "runner: drafter unavailable (\(detail))"
         case .resourceMissing(let detail):
             return "runner: required resource absent (\(detail))"
+        case .normConventionMismatch(let expectedOffset, let observed):
+            return "runner: the checkpoint's norm weights contradict the configured "
+                + "rms_norm_weight_offset \(expectedOffset) — \(observed). Applying the "
+                + "wrong convention produces incoherent output while every shape and "
+                + "digest still checks out"
         case .pagedPoolDTypeUnsupported(let requested, let served):
             return "runner: paged pool requested \(requested) but was built \(served)"
         }

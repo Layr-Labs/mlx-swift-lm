@@ -36,6 +36,13 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
         case textConfig = "text_config"
     }
 
+    /// Root keys that are READ but never written, so they stay out of
+    /// `CodingKeys` and the synthesized encoder. Same shape as
+    /// `Qwen4ExpTextConfiguration.RopeCodingKeys`.
+    enum RootCodingKeys: String, CodingKey {
+        case rmsNormWeightOffset = "rms_norm_weight_offset"
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.modelType =
@@ -44,7 +51,25 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
         if let nested = try container.decodeIfPresent(
             Qwen4ExpTextConfiguration.self, forKey: .textConfig)
         {
-            self.textConfig = nested
+            var text = nested
+            // THE NORM CONVENTION IS THE ONE ROOT KEY THIS READS, and the
+            // trees are why. The raw HF checkpoint carries
+            // `rms_norm_weight_offset` inside `text_config`; the TRANSFORMED
+            // tree has no `text_config` at all — the transform flattens it —
+            // and carries the key at the root. The flattened case already
+            // lands in the `else` branch below, and this covers the third
+            // shape: a `text_config` that does not name the offset while the
+            // root does. Nested still wins when it names it, so nothing that
+            // works today changes meaning.
+            if !text.rmsNormWeightOffsetIsExplicit,
+                let root = try? decoder.container(keyedBy: RootCodingKeys.self),
+                let declared = try root.decodeIfPresent(
+                    Float.self, forKey: .rmsNormWeightOffset)
+            {
+                text.rmsNormWeightOffset = declared
+                text.rmsNormWeightOffsetIsExplicit = true
+            }
+            self.textConfig = text
         } else {
             self.textConfig = try Qwen4ExpTextConfiguration(from: decoder)
         }
