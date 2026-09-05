@@ -198,17 +198,23 @@ case .resident:
         speculative: launch.speculative,
         build: BenchBuildRevision.value,
         device: probeDevice(),
-        kvBytesCapacity: launch.kvBytesCapacity)
+        kvBytesCapacity: launch.kvBytesCapacity,
+        pidfilePath: launch.pidfile)
+
     // The resident must not outlive its window: a stale one holds the
-    // artifact's memory and blocks the box.
-    for signalNumber in [SIGINT, SIGTERM] {
-        signal(signalNumber, SIG_IGN)
-        let source = DispatchSource.makeSignalSource(signal: signalNumber)
-        source.setEventHandler { resident.shutDown(); exit(0) }
-        source.resume()
-        residentSignalSources.append(source)
-    }
+    // artifact's memory and blocks the box. The handlers are installed from
+    // MLXRunners, NOT from a closure written here — top-level code in
+    // main.swift is @MainActor-isolated, so a handler written inline runs
+    // the executor-isolation check on the dispatch-source thread and traps
+    // before any teardown happens. See `BenchWorkerResidentTermination`.
+    residentSignalSources = BenchWorkerResidentTermination.install(for: resident)
+
+    // The signal handler only ASKS. The accept loop returns, and the owner —
+    // this thread — performs the teardown, so the socket and the pidfile are
+    // gone before the process exits.
     resident.serve()
+    resident.shutDown()
+    exit(0)
 
 case .runtimeWorker:
     let server = BenchWorkerServer(

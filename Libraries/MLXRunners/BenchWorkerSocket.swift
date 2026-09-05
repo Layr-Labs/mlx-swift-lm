@@ -53,7 +53,15 @@ public enum BenchWorkerSocketError: Error, CustomStringConvertible, Equatable {
 /// and a connection is owned by exactly one session at a time — which is the
 /// resident's whole concurrency model.
 public final class BenchWorkerSocketConnection: @unchecked Sendable {
-    private let descriptor: Int32
+    /// -1 once closed. Guarded, and cleared BEFORE the `close(2)`, because a
+    /// descriptor closed twice is not a harmless mistake: the number is
+    /// returned to the process immediately and the kernel hands it to the
+    /// next `accept`, so the second close shuts down an unrelated
+    /// connection. That defect showed up here as an intermittent "resident
+    /// sent no hello" — a phase whose freshly accepted socket had been
+    /// closed out from under it by the PREVIOUS phase's `deinit`.
+    private var descriptor: Int32
+    private let descriptorLock = NSLock()
     private var buffer = Data()
     private var atEOF = false
 
@@ -62,6 +70,13 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
     }
 
     deinit { close() }
+
+    /// The descriptor, or -1 when this connection no longer owns one.
+    private var borrowedDescriptor: Int32 {
+        descriptorLock.lock()
+        defer { descriptorLock.unlock() }
+        return descriptor
+    }
 
     /// The next newline-terminated line, or nil at EOF.
     public func readLine() -> String? {
@@ -78,8 +93,13 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
                 buffer.removeAll()
                 return line
             }
+            let fileDescriptor = borrowedDescriptor
+            guard fileDescriptor >= 0 else {
+                atEOF = true
+                continue
+            }
             var chunk = [UInt8](repeating: 0, count: 64 * 1024)
-            let count = Darwin.read(descriptor, &chunk, chunk.count)
+            let count = Darwin.read(fileDescriptor, &chunk, chunk.count)
             if count > 0 {
                 buffer.append(contentsOf: chunk[0 ..< count])
             } else if count == 0 {
@@ -96,6 +116,8 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
     /// write that was ignored would truncate a response and desynchronize
     /// the whole session.
     public func write(line: String) {
+        let fileDescriptor = borrowedDescriptor
+        guard fileDescriptor >= 0 else { return }
         var bytes = Array((line + "\n").utf8)
         var offset = 0
         while offset < bytes.count {
@@ -103,7 +125,7 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
             // this type's own `write(line:)` inside the class body.
             let written = bytes.withUnsafeBytes { raw -> Int in
                 Darwin.write(
-                    descriptor, raw.baseAddress!.advanced(by: offset),
+                    fileDescriptor, raw.baseAddress!.advanced(by: offset),
                     bytes.count - offset)
             }
             if written > 0 {
@@ -116,9 +138,16 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
         }
     }
 
+    /// Idempotent. The descriptor is surrendered under the lock before the
+    /// `close(2)`, so a second call — `runSession` finishing and then
+    /// `deinit`, say — cannot close a number the kernel has already reissued.
     public func close() {
-        guard descriptor >= 0 else { return }
-        _ = Darwin.close(descriptor)
+        descriptorLock.lock()
+        let owned = descriptor
+        descriptor = -1
+        descriptorLock.unlock()
+        guard owned >= 0 else { return }
+        _ = Darwin.close(owned)
     }
 }
 
@@ -126,6 +155,12 @@ public final class BenchWorkerSocketConnection: @unchecked Sendable {
 public final class BenchWorkerSocketListener: @unchecked Sendable {
     private let descriptor: Int32
     public let path: String
+    /// Teardown runs from the accept loop AND from a signal handler, so it
+    /// must be safe to call twice: closing an already-closed descriptor is
+    /// sloppy, and unlinking a path a LATER resident has already rebound
+    /// would delete a live socket.
+    private let lock = NSLock()
+    private var isShutDown = false
 
     /// Bind and listen.
     ///
@@ -182,9 +217,15 @@ public final class BenchWorkerSocketListener: @unchecked Sendable {
         }
     }
 
-    /// Close the listener and remove its socket file. Idempotent.
+    /// Close the listener and remove its socket file. Idempotent, and safe
+    /// to call from a signal-source thread: closing the descriptor is what
+    /// wakes a blocked `accept()`.
     public func shutDown() {
-        guard descriptor >= 0 else { return }
+        lock.lock()
+        let alreadyDown = isShutDown
+        isShutDown = true
+        lock.unlock()
+        guard !alreadyDown, descriptor >= 0 else { return }
         _ = Darwin.close(descriptor)
         unlink(path)
     }

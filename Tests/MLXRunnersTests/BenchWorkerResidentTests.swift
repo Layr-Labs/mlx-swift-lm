@@ -310,3 +310,170 @@ struct BenchWorkerResidentTests {
         }
     }
 }
+
+// MARK: - Termination
+
+/// The SIGTERM teardown, over the mock runner.
+///
+/// The defect this pins is a real one from M5 #4: the signal handler was a
+/// closure written in `main.swift`, whose top-level code is
+/// `@MainActor`-isolated, so dispatch ran a MainActor-isolated thunk on the
+/// signal source's own thread, Swift concurrency checked the executor, and
+/// the process trapped — killing a resident holding 113 GB before it could
+/// unlink its socket. The handler now only ASKS the resident to stop; the
+/// accept loop returns and its owner tears down.
+///
+/// `.serialized` because these install process-wide signal dispositions.
+@Suite("bench-worker resident termination", .serialized)
+struct BenchWorkerResidentTerminationTests {
+
+    private func makeResident(
+        socketPath: String, pidfilePath: String?
+    ) throws -> BenchWorkerResident {
+        BenchWorkerResident(
+            runner: MockRunner(),
+            listener: try BenchWorkerSocketListener(path: socketPath),
+            weightsPath: "/models/mock",
+            trusted: false,
+            speculative: true,
+            build: "fixture",
+            device: "mock",
+            kvBytesCapacity: 1 << 20,
+            pidfilePath: pidfilePath,
+            memory: FixtureMemoryReporter(),
+            loadEpoch: 7)
+    }
+
+    /// Short, and under `/tmp`: a `sockaddr_un` path is capped near 104
+    /// bytes and the per-user temporary directory already spends most of
+    /// that, which is exactly what a box hits when it puts a window's socket
+    /// somewhere tidy-looking.
+    private func temporaryPath(_ suffix: String) -> String {
+        "/tmp/bw-\(UUID().uuidString.prefix(8))\(suffix)"
+    }
+
+    /// The whole sequence a window's tooling depends on: a real SIGTERM
+    /// delivered to this process, the accept loop returning rather than the
+    /// process trapping, and the socket and pidfile gone afterwards.
+    @Test("SIGTERM stops the accept loop and the owner tears down cleanly")
+    func sigtermTearsDownCleanly() throws {
+        let socketPath = temporaryPath(".sock")
+        let pidfilePath = temporaryPath(".pid")
+        let resident = try makeResident(socketPath: socketPath, pidfilePath: pidfilePath)
+
+        // The same installation path main.swift uses, on SIGUSR2 rather than
+        // SIGTERM. The mechanism under test — dispatch source, handler,
+        // accept loop — is signal-number agnostic, while a real SIGTERM is
+        // delivered to the whole TEST PROCESS and disturbs residents other
+        // suites are running in parallel. The production list is asserted
+        // separately below. Retained for the test's lifetime: a source that
+        // goes out of scope stops firing.
+        let sources = BenchWorkerResidentTermination.install(
+            for: resident, signals: [SIGUSR2])
+        defer {
+            sources.forEach { $0.cancel() }
+            signal(SIGUSR2, SIG_DFL)
+        }
+
+        let returned = DispatchSemaphore(value: 0)
+        let thread = Thread {
+            resident.serve()
+            returned.signal()
+        }
+        thread.start()
+
+        // Wait for the pidfile, which `serve()` writes before it accepts —
+        // so the resident is listening and the signal cannot arrive early.
+        var listening = false
+        for _ in 0 ..< 200 where !listening {
+            listening = FileManager.default.fileExists(atPath: pidfilePath)
+            if !listening { usleep(10_000) }
+        }
+        #expect(listening)
+
+        raise(SIGUSR2)
+
+        // The accept loop RETURNS. Before the fix the process trapped here
+        // instead, so a timeout is the failure this test exists to catch.
+        #expect(returned.wait(timeout: .now() + 5) == .success)
+
+        // The owner's teardown, exactly as main.swift runs it before exit 0.
+        resident.shutDown()
+        #expect(!FileManager.default.fileExists(atPath: socketPath))
+        #expect(!FileManager.default.fileExists(atPath: pidfilePath))
+
+        // And nothing can attach to a torn-down resident.
+        #expect(throws: BenchWorkerSocketError.self) {
+            _ = try BenchWorkerSocketClient.connect(path: socketPath)
+        }
+    }
+
+    /// The signals a window's tooling actually sends.
+    @Test("The production handlers cover SIGINT and SIGTERM")
+    func productionSignals() {
+        #expect(BenchWorkerResidentTermination.signals == [SIGINT, SIGTERM])
+    }
+
+    /// Teardown runs from the accept loop AND from a signal handler, so
+    /// calling it twice must not close a descriptor twice or unlink a path a
+    /// later resident has already rebound.
+    @Test("Teardown is idempotent")
+    func teardownIsIdempotent() throws {
+        let socketPath = temporaryPath(".sock")
+        let pidfilePath = temporaryPath(".pid")
+        let resident = try makeResident(socketPath: socketPath, pidfilePath: pidfilePath)
+        try Data("1\n".utf8).write(to: URL(fileURLWithPath: pidfilePath))
+
+        resident.requestShutdown()
+        resident.shutDown()
+        resident.shutDown()
+        resident.requestShutdown()
+
+        #expect(!FileManager.default.fileExists(atPath: socketPath))
+        #expect(!FileManager.default.fileExists(atPath: pidfilePath))
+    }
+
+    /// A resident asked to stop before it ever accepted still returns, and
+    /// still leaves nothing behind.
+    @Test("A shutdown before the first connection still returns")
+    func shutdownBeforeFirstConnection() throws {
+        let socketPath = temporaryPath(".sock")
+        let resident = try makeResident(socketPath: socketPath, pidfilePath: nil)
+
+        let returned = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            resident.serve()
+            returned.signal()
+        }
+        usleep(50_000)
+        resident.requestShutdown()
+        #expect(returned.wait(timeout: .now() + 5) == .success)
+        #expect(!FileManager.default.fileExists(atPath: socketPath))
+    }
+
+    /// The resident writes its pid, so tooling that did not start it can
+    /// still reap it.
+    @Test("The pidfile carries this process's pid")
+    func pidfileCarriesThePid() throws {
+        let socketPath = temporaryPath(".sock")
+        let pidfilePath = temporaryPath(".pid")
+        let resident = try makeResident(socketPath: socketPath, pidfilePath: pidfilePath)
+
+        let returned = DispatchSemaphore(value: 0)
+        Thread.detachNewThread {
+            resident.serve()
+            returned.signal()
+        }
+        var contents = ""
+        for _ in 0 ..< 200 where contents.isEmpty {
+            contents = (try? String(contentsOfFile: pidfilePath, encoding: .utf8)) ?? ""
+            if contents.isEmpty { usleep(10_000) }
+        }
+        #expect(
+            contents.trimmingCharacters(in: .whitespacesAndNewlines)
+                == "\(ProcessInfo.processInfo.processIdentifier)")
+
+        resident.shutDown()
+        #expect(returned.wait(timeout: .now() + 5) == .success)
+    }
+}

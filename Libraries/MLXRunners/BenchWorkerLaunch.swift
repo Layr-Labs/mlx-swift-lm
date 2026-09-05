@@ -47,6 +47,8 @@ public enum WorkerLaunchError: Error, CustomStringConvertible, Equatable {
     case manifestTargetAmbiguous
     /// `manifest` names neither, so there is nothing to print.
     case manifestTargetMissing
+    /// `--pidfile` on a subcommand that owns no process for a window.
+    case pidfileNotAccepted(String)
 
     public var description: String {
         switch self {
@@ -67,6 +69,8 @@ public enum WorkerLaunchError: Error, CustomStringConvertible, Equatable {
             return "manifest takes --runner or --weights, not both"
         case .manifestTargetMissing:
             return "manifest requires --runner <id> or --weights <dir>"
+        case .pidfileNotAccepted(let subcommand):
+            return "--pidfile is only accepted by resident, not \(subcommand)"
         }
     }
 }
@@ -88,6 +92,10 @@ public struct BenchWorkerLaunchOptions: Sendable {
     /// The resident's socket path. Required by `resident`, refused on
     /// `runtime-worker` (which reads the environment instead).
     public var socket: String?
+    /// Optional pidfile the resident writes when it starts listening and
+    /// removes at teardown, so the window's tooling can reap a resident it
+    /// did not start. `resident` only.
+    public var pidfile: String?
     /// Checkpoint directory. NOT read during parsing — only carried.
     public var weights: URL
     /// Explicit runner id, or nil to resolve by the checkpoint's
@@ -123,6 +131,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
         var rawResources: [String] = []
         var subcommand: BenchWorkerSubcommand?
         var socket: String?
+        var pidfile: String?
 
         var index = 0
         while index < arguments.count {
@@ -143,6 +152,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
                 }
                 subcommand = BenchWorkerSubcommand(rawValue: argument)
             case "--socket": socket = try next("--socket")
+            case "--pidfile": pidfile = try next("--pidfile")
             case "--weights": weights = URL(fileURLWithPath: try next("--weights"))
             case "--runner": runnerID = try next("--runner")
             case "--drafter": drafter = URL(fileURLWithPath: try next("--drafter"))
@@ -174,6 +184,9 @@ public struct BenchWorkerLaunchOptions: Sendable {
                 throw WorkerLaunchError.socketNotAccepted(
                     resolvedSubcommand.rawValue)
             }
+            guard pidfile == nil else {
+                throw WorkerLaunchError.pidfileNotAccepted(resolvedSubcommand.rawValue)
+            }
         }
         if let runnerID {
             guard !runnerID.trimmingCharacters(in: .whitespaces).isEmpty else {
@@ -187,6 +200,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
         return BenchWorkerLaunchOptions(
             subcommand: resolvedSubcommand,
             socket: socket,
+            pidfile: pidfile,
             weights: weights,
             runnerID: runnerID,
             drafter: drafter,
@@ -220,6 +234,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
     public init(
         subcommand: BenchWorkerSubcommand = .runtimeWorker,
         socket: String? = nil,
+        pidfile: String? = nil,
         weights: URL,
         runnerID: String? = nil,
         drafter: URL? = nil,
@@ -230,6 +245,7 @@ public struct BenchWorkerLaunchOptions: Sendable {
     ) {
         self.subcommand = subcommand
         self.socket = socket
+        self.pidfile = pidfile
         self.weights = weights
         self.runnerID = runnerID
         self.drafter = drafter

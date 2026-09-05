@@ -121,6 +121,10 @@ public final class BenchWorkerResident: @unchecked Sendable {
     /// The checkpoint this resident holds, so an attaching worker can refuse
     /// a resident loaded from somewhere else.
     private let weightsPath: String
+    /// Written when the resident starts listening and removed at teardown,
+    /// when the caller asked for one. The window's tooling reads it to reap
+    /// a resident it did not start.
+    private let pidfilePath: String?
 
     /// This resident's identity. `loadEpoch` is stamped once, when the load
     /// finished, and never moves again — so every phase of one window seals
@@ -154,6 +158,7 @@ public final class BenchWorkerResident: @unchecked Sendable {
         build: String,
         device: String,
         kvBytesCapacity: Int,
+        pidfilePath: String? = nil,
         maxDecodeTokens: Int = 4096,
         memory: any WorkerMemoryReporter = MLXMemoryReporter(),
         loadEpoch: UInt64 = DispatchTime.now().uptimeNanoseconds,
@@ -167,6 +172,7 @@ public final class BenchWorkerResident: @unchecked Sendable {
         self.build = build
         self.device = device
         self.kvBytesCapacity = kvBytesCapacity
+        self.pidfilePath = pidfilePath
         self.maxDecodeTokens = maxDecodeTokens
         self.memory = memory
         self.nonceFactory = nonceFactory
@@ -174,8 +180,18 @@ public final class BenchWorkerResident: @unchecked Sendable {
             pid: ProcessInfo.processInfo.processIdentifier, loadEpoch: loadEpoch)
     }
 
-    /// Accept until `shutDown()`. Blocks the calling thread.
+    /// Write the pidfile, then accept until shutdown. Blocks the calling
+    /// thread; returns when the listener is closed.
     public func serve() {
+        if let pidfilePath {
+            try? Data("\(identity.pid)\n".utf8).write(
+                to: URL(fileURLWithPath: pidfilePath))
+        }
+        acceptLoop()
+    }
+
+    /// Accept until `shutDown()`.
+    private func acceptLoop() {
         while true {
             condition.lock()
             let done = stopped
@@ -220,13 +236,32 @@ public final class BenchWorkerResident: @unchecked Sendable {
         }
     }
 
-    /// Stop accepting and drop the socket file.
-    public func shutDown() {
+    /// Ask the resident to stop, from ANY thread — a signal source
+    /// included.
+    ///
+    /// This is the seam the SIGTERM handler uses, and it is deliberately
+    /// `nonisolated` and free of Swift concurrency: it takes a lock, sets a
+    /// flag, and closes the listener, which is what wakes the blocked
+    /// `accept()`. A handler that instead called an actor-isolated or
+    /// MainActor-isolated method would run the executor-isolation check on
+    /// the dispatch-source thread and TRAP — the crash this replaces, where
+    /// the resident died on SIGTERM without ever unlinking its socket.
+    ///
+    /// Idempotent, so the handler and the accept loop can both call it.
+    public nonisolated func requestShutdown() {
         condition.lock()
         stopped = true
         condition.broadcast()
         condition.unlock()
         listener.shutDown()
+    }
+
+    /// Full teardown: stop accepting, close the socket, remove the pidfile.
+    /// Idempotent, and safe after `requestShutdown()`.
+    public nonisolated func shutDown() {
+        requestShutdown()
+        guard let pidfilePath else { return }
+        try? FileManager.default.removeItem(atPath: pidfilePath)
     }
 
     /// One phase.
@@ -259,6 +294,48 @@ public final class BenchWorkerResident: @unchecked Sendable {
         }
         finished.wait()
         connection.close()
+    }
+}
+
+/// Termination handling for a resident, installed from a NON-isolated
+/// context.
+///
+/// This lives here rather than in `main.swift` for one reason, and it is the
+/// bug this fixes: top-level code in `main.swift` is `@MainActor`-isolated,
+/// so a `DispatchSource` event handler written there is a MainActor-isolated
+/// `@Sendable` thunk. Dispatch runs it on the signal source's own thread,
+/// Swift concurrency checks the executor, and the process traps
+/// (`_dispatch_assert_queue_fail` under `swift_task_isCurrentExecutor…`).
+/// On the box that killed a resident holding 113 GB before it could unlink
+/// its socket.
+///
+/// The handler therefore does the least possible: it asks the resident to
+/// stop. The accept loop observes that, returns, and the OWNER performs the
+/// teardown and exits — no isolation is touched from the signal thread, and
+/// nothing about the isolation checks is relaxed to make the trap go away.
+public enum BenchWorkerResidentTermination {
+
+    /// Signals a window's tooling uses to reap a resident.
+    public static let signals: [Int32] = [SIGINT, SIGTERM]
+
+    /// Install handlers that ask `resident` to stop.
+    ///
+    /// The returned sources MUST be retained: a `DispatchSourceSignal` that
+    /// goes out of scope stops firing.
+    public static func install(
+        for resident: BenchWorkerResident,
+        signals: [Int32] = BenchWorkerResidentTermination.signals,
+        queue: DispatchQueue = DispatchQueue(label: "bench-worker.resident.signals")
+    ) -> [DispatchSourceSignal] {
+        signals.map { number in
+            // The default disposition would kill the process before the
+            // source ever runs.
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
+            source.setEventHandler { resident.requestShutdown() }
+            source.resume()
+            return source
+        }
     }
 }
 
