@@ -108,4 +108,24 @@ struct EmbeddedHeadProvenanceTests {
         // without a head is a serial-only model.
         #expect(try RunnerCheckpoint.provenance(ofEmbeddedHeadAt: checkpoint.directory) == nil)
     }
+
+    /// FAIL CLOSED. A checkpoint with no head gives nil, but a checkpoint
+    /// whose index cannot be read is BROKEN, and the rule refuses it. This is
+    /// what `adopt` relies on: it calls the helper with `try`, so this throw
+    /// stops the adoption instead of shipping an unattributed head.
+    @Test("A corrupt index refuses instead of reporting no provenance")
+    func corruptIndexRefuses() throws {
+        let checkpoint = try makeCheckpoint(
+            headTensors: ["mtp.fc_embedding.weight"],
+            shardA: Data(repeating: 0xA1, count: 4096),
+            shardB: Data(repeating: 0xB2, count: 8192))
+        defer { try? FileManager.default.removeItem(at: checkpoint.directory) }
+        try Data("{ not json".utf8).write(
+            to: checkpoint.directory.appendingPathComponent(
+                "model.safetensors.index.json"))
+
+        #expect(throws: RunnerError.self) {
+            try RunnerCheckpoint.provenance(ofEmbeddedHeadAt: checkpoint.directory)
+        }
+    }
 }
