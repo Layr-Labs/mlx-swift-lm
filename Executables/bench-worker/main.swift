@@ -52,6 +52,10 @@ struct Options {
     var drafter: URL?
     var trusted = false
     var kvBytesCapacity = 8 << 30
+    /// Raw `<name>=<path>` values, in argv order. Validated once, together,
+    /// AFTER parsing so a duplicate name is reported against the whole
+    /// command rather than against whichever occurrence came second.
+    var resources: [String] = []
 }
 
 func parseOptions(_ arguments: [String]) throws -> Options {
@@ -73,6 +77,7 @@ func parseOptions(_ arguments: [String]) throws -> Options {
         case "--runner": options.runnerID = try next("--runner")
         case "--drafter": options.drafter = URL(fileURLWithPath: try next("--drafter"))
         case "--trusted": options.trusted = true
+        case "--resource": options.resources.append(try next("--resource"))
         case "--kv-bytes":
             guard let bytes = Int(try next("--kv-bytes")) else {
                 throw WorkerLaunchError.badValue("--kv-bytes")
@@ -118,12 +123,18 @@ if let runnerID = options.runnerID {
     runnerType = try RunnerRegistry.shared.resolve(checkpoint: weights)
 }
 
+// Resources are validated BEFORE the load: a bad path discovered after a
+// multi-minute weight load has wasted the box's time to report something
+// argv already knew.
+let resources = try RunnerResourceArguments.parse(options.resources)
+
 // ONE load, before the hello.
 let runner = try await runnerType.load(
     weights,
     options: RunnerLoadOptions(
         drafterDirectory: options.drafter,
-        kvBytesCapacity: options.kvBytesCapacity))
+        kvBytesCapacity: options.kvBytesCapacity,
+        resources: resources))
 
 let server = BenchWorkerServer(
     runner: runner,
