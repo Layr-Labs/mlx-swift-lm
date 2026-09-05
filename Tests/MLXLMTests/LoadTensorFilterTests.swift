@@ -9,11 +9,13 @@ import Testing
 
 /// True when `array` holds its data, i.e. it was materialized.
 ///
+/// Shared with the model-side filter tests.
+///
 /// mlx builds one unevaluated array per safetensors tensor; the bytes are read
 /// when the array is evaluated. `_mlx_array_is_available` therefore counts
 /// materialization exactly: it is `false` for a tensor whose bytes were never
 /// read and `true` after `eval`.
-private func isMaterialized(_ array: MLXArray) -> Bool {
+func isMaterialized(_ array: MLXArray) -> Bool {
     var available = false
     _ = _mlx_array_is_available(&available, array.ctx)
     return available

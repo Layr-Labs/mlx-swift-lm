@@ -402,8 +402,11 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
             }
 
             // The n-gram shards are never model parameters. They stay on disk
-            // and reach the model through a `Qwen4ExpNGramRowSource`.
-            if key.contains(".ngram_embedding.shard_") {
+            // and reach the model through a `Qwen4ExpNGramRowSource`. The
+            // loader already excludes them by name (`WeightNameFiltering`
+            // below); this stays for the callers that sanitize weights they
+            // read themselves.
+            if Self.isNGramShard(key) {
                 continue
             }
 
@@ -421,6 +424,27 @@ public final class Qwen4ExpModel: Module, LLMModel, KVCacheDimensionProvider {
             out[key] = value
         }
         return out
+    }
+}
+
+// MARK: - Weight name filter
+
+extension Qwen4ExpModel: WeightNameFiltering {
+    /// True for an n-gram shard tensor.
+    ///
+    /// The shards hold the n-gram table. They are not model parameters: the
+    /// table reaches the model through a `Qwen4ExpNGramRowSource`, which reads
+    /// the rows it needs from the files. Reading them here would cost the full
+    /// table in memory for nothing.
+    static func isNGramShard(_ name: String) -> Bool {
+        name.contains(".ngram_embedding.shard_")
+    }
+
+    /// Keeps the n-gram shards out of the load, before the loader materializes
+    /// them. The name is the name on the disk, so both checkpoint layouts
+    /// (`language_model.` prefixed or not) match.
+    public func shouldLoadWeight(named name: String) -> Bool {
+        !Self.isNGramShard(name)
     }
 }
 
