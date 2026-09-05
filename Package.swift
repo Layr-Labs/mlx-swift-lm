@@ -190,6 +190,7 @@ let package = Package(
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
+                .product(name: "Cmlx", package: "mlx-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
