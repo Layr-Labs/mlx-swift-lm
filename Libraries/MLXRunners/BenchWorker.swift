@@ -634,7 +634,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
     /// prefix cache, no waiting-queue use, no stop tokens on cohort requests.
     /// Nothing here is policy the worker invents — it is the one build the
     /// contract pins for benchd.
-    private func engineBuild(batch: Int, spec: SpecConfig) throws -> EngineBuild {
+    private func engineBuild(batch: Int, spec: SpecConfig, seedLength: Int) throws -> EngineBuild {
         let decoderID = DecoderID(spec.mode)
         var mtpConfig = CBv2MTPConfig(enabled: false)
         if decoderID != .serial {
@@ -656,8 +656,20 @@ public final class BenchWorkerServer: @unchecked Sendable {
             kvBytesCapacity: kvBytesCapacity,
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: batch,
+                // ONE SHAPE FOR THE ORACLE AND THE RUN. The correctness
+                // oracle (teacher-forced stepper) and the goldens it is
+                // checked against prefill the seed in ONE forward. The engine
+                // loop's default chunks a prompt at 512, and a chunked prefill
+                // is not bit-identical to a single forward: the attention and
+                // recurrent kernels tile differently, which the fixture model
+                // shows as a ~5e-5 logit delta in float32 and the 125B shows
+                // as an argmax flip on the first close margin (a box saw the
+                // botany golden diverge at step 1 with two 512-token chunks
+                // and reproduce through nine tokens with one). So a free run
+                // prefills its whole seed in one chunk. The diagnostic knob
+                // still overrides, by name, for shape experiments.
                 prefillChunkSize: Self.diagnosticPrefillChunk
-                    ?? CBv2SchedulerConfig().prefillChunkSize,
+                    ?? max(CBv2SchedulerConfig().prefillChunkSize, seedLength),
                 maxWaiting: batch,
                 enablePrefixCache: false),
             loopConfig: CBv2EngineLoopConfig(),
@@ -670,7 +682,9 @@ public final class BenchWorkerServer: @unchecked Sendable {
     /// `correctness`: free-run greedy through the engine, tokens only.
     private func freeRunGreedy(prompt: [Int], steps: Int) async throws -> [Int] {
         let engine = try runner.makeEngine(
-            try engineBuild(batch: 1, spec: SpecConfig(mode: DecoderID.serial.rawValue)))
+            try engineBuild(
+                batch: 1, spec: SpecConfig(mode: DecoderID.serial.rawValue),
+                seedLength: prompt.count))
         var request = CBv2Request(
             id: CBv2RequestID(1), promptTokens: prompt, maxTokens: steps)
         request.sampling = Self.greedySampling
@@ -764,7 +778,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
             }
         }
 
-        let engine = try runner.makeEngine(try engineBuild(batch: batch, spec: spec))
+        let engine = try runner.makeEngine(
+            try engineBuild(batch: batch, spec: spec, seedLength: seeds.map(\.count).max() ?? 0))
         // Submit ALL streams before consuming ANY: a cohort drained stream by
         // stream is a sequence of solo runs wearing a cohort's name.
         var iterators: [AsyncStream<CBv2Event>.Iterator] = []
@@ -948,7 +963,9 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 requested: seeds.count, streams: committed.count)
         }
         let engine = try runner.makeEngine(
-            try engineBuild(batch: 1, spec: SpecConfig(mode: DecoderID.serial.rawValue)))
+            try engineBuild(
+                batch: 1, spec: SpecConfig(mode: DecoderID.serial.rawValue),
+                seedLength: seeds.map(\.count).max() ?? 0))
 
         var streams: [CohortReferenceReplayReport.Stream] = []
         for (slot, seed) in seeds.enumerated() {
