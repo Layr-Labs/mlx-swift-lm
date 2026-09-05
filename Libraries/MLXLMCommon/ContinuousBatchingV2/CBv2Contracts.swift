@@ -841,9 +841,102 @@ public enum CBv2Event: Sendable {
     case finished(reason: CBv2FinishReason, usage: CBv2Usage)
 }
 
+/// Engine-side per-request timing and step-participation counters, exported
+/// once on the terminal `CBv2Usage`. NUMERICS ONLY: never token ids, text,
+/// hashes, or pointers — the provider copies this verbatim onto the wire.
+///
+/// Instants are nanosecond OFFSETS from the engine enqueue instant in the
+/// `DispatchTime.now().uptimeNanoseconds` domain (the loop's existing
+/// convention). `0` means "not observed"; every observed offset is clamped
+/// to `>= 1`. Durations (`*NanosSum`, `pausedNanos`, `detokDelayFirstNanos`,
+/// `prefix*Nanos`) are plain elapsed nanoseconds.
+///
+/// Stamps are written only by the engine thread and reuse the step's
+/// existing clock reads (`CBv2InFlightStep.wallStartedNanos` at launch, the
+/// readback-done instant in `finalize`) — no per-row clock reads.
+public struct CBv2RequestTiming: Sendable, Equatable {
+    /// First step whose plan included this row (`wallStartedNanos` of that
+    /// step). Queue wait == this value.
+    public var admittedNanos: UInt64 = 0
+    /// Per-layer KV state allocated (`ensureKVState`).
+    public var kvAllocatedNanos: UInt64 = 0
+    /// First step whose plan included one of this row's prefill chunks
+    /// (`wallStartedNanos` of that step).
+    public var prefillFirstLaunchNanos: UInt64 = 0
+    /// Finalize of the step where `numComputedTokens >= promptTokens`.
+    public var promptComputedNanos: UInt64 = 0
+    /// Finalize of the step that confirmed the first generated token
+    /// (engine-side; excludes the detokenization hop).
+    public var firstTokenNanos: UInt64 = 0
+    /// `finishRequest` instant.
+    public var finishedNanos: UInt64 = 0
+    /// Waiting→running crossings after the first admission (preemption
+    /// and capacity requeues).
+    public var readmissions: UInt32 = 0
+    public var preemptions: UInt32 = 0
+    public var capacityRequeues: UInt32 = 0
+    /// Prefill chunk forwards launched for this row (all shapes).
+    public var prefillChunks: UInt32 = 0
+    /// Of `prefillChunks`, those that rode a rectangular `[B, chunk]` cohort.
+    public var packedPrefillChunks: UInt32 = 0
+    /// Of `prefillChunks`, those carrying image spans.
+    public var visionChunks: UInt32 = 0
+    /// Of `prefillChunks`, solo chunks wider than `prefillChunkSize` (the
+    /// solo-prefill stripe).
+    public var soloStripeChunks: UInt32 = 0
+    public var prefillChunkTokensMax: UInt32 = 0
+    /// Finalized steps in which this row confirmed a token beyond its first
+    /// (an MTP verify round with ≥1 confirmed token counts once).
+    public var decodeSteps: UInt32 = 0
+    /// Of the participated steps, those launched on the chained-decode path.
+    public var chainedDecodeSteps: UInt32 = 0
+    /// Σ over participated steps of the token-producing row count.
+    public var batchRowsSum: UInt64 = 0
+    public var batchRowsMin: UInt32 = 0
+    public var batchRowsMax: UInt32 = 0
+    /// Σ (readback-done instant − `wallStartedNanos`) over participated steps.
+    public var stepLatencyNanosSum: UInt64 = 0
+    public var stepLatencyNanosMax: UInt64 = 0
+    public var mtpRounds: UInt32 = 0
+    public var mtpProposed: UInt32 = 0
+    public var mtpAccepted: UInt32 = 0
+    /// Total backpressure-paused time and pause transitions.
+    public var pausedNanos: UInt64 = 0
+    public var pauseCount: UInt32 = 0
+    /// FIRST token only, passthrough rows: engine confirm → detokenized
+    /// emit, measured inside the output stream's existing lock.
+    public var detokDelayFirstNanos: UInt64 = 0
+    /// Submit-thread prefix-cache lookup duration (hashing + lookup + plan).
+    public var prefixLookupNanos: UInt64 = 0
+    /// `applyAdoption` duration on the engine thread.
+    public var prefixAdoptionNanos: UInt64 = 0
+    public init() {}
+}
+
+/// Immutable heap box for `CBv2Usage.timing`. Keeps `CBv2Usage` — and every
+/// enum/struct/`async let` result that carries it — one pointer larger
+/// instead of ~170 bytes larger: the Swift 6.3 runtime frees `async let`
+/// result buffers above a size threshold out of order ("freed pointer was
+/// not the last allocation" in `asyncLet_finish_after_task_completion`),
+/// reproduced on the UNMODIFIED engine by padding a test result struct.
+/// Allocated only when `timing` is written (once per request at finish —
+/// never on the step path); the zero value is a shared instance.
+final class CBv2RequestTimingBox: Sendable {
+    let value: CBv2RequestTiming
+    init(_ value: CBv2RequestTiming) { self.value = value }
+    static let zero = CBv2RequestTimingBox(CBv2RequestTiming())
+}
+
 public struct CBv2Usage: Sendable {
     public var promptTokens: Int
     public var completionTokens: Int
+    /// Engine per-request timing (defaulted; folded in at `finishRequest`).
+    /// Boxed storage — see `CBv2RequestTimingBox`.
+    public var timing: CBv2RequestTiming {
+        get { timingBox.value }
+        set { timingBox = CBv2RequestTimingBox(newValue) }
+    }
+    private var timingBox: CBv2RequestTimingBox = .zero
     /// Final per-request prefix lookup/adoption result. This describes the
     /// in-memory engine tier only; SSD staging remains a provider concern.
     public var prefixCacheOutcome: CBv2PrefixCacheOutcome
@@ -936,10 +1029,18 @@ public struct CBv2CapacitySnapshot: Sendable {
     /// direct liveness/wedge signal (a stalled engine stops incrementing)
     /// instead of proxying via event counts.
     public var stepsExecuted: Int
+    /// Cumulative Σ over finalized steps of (readback-done instant −
+    /// `wallStartedNanos`), i.e. launch→confirm wall time. Monotonic;
+    /// `stepWallNanosTotal / stepsExecuted` is the mean step latency.
+    public var stepWallNanosTotal: UInt64 = 0
+    /// Cumulative Σ over finalized steps of rows that confirmed a token
+    /// beyond their first (decode rows). Monotonic;
+    /// `decodeRowsTotal / stepsExecuted` is the mean decode batch size.
+    public var decodeRowsTotal: UInt64 = 0
     public init(
         activeRequests: Int, waitingRequests: Int, kvBytesInUse: Int, kvBytesCapacity: Int,
         kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0, activeTokens: Int,
-        stepsExecuted: Int = 0
+        stepsExecuted: Int = 0, stepWallNanosTotal: UInt64 = 0, decodeRowsTotal: UInt64 = 0
     ) {
         self.activeRequests = activeRequests
         self.waitingRequests = waitingRequests
@@ -949,6 +1050,8 @@ public struct CBv2CapacitySnapshot: Sendable {
         self.kvBytesReserved = kvBytesReserved
         self.activeTokens = activeTokens
         self.stepsExecuted = stepsExecuted
+        self.stepWallNanosTotal = stepWallNanosTotal
+        self.decodeRowsTotal = decodeRowsTotal
     }
 }
 

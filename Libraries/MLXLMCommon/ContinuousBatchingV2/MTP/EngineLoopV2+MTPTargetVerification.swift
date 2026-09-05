@@ -175,6 +175,8 @@ extension EngineLoopV2 {
                 eval(
                     [columnScores, output.lastHidden] + eagerCacheInnerState(caches)
                         + recurrentArrays)
+                // One blocking evaluation per serial verify column, counted.
+                CBv2CoreInstrumentation.recordHostSync()
                 scoreColumnsAccum.append(columnScores)
                 hiddenColumns.append(output.lastHidden)
             }

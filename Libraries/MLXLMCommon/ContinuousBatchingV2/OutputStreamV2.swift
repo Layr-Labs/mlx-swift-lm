@@ -43,6 +43,14 @@ public final class CBv2OutputStream: @unchecked Sendable {
     /// queue could generate far past `capacity` before the buffer ever
     /// fills enough to fire the pause (PR#62 review).
     private var pendingEmissions = 0
+    /// First-token detokenization delay probe (`CBv2RequestTiming
+    /// .detokDelayFirstNanos`). Armed ONCE by the engine thread inside
+    /// `reserveEmission` with the readback-done instant of the step that
+    /// confirmed the first token; the matching deferred `emit` on the
+    /// detokenization queue reads the clock under this same lock and stores
+    /// the delay. Never touches scheduler state from the detok queue.
+    private var firstEmissionArmedNanos: UInt64 = 0
+    private var _firstEmissionDelayNanos: UInt64 = 0
 
     private let capacity: Int
     private var lowWatermark: Int { max(0, capacity / 2) }
@@ -74,10 +82,17 @@ public final class CBv2OutputStream: @unchecked Sendable {
     /// emit is deferred — a slow detokenizer or consumer pauses the request
     /// exactly as the synchronous path does (PR#62 review). Every
     /// reservation must be balanced by exactly one consuming emit.
-    public func reserveEmission() {
+    ///
+    /// `firstEmissionArmedNanos` (non-zero only for the FIRST token of a
+    /// passthrough request) arms the detok-delay probe under the same lock
+    /// acquisition — no extra lock traffic on the step path.
+    public func reserveEmission(firstEmissionArmedNanos: UInt64 = 0) {
         var firePause = false
         lock.lock()
         pendingEmissions += 1
+        if firstEmissionArmedNanos != 0, _firstEmissionDelayNanos == 0 {
+            self.firstEmissionArmedNanos = firstEmissionArmedNanos
+        }
         if !pausedForBackpressure, !finished, buffer.count + pendingEmissions >= capacity {
             pausedForBackpressure = true
             firePause = true
@@ -96,6 +111,12 @@ public final class CBv2OutputStream: @unchecked Sendable {
         var fireResume = false
         lock.lock()
         if consumingReservation { pendingEmissions = max(0, pendingEmissions - 1) }
+        if firstEmissionArmedNanos != 0 {
+            // First token only: one clock read on the detokenization queue.
+            _firstEmissionDelayNanos = max(
+                1, DispatchTime.now().uptimeNanoseconds &- firstEmissionArmedNanos)
+            firstEmissionArmedNanos = 0
+        }
         if finished {
             lock.unlock()
             return
@@ -130,6 +151,14 @@ public final class CBv2OutputStream: @unchecked Sendable {
     /// Terminal emit; idempotent (safe from both loop and watchdog).
     public func finish(reason: CBv2FinishReason, usage: CBv2Usage) {
         emit(.finished(reason: reason, usage: usage))
+    }
+
+    /// Engine confirm → deferred emit delay of the first token (0 until the
+    /// deferred emit ran, or for streams that never armed the probe).
+    var firstEmissionDelayNanos: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _firstEmissionDelayNanos
     }
 
     /// True once a terminal event has been enqueued.

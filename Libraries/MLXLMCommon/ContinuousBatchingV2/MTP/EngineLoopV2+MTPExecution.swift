@@ -60,13 +60,19 @@ extension EngineLoopV2 {
     func mtpPrepareRoundWork(
         _ plan: CBv2StepPlan,
         driver mtp: CBv2MTPRoundDriver,
-        demoteAllRounds: Bool
+        demoteAllRounds: Bool,
+        launchNanos: UInt64
     ) -> [CBv2MTPRowWork] {
         var work: [CBv2MTPRowWork] = []
         work.reserveCapacity(plan.assignments.count)
 
         for (id, assignedTokens) in plan.assignments {
             guard let rec = scheduler.record(for: id) else { continue }
+            // Admission stamp BEFORE `ensureKVState`, mirroring
+            // `executeMixed`: a capacity-requeued row is then already
+            // stamped, so its next waiting→running crossing counts as a
+            // re-admission on both launch paths (same `readmissions`).
+            rec.stampAdmission(launchNanos: launchNanos)
             guard ensureKVState(rec) != nil else { continue }
             var count = assignedTokens
             var preserveHistorySeed = false
@@ -117,7 +123,7 @@ extension EngineLoopV2 {
     }
 
     func mtpBuildRoundGraph(
-        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver, launchNanos: UInt64
     ) -> CBv2MTPGraphBuild {
         var cacheInnerState: [MLXArray] = []
         var logprobSegments: [CBv2StepLogprobs] = []
@@ -241,9 +247,17 @@ extension EngineLoopV2 {
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
             var observedHidden: MLXArray?
-            if let multimodal = multimodalByID[rec.id],
-                !multimodal.spansInChunk(start: row.start, count: row.count).isEmpty
-            {
+            // ONE `multimodalByID` lookup per prefill row; the span test
+            // iterates spans without allocating and runs only for rows that
+            // carry multimodal input. The row's prefill-chunk timing stamp
+            // rides the same binding (mirrors `executeMixed`).
+            let multimodal = multimodalByID[rec.id]
+            let visionChunk = multimodal?.hasSpans(start: row.start, count: row.count) ?? false
+            rec.stampPrefillChunkLaunch(
+                tokens: row.count, packed: false, vision: visionChunk,
+                stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
+                launchNanos: launchNanos)
+            if visionChunk, let multimodal {
                 let forward = multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
                     id: rec.id, multimodal: multimodal, caches: caches,
@@ -546,7 +560,11 @@ extension EngineLoopV2 {
         // false everywhere else, so contiguous stays byte-identical.
         guard backend.requiresMaterializedSnapshots else { return }
         let unfenceable = CBv2MTPCaptureFence.publish(captured)
-        if !unfenceable.isEmpty { eval(unfenceable) }
+        if !unfenceable.isEmpty {
+            // The fence contract's blunt fallback: one host sync, counted.
+            eval(unfenceable)
+            CBv2CoreInstrumentation.recordHostSync()
+        }
     }
 
 }
