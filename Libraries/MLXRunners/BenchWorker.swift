@@ -550,7 +550,22 @@ public final class BenchWorkerServer: @unchecked Sendable {
 
         case .correctnessBegin:
             let prompt = try require(request.promptTokens, "prompt_tokens")
-            fill(&response, with: try beginStepper().forward(prompt))
+            let stepper = try beginStepper()
+            if let chunk = Self.diagnosticStepperChunk, chunk < prompt.count {
+                // DIAGNOSTIC ONLY: prefill the teacher-forced row in chunks
+                // of `chunk` tokens, the shape the engine loop gives a free
+                // run, so the two prefill shapes can be swapped on a box.
+                var output: StepOutput?
+                var start = 0
+                while start < prompt.count {
+                    let end = min(start + chunk, prompt.count)
+                    output = try stepper.forward(Array(prompt[start ..< end]))
+                    start = end
+                }
+                fill(&response, with: output!)
+            } else {
+                fill(&response, with: try stepper.forward(prompt))
+            }
             completedWork += 1
 
         case .correctnessStep:
@@ -642,6 +657,8 @@ public final class BenchWorkerServer: @unchecked Sendable {
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: batch,
                 maxWaiting: batch,
+                prefillChunkSize: Self.diagnosticPrefillChunk
+                    ?? CBv2SchedulerConfig().prefillChunkSize,
                 enablePrefixCache: false),
             loopConfig: CBv2EngineLoopConfig(),
             prefixCache: nil,
@@ -993,6 +1010,29 @@ public final class BenchWorkerServer: @unchecked Sendable {
     }
 
     private static let greedySampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
+
+    /// DIAGNOSTIC knobs, environment only, never on a scored path by
+    /// default. `BENCH_WORKER_DIAG_PREFILL_CHUNK` sets the engine's prefill
+    /// chunk size for free runs (default: the scheduler's 512);
+    /// `BENCH_WORKER_DIAG_STEPPER_CHUNK` prefills the teacher-forced row in
+    /// chunks of that many tokens (default: one forward). They exist to swap
+    /// the two prefill SHAPES on a box where the free run and the
+    /// teacher-forced path disagree after a long seed and the fixture model
+    /// cannot reproduce it. A set knob is reported on the hello's stderr
+    /// summary path by name so no run can carry one silently.
+    static let diagnosticPrefillChunk: Int? = positiveEnvironment(
+        "BENCH_WORKER_DIAG_PREFILL_CHUNK")
+    static let diagnosticStepperChunk: Int? = positiveEnvironment(
+        "BENCH_WORKER_DIAG_STEPPER_CHUNK")
+
+    private static func positiveEnvironment(_ name: String) -> Int? {
+        guard let raw = ProcessInfo.processInfo.environment[name],
+            let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)), value > 0
+        else { return nil }
+        FileHandle.standardError.write(
+            Data("bench-worker: DIAGNOSTIC \(name)=\(value) (not a scored configuration)\n".utf8))
+        return value
+    }
 }
 
 /// Worker-level refusals. Every one is an `ok:false` line.
