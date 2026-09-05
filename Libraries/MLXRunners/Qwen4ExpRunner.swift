@@ -130,7 +130,7 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
         // so the load refuses here rather than at the first token.
         if !model.pleEmbeddings.isEmpty {
             model.install(
-                ngramRowSource: try Self.ngramRowSource(
+                ngramRowSource: try Self.resolveNGramRowSource(
                     options.resources[ngramRowSourceResource], for: model))
         }
 
@@ -170,7 +170,7 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
     /// The runner names the `Qwen4ExpNGramRowSource` seam and one construction
     /// entry point, `Qwen4ExpNGramRowSourceLoader`, and no conformer. A later
     /// conformer is chosen inside the loader, so this stays as it is.
-    private static func ngramRowSource(
+    static func resolveNGramRowSource(
         _ resource: AnyObject?, for model: Qwen4ExpModel
     ) throws -> any Qwen4ExpNGramRowSource {
         if let source = resource as? Qwen4ExpNGramRowSource {
