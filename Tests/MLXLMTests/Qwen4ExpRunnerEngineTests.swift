@@ -18,6 +18,8 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
+import MLXRandom
 import MLXRunners
 import XCTest
 
@@ -44,7 +46,7 @@ private struct Qwen4ExpStubTokenizer: MLXLMCommon.Tokenizer {
 
 final class Qwen4ExpRunnerEngineTests: XCTestCase {
 
-    private static let kvBytesCapacity = 1 << 26
+    private static let kvBytesCapacity = 1 << 28
 
     private func newCaches(
         _ model: Qwen4ExpModel
@@ -68,8 +70,22 @@ final class Qwen4ExpRunnerEngineTests: XCTestCase {
             build: EngineBuild(
                 kvBackend: kvBackend,
                 kvBytesCapacity: Self.kvBytesCapacity,
-                schedulerConfig: CBv2SchedulerConfig(maxConcurrentRequests: 1),
+                schedulerConfig: CBv2SchedulerConfig(
+                    maxConcurrentRequests: 1, prefillChunkSize: 64),
                 decoder: .serial))
+    }
+
+    /// Replace every floating-point parameter with seeded normal noise.
+    private static func randomizeParameters(_ model: Qwen4ExpModel, seed: UInt64) {
+        MLXRandom.seed(seed)
+        let replaced = model.parameters().flattened().compactMap {
+            key, value -> (String, MLXArray)? in
+            guard value.dtype == .float32 || value.dtype == .float16 || value.dtype == .bfloat16
+            else { return nil }
+            return (key, (MLXRandom.normal(value.shape) * 0.2).asType(value.dtype))
+        }
+        model.update(parameters: ModuleParameters.unflattened(replaced))
+        eval(model)
     }
 
     // MARK: - Paged is refused, by name
@@ -89,16 +105,26 @@ final class Qwen4ExpRunnerEngineTests: XCTestCase {
 
     func testStepperAndEngineChooseTheSameTokens() async throws {
         try requireCompleteMetallib()
-        let prompt = [3, 9, 14, 2]
-        let steps = 3
+        // A prompt longer than the engine's prefill chunk, so the engine
+        // prefills in several chunks while the stepper prefills in one
+        // forward; and longer than the fixture's indexer budget, so the keep
+        // mask is live. Deterministic content, no RNG.
+        let prompt: [Int] = (0 ..< 200).map { ($0 * 37 + 11) % 64 }
+        let steps = 12
         let model = try Qwen4ExpFixture.model(withMTP: false)
+        // The fixture's default parameters leave the hyper-connection mixer
+        // at its zero init, so every logit is 0.0 and the two drivers'
+        // argmax differ only by tie-break (argPartition candidates vs the
+        // first index), which proves nothing about the forward. Seeded
+        // random parameters give the comparison teeth.
+        Self.randomizeParameters(model, seed: 11)
 
         let stepper = CBv2SingleRowStepper(
             model: model,
             layerKinds: model.cbv2LayerKinds,
             newCaches: newCaches(model),
             kvBytesCapacity: Self.kvBytesCapacity,
-            maxLength: 256)
+            maxLength: 1024)
         try stepper.begin()
         var forced: [Int] = [try stepper.forward(prompt).argmax]
         for _ in 0 ..< steps {
