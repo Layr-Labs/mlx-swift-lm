@@ -2,7 +2,34 @@
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import CompilerPluginSupport
+import Foundation
 import PackageDescription
+
+/// Depend on a SIBLING `../mlx-swift` checkout when one exists, and on the
+/// remote otherwise.
+///
+/// Track repos and Darkbloom both consume this fork BESIDE an mlx-swift
+/// checkout of their own. With this package naming mlx-swift by URL and the
+/// consumer naming the same package by path, SwiftPM sees two packages
+/// claiming one identity and warns that the conflict "will be escalated to
+/// an error" — and until it does, which of the two trees actually compiles
+/// is a resolution detail rather than a decision. Pointing at the sibling
+/// makes it a decision: one checkout, the one on disk next to this one.
+///
+/// The check is on `Package.swift` inside the sibling, not on the directory:
+/// an empty or half-cloned `../mlx-swift` must fall back to the remote
+/// rather than fail resolution with a confusing "not a package" error.
+let mlxSwiftDependency: Package.Dependency = {
+    let sibling = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("mlx-swift")
+    let manifest = sibling.appendingPathComponent("Package.swift")
+    if FileManager.default.fileExists(atPath: manifest.path) {
+        return .package(path: sibling.path)
+    }
+    return .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main")
+}()
 
 let package = Package(
     name: "mlx-swift-lm",
@@ -48,7 +75,7 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
+        mlxSwiftDependency,
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
