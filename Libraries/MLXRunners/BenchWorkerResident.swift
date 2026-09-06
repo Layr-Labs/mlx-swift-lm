@@ -277,6 +277,15 @@ public final class BenchWorkerResident: @unchecked Sendable {
         // cannot inherit the allocator state of the phase before it. The
         // worker's own `phase_diagnostics` drain runs too; that is
         // idempotent and deliberate.
+        //
+        // SYNCHRONIZE FIRST. A drain only returns buffers whose work has
+        // finished; arrays the previous phase left in flight (its last
+        // asyncEval, its teardown) return to the cache AFTER a drain that
+        // ran too early, and the next phase's barrier then reads a non-zero
+        // cache it did not cause. A box saw 320 KiB on one connection in
+        // five. Waiting for the stream makes the drain read the settled
+        // state, at both ends of the session.
+        BenchWorkerTeardown.synchronizeMLX()
         memory.drain()
 
         let transport = BenchWorkerSocketTransport(connection: connection)
@@ -301,6 +310,10 @@ public final class BenchWorkerResident: @unchecked Sendable {
         }
         finished.wait()
         connection.close()
+        // PHASE END: settle and drain before the next accept, so the
+        // handover window never leaves cached bytes for the next phase.
+        BenchWorkerTeardown.synchronizeMLX()
+        memory.drain()
     }
 }
 
