@@ -378,7 +378,8 @@ extension Qwen4ExpAttention {
         .transposed(0, 2, 1, 3)
         .reshaped(B, S, -1)
 
-        return oProj(out * sigmoid(gate))
+        return oProj(
+            qwen4ExpLightFusionEnabled ? qwen4ExpAttentionGate(out, gate) : out * sigmoid(gate))
     }
 }
 

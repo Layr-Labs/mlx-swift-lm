@@ -430,8 +430,17 @@ public func qwen4ExpRopePartial(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> 
     let half = d / 2
     let x1 = rotated[.ellipsis, ..<half]
     let x2 = rotated[.ellipsis, half...]
-    let swapped = concatenated([-x2, x1], axis: -1)
-    let out = rotated * c + swapped * s
+    let out: MLXArray
+    if qwen4ExpLightFusionEnabled {
+        let halves = qwen4ExpRopeRotate([
+            x1, x2, c[.ellipsis, ..<half], c[.ellipsis, half...],
+            s[.ellipsis, ..<half], s[.ellipsis, half...],
+        ])
+        out = concatenated(halves, axis: -1)
+    } else {
+        let swapped = concatenated([-x2, x1], axis: -1)
+        out = rotated * c + swapped * s
+    }
     if x.dim(-1) == d { return out }
     return concatenated([out, x[.ellipsis, d...]], axis: -1)
 }
@@ -896,11 +905,52 @@ public final class Qwen4ExpSparseMoeBlock: Module {
         let logits = gate(x.asType(.float32))
         let indices = argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         let weights = MLX.softmax(takeAlong(logits, indices, axis: -1), axis: -1, precise: true)
-        let routed = (switchMLP(x, indices) * weights[.ellipsis, .newAxis])
-            .sum(axis: -2)
-            .asType(x.dtype)
-        return routed + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+        let experts = switchMLP(x, indices)
+        let shared = sharedExpert(x)
+        let sharedGate = sharedExpertGate(x)
+        guard qwen4ExpLightFusionEnabled else {
+            let routed = (experts * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype)
+            return routed + sigmoid(sharedGate) * shared
+        }
+        return qwen4ExpMoETail(experts, weights[.ellipsis, .newAxis], sharedGate, shared)
     }
+}
+
+/// A/B switch for the light-chain fusions below (MoE tail, attention output
+/// gate, partial rope): `MLXLM_LIGHT_FUSION=0` keeps the unfused chains in
+/// the same binary. Read once.
+let qwen4ExpLightFusionEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXLM_LIGHT_FUSION"] != "0"
+
+/// `sum(experts * weights, axis: -2).asType(shared.dtype) + sigmoid(gate) * shared`.
+/// The weighted sum and the shared-expert gate as one compiled graph: the
+/// multiply, cast, sigmoid, multiply and add fuse around the reduction.
+let qwen4ExpMoETail: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { (experts: MLXArray, weights: MLXArray, gate: MLXArray, shared: MLXArray) -> MLXArray in
+    (experts * weights).sum(axis: -2).asType(shared.dtype) + sigmoid(gate) * shared
+}
+
+/// `out * sigmoid(gate)`, one kernel.
+let qwen4ExpAttentionGate: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { (out: MLXArray, gate: MLXArray) -> MLXArray in
+    out * sigmoid(gate)
+}
+
+/// The two rotated halves of a partial rope, each one fused kernel:
+/// `out1 = x1·c1 − x2·s1`, `out2 = x2·c2 + x1·s2`. Every slice happens
+/// OUTSIDE (a shapeless trace cannot carry a slice); the concatenation of
+/// the halves is one copy either way.
+let qwen4ExpRopeRotate: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: true) {
+    (inputs: [MLXArray]) -> [MLXArray] in
+    let x1 = inputs[0]
+    let x2 = inputs[1]
+    let c1 = inputs[2]
+    let c2 = inputs[3]
+    let s1 = inputs[4]
+    let s2 = inputs[5]
+    return [x1 * c1 - x2 * s1, x2 * c2 + x1 * s2]
 }
 
 // MARK: - Hyper-connections
