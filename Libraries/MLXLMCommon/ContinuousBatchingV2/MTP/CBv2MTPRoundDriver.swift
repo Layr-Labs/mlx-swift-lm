@@ -107,6 +107,7 @@ final class CBv2MTPRoundInFlight {
         /// IDs feed greedy scoring on device; values are read only after the
         /// existing acceptance-packet fence.
         let policyTopTwoValues: MLXArray?
+        var diagnostics: [CBv2LogitDiagnosticPacket] = []
 
     }
 

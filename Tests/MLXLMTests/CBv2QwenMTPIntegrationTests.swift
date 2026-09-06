@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import Testing
 
-@testable import MLXLMCommon
+@_spi(Diagnostics) @testable import MLXLMCommon
 
 private final class QwenMTPFixtureState: CBv2MTPRequestState {
     var committedInputCount = 0
@@ -12,8 +12,32 @@ private final class QwenMTPFixtureState: CBv2MTPRequestState {
     var stagedShortlists: [MLXArray?] = []
 }
 
-private final class QwenMTPFixtureDrafter: CBv2MTPRequestStatefulDrafter {
+private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     private final class Prepared: CBv2MTPPreparedCapture {}
+    private final class PrefixCheckpoint: CBv2MTPPrefixCheckpoint {
+        let targetInputCount: Int
+        let materializedBytes = 0
+        let evaluationTargets: [MLXArray] = []
+        init(_ count: Int) { targetInputCount = count }
+    }
+    var restoreHook: (() -> Void)?
+
+    func capturePrefixCheckpoint(
+        requestState: any CBv2MTPRequestState, targetInputCount: Int
+    ) -> (any CBv2MTPPrefixCheckpoint)? {
+        PrefixCheckpoint(targetInputCount)
+    }
+
+    func restorePrefixCheckpoint(
+        _ checkpoint: any CBv2MTPPrefixCheckpoint
+    ) -> (any CBv2MTPRequestState)? {
+        let hook = restoreHook
+        restoreHook = nil
+        hook?()
+        let state = makeRequestState() as! QwenMTPFixtureState
+        state.committedInputCount = checkpoint.targetInputCount - 1
+        return state
+    }
 
     let targetIdentity: ObjectIdentifier
     let correctionOffset: Int
@@ -179,15 +203,16 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
 
     init(
         captureWindows: Bool = false, spreadLogits: Bool = false,
-        compactReplay: Bool = false, policyTopTwoAvailable: Bool = true
+        compactReplay: Bool = false, policyTopTwoAvailable: Bool = true,
+        checkpoints: Bool = false
     ) {
         self.captureWindows = captureWindows
         self.spreadLogits = spreadLogits
         self.compactReplay = compactReplay
         self.cbv2MTPPolicyTopTwoAvailable = policyTopTwoAvailable
         self.cbv2Capabilities = CBv2ModelCapabilities(
-            supportsPrefixReuse: false, supportsPagedKV: false,
-            supportsCompiledDecode: false, supportsPackedPrefill: false,
+            supportsPrefixReuse: false, supportsRecurrentCheckpointReuse: checkpoints,
+            supportsPagedKV: false, supportsCompiledDecode: false, supportsPackedPrefill: false,
             supportsMTP: true,
             supportsCompactRecurrentMTPReplay: compactReplay)
     }
@@ -393,6 +418,90 @@ struct CBv2QwenMTPIntegrationTests {
                 CBv2Request(
                     id: CBv2RequestID(id), promptTokens: [2, 4, 6],
                     sampling: sampling, maxTokens: maxTokens)))
+    }
+
+    @Test("cancellation between hybrid restoration and deadline commit releases every owner")
+    func cancellationAfterHybridRestoreBeforeDeadlineCommit() async throws {
+        final class RestoreGate: @unchecked Sendable {
+            let entered = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            func block() { entered.signal(); _ = release.wait(timeout: .now() + 10) }
+        }
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let model = QwenMTPFixtureModel(checkpoints: true)
+        let drafter = QwenMTPFixtureDrafter(target: model, correctionOffset: 0)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let engine = EngineV2(
+            model: model, layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxConcurrentPartialPrefills: 1,
+                maxWaiting: 2, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: .init(
+                maximumBytes: 128 << 10, modelID: "fixture",
+                promptContractID: "template", buildID: "fixture"),
+            mtpDrafter: drafter,
+            mtpConfig: .init(enabled: true, maxDraftTokens: 1, fixedDraftTokens: 1, verificationMode: .serialTarget))
+        let cache = try #require(engine.hybridPrefixCache)
+        let checkpoint = try #require(drafter.capturePrefixCheckpoint(
+            requestState: drafter.makeRequestState(), targetInputCount: chunk))
+        let roots = cache.capture(
+            requestID: .init(900), position: chunk, chunkSize: chunk,
+            spec: try #require(model.recurrentStateSpec),
+            layers: [0: .init(conv: MLXArray.zeros([1, 1, 1]), ssm: MLXArray.zeros([1, 1, 1, 1]))],
+            assistant: checkpoint)
+        asyncEval(roots)
+        let prompt = Array(repeating: 2, count: chunk + 1)
+        let kv = MLXArray.zeros([1, 1, chunk + 1, 1])
+        asyncEval(kv)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            cache.publish(
+                requestID: .init(900), tokens: prompt, cacheSalt: nil,
+                kv: [(keys: kv, values: kv, offset: chunk + 1)], backingBytes: kv.nbytes * 2
+            ) { done.resume() }
+        }
+        #expect(cache.stats.entries == 1)
+        let candidate = try #require(cache.candidate(
+            tokens: prompt, cacheSalt: nil, maximumChunkSize: chunk))
+        #expect(candidate.prefillTokensSaved == chunk)
+        let gate = RestoreGate()
+        drafter.restoreHook = { gate.block() }
+        let request = CBv2Request(id: .init(901), promptTokens: prompt, maxTokens: 1)
+        let admission = CBv2FirstTokenDeadlineAdmission(
+            deadline: ContinuousClock().now.advanced(by: .seconds(60)),
+            conservativePrefillTokensPerSecond: 1_000,
+            conservativeDecodeTokensPerSecond: 1_000)
+        let submission = Task { try await engine.submit(request, firstTokenDeadline: admission) }
+        let entered = await cbv2SchedWait { gate.entered.wait(timeout: .now()) == .success }
+        #expect(entered)
+        submission.cancel()
+        gate.release.signal()
+        do {
+            switch try await submission.value {
+            case .admitted:
+                Issue.record("cancelled pre-commit admission unexpectedly succeeded")
+            case .deadlineUnreachable:
+                Issue.record("fixture did not reach the hybrid restoration boundary")
+            }
+        } catch is CancellationError {
+            // The queue acknowledges cancellation only after undoing adoption.
+        }
+        engine.loopForTesting.onEngineQueueSync {
+            #expect(engine.loopForTesting.recurrentStates.isEmpty)
+            #expect(engine.loopForTesting.mtp?.requestStateCountForTesting == 0)
+            #expect(engine.loopForTesting.scheduler.record(for: request.id) == nil)
+        }
+        #expect(!cache.hasStagedCheckpoints(requestID: request.id))
+        #expect(backend.bytesReserved == 0)
+        let retry = await cbv2SchedCollect(try engine.submit(request))
+        #expect(retry.finishReason == .length)
+        #expect(retry.usage?.prefixCacheTier == .resident)
+        #expect(retry.usage?.prefixCachePrefillTokensSaved == chunk)
+        await engine.shutdown()
+        #expect(cache.stats.retainedBytes == 0)
     }
 
     @Test("policy is forced to serial B1 depth one")
@@ -1018,7 +1127,8 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(plan.assignments.map(\.numTokens) == [1])
         #expect(plan.speculationFallbacks[request.id] == .tokenBudget)
 
-        let step = try #require(loop.executeMTPRound(plan))
+        let executed = try loop.executeMTPRound(plan)
+        let step = try #require(executed)
         #expect(step.mtpRound?.seedRows.map(\.id) == [request.id])
         #expect(step.mtpRound?.verify == nil)
         let metrics = driver.metricsSnapshot()
@@ -1308,4 +1418,49 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(EngineLoopV2.mtpDraftShortlist(logits: logits, size: 8) == nil)
         #expect(EngineLoopV2.mtpDraftShortlist(logits: logits, size: 0) == nil)
     }
+    @Test("actual MTP diagnostic separates rejected history without another target forward",
+          arguments: [CBv2MTPVerificationMode.rectangular, .serialTarget])
+    func boundedActualMTPDiagnostic(_ mode: CBv2MTPVerificationMode) async throws {
+        let config = CBv2MTPConfig(
+            enabled: true, maxDraftTokens: 3, maxSpeculativeBatch: 1,
+            fixedDraftTokens: 3, verificationMode: mode, maxAutomaticRectangularTokens: 8)
+        let (control, _, controlModel) = engine(
+            correctionOffset: 1, mtpConfig: config, captureWindows: true,
+            verification: mode, maxDraft: 3)
+        let expected = try await run(control, id: 881, maxTokens: 12)
+        let controlMetrics = try #require(control.mtpMetricsSnapshot())
+        await control.shutdown()
+        let (observed, drafter, observedModel) = engine(
+            correctionOffset: 1, mtpConfig: config, captureWindows: true,
+            verification: mode, maxDraft: 3)
+        try observed.configureLogitDiagnostic(.init(
+            requestID: 881, outputIndex: 3, candidateIDs: [1, 2]))
+        let actual = try await run(observed, id: 881, maxTokens: 12)
+        let snapshot = try #require(try observed.takeLogitDiagnosticSnapshot())
+        let metrics = try #require(observed.mtpMetricsSnapshot())
+        #expect(actual.tokens == expected.tokens)
+        #expect(metrics.rounds == controlMetrics.rounds)
+        #expect(observedModel.capturedVerifyWidths == controlModel.capturedVerifyWidths)
+        #expect(observedModel.hiddenPositionIDs == controlModel.hiddenPositionIDs)
+        if mode == .rectangular {
+            #expect(observedModel.topTwoCalls == controlModel.topTwoCalls,
+                    "rectangular trace must reuse existing policy reductions")
+        }
+        #expect(snapshot.omittedRecords == 0)
+        #expect(snapshot.records.contains { $0.outcome == "speculative_suffix" })
+        let confirmed = try #require(snapshot.records.first { $0.outcome == "confirmed" })
+        #expect(confirmed.outputIndex == 3)
+        #expect(confirmed.targetToken == actual.tokens[3])
+        #expect(confirmed.argMaxID == actual.tokens[3])
+        #expect(confirmed.topTwoIDs[0] == actual.tokens[3])
+        #expect(confirmed.seedToken == actual.tokens[confirmed.outputBase - 1])
+        #expect(confirmed.cacheOffset == 3 + confirmed.outputBase - 1)
+        #expect(confirmed.phase == (mode == .rectangular ? "rectangular_verify" : "serial_verify"))
+        #expect(try observed.takeLogitDiagnosticSnapshot()?.records.isEmpty == true)
+        try observed.configureLogitDiagnostic(nil)
+        #expect(try observed.takeLogitDiagnosticSnapshot() == nil)
+        await observed.shutdown()
+        #expect(drafter.released == drafter.created)
+    }
+
 }

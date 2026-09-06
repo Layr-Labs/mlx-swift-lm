@@ -19,6 +19,9 @@ import MLX
 /// Per-layer, batch-facing cache + attention dispatcher for the v2 engine.
 public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
+    var attentionMetadata: CBv2AttentionMetadataForward?
+    var attentionPacket: CBv2AttentionPacketForward?
+
     public let layerIndex: Int
     public let kind: CBv2LayerKind
 
@@ -112,12 +115,20 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
+        let metadata = attentionMetadata?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap,
+            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
+        let packet = attentionPacket?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap,
+            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention)
+            serializeQueries: mtpSerializesRectangularAttention, metadata: metadata, packet: packet)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))

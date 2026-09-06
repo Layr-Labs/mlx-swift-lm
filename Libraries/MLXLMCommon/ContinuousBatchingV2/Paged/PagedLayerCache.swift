@@ -50,6 +50,9 @@ import MLX
 import MLXFast
 
 public final class PagedLayerCache: CBv2AttendingLayerCache {
+    var attentionMetadata: CBv2AttentionMetadataForward?
+    var attentionPacket: CBv2AttentionPacketForward?
+
     public let layerIndex: Int
     public let kind: CBv2LayerKind
     let pool: PagedKVPool
@@ -82,6 +85,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private var cachedTablesFingerprint: [(serial: UInt64, tableVersion: Int)] = []
     /// Times the device tables were rebuilt (test/telemetry hook).
     private(set) var tablesRebuildCount = 0
+
+    /// One immutable metadata plan; never owns segment storage or a write fence.
+    let segmentDispatchCache = PagedSegmentDispatchCache()
 
     // Kernel params `{softcap, scale, 0…}` are constant across steps for a
     // layer; cache the device array keyed on the scale actually passed.
@@ -159,15 +165,20 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
             "KV-shared layers own no rows; attention borrows via attendBorrowing")
-        pagedRows = rows.map { row in
+        let nextRows = rows.map { row -> PagedSequenceKV in
             guard let paged = row as? PagedSequenceKV else {
                 fatalError("[PagedLayerCache] rows must be PagedSequenceKV from the same backend")
             }
             precondition(
-                paged.groupKey == PagedKVGroupKey(kind),
+                paged.pool === pool && paged.groupKey == pool.groupKey(forLayer: layerIndex),
                 "row group \(paged.groupKey) does not match layer kind")
             return paged
         }
+        if nextRows.count != pagedRows.count
+            || !zip(nextRows, pagedRows).allSatisfy({ $0.serial == $1.serial }) {
+            segmentDispatchCache.clear()
+        }
+        pagedRows = nextRows
         rebuildPositionOffsets()
         retainedPrefillKV = []
     }
@@ -191,6 +202,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        guard pool.writeValidation.validate(
+            keys: keys, values: values, expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+        else { return queries }
         precondition(kind.sharesKVWithLayer == nil, "shared layers must call attendBorrowing")
         let b = queries.dim(0)
         let l = queries.dim(2)
@@ -199,6 +213,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // CBv2AttentionV1) — a sink-free layer must ignore a passed array.
         let effectiveSinks = kind.hasSinks ? sinks : nil
 
+        let metadata = attentionMetadata?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap, spans: boundSpanContext != nil)
+        let packet = attentionPacket?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap, spans: boundSpanContext != nil)
         let output: MLXArray
         if l == 1 {
             // Decode: reserve each row's destination host-side; the kernel
@@ -211,7 +231,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 newKeys: keys.squeezed(axis: 2),
                 newValues: values.squeezed(axis: 2),
                 writeTargets: targets,
-                rows: pagedRows, scale: scale, sinks: effectiveSinks)
+                rows: pagedRows, scale: scale, sinks: effectiveSinks, metadata: metadata, packet: packet)
         } else if mtpSerializesRectangularAttention {
             // MTP rectangular verification: the round batches the
             // weight-bound model body across the `1 + k` columns, but
@@ -291,6 +311,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         source: CBv2AttendingLayerCache,
         queries: MLXArray, scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        guard !pool.writeValidation.isFaulted else { return queries }
         precondition(kind.sharesKVWithLayer != nil, "attendBorrowing requires a KV-shared layer")
         guard let src = source as? PagedLayerCache else {
             fatalError("[PagedLayerCache] can only borrow from another PagedLayerCache")
@@ -367,11 +388,37 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         writeTargets: [(page: Int32, slot: Int)]? = nil,
         rows: [PagedSequenceKV], scale: Float, sinks: MLXArray?,
         tableProvider: PagedLayerCache? = nil,
-        qPosFromEnd: Int = 0
+        qPosFromEnd: Int = 0, metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         precondition((newKeys == nil) == (writeTargets == nil))
         let provider = tableProvider ?? self
         let group = pool.group(rows[0].groupKey)
+        if group.segmentLayout != nil {
+            let descriptors = rows.enumerated().map { index, row in
+                PagedSegmentDispatchPlan.Row(
+                    pages: row.table,
+                    info: row.seqInfoRow(
+                        attending: attendRange(row: row, qPosFromEnd: qPosFromEnd),
+                        writeTarget: writeTargets?[index]),
+                    identity: row.windowSize == nil
+                        ? .init(serial: row.serial, tableVersion: row.tableVersion) : nil)
+            }
+            let result = PagedSegmentAttention.decode(
+                queries: queries, newKeys: newKeys, newValues: newValues,
+                group: group, rows: descriptors, sinks: preparedSinks(sinks),
+                params: params(scale: scale), softcap: attentionSoftcap != nil,
+                source: pool.kernelSource,
+                dispatchCache: segmentDispatchCache).expandedDimensions(axis: 2)
+            let output = result.dtype == queries.dtype ? result : result.asType(queries.dtype)
+            metadata?.finishPaged(
+                group: group, kernelOutputDType: result.dtype, output: output,
+                dispatch: "paged_segmented_decode")
+            packet?.finishPaged(
+                group: group, row: rows[0], kernelOutputDType: result.dtype, output: output,
+                dispatch: "paged_segmented_decode")
+            return output
+        }
         let tables = provider.deviceTables(rows: rows)
 
         let (seqinfo, maxAttendLength) = PagedAttentionKernel.seqinfo(
@@ -381,22 +428,30 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                     writeTarget: writeTargets?[i])
             })
 
-        let (out, nextFence) = PagedAttentionKernel.decode(
-            queries: queries,
-            newKeys: newKeys,
-            newValues: newValues,
-            kSlab: group.kSlab,
-            vSlab: group.vSlab,
-            tables: tables,
-            seqinfo: seqinfo,
-            maxAttendLength: maxAttendLength,
-            sinks: preparedSinks(sinks),
-            params: params(scale: scale),
-            softcap: attentionSoftcap != nil,
-            pageSize: pool.config.pageSize,
-            writeFence: group.writeFence,
-            kernelSource: pool.kernelSource
-        )
+        let out: MLXArray
+        let nextFence: MLXArray?
+        do {
+            (out, nextFence) = try PagedAttentionKernel.decode(
+                queries: queries,
+                newKeys: newKeys,
+                newValues: newValues,
+                kSlab: group.kSlab,
+                vSlab: group.vSlab,
+                tables: tables,
+                seqinfo: seqinfo,
+                maxAttendLength: maxAttendLength,
+                sinks: preparedSinks(sinks),
+                params: params(scale: scale),
+                softcap: attentionSoftcap != nil,
+                pageSize: pool.config.pageSize,
+                writeFence: group.writeFence,
+                kernelSource: pool.kernelSource
+            )
+        } catch {
+            pool.writeValidation.record(error)
+            return queries
+        }
+
         // The fused write advanced the group's write-fence chain: later
         // slab readers (KV-borrowing layers, next steps' dispatches,
         // gathers) consume it and order after this dispatch's writes.
@@ -408,6 +463,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         if result.dtype != queries.dtype {
             result = result.asType(queries.dtype)
         }
+        metadata?.finishPaged(
+            group: group, kernelOutputDType: out.dtype, output: result,
+            dispatch: "paged_fixed_decode")
+        packet?.finishPaged(
+            group: group, row: rows[0], kernelOutputDType: out.dtype, output: result,
+            dispatch: "paged_fixed_decode")
         return result
     }
 
@@ -555,7 +616,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // refcount-pinned and permanently zeroed, so a slot the kernel should
         // never reach reads zeros instead of another request's tokens.
         let maxPages = max(8, rows.map { $0.table.count }.max() ?? 0)
-        let poison = pool.poisonPage(group: PagedKVGroupKey(kind))
+        let poison = pool.poisonPage(group: pool.groupKey(forLayer: layerIndex))
         var flat = [Int32](repeating: poison, count: rows.count * maxPages)
         for (i, row) in rows.enumerated() {
             flat.replaceSubrange(
@@ -665,12 +726,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // values the slab will hold. Otherwise prefill would score these
         // tokens at a precision no later decode over them can reproduce,
         // which is exactly the kind of per-phase drift this file pins out.
-        var chunkK = chunkKeys
-        var chunkV = chunkValues
-        if pool.config.dtype != chunkK.dtype {
-            chunkK = chunkK.asType(pool.config.dtype)
-            chunkV = chunkV.asType(pool.config.dtype)
-        }
+        let chunkK = chunkKeys
+        let chunkV = chunkValues
         guard start < queryStart else {
             row.write(keys: rowKeys, values: rowValues)
             return PrefillKV(
@@ -867,12 +924,18 @@ extension PagedLayerCache: KVCache {
         }
     }
 
-    /// The paged slabs are pool-owned persistent buffers; per-step writes
-    /// are materialized transitively by the engine's step asyncEval. The
-    /// on-device `positionOffsets` advance chain is surfaced here (same
-    /// convention as `CBv2LayerCache.innerState`) so it rides the step's
-    /// eval set and cannot grow O(steps).
-    public func innerState() -> [MLXArray] { [cachedPositionOffsets] }
+    /// Prompt attention can use its direct chunk tensors without reading the
+    /// freshly written pages. Include that write explicitly in the step eval
+    /// set, even when the prompt produces the terminal token: otherwise the
+    /// lazy fence can retain source/segment arrays after the row is retired.
+    /// The position chain also rides this set so it cannot grow with steps.
+    public func innerState() -> [MLXArray] {
+        guard !pool.writeValidation.isFaulted else { return [] }
+        guard kind.sharesKVWithLayer == nil, !pagedRows.isEmpty else {
+            return [cachedPositionOffsets]
+        }
+        return [cachedPositionOffsets, pool.group(pool.groupKey(forLayer: layerIndex)).writeFence]
+    }
 
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError(

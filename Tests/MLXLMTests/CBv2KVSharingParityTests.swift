@@ -101,7 +101,7 @@ final class CBv2KVSharingParityTests: XCTestCase {
                 paged = try PagedKVBackend(
                     layerKinds: layerKinds,
                     config: PagedKVPoolConfig(
-                        capacityBytes: 32 << 20,
+                        capacityBytes: 32 << 20, dtype: .float32,
                         maxPrefillChunk: 64,
                         nominalMaxSequenceLength: 256))
             } catch let error as CBv2KVError {

@@ -186,7 +186,8 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
-        serializeQueries: Bool = false
+        serializeQueries: Bool = false, metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -219,7 +220,7 @@ enum CBv2AttentionV1 {
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[0])
+                spanContext: spanContexts?[0], metadata: metadata, packet: packet)
         }
 
         if L == 1 {
@@ -360,7 +361,8 @@ enum CBv2AttentionV1 {
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?,
-        spanContext: CBv2SpanChunkContext?
+        spanContext: CBv2SpanChunkContext?, metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
@@ -380,7 +382,7 @@ enum CBv2AttentionV1 {
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional)
+            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional, metadata: metadata, packet: packet)
     }
 
     private static func updateAndAttendRowSerialQueries(
@@ -672,7 +674,8 @@ enum CBv2AttentionV1 {
     private static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
         L: Int, kL: Int, window: Int?, sinks: MLXArray?, softcap: Float?,
-        bidirectional: Bool = false
+        bidirectional: Bool = false, metadata: CBv2AttentionMetadataObservation? = nil,
+        packet: CBv2AttentionPacketObservation? = nil
     ) -> MLXArray {
         // A model may widen Q for safer attention math while retaining compact
         // K/V storage. SDPA requires one dtype, so widen only these views.
@@ -687,11 +690,18 @@ enum CBv2AttentionV1 {
             assert(
                 sinks == nil || sinks!.dtype == queries.dtype,
                 "CBv2AttentionV1: sinks must be normalized to the query dtype before SDPA")
-            return MLXFast.scaledDotProductAttention(
+            let output = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,
                 mask: maskMode(
                     L: L, kL: kL, window: window, bidirectional: bidirectional),
                 sinks: sinks)
+            if let metadata {
+                metadata.finish(
+                    storage: ["visible_keys": .init(keys), "visible_values": .init(values)],
+                    kernelOutputDType: output.dtype, output: output, dispatch: "contiguous_sdpa")
+            }
+            packet?.finishContiguous(keys: keys, values: values, output: output)
+            return output
         }
         return PagedAttentionReference.composedAttention(
             queries: queries, keys: attentionKeys, values: attentionValues, scale: scale,

@@ -600,7 +600,8 @@ public enum PagedAttentionKernel {
     ///   - queries: `[B, queryHeads, 1, headDim]` or `[B, queryHeads, headDim]`,
     ///     any float dtype (converted to the slab dtype if needed).
     ///   - newKeys/newValues: this step's K/V tiles `[B, kvHeads, headDim]`
-    ///     (any float dtype). When non-nil the kernel writes them IN PLACE
+    ///     in the exact slab dtype. A mismatch throws before dispatch.
+    ///     When non-nil the kernel writes them IN PLACE
     ///     into the slabs at each row's `{writePage, writeSlot}` (seqinfo
     ///     fields 3/4) before attending — the fused decode write. Pass nil
     ///     for KV-borrowing dispatches (the rows were written by their
@@ -639,7 +640,7 @@ public enum PagedAttentionKernel {
         writeFence: MLXArray,
         kernelSource: String,
         stream: StreamOrDevice = .default
-    ) -> (out: MLXArray, nextWriteFence: MLXArray?) {
+    ) throws(CBv2PagedKVWriteError) -> (out: MLXArray, nextWriteFence: MLXArray?) {
         var q = queries
         if q.ndim == 4 {
             precondition(q.dim(2) == 1, "decode kernel requires L == 1")
@@ -672,6 +673,11 @@ public enum PagedAttentionKernel {
                         ?? "headDim \(headDim), GQA \(gqa)"))
         }
 
+        if let newKeys, let newValues,
+            newKeys.dtype != dtype || newValues.dtype != dtype {
+            throw CBv2PagedKVWriteError(
+                layerIndex: nil, expected: dtype, keys: newKeys.dtype, values: newValues.dtype)
+        }
         if q.dtype != dtype { q = q.asType(dtype) }
 
         let hasWrite = newKeys != nil
@@ -681,9 +687,8 @@ public enum PagedAttentionKernel {
                 newKeys.ndim == 3 && newKeys.dim(0) == b && newKeys.dim(1) == kvHeads
                     && newKeys.dim(2) == headDim,
                 "newKeys must be [B, KVH, D]")
-            partInputs.append(newKeys.dtype == dtype ? newKeys : newKeys.asType(dtype))
-            partInputs.append(
-                newValues.dtype == dtype ? newValues : newValues.asType(dtype))
+            partInputs.append(newKeys)
+            partInputs.append(newValues)
         }
         partInputs.append(contentsOf: [kSlab, vSlab, tables, seqinfo, params, writeFence])
 
@@ -704,6 +709,10 @@ public enum PagedAttentionKernel {
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
             partitionTokens: ptok, hasWrite: hasWrite)
         let tg = 32 * nsg
+        // MLX passes arrays smaller than 8 elements in Metal's constant address
+        // space; the merge implementation expects a device pointer. Keep even
+        // a one-head/one-partition probe on the same legal interface.
+        let metaShape = [max(8, b * queryHeads * maxParts * 2)]
         let partOut = kernel(for: partKey, source: kernelSource)(
             partInputs,
             template: [
@@ -719,8 +728,8 @@ public enum PagedAttentionKernel {
             grid: (kvHeads * splits * tg, b, maxParts),
             threadGroup: (tg, 1, 1),
             outputShapes: hasWrite
-                ? [[b, queryHeads, maxParts, headDim], [b, queryHeads, maxParts, 2], [1]]
-                : [[b, queryHeads, maxParts, headDim], [b, queryHeads, maxParts, 2]],
+                ? [[b, queryHeads, maxParts, headDim], metaShape, [1]]
+                : [[b, queryHeads, maxParts, headDim], metaShape],
             outputDTypes: hasWrite ? [.float32, .float32, .int32] : [.float32, .float32],
             stream: stream
         )
@@ -763,10 +772,13 @@ public enum PagedAttentionKernel {
         pageSize: Int,
         kernelSource: String,
         stream: StreamOrDevice = .default
-    ) -> MLXArray {
+    ) throws(CBv2PagedKVWriteError) -> MLXArray {
         let dtype = kSlab.dtype
         precondition(keys.ndim == 3 && values.ndim == 3, "tiles must be [KVH, N, D]")
-        precondition(keys.dtype == dtype && values.dtype == dtype, "tiles in slab dtype")
+        guard keys.dtype == dtype, values.dtype == dtype else {
+            throw CBv2PagedKVWriteError(
+                layerIndex: nil, expected: dtype, keys: keys.dtype, values: values.dtype)
+        }
         let kvHeads = keys.dim(0)
         let n = keys.dim(1)
         let headDim = keys.dim(2)
