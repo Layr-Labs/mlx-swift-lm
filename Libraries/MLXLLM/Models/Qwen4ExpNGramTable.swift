@@ -567,6 +567,17 @@ public final class Qwen4ExpNGramTable: Qwen4ExpNGramRowSource {
     private let descriptors: [Int32]
     private let shards: [ShardLocation]
     private let cache: RowCache
+    /// Serializes every gather. The row cache is a plain LRU over one arena
+    /// and two index tables; two forwards gathering at once — the engine
+    /// loop's next step built while the previous one's host readback is
+    /// still inside `rows(globalIds:)`, or a draft round beside a verify —
+    /// mutate it under each other. A box ran 62 minutes of free-decode
+    /// oracle windows and died in `RowCache.value(for:)` on a freed pointer
+    /// shape (0x8000000000000010). A gather is host work of a few hundred
+    /// rows; holding one lock for its duration costs nothing measurable and
+    /// makes the table's exactness hold under concurrency, not only in a
+    /// single-threaded test.
+    private let gatherLock = NSLock()
 
     public var rowDimensions: Int { layout.rowDimensions }
 
@@ -823,6 +834,8 @@ public final class Qwen4ExpNGramTable: Qwen4ExpNGramRowSource {
         scales: UnsafeMutableRawPointer,
         biases: UnsafeMutableRawPointer
     ) {
+        gatherLock.lock()
+        defer { gatherLock.unlock() }
         // Distinct rows decide the path, exactly as mtplx's np.unique does.
         var seen = Set<Int>()
         var unique: [Int] = []
@@ -885,8 +898,10 @@ public final class Qwen4ExpNGramTable: Qwen4ExpNGramRowSource {
             row.reserveCapacity(layout.bytesPerRow)
             row.append(
                 contentsOf: weights[(position * weightBytes) ..< ((position + 1) * weightBytes)])
-            row.append(contentsOf: scales[(position * groupBytes) ..< ((position + 1) * groupBytes)])
-            row.append(contentsOf: biases[(position * groupBytes) ..< ((position + 1) * groupBytes)])
+            row.append(
+                contentsOf: scales[(position * groupBytes) ..< ((position + 1) * groupBytes)])
+            row.append(
+                contentsOf: biases[(position * groupBytes) ..< ((position + 1) * groupBytes)])
             return row
         }
     }
