@@ -97,6 +97,25 @@ public struct Qwen4ExpConfiguration: Codable, Sendable {
 
 // MARK: - Decoder layer
 
+/// SPEED DIAGNOSTIC ONLY (scratch branch). `MLXLM_SCRATCH_SKIP` is a comma
+/// list of blocks whose compute is left out of the legacy forward so
+/// diag-parity attributes the step time per block on the real model:
+/// `ple`, `hc`, `attn`, `gdn`, `moe`, `routed`, `shared`. Tokens are
+/// meaningless while any is set.
+enum Qwen4ExpScratchSkip {
+    static let current: Set<String> = Set(
+        (ProcessInfo.processInfo.environment["MLXLM_SCRATCH_SKIP"] ?? "")
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() })
+
+    /// A stand-in for the mixer: the first hyper-connection stream as the
+    /// block input (a view), unit inject weights.
+    static func cheapMix(_ hyper: MLXArray, hcCount: Int, dimensions: Int) -> (MLXArray, MLXArray, MLXArray) {
+        let lead = hyper.shape.dropLast()
+        let input = hyper.reshaped(lead + [hcCount, dimensions])[.ellipsis, 0, 0...]
+        return (input, hyper, MLXArray.ones(lead + [hcCount], dtype: hyper.dtype))
+    }
+}
+
 public final class Qwen4ExpDecoderLayer: Module {
     public let isLinear: Bool
 
@@ -148,7 +167,8 @@ public final class Qwen4ExpDecoderLayer: Module {
     ) -> MLXArray {
         var stream = hyper
 
-        if let ple, let previousContext {
+        let skip = Qwen4ExpScratchSkip.current
+        if let ple, let previousContext, !skip.contains("ple") {
             stream =
                 stream
                 + ple(
@@ -156,17 +176,22 @@ public final class Qwen4ExpDecoderLayer: Module {
                     cache: cache as? Qwen4ExpLayerCache)
         }
 
-        var (input, residual, inject) = attnHyperConnection.mixWithInject(stream)
+        var (input, residual, inject) = skip.contains("hc")
+            ? Qwen4ExpScratchSkip.cheapMix(stream, hcCount: attnHyperConnection.hcCount, dimensions: attnHyperConnection.dimensions)
+            : attnHyperConnection.mixWithInject(stream)
         let attended: MLXArray
         if isLinear {
-            attended = linearAttn!(input, mask: convMask, cache: cache as? Qwen4ExpLayerCache)
+            attended = skip.contains("gdn") ? input : linearAttn!(input, mask: convMask, cache: cache as? Qwen4ExpLayerCache)
         } else {
-            attended = selfAttn!(input, rope: rope, mask: mask, cache: cache)
+            attended = skip.contains("attn") ? input : selfAttn!(input, rope: rope, mask: mask, cache: cache)
         }
         stream = qwen4ExpInject(residual: residual, output: attended, inject: inject)
 
-        (input, residual, inject) = mlpHyperConnection.mixWithInject(stream)
-        return qwen4ExpInject(residual: residual, output: mlp(input), inject: inject)
+        (input, residual, inject) = skip.contains("hc")
+            ? Qwen4ExpScratchSkip.cheapMix(stream, hcCount: mlpHyperConnection.hcCount, dimensions: mlpHyperConnection.dimensions)
+            : mlpHyperConnection.mixWithInject(stream)
+        let fed = skip.contains("moe") ? input : mlp(input)
+        return qwen4ExpInject(residual: residual, output: fed, inject: inject)
     }
 }
 

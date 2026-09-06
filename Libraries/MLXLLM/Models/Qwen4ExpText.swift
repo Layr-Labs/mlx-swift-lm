@@ -1133,13 +1133,17 @@ public final class Qwen4ExpSparseMoeBlock: Module {
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         // The router runs in float32 and the softmax is taken AFTER selection,
         // over the selected logits only -- this is the reference order.
+        let skip = Qwen4ExpScratchSkip.current
+        let shared = skip.contains("shared") ? nil : sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+        if skip.contains("routed") { return shared ?? x }
         let logits = gate(x.asType(.float32))
         let indices = argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         let weights = MLX.softmax(takeAlong(logits, indices, axis: -1), axis: -1, precise: true)
         let routed = (routedExperts(x, indices: indices) * weights[.ellipsis, .newAxis])
             .sum(axis: -2)
             .asType(x.dtype)
-        return routed + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+        guard let shared else { return routed }
+        return routed + shared
     }
 }
 
