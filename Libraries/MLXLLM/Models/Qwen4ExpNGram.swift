@@ -296,6 +296,11 @@ public final class Qwen4ExpNGramEmbedding: Module {
     }
 
     public func callAsFunction(_ ids: MLXArray, previousContext: MLXArray) -> MLXArray {
+        // SPEED DIAGNOSTIC (scratch): MLXLM_SCRATCH_SKIP=ple-rows leaves out the
+        // hash, the context readback and the row gather; zeros stand in.
+        if Qwen4ExpScratchSkip.current.contains("ple-rows") {
+            return MLXArray.zeros([ids.dim(0), ids.dim(1), ngramHeads * rowDimensions], dtype: .bfloat16)
+        }
         if let host = rowSourceHolder.source as? Qwen4ExpNGramHostRowSource {
             // Host path: the ids are inputs (the token fed, and the staged
             // context), so reading them evaluates nothing of this step's

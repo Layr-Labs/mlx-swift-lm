@@ -794,6 +794,11 @@ public final class Qwen4ExpNGramTable: Qwen4ExpNGramHostRowSource {
 
     /// The host-id form (`Qwen4ExpNGramHostRowSource`): no device readback.
     public func rows(globalIds ids: [Int], shape: [Int]) -> MLXArray {
+        // SPEED DIAGNOSTIC (scratch): MLXLM_SCRATCH_SKIP=ple-gather skips the
+        // table read and the dequantisation; zeros stand in for the rows.
+        if Qwen4ExpScratchSkip.current.contains("ple-gather") {
+            return MLXArray.zeros(shape + [layout.rowDimensions], dtype: .bfloat16)
+        }
         let count = ids.count
 
         let weightBytes = layout.weightBytesPerRow
