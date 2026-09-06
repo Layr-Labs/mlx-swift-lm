@@ -11,20 +11,41 @@ struct CBv2ForwardShapeEngineTests {
         var supportsPackedPrefill: Bool { true }
         init(split: Bool) { self.split = split }
 
-        private func leaf(_ tokens: MLXArray) -> MLXArray {
+        private func leaf(_ tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
             let observation = CBv2ForwardShapeObservation.beginTarget(
                 liveBatchRows: tokens.dim(0), sequenceWidth: tokens.dim(1))
             defer { observation?.end() }
             calls += 1
-            return broadcast(MLXArray([Float(0), Float(1)]).reshaped([1, 1, 2]),
+            var logits = broadcast(MLXArray([Float(0), Float(1)]).reshaped([1, 1, 2]),
                 to: [tokens.dim(0), tokens.dim(1), 2])
+            for cache in caches {
+                let offsets = cache.rows.map(\.absoluteOffset)
+                let qkv = broadcast(tokens.asType(.float32).reshaped([tokens.dim(0), 1, tokens.dim(1), 1]),
+                    to: [tokens.dim(0), 1, tokens.dim(1), cache.kind.headDim])
+                let attended = cache.updateAndAttend(queries: qkv, keys: qkv, values: qkv,
+                    scale: 1 / Float(cache.kind.headDim).squareRoot(), sinks: nil)
+                // Both logits receive the same attention contribution, preserving
+                // token 1 while making the real KV/attention work part of readback.
+                logits = logits + sum(attended, axes: [1, 3]).expandedDimensions(axis: 2)
+                for (offset, row) in zip(offsets, cache.rows) {
+                    #expect(row.absoluteOffset == offset + tokens.dim(1))
+                }
+            }
+            return logits
         }
 
         func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
             if split {
-                return concatenated((0..<tokens.dim(0)).map { index in leaf(tokens[index..<(index + 1)]) }, axis: 0)
+                let rows = caches.map(\.rows)
+                defer {
+                    for (cache, originalRows) in zip(caches, rows) { cache.setRows(originalRows) }
+                }
+                return concatenated((0..<tokens.dim(0)).map { index in
+                    for (cache, originalRows) in zip(caches, rows) { cache.setRows([originalRows[index]]) }
+                    return leaf(tokens[index..<(index + 1)], caches: caches)
+                }, axis: 0)
             }
-            return leaf(tokens)
+            return leaf(tokens, caches: caches)
         }
 
         func prefill(tokens: MLXArray, inputEmbeddings: MLXArray?,
