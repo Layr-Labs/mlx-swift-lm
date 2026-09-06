@@ -597,6 +597,17 @@ public final class BenchWorkerServer: @unchecked Sendable {
             // the drain rather than the phase.
             let snapshot = memory.preDrainSnapshot()
             await releaseSessionsAndSettle()
+            // CBV2_STEP_PROFILE=1: the engine loop's per-phase timing table
+            // (launch, readback wait, sampler, per-step phases) on stderr,
+            // one table per phase, then reset so the next phase reads clean.
+            // Diagnostic only; stdout stays the wire.
+            if CBv2StepProfiler.enabled {
+                FileHandle.standardError.write(
+                    Data(
+                        ("bench-worker: step profile\n" + CBv2StepProfiler.summaryTable() + "\n")
+                            .utf8))
+                CBv2StepProfiler.reset()
+            }
             response.expertStats = ExpertStreamingStats()
             response.peakRAMGB = memory.peakRAMGB()
             response.completedWork = completedWork
