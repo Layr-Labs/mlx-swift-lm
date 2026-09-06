@@ -687,13 +687,27 @@ public final class Qwen4ExpAttention: Module {
         var queries = projected[0]
         let gate = projected[1].reshaped(B, S, -1)
 
-        queries = qNorm(queries).transposed(0, 2, 1, 3)
-        var keys = kNorm(kProj(x).reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
+        var keys: MLXArray
         let values = vProj(x).reshaped(B, S, kvHeads, -1).transposed(0, 2, 1, 3)
-
-        let (cos, sin) = rope.cosSin(qwen4ExpPositions(offset: offset, count: S))
-        queries = qwen4ExpRopePartial(queries, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
-        keys = qwen4ExpRopePartial(keys, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
+        if qwen4ExpScratchKernelsEnabled, headDim % 32 == 0 {
+            let positions = MLXArray(Int32(offset) ..< Int32(offset + S))
+            let invFreq = rope.scratchInvFreq
+            queries = Qwen4ExpAttnScratchKernels.ropeNorm(
+                queries, weight: qNorm.weight, eps: qNorm.eps, offsetZero: qNorm.weightOffset == 0,
+                positions: positions, invFreq: invFreq, rotaryDims: rope.dimensions
+            ).transposed(0, 2, 1, 3)
+            keys = Qwen4ExpAttnScratchKernels.ropeNorm(
+                kProj(x).reshaped(B, S, kvHeads, -1), weight: kNorm.weight, eps: kNorm.eps,
+                offsetZero: kNorm.weightOffset == 0, positions: positions, invFreq: invFreq,
+                rotaryDims: rope.dimensions
+            ).transposed(0, 2, 1, 3)
+        } else {
+            queries = qNorm(queries).transposed(0, 2, 1, 3)
+            keys = kNorm(kProj(x).reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
+            let (cos, sin) = rope.cosSin(qwen4ExpPositions(offset: offset, count: S))
+            queries = qwen4ExpRopePartial(queries, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
+            keys = qwen4ExpRopePartial(keys, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
+        }
 
         var effectiveMask = mask
         if let sparse {
@@ -729,7 +743,8 @@ public final class Qwen4ExpAttention: Module {
         .transposed(0, 2, 1, 3)
         .reshaped(B, S, -1)
 
-        return oProj(out * sigmoid(gate))
+        return oProj(
+            qwen4ExpScratchKernelsEnabled ? Qwen4ExpAttnScratchKernels.gate(out, gate: gate) : out * sigmoid(gate))
     }
 }
 
@@ -909,7 +924,7 @@ public final class Qwen4ExpSparseMoeBlock: Module {
         // The router runs in float32 and the softmax is taken AFTER selection,
         // over the selected logits only -- this is the reference order.
         let logits = gate(x.asType(.float32))
-        if qwen4ExpScratchKernelsEnabled {
+        if qwen4ExpScratchKernelsEnabled, logits.dim(-1) % 32 == 0, topK <= 16 {
             let routed = Qwen4ExpMoEScratchKernels.router(logits: logits, topK: topK)
             return Qwen4ExpMoEScratchKernels.tail(
                 experts: switchMLP(x, routed.indices), weights: routed.weights,

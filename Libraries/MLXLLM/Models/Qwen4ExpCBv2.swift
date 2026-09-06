@@ -362,13 +362,26 @@ extension Qwen4ExpAttention {
         var queries = projected[0]
         let gate = projected[1].reshaped(B, S, -1)
 
-        queries = qNorm(queries).transposed(0, 2, 1, 3)
-        var keys = kNorm(kProj(x).reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
+        var keys: MLXArray
         let values = vProj(x).reshaped(B, S, kvHeads, -1).transposed(0, 2, 1, 3)
-
-        let (cos, sin) = rope.cosSin(positions)
-        queries = qwen4ExpRopePartial(queries, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
-        keys = qwen4ExpRopePartial(keys, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
+        if qwen4ExpScratchKernelsEnabled, headDim % 32 == 0 {
+            let invFreq = rope.scratchInvFreq
+            queries = Qwen4ExpAttnScratchKernels.ropeNorm(
+                queries, weight: qNorm.weight, eps: qNorm.eps, offsetZero: qNorm.weightOffset == 0,
+                positions: positions, invFreq: invFreq, rotaryDims: rope.dimensions
+            ).transposed(0, 2, 1, 3)
+            keys = Qwen4ExpAttnScratchKernels.ropeNorm(
+                kProj(x).reshaped(B, S, kvHeads, -1), weight: kNorm.weight, eps: kNorm.eps,
+                offsetZero: kNorm.weightOffset == 0, positions: positions, invFreq: invFreq,
+                rotaryDims: rope.dimensions
+            ).transposed(0, 2, 1, 3)
+        } else {
+            queries = qNorm(queries).transposed(0, 2, 1, 3)
+            keys = kNorm(kProj(x).reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
+            let (cos, sin) = rope.cosSin(positions)
+            queries = qwen4ExpRopePartial(queries, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
+            keys = qwen4ExpRopePartial(keys, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
+        }
 
         let out = cache.updateAndAttend(
             queries: queries, keys: keys, values: values,
@@ -377,7 +390,8 @@ extension Qwen4ExpAttention {
         .transposed(0, 2, 1, 3)
         .reshaped(B, S, -1)
 
-        return oProj(out * sigmoid(gate))
+        return oProj(
+            qwen4ExpScratchKernelsEnabled ? Qwen4ExpAttnScratchKernels.gate(out, gate: gate) : out * sigmoid(gate))
     }
 }
 
