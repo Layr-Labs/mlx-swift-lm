@@ -307,20 +307,7 @@ public func gatedDeltaUpdate(
 ) -> (MLXArray, MLXArray) {
     let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
-    return gatedDeltaUpdate(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
-}
 
-/// The update with the gates already computed (`g` = decay, `beta`), both
-/// float32 `[B, T, Hv]`. The caller may fuse their computation.
-public func gatedDeltaUpdate(
-    q: MLXArray,
-    k: MLXArray,
-    v: MLXArray,
-    g: MLXArray,
-    beta: MLXArray,
-    state: MLXArray? = nil,
-    mask: MLXArray? = nil
-) -> (MLXArray, MLXArray) {
     let B = q.dim(0)
     let Dk = q.dim(3)
     let Hv = v.dim(2)

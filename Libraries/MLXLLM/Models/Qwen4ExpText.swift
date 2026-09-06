@@ -430,17 +430,8 @@ public func qwen4ExpRopePartial(_ x: MLXArray, cos: MLXArray, sin: MLXArray) -> 
     let half = d / 2
     let x1 = rotated[.ellipsis, ..<half]
     let x2 = rotated[.ellipsis, half...]
-    let out: MLXArray
-    if qwen4ExpLightFusionEnabled {
-        let halves = qwen4ExpRopeRotate([
-            x1, x2, c[.ellipsis, ..<half], c[.ellipsis, half...],
-            s[.ellipsis, ..<half], s[.ellipsis, half...],
-        ])
-        out = concatenated(halves, axis: -1)
-    } else {
-        let swapped = concatenated([-x2, x1], axis: -1)
-        out = rotated * c + swapped * s
-    }
+    let swapped = concatenated([-x2, x1], axis: -1)
+    let out = rotated * c + swapped * s
     if x.dim(-1) == d { return out }
     return concatenated([out, x[.ellipsis, d...]], axis: -1)
 }
@@ -905,52 +896,11 @@ public final class Qwen4ExpSparseMoeBlock: Module {
         let logits = gate(x.asType(.float32))
         let indices = argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         let weights = MLX.softmax(takeAlong(logits, indices, axis: -1), axis: -1, precise: true)
-        let experts = switchMLP(x, indices)
-        let shared = sharedExpert(x)
-        let sharedGate = sharedExpertGate(x)
-        guard qwen4ExpLightFusionEnabled else {
-            let routed = (experts * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype)
-            return routed + sigmoid(sharedGate) * shared
-        }
-        return qwen4ExpMoETail(experts, weights[.ellipsis, .newAxis], sharedGate, shared)
+        let routed = (switchMLP(x, indices) * weights[.ellipsis, .newAxis])
+            .sum(axis: -2)
+            .asType(x.dtype)
+        return routed + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
     }
-}
-
-/// A/B switch for the light-chain fusions below (MoE tail, attention output
-/// gate, partial rope): `MLXLM_LIGHT_FUSION=0` keeps the unfused chains in
-/// the same binary. Read once.
-let qwen4ExpLightFusionEnabled: Bool =
-    ProcessInfo.processInfo.environment["MLXLM_LIGHT_FUSION"] != "0"
-
-/// `sum(experts * weights, axis: -2).asType(shared.dtype) + sigmoid(gate) * shared`.
-/// The weighted sum and the shared-expert gate as one compiled graph: the
-/// multiply, cast, sigmoid, multiply and add fuse around the reduction.
-let qwen4ExpMoETail: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { (experts: MLXArray, weights: MLXArray, gate: MLXArray, shared: MLXArray) -> MLXArray in
-    (experts * weights).sum(axis: -2).asType(shared.dtype) + sigmoid(gate) * shared
-}
-
-/// `out * sigmoid(gate)`, one kernel.
-let qwen4ExpAttentionGate: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { (out: MLXArray, gate: MLXArray) -> MLXArray in
-    out * sigmoid(gate)
-}
-
-/// The two rotated halves of a partial rope, each one fused kernel:
-/// `out1 = x1·c1 − x2·s1`, `out2 = x2·c2 + x1·s2`. Every slice happens
-/// OUTSIDE (a shapeless trace cannot carry a slice); the concatenation of
-/// the halves is one copy either way.
-let qwen4ExpRopeRotate: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: true) {
-    (inputs: [MLXArray]) -> [MLXArray] in
-    let x1 = inputs[0]
-    let x2 = inputs[1]
-    let c1 = inputs[2]
-    let c2 = inputs[3]
-    let s1 = inputs[4]
-    let s2 = inputs[5]
-    return [x1 * c1 - x2 * s1, x2 * c2 + x1 * s2]
 }
 
 // MARK: - Hyper-connections
@@ -990,24 +940,13 @@ public final class Qwen4ExpGatedResidual: Module {
     }
 
     private func mixed(_ normed: MLXArray) -> MLXArray {
-        guard qwen4ExpHCFusionEnabled else {
-            var w = silu(mixDown(normed) / Float(hcCount))
-            w = sigmoid(mixUp(w))
-            let lead = w.shape.dropLast()
-            return
-                (w.reshaped(lead + [hcCount, dimensions])
-                * normed.reshaped(lead + [hcCount, dimensions])).mean(axis: -2)
-        }
-        let w = qwen4ExpHCScaledSilu(mixDown(normed), inverseCount)
+        var w = silu(mixDown(normed) / Float(hcCount))
+        w = sigmoid(mixUp(w))
         let lead = w.shape.dropLast()
-        return qwen4ExpHCMix(
-            mixUp(w).reshaped(lead + [hcCount, dimensions]),
-            normed.reshaped(lead + [hcCount, dimensions]))
+        return
+            (w.reshaped(lead + [hcCount, dimensions])
+            * normed.reshaped(lead + [hcCount, dimensions])).mean(axis: -2)
     }
-
-    /// `1 / hcCount` as an array, built once: a Swift scalar in a compiled
-    /// function would be baked into the trace.
-    private lazy var inverseCount = MLXArray(1 / Float(hcCount))
 
     /// Mixer without an inject head; the tower's final projection.
     public func callAsFunction(_ hyper: MLXArray) -> MLXArray {
@@ -1020,71 +959,14 @@ public final class Qwen4ExpGatedResidual: Module {
             preconditionFailure("Qwen4ExpGatedResidual: this mixer has no inject head")
         }
         let normed = hcNorm(hyper)
-        let inject =
-            qwen4ExpHCFusionEnabled
-            ? qwen4ExpHCInjectWeights(blockInject(normed), inverseCount)
-            : 2 * sigmoid(blockInject(normed) / Float(hcCount))
+        let inject = 2 * sigmoid(blockInject(normed) / Float(hcCount))
         return (mixed(normed), hyper, inject)
     }
 }
 
-// The hyper-connection's elementwise chains as COMPILED functions: the
-// compiler fuses each chain into one kernel instead of one per op, which is
-// what a decode step pays for (the step is dispatch-bound, not byte-bound:
-// a real-shaped model with negligible weights decodes at ~1.3 ms/layer).
-// `shapeless`, so one compiled graph serves prefill and decode. The
-// operations and their order are unchanged; a fused kernel keeps float32
-// between the ops where the unfused chain rounded to the activation dtype,
-// so results agree to activation precision rather than bit for bit.
-
-/// `silu(x * scale)`.
-let qwen4ExpHCScaledSilu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { (x: MLXArray, scale: MLXArray) -> MLXArray in
-    silu(x * scale)
-}
-
-/// `mean(sigmoid(w) * normed, axis: -2)` over the hc streams.
-let qwen4ExpHCMix: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { (w: MLXArray, normed: MLXArray) -> MLXArray in
-    (sigmoid(w) * normed).mean(axis: -2)
-}
-
-/// `2 * sigmoid(x * scale)`.
-let qwen4ExpHCInjectWeights: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { (x: MLXArray, scale: MLXArray) -> MLXArray in
-    2 * sigmoid(x * scale)
-}
-
-/// `residual + output * inject` over broadcast-ready operands. The reshapes
-/// that make them broadcast-ready happen OUTSIDE (they are views, no
-/// kernel): a shapeless compiled function must not carry a reshape whose
-/// dimensions differ between prefill and decode.
-let qwen4ExpHCInjectAdd: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
-    shapeless: true
-) { (residual: MLXArray, output: MLXArray, inject: MLXArray) -> MLXArray in
-    residual + output * inject
-}
-
-/// A/B switch for the harness: `MLXLM_HC_FUSION=0` restores the unfused
-/// chains in the same binary, so the two paths can be measured under the
-/// same machine state. Read once.
-let qwen4ExpHCFusionEnabled: Bool =
-    ProcessInfo.processInfo.environment["MLXLM_HC_FUSION"] != "0"
-
 /// Inject a block output back into the hyper-connection stream.
 public func qwen4ExpInject(residual: MLXArray, output: MLXArray, inject: MLXArray) -> MLXArray {
-    guard qwen4ExpHCFusionEnabled else {
-        let lead = output.shape.dropLast()
-        let spread = output[.ellipsis, .newAxis, 0...] * inject[.ellipsis, .newAxis]
-        return residual + spread.reshaped(lead + [-1])
-    }
     let lead = output.shape.dropLast()
-    let streams = inject.dim(-1)
-    let wide = residual.reshaped(lead + [streams, output.dim(-1)])
-    return qwen4ExpHCInjectAdd(
-        wide, output[.ellipsis, .newAxis, 0...], inject[.ellipsis, .newAxis]
-    ).reshaped(residual.shape)
+    let spread = output[.ellipsis, .newAxis, 0...] * inject[.ellipsis, .newAxis]
+    return residual + spread.reshaped(lead + [-1])
 }
