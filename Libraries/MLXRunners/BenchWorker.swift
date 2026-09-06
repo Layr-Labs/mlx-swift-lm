@@ -66,7 +66,16 @@ public struct MLXMemoryReporter: WorkerMemoryReporter {
     public func preDrainSnapshot() -> (active: Int, cache: Int, peak: Int)? {
         (Memory.activeMemory, Memory.cacheMemory, Memory.peakMemory)
     }
-    public func drain() { Memory.clearCache() }
+    /// Settle, then drain. A drain only returns buffers whose work has
+    /// finished; arrays a phase left in flight (its last asyncEval, its
+    /// teardown) come back to the cache AFTER a drain that ran too early,
+    /// and the next phase's barrier then reads a non-zero cache it did not
+    /// cause (a box saw 320 KiB on one resident connection in five). Waiting
+    /// for the stream makes the drain read the settled state.
+    public func drain() {
+        MLX.Stream().synchronize()
+        Memory.clearCache()
+    }
     public func cacheMemoryAfterDrain() -> Int? { Memory.cacheMemory }
     public func peakRAMGB() -> Double? { Double(Memory.peakMemory) / 1_000_000_000 }
 }
