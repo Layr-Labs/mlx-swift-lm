@@ -341,6 +341,15 @@ public final class Qwen4ExpNGramEmbedding: Module {
 /// Per-layer embedding block. It reads the n-gram embedding of the recent
 /// history, gates it against the current hidden state, and adds a dilated
 /// short convolution over the result.
+/// Scratch: the gate's epsilon as a cached array per dtype.
+enum Qwen4ExpPLEGateConstants {
+    nonisolated(unsafe) static var cache: [DType: MLXArray] = [:]
+    static func eps(_ dtype: DType) -> MLXArray {
+        if let v = cache[dtype] { return v }
+        let v = MLXArray(Float(1e-6)).asType(dtype); cache[dtype] = v; return v
+    }
+}
+
 public final class Qwen4ExpPLELayer: Module {
     let hiddenSize: Int
     let hcCount: Int
@@ -433,7 +442,13 @@ public final class Qwen4ExpPLELayer: Module {
             let query = queryFlat.reshaped(queryFlat.shape.dropLast() + [hcCount, hiddenSize])
             var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hiddenSize))
             if !skip.contains("ple-gate-math") {
-                gate = MLX.sqrt(maximum(MLX.abs(gate), MLXArray(Float(1e-6)))) * MLX.sign(gate)
+                // Sub-switches: ple-gate-eps (cached scalar of the gate's dtype
+                // instead of a fresh float32 scalar), ple-gate-sqrt (skip
+                // sqrt(maximum(abs))), ple-gate-sign (skip sign).
+                let eps: MLXArray = skip.contains("ple-gate-eps")
+                    ? Qwen4ExpPLEGateConstants.eps(gate.dtype) : MLXArray(Float(1e-6))
+                let magnitude = skip.contains("ple-gate-sqrt") ? gate : MLX.sqrt(maximum(MLX.abs(gate), eps))
+                gate = skip.contains("ple-gate-sign") ? magnitude : magnitude * MLX.sign(gate)
             }
             gated = (skip.contains("ple-gate-sig") ? gate : sigmoid(gate)) * value[.ellipsis, .newAxis, 0...]
         }
