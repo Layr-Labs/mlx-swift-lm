@@ -762,6 +762,13 @@ final class Qwen4ExpFusedLinearBox {
 /// An array derived from one parameter array, rebuilt only when that
 /// parameter is replaced (identity, not value: parameters are frozen after
 /// load, and `update(parameters:)` swaps the array object).
+///
+/// CAVEAT. The key is the source array's `ObjectIdentifier`, which the
+/// runtime may hand to a NEW array once the old one is freed. A later
+/// `update(parameters:)` that lands a replacement at the same address would
+/// then read a stale derived value. Serving never swaps weights after load,
+/// so this is accepted; a load path that replaces weights while a module is
+/// live must drop the module (or key on the data pointer plus shape).
 final class Qwen4ExpDerivedArrayCache {
     private var source: ObjectIdentifier?
     private var cached: MLXArray?
