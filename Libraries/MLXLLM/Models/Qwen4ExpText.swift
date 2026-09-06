@@ -819,7 +819,12 @@ enum Qwen4ExpFusedLeverSwitch {
     }
     static let qkv = enabled("MLXLM_FUSED_QKV")
     static let shared = enabled("MLXLM_FUSED_SHARED")
-    static let experts = enabled("MLXLM_FUSED_EXPERTS")
+    /// OFF BY DEFAULT. Measured on the 125B (2026-09-06, hand-proof/merge-ab-31c137e):
+    /// the stacked gate|up expert tensor is materialised on every step
+    /// (≈71 GiB), 2,020–2,190 ms/step against 115 with the switch layer's own
+    /// path. The merge can only exist by reference to the loaded shards,
+    /// which `concatenated` cannot give. Kept opt-in for the record.
+    static let experts = ProcessInfo.processInfo.environment["MLXLM_FUSED_EXPERTS"].map { ["1", "on", "true"].contains($0.lowercased()) } ?? false
 }
 
 /// An array derived from one parameter array, rebuilt only when that
