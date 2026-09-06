@@ -2458,6 +2458,19 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure("CBv2 recurrent bind failed for \(id): \(error)")
             }
         }
+        let forward = try recurrentTargetForward(
+            tokens: tokens, caches: caches, recurrentModel: recurrentModel,
+            evaluations: evaluations, positionIds: positionIds,
+            inputEmbeddings: inputEmbeddings, requirement: requirement)
+        return (forward.logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)), forward.innerState)
+    }
+
+    private func recurrentTargetForward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentModel: any CBv2RecurrentSteppableModel,
+        evaluations: [CBv2RecurrentStateEvaluation], positionIds: MLXArray? = nil,
+        inputEmbeddings: MLXArray? = nil, requirement: CBv2PrefillRequirement? = nil
+    ) throws -> (logits: MLXArray, innerState: [MLXArray]) {
         let logits: MLXArray
         if let requirement, Self.prefillNarrowingEnabled,
             let prefillable = model as? any CBv2RecurrentPrefillSteppableModel
@@ -2500,7 +2513,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure("CBv2 recurrent evaluation failed: \(error)")
             }
         }
-        return (logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)), arrays)
+        return (logits, arrays)
     }
 
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
@@ -2649,12 +2662,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         // Same allocation the loop makes for a real request of this shape.
-        let state = try backend.makeSequenceState(
+        let previousTargetBytes = backend.bytesReserved
+        var state = try backend.makeSequenceState(
             layerKinds: layerKinds,
             promptLength: promptTokens.count,
             maxLength: promptTokens.count + continuation.count)
         let writeBoundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
+        var recurrent: CBv2RecurrentRequestState?
+        var recurrentEvaluation: CBv2RecurrentStateEvaluation?
+        var recurrentReservation: CBv2CheckpointReservation?
         defer {
+            if let recurrent {
+                Stream.gpu.synchronize()
+                Stream.cpu.synchronize()
+                recurrentEvaluation = nil
+                recurrent.discardPendingAfterSynchronization()
+                releaseRecurrentState(recurrent)
+            }
             if let pool = (backend as? PagedKVBackend)?.pool, pool.writeValidation.isFaulted {
                 Stream.gpu.synchronize()
                 Stream.cpu.synchronize()
@@ -2665,7 +2689,53 @@ public final class EngineLoopV2: @unchecked Sendable {
             // step to rebind its own rows.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             backend.release(state)
+            state.removeAll()
             (backend as? PagedKVBackend)?.pool.writeValidation.clearAfterRetirement()
+            recurrentReservation?.release()
+        }
+        if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil {
+            guard let admission = capacity as? AdmissionV2 else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "recurrent teacher scoring requires peak admission accounting")
+            }
+            // makeRecurrentRequestState is a one-generation allocation check;
+            // ordinary admission owns the larger committed/pending peak. This
+            // private call needs that same obligation without a scheduler ID.
+            recurrentReservation = try admission.reserveUnscheduledRequest(
+                maximumTokens: promptTokens.count + continuation.count,
+                minimumTargetBytes: max(0, backend.bytesReserved - previousTargetBytes))
+        }
+        recurrent = try makeRecurrentRequestState()
+
+        func forward(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+            requirement: CBv2PrefillRequirement?
+        ) throws -> (logits: MLXArray, innerState: [MLXArray]) {
+            guard let recurrent else {
+                if let requirement {
+                    return (try prefillOutput(tokens: tokens, inputEmbeddings: nil,
+                        caches: caches, requirement: requirement), [])
+                }
+                return (try checkedModelForward { model.forward(tokens: tokens, caches: caches) }, [])
+            }
+            guard let recurrentModel = model as? any CBv2RecurrentSteppableModel else {
+                preconditionFailure("teacher recurrent state requires recurrent model")
+            }
+            recurrentEvaluation = try recurrent.bind()
+            return try recurrentTargetForward(
+                tokens: tokens, caches: caches, recurrentModel: recurrentModel,
+                evaluations: [recurrentEvaluation!], requirement: requirement)
+        }
+
+        func finishForward(_ arrays: [MLXArray]) throws {
+            if let evaluation = recurrentEvaluation {
+                eval(arrays)
+                StreamOrDevice.default.stream.synchronize()
+                try evaluation.commit()
+                recurrentEvaluation = nil
+            } else {
+                asyncEval(arrays)
+            }
         }
 
         // One lazy [1] argmax per continuation position; the forwards never
@@ -2685,11 +2755,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             let inputs = MLXArray(promptTokens[index ..< index + count].map(Int32.init))
                 .reshaped([1, count])
             let caches = eagerCaches(rowStates: [state])
-            let output = try prefillOutput(
-                tokens: inputs, inputEmbeddings: nil, caches: caches,
+            let forwarded = try forward(
+                tokens: inputs, caches: caches,
                 requirement: isFinalChunk ? .lastPositionLogits : .evaluationOnly)
+            let output = forwarded.logits
             teacherForcedPrefillChunks += 1
-            var toEval = eagerCacheInnerState(caches)
+            var toEval = eagerCacheInnerState(caches) + forwarded.innerState
             if isFinalChunk {
                 let argmax = argMax(output, axis: -1)  // [1]
                 top1.append(argmax)
@@ -2707,7 +2778,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // forces the chunk's whole graph, KV writes included.
                 toEval.append(output)
             }
-            asyncEval(toEval)
+            try finishForward(toEval)
             index += count
         }
 
@@ -2717,12 +2788,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         for forced in continuation.dropLast() {
             let inputs = MLXArray([Int32(forced)]).reshaped([1, 1])
             let caches = eagerCaches(rowStates: [state])
-            let full = try checkedModelForward { model.forward(tokens: inputs, caches: caches) }
-            let logits = full[0..., -1, 0...]
+            let forwarded = try forward(tokens: inputs, caches: caches, requirement: nil)
+            let logits = forwarded.logits[0..., -1, 0...]
             teacherForcedDecodeForwards += 1
             let argmax = argMax(logits, axis: -1)  // [1]
             top1.append(argmax)
-            var toEval = eagerCacheInnerState(caches)
+            var toEval = eagerCacheInnerState(caches) + forwarded.innerState
             toEval.append(argmax)
             if let diagnostic {
                 do { toEval += try diagnostic.capture(logits: logits, index: top1.count - 1) }
@@ -2732,7 +2803,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                     throw error
                 }
             }
-            asyncEval(toEval)
+            try finishForward(toEval)
         }
 
         let scored = top1.count == 1 ? top1[0] : concatenated(top1, axis: 0)
@@ -4323,29 +4394,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
             let state = try backend.makeSequenceState(
                 layerKinds: layerKinds, promptLength: rec.tokens.count, maxLength: maxLength)
-            if let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec {
-                do {
-                    let recurrent = try CBv2RecurrentRequestState(spec: spec)
-                    let existingRecurrentBytes = recurrentStates.values.reduce(0) { total, live in
-                        Self.saturatingAdd(total, live.byteCount)
-                    }
-                    let combined = Self.saturatingAdd(
-                        backend.bytesReserved,
-                        Self.saturatingAdd(existingRecurrentBytes, recurrent.byteCount))
-                    guard combined <= backend.bytesCapacity else {
-                        throw CBv2KVError.capacityExhausted(
-                            needed: recurrent.byteCount,
-                            available: max(
-                                0, backend.bytesCapacity - backend.bytesReserved
-                                    - existingRecurrentBytes))
-                    }
+            do {
+                if let recurrent = try makeRecurrentRequestState() {
                     recurrentStates[rec.id] = recurrent
-                } catch {
-                    backend.release(state)
-                    if let kvError = error as? CBv2KVError { throw kvError }
-                    throw CBv2KVError.backendIneligible(
-                        reason: "recurrent state allocation failed: \(error)")
                 }
+            } catch {
+                backend.release(state)
+                if let kvError = error as? CBv2KVError { throw kvError }
+                throw CBv2KVError.backendIneligible(
+                    reason: "recurrent state allocation failed: \(error)")
             }
             kvStates[rec.id] = state
             capacityRequeues.removeValue(forKey: rec.id)
@@ -4395,6 +4452,21 @@ public final class EngineLoopV2: @unchecked Sendable {
             finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
             return nil
         }
+    }
+
+    private func makeRecurrentRequestState() throws -> CBv2RecurrentRequestState? {
+        guard let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec else { return nil }
+        let recurrent = try CBv2RecurrentRequestState(spec: spec)
+        let existingRecurrentBytes = recurrentStates.values.reduce(0) { total, live in
+            Self.saturatingAdd(total, live.byteCount)
+        }
+        let combined = Self.saturatingAdd(backend.bytesReserved,
+            Self.saturatingAdd(existingRecurrentBytes, recurrent.byteCount))
+        guard combined <= backend.bytesCapacity else {
+            throw CBv2KVError.capacityExhausted(needed: recurrent.byteCount,
+                available: max(0, backend.bytesCapacity - backend.bytesReserved - existingRecurrentBytes))
+        }
+        return recurrent
     }
 
     private func releaseRecurrentState(_ state: CBv2RecurrentRequestState?) {

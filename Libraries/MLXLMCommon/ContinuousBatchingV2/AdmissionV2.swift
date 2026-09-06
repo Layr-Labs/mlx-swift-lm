@@ -271,6 +271,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private var reservedExactBytes: [CBv2RequestID: Int] = [:]
     private var ledgerBytes = 0
     private var transientBytes = 0
+    /// Private, unscheduled rows already allocated by the backend. Their KV
+    /// offsets the same physical floor as scheduled rows; their auxiliary
+    /// state remains additive until the call retires all buffer owners.
+    private var transientTargetBytes = 0
     private var checkpointStages: [UUID: CBv2CheckpointStageEntry] = [:]
     private var checkpointRequestOwners: [CBv2RequestID: UUID] = [:]
     /// Subset of reservedExactBytes belonging to imported recurrent/MTP state,
@@ -941,6 +945,49 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         }
     }
 
+    /// Price a private teacher row with the ordinary request projection,
+    /// including the resolved recurrent peak, allocator padding and any
+    /// configured auxiliary headroom. The backend row must already exist;
+    /// no forward may run until this reservation succeeds. The caller drops
+    /// every row/state alias before releasing the returned lease.
+    func reserveUnscheduledRequest(maximumTokens: Int, minimumTargetBytes: Int)
+        throws -> CBv2CheckpointReservation
+    {
+        guard maximumTokens > 0, minimumTargetBytes >= 0,
+            let allocated = allocatedBytesChecked(forTokens: maximumTokens),
+            let auxiliary = nonBackendBytesChecked(forTokens: maximumTokens),
+            allocated >= auxiliary,
+            let bytes = Self.add(max(allocated - auxiliary, minimumTargetBytes), auxiliary)
+        else { throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0) }
+        let target = bytes - auxiliary
+        let nominalDelta = try lock.withLock {
+            let delta = physicalFloor.isBound ? target : 0
+            guard let after = Self.add(ledgerBytes, bytes),
+                let nominal = Self.add(physicalFloor.nominalBytes, delta),
+                let charged = physicalFloor.chargedBytes(base: after, nominal: nominal),
+                charged <= mutationCeiling
+            else {
+                throw CBv2KVError.capacityExhausted(
+                    needed: bytes, available: max(0, reserveCeiling - chargedLedgerBytes))
+            }
+            try acceptProcessChargeLocked(charged)
+            physicalFloor.nominalBytes = nominal
+            ledgerBytes = after
+            transientBytes += bytes
+            transientTargetBytes += target
+            return delta
+        }
+        return CBv2CheckpointReservation { [self] in
+            lock.withLock {
+                ledgerBytes -= bytes
+                transientBytes -= bytes
+                transientTargetBytes -= target
+                physicalFloor.nominalBytes -= nominalDelta
+                publishProcessReductionLocked()
+            }
+        }
+    }
+
     /// Engine-created staging identities are the only source of a same-buffer
     /// destination transfer. Generic transient release callbacks cannot credit it.
     func reserveCheckpointStage(targetBytes: Int, auxiliaryBytes: Int, scratchBytes: Int)
@@ -1162,7 +1209,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public var nonBackendBytesReserved: Int {
         lock.lock()
         defer { lock.unlock() }
-        guard let transfers = Self.add(transientBytes, detachedNonBackendBytes),
+        guard let transfers = Self.add(transientBytes - transientTargetBytes, detachedNonBackendBytes),
             let withExternal = Self.add(externalReserveBytes, transfers),
             var total = Self.add(withExternal, physicalFloor.overheadBytes)
         else { return Int.max }
@@ -1187,7 +1234,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     ) -> (materialized: Int, unmaterialized: Int) {
         lock.lock()
         defer { lock.unlock() }
-        var materialized = 0
+        var materialized = transientTargetBytes
         var unmaterialized = 0
         let ids = Set(reservedTokens.keys).union(reservedExactBytes.keys)
         for id in ids {

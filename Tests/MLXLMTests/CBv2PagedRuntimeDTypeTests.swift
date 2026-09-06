@@ -130,6 +130,8 @@ private final class RuntimeDTypeModel: CBv2RecurrentSteppableModel, @unchecked S
     private let lock = NSLock()
     private var failOnCall: Int?
     private var calls = 0
+    private var recurrentCalls = 0
+    var recurrentForwardCount: Int { lock.withLock { recurrentCalls } }
 
     init(recurrent: Bool, failOnCall: Int?) {
         self.failOnCall = failOnCall
@@ -146,7 +148,8 @@ private final class RuntimeDTypeModel: CBv2RecurrentSteppableModel, @unchecked S
 
     func forward(tokens: MLXArray, caches: [any CBv2AttendingLayerCache],
                  recurrentState: [CBv2RecurrentStateEvaluation]) -> MLXArray {
-        build(tokens: tokens, caches: caches, recurrentState: recurrentState)
+        lock.withLock { recurrentCalls += 1 }
+        return build(tokens: tokens, caches: caches, recurrentState: recurrentState)
     }
 
     private func build(tokens: MLXArray, caches: [any CBv2AttendingLayerCache],
@@ -245,24 +248,31 @@ struct CBv2PagedRuntimeDTypeEngineTests {
         #expect(engine.admissionForTesting.bytesReserved == 0)
     }
 
-    @Test(arguments: [1, 2])
-    func teacherForcedFailureThrowsBeforeScoringAndReleasesPrivateRows(failOnCall: Int) async throws {
+    @Test(arguments: [false, true], [1, 2])
+    func teacherForcedFailureThrowsBeforeScoringAndReleasesPrivateRows(
+        recurrent: Bool, failOnCall: Int
+    ) async throws {
         let backend = try makeBackend()
-        let model = RuntimeDTypeModel(recurrent: false, failOnCall: failOnCall)
+        let model = RuntimeDTypeModel(recurrent: recurrent, failOnCall: failOnCall)
         let engine = EngineV2(model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
             sampler: CBv2GreedySampler(), admissionConfig: .init(watermarkFraction: 0))
         #expect(throws: CBv2PagedKVWriteError.self) {
             try engine.loopForTesting.teacherForcedTop1(promptTokens: [1, 2, 3], continuation: [1, 1])
         }
+        #expect(model.recurrentForwardCount == (recurrent ? failOnCall : 0))
         engine.loopForTesting.onEngineQueueSync {
             #expect(backend.bytesReserved == 0 && backend.bytesWired == 0)
             #expect(!backend.pool.writeValidation.isFaulted)
+            #expect(engine.admissionForTesting.bytesReserved == 0)
+            #expect(engine.admissionForTesting.transientBytesReserved == 0)
         }
         model.allowValidCalls()
         let recovered = try engine.loopForTesting.teacherForcedTop1(
             promptTokens: [1, 2], continuation: [1, 1])
         #expect(recovered == [1, 1])
+        #expect(engine.admissionForTesting.bytesReserved == 0)
+        #expect(engine.admissionForTesting.transientBytesReserved == 0)
         await engine.shutdown()
     }
 }
