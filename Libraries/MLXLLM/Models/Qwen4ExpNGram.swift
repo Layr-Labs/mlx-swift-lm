@@ -427,11 +427,15 @@ public final class Qwen4ExpPLELayer: Module {
         if skip.contains("ple-gate") {
             gated = MLX.broadcast(value[.ellipsis, .newAxis, 0...], to: lead + [hcCount, hiddenSize])
         } else {
-            let queryFlat = normQuery(hidden)
+            // Sub-switches: ple-gate-norm (skip the query norm), ple-gate-math
+            // (skip the sqrt/abs/max/sign chain), ple-gate-sig (skip the sigmoid).
+            let queryFlat = skip.contains("ple-gate-norm") ? hidden : normQuery(hidden)
             let query = queryFlat.reshaped(queryFlat.shape.dropLast() + [hcCount, hiddenSize])
             var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hiddenSize))
-            gate = MLX.sqrt(maximum(MLX.abs(gate), MLXArray(Float(1e-6)))) * MLX.sign(gate)
-            gated = sigmoid(gate) * value[.ellipsis, .newAxis, 0...]
+            if !skip.contains("ple-gate-math") {
+                gate = MLX.sqrt(maximum(MLX.abs(gate), MLXArray(Float(1e-6)))) * MLX.sign(gate)
+            }
+            gated = (skip.contains("ple-gate-sig") ? gate : sigmoid(gate)) * value[.ellipsis, .newAxis, 0...]
         }
         gated = gated.reshaped(gated.shape.dropLast(2) + [-1])
         if skip.contains("ple-conv") { return gated }
