@@ -759,6 +759,32 @@ final class Qwen4ExpFusedLinearBox {
     var built = false
 }
 
+/// Where the fused projections are used. `MLXLM_FUSED_PROJ` = `0` (never),
+/// `decode` (only when the forward carries one token per row, the gemv
+/// width), or `all` (default). The gemv path computes each output row
+/// independently, so row-stacking is exact there; the tiled matmul at
+/// prefill widths picks its tile from the output width and may sum K in a
+/// different order, which is what the `decode` setting avoids.
+enum Qwen4ExpFusedProjectionPolicy {
+    case never, decodeOnly, always
+
+    static let current: Qwen4ExpFusedProjectionPolicy = {
+        switch ProcessInfo.processInfo.environment["MLXLM_FUSED_PROJ"]?.lowercased() {
+        case "0", "off", "never": return .never
+        case "decode", "1token", "gemv": return .decodeOnly
+        default: return .always
+        }
+    }()
+
+    func allows(_ x: MLXArray) -> Bool {
+        switch self {
+        case .never: return false
+        case .decodeOnly: return x.ndim >= 2 && x.dim(-2) == 1
+        case .always: return true
+        }
+    }
+}
+
 /// An array derived from one parameter array, rebuilt only when that
 /// parameter is replaced (identity, not value: parameters are frozen after
 /// load, and `update(parameters:)` swaps the array object).
@@ -872,7 +898,7 @@ public final class Qwen4ExpGatedDeltaNet: Module {
             fusedInProj.linear = qwen4ExpFuseLinears([inProjQKV, inProjZ, inProjB, inProjA])
             fusedInProj.built = true
         }
-        guard let fused = fusedInProj.linear else {
+        guard let fused = fusedInProj.linear, Qwen4ExpFusedProjectionPolicy.current.allows(x) else {
             return (inProjQKV(x), inProjZ(x), inProjB(x), inProjA(x))
         }
         let parts = MLX.split(
@@ -1079,7 +1105,7 @@ public final class Qwen4ExpGatedResidual: Module {
             fusedDownInject.linear = qwen4ExpFuseLinears([mixDown, blockInject])
             fusedDownInject.built = true
         }
-        guard let fused = fusedDownInject.linear else {
+        guard let fused = fusedDownInject.linear, Qwen4ExpFusedProjectionPolicy.current.allows(normed) else {
             return (mixDown(normed), blockInject(normed))
         }
         let parts = MLX.split(fused(normed), indices: [mixDown.weight.dim(0)], axis: -1)
