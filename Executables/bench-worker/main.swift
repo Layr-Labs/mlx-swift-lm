@@ -214,6 +214,17 @@ case .resident:
     // worker that connects successfully knows the weights are already up —
     // there is no window where an attach races the load.
     guard let socketPath = launch.socket else { fail(WorkerLaunchError.missingSocket) }
+    // One throwaway pass before the socket exists, so the first timed leg
+    // does not inherit a cold process. See `BenchWorkerResidentWarm`.
+    do {
+        let warmSeconds = try BenchWorkerResidentWarm.run(runner: runner)
+        if RunnerLoadSummary.isEnabled(flag: launch.verbose, environment: environment) {
+            FileHandle.standardError.write(
+                Data(String(format: "bench-worker: resident warm pass %.2f s\n", warmSeconds).utf8))
+        }
+    } catch {
+        fail(error)
+    }
     let listener: BenchWorkerSocketListener
     do {
         listener = try BenchWorkerSocketListener(path: socketPath)
