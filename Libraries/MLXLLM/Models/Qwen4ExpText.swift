@@ -909,6 +909,12 @@ public final class Qwen4ExpSparseMoeBlock: Module {
         // The router runs in float32 and the softmax is taken AFTER selection,
         // over the selected logits only -- this is the reference order.
         let logits = gate(x.asType(.float32))
+        if qwen4ExpScratchKernelsEnabled {
+            let routed = Qwen4ExpMoEScratchKernels.router(logits: logits, topK: topK)
+            return Qwen4ExpMoEScratchKernels.tail(
+                experts: switchMLP(x, routed.indices), weights: routed.weights,
+                gate: sharedExpertGate(x), shared: sharedExpert(x))
+        }
         let indices = argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         let weights = MLX.softmax(takeAlong(logits, indices, axis: -1), axis: -1, precise: true)
         let routed = (switchMLP(x, indices) * weights[.ellipsis, .newAxis])
