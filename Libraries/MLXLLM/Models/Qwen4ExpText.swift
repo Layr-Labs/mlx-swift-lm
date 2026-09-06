@@ -352,12 +352,22 @@ public final class Qwen4ExpRMSNorm: Module {
         super.init()
     }
 
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+    /// `weightOffset + weight`, built once per loaded weight array. The add is
+    /// the same op it always was; it just stops being a graph node on every
+    /// forward (six norms per layer, 48 layers). Keyed on the weight array's
+    /// identity so a weight replaced by `update(parameters:)` rebuilds it.
+    private let scaleCache = Qwen4ExpDerivedArrayCache()
+
+    var scale: MLXArray {
         // EXACT WHEN THE OFFSET IS ZERO: `MLXArray(0) + weight` is the weight
         // itself, bit for bit, so the baked convention multiplies by the
         // checkpoint's own bytes and introduces no rounding of its own.
-        let scale =
-            weightOffset == 0 ? weight : MLXArray(weightOffset, dtype: weight.dtype) + weight
+        if weightOffset == 0 { return weight }
+        return scaleCache.value(for: weight) { MLXArray(weightOffset, dtype: weight.dtype) + weight }
+    }
+
+    public func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let scale = self.scale
         guard let groupSize else {
             return MLXFast.rmsNorm(x, weight: scale, eps: eps)
         }
@@ -402,17 +412,21 @@ public final class Qwen4ExpRMSNormGated: Module {
 public struct Qwen4ExpRotary {
     public let dimensions: Int
     public let base: Float
+    /// `exp(-log(base) * (0, 2, 4, ...) / dimensions)`: a constant of the two
+    /// integers, computed once at init instead of as three graph nodes on
+    /// every call (two calls per attention layer plus the indexer's).
+    private let invFreq: MLXArray
 
     public init(dimensions: Int, base: Float) {
         self.dimensions = dimensions
         self.base = base
+        let even = MLXArray(stride(from: Int32(0), to: Int32(dimensions), by: 2).map { $0 })
+            .asType(.float32)
+        self.invFreq = MLX.exp(even * (-Foundation.log(base) / Float(dimensions)))
     }
 
     /// cos/sin for `positions`, shaped `positions.shape + [dimensions]`.
     public func cosSin(_ positions: MLXArray) -> (MLXArray, MLXArray) {
-        let even = MLXArray(stride(from: Int32(0), to: Int32(dimensions), by: 2).map { $0 })
-            .asType(.float32)
-        let invFreq = MLX.exp(even * (-Foundation.log(base) / Float(dimensions)))
         let freqs = positions.asType(.float32)[.ellipsis, .newAxis] * invFreq
         let emb = concatenated([freqs, freqs], axis: -1)
         return (MLX.cos(emb), MLX.sin(emb))
@@ -745,8 +759,44 @@ final class Qwen4ExpFusedLinearBox {
     var built = false
 }
 
+/// An array derived from one parameter array, rebuilt only when that
+/// parameter is replaced (identity, not value: parameters are frozen after
+/// load, and `update(parameters:)` swaps the array object).
+final class Qwen4ExpDerivedArrayCache {
+    private var source: ObjectIdentifier?
+    private var cached: MLXArray?
+
+    func value(for source: MLXArray, build: () -> MLXArray) -> MLXArray {
+        let id = ObjectIdentifier(source)
+        if let cached, self.source == id { return cached }
+        let built = build()
+        self.cached = built
+        self.source = id
+        return built
+    }
+}
+
+/// Scalar constants cast to the activation dtype, built once per dtype.
+final class Qwen4ExpScalarCache {
+    private var cached: [DType: MLXArray] = [:]
+
+    func value(_ scalar: Float, dtype: DType) -> MLXArray {
+        if let v = cached[dtype] { return v }
+        let v = MLXArray(scalar).asType(dtype)
+        cached[dtype] = v
+        return v
+    }
+}
+
 /// Concatenate sibling projections that read the SAME input into one `Linear`
 /// along the output axis, so one matmul dispatch replaces N.
+///
+/// EXACT BY CONSTRUCTION. Every output row of a matmul is computed from its
+/// own weight row (and, for a quantized weight, its own scales and biases,
+/// which are packed along the same output axis), so stacking rows changes no
+/// arithmetic: the fused output split back into its parts is bit-identical to
+/// the separate projections. The concat is done on the loaded arrays, after
+/// `quantize(model:)` has replaced each `Linear` with a `QuantizedLinear`.
 ///
 /// QUANTIZED MODULES ONLY. The dense bf16 matmul picks its kernel and tiling
 /// from the output width, and a different tiling sums K in a different
@@ -803,6 +853,10 @@ public final class Qwen4ExpGatedDeltaNet: Module {
     /// built on the first forward from the loaded weights (see
     /// `qwen4ExpFuseLinears`). Four matmul dispatches become one.
     private let fusedInProj = Qwen4ExpFusedLinearBox()
+    /// The q/k scale constants (`keyHeadDim^-1` and `keyHeadDim^-0.5`) as
+    /// arrays of the activation dtype, built once instead of per forward.
+    let qScaleCache = Qwen4ExpScalarCache()
+    let kScaleCache = Qwen4ExpScalarCache()
 
     /// The four input projections of `x`, through the fused matmul when the
     /// loaded weights allow it and through the four modules otherwise.
@@ -891,10 +945,10 @@ public final class Qwen4ExpGatedDeltaNet: Module {
 
         let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
         q =
-            MLXArray(invScale * invScale).asType(x.dtype)
+            qScaleCache.value(invScale * invScale, dtype: x.dtype)
             * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
         k =
-            MLXArray(invScale).asType(x.dtype)
+            kScaleCache.value(invScale, dtype: x.dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, state) = gatedDeltaUpdate(

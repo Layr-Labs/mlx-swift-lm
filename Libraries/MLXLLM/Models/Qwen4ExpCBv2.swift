@@ -429,10 +429,10 @@ extension Qwen4ExpGatedDeltaNet {
 
         let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
         q =
-            MLXArray(invScale * invScale).asType(x.dtype)
+            qScaleCache.value(invScale * invScale, dtype: x.dtype)
             * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
         k =
-            MLXArray(invScale).asType(x.dtype)
+            kScaleCache.value(invScale, dtype: x.dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newSsmState) = gatedDeltaUpdate(
