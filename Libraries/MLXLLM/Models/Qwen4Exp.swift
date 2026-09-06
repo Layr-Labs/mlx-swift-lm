@@ -106,6 +106,8 @@ public final class Qwen4ExpDecoderLayer: Module {
     @ModuleInfo(key: "ple") public var ple: Qwen4ExpPLELayer?
     @ModuleInfo(key: "attn_hyper_connection") var attnHyperConnection: Qwen4ExpGatedResidual
     @ModuleInfo(key: "mlp_hyper_connection") var mlpHyperConnection: Qwen4ExpGatedResidual
+    /// DIAGNOSTIC (scratch): see Qwen4ExpScratchLayerCompile.swift.
+    let scratchCompiled = Qwen4ExpScratchCompiledLayer()
 
     /// - Parameters:
     ///   - args: the text tower configuration this layer is built from.
@@ -146,6 +148,9 @@ public final class Qwen4ExpDecoderLayer: Module {
         ids: MLXArray,
         previousContext: MLXArray?
     ) -> MLXArray {
+        if let compiled = scratchCompiledStep(hyper, convMask: convMask, cache: cache) {
+            return compiled
+        }
         var stream = hyper
 
         if let ple, let previousContext {
