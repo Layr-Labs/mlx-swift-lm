@@ -3681,7 +3681,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         if step.mtpRound != nil {
             finalizeMTPRound(step)
         }
-        step.forwardShapes?.complete()
         if let measurement = step.mtpMeasurement {
             let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
             mtp?.recordStepCost(
@@ -3692,6 +3691,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finalizedVerification: !(step.mtpRound?.finalizedVerifyIDs.isEmpty ?? true),
                 claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
         }
+        step.forwardShapes?.complete()
         // Preserve the normal adaptive-cost clock above. These compact arrays
         // already rode this step's fence; never launch another evaluation.
         materializeLogitDiagnostics(step)
