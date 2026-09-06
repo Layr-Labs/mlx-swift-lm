@@ -596,8 +596,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
             // `cache_memory` assertable, and reading after it would describe
             // the drain rather than the phase.
             let snapshot = memory.preDrainSnapshot()
-            releaseSessions()
-            memory.drain()
+            await releaseSessionsAndSettle()
             response.expertStats = ExpertStreamingStats()
             response.peakRAMGB = memory.peakRAMGB()
             response.completedWork = completedWork
@@ -1033,6 +1032,26 @@ public final class BenchWorkerServer: @unchecked Sendable {
     private func releaseSessions() {
         stepper = nil
         freeRun = nil
+    }
+
+    /// The phase-close release: shut the free-run engine DOWN before the
+    /// drain, then drain until the allocator is quiescent.
+    ///
+    /// WHY. Dropping the last reference to an engine does not free its
+    /// arrays at that instant: the loop's task tears them down on its own
+    /// thread, and frees that land after the drain sit in the cache the
+    /// barrier then reads (a box saw 384 bytes on a resident, down from
+    /// 320 KiB before drains settled the stream). Awaiting shutdown puts the
+    /// teardown before the drain; the bounded re-drain covers a straggler.
+    private func releaseSessionsAndSettle() async {
+        if let session = freeRun {
+            await session.engine.shutdown()
+        }
+        releaseSessions()
+        for _ in 0 ..< 4 {
+            memory.drain()
+            if (memory.cacheMemoryAfterDrain() ?? 0) == 0 { break }
+        }
     }
 
     private static let greedySampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)

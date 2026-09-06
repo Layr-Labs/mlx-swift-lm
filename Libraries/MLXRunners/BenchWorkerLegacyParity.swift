@@ -22,25 +22,74 @@ import MLXLMCommon
 
 public enum BenchWorkerLegacyParity {
 
-    /// The subset of a correctness golden this needs.
-    struct Golden: Decodable {
+    /// The subset of a correctness golden this needs, from any of the three
+    /// shapes the track carries: the free-run window under `benchmark`
+    /// (pool goldens), the same keys at the top level, or a teacher-forced
+    /// case (`cases[0].prompt_tokens` + `expected_tokens`, the public
+    /// gate golden).
+    struct Golden {
         var decodeSeedTokens: [Int]
         var expectedDecodeSeedToken: Int?
         var expectedDecodeTokens: [Int]
 
-        enum CodingKeys: String, CodingKey {
-            case decodeSeedTokens = "decode_seed_tokens"
-            case expectedDecodeSeedToken = "expected_decode_seed_token"
-            case expectedDecodeTokens = "expected_decode_tokens"
+        struct Window: Decodable {
+            var decodeSeedTokens: [Int]
+            var expectedDecodeSeedToken: Int?
+            var expectedDecodeTokens: [Int]
+            enum CodingKeys: String, CodingKey {
+                case decodeSeedTokens = "decode_seed_tokens"
+                case expectedDecodeSeedToken = "expected_decode_seed_token"
+                case expectedDecodeTokens = "expected_decode_tokens"
+            }
+        }
+        struct Case: Decodable {
+            var promptTokens: [Int]
+            var expectedTokens: [Int]
+            enum CodingKeys: String, CodingKey {
+                case promptTokens = "prompt_tokens"
+                case expectedTokens = "expected_tokens"
+            }
+        }
+        struct File: Decodable {
+            var benchmark: Window?
+            var cases: [Case]?
+        }
+
+        static func load(_ url: URL) throws -> Golden {
+            let data = try Data(contentsOf: url)
+            let decoder = JSONDecoder()
+            if let window = try? decoder.decode(Window.self, from: data) {
+                return Golden(
+                    decodeSeedTokens: window.decodeSeedTokens,
+                    expectedDecodeSeedToken: window.expectedDecodeSeedToken,
+                    expectedDecodeTokens: window.expectedDecodeTokens)
+            }
+            let file = try decoder.decode(File.self, from: data)
+            if let window = file.benchmark {
+                return Golden(
+                    decodeSeedTokens: window.decodeSeedTokens,
+                    expectedDecodeSeedToken: window.expectedDecodeSeedToken,
+                    expectedDecodeTokens: window.expectedDecodeTokens)
+            }
+            guard let first = file.cases?.first, !first.expectedTokens.isEmpty else {
+                throw Failure.noChain(url.path)
+            }
+            return Golden(
+                decodeSeedTokens: first.promptTokens,
+                expectedDecodeSeedToken: first.expectedTokens[0],
+                expectedDecodeTokens: Array(first.expectedTokens.dropFirst()))
         }
     }
 
     public enum Failure: Error, CustomStringConvertible {
         case notQwen4Exp(String)
+        case noChain(String)
         public var description: String {
             switch self {
             case .notQwen4Exp(let type):
                 return "diag-parity compares the Qwen4Exp legacy path; the loaded model is \(type)"
+            case .noChain(let path):
+                return "diag-parity: \(path) carries no benchmark window and no cases[0] chain"
             }
         }
     }
@@ -48,7 +97,7 @@ public enum BenchWorkerLegacyParity {
     public static func run(
         runner: any Runner, golden goldenURL: URL, steps: Int, output: FileHandle
     ) throws {
-        let golden = try JSONDecoder().decode(Golden.self, from: Data(contentsOf: goldenURL))
+        let golden = try Golden.load(goldenURL)
         guard let model = runner.servingModel as? Qwen4ExpModel else {
             throw Failure.notQwen4Exp(String(describing: type(of: runner.servingModel)))
         }
