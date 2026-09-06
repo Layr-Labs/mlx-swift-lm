@@ -176,6 +176,7 @@ private struct CBv2ProjectionRow {
     let isPaused: Bool
     let cancelRequested: Bool
     let prefixReusePlan: CBv2PrefixReusePlan?
+    let fullSequenceCapacityTokens: Int?
     var knownTokens: Int
     var computedTokens: Int
     var generatedTokens: Int
@@ -328,6 +329,7 @@ extension SchedulerV2 {
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
                 prefixReusePlan: rec.prefixReusePlan,
+                fullSequenceCapacityTokens: rec.fullSequenceCapacityTokens,
                 knownTokens: rec.tokens.count,
                 computedTokens: confirmedComputed,
                 generatedTokens: rec.generatedTokenCount)
@@ -358,9 +360,9 @@ extension SchedulerV2 {
             guard let row = rows[reservationID], start >= 0, count > 0 else {
                 return nil
             }
-            let tokens =
-                row.prefixReusePlan?.capacityTokensForChunk(start: start, count: count)
-                ?? count
+            let tokens = CBv2ScheduledRequest.capacityTokensForChunk(
+                start: start, count: count, plan: row.prefixReusePlan,
+                fullSequenceTokens: row.fullSequenceCapacityTokens)
             let bytes =
                 row.prefixReusePlan?.capacityBytesForChunk(start: start, count: count)
                 ?? 0
@@ -742,7 +744,8 @@ extension SchedulerV2 {
             }
 
             func chunkCap(for rowID: CBv2RequestID) -> Int {
-                soloStripe?.id == rowID ? soloStripe!.tokens : config.prefillChunkSize
+                rows[rowID]?.prefixReusePlan?.recurrentChunkSize
+                    ?? (soloStripe?.id == rowID ? soloStripe!.tokens : config.prefillChunkSize)
             }
 
             func prefixClamp(
@@ -778,6 +781,12 @@ extension SchedulerV2 {
                         count = min(count, headroom)
                     }
                     count = prefixClamp(row: row, proposed: count)
+                    if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
+                        // The live scheduler may cold-restart after bounded
+                        // geometry waits. A prefix-only bound would underprice
+                        // that fallback, so this projection must fail closed.
+                        return .unbounded
+                    }
                 } else {
                     // The live MTP planner mutates controller/round state and
                     // cannot be called from this pure projection. Charge its
@@ -862,6 +871,9 @@ extension SchedulerV2 {
                     normalHeadroom,
                     admissionHeadroom)
                 count = prefixClamp(row: row, proposed: count)
+                if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
+                    return .unbounded
+                }
                 guard count > 0 else { break }
 
                 guard let assignment = projectionAssignment(

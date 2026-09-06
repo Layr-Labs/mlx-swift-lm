@@ -208,11 +208,16 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
     public var cbv2Capabilities: CBv2ModelCapabilities {
         var capabilities = CBv2ModelCapabilities.initialRecurrentTarget
         capabilities.supportsMTP = true
+        capabilities.supportsPagedKV = true
+        capabilities.requiresNativePagedKV = true
         capabilities.supportsCompactRecurrentMTPReplay = true
         // Rectangular [B, L] prompt cohorts: one recurrent state row per
         // batch row; each packed row attends its own KV (see
         // `cbv2SupportsPackedPrefill` on the prefill conformance).
         capabilities.supportsPackedPrefill = true
+        // Dense and MoE layers share the same attention/recurrent state.
+        // Routed and shared experts are token-local and add no checkpoint state.
+        capabilities.supportsRecurrentCheckpointReuse = true
         return capabilities
     }
 }
@@ -1785,7 +1790,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public var cbv2LayerKinds: [CBv2LayerKind] { configuration.cbv2LayerKinds }
 
     public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
-        configuration.cbv2RecurrentStateSpec(activationDType: model.embedTokens.weight.dtype)
+        configuration.cbv2RecurrentStateSpec(
+            activationDType: cbv2CheckpointActivationDType ?? model.embedTokens.weight.dtype)
     }
 
     public var cbv2Capabilities: CBv2ModelCapabilities { configuration.cbv2Capabilities }

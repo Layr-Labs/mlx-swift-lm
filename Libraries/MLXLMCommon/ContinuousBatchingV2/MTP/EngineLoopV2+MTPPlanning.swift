@@ -156,6 +156,20 @@ extension EngineLoopV2 {
         }
     }
 
+    /// A depth-k round verifies and can emit k+1 target tokens. Reserve one
+    /// output slot for the mandatory target token, even when a carry already
+    /// exists. A draft with only one output slot left cannot avoid any target
+    /// work. Apply this bound to every offer, including fixed and exploration
+    /// depths, using the shortest row's budget for the common rectangle.
+    static func mtpDepthWithinOutputBudget(
+        offeredDepth: Int, remainingTokens: [Int]
+    ) -> Int {
+        guard offeredDepth > 0, !remainingTokens.isEmpty else { return 0 }
+        return remainingTokens.reduce(offeredDepth) { depth, remaining in
+            min(depth, remaining > 1 ? remaining - 1 : 0)
+        }
+    }
+
     /// Select one controller depth for all decode rows in the scheduler plan.
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
@@ -191,12 +205,12 @@ extension EngineLoopV2 {
             }
         }
         if mtp.planDepth > 0 {
-            let depth = mtp.planDepth
-            let tailDepth = eligibleRows.map { rec in
-                let remaining = rec.request.maxTokens - rec.generatedTokenCount
-                return mtp.hasValidCarry(for: rec) ? remaining : max(0, remaining - 1)
-            }.min() ?? 0
-            if tailDepth < depth {
+            let tailDepth = Self.mtpDepthWithinOutputBudget(
+                offeredDepth: mtp.planDepth,
+                remainingTokens: eligibleRows.map {
+                    $0.request.maxTokens - $0.generatedTokenCount
+                })
+            if tailDepth < mtp.planDepth {
                 mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
             }
         }
@@ -206,9 +220,7 @@ extension EngineLoopV2 {
             let capacityTokens = rows.reduce(0) { total, rec in
                 let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
                 return total
-                    + (rec.prefixReusePlan?.capacityTokensForChunk(
-                        start: rec.numComputedTokens,
-                        count: count) ?? count)
+                    + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: count)
             }
             if stepTokens > scheduler.config.maxBatchedTokensPerStep {
                 mtp.clampPlanDepth(to: 0, reason: "step_token_budget")

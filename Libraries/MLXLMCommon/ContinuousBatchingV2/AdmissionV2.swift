@@ -173,6 +173,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         public var auxiliaryTokenGranularity: Int
         /// Retained speculative high-water state beyond committed tokens.
         public var auxiliaryTokenAllocationPadding: Int
+        /// Immutable per-buffer allocator bounds resolved at engine creation.
+        public var auxiliaryAllocationProjection: CBv2AuxiliaryAllocationProjection? = nil
         public init(
             watermarkFraction: Double = 0.05, elementBytes: Int = 2,
             layerElementBytes: [Int]? = nil,
@@ -231,6 +233,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public let auxiliaryBytesPerToken: Int
     public let auxiliaryTokenGranularity: Int
     public let auxiliaryTokenAllocationPadding: Int
+    private let auxiliaryAllocationProjection: CBv2AuxiliaryAllocationProjection?
     /// Nominal bytes per token for storage-owning full-attention rows under
     /// this ledger's actual per-layer dtype assumptions.
     public let fullKVBytesPerToken: Int
@@ -267,12 +270,28 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private var reservedTokens: [CBv2RequestID: Int] = [:]
     private var reservedExactBytes: [CBv2RequestID: Int] = [:]
     private var ledgerBytes = 0
+    private var transientBytes = 0
+    private var checkpointStages: [UUID: CBv2CheckpointStageEntry] = [:]
+    private var checkpointRequestOwners: [CBv2RequestID: UUID] = [:]
+    /// Subset of reservedExactBytes belonging to imported recurrent/MTP state,
+    /// not target KV. It follows the same request generation and retirement.
+    private var checkpointAuxiliaryBytes: [CBv2RequestID: Int] = [:]
+    private var detachedNonBackendBytes = 0
+    private var physicalFloor = CBv2BackendPhysicalFloor()
+    private let processMemoryOwner: (any CBv2ProcessMemoryOwner)?
+    private var processChargedBytes = 0
+    private var processMaterializedBytes = 0
+    var hasProcessMemoryOwner: Bool { processMemoryOwner != nil }
 
     public init(
         layerKinds: [CBv2LayerKind], bytesCapacity: Int, config: Config = .init(),
         residency: any CBv2KVResidencyPolicy = CBv2ContiguousKVResidency(),
-        externalReserveBytes: Int = 0
+        externalReserveBytes: Int = 0,
+        processMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil
     ) {
+        precondition(processMemoryOwner == nil || externalReserveBytes == 0,
+                     "process-owned engines cannot start with an unreserved external carve")
+        self.processMemoryOwner = processMemoryOwner
         self.residency = residency
         self.layerKinds = layerKinds
         self._bytesCapacity = bytesCapacity
@@ -282,6 +301,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         self.auxiliaryTokenGranularity = max(1, config.auxiliaryTokenGranularity)
         self.auxiliaryTokenAllocationPadding = max(
             0, config.auxiliaryTokenAllocationPadding)
+        self.auxiliaryAllocationProjection = config.auxiliaryAllocationProjection
         if let table = config.layerElementBytes {
             precondition(
                 table.count == layerKinds.count,
@@ -320,12 +340,131 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             self.auxiliaryBytesPerToken.multipliedReportingOverflow(
                 by: self.auxiliaryTokenGranularity)
         let (totalPerToken, auxiliaryOverflow) = perToken.addingReportingOverflow(
-            maximumAuxiliaryGrowth)
+            max(maximumAuxiliaryGrowth, auxiliaryAllocationProjection?.maximumGrowthBytes ?? 0))
         self.maxPerTokenBytes = accountingOverflow || auxiliaryOverflow
             || auxiliaryGrowthOverflow
             ? Int.max : totalPerToken
         self.fullKVBytesPerToken = accountingOverflow ? Int.max : fullPerToken
     }
+
+    /// Engine construction binds its one immutable segmented backend before
+    /// accepting requests. Other slots own independent AdmissionV2 instances.
+    func bindBackendPhysicalFloor(initialBytes: Int) -> CBv2BackendPhysicalLease {
+        precondition(initialBytes >= 0)
+        precondition(!hasProcessMemoryOwner || initialBytes == 0,
+                     "process-owned segmented pools must bind before allocation")
+        lock.lock()
+        precondition(!physicalFloor.isBound && ledgerBytes == 0 && reservedTokens.isEmpty,
+                     "a physical floor must bind once before requests exist")
+        physicalFloor.isBound = true
+        physicalFloor.physicalBytes = initialBytes
+        lock.unlock()
+        return CBv2BackendPhysicalLease(bytes: initialBytes, resize: { [self] bytes in
+            try resizeBackendPhysicalFloor(to: bytes)
+        }, onClose: { [self] in
+            lock.lock()
+            physicalFloor.physicalBytes = 0
+            publishProcessReductionLocked()
+            lock.unlock()
+        }, snapshot: { [self] in
+            lock.withLock {
+                CBv2BackendPhysicalAccounting(
+                    nominalKVBytes: physicalFloor.nominalBytes,
+                    physicalFloorOverheadBytes: physicalFloor.overheadBytes)
+            }
+        }, admissionIdentity: ObjectIdentifier(self))
+    }
+
+    private func resizeBackendPhysicalFloor(to bytes: Int) throws {
+        guard bytes >= 0 else { throw CBv2KVError.backendIneligible(reason: "negative physical floor") }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let after = physicalFloor.chargedBytes(base: ledgerBytes, physical: bytes) else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
+        // Existing debt may be reused or reduced, but never increased.
+        guard bytes <= physicalFloor.physicalBytes || after <= mutationCeiling else {
+            throw CBv2KVError.capacityExhausted(
+                needed: max(0, after - chargedLedgerBytes),
+                available: max(0, reserveCeiling - chargedLedgerBytes))
+        }
+        try acceptProcessChargeLocked(after)
+        physicalFloor.physicalBytes = bytes
+    }
+
+    /// Callers hold lock. Only nominal target KV offsets the physical floor;
+    /// recurrent/MTP state, exact extra backing and scratch remain additive.
+    private var chargedLedgerBytes: Int {
+        physicalFloor.chargedBytes(base: ledgerBytes) ?? Int.max
+    }
+    private var mutationCeiling: Int {
+        physicalFloor.isBound ? max(reserveCeiling, chargedLedgerBytes) : reserveCeiling
+    }
+    private func nominalTargetBytes(forTokens tokens: Int, allocated: Int? = nil) -> Int? {
+        guard let total = allocated ?? allocatedBytesChecked(forTokens: tokens),
+              let auxiliary = nonBackendBytesChecked(forTokens: tokens), total >= auxiliary else { return nil }
+        return total - auxiliary
+    }
+    private func projectedNominal(
+        from nominal: Int, oldTokens: Int, newTokens: Int,
+        oldAllocated: Int? = nil, newAllocated: Int? = nil
+    ) -> Int? {
+        guard physicalFloor.isBound else { return 0 }
+        guard let old = nominalTargetBytes(forTokens: oldTokens, allocated: oldAllocated),
+              let new = nominalTargetBytes(forTokens: newTokens, allocated: newAllocated),
+              let value = Self.add(nominal, new - old), value >= 0 else { return nil }
+        return value
+    }
+
+    /// Called while holding Admission's lock, before local metadata commits.
+    private func acceptProcessChargeLocked(_ charged: Int) throws {
+        guard let processMemoryOwner else { return }
+        guard let complete = Self.add(charged, externalReserveBytes), complete >= 0 else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
+        }
+        // A closing owner disappears at zero. Repeated empty pool retirement
+        // must not submit a new transaction to that retired generation.
+        if complete == processChargedBytes { return }
+        do {
+            try processMemoryOwner.replaceCharge(UInt64(complete))
+            processChargedBytes = complete
+        }
+        catch {
+            throw CBv2KVError.capacityExhausted(
+                needed: max(0, charged - chargedLedgerBytes), available: 0)
+        }
+    }
+
+    /// Callers have withdrawn coverage and dropped any retiring buffer aliases.
+    private func publishProcessReductionLocked() {
+        do { try acceptProcessChargeLocked(chargedLedgerBytes) }
+        catch { preconditionFailure("process charge retirement refused: \(error)") }
+    }
+
+    /// Only evaluated, exclusively owned native allocations may call this.
+    /// A handle is shared when the same backing changes ownership metadata.
+    func coverEvaluatedAllocation(bytes: Int) throws -> CBv2MemoryCoverage? {
+        guard let processMemoryOwner else { return nil }
+        return try lock.withLock {
+            guard bytes >= 0, let next = Self.add(processMaterializedBytes, bytes),
+                next <= chargedLedgerBytes
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            try processMemoryOwner.recordMaterialization(UInt64(next))
+            processMaterializedBytes = next
+            return CBv2MemoryCoverage { [self] in
+                lock.withLock {
+                    precondition(bytes <= processMaterializedBytes)
+                    do { try processMemoryOwner.withdrawCoverage(UInt64(bytes)) }
+                    catch { preconditionFailure("process coverage retirement refused: \(error)") }
+                    processMaterializedBytes -= bytes
+                }
+            }
+        }
+    }
+
+    func closeProcessMemoryOwner() { processMemoryOwner?.retire() }
+
+    deinit { processMemoryOwner?.retire() }
 
     // MARK: Estimation
 
@@ -362,10 +501,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard tokens > 0 else { return 0 }
         guard let paddedTokens = Self.add(tokens, auxiliaryTokenAllocationPadding),
             let auxiliaryTokens = Self.roundUp(paddedTokens, to: auxiliaryTokenGranularity),
-            let auxiliary = Self.multiply(auxiliaryTokens, auxiliaryBytesPerToken),
-            let total = Self.add(fixedBytesPerRequest, auxiliary)
+            let auxiliary = Self.multiply(auxiliaryTokens, auxiliaryBytesPerToken)
         else { return nil }
-        return total
+        let physicalAuxiliary: Int
+        if let auxiliaryAllocationProjection {
+            guard let bytes = auxiliaryAllocationProjection.bytes(forTokens: tokens) else { return nil }
+            physicalAuxiliary = max(auxiliary, bytes)
+        } else { physicalAuxiliary = auxiliary }
+        return Self.add(fixedBytesPerRequest, physicalAuxiliary)
     }
 
     /// Bytes the BACKEND occupies at `tokens` beyond the content
@@ -446,8 +589,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     ///
     /// Shrink semantics are safe by construction: reservations already in
     /// the ledger are untouched (nothing is evicted here — preemption
-    /// remains the scheduler's job), while NEW `reserve` calls fail with
-    /// `capacityExhausted` until the pool drains below the new ceiling.
+    /// remains the scheduler's job). A segmented pool may reuse already
+    /// charged storage without increasing its debt; reservations requiring
+    /// additional bytes fail until the charge fits the new ceiling.
     /// Grow takes effect immediately.
     public func updateBytesCapacity(_ bytes: Int) {
         lock.lock()
@@ -474,6 +618,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public func refundExternalReserve() {
         lock.lock()
         externalReserveBytes = 0
+        publishProcessReductionLocked()
         lock.unlock()
     }
 
@@ -484,9 +629,13 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// optimistically and preempted if optimism loses. Judged on OCCUPANCY
     /// (fixed sliding rings included), so the gate agrees with both what
     /// `reserve` charges and what the backend allocates.
-    public func canEverFit(promptTokens: Int, maxTokens: Int) -> Bool {
+    public func canEverFit(
+        promptTokens: Int, maxTokens: Int, additionalBackendBytes: Int = 0
+    ) -> Bool {
         let (tokens, overflow) = promptTokens.addingReportingOverflow(max(maxTokens, 0))
-        guard !overflow, let bytes = allocatedBytesChecked(forTokens: tokens) else {
+        guard !overflow, additionalBackendBytes >= 0,
+            let allocated = allocatedBytesChecked(forTokens: tokens),
+            let bytes = Self.add(allocated, additionalBackendBytes) else {
             return false
         }
         return bytes <= admissibleBytesCapacity
@@ -499,7 +648,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// unreserved only after their full step-width peak has been checked, and
     /// a row is released only after the projected step that retires it.
     func canGuarantee(
-        projectedOperations: [CBv2ProjectedCapacityOperation]
+        projectedOperations: [CBv2ProjectedCapacityOperation],
+        projectedPhysicalBytes: (([CBv2RequestID: Int]) -> Int?)? = nil
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -507,6 +657,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         var simulatedTokens = reservedTokens
         var simulatedExactBytes = reservedExactBytes
         var simulatedLedgerBytes = ledgerBytes
+        var simulatedNominalBytes = physicalFloor.nominalBytes
+        var simulatedPhysicalBytes = physicalFloor.physicalBytes
 
         /// nil means malformed/unrepresentable; false means a valid
         /// reservation that cannot fit and was left unapplied.
@@ -539,10 +691,28 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             guard !tokenDeltaOverflow, !deltaOverflow, !ledgerOverflow else {
                 return nil
             }
-            guard after <= reserveCeiling else {
-                return false
-            }
-            simulatedTokens[reservation.id] = newTokens
+            var nextTokens = simulatedTokens
+            nextTokens[reservation.id] = newTokens
+            let physical: Int
+            if let projectedPhysicalBytes {
+                guard let estimated = projectedPhysicalBytes(nextTokens), estimated >= 0 else { return false }
+                // A projected release does not promise that free native
+                // segments or asynchronous export owners have retired yet.
+                physical = max(simulatedPhysicalBytes, estimated)
+            } else { physical = simulatedPhysicalBytes }
+            guard let nominal = projectedNominal(
+                from: simulatedNominalBytes, oldTokens: oldTokens, newTokens: newTokens,
+                oldAllocated: oldTokenBytes, newAllocated: newTokenBytes),
+                let charged = physicalFloor.chargedBytes(base: after, nominal: nominal, physical: physical),
+                let before = physicalFloor.chargedBytes(
+                    base: simulatedLedgerBytes, nominal: simulatedNominalBytes,
+                    physical: simulatedPhysicalBytes)
+            else { return nil }
+            let ceiling = physicalFloor.isBound ? max(reserveCeiling, before) : reserveCeiling
+            guard charged <= ceiling else { return false }
+            simulatedNominalBytes = nominal
+            simulatedPhysicalBytes = physical
+            simulatedTokens = nextTokens
             simulatedExactBytes[reservation.id] = newExactBytes
             simulatedLedgerBytes = after
             return true
@@ -584,10 +754,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 let (after, ledgerOverflow) =
                     simulatedLedgerBytes.subtractingReportingOverflow(releasedBytes)
                 guard !tokenOverflow, !exactOverflow, !releaseOverflow,
-                    !ledgerOverflow, after >= 0
+                    !ledgerOverflow, after >= 0,
+                    let nominal = projectedNominal(
+                        from: simulatedNominalBytes, oldTokens: oldTokens, newTokens: newTokens,
+                        oldAllocated: oldTokenBytes, newAllocated: newTokenBytes)
                 else {
                     return false
                 }
+                simulatedNominalBytes = nominal
                 if newTokens == 0 {
                     simulatedTokens.removeValue(forKey: reservation.id)
                 } else {
@@ -612,9 +786,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                     tokenBytes.addingReportingOverflow(oldExactBytes)
                 let (after, ledgerOverflow) =
                     simulatedLedgerBytes.subtractingReportingOverflow(releasedBytes)
-                guard !releaseOverflow, !ledgerOverflow, after >= 0 else {
-                    return false
-                }
+                guard !releaseOverflow, !ledgerOverflow, after >= 0,
+                    let nominal = projectedNominal(
+                        from: simulatedNominalBytes, oldTokens: oldTokens, newTokens: 0,
+                        oldAllocated: tokenBytes, newAllocated: 0)
+                else { return false }
+                simulatedNominalBytes = nominal
                 simulatedLedgerBytes = after
             }
         }
@@ -654,11 +831,19 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard !afterOverflow else {
             throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
         }
-        guard after <= reserveCeiling else {
-            throw CBv2KVError.capacityExhausted(
-                needed: delta,
-                available: max(0, reserveCeiling - ledgerBytes))
+        guard let nominal = projectedNominal(
+            from: physicalFloor.nominalBytes, oldTokens: old, newTokens: new,
+            oldAllocated: oldTokenBytes, newAllocated: newTokenBytes),
+              let charged = physicalFloor.chargedBytes(base: after, nominal: nominal) else {
+            throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
         }
+        guard charged <= mutationCeiling else {
+            throw CBv2KVError.capacityExhausted(
+                needed: max(0, charged - chargedLedgerBytes),
+                available: max(0, reserveCeiling - chargedLedgerBytes))
+        }
+        try acceptProcessChargeLocked(charged)
+        physicalFloor.nominalBytes = nominal
         reservedTokens[id] = new
         reservedExactBytes[id] = newExact
         ledgerBytes = after
@@ -676,10 +861,23 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let new = max(0, old - tokens)
         let oldExact = reservedExactBytes[id] ?? 0
         let newExact = max(0, oldExact - bytes)
-        ledgerBytes += allocatedBytes(forTokens: new) - allocatedBytes(forTokens: old)
-            + newExact - oldExact
+        if let auxiliary = checkpointAuxiliaryBytes[id] {
+            let remaining = min(auxiliary, newExact)
+            checkpointAuxiliaryBytes[id] = remaining > 0 ? remaining : nil
+        }
+        let oldAllocated = allocatedBytes(forTokens: old)
+        let newAllocated = allocatedBytes(forTokens: new)
+        guard let nominal = projectedNominal(
+            from: physicalFloor.nominalBytes, oldTokens: old, newTokens: new,
+            oldAllocated: oldAllocated, newAllocated: newAllocated) else {
+            preconditionFailure("invalid nominal KV release")
+        }
+        physicalFloor.nominalBytes = nominal
+        ledgerBytes += newAllocated - oldAllocated + newExact - oldExact
+        publishProcessReductionLocked()
         if new == 0 {
             reservedTokens.removeValue(forKey: id)
+            checkpointRequestOwners.removeValue(forKey: id)
         } else {
             reservedTokens[id] = new
         }
@@ -691,11 +889,209 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     }
 
     public func releaseAll(id: CBv2RequestID) {
-        lock.lock()
-        defer { lock.unlock() }
+        lock.withLock { releaseAllLocked(id: id) }
+    }
+
+    /// Only the current imported request generation may release this active
+    /// charge. detachReservation removes its marker before an ID can be reused.
+    func releaseCheckpointRequest(id: CBv2RequestID, ownerIdentity: UUID) {
+        lock.withLock {
+            guard checkpointRequestOwners[id] == ownerIdentity else { return }
+            releaseAllLocked(id: id)
+        }
+    }
+
+    private func releaseAllLocked(id: CBv2RequestID) {
+        checkpointRequestOwners.removeValue(forKey: id)
+        checkpointAuxiliaryBytes.removeValue(forKey: id)
         let old = reservedTokens.removeValue(forKey: id) ?? 0
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
+        guard let nominal = projectedNominal(
+            from: physicalFloor.nominalBytes, oldTokens: old, newTokens: 0) else {
+            preconditionFailure("invalid nominal KV completion")
+        }
+        physicalFloor.nominalBytes = nominal
         ledgerBytes -= allocatedBytes(forTokens: old) + exact
+        publishProcessReductionLocked()
+    }
+
+    /// Short-lived cache transfer buffers share the ordinary admission ceiling
+    /// but never masquerade as scheduled requests or reusable sampling IDs.
+    func reserveTransient(bytes: Int) throws -> CBv2CheckpointReservation {
+        guard bytes >= 0 else { throw CBv2CompleteCheckpointError.invalidManifest }
+        lock.lock()
+        let (after, overflow) = ledgerBytes.addingReportingOverflow(bytes)
+        guard !overflow, let charged = physicalFloor.chargedBytes(base: after),
+              charged <= mutationCeiling else {
+            let available = max(0, reserveCeiling - chargedLedgerBytes)
+            lock.unlock()
+            throw CBv2KVError.capacityExhausted(needed: bytes, available: available)
+        }
+        do { try acceptProcessChargeLocked(charged) }
+        catch { lock.unlock(); throw error }
+        ledgerBytes = after
+        transientBytes += bytes
+        lock.unlock()
+        return CBv2CheckpointReservation { [self] in
+            lock.lock()
+            ledgerBytes -= bytes
+            transientBytes -= bytes
+            publishProcessReductionLocked()
+            lock.unlock()
+        }
+    }
+
+    /// Engine-created staging identities are the only source of a same-buffer
+    /// destination transfer. Generic transient release callbacks cannot credit it.
+    func reserveCheckpointStage(targetBytes: Int, auxiliaryBytes: Int, scratchBytes: Int)
+        throws -> CBv2CheckpointStageLease
+    {
+        guard targetBytes >= 0, auxiliaryBytes >= 0, scratchBytes >= 0,
+            let destination = Self.add(targetBytes, auxiliaryBytes),
+            let bytes = Self.add(destination, scratchBytes)
+        else { throw CBv2CompleteCheckpointError.invalidManifest }
+        let identity = UUID()
+        try lock.withLock {
+            guard let after = Self.add(ledgerBytes, bytes),
+                let charged = physicalFloor.chargedBytes(base: after),
+                charged <= mutationCeiling
+            else {
+                throw CBv2KVError.capacityExhausted(
+                    needed: bytes, available: max(0, reserveCeiling - chargedLedgerBytes))
+            }
+            try acceptProcessChargeLocked(charged)
+            ledgerBytes = after
+            transientBytes += bytes
+            checkpointStages[identity] = .init(bytes: bytes, transferred: false)
+        }
+        return CBv2CheckpointStageLease(
+            admission: self, identity: identity, targetBytes: targetBytes,
+            auxiliaryBytes: auxiliaryBytes, scratchBytes: scratchBytes)
+    }
+
+    /// Typed private destination settlement, after all evaluated allocations
+    /// succeeded. This removes only unused allowance, never backing or scratch.
+    func settleCheckpointStage(identity: UUID, expectedBytes: Int, reduction: Int) throws {
+        try lock.withLock {
+            guard var entry = checkpointStages[identity], !entry.transferred, !entry.settled,
+                entry.bytes == expectedBytes, reduction >= 0, reduction <= entry.bytes
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            entry.bytes -= reduction
+            entry.settled = true
+            checkpointStages[identity] = entry
+            ledgerBytes -= reduction
+            transientBytes -= reduction
+            publishProcessReductionLocked()
+        }
+    }
+
+    func closeCheckpointStage(identity: UUID) {
+        lock.withLock {
+            let remaining = checkpointStages.removeValue(forKey: identity)?.bytes ?? 0
+            ledgerBytes -= remaining
+            transientBytes -= remaining
+            publishProcessReductionLocked()
+        }
+    }
+
+    /// Called under the pool's physical-lease lock, before allocating missing
+    /// suffix backing. The stage destination becomes ordinary request/floor
+    /// ownership in one Admission mutation; only its scratch stays transient.
+    /// The caller owns the payload exclusively and must discard it on failure.
+    func transferCheckpointStage(
+        _ stage: CBv2CheckpointStageLease, requestID: CBv2RequestID,
+        maximumTokens: Int, previousPhysicalBytes: Int, physicalBytes: Int
+    ) throws -> CBv2CheckpointAdoptionReservation {
+        // The stage lock precedes Admission; never acquire it while holding
+        // this ledger lock. Settlement happens before the frame is exposed.
+        let destination = stage.destination
+        let targetBytes = destination.targetBytes
+        let destinationBytes = destination.bytes
+        let totalBytes = destinationBytes + stage.scratchBytes
+        let rollback = try lock.withLock {
+            guard stage.admission === self, physicalFloor.isBound,
+                physicalFloor.physicalBytes == previousPhysicalBytes,
+                physicalBytes >= previousPhysicalBytes,
+                physicalBytes - previousPhysicalBytes >= targetBytes,
+                maximumTokens > 0, reservedTokens[requestID] == nil,
+                reservedExactBytes[requestID] == nil,
+                checkpointStages[stage.identity]?.transferred == false,
+                checkpointStages[stage.identity]?.bytes == totalBytes,
+                let allocated = allocatedBytesChecked(forTokens: maximumTokens),
+                let auxiliary = nonBackendBytesChecked(forTokens: maximumTokens),
+                let allocatedWithShortfall = Self.add(
+                    allocated, max(0, destination.auxiliaryBytes - auxiliary)),
+                let nominal = projectedNominal(
+                    from: physicalFloor.nominalBytes, oldTokens: 0,
+                    newTokens: maximumTokens, newAllocated: allocated),
+                let after = Self.add(ledgerBytes - destinationBytes, allocatedWithShortfall),
+                let charged = physicalFloor.chargedBytes(
+                    base: after, nominal: nominal, physical: physicalBytes)
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            guard charged <= mutationCeiling else {
+                throw CBv2KVError.capacityExhausted(
+                    needed: max(0, charged - chargedLedgerBytes),
+                    available: max(0, reserveCeiling - chargedLedgerBytes))
+            }
+            try acceptProcessChargeLocked(charged)
+            let previousNominal = physicalFloor.nominalBytes
+            ledgerBytes = after
+            transientBytes -= destinationBytes
+            checkpointStages[stage.identity] = .init(bytes: stage.scratchBytes, transferred: true)
+            reservedTokens[requestID] = maximumTokens
+            let auxiliaryShortfall = allocatedWithShortfall - allocated
+            if auxiliaryShortfall > 0 {
+                reservedExactBytes[requestID] = auxiliaryShortfall
+                checkpointAuxiliaryBytes[requestID] = auxiliaryShortfall
+            }
+            checkpointRequestOwners[requestID] = stage.identity
+            physicalFloor.nominalBytes = nominal
+            physicalFloor.physicalBytes = physicalBytes
+            return (allocated: allocatedWithShortfall, auxiliaryShortfall: auxiliaryShortfall,
+                    nominalDelta: nominal - previousNominal)
+        }
+        return CBv2CheckpointAdoptionReservation { [self] in
+            lock.withLock {
+                // Preparation is engine-queue exclusive and has not exposed
+                // this request yet. The ticket cannot outlive publication.
+                precondition(reservedTokens[requestID] == maximumTokens)
+                precondition(checkpointRequestOwners[requestID] == stage.identity)
+                precondition((reservedExactBytes[requestID] ?? 0) == rollback.auxiliaryShortfall)
+                precondition(physicalFloor.physicalBytes == physicalBytes)
+                reservedTokens.removeValue(forKey: requestID)
+                reservedExactBytes.removeValue(forKey: requestID)
+                checkpointAuxiliaryBytes.removeValue(forKey: requestID)
+                checkpointRequestOwners.removeValue(forKey: requestID)
+                ledgerBytes -= rollback.allocated
+                physicalFloor.nominalBytes -= rollback.nominalDelta
+                physicalFloor.physicalBytes = previousPhysicalBytes
+                publishProcessReductionLocked()
+            }
+        }
+    }
+
+    /// Finish scheduling without freeing buffers still owned by asynchronous
+    /// retirement. The detached lease can never release a reused request ID.
+    func detachReservation(id: CBv2RequestID) -> CBv2CheckpointReservation {
+        lock.lock()
+        checkpointRequestOwners.removeValue(forKey: id)
+        let tokens = reservedTokens.removeValue(forKey: id) ?? 0
+        let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
+        let bytes = allocatedBytes(forTokens: tokens) + exact
+        let auxiliary = checkpointAuxiliaryBytes.removeValue(forKey: id) ?? 0
+        let nonBackendBytes = (nonBackendBytesChecked(forTokens: tokens) ?? 0) + auxiliary
+        let nominalBytes = physicalFloor.isBound
+            ? (nominalTargetBytes(forTokens: tokens) ?? 0) : 0
+        detachedNonBackendBytes += nonBackendBytes
+        lock.unlock()
+        return CBv2CheckpointReservation { [self] in
+            lock.lock()
+            ledgerBytes -= bytes
+            physicalFloor.nominalBytes -= nominalBytes
+            detachedNonBackendBytes -= nonBackendBytes
+            publishProcessReductionLocked()
+            lock.unlock()
+        }
     }
 
     /// Conservative (window caps ignored): may under-report headroom, which
@@ -709,9 +1105,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard additionalTokens >= 0,
             let chargedTokens = Self.roundUp(additionalTokens, to: residency.rowGranularity),
             let additionalBytes = Self.multiply(chargedTokens, maxPerTokenBytes),
-            let after = Self.add(ledgerBytes, additionalBytes)
+            let after = Self.add(chargedLedgerBytes, additionalBytes)
         else { return false }
-        return after <= reserveCeiling
+        return after <= mutationCeiling
     }
 
     /// Smallest multiple of `granularity` at or above `value`; nil on
@@ -750,7 +1146,13 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public var bytesReserved: Int {
         lock.lock()
         defer { lock.unlock() }
-        return ledgerBytes
+        return chargedLedgerBytes
+    }
+
+    public var transientBytesReserved: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return transientBytes
     }
 
     /// Live obligations the KV backend does not own: fixed recurrent state,
@@ -760,11 +1162,18 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public var nonBackendBytesReserved: Int {
         lock.lock()
         defer { lock.unlock() }
-        var total = externalReserveBytes
+        guard let transfers = Self.add(transientBytes, detachedNonBackendBytes),
+            let withExternal = Self.add(externalReserveBytes, transfers),
+            var total = Self.add(withExternal, physicalFloor.overheadBytes)
+        else { return Int.max }
         for tokens in reservedTokens.values where tokens > 0 {
             guard let bytes = nonBackendBytesChecked(forTokens: tokens),
                 let next = Self.add(total, bytes)
             else { return Int.max }
+            total = next
+        }
+        for auxiliary in checkpointAuxiliaryBytes.values {
+            guard let next = Self.add(total, auxiliary) else { return Int.max }
             total = next
         }
         return total
@@ -788,7 +1197,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             else { return (Int.max, Int.max) }
             let (target, subtractionOverflow) = allocated.subtractingReportingOverflow(nonBackend)
             let (withExact, exactOverflow) = target.addingReportingOverflow(
-                reservedExactBytes[id] ?? 0)
+                (reservedExactBytes[id] ?? 0) - (checkpointAuxiliaryBytes[id] ?? 0))
             guard !subtractionOverflow, !exactOverflow else { return (Int.max, Int.max) }
             if materializedIDs.contains(id) {
                 guard let next = Self.add(materialized, withExact) else {
@@ -809,7 +1218,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         activeRequests: Int, waitingRequests: Int, activeTokens: Int, backendBytesInUse: Int? = nil
     ) -> CBv2CapacitySnapshot {
         lock.lock()
-        let ledger = ledgerBytes
+        let ledger = chargedLedgerBytes
         // Honor the field's contract (see `CBv2CapacitySnapshot
         // .kvBytesReserved`): reserved carries the live external (compiled
         // padding) carve too, so "capacity − reserved" matches what

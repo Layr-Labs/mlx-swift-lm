@@ -69,7 +69,7 @@ struct CBv2TeacherForcedScoringTests {
             return try PagedKVBackend(
                 layerKinds: kinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 64 << 20,
+                    capacityBytes: 64 << 20, dtype: .float32,
                     maxPrefillChunk: Self.chunkSize,
                     nominalMaxSequenceLength: 512))
         }

@@ -12,7 +12,12 @@ import MLX
 /// out of paths whose state semantics have not been proven.
 public struct CBv2ModelCapabilities: Sendable, Equatable {
     public var supportsPrefixReuse: Bool
+    /// Exact committed recurrent state paired with its attention KV.
+    public var supportsRecurrentCheckpointReuse: Bool
     public var supportsPagedKV: Bool
+    /// Models validated only on observed native types and dynamic segmented
+    /// ownership must not enter the historical fixed-precision pool.
+    public var requiresNativePagedKV: Bool
     public var supportsCompiledDecode: Bool
     public var supportsPackedPrefill: Bool
     public var supportsMTP: Bool
@@ -23,14 +28,18 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
 
     public init(
         supportsPrefixReuse: Bool = true,
+        supportsRecurrentCheckpointReuse: Bool = false,
         supportsPagedKV: Bool = true,
+        requiresNativePagedKV: Bool = false,
         supportsCompiledDecode: Bool = true,
         supportsPackedPrefill: Bool = true,
         supportsMTP: Bool = true,
         supportsCompactRecurrentMTPReplay: Bool = false
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
+        self.supportsRecurrentCheckpointReuse = supportsRecurrentCheckpointReuse
         self.supportsPagedKV = supportsPagedKV
+        self.requiresNativePagedKV = requiresNativePagedKV
         self.supportsCompiledDecode = supportsCompiledDecode
         self.supportsPackedPrefill = supportsPackedPrefill
         self.supportsMTP = supportsMTP
@@ -119,6 +128,25 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
             by: Self.maximumLiveGenerations)
         guard !overflow else { throw CBv2RecurrentStateError.byteCountOverflow }
         return bytes
+    }
+
+    /// Per-generation allocator bound, including a request row that aliases
+    /// a larger batched allocation. This runs only during engine construction.
+    func allocationBytesPerGeneration(policy: AllocationFootprintPolicy) throws -> Int {
+        _ = try fixedBytesPerRequest()
+        var total = 0
+        for layer in layers {
+            for (shape, dtype) in [(layer.convShape, layer.convDType), (layer.ssmShape, layer.ssmDType)] {
+                let logical = try Self.byteCount(shape: shape, dtype: dtype)
+                guard let bytes = CBv2AuxiliaryAllocationProjection.maximumBytesPerUnit(logical, policy: policy) else {
+                    throw CBv2RecurrentStateError.byteCountOverflow
+                }
+                let (next, overflow) = total.addingReportingOverflow(bytes)
+                guard !overflow else { throw CBv2RecurrentStateError.byteCountOverflow }
+                total = next
+            }
+        }
+        return total
     }
 
     public var modelLayerIndices: [Int] { layers.map(\.modelLayerIndex) }
@@ -269,6 +297,65 @@ public final class CBv2RecurrentRequestState {
         self.byteCount = try spec.fixedBytesPerRequest()
     }
 
+    public init(
+        spec: CBv2RecurrentStateSpec,
+        adoptedCommitted layers: [Int: CBv2RecurrentLayerState]
+    ) throws {
+        self.spec = spec
+        self.byteCount = try spec.fixedBytesPerRequest()
+        var adopted: [Int: CBv2RecurrentLayerState] = [:]
+        for layer in spec.layers {
+            guard let state = layers[layer.modelLayerIndex] else {
+                throw CBv2RecurrentStateError.invalidSpec(
+                    "adopted recurrent state is missing layer \(layer.modelLayerIndex)")
+            }
+            guard let conv = state.conv, let ssm = state.ssm else {
+                throw CBv2RecurrentStateError.invalidSpec(
+                    "adopted recurrent layer \(layer.modelLayerIndex) is incomplete")
+            }
+            guard conv.shape == layer.convShape else {
+                throw CBv2RecurrentStateError.invalidSpec(
+                    "adopted conv shape \(conv.shape) != spec \(layer.convShape) "
+                        + "at layer \(layer.modelLayerIndex)")
+            }
+            guard ssm.shape == layer.ssmShape, ssm.dtype == layer.ssmDType else {
+                throw CBv2RecurrentStateError.invalidSpec(
+                    "adopted ssm \(ssm.shape)/\(ssm.dtype) != spec "
+                        + "\(layer.ssmShape)/\(layer.ssmDType) "
+                        + "at layer \(layer.modelLayerIndex)")
+            }
+            adopted[layer.modelLayerIndex] = state
+        }
+        guard adopted.count == spec.layers.count else {
+            throw CBv2RecurrentStateError.invalidSpec(
+                "adopted recurrent state layer count mismatch")
+        }
+        self.committed = adopted
+    }
+
+    /// The latest CONFIRMED per-layer state, or nil when none exists.
+    ///
+    /// This is deliberately NOT `state(modelLayerIndex:)`, which returns
+    /// the newest VISIBLE state — `pending.last` when a speculative
+    /// generation exists (a chained-decode successor, a pipelined prefill
+    /// successor, an unresolved MTP verify window). Those are positions
+    /// the engine has not confirmed and may roll back, so a boundary
+    /// snapshot must never come from one.
+    ///
+    /// **Caller contract:** which POSITION this state belongs to is the
+    /// caller's knowledge, not this type's. `committed` advances exactly
+    /// once per `commit()`, so a caller that commits a generation and then
+    /// reads this — as `EngineLoopV2.finalize` does — sees the state after
+    /// that generation's tokens, even when a successor is already pending.
+    /// A caller that reads it at an arbitrary time learns only "the last
+    /// confirmed state", which is why the prefix bank tracks the position
+    /// itself in `CBv2RecurrentCaptureGeometry` rather than inferring it
+    /// from the scheduler's optimistically advanced token cursor.
+    public func confirmedStateSnapshot() -> [Int: CBv2RecurrentLayerState]? {
+        guard !isReleased, !committed.isEmpty else { return nil }
+        return committed
+    }
+
     /// Bind the latest visible generation for a target forward. A chained
     /// decode therefore reads the previous still-pending generation without
     /// prematurely committing it.
@@ -402,6 +489,14 @@ public final class CBv2RecurrentRequestState {
     /// Test/integration inspection of the latest visible state.
     public func state(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
         pending.last?.layers[modelLayerIndex] ?? committed[modelLayerIndex]
+    }
+
+    /// The engine has stopped and synchronized a failed planned cohort. No
+    /// forward/evaluation object may remain reachable when this is called.
+    /// Committed state is released by the ordinary request retirement next.
+    func discardPendingAfterSynchronization() {
+        bindingOpen = false
+        pending.removeAll()
     }
 
     public func release() throws {

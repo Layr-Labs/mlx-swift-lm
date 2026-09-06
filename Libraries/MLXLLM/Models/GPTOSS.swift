@@ -588,3 +588,8 @@ extension GPTOSSModel {
         }
     }
 }
+
+
+extension GPTOSSModel: CBv2HistoricalAttentionCheckpointProviding {
+    public var cbv2SupportsHistoricalAttentionCheckpoint: Bool { true }
+}

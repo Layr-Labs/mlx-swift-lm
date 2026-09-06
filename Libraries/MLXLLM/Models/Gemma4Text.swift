@@ -2010,6 +2010,44 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         model(inputs, cache: cache, captureHook: captureHook)
     }
 
+    @_spi(Diagnostics)
+    public func diagnosticLayer0Projections(tokens: [Int]) throws -> Gemma4Layer0ProjectionDiagnostic {
+        guard tokens.count == 2, tokens.allSatisfy({ (0..<vocabularySize).contains($0) }) else {
+            throw Gemma4Layer0ProjectionDiagnostic.Failure.invalidTokenPair
+        }
+        guard config.hiddenSizePerLayerInput == 0, let layer = model.layers.first,
+            !layer.selfAttn.usesSharedKV, !layer.selfAttn.useKeqV else {
+            throw Gemma4Layer0ProjectionDiagnostic.Failure.unsupportedLayer
+        }
+        guard let query = layer.selfAttn.qProj as? QuantizedLinear,
+            let key = layer.selfAttn.kProj as? QuantizedLinear,
+            let value = layer.selfAttn.vProj as? QuantizedLinear else {
+            throw Gemma4Layer0ProjectionDiagnostic.Failure.expectedQuantizedProjections
+        }
+        let projections = ["q": query, "k": key, "v": value]
+        var tensors: [String: MLXArray] = [:]
+        for width in 1...2 {
+            let input = MLXArray(tokens.prefix(width).map(Int32.init)).reshaped([1, width])
+            let embedded = model.embedTokens(input) * model.embedScale
+            let normalized = layer.inputLayernorm(embedded)
+            tensors["m\(width).embedding"] = embedded
+            tensors["m\(width).normalized"] = normalized
+            for (name, projection) in projections {
+                tensors["m\(width).\(name)"] = projection(normalized)
+            }
+        }
+        var parameters: [String: MLXArray] = ["input_layernorm.weight": layer.inputLayernorm.weight]
+        var quantization: [String: Gemma4Layer0ProjectionDiagnostic.Quantization] = [:]
+        for (name, projection) in projections {
+            for (parameter, tensor) in projection.parameters().flattened() {
+                parameters["\(name).\(parameter)"] = tensor
+            }
+            quantization[name] = .init(groupSize: projection.groupSize, bits: projection.bits,
+                mode: String(describing: projection.mode))
+        }
+        return .init(tensors: tensors, parameters: parameters, quantization: quantization)
+    }
+
     /// Parse the layer index out of a weight key like
     /// `"model.layers.15.self_attn.k_proj.weight"`. Returns nil if the key
     /// doesn't match the expected `...layers.<N>...` pattern.
@@ -2259,5 +2297,12 @@ extension Gemma4TextModel: CBv2MTPForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         let (postNorm, preNorm) = model.callCapturingPreNorm(tokens, cache: caches)
         return (applyLMHead(postNorm), preNorm)
+    }
+}
+
+
+extension Gemma4TextModel: CBv2HistoricalAttentionCheckpointProviding {
+    public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
+        !cbv2LayerKinds.contains(where: \.isBidirectional)
     }
 }

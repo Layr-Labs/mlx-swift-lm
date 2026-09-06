@@ -8,7 +8,12 @@ import XCTest
 
 final class CBv2RecurrentStateTests: XCTestCase {
     private final class RecurrentFixtureModel: CBv2RecurrentSteppableModel {
-        let cbv2Capabilities = CBv2ModelCapabilities.initialRecurrentTarget
+        let cbv2Capabilities: CBv2ModelCapabilities
+        init(checkpoints: Bool = false) {
+            var capabilities = CBv2ModelCapabilities.initialRecurrentTarget
+            capabilities.supportsRecurrentCheckpointReuse = checkpoints
+            self.cbv2Capabilities = capabilities
+        }
         let recurrentStateSpec: CBv2RecurrentStateSpec? = CBv2RecurrentStateSpec(layers: [
             CBv2RecurrentLayerStateSpec(
                 modelLayerIndex: 0,
@@ -280,6 +285,287 @@ final class CBv2RecurrentStateTests: XCTestCase {
         XCTAssertEqual(backend.bytesReserved, 0)
         XCTAssertEqual(engine.capacity().kvBytesInUse, 0)
         XCTAssertEqual(engine.capacity().kvBytesReserved, 0)
+    }
+
+    func testCheckpointPublicationUsesUniqueReceiptAcrossImmediateSeededIDReuse() async throws {
+        final class Publications: @unchecked Sendable {
+            let lock = NSLock()
+            private var values: [(CBv2RequestID, [Int])] = []
+            func append(_ id: CBv2RequestID, _ positions: [Int]) {
+                lock.lock(); values.append((id, positions)); lock.unlock()
+            }
+            var snapshot: [(CBv2RequestID, [Int])] {
+                lock.lock(); defer { lock.unlock() }; return values
+            }
+        }
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let engine = EngineV2(
+            model: RecurrentFixtureModel(checkpoints: true), layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: .init(
+                maximumBytes: 128 << 10, modelID: "fixture",
+                promptContractID: "fixture-template", buildID: "fixture-build"))
+        let publications = Publications()
+        engine.setResidentPrefixPublicationHandler { publications.append($0, $1) }
+        let donor = try engine.submit(.init(
+            id: .init(77), promptTokens: Array(repeating: 1, count: chunk + 1), maxTokens: 1,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1001)))
+        let cold = await cbv2SchedCollect(donor)
+        XCTAssertEqual(cold.finishReason, .length)
+        XCTAssertEqual(publications.snapshot.map(\.0), [.init(1001)])
+        let next = try engine.submit(.init(
+            id: .init(77), promptTokens: Array(repeating: 1, count: 3 * chunk + 1), maxTokens: 1,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1002)))
+        let warm = await cbv2SchedCollect(next)
+        XCTAssertEqual(warm.finishReason, .length)
+        XCTAssertEqual(warm.tokens, cold.tokens)
+        XCTAssertEqual(warm.usage?.prefixCacheTier, .resident)
+        XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, chunk)
+        XCTAssertEqual(publications.snapshot.map(\.0), [.init(1001), .init(1002)])
+        XCTAssertEqual(publications.snapshot.last?.1, [chunk, 3 * chunk])
+        XCTAssertEqual(backend.bytesReserved, 0, "DONE follows donor backing release")
+        await engine.shutdown()
+        XCTAssertEqual(engine.hybridPrefixCache?.stats.retainedBytes, 0)
+    }
+
+    func testMalformedCheckpointFallsBackAndReleasesAdoptionPinAndRequestState() async throws {
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let engine = EngineV2(
+            model: RecurrentFixtureModel(checkpoints: true), layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: .init(
+                maximumBytes: 128 << 10, modelID: "fixture",
+                promptContractID: "fixture-template", buildID: "fixture-build"))
+        let cache = try XCTUnwrap(engine.hybridPrefixCache)
+        let badSpec = CBv2RecurrentStateSpec(layers: [.init(
+            modelLayerIndex: 0, convShape: [1, 2, 1], convDType: .float32,
+            ssmShape: [1, 1, 1, 1], ssmDType: .float32)])
+        let roots = cache.capture(
+            requestID: .init(900), position: chunk, chunkSize: chunk, spec: badSpec,
+            layers: [0: .init(conv: MLXArray.zeros([1, 2, 1]), ssm: MLXArray.zeros([1, 1, 1, 1]))])
+        asyncEval(roots)
+        let prompt = Array(repeating: 1, count: chunk + 1)
+        let kv = MLXArray.zeros([1, 1, chunk + 1, 1])
+        asyncEval(kv)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            cache.publish(
+                requestID: .init(900), tokens: prompt, cacheSalt: nil,
+                kv: [(keys: kv, values: kv, offset: chunk + 1)], backingBytes: kv.nbytes * 2
+            ) { done.resume() }
+        }
+        let stream = try engine.submit(.init(id: .init(901), promptTokens: prompt, maxTokens: 1))
+        let result = await cbv2SchedCollect(stream)
+        XCTAssertEqual(result.finishReason, .length)
+        XCTAssertEqual(result.tokens, [1])
+        XCTAssertEqual(result.usage?.prefixCacheOutcome, .adoptionFailed)
+        XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved, 0)
+        XCTAssertEqual(cache.stats.lookupMatches, 1)
+        XCTAssertEqual(cache.stats.adoptions, 0)
+        XCTAssertEqual(backend.bytesReserved, 0)
+        XCTAssertTrue(engine.loopForTesting.recurrentStates.isEmpty)
+        await engine.shutdown()
+        XCTAssertEqual(cache.stats.retainedBytes, 0, "failed restoration must not strand the lookup pin")
+    }
+
+    func testHybridPlanSeparatesNonDivisibleBackingSlackFromExactPrefixDtype() async throws {
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let model = RecurrentFixtureModel(checkpoints: true)
+        let engine = EngineV2(
+            model: model, layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: .init(
+                maximumBytes: 128 << 10, modelID: "fixture",
+                promptContractID: "fixture-template", buildID: "fixture-build"))
+        let cache = try XCTUnwrap(engine.hybridPrefixCache)
+        let roots = cache.capture(
+            requestID: .init(900), position: chunk, chunkSize: chunk,
+            spec: try XCTUnwrap(model.recurrentStateSpec),
+            layers: [0: .init(conv: MLXArray.zeros([1, 1, 1]), ssm: MLXArray.zeros([1, 1, 1, 1]))])
+        asyncEval(roots)
+        let prompt = Array(repeating: 1, count: chunk + 1)
+        let backing = MLXArray.zeros([1, 1, 3 * chunk + 1, 1])
+        asyncEval(backing)
+        let bytes = backing.nbytes * 2
+        XCTAssertNotEqual(bytes % chunk, 0)
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            cache.publish(
+                requestID: .init(900), tokens: prompt, cacheSalt: nil,
+                kv: [(keys: backing, values: backing, offset: 3 * chunk + 1)], backingBytes: bytes
+            ) { done.resume() }
+        }
+        let overflowed = engine.hybridPrefixLookup(
+            for: .init(id: .init(899), promptTokens: prompt, maxTokens: .max), cache: cache)
+        XCTAssertNil(overflowed.adoption)
+        XCTAssertEqual(cache.stats.lookupMatches, 0, "overflow refuses before pinning a donor")
+        let lookup = engine.hybridPrefixLookup(
+            for: .init(id: .init(901), promptTokens: prompt, maxTokens: 1), cache: cache)
+        let adoption = try XCTUnwrap(lookup.adoption)
+        XCTAssertEqual(adoption.plan.capacityReservationTokens, prompt.count + 1)
+        XCTAssertEqual(adoption.plan.replayStart, chunk)
+        XCTAssertEqual(adoption.plan.prefillTokensSaved, chunk)
+        XCTAssertEqual(adoption.plan.fullKVBytesPerToken, 8)
+        XCTAssertEqual(adoption.plan.stagedFullKVBytes, chunk * 8)
+        XCTAssertGreaterThanOrEqual(adoption.plan.initialAdditionalCapacityBytes, bytes)
+        // The independent request reservation survives loss of the bank's
+        // reference before native adoption evaluates its source-copy graph.
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 1 << 20,
+            config: .init(watermarkFraction: 0, elementBytes: 4))
+        try admission.reserve(
+            id: .init(901), additionalTokens: adoption.plan.capacityReservationTokens,
+            additionalBytes: adoption.plan.initialAdditionalCapacityBytes)
+        cache.endAdoption(pin: try XCTUnwrap(adoption.hybridPin))
+        cache.close()
+        XCTAssertEqual(cache.stats.retainedBytes, 0)
+        let copied = try backend.makeSequenceState(
+            adopting: adoption.prefix, plan: adoption.plan, layerKinds: kinds, maxLength: chunk + 2)
+        XCTAssertGreaterThanOrEqual(admission.bytesReserved, bytes + (chunk + 2) * 8)
+        eval(copied.compactMap { $0?.snapshot().keys })
+        XCTAssertEqual(try XCTUnwrap(copied[0]).snapshot().offset, chunk)
+        backend.release(copied)
+        admission.releaseAll(id: .init(901))
+        XCTAssertEqual(admission.bytesReserved, 0)
+        await engine.shutdown()
+    }
+
+    func testShutdownWaitsForCancelledCheckpointRetirement() async throws {
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let model = RecurrentFixtureModel(checkpoints: true)
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let engine = EngineV2(
+            model: model, layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: .init(
+                maximumBytes: 128 << 10, modelID: "fixture",
+                promptContractID: "template", buildID: "fixture"))
+        let cache = try XCTUnwrap(engine.hybridPrefixCache)
+        let spec = try XCTUnwrap(model.recurrentStateSpec)
+        func stage(_ id: UInt64) {
+            let roots = cache.capture(
+                requestID: .init(id), position: chunk, chunkSize: chunk, spec: spec,
+                layers: [0: .init(conv: MLXArray.zeros([1, 1, 1]), ssm: MLXArray.zeros([1, 1, 1, 1]))])
+            asyncEval(roots)
+        }
+        stage(900)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        XCTAssertTrue(cache.dropStaged(requestID: .init(900)) {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 10)
+        })
+        let blocked = await cbv2SchedWait { entered.wait(timeout: .now()) == .success }
+        XCTAssertTrue(blocked)
+        // Retire an actual cancelled request behind the blocked earlier copy.
+        // Pre-staging makes the queued ownership deterministic without timing
+        // the fixture's tiny GPU prefill.
+        stage(901)
+        let requestID = CBv2RequestID(901)
+        let stream = try engine.submit(.init(
+            id: requestID, promptTokens: Array(repeating: 1, count: chunk + 1), maxTokens: 1_000))
+        var reason: CBv2FinishReason?
+        for await event in stream {
+            switch event {
+            case .delta(_, let tokens, _) where !tokens.isEmpty: engine.cancel(requestID)
+            case .finished(let finish, _): reason = finish
+            default: break
+            }
+        }
+        XCTAssertEqual(reason, .cancelled)
+        let stopped = DispatchSemaphore(value: 0)
+        let shutdown = Task { await engine.shutdown(); stopped.signal() }
+        XCTAssertEqual(stopped.wait(timeout: .now() + 0.05), .timedOut)
+        XCTAssertGreaterThan(cache.stats.retainedBytes, 0)
+        release.signal()
+        await shutdown.value
+        XCTAssertEqual(cache.stats.retainedBytes, 0)
+        XCTAssertEqual(backend.bytesReserved, 0)
+    }
+
+    func testCheckpointSnapshotReadsConfirmedGenerationBeforeChainedSuccessor() throws {
+        let state = try CBv2RecurrentRequestState(spec: oneLayerSpec)
+        try stage(1, on: state).commit()
+        let accepted = try stage(2, on: state)
+        let successor = try stage(3, on: state)
+        try accepted.commit()
+        XCTAssertEqual(scalar(state.state(modelLayerIndex: 0)?.conv), 3)
+        XCTAssertEqual(scalar(state.confirmedStateSnapshot()?[0]?.conv), 2)
+        try successor.rollback()
+        try state.release()
+        XCTAssertNil(state.confirmedStateSnapshot())
+    }
+
+    func testCompactPublicationKeepsSourceChargedUntilShutdownDrainCompletes() async throws {
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let bankBytes = chunk * 8 + 8 // One KV prefix plus one recurrent checkpoint.
+        let engine = EngineV2(
+            model: RecurrentFixtureModel(checkpoints: true), layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: .init(
+                maximumBytes: bankBytes, modelID: "fixture",
+                promptContractID: "template", buildID: "fixture"))
+        let cache = try XCTUnwrap(engine.hybridPrefixCache)
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        cache.setPublicationHandler { _, positions in
+            XCTAssertEqual(positions, [chunk])
+            entered.signal()
+            _ = release.wait(timeout: .now() + 10)
+        }
+        var request = CBv2Request(
+            id: .init(902), promptTokens: Array(repeating: 1, count: chunk * 2 + 1), maxTokens: 1)
+        request.prefixCacheReceiptID = .init(1902)
+        let stream = try engine.submit(request)
+        let collected = Task { await cbv2SchedCollect(stream) }
+        let blocked = await cbv2SchedWait { entered.wait(timeout: .now()) == .success }
+        XCTAssertTrue(blocked)
+        XCTAssertEqual(cache.stats.kvCompactions, 1)
+        XCTAssertEqual(cache.stats.retainedBytes, bankBytes)
+        XCTAssertGreaterThan(backend.bytesReserved, bankBytes, "retired full donor still has its original reservation")
+        let stopped = DispatchSemaphore(value: 0)
+        let shutdown = Task { await engine.shutdown(); stopped.signal() }
+        XCTAssertEqual(stopped.wait(timeout: .now() + 0.05), .timedOut)
+        // Reclaim the published copy while its donor completion is queued.
+        // The destination has no hidden aliases in the callback; the original
+        // full donor remains charged independently until that callback returns.
+        XCTAssertEqual(cache.resizeReservation(to: 0), 0)
+        cache.close()
+        XCTAssertEqual(cache.stats.retainedBytes, 0)
+        XCTAssertGreaterThan(backend.bytesReserved, bankBytes)
+        release.signal()
+        await shutdown.value
+        let output = await collected.value
+        XCTAssertEqual(output.finishReason, .length)
+        XCTAssertEqual(backend.bytesReserved, 0)
+        XCTAssertEqual(cache.stats.retainedBytes, 0)
     }
 
     func testCausalVisionPrefillUsesAndCleansRequestOwnedRecurrentState() async throws {

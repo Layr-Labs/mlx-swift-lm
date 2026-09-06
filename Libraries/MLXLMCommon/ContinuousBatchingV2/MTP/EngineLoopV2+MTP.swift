@@ -12,8 +12,8 @@ extension EngineLoopV2 {
     /// Execute a plan containing MTP work. Graph construction includes seed
     /// decodes, frozen-KV drafting, target-authoritative verification, ordinary
     /// decode neighbors, and per-request prefill chunks.
-    func executeMTPRound(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
-        guard let mtp else { return executeMixed(plan) }
+    func executeMTPRound(_ plan: CBv2StepPlan) throws -> CBv2InFlightStep? {
+        guard let mtp else { return try executeMixed(plan) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         launchClockNanos = wallStartedNanos
         defer { launchClockNanos = 0 }
@@ -51,7 +51,7 @@ extension EngineLoopV2 {
                 launchNanos: wallStartedNanos)
         }
 
-        let graph = mtpBuildRoundGraph(work, driver: mtp, launchNanos: wallStartedNanos)
+        let graph = try mtpBuildRoundGraph(work, driver: mtp, launchNanos: wallStartedNanos)
         scheduler.markPendingSamples(ids: graph.sampledRows)
         if let verify = graph.verify {
             scheduler.markPendingSamples(
@@ -71,9 +71,18 @@ extension EngineLoopV2 {
             sampledRows: graph.sampledRows,
             sampledTokens: graph.sampledTokens,
             evalTargets: graph.prefillEvalTargets,
+            computedRanges: Dictionary(
+                uniqueKeysWithValues: work.map {
+                    ($0.rec.id, $0.start ..< ($0.start + $0.count))
+                }),
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = graph.logprobSegments
+        step.logitDiagnostics = graph.diagnostics
         step.recurrentEvaluations = graph.recurrentEvaluations
+        if hybridPrefixCache != nil || completeCheckpointCapture != nil {
+            step.recurrentCheckpointChunkSizes = Dictionary(
+                uniqueKeysWithValues: work.map { ($0.rec.id, $0.rec.plannedPrefillChunkSize) })
+        }
         if graph.verify != nil || !graph.seedRows.isEmpty
             || !graph.committedObservationRows.isEmpty
         {

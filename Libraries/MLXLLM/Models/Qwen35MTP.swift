@@ -244,6 +244,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
 
+    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String) {
+        (target.configuration.hiddenSize, target.model.norm.weight.dtype,
+         target.vocabularySize, installedVerificationMode.rawValue)
+    }
+
     private init(
         configuration: Qwen35TextConfiguration,
         blockSize: Int,
@@ -677,7 +682,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 }
 
 extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
-    private final class RequestState: CBv2MTPRequestState {
+    final class RequestState: CBv2MTPRequestState {
         var caches: [any KVCache]
 
         /// Trusted target transitions not yet appended to the persistent head KV.
@@ -857,6 +862,24 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     }
     public var requestStateTokenGranularity: Int { Self.cacheAllocationStep }
     public var requestStateTokenAllocationPadding: Int { 4 }
+
+    public var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
+        let config = target.configuration
+        let (elements, geometryOverflow) = config.kvHeads.multipliedReportingOverflow(by: config.headDim ?? 0)
+        let (cacheRow, cacheOverflow) = elements.multipliedReportingOverflow(by: mtp.norm.weight.dtype.size)
+        let (cacheCount, countOverflow) = mtp.layers.count.multipliedReportingOverflow(by: 2)
+        let (hiddenRow, hiddenOverflow) = config.hiddenSize.multipliedReportingOverflow(
+            by: target.model.norm.weight.dtype.size)
+        guard !geometryOverflow, !cacheOverflow, !countOverflow, !hiddenOverflow else { return nil }
+        return [
+            .init(bytesPerToken: cacheRow, allocationCount: cacheCount,
+                  tokenGranularity: Self.cacheAllocationStep, tokenPadding: 4),
+            // Backlog and frontier are views of normalized committed chunks;
+            // the bound covers every possible partition of the retained rows.
+            .init(bytesPerToken: hiddenRow, tokenPadding: 4, partitioned: true),
+            .init(bytesPerToken: MemoryLayout<Int32>.stride, tokenPadding: 4, partitioned: true),
+        ]
+    }
 
     static func cacheBytesPerToken(
         configuration: Qwen35TextConfiguration,
