@@ -643,6 +643,25 @@ public final class Qwen4ExpAttention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: Qwen4ExpRMSNorm
     @ModuleInfo(key: "indexer") public var indexer: Qwen4ExpQSAIndexer
 
+    /// `q_proj | k_proj | v_proj` as one projection (three gemv dispatches
+    /// become one), built on the first forward; see `qwen4ExpFuseLinears`.
+    private let fusedQKV = Qwen4ExpFusedLinearBox()
+
+    /// The three projections of `x` (q carries its output gate, doubled width).
+    func qkvProjections(_ x: MLXArray) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        if !fusedQKV.built {
+            fusedQKV.linear = qwen4ExpFuseLinears([qProj, kProj, vProj])
+            fusedQKV.built = true
+        }
+        guard let fused = fusedQKV.linear, Qwen4ExpFusedProjectionPolicy.current.allows(x) else {
+            return (qProj(x), kProj(x), vProj(x))
+        }
+        let qWidth = heads * headDim * 2
+        let kWidth = kvHeads * headDim
+        let parts = MLX.split(fused(x), indices: [qWidth, qWidth + kWidth], axis: -1)
+        return (parts[0], parts[1], parts[2])
+    }
+
     public init(_ args: Qwen4ExpTextConfiguration) {
         self.heads = args.attentionHeads
         self.kvHeads = args.kvHeads
@@ -697,13 +716,14 @@ public final class Qwen4ExpAttention: Module {
 
         let sparse = indexer(x, rope: rope, cache: qsaCache, offset: offset)
 
-        let projected = qProj(x).reshaped(B, S, heads, -1).split(parts: 2, axis: -1)
+        let qkv = qkvProjections(x)
+        let projected = qkv.q.reshaped(B, S, heads, -1).split(parts: 2, axis: -1)
         var queries = projected[0]
         let gate = projected[1].reshaped(B, S, -1)
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
-        var keys = kNorm(kProj(x).reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
-        let values = vProj(x).reshaped(B, S, kvHeads, -1).transposed(0, 2, 1, 3)
+        var keys = kNorm(qkv.k.reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
+        let values = qkv.v.reshaped(B, S, kvHeads, -1).transposed(0, 2, 1, 3)
 
         let (cos, sin) = rope.cosSin(qwen4ExpPositions(offset: offset, count: S))
         queries = qwen4ExpRopePartial(queries, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
@@ -1017,8 +1037,19 @@ public final class Qwen4ExpMLP: Module, UnaryLayer {
         super.init()
     }
 
+    /// `gate_proj | up_proj` as one projection; see `qwen4ExpFuseLinears`.
+    private let fusedGateUp = Qwen4ExpFusedLinearBox()
+
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        if !fusedGateUp.built {
+            fusedGateUp.linear = qwen4ExpFuseLinears([gateProj, upProj])
+            fusedGateUp.built = true
+        }
+        guard let fused = fusedGateUp.linear, Qwen4ExpFusedProjectionPolicy.current.allows(x) else {
+            return downProj(silu(gateProj(x)) * upProj(x))
+        }
+        let parts = MLX.split(fused(x), indices: [gateProj.weight.dim(0)], axis: -1)
+        return downProj(silu(parts[0]) * parts[1])
     }
 }
 
@@ -1044,17 +1075,93 @@ public final class Qwen4ExpSparseMoeBlock: Module {
         super.init()
     }
 
+    /// The routed experts' `gate_proj | up_proj` stacked along the expert
+    /// output axis, plus `down_proj`, read once from the loaded quantized
+    /// `switch_mlp` parameters: two gathered matmuls per step instead of
+    /// three. Built on the first forward; `nil` when the switch layer is not
+    /// quantized or its layout is not the expected one.
+    private let fusedExperts = Qwen4ExpFusedExpertsBox()
+
+    private func routedExperts(_ x: MLXArray, indices: MLXArray) -> MLXArray {
+        if !fusedExperts.built {
+            fusedExperts.params = Qwen4ExpFusedExperts(switchMLP, inputDims: x.dim(-1))
+            fusedExperts.built = true
+        }
+        guard let f = fusedExperts.params, Qwen4ExpFusedProjectionPolicy.current.allows(x) else {
+            return switchMLP(x, indices)
+        }
+        // SwitchGLU's own shape: x [.., 1, 1, In], indices [.., K]; no sort at
+        // decode widths (it sorts only from 64 indices up).
+        let xe = expandedDimensions(x, axes: [-2, -3])
+        let gu = gatherQuantizedMM(
+            xe, f.gateUpWeight, scales: f.gateUpScales, biases: f.gateUpBiases,
+            rhsIndices: indices, transpose: true, groupSize: f.groupSize, bits: f.bits)
+        let g = gu[.ellipsis, ..<f.hiddenDims]
+        let u = gu[.ellipsis, f.hiddenDims...]
+        let down = gatherQuantizedMM(
+            silu(g) * u, f.downWeight, scales: f.downScales, biases: f.downBiases,
+            rhsIndices: indices, transpose: true, groupSize: f.groupSize, bits: f.bits)
+        return MLX.squeezed(down, axis: -2)
+    }
+
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         // The router runs in float32 and the softmax is taken AFTER selection,
         // over the selected logits only -- this is the reference order.
         let logits = gate(x.asType(.float32))
         let indices = argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
         let weights = MLX.softmax(takeAlong(logits, indices, axis: -1), axis: -1, precise: true)
-        let routed = (switchMLP(x, indices) * weights[.ellipsis, .newAxis])
+        let routed = (routedExperts(x, indices: indices) * weights[.ellipsis, .newAxis])
             .sum(axis: -2)
             .asType(x.dtype)
         return routed + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
     }
+}
+
+/// The routed experts' fused parameters (see `routedExperts`).
+struct Qwen4ExpFusedExperts {
+    let gateUpWeight: MLXArray
+    let gateUpScales: MLXArray
+    let gateUpBiases: MLXArray?
+    let downWeight: MLXArray
+    let downScales: MLXArray
+    let downBiases: MLXArray?
+    let hiddenDims: Int
+    let groupSize: Int
+    let bits: Int
+
+    /// Reads `gate_proj`, `up_proj` and `down_proj` (weight, scales, biases)
+    /// from the switch layer's parameters and stacks gate|up along the
+    /// per-expert output axis. Quantization geometry is derived from the
+    /// arrays: bits from the packed width, group size from the scales width.
+    init?(_ switchMLP: SwitchGLU, inputDims: Int) {
+        var p: [String: MLXArray] = [:]
+        for (key, value) in switchMLP.parameters().flattened() { p[key] = value }
+        guard let gw = p["gate_proj.weight"], let gs = p["gate_proj.scales"],
+            let uw = p["up_proj.weight"], let us = p["up_proj.scales"],
+            let dw = p["down_proj.weight"], let ds = p["down_proj.scales"],
+            gw.ndim == 3, gw.dtype == .uint32, gw.shape == uw.shape, gs.shape == us.shape,
+            p["gate_proj.bias"] == nil, p["up_proj.bias"] == nil, p["down_proj.bias"] == nil
+        else { return nil }
+        let bits = 32 * gw.dim(-1) / inputDims
+        let groupSize = inputDims / gs.dim(-1)
+        guard [2, 3, 4, 5, 6, 8].contains(bits), groupSize > 0, inputDims % groupSize == 0 else { return nil }
+        let gb = p["gate_proj.biases"], ub = p["up_proj.biases"]
+        guard (gb == nil) == (ub == nil) else { return nil }
+        self.gateUpWeight = concatenated([gw, uw], axis: 1)
+        self.gateUpScales = concatenated([gs, us], axis: 1)
+        self.gateUpBiases = gb == nil ? nil : concatenated([gb!, ub!], axis: 1)
+        self.downWeight = dw
+        self.downScales = ds
+        self.downBiases = p["down_proj.biases"]
+        self.hiddenDims = gw.dim(1)
+        self.groupSize = groupSize
+        self.bits = bits
+    }
+}
+
+final class Qwen4ExpFusedExpertsBox {
+    var params: Qwen4ExpFusedExperts?
+    var built = false
 }
 
 // MARK: - Hyper-connections

@@ -358,13 +358,14 @@ extension Qwen4ExpAttention {
 
         let keepMask = indexer.cbv2KeepMask(x, rope: rope, cache: cache, positions: positions)
 
-        let projected = qProj(x).reshaped(B, S, heads, -1).split(parts: 2, axis: -1)
+        let qkv = qkvProjections(x)
+        let projected = qkv.q.reshaped(B, S, heads, -1).split(parts: 2, axis: -1)
         var queries = projected[0]
         let gate = projected[1].reshaped(B, S, -1)
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
-        var keys = kNorm(kProj(x).reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
-        let values = vProj(x).reshaped(B, S, kvHeads, -1).transposed(0, 2, 1, 3)
+        var keys = kNorm(qkv.k.reshaped(B, S, kvHeads, -1)).transposed(0, 2, 1, 3)
+        let values = qkv.v.reshaped(B, S, kvHeads, -1).transposed(0, 2, 1, 3)
 
         let (cos, sin) = rope.cosSin(positions)
         queries = qwen4ExpRopePartial(queries, cos: cos[0..., .newAxis], sin: sin[0..., .newAxis])
