@@ -120,7 +120,7 @@ final class Qwen4ExpForwardParityTests: XCTestCase {
         let model = try Qwen4ExpFixture.model()
         let session = try Qwen4ExpCBv2Session(model: model)
         let drafter = try XCTUnwrap(Qwen4ExpInlineMTPAssistant(target: model))
-        XCTAssertEqual(drafter.maximumDraftTokens, 3)
+        XCTAssertEqual(drafter.maximumDraftTokens, Qwen4ExpInlineMTPAssistant.maximumDepth)
         XCTAssertEqual(drafter.maximumSpeculativeBatch, 1)
         XCTAssertEqual(drafter.requiredVerificationMode, .serialTarget)
         XCTAssertEqual(drafter.mtpTargetIdentity, ObjectIdentifier(model))
