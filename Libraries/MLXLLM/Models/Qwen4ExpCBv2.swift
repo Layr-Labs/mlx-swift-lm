@@ -32,6 +32,7 @@
 
 import Foundation
 import MLX
+import MLXFast
 import MLXLMCommon
 import MLXNN
 
@@ -434,9 +435,17 @@ extension Qwen4ExpGatedDeltaNet {
             MLXArray(invScale).asType(x.dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-        let (out, newSsmState) = gatedDeltaUpdate(
-            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
-            state: ssmState, mask: nil)
+        let (out, newSsmState): (MLXArray, MLXArray)
+        if qwen4ExpGDNFusionEnabled {
+            // The gate chain as one compiled kernel; see Qwen4ExpGDNKernels.
+            let gates = Qwen4ExpGDNKernels.gates([a, b, aLog, dtBias])
+            (out, newSsmState) = gatedDeltaUpdate(
+                q: q, k: k, v: v, g: gates[0], beta: gates[1], state: ssmState, mask: nil)
+        } else {
+            (out, newSsmState) = gatedDeltaUpdate(
+                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: ssmState, mask: nil)
+        }
 
         for (row, evaluation) in recurrentState.enumerated() {
             do {
