@@ -130,6 +130,15 @@ public enum BenchWorkerLegacyParity {
             let modelDType = model.model.parameters().flattened()
                 .first(where: { [.bfloat16, .float16, .float32].contains($0.1.dtype) })?.1.dtype
         else { throw Failure.streamPromoted("the tower has no floating tensor") }
+        if BenchWorkerCapturedProbe.isRequested() {
+            var probeTokens: [Int] = []
+            if let seedToken = golden.expectedDecodeSeedToken { probeTokens.append(seedToken) }
+            probeTokens.append(contentsOf: golden.expectedDecodeTokens.prefix(2))
+            try BenchWorkerCapturedProbe.run(
+                runner: runner, seed: golden.decodeSeedTokens, tokens: probeTokens,
+                kvBytesCapacity: 0, emit: emit)
+        }
+
         let legacyCaches = model.makeCache()
         let stepper = try runner.makeStepper()
         try stepper.begin()
