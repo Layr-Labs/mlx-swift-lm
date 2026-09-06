@@ -41,9 +41,10 @@ struct CBv2ForwardShapeEngineTests {
     @Test(arguments: [false, true])
     func fourRequestsObserveActualPackedOrSplitLeafCalls(split: Bool) async throws {
         let model = Model(split: split)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 1)]
         let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20))
-        let engine = EngineV2(model: model, layerKinds: [], backend: backend,
-            cacheProvider: CBv2LayerCacheBank(layerKinds: []), sampler: CBv2GreedySampler(),
+        let engine = EngineV2(model: model, layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
             schedulerConfig: .init(maxConcurrentRequests: 4, maxBatchedTokensPerStep: 64,
                 prefillChunkSize: 16, maxWaiting: 8, enablePrefixCache: false))
         let before = try engine.beginForwardShapeObservation()
@@ -77,9 +78,10 @@ struct CBv2ForwardShapeEngineTests {
 
     @Test func firstScopeRefusesDiscardedChainedWorkBeforeItsReadback() async throws {
         let model = Model(split: false)
-        let engine = EngineV2(model: model, layerKinds: [],
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 1)]
+        let engine = EngineV2(model: model, layerKinds: kinds,
             backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20)),
-            cacheProvider: CBv2LayerCacheBank(layerKinds: []), sampler: CBv2GreedySampler(),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
             schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: 64,
                 prefillChunkSize: 16, maxWaiting: 8, enablePrefixCache: false))
         let loop = engine.loopForTesting
