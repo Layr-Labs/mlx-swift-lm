@@ -410,7 +410,14 @@ public final class Qwen4ExpPLELayer: Module {
         let query = queryFlat.reshaped(queryFlat.shape.dropLast() + [hcCount, hiddenSize])
 
         var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hiddenSize))
-        gate = MLX.sqrt(maximum(MLX.abs(gate), MLXArray(Float(1e-6)))) * MLX.sign(gate)
+        // The floor is a scalar IN THE GATE'S DTYPE. `MLXArray(Float(1e-6))` is
+        // a float32 array, not a weak scalar, and `maximum` promotes: the gate,
+        // the gated value and the PLE output become float32, and `stream + ple`
+        // then carries the whole hyper stream in float32 for every layer after
+        // this one. The reference (`gate.abs().clamp_min(1e-6)`) keeps the
+        // model dtype.
+        let floor = MLXArray(Float(1e-6), dtype: gate.dtype)
+        gate = MLX.sqrt(maximum(MLX.abs(gate), floor)) * MLX.sign(gate)
 
         var gated = sigmoid(gate) * value[.ellipsis, .newAxis, 0...]
         gated = gated.reshaped(gated.shape.dropLast(2) + [-1])

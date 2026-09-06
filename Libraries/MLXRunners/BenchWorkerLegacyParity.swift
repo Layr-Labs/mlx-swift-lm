@@ -84,12 +84,15 @@ public enum BenchWorkerLegacyParity {
     public enum Failure: Error, CustomStringConvertible {
         case notQwen4Exp(String)
         case noChain(String)
+        case streamPromoted(String)
         public var description: String {
             switch self {
             case .notQwen4Exp(let type):
                 return "diag-parity compares the Qwen4Exp legacy path; the loaded model is \(type)"
             case .noChain(let path):
                 return "diag-parity: \(path) carries no benchmark window and no cases[0] chain"
+            case .streamPromoted(let detail):
+                return "diag-parity: \(detail)"
             }
         }
     }
@@ -121,6 +124,12 @@ public enum BenchWorkerLegacyParity {
                 + "legacy = model(ids, cache: makeCache()) in one forward, cbv2 = runner.makeStepper()"
         )
 
+        // The model dtype: the first floating tensor of the tower (a norm
+        // weight or a quantized scale; packed weights are integer).
+        guard
+            let modelDType = model.model.parameters().flattened()
+                .first(where: { [.bfloat16, .float16, .float32].contains($0.1.dtype) })?.1.dtype
+        else { throw Failure.streamPromoted("the tower has no floating tensor") }
         let legacyCaches = model.makeCache()
         let stepper = try runner.makeStepper()
         try stepper.begin()
@@ -136,8 +145,17 @@ public enum BenchWorkerLegacyParity {
             // Wall time per path, forward to readback, so the same run also
             // says what one step costs on each driver.
             let legacyStart = DispatchTime.now().uptimeNanoseconds
-            let legacy = model(ids, cache: legacyCaches)[0..., -1, 0...].asType(.float32)
+            let legacyRaw = model(ids, cache: legacyCaches)[0..., -1, 0...]
+            let legacy = legacyRaw.asType(.float32)
             eval(legacy)
+            // The head reads the hyper stream, so the raw logits carry the
+            // stream's dtype at the last layer. A stray float32 scalar
+            // anywhere in the tower promotes it, and everything after runs
+            // in float32 (the PLE gate floor did exactly that).
+            if step == 0, legacyRaw.dtype != modelDType {
+                throw Failure.streamPromoted(
+                    "stream dtype at the last layer is \(legacyRaw.dtype), model dtype is \(modelDType)")
+            }
             let legacyMs = Double(DispatchTime.now().uptimeNanoseconds - legacyStart) / 1e6
             let cbv2Start = DispatchTime.now().uptimeNanoseconds
             let cbv2 = try raw.forwardLogits(tokens).asType(.float32)
