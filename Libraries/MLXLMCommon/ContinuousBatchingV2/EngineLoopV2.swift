@@ -1353,6 +1353,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    /// A stopped scheduler may still own a discarded chained successor.
+    /// The first observation scope has no recorder pending-count to expose it.
+    func requireIdleForwardShapeBoundary() throws {
+        guard !scheduler.hasWork, inFlight == nil, buildingForwardShapes == nil else {
+            throw CBv2ForwardShapeError.engineBusy
+        }
+    }
+
     func configureLogitDiagnostic(_ configuration: CBv2LogitDiagnosticConfig?) throws {
         try onEngineQueueSync {
             guard !scheduler.hasWork, inFlight == nil else {

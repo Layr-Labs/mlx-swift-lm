@@ -15,7 +15,7 @@ extension EngineLoopV2 {
 
     func beginForwardShapeObservation() throws -> CBv2ForwardShapeSnapshot {
         try onEngineQueueSync {
-            guard !scheduler.hasWork else { throw CBv2ForwardShapeError.engineBusy }
+            try requireIdleForwardShapeBoundary()
             let recorder = forwardShapeRecorder ?? CBv2ForwardShapeRecorder()
             try recorder.reset()
             forwardShapeRecorder = recorder

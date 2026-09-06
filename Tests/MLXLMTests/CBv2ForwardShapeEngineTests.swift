@@ -75,6 +75,34 @@ struct CBv2ForwardShapeEngineTests {
         }
     }
 
+    @Test func firstScopeRefusesDiscardedChainedWorkBeforeItsReadback() async throws {
+        let model = Model(split: false)
+        let engine = EngineV2(model: model, layerKinds: [],
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: []), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: 64,
+                prefillChunkSize: 16, maxWaiting: 8, enablePrefixCache: false))
+        let loop = engine.loopForTesting
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 2 }
+        // The first sampled token stops the row only after its chained
+        // successor has already entered the target trunk. No scope exists yet.
+        let stream = try engine.submit(.init(id: .init(21), promptTokens: [1],
+            sampling: .init(temperature: 0), maxTokens: 16, stopTokens: [1], prefixCacheEnabled: false))
+        let tailHeld = await cbv2SchedWait {
+            loop.onEngineQueueSync { model.calls == 2 && !loop.scheduler.hasWork }
+        }
+        #expect(tailHeld)
+        #expect(!engine.forwardShapeSnapshot().enabled)
+        #expect(throws: CBv2ForwardShapeError.self) { try engine.beginForwardShapeObservation() }
+        #expect(!engine.forwardShapeSnapshot().enabled, "refusal must not create/reset a scope")
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+        let result = await cbv2SchedCollect(stream)
+        #expect(result.finishReason == .stop)
+        await engine.shutdown()
+        let scope = try engine.beginForwardShapeObservation()
+        #expect(scope.enabled && scope.scope == 1 && scope.pendingSteps == 0 && scope.entries.isEmpty)
+    }
+
     @Test(arguments: [false, true])
     func pagedRefusalRecordsOnlyCallsActuallyEntered(faultInside: Bool) async throws {
         let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)
