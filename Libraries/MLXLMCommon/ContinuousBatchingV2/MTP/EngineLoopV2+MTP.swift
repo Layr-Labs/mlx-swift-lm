@@ -14,6 +14,8 @@ extension EngineLoopV2 {
     /// decode neighbors, and per-request prefill chunks.
     func executeMTPRound(_ plan: CBv2StepPlan) throws -> CBv2InFlightStep? {
         guard let mtp else { return try executeMixed(plan) }
+        let shapes = beginForwardShapeStep()
+        defer { endForwardShapeStep(shapes) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         launchClockNanos = wallStartedNanos
         defer { launchClockNanos = 0 }
@@ -93,6 +95,8 @@ extension EngineLoopV2 {
                 seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
                 committedObservationRows: graph.committedObservationRows)
         }
+        step.forwardShapes = shapes
+        shapes?.attach()
         return step
     }
 }

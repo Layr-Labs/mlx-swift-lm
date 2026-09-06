@@ -184,7 +184,7 @@ extension EngineLoopV2 {
                     let positionIds = CBv2PositionState.decodePositionIds(
                         states: rows.map(\.rec.request.positionState),
                         cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                    output = try checkedModelForward { recurrentModel.forwardWithHidden(
+                    output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHidden(
                         tokens: column, caches: caches, recurrentState: evaluations,
                         positionIds: positionIds) }
                     for (row, evaluation) in zip(rows, evaluations) {
@@ -195,7 +195,7 @@ extension EngineLoopV2 {
                         recurrent[row.rec.id, default: []].append(evaluation)
                     }
                 } else {
-                    output = try checkedModelForward { mtp.model.forwardWithHidden(tokens: column, caches: caches) }
+                    output = try checkedModelForward(phase: .mtpVerification) { mtp.model.forwardWithHidden(tokens: column, caches: caches) }
                 }
                 captureDiagnostics(
                     output.logits, columnOffset: columnIndex, phase: "serial_verify")
@@ -244,7 +244,7 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
-                output = try checkedModelForward { recurrentModel.forwardWithHiddenCaptured(
+                output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
                     tokens: tokens, caches: caches, recurrentState: evaluations,
                     positionIds: positionIds) }
                 for (row, evaluation) in zip(rows, evaluations) {
@@ -260,7 +260,7 @@ extension EngineLoopV2 {
                     recurrent[row.rec.id] = [evaluation]
                 }
             } else {
-                output = try checkedModelForward { mtp.model.forwardWithHidden(tokens: tokens, caches: caches) }
+                output = try checkedModelForward(phase: .mtpVerification) { mtp.model.forwardWithHidden(tokens: tokens, caches: caches) }
             }
             if mtp.usesRequestStatefulDrafter {
                 guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {

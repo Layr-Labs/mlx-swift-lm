@@ -199,7 +199,9 @@ extension EngineLoopV2 {
                 let positionIds = CBv2PositionState.decodePositionIds(
                     states: decodeRows.map(\.rec.request.positionState),
                     cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                let output = try checkedModelForward { recurrentModel.forwardWithHidden(
+                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier)) { recurrentModel.forwardWithHidden(
                     tokens: inputs, caches: caches, recurrentState: evaluations,
                     positionIds: positionIds) }
                 logits = output.logits
@@ -213,7 +215,9 @@ extension EngineLoopV2 {
                     recurrentEvaluations[row.rec.id] = evaluation
                 }
             } else {
-                let output = try checkedModelForward { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
+                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier)) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
                 logits = output.logits
                 hidden = output.lastHidden
             }
@@ -320,7 +324,7 @@ extension EngineLoopV2 {
                 }
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
-                let forward = try checkedModelForward { recurrentModel.forwardWithHidden(
+                let forward = try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHidden(
                     tokens: inputs, caches: caches, recurrentState: [evaluation],
                     positionIds: positions) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
@@ -339,14 +343,14 @@ extension EngineLoopV2 {
                     row.start ..< row.start + row.count)
                 let forward = try targetForward(
                     tokens: inputs, caches: caches, ids: [rec.id],
-                    positionIds: positions)
+                    positionIds: positions, phase: .prefill)
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 cacheInnerState.append(contentsOf: forward.innerState)
                 recurrentEvaluations.merge(forward.recurrent) { _, _ in
                     preconditionFailure("duplicate recurrent evaluation")
                 }
             } else if mtp.tracksPersistentHistory {
-                let forward = try checkedModelForward { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
+                let forward = try checkedModelForward(phase: .prefill) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
             } else {

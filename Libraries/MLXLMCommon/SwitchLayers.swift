@@ -20,18 +20,18 @@ public let compiledSiluProduct: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         MLXNN.silu(gate) * up
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(shapeless: true, body)
+        return cbv2ObservedCompiled(.siluProduct, compile(shapeless: true, body))
     }
     return body
 }()
 
 /// Compiled weighted expert-output combine (`(outputs * weights[..., None]).sum(-2)`).
 /// Shared by MoE routers (e.g. Gemma 4) to fuse the scale + reduce. Upstream ef85ed0.
-public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = cbv2ObservedCompiled(.weightedExpertSum, compile(
     shapeless: true
 ) { outputs, weights in
     (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
-}
+})
 /// Effective-selection count for the direct sorted-expert reduction. Benchmark
 /// callers arm this after warmup and snapshot it only after the engine is idle.
 /// The unarmed hot path reads one plain Bool and performs no atomic operation,
@@ -194,7 +194,7 @@ public let safeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
         0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(shapeless: true, body)
+        return cbv2ObservedCompiled(.gelu, compile(shapeless: true, body))
     }
     return body
 }()
@@ -218,7 +218,7 @@ private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         MLXNN.silu(gate) * up
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(shapeless: true, body)
+        return cbv2ObservedCompiled(.swiGLU, compile(shapeless: true, body))
     }
     return body
 }()
@@ -232,7 +232,7 @@ private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
     }
     if MLXHardwareInfo.isCompiledDecodeSupported {
-        return compile(shapeless: true, body)
+        return cbv2ObservedCompiled(.geGLU, compile(shapeless: true, body))
     }
     return body
 }()

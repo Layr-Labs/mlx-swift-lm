@@ -161,6 +161,17 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public var stepCount: Int { loop.stepCount }
     public var chainedStepCount: Int { loop.chainedStepCount }
     public var preemptionCount: Int { loop.preemptionCount }
+    /// Reset only at an idle benchmark boundary after warmup. Ordinary
+    /// engines never allocate a recorder; snapshots add no device evaluation.
+    @_spi(Benchmarking)
+    public func beginForwardShapeObservation() throws -> CBv2ForwardShapeSnapshot {
+        try loop.beginForwardShapeObservation()
+    }
+
+    @_spi(Benchmarking)
+    public func forwardShapeSnapshot() -> CBv2ForwardShapeSnapshot {
+        loop.forwardShapeSnapshot()
+    }
     /// Steps that evaluated the eager caches' offset/KV inner state (DAR-325
     /// guard). Test hook; engine-thread owned, read at quiescent points.
     public var offsetChainEvalSteps: Int { loop.offsetChainEvalSteps }

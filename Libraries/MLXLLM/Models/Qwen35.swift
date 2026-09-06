@@ -1701,6 +1701,9 @@ public class Qwen35TextModelInner: Module {
         precondition(
             caches.count == layers.filter({ !$0.isLinear }).count,
             "Qwen35 CBv2 requires only full-attention caches")
+        let shapeCall = CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        defer { shapeCall?.end() }
         var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {

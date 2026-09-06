@@ -325,6 +325,9 @@ public class GPTOSSModelInner: Module {
         inputEmbeddings: MLXArray? = nil,
         lastLayerLastQuery: Bool = false
     ) -> MLXArray {
+        let shapeCall = CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        defer { shapeCall?.end() }
         var x: MLXArray
         if let inputEmbeddings {
             x = inputEmbeddings

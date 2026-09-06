@@ -390,6 +390,7 @@ final class CBv2InFlightStep {
     /// step commits it; a one-step-late discarded chained decode rolls it
     /// back before the request state is released.
     var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
+    var forwardShapes: CBv2ForwardShapeStep?
     var recurrentCheckpointChunkSizes: [CBv2RequestID: Int] = [:]
     var historicalCheckpoints: [CBv2RequestID: CBv2CapturedCompleteCheckpoint] = [:]
     var permitsChainedSuccessor: Bool {
@@ -691,6 +692,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
     var recurrentStates: [CBv2RequestID: CBv2RecurrentRequestState] = [:]
+    var forwardShapeRecorder: CBv2ForwardShapeRecorder?
+    var buildingForwardShapes: CBv2ForwardShapeStep?
     /// Tokens skipped via prefix-cache adoption, reported in usage.
     var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
@@ -2296,10 +2299,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Model protocols remain nonthrowing. A paged cache records a typed fault
     /// and returns shape-preserving placeholders so later model layers unwind
     /// normally; this boundary refuses those graphs before sampling/evaluation.
-    func checkedModelForward<Result>(_ body: () -> Result) throws -> Result {
+    func checkedModelForward<Result>(phase: CBv2ForwardPhase = .decode, _ body: () -> Result) throws -> Result {
         let validation = (backend as? PagedKVBackend)?.pool.writeValidation
         try validation?.check()
-        let value = body()
+        let value = CBv2ForwardShapeObservation.dispatch(step: buildingForwardShapes, phase: phase, body)
         try validation?.check()
         return value
     }
@@ -2401,10 +2404,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         tokens: MLXArray, caches: [CBv2AttendingLayerCache], ids: [CBv2RequestID],
         positionIds: MLXArray? = nil,
         inputEmbeddings: MLXArray? = nil,
-        requirement: CBv2PrefillRequirement? = nil
+        requirement: CBv2PrefillRequirement? = nil,
+        phase: CBv2ForwardPhase? = nil
     ) throws -> (logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
         innerState: [MLXArray])
     {
+        let forwardPhase = phase ?? (requirement == nil ? .decode : .prefill)
         guard let recurrentModel = model as? any CBv2RecurrentSteppableModel,
             recurrentModel.recurrentStateSpec != nil
         else {
@@ -2416,7 +2421,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                         preconditionFailure(
                             "CBv2 positioned embedding forward reached an unsupported model")
                     }
-                    let logits = try checkedModelForward { positioned.forward(
+                    let logits = try checkedModelForward(phase: forwardPhase) { positioned.forward(
                         tokens: tokens, inputEmbeddings: inputEmbeddings,
                         caches: caches, positionIds: positionIds) }
                     return (
@@ -2427,7 +2432,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 guard let multimodal = model as? any CBv2MultimodalSteppableModel else {
                     preconditionFailure("CBv2 embedding forward reached an unsupported model")
                 }
-                let logits = try checkedModelForward { multimodal.forward(
+                let logits = try checkedModelForward(phase: forwardPhase) { multimodal.forward(
                     tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches) }
                 return (
                     requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
@@ -2438,14 +2443,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                     preconditionFailure(
                         "CBv2 positioned attention forward reached an unsupported model")
                 }
-                let logits = try checkedModelForward { positioned.forward(
+                let logits = try checkedModelForward(phase: forwardPhase) { positioned.forward(
                     tokens: tokens, caches: caches, positionIds: positionIds) }
                 return (
                     requirement.map { narrowPrefillOutput(logits, requirement: $0) }
                         ?? logits,
                     [:], [])
             }
-            let logits = try checkedModelForward { model.forward(tokens: tokens, caches: caches) }
+            let logits = try checkedModelForward(phase: forwardPhase) { model.forward(tokens: tokens, caches: caches) }
             return (
                 requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
                 [:], [])
@@ -2461,7 +2466,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         let forward = try recurrentTargetForward(
             tokens: tokens, caches: caches, recurrentModel: recurrentModel,
             evaluations: evaluations, positionIds: positionIds,
-            inputEmbeddings: inputEmbeddings, requirement: requirement)
+            inputEmbeddings: inputEmbeddings, requirement: requirement, phase: forwardPhase)
         return (forward.logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)), forward.innerState)
     }
 
@@ -2469,8 +2474,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentModel: any CBv2RecurrentSteppableModel,
         evaluations: [CBv2RecurrentStateEvaluation], positionIds: MLXArray? = nil,
-        inputEmbeddings: MLXArray? = nil, requirement: CBv2PrefillRequirement? = nil
+        inputEmbeddings: MLXArray? = nil, requirement: CBv2PrefillRequirement? = nil,
+        phase: CBv2ForwardPhase? = nil
     ) throws -> (logits: MLXArray, innerState: [MLXArray]) {
+        let forwardPhase = phase ?? (requirement == nil ? .decode : .prefill)
         let logits: MLXArray
         if let requirement, Self.prefillNarrowingEnabled,
             let prefillable = model as? any CBv2RecurrentPrefillSteppableModel
@@ -2478,7 +2485,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Prefill seam: state already bound above, staging identical to
             // the full forward; the model returns only what the requirement
             // needs (no vocabulary projection on discarded rows).
-            logits = try checkedModelForward { prefillable.recurrentPrefill(
+            logits = try checkedModelForward(phase: forwardPhase) { prefillable.recurrentPrefill(
                 tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches,
                 recurrentState: evaluations, positionIds: positionIds,
                 requirement: requirement) }
@@ -2487,7 +2494,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure(
                     "CBv2 recurrent embedding forward reached an unsupported model")
             }
-            let full = try checkedModelForward { positioned.forward(
+            let full = try checkedModelForward(phase: forwardPhase) { positioned.forward(
                 tokens: tokens,
                 inputEmbeddings: inputEmbeddings,
                 caches: caches,
@@ -2498,12 +2505,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             guard let positioned = model as? any CBv2PositionedRecurrentSteppableModel else {
                 preconditionFailure("CBv2 positioned forward reached an unsupported model")
             }
-            let full = try checkedModelForward { positioned.forward(
+            let full = try checkedModelForward(phase: forwardPhase) { positioned.forward(
                 tokens: tokens, caches: caches,
                 recurrentState: evaluations, positionIds: positionIds) }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         } else {
-            let full = try checkedModelForward { recurrentModel.forward(
+            let full = try checkedModelForward(phase: forwardPhase) { recurrentModel.forward(
                 tokens: tokens, caches: caches, recurrentState: evaluations) }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         }
@@ -2522,7 +2529,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// (DAR-325).
     private func decodeLogits(
         rowStates: [[CBv2SequenceKV?]], tokens: MLXArray, ids: [CBv2RequestID],
-        chained: Bool = false
+        chained: Bool = false, phase: CBv2ForwardPhase = .decode
     ) throws -> (logits: MLXArray, cacheInnerState: [MLXArray],
         recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation])
     {
@@ -2538,7 +2545,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             states: ids.map { scheduler.record(for: $0)?.request.positionState },
             cacheOffsets: rowStates.map(Self.positionOffset))
         let forward = try targetForward(
-            tokens: tokens, caches: caches, ids: ids, positionIds: positionIds)
+            tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)
         forwardSucceeded = true
         return (
             forward.logits[0..., -1, 0...],
@@ -2562,7 +2569,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         requirement: CBv2PrefillRequirement
     ) throws -> MLXArray {
         if let prefillModel = model as? CBv2PrefillSteppableModel {
-            return try checkedModelForward { prefillModel.prefill(
+            return try checkedModelForward(phase: .prefill) { prefillModel.prefill(
                 tokens: tokens,
                 inputEmbeddings: inputEmbeddings,
                 caches: caches,
@@ -2575,10 +2582,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure(
                     "CBv2 embedding prefill reached a model without embedding-forward support")
             }
-            logits = try checkedModelForward { multimodalModel.forward(
+            logits = try checkedModelForward(phase: .prefill) { multimodalModel.forward(
                 tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches) }
         } else {
-            logits = try checkedModelForward { model.forward(tokens: tokens, caches: caches) }
+            logits = try checkedModelForward(phase: .prefill) { model.forward(tokens: tokens, caches: caches) }
         }
         switch requirement {
         case .evaluationOnly:
@@ -2816,6 +2823,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
     ) throws -> CBv2InFlightStep {
+        let shapes = beginForwardShapeStep()
+        defer { endForwardShapeStep(shapes) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
@@ -2896,6 +2905,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         step.attentionPacket = rawAttention
         step.recurrentEvaluations = recurrent
         step.chained = true
+        step.forwardShapes = shapes
+        shapes?.attach()
         return step
     }
 
@@ -2905,6 +2916,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `executeMTPRound` (this function's `rec.tokens` slicing and
     /// `samples` predicate are structurally wrong for speculative tokens).
     func executeMixed(_ plan: CBv2StepPlan) throws -> CBv2InFlightStep? {
+        let shapes = beginForwardShapeStep()
+        defer { endForwardShapeStep(shapes) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         launchClockNanos = wallStartedNanos
         defer { launchClockNanos = 0 }
@@ -2971,7 +2984,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             let (last, decodeInnerState, recurrent) = try decodeLogits(
                 rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
-                ids: decodeIDs)
+                ids: decodeIDs, phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier))
             cacheInnerState.append(contentsOf: decodeInnerState)
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
@@ -3308,6 +3323,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 throw error
             }
         }
+        step.forwardShapes = shapes
+        shapes?.attach()
         return step
     }
 
@@ -3377,7 +3394,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure(
                     "CBv2 DeepStack embeddings reached an unsupported model")
             }
-            let full = try checkedModelForward { deepstackModel.forward(
+            let full = try checkedModelForward(phase: .prefill) { deepstackModel.forward(
                 tokens: tokens,
                 inputEmbeddings: spliced,
                 deepstackEmbeddings: deepstack,
@@ -3664,6 +3681,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         if step.mtpRound != nil {
             finalizeMTPRound(step)
         }
+        step.forwardShapes?.complete()
         if let measurement = step.mtpMeasurement {
             let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
             mtp?.recordStepCost(
