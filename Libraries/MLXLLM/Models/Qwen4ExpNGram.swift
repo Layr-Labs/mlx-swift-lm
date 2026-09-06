@@ -46,6 +46,21 @@ public protocol Qwen4ExpNGramRowSource: AnyObject {
 /// tree. A bare property would be reported by `Module.items()` and, if the
 /// source happened to be a `Module`, its parameters would be walked as if they
 /// belonged to the model.
+/// A row source that can gather from HOST ids.
+///
+/// WHY. The row ids are a pure function of the last `ngramSize` token ids,
+/// which the host already holds. Hashing them on the device and reading the
+/// result back put a GPU→CPU→GPU sync in the MIDDLE of every decode step's
+/// graph (the layers before the PLE layer were evaluated alone, then the
+/// rest), and the table's gather is host work anyway. A source that takes
+/// host ids lets the embedding hash on the host, gather, and hand the
+/// device ONE input array, so the step submits as one graph.
+public protocol Qwen4ExpNGramHostRowSource: Qwen4ExpNGramRowSource {
+    /// Rows for `globalIds` (row-major over `shape`), shaped
+    /// `shape + [rowDimensions]`.
+    func rows(globalIds: [Int], shape: [Int]) -> MLXArray
+}
+
 public final class Qwen4ExpNGramRowSourceHolder {
     public var source: Qwen4ExpNGramRowSource?
     public init() {}
@@ -237,7 +252,70 @@ public final class Qwen4ExpNGramEmbedding: Module {
         return concatenated(blocks, axis: -1)[0..., (-newCount)..., 0...]
     }
 
+    /// `rowIds` on the host: the same hash, over host integers, for a batch
+    /// of histories (`previousContext ++ ids` per row). Returns
+    /// `[B][newCount][ngramHeads]` flattened row-major. Bit-for-bit the
+    /// device result: wrapping Int64 multiply, XOR, and Python-style
+    /// remainder (sign of the divisor), which is what MLX's `%` computes.
+    public func hostRowIds(history: [[Int64]], newCount: Int) -> [Int] {
+        let eos = Int64(eosTokenId)
+        let multipliers = constants.multipliers.asArray(Int64.self)
+        let sizes = constants.headVocabSizes.map(Int64.init)
+        let offsets = constants.headOffsets.map(Int64.init)
+        var out: [Int] = []
+        out.reserveCapacity(history.count * newCount * ngramHeads)
+        for row in history {
+            let T = row.count
+            // previous[t] = position of the last EOS strictly before t, or -1.
+            var previous = [Int](repeating: -1, count: T)
+            var last = -1
+            for t in 0 ..< T {
+                previous[t] = last
+                if row[t] == eos { last = t }
+            }
+            func shifted(_ s: Int, _ t: Int) -> Int64 {
+                if s == 0 { return row[t] }
+                let inSegment = t - (previous[t] + 1)
+                let source = t - s
+                return (inSegment >= s && source >= 0) ? row[source] : eos
+            }
+            for t in Swift.max(0, T - newCount) ..< T {
+                for ngram in 2 ... ngramSize {
+                    var mixed = shifted(0, t) &* multipliers[0]
+                    for p in 1 ..< ngram { mixed ^= shifted(p, t) &* multipliers[p] }
+                    let low = (ngram - 2) * headsPerNGram
+                    for head in low ..< low + headsPerNGram {
+                        var r = mixed % sizes[head]
+                        if r != 0, (r < 0) != (sizes[head] < 0) { r += sizes[head] }
+                        out.append(Int(r + offsets[head]))
+                    }
+                }
+            }
+        }
+        return out
+    }
+
     public func callAsFunction(_ ids: MLXArray, previousContext: MLXArray) -> MLXArray {
+        if let host = rowSourceHolder.source as? Qwen4ExpNGramHostRowSource {
+            // Host path: the ids are inputs (the token fed, and the staged
+            // context), so reading them evaluates nothing of this step's
+            // graph; the rows come back as ONE input array.
+            let B = ids.dim(0)
+            let newCount = ids.dim(1)
+            let context = previousContext.asType(.int64).asArray(Int64.self)
+            let tokens = ids.asType(.int64).asArray(Int64.self)
+            let contextLength = previousContext.dim(1)
+            var history: [[Int64]] = []
+            history.reserveCapacity(B)
+            for b in 0 ..< B {
+                history.append(
+                    Array(context[(b * contextLength) ..< ((b + 1) * contextLength)])
+                        + Array(tokens[(b * newCount) ..< ((b + 1) * newCount)]))
+            }
+            let gid = hostRowIds(history: history, newCount: newCount)
+            return host.rows(globalIds: gid, shape: [B, newCount, ngramHeads])
+                .reshaped(B, newCount, -1)
+        }
         guard let source = rowSourceHolder.source else {
             preconditionFailure(
                 """

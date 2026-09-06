@@ -534,7 +534,7 @@ public enum Qwen4ExpNGramHotness {
 /// EVICTION. Least recently used, by row. A row that a decode step touches is
 /// moved to the front. When the arena is full the row at the back is dropped
 /// and its slot is reused.
-public final class Qwen4ExpNGramTable: Qwen4ExpNGramRowSource {
+public final class Qwen4ExpNGramTable: Qwen4ExpNGramHostRowSource {
 
     /// The most distinct rows a gather may have and still take the LRU.
     /// mtplx's `_HOT_PATH_MAX_ROWS`: a decode step gathers a few dozen rows,
@@ -787,8 +787,13 @@ public final class Qwen4ExpNGramTable: Qwen4ExpNGramRowSource {
     // MARK: Row gathering
 
     public func rows(globalIds: MLXArray) -> MLXArray {
-        let shape = globalIds.shape
-        let ids = globalIds.asType(.int32).asArray(Int32.self).map(Int.init)
+        rows(
+            globalIds: globalIds.asType(.int32).asArray(Int32.self).map(Int.init),
+            shape: globalIds.shape)
+    }
+
+    /// The host-id form (`Qwen4ExpNGramHostRowSource`): no device readback.
+    public func rows(globalIds ids: [Int], shape: [Int]) -> MLXArray {
         let count = ids.count
 
         let weightBytes = layout.weightBytesPerRow

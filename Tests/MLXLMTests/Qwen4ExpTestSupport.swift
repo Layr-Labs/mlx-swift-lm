@@ -93,16 +93,34 @@ enum Qwen4ExpFixture {
 ///
 /// The contract asks only that the same ids always produce the same rows. A
 /// pure function of the id satisfies it exactly and needs no fixture file.
-final class DeterministicNGramRowSource: Qwen4ExpNGramRowSource {
+final class DeterministicNGramRowSource: Qwen4ExpNGramHostRowSource {
     let rowDimensions: Int
+    /// Serve the host-id form (the production path) unless a test wants
+    /// the device-id form to compare against.
+    var hostPath = true
 
-    init(rowDimensions: Int) { self.rowDimensions = rowDimensions }
+    init(rowDimensions: Int, hostPath: Bool = true) {
+        self.rowDimensions = rowDimensions
+        self.hostPath = hostPath
+    }
 
     func rows(globalIds: MLXArray) -> MLXArray {
         let ids = globalIds.asType(.float32)[.ellipsis, .newAxis]
         let lanes = MLXArray((0 ..< rowDimensions).map { Float($0) + 1 })
         return MLX.sin(ids * Float(0.017) * lanes) * Float(0.5)
     }
+
+    func rows(globalIds: [Int], shape: [Int]) -> MLXArray {
+        rows(globalIds: MLXArray(globalIds.map { Int32($0) }).reshaped(shape))
+    }
+}
+
+/// The device-id path only, for host-vs-device comparisons.
+final class DeviceOnlyNGramRowSource: Qwen4ExpNGramRowSource {
+    let inner: DeterministicNGramRowSource
+    init(rowDimensions: Int) { inner = DeterministicNGramRowSource(rowDimensions: rowDimensions) }
+    var rowDimensions: Int { inner.rowDimensions }
+    func rows(globalIds: MLXArray) -> MLXArray { inner.rows(globalIds: globalIds) }
 }
 
 /// One request's CBv2 state: the family's layer caches bound to contiguous
