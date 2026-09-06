@@ -897,6 +897,17 @@ public final class BenchWorkerServer: @unchecked Sendable {
             clamps = clamps.filter { $0.value > 0 }
             session.clampBaseline = Self.clampReasons(metrics)
             if !clamps.isEmpty { response.depthClampReasons = clamps }
+            // How the target verified, so an artifact can prove the window
+            // ran as one forward rather than one forward per column. Only on
+            // a window that verified: the frozen fixtures carry no rounds and
+            // stay byte-identical.
+            let verifyRounds =
+                metrics.rectangularVerificationRounds + metrics.serialVerificationRounds
+            if verifyRounds > 0 {
+                response.verificationMode = metrics.verificationMode.rawValue
+                response.rectangularVerificationRounds = metrics.rectangularVerificationRounds
+                response.serialVerificationRounds = metrics.serialVerificationRounds
+            }
         }
 
         // A SERIAL window journals no verify rounds, but the protocol carries

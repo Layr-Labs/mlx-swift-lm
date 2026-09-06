@@ -57,22 +57,76 @@ final class Qwen4ExpRunnerEngineTests: XCTestCase {
     }
 
     private func makeEngine(
-        _ model: Qwen4ExpModel, kvBackend: KVBackendKind
+        _ model: Qwen4ExpModel, kvBackend: KVBackendKind, mtpDepth: Int = 0
     ) throws -> any CBv2Engine {
-        try RunnerEngineAssembly.makeEngine(
+        let drafter = mtpDepth > 0 ? Qwen4ExpInlineMTPAssistant(target: model) : nil
+        if mtpDepth > 0 { XCTAssertNotNil(drafter, "the fixture carries an mtp head") }
+        // The worker's own speculative build: automatic verification with
+        // the envelope set to exactly this leg's shape.
+        let mtpConfig =
+            mtpDepth > 0
+            ? CBv2MTPConfig(
+                enabled: true, maxDraftTokens: mtpDepth, maxSpeculativeBatch: 1,
+                fixedDraftTokens: mtpDepth, verificationMode: .automatic,
+                maxAutomaticRectangularTokens: 1 + mtpDepth)
+            : CBv2MTPConfig(enabled: false)
+        return try RunnerEngineAssembly.makeEngine(
             manifest: Qwen4ExpRunner.manifest,
-            loadedDecoders: [.serial],
+            loadedDecoders: mtpDepth > 0 ? [.serial, .mtp] : [.serial],
             model: model,
             tokenizer: Qwen4ExpStubTokenizer(),
             layerKinds: model.cbv2LayerKinds,
             newCaches: newCaches(model),
-            mtpDrafter: nil,
+            mtpDrafter: drafter,
             build: EngineBuild(
                 kvBackend: kvBackend,
                 kvBytesCapacity: Self.kvBytesCapacity,
                 schedulerConfig: CBv2SchedulerConfig(
                     maxConcurrentRequests: 1, prefillChunkSize: 64),
-                decoder: .serial))
+                decoder: mtpDepth > 0 ? .mtp : .serial,
+                mtpConfig: mtpConfig))
+    }
+
+    private func greedyTokens(_ engine: any CBv2Engine, prompt: [Int], steps: Int) async throws -> [Int] {
+        var request = CBv2Request(
+            id: CBv2RequestID(1), promptTokens: prompt, maxTokens: steps + 1)
+        request.sampling = CBv2SamplingParams(temperature: 0, topP: 1, topK: 0)
+        request.stopTokens = []
+        var free: [Int] = []
+        for await event in try engine.submit(request) {
+            if case .delta(_, let tokens, _) = event { free.append(contentsOf: tokens) }
+        }
+        return free
+    }
+
+    // MARK: - MTP rounds verify the window in ONE target forward
+
+    /// A depth-2 free run through the engine must produce the serial
+    /// engine's tokens AND verify every round rectangularly: one target
+    /// forward over the `1 + k` window, never one forward per column.
+    func testMTPRoundsVerifyRectangularly() async throws {
+        try requireCompleteMetallib()
+        let prompt: [Int] = (0 ..< 40).map { ($0 * 37 + 11) % 64 }
+        let steps = 12
+        let model = try Qwen4ExpFixture.model()
+        Self.randomizeParameters(model, seed: 11)
+
+        let serialEngine = try makeEngine(model, kvBackend: .contiguous)
+        let serial = try await greedyTokens(serialEngine, prompt: prompt, steps: steps)
+        await serialEngine.shutdown()
+
+        let mtpEngine = try makeEngine(model, kvBackend: .contiguous, mtpDepth: 2)
+        let speculative = try await greedyTokens(mtpEngine, prompt: prompt, steps: steps)
+        let metrics = try XCTUnwrap(
+            (mtpEngine as? EngineV2)?.mtpMetricsSnapshot(), "the mtp driver must be active")
+        await mtpEngine.shutdown()
+
+        XCTAssertEqual(speculative, serial)
+        XCTAssertGreaterThan(metrics.rounds, 0, "the run must have drafted")
+        XCTAssertGreaterThan(metrics.rectangularVerificationRounds, 0)
+        XCTAssertEqual(metrics.serialVerificationRounds, 0, "no round may fall back to the serial oracle")
+        XCTAssertEqual(metrics.controllerFallbacks["captured_verify_unsupported"], nil)
+        XCTAssertEqual(metrics.controllerFallbacks["rectangular_cache_unsupported"], nil)
     }
 
     /// Replace every floating-point parameter with seeded normal noise.

@@ -98,7 +98,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// each column is bit-identical to that column run as a standalone
     /// `L == 1` decode. The engine sets it for the duration of an MTP
     /// verification round and clears it in a `defer`.
-    var mtpSerializesRectangularAttention = false
+    public var mtpSerializesRectangularAttention = false
 
     /// WS-1.2. The KV a KV-shared sibling needs in order to attend THIS
     /// layer's most recent prompt chunk, ONE ENTRY PER ROW of that chunk

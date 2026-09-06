@@ -179,11 +179,11 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
 
-    /// Serial target scoring: every verify column takes the same `[B, 1]`
-    /// forward ordinary decode takes. Rectangular scoring over a recurrent
-    /// target needs a captured verify window, which this family does not
-    /// implement (`supportsCompactRecurrentMTPReplay` is false).
-    public var requiredVerificationMode: CBv2MTPVerificationMode? { .serialTarget }
+    /// No required mode: the target implements the captured verify window
+    /// (`cbv2ForwardWithHiddenCaptured`), so the engine's configured mode
+    /// applies and a round verifies its `1 + k` candidates in one forward.
+    /// Serial target scoring remains available by configuration.
+    public var requiredVerificationMode: CBv2MTPVerificationMode? { nil }
 
     public var maximumDraftTokens: Int? { Self.maximumDepth }
     public var maximumSpeculativeBatch: Int? { 1 }

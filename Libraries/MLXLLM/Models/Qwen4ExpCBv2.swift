@@ -124,6 +124,17 @@ extension Qwen4ExpCBv2LayerCache: CBv2KeepMaskCapableCache {
     public var honorsKeepMask: Bool { true }
 }
 
+/// Rectangular MTP verification: while set, the wrapped cache attends one
+/// query position at a time, so a verify window's attention is arithmetically
+/// the serial decode path's. The keep mask carries one row per query and is
+/// sliced per position by the serialized path.
+extension Qwen4ExpCBv2LayerCache: CBv2MTPRectangularSerializing {
+    public var mtpSerializesRectangularAttention: Bool {
+        get { base.mtpSerializesRectangularAttention }
+        set { base.mtpSerializesRectangularAttention = newValue }
+    }
+}
+
 extension Qwen4ExpCBv2LayerCache: KVCache {
     public var offset: Int { base.offset }
     public var maxSize: Int? { base.maxSize }
@@ -451,6 +462,104 @@ extension Qwen4ExpGatedDeltaNet {
         }
         return outProj(norm(out, gate: z).reshaped(B, S, -1))
     }
+
+    /// MTP capture-verify: the same layer over a window of `S` tokens, with
+    /// the recurrent state after EVERY position staged (`stageCaptured`), so
+    /// finalize can keep the accepted prefix on device.
+    ///
+    /// The convolution is causal, so one call over the padded window gives
+    /// every position the output a single-token step would; the delta rule
+    /// runs one position at a time, which is exactly the serial decode
+    /// arithmetic, so a verify window and the same tokens fed one by one
+    /// produce the same logits and the same states.
+    func cbv2ForwardCaptured(
+        _ x: MLXArray,
+        modelLayerIndex: Int,
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let S = x.dim(1)
+        precondition(recurrentState.count == B, "Qwen4Exp CBv2 recurrent row count mismatch")
+        precondition(S >= 1, "Qwen4Exp capture-verify window must be non-empty")
+
+        let mixedQKV = inProjQKV(x)
+        let z = inProjZ(x).reshaped(B, S, valueHeads, valueHeadDim)
+        let b = inProjB(x)
+        let a = inProjA(x)
+
+        var convRows: [MLXArray] = []
+        var ssmRows: [MLXArray] = []
+        convRows.reserveCapacity(B)
+        ssmRows.reserveCapacity(B)
+        for evaluation in recurrentState {
+            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+            convRows.append(
+                state?.conv
+                    ?? MLXArray.zeros([1, convKernelSize - 1, convDim], dtype: x.dtype))
+            ssmRows.append(
+                state?.ssm
+                    ?? MLXArray.zeros(
+                        [1, valueHeads, valueHeadDim, keyHeadDim], dtype: .float32))
+        }
+        let convState = convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+        let ssmState = ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+
+        let nKeep = convKernelSize - 1
+        let convInput = concatenated([convState, mixedQKV], axis: 1)
+        let convOut = silu(conv1d(convInput))
+        let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+
+        var q = parts[0].reshaped(B, S, keyHeads, keyHeadDim)
+        var k = parts[1].reshaped(B, S, keyHeads, keyHeadDim)
+        let v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
+
+        let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
+        q =
+            MLXArray(invScale * invScale).asType(x.dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        k =
+            MLXArray(invScale).asType(x.dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        var outs: [MLXArray] = []
+        var ssmStates: [MLXArray] = []
+        outs.reserveCapacity(S)
+        ssmStates.reserveCapacity(S)
+        var state = ssmState
+        for s in 0 ..< S {
+            let (stepOut, next) = gatedDeltaUpdate(
+                q: q[0..., s ..< (s + 1)],
+                k: k[0..., s ..< (s + 1)],
+                v: v[0..., s ..< (s + 1)],
+                a: a[0..., s ..< (s + 1)],
+                b: b[0..., s ..< (s + 1)],
+                aLog: aLog, dtBias: dtBias,
+                state: state, mask: nil)
+            outs.append(stepOut)
+            ssmStates.append(next)
+            state = next
+        }
+
+        for (row, evaluation) in recurrentState.enumerated() {
+            // After consuming position s the retained conv tail is the
+            // nKeep inputs ending at s: convInput[s + 1 ..< s + 1 + nKeep].
+            let convStack = concatenated(
+                (0 ..< S).map { s in
+                    convInput[row ..< (row + 1), (s + 1) ..< (s + 1 + nKeep), 0...]
+                }, axis: 0)
+            let ssmStack = concatenated(ssmStates.map { $0[row ..< (row + 1)] }, axis: 0)
+            do {
+                try evaluation.stageCaptured(
+                    modelLayerIndex: modelLayerIndex,
+                    conv: convStack, ssm: ssmStack, positions: S)
+            } catch {
+                preconditionFailure(
+                    "Qwen4Exp CBv2 captured stage failed at layer \(modelLayerIndex): \(error)")
+            }
+        }
+        let out = outs.count == 1 ? outs[0] : concatenated(outs, axis: 1)
+        return outProj(norm(out, gate: z).reshaped(B, S, -1))
+    }
 }
 
 // MARK: - PLE layer, CBv2 form
@@ -472,7 +581,8 @@ extension Qwen4ExpPLELayer {
         ids: MLXArray,
         stateLayerIndex: Int,
         eosTokenId: Int,
-        recurrentState: [CBv2RecurrentStateEvaluation]
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         let B = hidden.dim(0)
         precondition(recurrentState.count == B, "Qwen4Exp CBv2 recurrent row count mismatch")
@@ -502,6 +612,34 @@ extension Qwen4ExpPLELayer {
             hidden, ids: ids, previousContext: previousContext, convState: convState)
 
         let history = concatenated([previousContext, ids], axis: 1)
+        if captureRecurrentWindow {
+            // MTP capture-verify: stage the state after EVERY window position.
+            // Both states are windows over a causal sequence, so position s's
+            // state is a slice: the conv tail ending at s, and the trailing
+            // context ending at s. Same bytes a single-token step would keep.
+            let S = ids.dim(1)
+            let n = shortConvStateLength
+            for (row, evaluation) in recurrentState.enumerated() {
+                let convStack = concatenated(
+                    (0 ..< S).map { s in
+                        block.convWindow[row ..< (row + 1), (s + 1) ..< (s + 1 + n), 0...]
+                    }, axis: 0)
+                let contextStack = concatenated(
+                    (0 ..< S).map { s in
+                        history[row ..< (row + 1), (s + 1) ..< (s + 1 + contextLength)]
+                    }, axis: 0
+                ).asType(.int32)
+                do {
+                    try evaluation.stageCaptured(
+                        modelLayerIndex: stateLayerIndex,
+                        conv: convStack, ssm: contextStack, positions: S)
+                } catch {
+                    preconditionFailure(
+                        "Qwen4Exp CBv2 PLE captured stage failed at slot \(stateLayerIndex): \(error)")
+                }
+            }
+            return block.value
+        }
         let newContext = history[0..., (-contextLength)...].asType(.int32)
         for (row, evaluation) in recurrentState.enumerated() {
             do {
@@ -524,7 +662,7 @@ extension Qwen4ExpPLELayer {
         ids: MLXArray,
         previousContext: MLXArray,
         convState: MLXArray
-    ) -> (value: MLXArray, convState: MLXArray) {
+    ) -> (value: MLXArray, convState: MLXArray, convWindow: MLXArray) {
         let embedded = pleEmbedding(ids, previousContext: previousContext).asType(hidden.dtype)
         let keyFlat = normKey(keyProj(embedded))
         let key = keyFlat.reshaped(keyFlat.shape.dropLast() + [hcCount, hiddenSize])
@@ -551,7 +689,7 @@ extension Qwen4ExpPLELayer {
         let full = concatenated([convState, normed], axis: 1)
         let newConvState = contiguous(full[0..., (-n)..., 0...])
         let convolved = silu(conv1d(full[0..., (-(n + S))..., 0...]))
-        return (gated + convolved, newConvState)
+        return (gated + convolved, newConvState, full)
     }
 }
 
@@ -567,7 +705,8 @@ extension Qwen4ExpDecoderLayer {
         eosTokenId: Int,
         recurrentState: [CBv2RecurrentStateEvaluation],
         ids: MLXArray,
-        positions: MLXArray
+        positions: MLXArray,
+        captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         var stream = hyper
 
@@ -576,15 +715,21 @@ extension Qwen4ExpDecoderLayer {
                 stream
                 + ple.cbv2Forward(
                     stream, ids: ids, stateLayerIndex: pleStateLayerIndex,
-                    eosTokenId: eosTokenId, recurrentState: recurrentState)
+                    eosTokenId: eosTokenId, recurrentState: recurrentState,
+                    captureRecurrentWindow: captureRecurrentWindow)
         }
 
         var (input, residual, inject) = attnHyperConnection.mixWithInject(stream)
         let attended: MLXArray
         if isLinear {
             precondition(attentionCache == nil, "Qwen4Exp recurrent layer received attention KV")
-            attended = linearAttn!.cbv2Forward(
-                input, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+            if captureRecurrentWindow {
+                attended = linearAttn!.cbv2ForwardCaptured(
+                    input, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+            } else {
+                attended = linearAttn!.cbv2Forward(
+                    input, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+            }
         } else {
             guard let attentionCache else {
                 preconditionFailure("Qwen4Exp full-attention layer is missing its CBv2 cache")
@@ -609,7 +754,8 @@ extension Qwen4ExpTower {
         inputEmbeddings: MLXArray?,
         caches: [Qwen4ExpCBv2LayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        positionIds: MLXArray?
+        positionIds: MLXArray?,
+        captureRecurrentWindow: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray) {
         precondition(
             caches.count == args.fullAttentionLayerIndices.count,
@@ -642,7 +788,8 @@ extension Qwen4ExpTower {
                 eosTokenId: args.eosTokenId,
                 recurrentState: recurrentState,
                 ids: ids,
-                positions: positions)
+                positions: positions,
+                captureRecurrentWindow: captureRecurrentWindow)
         }
         return (hyperConnectionMixer(hidden), hidden)
     }
@@ -728,11 +875,13 @@ extension Qwen4ExpModel {
     /// native MTP head.
     func cbv2Streams(
         _ inputs: MLXArray, inputEmbeddings: MLXArray?, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        captureRecurrentWindow: Bool = false
     ) -> (mixed: MLXArray, multi: MLXArray) {
         model.cbv2Streams(
             inputs, inputEmbeddings: inputEmbeddings, caches: cbv2Caches(caches),
-            recurrentState: recurrentState, positionIds: positionIds)
+            recurrentState: recurrentState, positionIds: positionIds,
+            captureRecurrentWindow: captureRecurrentWindow)
     }
 }
 
@@ -828,6 +977,43 @@ extension Qwen4ExpModel: CBv2RecurrentMTPForwardable {
         let streams = cbv2Streams(
             tokens, inputEmbeddings: nil, caches: caches,
             recurrentState: recurrentState, positionIds: positionIds)
+        return (head(streams.mixed), streams.multi)
+    }
+}
+
+extension Qwen4ExpModel: CBv2MTPPolicyTopTwoProviding {
+    /// Exact top-two ids and values per verify position. Rectangular
+    /// verification reads the target's argmax from `ids[..., 0]`; the kernel
+    /// orders by value descending then lowest id, which is the drafter's
+    /// `argMax` tie-break, so a draft is never rejected over a tie.
+    public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
+        precondition(logits.ndim == 3, "Qwen4Exp MTP policy logits must be [B,L,V]")
+        let batch = logits.dim(0)
+        let length = logits.dim(1)
+        let vocabularySize = logits.dim(2)
+        precondition(batch > 0 && length > 0 && vocabularySize >= 2)
+        let topTwo = qwen35MTPTopTwoRows(logits.reshaped([1, batch * length, vocabularySize]))
+        return (
+            topTwo.ids.reshaped([batch, length, 2]),
+            topTwo.values.reshaped([batch, length, 2]))
+    }
+}
+
+extension Qwen4ExpModel: CBv2RecurrentCaptureMTPForwardable {
+    /// MTP capture-verify: one forward over the whole verify window with the
+    /// recurrent state after every position staged, so the engine verifies
+    /// `1 + k` candidates in ONE target forward and commits the accepted
+    /// prefix on device. Attention serialises per query for the round
+    /// (`CBv2MTPRectangularSerializing`), so the arithmetic is the serial
+    /// decode path's at every position.
+    public func cbv2ForwardWithHiddenCaptured(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        let streams = cbv2Streams(
+            tokens, inputEmbeddings: nil, caches: caches,
+            recurrentState: recurrentState, positionIds: positionIds,
+            captureRecurrentWindow: true)
         return (head(streams.mixed), streams.multi)
     }
 }

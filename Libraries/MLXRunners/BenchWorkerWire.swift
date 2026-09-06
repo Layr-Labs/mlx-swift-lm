@@ -379,6 +379,12 @@ public struct WorkerResponse: Decodable, Sendable {
     public var rounds: Int?
     public var activeStreamsByRound: [Int]?
     public var depthClampReasons: [String: Int]?
+    /// MTP target verification: the configured strategy and how many verify
+    /// rounds ran rectangular (one forward per window) vs serial (one forward
+    /// per column). Present on speculative windows only.
+    public var verificationMode: String?
+    public var rectangularVerificationRounds: Int?
+    public var serialVerificationRounds: Int?
     public var prefillNsByStream: [Int]?
     public var decodeNsByStream: [Int]?
     public var verifyReplayDisagreements: Int?
@@ -437,6 +443,9 @@ public struct WorkerResponse: Decodable, Sendable {
         case rounds
         case activeStreamsByRound = "active_streams_by_round"
         case depthClampReasons = "depth_clamp_reasons"
+        case verificationMode = "verification_mode"
+        case rectangularVerificationRounds = "rectangular_verification_rounds"
+        case serialVerificationRounds = "serial_verification_rounds"
         case prefillNsByStream = "prefill_ns_by_stream"
         case decodeNsByStream = "decode_ns_by_stream"
         case verifyReplayDisagreements = "verify_replay_disagreements"
@@ -486,6 +495,9 @@ public struct WorkerResponse: Decodable, Sendable {
         rounds = try c.decodeIfPresent(Int.self, forKey: .rounds)
         activeStreamsByRound = try c.decodeIfPresent([Int].self, forKey: .activeStreamsByRound)
         depthClampReasons = try c.decodeIfPresent([String: Int].self, forKey: .depthClampReasons)
+        verificationMode = try c.decodeIfPresent(String.self, forKey: .verificationMode)
+        rectangularVerificationRounds = try c.decodeIfPresent(Int.self, forKey: .rectangularVerificationRounds)
+        serialVerificationRounds = try c.decodeIfPresent(Int.self, forKey: .serialVerificationRounds)
         prefillNsByStream = try c.decodeIfPresent([Int].self, forKey: .prefillNsByStream)
         decodeNsByStream = try c.decodeIfPresent([Int].self, forKey: .decodeNsByStream)
         verifyReplayDisagreements = try c.decodeIfPresent(
@@ -551,6 +563,9 @@ public struct WorkerResponse: Decodable, Sendable {
             depthClampReasons.map { reasons in
                 .object(reasons.keys.sorted().map { ($0, .int(reasons[$0]!)) })
             })
+        put("verification_mode", verificationMode.map(WireValue.string))
+        put("rectangular_verification_rounds", rectangularVerificationRounds.map(WireValue.int))
+        put("serial_verification_rounds", serialVerificationRounds.map(WireValue.int))
         put("prefill_ns_by_stream", prefillNsByStream.map { .array($0.map(WireValue.int)) })
         put("decode_ns_by_stream", decodeNsByStream.map { .array($0.map(WireValue.int)) })
         put("verify_replay_disagreements", verifyReplayDisagreements.map(WireValue.int))
