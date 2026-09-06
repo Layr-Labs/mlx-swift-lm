@@ -161,6 +161,19 @@ public final class Qwen4ExpDecoderLayer: Module {
                     cache: cache as? Qwen4ExpLayerCache)
         }
 
+        if qwen4ExpScratchKernelsEnabled {
+            let hc = attnHyperConnection.hcCount
+            var (input, residual, logit) = attnHyperConnection.scratchMixWithInject(stream)
+            let attended: MLXArray
+            if isLinear {
+                attended = linearAttn!(input, mask: convMask, cache: cache as? Qwen4ExpLayerCache)
+            } else {
+                attended = selfAttn!(input, rope: rope, mask: mask, cache: cache)
+            }
+            stream = qwen4ExpScratchInject(residual: residual, output: attended, injectLogit: logit, hc: hc)
+            (input, residual, logit) = mlpHyperConnection.scratchMixWithInject(stream)
+            return qwen4ExpScratchInject(residual: residual, output: mlp(input), injectLogit: logit, hc: hc)
+        }
         var (input, residual, inject) = attnHyperConnection.mixWithInject(stream)
         let attended: MLXArray
         if isLinear {

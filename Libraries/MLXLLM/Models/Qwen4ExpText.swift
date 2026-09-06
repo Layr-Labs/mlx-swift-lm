@@ -810,25 +810,35 @@ public final class Qwen4ExpGatedDeltaNet: Module {
                 expandedDimensions(mask, axis: -1), mixedQKV, MLXArray.zeros(like: mixedQKV))
         }
 
-        let convInput = concatenated([convState, mixedQKV], axis: 1)
-        if let cache {
-            cache[Qwen4ExpLayerCache.deltaConvSlot] =
-                contiguous(convInput[0..., (1 - convKernelSize)..., 0...])
-        }
-        let convOut = silu(conv1d(convInput))
-        let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-
-        var q = parts[0].reshaped(B, S, keyHeads, keyHeadDim)
-        var k = parts[1].reshaped(B, S, keyHeads, keyHeadDim)
-        let v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
-
+        let q: MLXArray
+        let k: MLXArray
+        let v: MLXArray
         let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
-        q =
-            MLXArray(invScale * invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        k =
-            MLXArray(invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        if qwen4ExpScratchKernelsEnabled, mask == nil {
+            let fused = Qwen4ExpGDNScratchKernels.conv(
+                state: convState, x: mixedQKV, weight: conv1d.weight, kernelSize: convKernelSize,
+                keyDim: keyDim, valueHeads: valueHeads, valueHeadDim: valueHeadDim)
+            if let cache { cache[Qwen4ExpLayerCache.deltaConvSlot] = fused.newState }
+            v = fused.v
+            let normed = Qwen4ExpGDNScratchKernels.qkNorm(
+                qk: fused.qk, keyHeads: keyHeads, keyHeadDim: keyHeadDim, eps: 1e-6,
+                scales: MLXArray([invScale * invScale, invScale]))
+            q = normed.q
+            k = normed.k
+        } else {
+            let convInput = concatenated([convState, mixedQKV], axis: 1)
+            if let cache {
+                cache[Qwen4ExpLayerCache.deltaConvSlot] =
+                    contiguous(convInput[0..., (1 - convKernelSize)..., 0...])
+            }
+            let convOut = silu(conv1d(convInput))
+            let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
+            q = MLXArray(invScale * invScale).asType(x.dtype)
+                * MLXFast.rmsNorm(parts[0].reshaped(B, S, keyHeads, keyHeadDim), weight: MLXArray.mlxNone, eps: 1e-6)
+            k = MLXArray(invScale).asType(x.dtype)
+                * MLXFast.rmsNorm(parts[1].reshaped(B, S, keyHeads, keyHeadDim), weight: MLXArray.mlxNone, eps: 1e-6)
+        }
 
         let (out, state) = gatedDeltaUpdate(
             q: q,
@@ -845,7 +855,12 @@ public final class Qwen4ExpGatedDeltaNet: Module {
             cache[Qwen4ExpLayerCache.deltaStateSlot] = state
             cache.advance(S)
         }
-        return outProj(norm(out, gate: z).reshaped(B, S, -1))
+        let gated =
+            qwen4ExpScratchKernelsEnabled
+            ? Qwen4ExpGDNScratchKernels.gate(
+                x: out, gate: z, weight: norm.weight, eps: norm.eps, sigmoid: norm.useSigmoid)
+            : norm(out, gate: z)
+        return outProj(gated.reshaped(B, S, -1))
     }
 }
 
@@ -953,6 +968,21 @@ public final class Qwen4ExpGatedResidual: Module {
         mixed(hcNorm(hyper))
     }
 
+    /// DIAGNOSTIC (scratch, MLXLM_SCRATCH_KERNELS=1): the mixer through
+    /// four custom kernels around the three quantized matmuls. Returns the
+    /// inject LOGITS (pre-sigmoid), which `qwen4ExpScratchInject` consumes.
+    public func scratchMixWithInject(_ hyper: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        guard let blockInject else {
+            preconditionFailure("Qwen4ExpGatedResidual: this mixer has no inject head")
+        }
+        let normed = Qwen4ExpHCScratchKernels.norm(
+            hyper, weight: hcNorm.weight, hc: hcCount, dims: dimensions, eps: hcNorm.eps,
+            offsetZero: hcNorm.weightOffset == 0)
+        let w = Qwen4ExpHCScratchKernels.scaledSilu(mixDown(normed), scale: 1 / Float(hcCount))
+        let mixed = Qwen4ExpHCScratchKernels.mix(mixUp(w), normed: normed, hc: hcCount, dims: dimensions)
+        return (mixed, hyper, blockInject(normed))
+    }
+
     /// - Returns: `(blockInput, residual, injectWeights)`.
     public func mixWithInject(_ hyper: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         guard let blockInject else {
@@ -962,6 +992,20 @@ public final class Qwen4ExpGatedResidual: Module {
         let inject = 2 * sigmoid(blockInject(normed) / Float(hcCount))
         return (mixed(normed), hyper, inject)
     }
+}
+
+/// DIAGNOSTIC (scratch): every block's non-matmul ops as custom kernels.
+let qwen4ExpScratchKernelsEnabled: Bool =
+    ProcessInfo.processInfo.environment["MLXLM_SCRATCH_KERNELS"] == "1"
+
+/// The inject with the LOGITS, one kernel (2·sigmoid(logit / hc) applied
+/// while adding). Pairs with `scratchMixWithInject`.
+public func qwen4ExpScratchInject(
+    residual: MLXArray, output: MLXArray, injectLogit: MLXArray, hc: Int
+) -> MLXArray {
+    Qwen4ExpHCScratchKernels.inject(
+        residual: residual, output: output, logit: injectLogit, scale: 1 / Float(hc),
+        hc: hc, dims: output.dim(-1))
 }
 
 /// Inject a block output back into the hyper-connection stream.

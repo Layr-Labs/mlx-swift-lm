@@ -417,22 +417,33 @@ extension Qwen4ExpGatedDeltaNet {
 
         // No conv mask: a CBv2 row is never a padded batch member, so every
         // position in the rectangle is a real token of this request.
-        let convInput = concatenated([convState, mixedQKV], axis: 1)
-        let newConvState = contiguous(convInput[0..., (1 - convKernelSize)..., 0...])
-        let convOut = silu(conv1d(convInput))
-        let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-
-        var q = parts[0].reshaped(B, S, keyHeads, keyHeadDim)
-        var k = parts[1].reshaped(B, S, keyHeads, keyHeadDim)
-        let v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
-
+        let q: MLXArray
+        let k: MLXArray
+        let v: MLXArray
+        let newConvState: MLXArray
         let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
-        q =
-            MLXArray(invScale * invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        k =
-            MLXArray(invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+        if qwen4ExpScratchKernelsEnabled {
+            let fused = Qwen4ExpGDNScratchKernels.conv(
+                state: convState, x: mixedQKV, weight: conv1d.weight, kernelSize: convKernelSize,
+                keyDim: keyDim, valueHeads: valueHeads, valueHeadDim: valueHeadDim)
+            newConvState = fused.newState
+            v = fused.v
+            let normed = Qwen4ExpGDNScratchKernels.qkNorm(
+                qk: fused.qk, keyHeads: keyHeads, keyHeadDim: keyHeadDim, eps: 1e-6,
+                scales: MLXArray([invScale * invScale, invScale]))
+            q = normed.q
+            k = normed.k
+        } else {
+            let convInput = concatenated([convState, mixedQKV], axis: 1)
+            newConvState = contiguous(convInput[0..., (1 - convKernelSize)..., 0...])
+            let convOut = silu(conv1d(convInput))
+            let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
+            q = MLXArray(invScale * invScale).asType(x.dtype)
+                * MLXFast.rmsNorm(parts[0].reshaped(B, S, keyHeads, keyHeadDim), weight: MLXArray.mlxNone, eps: 1e-6)
+            k = MLXArray(invScale).asType(x.dtype)
+                * MLXFast.rmsNorm(parts[1].reshaped(B, S, keyHeads, keyHeadDim), weight: MLXArray.mlxNone, eps: 1e-6)
+        }
 
         let (out, newSsmState) = gatedDeltaUpdate(
             q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
@@ -449,7 +460,12 @@ extension Qwen4ExpGatedDeltaNet {
                     "Qwen4Exp CBv2 recurrent stage failed at layer \(modelLayerIndex): \(error)")
             }
         }
-        return outProj(norm(out, gate: z).reshaped(B, S, -1))
+        let gated =
+            qwen4ExpScratchKernelsEnabled
+            ? Qwen4ExpGDNScratchKernels.gate(
+                x: out, gate: z, weight: norm.weight, eps: norm.eps, sigmoid: norm.useSigmoid)
+            : norm(out, gate: z)
+        return outProj(gated.reshaped(B, S, -1))
     }
 }
 
@@ -572,6 +588,23 @@ extension Qwen4ExpDecoderLayer {
                     eosTokenId: eosTokenId, recurrentState: recurrentState)
         }
 
+        if qwen4ExpScratchKernelsEnabled {
+            let hc = attnHyperConnection.hcCount
+            var (input, residual, logit) = attnHyperConnection.scratchMixWithInject(stream)
+            let attended: MLXArray
+            if isLinear {
+                attended = linearAttn!.cbv2Forward(
+                    input, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+            } else {
+                attended = selfAttn!.cbv2Forward(
+                    input, rope: rope, cache: attentionCache!, positions: positions)
+            }
+            stream = qwen4ExpScratchInject(
+                residual: residual, output: attended, injectLogit: logit, hc: hc)
+            (input, residual, logit) = mlpHyperConnection.scratchMixWithInject(stream)
+            return qwen4ExpScratchInject(
+                residual: residual, output: mlp(input), injectLogit: logit, hc: hc)
+        }
         var (input, residual, inject) = attnHyperConnection.mixWithInject(stream)
         let attended: MLXArray
         if isLinear {
