@@ -653,7 +653,9 @@ public final class Qwen4ExpAttention: Module {
             fusedQKV.linear = qwen4ExpFuseLinears([qProj, kProj, vProj])
             fusedQKV.built = true
         }
-        guard let fused = fusedQKV.linear, Qwen4ExpFusedProjectionPolicy.current.allows(x) else {
+        guard let fused = fusedQKV.linear, Qwen4ExpFusedLeverSwitch.qkv,
+            Qwen4ExpFusedProjectionPolicy.current.allows(x)
+        else {
             return (qProj(x), kProj(x), vProj(x))
         }
         let qWidth = heads * headDim * 2
@@ -803,6 +805,21 @@ enum Qwen4ExpFusedProjectionPolicy {
         case .always: return true
         }
     }
+}
+
+/// Per-lever switches for the speed diagnostic (default on):
+/// `MLXLM_FUSED_QKV`, `MLXLM_FUSED_SHARED`, `MLXLM_FUSED_EXPERTS` = 0 turns
+/// one merge off while the policy above still governs the rest.
+enum Qwen4ExpFusedLeverSwitch {
+    static func enabled(_ name: String) -> Bool {
+        switch ProcessInfo.processInfo.environment[name]?.lowercased() {
+        case "0", "off", "false": return false
+        default: return true
+        }
+    }
+    static let qkv = enabled("MLXLM_FUSED_QKV")
+    static let shared = enabled("MLXLM_FUSED_SHARED")
+    static let experts = enabled("MLXLM_FUSED_EXPERTS")
 }
 
 /// An array derived from one parameter array, rebuilt only when that
@@ -1045,7 +1062,9 @@ public final class Qwen4ExpMLP: Module, UnaryLayer {
             fusedGateUp.linear = qwen4ExpFuseLinears([gateProj, upProj])
             fusedGateUp.built = true
         }
-        guard let fused = fusedGateUp.linear, Qwen4ExpFusedProjectionPolicy.current.allows(x) else {
+        guard let fused = fusedGateUp.linear, Qwen4ExpFusedLeverSwitch.shared,
+            Qwen4ExpFusedProjectionPolicy.current.allows(x)
+        else {
             return downProj(silu(gateProj(x)) * upProj(x))
         }
         let parts = MLX.split(fused(x), indices: [gateProj.weight.dim(0)], axis: -1)
@@ -1087,7 +1106,9 @@ public final class Qwen4ExpSparseMoeBlock: Module {
             fusedExperts.params = Qwen4ExpFusedExperts(switchMLP, inputDims: x.dim(-1))
             fusedExperts.built = true
         }
-        guard let f = fusedExperts.params, Qwen4ExpFusedProjectionPolicy.current.allows(x) else {
+        guard let f = fusedExperts.params, Qwen4ExpFusedLeverSwitch.experts,
+            Qwen4ExpFusedProjectionPolicy.current.allows(x)
+        else {
             return switchMLP(x, indices)
         }
         // SwitchGLU's own shape: x [.., 1, 1, In], indices [.., K]; no sort at
