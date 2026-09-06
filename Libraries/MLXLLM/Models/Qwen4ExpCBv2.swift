@@ -535,7 +535,12 @@ extension Qwen4ExpPLELayer {
         let query = queryFlat.reshaped(queryFlat.shape.dropLast() + [hcCount, hiddenSize])
 
         var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hiddenSize))
-        gate = MLX.sqrt(maximum(MLX.abs(gate), MLXArray(Float(1e-6)))) * MLX.sign(gate)
+        // Scratch switch ple-gate-eps: the epsilon in the gate's own dtype. A fresh
+        // float32 scalar promotes the gate, and through it the whole hyper stream,
+        // to float32 for the rest of the tower (measured: 116 -> 28 ms/step).
+        let eps: MLXArray = Qwen4ExpScratchSkip.current.contains("ple-gate-eps")
+            ? Qwen4ExpPLEGateConstants.eps(gate.dtype) : MLXArray(Float(1e-6))
+        gate = MLX.sqrt(maximum(MLX.abs(gate), eps)) * MLX.sign(gate)
 
         var gated = sigmoid(gate) * value[.ellipsis, .newAxis, 0...]
         gated = gated.reshaped(gated.shape.dropLast(2) + [-1])
