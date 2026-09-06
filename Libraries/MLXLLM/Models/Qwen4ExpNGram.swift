@@ -407,18 +407,34 @@ public final class Qwen4ExpPLELayer: Module {
         previousContext: MLXArray,
         cache: Qwen4ExpLayerCache?
     ) -> MLXArray {
+        let skip = Qwen4ExpScratchSkip.current
         let embedded = pleEmbedding(ids, previousContext: previousContext).asType(hidden.dtype)
-        let keyFlat = normKey(keyProj(embedded))
-        let key = keyFlat.reshaped(keyFlat.shape.dropLast() + [hcCount, hiddenSize])
-        let value = valueProj(embedded)
-        let queryFlat = normQuery(hidden)
-        let query = queryFlat.reshaped(queryFlat.shape.dropLast() + [hcCount, hiddenSize])
-
-        var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hiddenSize))
-        gate = MLX.sqrt(maximum(MLX.abs(gate), MLXArray(Float(1e-6)))) * MLX.sign(gate)
-
-        var gated = sigmoid(gate) * value[.ellipsis, .newAxis, 0...]
+        let lead = hidden.shape.dropLast()
+        // SPEED DIAGNOSTIC (scratch): ple-proj skips keyProj/valueProj + normKey,
+        // ple-gate skips the query norm and the gate math, ple-conv skips the
+        // dilated depthwise conv; zeros / pass-through stand in.
+        let key: MLXArray
+        let value: MLXArray
+        if skip.contains("ple-proj") {
+            key = MLXArray.zeros(lead + [hcCount, hiddenSize], dtype: hidden.dtype)
+            value = MLXArray.zeros(lead + [hiddenSize], dtype: hidden.dtype)
+        } else {
+            let keyFlat = normKey(keyProj(embedded))
+            key = keyFlat.reshaped(keyFlat.shape.dropLast() + [hcCount, hiddenSize])
+            value = valueProj(embedded)
+        }
+        var gated: MLXArray
+        if skip.contains("ple-gate") {
+            gated = MLX.broadcast(value[.ellipsis, .newAxis, 0...], to: lead + [hcCount, hiddenSize])
+        } else {
+            let queryFlat = normQuery(hidden)
+            let query = queryFlat.reshaped(queryFlat.shape.dropLast() + [hcCount, hiddenSize])
+            var gate = (key * query).sum(axis: -1, keepDims: true) / Foundation.sqrt(Float(hiddenSize))
+            gate = MLX.sqrt(maximum(MLX.abs(gate), MLXArray(Float(1e-6)))) * MLX.sign(gate)
+            gated = sigmoid(gate) * value[.ellipsis, .newAxis, 0...]
+        }
         gated = gated.reshaped(gated.shape.dropLast(2) + [-1])
+        if skip.contains("ple-conv") { return gated }
         return gated + shortConv(normConv(gated), cache: cache)
     }
 }
