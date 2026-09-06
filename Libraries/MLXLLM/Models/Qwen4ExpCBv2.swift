@@ -393,10 +393,11 @@ extension Qwen4ExpGatedDeltaNet {
         let S = x.dim(1)
         precondition(recurrentState.count == B, "Qwen4Exp CBv2 recurrent row count mismatch")
 
-        let mixedQKV = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, valueHeads, valueHeadDim)
-        let b = inProjB(x)
-        let a = inProjA(x)
+        let projected = inProjections(x)
+        let mixedQKV = projected.qkv
+        let z = projected.z.reshaped(B, S, valueHeads, valueHeadDim)
+        let b = projected.b
+        let a = projected.a
 
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []

@@ -733,6 +733,50 @@ public final class Qwen4ExpAttention: Module {
     }
 }
 
+
+// MARK: - Fused projections (weight concat at load)
+
+/// Holds a projection built ONCE from sibling `Linear` modules after their
+/// weights are loaded. It is a plain class, not a `Module`, so `Module`'s
+/// reflection never sees it: the checkpoint keys stay on the four (or two)
+/// original modules and the fused copy is derived state.
+final class Qwen4ExpFusedLinearBox {
+    var linear: Linear?
+    var built = false
+}
+
+/// Concatenate sibling projections that read the SAME input into one `Linear`
+/// along the output axis, so one matmul dispatch replaces N.
+///
+/// QUANTIZED MODULES ONLY. The dense bf16 matmul picks its kernel and tiling
+/// from the output width, and a different tiling sums K in a different
+/// order, so a fused dense projection is NOT bit-identical to the separate
+/// ones. The quantized matmul computes every output row on its own from that
+/// row's packed weights, scales and biases, so stacking rows is exact there.
+/// The checkpoint quantizes every projection (affine, 4 bits, group 32), so
+/// the fused path is the production path; a plain `Linear` keeps its
+/// separate projections.
+///
+/// - Returns: `nil` when the modules cannot be fused exactly (any plain
+///   module, differing quantization parameters, or a bias on any of them).
+func qwen4ExpFuseLinears(_ parts: [Linear]) -> Linear? {
+    guard parts.count > 1 else { return parts.first }
+    let quantized = parts.compactMap { $0 as? QuantizedLinear }
+    guard quantized.count == parts.count else { return nil }
+    let first = quantized[0]
+    for q in quantized {
+        guard q.groupSize == first.groupSize, q.bits == first.bits, q.mode == first.mode,
+            q.bias == nil, (q.biases == nil) == (first.biases == nil)
+        else { return nil }
+    }
+    let weight = concatenated(quantized.map { $0.weight }, axis: 0)
+    let scales = concatenated(quantized.map { $0.scales }, axis: 0)
+    let biases = first.biases == nil ? nil : concatenated(quantized.map { $0.biases! }, axis: 0)
+    return QuantizedLinear(
+        weight: weight, bias: nil, scales: scales, biases: biases,
+        groupSize: first.groupSize, bits: first.bits, mode: first.mode)
+}
+
 // MARK: - Gated deltanet
 
 public final class Qwen4ExpGatedDeltaNet: Module {
@@ -754,6 +798,28 @@ public final class Qwen4ExpGatedDeltaNet: Module {
     @ParameterInfo(key: "A_log") var aLog: MLXArray
     @ModuleInfo(key: "norm") var norm: Qwen4ExpRMSNormGated
     @ModuleInfo(key: "out_proj") var outProj: Linear
+
+    /// `in_proj_qkv | in_proj_z | in_proj_b | in_proj_a` as one projection,
+    /// built on the first forward from the loaded weights (see
+    /// `qwen4ExpFuseLinears`). Four matmul dispatches become one.
+    private let fusedInProj = Qwen4ExpFusedLinearBox()
+
+    /// The four input projections of `x`, through the fused matmul when the
+    /// loaded weights allow it and through the four modules otherwise.
+    func inProjections(_ x: MLXArray) -> (qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray) {
+        if !fusedInProj.built {
+            fusedInProj.linear = qwen4ExpFuseLinears([inProjQKV, inProjZ, inProjB, inProjA])
+            fusedInProj.built = true
+        }
+        guard let fused = fusedInProj.linear else {
+            return (inProjQKV(x), inProjZ(x), inProjB(x), inProjA(x))
+        }
+        let parts = MLX.split(
+            fused(x),
+            indices: [convDim, convDim + valueDim, convDim + valueDim + valueHeads],
+            axis: -1)
+        return (parts[0], parts[1], parts[2], parts[3])
+    }
 
     public init(_ args: Qwen4ExpTextConfiguration) {
         self.valueHeads = args.linearNumValueHeads
@@ -796,10 +862,11 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         let B = x.dim(0)
         let S = x.dim(1)
 
-        var mixedQKV = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, valueHeads, valueHeadDim)
-        let b = inProjB(x)
-        let a = inProjA(x)
+        let projected = inProjections(x)
+        var mixedQKV = projected.qkv
+        let z = projected.z.reshaped(B, S, valueHeads, valueHeadDim)
+        let b = projected.b
+        let a = projected.a
 
         let convState =
             cache?[Qwen4ExpLayerCache.deltaConvSlot]
@@ -939,8 +1006,27 @@ public final class Qwen4ExpGatedResidual: Module {
         super.init()
     }
 
-    private func mixed(_ normed: MLXArray) -> MLXArray {
-        var w = silu(mixDown(normed) / Float(hcCount))
+    /// `input_mix_weight_down | block_inject_weight` as one projection over
+    /// `normed`, built on the first inject-carrying forward (see
+    /// `qwen4ExpFuseLinears`). Two matmul dispatches become one.
+    private let fusedDownInject = Qwen4ExpFusedLinearBox()
+
+    /// The low-rank mix input and the inject logits of `normed`, through the
+    /// fused matmul when the loaded weights allow it.
+    private func downAndInject(_ normed: MLXArray, blockInject: Linear) -> (MLXArray, MLXArray) {
+        if !fusedDownInject.built {
+            fusedDownInject.linear = qwen4ExpFuseLinears([mixDown, blockInject])
+            fusedDownInject.built = true
+        }
+        guard let fused = fusedDownInject.linear else {
+            return (mixDown(normed), blockInject(normed))
+        }
+        let parts = MLX.split(fused(normed), indices: [mixDown.weight.dim(0)], axis: -1)
+        return (parts[0], parts[1])
+    }
+
+    private func mixed(_ normed: MLXArray, down: MLXArray) -> MLXArray {
+        var w = silu(down / Float(hcCount))
         w = sigmoid(mixUp(w))
         let lead = w.shape.dropLast()
         return
@@ -950,7 +1036,8 @@ public final class Qwen4ExpGatedResidual: Module {
 
     /// Mixer without an inject head; the tower's final projection.
     public func callAsFunction(_ hyper: MLXArray) -> MLXArray {
-        mixed(hcNorm(hyper))
+        let normed = hcNorm(hyper)
+        return mixed(normed, down: mixDown(normed))
     }
 
     /// - Returns: `(blockInput, residual, injectWeights)`.
@@ -959,8 +1046,9 @@ public final class Qwen4ExpGatedResidual: Module {
             preconditionFailure("Qwen4ExpGatedResidual: this mixer has no inject head")
         }
         let normed = hcNorm(hyper)
-        let inject = 2 * sigmoid(blockInject(normed) / Float(hcCount))
-        return (mixed(normed), hyper, inject)
+        let (down, injectLogits) = downAndInject(normed, blockInject: blockInject)
+        let inject = 2 * sigmoid(injectLogits / Float(hcCount))
+        return (mixed(normed, down: down), hyper, inject)
     }
 }
 
