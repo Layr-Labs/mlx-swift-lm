@@ -75,7 +75,8 @@ struct CBv2ForwardShapeEngineTests {
         }
     }
 
-    @Test func latchedPagedRefusalNeverEntersTheModelOrSubmitsACall() async throws {
+    @Test(arguments: [false, true])
+    func pagedRefusalRecordsOnlyCallsActuallyEntered(faultInside: Bool) async throws {
         let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)
         let backend = try PagedKVBackend(layerKinds: [kind], config: .init(
             capacityBytes: 1 << 20, segmentSizeBytes: 32768, layerDTypes: [.bfloat16]))
@@ -87,18 +88,30 @@ struct CBv2ForwardShapeEngineTests {
             let loop = engine.loopForTesting
             let step = loop.beginForwardShapeStep()
             defer { loop.endForwardShapeStep(step) }
-            backend.pool.writeValidation.record(.init(layerIndex: 0, expected: .bfloat16,
-                keys: .float32, values: .bfloat16))
+            func refuse() {
+                backend.pool.writeValidation.record(.init(layerIndex: 0, expected: .bfloat16,
+                    keys: .float32, values: .bfloat16))
+            }
+            if !faultInside { refuse() }
             #expect(throws: CBv2PagedKVWriteError.self) {
                 try loop.checkedModelForward {
-                    model.forward(tokens: MLXArray([Int32(1)]).reshaped([1, 1]), caches: [])
+                    let output = model.forward(tokens: MLXArray([Int32(1)]).reshaped([1, 1]), caches: [])
+                    if faultInside { refuse() }
+                    return output
                 }
             }
             backend.pool.writeValidation.clearAfterRetirement()
         }
-        #expect(model.calls == 0)
+        #expect(model.calls == (faultInside ? 1 : 0))
         let snapshot = engine.forwardShapeSnapshot()
-        #expect(snapshot.entries.isEmpty && snapshot.pendingSteps == 0)
+        #expect(snapshot.pendingSteps == 0 && snapshot.unobservedDispatches == 0 && snapshot.droppedCalls == 0)
+        if faultInside {
+            #expect(snapshot.entries.count == 1 && snapshot.abandonedSteps == 1)
+            #expect(snapshot.entries.first?.submittedCalls == 1)
+            #expect(snapshot.entries.first?.completedCalls == 0)
+        } else {
+            #expect(snapshot.entries.isEmpty && snapshot.abandonedSteps == 0)
+        }
         await engine.shutdown()
     }
 }

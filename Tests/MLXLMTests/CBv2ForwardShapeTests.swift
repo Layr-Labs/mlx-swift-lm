@@ -132,6 +132,25 @@ final class CBv2ForwardShapeTests: XCTestCase {
         XCTAssertFalse(after.delta(since: before).complete)
     }
 
+    func testThrownDispatchRestoresContextAndRetiresEnteredCallsWithoutCompletion() throws {
+        enum Refusal: Error { case rejected }
+        let recorder = CBv2ForwardShapeRecorder(); try recorder.reset()
+        let before = recorder.snapshot(), step = recorder.beginStep()
+        XCTAssertThrowsError(try CBv2ForwardShapeObservation.dispatch(step: step, phase: .mtpVerification) {
+            LeafSpy().forward(rows: 2, columns: 3)
+            throw Refusal.rejected
+        })
+        XCTAssertFalse(CBv2ForwardShapeObservation.isActive)
+        step.finishBuilding()
+        let after = recorder.snapshot(), delta = after.delta(since: before)
+        XCTAssertEqual(after.pendingSteps, 0)
+        XCTAssertEqual(after.unobservedDispatches, 0)
+        XCTAssertEqual(after.droppedCalls, 0)
+        XCTAssertEqual(counts(after).first?.submittedCalls, 1)
+        XCTAssertEqual(counts(after).first?.completedCalls, 0)
+        XCTAssertEqual(Set(delta.reasons), Set(["abandoned_step", "unconfirmed_calls"]))
+    }
+
     func testMissingLeafAndInvalidOrExcessAxesFailClosedWithoutPrivatePayload() throws {
         let recorder = CBv2ForwardShapeRecorder(); try recorder.reset()
         let step = recorder.beginStep()
