@@ -133,9 +133,16 @@ public enum BenchWorkerLegacyParity {
         var firstPathSplit: Int?
         for (step, tokens) in fed.enumerated() {
             let ids = MLXArray(tokens.map { Int32($0) }).reshaped([1, tokens.count])
+            // Wall time per path, forward to readback, so the same run also
+            // says what one step costs on each driver.
+            let legacyStart = DispatchTime.now().uptimeNanoseconds
             let legacy = model(ids, cache: legacyCaches)[0..., -1, 0...].asType(.float32)
+            eval(legacy)
+            let legacyMs = Double(DispatchTime.now().uptimeNanoseconds - legacyStart) / 1e6
+            let cbv2Start = DispatchTime.now().uptimeNanoseconds
             let cbv2 = try raw.forwardLogits(tokens).asType(.float32)
-            eval(legacy, cbv2)
+            eval(cbv2)
+            let cbv2Ms = Double(DispatchTime.now().uptimeNanoseconds - cbv2Start) / 1e6
             let lTop = top(legacy, 4)
             let cTop = top(cbv2, 4)
             let linf = MLX.abs(legacy - cbv2).max().item(Float.self)
@@ -148,7 +155,9 @@ public enum BenchWorkerLegacyParity {
                 "step \(step) fed \(tokens.count == 1 ? String(tokens[0]) : "seed") expected \(expected.map(String.init) ?? "-") "
                     + "| legacy \(render(lTop)) \(legacyOK.map { $0 ? "OK" : "MISS" } ?? "") "
                     + "| cbv2 \(render(cTop)) \(cbv2OK.map { $0 ? "OK" : "MISS" } ?? "") "
-                    + "| linf \(String(format: "%.4f", linf))")
+                    + "| linf \(String(format: "%.4f", linf)) "
+                    + "| ms legacy \(String(format: "%.1f", legacyMs)) cbv2 \(String(format: "%.1f", cbv2Ms))"
+            )
         }
         emit(
             "diag-parity: first legacy miss vs golden: \(firstLegacyMiss.map(String.init) ?? "none"); "
