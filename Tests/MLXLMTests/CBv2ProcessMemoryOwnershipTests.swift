@@ -72,6 +72,36 @@ private final class WeakProcessArray { weak var array: MLXArray?; init(_ array: 
 
 @Suite("Native process ownership", .serialized)
 struct CBv2ProcessMemoryOwnershipTests {
+    @Test func opportunisticWorkspaceCannotBorrowAnotherEnginesFutureCredit() throws {
+        let capacity = NativeProcessCapacity(cap: 3_044)
+        let firstOwner = NativeProcessOwner(capacity), secondOwner = NativeProcessOwner(capacity)
+        let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 2)
+        func ledger(_ owner: NativeProcessOwner) -> AdmissionV2 {
+            var config = AdmissionV2.Config(watermarkFraction: 0, layerBytesPerToken: [80])
+            config.workspaceProjection = .init { _ in 192 }
+            return AdmissionV2(layerKinds: [kind], bytesCapacity: 4_096,
+                config: config, processMemoryOwner: owner)
+        }
+        let first = ledger(firstOwner), second = ledger(secondOwner)
+        try first.reserve(id: .init(1), additionalTokens: 16)
+        try second.reserve(id: .init(1), additionalTokens: 16)
+        #expect(throws: CBv2KVError.self) { try first.reserveOpportunisticWorkspace(bytes: 101) }
+        #expect(firstOwner.state().charge == 1_472)
+        let optional = try first.reserveOpportunisticWorkspace(bytes: 100)
+        #expect(firstOwner.state().charge == 1_572 && secondOwner.state().charge == 1_472)
+        #expect(throws: CBv2KVError.self) { try second.reserveOpportunisticWorkspace(bytes: 1) }
+        let firstDirect = try first.reserveWorkspace(bytes: 192)
+        let secondDirect = try second.reserveWorkspace(bytes: 192)
+        #expect(firstOwner.state().charge == 1_572 && secondOwner.state().charge == 1_472)
+        first.releaseAll(id: .init(1))
+        second.releaseAll(id: .init(1))
+        #expect(firstOwner.state().charge == 292 && secondOwner.state().charge == 192)
+        optional.release()
+        firstDirect.release()
+        secondDirect.release()
+        #expect(firstOwner.state().charge == 0 && secondOwner.state().charge == 0)
+    }
+
     private func fixture(_ owner: NativeProcessOwner, types: [DType] = [.bfloat16])
         throws -> (PagedKVBackend, AdmissionV2, [CBv2LayerKind])
     {

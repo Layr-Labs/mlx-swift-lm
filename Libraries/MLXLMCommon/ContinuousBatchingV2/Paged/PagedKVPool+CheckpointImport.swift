@@ -33,7 +33,8 @@ extension PagedKVPool {
             let kind = layerKinds[index]
             guard kind.sharesKVWithLayer == nil,
                 layer.key == groupKey(forLayer: index),
-                layer.key == PagedKVGroupKey(kind, dtype: layerDTypes[index], separateWindow: true)
+                layer.key == PagedKVGroupKey(kind, dtype: layerDTypes[index], separateWindow: true,
+                                            quantization: config.quantization)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             let pages = Self.pageDemand(kind: kind, maxLength: maximumTokens, config: config)
             guard layer.pageCount <= pages else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }

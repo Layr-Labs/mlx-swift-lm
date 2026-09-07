@@ -72,7 +72,8 @@ final class CBv2PagedCheckpointPageMap {
         do {
             for page in table.prefix(count) {
                 guard layout.isUsable(page), let segment = segments[layout.segmentIndex(page: page)],
-                      segment.storage.size <= Int(UInt32.max), segment.storage.dtype == key.dtype
+                      segment.storage.size <= Int(UInt32.max),
+                      segment.storage.dtype == (key.quantization == nil ? key.dtype : .uint8)
                 else { throw CBv2CompleteCheckpointError.incompleteTransfer }
                 records.advanced(by: initialized).initialize(to: .init(segment: segment, localPage: layout.localPage(page)))
                 initialized += 1

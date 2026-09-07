@@ -408,6 +408,10 @@ final class CBv2InFlightStep {
     var attentionMetadata: CBv2AttentionMetadataForward?
     var attentionPacket: CBv2AttentionPacketForward?
 
+    /// Per-step native workspaces for packed KV attention, separately charged
+    /// from persistent packed pages and never refunded by another step.
+    var quantizedScratch: [PagedQuantizedScratchLease] = []
+
     init(
         assignments: [(id: CBv2RequestID, numTokens: Int)],
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
@@ -1493,6 +1497,32 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    /// An optional prefill may spend otherwise free bytes after a heartbeat
+    /// advertised them. Retire the actual owning step before forecasting a
+    /// new arrival; subtracting its permit without completing GPU work would
+    /// let the forecast promise memory that prefix adoption could use too soon.
+    private func retireOptionalPrefillBeforeDeadlineAdmission() {
+        guard running, !draining,
+            let previous = inFlight, !previous.quantizedScratch.isEmpty,
+            let pool = (backend as? PagedKVBackend)?.pool,
+            pool.quantizedPrefillStatistics.currentAdditionalWorkspaceBytes > 0
+        else { return }
+
+        // This is the normal retirement half of a step, including watchdog
+        // coverage and cancellation/lease handling, without planning more work.
+        markStepStarted()
+        defer { markStepEnded() }
+        let now = config.clock.now()
+        boundaryClockNanos = 0
+        processCancellations(now: now)
+        processLeaseExpiry(now: now)
+        inFlight = nil
+        finalize(previous, now: now)
+        publishGauges()
+        // The already queued engineStep callback remains the continuation.
+        // It observes nil and cannot finalize this submitted step a second time.
+    }
+
     /// Atomic first-token deadline admission.
     ///
     /// The queue position is load-bearing: enqueue establishes authoritative
@@ -1567,6 +1597,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                                 ? .cancelled : .capacityRejected)
                         return
                     }
+
+                    // Keep the original absolute deadline. Both real GPU drain
+                    // time and this queue wait have elapsed when the existing
+                    // verdict below reads the clock; cancellation/running state
+                    // is rechecked below before any scheduler/prefix mutation.
+                    retireOptionalPrefillBeforeDeadlineAdmission()
 
                     prefixUsageByID[request.id] = CBv2PrefixUsage(
                         outcome: prefixLookup.outcome,
@@ -2159,7 +2195,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
                 let next: CBv2InFlightStep
                 do {
+                    try beginQuantizedScratch(for: plan)
                     next = try launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                    attachQuantizedScratch(to: next)
                 } catch {
                     handlePagedWriteFailure(error, plan: plan, boundary: boundary, now: stepNow)
                     publishGauges()
@@ -2284,7 +2322,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         let measurement = mtpMeasurement(for: plan)
         let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
         do {
+            try beginQuantizedScratch(for: plan)
             inFlight = try (mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan))
+            attachQuantizedScratch(to: inFlight)
         } catch {
             handlePagedWriteFailure(error, plan: plan, boundary: boundary, now: stepNow)
         }
@@ -2328,6 +2368,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         Stream.gpu.synchronize()
         Stream.cpu.synchronize()
         boundary?.discardFailedGraphAfterSynchronization()
+        discardPendingQuantizedScratchAfterSynchronization()
         attentionMetadata?.discardPendingForward()
         attentionPacket?.discardPendingForward()
         (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
@@ -2703,15 +2744,24 @@ public final class EngineLoopV2: @unchecked Sendable {
             // backend recycles its pages (PR#62), and force the next real
             // step to rebind its own rows.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            if let pool = (backend as? PagedKVBackend)?.pool {
+                let pending = pool.takePendingQuantizedScratch()
+                if !pending.isEmpty {
+                    Stream.gpu.synchronize()
+                    Stream.cpu.synchronize()
+                    for lease in pending { lease.finishAfterSynchronization() }
+                }
+            }
             backend.release(state)
             state.removeAll()
             (backend as? PagedKVBackend)?.pool.writeValidation.clearAfterRetirement()
             recurrentReservation?.release()
         }
-        if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil {
+        if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+            || (backend as? PagedKVBackend)?.pool.config.quantization != nil {
             guard let admission = capacity as? AdmissionV2 else {
                 throw CBv2KVError.backendIneligible(
-                    reason: "recurrent teacher scoring requires peak admission accounting")
+                    reason: "stateful or quantized teacher scoring requires peak admission accounting")
             }
             // makeRecurrentRequestState is a one-generation allocation check;
             // ordinary admission owns the larger committed/pending peak. This
@@ -2726,6 +2776,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             tokens: MLXArray, caches: [CBv2AttendingLayerCache],
             requirement: CBv2PrefillRequirement?
         ) throws -> (logits: MLXArray, innerState: [MLXArray]) {
+            try beginQuantizedScoringScratch(state: state, tokens: tokens)
             guard let recurrent else {
                 if let requirement {
                     return (try prefillOutput(tokens: tokens, inputEmbeddings: nil,
@@ -2743,6 +2794,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         func finishForward(_ arrays: [MLXArray]) throws {
+            let scratch = (backend as? PagedKVBackend)?.pool.takePendingQuantizedScratch() ?? []
+            if !scratch.isEmpty {
+                // Offline scoring does not enter CBv2InFlightStep. Bound its
+                // private workspace lifetime to each completed forward instead
+                // of retaining every continuation's scratch until final readback.
+                defer {
+                    Stream.gpu.synchronize()
+                    Stream.cpu.synchronize()
+                    for lease in scratch { lease.finishAfterSynchronization() }
+                }
+                try withError { eval(arrays + scratch.flatMap(\.evaluationTargets)) }
+                if let evaluation = recurrentEvaluation {
+                    try evaluation.commit()
+                    recurrentEvaluation = nil
+                }
+                return
+            }
             if let evaluation = recurrentEvaluation {
                 eval(arrays)
                 StreamOrDevice.default.stream.synchronize()
@@ -3488,13 +3556,27 @@ public final class EngineLoopV2: @unchecked Sendable {
         // graph pipelining stays bounded at two steps.
         let readbackStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         var host: [Int32] = []
+        let scratchCompletion = step.quantizedScratch.flatMap(\.evaluationTargets)
         if let tokens = step.sampledTokens {
+            if !scratchCompletion.isEmpty { eval([tokens] + scratchCompletion) }
             host = tokens.asArray(Int32.self)
             CBv2CoreInstrumentation.recordHostSync()
-        } else if !step.evalTargets.isEmpty {
-            eval(step.evalTargets)
+        } else if !step.evalTargets.isEmpty || !scratchCompletion.isEmpty {
+            eval(step.evalTargets + scratchCompletion)
             CBv2CoreInstrumentation.recordHostSync()
         }
+        if !scratchCompletion.isEmpty {
+            // MLX event readiness precedes Metal completion-handler retirement
+            // of temporary buffer owners. A real stream drain is required before
+            // refunding their byte lease; an evaluated scalar is not that fence.
+            // This conservative path may reduce quantized decode pipelining.
+            Stream.gpu.synchronize()
+            Stream.cpu.synchronize()
+        }
+        // Completion roots belong only to this step (never the already queued
+        // successor). Retire workspace ownership before delivering any terminal
+        // event or returning a request's prepaid admission credit.
+        step.finishQuantizedScratchAfterSynchronization()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)

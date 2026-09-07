@@ -23,8 +23,7 @@ extension CBv2CompleteCheckpointCodec {
         }
         var bytesPerToken = 0
         for (index, layer) in layout.layers.enumerated() where layer.owner == index && layer.window == nil {
-            let bytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-                shape: [2, layer.kvHeads, layer.headDim], dtype: layer.dtype.mlxDType)
+            let bytes = try storageKey(layerIndex: index).bytesPerToken()
             let (next, overflow) = bytesPerToken.addingReportingOverflow(bytes)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             bytesPerToken = next
@@ -61,7 +60,7 @@ extension CBv2CompleteCheckpointCodec {
         layout: CBv2HistoricalAttentionLayout, tokens: [Int], cacheSalt: String?,
         permit: CBv2CheckpointManifestMemory.Permit
     ) throws -> CBv2CompleteCheckpointExport {
-        let descriptors = try layout.tensorDescriptors(position: checkpoint.position)
+        let descriptors = try attentionTensorDescriptors(position: checkpoint.position)
         var sources: [CBv2CompleteCheckpointTensorSource] = []
         for index in layout.owningIndices {
             guard let row = state[index] as? PagedSequenceKV,
@@ -83,7 +82,8 @@ extension CBv2CompleteCheckpointCodec {
         for index in layout.layers.indices where layout.layers[index].owner != index {
             guard state[index] == nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         }
-        guard zip(sources, descriptors).allSatisfy({ $0.0.matches($0.1) }) else {
+        guard sources.count == descriptors.count,
+              zip(sources, descriptors).allSatisfy({ $0.0.matches($0.1) }) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let manifest = CBv2CompleteCheckpointManifest(
@@ -91,7 +91,8 @@ extension CBv2CompleteCheckpointCodec {
             backendLayout: backendLayout, position: checkpoint.position, chunkSize: checkpoint.chunkSize,
             cacheSalt: cacheSalt, assistantCodecID: nil,
             metadata: .init(tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
-                            attentionLayers: layout.layers, permit: permit))
+                            attentionLayers: layout.layers, permit: permit),
+            kvQuantization: kvQuantization)
         _ = try manifest.validateStructure()
         return .init(manifest: manifest, sources: sources, usesProcessMemoryOwner: admission.hasProcessMemoryOwner)
     }

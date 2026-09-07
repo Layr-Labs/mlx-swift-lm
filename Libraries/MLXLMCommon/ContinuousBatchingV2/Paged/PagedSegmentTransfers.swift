@@ -51,8 +51,10 @@ enum PagedSegmentTransfers {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
 
-    private static func kernel(reading: Bool, dtype: DType) -> MLXFast.MLXFastKernel {
+    private static func kernel(reading: Bool, dtype: DType,
+                               quantization: PagedKVQuantizationConfig? = nil) -> MLXFast.MLXFastKernel {
         let key = "cbv2_segment_\(reading ? "read" : "write")_\(dtype)"
+            + (quantization.map { "_k\($0.keyBits)v\($0.valueBits)g\($0.groupSize)r\($0.rotationBlockSize)" } ?? "")
         return lock.withLock {
             if let existing = kernels[key] { return existing }
             let made = MLXFast.metalKernel(
@@ -60,8 +62,11 @@ enum PagedSegmentTransfers {
                 inputNames: reading
                     ? ["storage", "records", "output", "previous"]
                     : ["keys", "values", "storage", "records", "previous"],
-                outputNames: ["fence"], source: reading ? readBody : writeBody,
-                ensureRowContiguous: true)
+                outputNames: ["fence"],
+                source: quantization == nil ? (reading ? readBody : writeBody)
+                    : (reading ? PagedQuantizedTransfers.readBody : PagedQuantizedTransfers.writeBody),
+                header: quantization == nil ? "" : PagedQuantizedMetal.header,
+                ensureRowContiguous: quantization == nil)
             kernels[key] = made
             return made
         }
@@ -92,6 +97,12 @@ enum PagedSegmentTransfers {
         }
     }
 
+    private static func quantizationTemplate(_ group: PagedKVGroup) -> [(String, any KernelTemplateArg)] {
+        guard let q = group.key.quantization else { return [] }
+        return [("KB", q.keyBits), ("VB", q.valueBits), ("G", q.groupSize),
+                ("R", q.resolvedRotationBlockSize(headDim: group.key.headDim))]
+    }
+
     static func write(group: PagedKVGroup, slots: [Int32], keys: MLXArray, values: MLXArray) {
         guard group.writeValidation.validate(keys: keys, values: values, expected: group.dtype) else { return }
         precondition(keys.shape == [group.key.kvHeads, slots.count, group.key.headDim])
@@ -99,13 +110,13 @@ enum PagedSegmentTransfers {
         let k = keys
         let v = values
         for (segment, triples) in buckets(group: group, slots: slots) {
-            group.writeFence = kernel(reading: false, dtype: group.dtype)(
+            group.writeFence = kernel(reading: false, dtype: group.dtype, quantization: group.key.quantization)(
                 [k, v, segment.storage, records(triples), group.writeFence],
                 template: [("T", group.dtype), ("H", group.key.kvHeads),
                            ("D", group.key.headDim), ("S", group.pageSize),
-                           ("VBASE", segment.valueOffset)],
+                           ("VBASE", segment.valueOffset)] + quantizationTemplate(group),
                 grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
-                threadGroup: (min(256, group.key.headDim), 1, 1),
+                threadGroup: (group.key.quantization == nil ? min(256, group.key.headDim) : group.key.headDim, 1, 1),
                 outputShapes: [[1]], outputDTypes: [.int32])[0]
         }
     }
@@ -138,11 +149,11 @@ enum PagedSegmentTransfers {
         let output = MLXArray.zeros([2, 1, h, count, d], dtype: group.dtype, stream: stream)
         var fence = group.writeFence
         for (segment, triples) in buckets(group: group, slots: slots) {
-            fence = kernel(reading: true, dtype: group.dtype)(
+            fence = kernel(reading: true, dtype: group.dtype, quantization: group.key.quantization)(
                 [segment.storage, records(triples), output, fence],
                 template: [("T", group.dtype), ("H", h), ("D", d),
-                           ("S", group.pageSize), ("VBASE", segment.valueOffset)],
-                grid: (d, h, triples.count / 3), threadGroup: (min(256, d), 1, 1),
+                           ("S", group.pageSize), ("VBASE", segment.valueOffset)] + quantizationTemplate(group),
+                grid: (d, h, triples.count / 3), threadGroup: (group.key.quantization == nil ? min(256, d) : d, 1, 1),
                 outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
         }
         fence = completionKernel(

@@ -144,6 +144,30 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// resolution. Shared/global budget bridges must use this value rather
     /// than recomputing the base recurrent peak from the model spec.
     public let resolvedFixedBytesPerRequest: Int
+    /// Conservative native-window and page-tail cost beyond the full-KV
+    /// marginal rate. Does not replace the separately owned scratch/pool ledger.
+    public let resolvedKVRequestOverheadBytes: Int
+
+    /// Prospective request-owned attention workspace, including overlapping
+    /// steps. A routing bridge must reserve this beyond marginal KV bytes.
+    public func routingWorkspaceBytes(forTokens tokens: Int) -> Int? {
+        admission.routingWorkspaceBytes(forTokens: tokens)
+    }
+
+    /// Workspace allowance for any distribution of new raw tokens over the
+    /// available request slots. Existing requests and retired leases remain in
+    /// the current admission commitments and must not be subtracted again.
+    public func routingWorkspaceBytes(totalTokens: Int, maximumRequests: Int) -> Int? {
+        admission.routingWorkspaceBytes(totalTokens: totalTokens, maximumRequests: maximumRequests)
+    }
+
+    /// Thread-safe observations of the packed prefill graphs actually built.
+    /// These counters do not establish GPU completion or sample confirmation.
+    public func quantizedPrefillStatisticsSnapshot() -> PagedQuantizedPrefillStatistics? {
+        guard let pool = (backend as? PagedKVBackend)?.pool,
+            pool.config.quantization != nil else { return nil }
+        return pool.quantizedPrefillStatistics
+    }
 
     private let stateLock = NSLock()
     private var rejectingSubmissions = false
@@ -238,8 +262,13 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             backend: backend.prefixReuseBackend,
             modelSupportsPrefixReuse: modelCapabilities.supportsPrefixReuse)
         self.prefixReuseCapability = prefixReuseCapability
+        // Snapshot caches materialize native tensors and would requantize
+        // them on adoption. Quantized pages may only reuse the original packed
+        // bytes through resident page sharing or complete packed checkpoints.
+        let quantizedPagedStorage = (backend as? PagedKVBackend)?.pool.config.quantization != nil
         let activePrefixCache =
             schedulerConfig.enablePrefixCache && prefixReuseCapability.isSupported
+                && !quantizedPagedStorage
             ? prefixCache : nil
         self.prefixCache = activePrefixCache
         let residentCandidate = backend as? any CBv2PagedPrefixSharingBackend
@@ -273,9 +302,23 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
 
         var admissionConfig = admissionConfig
         if let paged = backend as? PagedKVBackend {
-            // Native storage and the token ledger consume the same resolved
-            // table, including mixed BF16/FP32 layers after RoPE promotion.
+            // Compute dtypes remain native. Packed storage has a separate
+            // exact rate including scales/offsets; fractional element widths
+            // cannot be represented by layerElementBytes.
             admissionConfig.layerElementBytes = paged.pool.layerDTypes.map(\.size)
+            admissionConfig.layerBytesPerToken = layerKinds.indices.map { index in
+                (try? paged.pool.groupKey(forLayer: index).bytesPerToken()) ?? -1
+            }
+            if quantizedPagedStorage {
+                admissionConfig.workspaceProjection = .quantizedPaged(
+                    layerKinds: layerKinds, config: paged.pool.config,
+                    maximumChunk: max(
+                        max(paged.pool.config.maxPrefillChunk, schedulerConfig.prefillChunkSize),
+                        max(schedulerConfig.maxBatchedTokensPerStep, schedulerConfig.soloPrefillStripeTokens ?? 0)),
+                    maximumBatch: schedulerConfig.maxConcurrentRequests,
+                    maximumSerialDecodeCalls: (mtpDriver?.config.maxDraftTokens ?? 0) + 1,
+                    overlapPolicy: .engineSerialPrefill, sharesStepArenas: true)
+            }
         }
         // Capture allocator policy once, outside Admission. Failed projection
         // makes capacity unavailable instead of admitting logical-only bytes.
@@ -342,6 +385,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             config: admissionConfig, residency: backend.kvResidency,
             processMemoryOwner: processMemoryOwner)
         self.admission = admission
+        self.resolvedKVRequestOverheadBytes = admission.maximumKVRequestOverheadBytes
         let segmentedPool = (backend as? PagedKVBackend)?.pool
         if segmentedPool?.segmentGrant != nil {
             segmentedPool?.bindAdmission(admission)

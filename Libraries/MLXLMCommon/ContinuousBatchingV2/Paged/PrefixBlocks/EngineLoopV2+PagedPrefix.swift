@@ -16,8 +16,18 @@ extension EngineLoopV2 {
     func residentReusePlan(
         for match: CBv2PagedPrefixMatch, request: CBv2Request
     ) -> CBv2PrefixReusePlan? {
+        // Page sharing retains the same packed bytes; it never materializes a
+        // native snapshot. The historical capability's native estimate must
+        // not become an artificial extra charge against compressed admission.
+        var exactPackedBytes: Int?
+        if let paged = backend as? PagedKVBackend, paged.pool.config.quantization != nil {
+            let (bytes, overflow) = nominalFullKVBytesPerToken.multipliedReportingOverflow(by: match.matchedTokens)
+            guard !overflow, bytes >= 0 else { return nil }
+            exactPackedBytes = bytes
+        }
         guard let plan = prefixReuseCapability.plan(
             matchedBoundary: match.matchedTokens,
+            exactStagedFullKVBytes: exactPackedBytes,
             maximumSequenceLength: request.promptTokens.count + max(request.maxTokens, 1),
             nominalFullKVBytesPerToken: nominalFullKVBytesPerToken,
             reserveFullSequenceTokens: scheduler.reserveFullSequenceTokens),

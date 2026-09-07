@@ -266,6 +266,10 @@ public final class PagedKVBackend: CBv2KVBackend {
         plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
+        guard pool.config.quantization == nil else {
+            throw CBv2KVError.backendIneligible(
+                reason: "quantized paged caches require packed prefix adoption; native snapshots would requantize")
+        }
         guard plan.backend == .pagedFP16 else {
             throw CBv2KVError.backendIneligible(
                 reason: "paged adoption received \(plan.backend.rawValue) prefix plan")

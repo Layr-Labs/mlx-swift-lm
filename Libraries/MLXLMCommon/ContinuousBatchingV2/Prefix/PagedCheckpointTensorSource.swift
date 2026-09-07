@@ -11,6 +11,7 @@ final class CBv2PagedCheckpointTensorSource {
     private let pageSize: Int
     private let position: Int
     private let values: Bool
+    private let tensorLayout: CBv2CheckpointStorageTensorLayout
     private var pageMap: CBv2PagedCheckpointPageMap?
     let byteCount: Int
 
@@ -41,13 +42,14 @@ final class CBv2PagedCheckpointTensorSource {
         self.position = pageMap.position
         self.values = values
         self.pageMap = pageMap
+        self.tensorLayout = try .init(key: key, values: values)
         self.byteCount = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-            shape: [1, key.kvHeads, position, key.headDim], dtype: key.dtype)
+            shape: [1, key.kvHeads, position, tensorLayout.rowElements], dtype: tensorLayout.dtype.mlxDType)
     }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
-        descriptor.byteCount == byteCount && descriptor.dtype.mlxDType == key.dtype
-            && descriptor.shape == [1, key.kvHeads, position, key.headDim]
+        descriptor.byteCount == byteCount && descriptor.dtype == tensorLayout.dtype
+            && descriptor.shape == [1, key.kvHeads, position, tensorLayout.rowElements]
             && descriptor.role == (values ? .values : .keys)
     }
 
@@ -57,7 +59,7 @@ final class CBv2PagedCheckpointTensorSource {
     /// constructed; the page map pins every source throughout the copy.
     func readSegment(byteOffset: Int, maximumBytes: Int) throws -> Data {
         guard let pageMap else { throw CBv2CompleteCheckpointError.closed }
-        let width = key.dtype.size
+        let width = tensorLayout.itemSize
         guard byteOffset >= 0, byteOffset < byteCount, byteOffset % width == 0,
             maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
         else { throw CBv2CompleteCheckpointError.invalidSegment }
@@ -67,13 +69,13 @@ final class CBv2PagedCheckpointTensorSource {
         var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
             try CBv2PagedCheckpointByteLayout.runs(
-                headDim: key.headDim, position: position, pageSize: pageSize,
+                headDim: tensorLayout.rowElements, position: position, pageSize: pageSize,
                 itemSize: width, byteOffset: byteOffset, count: count
             ) { logicalPage, head, slot, feature, packedOffset, length in
                 let page = pageMap[logicalPage]
                 let segment = page.segment
                 let source = ((page.localPage * key.kvHeads + head) * pageSize + slot)
-                    * key.headDim + feature + (values ? segment.valueOffset : 0)
+                    * tensorLayout.rowElements + feature + (values ? segment.valueOffset : 0)
                 guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
                     throw CBv2CompleteCheckpointError.allocationFailed
                 }

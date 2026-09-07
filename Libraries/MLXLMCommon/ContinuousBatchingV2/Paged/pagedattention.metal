@@ -155,6 +155,14 @@ using namespace metal;
 
 namespace cbv2 {
 
+inline float paged_query_sign(uint index) {
+    uint x = index + 0x9e3779b9u;
+    x = (x ^ (x >> 16)) * 0x7feb352du;
+    x = (x ^ (x >> 15)) * 0x846ca68bu;
+    x ^= x >> 16;
+    return (x & 1u) ? -1.0f : 1.0f;
+}
+
 // Vectorized row load: each lane owns EPT contiguous elements of a K/V row.
 template <typename T, int EPT>
 inline void load_row(const device T* row, uint lane, thread float* dst) {
@@ -197,6 +205,17 @@ inline void load_row(const device T* row, uint lane, thread float* dst) {
 template <typename T> struct PagedKVPage {
     const device T* key;
     const device T* value;
+    template<int EPT>
+    void load(size_t base, uint lane, thread float* k, thread float* v) const {
+        load_row<T, EPT>(key + base, lane, k);
+        load_row<T, EPT>(value + base, lane, v);
+    }
+    template<int WIDTH, int TG>
+    void write(size_t base, const device T* k, const device T* v, int lin) const {
+        device T* kd = const_cast<device T*>(key) + base;
+        device T* vd = const_cast<device T*>(value) + base;
+        for (int i = lin; i < WIDTH; i += TG) { kd[i] = k[i]; vd[i] = v[i]; }
+    }
 };
 
 template <typename T> struct PagedSlabAccessor {
@@ -256,7 +275,13 @@ inline void paged_attention_part_cached_impl(
     uint3 tgpig,
     uint3 tpitg,
     uint sgitg,
-    uint lane
+    uint lane,
+    int64_t query_row_stride = 0,
+    int64_t query_head_stride = 0,
+    int query_index = -1,
+    int query_rotation = 0,
+    int64_t query_feature_stride = 1,
+    bool has_query_strides = false
 ) {
     static_assert(GQA % HPT == 0, "HPT must divide GQA");
     constexpr int SPLITS = GQA / HPT; // threadgroups per (kv head, partition)
@@ -304,21 +329,40 @@ inline void paged_attention_part_cached_impl(
         const int wslot = info[4];
         const auto page = cache.write_page(wpage);
         const size_t dst = ((size_t)kv_head * S + (size_t)wslot) * D;
-        device T* kdst = const_cast<device T*>(page.key) + dst;
-        device T* vdst = const_cast<device T*>(page.value) + dst;
-        for (int i = lin; i < D; i += TG) {
-            kdst[i] = knew[tile_src + i];
-            vdst[i] = vnew[tile_src + i];
-        }
+        page.template write<D, TG>(dst, knew + tile_src, vnew + tile_src, lin);
     }
 
     // Stage the (scaled) queries for this threadgroup's HPT query heads.
     const int q_head0 = kv_head * GQA + hgroup * HPT;
-    const device T* q_base = q + ((size_t)b * (size_t)(kvh * GQA) + (size_t)q_head0) * D;
+    // Native callers use the dense default. Explicit quantized strides may
+    // be zero (broadcast) or negative (a reversed MLX view), including D.
+    const int64_t qr = has_query_strides ? query_row_stride : (int64_t)(kvh * GQA) * D;
+    const int64_t qh = has_query_strides ? query_head_stride : D;
+    const int qi = query_index >= 0 ? query_index : b;
     for (int i = lin; i < HPT * D; i += TG) {
-        q_smem[i] = float(q_base[i]) * scale;
+        const int64_t offset = (int64_t)qi * qr + (q_head0 + i / D) * qh
+            + (i % D) * query_feature_stride;
+        const float value = float(q[offset]);
+        q_smem[i] = query_rotation == 0 ? value * scale
+            : value * paged_query_sign((i % D) % query_rotation);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (query_rotation != 0) {
+        float next[(HPT * D + TG - 1) / TG];
+        for (int stride = 1; stride < query_rotation; stride <<= 1) {
+            for (int i = lin, j = 0; i < HPT * D; i += TG, j++) {
+                float a = q_smem[i], b = q_smem[i ^ stride];
+                next[j] = (i & stride) ? b - a : a + b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = lin, j = 0; i < HPT * D; i += TG, j++) q_smem[i] = next[j];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for (int i = lin; i < HPT * D; i += TG) {
+            q_smem[i] = (q_smem[i] * rsqrt(float(query_rotation))) * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     // Per-simdgroup online softmax state (identical across lanes for m/l,
     // per-lane slices of the value accumulator).
@@ -350,8 +394,7 @@ inline void paged_attention_part_cached_impl(
             const int slot = pos % S;
             const auto page = cache.read_page(table, lpage, table_len);
             const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
-            load_row<T, EPT>(page.key + base, lane, kf);
-            load_row<T, EPT>(page.value + base, lane, vf);
+            page.template load<EPT>(base, lane, kf, vf);
         }
 
 #pragma unroll
@@ -472,7 +515,8 @@ inline void paged_attention_merge_impl(
     const int maxpart,
     device T* out,
     uint3 tgpig,
-    uint lane
+    uint lane,
+    int output_columns = 0
 ) {
     constexpr int EPT = D / 32;
 
@@ -519,7 +563,9 @@ inline void paged_attention_merge_impl(
     }
     const float inv = gl > 0.0f ? 1.0f / gl : 0.0f;
 
-    device T* orow = out + row * D;
+    device T* orow = output_columns > 0
+        ? out + ((size_t)head * output_columns + seqinfo[b * 8 + 5]) * D
+        : out + row * D;
 #pragma unroll
     for (int e = 0; e < EPT; e++) {
         orow[lane * EPT + e] = T(acc[e] * inv);
