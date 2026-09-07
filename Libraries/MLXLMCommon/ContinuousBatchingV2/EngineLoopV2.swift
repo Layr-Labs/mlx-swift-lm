@@ -1497,6 +1497,32 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    /// An optional prefill may spend otherwise free bytes after a heartbeat
+    /// advertised them. Retire the actual owning step before forecasting a
+    /// new arrival; subtracting its permit without completing GPU work would
+    /// let the forecast promise memory that prefix adoption could use too soon.
+    private func retireOptionalPrefillBeforeDeadlineAdmission() {
+        guard running, !draining,
+            let previous = inFlight, !previous.quantizedScratch.isEmpty,
+            let pool = (backend as? PagedKVBackend)?.pool,
+            pool.quantizedPrefillStatistics.currentAdditionalWorkspaceBytes > 0
+        else { return }
+
+        // This is the normal retirement half of a step, including watchdog
+        // coverage and cancellation/lease handling, without planning more work.
+        markStepStarted()
+        defer { markStepEnded() }
+        let now = config.clock.now()
+        boundaryClockNanos = 0
+        processCancellations(now: now)
+        processLeaseExpiry(now: now)
+        inFlight = nil
+        finalize(previous, now: now)
+        publishGauges()
+        // The already queued engineStep callback remains the continuation.
+        // It observes nil and cannot finalize this submitted step a second time.
+    }
+
     /// Atomic first-token deadline admission.
     ///
     /// The queue position is load-bearing: enqueue establishes authoritative
@@ -1571,6 +1597,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                                 ? .cancelled : .capacityRejected)
                         return
                     }
+
+                    // Keep the original absolute deadline. Both real GPU drain
+                    // time and this queue wait have elapsed when the existing
+                    // verdict below reads the clock; cancellation/running state
+                    // is rechecked below before any scheduler/prefix mutation.
+                    retireOptionalPrefillBeforeDeadlineAdmission()
 
                     prefixUsageByID[request.id] = CBv2PrefixUsage(
                         outcome: prefixLookup.outcome,
