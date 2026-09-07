@@ -255,6 +255,20 @@ public struct FreeRunRoundAudit: Sendable, Equatable {
     /// boundary carry intact. Nothing is dropped and nothing is counted
     /// twice; a box saw the alternative, a refusal whenever a round did not
     /// land on the count.
+    /// The rounds that state `count` plain SEED steps: width one, every stream
+    /// active, nothing drafted, nothing accepted. See `FreeRunSession.seedCursor`.
+    public static func seedRounds(count: Int, streamCount: Int) -> [FreeRunRound] {
+        guard count > 0 else { return [] }
+        return Array(
+            repeating: FreeRunRound(
+                width: 1,
+                active: Array(repeating: true, count: streamCount),
+                naturalAccepted: Array(repeating: 0, count: streamCount),
+                drafted: 0,
+                accepted: 0),
+            count: count)
+    }
+
     public static func split(
         rounds: [FreeRunRound], drainedPerStream: Int
     ) -> (window: [FreeRunRound], carry: [FreeRunRound]) {
@@ -734,6 +748,11 @@ public final class BenchWorkerServer: @unchecked Sendable {
         /// but a row CAN finalize one before `free_decode_run` is called, so
         /// the window starts where the journal stood after the seed drain.
         var journalCursor = 0
+        /// `CBv2MTPMetrics.seedSteps` at the same boundary. A SEED step is the
+        /// plain forward the planner runs when a row has no carry (the first
+        /// step of every window, and after a stale carry): it commits ONE token
+        /// and writes no round record, so the drain states it as a round itself.
+        var seedCursor = 0
         /// Rounds the journal already stated whose tokens this session has
         /// not yet returned: the clipped remainder and any run-ahead rounds.
         /// See `FreeRunRoundAudit.split`.
@@ -825,6 +844,7 @@ public final class BenchWorkerServer: @unchecked Sendable {
         // journal already holds belongs to the seed, not to the timed run.
         if let metrics = (engine as? any CBv2MTPCountersReporting)?.mtpMetricsSnapshot() {
             session.journalCursor = metrics.roundAudits.count
+            session.seedCursor = metrics.seedSteps
             session.clampBaseline = Self.clampReasons(metrics)
         }
         self.freeRun = session
@@ -883,8 +903,15 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 slotForRequestID: session.slotForRequestID,
                 streamCount: session.batch)
             session.journalCursor = metrics.roundAudits.count
+            // Seed steps taken inside this window (see `seedCursor`): each is
+            // one committed token with nothing drafted, stated as a width-one
+            // round ahead of the rounds it seeded, so the window states every
+            // token it returned (benchd: sum(acceptance_lengths) == N).
+            let seedDelta = max(0, metrics.seedSteps - session.seedCursor)
+            session.seedCursor = metrics.seedSteps
+            let seeded = FreeRunRoundAudit.seedRounds(count: seedDelta, streamCount: session.batch)
             let cut = FreeRunRoundAudit.split(
-                rounds: session.carriedRounds + fresh, drainedPerStream: count)
+                rounds: session.carriedRounds + seeded + fresh, drainedPerStream: count)
             session.carriedRounds = cut.carry
             if !cut.window.isEmpty {
                 audit = FreeRunRoundAudit(rounds: cut.window, streamCount: session.batch)
