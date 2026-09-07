@@ -172,31 +172,6 @@ enum BenchWorkerCapturedProbe {
             let afterC = report(try c.forward([window[1]])[0..., -1, 0...], label: "C plain t1 after keep-1 (batched attn)", emit: emit)
             emit(String(format: "captured-probe: C L_inf vs serial pos1 %.5f", MLX.abs(afterC - serial1).max().item(Float.self)))
         }
-        // E: the committed recurrent state after window keep-1 vs the serial state after t0, per layer.
-        do {
-            let e = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
-            _ = try e.forward(seed)
-            _ = try e.capturedWindow(window, serializeAttention: true, keep: 1)
-            let s0 = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
-            _ = try s0.forward(seed)
-            _ = try s0.forward([window[0]])
-            let ev = try e.recurrent.bind()
-            let sv = try s0.recurrent.bind()
-            var worstConv: (Int, Float) = (-1, 0); var worstSsm: (Int, Float) = (-1, 0); var firstBad = -1; var compared = 0
-            for spec in model.cbv2RecurrentStateSpec.layers {
-                let li = spec.modelLayerIndex
-                guard let x = ev.inputState(modelLayerIndex: li), let y = sv.inputState(modelLayerIndex: li) else { continue }
-                compared += 1
-                var dc: Float = 0; var ds: Float = 0
-                if let xc = x.conv, let yc = y.conv, xc.shape == yc.shape { dc = MLX.abs(xc.asType(.float32) - yc.asType(.float32)).max().item(Float.self) } else if x.conv != nil || y.conv != nil { dc = Float.infinity }
-                if let xs = x.ssm, let ys = y.ssm, xs.shape == ys.shape { ds = MLX.abs(xs.asType(.float32) - ys.asType(.float32)).max().item(Float.self) } else if x.ssm != nil || y.ssm != nil { ds = Float.infinity }
-                if dc > worstConv.1 { worstConv = (li, dc) }
-                if ds > worstSsm.1 { worstSsm = (li, ds) }
-                if firstBad < 0, dc > 1e-3 || ds > 1e-3 { firstBad = li; emit(String(format: "captured-probe: E first differing layer %d conv L_inf %.5f ssm L_inf %.5f conv shape %@ ssm shape %@", li, dc, ds, String(describing: x.conv?.shape ?? []), String(describing: x.ssm?.shape ?? []))) }
-            }
-            emit(String(format: "captured-probe: E compared %d layers; worst conv layer %d L_inf %.5f; worst ssm layer %d L_inf %.5f; first bad %d", compared, worstConv.0, worstConv.1, worstSsm.0, worstSsm.1, firstBad))
-            try ev.rollback(); try sv.rollback()
-        }
         // F: layer-by-layer position-0 comparison, window [t0,t1] vs serial [t0].
         do {
             let f = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
