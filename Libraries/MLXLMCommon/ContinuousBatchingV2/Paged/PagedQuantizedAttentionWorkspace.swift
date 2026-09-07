@@ -7,11 +7,13 @@ final class PagedQuantizedScratchLease {
     private var reservation: CBv2CheckpointReservation?
     private var roots: [MLXArray] = []
     private var completion: MLXArray?
+    private var onFinish: (() -> Void)?
     let reservedBytes: Int
 
-    init(reservation: CBv2CheckpointReservation?, bytes: Int) {
+    init(reservation: CBv2CheckpointReservation?, bytes: Int, onFinish: (() -> Void)? = nil) {
         self.reservation = reservation
         self.reservedBytes = bytes
+        self.onFinish = onFinish
     }
 
     var evaluationTargets: [MLXArray] { completion.map { [$0] } ?? [] }
@@ -25,6 +27,8 @@ final class PagedQuantizedScratchLease {
         completion = nil
         roots = []
         reservation = nil
+        onFinish?()
+        onFinish = nil
     }
 }
 

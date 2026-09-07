@@ -14,6 +14,7 @@ final class PagedQuantizedStepScratch {
     let maximumQueries: Int
     let maximumAttendLength: Int
     private(set) var arenas: [Geometry: PagedQuantizedStepArena] = [:]
+    var fusedPrefillArenas: [PagedQuantizedFusedPrefillGeometry: PagedQuantizedFusedPrefillArena] = [:]
 
     init(maximumQueries: Int, maximumAttendLength: Int) throws {
         guard maximumQueries > 0, maximumAttendLength > 0 else {

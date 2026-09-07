@@ -40,6 +40,9 @@ public struct PagedKVPoolConfig: Sendable {
     public var layerDTypes: [DType]?
     /// Experimental packed full-attention storage; requires segmented backing.
     public var quantization: PagedKVQuantizationConfig?
+    /// Explicit experimental prefill route. Packed direct attention remains
+    /// the guaranteed fallback and the default for quantized storage.
+    public var quantizedPrefillMode: PagedQuantizedPrefillMode
     /// Explicit foundation opt-in. nil retains the fixed-slab reference.
     /// Segments grow under the same byte grant; this is not a total-pool cap.
     public var segmentSizeBytes: Int?
@@ -84,13 +87,15 @@ public struct PagedKVPoolConfig: Sendable {
         prefixSharingBlockSize: Int? = nil,
         segmentSizeBytes: Int? = nil,
         layerDTypes: [DType]? = nil,
-        quantization: PagedKVQuantizationConfig? = nil
+        quantization: PagedKVQuantizationConfig? = nil,
+        quantizedPrefillMode: PagedQuantizedPrefillMode = .direct
     ) {
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
         self.dtype = dtype
         self.layerDTypes = layerDTypes
         self.quantization = quantization
+        self.quantizedPrefillMode = quantizedPrefillMode
         self.maxPrefillChunk = maxPrefillChunk
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
         self.maxBufferLength = maxBufferLength
@@ -123,6 +128,7 @@ public final class PagedKVPool {
     var memoryAdmission: AdmissionV2?
     var pendingQuantizedScratch: [PagedQuantizedScratchLease] = []
     var quantizedScratchScope: PagedQuantizedStepScratch?
+    let quantizedPrefillCounters: PagedQuantizedPrefillCounters
     var storageTelemetry = PagedKVStorageTelemetry()
     let writeValidation = CBv2PagedKVWriteValidation()
     /// Deterministic failure-order observer; production leaves this unset.
@@ -292,6 +298,7 @@ public final class PagedKVPool {
                 reason: "PagedKVPool: paged-attention runtime resource unavailable: \(error)")
         }
         self.config = config
+        self.quantizedPrefillCounters = PagedQuantizedPrefillCounters(mode: config.quantizedPrefillMode)
         self.layerDTypes = resolvedTypes
         self.layerGroupKeys = groupKeys
         self.kernelSource = source

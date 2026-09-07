@@ -61,6 +61,32 @@ struct CBv2QuantizedWorkspaceEngineTests {
         #expect(engine.chainedStepCount >= 2,
             "the fixture must cover both final-prefill/decode and decode/decode overlap")
         #expect(!backend.pool.writeValidation.isFaulted)
+        let statistics = try #require(engine.quantizedPrefillStatisticsSnapshot())
+        #expect(statistics.mode == .direct)
+        #expect(statistics.directCallCount == 1 && statistics.directQueryTokenCount == 33)
+        #expect(statistics.fusedCallCount == 0 && statistics.peakAdditionalWorkspaceBytes == 0)
+    }
+
+    @Test("native paged and contiguous engines omit quantized prefill statistics")
+    func nativeStorageHasNoQuantizedStatistics() async throws {
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)]
+        for paged in [false, true] {
+            let backend: any CBv2KVBackend
+            let caches: CBv2LayerCacheBank
+            if paged {
+                let value = try PagedKVBackend(layerKinds: kinds, config: .init(
+                    capacityBytes: 4 << 20, segmentSizeBytes: 32_768, layerDTypes: [.float32]))
+                backend = value
+                caches = CBv2LayerCacheBank(caches: value.makeLayerCaches())
+            } else {
+                backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 4 << 20))
+                caches = CBv2LayerCacheBank(layerKinds: kinds)
+            }
+            let engine = EngineV2(model: Model(), layerKinds: kinds, backend: backend,
+                cacheProvider: caches, sampler: CBv2GreedySampler())
+            #expect(engine.quantizedPrefillStatisticsSnapshot() == nil)
+            await engine.shutdown()
+        }
     }
 
     @Test("MTP marker prevents the engine from using a multi-column step as a chain base")

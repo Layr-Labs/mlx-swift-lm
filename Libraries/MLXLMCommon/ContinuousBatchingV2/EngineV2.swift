@@ -161,6 +161,14 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         admission.routingWorkspaceBytes(totalTokens: totalTokens, maximumRequests: maximumRequests)
     }
 
+    /// Thread-safe observations of the packed prefill graphs actually built.
+    /// These counters do not establish GPU completion or sample confirmation.
+    public func quantizedPrefillStatisticsSnapshot() -> PagedQuantizedPrefillStatistics? {
+        guard let pool = (backend as? PagedKVBackend)?.pool,
+            pool.config.quantization != nil else { return nil }
+        return pool.quantizedPrefillStatistics
+    }
+
     private let stateLock = NSLock()
     private var rejectingSubmissions = false
 

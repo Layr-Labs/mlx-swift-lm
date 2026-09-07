@@ -9,6 +9,10 @@ extension PagedLayerCache {
                          chunkKeys: MLXArray? = nil, chunkValues: MLXArray? = nil) -> MLXArray {
         precondition(row.windowSize == nil && queries.dim(0) == 1)
         let count = queries.dim(2)
+        if let accelerated = opportunisticQuantizedPrefill(
+            queries: queries, row: row, queryStart: queryStart, scale: scale, sinks: sinks,
+            chunkKeys: chunkKeys, chunkValues: chunkValues) { return accelerated }
+        pool.quantizedPrefillCounters.direct(tokens: count)
         let group = pool.group(row.groupKey)
         let blockSize = 8
         let workspace: PagedQuantizedAttentionWorkspace
