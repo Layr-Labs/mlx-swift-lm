@@ -142,6 +142,61 @@ enum BenchWorkerCapturedProbe {
         let dAfter = MLX.abs(after - serial1).max().item(Float.self)
         emit(String(format: "captured-probe: plain t1 after keep-1 commit L_inf vs serial pos1 %.5f", dAfter))
         emit("captured-probe: after that forward: kv offset \(rejected.kvOffset) tape \(rejected.tapeLength) (serial \(serial.kvOffset))")
+
+        // ---- isolating variants (2026-09-07) ----
+        // A: a ONE-position captured window [t0], keep 1, then plain t1. No rollback involved:
+        //    if this is wrong the captured stage/commit of a single position is wrong.
+        do {
+            let a = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
+            _ = try a.forward(seed)
+            _ = try a.capturedWindow([window[0]], serializeAttention: true, keep: 1)
+            emit("captured-probe: A window[t0] keep 1: kv offset \(a.kvOffset) tape \(a.tapeLength)")
+            let afterA = report(try a.forward([window[1]])[0..., -1, 0...], label: "A plain t1 after 1-window keep-1", emit: emit)
+            emit(String(format: "captured-probe: A L_inf vs serial pos1 %.5f", MLX.abs(afterA - serial1).max().item(Float.self)))
+        }
+        // B: window [t0, t1] keep 2 (full acceptance), then plain t2 vs serial pos2.
+        if tokens.count >= 3 {
+            let serial2 = report(try serial.forward([tokens[2]])[0..., -1, 0...], label: "serial pos2", emit: emit)
+            let b = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
+            _ = try b.forward(seed)
+            _ = try b.capturedWindow(window, serializeAttention: true, keep: 2)
+            emit("captured-probe: B window[t0,t1] keep 2: kv offset \(b.kvOffset) tape \(b.tapeLength)")
+            let afterB = report(try b.forward([tokens[2]])[0..., -1, 0...], label: "B plain t2 after keep-2", emit: emit)
+            emit(String(format: "captured-probe: B L_inf vs serial pos2 %.5f", MLX.abs(afterB - serial2).max().item(Float.self)))
+        }
+        // C: window [t0, t1] keep 1 with BATCHED attention, then plain t1.
+        do {
+            let c = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
+            _ = try c.forward(seed)
+            _ = try c.capturedWindow(window, serializeAttention: false, keep: 1)
+            let afterC = report(try c.forward([window[1]])[0..., -1, 0...], label: "C plain t1 after keep-1 (batched attn)", emit: emit)
+            emit(String(format: "captured-probe: C L_inf vs serial pos1 %.5f", MLX.abs(afterC - serial1).max().item(Float.self)))
+        }
+        // E: the committed recurrent state after window keep-1 vs the serial state after t0, per layer.
+        do {
+            let e = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
+            _ = try e.forward(seed)
+            _ = try e.capturedWindow(window, serializeAttention: true, keep: 1)
+            let s0 = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
+            _ = try s0.forward(seed)
+            _ = try s0.forward([window[0]])
+            let ev = try e.recurrent.bind()
+            let sv = try s0.recurrent.bind()
+            var worstConv: (Int, Float) = (-1, 0); var worstSsm: (Int, Float) = (-1, 0); var firstBad = -1; var compared = 0
+            for spec in model.cbv2RecurrentStateSpec.layers {
+                let li = spec.modelLayerIndex
+                guard let x = ev.inputState(modelLayerIndex: li), let y = sv.inputState(modelLayerIndex: li) else { continue }
+                compared += 1
+                var dc: Float = 0; var ds: Float = 0
+                if let xc = x.conv, let yc = y.conv, xc.shape == yc.shape { dc = MLX.abs(xc.asType(.float32) - yc.asType(.float32)).max().item(Float.self) } else if x.conv != nil || y.conv != nil { dc = Float.infinity }
+                if let xs = x.ssm, let ys = y.ssm, xs.shape == ys.shape { ds = MLX.abs(xs.asType(.float32) - ys.asType(.float32)).max().item(Float.self) } else if x.ssm != nil || y.ssm != nil { ds = Float.infinity }
+                if dc > worstConv.1 { worstConv = (li, dc) }
+                if ds > worstSsm.1 { worstSsm = (li, ds) }
+                if firstBad < 0, dc > 1e-3 || ds > 1e-3 { firstBad = li; emit(String(format: "captured-probe: E first differing layer %d conv L_inf %.5f ssm L_inf %.5f conv shape %@ ssm shape %@", li, dc, ds, String(describing: x.conv?.shape ?? []), String(describing: x.ssm?.shape ?? []))) }
+            }
+            emit(String(format: "captured-probe: E compared %d layers; worst conv layer %d L_inf %.5f; worst ssm layer %d L_inf %.5f; first bad %d", compared, worstConv.0, worstConv.1, worstSsm.0, worstSsm.1, firstBad))
+            try ev.rollback(); try sv.rollback()
+        }
         MLXMemoryReporter().drain()
     }
 }
