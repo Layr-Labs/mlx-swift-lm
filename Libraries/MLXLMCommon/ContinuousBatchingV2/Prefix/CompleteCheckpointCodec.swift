@@ -15,6 +15,11 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     let historicalLayout: CBv2HistoricalAttentionLayout?
     var targetTensorCount: Int { (historicalLayout?.owningIndices.count ?? layerKinds.count) * 2 }
     var backendLayout: String {
+        if kvQuantization != nil {
+            return recurrentSpec == nil
+                ? CBv2CompleteCheckpointManifest.quantizedHistoricalAttentionLayout
+                : CBv2CompleteCheckpointManifest.quantizedPagedLayout
+        }
         if recurrentSpec == nil { return CBv2CompleteCheckpointManifest.historicalAttentionLayout }
         return pagedConfig == nil ? CBv2CompleteCheckpointManifest.layout : CBv2CompleteCheckpointManifest.pagedLayout
     }
@@ -44,7 +49,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     func tensorDescriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
         if let historicalLayout {
             guard identity.isValid, position > 1 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            return try historicalLayout.tensorDescriptors(position: position)
+            return try attentionTensorDescriptors(position: position)
         }
         guard kvDTypes.count == layerKinds.count, recurrentSpec?.layers.isEmpty == false,
             identity.isValid, position > 1
@@ -53,12 +58,14 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         for (index, kind) in layerKinds.enumerated() {
             guard case .full = kind.attention, kind.sharesKVWithLayer == nil,
                 kind.kvHeads > 0, kind.headDim > 0,
-                let kvDType = CBv2CheckpointDType(kvDTypes[index]), kvDType != .int32
+                let kvDType = CBv2CheckpointDType(kvDTypes[index]),
+                [.float16, .bfloat16, .float32].contains(kvDType)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            for role in [CBv2CheckpointTensorRole.keys, .values] {
-                result.append(try .init(
-                    role: role, layer: kind.modelLayerIndex ?? index,
-                    shape: [1, kind.kvHeads, position, kind.headDim], dtype: kvDType))
+            let key = storageKey(layerIndex: index)
+            for values in [false, true] {
+                result.append(try CBv2CheckpointStorageTensorLayout(key: key, values: values)
+                    .descriptor(key: key, modelLayer: kind.modelLayerIndex ?? index,
+                                position: position, values: values))
             }
         }
         for spec in recurrentSpec?.layers ?? [] {
@@ -87,6 +94,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         guard !overflow, request.prefixCacheEnabled, request.multimodal == nil,
             request.positionState == nil, manifest.identity == identity,
             manifest.backendLayout == backendLayout,
+            manifest.kvQuantization == kvQuantization,
             manifest.cacheSalt == request.cacheSalt,
             manifest.position < request.promptTokens.count,
             manifest.prefixTokens.elementsEqual(request.promptTokens.prefix(manifest.position)),

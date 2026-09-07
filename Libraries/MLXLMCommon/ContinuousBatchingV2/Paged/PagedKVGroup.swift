@@ -3,6 +3,7 @@ import MLX
 
 /// Page ownership for one attention geometry; storage may be fixed or segmented.
 final class PagedKVGroup {
+    weak var pool: PagedKVPool?
     let key: PagedKVGroupKey
     let pageSize: Int
     let dtype: DType
@@ -72,7 +73,7 @@ final class PagedKVGroup {
 
     /// Bytes of ONE page counting both K and V slabs.
     var pageBytes: Int {
-        2 * key.kvHeads * pageSize * key.headDim * dtype.size
+        (try! key.bytesPerToken()) * pageSize
     }
 
     init(key: PagedKVGroupKey, pageCount: Int, pageSize: Int, dtype: DType,

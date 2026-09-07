@@ -3,7 +3,7 @@ import Foundation
 extension CBv2CompleteCheckpointManifest {
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, identity, backendLayout, position, chunkSize
-        case prefixTokens, cacheSalt, assistantCodecID, tensors, attentionLayers
+        case prefixTokens, cacheSalt, assistantCodecID, tensors, attentionLayers, kvQuantization
     }
 
     public init(from decoder: any Decoder) throws {
@@ -19,7 +19,8 @@ extension CBv2CompleteCheckpointManifest {
             metadata: .init(
                 tokens: try values.decode([Int].self, forKey: .prefixTokens),
                 tensors: try values.decode([CBv2CheckpointTensorDescriptor].self, forKey: .tensors),
-                attentionLayers: try values.decodeIfPresent([CBv2CheckpointAttentionLayer].self, forKey: .attentionLayers)))
+                attentionLayers: try values.decodeIfPresent([CBv2CheckpointAttentionLayer].self, forKey: .attentionLayers)),
+            kvQuantization: try values.decodeIfPresent(PagedKVQuantizationConfig.self, forKey: .kvQuantization))
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -34,6 +35,7 @@ extension CBv2CompleteCheckpointManifest {
         try values.encodeIfPresent(assistantCodecID, forKey: .assistantCodecID)
         try values.encode(tensors, forKey: .tensors)
         try values.encodeIfPresent(attentionLayers, forKey: .attentionLayers)
+        try values.encodeIfPresent(kvQuantization, forKey: .kvQuantization)
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -42,5 +44,6 @@ extension CBv2CompleteCheckpointManifest {
             && lhs.chunkSize == rhs.chunkSize && lhs.prefixTokens == rhs.prefixTokens
             && lhs.cacheSalt == rhs.cacheSalt && lhs.assistantCodecID == rhs.assistantCodecID
             && lhs.tensors == rhs.tensors && lhs.attentionLayers == rhs.attentionLayers
+            && lhs.kvQuantization == rhs.kvQuantization
     }
 }

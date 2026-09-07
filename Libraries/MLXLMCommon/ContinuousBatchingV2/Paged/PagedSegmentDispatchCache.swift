@@ -10,17 +10,37 @@ final class PagedSegmentPreparedDispatch {
     }
     let plan: PagedSegmentDispatchPlan
     let metadata: [Metadata]
+    /// Packed plans own two arenas; contiguous views add no GPU allocation.
+    let allocationArrays: [MLXArray]
 
     init(rows: [PagedSegmentDispatchPlan.Row], group: PagedKVGroup,
          partitionTokens: Int, hasWrite: Bool) {
         plan = PagedSegmentDispatchPlan(
             rows: rows, layout: group.segmentLayout!, pageSize: group.pageSize,
             partitionTokens: partitionTokens, hasWrite: hasWrite)
-        metadata = plan.buckets.map { bucket in
-            var offsets = bucket.segmentIDs.map { Int64(group.segments[$0]!.valueOffset) }
-            offsets.append(contentsOf: repeatElement(
-                offsets[0], count: max(8, bucket.bindingClass) - offsets.count))
-            return Metadata(records: MLXArray(bucket.records), valueOffsets: MLXArray(offsets))
+        if group.key.quantization != nil {
+            var allRecords: [Int32] = [], allOffsets: [Int64] = []
+            var slices: [(Range<Int>, Range<Int>)] = []
+            for bucket in plan.buckets {
+                let r = allRecords.count
+                allRecords.append(contentsOf: bucket.records)
+                let v = allOffsets.count
+                let offsets = bucket.segmentIDs.map { Int64(group.segments[$0]!.valueOffset) }
+                allOffsets.append(contentsOf: offsets)
+                allOffsets.append(contentsOf: repeatElement(offsets[0], count: max(8, bucket.bindingClass) - offsets.count))
+                slices.append((r ..< allRecords.count, v ..< allOffsets.count))
+            }
+            let records = MLXArray(allRecords), offsets = MLXArray(allOffsets)
+            allocationArrays = [records, offsets]
+            metadata = slices.map { Metadata(records: records[$0.0], valueOffsets: offsets[$0.1]) }
+        } else {
+            metadata = plan.buckets.map { bucket in
+                var offsets = bucket.segmentIDs.map { Int64(group.segments[$0]!.valueOffset) }
+                offsets.append(contentsOf: repeatElement(
+                    offsets[0], count: max(8, bucket.bindingClass) - offsets.count))
+                return Metadata(records: MLXArray(bucket.records), valueOffsets: MLXArray(offsets))
+            }
+            allocationArrays = metadata.flatMap { [$0.records, $0.valueOffsets] }
         }
     }
 }

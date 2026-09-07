@@ -4,7 +4,8 @@
 // The reference layout uses one fixed K/V slab pair per group. The explicit
 // segmented configuration instead commits bounded combined K/V buffers as
 // admitted demand grows; the total segment count has no dispatch-level cap.
-// Both preserve the selected FP16, BF16 or FP32 dtype without KV quantization.
+// Native remains default. Segmented full-attention groups can opt into packed
+// affine KV; their projection/compute dtype remains FP16, BF16 or FP32.
 //
 // Admission reserves each request's worst-case page demand and materializes
 // enough backing before creating its nonthrowing row. Actual page ownership
@@ -37,6 +38,8 @@ public struct PagedKVPoolConfig: Sendable {
     /// build-time forward probe must validate this table before serving. nil
     /// preserves the uniform fixed-reference policy.
     public var layerDTypes: [DType]?
+    /// Experimental packed full-attention storage; requires segmented backing.
+    public var quantization: PagedKVQuantizationConfig?
     /// Explicit foundation opt-in. nil retains the fixed-slab reference.
     /// Segments grow under the same byte grant; this is not a total-pool cap.
     public var segmentSizeBytes: Int?
@@ -80,12 +83,14 @@ public struct PagedKVPoolConfig: Sendable {
         maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize,
         prefixSharingBlockSize: Int? = nil,
         segmentSizeBytes: Int? = nil,
-        layerDTypes: [DType]? = nil
+        layerDTypes: [DType]? = nil,
+        quantization: PagedKVQuantizationConfig? = nil
     ) {
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
         self.dtype = dtype
         self.layerDTypes = layerDTypes
+        self.quantization = quantization
         self.maxPrefillChunk = maxPrefillChunk
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
         self.maxBufferLength = maxBufferLength
@@ -116,6 +121,8 @@ public final class PagedKVPool {
     /// segments. Only this pool's nominal request KV can offset its floor.
     var physicalLease: CBv2BackendPhysicalLease?
     var memoryAdmission: AdmissionV2?
+    var pendingQuantizedScratch: [PagedQuantizedScratchLease] = []
+    var quantizedScratchScope: PagedQuantizedStepScratch?
     var storageTelemetry = PagedKVStorageTelemetry()
     let writeValidation = CBv2PagedKVWriteValidation()
     /// Deterministic failure-order observer; production leaves this unset.
@@ -242,11 +249,20 @@ public final class PagedKVPool {
                         + "nil for a pool that never shares blocks")
             }
         }
+        if let quantization = config.quantization {
+            guard config.segmentSizeBytes != nil else {
+                throw CBv2KVError.backendIneligible(reason: "quantized KV requires segmented backing")
+            }
+            for kind in layerKinds where kind.attention == .full {
+                try quantization.validate(headDim: kind.headDim)
+            }
+        }
         let resolvedTypes = try PagedKVStorageLayout.resolve(layerKinds: layerKinds, config: config)
         let groupKeys = layerKinds.enumerated().map { index, kind in
             PagedKVGroupKey(
                 kind, dtype: resolvedTypes[index],
-                separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil)
+                separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil,
+                quantization: config.quantization)
         }
         // Demand-proportional capacity split.
         let owning = layerKinds.filter { $0.sharesKVWithLayer == nil }
@@ -293,9 +309,7 @@ public final class PagedKVPool {
         var demandBytes: [PagedKVGroupKey: Int] = [:]
         var totalDemand = 0
         for (key, tokens) in demandTokens {
-            let bytesPerToken = try Self.checkedMultiply(
-                [2, key.kvHeads, key.headDim, key.dtype.size],
-                context: "bytes per token")
+            let bytesPerToken = try key.bytesPerToken()
             let bytes = try Self.checkedMultiply(
                 [tokens, bytesPerToken],
                 context: "group byte demand")
@@ -311,7 +325,7 @@ public final class PagedKVPool {
         self.totalDemandBytes = totalDemand
         for (key, bytes) in demandBytes {
             let pageBytes = try Self.checkedMultiply(
-                [2, key.kvHeads, config.pageSize, key.headDim, key.dtype.size],
+                [try key.bytesPerToken(), config.pageSize],
                 context: "page bytes")
             if let target = config.segmentSizeBytes {
                 let layout = try PagedKVSegmentLayout(
@@ -347,6 +361,7 @@ public final class PagedKVPool {
                 key: key, pageCount: pageCount, pageSize: config.pageSize, dtype: key.dtype,
                 writeValidation: writeValidation)
         }
+        for group in groups.values { group.pool = self }
     }
 
     private static func checkedAdd(

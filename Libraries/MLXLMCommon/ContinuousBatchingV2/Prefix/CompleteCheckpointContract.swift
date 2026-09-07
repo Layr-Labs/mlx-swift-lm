@@ -32,7 +32,7 @@ public enum CBv2CheckpointTensorRole: String, Codable, Sendable {
 }
 
 public enum CBv2CheckpointDType: String, Codable, Sendable {
-    case float16, bfloat16, float32, int32
+    case float16, bfloat16, float32, int32, uint8
 
     public var mlxDType: DType {
         switch self {
@@ -40,6 +40,7 @@ public enum CBv2CheckpointDType: String, Codable, Sendable {
         case .bfloat16: .bfloat16
         case .float32: .float32
         case .int32: .int32
+        case .uint8: .uint8
         }
     }
 
@@ -49,6 +50,7 @@ public enum CBv2CheckpointDType: String, Codable, Sendable {
         case .bfloat16: self = .bfloat16
         case .float32: self = .float32
         case .int32: self = .int32
+        case .uint8: self = .uint8
         default: return nil
         }
     }
@@ -106,10 +108,14 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let layout = "native-contiguous-full-recurrent-v1"
     public static let pagedLayout = "native-paged-full-recurrent-v1"
     public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
+    public static let quantizedPagedLayout = "quantized-paged-full-recurrent-v1"
+    public static let quantizedHistoricalAttentionLayout = "quantized-paged-historical-attention-v1"
 
     public let schemaVersion: Int
     public let identity: CBv2CompleteCheckpointIdentity
     public let backendLayout: String
+    /// Authenticated storage and transform identity. Native manifests omit it.
+    public let kvQuantization: PagedKVQuantizationConfig?
     public let position: Int
     public let chunkSize: Int
     /// Read-only array aliases borrow the manifest's host ownership. Serving
@@ -127,20 +133,23 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         identity: CBv2CompleteCheckpointIdentity, position: Int, chunkSize: Int,
         prefixTokens: [Int], cacheSalt: String?, assistantCodecID: String?,
         tensors: [CBv2CheckpointTensorDescriptor], backendLayout: String = Self.layout,
-        attentionLayers: [CBv2CheckpointAttentionLayer]? = nil
+        attentionLayers: [CBv2CheckpointAttentionLayer]? = nil,
+        kvQuantization: PagedKVQuantizationConfig? = nil
     ) {
         self.init(schemaVersion: Self.currentSchemaVersion, identity: identity,
                   backendLayout: backendLayout, position: position, chunkSize: chunkSize,
                   cacheSalt: cacheSalt, assistantCodecID: assistantCodecID,
-                  metadata: .init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers))
+                  metadata: .init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers),
+                  kvQuantization: kvQuantization)
     }
 
     init(schemaVersion: Int, identity: CBv2CompleteCheckpointIdentity, backendLayout: String,
          position: Int, chunkSize: Int, cacheSalt: String?, assistantCodecID: String?,
-         metadata: CBv2CheckpointManifestMemory) {
+         metadata: CBv2CheckpointManifestMemory, kvQuantization: PagedKVQuantizationConfig? = nil) {
         self.schemaVersion = schemaVersion
         self.identity = identity
         self.backendLayout = backendLayout
+        self.kvQuantization = kvQuantization
         self.position = position
         self.chunkSize = chunkSize
         self.cacheSalt = cacheSalt
@@ -156,10 +165,19 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
 
     public func validateStructure() throws -> Int {
         defer { withExtendedLifetime(metadata) {} }
+        let quantized = backendLayout == Self.quantizedPagedLayout
+            || backendLayout == Self.quantizedHistoricalAttentionLayout
+        let historical = backendLayout == Self.historicalAttentionLayout
+            || backendLayout == Self.quantizedHistoricalAttentionLayout
+        if let kvQuantization {
+            do { try kvQuantization.validateParameters() }
+            catch { throw CBv2CompleteCheckpointError.invalidManifest }
+        }
         guard schemaVersion == Self.currentSchemaVersion, identity.isValid,
             (backendLayout == Self.layout || backendLayout == Self.pagedLayout
-                || backendLayout == Self.historicalAttentionLayout),
-            (backendLayout == Self.historicalAttentionLayout
+                || backendLayout == Self.historicalAttentionLayout || quantized),
+            quantized == (kvQuantization != nil),
+            (historical
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil),
             position > 1, chunkSize > 1,
@@ -174,6 +192,9 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         var roles = Set<String>()
         for tensor in tensors {
             try tensor.validate()
+            guard tensor.dtype != .uint8
+                || (quantized && (tensor.role == .keys || tensor.role == .values))
+            else { throw CBv2CompleteCheckpointError.invalidManifest }
             guard roles.insert("\(tensor.role.rawValue):\(tensor.layer ?? -1)").inserted else {
                 throw CBv2CompleteCheckpointError.invalidManifest
             }

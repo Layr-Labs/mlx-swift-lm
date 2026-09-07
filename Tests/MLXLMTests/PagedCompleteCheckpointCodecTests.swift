@@ -6,7 +6,7 @@ import Testing
 
 @Suite("Paged complete checkpoint codec", .serialized)
 struct PagedCompleteCheckpointCodecTests {
-    private struct Fixture {
+    struct Fixture {
         let backend: PagedKVBackend
         let admission: AdmissionV2
         let codec: CBv2CompleteCheckpointCodec
@@ -15,17 +15,18 @@ struct PagedCompleteCheckpointCodecTests {
         let bytes: [Data]
     }
 
-    private func fixture(dtype: DType = .bfloat16) throws -> Fixture {
+    func fixture(dtype: DType = .bfloat16, quantization: PagedKVQuantizationConfig? = nil) throws -> Fixture {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2,
                                   queryHeads: 4, modelLayerIndex: 1)]
         let config = PagedKVPoolConfig(capacityBytes: 64 << 20, maxPrefillChunk: 64,
-            segmentSizeBytes: 64 << 10, layerDTypes: [dtype])
+            segmentSizeBytes: 64 << 10, layerDTypes: [dtype], quantization: quantization)
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
         let spec = CBv2RecurrentStateSpec(layers: [.init(modelLayerIndex: 0,
             convShape: [1, 2, 2], convDType: dtype, ssmShape: [1, 1, 2, 2], ssmDType: .float32)])
         let admission = AdmissionV2(layerKinds: kinds, bytesCapacity: 64 << 20,
             config: .init(watermarkFraction: 0, elementBytes: dtype.size,
-                          fixedBytesPerRequest: try spec.fixedBytesPerRequest()),
+                          fixedBytesPerRequest: try spec.fixedBytesPerRequest(),
+                          layerBytesPerToken: [try backend.pool.groupKey(forLayer: 0).bytesPerToken()]),
             residency: CBv2PagedKVResidency(config: config))
         backend.pool.bindAdmission(admission)
         let identity = CBv2CompleteCheckpointIdentity(modelAggregateHash: "native-model",
@@ -38,7 +39,7 @@ struct PagedCompleteCheckpointCodecTests {
         let manifest = CBv2CompleteCheckpointManifest(identity: identity, position: chunk, chunkSize: chunk,
             prefixTokens: Array(request.promptTokens.prefix(chunk)), cacheSalt: request.cacheSalt,
             assistantCodecID: nil, tensors: try codec.tensorDescriptors(position: chunk),
-            backendLayout: CBv2CompleteCheckpointManifest.pagedLayout)
+            backendLayout: codec.backendLayout, kvQuantization: quantization)
         let bytes = manifest.tensors.enumerated().map { index, descriptor in
             Data((0 ..< descriptor.byteCount).map { UInt8(truncatingIfNeeded: ($0 * 73) ^ ($0 >> 3) ^ (index * 19)) })
         }
@@ -66,7 +67,11 @@ struct PagedCompleteCheckpointCodecTests {
     @Test("Actual-M destinations move into full-N request ownership without byte conversion",
           arguments: [DType.bfloat16, .float16, .float32])
     func roundTrip(dtype: DType) throws {
-        let fixture = try fixture(dtype: dtype)
+        try checkRoundTrip(dtype: dtype)
+    }
+
+    func checkRoundTrip(dtype: DType, quantization: PagedKVQuantizationConfig? = nil) throws {
+        let fixture = try fixture(dtype: dtype, quantization: quantization)
         func exercise() throws {
             let plan = try plan(fixture)
             let metadataBytes = try #require(plan.manifest.metadata.permit).bytes

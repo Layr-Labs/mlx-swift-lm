@@ -240,12 +240,14 @@ final class PagedKVSegment {
         self.index = index
         let pages = layout.range(index)
         self.pages = pages
-        self.valueOffset = pages.count * key.kvHeads * pageSize * key.headDim
+        let packedRow = try key.quantization?.rowLayout(headDim: key.headDim)
+        self.valueOffset = pages.count * key.kvHeads * pageSize * (packedRow?.keyRowBytes ?? key.headDim)
         self.byteCount = pages.count * layout.pageBytes
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
             let array = MLXArray.zeros(
-                [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
+                packedRow == nil ? [2, pages.count, key.kvHeads, pageSize, key.headDim] : [pages.count * layout.pageBytes],
+                dtype: packedRow == nil ? dtype : .uint8,
                 stream: allocationStream)
             do {
                 try fault.check()

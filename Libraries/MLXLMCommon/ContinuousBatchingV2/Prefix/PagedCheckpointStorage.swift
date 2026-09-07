@@ -69,7 +69,8 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
                 start = 0; ring = nil; count = pages
             }
-            let key = PagedKVGroupKey(kind, dtype: types[index], separateWindow: true)
+            let key = PagedKVGroupKey(kind, dtype: types[index], separateWindow: true,
+                                      quantization: config.quantization)
             let first = demand[key, default: 0]
             let (next, overflow) = first.addingReportingOverflow(count)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
@@ -81,8 +82,8 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
         var groups: [Group] = []
         var total = 0
         for key in demand.keys.sorted(by: { $0.sortKey < $1.sortKey }) {
-            let pageBytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-                shape: [2, key.kvHeads, config.pageSize, key.headDim], dtype: key.dtype)
+            let (pageBytes, pageOverflow) = try key.bytesPerToken().multipliedReportingOverflow(by: config.pageSize)
+            guard !pageOverflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             let layout = try PagedKVSegmentLayout(
                 pageBytes: pageBytes, targetBytes: targetBytes,
                 maximumBufferBytes: config.maxBufferLength,
@@ -156,16 +157,18 @@ final class CBv2PagedCheckpointStorage {
         }
         let layer = plan.layers[layerIndex]
         guard let group = groups[layer.key] else { throw CBv2CompleteCheckpointError.closed }
+        let tensorLayout = try CBv2CheckpointStorageTensorLayout(key: layer.key, values: values)
         let bytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-            shape: [1, layer.key.kvHeads, layer.tokenCount, layer.key.headDim], dtype: layer.key.dtype)
-        let width = layer.key.dtype.size
+            shape: [1, layer.key.kvHeads, layer.tokenCount, tensorLayout.rowElements],
+            dtype: tensorLayout.dtype.mlxDType)
+        let width = tensorLayout.itemSize
         guard byteOffset >= 0, byteOffset < bytes, byteOffset % width == 0,
             !data.isEmpty, data.count <= CBv2CompleteCheckpointManifest.maximumSegmentBytes,
             data.count % width == 0, data.count <= bytes - byteOffset
         else { throw CBv2CompleteCheckpointError.invalidSegment }
         try data.withUnsafeBytes { source in
             try CBv2PagedCheckpointByteLayout.runs(
-                headDim: layer.key.headDim, position: layer.tokenCount, pageSize: plan.pageSize,
+                headDim: tensorLayout.rowElements, position: layer.tokenCount, pageSize: plan.pageSize,
                 tokenStart: layer.tokenStart, ringPages: layer.ringPages, itemSize: width, byteOffset: byteOffset, count: data.count
             ) { logicalPage, head, slot, feature, packedOffset, count in
                 let page = group.pages[layer.firstPage + logicalPage]
@@ -175,7 +178,7 @@ final class CBv2PagedCheckpointStorage {
                 }
                 let localPage = group.layout.localPage(page)
                 let element = ((localPage * layer.key.kvHeads + head) * plan.pageSize + slot)
-                    * layer.key.headDim + feature + (values ? segment.valueOffset : 0)
+                    * tensorLayout.rowElements + feature + (values ? segment.valueOffset : 0)
                 UnsafeMutableRawPointer(mutating: pointer).advanced(by: element * width).copyMemory(
                     from: source.baseAddress!.advanced(by: packedOffset), byteCount: count)
             }

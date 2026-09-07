@@ -570,11 +570,13 @@ public enum PagedAttentionKernel {
         /// write (KV-borrowing layers, attention-only probes).
         var writePage: Int32 = 0
         var writeSlot: Int = 0
+        /// Input/output query column for broadcast-topology quantized prefill.
+        var queryIndex: Int = 0
 
         var packed: [Int32] {
             [
                 Int32(attendStart), Int32(attendLength), Int32(tableLength),
-                writePage, Int32(writeSlot), 0, 0, 0,
+                writePage, Int32(writeSlot), Int32(queryIndex), 0, 0,
             ]
         }
     }

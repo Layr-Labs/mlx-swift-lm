@@ -244,6 +244,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             output = attendRectangularColumns(
                 queries: queries, keys: keys, values: values,
                 rows: pagedRows, scale: scale, sinks: effectiveSinks)
+        } else if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            precondition(boundSpanContext == nil || b == 1)
+            retainedPrefillKV = []
+            output = CBv2AttentionV1.packedPerRow(batch: b) { index, slice in
+                let row = pagedRows[index]
+                let start = row.absoluteOffset
+                return quantizedPrefill(queries: slice(queries), row: row,
+                                       queryStart: start, scale: scale, sinks: effectiveSinks,
+                                       chunkKeys: slice(keys), chunkValues: slice(values))
+            }
         } else {
             precondition(
                 boundSpanContext == nil || b == 1,
@@ -337,6 +347,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 queries: queries, keys: nil, values: nil,
                 rows: src.pagedRows, scale: scale, sinks: effectiveSinks,
                 tableProvider: src)
+        } else if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            return CBv2AttentionV1.packedPerRow(batch: queries.dim(0)) { index, slice in
+                let row = src.pagedRows[index]
+                return quantizedPrefill(queries: slice(queries), row: row,
+                                       queryStart: row.absoluteOffset - l, scale: scale, sinks: effectiveSinks)
+            }
         } else {
             let b = queries.dim(0)
             precondition(
@@ -539,7 +555,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     }
 
     /// Kernel params `{softcap, scale, 0…}`, cached across steps.
-    private func params(scale: Float) -> MLXArray {
+    func params(scale: Float) -> MLXArray {
         if let cached = cachedParams, cachedParamsScale == scale {
             return cached
         }
@@ -553,7 +569,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     /// Sinks prepared for the merge kernel: fp32, padded to >= 8 elements
     /// so the generated signature keeps the `device` address space.
-    private func preparedSinks(_ sinks: MLXArray?) -> MLXArray? {
+    func preparedSinks(_ sinks: MLXArray?) -> MLXArray? {
         guard let sinks else { return nil }
         if let cached = cachedSinks, cachedSinksSource == ObjectIdentifier(sinks) {
             return cached

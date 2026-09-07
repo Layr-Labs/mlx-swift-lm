@@ -40,7 +40,8 @@ struct CBv2HistoricalAttentionLayout: Sendable {
         for (index, kind) in layerKinds.enumerated() {
             guard !kind.isBidirectional, kind.kvHeads > 0, kind.headDim >= 64,
                   kind.queryHeads > 0, kind.queryHeads % kind.kvHeads == 0,
-                  (kind.modelLayerIndex ?? index) >= 0, let dtype = CBv2CheckpointDType(dtypes[index]), dtype != .int32,
+                  (kind.modelLayerIndex ?? index) >= 0, let dtype = CBv2CheckpointDType(dtypes[index]),
+                  [.float16, .bfloat16, .float32].contains(dtype),
                   modelIndices.insert(kind.modelLayerIndex ?? index).inserted
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             let window: Int?

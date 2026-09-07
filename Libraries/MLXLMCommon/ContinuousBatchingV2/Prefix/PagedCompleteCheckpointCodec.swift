@@ -51,7 +51,8 @@ extension CBv2CompleteCheckpointCodec {
             schemaVersion: CBv2CompleteCheckpointManifest.currentSchemaVersion, identity: identity,
             backendLayout: backendLayout, position: checkpoint.position, chunkSize: checkpoint.chunkSize,
             cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
-            metadata: .init(tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors, permit: metadataPermit))
+            metadata: .init(tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors, permit: metadataPermit),
+            kvQuantization: kvQuantization)
         _ = try manifest.validateStructure()
         return .init(manifest: manifest, sources: sources, usesProcessMemoryOwner: admission.hasProcessMemoryOwner)
     }

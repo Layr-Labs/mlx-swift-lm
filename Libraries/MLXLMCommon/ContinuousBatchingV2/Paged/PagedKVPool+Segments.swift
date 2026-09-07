@@ -85,7 +85,9 @@ extension PagedKVPool {
         for (key, count) in pages {
             // Geometry was checked at construction; the token-dependent
             // products below still use checked arithmetic.
-            let pageBytes = 2 * key.kvHeads * config.pageSize * key.headDim * key.dtype.size
+            guard let tokenBytes = try? key.bytesPerToken(),
+                  let pageBytes = try? PagedKVQuantizationConfig.multiply(tokenBytes, config.pageSize)
+            else { return nil }
             guard let layout = try? PagedKVSegmentLayout(
                 pageBytes: pageBytes,
                 targetBytes: config.segmentSizeBytes ?? PagedKVSegmentLayout.defaultTargetBytes,

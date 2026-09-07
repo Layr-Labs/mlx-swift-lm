@@ -161,6 +161,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         /// nil ⇒ uniform `elementBytes`. Entries for KV-shared layers are
         /// ignored (those layers own no storage).
         public var layerElementBytes: [Int]?
+        /// Exact physical K+V bytes per token for each layer, including packed
+        /// codes and quantization metadata. When supplied, this overrides the
+        /// element-width estimate. Shared borrowers still own zero bytes.
+        /// A malformed table fails capacity checks closed; it must never fall
+        /// back to a cheaper dtype estimate.
+        public var layerBytesPerToken: [Int]?
         /// Fixed non-KV residency charged once for every active request.
         /// Hybrid recurrent models use this for conv + SSM state; attention-
         /// only models keep the source-compatible zero default.
@@ -175,10 +181,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         public var auxiliaryTokenAllocationPadding: Int
         /// Immutable per-buffer allocator bounds resolved at engine creation.
         public var auxiliaryAllocationProjection: CBv2AuxiliaryAllocationProjection? = nil
+        /// Separate prospective native workspace charge. Runtime leases consume
+        /// this credit; they never borrow target KV or assistant reservations.
+        public var workspaceProjection: CBv2RequestWorkspaceProjection? = nil
         public init(
             watermarkFraction: Double = 0.05, elementBytes: Int = 2,
             layerElementBytes: [Int]? = nil,
-            fixedBytesPerRequest: Int = 0
+            fixedBytesPerRequest: Int = 0,
+            layerBytesPerToken: [Int]? = nil
         ) {
             self.init(
                 watermarkFraction: watermarkFraction,
@@ -187,7 +197,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 fixedBytesPerRequest: fixedBytesPerRequest,
                 auxiliaryBytesPerToken: 0,
                 auxiliaryTokenGranularity: 1,
-                auxiliaryTokenAllocationPadding: 0)
+                auxiliaryTokenAllocationPadding: 0,
+                layerBytesPerToken: layerBytesPerToken)
         }
 
         public init(
@@ -195,11 +206,13 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             layerElementBytes: [Int]?, fixedBytesPerRequest: Int,
             auxiliaryBytesPerToken: Int,
             auxiliaryTokenGranularity: Int = 1,
-            auxiliaryTokenAllocationPadding: Int = 0
+            auxiliaryTokenAllocationPadding: Int = 0,
+            layerBytesPerToken: [Int]? = nil
         ) {
             self.watermarkFraction = watermarkFraction
             self.elementBytes = elementBytes
             self.layerElementBytes = layerElementBytes
+            self.layerBytesPerToken = layerBytesPerToken
             self.fixedBytesPerRequest = fixedBytesPerRequest
             self.auxiliaryBytesPerToken = auxiliaryBytesPerToken
             self.auxiliaryTokenGranularity = auxiliaryTokenGranularity
@@ -219,8 +232,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     private let lock = NSLock()
     private let layerKinds: [CBv2LayerKind]
-    /// Resolved bytes-per-element per layer (aligned to `layerKinds`).
-    private let perLayerElementBytes: [Int]
+    /// Resolved physical K+V bytes per token; nil marks invalid arithmetic.
+    private let perLayerTokenBytes: [Int?]
     /// Watermark fraction retained so `updateBytesCapacity` can recompute
     /// `watermark` against the new capacity.
     private let watermarkFraction: Double
@@ -234,9 +247,16 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public let auxiliaryTokenGranularity: Int
     public let auxiliaryTokenAllocationPadding: Int
     private let auxiliaryAllocationProjection: CBv2AuxiliaryAllocationProjection?
+    private let workspaceProjection: CBv2RequestWorkspaceProjection?
     /// Nominal bytes per token for storage-owning full-attention rows under
     /// this ledger's actual per-layer dtype assumptions.
     public let fullKVBytesPerToken: Int
+    /// Conservative target-KV cost above `tokens * fullKVBytesPerToken` for
+    /// one request: bounded window backing plus full-owner page rounding.
+    /// Routing bridges may reserve this before accepting an unknown shape.
+    /// It excludes recurrent/assistant state, native compute scratch and
+    /// pool-wide allocator slack; their existing owners charge those bytes.
+    public let maximumKVRequestOverheadBytes: Int
 
     /// Total KV byte budget. Runtime-resizable via `updateBytesCapacity`
     /// (multi-model co-residency re-slicing); reads take the ledger lock.
@@ -282,6 +302,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private var checkpointAuxiliaryBytes: [CBv2RequestID: Int] = [:]
     private var detachedNonBackendBytes = 0
     private var physicalFloor = CBv2BackendPhysicalFloor()
+    private var workspaceFloor = CBv2AdmissionWorkspaceFloor()
     private let processMemoryOwner: (any CBv2ProcessMemoryOwner)?
     private var processChargedBytes = 0
     private var processMaterializedBytes = 0
@@ -306,49 +327,22 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         self.auxiliaryTokenAllocationPadding = max(
             0, config.auxiliaryTokenAllocationPadding)
         self.auxiliaryAllocationProjection = config.auxiliaryAllocationProjection
-        if let table = config.layerElementBytes {
-            precondition(
-                table.count == layerKinds.count,
-                "AdmissionV2: layerElementBytes count \(table.count) != layer count \(layerKinds.count)"
-            )
-            self.perLayerElementBytes = table
-        } else {
-            self.perLayerElementBytes = Array(
-                repeating: config.elementBytes, count: layerKinds.count)
-        }
+        self.workspaceProjection = config.workspaceProjection
+        let storage = CBv2KVAdmissionStorageLayout(
+            layerKinds: layerKinds, config: config, residency: residency)
+        self.perLayerTokenBytes = storage.perLayerTokenBytes
         self.watermarkFraction = config.watermarkFraction
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
-        var perToken = 0
-        var fullPerToken = 0
-        var accountingOverflow = false
-        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
-            guard
-                let bytes = Self.storageBytesPerToken(
-                    kind: kind,
-                    elementBytes: self.perLayerElementBytes[index]),
-                let newPerToken = Self.add(perToken, bytes)
-            else {
-                accountingOverflow = true
-                break
-            }
-            perToken = newPerToken
-            if case .full = kind.attention {
-                guard let newFullPerToken = Self.add(fullPerToken, bytes) else {
-                    accountingOverflow = true
-                    break
-                }
-                fullPerToken = newFullPerToken
-            }
-        }
         let (maximumAuxiliaryGrowth, auxiliaryGrowthOverflow) =
             self.auxiliaryBytesPerToken.multipliedReportingOverflow(
                 by: self.auxiliaryTokenGranularity)
-        let (totalPerToken, auxiliaryOverflow) = perToken.addingReportingOverflow(
+        let (totalPerToken, auxiliaryOverflow) = storage.maximumPerTokenBytes.addingReportingOverflow(
             max(maximumAuxiliaryGrowth, auxiliaryAllocationProjection?.maximumGrowthBytes ?? 0))
-        self.maxPerTokenBytes = accountingOverflow || auxiliaryOverflow
+        self.maxPerTokenBytes = auxiliaryOverflow
             || auxiliaryGrowthOverflow
             ? Int.max : totalPerToken
-        self.fullKVBytesPerToken = accountingOverflow ? Int.max : fullPerToken
+        self.fullKVBytesPerToken = storage.fullPerTokenBytes
+        self.maximumKVRequestOverheadBytes = storage.maximumRequestOverheadBytes
     }
 
     /// Engine construction binds its one immutable segmented backend before
@@ -383,7 +377,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard bytes >= 0 else { throw CBv2KVError.backendIneligible(reason: "negative physical floor") }
         lock.lock()
         defer { lock.unlock() }
-        guard let after = physicalFloor.chargedBytes(base: ledgerBytes, physical: bytes) else {
+        guard let after = combinedChargedBytes(base: ledgerBytes, physical: bytes) else {
             throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
         }
         // Existing debt may be reused or reduced, but never increased.
@@ -399,7 +393,42 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// Callers hold lock. Only nominal target KV offsets the physical floor;
     /// recurrent/MTP state, exact extra backing and scratch remain additive.
     private var chargedLedgerBytes: Int {
-        physicalFloor.chargedBytes(base: ledgerBytes) ?? Int.max
+        combinedChargedBytes(base: ledgerBytes) ?? Int.max
+    }
+
+    private func combinedChargedBytes(
+        base: Int, nominal: Int? = nil, physical: Int? = nil,
+        workspacePrepaid: Int? = nil, workspaceLeased: Int? = nil,
+        workspaceState: CBv2AdmissionWorkspaceFloor? = nil
+    ) -> Int? {
+        guard let target = physicalFloor.chargedBytes(base: base, nominal: nominal, physical: physical) else { return nil }
+        return Self.add(target, (workspaceState ?? workspaceFloor).overhead(
+            prepaid: workspacePrepaid, leased: workspaceLeased))
+    }
+
+    private func workspaceBytes(forTokens tokens: Int) -> Int? {
+        guard let workspaceProjection else { return tokens >= 0 ? 0 : nil }
+        return workspaceProjection.bytes(forTokens: tokens)
+    }
+
+    /// Immutable prospective workspace bound used by the provider's raw-token
+    /// capacity projection. This is separate from the literal KV storage rate.
+    func routingWorkspaceBytes(forTokens tokens: Int) -> Int? {
+        workspaceBytes(forTokens: tokens)
+    }
+
+    func routingWorkspaceBytes(totalTokens: Int, maximumRequests: Int) -> Int? {
+        guard totalTokens >= 0, maximumRequests >= 0,
+            totalTokens == 0 || maximumRequests > 0 else { return nil }
+        guard let workspaceProjection else { return 0 }
+        return workspaceProjection.bytes(totalTokens: totalTokens, maximumRequests: maximumRequests)
+    }
+
+    private func projectedWorkspacePrepaid(from bytes: Int, oldTokens: Int, newTokens: Int) -> Int? {
+        guard let old = workspaceBytes(forTokens: oldTokens),
+            let new = workspaceBytes(forTokens: newTokens),
+            let after = Self.add(bytes, new - old), after >= 0 else { return nil }
+        return after
     }
     private var mutationCeiling: Int {
         physicalFloor.isBound ? max(reserveCeiling, chargedLedgerBytes) : reserveCeiling
@@ -490,9 +519,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             case .slidingWindow(let window): retained = min(tokens, window)
             }
             guard retained >= 0,
-                let perTokenBytes = Self.storageBytesPerToken(
-                    kind: kind,
-                    elementBytes: perLayerElementBytes[index]),
+                let perTokenBytes = perLayerTokenBytes[index],
                 let retainedBytes = Self.multiply(retained, perTokenBytes),
                 let newTotal = Self.add(total, retainedBytes)
             else { return nil }
@@ -512,7 +539,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             guard let bytes = auxiliaryAllocationProjection.bytes(forTokens: tokens) else { return nil }
             physicalAuxiliary = max(auxiliary, bytes)
         } else { physicalAuxiliary = auxiliary }
-        return Self.add(fixedBytesPerRequest, physicalAuxiliary)
+        guard let fixed = Self.add(fixedBytesPerRequest, physicalAuxiliary),
+            let workspace = workspaceBytes(forTokens: tokens) else { return nil }
+        return Self.add(fixed, workspace)
     }
 
     /// Bytes the BACKEND occupies at `tokens` beyond the content
@@ -541,9 +570,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             else { return nil }
             let missing = max(0, occupied - retained)
             guard
-                let perTokenBytes = Self.storageBytesPerToken(
-                    kind: kind,
-                    elementBytes: perLayerElementBytes[index]),
+                let perTokenBytes = perLayerTokenBytes[index],
                 let missingBytes = Self.multiply(missing, perTokenBytes),
                 let newTotal = Self.add(total, missingBytes)
             else { return nil }
@@ -663,6 +690,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         var simulatedLedgerBytes = ledgerBytes
         var simulatedNominalBytes = physicalFloor.nominalBytes
         var simulatedPhysicalBytes = physicalFloor.physicalBytes
+        var simulatedWorkspace = workspaceFloor
 
         /// nil means malformed/unrepresentable; false means a valid
         /// reservation that cannot fit and was left unapplied.
@@ -707,14 +735,18 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             guard let nominal = projectedNominal(
                 from: simulatedNominalBytes, oldTokens: oldTokens, newTokens: newTokens,
                 oldAllocated: oldTokenBytes, newAllocated: newTokenBytes),
-                let charged = physicalFloor.chargedBytes(base: after, nominal: nominal, physical: physical),
-                let before = physicalFloor.chargedBytes(
+                let prepaid = projectedWorkspacePrepaid(
+                    from: simulatedWorkspace.prepaidBytes, oldTokens: oldTokens, newTokens: newTokens),
+                let charged = combinedChargedBytes(base: after, nominal: nominal, physical: physical,
+                                                   workspacePrepaid: prepaid, workspaceState: simulatedWorkspace),
+                let before = combinedChargedBytes(
                     base: simulatedLedgerBytes, nominal: simulatedNominalBytes,
-                    physical: simulatedPhysicalBytes)
+                    physical: simulatedPhysicalBytes, workspaceState: simulatedWorkspace)
             else { return nil }
             let ceiling = physicalFloor.isBound ? max(reserveCeiling, before) : reserveCeiling
             guard charged <= ceiling else { return false }
             simulatedNominalBytes = nominal
+            simulatedWorkspace.replacePrepaid(prepaid)
             simulatedPhysicalBytes = physical
             simulatedTokens = nextTokens
             simulatedExactBytes[reservation.id] = newExactBytes
@@ -761,11 +793,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                     !ledgerOverflow, after >= 0,
                     let nominal = projectedNominal(
                         from: simulatedNominalBytes, oldTokens: oldTokens, newTokens: newTokens,
-                        oldAllocated: oldTokenBytes, newAllocated: newTokenBytes)
+                        oldAllocated: oldTokenBytes, newAllocated: newTokenBytes),
+                    let prepaid = projectedWorkspacePrepaid(
+                        from: simulatedWorkspace.prepaidBytes, oldTokens: oldTokens, newTokens: newTokens)
                 else {
                     return false
                 }
                 simulatedNominalBytes = nominal
+                simulatedWorkspace.replacePrepaid(prepaid)
                 if newTokens == 0 {
                     simulatedTokens.removeValue(forKey: reservation.id)
                 } else {
@@ -793,9 +828,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 guard !releaseOverflow, !ledgerOverflow, after >= 0,
                     let nominal = projectedNominal(
                         from: simulatedNominalBytes, oldTokens: oldTokens, newTokens: 0,
-                        oldAllocated: tokenBytes, newAllocated: 0)
+                        oldAllocated: tokenBytes, newAllocated: 0),
+                    let prepaid = projectedWorkspacePrepaid(
+                        from: simulatedWorkspace.prepaidBytes, oldTokens: oldTokens, newTokens: 0)
                 else { return false }
                 simulatedNominalBytes = nominal
+                simulatedWorkspace.replacePrepaid(prepaid)
                 simulatedLedgerBytes = after
             }
         }
@@ -838,7 +876,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard let nominal = projectedNominal(
             from: physicalFloor.nominalBytes, oldTokens: old, newTokens: new,
             oldAllocated: oldTokenBytes, newAllocated: newTokenBytes),
-              let charged = physicalFloor.chargedBytes(base: after, nominal: nominal) else {
+            let prepaid = projectedWorkspacePrepaid(
+                from: workspaceFloor.prepaidBytes, oldTokens: old, newTokens: new),
+            let charged = combinedChargedBytes(base: after, nominal: nominal, workspacePrepaid: prepaid) else {
             throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0)
         }
         guard charged <= mutationCeiling else {
@@ -848,6 +888,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         }
         try acceptProcessChargeLocked(charged)
         physicalFloor.nominalBytes = nominal
+        workspaceFloor.replacePrepaid(prepaid)
         reservedTokens[id] = new
         reservedExactBytes[id] = newExact
         ledgerBytes = after
@@ -873,10 +914,13 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let newAllocated = allocatedBytes(forTokens: new)
         guard let nominal = projectedNominal(
             from: physicalFloor.nominalBytes, oldTokens: old, newTokens: new,
-            oldAllocated: oldAllocated, newAllocated: newAllocated) else {
+            oldAllocated: oldAllocated, newAllocated: newAllocated),
+            let prepaid = projectedWorkspacePrepaid(
+                from: workspaceFloor.prepaidBytes, oldTokens: old, newTokens: new) else {
             preconditionFailure("invalid nominal KV release")
         }
         physicalFloor.nominalBytes = nominal
+        workspaceFloor.replacePrepaid(prepaid)
         ledgerBytes += newAllocated - oldAllocated + newExact - oldExact
         publishProcessReductionLocked()
         if new == 0 {
@@ -911,10 +955,13 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let old = reservedTokens.removeValue(forKey: id) ?? 0
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
         guard let nominal = projectedNominal(
-            from: physicalFloor.nominalBytes, oldTokens: old, newTokens: 0) else {
+            from: physicalFloor.nominalBytes, oldTokens: old, newTokens: 0),
+            let prepaid = projectedWorkspacePrepaid(
+                from: workspaceFloor.prepaidBytes, oldTokens: old, newTokens: 0) else {
             preconditionFailure("invalid nominal KV completion")
         }
         physicalFloor.nominalBytes = nominal
+        workspaceFloor.replacePrepaid(prepaid)
         ledgerBytes -= allocatedBytes(forTokens: old) + exact
         publishProcessReductionLocked()
     }
@@ -925,7 +972,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard bytes >= 0 else { throw CBv2CompleteCheckpointError.invalidManifest }
         lock.lock()
         let (after, overflow) = ledgerBytes.addingReportingOverflow(bytes)
-        guard !overflow, let charged = physicalFloor.chargedBytes(base: after),
+        guard !overflow, let charged = combinedChargedBytes(base: after),
               charged <= mutationCeiling else {
             let available = max(0, reserveCeiling - chargedLedgerBytes)
             lock.unlock()
@@ -945,6 +992,30 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         }
     }
 
+    /// Actual attention scratch consumes only its dedicated prepaid allowance.
+    /// The independent leased floor outlives request completion/cancellation,
+    /// including when a successor step has already borrowed another allowance.
+    func reserveWorkspace(bytes: Int) throws -> CBv2CheckpointReservation {
+        guard bytes >= 0 else { throw CBv2CompleteCheckpointError.invalidManifest }
+        try lock.withLock {
+            guard let leased = Self.add(workspaceFloor.leasedBytes, bytes),
+                let charged = combinedChargedBytes(base: ledgerBytes, workspaceLeased: leased),
+                charged <= mutationCeiling
+            else {
+                throw CBv2KVError.capacityExhausted(
+                    needed: bytes, available: max(0, reserveCeiling - chargedLedgerBytes))
+            }
+            try acceptProcessChargeLocked(charged)
+            workspaceFloor.leasedBytes = leased
+        }
+        return CBv2CheckpointReservation { [self] in
+            lock.withLock {
+                workspaceFloor.releaseLease(bytes)
+                publishProcessReductionLocked()
+            }
+        }
+    }
+
     /// Price a private teacher row with the ordinary request projection,
     /// including the resolved recurrent peak, allocator padding and any
     /// configured auxiliary headroom. The backend row must already exist;
@@ -956,6 +1027,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard maximumTokens > 0, minimumTargetBytes >= 0,
             let allocated = allocatedBytesChecked(forTokens: maximumTokens),
             let auxiliary = nonBackendBytesChecked(forTokens: maximumTokens),
+            let workspace = workspaceBytes(forTokens: maximumTokens),
             allocated >= auxiliary,
             let bytes = Self.add(max(allocated - auxiliary, minimumTargetBytes), auxiliary)
         else { throw CBv2KVError.capacityExhausted(needed: Int.max, available: 0) }
@@ -964,7 +1036,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             let delta = physicalFloor.isBound ? target : 0
             guard let after = Self.add(ledgerBytes, bytes),
                 let nominal = Self.add(physicalFloor.nominalBytes, delta),
-                let charged = physicalFloor.chargedBytes(base: after, nominal: nominal),
+                let prepaid = Self.add(workspaceFloor.prepaidBytes, workspace),
+                let charged = combinedChargedBytes(base: after, nominal: nominal, workspacePrepaid: prepaid),
                 charged <= mutationCeiling
             else {
                 throw CBv2KVError.capacityExhausted(
@@ -972,6 +1045,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             }
             try acceptProcessChargeLocked(charged)
             physicalFloor.nominalBytes = nominal
+            workspaceFloor.replacePrepaid(prepaid)
             ledgerBytes = after
             transientBytes += bytes
             transientTargetBytes += target
@@ -983,6 +1057,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 transientBytes -= bytes
                 transientTargetBytes -= target
                 physicalFloor.nominalBytes -= nominalDelta
+                workspaceFloor.replacePrepaid(workspaceFloor.prepaidBytes - workspace)
                 publishProcessReductionLocked()
             }
         }
@@ -1000,7 +1075,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let identity = UUID()
         try lock.withLock {
             guard let after = Self.add(ledgerBytes, bytes),
-                let charged = physicalFloor.chargedBytes(base: after),
+                let charged = combinedChargedBytes(base: after),
                 charged <= mutationCeiling
             else {
                 throw CBv2KVError.capacityExhausted(
@@ -1066,14 +1141,17 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 checkpointStages[stage.identity]?.bytes == totalBytes,
                 let allocated = allocatedBytesChecked(forTokens: maximumTokens),
                 let auxiliary = nonBackendBytesChecked(forTokens: maximumTokens),
+                let workspace = workspaceBytes(forTokens: maximumTokens),
+                auxiliary >= workspace,
                 let allocatedWithShortfall = Self.add(
-                    allocated, max(0, destination.auxiliaryBytes - auxiliary)),
+                    allocated, max(0, destination.auxiliaryBytes - (auxiliary - workspace))),
                 let nominal = projectedNominal(
                     from: physicalFloor.nominalBytes, oldTokens: 0,
                     newTokens: maximumTokens, newAllocated: allocated),
                 let after = Self.add(ledgerBytes - destinationBytes, allocatedWithShortfall),
-                let charged = physicalFloor.chargedBytes(
-                    base: after, nominal: nominal, physical: physicalBytes)
+                let prepaid = Self.add(workspaceFloor.prepaidBytes, workspace),
+                let charged = combinedChargedBytes(
+                    base: after, nominal: nominal, physical: physicalBytes, workspacePrepaid: prepaid)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             guard charged <= mutationCeiling else {
                 throw CBv2KVError.capacityExhausted(
@@ -1094,8 +1172,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             checkpointRequestOwners[requestID] = stage.identity
             physicalFloor.nominalBytes = nominal
             physicalFloor.physicalBytes = physicalBytes
+            workspaceFloor.replacePrepaid(prepaid)
             return (allocated: allocatedWithShortfall, auxiliaryShortfall: auxiliaryShortfall,
-                    nominalDelta: nominal - previousNominal)
+                    nominalDelta: nominal - previousNominal, workspace: workspace)
         }
         return CBv2CheckpointAdoptionReservation { [self] in
             lock.withLock {
@@ -1112,6 +1191,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 ledgerBytes -= rollback.allocated
                 physicalFloor.nominalBytes -= rollback.nominalDelta
                 physicalFloor.physicalBytes = previousPhysicalBytes
+                workspaceFloor.replacePrepaid(workspaceFloor.prepaidBytes - rollback.workspace)
                 publishProcessReductionLocked()
             }
         }
@@ -1129,12 +1209,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let nonBackendBytes = (nonBackendBytesChecked(forTokens: tokens) ?? 0) + auxiliary
         let nominalBytes = physicalFloor.isBound
             ? (nominalTargetBytes(forTokens: tokens) ?? 0) : 0
+        let workspace = workspaceBytes(forTokens: tokens) ?? 0
         detachedNonBackendBytes += nonBackendBytes
         lock.unlock()
         return CBv2CheckpointReservation { [self] in
             lock.lock()
             ledgerBytes -= bytes
             physicalFloor.nominalBytes -= nominalBytes
+            workspaceFloor.replacePrepaid(workspaceFloor.prepaidBytes - workspace)
             detachedNonBackendBytes -= nonBackendBytes
             publishProcessReductionLocked()
             lock.unlock()
@@ -1152,7 +1234,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard additionalTokens >= 0,
             let chargedTokens = Self.roundUp(additionalTokens, to: residency.rowGranularity),
             let additionalBytes = Self.multiply(chargedTokens, maxPerTokenBytes),
-            let after = Self.add(chargedLedgerBytes, additionalBytes)
+            let workspace = workspaceBytes(forTokens: chargedTokens),
+            let totalGrowth = Self.add(additionalBytes, workspace),
+            let after = Self.add(chargedLedgerBytes, totalGrowth)
         else { return false }
         return after <= mutationCeiling
     }
@@ -1163,17 +1247,6 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard granularity > 1 else { return value }
         guard let bumped = add(value, granularity - 1) else { return nil }
         return (bumped / granularity) * granularity
-    }
-
-    private static func storageBytesPerToken(
-        kind: CBv2LayerKind,
-        elementBytes: Int
-    ) -> Int? {
-        guard kind.kvHeads >= 0, kind.headDim >= 0, elementBytes >= 0,
-            let elements = multiply(kind.kvHeads, kind.headDim),
-            let kvElements = multiply(elements, 2)
-        else { return nil }
-        return multiply(kvElements, elementBytes)
     }
 
     private static func multiply(_ lhs: Int, _ rhs: Int) -> Int? {
@@ -1199,7 +1272,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     public var transientBytesReserved: Int {
         lock.lock()
         defer { lock.unlock() }
-        return transientBytes
+        return Self.add(transientBytes, workspaceFloor.leasedBytes) ?? Int.max
     }
 
     /// Live obligations the KV backend does not own: fixed recurrent state,
@@ -1211,7 +1284,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         defer { lock.unlock() }
         guard let transfers = Self.add(transientBytes - transientTargetBytes, detachedNonBackendBytes),
             let withExternal = Self.add(externalReserveBytes, transfers),
-            var total = Self.add(withExternal, physicalFloor.overheadBytes)
+            let physical = Self.add(withExternal, physicalFloor.overheadBytes),
+            var total = Self.add(physical, workspaceFloor.overhead())
         else { return Int.max }
         for tokens in reservedTokens.values where tokens > 0 {
             guard let bytes = nonBackendBytesChecked(forTokens: tokens),
