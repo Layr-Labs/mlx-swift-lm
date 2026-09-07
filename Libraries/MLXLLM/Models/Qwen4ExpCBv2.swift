@@ -695,6 +695,22 @@ extension Qwen4ExpPLELayer {
 
 // MARK: - Decoder layer and tower, CBv2 form
 
+
+/// Diagnostic sink (MLXFAST_DIAG_CAPTURED_WINDOW): records position 0 of the
+/// stream at three points of every decoder layer so a captured window can be
+/// compared with the serial path layer by layer. Off unless enabled; never
+/// touched by the runtime path.
+public enum Qwen4ExpWindowDebug {
+    nonisolated(unsafe) public static var enabled = false
+    nonisolated(unsafe) public static var records: [String: MLXArray] = [:]
+    static func record(_ key: String, _ value: MLXArray) {
+        guard enabled else { return }
+        let v = value[0..., 0 ..< 1, 0...].asType(.float32)
+        eval(v)
+        records[key] = v
+    }
+}
+
 extension Qwen4ExpDecoderLayer {
     func cbv2Forward(
         _ hyper: MLXArray,
@@ -709,6 +725,7 @@ extension Qwen4ExpDecoderLayer {
         captureRecurrentWindow: Bool = false
     ) -> MLXArray {
         var stream = hyper
+        Qwen4ExpWindowDebug.record("L\(modelLayerIndex).in", stream)
 
         if let ple, let pleStateLayerIndex {
             stream =
@@ -717,9 +734,11 @@ extension Qwen4ExpDecoderLayer {
                     stream, ids: ids, stateLayerIndex: pleStateLayerIndex,
                     eosTokenId: eosTokenId, recurrentState: recurrentState,
                     captureRecurrentWindow: captureRecurrentWindow)
+            Qwen4ExpWindowDebug.record("L\(modelLayerIndex).afterPle", stream)
         }
 
         var (input, residual, inject) = attnHyperConnection.mixWithInject(stream)
+        Qwen4ExpWindowDebug.record("L\(modelLayerIndex).mixIn", input)
         let attended: MLXArray
         if isLinear {
             precondition(attentionCache == nil, "Qwen4Exp recurrent layer received attention KV")
@@ -737,10 +756,13 @@ extension Qwen4ExpDecoderLayer {
             attended = selfAttn!.cbv2Forward(
                 input, rope: rope, cache: attentionCache, positions: positions)
         }
+        Qwen4ExpWindowDebug.record("L\(modelLayerIndex).attended", attended)
         stream = qwen4ExpInject(residual: residual, output: attended, inject: inject)
 
         (input, residual, inject) = mlpHyperConnection.mixWithInject(stream)
-        return qwen4ExpInject(residual: residual, output: mlp(input), inject: inject)
+        let out = qwen4ExpInject(residual: residual, output: mlp(input), inject: inject)
+        Qwen4ExpWindowDebug.record("L\(modelLayerIndex).out", out)
+        return out
     }
 }
 

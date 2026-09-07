@@ -197,6 +197,33 @@ enum BenchWorkerCapturedProbe {
             emit(String(format: "captured-probe: E compared %d layers; worst conv layer %d L_inf %.5f; worst ssm layer %d L_inf %.5f; first bad %d", compared, worstConv.0, worstConv.1, worstSsm.0, worstSsm.1, firstBad))
             try ev.rollback(); try sv.rollback()
         }
+        // F: layer-by-layer position-0 comparison, window [t0,t1] vs serial [t0].
+        do {
+            let f = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
+            _ = try f.forward(seed)
+            Qwen4ExpWindowDebug.records = [:]; Qwen4ExpWindowDebug.enabled = true
+            _ = try f.capturedWindow(window, serializeAttention: true, keep: 1)
+            Qwen4ExpWindowDebug.enabled = false
+            let win = Qwen4ExpWindowDebug.records
+            let g = try Session(model: model, kvBytesCapacity: capacity, maxLength: maxLength)
+            _ = try g.forward(seed)
+            Qwen4ExpWindowDebug.records = [:]; Qwen4ExpWindowDebug.enabled = true
+            _ = try g.forward([window[0]])
+            Qwen4ExpWindowDebug.enabled = false
+            let ser = Qwen4ExpWindowDebug.records
+            Qwen4ExpWindowDebug.records = [:]
+            var printed = 0
+            for layer in 0 ..< 8 {
+                for stage in ["in", "afterPle", "mixIn", "attended", "out"] {
+                    let key = "L\(layer).\(stage)"
+                    guard let a = win[key], let b = ser[key] else { continue }
+                    let d = MLX.abs(a - b).max().item(Float.self)
+                    emit(String(format: "captured-probe: F %@ L_inf %.5f", key, d))
+                    printed += 1
+                }
+            }
+            emit("captured-probe: F compared \(printed) stages (layers 0-7)")
+        }
         MLXMemoryReporter().drain()
     }
 }
