@@ -242,6 +242,22 @@ case .resident:
     // The signal handler only ASKS. The accept loop returns, and the owner —
     // this thread — performs the teardown, so the socket and the pidfile are
     // gone before the process exits.
+    //
+    // Warm the resident before it serves: the first phase's prefill must not
+    // be a cold or mid-ramp pass (see BenchWorkerResidentWarm).
+    if BenchWorkerResidentWarm.isEnabled() {
+        do {
+            let warm = try BenchWorkerResidentWarm.run(runner: runner, memory: MLXMemoryReporter())
+            FileHandle.standardError.write(
+                Data(
+                    String(
+                        format: "bench-worker: resident warm pass: prefill %d tokens in %.3f s, %d decode steps in %.3f s (%d forwards); allocator drained\n",
+                        warm.promptLength, warm.prefillSeconds, warm.decodeSteps, warm.decodeSeconds, warm.forwards
+                    ).utf8))
+        } catch {
+            fail(error)
+        }
+    }
     resident.serve()
     resident.shutDown()
     // Commit and drain any Metal work a faulted phase left open, BEFORE the
