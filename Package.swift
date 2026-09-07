@@ -43,7 +43,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
-                 revision: "22fa2d5aff9b1ada17c3188c7fe482ca937790ed"),
+                 revision: "37572f1f10a6c485ac4cc254cad63e8242643a6f"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -208,6 +208,11 @@ let package = Package(
                 "MLXLMCommon",
             ],
             path: "Libraries/MLXHuggingFace"
+        ),
+        .executableTarget(
+            name: "BenchSegmentedDecode",
+            dependencies: ["MLXLMCommon"],
+            path: "Sources/BenchSegmentedDecode"
         ),
         .executableTarget(
             name: "BenchLoad",

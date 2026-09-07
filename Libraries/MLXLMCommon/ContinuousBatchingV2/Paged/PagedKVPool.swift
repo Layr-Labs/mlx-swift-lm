@@ -1,57 +1,20 @@
-// PagedKVPool.swift
+// One native paged KV pool per loaded model. Layers with equal
+// native storage layout share page ownership and a generation-checked free queue.
 //
-// Global paged KV slab pool for the ContinuousBatchingV2 paged backend
-// (WS-C). One pool per loaded model.
+// The reference layout uses one fixed K/V slab pair per group. The explicit
+// segmented configuration instead commits bounded combined K/V buffers as
+// admitted demand grows; the total segment count has no dispatch-level cap.
+// Both preserve the selected FP16, BF16 or FP32 dtype without KV quantization.
 //
-// Design
-// ------
-// - Layers are bucketed into GROUPS by (kvHeads, headDim). Every group owns
-//   exactly TWO large MLXArray slabs (keys + values) shaped
-//   `[pageCount, kvHeads, pageSize, headDim]`. Pages of a group are fungible
-//   across layers and sequences, so a handful of multi-GB buffers back the
-//   whole model. This is deliberate: macOS caps the Metal resource COUNT at
-//   ~499k buffers (see research report 04 / mlx-lm#1332) — per-page buffers
-//   are forbidden.
-// - Page size is 16 tokens (`CBv2PagedDefaults.pageSize`), matching
-//   vLLM/mistral.rs block sizes. Revisit after kernel benchmarks.
-// - The free list is a plain stack of page indices: O(1) allocate/free.
-//   Pages carry refcounts, but every count is 0 or 1 — nothing retains a
-//   page twice. Copy-free prefix sharing would be what pushes a count
-//   above 1, and it does not exist: window adoption COPIES bytes
-//   (`PagedKVBackend.installWindow`), it does not adopt pages.
-// - Admission is RESERVATION based: the CBv2 contract's
-//   `CBv2SequenceKV.update` cannot throw, so capacity failures mid-decode
-//   would be unrecoverable. Instead, `reserve` claims the worst-case page
-//   count for a sequence's `maxLength` up front (mistral.rs Metal sizing
-//   model) and throws `CBv2KVError.capacityExhausted` at admission time.
-//   Physical pages are still allocated LAZILY as tokens are written, so
-//   `bytesInUse` reports truthful actual usage; `bytesReserved` reports the
-//   admission-relevant figure.
-// - Writes go through IN-PLACE Metal kernels (`PagedAttentionKernel
-//   .bulkWrite` here; the decode path fuses its single-token write into
-//   pass A). The slabs are STABLE buffers — never versioned through MLX
-//   slice updates. Slice updates are unusable at slab scale: MLX's
-//   gpu::eval retains every op's INPUT data handles until the command
-//   buffer completes, so a slice-update following any kernel read of the
-//   slab fails donation and degrades into a full-slab copy (~370 GiB of
-//   copies per decoded token on GPT-OSS-20B at a 16 GiB pool — the
-//   original ~100x real-model slowdown; docs/engine-v2/kernel-research.md
-//   §3). In-place writes are invisible to MLX's hazard tracking, so each
-//   bulk write emits a FENCE (chained per group) and every gather of the
-//   group's slabs consumes the latest fence for scheduling order + memory
-//   barriers. Decode dispatches don't consume fences: a row's decode
-//   always follows its writes via host syncs or step-graph dependencies
-//   (see pagedattention.metal, "In-place slab writes").
+// Admission reserves each request's worst-case page demand and materializes
+// enough backing before creating its nonthrowing row. Actual page ownership
+// grows as tokens are written. Poison pages are excluded from usable capacity.
 //
-// Pages are fp16, always. KV quantization was retired from the product, so
-// the `CBv2KVQuantScheme` hook and its refusal guard are gone; a quantized
-// config is now unrepresentable rather than rejected at runtime. Should
-// quantized pages come back, the v1 constraint that forced fp16 was the
-// decode kernel: it reads slab rows directly, so quantized pages need a
-// CACHE_T template parameter and an inline dequantize in `load_row`, plus a
-// third slab per group for affine scales/biases in mlx-lm's QuantizedKVCache
-// layout to keep `snapshot()` interchange-compatible. Sinks are a kernel
-// parameter rather than KV state, so they never interacted with it.
+// Buffers remain stable: in-place Metal writes avoid whole-pool slice copies.
+// Explicit fence inputs establish GPU buffer barriers for writes and gathers;
+// segmented decode preserves complete token partitions and merge order across
+// its bounded segment-binding buckets. Retired handles are invalidated before
+// page reuse, and release follows the engine's finalized-step discipline.
 
 import Foundation
 import MLX
@@ -66,11 +29,17 @@ public struct PagedKVPoolConfig: Sendable {
     /// Tokens per page. Must divide the decode kernel's expectations; keep
     /// at `CBv2PagedDefaults.pageSize` unless benchmarks say otherwise.
     public var pageSize: Int
-    /// Total byte budget for all slabs (K + V, all groups).
+    /// Total physical byte budget for K/V backing, including poison pages.
     public var capacityBytes: Int
-    /// Element type of the pages. `.float16` is the supported scheme;
-    /// `.float32` is allowed for tests/parity work.
+    /// Native page dtype: `.float16`, `.bfloat16` or `.float32`.
     public var dtype: DType
+    /// Actual post-projection/RoPE KV types in attention-storage order. A
+    /// build-time forward probe must validate this table before serving. nil
+    /// preserves the uniform fixed-reference policy.
+    public var layerDTypes: [DType]?
+    /// Explicit foundation opt-in. nil retains the fixed-slab reference.
+    /// Segments grow under the same byte grant; this is not a total-pool cap.
+    public var segmentSizeBytes: Int?
     /// Upper bound on tokens written to a WINDOWED layer in one
     /// `update(keys:values:)` call (i.e. the scheduler's max prefill chunk).
     /// Bounds one windowed update; larger updates trap. Since WS-1.2 the
@@ -81,16 +50,16 @@ public struct PagedKVPoolConfig: Sendable {
     /// Nominal per-sequence length used only to split `capacityBytes`
     /// across layer groups proportionally to their demand.
     public var nominalMaxSequenceLength: Int
-    /// Metal's maximum length for one buffer. Every K and V slab is
-    /// validated against this before any MLXArray is created; exceeding it
-    /// would otherwise surface as an uncatchable allocator/Metal failure.
+    /// Metal's per-buffer limit, checked for each fixed slab or combined
+    /// segment before allocation. Segment growth never copies existing KV.
     public var maxBufferLength: Int
     /// Prefix-cache block size this pool must be able to DONATE and ADOPT
     /// at, or `nil` for a pool that will never participate in block sharing
     /// (unit fixtures, microbenchmarks).
     ///
-    /// Set this to `CBv2BlockHasher.defaultBlockSize` for any pool behind a
-    /// prefix cache. It arms the WS-0.6 chunk-coverage guard below, which
+    /// Set this to the block size of the page-sharing cache. `PagedKVBackend`
+    /// does that automatically when `residentPrefixCache` is configured. It
+    /// arms the WS-0.6 chunk-coverage guard below, which
     /// is not merely advisory: WS-4's windowed-sharing residency proof
     /// assumes one prefill chunk plus the frontier's partial page covers a
     /// whole block, so a pool that cannot do that must be refused rather
@@ -109,184 +78,19 @@ public struct PagedKVPoolConfig: Sendable {
         maxPrefillChunk: Int = 512,
         nominalMaxSequenceLength: Int = 8192,
         maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize,
-        prefixSharingBlockSize: Int? = nil
+        prefixSharingBlockSize: Int? = nil,
+        segmentSizeBytes: Int? = nil,
+        layerDTypes: [DType]? = nil
     ) {
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
         self.dtype = dtype
+        self.layerDTypes = layerDTypes
         self.maxPrefillChunk = maxPrefillChunk
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
         self.maxBufferLength = maxBufferLength
         self.prefixSharingBlockSize = prefixSharingBlockSize
-    }
-}
-
-/// Identity of a slab group: layers with equal (kvHeads, headDim) share
-/// pages freely.
-public struct PagedKVGroupKey: Hashable, Sendable, CustomStringConvertible {
-    public let kvHeads: Int
-    public let headDim: Int
-
-    public init(kvHeads: Int, headDim: Int) {
-        self.kvHeads = kvHeads
-        self.headDim = headDim
-    }
-
-    public init(_ kind: CBv2LayerKind) {
-        self.init(kvHeads: kind.kvHeads, headDim: kind.headDim)
-    }
-
-    public var description: String { "kv\(kvHeads)xd\(headDim)" }
-}
-
-/// One slab group: two big MLXArrays plus page bookkeeping.
-final class PagedKVGroup {
-    let key: PagedKVGroupKey
-    let pageSize: Int
-    let dtype: DType
-    let pageCount: Int
-    /// `[pageCount, kvHeads, pageSize, headDim]`. STABLE arrays: written
-    /// in place by the write kernels, never replaced (see file header).
-    let kSlab: MLXArray
-    let vSlab: MLXArray
-    /// Latest fence of the group's bulk-write chain (`[1]` int32). Gathers
-    /// consume it so page reads order after every prior bulk write.
-    var writeFence: MLXArray
-    /// Stack of free page ids — O(1) alloc/free.
-    var freeList: [Int32]
-    /// Per-page refcount. Effectively a 0/1 owned flag: `allocatePage` sets
-    /// 1, `freePage` clears to 0, and the poison page is pinned at 1. No
-    /// code path raises a count above 1 — page sharing would need a retain
-    /// operation and a sharing-aware `installWindow` (which copies bytes, it
-    /// does not adopt pages), neither of which exists.
-    var refCounts: [Int]
-    /// Pages currently held by sequences (refCount > 0).
-    private(set) var pagesInUse: Int = 0
-    /// Pages promised to admitted sequences (lazily materialized).
-    var pagesReserved: Int = 0
-    /// Pages queued for release by an in-flight speculative transaction
-    /// (WS-3.2c). They keep `refCount > 0` until `drainDeferredFrees()`, so
-    /// they cannot be recycled to another row while a round's captures
-    /// still name them.
-    var deferredFrees: [Int32] = []
-    /// Which of this group's slabs `materializeSlabs` has ACTUALLY made
-    /// resident. Tracked explicitly — set only after the slab's blocking
-    /// eval returned — because MLX exposes no public "is this array
-    /// evaluated" API (mlx-c's `_mlx_array_is_available` is documented
-    /// internal and mlx-swift does not surface it). A retry after a
-    /// partial commit re-attempts only the slabs still unset here, and an
-    /// already-materialized pool commits for free (nothing left to eval).
-    var kSlabMaterialized = false
-    var vSlabMaterialized = false
-
-    /// Bytes of ONE slab (K or V alone), poison page included — the unit
-    /// `materializeSlabs` allocates and tracks.
-    var slabBytes: Int {
-        pageCount * key.kvHeads * pageSize * key.headDim * dtype.size
-    }
-
-    /// The reserved POISON page: physical page 0 of every group, permanently
-    /// zeroed, never allocatable, never writable, `refCount` pinned at 1.
-    ///
-    /// Two call sites pad an array up to the kernel's minimum length and
-    /// need a page id that is guaranteed inert: `PagedKVPool.writeTokens`
-    /// (the `slots` pad) and `PagedLayerCache.deviceTables` (the block-table
-    /// column pad). Both used to pad with a REAL page — a duplicated live
-    /// slot and a literal `0` respectively — which are fail-OPEN: page 0 is
-    /// the first page the free list hands out (`freeList` is built reversed
-    /// and popped with `removeLast`), so the literal pad named whichever
-    /// tenant happened to hold it.
-    ///
-    /// Page 0 is the poison page DELIBERATELY, rather than a high id past
-    /// the tenant range: `MLXArray.zeros`, `[Int32](repeating: 0, …)` and
-    /// every default-initialised int32 buffer produce 0, so reserving 0
-    /// makes the entire class of "forgot to pad / uninitialised table
-    /// entry" bugs read zeros instead of another sequence's live KV.
-    static let poisonPage: Int32 = 0
-    var poisonPage: Int32 { Self.poisonPage }
-
-    /// Pages a sequence row can actually own — every page except the
-    /// poison page. This, NOT `pageCount`, is the reservation ceiling and
-    /// the honest capacity figure.
-    var usablePageCount: Int { pageCount - 1 }
-
-    /// Bytes of ONE page counting both K and V slabs.
-    var pageBytes: Int {
-        2 * key.kvHeads * pageSize * key.headDim * dtype.size
-    }
-
-    init(key: PagedKVGroupKey, pageCount: Int, pageSize: Int, dtype: DType) {
-        precondition(
-            pageCount >= 2,
-            "[PagedKVPool] group \(key) needs at least one usable page beyond the poison page")
-        self.key = key
-        self.pageSize = pageSize
-        self.dtype = dtype
-        self.pageCount = pageCount
-        let shape = [pageCount, key.kvHeads, pageSize, key.headDim]
-        self.kSlab = MLXArray.zeros(shape, dtype: dtype)
-        self.vSlab = MLXArray.zeros(shape, dtype: dtype)
-        self.writeFence = MLXArray.zeros([1], dtype: .int32)
-        // LIFO stack: lowest ids pop first, so fresh sequential allocations
-        // tend to be physically consecutive (enables run-coalesced writes).
-        // The poison page is EXCLUDED — it is never handed out, so the
-        // stack starts one past it.
-        self.freeList = Array((Self.poisonPage + 1 ..< Int32(pageCount)).reversed())
-        // The slabs are zero-initialised and no write can ever address the
-        // poison page (every slot comes from an allocated page id), so
-        // pinning its refcount at 1 is the whole of "permanently zeroed":
-        // it can never be allocated, retained, freed or written.
-        var counts = [Int](repeating: 0, count: pageCount)
-        counts[Int(Self.poisonPage)] = 1
-        self.refCounts = counts
-    }
-
-    /// True when `page` is a page a sequence row can own. The poison page
-    /// and out-of-range ids are not.
-    func isAllocatable(_ page: Int32) -> Bool {
-        page != Self.poisonPage && page >= 0 && Int(page) < pageCount
-    }
-
-    func allocatePage() -> Int32 {
-        precondition(
-            !freeList.isEmpty,
-            "[PagedKVPool] free list underflow for group \(key) — reservation accounting bug")
-        let page = freeList.removeLast()
-        precondition(
-            page != Self.poisonPage,
-            "[PagedKVPool] poison page escaped the free list for group \(key)")
-        precondition(refCounts[Int(page)] == 0)
-        refCounts[Int(page)] = 1
-        pagesInUse += 1
-        return page
-    }
-
-    func freePage(_ page: Int32) {
-        precondition(
-            page != Self.poisonPage,
-            "[PagedKVPool] free of the reserved poison page in group \(key) — a row "
-                + "should never have held it")
-        let i = Int(page)
-        precondition(refCounts[i] > 0, "double free of page \(page) in group \(key)")
-        refCounts[i] -= 1
-        if refCounts[i] == 0 {
-            freeList.append(page)
-            pagesInUse -= 1
-        }
-    }
-
-    /// Queue `page` for release at the end of a speculative transaction.
-    /// The page keeps its refcount until the drain.
-    func deferFree(_ page: Int32) {
-        precondition(
-            page != Self.poisonPage,
-            "[PagedKVPool] deferred free of the reserved poison page in group \(key)")
-        deferredFrees.append(page)
-    }
-
-    func drainDeferredFrees() {
-        for page in deferredFrees { freePage(page) }
-        deferredFrees.removeAll(keepingCapacity: true)
+        self.segmentSizeBytes = segmentSizeBytes
     }
 }
 
@@ -295,11 +99,33 @@ final class PagedKVGroup {
 /// performs no internal locking.
 public final class PagedKVPool {
     public let config: PagedKVPoolConfig
+    let layerKinds: [CBv2LayerKind]
+    /// Authoritative native types and roots in dense attention-storage order.
+    public let layerDTypes: [DType]
+    private let layerGroupKeys: [PagedKVGroupKey]
+
+    public func groupKey(forLayer index: Int) -> PagedKVGroupKey {
+        layerGroupKeys[index]
+    }
     /// Validated Metal source retained for the pool's lifetime. Kernel
     /// dispatch never touches Bundle.module and therefore has no
     /// request-time resource-failure path.
     let kernelSource: String
+    let segmentGrant: PagedKVGrant?
+    /// One engine-ledger owner covers committed and privately preparing native
+    /// segments. Only this pool's nominal request KV can offset its floor.
+    var physicalLease: CBv2BackendPhysicalLease?
+    var memoryAdmission: AdmissionV2?
+    var storageTelemetry = PagedKVStorageTelemetry()
+    let writeValidation = CBv2PagedKVWriteValidation()
+    /// Deterministic failure-order observer; production leaves this unset.
+    var checkpointImportBeforeRollback: (() -> Void)?
+    let groupDemandBytes: [PagedKVGroupKey: Int]
+    let totalDemandBytes: Int
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
+    /// At most one page-native prefix index may observe a pool. Weak avoids a
+    /// cache↔backend ownership cycle; the cache retains the backend/pool.
+    weak var pageReuseObserver: (any PagedKVPageReuseObserver)?
 
     /// Monotonic identity for every `PagedSequenceKV` minted against this
     /// pool. Unlike `ObjectIdentifier` (a heap address, reusable after
@@ -313,9 +139,18 @@ public final class PagedKVPool {
         return lastRowSerial
     }
 
+    func installPageReuseObserver(_ observer: any PagedKVPageReuseObserver) {
+        if let existing = pageReuseObserver {
+            precondition(
+                existing === observer,
+                "[PagedKVPool] only one page-native prefix cache may observe a pool")
+        }
+        pageReuseObserver = observer
+    }
+
     /// Groups in deterministic order (for tests/telemetry).
     public var groupKeys: [PagedKVGroupKey] {
-        groups.keys.sorted { ($0.headDim, $0.kvHeads) < ($1.headDim, $1.kvHeads) }
+        groups.keys.sorted { $0.sortKey < $1.sortKey }
     }
 
     /// Build a pool sized for `layerKinds` (one entry per model layer;
@@ -325,7 +160,8 @@ public final class PagedKVPool {
     /// group's worst-case per-sequence demand at
     /// `nominalMaxSequenceLength` (windowed layers capped at their ring).
     public init(layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig) throws {
-        guard config.dtype == .float16 || config.dtype == .float32 else {
+        self.layerKinds = layerKinds
+        guard [.float16, .bfloat16, .float32].contains(config.dtype) else {
             throw CBv2KVError.backendIneligible(
                 reason: "PagedKVPool: unsupported page dtype \(config.dtype)")
         }
@@ -406,6 +242,12 @@ public final class PagedKVPool {
                         + "nil for a pool that never shares blocks")
             }
         }
+        let resolvedTypes = try PagedKVStorageLayout.resolve(layerKinds: layerKinds, config: config)
+        let groupKeys = layerKinds.enumerated().map { index, kind in
+            PagedKVGroupKey(
+                kind, dtype: resolvedTypes[index],
+                separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil)
+        }
         // Demand-proportional capacity split.
         let owning = layerKinds.filter { $0.sharesKVWithLayer == nil }
         guard !owning.isEmpty else {
@@ -434,11 +276,14 @@ public final class PagedKVPool {
                 reason: "PagedKVPool: paged-attention runtime resource unavailable: \(error)")
         }
         self.config = config
+        self.layerDTypes = resolvedTypes
+        self.layerGroupKeys = groupKeys
         self.kernelSource = source
+        self.segmentGrant = config.segmentSizeBytes == nil ? nil : PagedKVGrant(bytes: config.capacityBytes)
 
         var demandTokens: [PagedKVGroupKey: Int] = [:]
-        for kind in owning {
-            let key = PagedKVGroupKey(kind)
+        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
+            let key = groupKeys[index]
             let tokens = Self.perSequenceTokenDemand(kind: kind, config: config)
             demandTokens[key] = try Self.checkedAdd(
                 demandTokens[key, default: 0],
@@ -449,7 +294,7 @@ public final class PagedKVPool {
         var totalDemand = 0
         for (key, tokens) in demandTokens {
             let bytesPerToken = try Self.checkedMultiply(
-                [2, key.kvHeads, key.headDim, config.dtype.size],
+                [2, key.kvHeads, key.headDim, key.dtype.size],
                 context: "bytes per token")
             let bytes = try Self.checkedMultiply(
                 [tokens, bytesPerToken],
@@ -462,40 +307,36 @@ public final class PagedKVPool {
             throw CBv2KVError.backendIneligible(
                 reason: "PagedKVPool: zero byte demand")
         }
+        self.groupDemandBytes = demandBytes
+        self.totalDemandBytes = totalDemand
         for (key, bytes) in demandBytes {
+            let pageBytes = try Self.checkedMultiply(
+                [2, key.kvHeads, config.pageSize, key.headDim, key.dtype.size],
+                context: "page bytes")
+            if let target = config.segmentSizeBytes {
+                let layout = try PagedKVSegmentLayout(
+                    pageBytes: pageBytes, targetBytes: target,
+                    maximumBufferBytes: config.maxBufferLength,
+                    maximumAddressPages: Int(Int32.max) / config.pageSize)
+                groups[key] = PagedKVGroup(
+                    key: key, pageCount: 0, pageSize: config.pageSize,
+                    dtype: key.dtype, segmentLayout: layout, writeValidation: writeValidation)
+                continue
+            }
+            // Keep the fixed reference's construction quota unchanged.
             let share = Double(bytes) / Double(totalDemand)
             let groupBytes = Int(share * Double(config.capacityBytes))
-            let pageBytes = try Self.checkedMultiply(
-                [2, key.kvHeads, config.pageSize, key.headDim, config.dtype.size],
-                context: "page bytes")
-            // Pages the group's two slabs may PHYSICALLY hold. `pageBytes`
-            // counts K and V together, so this is the whole allocation the
-            // group makes and it never exceeds the group's share of
-            // `capacityBytes` — deployments that treat `capacityBytes` as
-            // the total slab-memory (wired) limit are held to it.
             let pageCount = groupBytes / pageBytes
-            // One of those physical pages backs the reserved poison page
-            // (WS-0.5): permanently zeroed, never allocatable, never
-            // written. It is carved OUT of the budget rather than on top of
-            // it, so a group needs room for two pages before it can serve
-            // anyone — one poison, one tenant. `bytesCapacity` reports the
-            // tenant figure (`usablePageCount * pageBytes`), which is now
-            // one page below the floor-divided budget instead of equal to
-            // it: a pool sized for exactly N requests must be sized for
-            // N requests PLUS one page.
             guard pageCount >= 2 else {
                 throw CBv2KVError.capacityExhausted(
-                    needed: try Self.checkedMultiply(
-                        [2, pageBytes], context: "minimum group bytes"),
+                    needed: try Self.checkedMultiply([2, pageBytes], context: "minimum group bytes"),
                     available: groupBytes)
             }
             guard pageCount <= Int(Int32.max) else {
-                throw CBv2KVError.backendIneligible(
-                    reason: "PagedKVPool: group \(key) needs \(pageCount) pages, "
-                        + "over the Int32 page-table limit")
+                throw CBv2KVError.backendIneligible(reason: "paged group exceeds Int32 page-table limit")
             }
             let slabBytes = try Self.checkedMultiply(
-                [pageCount, key.kvHeads, config.pageSize, key.headDim, config.dtype.size],
+                [pageCount, key.kvHeads, config.pageSize, key.headDim, key.dtype.size],
                 context: "slab bytes")
             guard slabBytes <= config.maxBufferLength else {
                 throw CBv2KVError.backendIneligible(
@@ -503,7 +344,8 @@ public final class PagedKVPool {
                         + "over Metal maxBufferLength \(config.maxBufferLength) B")
             }
             groups[key] = PagedKVGroup(
-                key: key, pageCount: pageCount, pageSize: config.pageSize, dtype: config.dtype)
+                key: key, pageCount: pageCount, pageSize: config.pageSize, dtype: key.dtype,
+                writeValidation: writeValidation)
         }
     }
 
@@ -807,13 +649,23 @@ public final class PagedKVPool {
     /// Atomically reserve worst-case page counts per group; throws
     /// `capacityExhausted` (in bytes) without partial effects.
     public func reserve(_ needs: [PagedKVGroupKey: Int]) throws {
+        if segmentGrant != nil {
+            try reserveSegments(needs)
+            return
+        }
         // Validate everything first — no partial reservations.
         for (key, pages) in needs {
+            guard pages >= 0 else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "negative paged KV reservation for group \(key): \(pages)")
+            }
             let g = group(key)
             let available = g.usablePageCount - g.pagesReserved
             if pages > available {
+                let (neededBytes, overflow) = pages.multipliedReportingOverflow(by: g.pageBytes)
                 throw CBv2KVError.capacityExhausted(
-                    needed: pages * g.pageBytes, available: max(0, available) * g.pageBytes)
+                    needed: overflow ? Int.max : neededBytes,
+                    available: max(0, available) * g.pageBytes)
             }
         }
         for (key, pages) in needs {
@@ -822,24 +674,85 @@ public final class PagedKVPool {
     }
 
     public func unreserve(_ needs: [PagedKVGroupKey: Int]) {
+        // Validate the complete release before touching any group so a bad
+        // caller cannot partially corrupt a multi-group reservation ledger.
         for (key, pages) in needs {
-            let g = group(key)
-            g.pagesReserved -= pages
-            precondition(g.pagesReserved >= 0, "unreserve underflow for group \(key)")
+            let reserved = group(key).pagesReserved
+            precondition(pages >= 0, "negative paged KV unreservation for group \(key)")
+            precondition(
+                pages <= reserved,
+                "unreserve underflow for group \(key): \(pages) > \(reserved)")
         }
+        for (key, pages) in needs {
+            group(key).pagesReserved -= pages
+        }
+        trimFreeSegments()
+    }
+
+    /// Retire free native segments after reservation/row release. Fixed pools
+    /// retain their reference behavior until segmented execution is promoted.
+    func trimFreeSegments() {
+        guard config.segmentSizeBytes != nil else { return }
+        for key in groupKeys {
+            group(key).trimSegments { [unowned self] handle in
+                pageReuseObserver?.pagedKVPool(self, willReuse: handle)
+            }
+        }
+        physicalLease?.release(to: bytesMaterialized)
+    }
+
+    deinit {
+        // Native segment aliases must leave the pool before its charge does.
+        for group in groups.values {
+            for segment in group.segments.values { segment.backing.invalidateCoverage() }
+        }
+        groups.removeAll()
+        physicalLease?.close()
     }
 
     // MARK: - Page lifecycle
 
     func allocatePage(group key: PagedKVGroupKey) -> Int32 {
-        group(key).allocatePage()
+        group(key).allocatePage { [unowned self] handle in
+            pageReuseObserver?.pagedKVPool(self, willReuse: handle)
+        }
     }
 
     func freePages(group key: PagedKVGroupKey, pages: some Sequence<Int32>) {
         let g = group(key)
-        for page in pages {
-            g.freePage(page)
+        g.release(pages) { [unowned self] handle in
+            pageReuseObserver?.pagedKVPool(self, isCached: handle) ?? false
         }
+    }
+
+    func currentHandle(group key: PagedKVGroupKey, page: Int32) -> PagedKVPageHandle {
+        group(key).currentHandle(page)
+    }
+
+    func isValid(_ handle: PagedKVPageHandle) -> Bool {
+        groups[handle.group]?.isValid(handle) == true
+    }
+
+    /// All-or-nothing generation validation, followed by one retain per page
+    /// table reference. Must run on the engine queue.
+    func retainPages(_ handles: some Collection<PagedKVPageHandle>) -> Bool {
+        guard handles.allSatisfy({ isValid($0) }) else { return false }
+        for handle in handles {
+            group(handle.group).retain(handle)
+        }
+        return true
+    }
+
+    func refCount(for handle: PagedKVPageHandle) -> Int? {
+        guard isValid(handle) else { return nil }
+        return group(handle.group).refCounts[Int(handle.page)]
+    }
+
+    /// Move a generation-valid, zero-ref page to the immediate-reuse end after
+    /// its final cache alias disappears. Active pages are classified when
+    /// their last owner releases them instead.
+    func reclassifyAsUncached(_ handle: PagedKVPageHandle) {
+        groups[handle.group]?.reclassifyAsUncached(handle)
     }
 
     /// Queue `pages` for release at the END of a speculative transaction
@@ -873,7 +786,9 @@ public final class PagedKVPool {
     /// queue per-row.
     func drainDeferredFrees() {
         for g in groups.values {
-            g.drainDeferredFrees()
+            g.drainDeferredFrees { [unowned self] handle in
+                pageReuseObserver?.pagedKVPool(self, isCached: handle) ?? false
+            }
         }
     }
 
@@ -881,7 +796,7 @@ public final class PagedKVPool {
     //
     // All bulk writes go through the in-place write kernel and advance the
     // group's fence chain (see file header — slice updates on the slabs
-    // are forbidden). Values are converted to the pool dtype on the way in.
+    // are forbidden). Runtime K/V must match their observed native dtype.
 
     /// Scatter `slots.count` tokens into the group's slabs. `keys`/`values`
     /// are `[kvHeads, n, headDim]`; `slots[i]` is token `i`'s physical
@@ -891,9 +806,14 @@ public final class PagedKVPool {
     ) {
         guard !slots.isEmpty else { return }
         let g = group(key)
+        guard writeValidation.validate(keys: keys, values: values, expected: g.dtype) else { return }
+        if g.segmentLayout != nil {
+            PagedSegmentTransfers.write(group: g, slots: slots, keys: keys, values: values)
+            return
+        }
         precondition(keys.dim(1) == slots.count && values.dim(1) == slots.count)
-        let k = keys.dtype == g.dtype ? keys : keys.asType(g.dtype)
-        let v = values.dtype == g.dtype ? values : values.asType(g.dtype)
+        let k = keys
+        let v = values
         // Pad to >= 8 entries so the generated kernel signature keeps the
         // device address space. The pad target is the group's reserved
         // POISON page, never a real slot.
@@ -911,13 +831,17 @@ public final class PagedKVPool {
             let poisonSlot = g.poisonPage * Int32(g.pageSize)
             padded.append(contentsOf: repeatElement(poisonSlot, count: 8 - padded.count))
         }
-        g.writeFence = PagedAttentionKernel.bulkWrite(
-            kSlab: g.kSlab, vSlab: g.vSlab,
-            keys: k, values: v,
-            slots: MLXArray(padded),
-            prevFence: g.writeFence,
-            pageSize: g.pageSize,
-            kernelSource: kernelSource)
+        do {
+            g.writeFence = try PagedAttentionKernel.bulkWrite(
+                kSlab: g.kSlab, vSlab: g.vSlab,
+                keys: k, values: v,
+                slots: MLXArray(padded),
+                prevFence: g.writeFence,
+                pageSize: g.pageSize,
+                kernelSource: kernelSource)
+        } catch {
+            writeValidation.record(error)
+        }
     }
 
     // MARK: - Reads
@@ -952,6 +876,9 @@ public final class PagedKVPool {
         group key: PagedKVGroupKey, pages: [Int32], firstSlot: Int, count: Int
     ) -> (keys: MLXArray, values: MLXArray) {
         let g = group(key)
+        if g.segmentLayout != nil {
+            return PagedSegmentTransfers.gather(group: g, pages: pages, firstSlot: firstSlot, count: count)
+        }
         let h = g.key.kvHeads
         let d = g.key.headDim
         let s = g.pageSize
@@ -999,38 +926,42 @@ public final class PagedKVPool {
         groups.values.reduce(0) { $0 + $1.pagesReserved * $1.pageBytes }
     }
 
-    /// Bytes a sequence can actually be given. Counts USABLE pages: the
-    /// per-group poison page is physically allocated but is not tenant
-    /// storage, so reporting it here would overstate what admission can
-    /// hand out. Strictly below `bytesPhysical` — by exactly one page per
-    /// group.
+    /// Segmented pools expose the current shared physical grant; their exact
+    /// growth planner charges poison/slack inside it. Fixed pools retain their
+    /// construction-time tenant capacity with poison pages excluded.
     public var bytesCapacity: Int {
-        groups.values.reduce(0) { $0 + $1.usablePageCount * $1.pageBytes }
+        if let segmentGrant { return segmentGrant.snapshot().bytes }
+        return groups.values.reduce(0) { $0 + $1.usablePageCount * $1.pageBytes }
     }
 
-    /// Bytes the slabs actually allocate (`materializeSlabs`), poison pages
-    /// INCLUDED. This is the figure a wired-memory or container limit sees,
-    /// and `PagedKVPool.init` holds it at or below `config.capacityBytes`.
+    /// Current physical grant (fixed pools retain their configured ceiling).
+    /// A segmented pool may retain pre-shrink owners above this value; use
+    /// segmentStorageSnapshot.overGrantBytes to observe that debt.
     public var bytesPhysical: Int {
-        groups.values.reduce(0) { $0 + $1.pageCount * $1.pageBytes }
+        if let segmentGrant { return segmentGrant.snapshot().bytes }
+        return groups.values.reduce(0) { $0 + $1.pageCount * $1.pageBytes }
     }
 
-    /// Bytes the slabs still need to ALLOCATE before the pool is fully
-    /// resident: `bytesPhysical` before the first materialization, shrinking
-    /// slab-by-slab as evals complete, zero once wired. Diagnostic and
-    /// failure-payload figure only — admission is decided by the
-    /// allocation attempt itself, never by comparing this against a
-    /// memory counter (see `PagedKVBackend.commitSlabs`).
+    /// Uncommitted portion of the configured backing. Segmented retirement
+    /// increases this value; a later admission may commit that capacity again.
     public var bytesUnmaterialized: Int {
-        groups.values.reduce(0) {
+        if let segmentGrant {
+            return max(0, segmentGrant.snapshot().bytes - bytesMaterialized)
+        }
+        return groups.values.reduce(0) {
             $0 + ($1.kSlabMaterialized ? 0 : $1.slabBytes)
                 + ($1.vSlabMaterialized ? 0 : $1.slabBytes)
         }
     }
 
-    /// Bytes the slabs have actually made resident so far. Complement of
-    /// `bytesUnmaterialized`; equals `bytesPhysical` once wired.
-    public var bytesMaterialized: Int { bytesPhysical - bytesUnmaterialized }
+    /// Native ownership is not clamped to a shrunken grant. Existing rows
+    /// retain their backing until release, and diagnostics expose that debt.
+    public var bytesMaterialized: Int {
+        if segmentGrant != nil {
+            return groups.values.reduce(0) { $0 + $1.committedSegmentBytes }
+        }
+        return bytesPhysical - bytesUnmaterialized
+    }
 
     /// How one slab is evaluated into residency. Internal seam so tests can
     /// inject a deterministic allocation failure mid-materialization;
@@ -1045,27 +976,14 @@ public final class PagedKVPool {
         try withError { eval(slab) }
     }
 
-    /// Force-materialize the slabs (e.g. at engine warmup, before the wired
-    /// limit is measured) so first-token latency never pays the allocation.
-    /// Wire-down itself is owned by the existing WiredMemory policy plumbing
-    /// (`WiredSumPolicy` et al.) — slabs participate like any other resident
-    /// allocation once evaluated.
-    ///
-    /// THROWS on allocation failure instead of aborting the process, and
-    /// evaluates SLAB-BY-SLAB (deterministic group order) rather than one
-    /// batched eval: each slab's residency is recorded the moment its
-    /// blocking eval returns, so a mid-materialization failure leaves the
-    /// exact boundary knowable — everything before the failing slab is
-    /// resident and flagged, the failing slab and everything after are not.
-    /// A retry re-evaluates only the missing slabs and skips the resident
-    /// ones (their flags short-circuit; re-evaling an already-evaluated
-    /// array would be a no-op anyway). The per-slab evals carry no
-    /// batching benefit to give up: every slab is an independent `Full`
-    /// zero-fill leaf, materialized once per pool lifetime.
-    /// `PagedKVBackend.commitSlabs()` is the admission-path wrapper that
-    /// maps the failure to the engine's retryable `capacityExhausted`
-    /// class.
+    /// Explicitly materialize the configured pool for eager profiling.
+    /// Fixed slabs record progress individually so a partial failure retries
+    /// only missing slabs. Segmented buffers publish as one transaction.
     public func materializeSlabs() throws {
+        if config.segmentSizeBytes != nil {
+            try materializeSegments(all: true)
+            return
+        }
         for key in groups.keys.sorted(by: { $0.description < $1.description }) {
             let g = groups[key]!
             if !g.kSlabMaterialized {
@@ -1078,4 +996,13 @@ public final class PagedKVPool {
             }
         }
     }
+
+    /// Allocate only enough native segments to honor currently admitted rows.
+    /// Evaluate every candidate privately, then install all groups together.
+    /// A failed allocation cannot leave newly committed backing or queue edits.
+    func materializeReservedSegments() throws {
+        precondition(config.segmentSizeBytes != nil)
+        try materializeSegments(all: false)
+    }
+
 }

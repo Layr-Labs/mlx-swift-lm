@@ -1297,7 +1297,7 @@ struct CBv2PagedBackendTests {
             try PagedKVBackend(
                 layerKinds: kinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 32 << 20, maxPrefillChunk: chunkSize,
+                    capacityBytes: 32 << 20, dtype: .float32, maxPrefillChunk: chunkSize,
                     nominalMaxSequenceLength: 512))
         }
 

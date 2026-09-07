@@ -188,6 +188,11 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
+            for packet in verify.diagnostics where packet.requestID == id {
+                let drafts = (0..<k).map { Int(host[batchIndex * k + $0]) }
+                packet.reconcile(
+                    accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
+            }
             let rejected = (1 + k) - confirmed
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
@@ -249,6 +254,13 @@ extension EngineLoopV2 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
             }
+            // The speculative suffix is now reconciled in BOTH the page tables
+            // and scheduler record. Publish only the accepted frontier; doing
+            // this before rollback would make a rejected block cache-visible.
+            let launchedEnd = step.computedRanges[id]?.upperBound ?? rec.numComputedTokens
+            publishFinalizedResidentBlocks(
+                requestID: id,
+                safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
             if hasStopStrings {
                 stream(for: id)?.emit(

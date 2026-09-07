@@ -81,6 +81,23 @@ struct CBv2PagedPoolGuardTests {
         #expect(pool.bytesInUse == 0)
     }
 
+    @Test func negativeReservationCannotCorruptTheAdmissionLedger() throws {
+        let pool = try PagedKVPool(layerKinds: [fullKind()], config: config())
+        let initialFreeList = pool.group(key).freeList
+
+        #expect(throws: CBv2KVError.self) { try pool.reserve([key: -1]) }
+        #expect(pool.bytesReserved == 0)
+        #expect(pool.group(key).pagesReserved == 0)
+        #expect(pool.group(key).freeList == initialFreeList)
+
+        // A rejected negative claim must not buy capacity for a later request.
+        let usable = pool.usablePageCount(group: key)
+        try pool.reserve([key: usable])
+        #expect(throws: CBv2KVError.self) { try pool.reserve([key: 1]) }
+        pool.unreserve([key: usable])
+        #expect(pool.bytesReserved == 0)
+    }
+
     /// Repeated allocate/free churn must never work the poison page into the
     /// free list. The free list is a LIFO stack that `freePage` appends to,
     /// so a single mis-accounted release would surface as the poison page
@@ -567,19 +584,19 @@ struct CBv2PagedPoolGuardTests {
             let queries = MLXArray.zeros([batch, queryHeads, headDim], dtype: dtype)
             eval(kSlab, vSlab, tables, seqinfo, params, queries, fence)
 
-            func dispatch() -> MLXArray {
-                PagedAttentionKernel.decode(
+            func dispatch() throws -> MLXArray {
+                try PagedAttentionKernel.decode(
                     queries: queries, kSlab: kSlab, vSlab: vSlab, tables: tables,
                     seqinfo: seqinfo, maxAttendLength: context, sinks: nil, params: params,
                     softcap: false, pageSize: pageSize, writeFence: fence,
                     kernelSource: source
                 ).out
             }
-            for _ in 0 ..< 8 { eval(dispatch()) }  // JIT + warm the pipeline
+            for _ in 0 ..< 8 { eval(try dispatch()) }  // JIT + warm the pipeline
 
             let iterations = 200
             let started = Date()
-            for _ in 0 ..< iterations { eval(dispatch()) }
+            for _ in 0 ..< iterations { eval(try dispatch()) }
             let micros = Date().timeIntervalSince(started) * 1e6 / Double(iterations)
 
             let hpt = PagedAttentionKernel.headsPerThreadgroup(

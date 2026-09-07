@@ -745,9 +745,9 @@ public struct CBv2SchedulerConfig: Sendable {
     public var maxConcurrentPartialPrefills: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
-    /// Prefix-cache participation (lookup+adopt on submit, donate on
-    /// finish). Off by default; requires a `CBv2PrefixCache` instance to be
-    /// supplied at engine construction as well.
+    /// Prefix-cache participation (lookup+adopt on submit, publish/donate on
+    /// finalized work). Off by default; requires a resident paged cache, a
+    /// `CBv2PrefixCache` snapshot tier, or both.
     public var enablePrefixCache: Bool
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
@@ -890,9 +890,10 @@ public struct CBv2Usage: Sendable {
         set { timingBox = CBv2RequestTimingBox(newValue) }
     }
     private var timingBox: CBv2RequestTimingBox = .zero
-    /// Final per-request prefix lookup/adoption result. This describes the
-    /// in-memory engine tier only; SSD staging remains a provider concern.
+    /// Final per-request prefix lookup/adoption result.
     public var prefixCacheOutcome: CBv2PrefixCacheOutcome
+    /// Physical source of an adopted hit; nil for every non-hit.
+    public var prefixCacheTier: CBv2PrefixCacheTier?
     /// Whole-block tokens matched by lookup before the model-specific
     /// recompute bound and backend adoption are applied.
     public var prefixCacheMatchedTokens: Int
@@ -910,6 +911,7 @@ public struct CBv2Usage: Sendable {
     public init(
         promptTokens: Int, completionTokens: Int, prefixCacheHitTokens: Int = 0,
         prefixCacheOutcome: CBv2PrefixCacheOutcome = .disabled,
+        prefixCacheTier: CBv2PrefixCacheTier? = nil,
         prefixCacheMatchedTokens: Int = 0,
         prefixCachePrefillTokensSaved: Int = 0,
         prefixCacheStrategy: CBv2PrefixReuseStrategy? = nil,
@@ -919,6 +921,7 @@ public struct CBv2Usage: Sendable {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.prefixCacheOutcome = prefixCacheOutcome
+        self.prefixCacheTier = prefixCacheTier
         self.prefixCacheMatchedTokens = prefixCacheMatchedTokens
         self.prefixCachePrefillTokensSaved = prefixCachePrefillTokensSaved
         self.prefixCacheStrategy = prefixCacheStrategy
@@ -926,6 +929,14 @@ public struct CBv2Usage: Sendable {
         self.prefixCacheBoundarySplits = prefixCacheBoundarySplits
         self.prefixCacheHitTokens = prefixCacheHitTokens
     }
+}
+
+/// Physical source of a successful engine-level prefix adoption.
+public enum CBv2PrefixCacheTier: String, Sendable, Equatable {
+    /// Zero-copy physical pages already resident in the paged KV pool.
+    case resident
+    /// Materialized KV snapshots supplied through `CBv2PrefixCache`.
+    case snapshot
 }
 
 /// Engine-local prefix-cache result. The provider maps this to its wire
@@ -952,30 +963,15 @@ public struct CBv2CapacitySnapshot: Sendable {
     public var activeRequests: Int
     public var waitingRequests: Int
     public var kvBytesInUse: Int
-    /// The ADMISSION ceiling (runtime-resizable soft ledger). On the
-    /// contiguous backend this equals the backend's capacity (resize fans
-    /// out to both); on the paged backend a re-slice moves only this
-    /// ledger — the physically preallocated slabs stay at
-    /// `kvBytesBackendCapacity`.
+    /// Runtime admission ceiling, including request KV and auxiliary state.
     public var kvBytesCapacity: Int
-    /// The backend's PHYSICAL byte capacity (paged: pageCount × pageBytes
-    /// over all groups, construction-fixed; contiguous: == the admission
-    /// ceiling). Capacity planning binds to min(kvBytesCapacity, this)
-    /// ONLY WHEN THIS IS NONZERO — after a ledger GROW past pool truth the
-    /// pool is what actually admits. 0 means UNKNOWN (snapshots built
-    /// through the backwards-compatible initializer, e.g. test stubs) and
-    /// must never be read as zero capacity.
+    /// Backend ceiling. Contiguous and segmented paged grants resize; the
+    /// fixed-slab reference keeps its construction capacity. Zero means an
+    /// older/test snapshot did not report a separate backend ceiling.
     public var kvBytesBackendCapacity: Int
-    /// Bytes NOT available for new admissions: the backend's admission
-    /// truth — bytes PROMISED to admitted sequences (the paged pool's
-    /// atomic worst-case page charges; the contiguous backend's per-row
-    /// `max(allocated, reservation)`) — PLUS the compiled decode path's
-    /// live padding carve (`AdmissionV2.bytesExternallyReserved`, 0 after
-    /// a warmup refund and always 0 on paged backends, where compiled
-    /// decode is vetoed). `kvBytesInUse` lags this — storage materializes
-    /// lazily as tokens are written — so capacity planning (provider
-    /// heartbeats) must subtract RESERVED, not in-use, or several
-    /// admitted-but-cold requests look like free headroom.
+    /// Bytes unavailable to new admissions: promised target KV plus tracked
+    /// recurrent/assistant state and transfer reservations. In-use page bytes
+    /// can be smaller because admitted rows have not filled their reservation.
     public var kvBytesReserved: Int
     public var activeTokens: Int
     /// Monotonic count of engine steps executed. Providers use this as a
@@ -990,10 +986,13 @@ public struct CBv2CapacitySnapshot: Sendable {
     /// beyond their first (decode rows). Monotonic;
     /// `decodeRowsTotal / stepsExecuted` is the mean decode batch size.
     public var decodeRowsTotal: UInt64 = 0
+    /// Queue-captured segmented-pool ownership; nil for other backends.
+    public var pagedStorage: PagedKVStorageSnapshot?
     public init(
         activeRequests: Int, waitingRequests: Int, kvBytesInUse: Int, kvBytesCapacity: Int,
         kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0, activeTokens: Int,
-        stepsExecuted: Int = 0, stepWallNanosTotal: UInt64 = 0, decodeRowsTotal: UInt64 = 0
+        stepsExecuted: Int = 0, stepWallNanosTotal: UInt64 = 0, decodeRowsTotal: UInt64 = 0,
+        pagedStorage: PagedKVStorageSnapshot? = nil
     ) {
         self.activeRequests = activeRequests
         self.waitingRequests = waitingRequests
@@ -1005,6 +1004,7 @@ public struct CBv2CapacitySnapshot: Sendable {
         self.stepsExecuted = stepsExecuted
         self.stepWallNanosTotal = stepWallNanosTotal
         self.decodeRowsTotal = decodeRowsTotal
+        self.pagedStorage = pagedStorage
     }
 }
 
@@ -1207,6 +1207,19 @@ public struct CBv2PackedPrefillActivity: Sendable, Equatable {
         isSupported: false, rowsExecuted: 0, groupsExecuted: 0)
 }
 
+/// Advisory result from the resident physical-page tier before submission.
+/// It never pins pages: allocator reuse may invalidate it before `submit`, in
+/// which case the engine safely falls back to ordinary prefill.
+public struct CBv2ResidentPrefixCandidate: Sendable, Equatable {
+    public let matchedTokens: Int
+    public let prefillTokensSaved: Int
+
+    public init(matchedTokens: Int, prefillTokensSaved: Int) {
+        self.matchedTokens = matchedTokens
+        self.prefillTokensSaved = prefillTokensSaved
+    }
+}
+
 /// `Sendable`: engine handles cross concurrency domains by design (the
 /// provider submits from request tasks, cancels from disconnect handlers,
 /// and reads capacity from heartbeat timers). Implementations synchronize
@@ -1227,6 +1240,13 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
+    /// Non-mutating, non-pinning resident-prefix preflight. Providers use a
+    /// positive result to avoid reading a slower snapshot/SSD tier before
+    /// submission. nil means absent, ineligible, or unsupported. The real
+    /// lookup and generation-checked claim still happen inside `submit`.
+    func residentPrefixCandidate(
+        for request: CBv2Request
+    ) -> CBv2ResidentPrefixCandidate?
     /// Packed-prefill capability AND cumulative execution evidence. Cheap
     /// (plain counter reads); safe to poll from a benchmark harness or
     /// heartbeat. Fail-closed default: `.none`.
@@ -1292,6 +1312,9 @@ public protocol CBv2Engine: AnyObject, Sendable {
 
 extension CBv2Engine {
     public func updateKVBytesCapacity(_ bytes: Int) {}
+    public func residentPrefixCandidate(
+        for request: CBv2Request
+    ) -> CBv2ResidentPrefixCandidate? { nil }
     /// An engine with no packed-prefill path reports neither capability nor
     /// execution.
     public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }

@@ -292,7 +292,7 @@ extension PagedAttentionKernel {
             let writeTile = MLXArray.zeros(
                 [shape.kvHeads, 1, shape.headDim],
                 dtype: .float16)
-            var fence = bulkWrite(
+            var fence = try bulkWrite(
                 kSlab: kSlab,
                 vSlab: vSlab,
                 keys: writeTile,
@@ -331,7 +331,7 @@ extension PagedAttentionKernel {
                 let tables = MLXArray(probe.table)
                     .reshaped([1, probe.table.count])
                 let seqinfo = MLXArray(probe.seqinfo, [1, 8])
-                let result = decode(
+                let result = try decode(
                     queries: queries,
                     newKeys: shape.hasWrite ? decodeTile : nil,
                     newValues: shape.hasWrite ? decodeTile : nil,

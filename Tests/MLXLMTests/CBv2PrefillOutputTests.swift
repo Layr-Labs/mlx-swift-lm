@@ -230,7 +230,7 @@ private final class CBv2PrefillOutputDriver {
             let isFrontier = start + count == prompt.count
             let tokens = MLXArray(prompt[start ..< start + count].map(Int32.init))
                 .reshaped(1, count)
-            let output = loop.prefillOutput(
+            let output = try loop.prefillOutput(
                 tokens: tokens, inputEmbeddings: nil,
                 caches: caches.map { $0 as CBv2AttendingLayerCache },
                 requirement: isFrontier ? .lastPositionLogits : .evaluationOnly)
@@ -337,13 +337,13 @@ final class CBv2PrefillOutputTests: XCTestCase {
 
             let logitsCaches = try freshCaches(
                 base.layerKinds, backend: backend, promptLength: chunkLength)
-            let seamLast = loop.prefillOutput(
+            let seamLast = try loop.prefillOutput(
                 tokens: tokens, inputEmbeddings: nil, caches: logitsCaches,
                 requirement: .lastPositionLogits)
 
             let evalCaches = try freshCaches(
                 base.layerKinds, backend: backend, promptLength: chunkLength)
-            let seamEval = loop.prefillOutput(
+            let seamEval = try loop.prefillOutput(
                 tokens: tokens, inputEmbeddings: nil, caches: evalCaches,
                 requirement: .evaluationOnly)
 
@@ -388,11 +388,11 @@ final class CBv2PrefillOutputTests: XCTestCase {
         let refEval = full[0..., -1, 0 ..< 1]
 
         let lastCaches = try freshCaches(base.layerKinds, backend: backend, promptLength: length)
-        let seamLast = loop.prefillOutput(
+        let seamLast = try loop.prefillOutput(
             tokens: tokens, inputEmbeddings: embeddings, caches: lastCaches,
             requirement: .lastPositionLogits)
         let evalCaches = try freshCaches(base.layerKinds, backend: backend, promptLength: length)
-        let seamEval = loop.prefillOutput(
+        let seamEval = try loop.prefillOutput(
             tokens: tokens, inputEmbeddings: embeddings, caches: evalCaches,
             requirement: .evaluationOnly)
 

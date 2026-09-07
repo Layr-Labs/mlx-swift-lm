@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 enum GPTOSSCompiledExpertsPolicy {
@@ -52,6 +53,10 @@ final class GPTOSSCompiledExpertCache {
             return created
         }
         // MLX acquires its eval/compile locks outside the holder lock.
+        if CBv2ForwardShapeObservation.isActive {
+            return CBv2ForwardShapeObservation.compiledComponent(.gptossExperts,
+                physicalRows: x.dim(0)) { forward(x, indices) }
+        }
         return forward(x, indices)
     }
 

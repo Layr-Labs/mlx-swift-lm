@@ -4,10 +4,37 @@ import MLXNN
 import MLXRandom
 import Testing
 @testable import MLXLLM
-import MLXLMCommon
+@testable import MLXLMCommon
 
 @Suite("GPTOSS compiled expert graph", .serialized)
 struct GPTOSSCompiledExpertsTests {
+    @Test func shapeCountersObserveRuntimeInvocationsAfterTraceWarmup() throws {
+        let expert = layer()
+        let (input, indices) = inputs(batch: 2, dtype: .bfloat16)
+        eval(expert.compiledExpertForward(input, indices))
+        let recorder = CBv2ForwardShapeRecorder()
+        try recorder.reset()
+        let before = recorder.snapshot()
+        for _ in 0..<2 {
+            let step = recorder.beginStep()
+            let output = CBv2ForwardShapeObservation.dispatch(step: step, phase: .decode) {
+                let call = CBv2ForwardShapeObservation.beginTarget(liveBatchRows: 2, sequenceWidth: 1)
+                defer { call?.end() }
+                return expert.compiledExpertForward(input, indices)
+            }
+            step.attach()
+            eval(output)
+            step.complete()
+        }
+        let delta = recorder.snapshot().delta(since: before)
+        #expect(delta.complete)
+        let components = delta.entries.filter { $0.axes.kind == .compiledComponent }
+        #expect(components.count == 1)
+        #expect(components.first?.axes.component == .gptossExperts)
+        #expect(components.first?.axes.liveBatchRows == 2)
+        #expect(components.first?.completedCalls == 2)
+    }
+
     private func layer(fused: Bool = false) -> SwiGLUSwitchGLU {
         MLXRandom.seed(0xC0DEC0DE)
         let layer = SwiGLUSwitchGLU(inputDims: 64, hiddenDims: 64,

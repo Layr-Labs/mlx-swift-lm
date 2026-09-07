@@ -545,16 +545,18 @@ struct CBv2PagedKernelTests {
 
         init(
             _ arm: StorageArm, kind: CBv2LayerKind, histories: [[MLXArray]],
-            maxLength: Int
+            maxLength: Int, dtype: DType = .float16, segmentSizeBytes: Int? = nil
         ) throws {
             let kinds = [kind]
             var rows: [CBv2SequenceKV] = []
             switch arm {
             case .paged:
+                var config = CBv2PagedKernelTests.pagedConfig(
+                    for: kind, capacityBytes: 128 << 20)
+                config.dtype = dtype
+                config.segmentSizeBytes = segmentSizeBytes
                 let backend = try PagedKVBackend(
-                    layerKinds: kinds,
-                    config: CBv2PagedKernelTests.pagedConfig(
-                        for: kind, capacityBytes: 128 << 20))
+                    layerKinds: kinds, config: config)
                 cache = backend.makeLayerCaches()[0]
                 var states: [[CBv2SequenceKV?]] = []
                 for chunks in histories {
@@ -570,7 +572,7 @@ struct CBv2PagedKernelTests {
                 release = { states.forEach { backend.release($0) } }
             case .contiguous:
                 let backend = CBv2ContiguousKVBackend(
-                    config: .init(bytesCapacity: 1 << 29))
+                    config: .init(bytesCapacity: 1 << 29, kvDType: dtype))
                 cache = CBv2LayerCache(layerIndex: 0, kind: kind)
                 var states: [[CBv2SequenceKV?]] = []
                 for chunks in histories {
@@ -643,7 +645,8 @@ struct CBv2PagedKernelTests {
     /// use the same widths or the two rows' retained spans diverge for reasons
     /// that have nothing to do with storage.
     private func makeHistories(
-        kind: CBv2LayerKind, lengths: [Int], rng: inout KeyedRandom
+        kind: CBv2LayerKind, lengths: [Int], rng: inout KeyedRandom,
+        dtype: DType = .float16
     ) -> [[MLXArray]] {
         let chunk = CBv2PagedKernelTests.rowSafeWriteChunk(for: kind)
         return lengths.map { tokens in
@@ -651,8 +654,8 @@ struct CBv2PagedKernelTests {
             var remaining = tokens
             while remaining > 0 {
                 let n = min(remaining, chunk)
-                chunks.append(rng.normal([kind.kvHeads, n, kind.headDim]))
-                chunks.append(rng.normal([kind.kvHeads, n, kind.headDim]))
+                chunks.append(rng.normal([kind.kvHeads, n, kind.headDim], dtype: dtype))
+                chunks.append(rng.normal([kind.kvHeads, n, kind.headDim], dtype: dtype))
                 remaining -= n
             }
             return chunks
@@ -942,6 +945,178 @@ struct CBv2PagedKernelTests {
                         + "row \(row) step \(step)")
             }
         }
+    }
+
+    // MARK: - Qwen3.6 full-attention geometry at the measured history lengths
+
+    private static let qwen36Kind = CBv2LayerKind(
+        attention: .full, headDim: 256, kvHeads: 2, queryHeads: 16)
+    private static let qwen36Scale: Float = 1.0 / 16.0
+
+    /// Three usable pages per segment force partitions across physical bindings.
+    /// This stresses placement, not the production segment-size policy.
+    private static func qwen36SegmentBytes(_ dtype: DType) -> Int {
+        4 * 2 * CBv2PagedDefaults.pageSize * 2 * 256 * dtype.size
+    }
+
+    @Test(arguments: [DType.bfloat16, .float32], [4094, 5523, 5585])
+    func qwen36LongDecodeUsesIdenticalStoredValues(dtype: DType, history: Int) throws {
+        var rng = KeyedRandom(seed: 0x5136_5523)
+        let kind = Self.qwen36Kind, scale = Self.qwen36Scale
+        let histories = makeHistories(kind: kind, lengths: [history], rng: &rng, dtype: dtype)
+        let fixed = try Arm(.paged, kind: kind, histories: histories,
+                            maxLength: history + 3, dtype: dtype)
+        let segmented = try Arm(.paged, kind: kind, histories: histories,
+                                maxLength: history + 3, dtype: dtype,
+                                segmentSizeBytes: Self.qwen36SegmentBytes(dtype))
+        let pool = try #require((segmented.cache as? PagedLayerCache)?.pool)
+        #expect((pool.segmentStorageSnapshot?.segmentCount ?? 0) > 1)
+        let contiguous = try Arm(.contiguous, kind: kind, histories: histories,
+                                 maxLength: history + 3, dtype: dtype)
+        var oracle = Fp32Oracle(kind: kind, history: histories[0])
+        var stored = histories[0]
+        // B1 preserves the actual dispatch geometry. The first case attends
+        // 4095/4096/4097 tokens; the others include the partial last partition
+        // beyond the 5523-token prompt and near the MTP-off mismatch context.
+        for step in 0 ..< 3 {
+            let q = rng.normal([1, 16, 1, 256], dtype: dtype)
+            let k = rng.normal([1, 2, 1, 256], dtype: dtype)
+            let v = rng.normal([1, 2, 1, 256], dtype: dtype)
+            let outputs = [fixed, segmented, contiguous].map {
+                $0.step(queries: q, keys: k, values: v, scale: scale, sinks: nil)
+            }
+            oracle.append(keys: k[0], values: v[0])
+            stored += [k[0], v[0]]
+            let reference = oracle.attend(queries: q[0], scale: scale, sinks: nil)
+            for (index, label) in ["fixed", "segmented"].enumerated() {
+                #expect(outputs[index].shape == [1, 16, 1, 256])
+                #expect(outputs[index].dtype == dtype)
+                assertClose(outputs[index], outputs[2])
+                let error = expectPagedWithinOracleBar(
+                    paged: outputs[index], contiguous: outputs[2], reference: reference,
+                    "Q36 \(dtype) \(label) history \(history) step \(step)")
+                print("Q36 oracle \(dtype) \(label) attended=\(history + step + 1) "
+                    + "paged=\(error.paged) contiguous=\(error.contiguous) bar=\(error.bar)")
+            }
+            #expect(outputs[0].asData(access: .copy).data == outputs[1].asData(access: .copy).data,
+                    "physical segment placement must preserve the fixed kernel's output bits")
+        }
+        let expectedK = concatenated(stride(from: 0, to: stored.count, by: 2).map { stored[$0] }, axis: 1)
+            .expandedDimensions(axis: 0).asData(access: .copy).data
+        let expectedV = concatenated(stride(from: 1, to: stored.count, by: 2).map { stored[$0] }, axis: 1)
+            .expandedDimensions(axis: 0).asData(access: .copy).data
+        for arm in [fixed, segmented, contiguous] {
+            let snapshot = arm.cache.rows[0].snapshot()
+            #expect(snapshot.keys.dtype == dtype && snapshot.values.dtype == dtype)
+            #expect(snapshot.keys.shape == [1, 2, history + 3, 256])
+            #expect(snapshot.keys.asData(access: .copy).data == expectedK)
+            #expect(snapshot.values.asData(access: .copy).data == expectedV)
+        }
+    }
+
+    /// Calibrate missing boundary/final entries and wrong GQA-head mapping on
+    /// this long shape. A random single entry at 5.5k can have negligible mass;
+    /// give the selected key a score >=12 so rejection is non-vacuous.
+    @Test(arguments: [DType.bfloat16, .float32], [4095, 5522, 5523])
+    func qwen36LongOracleRejectsBoundaryAndHeadFaults(dtype: DType, salient: Int) throws {
+        let history = 5523, kind = Self.qwen36Kind, scale = Self.qwen36Scale
+        var rng = KeyedRandom(seed: 0x5136_FA17)
+        let histories = makeHistories(kind: kind, lengths: [history], rng: &rng, dtype: dtype)
+        var stored = histories[0]
+        let salientK = MLXArray.full([2, 1, 256], values: MLXArray(Float(0.75)), dtype: dtype)
+        let salientV = broadcast(MLXArray([Float(3), -3]).reshaped([2, 1, 1]), to: [2, 1, 256])
+            .asType(dtype)
+        if salient < history {
+            let chunkWidth = Self.rowSafeWriteChunk(for: kind)
+            let pair = 2 * (salient / chunkWidth), offset = salient % chunkWidth
+            func replacing(_ chunk: MLXArray, with value: MLXArray) -> MLXArray {
+                var pieces: [MLXArray] = []
+                if offset > 0 { pieces.append(chunk[0..., 0 ..< offset, 0...]) }
+                pieces.append(value)
+                if offset + 1 < chunk.dim(1) {
+                    pieces.append(chunk[0..., (offset + 1) ..< chunk.dim(1), 0...])
+                }
+                return concatenated(pieces, axis: 1)
+            }
+            stored[pair] = replacing(stored[pair], with: salientK)
+            stored[pair + 1] = replacing(stored[pair + 1], with: salientV)
+        }
+        let fixed = try Arm(.paged, kind: kind, histories: [stored], maxLength: history + 1, dtype: dtype)
+        let segmented = try Arm(.paged, kind: kind, histories: [stored], maxLength: history + 1,
+                                dtype: dtype, segmentSizeBytes: Self.qwen36SegmentBytes(dtype))
+        let contiguous = try Arm(.contiguous, kind: kind, histories: [stored],
+                                 maxLength: history + 1, dtype: dtype)
+        var oracle = Fp32Oracle(kind: kind, history: stored)
+        let q = broadcast((MLXArray(0 ..< 16).asType(.float32) / 100 + 1)
+            .reshaped([1, 16, 1, 1]), to: [1, 16, 1, 256]).asType(dtype)
+        let k = (salient == history ? salientK : rng.normal([2, 1, 256], dtype: dtype))
+            .expandedDimensions(axis: 0)
+        let v = (salient == history ? salientV : rng.normal([2, 1, 256], dtype: dtype))
+            .expandedDimensions(axis: 0)
+        oracle.append(keys: k[0], values: v[0])
+        let reference = oracle.attend(queries: q[0], scale: scale, sinks: nil)
+        #expect(oracle.heaviestKeyIndex(queries: q[0], scale: scale) == salient)
+        let dropped = oracle.attend(queries: q[0], scale: scale, sinks: nil, dropping: salient)
+        let wrongHeads = concatenated(
+            [reference[0..., 8 ..< 16, 0..., 0...], reference[0..., 0 ..< 8, 0..., 0...]], axis: 1)
+        let want = contiguous.step(queries: q, keys: k, values: v, scale: scale, sinks: nil)
+        for (arm, label) in [(fixed, "fixed"), (segmented, "segmented")] {
+            let got = arm.step(queries: q, keys: k, values: v, scale: scale, sinks: nil)
+            let honest = expectPagedWithinOracleBar(
+                paged: got, contiguous: want, reference: reference,
+                "Q36 \(dtype) \(label) salient \(salient)")
+            assertClose(got, want)
+            for (fault, output) in [("dropped salient entry", dropped), ("swapped GQA groups", wrongHeads)] {
+                let error = Self.relativeError(output, vs: reference)
+                expectPlantedFaultRejected("Q36 \(dtype) \(label) \(fault) at \(salient)",
+                                           error: error, honest: honest, enforced: true)
+                #expect(!Self.oracleAccepts(paged: output, contiguous: want, reference: reference))
+                print("Q36 calibration \(dtype) \(label) salient=\(salient) \(fault) "
+                    + "error=\(error) honest=\(honest.paged) bar=\(honest.bar)")
+            }
+            let sharedlyWrong = want * MLXArray(Float(1.05))
+            #expect(!Self.oracleAccepts(
+                paged: sharedlyWrong, contiguous: sharedlyWrong, reference: reference))
+        }
+    }
+
+    /// Conditional diagnostic only: current model Q dtype is not established.
+    /// Paged decode narrows a wider Q to pool dtype and restores output dtype;
+    /// score BOTH the original-Q and narrowed-Q references, without treating
+    /// agreement with the latter as evidence of unrounded-query equivalence.
+    @Test func qwen36WiderQueryDiagnosticKeepsBothReferences() throws {
+        let kind = Self.qwen36Kind, scale = Self.qwen36Scale, dtype = DType.bfloat16
+        var rng = KeyedRandom(seed: 0x5136_C457)
+        let histories = makeHistories(kind: kind, lengths: [5523], rng: &rng, dtype: dtype)
+        let wide = try Arm(.paged, kind: kind, histories: histories, maxLength: 5524,
+                           dtype: dtype, segmentSizeBytes: Self.qwen36SegmentBytes(dtype))
+        let narrow = try Arm(.paged, kind: kind, histories: histories, maxLength: 5524,
+                             dtype: dtype, segmentSizeBytes: Self.qwen36SegmentBytes(dtype))
+        let contiguous = try Arm(.contiguous, kind: kind, histories: histories, maxLength: 5524, dtype: dtype)
+        var oracle = Fp32Oracle(kind: kind, history: histories[0])
+        let q = rng.normal([1, 16, 1, 256], dtype: .float32)
+        let roundedQ = q.asType(dtype)
+        let k = rng.normal([1, 2, 1, 256], dtype: dtype)
+        let v = rng.normal([1, 2, 1, 256], dtype: dtype)
+        let got = wide.step(queries: q, keys: k, values: v, scale: scale, sinks: nil)
+        let rounded = narrow.step(queries: roundedQ, keys: k, values: v, scale: scale, sinks: nil)
+        let want = contiguous.step(queries: q, keys: k, values: v, scale: scale, sinks: nil)
+        oracle.append(keys: k[0], values: v[0])
+        let originalReference = oracle.attend(queries: q[0], scale: scale, sinks: nil)
+        let roundedReference = oracle.attend(queries: roundedQ[0], scale: scale, sinks: nil)
+        #expect(got.dtype == .float32 && want.dtype == .float32)
+        #expect(got.asData(access: .copy).data == rounded.asType(.float32).asData(access: .copy).data)
+        #expect(q.asData(access: .copy).data != roundedQ.asType(.float32).asData(access: .copy).data)
+        let error = expectPagedWithinOracleBar(
+            paged: got, contiguous: want, reference: originalReference, "Q36 wider-Q original reference")
+        assertClose(got, want)
+        let roundedError = Self.relativeError(got, vs: roundedReference)
+        #expect(roundedError <= error.bar)
+        let queryRoundingError = Self.relativeError(roundedReference, vs: originalReference)
+        #expect(queryRoundingError > 0)
+        print("Q36 conditional FP32-Q/BF16-KV originalError=\(error.paged) "
+            + "roundedError=\(roundedError) queryRoundingError=\(queryRoundingError) "
+            + "contiguousError=\(error.contiguous) bar=\(error.bar)")
     }
 
     /// One planted-fault calibration case.

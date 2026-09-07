@@ -242,6 +242,9 @@ public protocol CBv2MTPDrafter: AnyObject {
     var requestStateTokenGranularity: Int { get }
     /// Maximum physical high-water tokens retained beyond committed logical state.
     var requestStateTokenAllocationPadding: Int { get }
+    /// Physical buffer families for allocator-aware request admission. A nil
+    /// declaration uses the conservative fragmented-byte fallback.
+    var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? { get }
     /// Build round-scoped batch state from per-row captures. `rows` order
     /// == the round's speculating-row order.
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
@@ -266,6 +269,7 @@ extension CBv2MTPDrafter {
     public var requestStateBytesPerToken: Int { 0 }
     public var requestStateTokenGranularity: Int { 1 }
     public var requestStateTokenAllocationPadding: Int { 0 }
+    public var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? { nil }
     /// True when this drafter's rounds may accept via target-prefix
     /// pre-sampling (accept draft iff it equals a token pre-sampled from the
     /// target's real per-request sampler distribution; the committed token is

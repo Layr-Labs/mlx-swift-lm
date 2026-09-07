@@ -25,6 +25,7 @@ struct CBv2MTPGraphBuild {
     /// Non-sampling prefill handles retained by the in-flight step.
     let prefillEvalTargets: [MLXArray]
     let asyncEvalTargets: [MLXArray]
+    let diagnostics: [CBv2LogitDiagnosticPacket]
     let logprobSegments: [CBv2StepLogprobs]
     let verify: CBv2MTPRoundInFlight.Verify?
     let seedRows: [(id: CBv2RequestID, decodeIndex: Int)]
@@ -124,9 +125,10 @@ extension EngineLoopV2 {
 
     func mtpBuildRoundGraph(
         _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver, launchNanos: UInt64
-    ) -> CBv2MTPGraphBuild {
+    ) throws -> CBv2MTPGraphBuild {
         var cacheInnerState: [MLXArray] = []
         var logprobSegments: [CBv2StepLogprobs] = []
+        var diagnostics: [CBv2LogitDiagnosticPacket] = []
 
         // Plain and seed rows share one eager [B, 1] target batch. Seed rows
         // retain the pre-norm hidden; logits remain identical to plain eager.
@@ -138,6 +140,16 @@ extension EngineLoopV2 {
         var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
         var committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow] = []
         var committedObservationEvalTargets: [MLXArray] = []
+        var observationsTransferred = false
+        defer {
+            if !observationsTransferred {
+                // Keep detached owners alive until the engine fences already
+                // submitted work, then retires the failed cohort explicitly.
+                for observation in committedObservationRows {
+                    mtp.restoreAssistantState(observation.assistantState, for: observation.id)
+                }
+            }
+        }
 
         func observeCommittedTarget(
             row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
@@ -167,6 +179,10 @@ extension EngineLoopV2 {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
+            let diagnosticOffsets = logitDiagnostic == nil ? nil : decodeRows.map {
+                Self.positionOffset(kvStates[$0.rec.id]!)
+            }
+            var diagnosticTopTwo: (ids: MLXArray, values: MLXArray)?
             let logits: MLXArray
             let hidden: MLXArray
             if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
@@ -183,9 +199,11 @@ extension EngineLoopV2 {
                 let positionIds = CBv2PositionState.decodePositionIds(
                     states: decodeRows.map(\.rec.request.positionState),
                     cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                let output = recurrentModel.forwardWithHidden(
+                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier)) { recurrentModel.forwardWithHidden(
                     tokens: inputs, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds)
+                    positionIds: positionIds) }
                 logits = output.logits
                 hidden = output.lastHidden
                 for (row, evaluation) in zip(decodeRows, evaluations) {
@@ -197,7 +215,9 @@ extension EngineLoopV2 {
                     recurrentEvaluations[row.rec.id] = evaluation
                 }
             } else {
-                let output = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier)) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
                 logits = output.logits
                 hidden = output.lastHidden
             }
@@ -223,9 +243,32 @@ extension EngineLoopV2 {
                 let vocabulary = logits.dim(-1)
                 let topTwo = provider.cbv2MTPTopTwo(
                     logits.reshaped([1, decodeRows.count, vocabulary]))
+                if logitDiagnostic != nil {
+                    diagnosticTopTwo = (
+                        topTwo.ids.reshaped([decodeRows.count, 2]),
+                        topTwo.values.reshaped([decodeRows.count, 2]))
+                }
                 seedPolicyTopTwoValues = topTwo.values
                     .reshaped([decodeRows.count, 1, 2])
                     .asType(.float32)
+            }
+            if let diagnosticOffsets, let diagnostic = logitDiagnostic {
+                for (index, row) in decodeRows.enumerated()
+                where row.rec.id.raw == diagnostic.configuration.requestID
+                    && row.rec.generatedTokenCount == diagnostic.configuration.outputIndex {
+                    let retainedTopTwo = diagnosticTopTwo.map {
+                        (ids: $0.ids[index], values: $0.values[index])
+                    }
+                    if let packet = makeLogitDiagnostic(
+                        logits: logits[index, -1], requestID: row.rec.id,
+                        outputIndex: row.rec.generatedTokenCount,
+                        phase: row.start < row.rec.request.promptTokens.count ? "prefill"
+                            : row.isSeed ? "seed" : "plain",
+                        batchIndex: index, batchSize: decodeRows.count,
+                        seedToken: row.rec.tokens[row.start], cacheOffset: diagnosticOffsets[index],
+                        policyTopTwo: retainedTopTwo)
+                    { diagnostics.append(packet) }
+                }
             }
             for (index, row) in decodeRows.enumerated() {
                 observeCommittedTarget(
@@ -243,6 +286,7 @@ extension EngineLoopV2 {
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
+            let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
@@ -258,7 +302,7 @@ extension EngineLoopV2 {
                 stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
                 launchNanos: launchNanos)
             if visionChunk, let multimodal {
-                let forward = multimodalChunkForward(
+                let forward = try multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
                     id: rec.id, multimodal: multimodal, caches: caches,
                     requirement: requirement)
@@ -280,9 +324,9 @@ extension EngineLoopV2 {
                 }
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
-                let forward = recurrentModel.forwardWithHidden(
+                let forward = try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHidden(
                     tokens: inputs, caches: caches, recurrentState: [evaluation],
-                    positionIds: positions)
+                    positionIds: positions) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
                 do {
@@ -297,20 +341,20 @@ extension EngineLoopV2 {
             {
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
-                let forward = targetForward(
+                let forward = try targetForward(
                     tokens: inputs, caches: caches, ids: [rec.id],
-                    positionIds: positions)
+                    positionIds: positions, phase: .prefill)
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 cacheInnerState.append(contentsOf: forward.innerState)
                 recurrentEvaluations.merge(forward.recurrent) { _, _ in
                     preconditionFailure("duplicate recurrent evaluation")
                 }
             } else if mtp.tracksPersistentHistory {
-                let forward = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                let forward = try checkedModelForward(phase: .prefill) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
             } else {
-                output = prefillOutput(
+                output = try prefillOutput(
                     tokens: inputs, inputEmbeddings: nil, caches: caches,
                     requirement: requirement)
             }
@@ -319,6 +363,12 @@ extension EngineLoopV2 {
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
+                if logitDiagnostic != nil,
+                    let packet = makeLogitDiagnostic(
+                        logits: output[0], requestID: rec.id, outputIndex: rec.generatedTokenCount,
+                        phase: "prefill", batchIndex: 0, batchSize: 1,
+                        seedToken: slice.last, cacheOffset: diagnosticOffset)
+                { diagnostics.append(packet) }
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
                     params: [rec.request.sampling],
@@ -335,7 +385,7 @@ extension EngineLoopV2 {
         }
 
         let verifyRows = work.filter { $0.carry != nil }
-        let verify = mtpBuildVerifyGraph(
+        let verify = try mtpBuildVerifyGraph(
             verifyRows, driver: mtp, cacheInnerState: &cacheInnerState)
 
         // Plain sampled tokens stay in plan order. Verify rows are finalized
@@ -356,7 +406,9 @@ extension EngineLoopV2 {
         let sampledTokens: MLXArray? =
             pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
 
+        if let verify { diagnostics.append(contentsOf: verify.diagnostics) }
         var asyncEvalTargets = prefillEvalTargets
+        for packet in diagnostics { asyncEvalTargets.append(contentsOf: packet.evaluationTargets) }
         if let sampledTokens { asyncEvalTargets.append(sampledTokens) }
         for segment in logprobSegments {
             asyncEvalTargets.append(contentsOf: segment.evalTargets)
@@ -381,11 +433,13 @@ extension EngineLoopV2 {
             offsetChainEvalSteps += 1
         }
 
+        observationsTransferred = true
         return CBv2MTPGraphBuild(
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
             prefillEvalTargets: prefillEvalTargets,
             asyncEvalTargets: asyncEvalTargets,
+            diagnostics: diagnostics,
             logprobSegments: logprobSegments,
             verify: verify,
             seedRows: seedRows,
@@ -399,7 +453,7 @@ extension EngineLoopV2 {
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
         cacheInnerState: inout [MLXArray]
-    ) -> CBv2MTPRoundInFlight.Verify? {
+    ) throws -> CBv2MTPRoundInFlight.Verify? {
         guard !verifyRows.isEmpty else { return nil }
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
@@ -408,6 +462,19 @@ extension EngineLoopV2 {
         let batch = verifyRows.count
         var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
+        var assistantOwnersTransferred = false
+        defer {
+            if !assistantOwnersTransferred {
+                // Draft column zero may already be evaluating. Restore its
+                // owner before unwinding; request retirement synchronizes and
+                // calls releaseRequestState before returning capacity.
+                for row in rowMetadata {
+                    if let state = row.assistantState {
+                        mtp.restoreAssistantState(state, for: row.id)
+                    }
+                }
+            }
+        }
         var seedTokens: [Int32] = []
         var carryHiddens: [MLXArray] = []
         // Each capture paired with the row it was gathered from, so
@@ -524,7 +591,7 @@ extension EngineLoopV2 {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
-        let target = mtpBuildTargetVerification(
+        let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
@@ -537,7 +604,8 @@ extension EngineLoopV2 {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
-        return CBv2MTPRoundInFlight.Verify(
+        assistantOwnersTransferred = true
+        var result = CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
@@ -546,6 +614,8 @@ extension EngineLoopV2 {
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,
             policyTopTwoValues: target.policyTopTwo?.values)
+        result.diagnostics = target.diagnostics
+        return result
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes

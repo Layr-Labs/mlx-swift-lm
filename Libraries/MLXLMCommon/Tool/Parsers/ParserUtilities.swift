@@ -1,5 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
+import CoreFoundation
 import Foundation
 
 // MARK: - JSON to Sendable Bridge
@@ -11,7 +12,11 @@ import Foundation
 func asSendable(_ value: Any) -> any Sendable {
     switch value {
     case let s as String: return s
-    case let n as NSNumber: return n
+    case let n as NSNumber:
+        // NSNumber booleans also bridge to Int, which Jinja tests before Bool.
+        // Preserve their native type without treating numeric 0/1 as booleans.
+        if CFGetTypeID(n) == CFBooleanGetTypeID() { return n.boolValue }
+        return n
     case let a as [Any]: return a.map(asSendable)
     case let d as [String: Any]: return d.mapValues(asSendable)
     case let null as NSNull: return null

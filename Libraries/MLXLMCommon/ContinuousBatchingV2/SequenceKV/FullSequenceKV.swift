@@ -116,6 +116,26 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
     }
 
+    /// Transfer an exclusively owned, fully authenticated native destination.
+    /// No prefix copy or lazy assignment may retain the staging buffers.
+    init(
+        restoredKeys: MLXArray, restoredValues: MLXArray, offset: Int,
+        maxLength: Int, kvHeads: Int, headDim: Int
+    ) throws {
+        let shape = [1, kvHeads, maxLength, headDim]
+        guard maxLength > 0, offset > 0, offset <= maxLength,
+            restoredKeys.shape == shape, restoredValues.shape == shape,
+            restoredKeys.dtype == restoredValues.dtype
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        self.maxLength = maxLength
+        self.kvHeads = kvHeads
+        self.headDim = headDim
+        self.capacity = maxLength
+        self.absoluteOffset = offset
+        self.keys = restoredKeys
+        self.values = restoredValues
+    }
+
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,

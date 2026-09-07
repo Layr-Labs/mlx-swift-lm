@@ -318,9 +318,9 @@ final class CBv2PackedHarness {
 
     /// One planned mixed step. Returns the (id, token) pairs sampled.
     @discardableResult
-    func step() -> [(id: CBv2RequestID, token: Int)] {
+    func step() throws -> [(id: CBv2RequestID, token: Int)] {
         let plan = scheduler.plan()
-        guard let inFlight = loop.executeMixed(plan) else { return [] }
+        guard let inFlight = try loop.executeMixed(plan) else { return [] }
         var sampled: [(id: CBv2RequestID, token: Int)] = []
         if let tokens = inFlight.sampledTokens {
             let host = tokens.asArray(Int32.self)
@@ -335,8 +335,8 @@ final class CBv2PackedHarness {
         return sampled
     }
 
-    func run(steps: Int) {
-        for _ in 0 ..< steps { step() }
+    func run(steps: Int) throws {
+        for _ in 0 ..< steps { try step() }
     }
 
     // MARK: inspection
@@ -433,7 +433,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
     private func assertParity(
         prompts: [[Int]], chunkSize: Int, budget: Int, steps: Int,
         expectPackedShape: [Int], file: StaticString = #filePath, line: UInt = #line
-    ) -> (packed: CBv2PackedHarness, singleton: CBv2PackedHarness) {
+    ) throws -> (packed: CBv2PackedHarness, singleton: CBv2PackedHarness) {
         let base = TinyTestModel.make(seed: weightSeed)
         let (packed, singleton) = makePair(
             base: base, prefillChunkSize: chunkSize, maxBatchedTokensPerStep: budget)
@@ -442,8 +442,8 @@ final class CBv2PackedPrefillTests: XCTestCase {
             XCTAssertNoThrow(try packed.enqueue(prompt: prompt), file: file, line: line)
             XCTAssertNoThrow(try singleton.enqueue(prompt: prompt), file: file, line: line)
         }
-        packed.run(steps: steps)
-        singleton.run(steps: steps)
+        try packed.run(steps: steps)
+        try singleton.run(steps: steps)
 
         // Test premise: packing really happened on one side and never on
         // the other.
@@ -506,7 +506,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
 
         // Step 1 — all four admitted, chunk [0, 8): intermediate.
         harness.model.reset()
-        harness.step()
+        try harness.step()
         XCTAssertEqual(
             harness.model.calls,
             [.prefill(shape: [4, 8], requirement: .evaluationOnly, spliced: false)],
@@ -514,7 +514,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
 
         // Step 2 — chunk [8, 16): the frontier, still four equal rows.
         harness.model.reset()
-        let sampled = harness.step()
+        let sampled = try harness.step()
         XCTAssertEqual(
             harness.model.calls,
             [.prefill(shape: [4, 8], requirement: .lastPositionLogits, spliced: false)],
@@ -530,14 +530,14 @@ final class CBv2PackedPrefillTests: XCTestCase {
     func testPackedRowsAreParityWithSingletonExecutionB2() throws {
         // Prompt 24 / chunk 8 ⇒ 3 prompt chunks, the last sampling.
         let prompts = (0 ..< 2).map { makePromptTokens(length: 24, seed: UInt64(3100 + $0)) }
-        assertParity(
+        try assertParity(
             prompts: prompts, chunkSize: 8, budget: 64, steps: 3,
             expectPackedShape: [2, 8])
     }
 
     func testPackedRowsAreParityWithSingletonExecutionB4() throws {
         let prompts = (0 ..< 4).map { makePromptTokens(length: 24, seed: UInt64(3200 + $0)) }
-        assertParity(
+        try assertParity(
             prompts: prompts, chunkSize: 8, budget: 64, steps: 3,
             expectPackedShape: [4, 8])
     }
@@ -554,7 +554,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         XCTAssertEqual(
             Set(prompts.map { $0.description }).count, prompts.count,
             "test premise: the four prompts must differ")
-        let (packed, _) = assertParity(
+        let (packed, _) = try assertParity(
             prompts: prompts, chunkSize: 8, budget: 64, steps: 3,
             expectPackedShape: [4, 8])
 
@@ -580,7 +580,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         for harness in [packed, singleton] {
             // A alone first: it reaches offset 8 before B ever runs.
             try harness.enqueue(prompt: promptA)
-            harness.step()
+            try harness.step()
             try harness.enqueue(prompt: promptB)
         }
 
@@ -596,14 +596,14 @@ final class CBv2PackedPrefillTests: XCTestCase {
         // Step 2 packs A's [8, 16) chunk with B's [0, 8) chunk: same length,
         // same samples flag, DIFFERENT absolute offsets.
         packed.model.reset()
-        packed.step()
-        singleton.step()
+        try packed.step()
+        try singleton.step()
         XCTAssertEqual(
             packed.model.prefillShapes, [[2, 8]],
             "equal-length chunks at different offsets must still pack")
 
-        packed.run(steps: 4)
-        singleton.run(steps: 4)
+        try packed.run(steps: 4)
+        try singleton.run(steps: 4)
 
         for (index, id) in packed.order.enumerated() {
             XCTAssertEqual(
@@ -632,7 +632,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         }
 
         harness.model.reset()
-        harness.step()
+        try harness.step()
         XCTAssertEqual(
             harness.model.calls,
             [
@@ -657,7 +657,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         try harness.enqueue(prompt: makePromptTokens(length: 8, seed: 5201))
 
         harness.model.reset()
-        let sampled = harness.step()
+        let sampled = try harness.step()
         XCTAssertEqual(
             harness.model.prefillShapes, [[1, 8], [1, 8]],
             "an intermediate chunk and a frontier chunk of equal length must not pack")
@@ -681,7 +681,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         try harness.enqueue(prompt: makePromptTokens(length: 24, seed: 5300))
 
         harness.model.reset()
-        harness.step()
+        try harness.step()
         XCTAssertEqual(
             harness.model.calls,
             [.prefill(shape: [1, 8], requirement: .evaluationOnly, spliced: false)],
@@ -705,7 +705,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
 
         let prompts = (0 ..< 4).map { makePromptTokens(length: 24, seed: UInt64(6100 + $0)) }
         for prompt in prompts { try vetoed.enqueue(prompt: prompt) }
-        vetoed.run(steps: 3)
+        try vetoed.run(steps: 3)
 
         XCTAssertEqual(
             vetoed.model.prefillShapes, Array(repeating: [1, 8], count: 12),
@@ -717,7 +717,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
             inner: base, layerKinds: base.layerKinds, modelClaimsPacking: false,
             prefillChunkSize: 8, maxBatchedTokensPerStep: 64)
         for prompt in prompts { try reference.enqueue(prompt: prompt) }
-        reference.run(steps: 3)
+        try reference.run(steps: 3)
         for (index, id) in vetoed.order.enumerated() {
             XCTAssertEqual(
                 vetoed.generated[id] ?? [],
@@ -736,7 +736,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         for seed in 0 ..< 4 {
             try vetoed.enqueue(prompt: makePromptTokens(length: 24, seed: UInt64(6200 + seed)))
         }
-        vetoed.run(steps: 3)
+        try vetoed.run(steps: 3)
         XCTAssertEqual(
             vetoed.model.prefillShapes, Array(repeating: [1, 8], count: 12),
             "a model that does not claim packed prefill must only ever see [1, chunk]")
@@ -772,7 +772,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
                     promptTokens: makePromptTokens(length: 24, seed: UInt64(6300 + raw)),
                     sampling: .init(temperature: 0), maxTokens: 8))
         }
-        _ = loop.executeMixed(scheduler.plan())
+        _ = try loop.executeMixed(scheduler.plan())
 
         let shapes = narrowing.log.compactMap { entry -> [Int]? in
             if case .prefill(let call) = entry { return call.tokenShape }
@@ -810,7 +810,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         try harness.enqueue(prompt: makePromptTokens(length: 16, seed: 6402))
 
         harness.model.reset()
-        harness.step()
+        try harness.step()
         XCTAssertEqual(
             harness.model.calls,
             [
@@ -824,7 +824,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
         // packable again alongside its neighbours — the exclusion is a pure
         // function of has-spans, not of the request.
         harness.model.reset()
-        harness.step()
+        try harness.step()
         XCTAssertEqual(
             harness.model.calls,
             [.prefill(shape: [3, 8], requirement: .lastPositionLogits, spliced: false)],
@@ -871,14 +871,14 @@ final class CBv2PackedPrefillTests: XCTestCase {
             // Two short requests prefill (and sample) in step 1, so they are
             // decode-ready in step 2.
             for prompt in decodePrompts { try harness.enqueue(prompt: prompt) }
-            harness.step()
+            try harness.step()
             for prompt in promptRows { try harness.enqueue(prompt: prompt) }
         }
 
         packed.model.reset()
-        let packedSampled = packed.step()
+        let packedSampled = try packed.step()
         singleton.model.reset()
-        let singletonSampled = singleton.step()
+        let singletonSampled = try singleton.step()
 
         XCTAssertEqual(
             packed.model.forwardShapes, [[2, 1]],
@@ -901,8 +901,8 @@ final class CBv2PackedPrefillTests: XCTestCase {
             "packing the prompt rows must not change the decode rows' tokens")
 
         // Continue the mixed run: every row must still agree.
-        packed.run(steps: 5)
-        singleton.run(steps: 5)
+        try packed.run(steps: 5)
+        try singleton.run(steps: 5)
         for (index, id) in packed.order.enumerated() {
             XCTAssertEqual(
                 packed.generated[id] ?? [], singleton.generated[singleton.order[index]] ?? [],
@@ -917,7 +917,7 @@ final class CBv2PackedPrefillTests: XCTestCase {
     func testContinuationAfterPackedPrefillMatchesSingletonReference() throws {
         // 3 prefill steps (prompt 24 / chunk 8) then 8 chained decode steps.
         let prompts = (0 ..< 4).map { makePromptTokens(length: 24, seed: UInt64(8100 + $0)) }
-        let (packed, _) = assertParity(
+        let (packed, _) = try assertParity(
             prompts: prompts, chunkSize: 8, budget: 64, steps: 11,
             expectPackedShape: [4, 8])
         for id in packed.order {
@@ -994,8 +994,8 @@ final class CBv2PackedPrefillTests: XCTestCase {
             try packed.enqueue(prompt: prompt)
             try singleton.enqueue(prompt: prompt)
         }
-        packed.run(steps: 6)
-        singleton.run(steps: 6)
+        try packed.run(steps: 6)
+        try singleton.run(steps: 6)
 
         XCTAssertTrue(
             packed.model.prefillShapes.contains([2, 8]),
