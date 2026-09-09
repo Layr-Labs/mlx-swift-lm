@@ -457,6 +457,41 @@ struct CBv2MTPRoundSmokeTests {
         #expect(on.capacity().activeRequests == 0 && on.capacity().kvBytesReserved == 0)
     }
 
+    @Test(arguments: [Float(0.7), Float(1.1)])
+    func stochasticGemmaRectangularUsesTargetSamplesThroughWindowWrap(temperature: Float)
+        async throws
+    {
+        let fixture = try makeFixture()
+        let prompt = makePromptTokens(length: 24, seed: 61, vocabSize: vocabSize)
+        let request = CBv2Request(id: .init(603), promptTokens: prompt,
+            sampling: .init(temperature: temperature, topP: 0.9, topK: 24, minP: 0.02, seed: 312),
+            maxTokens: 32)
+        let off = try makeEngine(fixture, mtp: false)
+        let expected = try await run(off, request)
+        await off.shutdown()
+
+        // Exercise the real Gemma adapter and automatic rectangular selection
+        // at the release draft depth. Exact seeded output is a tiny-fixture
+        // oracle for target-prefix sampling and rollback, not a requirement
+        // that full-size BF16 models use identical arithmetic across widths.
+        let on = try makeEngine(fixture, mtp: true, maxDraftTokens: 1,
+            verificationMode: .automatic)
+        let before = try on.beginForwardShapeObservation()
+        let actual = try await run(on, request)
+        let metrics = try #require(on.mtpMetricsSnapshot())
+        await on.shutdown()
+        _ = completedForwardShapes(on, since: before)
+
+        #expect(expected.finishReason == .length && expected.tokens.count == 32)
+        #expect(actual.finishReason == expected.finishReason)
+        #expect(actual.tokens == expected.tokens)
+        #expect(metrics.seedSteps > 0 && metrics.rectangularVerificationRounds > 0)
+        #expect(metrics.proposedTokens > metrics.acceptedTokens,
+                "the fixture must exercise discarded rectangular suffixes")
+        #expect(on.capacity().activeRequests == 0 && on.capacity().kvBytesReserved == 0)
+        #expect(off.capacity().activeRequests == 0 && off.capacity().kvBytesReserved == 0)
+    }
+
     private final class ExclusionConstraint: CBv2TokenConstraint {
         let mode: CBv2TokenConstraintMode = .none
         let initialState = 0
