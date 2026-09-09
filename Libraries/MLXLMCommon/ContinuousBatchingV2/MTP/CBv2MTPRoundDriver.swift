@@ -378,6 +378,8 @@ final class CBv2MTPRoundDriver {
         if let rowIDs, depthController.usesCommittedDecodeBaseline {
             if !canSpeculate || Set(rowIDs) != Set(goodputPlanRows) {
                 committedGoodputClock.reset()
+                depthController.cancelCommittedWindow(
+                    decodeRowBucket: CBv2MTPDepthController.decodeRowBucket(goodputPlanRows.count))
             }
             goodputPlanRows = rowIDs
             depthController.beginWorkload(rowIDs: rowIDs)
@@ -451,6 +453,7 @@ final class CBv2MTPRoundDriver {
         let newDepth = min(max(requestedDepth, 0), planDecision.depth)
         guard newDepth != planDecision.depth else { return }
         let oldDepth = planDecision.depth
+        depthController.cancelCommittedWindow(decodeRowBucket: planDecision.decodeRowBucket)
         planDecision = CBv2MTPDepthDecision(
             depth: newDepth, decodeRowBucket: planDecision.decodeRowBucket,
             reason: reason, isExploration: false)
@@ -818,6 +821,8 @@ final class CBv2MTPRoundDriver {
                     depthController.recordCommittedVerification(
                         decision: decision, wallTimeNanos: sample.wallTimeNanos,
                         committedTokens: sample.committedTokens, rowCount: committedRows.count)
+                } else {
+                    depthController.cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
                 }
                 metricsLock.lock()
                 // Warmup is real work even when excluded from steady EWMA.
@@ -829,12 +834,18 @@ final class CBv2MTPRoundDriver {
             }
         }
         if measurement.seedOnly, decision.depth > 0 {
-            guard measurement.costEligible, !finalizedSeedIDs.isEmpty else { return }
+            guard measurement.costEligible, !finalizedSeedIDs.isEmpty else {
+                depthController.cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
+                return
+            }
             pendingSeedCosts.record(
                 decodeRowBucket: decision.decodeRowBucket,
                 requestIDs: finalizedSeedIDs,
                 nanos: wallTimeNanos)
             return
+        }
+        if measurement.actualDepth == 0 {
+            depthController.cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
         }
         let rawCostEligible =
             usesMarginalPolicy

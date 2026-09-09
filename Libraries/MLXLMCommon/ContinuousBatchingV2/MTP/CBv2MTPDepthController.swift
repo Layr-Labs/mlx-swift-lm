@@ -149,6 +149,7 @@ final class CBv2MTPDepthController {
         var committedBaseline = CostState()
         var committedTokensPerRow: [Int: Double] = [:]
         var warmedDepths: Set<Int> = []
+        var committedWindow: CBv2MTPCommittedWindow?
         var acceptance = AcceptanceState()
         var activeDepth = 0
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
@@ -199,9 +200,17 @@ final class CBv2MTPDepthController {
         buckets[bucket] = fresh
     }
 
-    /// Actual committed outputs include seed outputs paired with seed time.
-    /// The first positive sample may compile a new shape; account its wall
-    /// time in driver telemetry but immediately retry with the retained carry.
+    /// Invalid/cohort-changing work cannot extend a contiguous observation.
+    /// Discard incomplete learning windows; all executed work remains in the
+    /// driver's cumulative telemetry, and ordinary request limits still win.
+    func cancelCommittedWindow(decodeRowBucket: Int) {
+        guard usesCommittedDecodeBaseline else { return }
+        buckets[decodeRowBucket]?.committedWindow = nil
+    }
+
+    /// Update profitability only after a bounded contiguous window. Both
+    /// seed and verify outputs accompany their time, and a lone rejected
+    /// token cannot replace an otherwise profitable active-mode estimate.
     @discardableResult
     func recordCommittedVerification(
         decision: CBv2MTPDepthDecision, wallTimeNanos: UInt64,
@@ -211,22 +220,38 @@ final class CBv2MTPDepthController {
             decision.depth <= maxDepth, wallTimeNanos > 0,
             committedTokens > 0, rowCount > 0,
             Self.decodeRowBucket(rowCount) == decision.decodeRowBucket
-        else { return false }
+        else {
+            cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
+            return false
+        }
         var state = buckets[decision.decodeRowBucket] ?? BucketState()
-        if state.warmedDepths.insert(decision.depth).inserted {
+        var window = state.committedWindow
+            ?? CBv2MTPCommittedWindow(decision: decision, rowCount: rowCount)
+        guard window.decision.depth == decision.depth, window.rowCount == rowCount else {
+            state.committedWindow = nil
             buckets[decision.decodeRowBucket] = state
             return false
         }
+        let warmup = state.warmedDepths.insert(decision.depth).inserted
+        window.observe(
+            wallTimeNanos: wallTimeNanos, committedTokens: committedTokens, warmup: warmup)
+        guard window.isComplete else {
+            state.committedWindow = window
+            buckets[decision.decodeRowBucket] = state
+            return false
+        }
+        state.committedWindow = nil
         var wall = state.costs[decision.depth] ?? CostState()
-        // Use the same EWMA weights for time and outputs. Averaging each
-        // round's inverse throughput would over-penalize rejected drafts.
-        wall.observe(wallTimeNanos, clampInnovation: false)
+        // Use identical EWMA weights for whole-window time and outputs.
+        // Clamping time alone would undercharge seed transitions while
+        // crediting every extra output, manufacturing apparent profit.
+        wall.observe(window.wallTimeNanos, clampInnovation: false)
         state.costs[decision.depth] = wall
-        let tokensPerRow = Double(committedTokens) / Double(rowCount)
+        let tokensPerRow = Double(window.committedTokens) / Double(rowCount)
         let previous = state.committedTokensPerRow[decision.depth] ?? tokensPerRow
         state.committedTokensPerRow[decision.depth] =
             previous + Self.costAlpha * (tokensPerRow - previous)
-        complete(decision, state: &state)
+        complete(window.decision, state: &state)
         buckets[decision.decodeRowBucket] = state
         return true
     }
@@ -362,6 +387,7 @@ final class CBv2MTPDepthController {
                 mutate: mutate)
         }
         guard canSpeculate, maxDepth > 0 else {
+            if mutate { cancelCommittedWindow(decodeRowBucket: bucket) }
             return finish(
                 CBv2MTPDepthDecision(
                     depth: 0, decodeRowBucket: bucket,
@@ -393,6 +419,11 @@ final class CBv2MTPDepthController {
             decision = CBv2MTPDepthDecision(
                 depth: 0, decodeRowBucket: bucket, reason: "warmup_chained_baseline",
                 isExploration: false)
+        } else if let window = state.committedWindow {
+            decision = CBv2MTPDepthDecision(
+                depth: min(window.decision.depth, limit), decodeRowBucket: bucket,
+                reason: window.decision.isExploration ? "explore_window" : "goodput_window",
+                isExploration: window.decision.isExploration)
         } else if let unsampled = (0 ... limit).first(where: { state.costs[$0] == nil }) {
             decision = CBv2MTPDepthDecision(
                 depth: unsampled, decodeRowBucket: bucket, reason: "explore_cost",

@@ -459,6 +459,8 @@ public struct CBv2MTPCostInput: Sendable, Equatable {
     public var decodeRowBucket: Int
     public var depth: Int
     public var samples: Int
+    /// Whole-window elapsed time for adaptive stateless MTP; per-step time
+    /// for ordinary and legacy policies. Use normalized cadence to compare.
     public var ewmaWallTimeNanos: UInt64
     public var totalWallTimeNanos: UInt64
     /// Per-row committed-token cadence used by adaptive stateless MTP.

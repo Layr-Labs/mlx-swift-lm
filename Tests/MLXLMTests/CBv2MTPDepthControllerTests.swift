@@ -112,19 +112,37 @@ struct CBv2MTPDepthControllerTests {
             completedAtNanos: 2_900_000_000, committedRows: rows, committedTokenCount: 2)
         #expect(driver.metricsSnapshot().totalRoundWallTimeNanos == 908_000_000)
         #expect(driver.metricsSnapshot().costInputs.allSatisfy { $0.depth == 0 })
-        let confirmation = begin(driver)
-        #expect(confirmation.depth == 1)
-        driver.recordStepCost(
-            .init(decision: confirmation, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
-            wallTimeNanos: 14_000_000, finalizedPlainWork: false,
-            finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
-            completedAtNanos: 2_916_000_000, committedRows: rows, committedTokenCount: 2)
+        for index in 1 ..< 8 {
+            let confirmation = begin(driver)
+            #expect(confirmation.depth == 1)
+            #expect(confirmation.reason == "explore_window")
+            driver.recordStepCost(
+                .init(decision: confirmation, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+                wallTimeNanos: 14_000_000, finalizedPlainWork: false,
+                finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
+                completedAtNanos: 2_900_000_000 + UInt64(index) * 16_000_000,
+                committedRows: rows, committedTokenCount: 2)
+            if index < 7 {
+                #expect(driver.metricsSnapshot().costInputs.allSatisfy { $0.depth == 0 })
+            }
+        }
         let cost = try #require(driver.metricsSnapshot().costInputs.first { $0.depth == 1 })
         #expect(cost.samples == 1)
-        #expect(cost.ewmaWallTimeNanos == 16_000_000)
+        #expect(cost.ewmaWallTimeNanos == 112_000_000)
         #expect(cost.ewmaNanosPerCommittedToken == 8_000_000)
-        #expect(driver.metricsSnapshot().totalRoundWallTimeNanos == 924_000_000)
+        #expect(driver.metricsSnapshot().totalRoundWallTimeNanos == 1_020_000_000)
+        let active = begin(driver)
+        #expect(active.reason == "goodput")
+        driver.recordStepCost(
+            .init(decision: active, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+            wallTimeNanos: 14_000_000, finalizedPlainWork: false,
+            finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
+            completedAtNanos: 3_028_000_000, committedRows: rows, committedTokenCount: 2)
+        #expect(begin(driver).reason == "goodput_window")
+        driver.clampPlanDepth(to: 0, reason: "tail_depth")
+        #expect(driver.planDepth == 0)
         #expect(begin(driver).reason == "goodput")
+        #expect(driver.metricsSnapshot().costInputs.first { $0.depth == 1 }?.samples == 1)
     }
 
     @Test func automaticVerificationCapsDepthByRectangularWork() throws {
