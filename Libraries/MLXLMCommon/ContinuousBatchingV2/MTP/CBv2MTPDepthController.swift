@@ -42,6 +42,7 @@ final class CBv2MTPDepthController {
     private static let hysteresisFraction = 0.05
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
+    private static let committedBaselineMinSamples = 3
 
     private struct CostState {
         var samples = 0
@@ -144,6 +145,7 @@ final class CBv2MTPDepthController {
 
     private struct BucketState {
         var costs: [Int: CostState] = [:]
+        var committedBaseline = CostState()
         var acceptance = AcceptanceState()
         var activeDepth = 0
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
@@ -152,14 +154,16 @@ final class CBv2MTPDepthController {
 
     let maxDepth: Int
     let fixedDepth: Int?
+    let usesCommittedDecodeBaseline: Bool
     private var buckets: [Int: BucketState] = [:]
     private var lastDecision = CBv2MTPDepthDecision(
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
 
-    init(maxDepth: Int, fixedDepth: Int?) {
+    init(maxDepth: Int, fixedDepth: Int?, useCommittedDecodeBaseline: Bool = false) {
         let resolvedMax = min(max(maxDepth, 0), CBv2MTPConfig.testedMaxDraftTokens)
         self.maxDepth = resolvedMax
         self.fixedDepth = fixedDepth.map { min(max($0, 0), resolvedMax) }
+        self.usesCommittedDecodeBaseline = useCommittedDecodeBaseline && fixedDepth == nil
     }
 
     static func decodeRowBucket(_ rows: Int) -> Int {
@@ -195,10 +199,19 @@ final class CBv2MTPDepthController {
         buckets[decodeRowBucket] = state
     }
 
-    /// A depth-zero baseline is only comparable with verify steps when it is
-    /// finalized before another graph is constructed. One such probe is
-    /// required per bucket; ordinary target-only steps may keep chaining
-    /// after the baseline exists.
+    /// Record one non-overlapping steady ordinary-decode interval. The
+    /// engine supplies commit-to-commit time for an unchanged row cohort,
+    /// never a chained step's overlapping launch-to-finalize latency.
+    func observeCommittedDecodeInterval(decodeRowBucket: Int, wallTimeNanos: UInt64) {
+        guard usesCommittedDecodeBaseline, decodeRowBucket > 0, wallTimeNanos > 0 else { return }
+        var state = buckets[decodeRowBucket] ?? BucketState()
+        state.committedBaseline.observe(wallTimeNanos)
+        buckets[decodeRowBucket] = state
+    }
+
+    /// Retain one isolated warmup per bucket. Adaptive stateless target-prefix
+    /// serving then calibrates its actual chained alternative separately;
+    /// stateful/legacy policies continue using the isolated baseline.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
@@ -226,7 +239,9 @@ final class CBv2MTPDepthController {
         else { return false }
 
         if actualDepth > 0 {
-            guard finalizedVerification, costEligible, wallTimeNanos > 0 else { return false }
+            guard finalizedVerification, costEligible, !chained, wallTimeNanos > 0 else {
+                return false
+            }
         } else {
             guard finalizedPlainWork else { return false }
             if chained {
@@ -264,7 +279,7 @@ final class CBv2MTPDepthController {
         for bucket in buckets.keys.sorted() {
             guard let state = buckets[bucket] else { continue }
             for depth in state.costs.keys.sorted() {
-                guard let cost = state.costs[depth] else { continue }
+                guard let cost = effectiveCost(depth: depth, state: state) else { continue }
                 inputs.append(
                     CBv2MTPCostInput(
                         decodeRowBucket: bucket,
@@ -317,6 +332,14 @@ final class CBv2MTPDepthController {
             decision = CBv2MTPDepthDecision(
                 depth: 0, decodeRowBucket: bucket, reason: "warmup_baseline",
                 isExploration: true)
+        } else if usesCommittedDecodeBaseline,
+            state.committedBaseline.samples < Self.committedBaselineMinSamples
+        {
+            // Short requests simply remain ordinary decode. Calibration
+            // cannot manufacture samples from seeds, prefill, or idle time.
+            decision = CBv2MTPDepthDecision(
+                depth: 0, decodeRowBucket: bucket, reason: "warmup_chained_baseline",
+                isExploration: false)
         } else if let unsampled = (0 ... limit).first(where: { state.costs[$0] == nil }) {
             decision = CBv2MTPDepthDecision(
                 depth: unsampled, decodeRowBucket: bucket, reason: "explore_cost",
@@ -386,8 +409,17 @@ final class CBv2MTPDepthController {
         }
     }
 
+    private func effectiveCost(depth: Int, state: BucketState) -> CostState? {
+        if depth == 0, usesCommittedDecodeBaseline,
+            state.committedBaseline.samples >= Self.committedBaselineMinSamples
+        {
+            return state.committedBaseline
+        }
+        return state.costs[depth]
+    }
+
     private func goodput(depth: Int, state: BucketState) -> Double {
-        guard let cost = state.costs[depth], cost.ewmaNanos > 0 else { return 0 }
+        guard let cost = effectiveCost(depth: depth, state: state), cost.ewmaNanos > 0 else { return 0 }
         return state.acceptance.expectedCommitted(depth: depth) / cost.ewmaNanos
     }
 

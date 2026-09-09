@@ -6,6 +6,76 @@ import Testing
 
 @Suite("CBv2MTPDepthController")
 struct CBv2MTPDepthControllerTests {
+    @Test func targetPrefixDriverRequiresRealCommittedDecodeCalibration() throws {
+        let model = MTPControllerTestModel()
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model,
+                drafter: MTPControllerTestDrafter(target: model, targetPrefixAcceptance: true),
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 1,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: nil)))
+        record(
+            driver, decision: begin(driver), actualDepth: 0,
+            wallTimeNanos: 12_000_000, finalizedPlainWork: true)
+        let calibration = begin(driver)
+        #expect(calibration.reason == "warmup_chained_baseline")
+        let measurement = CBv2MTPStepMeasurement(
+            decision: calibration, actualDepth: 0, costEligible: true,
+            chained: true, seedOnly: false)
+        let rows = [CBv2RequestID(1)]
+        var timestamp: UInt64 = 1_000_000_000
+        func commit(
+            _ sample: CBv2MTPStepMeasurement?, finalizedRows: Int = 1,
+            successor: Bool = true
+        ) {
+            timestamp += 8_000_000
+            driver.recordCommittedDecodeBaseline(
+                measurement: sample, completedAtNanos: timestamp,
+                sampledRows: rows, finalizedPlainRowCount: finalizedRows,
+                hasChainedSuccessor: successor)
+        }
+        // Each disqualifying finalize clears the preceding anchor. None of
+        // these gaps may become the three required steady baseline samples.
+        let invalidSamples: [CBv2MTPStepMeasurement?] = [
+            nil,
+            .init(
+                decision: calibration, actualDepth: 0, costEligible: false,
+                chained: true, seedOnly: false),
+            .init(
+                decision: calibration, actualDepth: 0, costEligible: true,
+                chained: true, seedOnly: true),
+            .init(
+                decision: calibration, actualDepth: 0, costEligible: true,
+                chained: false, seedOnly: false),
+        ]
+        for invalid in invalidSamples {
+            commit(measurement)
+            commit(invalid)
+            #expect(begin(driver).reason == "warmup_chained_baseline")
+        }
+        commit(measurement)
+        commit(measurement, finalizedRows: 0)
+        commit(measurement)
+        commit(measurement, successor: false)
+        timestamp += 60_000_000_000  // idle between requests is excluded
+        commit(measurement)  // pipeline fill anchor
+        for _ in 0 ..< 2 {
+            commit(measurement)
+            #expect(begin(driver).reason == "warmup_chained_baseline")
+        }
+        commit(measurement)
+        let probe = begin(driver)
+        #expect(probe.depth == 1)
+        #expect(probe.reason == "explore_cost")
+        let baseline = try #require(driver.metricsSnapshot().costInputs.first {
+            $0.depth == 0
+        })
+        #expect(baseline.samples == 3)
+        #expect(baseline.ewmaWallTimeNanos == 8_000_000)
+        #expect(baseline.totalWallTimeNanos == 24_000_000)
+    }
+
     @Test func automaticVerificationCapsDepthByRectangularWork() throws {
         let model = MTPControllerTestModel()
         let driver = try #require(
@@ -671,9 +741,11 @@ private final class MTPControllerTestPrepared: CBv2MTPPreparedCapture {}
 
 private final class MTPControllerTestDrafter: CBv2MTPDrafter {
     let mtpTargetIdentity: ObjectIdentifier?
+    let supportsTargetPrefixAcceptance: Bool
 
-    init(target: MTPControllerTestModel) {
+    init(target: MTPControllerTestModel, targetPrefixAcceptance: Bool = false) {
         self.mtpTargetIdentity = ObjectIdentifier(target)
+        self.supportsTargetPrefixAcceptance = targetPrefixAcceptance
     }
 
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {

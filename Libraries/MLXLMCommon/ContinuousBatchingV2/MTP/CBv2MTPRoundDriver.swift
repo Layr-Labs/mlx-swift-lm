@@ -224,6 +224,7 @@ final class CBv2MTPRoundDriver {
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
     let targetPrefixAcceptance: Bool
     private let depthController: CBv2MTPDepthController
+    private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
 
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
@@ -309,7 +310,9 @@ final class CBv2MTPRoundDriver {
         self.model = model
         self.captureLayers = captureLayers
         self.depthController = CBv2MTPDepthController(
-            maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens)
+            maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
+            useCommittedDecodeBaseline: drafter.supportsTargetPrefixAcceptance
+                && !(drafter is any CBv2MTPRequestStatefulDrafter))
         self.metrics.verificationMode = self.config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
     }
@@ -753,6 +756,27 @@ final class CBv2MTPRoundDriver {
     ) -> UInt64 {
         pendingSeedCosts.take(
             decodeRowBucket: decodeRowBucket, requestIDs: finalizedVerifyIDs)
+    }
+
+    /// The ordinary alternative to stateless MTP can pipeline target decode.
+    /// Measure its actual commit cadence, with no extra clock or GPU readback.
+    /// Reset on every nonqualifying finalize to exclude idle/cohort transitions.
+    func recordCommittedDecodeBaseline(
+        measurement: CBv2MTPStepMeasurement?, completedAtNanos: UInt64,
+        sampledRows: [CBv2RequestID], finalizedPlainRowCount: Int,
+        hasChainedSuccessor: Bool
+    ) {
+        guard depthController.usesCommittedDecodeBaseline else { return }
+        let eligible = measurement.map {
+            $0.costEligible && $0.chained && !$0.seedOnly
+                && $0.actualDepth == 0 && $0.decision.depth == 0
+                && $0.decision.decodeRowBucket == CBv2MTPDepthController.decodeRowBucket(sampledRows.count)
+        } == true && hasChainedSuccessor && sampledRows.count == finalizedPlainRowCount
+        guard let elapsed = committedDecodeClock.observe(
+            completedAtNanos: completedAtNanos, rowIDs: sampledRows, eligible: eligible),
+            let measurement else { return }
+        depthController.observeCommittedDecodeInterval(
+            decodeRowBucket: measurement.decision.decodeRowBucket, wallTimeNanos: elapsed)
     }
 
     func recordStepCost(

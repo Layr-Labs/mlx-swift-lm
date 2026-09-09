@@ -3569,6 +3569,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var finalizedPlainWork = false
+        var finalizedPlainRowCount = 0
         let mtpSeedIDs = Set(step.mtpRound?.seedRows.map(\.id) ?? [])
         var deferredMTPFinishes: [CBv2RequestID: CBv2FinishReason] = [:]
 
@@ -3583,6 +3584,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             if step.discard.contains(id) { continue }
             guard let rec = scheduler.record(for: id) else { continue }
             finalizedPlainWork = true
+            finalizedPlainRowCount += 1
             let token = Int(host[i])
             for packet in step.logitDiagnostics where packet.requestID == id {
                 packet.seedToken = rec.tokens.last
@@ -3689,6 +3691,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         if step.mtpRound != nil {
             finalizeMTPRound(step)
         }
+        mtp?.recordCommittedDecodeBaseline(
+            measurement: step.mtpMeasurement, completedAtNanos: readbackDoneNanos,
+            sampledRows: step.sampledRows, finalizedPlainRowCount: finalizedPlainRowCount,
+            // Only steady pipeline commits qualify. The final draining step
+            // has no successor; stopped/cancelled rows mark it discarded.
+            hasChainedSuccessor: inFlight?.chained == true
+                && inFlight?.sampledRows == step.sampledRows
+                && inFlight?.discard.isEmpty == true)
         if let measurement = step.mtpMeasurement {
             let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
             mtp?.recordStepCost(
