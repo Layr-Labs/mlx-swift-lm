@@ -188,6 +188,9 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
+            round.committedVerifyTokenCount += kept.filter {
+                !rec.request.stopTokens.contains($0)
+            }.count
             for packet in verify.diagnostics where packet.requestID == id {
                 let drafts = (0..<k).map { Int(host[batchIndex * k + $0]) }
                 packet.reconcile(

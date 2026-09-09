@@ -132,6 +132,8 @@ final class CBv2MTPRoundInFlight {
     var finalizedSeedIDs: Set<CBv2RequestID> = []
     var finalizedVerifyIDs: Set<CBv2RequestID> = []
     var claimedSeedCostNanos: UInt64 = 0
+    /// Outputs actually kept after common-width, EOS, stop and budget handling.
+    var committedVerifyTokenCount = 0
     /// Cancellation-owned assistant states released only after the target KV
     /// and recurrent deferred-release fence has retired.
     var deferredAssistantReleases: [any CBv2MTPRequestState] = []
@@ -225,6 +227,8 @@ final class CBv2MTPRoundDriver {
     let targetPrefixAcceptance: Bool
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
+    private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
+    private var goodputPlanRows: [CBv2RequestID] = []
 
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
@@ -367,7 +371,17 @@ final class CBv2MTPRoundDriver {
     /// Reset speculation marks. Called immediately before every
     /// `scheduler.plan()` so marks can never leak across plans (a rolled-
     /// back plan's marks must not classify the next plan's rows).
-    func beginPlan(plannedDecodeRows: Int, canSpeculate: Bool) {
+    func beginPlan(
+        plannedDecodeRows: Int, canSpeculate: Bool,
+        rowIDs: [CBv2RequestID]? = nil
+    ) {
+        if let rowIDs, depthController.usesCommittedDecodeBaseline {
+            if !canSpeculate || Set(rowIDs) != Set(goodputPlanRows) {
+                committedGoodputClock.reset()
+            }
+            goodputPlanRows = rowIDs
+            depthController.beginWorkload(rowIDs: rowIDs)
+        }
         if !roundMarks.isEmpty { roundMarks = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
         forceSeedPlan = false
@@ -785,10 +799,35 @@ final class CBv2MTPRoundDriver {
         finalizedPlainWork: Bool,
         finalizedSeedIDs: Set<CBv2RequestID>,
         finalizedVerification: Bool,
-        claimedSeedCostNanos: UInt64
+        claimedSeedCostNanos: UInt64,
+        completedAtNanos: UInt64 = 0,
+        committedRows: [CBv2RequestID] = [],
+        committedTokenCount: Int = 0
     ) {
         guard wallTimeNanos > 0 else { return }
         let decision = measurement.decision
+        if depthController.usesCommittedDecodeBaseline {
+            let sample = committedGoodputClock.observe(
+                measurement: measurement, completedAtNanos: completedAtNanos,
+                isolatedWallTimeNanos: wallTimeNanos, rowIDs: committedRows,
+                committedTokens: committedTokenCount)
+            if measurement.actualDepth > 0, !measurement.seedOnly,
+                finalizedVerification
+            {
+                if let sample {
+                    depthController.recordCommittedVerification(
+                        decision: decision, wallTimeNanos: sample.wallTimeNanos,
+                        committedTokens: sample.committedTokens, rowCount: committedRows.count)
+                }
+                metricsLock.lock()
+                // Warmup is real work even when excluded from steady EWMA.
+                metrics.totalRoundWallTimeNanos &+= sample?.wallTimeNanos
+                    ?? (wallTimeNanos &+ claimedSeedCostNanos)
+                refreshControllerMetricsLocked()
+                metricsLock.unlock()
+                return
+            }
+        }
         if measurement.seedOnly, decision.depth > 0 {
             guard measurement.costEligible, !finalizedSeedIDs.isEmpty else { return }
             pendingSeedCosts.record(

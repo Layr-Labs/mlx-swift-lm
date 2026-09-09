@@ -461,16 +461,20 @@ public struct CBv2MTPCostInput: Sendable, Equatable {
     public var samples: Int
     public var ewmaWallTimeNanos: UInt64
     public var totalWallTimeNanos: UInt64
+    /// Per-row committed-token cadence used by adaptive stateless MTP.
+    public var ewmaNanosPerCommittedToken: UInt64?
 
     public init(
         decodeRowBucket: Int, depth: Int, samples: Int,
-        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64
+        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64,
+        ewmaNanosPerCommittedToken: UInt64? = nil
     ) {
         self.decodeRowBucket = decodeRowBucket
         self.depth = depth
         self.samples = samples
         self.ewmaWallTimeNanos = ewmaWallTimeNanos
         self.totalWallTimeNanos = totalWallTimeNanos
+        self.ewmaNanosPerCommittedToken = ewmaNanosPerCommittedToken
     }
 }
 

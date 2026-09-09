@@ -76,6 +76,57 @@ struct CBv2MTPDepthControllerTests {
         #expect(baseline.totalWallTimeNanos == 24_000_000)
     }
 
+    @Test func statelessDriverKeepsWarmupTelemetryAndLearnsRetainedCarry() throws {
+        let model = MTPControllerTestModel()
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model,
+                drafter: MTPControllerTestDrafter(target: model, targetPrefixAcceptance: true),
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 1,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: nil)))
+        record(
+            driver, decision: begin(driver), actualDepth: 0,
+            wallTimeNanos: 12_000_000, finalizedPlainWork: true)
+        let rows = [CBv2RequestID(1)]
+        let calibration = CBv2MTPStepMeasurement(
+            decision: begin(driver), actualDepth: 0,
+            costEligible: true, chained: true, seedOnly: false)
+        for index in 0 ..< 4 {
+            driver.recordCommittedDecodeBaseline(
+                measurement: calibration,
+                completedAtNanos: 1_000_000_000 + UInt64(index) * 8_700_000,
+                sampledRows: rows, finalizedPlainRowCount: 1, hasChainedSuccessor: true)
+        }
+        let probe = begin(driver)
+        driver.recordStepCost(
+            .init(decision: probe, actualDepth: 0, costEligible: true, chained: false, seedOnly: true),
+            wallTimeNanos: 8_000_000, finalizedPlainWork: true,
+            finalizedSeedIDs: Set(rows), finalizedVerification: false, claimedSeedCostNanos: 0,
+            completedAtNanos: 2_000_000_000, committedRows: rows, committedTokenCount: 1)
+        let seedCost = driver.claimPendingSeedCost(decodeRowBucket: 1, finalizedVerifyIDs: Set(rows))
+        driver.recordStepCost(
+            .init(decision: probe, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+            wallTimeNanos: 900_000_000, finalizedPlainWork: false,
+            finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: seedCost,
+            completedAtNanos: 2_900_000_000, committedRows: rows, committedTokenCount: 2)
+        #expect(driver.metricsSnapshot().totalRoundWallTimeNanos == 908_000_000)
+        #expect(driver.metricsSnapshot().costInputs.allSatisfy { $0.depth == 0 })
+        let confirmation = begin(driver)
+        #expect(confirmation.depth == 1)
+        driver.recordStepCost(
+            .init(decision: confirmation, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+            wallTimeNanos: 14_000_000, finalizedPlainWork: false,
+            finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
+            completedAtNanos: 2_916_000_000, committedRows: rows, committedTokenCount: 2)
+        let cost = try #require(driver.metricsSnapshot().costInputs.first { $0.depth == 1 })
+        #expect(cost.samples == 1)
+        #expect(cost.ewmaWallTimeNanos == 16_000_000)
+        #expect(cost.ewmaNanosPerCommittedToken == 8_000_000)
+        #expect(driver.metricsSnapshot().totalRoundWallTimeNanos == 924_000_000)
+        #expect(begin(driver).reason == "goodput")
+    }
+
     @Test func automaticVerificationCapsDepthByRectangularWork() throws {
         let model = MTPControllerTestModel()
         let driver = try #require(
