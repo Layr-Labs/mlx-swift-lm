@@ -428,22 +428,67 @@ struct CBv2MTPRoundSmokeTests {
         }
     }
 
-    // MARK: - (6) Non-greedy rows never speculate
+    // MARK: - (6) Stateless target-prefix sampling
 
-    @Test func temperatureRowsNeverSpeculate() async throws {
+    @Test(arguments: [Float(0.7), Float(1.1)])
+    func stochasticGemmaUsesActualAdapterAndTargetSamples(temperature: Float) async throws {
         let fixture = try makeFixture()
-        let prompt = makePromptTokens(length: 16, seed: 61, vocabSize: vocabSize)
-
-        let on = try makeEngine(fixture, mtp: true)
-        let collected = try await run(
-            on, greedyRequest(id: 1, prompt: prompt, maxTokens: 12, temperature: 0.7))
+        let adapter = try Gemma4CBv2MTPDrafter(drafter: fixture.drafter, target: fixture.target)
+        #expect(adapter.supportsTargetPrefixAcceptance)
+        let prompt = makePromptTokens(length: 24, seed: 61, vocabSize: vocabSize)
+        let request = CBv2Request(id: .init(601), promptTokens: prompt,
+            sampling: .init(temperature: temperature, topP: 0.9, topK: 24, minP: 0.02, seed: 312),
+            maxTokens: 32)
+        let off = try makeEngine(fixture, mtp: false)
+        let expected = try await run(off, request)
+        await off.shutdown()
+        // Serial target geometry isolates acceptance/RNG semantics from the
+        // independent rectangular arithmetic policy. Actual Gemma drafting,
+        // wrapped-window state and the shared accept/rollback walk still run.
+        let on = try makeEngine(fixture, mtp: true, verificationMode: .serialTarget)
+        let actual = try await run(on, request)
         let metrics = try #require(on.mtpMetricsSnapshot())
         await on.shutdown()
+        #expect(actual.finishReason == .length && actual.tokens.count == 32)
+        #expect(actual.tokens == expected.tokens)
+        #expect(metrics.rounds > 0 && metrics.seedSteps > 0)
+        #expect(metrics.proposedTokens > metrics.acceptedTokens,
+                "the fixture must exercise discarded speculative suffixes")
+        #expect(on.capacity().activeRequests == 0 && on.capacity().kvBytesReserved == 0)
+    }
 
-        #expect(collected.finishReason == .length)
-        #expect(collected.tokens.count == 12)
-        #expect(metrics.rounds == 0, "temperature>0 row must never draft")
-        #expect(metrics.seedSteps == 0, "temperature>0 row must never seed")
+    private final class ExclusionConstraint: CBv2TokenConstraint {
+        let mode: CBv2TokenConstraintMode = .none
+        let initialState = 0
+        let maxTokens = 8
+        let fallbackTokenID = 0
+        func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] { [0] }
+        func nextState(state: Int, tokenID: Int) -> Int? { 0 }
+    }
+
+    @Test func stochasticOptInPreservesUnsupportedTransformExclusions() async throws {
+        let fixture = try makeFixture()
+        let engine = try makeEngine(fixture, mtp: true)
+        let base = CBv2Request(id: .init(602), promptTokens: [1, 2, 3],
+            sampling: .init(temperature: 0.7, topP: 0.9, topK: 12, minP: 0.05, seed: 42),
+            maxTokens: 8)
+        func eligible(_ request: CBv2Request) -> Bool {
+            engine.loopForTesting.onEngineQueueSync {
+                engine.loopForTesting.mtpBasicEligible(CBv2ScheduledRequest(
+                    request: request, arrivalSeq: 1, submittedAt: Date()))
+            }
+        }
+        #expect(eligible(base))
+        var requests: [CBv2Request] = []
+        var changed = base; changed.sampling.logitBias = [1: 0.5]; requests.append(changed)
+        changed = base; changed.sampling.repetitionPenalty = 1.1; requests.append(changed)
+        changed = base; changed.sampling.frequencyPenalty = 0.1; requests.append(changed)
+        changed = base; changed.sampling.presencePenalty = 0.1; requests.append(changed)
+        changed = base; changed.sampling.topLogprobs = 1; requests.append(changed)
+        changed = base; changed.stopStrings = ["stop"]; requests.append(changed)
+        changed = base; changed.tokenConstraint = ExclusionConstraint(); requests.append(changed)
+        for request in requests { #expect(!eligible(request)) }
+        await engine.shutdown()
     }
 
     @Test func stopStringRowsFailOpenToPlainDecode() async throws {
