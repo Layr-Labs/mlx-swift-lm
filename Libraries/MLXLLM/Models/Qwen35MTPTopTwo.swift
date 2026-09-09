@@ -187,7 +187,7 @@ private let qwen35MTPTopTwoFinalizeKernel = MLXFast.metalKernel(
 /// Returns lazy device arrays shaped `[rows, 2]`: ids are `int32`, values are
 /// `float32`. No evaluation or host read occurs here. Results are ordered by
 /// value descending, then token id ascending on exact ties, with NaNs last.
-func qwen35MTPTopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
+public func qwen35MTPTopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
     precondition(logits.ndim == 3 && logits.dim(0) == 1)
     let rows = logits.dim(1)
     let vocabularySize = logits.dim(2)
