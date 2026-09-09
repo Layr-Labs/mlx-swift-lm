@@ -48,13 +48,17 @@ public final class PagedKVBackend: CBv2KVBackend {
     public let pool: PagedKVPool
     /// The model's per-layer structure this backend was built for.
     public let layerKinds: [CBv2LayerKind]
+    /// Non-owning physical-page prefix index. nil preserves the historical
+    /// paged backend byte-for-byte; the engine discovers the optional native
+    /// capability without changing the snapshot-cache contract.
+    let residentPrefixIndex: PagedPrefixBlockIndex?
     /// WHEN this backend's slabs become MLX-resident. See
     /// PagedKVSlabCommitment.swift — the default defers the commitment past
     /// engine construction so an idle pool does not pre-empt a co-resident
     /// model's post-load headroom measurement (D1).
     public let slabCommitment: PagedKVSlabCommitment
-    /// True once the slabs have actually been evaluated. Flipped exactly
-    /// once, on the engine loop thread, by `commitSlabs()`.
+    /// Fixed-reference commitment flag. Segmented pools instead track each
+    /// live buffer and may retire it after the final request releases it.
     private(set) var slabsAreWired = false
     /// The only writer of `slabsAreWired`; `private(set)` keeps the flag out
     /// of reach of everything except `commitSlabs()`, which lives in the
@@ -64,7 +68,8 @@ public final class PagedKVBackend: CBv2KVBackend {
     public init(
         layerKinds: [CBv2LayerKind],
         config: PagedKVPoolConfig,
-        slabCommitment: PagedKVSlabCommitment = .atFirstAdmission
+        slabCommitment: PagedKVSlabCommitment = .atFirstAdmission,
+        residentPrefixCache: CBv2PagedPrefixCacheConfig? = nil
     ) throws {
         for (index, kind) in layerKinds.enumerated() {
             if let source = kind.sharesKVWithLayer {
@@ -105,12 +110,33 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
         self.layerKinds = layerKinds
         self.slabCommitment = slabCommitment
-        self.pool = try PagedKVPool(layerKinds: layerKinds, config: config)
+        var effectiveConfig = config
+        if let residentPrefixCache {
+            if let declared = effectiveConfig.prefixSharingBlockSize,
+                declared != residentPrefixCache.blockSize
+            {
+                throw CBv2KVError.backendIneligible(
+                    reason: "pool prefixSharingBlockSize \(declared) does not match resident "
+                        + "cache block size \(residentPrefixCache.blockSize)")
+            }
+            effectiveConfig.prefixSharingBlockSize = residentPrefixCache.blockSize
+        }
+        self.pool = try PagedKVPool(layerKinds: layerKinds, config: effectiveConfig)
+        if let residentPrefixCache {
+            self.residentPrefixIndex = try PagedPrefixBlockIndex(
+                pool: pool, layerKinds: layerKinds, config: residentPrefixCache)
+        } else {
+            self.residentPrefixIndex = nil
+        }
         if slabCommitment == .atConstruction {
             // An eager commit that cannot fit fails the BUILD (throwing
             // `capacityExhausted`), which is the honest posture for the
             // profiler/single-slot deployments that opt into it.
-            try commitSlabs()
+            if config.segmentSizeBytes != nil {
+                try pool.materializeSlabs()
+            } else {
+                try commitSlabs()
+            }
         }
     }
 
@@ -189,7 +215,7 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
         var states: [CBv2SequenceKV?] = []
         states.reserveCapacity(layerKinds.count)
-        for kind in layerKinds {
+        for (index, kind) in layerKinds.enumerated() {
             if kind.sharesKVWithLayer != nil {
                 states.append(nil)
             } else {
@@ -197,7 +223,8 @@ public final class PagedKVBackend: CBv2KVBackend {
                     kind: kind, maxLength: maxLength, config: pool.config)
                 states.append(
                     PagedSequenceKV(
-                        pool: pool, kind: kind, maxLength: maxLength, reservedPages: reserved))
+                        pool: pool, kind: kind, groupKey: pool.groupKey(forLayer: index),
+                        maxLength: maxLength, reservedPages: reserved))
             }
         }
         return states
@@ -246,6 +273,21 @@ public final class PagedKVBackend: CBv2KVBackend {
         guard prefix.count == layerKinds.count else {
             throw CBv2KVError.backendIneligible(
                 reason: "prefix count \(prefix.count) != layer count \(layerKinds.count)")
+        }
+        guard layerKinds.count == pool.layerDTypes.count else {
+            throw CBv2KVError.backendIneligible(reason: "prefix layer count does not match paged pool")
+        }
+        // Snapshot import is a throwing boundary, unlike model forward.
+        // Reject all source dtypes before reserving/mutating any destination;
+        // a bad cached frame must not poison another live request's latch.
+        try pool.writeValidation.check()
+        for (index, entry) in prefix.enumerated() {
+            guard let entry else { continue }
+            let expected = pool.layerDTypes[index]
+            guard entry.keys.dtype == expected, entry.values.dtype == expected else {
+                throw CBv2PagedKVWriteError(layerIndex: index, expected: expected,
+                    keys: entry.keys.dtype, values: entry.values.dtype)
+            }
         }
         guard plan.matchedBoundary > 0, plan.matchedBoundary <= maxLength,
             plan.replayStart >= 0, plan.replayStart <= plan.matchedBoundary,
@@ -533,29 +575,30 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
     }
 
+    /// Only the grant changes off queue. Live page/range ownership survives
+    /// a shrink and new growth must revalidate the current grant epoch.
+    public func updateBytesCapacity(_ bytes: Int) { pool.segmentGrant?.update(bytes: bytes) }
+
     public var bytesInUse: Int { pool.bytesInUse }
     public var bytesCapacity: Int { pool.bytesCapacity }
     /// Admission-relevant bytes (worst-case reservations of live requests).
     public var bytesReserved: Int { pool.bytesReserved }
-    /// The slabs' allocation CEILING — `pageCount * pageBytes` over every
-    /// group, poison pages included. Derived from page bookkeeping fixed at
-    /// `PagedKVPool.init`, NOT from whether the slabs have been evaluated,
-    /// so it is time-INVARIANT and safe for sizing/limit consumers.
-    /// For "how much is resident right now" use `bytesWired`.
+    /// Current physical grant. A shrink preserves live segmented owners;
+    /// bytesWired may temporarily exceed this ceiling until they release.
     public var bytesPhysical: Int { pool.bytesPhysical }
-    /// Paged snapshots are views over the SHARED slabs; the donor's pages
-    /// are recycled once its state is released, so donated snapshots must
-    /// be device-materialized before the prefix cache indexes them.
+    /// Fixed-reference snapshots can alias recyclable slab storage. Require
+    /// materialized donations conservatively for both layouts; segmented
+    /// gathers already return a separate exact native destination.
     public var requiresMaterializedSnapshots: Bool { true }
 
     // MARK: - Helpers
 
     func pageNeeds(layerKinds: [CBv2LayerKind], maxLength: Int) -> [PagedKVGroupKey: Int] {
         var needs: [PagedKVGroupKey: Int] = [:]
-        for kind in layerKinds where kind.sharesKVWithLayer == nil {
+        for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
             let pages = PagedKVPool.pageDemand(
                 kind: kind, maxLength: maxLength, config: pool.config)
-            needs[PagedKVGroupKey(kind), default: 0] += pages
+            needs[pool.groupKey(forLayer: index), default: 0] += pages
         }
         return needs
     }

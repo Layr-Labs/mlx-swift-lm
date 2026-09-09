@@ -28,7 +28,8 @@ let mlxSwiftDependency: Package.Dependency = {
     if FileManager.default.fileExists(atPath: manifest.path) {
         return .package(path: sibling.path)
     }
-    return .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main")
+    return .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
+                    revision: "37572f1f10a6c485ac4cc254cad63e8242643a6f")
 }()
 
 let package = Package(
@@ -272,6 +273,11 @@ let package = Package(
                 "MLXLMCommon",
             ],
             path: "Libraries/MLXHuggingFace"
+        ),
+        .executableTarget(
+            name: "BenchSegmentedDecode",
+            dependencies: ["MLXLMCommon"],
+            path: "Sources/BenchSegmentedDecode"
         ),
         .executableTarget(
             name: "BenchLoad",

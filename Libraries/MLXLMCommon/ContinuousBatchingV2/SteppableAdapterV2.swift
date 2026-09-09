@@ -54,6 +54,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
         (model as? any CBv2PositionAxisProviding)?.cbv2PositionAxisCount
     }
 }
+
+extension CBv2SteppableLanguageModelAdapter: CBv2CompleteCheckpointKVTypeProviding {
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? {
+        (model as? any CBv2CompleteCheckpointKVTypeProviding)?.cbv2CompleteCheckpointKVDTypes
+    }
+}
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionedSteppableModel {
     public var supportsPositionedForwarding: Bool {
         if model is any CBv2RecurrentLanguageModelForwardable {
@@ -430,5 +436,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
         return forwardable.cbv2ForwardWithHiddenCaptured(
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
             positionIds: positionIds)
+    }
+}
+
+
+extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
+    public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
+        (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true
     }
 }

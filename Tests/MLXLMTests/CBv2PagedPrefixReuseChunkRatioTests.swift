@@ -79,11 +79,12 @@ struct CBv2PagedPrefixReuseChunkRatioTests {
             windowSize: Self.window)
     }
 
+    // TinyTestModel projects native float32 K/V; the pool must preserve that dtype.
     private func makeBackend(_ kinds: [CBv2LayerKind]) throws -> PagedKVBackend {
         try PagedKVBackend(
             layerKinds: kinds,
             config: PagedKVPoolConfig(
-                capacityBytes: 64 << 20,
+                capacityBytes: 64 << 20, dtype: .float32,
                 maxPrefillChunk: Self.chunkSize,
                 nominalMaxSequenceLength: Self.maxLength))
     }

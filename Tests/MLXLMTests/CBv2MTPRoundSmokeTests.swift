@@ -17,7 +17,7 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
+@_spi(Benchmarking) @testable import MLXLMCommon
 import MLXRandom
 import Testing
 
@@ -164,6 +164,21 @@ struct CBv2MTPRoundSmokeTests {
         _ engine: EngineV2, _ request: CBv2Request
     ) async throws -> CBv2SchedCollected {
         await cbv2SchedCollect(try engine.submit(request))
+    }
+
+    private func completedForwardShapes(
+        _ engine: EngineV2, since before: CBv2ForwardShapeSnapshot,
+        requireVerification: Bool = true
+    ) -> CBv2ForwardShapeDelta {
+        let after = engine.forwardShapeSnapshot(), delta = after.delta(since: before)
+        #expect(after.pendingSteps == 0 && after.abandonedSteps == 0)
+        #expect(after.unobservedDispatches == 0 && after.droppedCalls == 0)
+        #expect(delta.complete)
+        #expect(delta.entries.allSatisfy { $0.submittedCalls == $0.completedCalls })
+        let targets = delta.entries.filter { $0.axes.kind == .target }
+        #expect(!targets.isEmpty)
+        if requireVerification { #expect(targets.contains { $0.axes.phase == .mtpVerification }) }
+        return delta
     }
 
     // MARK: - (1) Solo greedy parity through window wraps + metrics sanity
@@ -319,11 +334,25 @@ struct CBv2MTPRoundSmokeTests {
         // serial target verifier and the explicit rectangular optimization.
         for mode in [CBv2MTPVerificationMode.serialTarget, .rectangular] {
             let on = try makeEngine(fixture, mtp: true, verificationMode: mode)
-            async let a = run(on, greedyRequest(id: 1, prompt: promptA, maxTokens: 24))
-            async let b = run(on, greedyRequest(id: 2, prompt: promptB, maxTokens: 24))
-            let (collectedA, collectedB) = try await (a, b)
+            let before = try on.beginForwardShapeObservation()
+            let streams = try on.loopForTesting.onEngineQueueSync {
+                (try on.submit(greedyRequest(id: 1, prompt: promptA, maxTokens: 24)),
+                 try on.submit(greedyRequest(id: 2, prompt: promptB, maxTokens: 24)))
+            }
+            async let a = cbv2SchedCollect(streams.0)
+            async let b = cbv2SchedCollect(streams.1)
+            let (collectedA, collectedB) = await (a, b)
             let metrics = try #require(on.mtpMetricsSnapshot())
             await on.shutdown()
+            let shapes = completedForwardShapes(on, since: before)
+            let verification = shapes.entries.filter { $0.axes.kind == .target && $0.axes.phase == .mtpVerification }
+            #expect(verification.contains { $0.axes.liveBatchRows == 2 && $0.completedCalls > 0 })
+            #expect(verification.allSatisfy { $0.axes.liveBatchRows <= 2 })
+            if mode == .serialTarget {
+                #expect(verification.allSatisfy { $0.axes.sequenceWidth == 1 })
+            } else {
+                #expect(verification.contains { $0.axes.sequenceWidth > 1 })
+            }
 
             #expect(
                 collectedA.tokens == baselines[0].tokens,
@@ -332,6 +361,7 @@ struct CBv2MTPRoundSmokeTests {
                 collectedB.tokens == baselines[1].tokens,
                 "row B diverged in \(mode.rawValue) mode")
             #expect(metrics.rounds >= 1)
+            #expect(metrics.acceptedTokens < metrics.draftedTokens, "fixture must exercise rejected speculative work")
         }
     }
 
@@ -383,9 +413,11 @@ struct CBv2MTPRoundSmokeTests {
             await off.shutdown()
 
             let on = try makeEngine(fixture, mtp: true)
+            let before = try on.beginForwardShapeObservation()
             let speculative = try await run(
                 on, greedyRequest(id: 1, prompt: prompt, maxTokens: maxTokens))
             await on.shutdown()
+            _ = completedForwardShapes(on, since: before, requireVerification: false)
 
             #expect(baseline.finishReason == .length)
             #expect(speculative.finishReason == .length)
@@ -437,6 +469,7 @@ struct CBv2MTPRoundSmokeTests {
         let prompt = makePromptTokens(length: 20, seed: 71, vocabSize: vocabSize)
 
         let on = try makeEngine(fixture, mtp: true, verificationMode: .automatic)
+        let before = try on.beginForwardShapeObservation()
         let victim = greedyRequest(id: 1, prompt: prompt, maxTokens: 512)
         let stream = try on.submit(victim)
         // Let it get well into MTP rounds, then cancel mid-flight.
@@ -457,6 +490,7 @@ struct CBv2MTPRoundSmokeTests {
         // this follow-up request must run to completion.
         let follower = try await run(on, greedyRequest(id: 2, prompt: prompt, maxTokens: 8))
         await on.shutdown()
+        _ = completedForwardShapes(on, since: before)
         #expect(follower.finishReason == .length)
         #expect(follower.tokens.count == 8)
     }
