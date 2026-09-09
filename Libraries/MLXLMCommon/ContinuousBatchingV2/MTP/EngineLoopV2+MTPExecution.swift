@@ -570,9 +570,16 @@ extension EngineLoopV2 {
             let prepared = mtp.drafter.prepare(rows: captures)
             var draftInput = seedColumn
             var draftHidden = concatenated(carryHiddens, axis: 0)
-            for _ in 0 ..< k {
+            for draftIndex in 0 ..< k {
                 let (next, nextHidden) = mtp.drafter.draftStep(
                     tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                // Captures are already fenced. Overlap the read-only draft
+                // with target graph construction; finalization still joins
+                // this token through the acceptance packet. At depth one,
+                // nextHidden is unused and need not be materialized.
+                if draftIndex == 0 && mtp.drafter.supportsEarlyDraftSubmission {
+                    asyncEval(next)
+                }
                 draftSteps.append(next)
                 draftInput = next.reshaped([batch, 1])
                 draftHidden = nextHidden

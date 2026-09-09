@@ -234,6 +234,10 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this drafter's rounds may accept via target-prefix
     /// pre-sampling; see the extension default for the full contract.
     var supportsTargetPrefixAcceptance: Bool { get }
+    /// The first stateless draft token may be submitted while target graph
+    /// construction continues. Its graph must only read immutable weights
+    /// and the engine's fenced captures, with no mutable assistant state.
+    var supportsEarlyDraftSubmission: Bool { get }
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
@@ -278,6 +282,7 @@ extension CBv2MTPDrafter {
     /// eligibility gate when the installed sampler also supports MTP verify
     /// sampling. Default false: greedy argmax acceptance only.
     public var supportsTargetPrefixAcceptance: Bool { false }
+    public var supportsEarlyDraftSubmission: Bool { false }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
