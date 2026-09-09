@@ -84,7 +84,8 @@ struct CBv2MTPDepthControllerTests {
                 drafter: MTPControllerTestDrafter(target: model, targetPrefixAcceptance: true),
                 config: CBv2MTPConfig(
                     enabled: true, maxDraftTokens: 1,
-                    maxSpeculativeBatch: 1, fixedDraftTokens: nil)))
+                    maxSpeculativeBatch: 1, fixedDraftTokens: nil,
+                    maxAutomaticRectangularTokens: 2)))
         record(
             driver, decision: begin(driver), actualDepth: 0,
             wallTimeNanos: 12_000_000, finalizedPlainWork: true)
@@ -139,6 +140,7 @@ struct CBv2MTPDepthControllerTests {
             finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
             completedAtNanos: 3_028_000_000, committedRows: rows, committedTokenCount: 2)
         #expect(begin(driver).reason == "goodput_window")
+        #expect(driver.planDepth == 1)
         driver.clampPlanDepth(to: 0, reason: "tail_depth")
         #expect(driver.planDepth == 0)
         #expect(begin(driver).reason == "goodput")
