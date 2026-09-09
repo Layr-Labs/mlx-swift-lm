@@ -105,6 +105,39 @@ struct CBv2MTPCommittedGoodputTests {
         #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).reason == "goodput")
     }
 
+    @Test(arguments: [3, 4])
+    func warmupUsesExactVerificationRowsWithinSharedBucket(firstRows: Int) throws {
+        let controller = CBv2MTPDepthController(
+            maxDepth: 1, fixedDepth: nil, useCommittedDecodeBaseline: true)
+        let secondRows = firstRows == 3 ? 4 : 3
+        // Both shapes map to bucket four. Each new physical shape must exclude
+        // its cold compile, but returning to an exact warmed shape must keep
+        // the entire first interval, including seed work.
+        for (generation, rows) in [firstRows, secondRows, firstRows].enumerated() {
+            controller.beginWorkload(rowIDs: (0 ..< rows).map {
+                CBv2RequestID(UInt64(generation * 100 + $0 + 1))
+            })
+            controller.observeCost(decodeRowBucket: 4, depth: 0, wallTimeNanos: 12_000_000)
+            for _ in 0 ..< 3 {
+                controller.observeCommittedDecodeInterval(
+                    decodeRowBucket: 4, wallTimeNanos: 8_700_000)
+            }
+            for index in 0 ..< 8 {
+                let decision = controller.select(plannedDecodeRows: rows, canSpeculate: true)
+                #expect(decision.depth == 1)
+                let firstCost: UInt64 = generation < 2 ? 1_000_000_000 : 27_000_000
+                #expect(controller.recordCommittedVerification(
+                    decision: decision, wallTimeNanos: index == 0 ? firstCost : 15_000_000,
+                    committedTokens: (index == 0 ? 3 : 2) * rows, rowCount: rows)
+                    == (index == 7))
+            }
+            let input = try #require(controller.snapshot().costInputs.first { $0.depth == 1 })
+            #expect(input.samples == 1)
+            #expect(input.totalWallTimeNanos == (generation < 2 ? 105_000_000 : 132_000_000))
+            #expect(controller.select(plannedDecodeRows: rows, canSpeculate: true).reason == "goodput")
+        }
+    }
+
     @Test func matchedWindowWeightsDoNotManufactureSeedProfit() throws {
         let controller = warmedFreshController(rows: 1)
         recordWindow(controller, costs: Array(repeating: 16_000_000, count: 8), tokens: Array(repeating: 2, count: 8))

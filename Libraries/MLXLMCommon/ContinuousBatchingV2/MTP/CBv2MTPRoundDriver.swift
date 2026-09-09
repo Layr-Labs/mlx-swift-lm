@@ -229,6 +229,10 @@ final class CBv2MTPRoundDriver {
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
     private var goodputPlanRows: [CBv2RequestID] = []
+    /// Numeric request IDs can be reused. Stamp launch measurements with the
+    /// current lifetime so late chained finalization cannot train a new one.
+    private(set) var workloadGeneration: UInt64 = 0
+    private var workloadInvalidated = false
 
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
@@ -376,12 +380,19 @@ final class CBv2MTPRoundDriver {
         rowIDs: [CBv2RequestID]? = nil
     ) {
         if let rowIDs, depthController.usesCommittedDecodeBaseline {
-            if !canSpeculate || Set(rowIDs) != Set(goodputPlanRows) {
+            let changedCohort = Set(rowIDs) != Set(goodputPlanRows)
+            if changedCohort {
+                workloadGeneration &+= 1
+                committedDecodeClock = CBv2MTPCommittedDecodeClock()
+                pendingSeedCosts.removeAll()
+            }
+            if !canSpeculate || changedCohort {
                 committedGoodputClock.reset()
                 depthController.cancelCommittedWindow(
                     decodeRowBucket: CBv2MTPDepthController.decodeRowBucket(goodputPlanRows.count))
             }
             goodputPlanRows = rowIDs
+            workloadInvalidated = false
             depthController.beginWorkload(rowIDs: rowIDs)
         }
         if !roundMarks.isEmpty { roundMarks = [:] }
@@ -685,6 +696,7 @@ final class CBv2MTPRoundDriver {
     /// The request left the engine for good — ids are legally reusable, so
     /// every per-id trace must go (a reused id must never inherit a carry).
     func requestDidFinish(_ id: CBv2RequestID) {
+        if goodputPlanRows.contains(id) { invalidateWorkload() }
         carries.removeValue(forKey: id)
         releaseAssistantState(id)
         roundMarks.removeValue(forKey: id)
@@ -693,9 +705,34 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
     }
 
-    /// Drain/shutdown drops every device-resident request trace while
-    /// retaining cumulative metrics/controller estimates for a final poll.
+    /// Invalidate only adaptive stateless learning. Other live rows retain
+    /// their carries; the next plan calibrates its new request cohort.
+    private func invalidateWorkload() {
+        guard depthController.usesCommittedDecodeBaseline else { return }
+        workloadGeneration &+= 1
+        workloadInvalidated = true
+        goodputPlanRows.removeAll(keepingCapacity: true)
+        committedDecodeClock = CBv2MTPCommittedDecodeClock()
+        committedGoodputClock.reset()
+        pendingSeedCosts.removeAll()
+        depthController.invalidateWorkload()
+        metricsLock.lock()
+        refreshControllerMetricsLocked()
+        metricsLock.unlock()
+    }
+
+    private func acceptsWorkloadMeasurement(_ measurement: CBv2MTPStepMeasurement?) -> Bool {
+        guard depthController.usesCommittedDecodeBaseline else { return true }
+        guard !workloadInvalidated else { return false }
+        // Older host-only tests construct unstamped measurements. Production
+        // always stamps at plan capture and preserves the stamp at attachment.
+        return measurement?.workloadGeneration.map { $0 == workloadGeneration } ?? true
+    }
+
+    /// Drain/shutdown drops every request trace and adaptive workload while
+    /// retaining cumulative metrics for a final poll.
     func removeAllRequestState() {
+        invalidateWorkload()
         carries.removeAll(keepingCapacity: false)
         rawCostEstimators.removeAll(keepingCapacity: false)
         for id in Array(assistantStates.keys) { releaseAssistantState(id) }
@@ -757,8 +794,10 @@ final class CBv2MTPRoundDriver {
     /// row can commit together, once per step (not once per row).
     func recordStepAcceptance(
         drafted: Int, accepted: Int, observedDrafts: Int,
-        decodeRowBucket: Int
+        decodeRowBucket: Int,
+        measurement: CBv2MTPStepMeasurement? = nil
     ) {
+        guard acceptsWorkloadMeasurement(measurement) else { return }
         depthController.observeAcceptance(
             decodeRowBucket: decodeRowBucket,
             drafted: observedDrafts,
@@ -769,9 +808,11 @@ final class CBv2MTPRoundDriver {
     }
 
     func claimPendingSeedCost(
-        decodeRowBucket: Int, finalizedVerifyIDs: Set<CBv2RequestID>
+        decodeRowBucket: Int, finalizedVerifyIDs: Set<CBv2RequestID>,
+        measurement: CBv2MTPStepMeasurement? = nil
     ) -> UInt64 {
-        pendingSeedCosts.take(
+        guard acceptsWorkloadMeasurement(measurement) else { return 0 }
+        return pendingSeedCosts.take(
             decodeRowBucket: decodeRowBucket, requestIDs: finalizedVerifyIDs)
     }
 
@@ -783,7 +824,8 @@ final class CBv2MTPRoundDriver {
         sampledRows: [CBv2RequestID], finalizedPlainRowCount: Int,
         hasChainedSuccessor: Bool
     ) {
-        guard depthController.usesCommittedDecodeBaseline else { return }
+        guard depthController.usesCommittedDecodeBaseline,
+            acceptsWorkloadMeasurement(measurement) else { return }
         let eligible = measurement.map {
             $0.costEligible && $0.chained && !$0.seedOnly
                 && $0.actualDepth == 0 && $0.decision.depth == 0
@@ -810,6 +852,16 @@ final class CBv2MTPRoundDriver {
         guard wallTimeNanos > 0 else { return }
         let decision = measurement.decision
         if depthController.usesCommittedDecodeBaseline {
+            guard acceptsWorkloadMeasurement(measurement) else {
+                // Finishing may precede this step's measurement callback.
+                // Preserve executed-work telemetry without reviving learning.
+                if measurement.actualDepth > 0, !measurement.seedOnly, finalizedVerification {
+                    metricsLock.lock()
+                    metrics.totalRoundWallTimeNanos &+= wallTimeNanos &+ claimedSeedCostNanos
+                    metricsLock.unlock()
+                }
+                return
+            }
             let sample = committedGoodputClock.observe(
                 measurement: measurement, completedAtNanos: completedAtNanos,
                 isolatedWallTimeNanos: wallTimeNanos, rowIDs: committedRows,

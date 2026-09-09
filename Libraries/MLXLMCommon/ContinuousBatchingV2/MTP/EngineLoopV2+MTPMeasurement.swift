@@ -28,7 +28,8 @@ extension EngineLoopV2 {
             actualDepth: 0,
             costEligible: pureDecode,
             chained: false,
-            seedOnly: false)
+            seedOnly: false,
+            workloadGeneration: mtp.workloadGeneration)
     }
 
     func attachMTPMeasurement(
@@ -43,6 +44,7 @@ extension EngineLoopV2 {
             actualDepth: actualDepth,
             costEligible: measurement.costEligible,
             chained: chained,
-            seedOnly: seedOnly)
+            seedOnly: seedOnly,
+            workloadGeneration: measurement.workloadGeneration)
     }
 }

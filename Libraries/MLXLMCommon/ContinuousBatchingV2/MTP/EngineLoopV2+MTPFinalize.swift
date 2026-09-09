@@ -137,7 +137,8 @@ extension EngineLoopV2 {
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
         round.claimedSeedCostNanos = mtp.claimPendingSeedCost(
             decodeRowBucket: mtp.planDecodeRowBucket,
-            finalizedVerifyIDs: round.finalizedVerifyIDs)
+            finalizedVerifyIDs: round.finalizedVerifyIDs,
+            measurement: step.mtpMeasurement)
 
         if !outcomes.isEmpty {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
@@ -148,7 +149,8 @@ extension EngineLoopV2 {
                 drafted: k,
                 accepted: stepAccepted,
                 observedDrafts: observedDrafts,
-                decodeRowBucket: mtp.planDecodeRowBucket)
+                decodeRowBucket: mtp.planDecodeRowBucket,
+                measurement: step.mtpMeasurement)
         }
 
         for outcome in outcomes {

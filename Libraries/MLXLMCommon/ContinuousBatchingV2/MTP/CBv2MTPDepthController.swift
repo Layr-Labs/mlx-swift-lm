@@ -4,7 +4,8 @@
 // One controller belongs to one EngineV2, so model build, assistant revision,
 // chip class, and target/assistant quantization are naturally isolated by the
 // loaded engine. Within that engine, learned state is keyed by the planned
-// decode-row bucket and persists across requests.
+// decode-row bucket. Adaptive stateless workload estimates reset across
+// request generations; exact verification-shape warmup persists.
 
 import Foundation
 
@@ -32,6 +33,8 @@ struct CBv2MTPStepMeasurement {
     /// successor construction because the step participated in a chain.
     var chained: Bool
     let seedOnly: Bool
+    /// Captured at launch so finalizing an older chained step cannot train a reused ID.
+    var workloadGeneration: UInt64? = nil
 }
 
 final class CBv2MTPDepthController {
@@ -148,7 +151,6 @@ final class CBv2MTPDepthController {
         var costs: [Int: CostState] = [:]
         var committedBaseline = CostState()
         var committedTokensPerRow: [Int: Double] = [:]
-        var warmedDepths: Set<Int> = []
         var committedWindow: CBv2MTPCommittedWindow?
         var acceptance = AcceptanceState()
         var activeDepth = 0
@@ -160,6 +162,12 @@ final class CBv2MTPDepthController {
     let fixedDepth: Int?
     let usesCommittedDecodeBaseline: Bool
     private var buckets: [Int: BucketState] = [:]
+    private struct VerificationShape: Hashable {
+        let rowCount: Int
+        let depth: Int
+    }
+
+    private var warmedVerificationShapes: Set<VerificationShape> = []
     private var workloadRows: [CBv2RequestID] = []
     private var lastDecision = CBv2MTPDepthDecision(
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
@@ -196,7 +204,19 @@ final class CBv2MTPDepthController {
         let previous = buckets[bucket] ?? BucketState()
         var fresh = BucketState()
         fresh.costs[0] = previous.costs[0]
-        fresh.warmedDepths = previous.warmedDepths
+        buckets[bucket] = fresh
+    }
+
+    /// Finishing a request ends this workload generation even if the caller
+    /// later reuses its numeric ID. Old in-flight observations must be dropped
+    /// by the driver; only shape knowledge and isolated depth-zero warmup survive.
+    func invalidateWorkload() {
+        guard usesCommittedDecodeBaseline else { return }
+        let bucket = Self.decodeRowBucket(workloadRows.count)
+        workloadRows.removeAll(keepingCapacity: true)
+        guard bucket > 0 else { return }
+        var fresh = BucketState()
+        fresh.costs[0] = buckets[bucket]?.costs[0]
         buckets[bucket] = fresh
     }
 
@@ -232,7 +252,10 @@ final class CBv2MTPDepthController {
             buckets[decision.decodeRowBucket] = state
             return false
         }
-        let warmup = state.warmedDepths.insert(decision.depth).inserted
+        // Buckets group costs, but Metal verifies the exact physical row count.
+        // Three and four rows share a bucket without sharing their first compile.
+        let warmup = warmedVerificationShapes.insert(
+            VerificationShape(rowCount: rowCount, depth: decision.depth)).inserted
         window.observe(
             wallTimeNanos: wallTimeNanos, committedTokens: committedTokens, warmup: warmup)
         guard window.isComplete else {
