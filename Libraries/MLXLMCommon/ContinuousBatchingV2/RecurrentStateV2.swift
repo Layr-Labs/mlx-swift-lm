@@ -10,7 +10,7 @@ import MLX
 /// Explicit model/backend feature gates. Attention-only models inherit the
 /// historical all-enabled defaults; first-generation recurrent adapters opt
 /// out of paths whose state semantics have not been proven.
-public struct CBv2ModelCapabilities: Sendable, Equatable {
+public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
     public var supportsPrefixReuse: Bool
     /// Exact committed recurrent state paired with its attention KV.
     public var supportsRecurrentCheckpointReuse: Bool
@@ -44,6 +44,40 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         self.supportsPackedPrefill = supportsPackedPrefill
         self.supportsMTP = supportsMTP
         self.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case supportsPrefixReuse
+        case supportsRecurrentCheckpointReuse
+        case supportsPagedKV
+        case requiresNativePagedKV
+        case supportsCompiledDecode
+        case supportsPackedPrefill
+        case supportsMTP
+        case supportsCompactRecurrentMTPReplay
+    }
+
+    /// The Engine Protocol v1 manifest wire shape
+    /// (`RunnerManifest.canonicalJSON`) froze the SIX flags it declared, and
+    /// a checked-in v1 manifest carries only those. Flags added after that
+    /// freeze decode to their initializer defaults instead of making the
+    /// pinned file undecodable. The six frozen flags stay mandatory.
+    public init(from decoder: any Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let defaults = CBv2ModelCapabilities()
+        supportsPrefixReuse = try values.decode(Bool.self, forKey: .supportsPrefixReuse)
+        supportsPagedKV = try values.decode(Bool.self, forKey: .supportsPagedKV)
+        supportsCompiledDecode = try values.decode(Bool.self, forKey: .supportsCompiledDecode)
+        supportsPackedPrefill = try values.decode(Bool.self, forKey: .supportsPackedPrefill)
+        supportsMTP = try values.decode(Bool.self, forKey: .supportsMTP)
+        supportsCompactRecurrentMTPReplay = try values.decode(
+            Bool.self, forKey: .supportsCompactRecurrentMTPReplay)
+        supportsRecurrentCheckpointReuse =
+            try values.decodeIfPresent(Bool.self, forKey: .supportsRecurrentCheckpointReuse)
+            ?? defaults.supportsRecurrentCheckpointReuse
+        requiresNativePagedKV =
+            try values.decodeIfPresent(Bool.self, forKey: .requiresNativePagedKV)
+            ?? defaults.requiresNativePagedKV
     }
 
     public static let attentionOnly = CBv2ModelCapabilities()

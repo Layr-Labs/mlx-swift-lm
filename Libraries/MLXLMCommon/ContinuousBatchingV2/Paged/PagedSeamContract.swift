@@ -264,7 +264,7 @@ public enum CBv2PagedRingGeometry {
 ///
 /// Callers MUST degrade to serial verification for a cache that does not
 /// conform, and MUST NOT trap.
-protocol CBv2MTPRectangularSerializing: AnyObject {
+public protocol CBv2MTPRectangularSerializing: AnyObject {
     /// While `true`, attention is computed one query position at a time.
     /// Set for the duration of a rectangular verification round and cleared
     /// in a `defer`.

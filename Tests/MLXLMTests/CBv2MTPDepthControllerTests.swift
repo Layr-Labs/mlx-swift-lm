@@ -91,8 +91,10 @@ struct CBv2MTPDepthControllerTests {
         let controller = CBv2MTPDepthController(maxDepth: 7, fixedDepth: nil)
         controller.observeCost(decodeRowBucket: 1, depth: 0, wallTimeNanos: 10)
         controller.observeCost(decodeRowBucket: 1, depth: 1, wallTimeNanos: 12)
-        #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).reason != "warmup_baseline")
-        #expect(controller.select(plannedDecodeRows: 3, canSpeculate: true).reason == "warmup_baseline")
+        #expect(
+            controller.select(plannedDecodeRows: 1, canSpeculate: true).reason != "warmup_baseline")
+        #expect(
+            controller.select(plannedDecodeRows: 3, canSpeculate: true).reason == "warmup_baseline")
     }
 
     @Test func oneWallCostOutlierIsClamped() throws {
@@ -559,7 +561,7 @@ struct CBv2MTPDepthControllerTests {
     @Test func requestAcceptanceUpdatesOnlyObservedPositions() {
         var state = CBv2MTPRequestAcceptanceState()
         let initial = state.probabilities
-        #expect(initial.count == 4)
+        #expect(initial.count == 6)
         for position in 0 ..< initial.count {
             #expect(abs(initial[position] - 0.85 * pow(0.98, Double(position))) < 1e-12)
         }

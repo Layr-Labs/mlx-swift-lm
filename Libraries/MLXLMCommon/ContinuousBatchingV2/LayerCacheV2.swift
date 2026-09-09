@@ -49,7 +49,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
     /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
-    var mtpSerializesRectangularAttention = false
+    public var mtpSerializesRectangularAttention = false
 
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.
@@ -112,23 +112,43 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
+        updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: sinks,
+            keepMask: nil)
+    }
+
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, keepMask: MLXArray?
+    ) -> MLXArray {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
-        let metadata = attentionMetadata?.begin(
-            cache: self, queries: queries, keys: keys, values: values, scale: scale,
-            sinks: sinks, softcap: attentionSoftcap,
-            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
-        let packet = attentionPacket?.begin(
-            cache: self, queries: queries, keys: keys, values: values, scale: scale,
-            sinks: sinks, softcap: attentionSoftcap,
-            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
+        // An observed forward receipt states a dense causal/window mask: the
+        // replay reference attends the whole retained KV. A keep mask removes
+        // keys that reference would attend, so its output can never replay.
+        // Refuse the capture BY NAME instead of recording a bad receipt.
+        var metadata: CBv2AttentionMetadataObservation?
+        var packet: CBv2AttentionPacketObservation?
+        if keepMask == nil {
+            let spans = boundSpanContexts?.contains(where: { $0 != nil }) ?? false
+            metadata = attentionMetadata?.begin(
+                cache: self, queries: queries, keys: keys, values: values, scale: scale,
+                sinks: sinks, softcap: attentionSoftcap, spans: spans)
+            packet = attentionPacket?.begin(
+                cache: self, queries: queries, keys: keys, values: values, scale: scale,
+                sinks: sinks, softcap: attentionSoftcap, spans: spans)
+        } else {
+            attentionMetadata?.state.refuse("keep_masked_attention_not_replayable")
+            attentionPacket?.state.refuse("keep_masked_attention_not_replayable")
+        }
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention, metadata: metadata, packet: packet)
+            serializeQueries: mtpSerializesRectangularAttention,
+            keepMask: keepMask, metadata: metadata, packet: packet)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
@@ -191,6 +211,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 // MARK: - Final-layer last-query prefill
 
 extension CBv2LayerCache: CBv2LastQueryPrefillLayerCache {}
+
+// MARK: - Keep-mask support
+
+/// The contiguous backend composes the keep mask with the causal or window
+/// mask in absolute coordinates, so it is exact on every layer this cache
+/// vends.
+extension CBv2LayerCache: CBv2KeepMaskCapableCache {
+    public var honorsKeepMask: Bool { true }
+}
 
 // MARK: - Vision span-mask binding
 
