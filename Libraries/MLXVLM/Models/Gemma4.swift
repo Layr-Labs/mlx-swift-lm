@@ -1425,7 +1425,7 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         let softcappedLogits: MLXArray
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
             let scale = MLXArray(finalLogitSoftcapping)
-            softcappedLogits = tanh(logits / scale) * scale
+            softcappedLogits = gemma4LogitSoftcap(logits, scale)
         } else {
             softcappedLogits = logits
         }
