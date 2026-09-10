@@ -27,7 +27,7 @@ enum PagedSegmentAttention {
             threadgroup float red_smem[NSG * HPT * (D + 2)];
             cbv2::paged_attention_part_cached_impl<T, D, S, GQA, HPT, NSG, PTOK, HAS_WRITE, HAS_SOFTCAP>(
                 q, knew, vnew, cache, seqinfo, seqinfo, params, KVH, 0, record[6],
-                q_smem, red_smem, const_cast<device float*>(partials), const_cast<device float*>(meta),
+                q_smem, red_smem, partials, meta,
                 position, thread_position_in_threadgroup, simdgroup_index_in_threadgroup,
                 thread_index_in_simdgroup);
             """
@@ -40,7 +40,9 @@ enum PagedSegmentAttention {
             if let existing = kernels[name] { return existing }
             let made = MLXFast.metalKernel(
                 name: name, inputNames: inputNames(bindings: bindings), outputNames: ["fence"],
-                source: body(bindings: bindings), header: source, ensureRowContiguous: true)
+                source: body(bindings: bindings), header: source, ensureRowContiguous: true,
+                mutableInputs: ["partials", "meta"]
+                    + (key.hasWrite ? (0..<bindings).map { "segment\($0)" } : []))
             kernels[name] = made
             return made
         }
@@ -139,5 +141,43 @@ enum PagedSegmentAttention {
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+    }
+}
+
+/// Experimental dispatch batching, not a new attention reduction. A single
+/// global-cache sequence becomes one independent native decode row per query.
+/// Fixed PTOK is required: adaptive batch sizing would change arithmetic.
+enum PagedMTPBatchedColumns {
+    static let enabled = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NEMOTRON35_MTP_BATCHED_ATTENTION"] != "0"
+
+    static func eligible(queries: MLXArray, row: PagedSequenceKV, group: PagedKVGroup) -> Bool {
+        queries.dim(0) == 1 && (2...8).contains(queries.dim(2))
+            && row.windowSize == nil && group.segmentLayout != nil
+            && row.absoluteOffset >= row.frozenHighWater
+            && PagedAttentionKernel.partitionTargetThreadgroups == 0
+    }
+
+    static func attend(queries: MLXArray, keys: MLXArray, values: MLXArray,
+                       row: PagedSequenceKV, group: PagedKVGroup,
+                       sinks: MLXArray?, params: MLXArray, softcap: Bool,
+                       source: String, dispatchCache: PagedSegmentDispatchCache) -> MLXArray {
+        precondition(eligible(queries: queries, row: row, group: group))
+        let count = queries.dim(2), heads = queries.dim(1), width = queries.dim(3)
+        // One ordinary chunk write, followed by independent causal query rows.
+        row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
+        let descriptors = (0..<count).map { position in
+            let end = row.absoluteOffset - count + position + 1
+            return PagedSegmentDispatchPlan.Row(pages: row.table,
+                info: row.seqInfoRow(attending: (start: row.baseOffset,
+                    length: end - row.baseOffset)),
+                identity: .init(serial: row.serial, tableVersion: row.tableVersion))
+        }
+        let batch = queries.transposed(0, 2, 1, 3).reshaped(count, heads, width)
+        let result = PagedSegmentAttention.decode(queries: batch, newKeys: nil, newValues: nil,
+            group: group, rows: descriptors, sinks: sinks, params: params, softcap: softcap,
+            source: source, dispatchCache: dispatchCache)
+        let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
+        return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
     }
 }

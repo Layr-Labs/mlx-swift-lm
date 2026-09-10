@@ -3,9 +3,7 @@ import MLX
 
 extension EngineLoopV2 {
     func captureRecurrentCheckpoints(_ step: CBv2InFlightStep) {
-        guard hybridPrefixCache != nil || completeCheckpointCapture != nil,
-            let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec
-        else { return }
+        guard hybridPrefixCache != nil || completeCheckpointCapture != nil else { return }
         var roots: [MLXArray] = []
         for (id, range) in step.computedRanges {
             guard !step.discard.contains(id), step.recurrentEvaluations[id] != nil,
@@ -31,7 +29,13 @@ extension EngineLoopV2 {
                     layers: layers, assistantState: assistantState))
                 continue
             }
-            guard let cache = hybridPrefixCache else { continue }
+            // The durable codec already owns the loaded recurrent geometry.
+            // Resolve the resident codec's spec only for an actual capture:
+            // native model getters may build dtype-probe graphs, so reading
+            // them on every decode finalization adds work without a checkpoint.
+            guard let cache = hybridPrefixCache,
+                let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec
+            else { continue }
             var assistant: (any CBv2MTPPrefixCheckpoint)?
             if let mtp, mtp.tracksPersistentHistory {
                 guard let drafter = mtp.drafter as? any CBv2MTPPrefixCheckpointDrafter,

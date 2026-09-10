@@ -431,8 +431,8 @@ struct CBv2MTPDepthControllerTests {
         #expect(ledger.take(decodeRowBucket: 2, requestIDs: [first, second]) == 88)
     }
 
-    @Test func marginalPolicyClampsEveryDepthInputToZeroThroughFour() {
-        let probabilities = [1.0, 1.0, 1.0, 1.0]
+    @Test func marginalPolicyClampsEveryDepthInputToZeroThroughFive() {
+        let probabilities = [1.0, 1.0, 1.0, 1.0, 1.0]
         func select(_ offered: Int, remaining: Int = 10, verification: Int = 10) -> Int {
             CBv2MTPMarginalDepthPolicy.selectDepth(
                 offeredDepth: offered,
@@ -443,12 +443,12 @@ struct CBv2MTPDepthControllerTests {
                 headStepCostRatio: 0)
         }
 
-        for depth in 0 ... 4 {
+        for depth in 0 ... 5 {
             #expect(select(depth) == depth)
         }
-        #expect(select(99) == 4)
+        #expect(select(99) == 5)
         #expect(select(-1) == 0)
-        #expect(select(4, remaining: 1) == 0)
+        #expect(select(5, remaining: 1) == 0)
         #expect(select(4, remaining: 2) == 1)
         #expect(select(4, remaining: 99, verification: 2) == 2)
         #expect(select(4, remaining: 99, verification: -1) == 0)
@@ -700,7 +700,7 @@ struct CBv2MTPDepthControllerTests {
     @Test func requestAcceptanceUpdatesOnlyObservedPositions() {
         var state = CBv2MTPRequestAcceptanceState()
         let initial = state.probabilities
-        #expect(initial.count == 4)
+        #expect(initial.count == 7)
         for position in 0 ..< initial.count {
             #expect(abs(initial[position] - 0.85 * pow(0.98, Double(position))) < 1e-12)
         }
@@ -710,6 +710,7 @@ struct CBv2MTPDepthControllerTests {
         #expect(abs(state.probabilities[1] - (initial[1] + 0.15 * (1 - initial[1]))) < 1e-12)
         #expect(abs(state.probabilities[2] - (initial[2] + 0.15 * (0 - initial[2]))) < 1e-12)
         #expect(state.probabilities[3] == initial[3])
+        #expect(state.probabilities[4] == initial[4])
     }
 
     @Test func truncationDoesNotRecordARejection() {
@@ -725,6 +726,7 @@ struct CBv2MTPDepthControllerTests {
         #expect(state.probabilities[1] > initial[1])
         #expect(state.probabilities[2] == initial[2])
         #expect(state.probabilities[3] == initial[3])
+        #expect(state.probabilities[4] == initial[4])
     }
 
     @Test func fullAcceptanceTransfersOnlyBoundedNontruncatedOptimism() {

@@ -54,6 +54,7 @@ extension CBv2SteppableLanguageModelAdapter: CBv2CompleteCheckpointKVTypeProvidi
         (model as? any CBv2CompleteCheckpointKVTypeProviding)?.cbv2CompleteCheckpointKVDTypes
     }
 }
+
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionedSteppableModel {
     public var supportsPositionedForwarding: Bool {
         if model is any CBv2RecurrentLanguageModelForwardable {
@@ -402,6 +403,20 @@ extension CBv2SteppableLanguageModelAdapter:
 }
 
 extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        if let forwardable = model as? any CBv2RecurrentPrefillHiddenForwardable {
+            return forwardable.cbv2ForwardWithHiddenForPrefill(
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+                positionIds: positionIds, requirement: requirement)
+        }
+        return forwardWithHidden(tokens: tokens, caches: caches, recurrentState: recurrentState,
+                                 positionIds: positionIds)
+    }
+
     public func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
@@ -432,6 +447,7 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
             positionIds: positionIds)
     }
 }
+
 
 
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {

@@ -108,6 +108,7 @@ final class CBv2MTPRoundInFlight {
         /// existing acceptance-packet fence.
         let policyTopTwoValues: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
+        var includesAssistantPrefill = false
 
     }
 
@@ -559,12 +560,23 @@ final class CBv2MTPRoundDriver {
     }
 
     func takeOrMakeAssistantState(
-        for id: CBv2RequestID
-    ) -> (any CBv2MTPRequestState)? {
+        for id: CBv2RequestID, maximumSequenceLength: Int
+    ) throws -> (any CBv2MTPRequestState)? {
         guard tracksPersistentHistory,
             let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
         else { return nil }
-        return assistantStates.removeValue(forKey: id) ?? stateful.makeRequestState()
+        let state = assistantStates.removeValue(forKey: id) ?? stateful.makeRequestState()
+        do {
+            try stateful.configureRequestState(
+                state, maximumSequenceLength: maximumSequenceLength)
+        } catch {
+            // Configuration detached an existing owner from the map. Put it
+            // back before propagating so the fenced cohort retirement path
+            // remains the single authority that releases request state.
+            assistantStates[id] = state
+            throw error
+        }
+        return state
     }
 
     var usesMarginalPolicy: Bool {
@@ -766,6 +778,12 @@ final class CBv2MTPRoundDriver {
         guard count > 0 else { return }
         metricsLock.lock()
         metrics.seedSteps += count
+        metricsLock.unlock()
+    }
+
+    func recordEarlyDraftSubmission() {
+        metricsLock.lock()
+        metrics.earlyDraftSubmissions += 1
         metricsLock.unlock()
     }
 

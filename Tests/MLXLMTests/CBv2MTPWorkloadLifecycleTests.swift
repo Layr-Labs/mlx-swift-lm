@@ -5,6 +5,24 @@ import Testing
 
 @Suite("CBv2MTPWorkloadLifecycle")
 struct CBv2MTPWorkloadLifecycleTests {
+    @Test(arguments: [false, true])
+    func assistantPrefillExclusionPreservesLaunchedWorkloadGeneration(includesPrefill: Bool) {
+        let original = CBv2MTPStepMeasurement(
+            decision: .init(depth: 1, decodeRowBucket: 2, reason: "explore_cost", isExploration: true),
+            actualDepth: 1, costEligible: true, chained: true, seedOnly: false,
+            workloadGeneration: 73)
+        let filtered = original.excludingAssistantPrefill(includesPrefill)
+        #expect(filtered.workloadGeneration == 73)
+        #expect(filtered.costEligible == !includesPrefill)
+        #expect(filtered.chained)
+        #expect(filtered.actualDepth == original.actualDepth)
+        #expect(filtered.decision.depth == original.decision.depth)
+        #expect(filtered.decision.decodeRowBucket == original.decision.decodeRowBucket)
+        #expect(filtered.seedOnly == original.seedOnly)
+        #expect(original.excludingAssistantPrefill(true)
+            .excludingAssistantPrefill(false).costEligible == false)
+    }
+
     @Test(arguments: [1, 2, 4])
     func reusedNumericCohortRequiresFreshChainedBaseline(width: Int) throws {
         let driver = try makeDriver()

@@ -137,9 +137,9 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         _ = try captured.evaluate()
         XCTAssertEqual(state.materializedByteCount, 3 * state.byteCount)
 
-        // Committing one position collapses the window back to one copy.
+        // The committed prefix is a view retaining both captured positions.
         try captured.commit(keepPositions: 1)
-        XCTAssertEqual(state.materializedByteCount, state.byteCount)
+        XCTAssertEqual(state.materializedByteCount, 2 * state.byteCount)
     }
 
     func testCompactReplayStrictPrefixFullCommitAndRollback() throws {

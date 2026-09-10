@@ -295,6 +295,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 && (mtpDriver.map { $0.config.verificationMode != .serialTarget } ?? false)
             let recurrentDepth = mtpDriver?.config.fixedDraftTokens ?? mtpDriver?.config.maxDraftTokens ?? 0
             let compactContinuationHeadroom = usesCompactRectangularReplay && recurrentDepth >= 2
+            let capturedContinuationHeadroom = !usesCompactRectangularReplay && recurrentDepth > 0
+                && mtpDriver?.config.verificationMode != .serialTarget
+                && (model as? any CBv2RecurrentMTPSteppableModel)?.supportsCapturedVerifyWindow == true
             let extraGenerations: Int
             if compactContinuationHeadroom {
                 // One strict-prefix tape can survive into its successor.
@@ -305,8 +308,19 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             } else {
                 extraGenerations = 0
             }
-            let (generations, countOverflow) = CBv2RecurrentStateSpec.maximumLiveGenerations
-                .addingReportingOverflow(extraGenerations)
+            let generations: Int
+            let countOverflow: Bool
+            if capturedContinuationHeadroom {
+                // A committed prefix is a view retaining the previous whole
+                // window. Its successor builds another whole captured stack.
+                let (width, widthOverflow) = recurrentDepth.addingReportingOverflow(1)
+                let (count, overlapOverflow) = width.multipliedReportingOverflow(by: 2)
+                generations = count
+                countOverflow = widthOverflow || overlapOverflow
+            } else {
+                (generations, countOverflow) = CBv2RecurrentStateSpec.maximumLiveGenerations
+                    .addingReportingOverflow(extraGenerations)
+            }
             let (bytes, byteOverflow) = perGeneration.multipliedReportingOverflow(by: generations)
             admissionConfig.fixedBytesPerRequest = countOverflow || byteOverflow ? Int.max : bytes
         }

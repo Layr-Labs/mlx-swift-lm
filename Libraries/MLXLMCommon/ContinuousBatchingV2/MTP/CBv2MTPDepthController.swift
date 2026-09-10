@@ -35,6 +35,13 @@ struct CBv2MTPStepMeasurement {
     let seedOnly: Bool
     /// Captured at launch so finalizing an older chained step cannot train a reused ID.
     var workloadGeneration: UInt64? = nil
+
+    func excludingAssistantPrefill(_ includesPrefill: Bool) -> Self {
+        .init(decision: decision, actualDepth: actualDepth,
+              costEligible: costEligible && !includesPrefill,
+              chained: chained, seedOnly: seedOnly,
+              workloadGeneration: workloadGeneration)
+    }
 }
 
 final class CBv2MTPDepthController {
@@ -545,10 +552,11 @@ final class CBv2MTPDepthController {
     }
 }
 
-/// Request-owned conditional acceptance estimates for the Qwen MTP marginal
+/// Request-owned conditional acceptance estimates for the stateful MTP marginal
 /// depth policy. Hardware cost observations deliberately do not live here.
 struct CBv2MTPRequestAcceptanceState: Equatable {
-    static let maximumDepth = 4
+    /// Bounded by each drafter's qualified captured-window contract.
+    static let maximumDepth = 7
     private static let alpha = 0.15
 
     private(set) var probabilities: [Double] =

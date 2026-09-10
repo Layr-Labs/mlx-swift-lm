@@ -16,7 +16,7 @@ enum PagedSegmentTransfers {
         if (page > 0) {
             const size_t source = ((size_t)h * n + token) * D + d;
             const size_t target = (((size_t)page * H + h) * S + slot) * D + d;
-            device T* destination = const_cast<device T*>(storage);
+            device T* destination = storage;
             destination[target] = keys[source];
             destination[VBASE + target] = values[source];
         }
@@ -33,7 +33,7 @@ enum PagedSegmentTransfers {
         const int count = output_shape[3];
         const size_t source = (((size_t)page * H + h) * S + slot) * D + d;
         const size_t target = ((size_t)h * count + token) * D + d;
-        device T* destination = const_cast<device T*>(output);
+        device T* destination = output;
         destination[target] = storage[source];
         destination[(size_t)H * count * D + target] = storage[VBASE + source];
         if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
@@ -61,7 +61,8 @@ enum PagedSegmentTransfers {
                     ? ["storage", "records", "output", "previous"]
                     : ["keys", "values", "storage", "records", "previous"],
                 outputNames: ["fence"], source: reading ? readBody : writeBody,
-                ensureRowContiguous: true)
+                ensureRowContiguous: true,
+                mutableInputs: [reading ? "output" : "storage"])
             kernels[key] = made
             return made
         }

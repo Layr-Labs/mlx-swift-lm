@@ -12,9 +12,14 @@ private final class CompleteCheckpointFixtureModel:
         return result
     }
     let cbv2CompleteCheckpointKVDTypes: [DType]? = [.float32]
-    let recurrentStateSpec: CBv2RecurrentStateSpec? = .init(layers: [.init(
+    private let spec: CBv2RecurrentStateSpec = .init(layers: [.init(
         modelLayerIndex: 0, convShape: [1, 1, 1], convDType: .float32,
         ssmShape: [1, 1, 1, 1], ssmDType: .float32)])
+    private(set) var recurrentSpecReads = 0
+    var recurrentStateSpec: CBv2RecurrentStateSpec? {
+        recurrentSpecReads += 1
+        return spec
+    }
 
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         preconditionFailure("explicit recurrent state is required")
@@ -163,16 +168,47 @@ private final class CompleteCheckpointReceiptLog: @unchecked Sendable {
 
 final class CBv2CompleteCheckpointEngineTests: XCTestCase {
     private var chunk: Int { max(32, CBv2AttentionV1.queryBlockSize) }
-    private func engine(_ store: CompleteCheckpointFixtureStore) -> (EngineV2, CBv2ContiguousKVBackend) {
+    private func engine(
+        _ store: CompleteCheckpointFixtureStore,
+        model: CompleteCheckpointFixtureModel = CompleteCheckpointFixtureModel()
+    ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1, modelLayerIndex: 1)]
         let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
         return (EngineV2(
-            model: CompleteCheckpointFixtureModel(), layerKinds: kinds, backend: backend,
+            model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
             schedulerConfig: .init(
                 maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
                 prefillChunkSize: chunk, maxWaiting: 4, enablePrefixCache: true),
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store), backend)
+    }
+
+    func testCompleteCacheSkipsRecurrentSpecReadsUntilEligibleCapture() async throws {
+        let store = CompleteCheckpointFixtureStore()
+        let model = CompleteCheckpointFixtureModel()
+        let (engine, _) = engine(store, model: model)
+
+        let decodeOnly = await cbv2SchedCollect(try engine.submit(CBv2Request(
+            id: .init(5), promptTokens: [1, 2, 3], maxTokens: 6,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1005))))
+        XCTAssertEqual(decodeOnly.finishReason, .length)
+        XCTAssertTrue(store.saved.isEmpty)
+        let readsAfterDecode = model.recurrentSpecReads
+        let emptyFinalize = CBv2InFlightStep(
+            assignments: [], participants: [], sampledRows: [], sampledTokens: nil,
+            evalTargets: [], wallStartedNanos: 0)
+        engine.loopForTesting.onEngineQueueSync {
+            engine.loopForTesting.captureRecurrentCheckpoints(emptyFinalize)
+        }
+        XCTAssertEqual(model.recurrentSpecReads, readsAfterDecode,
+            "finalization without eligible checkpoint geometry must not probe recurrent spec")
+
+        let capture = await cbv2SchedCollect(try engine.submit(CBv2Request(
+            id: .init(6), promptTokens: Array(repeating: 1, count: chunk + 1), maxTokens: 2,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1006))))
+        XCTAssertEqual(capture.finishReason, .length)
+        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk])
+        await engine.shutdown()
     }
 
     func testInitialReadScratchUsesSlotCeilingAndReleasesExactlyOnce() async throws {

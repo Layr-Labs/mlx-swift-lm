@@ -432,6 +432,18 @@ public final class CBv2RecurrentRequestState {
                     conv: layer.conv.map { $0[(keep - 1) ..< keep] },
                     ssm: layer.ssm.map { $0[(keep - 1) ..< keep] })
             }
+            // MLX slices share their allocation: selecting one prefix does
+            // not release the other positions in the captured backing stack.
+            // Preserve that obligation through rollback of later work, until
+            // a newer committed generation replaces these views or release.
+            if captured > 1 {
+                let (retained, overflow) = byteCount.multipliedReportingOverflow(by: captured - 1)
+                committedTransitionGeneration = generation
+                committedTransitionRetainedByteCount = overflow ? Int.max : retained
+                committedTransitionRetainedRoots = first.layers.values.flatMap {
+                    [$0.conv, $0.ssm].compactMap { $0 }
+                }
+            }
         } else if let replay = first.prefixReplay {
             guard let positions = replay.values.first?.positions,
                   let keep = keepPositions, (1 ... positions).contains(keep)
