@@ -17,6 +17,25 @@ private func create<C: Codable, M>(
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
 /// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
+private struct NemotronHVariantProbe: Decodable {
+    let layersBlockType: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case layersBlockType = "layers_block_type"
+    }
+}
+
+private func createNemotronH(_ data: Data) throws -> any LanguageModel {
+    let decoder = JSONDecoder.json5()
+    let probe = try decoder.decode(NemotronHVariantProbe.self, from: data)
+    if probe.layersBlockType != nil {
+        return NemotronH35Model(
+            try decoder.decode(NemotronH35Configuration.self, from: data))
+    }
+    return NemotronHModel(
+        try decoder.decode(NemotronHConfiguration.self, from: data))
+}
+
 public enum LLMTypeRegistry {
 
     /// Shared instance with default model types.
@@ -73,7 +92,7 @@ public enum LLMTypeRegistry {
         "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
-        "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
+        "nemotron_h": createNemotronH,
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
