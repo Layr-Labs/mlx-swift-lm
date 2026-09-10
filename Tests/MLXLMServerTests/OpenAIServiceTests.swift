@@ -8,6 +8,44 @@ import MLXLMCommon
 import Testing
 
 struct OpenAIServiceTests {
+    @Test("native Nemotron channels survive the coordinator SSE serializer")
+    func nativeNemotronChannelsPreserveProductionSSE() async throws {
+        let engine = ScriptedServerEngine(events: [
+            .parsed(.init(content: "", reasoningContent: "check constraints")),
+            .parsed(.init(content: "literal <think>visible</think>", reasoningContent: nil)),
+            .toolCall(.init(function: .init(name: "lookup", arguments: ["query": .string("literal")] ))),
+            .info(.init(promptTokens: 9, completionTokens: 3)),
+        ])
+        let service = MLXOpenAIService(engine: engine)
+        var request = OpenAIChatCompletionRequest.test(
+            reasoningParser: .deepseekR1,
+            stream: true,
+            streamOptions: .init(includeUsage: true, continuousUsageStats: nil))
+        request.model = "nvidia-nemotron-3.5-lightning"
+        let stream = try await service.streamChatCompletionFrames(request: request)
+        var frames: [String] = []
+        for try await frame in stream { frames.append(frame) }
+        #expect(frames.contains { $0.contains("\"reasoning_content\":\"check constraints\"") })
+        #expect(frames.contains { $0.contains("literal <think>visible</think>") })
+        #expect(frames.contains { $0.contains("\"name\":\"lookup\"") })
+        #expect(frames.contains { $0.contains("\"prompt_tokens\":9") })
+        #expect(frames.contains { $0.contains("\"finish_reason\":\"tool_calls\"") })
+        #expect(frames.last == ServerSentEventEncoder.done)
+    }
+
+    @Test("native Nemotron text is not parsed a second time during collection")
+    func nativeNemotronCollectedChannelsRemainExact() async throws {
+        let service = MLXOpenAIService(engine: ScriptedServerEngine(events: [
+            .parsed(.init(content: "literal <think>visible</think>", reasoningContent: "check")),
+            .info(.init(promptTokens: 9, completionTokens: 3)),
+        ]))
+        let response = try await service.createChatCompletion(request: .test(reasoningParser: .deepseekR1))
+        #expect(response.choices.first?.message.content == .text("literal <think>visible</think>"))
+        #expect(response.choices.first?.message.reasoningContent == "check")
+        #expect(response.usage.promptTokens == 9)
+        #expect(response.usage.completionTokens == 3)
+    }
+
     @Test("responses API enforces parallel_tool_calls false")
     func responsesAPIEnforcesParallelToolCalls() async throws {
         let request = try JSONDecoder().decode(

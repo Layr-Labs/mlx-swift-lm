@@ -50,6 +50,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// and stores the whole rectangle once, but attention evaluates each
     /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
     var mtpSerializesRectangularAttention = false
+    var mtpBatchesRectangularAttention = false
 
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.

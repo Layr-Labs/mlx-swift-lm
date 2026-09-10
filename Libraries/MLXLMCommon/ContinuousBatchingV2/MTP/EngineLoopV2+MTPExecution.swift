@@ -153,9 +153,12 @@ extension EngineLoopV2 {
 
         func observeCommittedTarget(
             row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
-        ) {
+        ) throws {
             guard mtp.tracksPersistentHistory, mtpBasicEligible(row.rec),
-                let state = mtp.takeOrMakeAssistantState(for: row.rec.id)
+                let state = try mtp.takeOrMakeAssistantState(
+                    for: row.rec.id,
+                    maximumSequenceLength: row.rec.request.promptTokens.count
+                        + max(row.rec.request.maxTokens, 1))
             else { return }
             if let carry = row.historyCarry {
                 mtp.observeCommittedTarget(
@@ -271,7 +274,7 @@ extension EngineLoopV2 {
                 }
             }
             for (index, row) in decodeRows.enumerated() {
-                observeCommittedTarget(
+                try observeCommittedTarget(
                     row: row,
                     tokens: inputs[index ..< index + 1, 0...],
                     hidden: hidden[index ..< index + 1, 0..., 0...])
@@ -324,9 +327,9 @@ extension EngineLoopV2 {
                 }
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
-                let forward = try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHidden(
+                let forward = try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHiddenForPrefill(
                     tokens: inputs, caches: caches, recurrentState: [evaluation],
-                    positionIds: positions) }
+                    positionIds: positions, requirement: requirement) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
                 do {
@@ -359,7 +362,7 @@ extension EngineLoopV2 {
                     requirement: requirement)
             }
             if let observedHidden {
-                observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
+                try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -518,10 +521,21 @@ extension EngineLoopV2 {
                     assistantState:
                         mtp.usesRequestStatefulDrafter
                         ? mtp.takeAssistantState(for: row.rec.id) : nil))
+            if let assistantState = rowMetadata.last?.assistantState,
+                let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
+            {
+                try stateful.configureRequestState(
+                    assistantState,
+                    maximumSequenceLength: row.rec.request.promptTokens.count
+                        + max(row.rec.request.maxTokens, 1))
+            }
             seedTokens.append(Int32(carry.token))
             carryHiddens.append(carry.hidden)
         }
 
+        let includesAssistantPrefill = rowMetadata.contains {
+            $0.assistantState?.hasPendingPrefillForCostAccounting == true
+        }
         mtpFreezeCaptures(captured)
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
@@ -559,7 +573,10 @@ extension EngineLoopV2 {
                 // Publish the first mutable head-cache generation before
                 // constructing a deeper generation. This is nonblocking and
                 // joins the round's sole finalize fence.
-                if draftIndex == 0 { asyncEval(stepEvalTargets) }
+                if draftIndex == 0 {
+                    asyncEval(stepEvalTargets)
+                    mtp.recordEarlyDraftSubmission()
+                }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
                 let stepTokens = concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
@@ -591,6 +608,7 @@ extension EngineLoopV2 {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
+
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
@@ -615,6 +633,7 @@ extension EngineLoopV2 {
             recurrentEvaluations: target.recurrent,
             policyTopTwoValues: target.policyTopTwo?.values)
         result.diagnostics = target.diagnostics
+        result.includesAssistantPrefill = includesAssistantPrefill
         return result
     }
 

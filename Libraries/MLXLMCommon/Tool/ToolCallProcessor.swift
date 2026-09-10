@@ -30,6 +30,7 @@ public class ToolCallProcessor {
     private let tools: [[String: any Sendable]]?
     private var state = State.normal
     private var toolCallBuffer = ""
+    private var activeEndTags: [String]?
 
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
@@ -110,6 +111,7 @@ public class ToolCallProcessor {
         guard state == .collectingToolCall || state == .potentialToolCall else { return nil }
         guard !toolCallBuffer.isEmpty else {
             state = .normal
+            activeEndTags = nil
             return nil
         }
 
@@ -120,6 +122,7 @@ public class ToolCallProcessor {
         let buffered = toolCallBuffer
         toolCallBuffer = ""
         state = .normal
+        activeEndTags = nil
 
         if returnBufferedText && parsed.isEmpty {
             return buffered
@@ -229,7 +232,7 @@ public class ToolCallProcessor {
     /// Process chunk for tagged formats.
     private func processTaggedChunk(_ chunk: String) -> String? {
         let startTags = parser.acceptedStartTags
-        let endTags = parser.acceptedEndTags
+        var endTags = activeEndTags ?? parser.acceptedEndTags
 
         guard !startTags.isEmpty else {
             return chunk
@@ -257,6 +260,8 @@ public class ToolCallProcessor {
         case .potentialToolCall:
             if let startTag = partialMatch(buffer: toolCallBuffer, tags: startTags) {
                 if toolCallBuffer.starts(with: startTag) {
+                    activeEndTags = parser.endTags(forStartTag: startTag)
+                    endTags = activeEndTags!
                     state = .collectingToolCall
                     fallthrough
                 } else {
@@ -292,6 +297,7 @@ public class ToolCallProcessor {
                 }
 
                 state = .normal
+                activeEndTags = nil
                 toolCallBuffer = ""
 
                 // If the token contains the start character, there may be more tool calls to come
