@@ -105,6 +105,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// `L == 1` decode. The engine sets it for the duration of an MTP
     /// verification round and clears it in a `defer`.
     var mtpSerializesRectangularAttention = false
+    var mtpBatchesRectangularAttention = false
+    private(set) var mtpBatchedAttentionCalls = 0
 
     /// WS-1.2. The KV a KV-shared sibling needs in order to attend THIS
     /// layer's most recent prompt chunk, ONE ENTRY PER ROW of that chunk
@@ -197,6 +199,33 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     }
 
     // MARK: - Attention
+
+    /// Append trusted projected K/V and return the native slab-write fence.
+    public func appendTrusted(keys: MLXArray, values: MLXArray) -> [MLXArray] {
+        guard pool.writeValidation.validate(
+            keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+            layerIndex: layerIndex)
+        else { return [keys, values] }
+        precondition(kind.sharesKVWithLayer == nil && pagedRows.count == keys.dim(0))
+        precondition(keys.ndim == 4 && values.shape == keys.shape)
+        var roots: [MLXArray] = []
+        roots.reserveCapacity(pagedRows.count * 2)
+        for (index, row) in pagedRows.enumerated() {
+            let k = keys[index]
+            let v = values[index]
+            row.write(keys: k, values: v)
+            roots.append(k)
+            roots.append(v)
+        }
+        rebuildPositionOffsets()
+        retainedPrefillKV = []
+        // The slab mutation is represented by the group's write fence, not
+        // by the projected source tensors. Return it so callers that publish
+        // one trusted chunk before constructing the next establish the same
+        // generation ordering as updateAndAttend.
+        roots.append(contentsOf: innerState())
+        return roots
+    }
 
     public func updateAndAttend(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -515,6 +544,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             "rectangular verification needs one row per query batch entry")
         let l = queries.dim(2)
         var outputs: [MLXArray] = []
+        if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
+           let keys, let values {
+            let group = pool.group(rows[0].groupKey)
+            if PagedMTPBatchedColumns.eligible(queries: queries, row: rows[0], group: group) {
+                mtpBatchedAttentionCalls += 1
+                return PagedMTPBatchedColumns.attend(queries: queries, keys: keys, values: values,
+                    row: rows[0], group: group, sinks: preparedSinks(sinks), params: params(scale: scale),
+                    softcap: attentionSoftcap != nil, source: pool.kernelSource,
+                    dispatchCache: segmentDispatchCache)
+            }
+        }
         outputs.reserveCapacity(l)
         for t in 0 ..< l {
             let column = queries[0..., 0..., t ..< (t + 1), 0...]

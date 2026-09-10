@@ -116,6 +116,16 @@ public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable 
 /// Steppable models that can drive MTP rounds. Additive refinement of
 /// `CBv2SteppableModel`; the engine speculates only when the bound model
 /// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
+public protocol CBv2RecurrentPrefillHiddenForwardable: CBv2RecurrentMTPForwardable {
+    /// Preserve every trusted hidden row needed by the assistant, while
+    /// projecting vocabulary logits only at the positions the caller needs.
+    func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
 public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// nil when the underlying model cannot drive MTP (adapters over
     /// arbitrary models answer at runtime).
@@ -144,6 +154,11 @@ extension CBv2MTPSteppableModel {
 public protocol CBv2RecurrentMTPSteppableModel:
     CBv2MTPSteppableModel, CBv2RecurrentSteppableModel
 {
+    func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
     func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
@@ -162,6 +177,15 @@ public protocol CBv2RecurrentMTPSteppableModel:
 }
 
 extension CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        forwardWithHidden(tokens: tokens, caches: caches, recurrentState: recurrentState,
+                          positionIds: positionIds)
+    }
+
     /// Fail-safe defaults for first-generation recurrent targets: no
     /// captured-window support (the serial oracle remains the verify path).
     public var supportsCapturedVerifyWindow: Bool { false }
@@ -234,6 +258,9 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this drafter's rounds may accept via target-prefix
     /// pre-sampling; see the extension default for the full contract.
     var supportsTargetPrefixAcceptance: Bool { get }
+    /// True when this model's paged full-attention layers may represent an
+    /// exact rectangular window as independent native decode rows.
+    var prefersBatchedRectangularAttention: Bool { get }
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
@@ -278,6 +305,7 @@ extension CBv2MTPDrafter {
     /// eligibility gate when the installed sampler also supports MTP verify
     /// sampling. Default false: greedy argmax acceptance only.
     public var supportsTargetPrefixAcceptance: Bool { false }
+    public var prefersBatchedRectangularAttention: Bool { false }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
@@ -287,10 +315,14 @@ public protocol CBv2MTPRequestState: AnyObject {
     var stagedInputCount: Int { get }
     /// Actual materialized device-array residency currently owned by this state.
     var materializedBytes: Int { get }
+    /// Before drafting: true when queued history requires preparation beyond
+    /// a normal steady decode round. Accounting only; never suppresses work.
+    var hasPendingPrefillForCostAccounting: Bool { get }
 }
 
 extension CBv2MTPRequestState {
     public var materializedBytes: Int { 0 }
+    public var hasPendingPrefillForCostAccounting: Bool { false }
 }
 
 /// Trusted target inputs and their corresponding pre-norm hidden rows.
@@ -311,6 +343,12 @@ public struct CBv2MTPCommittedTargetObservation {
 /// the target verifier may still batch the resulting columns as `[B,1]`.
 public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     func makeRequestState() -> any CBv2MTPRequestState
+    /// Bind the admitted request's complete logical bound before the state
+    /// allocates request-owned storage. Stateful assistants whose allocator
+    /// needs an up-front promise (notably native paged KV) use this instead
+    /// of guessing a process-wide maximum. The call is idempotent.
+    func configureRequestState(
+        _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int) throws
     /// Queue trusted target inputs/hidden rows without evaluating them.
     func observeCommittedTarget(
         _ observation: CBv2MTPCommittedTargetObservation,
@@ -352,6 +390,9 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 
 extension CBv2MTPRequestStatefulDrafter {
     public var draftShortlistSize: Int? { nil }
+    public func configureRequestState(
+        _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
+    ) throws {}
 }
 
 // MARK: - Config
@@ -410,7 +451,6 @@ public struct CBv2MTPConfig: Sendable {
     /// no envelope, automatic mode performs no speculative work. Ignored by
     /// explicit serial/rectangular modes.
     public var maxAutomaticRectangularTokens: Int
-
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
@@ -495,6 +535,8 @@ public struct CBv2MTPMetrics: Sendable {
     /// Seed steps (eligible rows that decoded eagerly with hidden capture
     /// to establish the drafter carry — no drafts yet).
     public var seedSteps: Int = 0
+    /// Nonblocking assistant graph submissions before target verification.
+    public var earlyDraftSubmissions: Int = 0
     /// Total draft tokens proposed across all rounds.
     public var draftedTokens: Int = 0
     /// Total draft tokens accepted across all rounds.

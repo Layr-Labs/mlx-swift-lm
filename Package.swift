@@ -43,7 +43,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
-                 revision: "37572f1f10a6c485ac4cc254cad63e8242643a6f"),
+                 revision: "86e91e9950dd30bce8b4c14dd06b27b4534444ef"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -183,6 +183,16 @@ let package = Package(
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
                 .process("Resources/block_hash_vectors.json"),
             ]
+        ),
+        .testTarget(
+            name: "OnboardingQualificationTests",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                "MLXLMCommon",
+                "MLXLLM",
+            ],
+            path: "Tests/OnboardingQualificationTests"
         ),
         .testTarget(
             name: "MLXLMServerTests",
