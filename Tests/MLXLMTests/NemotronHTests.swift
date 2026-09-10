@@ -2,12 +2,40 @@
 
 import Foundation
 import MLX
-import MLXLLM
-import MLXLMCommon
+@testable import MLXLLM
+@testable import MLXLMCommon
 import MLXNN
 import XCTest
 
 public class NemotronHTests: XCTestCase {
+
+    func testLightningCheckpointTypesMatchActualCachesWithoutChangingOutput() throws {
+        let config = try makeTestLightningConfiguration()
+        let model = NemotronH35Model(config)
+        eval(model)
+        let tokens = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
+        let caches = model.newCache(parameters: nil)
+        let before = model(tokens, cache: caches)
+        eval(before, caches)
+        let types = try XCTUnwrap(model.cbv2CompleteCheckpointKVDTypes)
+        var expected: [DType] = []
+        var cacheIndex = 0
+        for block in config.target.hybridOverridePattern {
+            if block == "M" || block == "*" {
+                if block == "*" {
+                    XCTAssertEqual(caches[cacheIndex].state[0].dtype, caches[cacheIndex].state[1].dtype)
+                    expected.append(caches[cacheIndex].state[0].dtype)
+                }
+                cacheIndex += 1
+            }
+        }
+        XCTAssertEqual(types, expected)
+        XCTAssertEqual(types.count, model.cbv2LayerKinds.count)
+        let after = model(tokens, cache: model.newCache(parameters: nil))
+        eval(after)
+        XCTAssertTrue(all(before .== after).item(Bool.self))
+        XCTAssertTrue(model.cbv2Capabilities.supportsRecurrentCheckpointReuse)
+    }
 
     /// Create a minimal test configuration for NemotronH
     /// Uses small dimensions to keep tests fast
@@ -35,7 +63,80 @@ public class NemotronHTests: XCTestCase {
         )
     }
 
+    private func makeTestLightningConfiguration() throws
+        -> NemotronH35Configuration
+    {
+        let json = """
+            {
+              "model_type": "nemotron_h",
+              "vocab_size": 100,
+              "hidden_size": 64,
+              "num_hidden_layers": 4,
+              "num_attention_heads": 4,
+              "num_key_value_heads": 2,
+              "head_dim": 64,
+              "mamba_num_heads": 4,
+              "mamba_head_dim": 16,
+              "ssm_state_size": 16,
+              "conv_kernel": 4,
+              "n_groups": 2,
+              "intermediate_size": 128,
+              "moe_intermediate_size": 64,
+              "moe_shared_expert_intermediate_size": 64,
+              "n_routed_experts": 4,
+              "num_experts_per_tok": 2,
+              "layers_block_type": ["mamba", "moe", "mamba", "attention"],
+              "norm_eps": 0.00001,
+              "mamba_ssm_cache_dtype": "float32"
+            }
+            """
+        return try JSONDecoder().decode(
+            NemotronH35Configuration.self,
+            from: Data(json.utf8))
+    }
+
     // MARK: - Configuration Decoding Tests
+
+    func testLightningTimestepMetadataAndExplicitLimitsRoundTrip() throws {
+        let base = try makeTestLightningConfiguration()
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
+        json["time_step_min"] = 0.001
+        json["time_step_max"] = 0.1
+        let metadata = try JSONDecoder().decode(NemotronH35Configuration.self,
+            from: JSONSerialization.data(withJSONObject: json))
+        XCTAssertFalse(metadata.hasExplicitExecutionLimits)
+        XCTAssertEqual(NemotronH35Model(metadata).configuration.timeStepLimitMin, 0)
+        XCTAssertEqual(NemotronH35Model(metadata).configuration.timeStepLimitMax, .infinity)
+        let reopened = try JSONDecoder().decode(NemotronH35Configuration.self,
+            from: JSONEncoder().encode(metadata))
+        XCTAssertFalse(reopened.hasExplicitExecutionLimits)
+        XCTAssertEqual(reopened.target.timeStepLimitMin, Float(0.001))
+        XCTAssertEqual(NemotronH35Model(reopened).configuration.timeStepLimitMax, .infinity)
+
+        json["time_step_limit"] = [0.2, 0.8]
+        let explicit = try JSONDecoder().decode(NemotronH35Configuration.self,
+            from: JSONSerialization.data(withJSONObject: json))
+        let roundTrip = try JSONDecoder().decode(NemotronH35Configuration.self,
+            from: JSONEncoder().encode(explicit))
+        XCTAssertTrue(roundTrip.hasExplicitExecutionLimits)
+        XCTAssertEqual(NemotronH35Model(roundTrip).configuration.timeStepLimitMin, Float(0.2))
+        XCTAssertEqual(NemotronH35Model(roundTrip).configuration.timeStepLimitMax, Float(0.8))
+    }
+
+    func testMalformedTimestepLimitsThrowInsteadOfTrappingOrFallingBack() throws {
+        let base = try makeTestLightningConfiguration()
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
+        for value: Any in [[], [0, 1, 2], [1, 0], [-1, 1], "invalid"] {
+            var json = object
+            json["time_step_limit"] = value
+            let data = try JSONSerialization.data(withJSONObject: json)
+            XCTAssertThrowsError(try JSONDecoder().decode(NemotronH35Configuration.self, from: data))
+        }
+        var legacy = object
+        legacy["time_step_limit_min"] = []
+        XCTAssertThrowsError(try JSONDecoder().decode(NemotronHConfiguration.self,
+            from: JSONSerialization.data(withJSONObject: legacy)))
+    }
 
     func testConfigurationDecodingFromJSON() throws {
         let json = """
@@ -112,6 +213,374 @@ public class NemotronHTests: XCTestCase {
             NemotronHConfiguration.self, from: json.data(using: .utf8)!)
 
         XCTAssertEqual(config.hybridOverridePattern, "M*M-")
+    }
+
+    func testNemotron35LightningConfigurationDecoding() async throws {
+        let json = """
+            {
+                "model_type": "nemotron_h",
+                "vocab_size": 131072,
+                "hidden_size": 2688,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 2,
+                "mamba_num_heads": 64,
+                "mamba_head_dim": 64,
+                "ssm_state_size": 128,
+                "conv_kernel": 4,
+                "n_groups": 8,
+                "intermediate_size": 1856,
+                "moe_intermediate_size": 1856,
+                "moe_shared_expert_intermediate_size": 3712,
+                "n_routed_experts": 128,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 6,
+                "layers_block_type": ["mamba", "moe", "attention", "mlp"],
+                "norm_eps": 0.00001,
+                "time_step_min": 0.001,
+                "time_step_max": 0.1,
+                "chunk_size": 128,
+                "mamba_ssm_cache_dtype": "float32",
+                "num_nextn_predict_layers": 1,
+                "mtp_layers_block_type": ["attention", "moe"]
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            NemotronHConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(config.hybridOverridePattern, "ME*-")
+        XCTAssertEqual(config.layerNormEpsilon, 1e-5)
+        XCTAssertEqual(config.timeStepLimitMin, 0.001)
+        XCTAssertEqual(config.timeStepLimitMax, 0.1)
+        XCTAssertEqual(config.chunkSize, 128)
+        XCTAssertEqual(config.mambaSSMCacheDType, "float32")
+        XCTAssertEqual(config.numNextnPredictLayers, 1)
+        XCTAssertEqual(config.mtpLayersBlockType, ["attention", "moe"])
+
+        let lightning = try JSONDecoder().decode(
+            NemotronH35Configuration.self, from: json.data(using: .utf8)!)
+        XCTAssertEqual(lightning.target.hybridOverridePattern, "ME*-")
+
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: json.data(using: .utf8)!,
+            modelType: "nemotron_h")
+        XCTAssertTrue(model is NemotronH35Model)
+        let lightningModel = try XCTUnwrap(model as? NemotronH35Model)
+        XCTAssertEqual(
+            lightningModel.lightningConfiguration.target.timeStepLimitMin,
+            0.001)
+        XCTAssertFalse(lightningModel.cbv2Capabilities.supportsPrefixReuse)
+        XCTAssertTrue(lightningModel.cbv2Capabilities.supportsRecurrentCheckpointReuse)
+        let capabilityProvider =
+            lightningModel as any CBv2ModelCapabilityProviding
+        XCTAssertTrue(
+            capabilityProvider.cbv2Capabilities.supportsRecurrentCheckpointReuse)
+
+        let roundTripModel = try await LLMTypeRegistry.shared.createModel(
+            configuration: JSONEncoder().encode(lightning),
+            modelType: "nemotron_h")
+        XCTAssertTrue(roundTripModel is NemotronH35Model)
+    }
+
+    func testLegacyNemotronRegistryStillSelectsNanoModel() async throws {
+        let config = NemotronHConfiguration(
+            vocabSize: 100,
+            hiddenSize: 64,
+            numHiddenLayers: 2,
+            numAttentionHeads: 4,
+            numKeyValueHeads: 2,
+            mambaNumHeads: 4,
+            mambaHeadDim: 16,
+            ssmStateSize: 16,
+            convKernel: 4,
+            nGroups: 2,
+            intermediateSize: 128,
+            moeIntermediateSize: 64,
+            moeSharedExpertIntermediateSize: 64,
+            nRoutedExperts: 4,
+            numExpertsPerTok: 2,
+            hybridOverridePattern: "M*",
+            timeStepLimitMax: 100)
+        let model = try await LLMTypeRegistry.shared.createModel(
+            configuration: JSONEncoder().encode(config),
+            modelType: "nemotron_h")
+        XCTAssertTrue(model is NemotronHModel)
+        XCTAssertFalse(model is NemotronH35Model)
+    }
+
+    func testNemotron35RejectsUnknownBlockType() throws {
+        let json = """
+            {
+                "vocab_size": 100,
+                "hidden_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "mamba_num_heads": 4,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 16,
+                "conv_kernel": 4,
+                "n_groups": 2,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 64,
+                "moe_shared_expert_intermediate_size": 64,
+                "n_routed_experts": 4,
+                "num_experts_per_tok": 2,
+                "layers_block_type": ["unsupported"]
+            }
+            """
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                NemotronHConfiguration.self, from: json.data(using: .utf8)!))
+    }
+
+    func testNemotron35CBv2StateAndAttentionLayout() throws {
+        let config = makeTestConfig(pattern: "M*ME")
+        let layerKinds = config.cbv2LayerKinds
+        XCTAssertEqual(layerKinds.count, 1)
+        XCTAssertEqual(layerKinds[0].modelLayerIndex, 1)
+        XCTAssertEqual(layerKinds[0].headDim, 16)
+        XCTAssertEqual(layerKinds[0].kvHeads, 2)
+        XCTAssertEqual(layerKinds[0].queryHeads, 4)
+
+        let state = config.cbv2RecurrentStateSpec(activationDType: .bfloat16)
+        XCTAssertEqual(state.modelLayerIndices, [0, 2])
+        XCTAssertEqual(state.layers[0].convShape, [1, 3, 128])
+        XCTAssertEqual(state.layers[0].convDType, .bfloat16)
+        XCTAssertEqual(state.layers[0].ssmShape, [1, 4, 16, 16])
+        XCTAssertEqual(state.layers[0].ssmDType, .float32)
+        XCTAssertEqual(try state.fixedBytesPerRequest(), 9_728)
+
+        XCTAssertFalse(config.cbv2Capabilities.supportsPrefixReuse)
+        XCTAssertFalse(config.cbv2Capabilities.supportsRecurrentCheckpointReuse)
+        XCTAssertFalse(config.cbv2Capabilities.supportsPagedKV)
+        XCTAssertFalse(config.cbv2Capabilities.supportsPackedPrefill)
+        XCTAssertFalse(config.cbv2Capabilities.supportsMTP)
+    }
+
+    func testSelectedLightningArtifactGeometry() throws {
+        let pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+        let config = NemotronHConfiguration(
+            vocabSize: 131_072,
+            hiddenSize: 2_688,
+            numHiddenLayers: 52,
+            numAttentionHeads: 32,
+            numKeyValueHeads: 2,
+            mambaNumHeads: 64,
+            mambaHeadDim: 64,
+            ssmStateSize: 128,
+            convKernel: 4,
+            nGroups: 8,
+            intermediateSize: 1_856,
+            moeIntermediateSize: 1_856,
+            moeSharedExpertIntermediateSize: 3_712,
+            nRoutedExperts: 128,
+            numExpertsPerTok: 6,
+            hybridOverridePattern: pattern,
+            headDim: 128,
+            nSharedExperts: 1,
+            routedScalingFactor: 2.5,
+            timeStepLimitMin: 0.001,
+            timeStepLimitMax: 0.1,
+            numNextnPredictLayers: 1,
+            mtpLayersBlockType: ["attention", "moe"])
+
+        XCTAssertEqual(pattern.count, 52)
+        XCTAssertEqual(pattern.filter { $0 == "M" }.count, 23)
+        XCTAssertEqual(pattern.filter { $0 == "E" }.count, 23)
+        XCTAssertEqual(
+            config.cbv2LayerKinds.compactMap(\.modelLayerIndex),
+            [5, 12, 19, 26, 33, 42])
+
+        let recurrent = config.cbv2RecurrentStateSpec()
+        XCTAssertEqual(recurrent.modelLayerIndices.count, 23)
+        XCTAssertEqual(recurrent.layers[0].convShape, [1, 3, 6_144])
+        XCTAssertEqual(recurrent.layers[0].ssmShape, [1, 64, 64, 128])
+        XCTAssertEqual(try recurrent.fixedBytesPerRequest(), 49_082_368)
+    }
+
+    func testNemotron35CBv2MambaStagesRequestOwnedState() throws {
+        let model = NemotronHModel(makeTestConfig(pattern: "M"))
+        let tokens = MLXArray([1, 2, 3]).reshaped(1, 3)
+        let serial = model(tokens, cache: model.newCache(parameters: nil))
+        let state = try CBv2RecurrentRequestState(
+            spec: model.cbv2RecurrentStateSpec)
+        let binding = try state.bind()
+        let logits = model.cbv2Forward(
+            tokens,
+            caches: [],
+            recurrentState: [binding])
+        let roots = try binding.evaluate()
+        eval([serial, logits] + roots)
+        try binding.commit()
+
+        XCTAssertEqual(logits.shape, [1, 3, 100])
+        XCTAssertTrue(arrayEqual(serial, logits).item(Bool.self))
+        let committed = try XCTUnwrap(state.state(modelLayerIndex: 0))
+        XCTAssertEqual(committed.conv?.shape, [1, 3, 128])
+        XCTAssertEqual(committed.ssm?.shape, [1, 4, 16, 16])
+        XCTAssertEqual(committed.ssm?.dtype, .float32)
+
+        let next = try state.bind()
+        let nextLogits = model.cbv2Forward(
+            MLXArray([4]).reshaped(1, 1),
+            caches: [],
+            recurrentState: [next])
+        eval([nextLogits] + (try next.evaluate()))
+        try next.commit()
+        XCTAssertEqual(nextLogits.shape, [1, 1, 100])
+    }
+
+    func testNemotron35CBv2ChunkedPrefillMatchesOneShot() throws {
+        let model = NemotronHModel(makeTestConfig(pattern: "M"))
+
+        let oneShotState = try CBv2RecurrentRequestState(
+            spec: model.cbv2RecurrentStateSpec)
+        let oneShotBinding = try oneShotState.bind()
+        let oneShot = model.cbv2Forward(
+            MLXArray([1, 2, 3]).reshaped(1, 3),
+            caches: [],
+            recurrentState: [oneShotBinding])
+        eval([oneShot] + (try oneShotBinding.evaluate()))
+        try oneShotBinding.commit()
+
+        let chunkedState = try CBv2RecurrentRequestState(
+            spec: model.cbv2RecurrentStateSpec)
+        let firstBinding = try chunkedState.bind()
+        _ = model.cbv2Forward(
+            MLXArray([1, 2]).reshaped(1, 2),
+            caches: [],
+            recurrentState: [firstBinding])
+        eval(try firstBinding.evaluate())
+        try firstBinding.commit()
+        let secondBinding = try chunkedState.bind()
+        let chunked = model.cbv2Forward(
+            MLXArray([3]).reshaped(1, 1),
+            caches: [],
+            recurrentState: [secondBinding])
+        eval([chunked] + (try secondBinding.evaluate()))
+        try secondBinding.commit()
+
+        XCTAssertEqual(
+            oneShot[0, -1].argMax().item(Int.self),
+            chunked[0, -1].argMax().item(Int.self))
+        let oneShotFinal = try XCTUnwrap(
+            oneShotState.state(modelLayerIndex: 0))
+        let chunkedFinal = try XCTUnwrap(
+            chunkedState.state(modelLayerIndex: 0))
+        XCTAssertEqual(oneShotFinal.conv?.dtype, chunkedFinal.conv?.dtype)
+        XCTAssertEqual(oneShotFinal.ssm?.dtype, .float32)
+        XCTAssertEqual(chunkedFinal.ssm?.dtype, .float32)
+    }
+
+    func testNemotron35HybridEngineDonatesExactRecurrentState() async throws {
+        let model = NemotronH35Model(
+            try makeTestLightningConfiguration())
+        quantize(model: model, groupSize: 32, bits: 4)
+        eval(model)
+        XCTAssertEqual(model.cbv2RecurrentStateSpec.layers.last?.convDType, .float32)
+        let layerKinds = model.cbv2LayerKinds
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        func engine(_ store: CompleteCheckpointFixtureStore?) -> (EngineV2, CBv2ContiguousKVBackend) {
+            let backend = CBv2ContiguousKVBackend(
+                config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
+            let caches = model.newCacheV2 { index, kind in CBv2LayerCache(layerIndex: index, kind: kind) }
+            return (EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(model), layerKinds: layerKinds,
+                backend: backend, cacheProvider: CBv2LayerCacheBank(caches: caches),
+                sampler: CBv2GreedySampler(),
+                schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                    prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: store != nil),
+                admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store), backend)
+        }
+        let store = CompleteCheckpointFixtureStore()
+        let (donor, donorBackend) = engine(store)
+        let prompt = (0..<2 * chunk + 7).map { 1 + ($0 * 7) % 97 }
+        let request = CBv2Request(id: .init(3501), promptTokens: prompt, maxTokens: 4,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(4501))
+        let donated = await cbv2SchedCollect(try donor.submit(request))
+        XCTAssertEqual(donated.finishReason, .length)
+        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        XCTAssertEqual(donorBackend.bytesReserved, 0)
+        await donor.shutdown()
+
+        // Carry encoded bytes only into a new engine, never donor KV/SSM arrays.
+        let restoredStore = CompleteCheckpointFixtureStore(archives: store.saved)
+        let (warm, warmBackend) = engine(restoredStore)
+        let (cold, coldBackend) = engine(nil)
+        var branch = prompt
+        branch[chunk + 3] = (branch[chunk + 3] % 97) + 1
+        for (index, entry) in [(prompt, 2 * chunk), (branch, chunk)].enumerated() {
+            let req = CBv2Request(id: .init(UInt64(3502 + index)), promptTokens: entry.0,
+                maxTokens: 4, cacheSalt: "tenant", prefixCacheReceiptID: .init(UInt64(4502 + index)))
+            let expected = await cbv2SchedCollect(try cold.submit(req))
+            XCTAssertTrue(try restoredStore.stage(engine: warm, request: req))
+            let actual = await cbv2SchedCollect(try warm.submit(req))
+            XCTAssertEqual(actual.tokens, expected.tokens)
+            XCTAssertEqual(actual.finishReason, .length)
+            XCTAssertEqual(actual.usage?.prefixCachePrefillTokensSaved, entry.1)
+            XCTAssertEqual(actual.usage?.prefixCacheTier, .snapshot)
+            XCTAssertEqual(warmBackend.bytesReserved, 0)
+            XCTAssertEqual(coldBackend.bytesReserved, 0)
+        }
+        let foreign = CBv2Request(id: .init(3599), promptTokens: prompt, maxTokens: 4,
+            cacheSalt: "other-tenant", prefixCacheReceiptID: .init(4599))
+        XCTAssertFalse(try restoredStore.stage(engine: warm, request: foreign))
+        await warm.shutdown()
+        await cold.shutdown()
+    }
+
+    func testLightningNativePagedCheckpointRoundTrip() async throws {
+        let model = NemotronH35Model(try makeTestLightningConfiguration())
+        quantize(model: model, groupSize: 32, bits: 4)
+        eval(model)
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let kinds = model.cbv2LayerKinds
+        let adapter = CBv2SteppableLanguageModelAdapter(model)
+        let observed = try CBv2NativeKVTypeProbe.run(model: adapter, layerKinds: kinds,
+            caches: model.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
+        XCTAssertEqual(observed.layerDTypes, model.cbv2CompleteCheckpointKVDTypes)
+
+        func engine(_ store: CompleteCheckpointFixtureStore?) throws -> (EngineV2, PagedKVBackend) {
+            let backend = try PagedKVBackend(layerKinds: kinds, config: .init(
+                capacityBytes: 96 << 20, maxPrefillChunk: chunk, nominalMaxSequenceLength: 512,
+                segmentSizeBytes: 64 << 10, layerDTypes: observed.layerDTypes))
+            let storage = backend.makeLayerCaches()
+            let indices = Dictionary(uniqueKeysWithValues: kinds.enumerated().map {
+                ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
+            })
+            let caches = model.newCacheV2 { index, _ in storage[indices[index]!] }
+            return (EngineV2(model: adapter, layerKinds: kinds, backend: backend,
+                cacheProvider: CBv2LayerCacheBank(caches: caches), sampler: CBv2GreedySampler(),
+                schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                    prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: store != nil),
+                admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store), backend)
+        }
+        let store = CompleteCheckpointFixtureStore()
+        let (donor, donorBackend) = try engine(store)
+        let prompt = (0..<2 * chunk + 7).map { 1 + ($0 * 7) % 97 }
+        let req = CBv2Request(id: .init(3601), promptTokens: prompt, maxTokens: 6,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(4601))
+        let expected = await cbv2SchedCollect(try donor.submit(req))
+        XCTAssertEqual(expected.finishReason, .length)
+        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        XCTAssertTrue(store.saved.allSatisfy {
+            $0.manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedLayout
+        })
+        XCTAssertEqual(donorBackend.bytesReserved, 0)
+        await donor.shutdown()
+
+        let reopened = CompleteCheckpointFixtureStore(archives: store.saved)
+        let (warm, warmBackend) = try engine(reopened)
+        XCTAssertTrue(try reopened.stage(engine: warm, request: req))
+        let actual = await cbv2SchedCollect(try warm.submit(req))
+        XCTAssertEqual(actual.tokens, expected.tokens)
+        XCTAssertEqual(actual.finishReason, .length)
+        XCTAssertEqual(actual.usage?.prefixCachePrefillTokensSaved, 2 * chunk)
+        XCTAssertEqual(warmBackend.bytesReserved, 0)
+        await warm.shutdown()
     }
 
     func testConfigurationDecodingWithTimeStepLimitArray() throws {
@@ -226,6 +695,19 @@ public class NemotronHTests: XCTestCase {
         // Should remain unchanged [convDim, kernelSize, 1]
         let sanitizedConv = sanitized["backbone.layers.0.mixer.conv1d.weight"]!
         XCTAssertEqual(sanitizedConv.shape, [convDim, config.convKernel, 1])
+    }
+
+    func testSanitizeStripsUnboundMTPWeights() throws {
+        let model = NemotronHModel(makeTestConfig(pattern: "M*"))
+        let weights = [
+            "backbone.embeddings.weight": MLXArray.ones([100, 64]),
+            "mtp.layers.0.enorm.weight": MLXArray.ones([64]),
+        ]
+
+        let sanitized = model.sanitize(weights: weights)
+
+        XCTAssertNotNil(sanitized["backbone.embeddings.weight"])
+        XCTAssertNil(sanitized["mtp.layers.0.enorm.weight"])
     }
 
     func testSanitizeExpertWeights() throws {
@@ -639,5 +1121,47 @@ public class NemotronHTests: XCTestCase {
 
         // Only M and * contribute to kvHeads
         XCTAssertEqual(model.kvHeads, [0, 2])
+    }
+
+    func testNemotronHSSMPreservesActivationAndStateDTypes() throws {
+        // Nemotron 3.5 keeps model activations at bf16 while its recurrent
+        // accumulator remains fp32. Regressing either side changes greedy
+        // logits on the selected checkpoint.
+        let hidden = MLXArray.ones([1, 2, 2, 4]).asType(.bfloat16)
+        // castPredicate intentionally retains A_log at fp32; this is what
+        // promotes the persistent decay accumulator without widening x.
+        let aLog = MLXArray.zeros([2]).asType(.float32)
+        let b = MLXArray.ones([1, 2, 1, 3]).asType(.bfloat16)
+        let c = MLXArray.ones([1, 2, 1, 3]).asType(.bfloat16)
+        let d = MLXArray.ones([2]).asType(.bfloat16)
+        let dt = MLXArray.zeros([1, 2, 2]).asType(.bfloat16)
+        let dtBias = MLXArray.zeros([2]).asType(.bfloat16)
+
+        let (prefill, prefillState) = ssmUpdate(
+            hiddenStates: hidden,
+            ALog: aLog,
+            B: b,
+            C: c,
+            D: d,
+            dt: dt,
+            dtBias: dtBias)
+        eval(prefill, prefillState)
+
+        XCTAssertEqual(prefill.dtype, .bfloat16)
+        XCTAssertEqual(prefillState.dtype, .float32)
+
+        let (decode, decodeState) = ssmUpdate(
+            hiddenStates: hidden[0..., (-1)..., 0..., 0...],
+            ALog: aLog,
+            B: b[0..., (-1)..., 0..., 0...],
+            C: c[0..., (-1)..., 0..., 0...],
+            D: d,
+            dt: dt[0..., (-1)..., 0...],
+            dtBias: dtBias,
+            state: prefillState)
+        eval(decode, decodeState)
+
+        XCTAssertEqual(decode.dtype, .bfloat16)
+        XCTAssertEqual(decodeState.dtype, .float32)
     }
 }
