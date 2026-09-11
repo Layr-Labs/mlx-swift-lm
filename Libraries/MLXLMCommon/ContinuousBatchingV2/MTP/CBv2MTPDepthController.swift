@@ -4,7 +4,8 @@
 // One controller belongs to one EngineV2, so model build, assistant revision,
 // chip class, and target/assistant quantization are naturally isolated by the
 // loaded engine. Within that engine, learned state is keyed by the planned
-// decode-row bucket and persists across requests.
+// decode-row bucket. Adaptive stateless workload estimates reset across
+// request generations; exact verification-shape warmup persists.
 
 import Foundation
 
@@ -32,11 +33,14 @@ struct CBv2MTPStepMeasurement {
     /// successor construction because the step participated in a chain.
     var chained: Bool
     let seedOnly: Bool
+    /// Captured at launch so finalizing an older chained step cannot train a reused ID.
+    var workloadGeneration: UInt64? = nil
 
     func excludingAssistantPrefill(_ includesPrefill: Bool) -> Self {
         .init(decision: decision, actualDepth: actualDepth,
               costEligible: costEligible && !includesPrefill,
-              chained: chained, seedOnly: seedOnly)
+              chained: chained, seedOnly: seedOnly,
+              workloadGeneration: workloadGeneration)
     }
 }
 
@@ -48,20 +52,22 @@ final class CBv2MTPDepthController {
     private static let hysteresisFraction = 0.05
     private static let baseProbeInterval = 8
     private static let maxProbeInterval = 256
+    private static let committedBaselineMinSamples = 3
 
     private struct CostState {
         var samples = 0
         var ewmaNanos = 0.0
         var totalNanos: UInt64 = 0
 
-        mutating func observe(_ nanos: UInt64) {
+        mutating func observe(_ nanos: UInt64, clampInnovation: Bool = true) {
             guard nanos > 0 else { return }
             let sample = Double(nanos)
             if samples == 0 {
                 ewmaNanos = sample
             } else {
                 let limit = SelfLimit.fraction * ewmaNanos
-                let innovation = min(max(sample - ewmaNanos, -limit), limit)
+                let innovation = clampInnovation
+                    ? min(max(sample - ewmaNanos, -limit), limit) : sample - ewmaNanos
                 ewmaNanos += CBv2MTPDepthController.costAlpha * innovation
             }
             samples += 1
@@ -150,6 +156,9 @@ final class CBv2MTPDepthController {
 
     private struct BucketState {
         var costs: [Int: CostState] = [:]
+        var committedBaseline = CostState()
+        var committedTokensPerRow: [Int: Double] = [:]
+        var committedWindow: CBv2MTPCommittedWindow?
         var acceptance = AcceptanceState()
         var activeDepth = 0
         var probeInterval = CBv2MTPDepthController.baseProbeInterval
@@ -158,14 +167,23 @@ final class CBv2MTPDepthController {
 
     let maxDepth: Int
     let fixedDepth: Int?
+    let usesCommittedDecodeBaseline: Bool
     private var buckets: [Int: BucketState] = [:]
+    private struct VerificationShape: Hashable {
+        let rowCount: Int
+        let depth: Int
+    }
+
+    private var warmedVerificationShapes: Set<VerificationShape> = []
+    private var workloadRows: [CBv2RequestID] = []
     private var lastDecision = CBv2MTPDepthDecision(
         depth: 0, decodeRowBucket: 0, reason: "inactive", isExploration: false)
 
-    init(maxDepth: Int, fixedDepth: Int?) {
+    init(maxDepth: Int, fixedDepth: Int?, useCommittedDecodeBaseline: Bool = false) {
         let resolvedMax = min(max(maxDepth, 0), CBv2MTPConfig.testedMaxDraftTokens)
         self.maxDepth = resolvedMax
         self.fixedDepth = fixedDepth.map { min(max($0, 0), resolvedMax) }
+        self.usesCommittedDecodeBaseline = useCommittedDecodeBaseline && fixedDepth == nil
     }
 
     static func decodeRowBucket(_ rows: Int) -> Int {
@@ -181,6 +199,91 @@ final class CBv2MTPDepthController {
 
     func select(plannedDecodeRows: Int, canSpeculate: Bool) -> CBv2MTPDepthDecision {
         decide(plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate, mutate: true)
+    }
+
+    /// Request membership changes require a fresh ordinary baseline and fresh
+    /// workload profitability. Keep only shape warmup knowledge across requests.
+    func beginWorkload(rowIDs: [CBv2RequestID]) {
+        guard usesCommittedDecodeBaseline, Set(rowIDs) != Set(workloadRows) else { return }
+        workloadRows = rowIDs
+        let bucket = Self.decodeRowBucket(rowIDs.count)
+        guard bucket > 0 else { return }
+        let previous = buckets[bucket] ?? BucketState()
+        var fresh = BucketState()
+        fresh.costs[0] = previous.costs[0]
+        buckets[bucket] = fresh
+    }
+
+    /// Finishing a request ends this workload generation even if the caller
+    /// later reuses its numeric ID. Old in-flight observations must be dropped
+    /// by the driver; only shape knowledge and isolated depth-zero warmup survive.
+    func invalidateWorkload() {
+        guard usesCommittedDecodeBaseline else { return }
+        let bucket = Self.decodeRowBucket(workloadRows.count)
+        workloadRows.removeAll(keepingCapacity: true)
+        guard bucket > 0 else { return }
+        var fresh = BucketState()
+        fresh.costs[0] = buckets[bucket]?.costs[0]
+        buckets[bucket] = fresh
+    }
+
+    /// Invalid/cohort-changing work cannot extend a contiguous observation.
+    /// Discard incomplete learning windows; all executed work remains in the
+    /// driver's cumulative telemetry, and ordinary request limits still win.
+    func cancelCommittedWindow(decodeRowBucket: Int) {
+        guard usesCommittedDecodeBaseline else { return }
+        buckets[decodeRowBucket]?.committedWindow = nil
+    }
+
+    /// Update profitability only after a bounded contiguous window. Both
+    /// seed and verify outputs accompany their time, and a lone rejected
+    /// token cannot replace an otherwise profitable active-mode estimate.
+    @discardableResult
+    func recordCommittedVerification(
+        decision: CBv2MTPDepthDecision, wallTimeNanos: UInt64,
+        committedTokens: Int, rowCount: Int
+    ) -> Bool {
+        guard usesCommittedDecodeBaseline, decision.depth > 0,
+            decision.depth <= maxDepth, wallTimeNanos > 0,
+            committedTokens > 0, rowCount > 0,
+            Self.decodeRowBucket(rowCount) == decision.decodeRowBucket
+        else {
+            cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
+            return false
+        }
+        var state = buckets[decision.decodeRowBucket] ?? BucketState()
+        var window = state.committedWindow
+            ?? CBv2MTPCommittedWindow(decision: decision, rowCount: rowCount)
+        guard window.decision.depth == decision.depth, window.rowCount == rowCount else {
+            state.committedWindow = nil
+            buckets[decision.decodeRowBucket] = state
+            return false
+        }
+        // Buckets group costs, but Metal verifies the exact physical row count.
+        // Three and four rows share a bucket without sharing their first compile.
+        let warmup = warmedVerificationShapes.insert(
+            VerificationShape(rowCount: rowCount, depth: decision.depth)).inserted
+        window.observe(
+            wallTimeNanos: wallTimeNanos, committedTokens: committedTokens, warmup: warmup)
+        guard window.isComplete else {
+            state.committedWindow = window
+            buckets[decision.decodeRowBucket] = state
+            return false
+        }
+        state.committedWindow = nil
+        var wall = state.costs[decision.depth] ?? CostState()
+        // Use identical EWMA weights for whole-window time and outputs.
+        // Clamping time alone would undercharge seed transitions while
+        // crediting every extra output, manufacturing apparent profit.
+        wall.observe(window.wallTimeNanos, clampInnovation: false)
+        state.costs[decision.depth] = wall
+        let tokensPerRow = Double(window.committedTokens) / Double(rowCount)
+        let previous = state.committedTokensPerRow[decision.depth] ?? tokensPerRow
+        state.committedTokensPerRow[decision.depth] =
+            previous + Self.costAlpha * (tokensPerRow - previous)
+        complete(window.decision, state: &state)
+        buckets[decision.decodeRowBucket] = state
+        return true
     }
 
     func observeAcceptance(decodeRowBucket: Int, drafted: Int, accepted: Int) {
@@ -201,10 +304,19 @@ final class CBv2MTPDepthController {
         buckets[decodeRowBucket] = state
     }
 
-    /// A depth-zero baseline is only comparable with verify steps when it is
-    /// finalized before another graph is constructed. One such probe is
-    /// required per bucket; ordinary target-only steps may keep chaining
-    /// after the baseline exists.
+    /// Record one non-overlapping steady ordinary-decode interval. The
+    /// engine supplies commit-to-commit time for an unchanged row cohort,
+    /// never a chained step's overlapping launch-to-finalize latency.
+    func observeCommittedDecodeInterval(decodeRowBucket: Int, wallTimeNanos: UInt64) {
+        guard usesCommittedDecodeBaseline, decodeRowBucket > 0, wallTimeNanos > 0 else { return }
+        var state = buckets[decodeRowBucket] ?? BucketState()
+        state.committedBaseline.observe(wallTimeNanos)
+        buckets[decodeRowBucket] = state
+    }
+
+    /// Retain one isolated warmup per bucket. Adaptive stateless target-prefix
+    /// serving then calibrates its actual chained alternative separately;
+    /// stateful/legacy policies continue using the isolated baseline.
     func requiresNonChainedDepthZeroProbe(_ decision: CBv2MTPDepthDecision) -> Bool {
         guard decision.depth == 0, decision.decodeRowBucket > 0 else { return false }
         return buckets[decision.decodeRowBucket]?.costs[0] == nil
@@ -232,7 +344,9 @@ final class CBv2MTPDepthController {
         else { return false }
 
         if actualDepth > 0 {
-            guard finalizedVerification, costEligible, wallTimeNanos > 0 else { return false }
+            guard finalizedVerification, costEligible, !chained, wallTimeNanos > 0 else {
+                return false
+            }
         } else {
             guard finalizedPlainWork else { return false }
             if chained {
@@ -270,14 +384,17 @@ final class CBv2MTPDepthController {
         for bucket in buckets.keys.sorted() {
             guard let state = buckets[bucket] else { continue }
             for depth in state.costs.keys.sorted() {
-                guard let cost = state.costs[depth] else { continue }
+                guard let cost = effectiveCost(depth: depth, state: state) else { continue }
                 inputs.append(
                     CBv2MTPCostInput(
                         decodeRowBucket: bucket,
                         depth: depth,
                         samples: cost.samples,
                         ewmaWallTimeNanos: UInt64(max(0, cost.ewmaNanos.rounded())),
-                        totalWallTimeNanos: cost.totalNanos))
+                        totalWallTimeNanos: cost.totalNanos,
+                        ewmaNanosPerCommittedToken: state.committedTokensPerRow[depth].map {
+                            UInt64(max(0, (cost.ewmaNanos / $0).rounded()))
+                        }))
             }
         }
         let state = buckets[lastDecision.decodeRowBucket]
@@ -300,6 +417,7 @@ final class CBv2MTPDepthController {
                 mutate: mutate)
         }
         guard canSpeculate, maxDepth > 0 else {
+            if mutate { cancelCommittedWindow(decodeRowBucket: bucket) }
             return finish(
                 CBv2MTPDepthDecision(
                     depth: 0, decodeRowBucket: bucket,
@@ -323,6 +441,19 @@ final class CBv2MTPDepthController {
             decision = CBv2MTPDepthDecision(
                 depth: 0, decodeRowBucket: bucket, reason: "warmup_baseline",
                 isExploration: true)
+        } else if usesCommittedDecodeBaseline,
+            state.committedBaseline.samples < Self.committedBaselineMinSamples
+        {
+            // Short requests simply remain ordinary decode. Calibration
+            // cannot manufacture samples from seeds, prefill, or idle time.
+            decision = CBv2MTPDepthDecision(
+                depth: 0, decodeRowBucket: bucket, reason: "warmup_chained_baseline",
+                isExploration: false)
+        } else if let window = state.committedWindow {
+            decision = CBv2MTPDepthDecision(
+                depth: min(window.decision.depth, limit), decodeRowBucket: bucket,
+                reason: window.decision.isExploration ? "explore_window" : "goodput_window",
+                isExploration: window.decision.isExploration)
         } else if let unsampled = (0 ... limit).first(where: { state.costs[$0] == nil }) {
             decision = CBv2MTPDepthDecision(
                 depth: unsampled, decodeRowBucket: bucket, reason: "explore_cost",
@@ -343,7 +474,8 @@ final class CBv2MTPDepthController {
             var selected = current
             var reason = current == 0 ? "unprofitable" : "goodput"
             if best != current {
-                if currentGoodput <= 0
+                if (usesCommittedDecodeBaseline && best == 0)
+                    || currentGoodput <= 0
                     || bestGoodput >= currentGoodput * (1 + Self.hysteresisFraction)
                 {
                     selected = best
@@ -392,8 +524,23 @@ final class CBv2MTPDepthController {
         }
     }
 
+    private func effectiveCost(depth: Int, state: BucketState) -> CostState? {
+        if depth == 0, usesCommittedDecodeBaseline,
+            state.committedBaseline.samples >= Self.committedBaselineMinSamples
+        {
+            return state.committedBaseline
+        }
+        return state.costs[depth]
+    }
+
     private func goodput(depth: Int, state: BucketState) -> Double {
-        guard let cost = state.costs[depth], cost.ewmaNanos > 0 else { return 0 }
+        if usesCommittedDecodeBaseline, depth > 0,
+            let tokens = state.committedTokensPerRow[depth],
+            let cost = state.costs[depth], cost.ewmaNanos > 0
+        {
+            return tokens / cost.ewmaNanos
+        }
+        guard let cost = effectiveCost(depth: depth, state: state), cost.ewmaNanos > 0 else { return 0 }
         return state.acceptance.expectedCommitted(depth: depth) / cost.ewmaNanos
     }
 

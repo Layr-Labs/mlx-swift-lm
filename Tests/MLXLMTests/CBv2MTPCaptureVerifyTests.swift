@@ -377,8 +377,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
 
     /// After a REJECTED draft the captured commit at keep=1 must reproduce
     /// the state of a control that never speculated (only consumed the seed
-    /// column); after an ACCEPTED draft the captured commit at keep=2 must
-    /// match a control that decoded the same two tokens serially. Outputs
+    /// column); partial and full acceptance must match controls that decoded
+    /// exactly that many tokens serially. Outputs
     /// use the installed W4/g64 exact projection geometry.
     func testExactGDNCapturedWindowMatchesSerialOracle() throws {
         func assertExact(_ actual: MLXArray, _ expected: MLXArray) {
@@ -413,7 +413,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             return state
         }
 
-        // Serial oracle: two [1, 1] columns through plain transactions.
+        // Serial oracle: three [1, 1] columns through plain transactions.
         let serialState = try freshState()
         let serial0 = try serialState.bind()
         let y0 = layer.cbv2Forward(x0, modelLayerIndex: 0, recurrentState: [serial0])
@@ -426,6 +426,9 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let y1 = layer.cbv2Forward(x1, modelLayerIndex: 0, recurrentState: [serial1])
         _ = try serial1.evaluate()
         try serial1.commit()
+        let afterFirstDraft = serialState.state(modelLayerIndex: 0)!
+        let afterFirstDraftConv = afterFirstDraft.conv! + 0
+        let afterFirstDraftSSM = afterFirstDraft.ssm! + 0
         let serial2 = try serialState.bind()
         let y2 = layer.cbv2Forward(x2, modelLayerIndex: 0, recurrentState: [serial2])
         _ = try serial2.evaluate()
@@ -450,6 +453,19 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         assertExact(rejectedFinal.conv!, afterSeedConv)
         assertExact(rejectedFinal.ssm!, afterSeedSSM)
 
+        // Partial acceptance exercises the strict-prefix replay boundary
+        // between total rejection and full acceptance with the exact oracle.
+        let partialState = try freshState()
+        let partial = try partialState.bind()
+        let partialOut = layer.cbv2ForwardCaptured(
+            window, modelLayerIndex: 0, recurrentState: [partial],
+            exactTargetVerify: true)
+        eval(try partial.evaluate())
+        try partial.commit(keepPositions: 2)
+        let partialFinal = partialState.state(modelLayerIndex: 0)!
+        assertExact(partialFinal.conv!, afterFirstDraftConv)
+        assertExact(partialFinal.ssm!, afterFirstDraftSSM)
+
         // Accepted draft: captured window, keep 3 → state == control that
         // decoded all three tokens serially; window outputs match the serial
         // column outputs.
@@ -466,12 +482,40 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         assertExact(acceptedFinal.ssm!, afterDraft.ssm!)
         XCTAssertTrue(acceptedOut.shape == [1, 3, hidden])
         assertExact(acceptedOut, concatenated([y0, y1, y2], axis: 1))
-        for value in [rejectedOut, acceptedOut] {
+        for value in [rejectedOut, partialOut, acceptedOut] {
             XCTAssertTrue(isFinite(value).all().item(Bool.self))
         }
     }
 
-    func testGDNWideWindowUsesCompactReplayAndMatchesEverySerialPrefix() throws {
+    /// Independent recurrence oracle: consumes each already-projected verify
+    /// row once, preserving a snapshot at every prefix. It deliberately does
+    /// not use the production prefix-replay helper or its captured closure.
+    private func tokenwiseRecurrenceOracle(
+        tape: ArraysCache.PrefixReplayTape, layer: Qwen35GatedDeltaNet
+    ) throws -> [(conv: MLXArray, ssm: MLXArray)] {
+        var conv = tape.convInput[0..., 0..<tape.convStateRows, 0...]
+        var ssm = try XCTUnwrap(tape.ssmPre)
+        var snapshots: [(conv: MLXArray, ssm: MLXArray)] = []
+        for row in 0..<tape.rowCount {
+            let next = row..<(row + 1)
+            ssm = gatedDeltaUpdate(
+                q: tape.q[0..., next], k: tape.k[0..., next], v: tape.v[0..., next],
+                a: tape.a[0..., next], b: tape.b[0..., next],
+                aLog: layer.aLog, dtBias: layer.dtBias, state: ssm,
+                mask: tape.mask.map { $0[0..., next] }).1
+            let incoming = tape.convStateRows + row
+            conv = concatenated([
+                conv[0..., 1..., 0...],
+                tape.convInput[0..., incoming..<(incoming + 1), 0...],
+            ], axis: 1)
+            let snapshot = (conv: conv + 0, ssm: ssm + 0)
+            eval(snapshot.conv, snapshot.ssm)
+            snapshots.append(snapshot)
+        }
+        return snapshots
+    }
+
+    func testGDNWideWindowUsesCompactReplayAndMatchesEveryRecurrencePrefix() throws {
         MLXRandom.seed(0xC0FFEE)
         let config = try smallGDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
@@ -485,31 +529,29 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             let state = try CBv2RecurrentRequestState(spec: gdnSpec(config))
             let warm = try state.bind()
             _ = layer.cbv2Forward(history, modelLayerIndex: 0, recurrentState: [warm])
-            _ = try warm.evaluate()
+            eval(try warm.evaluate())
             try warm.commit()
             return state
         }
 
-        let serial = try freshState()
-        var oracle: [(conv: MLXArray, ssm: MLXArray)] = []
-        for column in columns {
-            let step = try serial.bind()
-            _ = layer.cbv2Forward(column, modelLayerIndex: 0, recurrentState: [step])
-            _ = try step.evaluate()
-            try step.commit()
-            let state = serial.state(modelLayerIndex: 0)!
-            let conv = state.conv! + 0
-            let ssm = state.ssm! + 0
-            eval(conv, ssm)
-            oracle.append((conv, ssm))
-        }
+        // Default rectangular arithmetic need not reproduce width-one dense
+        // projection rounding. Obtain a separate same-width tape, then compute
+        // each expected boundary independently one recurrence step at a time.
+        let initial = try freshState().state(modelLayerIndex: 0)!
+        let legacy = MambaCache()
+        legacy[0] = initial.conv
+        legacy[1] = initial.ssm
+        let legacyOutput = layer(window, cache: legacy, nConfirmed: 1)
+        eval([legacyOutput] + legacy.innerState())
+        let tape = try XCTUnwrap(legacy.prefixReplayTape)
+        let oracle = try tokenwiseRecurrenceOracle(tape: tape, layer: layer)
 
         for keep in 1 ... columns.count {
             let compactState = try freshState()
             let compact = try compactState.bind()
             _ = layer.cbv2ForwardCaptured(
                 window, modelLayerIndex: 0, recurrentState: [compact])
-            _ = try compact.evaluate()
+            eval(try compact.evaluate())
             XCTAssertTrue(compact.isCaptured)
             XCTAssertLessThan(
                 compactState.materializedByteCount,
@@ -523,6 +565,46 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             XCTAssertTrue(
                 allClose(actual.ssm!, oracle[keep - 1].ssm, rtol: 1e-4, atol: 1e-5)
                     .item(Bool.self))
+        }
+    }
+
+    /// Same-width control isolates captured bookkeeping from recomputing
+    /// projections and convolution with a different forward width.
+    func testGDNWideCapturedMatchesOrdinaryWideFromMaterializedState() throws {
+        MLXRandom.seed(0xC0FFEE)
+        let config = try smallGDNConfiguration()
+        let layer = Qwen35GatedDeltaNet(config)
+        eval(layer)
+        let columns = (0 ..< 4).map { _ in MLXRandom.normal([1, 1, config.hiddenSize]) }
+        let window = concatenated(columns, axis: 1)
+        let history = MLXRandom.normal([1, 3, config.hiddenSize])
+        eval(window, history)
+
+        func freshState() throws -> CBv2RecurrentRequestState {
+            let state = try CBv2RecurrentRequestState(spec: gdnSpec(config))
+            let warm = try state.bind()
+            _ = layer.cbv2Forward(history, modelLayerIndex: 0, recurrentState: [warm])
+            eval(try warm.evaluate())
+            try warm.commit()
+            return state
+        }
+        let ordinaryState = try freshState()
+        let ordinary = try ordinaryState.bind()
+        _ = layer.cbv2Forward(window, modelLayerIndex: 0, recurrentState: [ordinary])
+        eval(try ordinary.evaluate())
+        try ordinary.commit()
+
+        let capturedState = try freshState()
+        let captured = try capturedState.bind()
+        _ = layer.cbv2ForwardCaptured(window, modelLayerIndex: 0, recurrentState: [captured])
+        eval(try captured.evaluate())
+        try captured.commit(keepPositions: 4)
+        let actual = capturedState.state(modelLayerIndex: 0)!
+        let expected = ordinaryState.state(modelLayerIndex: 0)!
+        for (name, left, right) in [("conv", actual.conv!, expected.conv!),
+                                  ("ssm", actual.ssm!, expected.ssm!)] {
+            XCTAssertTrue(allClose(left, right, rtol: 1e-4, atol: 1e-5).item(Bool.self),
+                "same-width captured \(name) must match ordinary forward")
         }
     }
 
@@ -664,7 +746,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// A partially accepted wide verify rebuilds each recurrent layer from its
     /// compact tape, while attention remains at the speculative offset until
     /// the caller trims exactly the rejected suffix.
-    func testRecurrentPrefixReplayMatchesSerialPrefixAndAttentionTrim() throws {
+    func testRecurrentPrefixReplayMatchesRecurrencePrefixAndAttentionTrim() throws {
         MLXRandom.seed(61_337)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
@@ -693,6 +775,16 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                     baseAttentionOffsets[index] + verifyTokens.count)
             }
 
+            var recurrentOracle: [Int: (conv: MLXArray, ssm: MLXArray)] = [:]
+            for (index, cache) in verify.enumerated() {
+                guard let recurrent = cache as? MambaCache else { continue }
+                let tape = try XCTUnwrap(recurrent.prefixReplayTape)
+                let layer = try XCTUnwrap(model.model.namedModules().first {
+                    $0.0 == "layers.\(index).linear_attn"
+                }?.1 as? Qwen35GatedDeltaNet)
+                let prefixes = try tokenwiseRecurrenceOracle(tape: tape, layer: layer)
+                recurrentOracle[index] = prefixes[committedRows - 1]
+            }
             XCTAssertTrue(
                 model.replayRecurrentPrefix(
                     cache: verify, committedRows: committedRows))
@@ -717,6 +809,14 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                 tokens: Array(verifyTokens.prefix(committedRows)),
                 caches: oracle,
                 nConfirmed: 0)
+            // Ordinary prefix forwarding remains the attention-offset
+            // control. Recurrent numerics use the same wide transformed inputs
+            // as verification, avoiding an unsupported cross-width identity.
+            for (index, expected) in recurrentOracle {
+                let recurrent = try XCTUnwrap(oracle[index] as? MambaCache)
+                recurrent[0] = expected.conv
+                recurrent[1] = expected.ssm
+            }
             assertRecurrentStateEqual(verify, oracle)
             for index in oracle.indices where !(oracle[index] is ArraysCache) {
                 XCTAssertEqual(verify[index].offset, oracle[index].offset)

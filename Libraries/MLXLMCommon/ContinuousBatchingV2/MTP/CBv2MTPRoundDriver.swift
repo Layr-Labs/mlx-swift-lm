@@ -133,6 +133,8 @@ final class CBv2MTPRoundInFlight {
     var finalizedSeedIDs: Set<CBv2RequestID> = []
     var finalizedVerifyIDs: Set<CBv2RequestID> = []
     var claimedSeedCostNanos: UInt64 = 0
+    /// Outputs actually kept after common-width, EOS, stop and budget handling.
+    var committedVerifyTokenCount = 0
     /// Cancellation-owned assistant states released only after the target KV
     /// and recurrent deferred-release fence has retired.
     var deferredAssistantReleases: [any CBv2MTPRequestState] = []
@@ -225,6 +227,13 @@ final class CBv2MTPRoundDriver {
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
     let targetPrefixAcceptance: Bool
     private let depthController: CBv2MTPDepthController
+    private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
+    private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
+    private var goodputPlanRows: [CBv2RequestID] = []
+    /// Numeric request IDs can be reused. Stamp launch measurements with the
+    /// current lifetime so late chained finalization cannot train a new one.
+    private(set) var workloadGeneration: UInt64 = 0
+    private var workloadInvalidated = false
 
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
@@ -310,7 +319,9 @@ final class CBv2MTPRoundDriver {
         self.model = model
         self.captureLayers = captureLayers
         self.depthController = CBv2MTPDepthController(
-            maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens)
+            maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
+            useCommittedDecodeBaseline: drafter.supportsTargetPrefixAcceptance
+                && !(drafter is any CBv2MTPRequestStatefulDrafter))
         self.metrics.verificationMode = self.config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
     }
@@ -365,7 +376,26 @@ final class CBv2MTPRoundDriver {
     /// Reset speculation marks. Called immediately before every
     /// `scheduler.plan()` so marks can never leak across plans (a rolled-
     /// back plan's marks must not classify the next plan's rows).
-    func beginPlan(plannedDecodeRows: Int, canSpeculate: Bool) {
+    func beginPlan(
+        plannedDecodeRows: Int, canSpeculate: Bool,
+        rowIDs: [CBv2RequestID]? = nil
+    ) {
+        if let rowIDs, depthController.usesCommittedDecodeBaseline {
+            let changedCohort = Set(rowIDs) != Set(goodputPlanRows)
+            if changedCohort {
+                workloadGeneration &+= 1
+                committedDecodeClock = CBv2MTPCommittedDecodeClock()
+                pendingSeedCosts.removeAll()
+            }
+            if !canSpeculate || changedCohort {
+                committedGoodputClock.reset()
+                depthController.cancelCommittedWindow(
+                    decodeRowBucket: CBv2MTPDepthController.decodeRowBucket(goodputPlanRows.count))
+            }
+            goodputPlanRows = rowIDs
+            workloadInvalidated = false
+            depthController.beginWorkload(rowIDs: rowIDs)
+        }
         if !roundMarks.isEmpty { roundMarks = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
         forceSeedPlan = false
@@ -435,6 +465,7 @@ final class CBv2MTPRoundDriver {
         let newDepth = min(max(requestedDepth, 0), planDecision.depth)
         guard newDepth != planDecision.depth else { return }
         let oldDepth = planDecision.depth
+        depthController.cancelCommittedWindow(decodeRowBucket: planDecision.decodeRowBucket)
         planDecision = CBv2MTPDepthDecision(
             depth: newDepth, decodeRowBucket: planDecision.decodeRowBucket,
             reason: reason, isExploration: false)
@@ -677,6 +708,7 @@ final class CBv2MTPRoundDriver {
     /// The request left the engine for good — ids are legally reusable, so
     /// every per-id trace must go (a reused id must never inherit a carry).
     func requestDidFinish(_ id: CBv2RequestID) {
+        if goodputPlanRows.contains(id) { invalidateWorkload() }
         carries.removeValue(forKey: id)
         releaseAssistantState(id)
         roundMarks.removeValue(forKey: id)
@@ -685,9 +717,34 @@ final class CBv2MTPRoundDriver {
         requestAcceptance.removeValue(forKey: id)
     }
 
-    /// Drain/shutdown drops every device-resident request trace while
-    /// retaining cumulative metrics/controller estimates for a final poll.
+    /// Invalidate only adaptive stateless learning. Other live rows retain
+    /// their carries; the next plan calibrates its new request cohort.
+    private func invalidateWorkload() {
+        guard depthController.usesCommittedDecodeBaseline else { return }
+        workloadGeneration &+= 1
+        workloadInvalidated = true
+        goodputPlanRows.removeAll(keepingCapacity: true)
+        committedDecodeClock = CBv2MTPCommittedDecodeClock()
+        committedGoodputClock.reset()
+        pendingSeedCosts.removeAll()
+        depthController.invalidateWorkload()
+        metricsLock.lock()
+        refreshControllerMetricsLocked()
+        metricsLock.unlock()
+    }
+
+    private func acceptsWorkloadMeasurement(_ measurement: CBv2MTPStepMeasurement?) -> Bool {
+        guard depthController.usesCommittedDecodeBaseline else { return true }
+        guard !workloadInvalidated else { return false }
+        // Older host-only tests construct unstamped measurements. Production
+        // always stamps at plan capture and preserves the stamp at attachment.
+        return measurement?.workloadGeneration.map { $0 == workloadGeneration } ?? true
+    }
+
+    /// Drain/shutdown drops every request trace and adaptive workload while
+    /// retaining cumulative metrics for a final poll.
     func removeAllRequestState() {
+        invalidateWorkload()
         carries.removeAll(keepingCapacity: false)
         rawCostEstimators.removeAll(keepingCapacity: false)
         for id in Array(assistantStates.keys) { releaseAssistantState(id) }
@@ -755,8 +812,10 @@ final class CBv2MTPRoundDriver {
     /// row can commit together, once per step (not once per row).
     func recordStepAcceptance(
         drafted: Int, accepted: Int, observedDrafts: Int,
-        decodeRowBucket: Int
+        decodeRowBucket: Int,
+        measurement: CBv2MTPStepMeasurement? = nil
     ) {
+        guard acceptsWorkloadMeasurement(measurement) else { return }
         depthController.observeAcceptance(
             decodeRowBucket: decodeRowBucket,
             drafted: observedDrafts,
@@ -767,10 +826,34 @@ final class CBv2MTPRoundDriver {
     }
 
     func claimPendingSeedCost(
-        decodeRowBucket: Int, finalizedVerifyIDs: Set<CBv2RequestID>
+        decodeRowBucket: Int, finalizedVerifyIDs: Set<CBv2RequestID>,
+        measurement: CBv2MTPStepMeasurement? = nil
     ) -> UInt64 {
-        pendingSeedCosts.take(
+        guard acceptsWorkloadMeasurement(measurement) else { return 0 }
+        return pendingSeedCosts.take(
             decodeRowBucket: decodeRowBucket, requestIDs: finalizedVerifyIDs)
+    }
+
+    /// The ordinary alternative to stateless MTP can pipeline target decode.
+    /// Measure its actual commit cadence, with no extra clock or GPU readback.
+    /// Reset on every nonqualifying finalize to exclude idle/cohort transitions.
+    func recordCommittedDecodeBaseline(
+        measurement: CBv2MTPStepMeasurement?, completedAtNanos: UInt64,
+        sampledRows: [CBv2RequestID], finalizedPlainRowCount: Int,
+        hasChainedSuccessor: Bool
+    ) {
+        guard depthController.usesCommittedDecodeBaseline,
+            acceptsWorkloadMeasurement(measurement) else { return }
+        let eligible = measurement.map {
+            $0.costEligible && $0.chained && !$0.seedOnly
+                && $0.actualDepth == 0 && $0.decision.depth == 0
+                && $0.decision.decodeRowBucket == CBv2MTPDepthController.decodeRowBucket(sampledRows.count)
+        } == true && hasChainedSuccessor && sampledRows.count == finalizedPlainRowCount
+        guard let elapsed = committedDecodeClock.observe(
+            completedAtNanos: completedAtNanos, rowIDs: sampledRows, eligible: eligible),
+            let measurement else { return }
+        depthController.observeCommittedDecodeInterval(
+            decodeRowBucket: measurement.decision.decodeRowBucket, wallTimeNanos: elapsed)
     }
 
     func recordStepCost(
@@ -779,17 +862,60 @@ final class CBv2MTPRoundDriver {
         finalizedPlainWork: Bool,
         finalizedSeedIDs: Set<CBv2RequestID>,
         finalizedVerification: Bool,
-        claimedSeedCostNanos: UInt64
+        claimedSeedCostNanos: UInt64,
+        completedAtNanos: UInt64 = 0,
+        committedRows: [CBv2RequestID] = [],
+        committedTokenCount: Int = 0
     ) {
         guard wallTimeNanos > 0 else { return }
         let decision = measurement.decision
+        if depthController.usesCommittedDecodeBaseline {
+            guard acceptsWorkloadMeasurement(measurement) else {
+                // Finishing may precede this step's measurement callback.
+                // Preserve executed-work telemetry without reviving learning.
+                if measurement.actualDepth > 0, !measurement.seedOnly, finalizedVerification {
+                    metricsLock.lock()
+                    metrics.totalRoundWallTimeNanos &+= wallTimeNanos &+ claimedSeedCostNanos
+                    metricsLock.unlock()
+                }
+                return
+            }
+            let sample = committedGoodputClock.observe(
+                measurement: measurement, completedAtNanos: completedAtNanos,
+                isolatedWallTimeNanos: wallTimeNanos, rowIDs: committedRows,
+                committedTokens: committedTokenCount)
+            if measurement.actualDepth > 0, !measurement.seedOnly,
+                finalizedVerification
+            {
+                if let sample {
+                    depthController.recordCommittedVerification(
+                        decision: decision, wallTimeNanos: sample.wallTimeNanos,
+                        committedTokens: sample.committedTokens, rowCount: committedRows.count)
+                } else {
+                    depthController.cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
+                }
+                metricsLock.lock()
+                // Warmup is real work even when excluded from steady EWMA.
+                metrics.totalRoundWallTimeNanos &+= sample?.wallTimeNanos
+                    ?? (wallTimeNanos &+ claimedSeedCostNanos)
+                refreshControllerMetricsLocked()
+                metricsLock.unlock()
+                return
+            }
+        }
         if measurement.seedOnly, decision.depth > 0 {
-            guard measurement.costEligible, !finalizedSeedIDs.isEmpty else { return }
+            guard measurement.costEligible, !finalizedSeedIDs.isEmpty else {
+                depthController.cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
+                return
+            }
             pendingSeedCosts.record(
                 decodeRowBucket: decision.decodeRowBucket,
                 requestIDs: finalizedSeedIDs,
                 nanos: wallTimeNanos)
             return
+        }
+        if measurement.actualDepth == 0 {
+            depthController.cancelCommittedWindow(decodeRowBucket: decision.decodeRowBucket)
         }
         let rawCostEligible =
             usesMarginalPolicy

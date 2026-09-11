@@ -3569,6 +3569,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var finalizedPlainWork = false
+        var finalizedPlainRowCount = 0
+        var committedPlainRows: [CBv2RequestID] = []
         let mtpSeedIDs = Set(step.mtpRound?.seedRows.map(\.id) ?? [])
         var deferredMTPFinishes: [CBv2RequestID: CBv2FinishReason] = [:]
 
@@ -3583,6 +3585,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             if step.discard.contains(id) { continue }
             guard let rec = scheduler.record(for: id) else { continue }
             finalizedPlainWork = true
+            finalizedPlainRowCount += 1
             let token = Int(host[i])
             for packet in step.logitDiagnostics where packet.requestID == id {
                 packet.seedToken = rec.tokens.last
@@ -3625,6 +3628,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Skipping the detokenizer push keeps its held-back text
             // intact for the finish-time flush.
             let isStopToken = rec.request.stopTokens.contains(token)
+            if !isStopToken { committedPlainRows.append(id) }
             let detokenizer = detokenizers[id]
             let logprobs = logprobsByID[id].map { [$0] }
 
@@ -3689,15 +3693,35 @@ public final class EngineLoopV2: @unchecked Sendable {
         if step.mtpRound != nil {
             finalizeMTPRound(step)
         }
+        mtp?.recordCommittedDecodeBaseline(
+            measurement: step.mtpMeasurement, completedAtNanos: readbackDoneNanos,
+            sampledRows: step.sampledRows, finalizedPlainRowCount: finalizedPlainRowCount,
+            // Only steady pipeline commits qualify. The final draining step
+            // has no successor; stopped/cancelled rows mark it discarded.
+            hasChainedSuccessor: inFlight?.chained == true
+                && inFlight?.sampledRows == step.sampledRows
+                && inFlight?.discard.isEmpty == true)
         if let measurement = step.mtpMeasurement {
-            let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
+            let completedAtNanos = DispatchTime.now().uptimeNanoseconds
+            let elapsed = completedAtNanos &- step.wallStartedNanos
+            let verifiedRows = step.mtpRound?.finalizedVerifyIDs ?? []
+            let actualCommittedRows = verifiedRows.isEmpty
+                ? committedPlainRows : verifiedRows.sorted { $0.raw < $1.raw }
+            let expectedRows = step.mtpRound?.verify?.rows.map(\.id) ?? step.sampledRows
+            let committedRows = step.discard.isEmpty
+                && Set(actualCommittedRows) == Set(expectedRows)
+                ? actualCommittedRows : []
             mtp?.recordStepCost(
                 measurement,
                 wallTimeNanos: elapsed,
                 finalizedPlainWork: finalizedPlainWork,
                 finalizedSeedIDs: step.mtpRound?.finalizedSeedIDs ?? [],
                 finalizedVerification: !(step.mtpRound?.finalizedVerifyIDs.isEmpty ?? true),
-                claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
+                claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0,
+                completedAtNanos: completedAtNanos,
+                committedRows: committedRows,
+                committedTokenCount: verifiedRows.isEmpty
+                    ? committedPlainRows.count : (step.mtpRound?.committedVerifyTokenCount ?? 0))
         }
         step.forwardShapes?.complete()
         // Preserve the normal adaptive-cost clock above. These compact arrays

@@ -258,6 +258,10 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this drafter's rounds may accept via target-prefix
     /// pre-sampling; see the extension default for the full contract.
     var supportsTargetPrefixAcceptance: Bool { get }
+    /// The first stateless draft token may be submitted while target graph
+    /// construction continues. Its graph must only read immutable weights
+    /// and the engine's fenced captures, with no mutable assistant state.
+    var supportsEarlyDraftSubmission: Bool { get }
     /// True when this model's paged full-attention layers may represent an
     /// exact rectangular window as independent native decode rows.
     var prefersBatchedRectangularAttention: Bool { get }
@@ -305,6 +309,7 @@ extension CBv2MTPDrafter {
     /// eligibility gate when the installed sampler also supports MTP verify
     /// sampling. Default false: greedy argmax acceptance only.
     public var supportsTargetPrefixAcceptance: Bool { false }
+    public var supportsEarlyDraftSubmission: Bool { false }
     public var prefersBatchedRectangularAttention: Bool { false }
 }
 
@@ -494,18 +499,24 @@ public struct CBv2MTPCostInput: Sendable, Equatable {
     public var decodeRowBucket: Int
     public var depth: Int
     public var samples: Int
+    /// Whole-window elapsed time for adaptive stateless MTP; per-step time
+    /// for ordinary and legacy policies. Use normalized cadence to compare.
     public var ewmaWallTimeNanos: UInt64
     public var totalWallTimeNanos: UInt64
+    /// Per-row committed-token cadence used by adaptive stateless MTP.
+    public var ewmaNanosPerCommittedToken: UInt64?
 
     public init(
         decodeRowBucket: Int, depth: Int, samples: Int,
-        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64
+        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64,
+        ewmaNanosPerCommittedToken: UInt64? = nil
     ) {
         self.decodeRowBucket = decodeRowBucket
         self.depth = depth
         self.samples = samples
         self.ewmaWallTimeNanos = ewmaWallTimeNanos
         self.totalWallTimeNanos = totalWallTimeNanos
+        self.ewmaNanosPerCommittedToken = ewmaNanosPerCommittedToken
     }
 }
 

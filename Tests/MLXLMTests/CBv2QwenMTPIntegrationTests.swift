@@ -379,6 +379,31 @@ private final class QwenMTPIncompatibleTarget: QwenMTPFixtureModel {
 
 @Suite("CBv2 Qwen-style request-stateful MTP", .serialized)
 struct CBv2QwenMTPIntegrationTests {
+    @Test("stateful target-prefix policy retains its isolated decode baseline")
+    func statefulTargetPrefixDoesNotRequireChainedCalibration() throws {
+        let model = QwenMTPFixtureModel()
+        let drafter = QwenMTPFixtureDrafter(
+            target: model, correctionOffset: 0, targetPrefix: true)
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model, drafter: drafter,
+                config: .init(
+                    enabled: true, maxDraftTokens: 1,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: nil)))
+        driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
+        let baseline = driver.controllerDecision
+        #expect(baseline.reason == "warmup_baseline")
+        driver.recordStepCost(
+            .init(
+                decision: baseline, actualDepth: 0, costEligible: true,
+                chained: false, seedOnly: false),
+            wallTimeNanos: 12_000_000, finalizedPlainWork: true,
+            finalizedSeedIDs: [], finalizedVerification: false, claimedSeedCostNanos: 0)
+        driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
+        #expect(driver.controllerDecision.depth == 1)
+        #expect(driver.controllerDecision.reason == "explore_cost")
+    }
+
     @Test("assistant allocation refusal restores ownership for terminal cleanup")
     func assistantConfigurationFailureRestoresOwnership() throws {
         let model = QwenMTPFixtureModel()

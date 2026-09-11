@@ -6,6 +6,147 @@ import Testing
 
 @Suite("CBv2MTPDepthController")
 struct CBv2MTPDepthControllerTests {
+    @Test func targetPrefixDriverRequiresRealCommittedDecodeCalibration() throws {
+        let model = MTPControllerTestModel()
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model,
+                drafter: MTPControllerTestDrafter(target: model, targetPrefixAcceptance: true),
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 1,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: nil)))
+        record(
+            driver, decision: begin(driver), actualDepth: 0,
+            wallTimeNanos: 12_000_000, finalizedPlainWork: true)
+        let calibration = begin(driver)
+        #expect(calibration.reason == "warmup_chained_baseline")
+        let measurement = CBv2MTPStepMeasurement(
+            decision: calibration, actualDepth: 0, costEligible: true,
+            chained: true, seedOnly: false)
+        let rows = [CBv2RequestID(1)]
+        var timestamp: UInt64 = 1_000_000_000
+        func commit(
+            _ sample: CBv2MTPStepMeasurement?, finalizedRows: Int = 1,
+            successor: Bool = true
+        ) {
+            timestamp += 8_000_000
+            driver.recordCommittedDecodeBaseline(
+                measurement: sample, completedAtNanos: timestamp,
+                sampledRows: rows, finalizedPlainRowCount: finalizedRows,
+                hasChainedSuccessor: successor)
+        }
+        // Each disqualifying finalize clears the preceding anchor. None of
+        // these gaps may become the three required steady baseline samples.
+        let invalidSamples: [CBv2MTPStepMeasurement?] = [
+            nil,
+            .init(
+                decision: calibration, actualDepth: 0, costEligible: false,
+                chained: true, seedOnly: false),
+            .init(
+                decision: calibration, actualDepth: 0, costEligible: true,
+                chained: true, seedOnly: true),
+            .init(
+                decision: calibration, actualDepth: 0, costEligible: true,
+                chained: false, seedOnly: false),
+        ]
+        for invalid in invalidSamples {
+            commit(measurement)
+            commit(invalid)
+            #expect(begin(driver).reason == "warmup_chained_baseline")
+        }
+        commit(measurement)
+        commit(measurement, finalizedRows: 0)
+        commit(measurement)
+        commit(measurement, successor: false)
+        timestamp += 60_000_000_000  // idle between requests is excluded
+        commit(measurement)  // pipeline fill anchor
+        for _ in 0 ..< 2 {
+            commit(measurement)
+            #expect(begin(driver).reason == "warmup_chained_baseline")
+        }
+        commit(measurement)
+        let probe = begin(driver)
+        #expect(probe.depth == 1)
+        #expect(probe.reason == "explore_cost")
+        let baseline = try #require(driver.metricsSnapshot().costInputs.first {
+            $0.depth == 0
+        })
+        #expect(baseline.samples == 3)
+        #expect(baseline.ewmaWallTimeNanos == 8_000_000)
+        #expect(baseline.totalWallTimeNanos == 24_000_000)
+    }
+
+    @Test func statelessDriverKeepsWarmupTelemetryAndLearnsRetainedCarry() throws {
+        let model = MTPControllerTestModel()
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model,
+                drafter: MTPControllerTestDrafter(target: model, targetPrefixAcceptance: true),
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 1,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: nil,
+                    maxAutomaticRectangularTokens: 2)))
+        record(
+            driver, decision: begin(driver), actualDepth: 0,
+            wallTimeNanos: 12_000_000, finalizedPlainWork: true)
+        let rows = [CBv2RequestID(1)]
+        let calibration = CBv2MTPStepMeasurement(
+            decision: begin(driver), actualDepth: 0,
+            costEligible: true, chained: true, seedOnly: false)
+        for index in 0 ..< 4 {
+            driver.recordCommittedDecodeBaseline(
+                measurement: calibration,
+                completedAtNanos: 1_000_000_000 + UInt64(index) * 8_700_000,
+                sampledRows: rows, finalizedPlainRowCount: 1, hasChainedSuccessor: true)
+        }
+        let probe = begin(driver)
+        driver.recordStepCost(
+            .init(decision: probe, actualDepth: 0, costEligible: true, chained: false, seedOnly: true),
+            wallTimeNanos: 8_000_000, finalizedPlainWork: true,
+            finalizedSeedIDs: Set(rows), finalizedVerification: false, claimedSeedCostNanos: 0,
+            completedAtNanos: 2_000_000_000, committedRows: rows, committedTokenCount: 1)
+        let seedCost = driver.claimPendingSeedCost(decodeRowBucket: 1, finalizedVerifyIDs: Set(rows))
+        driver.recordStepCost(
+            .init(decision: probe, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+            wallTimeNanos: 900_000_000, finalizedPlainWork: false,
+            finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: seedCost,
+            completedAtNanos: 2_900_000_000, committedRows: rows, committedTokenCount: 2)
+        #expect(driver.metricsSnapshot().totalRoundWallTimeNanos == 908_000_000)
+        #expect(driver.metricsSnapshot().costInputs.allSatisfy { $0.depth == 0 })
+        for index in 1 ..< 8 {
+            let confirmation = begin(driver)
+            #expect(confirmation.depth == 1)
+            #expect(confirmation.reason == "explore_window")
+            driver.recordStepCost(
+                .init(decision: confirmation, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+                wallTimeNanos: 14_000_000, finalizedPlainWork: false,
+                finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
+                completedAtNanos: 2_900_000_000 + UInt64(index) * 16_000_000,
+                committedRows: rows, committedTokenCount: 2)
+            if index < 7 {
+                #expect(driver.metricsSnapshot().costInputs.allSatisfy { $0.depth == 0 })
+            }
+        }
+        let cost = try #require(driver.metricsSnapshot().costInputs.first { $0.depth == 1 })
+        #expect(cost.samples == 1)
+        #expect(cost.ewmaWallTimeNanos == 112_000_000)
+        #expect(cost.ewmaNanosPerCommittedToken == 8_000_000)
+        #expect(driver.metricsSnapshot().totalRoundWallTimeNanos == 1_020_000_000)
+        let active = begin(driver)
+        #expect(active.reason == "goodput")
+        driver.recordStepCost(
+            .init(decision: active, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+            wallTimeNanos: 14_000_000, finalizedPlainWork: false,
+            finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
+            completedAtNanos: 3_028_000_000, committedRows: rows, committedTokenCount: 2)
+        #expect(begin(driver).reason == "goodput_window")
+        #expect(driver.planDepth == 1)
+        driver.clampPlanDepth(to: 0, reason: "tail_depth")
+        #expect(driver.planDepth == 0)
+        #expect(begin(driver).reason == "goodput")
+        #expect(driver.metricsSnapshot().costInputs.first { $0.depth == 1 }?.samples == 1)
+    }
+
     @Test func automaticVerificationCapsDepthByRectangularWork() throws {
         let model = MTPControllerTestModel()
         let driver = try #require(
@@ -673,9 +814,11 @@ private final class MTPControllerTestPrepared: CBv2MTPPreparedCapture {}
 
 private final class MTPControllerTestDrafter: CBv2MTPDrafter {
     let mtpTargetIdentity: ObjectIdentifier?
+    let supportsTargetPrefixAcceptance: Bool
 
-    init(target: MTPControllerTestModel) {
+    init(target: MTPControllerTestModel, targetPrefixAcceptance: Bool = false) {
         self.mtpTargetIdentity = ObjectIdentifier(target)
+        self.supportsTargetPrefixAcceptance = targetPrefixAcceptance
     }
 
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
