@@ -51,4 +51,4 @@ Record exact source, artifact, sampler, MTP/cache posture, binary/metallib and
 pass/fail/skip counts. Supply approved environment configuration externally;
 never commit endpoints, credentials or private diagnostics.
 
-Implementation provenance and excluded experiments: [composition](QWEN4-COMPOSITION.md).
+Implementation provenance and excluded experiments: [composition](composition.md).

@@ -16,11 +16,11 @@ Reference: <https://github.com/jonathan308/omlx-fusion>.
 Copyright 2025 oMLX contributors.
 
 Adapted oMLX portions are provided under the Apache License, Version 2.0.
-The complete license is in `LICENSE-APACHE-2.0`. Swift translation, native
+The complete license is in [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0). Swift translation, native
 paged storage integration, explicit state/ownership validation and local
 qualification are modifications, not an assertion that the upstream code was
 distributed in this form. Model preprocessing references have their own notice
-in `NOTICE-QWEN4-PREPROCESSING.md`.
+in [preprocessing attribution](preprocessing.md).
 
 ## mlx-serve
 

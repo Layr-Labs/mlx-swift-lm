@@ -195,10 +195,7 @@ def:
             - "Libraries/MLXLMCommon/Resources/Qwen4Metal/**"
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
-            - "NOTICE-QWEN4-IMPLEMENTATION-REFERENCES.md"
-            - "NOTICE-QWEN4-PREPROCESSING.md"
-            - "QWEN4-COMPOSITION.md"
-            - "QWEN4-QUALIFICATION.md"
+            - "docs/qwen4/**"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
@@ -299,6 +296,5 @@ def:
 
 # ignored globally, does not count towards line count
 ignore:
-  - "LICENSE-APACHE-2.0"
   - "fork.yaml"
   - ".github/**"

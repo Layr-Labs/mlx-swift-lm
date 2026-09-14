@@ -21,7 +21,7 @@ All rights reserved.
 Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 
 These adaptations are provided under Apache License 2.0; the complete license
-is in `LICENSE-APACHE-2.0`. Modifications include translation to Swift, explicit
+is in [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0). Modifications include translation to Swift, explicit
 overflow/metadata validation, and separation of geometry from allocation and
 memory admission. This notice does not relicense unrelated files or establish
 that all preprocessing integration and model qualification gates have passed.

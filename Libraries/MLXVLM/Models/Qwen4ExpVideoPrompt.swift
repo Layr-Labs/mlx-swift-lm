@@ -1,5 +1,5 @@
 // Copyright © 2026 Eigen Labs.
-// Timestamp layout follows Transformers v5.8.0 Qwen3VLProcessor; see NOTICE-QWEN4-PREPROCESSING.md.
+// Timestamp layout follows Transformers v5.8.0; see docs/qwen4/preprocessing.md.
 import Foundation
 import MLXLMCommon
 

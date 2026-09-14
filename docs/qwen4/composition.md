@@ -4,7 +4,7 @@ Prepared September 11, 2026. This is a local review candidate, not a production
 qualification, benchmark result, or publication authorization.
 
 Parent verification after composition is recorded in
-[the September 12 validation checkpoint](QWEN4-QUALIFICATION.md).
+[the qualification scope](qualification.md).
 The original composition-only checks below retain their historical scope.
 
 ## Source identity and scope

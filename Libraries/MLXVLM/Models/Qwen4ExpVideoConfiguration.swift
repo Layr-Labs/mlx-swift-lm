@@ -1,5 +1,5 @@
 // Copyright © 2026 Eigen Labs.
-// Configuration semantics follow Transformers v5.8.0; see NOTICE-QWEN4-PREPROCESSING.md.
+// Configuration follows Transformers v5.8.0; see docs/qwen4/preprocessing.md.
 import Foundation
 
 struct Qwen4ExpVideoConfiguration: Codable, Sendable {

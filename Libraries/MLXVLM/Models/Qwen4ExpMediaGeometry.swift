@@ -1,10 +1,6 @@
-// Adapted from Transformers v5.8.0, commit 049d2bf1220747b6d39e2a978b9f5fe0defa1dca:
-// qwen2_vl/image_processing_qwen2_vl.py (smart_resize), and
-// qwen3_vl/{video_processing_qwen3_vl,processing_qwen3_vl}.py.
 // Copyright 2024 The Qwen team, Alibaba Group and The HuggingFace Inc. team. All rights reserved.
 // Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
-// Licensed under Apache License 2.0; see LICENSE-APACHE-2.0 and NOTICE-QWEN4-PREPROCESSING.md.
-// Provided AS IS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
+// Adapted from Transformers v5.8.0 (Apache-2.0); see docs/qwen4/preprocessing.md.
 
 import Foundation
 
