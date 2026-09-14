@@ -4,6 +4,7 @@ extension CBv2CompleteCheckpointManifest {
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, identity, backendLayout, position, chunkSize
         case prefixTokens, cacheSalt, assistantCodecID, tensors, attentionLayers
+        case mediaIdentity, mediaTargetOnly
     }
 
     public init(from decoder: any Decoder) throws {
@@ -16,6 +17,8 @@ extension CBv2CompleteCheckpointManifest {
             chunkSize: try values.decode(Int.self, forKey: .chunkSize),
             cacheSalt: try values.decodeIfPresent(String.self, forKey: .cacheSalt),
             assistantCodecID: try values.decodeIfPresent(String.self, forKey: .assistantCodecID),
+            mediaIdentity: try values.decodeIfPresent(CBv2HybridPrefixIdentity.self, forKey: .mediaIdentity),
+            mediaTargetOnly: try values.decodeIfPresent(Bool.self, forKey: .mediaTargetOnly) ?? false,
             metadata: .init(
                 tokens: try values.decode([Int].self, forKey: .prefixTokens),
                 tensors: try values.decode([CBv2CheckpointTensorDescriptor].self, forKey: .tensors),
@@ -32,6 +35,8 @@ extension CBv2CompleteCheckpointManifest {
         try values.encode(prefixTokens, forKey: .prefixTokens)
         try values.encodeIfPresent(cacheSalt, forKey: .cacheSalt)
         try values.encodeIfPresent(assistantCodecID, forKey: .assistantCodecID)
+        try values.encodeIfPresent(mediaIdentity, forKey: .mediaIdentity)
+        if mediaTargetOnly { try values.encode(true, forKey: .mediaTargetOnly) }
         try values.encode(tensors, forKey: .tensors)
         try values.encodeIfPresent(attentionLayers, forKey: .attentionLayers)
     }
@@ -41,6 +46,7 @@ extension CBv2CompleteCheckpointManifest {
             && lhs.backendLayout == rhs.backendLayout && lhs.position == rhs.position
             && lhs.chunkSize == rhs.chunkSize && lhs.prefixTokens == rhs.prefixTokens
             && lhs.cacheSalt == rhs.cacheSalt && lhs.assistantCodecID == rhs.assistantCodecID
+            && lhs.mediaIdentity == rhs.mediaIdentity && lhs.mediaTargetOnly == rhs.mediaTargetOnly
             && lhs.tensors == rhs.tensors && lhs.attentionLayers == rhs.attentionLayers
     }
 }

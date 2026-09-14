@@ -18,12 +18,22 @@ func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
 
 // MARK: - Model Components
 
+enum QwenGatedNormActivation: Sendable {
+    case silu
+    case sigmoid
+}
+
 final class Qwen3NextRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
+    let gateActivation: QwenGatedNormActivation
 
-    init(dimensions: Int, eps: Float) {
+    init(
+        dimensions: Int, eps: Float,
+        gateActivation: QwenGatedNormActivation = .silu
+    ) {
         self.eps = eps
+        self.gateActivation = gateActivation
         self._weight.wrappedValue = MLXArray.ones([dimensions])
         super.init()
     }
@@ -32,7 +42,14 @@ final class Qwen3NextRMSNormGated: Module {
         let x = MLXFast.rmsNorm(hiddenStates, weight: weight, eps: eps)
         if let gate {
             // Upcast to float32 for numerical precision — mirrors Python _precise_swiglu.
-            let g = silu(gate.asType(.float32))
+            let raw = gate.asType(.float32)
+            let g: MLXArray
+            switch gateActivation {
+            case .silu:
+                g = silu(raw)
+            case .sigmoid:
+                g = sigmoid(raw)
+            }
             return (g * x.asType(.float32)).asType(hiddenStates.dtype)
         }
         return x

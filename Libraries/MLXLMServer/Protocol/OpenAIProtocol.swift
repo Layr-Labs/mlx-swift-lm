@@ -35,7 +35,7 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let type = try container.decode(String.self, forKey: .type)
         switch type {
-        case PartType.text.rawValue, PartType.inputText.rawValue:
+        case PartType.text.rawValue, PartType.inputText.rawValue, "output_text":
             self = .text(try container.decode(String.self, forKey: .text))
         case PartType.imageURL.rawValue:
             let image = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageURL)
@@ -372,9 +372,11 @@ public enum OpenAIToolChoice: Codable, Sendable, Equatable {
 
 public struct OpenAIReasoningConfig: Codable, Sendable, Equatable {
     public var enabled: Bool?
+    public var effort: String?
 
-    public init(enabled: Bool? = nil) {
+    public init(enabled: Bool? = nil, effort: String? = nil) {
         self.enabled = enabled
+        self.effort = effort
     }
 }
 
@@ -398,6 +400,8 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var frequencyPenalty: Float?
     public var repetitionPenalty: Float?
     public var stop: [String]?
+    public var seed: UInt64?
+    public var logitBias: [String: Float]?
     public var streamOptions: OpenAIStreamOptions?
 
     private enum CodingKeys: String, CodingKey {
@@ -420,6 +424,8 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         case frequencyPenalty = "frequency_penalty"
         case repetitionPenalty = "repetition_penalty"
         case stop
+        case seed
+        case logitBias = "logit_bias"
         case streamOptions = "stream_options"
     }
 
@@ -443,6 +449,8 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         frequencyPenalty: Float? = nil,
         repetitionPenalty: Float? = nil,
         stop: [String]? = nil,
+        seed: UInt64? = nil,
+        logitBias: [String: Float]? = nil,
         streamOptions: OpenAIStreamOptions? = nil
     ) {
         self.model = model
@@ -464,6 +472,8 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
         self.frequencyPenalty = frequencyPenalty
         self.repetitionPenalty = repetitionPenalty
         self.stop = stop
+        self.seed = seed
+        self.logitBias = logitBias
         self.streamOptions = streamOptions
     }
 
@@ -496,21 +506,36 @@ public struct OpenAIStreamOptions: Codable, Sendable, Equatable {
     }
 }
 
+public struct OpenAICachedTokenDetails: Codable, Sendable, Equatable {
+    public var cachedTokens: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case cachedTokens = "cached_tokens"
+    }
+
+    public init(cachedTokens: Int) { self.cachedTokens = cachedTokens }
+}
+
 public struct OpenAIUsage: Codable, Sendable, Equatable {
     public var promptTokens: Int
     public var completionTokens: Int
     public var totalTokens: Int
+    public var promptTokensDetails: OpenAICachedTokenDetails?
 
     private enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
         case totalTokens = "total_tokens"
+        case promptTokensDetails = "prompt_tokens_details"
     }
 
-    public init(promptTokens: Int, completionTokens: Int) {
+    public init(promptTokens: Int, completionTokens: Int, cachedPromptTokens: Int? = nil) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.totalTokens = promptTokens + completionTokens
+        self.promptTokensDetails = cachedPromptTokens.map {
+            .init(cachedTokens: min(max(0, $0), max(0, promptTokens)))
+        }
     }
 }
 

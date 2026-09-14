@@ -198,7 +198,8 @@ public struct MLXOpenAIService: Sendable {
                         case .info(let info):
                             usage = .init(
                                 promptTokens: info.promptTokens,
-                                completionTokens: info.completionTokens
+                                completionTokens: info.completionTokens,
+                                cachedPromptTokens: info.cachedPromptTokens
                             )
                             if finishReason != "tool_calls" {
                                 finishReason = info.stopReason
@@ -266,6 +267,61 @@ public struct MLXOpenAIService: Sendable {
             continuation.onTermination = { _ in
                 task.cancel()
             }
+        }
+    }
+
+    public func streamResponseFrames(
+        request: OpenAIResponseRequest
+    ) async throws -> AsyncThrowingStream<String, Error> {
+        await metrics.recordResponseRequest()
+        let generationRequest = try OpenAIResponseFormatSupport.preparedRequest(request.chatCompletionRequest)
+        let stream = try await engine.streamChatCompletion(request: generationRequest)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                var writer = ResponsesStreamWriter(request: request, idProvider: idProvider)
+                var parser = StreamingReasoningParser(format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
+                do {
+                    try writer.start()
+                    for frame in writer.takeFrames() { continuation.yield(frame) }
+                    for try await event in stream {
+                        try Task.checkCancellation()
+                        switch event {
+                        case .content(let text):
+                            for parsed in parser.parse(text) { try writer.append(parsed) }
+                        case .parsed(let parsed):
+                            try writer.append(parsed)
+                        case .toolCall(let call):
+                            for parsed in parser.finish() { try writer.append(parsed) }
+                            try writer.append(call)
+                        case .info(let info):
+                            writer.update(info)
+                        }
+                        for frame in writer.takeFrames() { continuation.yield(frame) }
+                    }
+                    try Task.checkCancellation()
+                    for parsed in parser.finish() { try writer.append(parsed) }
+                    let response = try writer.finish()
+                    if request.store != false { await responseStore.save(response) }
+                    if let usage = response.usage { await metrics.recordUsage(usage.chatUsage) }
+                    for frame in writer.takeFrames() { continuation.yield(frame) }
+                    continuation.finish()
+                } catch {
+                    await metrics.recordError()
+                    if Task.isCancelled {
+                        continuation.finish(throwing: CancellationError())
+                        return
+                    }
+                    do {
+                        let response = try writer.fail(error)
+                        if request.store != false { await responseStore.save(response) }
+                        for frame in writer.takeFrames() { continuation.yield(frame) }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -368,7 +424,8 @@ public struct MLXOpenAIService: Sendable {
             case .info(let info):
                 output.usage = .init(
                     promptTokens: info.promptTokens,
-                    completionTokens: info.completionTokens
+                    completionTokens: info.completionTokens,
+                    cachedPromptTokens: info.cachedPromptTokens
                 )
                 if output.finishReason != "tool_calls" {
                     output.finishReason = info.stopReason
@@ -436,14 +493,16 @@ public struct MLXOpenAIService: Sendable {
             outputItems.append(.functionCall(id: idProvider("fc"), toolCall: toolCall))
         }
 
+        let incomplete = output.toolCalls.isEmpty && ["length", "content_filter"].contains(output.finishReason)
         return .init(
             id: idProvider("resp"),
-            status: .completed,
+            status: incomplete ? .incomplete : .completed,
             model: request.model,
             output: outputItems,
             outputText: parsed.content,
             usage: output.usage.map(OpenAIResponseUsage.init(chatUsage:)),
-            metadata: request.metadata
+            metadata: request.metadata,
+            incompleteDetails: incomplete ? .init(reason: output.finishReason == "length" ? "max_output_tokens" : output.finishReason) : nil
         )
     }
 }

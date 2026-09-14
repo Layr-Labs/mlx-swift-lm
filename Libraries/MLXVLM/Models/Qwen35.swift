@@ -266,7 +266,7 @@ public struct Qwen35VisionFeature: @unchecked Sendable {
     /// `[1, visualTokens, textHidden]`, in the language token-embedding dtype.
     public let features: MLXArray
 
-    fileprivate init(kind: Kind, features: MLXArray) {
+    init(kind: Kind, features: MLXArray) {
         self.kind = kind
         self.features = features
     }
@@ -289,7 +289,7 @@ public struct Qwen35VisionFeatures: @unchecked Sendable {
     /// image and video placeholder tokens.
     public let flattenedFeatures: MLXArray
 
-    fileprivate init(ordered: [Qwen35VisionFeature], flattenedFeatures: MLXArray) {
+    init(ordered: [Qwen35VisionFeature], flattenedFeatures: MLXArray) {
         self.ordered = ordered
         self.flattenedFeatures = flattenedFeatures
     }

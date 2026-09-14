@@ -58,13 +58,20 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     /// entire retained SSM backing; it survives until every alias retires.
     func capture(
         requestID: CBv2RequestID, position: Int, chunkSize: Int,
-        layers: [Int: CBv2RecurrentLayerState], assistantState: (any CBv2MTPRequestState)?
+        layers: [Int: CBv2RecurrentLayerState], assistantState: (any CBv2MTPRequestState)?,
+        rowStates: [CBv2SequenceKV?] = [],
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
     ) -> [MLXArray] {
         guard !isClosed, position > 1, chunkSize > 1, position % chunkSize == 0,
+            !mediaTargetOnly || mediaIdentity != nil,
             !(staged[requestID]?.contains { $0.checkpoint?.position == position } ?? false)
         else { return [] }
         do {
-            let descriptors = try codec.tensorDescriptors(position: position)
+            let qwen4 = try codec.qwen4Snapshots(rows: rowStates, position: position)
+            let logical = CBv2RecurrentCheckpoint(position: position, chunkSize: chunkSize,
+                layers: [:], byteCount: 0, qwen4: qwen4)
+            let descriptors = try codec.tensorDescriptors(position: position, qwen4: codec.qwen4Descriptors(logical),
+                                                          mediaTargetOnly: mediaTargetOnly)
             var packedBytes = 0
             for descriptor in descriptors {
                 let (next, overflow) = packedBytes.addingReportingOverflow(descriptor.byteCount)
@@ -84,7 +91,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             let reservation = try codec.admission.reserveTransient(bytes: bytes)
             let checkpoint = try withError { error in
                 var assistant: (any CBv2MTPPrefixCheckpoint)?
-                if let drafter = codec.assistant {
+                if let drafter = codec.assistant, !mediaTargetOnly {
                     guard let assistantState,
                         let captured = drafter.capturePrefixCheckpoint(requestState: assistantState, targetInputCount: position)
                     else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
@@ -100,7 +107,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 try error.check()
                 return CBv2RecurrentCheckpoint(
                     position: position, chunkSize: chunkSize, layers: copies,
-                    byteCount: stateDescriptors.reduce(0) { $0 + $1.byteCount }, assistant: assistant)
+                    byteCount: stateDescriptors.reduce(0) { $0 + $1.byteCount }, assistant: assistant,
+                    qwen4: try codec.compactQwen4(qwen4), mediaIdentity: mediaIdentity,
+                    mediaTargetOnly: mediaTargetOnly)
             }
             let captured = CBv2CapturedCompleteCheckpoint(checkpoint: checkpoint, reservation: reservation)
             if staged[requestID, default: []].count == 2 {

@@ -88,6 +88,7 @@ public enum VLMTypeRegistry {
         "qwen3_vl_moe": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        "qwen4_exp": create(Qwen4ExpVLMConfiguration.self, Qwen4Exp.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
@@ -114,6 +115,8 @@ public enum VLMProcessorTypeRegistry {
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
             Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen4ExpProcessor": create(
+            Qwen4ExpProcessorConfiguration.self, Qwen4ExpProcessor.init),
         "Idefics3Processor": create(
             Idefics3ProcessorConfiguration.self, Idefics3Processor.init),
         "Gemma3Processor": create(
@@ -403,14 +406,13 @@ public final class VLMModelFactory: GenericModelFactory {
         // Override processor type based on model type for models that need special handling
         // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
         // to handle spatial merging correctly
-        let processorTypeOverrides: [String: String] = [
-            "mistral3": "Mistral3Processor"
-        ]
-        let processorType =
-            processorTypeOverrides[baseConfig.modelType] ?? baseProcessorConfig.processorClass
+        let processorType = Self.processorType(
+            modelType: baseConfig.modelType, declaredClass: baseProcessorConfig.processorClass)
 
         let processor = try await processorRegistry.createModel(
-            configuration: processorConfigData,
+            configuration: baseConfig.modelType == "qwen4_exp"
+                ? Qwen4ExpProcessorFiles.combined(directory: modelDirectory, fallbackImage: processorConfigData)
+                : processorConfigData,
             processorType: processorType, tokenizer: tokenizer)
 
         // Build a ModelConfiguration for the ModelContext
@@ -437,6 +439,16 @@ public final class VLMModelFactory: GenericModelFactory {
 private struct ProcessorConfigError: Error {
     let filename: String
     let underlying: Error
+}
+
+extension VLMModelFactory {
+    static func processorType(modelType: String, declaredClass: String) -> String {
+        switch modelType {
+        case "mistral3": "Mistral3Processor"
+        case "qwen4_exp": "Qwen4ExpProcessor"
+        default: declaredClass
+        }
+    }
 }
 
 /// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.

@@ -9,6 +9,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     let recurrentSpec: CBv2RecurrentStateSpec?
     let kvDTypes: [DType]
     let assistant: (any CBv2MTPPrefixCheckpointCoding)?
+    let qwen4Geometries: [CBv2Qwen4CheckpointGeometry]
     let admission: AdmissionV2
     /// Copied immutable layout only. Planning/staging never reads live pool maps.
     let pagedConfig: PagedKVPoolConfig?
@@ -28,20 +29,27 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         identity: CBv2CompleteCheckpointIdentity, layerKinds: [CBv2LayerKind],
         recurrentSpec: CBv2RecurrentStateSpec?, kvDTypes: [DType],
         assistant: (any CBv2MTPPrefixCheckpointCoding)?, admission: AdmissionV2,
-        pagedConfig: PagedKVPoolConfig? = nil
+        pagedConfig: PagedKVPoolConfig? = nil,
+        qwen4Geometries: [CBv2Qwen4CheckpointGeometry] = []
     ) {
         self.identity = identity
         self.layerKinds = layerKinds
         self.recurrentSpec = recurrentSpec
         self.kvDTypes = kvDTypes
         self.assistant = assistant
+        self.qwen4Geometries = qwen4Geometries
         self.admission = admission
         self.pagedConfig = pagedConfig
         self.historicalLayout = recurrentSpec == nil && pagedConfig != nil && assistant == nil
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil
     }
 
-    func tensorDescriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
+    func tensorDescriptors(position: Int, qwen4: [CBv2CheckpointTensorDescriptor] = [],
+                           mediaTargetOnly: Bool = false) throws -> [CBv2CheckpointTensorDescriptor] {
+        guard !mediaTargetOnly || !qwen4Geometries.isEmpty else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        try validateQwen4Descriptors(qwen4, position: position)
         if let historicalLayout {
             guard identity.isValid, position > 1 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             return try historicalLayout.tensorDescriptors(position: position)
@@ -53,7 +61,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         for (index, kind) in layerKinds.enumerated() {
             guard case .full = kind.attention, kind.sharesKVWithLayer == nil,
                 kind.kvHeads > 0, kind.headDim > 0,
-                let kvDType = CBv2CheckpointDType(kvDTypes[index]), kvDType != .int32
+                let kvDType = CBv2CheckpointDType(kvDTypes[index]), kvDType.isFloatingPoint
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             for role in [CBv2CheckpointTensorRole.keys, .values] {
                 result.append(try .init(
@@ -70,7 +78,8 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             result.append(try .init(
                 role: .recurrent, layer: spec.modelLayerIndex, shape: spec.ssmShape, dtype: ssm))
         }
-        if let assistant {
+        result.append(contentsOf: qwen4)
+        if let assistant, !mediaTargetOnly {
             guard let descriptors = assistant.prefixCheckpointTensorDescriptors(targetInputCount: position)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             result.append(contentsOf: descriptors)
@@ -84,17 +93,20 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     ) throws -> CBv2CompleteCheckpointImportPlan {
         _ = try manifest.validateStructure()
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
-        guard !overflow, request.prefixCacheEnabled, request.multimodal == nil,
-            request.positionState == nil, manifest.identity == identity,
+        guard !overflow, request.permitsHybridCheckpoint(layerKinds: layerKinds),
+            manifest.identity == identity,
             manifest.backendLayout == backendLayout,
-            manifest.cacheSalt == request.cacheSalt,
+            manifest.cacheSalt == request.checkpointCacheSalt,
+            manifest.mediaIdentity == request.hybridPrefixIdentity,
+            manifest.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint,
             manifest.position < request.promptTokens.count,
             manifest.prefixTokens.elementsEqual(request.promptTokens.prefix(manifest.position)),
             manifest.chunkSize >= minimumChunkSize, manifest.chunkSize <= maximumChunkSize,
             CBv2AttentionV1.queryBlockSize <= 0 || manifest.chunkSize % CBv2AttentionV1.queryBlockSize == 0,
-            manifest.assistantCodecID == assistant?.prefixCheckpointCodecID,
+            manifest.assistantCodecID == (manifest.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID),
             manifest.attentionLayers == historicalLayout?.layers,
-            manifest.tensors == (try tensorDescriptors(position: manifest.position))
+            manifest.tensors == (try tensorDescriptors(position: manifest.position, qwen4: qwen4Descriptors(in: manifest),
+                                                       mediaTargetOnly: manifest.mediaTargetOnly))
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         return try .init(codec: self, manifest: manifest, maximumSequenceLength: maximumLength)
     }
@@ -120,7 +132,8 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         checkpoint: CBv2RecurrentCheckpoint, kv: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         tokens: [Int], cacheSalt: String?, metadataPermit: CBv2CheckpointManifestMemory.Permit
     ) throws -> CBv2CompleteCheckpointExport {
-        let descriptors = try tensorDescriptors(position: checkpoint.position)
+        let descriptors = try tensorDescriptors(position: checkpoint.position, qwen4: qwen4Descriptors(checkpoint),
+                                                mediaTargetOnly: checkpoint.mediaTargetOnly)
         var arrays: [MLXArray] = []
         for entry in kv {
             guard let entry, entry.offset >= checkpoint.position else {
@@ -135,7 +148,8 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             arrays.append(contentsOf: [conv, ssm])
         }
-        if let assistant {
+        arrays.append(contentsOf: try qwen4Arrays(checkpoint))
+        if let assistant, !checkpoint.mediaTargetOnly {
             guard let state = checkpoint.assistant,
                 let encoded = assistant.encodePrefixCheckpoint(state)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
@@ -151,7 +165,8 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         let manifest = CBv2CompleteCheckpointManifest(
             schemaVersion: CBv2CompleteCheckpointManifest.currentSchemaVersion, identity: identity,
             backendLayout: backendLayout, position: checkpoint.position, chunkSize: checkpoint.chunkSize,
-            cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
+            cacheSalt: cacheSalt, assistantCodecID: checkpoint.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID,
+            mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
             metadata: .init(tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors, permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(manifest: manifest, arrays: arrays, usesProcessMemoryOwner: admission.hasProcessMemoryOwner)
@@ -181,8 +196,10 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 offset: manifest.position, maxLength: maximumSequenceLength,
                 kvHeads: kind.kvHeads, headDim: kind.headDim))
         }
-        return .init(state: rows, checkpoint: try recurrentCheckpoint(
-            manifest: manifest, auxiliary: Array(arrays.dropFirst(targetTensorCount))))
+        let checkpoint = try recurrentCheckpoint(
+            manifest: manifest, auxiliary: Array(arrays.dropFirst(targetTensorCount)))
+        try restoreQwen4(checkpoint, rows: rows)
+        return .init(state: rows, checkpoint: checkpoint)
     }
 
     /// Decode only after the complete authenticated import owns evaluated
@@ -193,7 +210,8 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         defer { withExtendedLifetime(manifest) {} }
         guard recurrentSpec != nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let descriptors = Array(manifest.tensors.dropFirst(targetTensorCount))
-        guard manifest.tensors == (try tensorDescriptors(position: manifest.position)),
+        guard manifest.tensors == (try tensorDescriptors(position: manifest.position, qwen4: qwen4Descriptors(in: manifest),
+                                                          mediaTargetOnly: manifest.mediaTargetOnly)),
               auxiliary.count == descriptors.count,
               zip(auxiliary, descriptors).allSatisfy({ $0.0.shape == $0.1.shape && $0.0.dtype == $0.1.dtype.mlxDType })
         else { throw CBv2CompleteCheckpointError.incompleteTransfer }
@@ -204,8 +222,17 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             checkpointBytes += auxiliary[cursor].nbytes + auxiliary[cursor + 1].nbytes
             cursor += 2
         }
+        var qwen4Snapshots: [Int: CBv2Qwen4IndexerSnapshot] = [:]
+        for geometry in qwen4Geometries {
+            let side = qwen4Descriptors(in: manifest).filter { $0.layer == geometry.layer }
+            let values = Array(auxiliary[cursor..<cursor + side.count])
+            qwen4Snapshots[geometry.layer] = try CBv2Qwen4CheckpointTensorCodec.decode(
+                values, descriptors: side, position: manifest.position, geometry: geometry)
+            checkpointBytes += values.reduce(0) { $0 + $1.nbytes }
+            cursor += side.count
+        }
         var assistantCheckpoint: (any CBv2MTPPrefixCheckpoint)?
-        if let assistant {
+        if let assistant, !manifest.mediaTargetOnly {
             guard let restored = assistant.decodePrefixCheckpoint(
                 tensors: Array(auxiliary[cursor...]), prefixTokens: manifest.prefixTokens)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
@@ -213,7 +240,9 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             checkpointBytes += restored.materializedBytes
         }
         return .init(position: manifest.position, chunkSize: manifest.chunkSize,
-                     layers: layers, byteCount: checkpointBytes, assistant: assistantCheckpoint)
+                     layers: layers, byteCount: checkpointBytes, assistant: assistantCheckpoint,
+                     qwen4: qwen4Snapshots, mediaIdentity: manifest.mediaIdentity,
+                     mediaTargetOnly: manifest.mediaTargetOnly)
     }
 
 }

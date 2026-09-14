@@ -56,10 +56,14 @@ struct CBv2RecurrentCheckpoint {
     let layers: [Int: CBv2RecurrentLayerState]
     let byteCount: Int
     var assistant: (any CBv2MTPPrefixCheckpoint)? = nil
+    var qwen4: [Int: CBv2Qwen4IndexerSnapshot] = [:]
+    var mediaIdentity: CBv2HybridPrefixIdentity? = nil
+    var mediaTargetOnly = false
 
     var evaluationRoots: [MLXArray] {
         layers.values.flatMap { [$0.conv, $0.ssm].compactMap { $0 } }
             + (assistant?.evaluationTargets ?? [])
+            + qwen4.values.flatMap { $0.arrays }
     }
 }
 

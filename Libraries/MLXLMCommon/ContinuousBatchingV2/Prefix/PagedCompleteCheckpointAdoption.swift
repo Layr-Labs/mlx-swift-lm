@@ -33,6 +33,7 @@ extension EngineLoopV2 {
                     }
                     let checkpoint = try staged.codec.recurrentCheckpoint(
                         manifest: staged.manifest, auxiliary: auxiliary)
+                    try staged.codec.restoreQwen4(checkpoint, rows: adopted.rows)
                     try adoptRecurrentCheckpoint(checkpoint, requestID: requestID)
                 } catch {
                     // Restoration builds only candidate state; none has run a

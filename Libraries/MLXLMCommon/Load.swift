@@ -62,6 +62,35 @@ private final class ParallelShardState: @unchecked Sendable {
     }
 }
 
+/// A model-supplied checkpoint-key filter applied immediately after each
+/// safetensors header is decoded and BEFORE any array from that shard is
+/// evaluated/materialized.
+///
+/// This differs intentionally from `sanitize(weights:)`: sanitization may
+/// rename, reshape, or fuse arrays that have already been loaded. A loading
+/// filter is only for checkpoint tensors the model proves it will never
+/// materialize (for example Qwen4's SSD-backed learned PLE table).
+public typealias CheckpointWeightLoadFilter = @Sendable (String) -> Bool
+
+/// Implemented by models that must exclude some checkpoint tensors before
+/// bulk materialization. The returned closure must capture only immutable,
+/// Sendable configuration; shard reads invoke it concurrently.
+public protocol CheckpointWeightLoadFiltering {
+    /// Return true for a checkpoint key that should enter the ordinary
+    /// in-memory load/update path, false for one owned by an external exact
+    /// row source or otherwise absent from this model topology.
+    var checkpointWeightLoadFilter: CheckpointWeightLoadFilter { get }
+
+    /// Whole-file read-ahead must be skipped when an excluded tensor is
+    /// intentionally kept cold on external storage. Filters used only to
+    /// remove topology-absent tensors may leave read-ahead enabled.
+    var skipWholeShardPrefetch: Bool { get }
+}
+
+extension CheckpointWeightLoadFiltering {
+    public var skipWholeShardPrefetch: Bool { true }
+}
+
 /// Implemented by models whose ``BaseLanguageModel/sanitize(weights:)``
 /// renames or fuses modules relative to the checkpoint layout.
 ///
@@ -159,14 +188,26 @@ public func loadWeights(
     }
     shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
 
+    let filterOwner = model as? any CheckpointWeightLoadFiltering
+    let checkpointFilter = filterOwner?.checkpointWeightLoadFilter
+
     // Hand the kernel a head start on every shard. F_RDADVISE is Darwin's
     // async-prefetch primitive — it issues a non-blocking advisory read into
     // the unified buffer cache, letting the SSD start streaming pages before
     // we ask for them. Net cost is one open/fcntl/close per shard. By the
     // time the DispatchQueue.concurrentPerform tasks below try to read, the
     // pages may already be resident.
-    prefetchShards(shardURLs)
-    mark("rdadvise")
+    //
+    // Do NOT advise whole files for an externally-backed model. Qwen4's PLE
+    // tensors share safetensor files with compute weights; whole-file advice
+    // would explicitly pull the 30 GiB SSD table into the unified buffer
+    // cache even though the key filter below never evaluates those arrays.
+    if filterOwner?.skipWholeShardPrefetch != true {
+        prefetchShards(shardURLs)
+        mark("rdadvise")
+    } else {
+        mark("rdadvise skipped (checkpoint filter)")
+    }
 
     // Load shards in parallel. Each task forces eval() on its arrays so MLX
     // actually performs the disk read inside the task rather than deferring all
@@ -179,10 +220,19 @@ public func loadWeights(
     DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
         do {
             let (w, m) = try loadArraysAndMetadata(url: urls[idx])
-            if !w.isEmpty {
-                eval(Array(w.values))
+            // Filter before eval: excluded arrays remain lazy views over the
+            // file and disappear with `w` at the end of this task. Retained
+            // arrays alone fault their exact ranges into memory.
+            let selected =
+                if let checkpointFilter {
+                    w.filter { checkpointFilter($0.key) }
+                } else {
+                    w
+                }
+            if !selected.isEmpty {
+                eval(Array(selected.values))
             }
-            shared.store(index: idx, result: (w, m))
+            shared.store(index: idx, result: (selected, m))
         } catch {
             shared.recordError(error)
         }

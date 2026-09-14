@@ -75,7 +75,7 @@ protocol CBv2InnerStateProviding {
 /// donates the input buffer when refcount permits, so an append is O(n), not
 /// O(cache). `update` returns temporal-order zero-copy strided views
 /// `[..., 0..<retained, :]`; MLX SDPA accepts strided K/V.
-public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
+public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, CBv2Qwen4IndexerRow {
 
     /// Extra slots allocated beyond the prompt so the first decode steps
     /// don't immediately grow the buffer.
@@ -94,6 +94,14 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     private var keys: MLXArray?
     private var values: MLXArray?
     private var capacity: Int
+
+    /// Qwen4 QSA indexer sidecar. Lives on the row so `setRows` rebinds can
+    /// restore gathered-QSA state after MTP finalize invalidates composition.
+    public var qwen4IndexKeys: MLXArray?
+    public var qwen4IndexTokenCount: Int?
+    public var qwen4IndexPositionIds: MLXArray?
+    public var qwen4PooledIndexKeys: MLXArray?
+    public var qwen4PooledIndexBlocks: Int = 0
 
     /// - Parameters:
     ///   - promptLength: expected prompt length, used to size the initial

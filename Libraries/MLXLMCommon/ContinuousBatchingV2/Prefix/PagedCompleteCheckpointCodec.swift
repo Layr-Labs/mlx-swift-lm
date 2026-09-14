@@ -21,7 +21,8 @@ extension CBv2CompleteCheckpointCodec {
         checkpoint: CBv2RecurrentCheckpoint, state: [CBv2SequenceKV?], tokens: [Int], cacheSalt: String?,
         metadataPermit: CBv2CheckpointManifestMemory.Permit
     ) throws -> CBv2CompleteCheckpointExport {
-        let descriptors = try tensorDescriptors(position: checkpoint.position)
+        let descriptors = try tensorDescriptors(position: checkpoint.position, qwen4: qwen4Descriptors(checkpoint),
+                                                mediaTargetOnly: checkpoint.mediaTargetOnly)
         var sources: [CBv2CompleteCheckpointTensorSource] = []
         for (index, entry) in state.enumerated() {
             guard let row = entry as? PagedSequenceKV,
@@ -37,7 +38,8 @@ extension CBv2CompleteCheckpointCodec {
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             sources.append(contentsOf: [.array(conv), .array(ssm)])
         }
-        if let assistant {
+        sources.append(contentsOf: try qwen4Arrays(checkpoint).map { .array($0) })
+        if let assistant, !checkpoint.mediaTargetOnly {
             guard let state = checkpoint.assistant, let encoded = assistant.encodePrefixCheckpoint(state)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             sources.append(contentsOf: encoded.map { .array($0) })
@@ -50,7 +52,8 @@ extension CBv2CompleteCheckpointCodec {
         let manifest = CBv2CompleteCheckpointManifest(
             schemaVersion: CBv2CompleteCheckpointManifest.currentSchemaVersion, identity: identity,
             backendLayout: backendLayout, position: checkpoint.position, chunkSize: checkpoint.chunkSize,
-            cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
+            cacheSalt: cacheSalt, assistantCodecID: checkpoint.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID,
+            mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
             metadata: .init(tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors, permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(manifest: manifest, sources: sources, usesProcessMemoryOwner: admission.hasProcessMemoryOwner)

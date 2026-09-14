@@ -13,7 +13,21 @@ public enum OpenAIResponseInput: Codable, Sendable, Equatable {
             self = .text(text)
             return
         }
-        self = .messages(try container.decode([OpenAIChatMessage].self))
+        let items = try container.decode([OpenAIResponseInputMessage].self)
+        var messages: [OpenAIChatMessage] = []
+        for item in items {
+            let message = item.message
+            // Consecutive function_call items belong to one assistant turn.
+            // The template must see all calls before their tool results.
+            if let calls = message.toolCalls, let last = messages.indices.last,
+                messages[last].role == .assistant, messages[last].toolCalls != nil
+            {
+                messages[last].toolCalls?.append(contentsOf: calls)
+            } else {
+                messages.append(message)
+            }
+        }
+        self = .messages(messages)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -120,6 +134,7 @@ public struct OpenAIResponseRequest: Codable, Sendable, Equatable {
             toolChoice: toolChoice,
             parallelToolCalls: parallelToolCalls,
             reasoningParser: reasoning?.parser,
+            reasoning: reasoning.flatMap(\.effort).map { .init(effort: $0) },
             stream: stream,
             temperature: temperature,
             topP: topP,
@@ -133,6 +148,18 @@ public enum OpenAIResponseStatus: String, Codable, Sendable, Equatable {
     case completed
     case cancelled
     case failed
+    case incomplete
+}
+
+public struct OpenAIResponseIncompleteDetails: Codable, Sendable, Equatable {
+    public var reason: String
+    public init(reason: String) { self.reason = reason }
+}
+
+public struct OpenAIResponseError: Codable, Sendable, Equatable {
+    public var code: String
+    public var message: String
+    public init(code: String, message: String) { self.code = code; self.message = message }
 }
 
 public struct OpenAIResponseOutputContent: Codable, Sendable, Equatable {
@@ -217,25 +244,32 @@ public struct OpenAIResponseUsage: Codable, Sendable, Equatable {
     public var inputTokens: Int
     public var outputTokens: Int
     public var totalTokens: Int
+    public var inputTokensDetails: OpenAICachedTokenDetails?
 
     private enum CodingKeys: String, CodingKey {
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
         case totalTokens = "total_tokens"
+        case inputTokensDetails = "input_tokens_details"
     }
 
-    public init(inputTokens: Int, outputTokens: Int) {
+    public init(inputTokens: Int, outputTokens: Int, cachedInputTokens: Int? = nil) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.totalTokens = inputTokens + outputTokens
+        self.inputTokensDetails = cachedInputTokens.map {
+            .init(cachedTokens: min(max(0, $0), max(0, inputTokens)))
+        }
     }
 
     public init(chatUsage: OpenAIUsage) {
-        self.init(inputTokens: chatUsage.promptTokens, outputTokens: chatUsage.completionTokens)
+        self.init(inputTokens: chatUsage.promptTokens, outputTokens: chatUsage.completionTokens,
+                  cachedInputTokens: chatUsage.promptTokensDetails?.cachedTokens)
     }
 
     public var chatUsage: OpenAIUsage {
-        OpenAIUsage(promptTokens: inputTokens, completionTokens: outputTokens)
+        OpenAIUsage(promptTokens: inputTokens, completionTokens: outputTokens,
+                    cachedPromptTokens: inputTokensDetails?.cachedTokens)
     }
 }
 
@@ -249,6 +283,8 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
     public var outputText: String
     public var usage: OpenAIResponseUsage?
     public var metadata: [String: JSONValue]?
+    public var incompleteDetails: OpenAIResponseIncompleteDetails?
+    public var error: OpenAIResponseError?
 
     private enum CodingKeys: String, CodingKey {
         case id
@@ -260,6 +296,8 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
         case outputText = "output_text"
         case usage
         case metadata
+        case incompleteDetails = "incomplete_details"
+        case error
     }
 
     public init(
@@ -270,7 +308,9 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
         outputText: String,
         usage: OpenAIResponseUsage?,
         metadata: [String: JSONValue]? = nil,
-        createdAt: Int = Int(Date().timeIntervalSince1970)
+        createdAt: Int = Int(Date().timeIntervalSince1970),
+        incompleteDetails: OpenAIResponseIncompleteDetails? = nil,
+        error: OpenAIResponseError? = nil
     ) {
         self.id = id
         self.object = "response"
@@ -281,5 +321,7 @@ public struct OpenAIResponse: Codable, Sendable, Equatable {
         self.outputText = outputText
         self.usage = usage
         self.metadata = metadata
+        self.incompleteDetails = incompleteDetails
+        self.error = error
     }
 }

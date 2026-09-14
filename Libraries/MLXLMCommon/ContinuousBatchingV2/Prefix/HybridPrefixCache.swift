@@ -93,11 +93,22 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
     func capture(
         requestID: CBv2RequestID, position: Int, chunkSize: Int,
         spec: CBv2RecurrentStateSpec, layers: [Int: CBv2RecurrentLayerState],
-        assistant: (any CBv2MTPPrefixCheckpoint)? = nil
+        assistant: (any CBv2MTPPrefixCheckpoint)? = nil,
+        qwen4: [Int: CBv2Qwen4IndexerSnapshot] = [:],
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
     ) -> [MLXArray] {
         guard position > 0, chunkSize > 1, position % chunkSize == 0 else { return [] }
         guard assistant == nil || assistant?.targetInputCount == position else { return [] }
+        guard !mediaTargetOnly || (mediaIdentity != nil && assistant == nil && !qwen4.isEmpty) else { return [] }
         var bytes = assistant?.materializedBytes ?? 0
+        for snapshot in qwen4.values {
+            guard snapshot.tokenCount == position else { return [] }
+            for array in snapshot.arrays {
+                let (next, overflow) = bytes.addingReportingOverflow(array.nbytes)
+                guard !overflow else { return [] }
+                bytes = next
+            }
+        }
         for layer in spec.layers {
             guard let state = layers[layer.modelLayerIndex],
                 let conv = state.conv, let ssm = state.ssm,
@@ -144,7 +155,8 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         }
         let checkpoint = CBv2RecurrentCheckpoint(
             position: position, chunkSize: chunkSize, layers: captured, byteCount: bytes,
-            assistant: assistant)
+            assistant: assistant, qwen4: CBv2HybridQwen4State.compact(qwen4),
+            mediaIdentity: mediaIdentity, mediaTargetOnly: mediaTargetOnly)
         staged[requestID, default: []].append(checkpoint)
         checkpointOwnership.retain(checkpoint, as: .staged)
         return checkpoint.evaluationRoots

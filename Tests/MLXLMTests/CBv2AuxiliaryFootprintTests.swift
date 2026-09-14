@@ -22,7 +22,10 @@ struct CBv2AuxiliaryFootprintTests {
         }
     }
 
-    @Test func blockPaddingAndFirstTokenGrowthAreConservativeWithoutAllocation() throws {
+    @Test(.enabled(
+        if: ProcessInfo.processInfo.environment["DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST"] == "1",
+        "Set DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1 and run this allocator check alone"))
+    func blockPaddingAndFirstTokenGrowthAreConservativeWithoutAllocation() throws {
         let policy = try #require(Memory.allocationFootprintPolicy())
         let projection = try #require(CBv2AuxiliaryAllocationProjection(policy: policy, buffers: [
             .init(bytesPerToken: 512, allocationCount: 2, tokenGranularity: 256, tokenPadding: 4),

@@ -10,7 +10,7 @@ extension EngineV2 {
     func hybridPrefixLookup(
         for request: CBv2Request, cache: CBv2HybridPrefixCache
     ) -> CBv2PrefixLookup {
-        guard request.prefixCacheEnabled, request.multimodal == nil, request.positionState == nil else {
+        guard request.permitsHybridCheckpoint(layerKinds: layerKinds) else {
             return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
         }
         let (maximumSequenceLength, overflow) = request.promptTokens.count.addingReportingOverflow(
@@ -21,9 +21,14 @@ extension EngineV2 {
         let maximumChunk = max(
             schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0)
         guard let hit = cache.lookup(
-            tokens: request.promptTokens, cacheSalt: request.cacheSalt,
+            tokens: request.promptTokens, cacheSalt: request.checkpointCacheSalt,
             maximumChunkSize: maximumChunk)
         else { return .init(adoption: nil, outcome: .miss, matchedTokens: 0) }
+        guard hit.checkpoint.mediaIdentity == request.hybridPrefixIdentity,
+              hit.checkpoint.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint else {
+            cache.endAdoption(pin: hit.pin)
+            return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
+        }
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds, backend: .contiguousUnquantized)
         guard var plan = capability.plan(
@@ -48,7 +53,7 @@ extension EngineV2 {
             adoption: .init(
                 requestID: request.id, tokens: request.promptTokens,
                 matched: hit.checkpoint.position, plan: plan, prefix: hit.kvPrefix,
-                cacheSalt: request.cacheSalt,
+                cacheSalt: request.checkpointCacheSalt,
                 recurrentCheckpoint: hit.checkpoint, hybridPin: hit.pin),
             outcome: .adoptionFailed, matchedTokens: hit.checkpoint.position)
     }

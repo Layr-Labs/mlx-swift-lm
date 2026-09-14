@@ -13,10 +13,12 @@ import MLXLMCommon
 /// tool-call stream parser the Darkbloom provider drives over its
 /// ContinuousBatchingV2 generation events.
 public final class BatchedToolStreamHandler: @unchecked Sendable {
+    public let format: ToolCallFormat
     private let processor: ToolCallProcessor
     private var residualText: String?
 
     public init(format: ToolCallFormat, tools: [[String: any Sendable]]?) {
+        self.format = format
         self.processor = ToolCallProcessor(format: format, tools: tools)
     }
 

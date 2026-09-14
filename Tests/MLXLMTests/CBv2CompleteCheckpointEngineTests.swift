@@ -91,7 +91,7 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
     func stage(engine: EngineV2, request: CBv2Request) throws -> Bool {
         guard let receipt = request.prefixCacheReceiptID else { return false }
         let matching = saved.filter {
-            $0.manifest.cacheSalt == request.cacheSalt
+            $0.manifest.cacheSalt == request.checkpointCacheSalt
                 && $0.manifest.position < request.promptTokens.count
                 && $0.manifest.prefixTokens.elementsEqual(request.promptTokens.prefix($0.manifest.position))
         }.max { $0.manifest.position < $1.manifest.position }
