@@ -40,8 +40,11 @@ final class Qwen4RealStateFixture {
         let indexData = try Data(contentsOf: directory.appendingPathComponent("model.safetensors.index.json"))
         let index = try XCTUnwrap(JSONSerialization.jsonObject(with: indexData) as? [String: Any])
         let weights = try XCTUnwrap(index["weight_map"] as? [String: String])
-        guard weights.count == 3866, Set(weights.values).count == 131,
-            weights.keys.contains(where: { $0.hasPrefix("mtp.") }) else { throw Failure.invalidArtifact }
+        let profile = try Qwen4RealArtifactProfile.requested(environment: env)
+        guard profile.matches(configSHA256: Self.hash(configData), indexSHA256: Self.hash(indexData),
+            tensorCount: weights.count, shardCount: Set(weights.values).count,
+            mtpTensorCount: weights.keys.filter { $0.hasPrefix("mtp.") }.count)
+        else { throw Failure.invalidArtifact }
         for shard in Set(weights.values) {
             guard !shard.contains("/"), shard.hasSuffix(".safetensors"),
                 FileManager.default.fileExists(atPath: directory.appendingPathComponent(shard).path)
@@ -70,7 +73,7 @@ final class Qwen4RealStateFixture {
             loaded.releaseExternalPLEResources()
             throw Failure.invalidPrerequisite
         }
-        Self.log("loaded config_sha256=\(Self.hash(configData)) index_sha256=\(Self.hash(indexData)) tensors=\(weights.count) shards=\(Set(weights.values).count) PLE=SSD production_default_draft_max=4 explicit_qualification_draft_max=5")
+        Self.log("loaded artifact_profile=\(profile.rawValue) config_sha256=\(Self.hash(configData)) index_sha256=\(Self.hash(indexData)) tensors=\(weights.count) shards=\(Set(weights.values).count) PLE=SSD production_default_draft_max=4 explicit_qualification_draft_max=5")
         Self.log("owned_model=Qwen3.8-Flash-Next native_qwen4 diagnostic_capacity_bytes=\(diagnosticKVCapacityBytes) host_physical_bytes=\(ProcessInfo.processInfo.physicalMemory); not a production grant or hardware-tier qualification")
     }
 

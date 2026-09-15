@@ -5,10 +5,42 @@ affine-Q4 target and runtime sampling contract; it is not BF16 equivalence or
 universal answer-quality certification. The companion provider repository
 contains the API and lifecycle qualification procedures.
 
-## Recorded runtime checks
+## Selected-checkpoint qualification update
+
+The September 15 follow-up preserves the production `Libraries/` and
+`Package.swift` trees from public SDK `f3f0b235c4e98c9c8e9f3cd76b4ec1752c27960b`.
+It adds explicit test-only artifact profiles and records the completed native
+and companion-provider requalification. No replacement numerical baseline,
+weight, tokenizer, MTP-head, sampler or serving-default change is included.
+
+- Each SDK optimization posture reports 891 XCTest tests with 9 skips and no
+  failures, plus 1,210 Swift Testing pass records and 14 skips. Framework
+  aggregates and individual pass records are not interchangeable totals.
+- The selected checkpoint passes 25 native retained/rejected state and logit
+  cases, trained-head replay/discard, serialized suffix restore, and output
+  budgets 1–9. The original affine-Q4 profile and its oracles remain separate.
+- The companion's final real-coordinator local API matrix passes all 118
+  required cells across MTP OFF/AUTO, including reasoning OFF/ON, tools and
+  supported streaming/nonstreaming Chat/Responses. Standard API compatibility
+  does not replace strict semantic-quality or hosted-route qualification.
+- Default one-row long-prefix cache checks pass 24 waves/32 responses across
+  MTP OFF/AUTO and cache OFF/ON, with observed 6,144-token warm reuse. A separate
+  opt-in multirow recheck has 58 passing and 16 failing waves; it remains
+  disabled by default and is not qualified by queued HTTP concurrency.
+- A 36-request matched text/image/code comparison preserves requests, outputs
+  and token counts. Candidate/reference wall-time ratios range from 0.971784
+  to 1.008637. These client measurements do not certify sustained throughput.
+
+Strict literal-copy and some visual/tool-history answer failures remain open.
+Physical tiers, original BF16 equivalence, signed persistence/trust and final
+release operations require their own evidence. The complete current provider
+record is `docs/reports/2026-09-15-qwen38-native-api-qualification.md` in
+[d-inference PR1030](https://github.com/Layr-Labs/d-inference/pull/1030).
+
+## Historical original-checkpoint runtime checks
 
 Performance checkpoint qualified September 14 and published for draft review September 15, 2026. The qualified
-runtime delta from SDK `d41be4f88a31db99f7727a0e6fff029ad31ab9d6` is four files,
+runtime delta from the initial Qwen4 implementation is four files,
 with archived patch SHA256
 `afdd5eb45e89ae547b8b28b34ce656b6cdfdd78f6836cd3655db95a2b542f0d1`.
 Review packaging preserves that exact runtime patch; later submission-cadence
@@ -99,9 +131,19 @@ Record exact source, artifact, sampler, MTP/cache posture, binary/metallib and
 pass/fail/skip counts. Supply approved environment configuration externally;
 never commit endpoints, credentials or private diagnostics.
 
+The full-weight state fixture binds the config and index SHA256, tensor/shard
+counts and embedded MTP entry count to `Qwen4RealArtifactProfile`. The default
+`affine-q4` retains the original target; explicitly set
+`DARKBLOOM_QWEN4_REAL_ARTIFACT_PROFILE=selected-q4` for the separately selected
+checkpoint. Unknown profiles and mismatched artifacts fail before weight load.
+The same independent serial-state, rollback, serialization and output-budget
+assertions apply to either profile; no original-target goldens or tolerances
+are relabeled. This fixture change is not itself a passed full-weight run or
+a whole-payload integrity proof.
+
 Implementation provenance and excluded experiments: [composition](composition.md).
 
-## Artifact and draft-review boundary
+## Artifact and deployment boundary
 
 A separately selected checkpoint uses predominantly 4-bit storage with selected
 5-, 6- and 8-bit modules and retains its native vision and embedded MTP weights.

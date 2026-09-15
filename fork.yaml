@@ -193,6 +193,8 @@ def:
             Mixed text/media batches retain per-request implicit versus explicit
             position provenance through a scoped Qwen4-only forward binding;
             synthesized rectangle rows do not change the text rotary path.
+            Full-weight tests bind explicit original/selected artifact profiles
+            without replacing numerical oracles or changing production defaults.
           globs:
             - "Libraries/MLXLLM/Models/Qwen4Exp*.swift"
             - "Libraries/MLXLMCommon/Resources/Qwen4Metal/**"
