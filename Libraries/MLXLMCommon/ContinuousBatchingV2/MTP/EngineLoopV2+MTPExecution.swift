@@ -202,11 +202,15 @@ extension EngineLoopV2 {
                 let positionIds = CBv2PositionState.decodePositionIds(
                     states: decodeRows.map(\.rec.request.positionState),
                     cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                        ? .decode : .mixedFrontier)) { recurrentModel.forwardWithHidden(
-                    tokens: inputs, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                let output = try withQwen4PositionScope(
+                    ids: decodeRows.map(\.rec.id), positionIds: positionIds
+                ) {
+                    try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                        ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                            ? .decode : .mixedFrontier)) { recurrentModel.forwardWithHidden(
+                        tokens: inputs, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds) }
+                }
                 logits = output.logits
                 hidden = output.lastHidden
                 for (row, evaluation) in zip(decodeRows, evaluations) {
@@ -327,9 +331,11 @@ extension EngineLoopV2 {
                 }
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
-                let forward = try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHiddenForPrefill(
-                    tokens: inputs, caches: caches, recurrentState: [evaluation],
-                    positionIds: positions, requirement: requirement) }
+                let forward = try withQwen4PositionScope(ids: [rec.id], positionIds: positions) {
+                    try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHiddenForPrefill(
+                        tokens: inputs, caches: caches, recurrentState: [evaluation],
+                        positionIds: positions, requirement: requirement) }
+                }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
                 do {

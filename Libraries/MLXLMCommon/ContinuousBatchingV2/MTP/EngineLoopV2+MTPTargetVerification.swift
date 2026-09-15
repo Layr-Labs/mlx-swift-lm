@@ -184,9 +184,11 @@ extension EngineLoopV2 {
                     let positionIds = CBv2PositionState.decodePositionIds(
                         states: rows.map(\.rec.request.positionState),
                         cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                    output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHidden(
-                        tokens: column, caches: caches, recurrentState: evaluations,
-                        positionIds: positionIds) }
+                    output = try withQwen4PositionScope(ids: rows.map(\.rec.id), positionIds: positionIds) {
+                        try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHidden(
+                            tokens: column, caches: caches, recurrentState: evaluations,
+                            positionIds: positionIds) }
+                    }
                     for (row, evaluation) in zip(rows, evaluations) {
                         do { recurrentArrays.append(contentsOf: try evaluation.evaluate()) } catch {
                             preconditionFailure(
@@ -250,9 +252,11 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
-                output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                output = try withQwen4PositionScope(ids: rows.map(\.rec.id), positionIds: positionIds) {
+                    try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
+                        tokens: tokens, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds) }
+                }
                 for (row, evaluation) in zip(rows, evaluations) {
                     precondition(
                         evaluation.isCaptured,

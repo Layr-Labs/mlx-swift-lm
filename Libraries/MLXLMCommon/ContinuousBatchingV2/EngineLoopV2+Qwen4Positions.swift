@@ -19,9 +19,18 @@ extension EngineLoopV2 {
                 tokens: tokens, caches: caches, ids: ids, positionIds: positionIds,
                 inputEmbeddings: inputEmbeddings, requirement: requirement, phase: phase)
         }
+        return try withQwen4PositionScope(ids: ids, positionIds: positionIds, operation: forward)
+    }
+
+    /// Shared by ordinary and direct hidden-returning MTP target paths.
+    /// Stateful MTP still uses the latter while batch pressure sets depth zero.
+    func withQwen4PositionScope<Result>(
+        ids: [CBv2RequestID], positionIds: MLXArray?,
+        operation: () throws -> Result
+    ) rethrows -> Result {
         guard positionIds != nil, ids.count > 1,
             layerKinds.contains(where: { $0.qwen4IndexerCompressRatio != nil })
-        else { return try forward() }
+        else { return try operation() }
 
         let explicit = ids.map { id -> Bool in
             guard let record = scheduler.record(for: id) else {
@@ -29,6 +38,6 @@ extension EngineLoopV2 {
             }
             return record.request.positionState != nil
         }
-        return try CBv2Qwen4PositionScope.withExplicitRows(explicit, operation: forward)
+        return try CBv2Qwen4PositionScope.withExplicitRows(explicit, operation: operation)
     }
 }
