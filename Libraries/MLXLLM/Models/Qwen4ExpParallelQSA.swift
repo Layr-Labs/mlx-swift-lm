@@ -3,13 +3,19 @@ import MLX
 import MLXLMCommon
 import os
 
-/// Opt-in compact decode/verify experiment. Independent QK tiles run in parallel;
+/// Opt-in decode/verify experiment. Independent QK tiles run in parallel;
 /// FP32 scores feed the unchanged ordered online-softmax/PV recurrence. No split-K
-/// reduction, selector change, lower precision or whole-history staging.
+/// reduction, selector change or lower precision. Full-KV mode consumes the
+/// caller's existing materialized arrays; it never changes page ownership.
 enum Qwen4ExpParallelQSA {
     static let flag = "DARKBLOOM_QWEN4_QSA_PARALLEL_SCORES"
+    static let fullKVFlag = "DARKBLOOM_QWEN4_QSA_PARALLEL_FULL_KV"
     static func enabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
         environment[flag] == "1"
+    }
+
+    static func fullKVEnabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
+        environment[fullKVFlag] == "1"
     }
 
     static func valuePartitions(requested: Int?, fallback: Int,
@@ -59,6 +65,7 @@ enum Qwen4ExpParallelQSA {
 
     static func attend(inputs: [MLXArray], queryTokens: Int, outputPartitions: Int,
                        valuePartitions requestedPartitions: Int?,
+                       compactKV: Bool,
                        outputShape: [Int], dtype: DType) -> MLXArray {
         precondition(
             (1...Qwen4ExpGatheredQSA.optimizedVerifyMaxQueryTokens).contains(queryTokens)
@@ -69,7 +76,7 @@ enum Qwen4ExpParallelQSA {
         let simdWidth = 32, warps = 2, kvHeads = 2
         let common: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("BK", 64),
-            ("COMPACT_KV", true), ("STRIDED_KV", false)]
+            ("COMPACT_KV", compactKV), ("STRIDED_KV", false)]
         let bank = scores(inputs, template: common + [("DC", 64), ("OPARTS", 1)],
             grid: (queryTokens * simdWidth, kvHeads * warps, keyTiles),
             threadGroup: (simdWidth, warps, 1),

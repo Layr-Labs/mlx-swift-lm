@@ -1384,6 +1384,10 @@ final class Qwen4ExpTextModelInner: Module {
         var hiddenStates = Qwen4ExpDecodeProfile.stage("embed+mask") {
             embedAndTile(inputs, inputEmbeddings: inputEmbeddings)
         }
+        let layerSubmission = Qwen4ExpLayerSubmission.plan(
+            batchSize: inputs.dim(0), sequenceWidth: inputs.dim(1),
+            hasEmbeddings: inputEmbeddings != nil, hasPositions: positionIds != nil,
+            caches: caches)
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let attentionCache: (any CBv2AttendingLayerCache)?
@@ -1405,6 +1409,7 @@ final class Qwen4ExpTextModelInner: Module {
                 recurrentState: recurrentState,
                 positionIds: positionIds,
                 captureRecurrentWindow: captureRecurrentWindow)
+            layerSubmission?.submit(hiddenStates)
         }
         return hiddenStates
     }

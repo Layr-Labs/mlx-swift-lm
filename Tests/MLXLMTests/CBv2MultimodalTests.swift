@@ -614,22 +614,25 @@ final class CBv2MultimodalTests: XCTestCase {
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: 3, maxBatchedTokensPerStep: 48,
                 prefillChunkSize: 16, maxWaiting: 4))
-        engine.loopForTesting.enqueueStartDelayForTesting = 0.05
-
-        let streamA = try engine.submit(
-            CBv2Request(
-                id: CBv2RequestID(120), promptTokens: promptA,
-                sampling: .init(temperature: 0), maxTokens: decodeSteps,
-                multimodal: CBv2VisionFixtures.input(imagesA)))
-        let streamB = try engine.submit(
-            CBv2Request(
-                id: CBv2RequestID(121), promptTokens: promptB,
-                sampling: .init(temperature: 0), maxTokens: decodeSteps,
-                multimodal: CBv2VisionFixtures.input(imagesB)))
-        let streamText = try engine.submit(
-            CBv2Request(
-                id: CBv2RequestID(122), promptTokens: textPrompt,
-                sampling: .init(temperature: 0), maxTokens: decodeSteps))
+        let (streamA, streamB, streamText) = try engine.loopForTesting.onEngineQueueSync {
+            // Queue all three admissions before the first engine step. A fixed
+            // sleep cannot guarantee this when the submit thread is delayed.
+            // These image embeddings are already evaluated synthetic fixtures;
+            // no production vision-tower scheduling is changed by this setup.
+            (
+                try engine.submit(CBv2Request(
+                    id: CBv2RequestID(120), promptTokens: promptA,
+                    sampling: .init(temperature: 0), maxTokens: decodeSteps,
+                    multimodal: CBv2VisionFixtures.input(imagesA))),
+                try engine.submit(CBv2Request(
+                    id: CBv2RequestID(121), promptTokens: promptB,
+                    sampling: .init(temperature: 0), maxTokens: decodeSteps,
+                    multimodal: CBv2VisionFixtures.input(imagesB))),
+                try engine.submit(CBv2Request(
+                    id: CBv2RequestID(122), promptTokens: textPrompt,
+                    sampling: .init(temperature: 0), maxTokens: decodeSteps))
+            )
+        }
 
         async let outputA = cbv2SchedCollect(streamA)
         async let outputB = cbv2SchedCollect(streamB)

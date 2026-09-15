@@ -244,7 +244,8 @@ public enum Qwen4ExpNativeSparseGQA: Sendable {
         compactLogicalKeyTokens: Int? = nil,
         preserveKVStrides: Bool? = nil,
         parallelScores: Bool? = nil,
-        parallelValuePartitions: Int? = nil
+        parallelValuePartitions: Int? = nil,
+        parallelFullKV: Bool? = nil
     ) -> MLXArray? {
         let qL = queries.dim(2)
         let kL = compactLogicalKeyTokens ?? keys.dim(2)
@@ -299,14 +300,17 @@ public enum Qwen4ExpNativeSparseGQA: Sendable {
         let outputShapes = [[1, queryHeads, qL, headDim]]
         let outputDTypes = [queries.dtype]
         let output: MLXArray
-        if (parallelScores ?? Qwen4ExpParallelQSA.enabled()), steelEnabled(),
-            compactLogicalKeyTokens != nil, !stridedKV,
+        let parallelLayoutEnabled = compactLogicalKeyTokens != nil
+            ? (parallelScores ?? Qwen4ExpParallelQSA.enabled())
+            : (parallelFullKV ?? Qwen4ExpParallelQSA.fullKVEnabled())
+        if parallelLayoutEnabled, steelEnabled(), !stridedKV,
             (1...Qwen4ExpGatheredQSA.optimizedVerifyMaxQueryTokens).contains(qL),
             tiles.keyTile == 64, tiles.dimensionTile == 64
         {
             output = Qwen4ExpParallelQSA.attend(
                 inputs: inputs, queryTokens: qL, outputPartitions: outputPartitions,
                 valuePartitions: parallelValuePartitions,
+                compactKV: compactLogicalKeyTokens != nil,
                 outputShape: outputShapes[0], dtype: queries.dtype)
         } else if steelEnabled() {
             let kernel = stridedKV ? qwen4SparseGQASteelStridedKernel : qwen4SparseGQASteelKernel

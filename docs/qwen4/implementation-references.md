@@ -9,7 +9,9 @@ unrelated files or declare experimental paths qualified for production.
 The Qwen4 model, PLE, gathered attention, MTP and profiling modules identify
 oMLX Fusion references in their source comments, including
 `Libraries/MLXLLM/Models/Qwen4Exp.swift`, `Qwen4ExpPLE.swift`,
-`Qwen4ExpQSA.swift`, `Qwen4ExpQSASteel.swift`, and `Qwen4ExpDecodeProfile.swift`.
+`Qwen4ExpQSA.swift`, `Qwen4ExpQSASteel.swift`, `Qwen4ExpDecodeProfile.swift`,
+and `Qwen4ExpLayerSubmission.swift`. The last adapts early layer submission
+to native paged fault checks and engine-owned deferred-fill/retirement scopes.
 
 Reference: <https://github.com/jonathan308/omlx-fusion>.
 
