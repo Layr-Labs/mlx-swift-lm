@@ -250,6 +250,8 @@ def:
         `response_format` (`json_object` / `json_schema`); streaming reasoning parsers (think tags,
         Gemma 4, Harmony); streamed tool-call handling; a batched engine adapter over CBv2 and a
         runtime `setMaxNumSeqs` for adaptive concurrency.
+        Responses input replay retains reasoning and adjacent function calls in one assistant turn,
+        preserving tool arguments and explicit message/result boundaries.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"

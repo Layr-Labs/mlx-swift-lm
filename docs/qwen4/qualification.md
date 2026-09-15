@@ -5,9 +5,25 @@ affine-Q4 target and runtime sampling contract; it is not BF16 equivalence or
 universal answer-quality certification. The companion provider repository
 contains the API and lifecycle qualification procedures.
 
-## Selected-checkpoint qualification update
+## Responses input-history follow-up
 
-The September 15 follow-up preserves the production `Libraries/` and
+The standalone SDK Responses decoder keeps a reasoning item and its immediately
+following function calls in one assistant turn when a client replays output as
+input. Explicit message items and tool results remain turn boundaries. Tool
+argument strings, call IDs, reasoning text and media parts are preserved.
+This request-boundary fix does not change Qwen4 model math, MTP, sampling,
+trained weights, PLE offload or cache implementations.
+
+The focused input tests are in
+`Tests/MLXLMServerTests/OpenAIResponsesInputReplayTests.swift`. The streaming
+service output-to-input regression is in
+`Tests/MLXLMServerTests/OpenAIResponsesCompatibilityTests.swift`.
+Passing ordinary tool generation is distinct from preserving that replayed
+history; model/native and composed-provider qualification remain separate gates.
+
+## Earlier selected-checkpoint qualification update
+
+The earlier September 15 follow-up preserves the production `Libraries/` and
 `Package.swift` trees from public SDK `f3f0b235c4e98c9c8e9f3cd76b4ec1752c27960b`.
 It adds explicit test-only artifact profiles and records the completed native
 and companion-provider requalification. No replacement numerical baseline,

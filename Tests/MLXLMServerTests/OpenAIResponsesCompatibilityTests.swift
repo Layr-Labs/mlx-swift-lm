@@ -161,6 +161,25 @@ struct OpenAIResponsesCompatibilityTests {
         let added = events.filter { $0["type"] as? String == "response.output_item.added" }
         #expect(added.compactMap { $0["output_index"] as? Int } == [0, 1, 2])
         #expect(response.outputText.isEmpty)
+
+        // Clients replay the emitted items before appending tool results.
+        // The next prompt must retain one assistant turn with its reasoning
+        // and both calls, rather than inserting a reasoning-only turn.
+        var replay = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(response.output))
+                as? [[String: Any]])
+        for callID in response.output.compactMap(\.callID) {
+            replay.append(["type": "function_call_output", "call_id": callID, "output": "ok"])
+        }
+        let replayData = try JSONSerialization.data(withJSONObject: ["model": "m", "input": replay])
+        let replayRequest = try JSONDecoder().decode(OpenAIResponseRequest.self, from: replayData)
+        let messages = replayRequest.chatCompletionRequest.messages
+        #expect(messages.map(\.role) == [.assistant, .tool, .tool])
+        #expect(messages.first?.reasoningContent == "think once")
+        #expect(messages.first?.toolCalls?.map(\.id) == response.output.compactMap(\.callID))
+        #expect(messages.first?.toolCalls?.map(\.function.name) == ["a", "b"])
+        #expect(messages.filter { $0.role == .tool }.map(\.toolCallID)
+            == response.output.compactMap(\.callID))
     }
 
     @Test func cancelledResponseConsumptionTerminatesTheUpstreamStream() async throws {

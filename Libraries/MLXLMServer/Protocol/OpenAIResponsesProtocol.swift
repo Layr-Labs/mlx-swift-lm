@@ -15,17 +15,21 @@ public enum OpenAIResponseInput: Codable, Sendable, Equatable {
         }
         let items = try container.decode([OpenAIResponseInputMessage].self)
         var messages: [OpenAIChatMessage] = []
+        var previousKind: OpenAIResponseInputMessage.Kind?
         for item in items {
             let message = item.message
-            // Consecutive function_call items belong to one assistant turn.
-            // The template must see all calls before their tool results.
+            // A reasoning item and its following function calls form one
+            // assistant turn. Explicit messages/tool outputs remain boundaries.
+            let followsReasoning = previousKind == .reasoning && item.kind == .functionCall
             if let calls = message.toolCalls, let last = messages.indices.last,
-                messages[last].role == .assistant, messages[last].toolCalls != nil
+                messages[last].role == .assistant,
+                messages[last].toolCalls != nil || followsReasoning
             {
-                messages[last].toolCalls?.append(contentsOf: calls)
+                messages[last].toolCalls = (messages[last].toolCalls ?? []) + calls
             } else {
                 messages.append(message)
             }
+            previousKind = item.kind
         }
         self = .messages(messages)
     }
