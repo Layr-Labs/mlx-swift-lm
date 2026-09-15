@@ -82,6 +82,13 @@ enum Qwen4ExpBatchedQSA {
     /// Text positions are [B,L]; M-RoPE positions are [3,B,L]. Preserve the
     /// request's complete three-plane slice, including non-text history.
     static func positions(_ positions: MLXArray?, row: Int, batch: Int, length: Int) -> MLXArray? {
+        // The engine's rectangular fill is not permission to switch a text
+        // request from its original offset-based RoPE to explicit M-RoPE.
+        // Never infer absence by comparing plane values: genuine media
+        // decode positions may also have three identical planes.
+        if CBv2Qwen4PositionScope.explicitPosition(row: row, batch: batch) == false {
+            return nil
+        }
         guard let positions else { return nil }
         precondition(row >= 0 && row < batch)
         if positions.ndim == 2, positions.shape == [batch, length] {

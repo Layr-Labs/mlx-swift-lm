@@ -2410,7 +2410,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `CBv2RecurrentPrefillSteppableModel` (skipping the unused vocabulary
     /// projection), else by the engine's own slice. Decode and MTP callers
     /// pass nil and keep the full-logits contract.
-    func targetForward(
+    func targetForwardWithoutQwen4PositionScope(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache], ids: [CBv2RequestID],
         positionIds: MLXArray? = nil,
         inputEmbeddings: MLXArray? = nil,
