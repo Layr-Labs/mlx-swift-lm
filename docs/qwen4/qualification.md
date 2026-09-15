@@ -109,3 +109,40 @@ The original fixed-depth numerical/speed evidence above does not automatically
 qualify that different target. See the companion provider's September 15 report
 for its separate local compatibility results and unresolved literal-string,
 visual-quality and release gates. No artifact is made public by this code PR.
+
+## Mixed text/media position correction
+
+Mixed decoding builds a rectangular positions tensor, including synthetic ramps
+for text requests that originally had no explicit positions. Those filler rows
+must not change the text request from its native offset-based rotary path to
+explicit media rotary processing. Equal-valued genuine media planes remain
+explicit; tensor values are not an absence test.
+
+`CBv2Qwen4PositionScope` carries request-owned host booleans for one synchronous
+forward. `EngineLoopV2.withQwen4PositionScope` binds ordinary target forwards and
+direct hidden-returning MTP seed/decode/prefill/verification paths. This includes
+stateful history maintenance when batch pressure reduces draft depth to zero.
+`Qwen4ExpBatchedQSA.positions` honors that provenance without changing external
+explicit-position callers, singleton calls or other model architectures.
+
+The correction's release build and 43 targeted tests passed: seven XCTest
+position/policy/PLE tests plus 36 stateful-MTP integration tests, with no failures
+or skips. Actual EngineV2 route spies exercise both ordinary and hidden-returning
+mixed forwarding; scope tests cover reordering, equal media planes, nested
+throws and concurrent isolation. These targeted results do not replace a fresh
+full-suite run or full-model exactness qualification.
+
+On the selected checkpoint, MTP OFF/cache ON and MTP AUTO/cache OFF each passed
+11 unchanged HTTP/lifecycle waves: 19 completed responses and one live-peer
+cancellation. Content, reasoning, tool arguments, finish and usage matched the
+original isolated references. Both arms observed native B4; the AUTO singleton
+control proposed 238 draft tokens, while OFF proposed zero. This is scoped
+mixed-position evidence, not a full cache-by-MTP matrix or native logit proof.
+
+The companion provider report records the real-model reproduction and its
+remaining boundaries. Longer-prefix batching already diverged on the prior
+runtime, including cache-disabled cases; that separate failure is not fixed or
+waived here. Default admission remains one active row, the batched-QSA path
+remains opt-in, and native Qwen4 MTP speculation remains capped to one row.
+Weights, quantization, trained heads, sampler, cache format and fleet defaults
+are unchanged.
