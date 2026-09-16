@@ -18,6 +18,7 @@ struct RunnerRegistryTests {
             "gemma4": "layr/gemma4-text",
             "gemma4_text": "layr/gemma4-text",
             "gpt_oss": "layr/gptoss",
+            "nemotron_h": "layr/nemotron35-lightning",
             "qwen3_5": "layr/qwen35",
             "qwen3_5_moe": "layr/qwen35",
             "qwen3_5_text": "layr/qwen35",
@@ -48,8 +49,8 @@ struct RunnerRegistryTests {
         #expect(
             Set(ids).isSuperset(
                 of: [
-                    "layr/gemma4-text", "layr/gptoss", "layr/qwen35", "layr/qwen3vl",
-                    "layr/qwen4exp-125b-a6b",
+                    "layr/gemma4-text", "layr/gptoss", "layr/nemotron35-lightning",
+                    "layr/qwen35", "layr/qwen3vl", "layr/qwen4exp-125b-a6b",
                 ]))
         #expect(ids.count == Set(ids).count)
     }

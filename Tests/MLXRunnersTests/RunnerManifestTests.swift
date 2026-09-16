@@ -131,6 +131,30 @@ struct RunnerManifestTests {
                 == "2afbe23fc67ea9f2e9fd017098bb8b2877166190c9d56966dbeaa05656fcf8a2")
     }
 
+    /// Nemotron 3.5 Lightning. `kvBackends` is contiguous-only although the
+    /// engine capability declares paged support: the model also requires the
+    /// NATIVE segmented paged pool, which the shared assembly does not build.
+    @Test("Nemotron 3.5 Lightning manifest")
+    func nemotronH35Manifest() {
+        #expect(
+            canonical(NemotronH35Runner.manifest) == """
+                {"schemaVersion":1,"runnerID":"layr/nemotron35-lightning","modelTypes":\
+                ["nemotron_h"],"backend":"mlx","engine":\
+                {"supportsPrefixReuse":false,"supportsPagedKV":true,\
+                "supportsCompiledDecode":false,"supportsPackedPrefill":false,\
+                "supportsMTP":true,"supportsCompactRecurrentMTPReplay":false},\
+                "kvBackends":["contiguous"],"decoders":[{"mode":"serial",\
+                "drafter":"none","state":"stateless","depth":null},{"mode":"mtp",\
+                "drafter":"embeddedHead","state":"requestStateful","depth":[1,7]}],\
+                "regimes":[{"batch":"single","timing":"freeRun","perStreamTiming":false},\
+                {"batch":"single","timing":"teacherForced","perStreamTiming":false}],\
+                "multimodal":false,"recurrentLayers":true,"requiresKeepMask":false}
+                """)
+        #expect(
+            NemotronH35Runner.manifest.sha256Digest()
+                == "10b8718181feb354dd6b0bd75e6a0df554f23313d3dfe3d018ccf91f77b74c73")
+    }
+
     @Test("Qwen 3.5 manifest")
     func qwen35Manifest() {
         #expect(

@@ -50,6 +50,7 @@ public final class RunnerRegistry: @unchecked Sendable {
         [
             Gemma4TextRunner.self,
             GPTOSSRunner.self,
+            NemotronH35Runner.self,
             Qwen35Runner.self,
             Qwen3VLRunner.self,
             Qwen4ExpRunner.self,
