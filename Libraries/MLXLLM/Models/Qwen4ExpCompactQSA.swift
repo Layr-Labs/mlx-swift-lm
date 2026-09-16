@@ -3,7 +3,7 @@ import MLX
 import MLXLMCommon
 import os
 
-/// Private opt-in experiment. Sparse selection and Steel attention arithmetic
+/// Native selected-page read profile. Sparse selection and Steel attention arithmetic
 /// remain the existing implementation; only KV row materialization/addressing
 /// changes. No alternate SDPA and no split-K reduction are used.
 enum Qwen4ExpCompactQSA {
@@ -12,7 +12,7 @@ enum Qwen4ExpCompactQSA {
 
     static func enabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
         ["1", "true", "yes", "on"].contains(
-            environment[envFlag]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+            environment[envFlag]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "1")
     }
 
     static func eligible(offset: Int, width: Int) -> Bool {

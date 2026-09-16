@@ -7,7 +7,8 @@ import os
 /// slab concatenation. Segmented storage follows PagedSegmentTransfers' exact
 /// write-fence/completion-witness contract for hidden destination mutations.
 /// `DARKBLOOM_QWEN4_PAGED_SELECTED_GATHER_BOUND=1` groups up to 17 current
-/// segment buffers per pass; absent or any other value keeps the old path.
+/// segment buffers per pass; it is the default. Explicit zero retains the
+/// previous per-segment read path. Only Qwen4 selected-row reads use this gate.
 enum PagedSelectedGather {
     static let boundEnvFlag = "DARKBLOOM_QWEN4_PAGED_SELECTED_GATHER_BOUND"
 
@@ -22,7 +23,7 @@ enum PagedSelectedGather {
     static func boundEnabled(
         environment: [String: String] = Qwen4ExpEnvironment.snapshot
     ) -> Bool {
-        environment[boundEnvFlag] == "1"
+        environment[boundEnvFlag, default: "1"] == "1"
     }
 
     private static let monolithic = MLXFast.metalKernel(

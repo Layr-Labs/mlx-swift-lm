@@ -1,14 +1,15 @@
 import Foundation
 import MLX
 
-/// Experimental assistant-only catch-up. Default zero preserves the existing
-/// whole-history draft. Chunking can change assistant proposals; committed
-/// outputs still require the unchanged target verification/rollback contract.
+/// Bounded assistant-only catch-up. This can change draft proposals, never
+/// target weights or the target verification/rollback contract. Explicit zero
+/// retains the former whole-history catch-up for qualification/rollback.
 enum Qwen4ExpMTPPriming {
     static let environmentFlag = "DARKBLOOM_QWEN4_MTP_PRIME_CHUNK_TOKENS"
     static let skipColdPromptReplayEnvironmentFlag =
         "DARKBLOOM_QWEN4_MTP_SKIP_COLD_PROMPT_REPLAY"
     static let maximumChunkTokens = 8192
+    static let defaultChunkTokens = 2048
 
     /// Five accepted drafts plus the target seed can be normal round work.
     /// Initial history and a larger backlog after target-only steps are not.
@@ -16,15 +17,15 @@ enum Qwen4ExpMTPPriming {
         cacheTokens == 0 && backlogTokens > 0 || backlogTokens > 6
     }
 
-    /// Explicit Qwen4-only rollbackable policy. Unset, false, and malformed
-    /// values retain the established whole-history assistant prime. The
+    /// Qwen4-only rollbackable policy. Unset selects a carry-only first cold
+    /// round; false and malformed values retain whole-history priming. The
     /// caller applies true only to a fresh request's first round; restored
     /// prefix and settled-state checkpoints keep their exact replay path.
     static func skipsColdPromptReplay(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
         guard let raw = environment[skipColdPromptReplayEnvironmentFlag] else {
-            return false
+            return true
         }
         return ["1", "true", "yes", "on"].contains(
             raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
@@ -37,8 +38,8 @@ enum Qwen4ExpMTPPriming {
     static func environmentChunkTokens(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Int {
-        guard let raw = environment[environmentFlag],
-            let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard let raw = environment[environmentFlag] else { return defaultChunkTokens }
+        guard let value = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines))
         else { return 0 }
         return validatedChunkTokens(value)
     }

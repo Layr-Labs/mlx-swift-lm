@@ -7,13 +7,13 @@ import os
 /// FP32 scores feed the unchanged ordered online-softmax/PV recurrence. No split-K
 /// reduction, selector change or lower precision. Full-KV mode consumes the
 /// caller's existing materialized arrays; it never changes page ownership.
-/// Compact-KV parallel scores remain a separate opt-in experiment.
+/// Compact and full-KV reads use the same ordered score/value implementation.
 enum Qwen4ExpParallelQSA {
     static let flag = "DARKBLOOM_QWEN4_QSA_PARALLEL_SCORES"
     static let fullKVFlag = "DARKBLOOM_QWEN4_QSA_PARALLEL_FULL_KV"
     static let valuePartitionsFlag = "DARKBLOOM_QWEN4_QSA_PARALLEL_VALUE_PARTITIONS"
     static func enabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
-        environment[flag] == "1"
+        environment[flag, default: "1"] == "1"
     }
 
     static func fullKVEnabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
@@ -24,10 +24,10 @@ enum Qwen4ExpParallelQSA {
                                 environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Int {
         let configured = environment[valuePartitionsFlag]
         if requested == nil && configured == nil {
-            return compactKV ? fallback : 32
+            return 32
         }
         // Explicit caller/environment overrides keep their existing precedence
-        // and invalid-value fallback. Only the absent full-KV default changes.
+        // and invalid-value fallback. Both absent native defaults use32.
         let value = requested ?? Int(configured ?? "")
         return value.flatMap { [1, 2, 4, 8, 16, 32].contains($0) ? $0 : nil } ?? fallback
     }

@@ -155,8 +155,13 @@ full-suite checks in both optimization postures before promotion.
 
 The default `DARKBLOOM_QWEN4_QSA_PARALLEL_FULL_KV=1` uses independent QK
 tiles followed by the unchanged ordered softmax/PV recurrence on the caller's
-full materialized KV. It is separate from compact-KV parallel scores. The
-full-KV default is `DARKBLOOM_QWEN4_QSA_PARALLEL_VALUE_PARTITIONS=32`.
+full materialized KV. Eligible sparse paged requests instead gather the exact
+selected rows with `DARKBLOOM_QWEN4_QSA_PAGED_SELECTED=1`, preserving selection
+order, duplicates, absolute masks and Steel attention arithmetic. The default
+`DARKBLOOM_QWEN4_PAGED_SELECTED_GATHER_BOUND=1` binds up to17 segments per pass.
+Compact and full reads use32 value partitions; compact parallel scores default
+to `DARKBLOOM_QWEN4_QSA_PARALLEL_SCORES=1`. Unsupported/shared/frozen row views,
+non-sparse shapes and wider query windows retain their previous paths.
 The default `DARKBLOOM_QWEN4_LAYER_ASYNC=1` submits valid singleton text layers early for
 native paged widths1–6, excluding explicit embeddings/positions. It resolves
 deferred host fills without closing the owning scope and checks the whole
@@ -167,17 +172,35 @@ Unset switches select this profile. Explicit `0` on both switches restores
 the original dispatch/scheduling; unsetting them no longer disables it. The
 existing strict flag parser is preserved: explicit values other than `1` are
 disabled. Caller-supplied valid partitions override the environment; invalid
-explicit partitions retain the caller's existing fallback. Compact-KV parallel
-scores remain OFF and retain their caller-selected partition default.
+explicit partitions retain the caller's existing fallback. Explicit `0` on the
+selected-page, bound-gather or parallel-score switches independently restores
+their previous paths. The optional five-draft chain's six-column rectangle is
+accepted by selected-page storage; the production draft ceiling remains four.
+
+The assistant uses `DARKBLOOM_QWEN4_MTP_PRIME_CHUNK_TOKENS=2048` for bounded
+catch-up and `DARKBLOOM_QWEN4_MTP_SKIP_COLD_PROMPT_REPLAY=1` for the first cold
+round's carry-only policy. Restored prefix and settled-state histories retain
+replay, now bounded by the chunk policy. Explicit zero restores each former
+behavior. Draft proposals may change; target verification, exact committed
+outputs, rollback and complete checkpoint semantics must still pass their
+independent gates. These controls change no learned parameters or target
+prefill chunk policy. A high-acceptance short fixture is not a universal speed
+claim: qualify cold and warm-prefix replay, long contexts and low-acceptance
+prose, separating catch-up latency from steady decoding.
 
 These paths target decode and MTP verification widths1–6. Larger prefill chunks
 retain their existing paths; this default change is not evidence of1.5K–2K
 prefill throughput. Shape-eligible GDN blocked prefill, affine QMM and PLE
 gather were already default ON and are unchanged. No weights, precision,
-selector, trained head, sampler, MTP controller or prefill chunk policy changes
+selector, trained parameters, sampler or target prefill chunk policy changes
 are included. Keep SDK/provider pins paired when reverting commits.
 
 `Qwen4PerformanceDefaultsTests` verifies flag/partition behavior.
+`Qwen4SelectedPageCopiesTests` checks exact segmented reads, duplicate/invalid
+indices, rollback visibility and six-column eligibility. Priming fixtures that
+intend to exercise whole-history/chunked replay explicitly disable cold skip;
+they must not silently become no-ops after a default change. The existing
+whole-versus-chunked assistant closeness test is not a target-exactness oracle.
 `Qwen4ParallelFullKVParityTests` compares the unset default and every valid
 partition override against an explicitly disabled independent Steel oracle;
 wider prefill must retain the original dispatch. `Qwen4LayerSubmissionTests`

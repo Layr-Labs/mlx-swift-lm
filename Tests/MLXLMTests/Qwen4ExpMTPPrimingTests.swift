@@ -7,12 +7,12 @@ import Testing
 
 @Suite("Qwen4 bounded assistant priming", .serialized)
 struct Qwen4ExpMTPPrimingTests {
-    @Test func policyIsOptInAndBounded() {
+    @Test func defaultPolicyIsBoundedAndRetainsExplicitRollback() {
         let key = Qwen4ExpMTPPriming.environmentFlag
         for raw in ["", "0", "-1", "8193", "1.5", "true", "999999999999999999999"] {
             #expect(Qwen4ExpMTPPriming.environmentChunkTokens(environment: [key: raw]) == 0)
         }
-        #expect(Qwen4ExpMTPPriming.environmentChunkTokens(environment: [:]) == 0)
+        #expect(Qwen4ExpMTPPriming.environmentChunkTokens(environment: [:]) == 2048)
         #expect(Qwen4ExpMTPPriming.environmentChunkTokens(environment: [key: " 2048 "]) == 2048)
         #expect(Qwen4ExpMTPPriming.environmentChunkTokens(environment: [key: "8192"]) == 8192)
         #expect(!Qwen4ExpMTPPriming.needsChunking(backlog: [], chunkTokens: 1))
@@ -22,7 +22,7 @@ struct Qwen4ExpMTPPrimingTests {
         #expect(!Qwen4ExpMTPPriming.needsChunking(backlog: backlog, chunkTokens: 0))
 
         let skipKey = Qwen4ExpMTPPriming.skipColdPromptReplayEnvironmentFlag
-        #expect(!Qwen4ExpMTPPriming.skipsColdPromptReplay(environment: [:]))
+        #expect(Qwen4ExpMTPPriming.skipsColdPromptReplay(environment: [:]))
         for raw in ["", "0", "false", "off", "invalid"] {
             #expect(!Qwen4ExpMTPPriming.skipsColdPromptReplay(
                 environment: [skipKey: raw]))
@@ -76,9 +76,11 @@ struct Qwen4ExpMTPPrimingTests {
         MLXRandom.seed(8421)
         let target = Qwen4ExpTextModel(c)
         let whole = try Qwen4ExpInlineMTPAssistant(configuration: c, blockSize: 3,
-            target: target, verificationMode: .rectangularExact, primeChunkTokens: 0)
+            target: target, verificationMode: .rectangularExact, primeChunkTokens: 0,
+            skipColdPromptReplay: false)
         let chunked = try Qwen4ExpInlineMTPAssistant(configuration: c, blockSize: 3,
-            target: target, verificationMode: .rectangularExact, primeChunkTokens: 8)
+            target: target, verificationMode: .rectangularExact, primeChunkTokens: 8,
+            skipColdPromptReplay: false)
         chunked.update(parameters: whole.parameters())
         eval(target.parameters(), whole.parameters(), chunked.parameters())
         return (whole, chunked)

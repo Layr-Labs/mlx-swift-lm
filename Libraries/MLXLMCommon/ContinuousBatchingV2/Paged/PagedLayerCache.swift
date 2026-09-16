@@ -398,7 +398,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     public func qwen4CanGatherSelectedKV(keys: MLXArray, values: MLXArray) -> Bool {
         guard !pool.writeValidation.isFaulted, pagedRows.count == 1, kind.sharesKVWithLayer == nil,
               !retainsChunkForBorrowers, boundSpanContext == nil,
-              keys.ndim == 4, keys.dim(0) == 1, (1...5).contains(keys.dim(2)),
+              // Five chained drafts plus the target seed use six columns.
+              keys.ndim == 4, keys.dim(0) == 1, (1...6).contains(keys.dim(2)),
               keys.shape == values.shape, keys.dtype == values.dtype,
               pagedRows[0].supportsQwen4SelectedGather else { return false }
         let group = pool.group(pagedRows[0].groupKey)
