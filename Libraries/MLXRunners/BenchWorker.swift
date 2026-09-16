@@ -701,8 +701,14 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 // and reproduce through nine tokens with one). So a free run
                 // prefills its whole seed in one chunk. The diagnostic knob
                 // still overrides, by name, for shape experiments.
+                // A seed up to `freeRunSingleChunkLimit` stays one chunk (the
+                // scored 1024-token window); a longer seed is chunked so no
+                // single step outruns the engine's step watchdog and no
+                // chunk's transients scale with the whole prompt.
                 prefillChunkSize: Self.diagnosticPrefillChunk
-                    ?? max(CBv2SchedulerConfig().prefillChunkSize, seedLength),
+                    ?? (seedLength <= Self.freeRunSingleChunkLimit
+                        ? max(CBv2SchedulerConfig().prefillChunkSize, seedLength)
+                        : Self.freeRunSingleChunkLimit),
                 maxWaiting: batch,
                 enablePrefixCache: false),
             loopConfig: CBv2EngineLoopConfig(),
@@ -1121,6 +1127,9 @@ public final class BenchWorkerServer: @unchecked Sendable {
     /// summary path by name so no run can carry one silently.
     static let diagnosticPrefillChunk: Int? = positiveEnvironment(
         "BENCH_WORKER_DIAG_PREFILL_CHUNK")
+    /// Widest free-run seed that is prefilled as ONE chunk; longer seeds are
+    /// chunked at this width.
+    static let freeRunSingleChunkLimit = 4096
     static let diagnosticStepperChunk: Int? = positiveEnvironment(
         "BENCH_WORKER_DIAG_STEPPER_CHUNK")
 

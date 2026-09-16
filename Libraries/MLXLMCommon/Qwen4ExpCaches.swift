@@ -138,22 +138,58 @@ public func qwen4ExpGatherAttention(
         indices.dim(0) == S && valid.dim(0) == S,
         "Qwen4Exp QSA gather \(indices.shape) does not match \(S) queries")
     let dtype = queries.dtype
-    var outputs: [MLXArray] = []
-    outputs.reserveCapacity(S)
-    for s in 0 ..< S {
-        let columns = indices[s]
-        let k = take(cachedKeys, columns, axis: 2)
-        let v = take(cachedValues, columns, axis: 2)
-        outputs.append(
-            MLXFast.scaledDotProductAttention(
-                queries: queries[0..., 0..., s ..< (s + 1), 0...],
-                keys: k.dtype == dtype ? k : k.asType(dtype),
-                values: v.dtype == dtype ? v : v.asType(dtype),
-                scale: scale, mask: .array(valid[s].reshaped(1, 1, 1, -1)),
-                sinks: nil))
+    let keys = cachedKeys.dtype == dtype ? cachedKeys : cachedKeys.asType(dtype)
+    let values = cachedValues.dtype == dtype ? cachedValues : cachedValues.asType(dtype)
+    if S == 1 {
+        let columns = indices[0]
+        return MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: take(keys, columns, axis: 2),
+            values: take(values, columns, axis: 2),
+            scale: scale, mask: .array(valid[0].reshaped(1, 1, 1, -1)),
+            sinks: nil)
     }
-    return S == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    // Wide windows (prefill chunks, the head's flush): rows in blocks, each
+    // row attending its own gathered keys as a batch member. Each block is
+    // EVALUATED before the next is built, so the live transient is one
+    // block's gathered keys and values (~0.5 GB at the 2048 budget), never
+    // the whole window's: sixteen blocks left lazy in one graph measured
+    // +11 GB per layer window, which on a box whose GPU may wire 100 GiB
+    // with 82 GB of weights resident is the difference between running and
+    // a kernel watchdog reset.
+    let heads = queries.dim(1)
+    let kvHeads = keys.dim(1)
+    let headDim = keys.dim(3)
+    let n = indices.dim(1)
+    let block = qwen4ExpGatherRowBlock
+    var outputs: [MLXArray] = []
+    outputs.reserveCapacity((S + block - 1) / block)
+    var start = 0
+    while start < S {
+        let end = min(start + block, S)
+        let rows = end - start
+        let columns = indices[start ..< end].reshaped(-1)
+        let k = take(keys, columns, axis: 2)
+            .reshaped(1, kvHeads, rows, n, headDim).transposed(0, 2, 1, 3, 4)
+            .reshaped(rows, kvHeads, n, headDim)
+        let v = take(values, columns, axis: 2)
+            .reshaped(1, kvHeads, rows, n, headDim).transposed(0, 2, 1, 3, 4)
+            .reshaped(rows, kvHeads, n, headDim)
+        let q = queries[0..., 0..., start ..< end, 0...]
+            .transposed(0, 2, 1, 3).reshaped(rows, heads, 1, headDim)
+        let out = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v, scale: scale,
+            mask: .array(valid[start ..< end].reshaped(rows, 1, 1, n)), sinks: nil)
+        let blockOut = out.reshaped(1, rows, heads, headDim).transposed(0, 2, 1, 3)
+        eval(blockOut)
+        outputs.append(blockOut)
+        start = end
+    }
+    return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
 }
+
+/// Rows per gathered attention block for wide windows.
+public let qwen4ExpGatherRowBlock = 128
 
 /// KV cache for one Qwen4-Exp full-attention layer.
 ///

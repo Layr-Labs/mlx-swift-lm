@@ -308,10 +308,20 @@ extension Qwen4ExpTextConfiguration {
 
 extension Qwen4ExpQSAIndexer {
 
-    /// Windows up to this many queries gather their selected keys; wider
-    /// windows (prefill chunks) take the dense keep mask, whose cost is the
-    /// ordinary causal prefill cost.
+    /// Windows up to this many queries always gather their selected keys
+    /// (decode, MTP verify).
     public static let gatherWindowLimit = 32
+    /// Wide windows (prefill chunks, the head's flush) gather too once the
+    /// tape holds at least this many keys: below it the dense keep mask
+    /// through MLX's fused kernel reads at most `kvLength` keys per row and
+    /// wins; past it the gather's fixed `budget + compressRatio` keys per row
+    /// win, and its cost stops scaling with the context. Measured per
+    /// 2048-row window on the M5 Max: dense 0.6 s at 16K, 4 s at 28K; the
+    /// gather a flat 1.6 s from 8K to 32K. The crossover is near 20K. The
+    /// gather evaluates one 128-row block at a time (see
+    /// qwen4ExpGatherAttention), so its memory is one block's keys, whatever
+    /// the window width.
+    public static let gatherMinKeys = 20480
 
     /// The indexer's selection for this forward, projecting the indexer q/k
     /// from `x` here. See `cbv2Selection(q:keys:rope:cache:positions:)`.
@@ -428,7 +438,7 @@ extension Qwen4ExpQSAIndexer {
         // tape coordinates and the query's own position bounds it.
         let ownStart = complete * Int32(ratio)
 
-        if S <= Self.gatherWindowLimit {
+        if S <= Self.gatherWindowLimit || kvLength >= Self.gatherMinKeys {
             let within = MLXArray(Int32(0) ..< Int32(ratio))
             let blockTokens = (top[.ellipsis, .newAxis] * Int32(ratio) + within)
                 .reshaped(B, S, k * ratio)
