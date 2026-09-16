@@ -2,9 +2,45 @@ import MLX
 import Testing
 
 @testable import MLXLMCommon
+@testable import MLXLLM
 
 @Suite("Qwen4 selected-page copies", .serialized)
 struct Qwen4SelectedPageCopiesTests {
+    @Test(arguments: [1, 2, 5, 6])
+    func selectedAttentionPreservesIndependentOrderedSteelBytes(width: Int) throws {
+        let count = 16_389, offset = count - width
+        let kind = CBv2LayerKind(attention: .full, headDim: 256, kvHeads: 2, queryHeads: 24)
+        let backend = try PagedKVBackend(layerKinds: [kind], config: .init(
+            capacityBytes: 64 << 20, dtype: .bfloat16, maxPrefillChunk: count,
+            nominalMaxSequenceLength: count, segmentSizeBytes: 1 << 20))
+        let states = try backend.makeSequenceState(layerKinds: [kind], promptLength: 0, maxLength: count)
+        defer { backend.release(states) }
+        let row = try #require(states[0] as? PagedSequenceKV)
+        let queries = MLXRandom.normal([1, 24, width, 256], key: MLXRandom.key(UInt64(912 + width))).asType(.bfloat16)
+        let keys = MLXRandom.normal([1, 2, count, 256], key: MLXRandom.key(913)).asType(.bfloat16)
+        let values = MLXRandom.normal([1, 2, count, 256], key: MLXRandom.key(914)).asType(.bfloat16)
+        let selected = (0..<width).flatMap { column -> [Int32] in
+            let completeBlocks = (offset + column + 1) / 4
+            return (0..<512).map { Int32($0 * completeBlocks / 512) }
+        }
+        let blocks = MLXArray(selected, [1, width, 512])
+        eval(queries, keys, values, blocks)
+        let reference = try #require(Qwen4ExpNativeSparseGQA.attend(
+            queries: queries, keys: keys, values: values, selectedBlocks: blocks,
+            qOffset: offset, parallelScores: false, parallelFullKV: false))
+        row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
+        let indices = Qwen4ExpCompactQSA.tokenIndices(selected: blocks, offset: offset, keyTokens: count)
+        let compact = row.gatherSelected(indices)
+        let actual = try #require(Qwen4ExpNativeSparseGQA.attend(
+            queries: queries, keys: compact.keys, values: compact.values, selectedBlocks: blocks,
+            qOffset: offset, compactLogicalKeyTokens: count,
+            parallelScores: true, parallelValuePartitions: 32, parallelFullKV: false))
+        eval(reference, actual)
+        #expect(actual.shape == reference.shape && actual.dtype == reference.dtype)
+        #expect(actual.asData(access: .copy).data == reference.asData(access: .copy).data,
+                "Selected-page addressing must preserve the original ordered attention bytes")
+    }
+
     @Test(arguments: [DType.bfloat16, .float32])
     func selectedRowsAcrossBindingGroupsMatchDenseReference(dtype: DType) throws {
         let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 2)
