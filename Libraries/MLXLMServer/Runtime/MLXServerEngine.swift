@@ -63,6 +63,9 @@ public struct ServerGenerationInfo: Sendable, Equatable {
 
 public enum MLXServerGenerationEvent: Sendable, Equatable {
     case content(String)
+    /// Authoritative native channel separation. Do not parse its content again
+    /// or reinterpret reasoning as ordinary text, including at end-of-stream.
+    case parsed(ParsedReasoning)
     case toolCall(ToolCall)
     case info(ServerGenerationInfo)
 }

@@ -24,6 +24,8 @@ public protocol ToolCallParser: Sendable {
 
     /// Additional model-specific end tags accepted by this parser.
     var alternateEndTags: [String] { get }
+    /// Select the matching end delimiter when a parser accepts multiple frames.
+    func endTags(forStartTag startTag: String) -> [String]
 
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
@@ -43,6 +45,7 @@ public protocol ToolCallParser: Sendable {
 extension ToolCallParser {
     public var alternateStartTags: [String] { [] }
     public var alternateEndTags: [String] { [] }
+    public func endTags(forStartTag startTag: String) -> [String] { acceptedEndTags }
 
     package var acceptedStartTags: [String] {
         ([startTag].compactMap { $0 } + alternateStartTags)
@@ -95,6 +98,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// XML function format used by Nemotron, Qwen3 Coder, Qwen3 Next, and similar models.
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
+    /// Nemotron accepts the native complete function frame with or without
+    /// the outer tool_call wrapper. It never enables bare JSON recovery.
+    case nemotron
 
     /// Qwen 3.5's XML function format with a framed Hermes-JSON compatibility dialect.
     ///
@@ -149,6 +155,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .nemotron:
+            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>", acceptBareFunction: true)
         case .qwen35:
             return Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .glm4:
@@ -223,7 +231,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         // Nemotron family (nemotron_h, etc.)
         if type.hasPrefix("nemotron") {
-            return .xmlFunction
+            return .nemotron
         }
 
         // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.). Resolves to `.qwen35`,

@@ -485,7 +485,7 @@ struct CBv2MTPEngineMixedTests {
         #expect(engine.preemptionCount == 0)
     }
 
-    @Test func samplingAndLogprobRowsStayPlain() async throws {
+    @Test func stochasticRowsSpeculateAndLogprobRowsStayPlain() async throws {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 16, seed: 441, vocabSize: vocabSize)
 
@@ -498,8 +498,8 @@ struct CBv2MTPEngineMixedTests {
         let sampledMetrics = try #require(temperature.mtpMetricsSnapshot())
         await temperature.shutdown()
         #expect(sampled.finishReason == .length)
-        #expect(sampledMetrics.rounds == 0)
-        #expect(sampledMetrics.seedSteps == 0)
+        #expect(sampledMetrics.rounds > 0)
+        #expect(sampledMetrics.seedSteps > 0)
 
         let logprobs = try makeEngine(fixture, mtp: true)
         let stream = try logprobs.submit(
@@ -560,7 +560,7 @@ struct CBv2MTPEngineMixedTests {
             engine,
             request(
                 id: 1, prompt: plainPrompt, maxTokens: 16,
-                temperature: 0.7, seed: 7))
+                temperature: 0.7, topLogprobs: 1, seed: 7))
         let value = try await run(engine, mtpRequest)
         let metrics = try #require(engine.mtpMetricsSnapshot())
         await engine.shutdown()

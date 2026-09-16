@@ -1,5 +1,7 @@
 # MLX Swift LM
 
+> **This is a fork.** `Layr-Labs/mlx-swift-lm` tracks [`ml-explore/mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm) and adds Layr-Labs' production serving stack: the ContinuousBatchingV2 engine with a paged KV backend, MTP speculative decoding, production model work (Gemma 4, GPT-OSS, Qwen 3.5/3.6, Nemotron-H) and an OpenAI-compatible server. Everything changed relative to upstream is published as a fork diff at **https://layr-labs.github.io/mlx-swift-lm/**, described in [`fork.yaml`](fork.yaml) and kept honest by CI — see [FORKDIFF.md](FORKDIFF.md).
+
 MLX Swift LM is a Swift package to build tools and applications with large language models (LLMs) and vision language models (VLMs) in [MLX Swift](https://github.com/ml-explore/mlx-swift).
 
 > [!IMPORTANT]

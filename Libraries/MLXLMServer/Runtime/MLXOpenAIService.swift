@@ -14,11 +14,13 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
         case .responseNotFound(let id):
             return "Response '\(id)' was not found"
         case .embeddingsNotConfigured:
-            return "Embeddings require an embedding model engine; this server instance was started without one."
+            return
+                "Embeddings require an embedding model engine; this server instance was started without one."
         case .invalidResponseFormatOutput(let message):
             return "Generated output did not satisfy response_format: \(message)"
         case .multipleToolCallsNotAllowed:
-            return "Generated output contained multiple tool calls while parallel_tool_calls was false"
+            return
+                "Generated output contained multiple tool calls while parallel_tool_calls was false"
         }
     }
 }
@@ -26,6 +28,8 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
 public struct MLXOpenAIService: Sendable {
     private struct CollectedChatOutput: Sendable {
         var content: String = ""
+        var nativeReasoning: String = ""
+        var hasNativeChannels = false
         var toolCalls: [OpenAIToolCall] = []
         var usage: OpenAIUsage?
         var finishReason = "stop"
@@ -122,35 +126,40 @@ public struct MLXOpenAIService: Sendable {
                         )
                     )
 
+                    func emitParsed(_ parsed: ParsedReasoning) throws {
+                        let content = parsed.content.isEmpty ? nil : parsed.content
+                        guard content != nil || parsed.reasoningContent != nil else { return }
+                        continuation.yield(
+                            try ServerSentEventEncoder.encode(
+                                OpenAIChatCompletionChunk(
+                                    id: id,
+                                    model: request.model,
+                                    choices: [
+                                        .init(
+                                            index: 0,
+                                            delta: .init(
+                                                role: nil,
+                                                content: content,
+                                                reasoningContent: parsed.reasoningContent,
+                                                toolCalls: nil
+                                            ),
+                                            finishReason: nil
+                                        )
+                                    ],
+                                    usage: nil,
+                                    created: created
+                                )
+                            )
+                        )
+                    }
                     for try await event in stream {
                         switch event {
                         case .content(let text):
                             for parsed in reasoningParser.parse(text) {
-                                let content = parsed.content.isEmpty ? nil : parsed.content
-                                guard content != nil || parsed.reasoningContent != nil else { continue }
-                                continuation.yield(
-                                    try ServerSentEventEncoder.encode(
-                                        OpenAIChatCompletionChunk(
-                                            id: id,
-                                            model: request.model,
-                                            choices: [
-                                                .init(
-                                                    index: 0,
-                                                    delta: .init(
-                                                        role: nil,
-                                                        content: content,
-                                                        reasoningContent: parsed.reasoningContent,
-                                                        toolCalls: nil
-                                                    ),
-                                                    finishReason: nil
-                                                )
-                                            ],
-                                            usage: nil,
-                                            created: created
-                                        )
-                                    )
-                                )
+                                try emitParsed(parsed)
                             }
+                        case .parsed(let parsed):
+                            try emitParsed(parsed)
                         case .toolCall(let toolCall):
                             if request.parallelToolCalls == false,
                                 nextToolCallIndex > 0
@@ -342,6 +351,10 @@ public struct MLXOpenAIService: Sendable {
             switch event {
             case .content(let text):
                 output.content += text
+            case .parsed(let parsed):
+                output.hasNativeChannels = true
+                output.content += parsed.content
+                output.nativeReasoning += parsed.reasoningContent ?? ""
             case .toolCall(let toolCall):
                 if request.parallelToolCalls == false,
                     !output.toolCalls.isEmpty
@@ -370,9 +383,15 @@ public struct MLXOpenAIService: Sendable {
         request: OpenAIChatCompletionRequest,
         output: CollectedChatOutput
     ) throws -> OpenAIChatCompletionResponse {
-        let parsed = ReasoningParser(format: request.reasoningParser ?? defaultReasoningParser ?? .none)
-            .parse(output.content)
-        let content = output.toolCalls.isEmpty
+        let parsed =
+            output.hasNativeChannels
+            ? ParsedReasoning(
+                content: output.content,
+                reasoningContent: output.nativeReasoning.isEmpty ? nil : output.nativeReasoning)
+            : ReasoningParser(format: request.reasoningParser ?? defaultReasoningParser ?? .none)
+                .parse(output.content)
+        let content =
+            output.toolCalls.isEmpty
             ? try OpenAIResponseFormatSupport.normalizedContent(
                 parsed.content,
                 for: request.responseFormat
@@ -399,8 +418,13 @@ public struct MLXOpenAIService: Sendable {
         request: OpenAIResponseRequest,
         output: CollectedChatOutput
     ) -> OpenAIResponse {
-        let parsed = ReasoningParser(format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
-            .parse(output.content)
+        let parsed =
+            output.hasNativeChannels
+            ? ParsedReasoning(
+                content: output.content,
+                reasoningContent: output.nativeReasoning.isEmpty ? nil : output.nativeReasoning)
+            : ReasoningParser(format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
+                .parse(output.content)
         var outputItems: [OpenAIResponseOutputItem] = []
         if let reasoningContent = parsed.reasoningContent, !reasoningContent.isEmpty {
             outputItems.append(.reasoning(id: idProvider("rs"), text: reasoningContent))

@@ -488,7 +488,8 @@ public enum PagedAttentionKernel {
                     outputNames: ["partials", "meta", "fence"],
                     source: PagedAttentionMSL.partBody,
                     header: source,
-                    ensureRowContiguous: true
+                    ensureRowContiguous: true,
+                    mutableInputs: ["kcache", "vcache"]
                 )
             case .part:
                 k = MLXFast.metalKernel(
@@ -517,7 +518,8 @@ public enum PagedAttentionKernel {
                     outputNames: ["fence"],
                     source: PagedAttentionMSL.writeBody,
                     header: source,
-                    ensureRowContiguous: true
+                    ensureRowContiguous: true,
+                    mutableInputs: ["kcache", "vcache"]
                 )
             }
             kernels[key] = k

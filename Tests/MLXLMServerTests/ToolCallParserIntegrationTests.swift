@@ -677,7 +677,7 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: "qwen3_5", modelType: nil) == .qwen35)
         #expect(try ServerToolParser.resolve(requested: "qwen35", modelType: nil) == .qwen35)
         #expect(try ServerToolParser.resolve(requested: "hermes", modelType: nil) == .xmlFunction)
-        #expect(try ServerToolParser.resolve(requested: "nemotron", modelType: nil) == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: "nemotron", modelType: nil) == .nemotron)
         #expect(try ServerToolParser.resolve(requested: "glm4", modelType: nil) == .glm4)
         #expect(try ServerToolParser.resolve(requested: "glm_4", modelType: nil) == .glm4)
         #expect(try ServerToolParser.resolve(requested: "kimi_k2", modelType: nil) == .kimiK2)
@@ -694,7 +694,7 @@ struct ToolCallParserIntegrationTests {
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "mistral3") == .mistral)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_5") == .qwen35)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "qwen3_next") == .xmlFunction)
-        #expect(try ServerToolParser.resolve(requested: nil, modelType: "nemotron_h") == .xmlFunction)
+        #expect(try ServerToolParser.resolve(requested: nil, modelType: "nemotron_h") == .nemotron)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "lfm2") == .lfm2)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "glm4") == .glm4)
         #expect(try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .qwen35)
@@ -756,7 +756,7 @@ struct ToolCallParserIntegrationTests {
         #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
         #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
         #expect(ToolCallFormat.infer(from: "qwen3_next") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "nemotron_h") == .nemotron)
 
         // LFM2 family
         #expect(ToolCallFormat.infer(from: "lfm2") == .lfm2)
@@ -822,7 +822,7 @@ struct ToolCallParserIntegrationTests {
             case .mistral:
                 #expect(parser.startTag == "[TOOL_CALLS]")
                 #expect(parser.endTag == nil)  // Mistral uses EOS, no end tag
-            case .xmlFunction:
+            case .xmlFunction, .nemotron:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
             case .qwen35:

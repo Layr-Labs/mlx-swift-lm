@@ -34,6 +34,10 @@ public enum CBv2CheckpointTensorRole: String, Codable, Sendable {
 public enum CBv2CheckpointDType: String, Codable, Sendable {
     case float16, bfloat16, float32, int32
 
+    public var isFloatingPoint: Bool {
+        self == .float16 || self == .bfloat16 || self == .float32
+    }
+
     public var mlxDType: DType {
         switch self {
         case .float16: .float16

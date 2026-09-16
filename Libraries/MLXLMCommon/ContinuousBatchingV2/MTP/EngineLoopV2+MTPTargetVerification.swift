@@ -218,9 +218,15 @@ extension EngineLoopV2 {
             hidden = concatenated(hiddenColumns, axis: 1)
 
         } else {
-            for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }
+            for cache in serializingCaches {
+                cache.mtpSerializesRectangularAttention = true
+                cache.mtpBatchesRectangularAttention = mtp.drafter.prefersBatchedRectangularAttention
+            }
             defer {
-                for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
+                for cache in serializingCaches {
+                    cache.mtpSerializesRectangularAttention = false
+                    cache.mtpBatchesRectangularAttention = false
+                }
             }
             let tokens = concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)

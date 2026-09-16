@@ -439,11 +439,12 @@ struct CBv2MTPRectangularDegradeTests {
     }
 
     /// The invariant the edge buys: a write that lands on the captured slots
-    /// after `publish` cannot be observed by the capture, even when both are
-    /// forced in one `eval`. Rollback-then-rewrite is the strongest possible
+    /// after `publish` cannot be observed by the capture, with early or joint
+    /// submission. Rollback-then-rewrite is the strongest possible
     /// aliasing — the round's new tokens reuse the exact physical slots the
     /// capture named.
-    @Test func capturedBytesSurviveAWriteOverTheSameSlots() throws {
+    @Test(arguments: [false, true])
+    func capturedBytesSurviveAWriteOverTheSameSlots(submitCaptureConsumerEarly: Bool) throws {
         let (heads, dim) = (2, 64)
         let fixture = try pagedFixture(heads: heads, dim: dim)
         defer { fixture.backend.release(fixture.state) }
@@ -457,6 +458,11 @@ struct CBv2MTPRectangularDegradeTests {
         CBv2MTPCaptureFence.publish(
             [(row: row as CBv2SequenceKV, keys: snapshot.keys, values: snapshot.values)])
 
+        // A read-only draft may begin before target writes are constructed.
+        // Its result must retain the same pre-round bytes in both schedules.
+        let captureConsumer = snapshot.keys.sum() + snapshot.values.sum()
+        if submitCaptureConsumerEarly { asyncEval(captureConsumer) }
+
         // The "round": roll back to position 4 and write different bytes
         // into positions 4..<8 — the same pages, the same slots.
         row.rollback(4)
@@ -464,9 +470,8 @@ struct CBv2MTPRectangularDegradeTests {
             keys: tile(7, heads: heads, tokens: 4, dim: dim),
             values: tile(9, heads: heads, tokens: 4, dim: dim))
 
-        // One eval, captures and write together: exactly the shape of the
-        // round's single `asyncEval`.
-        eval([snapshot.keys, snapshot.values, group.writeFence])
+        eval([snapshot.keys, snapshot.values, captureConsumer, group.writeFence])
+        #expect(captureConsumer.item(Float.self) == Float(3 * heads * 8 * dim))
 
         let keyTail = snapshot.keys[0..., 0..., 4 ..< 8, 0...].asArray(Float.self)
         let valueTail = snapshot.values[0..., 0..., 4 ..< 8, 0...].asArray(Float.self)

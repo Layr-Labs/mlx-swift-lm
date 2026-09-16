@@ -179,7 +179,9 @@ extension EngineLoopV2 {
         }
         let withinBatchGate = rows.count <= mtp.config.maxSpeculativeBatch
         let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(rows)
-        mtp.beginPlan(plannedDecodeRows: rows.count, canSpeculate: canSpeculate)
+        mtp.beginPlan(
+            plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
+            rowIDs: rows.map(\.id))
         let eligibleRows = rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)

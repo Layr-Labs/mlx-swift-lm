@@ -29,7 +29,7 @@ let mlxSwiftDependency: Package.Dependency = {
         return .package(path: sibling.path)
     }
     return .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
-                    revision: "37572f1f10a6c485ac4cc254cad63e8242643a6f")
+                    revision: "6d6796d7a81b656d2749d39067e0a6bea2bc2986")
 }()
 
 let package = Package(
@@ -248,6 +248,16 @@ let package = Package(
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),
                 .process("Resources/block_hash_vectors.json"),
             ]
+        ),
+        .testTarget(
+            name: "OnboardingQualificationTests",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                "MLXLMCommon",
+                "MLXLLM",
+            ],
+            path: "Tests/OnboardingQualificationTests"
         ),
         .testTarget(
             name: "MLXLMServerTests",
