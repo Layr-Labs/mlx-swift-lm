@@ -12,12 +12,16 @@
 //
 //  THREE THINGS ARE FAMILY-SPECIFIC HERE.
 //
-//   1. The QSA indexer keeps a second per-row tape beside the key-value tape.
-//      `Qwen4ExpCBv2LayerCache` owns it and re-synchronizes it to the row's
-//      own `absoluteOffset` before every append, so an engine-driven rollback
-//      of the key-value tape moves the indexer tape with it.
-//   2. The keep mask the indexer produces reaches attention through the
-//      `keepMask` seam on `CBv2AttendingLayerCache.updateAndAttend`.
+//   1. The QSA indexer keeps a second per-row tape beside the key-value tape,
+//      plus the pooled blocks derived from it. `Qwen4ExpCBv2LayerCache` owns
+//      both and re-synchronizes them to the row's own `absoluteOffset` before
+//      every append, so an engine-driven rollback of the key-value tape moves
+//      the indexer tape with it. Blocks are pooled ONCE, when they complete.
+//   2. Past the budget the indexer's choice reaches attention as a
+//      `Qwen4ExpQSASelection`: decode and MTP verify windows GATHER their
+//      selected keys (attention over <= budget + compressRatio keys, whatever
+//      the context length); wide prefill windows use the dense `keepMask` seam
+//      on `CBv2AttendingLayerCache.updateAndAttend`.
 //   3. The PLE layer's short-convolution state and its n-gram token history
 //      ride the recurrent-state spec under a SYNTHETIC layer index, past the
 //      last real layer. Spec keys are opaque, so this carries the two extra
@@ -37,18 +41,16 @@ import MLXNN
 
 // MARK: - Layer cache with the indexer tape
 
-/// A `CBv2LayerCache` plus the QSA indexer's raw key tape.
+/// A `CBv2LayerCache` plus the QSA indexer's tape (see `Qwen4ExpIndexerTape`).
 ///
-/// The tape holds one un-rotated, un-pooled indexer key per token, which is
-/// what the indexer pools into blocks on each call. It is EXACT -- one row per
-/// processed token, no reserve -- and it is truncated to the sequence row's
-/// own `absoluteOffset` before every append. That single rule keeps it in step
-/// with the key-value tape: the engine rolls a speculative round back by
-/// calling `rollback` on the row, and the next append sees the shorter offset.
+/// The tape is truncated to the sequence row's own `absoluteOffset` before
+/// every append. That single rule keeps it in step with the key-value tape:
+/// the engine rolls a speculative round back by calling `rollback` on the
+/// row, and the next append sees the shorter offset.
 public final class Qwen4ExpCBv2LayerCache: CBv2AttendingLayerCache {
 
     private let base: CBv2LayerCache
-    private var tapes: [ObjectIdentifier: MLXArray] = [:]
+    private var tapes: [ObjectIdentifier: Qwen4ExpIndexerTape] = [:]
 
     public init(layerIndex: Int, kind: CBv2LayerKind) {
         precondition(
@@ -72,7 +74,7 @@ public final class Qwen4ExpCBv2LayerCache: CBv2AttendingLayerCache {
     /// Length of the bound row's tape, for tests and diagnostics.
     public var indexerTapeLength: Int {
         guard let row = rows.first else { return 0 }
-        return tapes[ObjectIdentifier(row)]?.dim(1) ?? 0
+        return tapes[ObjectIdentifier(row)]?.length ?? 0
     }
 
     /// Append this step's raw indexer keys `[1, S, indexerHeadDim]` to the
@@ -85,14 +87,50 @@ public final class Qwen4ExpCBv2LayerCache: CBv2AttendingLayerCache {
             rows.count == 1, "Qwen4Exp QSA serves one row per call, got \(rows.count)")
         let row = rows[0]
         let identity = ObjectIdentifier(row)
-        let committed = row.absoluteOffset
-        var tape = tapes[identity]
-        if let existing = tape, existing.dim(1) > committed {
-            tape = committed == 0 ? nil : existing[0..., ..<committed, 0...]
+        let tape = tapes[identity] ?? Qwen4ExpIndexerTape()
+        tape.truncate(to: row.absoluteOffset)
+        tapes[identity] = tape
+        return tape.append(keys)
+    }
+
+    /// Pooled indexer blocks `[1, tapeLength / compressRatio, headDim]` for
+    /// the single bound row, pooling only the blocks completed since the last
+    /// call. Call AFTER `updateIndexerTape` in the same forward.
+    public func indexerBlocks(
+        compressRatio: Int, pool: (_ raw: MLXArray, _ firstBlock: Int) -> MLXArray
+    ) -> MLXArray {
+        precondition(
+            rows.count == 1, "Qwen4Exp QSA serves one row per call, got \(rows.count)")
+        guard let tape = tapes[ObjectIdentifier(rows[0])] else {
+            preconditionFailure("Qwen4Exp indexer blocks requested before the tape was appended")
         }
-        let updated = tape.map { concatenated([$0, keys], axis: 1) } ?? keys
-        tapes[identity] = updated
-        return updated
+        return tape.blocks(compressRatio: compressRatio, pool: pool)
+    }
+
+    /// Append this step's K/V and attend over the indexer's selection.
+    ///
+    /// `.gather` appends without the base attention and runs SDPA per query
+    /// over that query's gathered keys only, so a decode step past the budget
+    /// reads `budget + compressRatio` keys, not the whole context.
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, selection: Qwen4ExpQSASelection
+    ) -> MLXArray {
+        switch selection {
+        case .all:
+            return base.updateAndAttend(
+                queries: queries, keys: keys, values: values, scale: scale, sinks: nil,
+                keepMask: nil)
+        case .keepMask(let mask):
+            return base.updateAndAttend(
+                queries: queries, keys: keys, values: values, scale: scale, sinks: nil,
+                keepMask: mask)
+        case .gather(let indices, let valid):
+            let (cachedKeys, cachedValues) = base.updateOnly(keys: keys, values: values)
+            return qwen4ExpGatherAttention(
+                queries: queries, cachedKeys: cachedKeys, cachedValues: cachedValues,
+                scale: scale, indices: indices, valid: valid)
+        }
     }
 
     public func updateAndAttend(
@@ -142,7 +180,9 @@ extension Qwen4ExpCBv2LayerCache: KVCache {
     public func innerState() -> [MLXArray] {
         var arrays = base.innerState()
         for row in rows {
-            if let tape = tapes[ObjectIdentifier(row)] { arrays.append(tape) }
+            if let tape = tapes[ObjectIdentifier(row)] {
+                arrays.append(contentsOf: tape.arrays)
+            }
         }
         return arrays
     }
@@ -268,51 +308,107 @@ extension Qwen4ExpTextConfiguration {
 
 extension Qwen4ExpQSAIndexer {
 
-    /// Keep mask over the row's whole indexer tape, or nil while the visible
-    /// context still fits the budget.
-    ///
-    /// Same computation as the legacy `callAsFunction`, reading the tape from
-    /// the CBv2 layer cache instead of a `Qwen4ExpAttentionCache`, and taking
-    /// query positions as an array so the row's absolute history is honored.
-    ///
-    /// - Returns: `[1, 1, S, kvLength]` boolean, true == attend.
-    func cbv2KeepMask(
+    /// Windows up to this many queries gather their selected keys; wider
+    /// windows (prefill chunks) take the dense keep mask, whose cost is the
+    /// ordinary causal prefill cost.
+    public static let gatherWindowLimit = 32
+
+    /// The indexer's selection for this forward, projecting the indexer q/k
+    /// from `x` here. See `cbv2Selection(q:keys:rope:cache:positions:)`.
+    public func cbv2Selection(
         _ x: MLXArray,
         rope: Qwen4ExpRotary,
         cache: Qwen4ExpCBv2LayerCache,
         positions: MLXArray
-    ) -> MLXArray? {
-        let B = x.dim(0)
-        let S = x.dim(1)
-        precondition(B == 1, "Qwen4Exp QSA serves one row per call, got batch \(B)")
-
+    ) -> Qwen4ExpQSASelection {
         let qk = indexQKProj(x)
         let split = heads * headDim
-        var q = qk[.ellipsis, ..<split].reshaped(B, S, heads, headDim)
-        let rawK = cache.updateIndexerTape(
-            keys: qk[.ellipsis, split...].reshaped(B, S, headDim))
+        return cbv2Selection(
+            q: qk[.ellipsis, ..<split], keys: qk[.ellipsis, split...],
+            rope: rope, cache: cache, positions: positions)
+    }
 
-        let kvLength = rawK.dim(1)
-        if kvLength <= tokenBudget { return nil }
+    /// The indexer's selection for this forward.
+    ///
+    /// Same scoring as the legacy `callAsFunction`, over the CBv2 layer
+    /// cache's tape and pooled blocks (pooled incrementally, see
+    /// `Qwen4ExpIndexerTape`), taking query positions as an array so the
+    /// row's absolute history is honored. Appends `keys` to the tape, so call
+    /// it BEFORE the key-value update of the same forward.
+    ///
+    /// - Parameters:
+    ///   - q: raw indexer queries `[1, S, heads * headDim]` (before norm/rope).
+    ///   - keys: raw indexer keys `[1, S, headDim]` (before norm/rope).
+    public func cbv2Selection(
+        q rawQ: MLXArray,
+        keys: MLXArray,
+        rope: Qwen4ExpRotary,
+        cache: Qwen4ExpCBv2LayerCache,
+        positions: MLXArray
+    ) -> Qwen4ExpQSASelection {
+        let B = rawQ.dim(0)
+        let S = rawQ.dim(1)
+        precondition(B == 1, "Qwen4Exp QSA serves one row per call, got batch \(B)")
+        let rawK = cache.updateIndexerTape(keys: keys.reshaped(B, S, headDim))
+        return select(rawQ: rawQ, kvLength: rawK.dim(1), rope: rope, positions: positions) {
+            cache.indexerBlocks(compressRatio: compressRatio, pool: $0)
+        }
+    }
 
-        let blocks = kvLength / compressRatio
-        var pooled = rawK[0..., ..<(blocks * compressRatio), 0...]
-            .reshaped(B, blocks, compressRatio, headDim)
-        pooled = kLayerNorm(pooled.asType(.float32).mean(axis: 2).asType(rawK.dtype))
+    /// The same selection over a legacy `Qwen4ExpAttentionCache` (the MTP
+    /// head's cache). Positions run from `offset`, the cache's pre-update KV
+    /// offset. Appends `keys` to the cache's tape.
+    public func legacySelection(
+        q rawQ: MLXArray,
+        keys: MLXArray,
+        rope: Qwen4ExpRotary,
+        cache: Qwen4ExpAttentionCache,
+        offset: Int
+    ) -> Qwen4ExpQSASelection {
+        let B = rawQ.dim(0)
+        let S = rawQ.dim(1)
+        precondition(B == 1, "Qwen4Exp QSA serves one row per call, got batch \(B)")
+        let rawK = cache.updateIndexer(keys: keys.reshaped(B, S, headDim))
+        return select(
+            rawQ: rawQ, kvLength: rawK.dim(1), rope: rope,
+            positions: qwen4ExpPositions(offset: offset, count: S)
+        ) {
+            cache.indexerBlocks(compressRatio: compressRatio, pool: $0)
+        }
+    }
 
-        // Block n holds the logical positions n * compressRatio and up.
-        let blockStarts = MLXArray(Int32(0) ..< Int32(blocks)) * Int32(compressRatio)
-        let (cosK, sinK) = rope.cosSin(blockStarts[.newAxis])
-        pooled = qwen4ExpRopePartial(pooled, cos: cosK, sin: sinK)
+    /// Score the pooled blocks for every query and choose: `.all` while the
+    /// tape fits the budget, else `.gather` for a narrow window and
+    /// `.keepMask` for a wide one. `blocks` returns the pooled blocks for the
+    /// pooling closure this indexer supplies (norm, then rope by block start).
+    private func select(
+        rawQ: MLXArray, kvLength: Int, rope: Qwen4ExpRotary, positions: MLXArray,
+        blocks: ((MLXArray, Int) -> MLXArray) -> MLXArray
+    ) -> Qwen4ExpQSASelection {
+        let B = rawQ.dim(0)
+        let S = rawQ.dim(1)
+        if kvLength <= tokenBudget { return .all }
+
+        let ratio = compressRatio
+        // Block n holds the logical positions n * compressRatio and up. A
+        // block is a pure function of its own raw keys, so it is pooled once.
+        let pooled = blocks { raw, firstBlock in
+            var block = kLayerNorm(raw.asType(.float32).mean(axis: 2).asType(raw.dtype))
+            let blockStarts =
+                MLXArray(Int32(firstBlock) ..< Int32(firstBlock + raw.dim(1))) * Int32(ratio)
+            let (cosK, sinK) = rope.cosSin(blockStarts[.newAxis])
+            block = qwen4ExpRopePartial(block, cos: cosK, sin: sinK)
+            return block.asType(.float32)
+        }
+        let blocks = pooled.dim(1)
 
         let qPos = positions.asType(.int32)
         let (cosQ, sinQ) = rope.cosSin(qPos)
-        q = qLayerNorm(q)
+        var q = qLayerNorm(rawQ.reshaped(B, S, heads, headDim))
         q = qwen4ExpRopePartial(
             q, cos: cosQ[0..., 0..., .newAxis, 0...], sin: sinQ[0..., 0..., .newAxis, 0...])
 
-        var scores = qwen4ExpIndexerBlockScores(
-            q: q.asType(.float32), pooled: pooled.asType(.float32))
+        var scores = qwen4ExpIndexerBlockScores(q: q.asType(.float32), pooled: pooled)
         scores = maximum(scores, MLXArray(Float(0))).sum(axis: -1) / Foundation.sqrt(Float(headDim))
 
         // Integer block COUNT. See the legacy path for why floor division is
@@ -325,8 +421,28 @@ extension Qwen4ExpQSAIndexer {
         scores = MLX.where(visible, scores, MLXArray(-Float.infinity))
 
         let k = Swift.min(blockTopK, blocks)
-        let top = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        let top = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k].asType(.int32)
         let picked = takeAlong(visible, top, axis: -1)
+        // Each query also keeps the partial block it sits in. Tape column c
+        // holds the token at absolute position c, so this comparison is in
+        // tape coordinates and the query's own position bounds it.
+        let ownStart = complete * Int32(ratio)
+
+        if S <= Self.gatherWindowLimit {
+            let within = MLXArray(Int32(0) ..< Int32(ratio))
+            let blockTokens = (top[.ellipsis, .newAxis] * Int32(ratio) + within)
+                .reshaped(B, S, k * ratio)
+            let blockValid = repeated(picked, count: ratio, axis: -1)
+            let ownTokens = ownStart[.ellipsis, .newAxis] + within
+            let ownValid = ownTokens .<= qPos[.ellipsis, .newAxis]
+            let indices = concatenated([blockTokens, ownTokens], axis: -1)
+            let valid = concatenated([blockValid, ownValid], axis: -1)
+            // An unpicked slot reads column 0 and is masked off; every query
+            // keeps at least one visible column (its own, or the visible
+            // block its position closes), so no row is fully masked.
+            return .gather(
+                indices: MLX.where(valid, indices, MLXArray(Int32(0)))[0], valid: valid[0])
+        }
 
         let sentinel = MLXArray(Int32(blocks))
         let keepBlocks = putAlong(
@@ -335,22 +451,16 @@ extension Qwen4ExpQSAIndexer {
             values: MLXArray(true),
             axis: -1
         )[.ellipsis, ..<blocks]
-        var keep = repeated(keepBlocks, count: compressRatio, axis: -1)
-        let rest = kvLength - blocks * compressRatio
+        var keep = repeated(keepBlocks, count: ratio, axis: -1)
+        let rest = kvLength - blocks * ratio
         if rest > 0 {
             keep = concatenated([keep, MLXArray.zeros([B, S, rest], dtype: .bool)], axis: -1)
         }
-
-        // Each query also keeps the partial block it sits in. Tape column c
-        // holds the token at absolute position c, so this comparison is in
-        // tape coordinates and the query's own position bounds it.
-        let ownStart = complete * Int32(compressRatio)
         let tokens = MLXArray(Int32(0) ..< Int32(kvLength))
         let own =
             (tokens[.newAxis, .newAxis, 0...] .>= ownStart[.ellipsis, .newAxis])
             & (tokens[.newAxis, .newAxis, 0...] .<= qPos[.ellipsis, .newAxis])
-
-        return expandedDimensions(keep | own, axis: 1)
+        return .keepMask(expandedDimensions(keep | own, axis: 1))
     }
 }
 
@@ -367,7 +477,7 @@ extension Qwen4ExpAttention {
         let S = x.dim(1)
         precondition(B == 1, "Qwen4Exp CBv2 attention serves one row per call, got batch \(B)")
 
-        let keepMask = indexer.cbv2KeepMask(x, rope: rope, cache: cache, positions: positions)
+        let selection = indexer.cbv2Selection(x, rope: rope, cache: cache, positions: positions)
 
         let projected = qProj(x).reshaped(B, S, heads, -1).split(parts: 2, axis: -1)
         var queries = projected[0]
@@ -383,7 +493,7 @@ extension Qwen4ExpAttention {
 
         let out = cache.updateAndAttend(
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: nil, keepMask: keepMask
+            scale: scale, selection: selection
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, S, -1)

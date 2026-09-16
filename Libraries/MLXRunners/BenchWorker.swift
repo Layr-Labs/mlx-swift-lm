@@ -992,8 +992,13 @@ public final class BenchWorkerServer: @unchecked Sendable {
             switch event {
             case .delta(_, let tokens, _):
                 out.append(contentsOf: tokens)
-            case .finished:
+            case .finished(let reason, _):
                 guard out.count >= count else {
+                    // The refusal names the count; the cause goes to stderr,
+                    // where the operator reads it (a lease, the watchdog, an
+                    // engine error) instead of a bare "0 of 1".
+                    FileHandle.standardError.write(
+                        Data("bench-worker: stream \(slot) finished early: \(reason)\n".utf8))
                     throw WorkerError.streamEndedEarly(
                         slot: slot, got: out.count, want: count)
                 }
