@@ -561,8 +561,10 @@ final class Qwen35GatedDeltaNet: Module {
 
     /// `norm(out, gate: z)`; on qwen4 the sigmoid-gate tail after the fast
     /// RMSNorm kernel is one compiled kernel (same ops and dtypes).
-    private func gatedOutputNorm(_ out: MLXArray, gate: MLXArray) -> MLXArray {
-        if qkNormalization == .qwen4L2, Qwen4ExpFusions.isEnabled {
+    func gatedOutputNorm(_ out: MLXArray, gate: MLXArray) -> MLXArray {
+        if qkNormalization == .qwen4L2, case .sigmoid = norm.gateActivation,
+            Qwen4ExpFusions.isEnabled
+        {
             let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
             return Qwen4ExpFusions.gatedNormFinish(normed, gate)
         }

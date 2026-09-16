@@ -23,7 +23,7 @@ final class Qwen4ExpCodableTests: XCTestCase {
       "make_ngram_vocab_size_divisible_by": 32, "split_ngram_parts": 4,
       "indexer_n_heads": 2, "indexer_kv_heads": 2, "indexer_head_dim": 16,
       "indexer_budget": 16, "indexer_compress_ratio": 2,
-      "output_gate_type": "identity", "num_experts": 4, "num_experts_per_tok": 2,
+      "output_gate_type": "silu", "num_experts": 4, "num_experts_per_tok": 2,
       "shared_expert_intermediate_size": 32, "moe_intermediate_size": 48,
       "norm_topk_prob": false,
       "rope_parameters": {"rope_theta": 32768, "partial_rotary_factor": 0.5, "mrope_section": [2, 3, 7]},

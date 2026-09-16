@@ -24,6 +24,21 @@ empty or populated tool-call arrays. The generic SDK model-container server
 rejects unsupported seed/nonempty logit-bias controls instead of ignoring them;
 the native provider's request-scoped sampling support is unchanged.
 
+The generic server also rejects explicit `reasoning.effort` and
+`reasoning.enabled` with a structured HTTP400 before streaming starts. It has
+no model-specific thinking-template contract. Parser-only reasoning remains
+supported, and the shared Chat/Responses translation still forwards reasoning
+controls to capable native engines. Changing an output parser is not a substitute
+for applying a requested inference control.
+
+Qwen4 `output_gate_type` accepts `sigmoid` and `silu`; configuration decoding
+rejects other values before weight loading. Recurrent construction uses that
+mapping. The sigmoid-only fused normalization tail is eligible only for sigmoid;
+SiLU executes its existing native normalization path. The selected checkpoint's
+sigmoid math, weights and embedded MTP heads are unchanged. Focused coverage is
+`Qwen4ExpOutputGateTests`, `MLXModelContainerEngineReasoningTests` and
+`ContainerControlHTTPTests`; these tests do not replace composed-model gates.
+
 The associated miniature tests are `Qwen4FactoryLifecycleTests`,
 `Qwen4ExpPLEResidencyTests`, `Qwen4ExpCodableTests`,
 `OpenAIResponsesInputReplayTests` and `ContainerControlHTTPTests`. These changes

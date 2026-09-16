@@ -13,7 +13,10 @@ struct ContainerControlHTTPTests {
             service: MLXOpenAIService(engine: ControlFixtureEngine()), host: "127.0.0.1", port: 8080)
         try await app.test(.router) { client in
             for streaming in [false, true] {
-                for control in [#""seed":0"#, #""logit_bias":{"0":100}"#] {
+                for control in [#""seed":0"#, #""logit_bias":{"0":100}"#,
+                    #""reasoning":{"effort":"none"}"#, #""reasoning":{"effort":"high"}"#,
+                    #""reasoning":{"enabled":false}"#, #""reasoning":{"enabled":true}"#]
+                {
                     let body = #"{"model":"fixture","messages":[{"role":"user","content":"hi"}],"stream":\#(streaming),\#(control)}"#
                     try await client.execute(uri: "/v1/chat/completions", method: .post,
                         headers: [.contentType: "application/json"], body: ByteBuffer(string: body)) { response in
@@ -29,6 +32,46 @@ struct ContainerControlHTTPTests {
         }
     }
 
+    @Test func responsesReasoningEffortFailsBeforeStreamingHeaders() async throws {
+        let app = MLXServerApplication.buildApplication(
+            service: MLXOpenAIService(engine: ControlFixtureEngine()), host: "127.0.0.1", port: 8080)
+        try await app.test(.router) { client in
+            for streaming in [false, true] {
+                for effort in ["none", "low", "high"] {
+                    let body = #"{"model":"fixture","input":"hi","stream":\#(streaming),"reasoning":{"effort":"\#(effort)"}}"#
+                    try await client.execute(uri: "/v1/responses", method: .post,
+                        headers: [.contentType: "application/json"], body: ByteBuffer(string: body)) { response in
+                            #expect(response.status == .badRequest)
+                            let text = String(buffer: response.body)
+                            let error = try JSONDecoder().decode(OpenAIErrorResponse.self, from: Data(text.utf8))
+                            #expect(error.error.type == "invalid_request_error")
+                            #expect(error.error.message.contains("reasoning.effort"))
+                            #expect(!text.contains("data:"))
+                        }
+                }
+            }
+        }
+    }
+
+    @Test func sharedResponsesHTTPStackPreservesControlsForCapableEngines() async throws {
+        let engine = ControlFixtureEngine(acceptsControls: true)
+        let app = MLXServerApplication.buildApplication(
+            service: MLXOpenAIService(engine: engine), host: "127.0.0.1", port: 8080)
+        try await app.test(.router) { client in
+            for streaming in [false, true] {
+                for effort in ["none", "high"] {
+                    let body = #"{"model":"fixture","input":"hi","stream":\#(streaming),"reasoning":{"effort":"\#(effort)"}}"#
+                    try await client.execute(uri: "/v1/responses", method: .post,
+                        headers: [.contentType: "application/json"], body: ByteBuffer(string: body)) { response in
+                            #expect(response.status == .ok)
+                        }
+                    let seen = await engine.lastRequest
+                    #expect(seen?.reasoning?.effort == effort)
+                }
+            }
+        }
+    }
+
     @Test func sharedHTTPStackDoesNotRejectCapableEngines() async throws {
         let engine = ControlFixtureEngine(acceptsControls: true)
         let app = MLXServerApplication.buildApplication(
@@ -36,13 +79,14 @@ struct ContainerControlHTTPTests {
         try await app.test(.router) { client in
             try await client.execute(uri: "/v1/chat/completions", method: .post,
                 headers: [.contentType: "application/json"],
-                body: ByteBuffer(string: #"{"model":"fixture","messages":[{"role":"user","content":"hi"}],"seed":17,"logit_bias":{"42":-12.5}}"#)) { response in
+                body: ByteBuffer(string: #"{"model":"fixture","messages":[{"role":"user","content":"hi"}],"seed":17,"logit_bias":{"42":-12.5},"reasoning":{"enabled":false,"effort":"none"}}"#)) { response in
                     #expect(response.status == .ok)
                 }
         }
         let seen = await engine.lastRequest
         #expect(seen?.seed == 17)
         #expect(seen?.logitBias == ["42": -12.5])
+        #expect(seen?.reasoning == .init(enabled: false, effort: "none"))
     }
 }
 
@@ -54,7 +98,10 @@ private actor ControlFixtureEngine: MLXServerEngine {
     func streamChatCompletion(request: OpenAIChatCompletionRequest)
         async throws -> AsyncThrowingStream<MLXServerGenerationEvent, Error>
     {
-        if !acceptsControls { try MLXModelContainerEngine.validateSamplingControls(request) }
+        if !acceptsControls {
+            try MLXModelContainerEngine.validateSamplingControls(request)
+            try MLXModelContainerEngine.validateReasoningControls(request)
+        }
         lastRequest = request
         return AsyncThrowingStream { continuation in
             continuation.yield(.content("ok"))

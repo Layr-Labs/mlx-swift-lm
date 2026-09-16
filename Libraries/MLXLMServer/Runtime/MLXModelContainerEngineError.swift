@@ -19,6 +19,7 @@ public enum MLXModelContainerEngineError: Error, LocalizedError, Equatable, HTTP
     case unsupportedToolCallParser(pinned: ToolCallFormat, requested: ToolCallFormat)
 
     case unsupportedSamplingControl(String)
+    case unsupportedReasoningControl(String)
     case nativeGenerationRequired(String)
 
     public var status: HTTPResponse.Status {
@@ -46,6 +47,8 @@ public enum MLXModelContainerEngineError: Error, LocalizedError, Equatable, HTTP
                 "This model server is pinned to the '\(pinned.rawValue)' tool-call parser; a per-request override to '\(requested.rawValue)' is not supported. Start the server with the desired --tool-call-parser instead."
         case .unsupportedSamplingControl(let field):
             return "The generic model-container engine does not support '\(field)'. Use a native engine with request-scoped sampling controls or omit this field."
+        case .unsupportedReasoningControl(let field):
+            return "The generic model-container engine does not support '\(field)'. Use an engine with model-specific reasoning controls or omit this field."
         case .nativeGenerationRequired(let reason):
             return reason
         }

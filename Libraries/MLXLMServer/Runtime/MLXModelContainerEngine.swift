@@ -46,6 +46,7 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         }
 
         try Self.validateSamplingControls(request)
+        try Self.validateReasoningControls(request)
         do {
             try await model.perform { context in
                 try (context.model as? any GenericGenerationValidating)?.validateGenericGeneration()
@@ -132,6 +133,19 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         }
         if request.logitBias?.isEmpty == false {
             throw MLXModelContainerEngineError.unsupportedSamplingControl("logit_bias")
+        }
+    }
+
+    /// This generic engine has no model-specific thinking-template contract.
+    /// Output parsing is supported, but it cannot implement inference controls
+    /// such as `effort: "none"` by merely changing the response parser. Keep
+    /// this refusal engine-local so native engines can honor these controls.
+    static func validateReasoningControls(_ request: OpenAIChatCompletionRequest) throws {
+        if request.reasoning?.effort != nil {
+            throw MLXModelContainerEngineError.unsupportedReasoningControl("reasoning.effort")
+        }
+        if request.reasoning?.enabled != nil {
+            throw MLXModelContainerEngineError.unsupportedReasoningControl("reasoning.enabled")
         }
     }
 

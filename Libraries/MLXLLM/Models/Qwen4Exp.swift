@@ -148,6 +148,7 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         indexerCompressRatio =
             try container.decodeIfPresent(Int.self, forKey: .indexerCompressRatio) ?? 4
         outputGateType = try container.decodeIfPresent(String.self, forKey: .outputGateType) ?? "sigmoid"
+        _ = try recurrentOutputGate(codingPath: decoder.codingPath)
         numExperts = try container.decodeIfPresent(Int.self, forKey: .numExperts) ?? 512
         numExpertsPerTok = try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 10
         sharedExpertIntermediateSize =
@@ -1222,7 +1223,7 @@ final class Qwen4ExpDecoderLayer: Module {
         let bridge = try args.qwen35BridgeConfiguration()
         if isLinear {
             _linearAttn.wrappedValue = Qwen35GatedDeltaNet(
-                bridge, qkNormalization: .qwen4L2, outputGate: .sigmoid)
+                bridge, qkNormalization: .qwen4L2, outputGate: try args.recurrentOutputGate())
         } else {
             _selfAttn.wrappedValue = Qwen4ExpAttention(args)
         }
