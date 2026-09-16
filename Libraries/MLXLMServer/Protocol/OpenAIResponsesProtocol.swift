@@ -20,10 +20,10 @@ public enum OpenAIResponseInput: Codable, Sendable, Equatable {
             let message = item.message
             // A reasoning item and its following function calls form one
             // assistant turn. Explicit messages/tool outputs remain boundaries.
-            let followsReasoning = previousKind == .reasoning && item.kind == .functionCall
-            if let calls = message.toolCalls, let last = messages.indices.last,
-                messages[last].role == .assistant,
-                messages[last].toolCalls != nil || followsReasoning
+            let followsSameTurnItem = previousKind == .reasoning || previousKind == .functionCall
+            if item.kind == .functionCall, followsSameTurnItem,
+                let calls = message.toolCalls, let last = messages.indices.last,
+                messages[last].role == .assistant
             {
                 messages[last].toolCalls = (messages[last].toolCalls ?? []) + calls
             } else {

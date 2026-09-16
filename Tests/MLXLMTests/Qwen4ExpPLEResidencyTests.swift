@@ -6,6 +6,35 @@ import XCTest
 @testable import MLXLLM
 
 final class Qwen4ExpPLEResidencyTests: XCTestCase {
+    func testFactoryLeaseTransfersToModelOwnership() throws {
+        guard Qwen4ExpPLEResidency.useMmap else { throw XCTSkip("Requires default mmap policy") }
+        let dir = try makeSnapshot(modelType: "qwen4_exp")
+        let loader = try XCTUnwrap(Qwen4ExpPLEResidency.acquireLoadLease(
+            directory: dir, modelType: "qwen4_exp"))
+        let model = try XCTUnwrap(Qwen4ExpPLEResidency.retainCurrentDirectory())
+        XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 2)
+        loader.release()
+        XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 1)
+        XCTAssertEqual(Qwen4ExpPLEResidency.modelDirectory, dir.standardizedFileURL)
+        model.release()
+        XCTAssertNil(Qwen4ExpPLEResidency.modelDirectory)
+    }
+
+    func testFactoryLeaseFailureAndNonQwenLeaveNoBinding() throws {
+        guard Qwen4ExpPLEResidency.useMmap else { throw XCTSkip("Requires default mmap policy") }
+        let dir = try makeSnapshot(modelType: "qwen4_exp")
+        XCTAssertNil(try Qwen4ExpPLEResidency.acquireLoadLease(directory: dir, modelType: "gemma4"))
+        enum Failure: Error { case fixture }
+        func failedLoad() throws {
+            let loader = try Qwen4ExpPLEResidency.acquireLoadLease(directory: dir, modelType: "qwen4_exp_text")
+            defer { loader?.release() }
+            throw Failure.fixture
+        }
+        XCTAssertThrowsError(try failedLoad())
+        XCTAssertNil(Qwen4ExpPLEResidency.modelDirectory)
+        XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 0)
+    }
+
     func testModelLeaseOutlivesLoaderAndDeinitReleasesBinding() throws {
         let dir = try makeSnapshot(modelType: "qwen4_exp")
         XCTAssertTrue(Qwen4ExpPLEResidency.adoptIfQwen4Exp(directory: dir))

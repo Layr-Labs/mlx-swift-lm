@@ -3,19 +3,23 @@ import MLX
 import MLXLMCommon
 import os
 
-/// Opt-in layer scheduling, adapted from the oMLX
+/// Default native layer scheduling, adapted from the oMLX
 /// Qwen4 decoder loop's early layer submission. No model arithmetic changes.
 /// The initial proof scope is singleton text decode/verify on native paged KV;
 /// unknown caches, media/position payloads and wider prefill retain old scheduling.
 enum Qwen4ExpLayerSubmission {
     static let flag = "DARKBLOOM_QWEN4_LAYER_ASYNC"
 
+    static func enabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
+        environment[flag, default: "1"] == "1"
+    }
+
     static func plan(
         batchSize: Int, sequenceWidth: Int, hasEmbeddings: Bool, hasPositions: Bool,
         caches: [any CBv2AttendingLayerCache],
         environment: [String: String] = Qwen4ExpEnvironment.snapshot
     ) -> Plan? {
-        guard environment[flag] == "1", batchSize == 1, (1...6).contains(sequenceWidth),
+        guard enabled(environment: environment), batchSize == 1, (1...6).contains(sequenceWidth),
             !hasEmbeddings, !hasPositions, !caches.isEmpty
         else { return nil }
         let native = caches.compactMap { $0 as? PagedLayerCache }

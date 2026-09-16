@@ -112,7 +112,7 @@ public struct Qwen4ExpVLMConfiguration: Codable, Sendable {
 
 public final class Qwen4Exp:
     Module, VLMModel, KVCacheDimensionProvider, QwenVisionSeamModel,
-    CBv2TargetAuxiliaryAllocationProviding
+    CBv2TargetAuxiliaryAllocationProviding, GenericGenerationValidating
 {
     public let configuration: Qwen4ExpConfiguration
     public let vlmConfiguration: Qwen4ExpVLMConfiguration
@@ -170,6 +170,10 @@ public final class Qwen4Exp:
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    public func validateGenericGeneration() throws {
+        try languageModel.validateGenericGeneration()
     }
 
     public static let mediaRejectedMessage =
@@ -336,6 +340,16 @@ extension Qwen4Exp: CheckpointWeightLoadFiltering {
     }
 
     public var skipWholeShardPrefetch: Bool { languageModel.mmapPLE }
+}
+
+extension Qwen4Exp: IncrementalCheckpointMaterializing {
+    public var needsIncrementalCheckpointMaterialization: Bool {
+        languageModel.needsIncrementalCheckpointMaterialization
+    }
+
+    public func materializeCheckpointWeightsIncrementally() throws {
+        try languageModel.materializeCheckpointWeightsIncrementally()
+    }
 }
 
 extension Qwen4Exp: Qwen4ExpExternalPLEReleasing {

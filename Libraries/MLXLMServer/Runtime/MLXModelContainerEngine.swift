@@ -45,6 +45,15 @@ public struct MLXModelContainerEngine: MLXServerEngine {
             throw MLXModelContainerEngineError.mediaUnsupported
         }
 
+        try Self.validateSamplingControls(request)
+        do {
+            try await model.perform { context in
+                try (context.model as? any GenericGenerationValidating)?.validateGenericGeneration()
+            }
+        } catch let error as GenericGenerationError {
+            throw MLXModelContainerEngineError.nativeGenerationRequired(error.localizedDescription)
+        }
+
         try await validateToolParserOverride(for: request)
 
         // Multi-turn tool-use history (assistant `tool_calls`,
@@ -111,6 +120,18 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         messages.contains {
             ($0.toolCalls?.isEmpty == false) || $0.toolCallID != nil
                 || $0.reasoningContent != nil || $0.name != nil
+        }
+    }
+
+    /// This iterator does not own a request-scoped RNG or logit-bias processor.
+    /// Reject unsupported controls here, not in the shared wire validator:
+    /// native CBv2 engines implement them and must continue to accept them.
+    static func validateSamplingControls(_ request: OpenAIChatCompletionRequest) throws {
+        if request.seed != nil {
+            throw MLXModelContainerEngineError.unsupportedSamplingControl("seed")
+        }
+        if request.logitBias?.isEmpty == false {
+            throw MLXModelContainerEngineError.unsupportedSamplingControl("logit_bias")
         }
     }
 

@@ -205,10 +205,32 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         try container.encode(hcLowrank, forKey: .hcLowrank)
         try container.encode(pleLayerIds, forKey: .pleLayerIds)
         try container.encode(pleEmbedDim, forKey: .pleEmbedDim)
+        try container.encode(pleConvKernelSize, forKey: .pleConvKernelSize)
+        try container.encode(ngramSize, forKey: .ngramSize)
+        try container.encode(headsPerNgram, forKey: .headsPerNgram)
+        try container.encode(ngramVocabSizeBase, forKey: .ngramVocabSizeBase)
+        try container.encode(makeNgramVocabSizeDivisibleBy, forKey: .makeNgramVocabSizeDivisibleBy)
+        try container.encode(splitNgramParts, forKey: .splitNgramParts)
+        try container.encode(indexerNHeads, forKey: .indexerNHeads)
+        try container.encode(indexerKVHeads, forKey: .indexerKVHeads)
+        try container.encode(indexerHeadDim, forKey: .indexerHeadDim)
+        try container.encode(indexerBudget, forKey: .indexerBudget)
+        try container.encode(indexerCompressRatio, forKey: .indexerCompressRatio)
+        try container.encode(outputGateType, forKey: .outputGateType)
         try container.encode(numExperts, forKey: .numExperts)
         try container.encode(numExpertsPerTok, forKey: .numExpertsPerTok)
         try container.encode(sharedExpertIntermediateSize, forKey: .sharedExpertIntermediateSize)
         try container.encode(moeIntermediateSize, forKey: .moeIntermediateSize)
+        try container.encode(normTopkProb, forKey: .normTopkProb)
+        let rope: [String: StringOrNumber] = [
+            "rope_theta": .float(ropeTheta),
+            "partial_rotary_factor": .float(partialRotaryFactor),
+            "mrope_section": .ints(mropeSection),
+        ]
+        try container.encode(rope, forKey: .ropeParameters)
+        try container.encode(eosTokenId, forKey: .eosTokenId)
+        try container.encode(mtpNumHiddenLayers, forKey: .mtpNumHiddenLayers)
+        try container.encode(seed, forKey: .seed)
     }
 
     /// QSA / full-attention rows only. GDN stays in recurrent state.
@@ -1222,11 +1244,12 @@ final class Qwen4ExpDecoderLayer: Module {
         inputIds: MLXArray,
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
-        cache: KVCache?
+        cache: KVCache?,
+        pleCache: ArraysCache? = nil
     ) -> MLXArray {
         var hiddenStates = Qwen4ExpActivation.keep(hidden)
         if let ple {
-            hiddenStates = hiddenStates + ple(hiddenStates, inputIds: inputIds)
+            hiddenStates = hiddenStates + ple(hiddenStates, inputIds: inputIds, cache: pleCache)
         }
         let (attnMixed, attnHyper, attnInject) = attnHyperConnection(hiddenStates)
         let attnBranch: MLXArray
@@ -1354,14 +1377,29 @@ final class Qwen4ExpTextModelInner: Module {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         batchingPolicy.sealOnForward { currentBatchedQSAPolicy }
         var hidden = embedAndTile(inputs)
-        let mask = createAttentionMask(h: hidden, cache: cache)
+        let pleCount = layers.filter { $0.ple != nil }.count
+        if let cache {
+            precondition(cache.count == layers.count + pleCount,
+                "Qwen4 request cache must include attention/GDN and PLE state")
+        }
+        let attentionCaches = cache.map { Array($0.prefix(layers.count)) }
+        let mask = createAttentionMask(h: hidden, cache: attentionCaches)
+        var pleCacheIndex = layers.count
         for (index, layer) in layers.enumerated() {
+            let pleCache: ArraysCache?
+            if layer.ple != nil {
+                pleCache = cache?[pleCacheIndex] as? ArraysCache
+                precondition(cache == nil || pleCache != nil, "Qwen4 PLE cache has the wrong type")
+                pleCacheIndex += 1
+            } else {
+                pleCache = nil
+            }
             hidden = layer(
                 hidden,
                 inputIds: inputs,
                 attentionMask: mask,
                 ssmMask: nil,
-                cache: cache?[index])
+                cache: attentionCaches?[index], pleCache: pleCache)
         }
         return hyperConnectionMixer.mix(hidden)
     }
@@ -1500,9 +1538,15 @@ public class Qwen4ExpTextModel:
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        model.layers.map { layer in
+        let attention: [KVCache] = model.layers.map { layer in
             layer.isLinear ? MambaCache() : KVCacheSimple()
         }
+        // Preserve layer-indexed attention/GDN positions; PLE state is also
+        // owned by this request rather than retained on the shared model.
+        let ple: [KVCache] = model.layers.compactMap { layer in
+            layer.ple == nil ? nil : ArraysCache(size: 2)
+        }
+        return attention + ple
     }
 
     public var loraLayers: [Module] { model.layers }
@@ -1752,6 +1796,19 @@ public enum Qwen4ExpPLEResidency {
     public static func isQwen4ExpModelType(_ modelType: String?) -> Bool {
         guard let modelType else { return false }
         return qwen4ExpModelTypes.contains(modelType)
+    }
+
+    /// Temporary factory ownership. Construct the model while this lease is
+    /// alive so its own lease is retained before the factory scope exits.
+    /// Use the already decoded type rather than rereading a mutable config.
+    public static func acquireLoadLease(
+        directory: URL, modelType: String?
+    ) throws -> Qwen4ExpPLEDirectoryLease? {
+        guard useMmap, isQwen4ExpModelType(modelType) else { return nil }
+        guard adopt(directory: directory) else {
+            throw Qwen4ExpPLEResidencyError.conflictingActiveModel
+        }
+        return Qwen4ExpPLEDirectoryLease(directory: directory.standardizedFileURL)
     }
 
     public static func configDeclaresQwen4Exp(at directory: URL) -> Bool {

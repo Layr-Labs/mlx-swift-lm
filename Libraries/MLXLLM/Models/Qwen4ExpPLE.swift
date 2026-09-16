@@ -1376,9 +1376,6 @@ final class Qwen4ExpPLELayer: Module {
     @ModuleInfo(key: "norm_conv") var normConv: Qwen4ExpRMSNorm
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
 
-    private var legacyHistory: [[Int]] = []
-    private var legacyConv: MLXArray?
-
     init(_ args: Qwen4ExpTextConfiguration, layerIndex: Int, pleIndex: Int, mmap: Bool) {
         self.tables = Qwen4ExpNGramTables(args, pleIndex: pleIndex)
         self.hcCount = args.hcCount
@@ -1409,20 +1406,30 @@ final class Qwen4ExpPLELayer: Module {
         super.init()
     }
 
-    func callAsFunction(_ hidden: MLXArray, inputIds: MLXArray) -> MLXArray {
+    func callAsFunction(
+        _ hidden: MLXArray, inputIds: MLXArray, cache: ArraysCache? = nil
+    ) -> MLXArray {
         let batch = hidden.dim(0)
         let width = inputIds.dim(1)
         let tokens = inputIds.asType(.int64)
-        let history = concatenated([legacyContext(batch: batch), tokens], axis: 1)
+        let history = concatenated([legacyContext(cache: cache, batch: batch), tokens], axis: 1)
         let embeddings = embedGPU(hidden: hidden, history: history, inputWidth: width)
-        legacyHistory = hostTokenRows(history[0..., (-tables.contextLen)...])
+        if let cache {
+            let rows = tables.contextLen == 0 ? [[Int]](repeating: [], count: batch)
+                : hostTokenRows(history[0..., (-tables.contextLen)...])
+            cache[0] = MLXArray(rows.flatMap { $0.map { Int64($0) } })
+                .reshaped([batch, tables.contextLen])
+        }
         let (gated, normed) = mix(hidden: hidden, embeddings: embeddings, mask: nil)
         let convState =
-            legacyConv
+            cache?[1]
             ?? MLXArray.zeros([batch, shortConvStateLen, hidden.dim(-1)], dtype: hidden.dtype)
         let convOut = shortConv(normed, state: convState)
         let convInput = concatenated([convState, normed], axis: 1)
-        legacyConv = convInput[0..., (-shortConvStateLen)..., 0...]
+        cache?[1] = shortConvStateLen == 0
+            ? MLXArray.zeros([batch, 0, hidden.dim(-1)], dtype: hidden.dtype)
+            : convInput[0..., (-shortConvStateLen)..., 0...]
+        if let cache { cache.offset += width }
         return gated + convOut
     }
 
@@ -1671,14 +1678,10 @@ final class Qwen4ExpPLELayer: Module {
             type: Int64.self)
     }
 
-    private func legacyContext(batch: Int) -> MLXArray {
-        guard legacyHistory.count == batch,
-            legacyHistory.allSatisfy({ $0.count == tables.contextLen })
-        else {
-            return eosContext(batch: batch)
-        }
-        return MLXArray(legacyHistory.flatMap { $0.map { Int64($0) } })
-            .reshaped([batch, tables.contextLen])
+    private func legacyContext(cache: ArraysCache?, batch: Int) -> MLXArray {
+        guard let history = cache?[0] else { return eosContext(batch: batch) }
+        precondition(history.shape == [batch, tables.contextLen], "Qwen4 PLE history shape mismatch")
+        return history.asType(.int64)
     }
 
     /// CBv2 stores PLE history as float32 `[1,1,1,contextLen]` (exact for token ids).
@@ -1703,11 +1706,9 @@ final class Qwen4ExpPLELayer: Module {
     }
 
     /// Called after the engine drains, before the model container is dropped.
-    /// Legacy request state is model data too; clear it with the mmap handles.
+    /// Mutable request state belongs to the caller's cache, not this module.
     func releaseExternalResources() {
         pleEmbedding.releaseExternalResources()
-        legacyHistory.removeAll(keepingCapacity: false)
-        legacyConv = nil
     }
 
     private func hostTokenRows(_ tokens: MLXArray) -> [[Int]] {

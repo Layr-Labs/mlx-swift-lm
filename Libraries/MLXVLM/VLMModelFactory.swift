@@ -2,6 +2,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
@@ -348,6 +349,10 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        let pleLoadLease = try Qwen4ExpPLEResidency.acquireLoadLease(
+            directory: modelDirectory, modelType: baseConfig.modelType)
+        defer { pleLoadLease?.release() }
+
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
@@ -357,80 +362,89 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
-        let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        if let generationData = try? Data(contentsOf: generationConfigURL),
-            let generationConfig = try? JSONDecoder.json5().decode(
-                GenerationConfigFile.self, from: generationData),
-            let genEosIds = generationConfig.eosTokenIds?.values
-        {
-            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
-        }
-
-        var mutableConfiguration = configuration
-        mutableConfiguration.eosTokenIds = eosTokenIds
-
-        // Auto-detect tool call format from model type if not explicitly set
-        if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
-        }
-
-        // Load tokenizer from model directory (or alternate tokenizer repo),
-        // processor config, and weights in parallel using async let.
-        // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
-        // parallel scheduling. This may briefly block a cooperative thread pool thread,
-        // but the config file is small and model loading is not a high-concurrency path.
-        async let tokenizerTask = tokenizerLoader.load(
-            from: configuration.tokenizerDirectory)
-        async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
-
-        try loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
-
-        let tokenizer = try await tokenizerTask
-        let processorConfigData: Data
-        let baseProcessorConfig: BaseProcessorConfiguration
+        let components: (configuration: ModelConfiguration, processor: any UserInputProcessor, tokenizer: any Tokenizer)
         do {
-            (processorConfigData, baseProcessorConfig) = try await processorConfigTask
-        } catch let error as ProcessorConfigError {
-            if let decodingError = error.underlying as? DecodingError {
-                throw ModelFactoryError.configurationDecodingError(
-                    error.filename, configuration.name, decodingError)
+            // Load EOS token IDs from config.json, with optional override from generation_config.json
+            var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+            let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
+            if let generationData = try? Data(contentsOf: generationConfigURL),
+                let generationConfig = try? JSONDecoder.json5().decode(
+                    GenerationConfigFile.self, from: generationData),
+                let genEosIds = generationConfig.eosTokenIds?.values
+            {
+                eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
             }
-            throw ModelFactoryError.configurationFileError(
-                error.filename, configuration.name, error.underlying)
+
+            var mutableConfiguration = configuration
+            mutableConfiguration.eosTokenIds = eosTokenIds
+
+            // Auto-detect tool call format from model type if not explicitly set
+            if mutableConfiguration.toolCallFormat == nil {
+                mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+            }
+
+            // Load tokenizer from model directory (or alternate tokenizer repo),
+            // processor config, and weights in parallel using async let.
+            // Note: loadProcessorConfig does synchronous I/O but is marked async to enable
+            // parallel scheduling. This may briefly block a cooperative thread pool thread,
+            // but the config file is small and model loading is not a high-concurrency path.
+            async let tokenizerTask = tokenizerLoader.load(
+                from: configuration.tokenizerDirectory)
+            async let processorConfigTask = loadProcessorConfig(from: modelDirectory)
+
+            try loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization)
+            try Qwen4ExpFactoryResources.validate(model)
+
+            let tokenizer = try await tokenizerTask
+            let processorConfigData: Data
+            let baseProcessorConfig: BaseProcessorConfiguration
+            do {
+                (processorConfigData, baseProcessorConfig) = try await processorConfigTask
+            } catch let error as ProcessorConfigError {
+                if let decodingError = error.underlying as? DecodingError {
+                    throw ModelFactoryError.configurationDecodingError(
+                        error.filename, configuration.name, decodingError)
+                }
+                throw ModelFactoryError.configurationFileError(
+                    error.filename, configuration.name, error.underlying)
+            }
+
+            // Override processor type based on model type for models that need special handling
+            // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
+            // to handle spatial merging correctly
+            let processorType = Self.processorType(
+                modelType: baseConfig.modelType, declaredClass: baseProcessorConfig.processorClass)
+
+            let processor = try await processorRegistry.createModel(
+                configuration: baseConfig.modelType == "qwen4_exp"
+                    ? Qwen4ExpProcessorFiles.combined(directory: modelDirectory, fallbackImage: processorConfigData)
+                    : processorConfigData,
+                processorType: processorType, tokenizer: tokenizer)
+
+            // Build a ModelConfiguration for the ModelContext
+            let tokenizerSource: TokenizerSource? =
+                configuration.tokenizerDirectory == modelDirectory
+                ? nil
+                : .directory(configuration.tokenizerDirectory)
+            let modelConfig = ModelConfiguration(
+                directory: modelDirectory,
+                tokenizerSource: tokenizerSource,
+                defaultPrompt: configuration.defaultPrompt,
+                extraEOSTokens: mutableConfiguration.extraEOSTokens,
+                eosTokenIds: mutableConfiguration.eosTokenIds,
+                toolCallFormat: mutableConfiguration.toolCallFormat)
+
+            components = (modelConfig, processor, tokenizer)
+        } catch {
+            Qwen4ExpFactoryResources.release(model)
+            throw error
         }
-
-        // Override processor type based on model type for models that need special handling
-        // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
-        // to handle spatial merging correctly
-        let processorType = Self.processorType(
-            modelType: baseConfig.modelType, declaredClass: baseProcessorConfig.processorClass)
-
-        let processor = try await processorRegistry.createModel(
-            configuration: baseConfig.modelType == "qwen4_exp"
-                ? Qwen4ExpProcessorFiles.combined(directory: modelDirectory, fallbackImage: processorConfigData)
-                : processorConfigData,
-            processorType: processorType, tokenizer: tokenizer)
-
-        // Build a ModelConfiguration for the ModelContext
-        let tokenizerSource: TokenizerSource? =
-            configuration.tokenizerDirectory == modelDirectory
-            ? nil
-            : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
-            directory: modelDirectory,
-            tokenizerSource: tokenizerSource,
-            defaultPrompt: configuration.defaultPrompt,
-            extraEOSTokens: mutableConfiguration.extraEOSTokens,
-            eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
-
-        return .init(
-            configuration: modelConfig, model: model, processor: processor,
-            tokenizer: tokenizer)
+        // Transfer the model only after failure cleanup's scope has ended.
+        // The returned non-Sendable region has one owner, the ModelContext.
+        return .init(configuration: components.configuration, model: model,
+            processor: components.processor, tokenizer: components.tokenizer)
     }
 
 }

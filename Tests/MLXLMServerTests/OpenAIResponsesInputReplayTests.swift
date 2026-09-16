@@ -182,4 +182,67 @@ struct OpenAIResponsesInputReplayTests {
         #expect(chat.chatCompletionRequest.messages[1].reasoningContent == "private")
         #expect(chat.chatCompletionRequest.messages[1].toolCalls == nil)
     }
+
+    private func explicitAssistant(_ id: String?, content: String) -> [String: Any] {
+        let calls: [[String: Any]] = id.map { [[
+            "id": $0, "type": "function",
+            "function": ["name": "record", "arguments": "{}"],
+        ]] } ?? []
+        return [
+            "type": "message", "role": "assistant", "content": content,
+            "name": "explicit_" + content, "reasoning_content": "reasoning_" + content,
+            "tool_calls": calls,
+        ]
+    }
+
+    private func chatMessage(_ object: [String: Any]) throws -> OpenAIChatMessage {
+        try JSONDecoder().decode(OpenAIChatMessage.self,
+            from: JSONSerialization.data(withJSONObject: object))
+    }
+
+    @Test func explicitMessagesPreserveEmptyCallsContentNameAndReasoning() throws {
+        let first = explicitAssistant("a", content: "first")
+        let second = explicitAssistant(nil, content: "keep me")
+        let request = try decode([first, second])
+        #expect(request.chatCompletionRequest.messages == [try chatMessage(first), try chatMessage(second)])
+        #expect(try JSONDecoder().decode(OpenAIResponseRequest.self,
+            from: JSONEncoder().encode(request)) == request)
+    }
+
+    @Test func explicitMessagesPreservePopulatedCallsContentNameAndReasoning() throws {
+        let first = explicitAssistant("a", content: "first")
+        let second = explicitAssistant("b", content: "keep me")
+        #expect(try decode([first, second]).chatCompletionRequest.messages ==
+            [try chatMessage(first), try chatMessage(second)])
+    }
+
+    @Test func explicitMessageIsABoundaryBeforeFunctionCalls() throws {
+        for id: String? in [nil, "prior"] {
+            let explicit = explicitAssistant(id, content: "separate")
+            let messages = try decode([explicit, call("a"), call("b")]).chatCompletionRequest.messages
+            #expect(messages.count == 2)
+            #expect(messages.first == (try chatMessage(explicit)))
+            #expect(messages.last?.toolCalls?.map(\.id) == ["a", "b"])
+            #expect(messages.last?.textContent == "")
+        }
+    }
+
+    @Test func explicitMessageIsABoundaryAfterFunctionCalls() throws {
+        for id: String? in [nil, "next"] {
+            let explicit = explicitAssistant(id, content: "keep me")
+            let messages = try decode([call("a"), explicit]).chatCompletionRequest.messages
+            #expect(messages.count == 2)
+            #expect(messages.first?.toolCalls?.map(\.id) == ["a"])
+            #expect(messages.last == (try chatMessage(explicit)))
+        }
+    }
+
+    @Test func reasoningCallsCannotAbsorbFollowingExplicitMessage() throws {
+        let explicit = explicitAssistant("explicit", content: "keep me")
+        let messages = try decode([reasoning("prior"), call("a"), explicit]).chatCompletionRequest.messages
+        #expect(messages.count == 2)
+        #expect(messages.first?.reasoningContent == "prior")
+        #expect(messages.first?.toolCalls?.map(\.id) == ["a"])
+        #expect(messages.last == (try chatMessage(explicit)))
+    }
 }

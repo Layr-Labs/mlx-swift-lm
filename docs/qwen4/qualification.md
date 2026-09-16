@@ -5,6 +5,34 @@ affine-Q4 target and runtime sampling contract; it is not BF16 equivalence or
 universal answer-quality certification. The companion provider repository
 contains the API and lifecycle qualification procedures.
 
+## Public entry-point and configuration contracts
+
+Qwen4 factories bind their external PLE directory before constructing a model,
+transfer that lease to the model, validate the mmap catalog before returning,
+and release resources on tokenizer, weight or processor failure. A successful
+load does not imply that every generation API implements native QSA/GDN/PLE.
+The generic TokenIterator path rejects Qwen4 recoverably; production inference
+and the companion provider's ordinary Qwen4 benchmark use native CBv2. Do not
+disable SSD offload as a workaround or substitute a dense-attention family.
+
+Low-level request caches own their own PLE token history and convolution carry;
+allocating one request's cache must not reset another request on the same model.
+Text configuration encoding preserves all supported semantic fields, including
+structured RoPE, EOS, MTP count, indexer budget, learned-table geometry and seed.
+Explicit Responses message items remain boundaries even when they contain
+empty or populated tool-call arrays. The generic SDK model-container server
+rejects unsupported seed/nonempty logit-bias controls instead of ignoring them;
+the native provider's request-scoped sampling support is unchanged.
+
+The associated miniature tests are `Qwen4FactoryLifecycleTests`,
+`Qwen4ExpPLEResidencyTests`, `Qwen4ExpCodableTests`,
+`OpenAIResponsesInputReplayTests` and `ContainerControlHTTPTests`. These changes
+require fresh composed-runtime qualification; the historical passes below do
+not automatically qualify them. Incremental fusion materialization uses the
+existing loader staging-release hook, with actual load peaks and hardware-tier
+admission still requiring measurement. No numerical golden or weight changes
+are authorized by these contract repairs.
+
 ## Responses input-history follow-up
 
 The standalone SDK Responses decoder keeps a reasoning item and its immediately
@@ -94,7 +122,7 @@ and metallib SHA256
 `2129f6132794d84243c02631bc7478417dba0e0dbd10467beab56c11bf20bdd2`.
 Source-equivalence checks must accompany publication-only packaging changes.
 
-## Opt-in performance contract
+## Default performance contract
 
 Clean-checkout follow-up: the generic packed-vision fixture previously relied
 on a50ms enqueue delay to obtain one three-row batch. A full enabled run kept
@@ -105,22 +133,39 @@ assertion and all independent output oracles are unchanged; no runtime scheduler
 or model code changes. Preserve the original failure and require isolated and
 full-suite checks in both optimization postures before promotion.
 
-`DARKBLOOM_QWEN4_QSA_PARALLEL_FULL_KV=1` enables the existing independent QK
+The default `DARKBLOOM_QWEN4_QSA_PARALLEL_FULL_KV=1` uses independent QK
 tiles followed by the unchanged ordered softmax/PV recurrence on the caller's
 full materialized KV. It is separate from compact-KV parallel scores. The
-qualified setting uses `DARKBLOOM_QWEN4_QSA_PARALLEL_VALUE_PARTITIONS=32`.
-`DARKBLOOM_QWEN4_LAYER_ASYNC=1` submits valid singleton text layers early for
+full-KV default is `DARKBLOOM_QWEN4_QSA_PARALLEL_VALUE_PARTITIONS=32`.
+The default `DARKBLOOM_QWEN4_LAYER_ASYNC=1` submits valid singleton text layers early for
 native paged widths1–6, excluding explicit embeddings/positions. It resolves
 deferred host fills without closing the owning scope and checks the whole
 native fault bank before and after fills. Existing final roots, commit/rollback,
 retirement and fallbacks remain authoritative.
 
-Both new switches default OFF. The qualification profile enables them
-explicitly; including this code does not activate them fleet-wide. No weights,
-precision, selector, trained head, sampler or MTP controller changes are included.
-Disable the two switches to revert scheduling/attention dispatch without a
-model conversion. Preserve paired SDK/provider pins when reverting commits.
-The40/66–88 tok/s goal and complete deployment qualification remain open.
+Unset switches select this profile. Explicit `0` on both switches restores
+the original dispatch/scheduling; unsetting them no longer disables it. The
+existing strict flag parser is preserved: explicit values other than `1` are
+disabled. Caller-supplied valid partitions override the environment; invalid
+explicit partitions retain the caller's existing fallback. Compact-KV parallel
+scores remain OFF and retain their caller-selected partition default.
+
+These paths target decode and MTP verification widths1–6. Larger prefill chunks
+retain their existing paths; this default change is not evidence of1.5K–2K
+prefill throughput. Shape-eligible GDN blocked prefill, affine QMM and PLE
+gather were already default ON and are unchanged. No weights, precision,
+selector, trained head, sampler, MTP controller or prefill chunk policy changes
+are included. Keep SDK/provider pins paired when reverting commits.
+
+`Qwen4PerformanceDefaultsTests` verifies flag/partition behavior.
+`Qwen4ParallelFullKVParityTests` compares the unset default and every valid
+partition override against an explicitly disabled independent Steel oracle;
+wider prefill must retain the original dispatch. `Qwen4LayerSubmissionTests`
+preserves native-cache, deferred-fill, fault/retirement and same-ID recovery
+gates. Run these native tests alone in the owned GPU lane. Default activation
+requires fresh composed-runtime/model qualification; historical opt-in receipts
+are not renamed as a new default run. Complete deployment qualification and
+the sustained40/66–88 tok/s objective remain separate gates.
 
 ## Behavior that must remain explicit
 

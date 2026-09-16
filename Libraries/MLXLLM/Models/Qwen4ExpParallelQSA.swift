@@ -3,24 +3,32 @@ import MLX
 import MLXLMCommon
 import os
 
-/// Opt-in decode/verify experiment. Independent QK tiles run in parallel;
+/// Native full-KV decode/verify profile. Independent QK tiles run in parallel;
 /// FP32 scores feed the unchanged ordered online-softmax/PV recurrence. No split-K
 /// reduction, selector change or lower precision. Full-KV mode consumes the
 /// caller's existing materialized arrays; it never changes page ownership.
+/// Compact-KV parallel scores remain a separate opt-in experiment.
 enum Qwen4ExpParallelQSA {
     static let flag = "DARKBLOOM_QWEN4_QSA_PARALLEL_SCORES"
     static let fullKVFlag = "DARKBLOOM_QWEN4_QSA_PARALLEL_FULL_KV"
+    static let valuePartitionsFlag = "DARKBLOOM_QWEN4_QSA_PARALLEL_VALUE_PARTITIONS"
     static func enabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
         environment[flag] == "1"
     }
 
     static func fullKVEnabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
-        environment[fullKVFlag] == "1"
+        environment[fullKVFlag, default: "1"] == "1"
     }
 
-    static func valuePartitions(requested: Int?, fallback: Int,
+    static func valuePartitions(requested: Int?, fallback: Int, compactKV: Bool = true,
                                 environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Int {
-        let value = requested ?? Int(environment["DARKBLOOM_QWEN4_QSA_PARALLEL_VALUE_PARTITIONS"] ?? "")
+        let configured = environment[valuePartitionsFlag]
+        if requested == nil && configured == nil {
+            return compactKV ? fallback : 32
+        }
+        // Explicit caller/environment overrides keep their existing precedence
+        // and invalid-value fallback. Only the absent full-KV default changes.
+        let value = requested ?? Int(configured ?? "")
         return value.flatMap { [1, 2, 4, 8, 16, 32].contains($0) ? $0 : nil } ?? fallback
     }
 
@@ -70,7 +78,8 @@ enum Qwen4ExpParallelQSA {
         precondition(
             (1...Qwen4ExpGatheredQSA.optimizedVerifyMaxQueryTokens).contains(queryTokens)
                 && [1, 2, 4].contains(outputPartitions))
-        let partitions = valuePartitions(requested: requestedPartitions, fallback: outputPartitions)
+        let partitions = valuePartitions(requested: requestedPartitions, fallback: outputPartitions,
+                                         compactKV: compactKV)
         let valueTile = min(64, 256 / partitions)
         let keyTiles = (Qwen4ExpCompactQSA.slotsPerQuery + 63) / 64
         let simdWidth = 32, warps = 2, kvHeads = 2
