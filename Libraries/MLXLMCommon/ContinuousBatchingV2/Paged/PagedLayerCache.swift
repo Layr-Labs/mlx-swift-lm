@@ -105,7 +105,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// `L == 1` decode. The engine sets it for the duration of an MTP
     /// verification round and clears it in a `defer`.
     public var mtpSerializesRectangularAttention = false
-    var mtpBatchesRectangularAttention = false
+    public var mtpBatchesRectangularAttention = false
     private(set) var mtpBatchedAttentionCalls = 0
 
     /// WS-1.2. The KV a KV-shared sibling needs in order to attend THIS
