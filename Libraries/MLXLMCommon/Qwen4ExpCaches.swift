@@ -14,47 +14,261 @@
 
 import Foundation
 import MLX
+import MLXFast
+
+// MARK: - QSA indexer tape, selection and gathered attention
+
+/// One row's indexer tape: the raw indexer keys, one per processed token,
+/// and the pooled blocks derived from them.
+///
+/// Both live in capacity-doubling buffers, so an append is a slice write and
+/// not a copy of the history, and both follow the row's rollback: `truncate`
+/// drops the tail, and a pooled block that overlapped the dropped tail is
+/// recomputed by the next `blocks` call. Everything else pooled stays.
+public final class Qwen4ExpIndexerTape {
+    public static let slack = 256
+
+    public init() {}
+
+    public private(set) var length = 0
+    private var raw: MLXArray?
+    private var pooled: MLXArray?
+    private var pooledCount = 0
+    /// Shortest length the tape was truncated to since the pooled blocks
+    /// were last brought up to date; `Int.max` when they are current.
+    private var lowWater = Int.max
+
+    /// Storage the engine loop evaluates each step (graph hygiene).
+    public var arrays: [MLXArray] { [raw, pooled].compactMap { $0 } }
+
+    /// The tape `[1, length, headDim]`, or nil before the first append.
+    public var view: MLXArray? {
+        guard let raw, length > 0 else { return nil }
+        return raw[0..., ..<length, 0...]
+    }
+
+    /// Replace the tape with `keys` `[1, n, headDim]` (state round-trips);
+    /// nothing pooled survives.
+    public func load(_ keys: MLXArray?) {
+        raw = keys
+        length = keys?.dim(1) ?? 0
+        pooled = nil
+        pooledCount = 0
+        lowWater = Int.max
+    }
+
+    public func truncate(to count: Int) {
+        guard count < length else { return }
+        length = count
+        lowWater = Swift.min(lowWater, count)
+    }
+
+    /// Append `[1, n, headDim]` and return the tape `[1, length, headDim]`.
+    public func append(_ keys: MLXArray) -> MLXArray {
+        let n = keys.dim(1)
+        raw = Self.reserve(raw, rows: length + n, like: keys)
+        raw![0..., length ..< (length + n), 0...] = keys
+        length += n
+        return raw![0..., ..<length, 0...]
+    }
+
+    /// Pooled blocks `[1, length / compressRatio, headDim]`. Only the blocks
+    /// completed since the last call are pooled: `pool` receives their raw
+    /// keys `[1, n, compressRatio, headDim]` and the index of the first one.
+    public func blocks(compressRatio: Int, pool: (MLXArray, Int) -> MLXArray) -> MLXArray {
+        if lowWater < Int.max {
+            pooledCount = Swift.min(pooledCount, lowWater / compressRatio)
+            lowWater = Int.max
+        }
+        let total = length / compressRatio
+        if total > pooledCount {
+            let start = pooledCount * compressRatio
+            let fresh = pool(
+                raw![0..., start ..< (total * compressRatio), 0...]
+                    .reshaped(1, total - pooledCount, compressRatio, -1),
+                pooledCount)
+            pooled = Self.reserve(pooled, rows: total, like: fresh)
+            pooled![0..., pooledCount ..< total, 0...] = fresh
+            pooledCount = total
+        }
+        guard let pooled, pooledCount > 0 else {
+            return MLXArray.zeros([1, 0, raw?.dim(-1) ?? 0], dtype: .float32)
+        }
+        return pooled[0..., ..<pooledCount, 0...]
+    }
+
+    /// `buffer` with room for `rows` entries on axis 1, grown by doubling.
+    private static func reserve(_ buffer: MLXArray?, rows: Int, like template: MLXArray)
+        -> MLXArray
+    {
+        guard let buffer else {
+            return MLXArray.zeros([1, rows + slack, template.dim(-1)], dtype: template.dtype)
+        }
+        let capacity = buffer.dim(1)
+        guard rows > capacity else { return buffer }
+        let grown = Swift.max(capacity * 2, rows + slack)
+        return concatenated(
+            [buffer, MLXArray.zeros([1, grown - capacity, buffer.dim(-1)], dtype: buffer.dtype)],
+            axis: 1)
+    }
+}
+
+/// What the QSA indexer chose for one forward: the keys attention may read.
+public enum Qwen4ExpQSASelection {
+    /// The context fits the budget: attend everything.
+    case all
+    /// Dense keep mask `[1, 1, S, kvLength]`, true == attend, for wide windows.
+    case keepMask(MLXArray)
+    /// Per-query gathered keys: `indices [S, n]` int32 tape columns and
+    /// `valid [S, n]` bool (false == a padding column to ignore).
+    case gather(indices: MLXArray, valid: MLXArray)
+}
+
+
+/// Attention of `queries` `[1, heads, S, D]` over, per query, the cached
+/// columns a `Qwen4ExpQSASelection.gather` names: `indices` / `valid` are
+/// `[S, n]`. Each query reads `n` keys (budget + compressRatio), whatever the
+/// context length; a padding column is masked off.
+public func qwen4ExpGatherAttention(
+    queries: MLXArray, cachedKeys: MLXArray, cachedValues: MLXArray,
+    scale: Float, indices: MLXArray, valid: MLXArray
+) -> MLXArray {
+    let S = queries.dim(2)
+    precondition(
+        indices.dim(0) == S && valid.dim(0) == S,
+        "Qwen4Exp QSA gather \(indices.shape) does not match \(S) queries")
+    let dtype = queries.dtype
+    let keys = cachedKeys.dtype == dtype ? cachedKeys : cachedKeys.asType(dtype)
+    let values = cachedValues.dtype == dtype ? cachedValues : cachedValues.asType(dtype)
+    if S == 1 {
+        let columns = indices[0]
+        return MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: take(keys, columns, axis: 2),
+            values: take(values, columns, axis: 2),
+            scale: scale, mask: .array(valid[0].reshaped(1, 1, 1, -1)),
+            sinks: nil)
+    }
+    // Wide windows (prefill chunks, the head's flush): rows in blocks, each
+    // row attending its own gathered keys as a batch member. Each block is
+    // EVALUATED before the next is built, so the live transient is one
+    // block's gathered keys and values (~0.5 GB at the 2048 budget), never
+    // the whole window's: sixteen blocks left lazy in one graph measured
+    // +11 GB per layer window, which on a box whose GPU may wire 100 GiB
+    // with 82 GB of weights resident is the difference between running and
+    // a kernel watchdog reset.
+    let heads = queries.dim(1)
+    let kvHeads = keys.dim(1)
+    let headDim = keys.dim(3)
+    let n = indices.dim(1)
+    let block = qwen4ExpGatherRowBlock
+    var outputs: [MLXArray] = []
+    outputs.reserveCapacity((S + block - 1) / block)
+    var start = 0
+    while start < S {
+        let end = min(start + block, S)
+        let rows = end - start
+        let columns = indices[start ..< end].reshaped(-1)
+        let k = take(keys, columns, axis: 2)
+            .reshaped(1, kvHeads, rows, n, headDim).transposed(0, 2, 1, 3, 4)
+            .reshaped(rows, kvHeads, n, headDim)
+        let v = take(values, columns, axis: 2)
+            .reshaped(1, kvHeads, rows, n, headDim).transposed(0, 2, 1, 3, 4)
+            .reshaped(rows, kvHeads, n, headDim)
+        let q = queries[0..., 0..., start ..< end, 0...]
+            .transposed(0, 2, 1, 3).reshaped(rows, heads, 1, headDim)
+        let out = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v, scale: scale,
+            mask: .array(valid[start ..< end].reshaped(rows, 1, 1, n)), sinks: nil)
+        let blockOut = out.reshaped(1, rows, heads, headDim).transposed(0, 2, 1, 3)
+        eval(blockOut)
+        outputs.append(blockOut)
+        start = end
+    }
+    return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+}
+
+/// Rows per gathered attention block for wide windows.
+public let qwen4ExpGatherRowBlock = 128
 
 /// KV cache for one Qwen4-Exp full-attention layer.
 ///
 /// A full-attention layer runs a QSA indexer beside the ordinary attention. The
-/// indexer keeps its own key tape: one raw key vector per token (never pooled,
-/// never rotated), which the indexer pools into blocks on each call. The tape
-/// has to live with the KV tape so that a trim, a copy or a state round-trip
-/// keeps the two in step.
-///
-/// The indexer tape is EXACT — it holds `offset` rows and no reserve — while
-/// `KVCacheSimple` over-allocates its KV buffers and tracks the live length in
-/// `offset`. `trim` therefore slices the indexer tape and only moves the KV
-/// offset.
+/// indexer keeps its own key tape (`Qwen4ExpIndexerTape`): one raw key vector
+/// per token, plus the blocks pooled from them. The tape has to live with the
+/// KV tape so that a trim, a copy or a state round-trip keeps the two in step:
+/// `trim` moves the KV offset and truncates the tape to it, and every
+/// `updateIndexer` re-synchronizes the tape to `offset` before appending.
 public final class Qwen4ExpAttentionCache: KVCacheSimple {
+
+    private let tape = Qwen4ExpIndexerTape()
 
     /// Raw indexer keys, shape `[B, offset, indexerHeadDim]`, or `nil` before
     /// the first update.
-    public private(set) var indexerKeys: MLXArray?
+    public var indexerKeys: MLXArray? { tape.view }
 
     public override init() {
         super.init()
     }
 
-    /// Append `keys` to the indexer tape and return the whole tape.
+    /// Append `keys` to the indexer tape and return the whole tape. Call
+    /// BEFORE the key-value update of the same step: the tape is truncated to
+    /// the pre-update `offset` first.
     public func updateIndexer(keys: MLXArray) -> MLXArray {
-        let updated: MLXArray
-        if let indexerKeys {
-            updated = concatenated([indexerKeys, keys], axis: 1)
-        } else {
-            updated = keys
+        tape.truncate(to: offset)
+        return tape.append(keys)
+    }
+
+    /// Pooled indexer blocks `[1, offset / compressRatio, headDim]`, pooling
+    /// only the blocks completed since the last call. Call AFTER
+    /// `updateIndexer` in the same step.
+    public func indexerBlocks(
+        compressRatio: Int, pool: (_ raw: MLXArray, _ firstBlock: Int) -> MLXArray
+    ) -> MLXArray {
+        tape.blocks(compressRatio: compressRatio, pool: pool)
+    }
+
+    /// Append this step's K/V and attend over the indexer's selection.
+    /// `mask` is the causal/window mask the caller would pass to plain
+    /// `attentionWithCacheUpdate`; it applies to `.all` and `.keepMask`.
+    public func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, selection: Qwen4ExpQSASelection
+    ) -> MLXArray {
+        let (cachedKeys, cachedValues) = update(keys: keys, values: values)
+        switch selection {
+        case .all:
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                mask: mask)
+        case .keepMask(let keep):
+            let S = queries.dim(2)
+            let kvLength = cachedKeys.dim(2)
+            let composed: MLXArray
+            switch mask {
+            case .none:
+                composed = keep
+            case .causal:
+                let rinds = MLXArray(Int32(0) ..< Int32(kvLength))
+                let linds = MLXArray(Int32(kvLength - S) ..< Int32(kvLength))[0..., .newAxis]
+                composed = (linds .>= rinds) & keep
+            case .array(let m) where m.dtype == .bool:
+                composed = m & keep
+            default:
+                preconditionFailure("Qwen4ExpAttentionCache: cannot combine the keep mask with \(mask)")
+            }
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                mask: .array(composed))
+        case .gather(let indices, let valid):
+            return qwen4ExpGatherAttention(
+                queries: queries, cachedKeys: cachedKeys, cachedValues: cachedValues,
+                scale: scale, indices: indices, valid: valid)
         }
-        self.indexerKeys = updated
-        return updated
     }
 
     public override func innerState() -> [MLXArray] {
-        var inner = super.innerState()
-        if let indexerKeys {
-            inner.append(indexerKeys)
-        }
-        return inner
+        super.innerState() + tape.arrays
     }
 
     /// The indexer tape is serialized as the last entry. An empty array stands
@@ -66,10 +280,10 @@ public final class Qwen4ExpAttentionCache: KVCacheSimple {
             return kv.isEmpty ? [tape] : kv + [tape]
         }
         set {
-            guard let tape = newValue.last else {
+            guard let keys = newValue.last else {
                 fatalError("Qwen4ExpAttentionCache state must carry the indexer tape")
             }
-            indexerKeys = tape.size > 0 ? tape : nil
+            tape.load(keys.size > 0 ? keys : nil)
             let kv = Array(newValue.dropLast())
             if !kv.isEmpty {
                 super.state = kv
@@ -80,9 +294,7 @@ public final class Qwen4ExpAttentionCache: KVCacheSimple {
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         let trimmed = super.trim(n)
-        if let indexerKeys, indexerKeys.dim(1) > offset {
-            self.indexerKeys = indexerKeys[0..., ..<offset, 0...]
-        }
+        tape.truncate(to: offset)
         return trimmed
     }
 
@@ -93,7 +305,7 @@ public final class Qwen4ExpAttentionCache: KVCacheSimple {
         if s.count > 1 {
             new.state = s.map { $0[.ellipsis] }
         } else if let indexerKeys {
-            new.indexerKeys = indexerKeys[.ellipsis]
+            new.tape.load(indexerKeys[.ellipsis])
         }
         return new
     }
@@ -172,9 +384,7 @@ extension Qwen4ExpAttentionCache {
             target >= 0 && target <= offset,
             "Qwen4ExpAttentionCache: cannot restore forward, from \(offset) to \(target)")
         offset = target
-        if let indexerKeys, indexerKeys.dim(1) > target {
-            self.indexerKeys = target == 0 ? nil : indexerKeys[0..., ..<target, 0...]
-        }
+        tape.truncate(to: target)
     }
 }
 

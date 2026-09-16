@@ -134,6 +134,23 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    /// Append this step's K/V to the single bound row WITHOUT attending, and
+    /// advance the offsets exactly as `updateAndAttend` would. For a model
+    /// that attends over a gathered subset of the row on its own (the
+    /// Qwen4Exp sparse indexer). Returns the row's retained
+    /// `[1, kvHeads, retained, headDim]` views in temporal order.
+    public func updateOnly(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage to update")
+        precondition(
+            rows.count == 1 && keys.dim(0) == 1 && values.dim(0) == 1,
+            "CBv2LayerCache: updateOnly serves one bound row, got \(rows.count) rows")
+        let views = rows[0].update(keys: keys, values: values)
+        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        return views
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk
