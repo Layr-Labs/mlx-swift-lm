@@ -133,6 +133,10 @@ extension Qwen4ExpCBv2LayerCache: CBv2MTPRectangularSerializing {
         get { base.mtpSerializesRectangularAttention }
         set { base.mtpSerializesRectangularAttention = newValue }
     }
+    public var mtpBatchesRectangularAttention: Bool {
+        get { base.mtpBatchesRectangularAttention }
+        set { base.mtpBatchesRectangularAttention = newValue }
+    }
 }
 
 extension Qwen4ExpCBv2LayerCache: KVCache {
