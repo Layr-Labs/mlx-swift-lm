@@ -566,7 +566,10 @@ final class Qwen35GatedDeltaNet: Module {
             Qwen4ExpFusions.isEnabled
         {
             let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
-            return Qwen4ExpFusions.gatedNormFinish(normed, gate)
+            // rmsNorm may promote a low-precision activation when the norm
+            // weight is float32. Match the ordinary norm's final cast; this is
+            // a no-op for the selected checkpoint's BF16 weights/activations.
+            return Qwen4ExpFusions.gatedNormFinish(normed, gate).asType(out.dtype)
         }
         return norm(out, gate: gate)
     }

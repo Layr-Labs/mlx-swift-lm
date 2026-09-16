@@ -92,4 +92,31 @@ final class Qwen4ExpOutputGateTests: XCTestCase {
             }
         }
     }
+
+    func testSelectedBfloat16SigmoidRetainsLegacyFusedBytes() throws {
+        let layer = try Qwen4ExpDecoderLayer(configuration(gate: "sigmoid"),
+            layerIdx: 0, mmapPLE: false)
+        let gdn = try XCTUnwrap(layer.linearAttn)
+        gdn.norm.update(parameters: ModuleParameters.unflattened([
+            ("weight", gdn.norm.weight.asType(.bfloat16))
+        ]))
+        for width in [1, 6, 64] {
+            let shape = [1, width, 2, 8]
+            let input = MLXArray((0 ..< width * 16).map { Float($0 % 23 - 11) / 7 })
+                .reshaped(shape).asType(.bfloat16)
+            let gate = MLXArray((0 ..< width * 16).map { Float($0 % 17 - 8) / 3 })
+                .reshaped(shape).asType(.bfloat16)
+            let old: MLXArray
+            if Qwen4ExpFusions.isEnabled {
+                let normed = MLXFast.rmsNorm(input, weight: gdn.norm.weight, eps: gdn.norm.eps)
+                old = Qwen4ExpFusions.gatedNormFinish(normed, gate)
+            } else {
+                old = gdn.norm(input, gate: gate)
+            }
+            let actual = gdn.gatedOutputNorm(input, gate: gate)
+            eval(old, actual)
+            XCTAssertEqual(actual.dtype, old.dtype)
+            XCTAssertEqual(actual.asData().data, old.asData().data)
+        }
+    }
 }

@@ -38,6 +38,11 @@ SiLU executes its existing native normalization path. The selected checkpoint's
 sigmoid math, weights and embedded MTP heads are unchanged. Focused coverage is
 `Qwen4ExpOutputGateTests`, `MLXModelContainerEngineReasoningTests` and
 `ContainerControlHTTPTests`; these tests do not replace composed-model gates.
+The fused sigmoid tail also preserves the ordinary normalization's output dtype
+when an FP32 norm weight promotes a low-precision activation. The final cast is
+a no-op for the selected BF16 weights/activations; a separate exact regression
+compares that selected layout with the original fused bytes. Mixed-dtype fixture
+failures must not be hidden by loosening numerical assertions.
 
 The associated miniature tests are `Qwen4FactoryLifecycleTests`,
 `Qwen4ExpPLEResidencyTests`, `Qwen4ExpCodableTests`,
