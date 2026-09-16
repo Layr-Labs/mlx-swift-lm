@@ -206,6 +206,14 @@ the sustained40/66–88 tok/s objective remain separate gates.
 
 ## Reproduction
 
+Resource preflight must include generated bundles carrying the filesystem
+hidden flag. Their visibility does not alter the sealed-app search boundary,
+expected resource name, readable-source validation or refusal of conflicting
+bytes. `CBv2HiddenResourceTests` covers hidden names/flags and identical versus
+conflicting copies; the existing `CBv2PagedSafetyTests` still checks that a
+packaged application cannot use an unsigned external resource. Do not clear
+filesystem flags or disable resource eligibility to relabel a failed run.
+
 Tests and opt-in requirements are in `Tests/MLXLMTests/Qwen4RealStateTests.swift`,
 `Qwen4RealStateFixture.swift`, and the companion provider's validation guides.
 Record exact source, artifact, sampler, MTP/cache posture, binary/metallib and
