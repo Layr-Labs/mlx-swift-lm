@@ -13,8 +13,8 @@ final class Qwen4RealStateFixture {
     var target: Qwen4ExpTextModel { model.languageModel }
     let assistant: Qwen4ExpInlineMTPAssistant
     let dtypes: [DType]
-    let chunk = 128
-    let maximumLength = 2304
+    let chunk: Int
+    let maximumLength: Int
     static let maximumOutputBudget = 9
     // Explicit test grant: the full artifact's native GDN/assistant admission
     // requires more than 1 GiB even for a one-token output. Preserve admission
@@ -22,7 +22,12 @@ final class Qwen4RealStateFixture {
     // certify the physical 128-GB hardware tier.
     let diagnosticKVCapacityBytes = 2 << 30
 
-    init() throws {
+    init(chunk: Int = 128, maximumLength: Int = 2304) throws {
+        guard (1...2048).contains(chunk), (chunk...16384).contains(maximumLength) else {
+            throw Failure.invalidPrerequisite
+        }
+        self.chunk = chunk
+        self.maximumLength = maximumLength
         let env = ProcessInfo.processInfo.environment
         let path = try XCTUnwrap(env["DARKBLOOM_QWEN4_REAL_MODEL"], "Explicit owned artifact path required")
         guard path.hasPrefix("/"), Qwen4ExpPLEResidency.useMmap,
