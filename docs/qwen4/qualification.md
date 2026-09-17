@@ -178,10 +178,12 @@ their previous paths. The optional five-draft chain's six-column rectangle is
 accepted by selected-page storage; the production draft ceiling remains four.
 
 The assistant uses `DARKBLOOM_QWEN4_MTP_PRIME_CHUNK_TOKENS=2048` for bounded
-catch-up and `DARKBLOOM_QWEN4_MTP_SKIP_COLD_PROMPT_REPLAY=1` for the first cold
-round's carry-only policy. Restored prefix and settled-state histories retain
-replay, now bounded by the chunk policy. Explicit zero restores each former
-behavior. Draft proposals may change; target verification, exact committed
+catch-up and `DARKBLOOM_QWEN4_MTP_SKIP_PROMPT_REPLAY=1` for consistent carry-only
+initialization of an unprimed head, whether the target history is cold or
+restored. Concrete already-primed caches are never reset; later catch-up remains
+bounded. Explicit zero restores full-history replay. The older explicit
+`DARKBLOOM_QWEN4_MTP_SKIP_COLD_PROMPT_REPLAY` switch retains its cold-only
+experiment when the new switch is absent. Draft proposals may change; target verification, exact committed
 outputs, rollback and complete checkpoint semantics must still pass their
 independent gates. These controls change no learned parameters or target
 prefill chunk policy. A high-acceptance short fixture is not a universal speed
@@ -201,6 +203,9 @@ indices, rollback visibility and six-column eligibility. Priming fixtures that
 intend to exercise whole-history/chunked replay explicitly disable cold skip;
 they must not silently become no-ops after a default change. The existing
 whole-versus-chunked assistant closeness test is not a target-exactness oracle.
+Default prefix and unprimed/primed request-state restores must match their
+uncached/direct assistant counterparts exactly. The legacy settled-state test
+selects full replay explicitly and retains its original physical-cache oracle.
 `Qwen4ParallelFullKVParityTests` compares the unset default and every valid
 partition override against an explicitly disabled independent Steel oracle;
 wider prefill must retain the original dispatch. `Qwen4LayerSubmissionTests`

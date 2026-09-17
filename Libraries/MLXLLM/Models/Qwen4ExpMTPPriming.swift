@@ -8,6 +8,8 @@ enum Qwen4ExpMTPPriming {
     static let environmentFlag = "DARKBLOOM_QWEN4_MTP_PRIME_CHUNK_TOKENS"
     static let skipColdPromptReplayEnvironmentFlag =
         "DARKBLOOM_QWEN4_MTP_SKIP_COLD_PROMPT_REPLAY"
+    static let skipPromptReplayEnvironmentFlag =
+        "DARKBLOOM_QWEN4_MTP_SKIP_PROMPT_REPLAY"
     static let maximumChunkTokens = 8192
     static let defaultChunkTokens = 2048
 
@@ -17,18 +19,31 @@ enum Qwen4ExpMTPPriming {
         cacheTokens == 0 && backlogTokens > 0 || backlogTokens > 6
     }
 
-    /// Qwen4-only rollbackable policy. Unset selects a carry-only first cold
-    /// round; false and malformed values retain whole-history priming. The
-    /// caller applies true only to a fresh request's first round; restored
-    /// prefix and settled-state checkpoints keep their exact replay path.
+    enum ReplayPolicy { case full, coldOnly, unprimed }
+
+    /// Prefix checkpoints contain unprimed target history. The default must
+    /// initialize that history exactly like the same uncached prompt. The old
+    /// explicit cold-only switch retains its narrower experimental behavior.
+    static func replayPolicy(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> ReplayPolicy {
+        func enabled(_ value: String) -> Bool {
+            ["1", "true", "yes", "on"].contains(
+                value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        }
+        if let value = environment[skipPromptReplayEnvironmentFlag] {
+            return enabled(value) ? .unprimed : .full
+        }
+        if let value = environment[skipColdPromptReplayEnvironmentFlag] {
+            return enabled(value) ? .coldOnly : .full
+        }
+        return .unprimed
+    }
+
     static func skipsColdPromptReplay(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        guard let raw = environment[skipColdPromptReplayEnvironmentFlag] else {
-            return true
-        }
-        return ["1", "true", "yes", "on"].contains(
-            raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        replayPolicy(environment: environment) != .full
     }
 
     static func validatedChunkTokens(_ value: Int) -> Int {

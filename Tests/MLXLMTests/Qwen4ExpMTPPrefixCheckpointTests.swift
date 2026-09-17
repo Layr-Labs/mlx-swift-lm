@@ -148,4 +148,29 @@ struct Qwen4ExpMTPPrefixCheckpointTests {
         #expect(try lazy.evaluatedBufferInfo() == nil)
         assistant.releaseRequestState(state)
     }
+
+    @Test func unprimedAndPrimedSnapshotsPreserveDefaultCarryPolicyExactly() throws {
+        let assistant = try fixture()
+        let donor = assistant.makeRequestState()
+        assistant.observeCommittedTarget(observation(), requestState: donor)
+        let snapshot = try assistant.snapshotRequestState(donor)
+        let restored = try assistant.restoreRequestState(from: snapshot)
+        let expected = draft(assistant, donor), actual = draft(assistant, restored)
+        #expect(expected.tokens == actual.tokens && expected.hidden == actual.hidden)
+        for state in [donor, restored] {
+            assistant.finalizeRound(requestState: state, confirmedInputTokens: 1,
+                committedDraftTokens: MLXArray.zeros([1, 0], dtype: .int32),
+                committedTargetHidden: MLXArray.zeros([1, 0, 64], dtype: .bfloat16))
+        }
+        let primed = try assistant.snapshotRequestState(donor)
+        #expect(primed.cacheLayers[0].offset == 1 && primed.logicalInputBase == 3)
+        #expect(primed.committedInputCount == 4)
+        let resumed = try assistant.restoreRequestState(from: primed)
+        let next = draft(assistant, donor, seed: 6), resumedNext = draft(assistant, resumed, seed: 6)
+        #expect(next.tokens == resumedNext.tokens && next.hidden == resumedNext.hidden)
+        for state in [donor, restored, resumed] {
+            assistant.discardRound(requestState: state)
+            assistant.releaseRequestState(state)
+        }
+    }
 }

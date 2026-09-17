@@ -77,9 +77,11 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
             checkpoint.owner == ObjectIdentifier(self),
             let state = makeRequestState() as? RequestState
         else { return nil }
-        // A restored checkpoint is a warm, trusted history. The cold-only
-        // no-replay experiment must never discard or reinterpret it.
-        state.coldPromptReplayEligible = false
+        // This checkpoint has no assistant KV yet. Use the same initial-head
+        // policy as an uncached prompt; retain the full trusted bytes for
+        // discard/retry and codec validation. The old explicit cold-only
+        // experiment still replays restored history.
+        state.coldPromptReplayEligible = skipUnprimedRestoredReplay
         state.backlogHidden = [checkpoint.hidden]
         state.backlogTokens = [checkpoint.tokens]
         state.targetHiddenFrontier = checkpoint.frontier

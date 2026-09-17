@@ -86,6 +86,11 @@ struct Qwen4SelectedPageCopiesTests {
         defer { cache.setRows([]); backend.release(states) }
         let row = try #require(states[0] as? PagedSequenceKV)
         cache.setRows([row])
+        let six = MLXArray.zeros([1, 1, 6, 64], dtype: .bfloat16)
+        #expect(!cache.qwen4CanGatherSelectedKV(keys: six, values: six),
+                "Borrower-retaining cache must keep its existing fallback")
+        // Production LayerCacheBankV2 clears this for non-borrowed roots.
+        cache.setRetainsChunkForBorrowers(false)
         for width in [1, 5, 6, 7] {
             let keys = MLXArray.zeros([1, 1, width, 64], dtype: .bfloat16)
             #expect(cache.qwen4CanGatherSelectedKV(keys: keys, values: keys) == (width <= 6))

@@ -251,7 +251,8 @@ struct Qwen4ExpLightningMTPTests {
             configuration: args,
             blockSize: 3,
             target: target,
-            verificationMode: .rectangularExact)
+            verificationMode: .rectangularExact,
+            skipColdPromptReplay: false)
         let original = assistant.makeRequestState()
         assistant.observeCommittedTarget(
             CBv2MTPCommittedTargetObservation(

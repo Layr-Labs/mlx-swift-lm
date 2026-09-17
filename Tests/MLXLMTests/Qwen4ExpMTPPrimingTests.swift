@@ -22,6 +22,11 @@ struct Qwen4ExpMTPPrimingTests {
         #expect(!Qwen4ExpMTPPriming.needsChunking(backlog: backlog, chunkTokens: 0))
 
         let skipKey = Qwen4ExpMTPPriming.skipColdPromptReplayEnvironmentFlag
+        let replayKey = Qwen4ExpMTPPriming.skipPromptReplayEnvironmentFlag
+        #expect(Qwen4ExpMTPPriming.replayPolicy(environment: [:]) == .unprimed)
+        #expect(Qwen4ExpMTPPriming.replayPolicy(environment: [skipKey: "1"]) == .coldOnly)
+        #expect(Qwen4ExpMTPPriming.replayPolicy(environment: [replayKey: "0", skipKey: "1"]) == .full)
+        #expect(Qwen4ExpMTPPriming.replayPolicy(environment: [replayKey: "1", skipKey: "0"]) == .unprimed)
         #expect(Qwen4ExpMTPPriming.skipsColdPromptReplay(environment: [:]))
         for raw in ["", "0", "false", "off", "invalid"] {
             #expect(!Qwen4ExpMTPPriming.skipsColdPromptReplay(

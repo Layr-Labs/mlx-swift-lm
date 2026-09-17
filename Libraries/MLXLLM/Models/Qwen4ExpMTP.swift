@@ -162,6 +162,7 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
     private let installedVerificationMode: CBv2MTPVerificationMode
     private let primeChunkTokens: Int
     private let skipColdPromptReplay: Bool
+    let skipUnprimedRestoredReplay: Bool
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
@@ -189,8 +190,11 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
         self.target = target
         self.primeChunkTokens = Qwen4ExpMTPPriming.validatedChunkTokens(
             primeChunkTokens ?? Qwen4ExpMTPPriming.environmentChunkTokens())
-        self.skipColdPromptReplay = skipColdPromptReplay
-            ?? Qwen4ExpMTPPriming.skipsColdPromptReplay()
+        let replayPolicy = skipColdPromptReplay.map {
+            $0 ? Qwen4ExpMTPPriming.ReplayPolicy.coldOnly : .full
+        } ?? Qwen4ExpMTPPriming.replayPolicy()
+        self.skipColdPromptReplay = replayPolicy != .full
+        self.skipUnprimedRestoredReplay = replayPolicy == .unprimed
         self.installedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
             forceSerialEnvironment: Self.forceSerialVerification)
@@ -999,7 +1003,8 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         }
         let state = RequestState(
             owner: ObjectIdentifier(self), caches: caches,
-            coldPromptReplayEligible: false)
+            coldPromptReplayEligible: skipUnprimedRestoredReplay
+                && snapshot.logicalInputBase == 0 && commonOffset == 0)
         state.backlogHidden = snapshot.backlogHidden
         state.backlogTokens = snapshot.backlogTokens
         state.targetHiddenFrontier = snapshot.targetHiddenFrontier
