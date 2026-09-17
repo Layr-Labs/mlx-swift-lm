@@ -11,14 +11,19 @@ public enum Qwen4ExpMetalHeaders {
     public static let quantizedUtils = load("quantized_utils")
     public static let quantized = load("quantized")
 
-    private static func load(_ name: String) -> String {
-        guard let url = Bundle.module.url(
-            forResource: name, withExtension: "metal", subdirectory: "Qwen4Metal"),
-            let source = try? String(contentsOf: url, encoding: .utf8),
-            !source.isEmpty
-        else {
-            preconditionFailure("Required native Qwen4 Metal resource is unavailable: \(name)")
+    /// Release/installer smoke must exercise this lookup from the packaged
+    /// executable before an inference process reaches a static kernel header.
+    public static func validateResources() throws {
+        for name in Qwen4ExpMetalResources.names {
+            _ = try Qwen4ExpMetalResources.load(name)
         }
-        return source
+    }
+
+    private static func load(_ name: String) -> String {
+        do {
+            return try Qwen4ExpMetalResources.load(name)
+        } catch {
+            preconditionFailure("\(error)")
+        }
     }
 }

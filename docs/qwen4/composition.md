@@ -239,3 +239,7 @@ and every captured FP32 state against chained canonical kernels for widths
 
 Follow-up no-output syntax parsing and `git diff --check` passed. No build,
 GPU execution, commit, or push was performed.
+
+### Signed app resources
+
+`Qwen4ExpMetalHeaders` resolves native preambles through `Qwen4ExpMetalResources`. Packaged executables, including symlinked CLI launches, load only from the app’s sealed `Contents/Resources/mlx-swift-lm_MLXLMCommon.bundle/Qwen4Metal` directory. Missing files cannot fall back to a developer checkout or the working directory. `validateResources()` provides a throwing preflight for distribution smoke checks; standalone development still discovers adjacent SwiftPM bundles.
