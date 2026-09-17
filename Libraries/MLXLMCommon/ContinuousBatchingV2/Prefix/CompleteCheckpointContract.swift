@@ -29,10 +29,11 @@ public struct CBv2CompleteCheckpointIdentity: Codable, Sendable, Equatable {
 public enum CBv2CheckpointTensorRole: String, Codable, Sendable {
     case keys, values, convolution, recurrent
     case assistantHidden, assistantTokens, assistantFrontier
+    case indexKeys, indexPositions, pooledIndexKeys
 }
 
 public enum CBv2CheckpointDType: String, Codable, Sendable {
-    case float16, bfloat16, float32, int32
+    case float16, bfloat16, float32, int32, int64
 
     public var isFloatingPoint: Bool {
         self == .float16 || self == .bfloat16 || self == .float32
@@ -44,6 +45,7 @@ public enum CBv2CheckpointDType: String, Codable, Sendable {
         case .bfloat16: .bfloat16
         case .float32: .float32
         case .int32: .int32
+        case .int64: .int64
         }
     }
 
@@ -53,6 +55,7 @@ public enum CBv2CheckpointDType: String, Codable, Sendable {
         case .bfloat16: self = .bfloat16
         case .float32: self = .float32
         case .int32: self = .int32
+        case .int64: self = .int64
         default: return nil
         }
     }
@@ -122,6 +125,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public var prefixTokens: [Int] { metadata.tokens }
     public let cacheSalt: String?
     public let assistantCodecID: String?
+    public let mediaIdentity: CBv2HybridPrefixIdentity?
+    public let mediaTargetOnly: Bool
     /// Shares the same ownership boundary as prefixTokens, including shape arrays.
     public var tensors: [CBv2CheckpointTensorDescriptor] { metadata.tensors }
     public var attentionLayers: [CBv2CheckpointAttentionLayer]? { metadata.attentionLayers }
@@ -131,16 +136,19 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         identity: CBv2CompleteCheckpointIdentity, position: Int, chunkSize: Int,
         prefixTokens: [Int], cacheSalt: String?, assistantCodecID: String?,
         tensors: [CBv2CheckpointTensorDescriptor], backendLayout: String = Self.layout,
-        attentionLayers: [CBv2CheckpointAttentionLayer]? = nil
+        attentionLayers: [CBv2CheckpointAttentionLayer]? = nil,
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
     ) {
         self.init(schemaVersion: Self.currentSchemaVersion, identity: identity,
                   backendLayout: backendLayout, position: position, chunkSize: chunkSize,
                   cacheSalt: cacheSalt, assistantCodecID: assistantCodecID,
+                  mediaIdentity: mediaIdentity, mediaTargetOnly: mediaTargetOnly,
                   metadata: .init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers))
     }
 
     init(schemaVersion: Int, identity: CBv2CompleteCheckpointIdentity, backendLayout: String,
          position: Int, chunkSize: Int, cacheSalt: String?, assistantCodecID: String?,
+         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
          metadata: CBv2CheckpointManifestMemory) {
         self.schemaVersion = schemaVersion
         self.identity = identity
@@ -149,6 +157,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         self.chunkSize = chunkSize
         self.cacheSalt = cacheSalt
         self.assistantCodecID = assistantCodecID
+        self.mediaIdentity = mediaIdentity
+        self.mediaTargetOnly = mediaTargetOnly
         self.metadata = metadata
     }
 
@@ -172,7 +182,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             prefixTokens.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }),
             !tensors.isEmpty, tensors.count <= 4096,
             (cacheSalt?.utf8.count ?? 0) <= 4096,
-            (assistantCodecID?.utf8.count ?? 0) <= 512
+            (assistantCodecID?.utf8.count ?? 0) <= 512,
+            !mediaTargetOnly || (mediaIdentity != nil && assistantCodecID == nil)
         else { throw CBv2CompleteCheckpointError.invalidManifest }
         var total = 0
         var roles = Set<String>()

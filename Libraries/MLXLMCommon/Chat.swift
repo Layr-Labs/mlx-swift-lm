@@ -14,6 +14,11 @@ public enum Chat {
         /// Array of video data associated with the message.
         public var videos: [UserInput.Video]
 
+        /// Optional structured template fields. Generators retain ownership
+        /// of role/content and media placeholders; only the standard tool and
+        /// reasoning fields are forwarded by the default message-list renderer.
+        public var templateFields: [String: any Sendable] = [:]
+
         public init(
             role: Role, content: String, images: [UserInput.Image] = [],
             videos: [UserInput.Video] = []
@@ -91,7 +96,10 @@ extension MessageGenerator {
         var rawMessages: [Message] = []
 
         for message in messages {
-            let raw = generate(message: message)
+            var raw = generate(message: message)
+            for key in ["name", "tool_call_id", "tool_calls", "reasoning_content"] {
+                if let value = message.templateFields[key] { raw[key] = value }
+            }
             rawMessages.append(raw)
         }
 

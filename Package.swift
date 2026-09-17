@@ -96,7 +96,10 @@ let package = Package(
             resources: [
                 // CBv2 paged-attention MSL source, JIT-compiled at runtime
                 // via MLXFast.metalKernel (NOT compiled by SwiftPM).
-                .copy("ContinuousBatchingV2/Paged/pagedattention.metal")
+                .copy("ContinuousBatchingV2/Paged/pagedattention.metal"),
+                // Exact MLX preambles used by native Qwen4 JIT kernels.
+                // Copy as text; SwiftPM must not compile these header fragments.
+                .copy("Resources/Qwen4Metal")
             ]
         ),
         .target(

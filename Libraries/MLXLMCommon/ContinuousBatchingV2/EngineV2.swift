@@ -350,6 +350,9 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 admissionConfig.fixedBytesPerRequest = Int.max
             }
         }
+        CBv2TargetAuxiliaryAdmission.apply(
+            model: model, config: &admissionConfig, policy: allocationPolicy,
+            draftSpecs: fixedTargetOnly ? [] : mtpDriver?.drafter.requestStateAllocationSpecs)
         self.resolvedFixedBytesPerRequest = admissionConfig.fixedBytesPerRequest
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
@@ -428,6 +431,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             let recurrentSpec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,
             let kvDTypes = (model as? any CBv2CompleteCheckpointKVTypeProviding)?.cbv2CompleteCheckpointKVDTypes,
             kvDTypes.count == layerKinds.count,
+            let qwen4Geometries = Self.checkpointQwen4Geometries(model: model, layerKinds: layerKinds),
             pagedCheckpointConfig == nil || kvDTypes == segmentedPool?.layerDTypes,
             !(mtpDriver?.tracksPersistentHistory ?? false)
                 || mtpDriver?.drafter is any CBv2MTPPrefixCheckpointCoding
@@ -437,7 +441,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 recurrentSpec: recurrentSpec, kvDTypes: kvDTypes,
                 assistant: mtpDriver?.tracksPersistentHistory == true
                     ? mtpDriver?.drafter as? any CBv2MTPPrefixCheckpointCoding : nil,
-                admission: admission, pagedConfig: pagedCheckpointConfig)
+                admission: admission, pagedConfig: pagedCheckpointConfig, qwen4Geometries: qwen4Geometries)
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
@@ -970,11 +974,10 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
     public func residentPrefixCandidate(
         for request: CBv2Request
     ) -> CBv2ResidentPrefixCandidate? {
-        if let hybridPrefixCache, request.prefixCacheEnabled,
-            request.multimodal == nil, request.positionState == nil
+        if let hybridPrefixCache, request.permitsHybridCheckpoint(layerKinds: layerKinds)
         {
             return hybridPrefixCache.candidate(
-                tokens: request.promptTokens, cacheSalt: request.cacheSalt,
+                tokens: request.promptTokens, cacheSalt: request.checkpointCacheSalt,
                 maximumChunkSize: max(
                     schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0))
         }

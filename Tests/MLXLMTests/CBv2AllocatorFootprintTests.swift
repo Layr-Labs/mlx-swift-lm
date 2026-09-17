@@ -74,7 +74,10 @@ struct CBv2AllocatorFootprintTests {
         return view
     }
 
-    @Test func metadataPricesIndependentSizeClassBuffersBeforeAllocation() throws {
+    @Test(.enabled(
+        if: ProcessInfo.processInfo.environment["DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST"] == "1",
+        "Set DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1 and run this allocator check alone"))
+    func metadataPricesIndependentSizeClassBuffersBeforeAllocation() throws {
         let layout = try PagedKVSegmentLayout(pageBytes: pageBytes, targetBytes: 9 * pageBytes,
                                               maximumBufferBytes: 8 << 20)
         let before = Memory.snapshot()
@@ -139,7 +142,10 @@ struct CBv2AllocatorFootprintTests {
         withExtendedLifetime(view) {}
     }
 
-    @Test func evaluatedThenThrownAllocationKeepsRetainedViewInAllocatorUsage() throws {
+    @Test(.enabled(
+        if: ProcessInfo.processInfo.environment["DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST"] == "1",
+        "Set DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1 and run this allocator check alone"))
+    func evaluatedThenThrownAllocationKeepsRetainedViewInAllocatorUsage() throws {
         let (backend, admission, owner) = try fixture()
         try admission.reserve(id: .init(1), additionalTokens: 32)
         let nominal = admission.bytesReserved

@@ -55,6 +55,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2CompleteCheckpointKVTypeProvidi
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2Qwen4CheckpointGeometryProviding {
+    public var cbv2Qwen4CheckpointGeometries: [CBv2Qwen4CheckpointGeometry]? {
+        guard let owner = model as? any CBv2Qwen4CheckpointGeometryProviding else { return [] }
+        return owner.cbv2Qwen4CheckpointGeometries
+    }
+}
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionedSteppableModel {
     public var supportsPositionedForwarding: Bool {
         if model is any CBv2RecurrentLanguageModelForwardable {
@@ -449,6 +455,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
 }
 
 
+extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProviding {
+    public var cbv2TargetAuxiliaryAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
+        guard let owner = model as? any CBv2TargetAuxiliaryAllocationProviding else { return [] }
+        return owner.cbv2TargetAuxiliaryAllocationSpecs
+    }
+}
 
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {

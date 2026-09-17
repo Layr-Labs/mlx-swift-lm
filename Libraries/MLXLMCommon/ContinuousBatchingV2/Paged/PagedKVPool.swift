@@ -120,6 +120,8 @@ public final class PagedKVPool {
     let writeValidation = CBv2PagedKVWriteValidation()
     /// Deterministic failure-order observer; production leaves this unset.
     var checkpointImportBeforeRollback: (() -> Void)?
+    /// Empty-pool retirement boundary; replaceable only for ordering tests.
+    var synchronizeEmptyRetirement: (MLX.Stream) -> Void = { $0.synchronize() }
     let groupDemandBytes: [PagedKVGroupKey: Int]
     let totalDemandBytes: Int
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
@@ -693,12 +695,21 @@ public final class PagedKVPool {
     /// retain their reference behavior until segmented execution is promoted.
     func trimFreeSegments() {
         guard config.segmentSizeBytes != nil else { return }
+        let previousBytes = bytesMaterialized
         for key in groupKeys {
             group(key).trimSegments { [unowned self] handle in
                 pageReuseObserver?.pagedKVPool(self, willReuse: handle)
             }
         }
-        physicalLease?.release(to: bytesMaterialized)
+        let remainingBytes = bytesMaterialized
+        if previousBytes > 0 && remainingBytes == 0 {
+            // Eval/readback can signal before Metal completion handlers drop
+            // their input-buffer owners. Drain after the pool's owners die,
+            // before refunding its last floor. Native kernels and retirement
+            // share the engine's default stream (including a scoped override).
+            synchronizeEmptyRetirement(StreamOrDevice.default.stream)
+        }
+        physicalLease?.release(to: remainingBytes)
     }
 
     deinit {

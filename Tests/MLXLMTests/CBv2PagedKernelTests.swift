@@ -254,7 +254,10 @@ struct CBv2PagedKernelTests {
 
     // MARK: - Batch-composition invariance
 
-    @Test func decodeBatchCompositionInvariance() throws {
+    @Test(.enabled(
+        if: ProcessInfo.processInfo.environment["DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST"] == "1",
+        "Set DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1 and run this GPU-global check alone"))
+    func decodeBatchCompositionInvariance() throws {
         MLXRandom.seed(11)
         let kind = CBv2LayerKind(
             attention: .full, headDim: 64, kvHeads: 2, queryHeads: 8)

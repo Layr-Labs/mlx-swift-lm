@@ -209,6 +209,7 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
     var supportsCapturedVerifyWindow: Bool { captureWindows }
     var cbv2PositionAxisCount: Int? { 3 }
     private(set) var hiddenPositionIDs: [[Int32]] = []
+    private(set) var batchPositionScopes: [(hidden: Bool, positions: [Int32], explicit: [Bool?])] = []
     private(set) var capturedVerifyWidths: [Int] = []
     private(set) var topTwoCalls = 0
 
@@ -291,6 +292,7 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
         recordsHiddenPositions: Bool
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        recordPositionScope(tokens: tokens, positionIds: positionIds, hidden: recordsHiddenPositions)
         if recordsHiddenPositions, let positionIds {
             hiddenPositionIDs.append(positionIds[0].asArray(Int32.self))
         }
@@ -330,6 +332,7 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        recordPositionScope(tokens: tokens, positionIds: positionIds, hidden: true)
         precondition(captureWindows, "fixture built without capture-window support")
         if let positionIds {
             hiddenPositionIDs.append(positionIds[0].asArray(Int32.self))
@@ -358,6 +361,14 @@ private class QwenMTPFixtureModel: CBv2RecurrentMTPSteppableModel,
         let logits = fixtureLogits(targetIDs: targetIDs, batch: batch, length: length)
         let hidden = states.reshaped([batch, length, 1])
         return (logits, hidden)
+    }
+
+    private func recordPositionScope(tokens: MLXArray, positionIds: MLXArray?, hidden: Bool) {
+        guard tokens.dim(0) > 1, let positionIds, positionIds.ndim == 3 else { return }
+        let count = tokens.dim(0)
+        batchPositionScopes.append((
+            hidden: hidden, positions: positionIds[0, 0..., 0].asArray(Int32.self),
+            explicit: (0..<count).map { CBv2Qwen4PositionScope.explicitPosition(row: $0, batch: count) }))
     }
 
     private func fixtureLogits(
@@ -435,7 +446,8 @@ struct CBv2QwenMTPIntegrationTests {
         verification: CBv2MTPVerificationMode = .serialTarget,
         targetPrefix: Bool = false, maxDraft: Int? = 1,
         advanceHiddenPerDraft: Bool = false,
-        sampler: (any CBv2StepSampler)? = nil
+        sampler: (any CBv2StepSampler)? = nil,
+        qwen4Positions: Bool = false
     ) -> (EngineV2, QwenMTPFixtureDrafter, QwenMTPFixtureModel) {
         let model = QwenMTPFixtureModel(
             captureWindows: captureWindows, spreadLogits: spreadLogits,
@@ -447,7 +459,8 @@ struct CBv2QwenMTPIntegrationTests {
             advanceHiddenPerDraft: advanceHiddenPerDraft)
         let kinds = [
             CBv2LayerKind(
-                attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)
+                attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1,
+                qwen4IndexerCompressRatio: qwen4Positions ? 4 : nil)
         ]
         return (
             EngineV2(
@@ -1008,6 +1021,67 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(drafter.observedWidths.contains(1))
         await mtp.shutdown()
         #expect(drafter.released == drafter.created)
+    }
+
+    private func checkMixedPositionProvenance(mtpEnabled: Bool) async throws {
+        let config = CBv2MTPConfig(
+            enabled: mtpEnabled, maxDraftTokens: 1, maxSpeculativeBatch: 1,
+            fixedDraftTokens: 1, verificationMode: .serialTarget)
+        let (runtime, drafter, observed) = engine(
+            correctionOffset: 0, enabled: mtpEnabled, mtpConfig: config,
+            qwen4Positions: true)
+        let positions = CBv2PositionState(
+            promptPositionIds: MLXArray([Int32(1000), 1001, 1002,
+                1000, 1001, 1002, 1000, 1001, 1002], [3, 1, 3]),
+            decodeDeltas: [1000])
+        let embedding = MLXArray([Float(4)]).reshaped([1, 1, 1])
+        eval(positions.promptPositionIds, embedding)
+        let media = CBv2MultimodalInput(
+            spans: [CBv2ImageSpan(tokenOffset: 1, length: 1)],
+            attention: .causal, positionState: positions,
+            embeddings: { [embedding] })
+        do {
+            let streams = try runtime.loopForTesting.onEngineQueueSync {
+                // Atomically admit both ready fixtures before the first step;
+                // a timed sleep does not prove that the mixed route executes.
+                (
+                    try runtime.submit(CBv2Request(
+                        id: CBv2RequestID(940), promptTokens: [2, 4, 6],
+                        sampling: .init(temperature: 0), maxTokens: 10)),
+                    try runtime.submit(CBv2Request(
+                        id: CBv2RequestID(941), promptTokens: [2, 4, 6],
+                        sampling: .init(temperature: 0), maxTokens: 10,
+                        multimodal: media, positionState: positions))
+                )
+            }
+            async let first = cbv2SchedCollect(streams.0)
+            async let second = cbv2SchedCollect(streams.1)
+            let results = await (first, second)
+            await runtime.shutdown()
+            #expect(results.0.tokens.count == 10)
+            #expect(results.1.tokens.count == 10)
+            #expect(results.0.tokens == results.1.tokens)
+            #expect(!observed.batchPositionScopes.isEmpty)
+            for row in observed.batchPositionScopes {
+                #expect(row.positions.count == 2)
+                #expect(row.explicit == row.positions.map { Optional($0 >= 1000) })
+                #expect(row.hidden == mtpEnabled)
+            }
+            #expect(drafter.released == drafter.created)
+        } catch {
+            await runtime.shutdown()
+            throw error
+        }
+    }
+
+    @Test("mixed position provenance reaches ordinary target")
+    func mixedPositionProvenanceOrdinary() async throws {
+        try await checkMixedPositionProvenance(mtpEnabled: false)
+    }
+
+    @Test("mixed position provenance reaches stateful target-only forward")
+    func mixedPositionProvenanceStateful() async throws {
+        try await checkMixedPositionProvenance(mtpEnabled: true)
     }
 
     @Test("terminal seed cost is invalidated before same request id reuse")

@@ -34,7 +34,7 @@
 import Foundation
 import MLX
 
-public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
+public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv2Qwen4IndexerRow {
     let pool: PagedKVPool
     let groupKey: PagedKVGroupKey
     /// Pool-issued monotonic identity (never reused, unlike a heap address).
@@ -57,8 +57,16 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// Bumped whenever `table` changes — lets the layer cache reuse device
     /// block tables across steps that only append tokens within a page.
     private(set) var tableVersion: Int = 0
+    private var selectedGatherPlanVersion = -1
+    private var selectedGatherPlan: PagedSelectedGather.Plan?
 
     public private(set) var absoluteOffset: Int = 0
+    /// Qwen4 QSA indexer sidecar. Same lifecycle as `CBv2FullSequenceKV`.
+    public var qwen4IndexKeys: MLXArray?
+    public var qwen4IndexTokenCount: Int?
+    public var qwen4IndexPositionIds: MLXArray?
+    public var qwen4PooledIndexKeys: MLXArray?
+    public var qwen4PooledIndexBlocks: Int = 0
     /// Highest absolute position this row has ever WRITTEN. Equal to
     /// `absoluteOffset` for every row that never rolled back, and strictly
     /// greater afterwards: `rollback` retreats the cursor, it does not
@@ -501,6 +509,21 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         let retained = retainedCount
         let start = absoluteOffset - retained
         return gatherRange(start: start, count: retained)
+    }
+
+    var supportsQwen4SelectedGather: Bool {
+        !released && windowSize == nil && baseOffset == 0 && frozenHighWater == 0
+    }
+
+    func gatherSelected(_ indices: MLXArray) -> (keys: MLXArray, values: MLXArray) {
+        precondition(supportsQwen4SelectedGather)
+        let group = pool.group(groupKey)
+        if selectedGatherPlanVersion != tableVersion || selectedGatherPlan == nil {
+            selectedGatherPlan = PagedSelectedGather.prepare(group: group, pages: table)
+            selectedGatherPlanVersion = tableVersion
+        }
+        return PagedSelectedGather.gather(
+            group: group, plan: selectedGatherPlan!, indices: indices, length: absoluteOffset)
     }
 
     /// Oldest absolute position this row still physically holds.

@@ -39,13 +39,13 @@ extension EngineV2 {
     }
 
     func completeCheckpointLookup(for request: CBv2Request) -> CBv2PrefixLookup {
-        guard request.prefixCacheEnabled, request.multimodal == nil, request.positionState == nil,
+        guard request.permitsHybridCheckpoint(layerKinds: layerKinds),
             let receiptID = request.prefixCacheReceiptID, let completePrefixCache
         else { return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0) }
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
         guard !overflow else { return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0) }
         guard let staged = completePrefixCache.takeStaged(
-            requestID: receiptID, tokens: request.promptTokens, cacheSalt: request.cacheSalt,
+            requestID: receiptID, tokens: request.promptTokens, cacheSalt: request.checkpointCacheSalt,
             maximumSequenceLength: maximumLength)
         else { return .init(adoption: nil, outcome: .miss, matchedTokens: 0) }
         do {
@@ -78,7 +78,7 @@ extension EngineV2 {
             return .init(
                 adoption: .init(
                     requestID: receiptID, tokens: request.promptTokens, matched: matched,
-                    plan: plan, prefix: [], cacheSalt: request.cacheSalt, completeCheckpoint: staged),
+                    plan: plan, prefix: [], cacheSalt: request.checkpointCacheSalt, completeCheckpoint: staged),
                 outcome: .adoptionFailed, matchedTokens: matched)
         } catch {
             staged.close()

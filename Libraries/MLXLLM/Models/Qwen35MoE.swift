@@ -50,11 +50,11 @@ public struct Qwen35Configuration: Codable, Sendable {
 /// gate+up).
 ///
 /// Two checkpoint families are handled, prefix-agnostically:
-/// - Raw HF exports carry one stacked tensor `<mlp>.experts.gate_up_proj`
-///   (`[E, 2*ffn, hidden]`, gate rows first — exactly the order
-///   `SwitchGLU` slices) plus `<mlp>.experts.down_proj`; both map directly
-///   onto `<mlp>.switch_mlp.{gate_up_proj,down_proj}.weight` without the
-///   historical split.
+/// - Raw HF exports carry stacked `<mlp>.experts.gate_up_proj` (BF16) or
+///   affine `<mlp>.experts.gate_up_proj.{weight,scales,biases}` plus matching
+///   `down_proj` tensors (`[E, 2*ffn, hidden]`, gate rows first — exactly the
+///   order `SwitchGLU` slices). Both layouts remap onto
+///   `<mlp>.switch_mlp.{gate_up_proj,down_proj}.*`.
 /// - MLX-converted checkpoints (including quantized ones, e.g. the
 ///   production W4/g64 artifact) carry split `<mlp>.switch_mlp.gate_proj.*`
 ///   and `up_proj.*` tensors. Concatenating along the output-row axis is
@@ -100,15 +100,41 @@ public func qwen35FuseSwitchMLPGateUp(
 ) -> [String: MLXArray] {
     var adjusted = weights
 
-    // Raw HF stacked exports: already fused, just re-keyed.
-    let rawSuffix = ".experts.gate_up_proj"
-    for key in Array(adjusted.keys)
-    where key.hasSuffix(rawSuffix) && !key.contains("mtp.") {
-        guard let gateUp = adjusted.removeValue(forKey: key) else { continue }
-        let prefix = String(key.dropLast(rawSuffix.count))
-        adjusted["\(prefix).switch_mlp.gate_up_proj.weight"] = gateUp
-        if let downProj = adjusted.removeValue(forKey: "\(prefix).experts.down_proj") {
-            adjusted["\(prefix).switch_mlp.down_proj.weight"] = downProj
+    // Raw HF stacked exports: already fused, just re-keyed onto SwitchGLU.
+    // Unquantized BF16 uses a suffix-less `<mlp>.experts.gate_up_proj` tensor.
+    // Affine Q4 (official Flash-Next conversion) keeps the stacked layout but
+    // writes `.experts.gate_up_proj.{weight,scales,biases}` plus matching
+    // `down_proj` tensors. Those must move with the same prefix remap or the
+    // fused module's `gate_up_proj.weight` stays unset and strict update 500s.
+    let rawGateUp = ".experts.gate_up_proj"
+    let rawDown = ".experts.down_proj"
+    let mlxGateUp = ".switch_mlp.gate_up_proj"
+    let mlxDown = ".switch_mlp.down_proj"
+    for key in Array(adjusted.keys) where !key.contains("mtp.") {
+        if key.hasSuffix(rawGateUp) {
+            guard let gateUp = adjusted.removeValue(forKey: key) else { continue }
+            let prefix = String(key.dropLast(rawGateUp.count))
+            adjusted["\(prefix)\(mlxGateUp).weight"] = gateUp
+            continue
+        }
+        if let range = key.range(of: "\(rawGateUp).") {
+            let prefix = String(key[..<range.lowerBound])
+            let suffix = String(key[range.upperBound...])
+            guard let value = adjusted.removeValue(forKey: key) else { continue }
+            adjusted["\(prefix)\(mlxGateUp).\(suffix)"] = value
+            continue
+        }
+        if key.hasSuffix(rawDown) {
+            guard let downProj = adjusted.removeValue(forKey: key) else { continue }
+            let prefix = String(key.dropLast(rawDown.count))
+            adjusted["\(prefix)\(mlxDown).weight"] = downProj
+            continue
+        }
+        if let range = key.range(of: "\(rawDown).") {
+            let prefix = String(key[..<range.lowerBound])
+            let suffix = String(key[range.upperBound...])
+            guard let value = adjusted.removeValue(forKey: key) else { continue }
+            adjusted["\(prefix)\(mlxDown).\(suffix)"] = value
         }
     }
 

@@ -39,7 +39,7 @@ enum CBv2CheckpointAllocationFootprint {
         for descriptor in descriptors {
             let charge: Int
             switch descriptor.role {
-            case .convolution, .assistantFrontier:
+            case .convolution, .assistantFrontier, .indexKeys, .indexPositions, .pooledIndexKeys:
                 charge = try add(bound(descriptor.byteCount), boolean)
             case .assistantHidden, .assistantTokens:
                 // Concatenate and compact copy may coexist until evaluation.

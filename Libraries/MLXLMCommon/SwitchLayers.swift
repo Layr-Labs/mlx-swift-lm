@@ -135,19 +135,22 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     ensureRowContiguous: true
 )
 
-/// Consume production-shaped sorted Gemma 4 expert rows through their inverse
+/// Consume production-shaped sorted expert rows through their inverse
 /// permutation and reduce original top-K slots into `[tokens, hidden]`.
 ///
-/// This primitive deliberately accepts only the production logical layout:
-/// bfloat16 `[tokens * 8, 2816]`, uint32 inverse order, and bfloat16
-/// `[tokens, 8]`. Callers must use the legacy scatter + weighted sum for every
-/// other dtype, shape, or layout.
+/// Accepted layouts are bfloat16 `[tokens * K, hidden]` with `hidden % 64 == 0`,
+/// uint32 inverse order, and bfloat16 `[tokens, K]` with `K >= 1` and at least
+/// 64 assignments (the SwitchGLU sorted-prefill threshold). Gemma 4 uses
+/// `K = 8` / hidden 2816; Flash-Next Qwen4 uses `K = 10` / hidden 2560.
+/// Callers must use the legacy scatter + weighted sum for every other dtype,
+/// shape, or layout.
 public func weightedExpertUnsort(
     sortedOutputs: MLXArray,
     inverseOrder: MLXArray,
     weights: MLXArray
 ) -> MLXArray {
     let hidden = sortedOutputs.dim(1)
+    let topK = weights.ndim == 2 ? weights.dim(1) : 0
     precondition(
         sortedOutputs.ndim == 2 && (hidden % 64 == 0)
             && sortedOutputs.dtype == .bfloat16,
@@ -156,9 +159,9 @@ public func weightedExpertUnsort(
         inverseOrder.ndim == 1 && inverseOrder.dtype == .uint32,
         "weightedExpertUnsort inverse order must be flat uint32")
     precondition(
-        weights.ndim == 2 && weights.dim(1) == 8 && weights.size >= 64
+        weights.ndim == 2 && topK >= 1 && weights.size >= 64
             && weights.dtype == .bfloat16,
-        "weightedExpertUnsort weights must be sorted-prefill bfloat16 [tokens, 8]")
+        "weightedExpertUnsort weights must be sorted-prefill bfloat16 [tokens, K]")
     precondition(
         sortedOutputs.dim(0) == weights.size && inverseOrder.size == weights.size,
         "weightedExpertUnsort assignment counts must match")
@@ -169,7 +172,7 @@ public func weightedExpertUnsort(
         [sortedOutputs, inverseOrder, weights],
         template: [
             ("T", sortedOutputs.dtype),
-            ("K", 8),
+            ("K", topK),
         ],
         grid: (hidden, tokens, 1),
         threadGroup: (64, 4, 1),
@@ -264,6 +267,24 @@ private let qwenDirectExpertReductionEnabled: Bool = {
     return raw == "1" || raw == "true" || raw == "on"
 }()
 
+/// Flash-Next fused inverse-permutation weighted reduction. Default on.
+/// `DARKBLOOM_QWEN4_WEIGHTED_UNSORT=0` restores scatter + `weightedExpertSum`.
+/// Qwen3.5 27B stays behind `MLX_QWEN_DIRECT_EXPERT_REDUCTION` (opt-in).
+public enum Qwen4WeightedExpertUnsort: Sendable {
+    public static let envFlag = "DARKBLOOM_QWEN4_WEIGHTED_UNSORT"
+
+    public static func isEnabled(
+        environment: [String: String] = Qwen4ExpEnvironment.snapshot
+    ) -> Bool {
+        let raw = environment[envFlag]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
+            return false
+        }
+        return true
+    }
+}
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -273,6 +294,8 @@ public enum SwitchGLUWeightedReductionProfile: Sendable {
     case generic
     case gemma4ProductionGeGLU
     case qwen35ProductionSwiGLU
+    /// Flash-Next oQ4e: hidden 2560, expert width 640, 512 experts, top-10.
+    case qwen4ProductionSwiGLU
 }
 
 
@@ -615,6 +638,23 @@ public class SwitchGLU: Module {
         SwitchGLU(copying: self, fusedGateUp: true)
     }
 
+    /// The immutable owning-model profile authorizes Qwen4 expert arithmetic.
+    /// Quantization replaces child modules, and fused/split twins preserve this
+    /// profile, so the choice is made here on every call rather than stored in
+    /// a process-global flag or inferred from a child's expert count.
+    private func projectExpert(
+        _ projection: SwitchLinear, _ x: MLXArray, _ indices: MLXArray,
+        sortedIndices: Bool
+    ) -> MLXArray {
+        if weightedReductionProfile == .qwen4ProductionSwiGLU,
+            let quantized = projection as? QuantizedSwitchLinear,
+            ObjectIdentifier(type(of: quantized)) == ObjectIdentifier(QuantizedSwitchLinear.self)
+        {
+            return quantized.qwen4Projection(x, indices, sortedIndices: sortedIndices)
+        }
+        return projection(x, indices, sortedIndices: sortedIndices)
+    }
+
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
@@ -630,15 +670,15 @@ public class SwitchGLU: Module {
         let xGate: MLXArray
         let xUp: MLXArray
         if let gateUpProj {
-            let xGateUp = gateUpProj(x, idx, sortedIndices: doSort)
+            let xGateUp = projectExpert(gateUpProj, x, idx, sortedIndices: doSort)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
             guard let gateProj, let upProj else {
                 preconditionFailure("SwitchGLU requires gate_up_proj or gate_proj/up_proj")
             }
-            xUp = upProj(x, idx, sortedIndices: doSort)
-            xGate = gateProj(x, idx, sortedIndices: doSort)
+            xUp = projectExpert(upProj, x, idx, sortedIndices: doSort)
+            xGate = projectExpert(gateProj, x, idx, sortedIndices: doSort)
         }
 
         let activated: MLXArray
@@ -652,7 +692,7 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = downProj(activated, idx, sortedIndices: doSort)
+        x = projectExpert(downProj, activated, idx, sortedIndices: doSort)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
@@ -709,6 +749,23 @@ public class SwitchGLU: Module {
                 && weights.shape == indices.shape
                 && weights.dtype == .bfloat16
                 && indices.size >= 64
+        case .qwen4ProductionSwiGLU:
+            return Qwen4WeightedExpertUnsort.isEnabled()
+                && inputDims == 2560
+                && hiddenDims == 640
+                && numExperts == 512
+                && isSiluActivation
+                && x.ndim == 2
+                && x.dim(1) == 2560
+                && x.dtype == .bfloat16
+                && indices.ndim == 2
+                && indices.dim(0) == x.dim(0)
+                && indices.dim(1) == 10
+                && (indices.dtype == .uint32 || indices.dtype == .int32)
+                && weights.ndim == 2
+                && weights.shape == indices.shape
+                && weights.dtype == .bfloat16
+                && indices.size >= 64
         }
     }
 
@@ -724,10 +781,10 @@ public class SwitchGLU: Module {
     /// Always-called expert projection + weighted reduction entry point.
     ///
     /// When the experiment is enabled, only the exact sorted production Gemma
-    /// prefill contract reduces directly to `[tokens, hidden]`. Disabled,
-    /// decode/small-assignment, generic, custom-activation, dtype/layout, and
-    /// near-geometry calls retain scatter/unsort followed by
-    /// ``weightedExpertSum``.
+    /// (`K=8`) or Flash-Next Qwen4 (`K=10`) prefill contract reduces directly
+    /// to `[tokens, hidden]`. Disabled, decode/small-assignment, generic,
+    /// custom-activation, dtype/layout, and near-geometry calls retain
+    /// scatter/unsort followed by ``weightedExpertSum``.
     public func callAndWeightedReduce(
         _ x: MLXArray,
         _ indices: MLXArray,
@@ -905,6 +962,25 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     override public func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
+        project(x, indices, sortedIndices: sortedIndices, nativeQwen4: false)
+    }
+
+    /// Invoked only by an explicitly Qwen4-owned SwitchGLU. Generic direct
+    /// projection calls retain the original MLX implementation and dtype even
+    /// when an unrelated model has exactly the same expert geometry.
+    fileprivate func qwen4Projection(
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool
+    ) -> MLXArray {
+        project(x, indices, sortedIndices: sortedIndices, nativeQwen4: true)
+    }
+
+    private func project(
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool,
+        nativeQwen4: Bool
+    ) -> MLXArray {
+        // Layr #126: the MLX hint is only safe when `x` already carries one
+        // row per gathered index (see doc comment). The Fusion tiled kernel
+        // enforces `indices.size == assignments` itself and returns nil otherwise.
         let indexAligned = x.size == indices.size * x.dim(-2) * x.dim(-1)
         let scales = mode == .affine
             ? (scaleCastCache.cachedCast(self.scales, to: x.dtype) ?? self.scales)
@@ -914,18 +990,41 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 ? (offsetCastCache.cachedCast(offsets, to: x.dtype) ?? offsets)
                 : offsets
         }
-        var result = MLX.gatherQuantizedMM(
-            x,
-            self.weight,
-            scales: scales,
-            biases: biases,
-            rhsIndices: indices,
-            transpose: true,
-            groupSize: self.groupSize,
+        var result: MLXArray
+        if nativeQwen4, let tiled = Qwen4ExpGatherQMM.tryMatmul(
+            x: x,
+            indices: indices,
+            weight: self.weight,
+            scales: self.scales,
+            affineBiases: self.biases,
+            sorted: sortedIndices,
             bits: self.bits,
-            mode: mode,
-            sortedIndices: sortedIndices && indexAligned
-        )
+            groupSize: self.groupSize,
+            mode: mode)
+        {
+            result = tiled
+        } else {
+            if nativeQwen4, sortedIndices,
+                weight.ndim == 3, weight.dim(0) == Qwen4ExpGatherQMM.expertCount,
+                x.ndim >= 2, x.size / max(x.dim(-1), 1) >= Qwen4ExpGatherQMM.minAssignments
+            {
+                Qwen4ExpGatherQMMInvocation.recordFallback()
+            }
+            result = MLX.gatherQuantizedMM(
+                x,
+                self.weight,
+                scales: scales,
+                biases: biases,
+                rhsIndices: indices,
+                transpose: true,
+                groupSize: self.groupSize,
+                bits: self.bits,
+                mode: mode,
+                sortedIndices: sortedIndices && indexAligned)
+            if nativeQwen4, weight.dim(0) == Qwen4ExpGatherQMM.expertCount {
+                result = Qwen4ExpActivation.keep(result)
+            }
+        }
 
         if let bias = self.bias {
             // During transforms cachedCast returns nil, preserving the old

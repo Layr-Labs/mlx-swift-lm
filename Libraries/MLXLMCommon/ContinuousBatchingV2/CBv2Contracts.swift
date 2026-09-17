@@ -109,6 +109,9 @@ public struct CBv2Request: Sendable {
     /// cache-offset path byte-for-byte. Multiaxis users provide an evaluated
     /// prompt tensor plus host decode deltas; no model-global state is shared.
     public var positionState: CBv2PositionState?
+    /// Opaque provider-authenticated media/position binding for complete
+    /// recurrent checkpoint reuse. Unbound out-of-band inputs fail closed.
+    public var hybridPrefixIdentity: CBv2HybridPrefixIdentity?
     /// Optional inference-time token automaton. nil preserves the ordinary
     /// sampler byte-for-byte. Required/named/none tool choices install a
     /// row-local machine compiled before submission.
@@ -120,6 +123,7 @@ public struct CBv2Request: Sendable {
         cacheSalt: String? = nil, prefixCacheEnabled: Bool = true,
         multimodal: CBv2MultimodalInput? = nil,
         positionState: CBv2PositionState? = nil,
+        hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
         tokenConstraint: (any CBv2TokenConstraint)? = nil
     ) {
@@ -134,6 +138,7 @@ public struct CBv2Request: Sendable {
         self.prefixCacheEnabled = prefixCacheEnabled
         self.multimodal = multimodal
         self.positionState = positionState
+        self.hybridPrefixIdentity = hybridPrefixIdentity
         self.prefixCacheReceiptID = prefixCacheReceiptID
         self.tokenConstraint = tokenConstraint
     }
@@ -346,10 +351,16 @@ public struct CBv2LayerKind: Sendable, Equatable {
     /// storage index == model layer index.
     public var modelLayerIndex: Int?
 
+    /// Model-owned state alongside K/V; zero for ordinary attention.
+    public var extraStorageBytesPerToken: Int
+    /// Structural QSA side-state geometry, absent on other attention families.
+    public var qwen4IndexerCompressRatio: Int?
+
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
         isBidirectional: Bool = false,
-        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil
+        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil,
+        extraStorageBytesPerToken: Int = 0, qwen4IndexerCompressRatio: Int? = nil
     ) {
         self.attention = attention
         self.sharesKVWithLayer = sharesKVWithLayer
@@ -359,6 +370,8 @@ public struct CBv2LayerKind: Sendable, Equatable {
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
         self.modelLayerIndex = modelLayerIndex
+        self.extraStorageBytesPerToken = max(0, extraStorageBytesPerToken)
+        self.qwen4IndexerCompressRatio = qwen4IndexerCompressRatio
     }
 }
 

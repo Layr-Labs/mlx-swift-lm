@@ -177,9 +177,30 @@ def:
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
-            - "Tests/MLXLMTests/Qwen*.swift"
+            - "Tests/MLXLMTests/Qwen3*.swift"
+            - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
+            - "Tests/MLXLMTests/QwenImageBudgetTests.swift"
             - "Tests/MLXLMTests/GatedDelta*.swift"
             - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
+        - title: "Qwen 3.8 Next (native Qwen4 architecture)"
+          description: |
+            Native Qwen4-Exp text and multimodal support, distinct from Qwen3.5:
+            QSA/indexer attention, GDN, hyper-connections, MoE routing, SSD-backed
+            learned PLE/ngram tables, embedded trained MTP, complete prefix
+            checkpoints and media identity/lifecycle validation. The native vision
+            wrapper and processor live under the VLM section. Runtime exactness
+            gates are distinct from model answer-quality and deployment approval.
+            Mixed text/media batches retain per-request implicit versus explicit
+            position provenance through a scoped Qwen4-only forward binding;
+            synthesized rectangle rows do not change the text rotary path.
+            Full-weight tests bind explicit original/selected artifact profiles
+            without replacing numerical oracles or changing production defaults.
+          globs:
+            - "Libraries/MLXLLM/Models/Qwen4Exp*.swift"
+            - "Libraries/MLXLMCommon/Resources/Qwen4Metal/**"
+            - "Tests/MLXLMTests/Qwen4*.swift"
+            - "Tests/MLXLMTests/HybridMedia*.swift"
+            - "docs/qwen4/**"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
@@ -229,6 +250,8 @@ def:
         `response_format` (`json_object` / `json_schema`); streaming reasoning parsers (think tags,
         Gemma 4, Harmony); streamed tool-call handling; a batched engine adapter over CBv2 and a
         runtime `setMaxNumSeqs` for adaptive concurrency.
+        Responses input replay retains reasoning and adjacent function calls in one assistant turn,
+        preserving tool arguments and explicit message/result boundaries.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"

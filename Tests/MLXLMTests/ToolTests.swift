@@ -962,8 +962,8 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma)
 
         // Nemotron models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "nemotron_h") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "nemotron_h") == .nemotron)
+        #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .nemotron)
 
         // Qwen3.5 models (prefix matching)
         #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)

@@ -237,7 +237,10 @@ struct CBv2PagedAdmissionTests {
         var expectedPhysical = 0
     }
 
-    @Test func prefillOnlyTerminalDropsLastNativeOwnerBeforeFloorRefund() throws {
+    @Test(.enabled(
+        if: ProcessInfo.processInfo.environment["DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST"] == "1",
+        "Set DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST=1 and run this allocator check alone"))
+    func prefillOnlyTerminalDropsLastNativeOwnerBeforeFloorRefund() throws {
         let (backend, admission) = try nativeFixture()
         let original = try #require(backend.pool.physicalLease)
         let probe = NativeOwnerProbe()

@@ -1930,6 +1930,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             if let checkpoint = adoption.recurrentCheckpoint {
                 do {
+                    try CBv2HybridQwen4State.restore(
+                        checkpoint.qwen4, model: model, layerKinds: layerKinds, rows: state)
                     try adoptRecurrentCheckpoint(checkpoint, requestID: requestID)
                 } catch {
                     backend.release(state)
@@ -2408,7 +2410,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `CBv2RecurrentPrefillSteppableModel` (skipping the unused vocabulary
     /// projection), else by the engine's own slice. Decode and MTP callers
     /// pass nil and keep the full-logits contract.
-    func targetForward(
+    func targetForwardWithoutQwen4PositionScope(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache], ids: [CBv2RequestID],
         positionIds: MLXArray? = nil,
         inputEmbeddings: MLXArray? = nil,
@@ -2844,8 +2846,20 @@ public final class EngineLoopV2: @unchecked Sendable {
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let diagnosticOffsets = logitDiagnostic == nil ? nil : rowStates.map(Self.positionOffset)
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        // Build the successor graph while its input is still on the GPU.
+        // Qwen4 registers exact SSD PLE row fills instead of synchronizing
+        // inside the model. Resolve every placeholder before graph submission.
+        let deferredFills = CBv2DeferredHostFill.open()
+        defer {
+            // New native forward checks can throw. Fill any registered input
+            // even on unwind so a later graph drain never sees uninitialized
+            // placeholder bytes; this does not submit the failed forward.
+            deferredFills.close()
+            deferredFills.run()
+        }
         let (last, cacheInnerState, recurrent) = try decodeLogits(
             rowStates: rowStates, tokens: inputs, ids: ids, chained: true)  // [B, vocab]
+        deferredFills.close()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
@@ -2890,6 +2904,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         if !cacheInnerState.isEmpty {
             toEval.append(contentsOf: cacheInnerState)
             offsetChainEvalSteps += 1
+        }
+        let fillStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        deferredFills.run()
+        if CBv2StepProfiler.enabled, deferredFills.registeredCount > 0 {
+            CBv2StepProfiler.record("v2.deferredFill", seconds: CFAbsoluteTimeGetCurrent() - fillStart)
         }
         let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         asyncEval(toEval)

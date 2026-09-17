@@ -69,7 +69,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPPrefixCheckpointCoding {
         -> [CBv2CheckpointTensorDescriptor]?
     {
         let geometry = prefixCheckpointGeometry
-        guard targetInputCount > 1, let dtype = CBv2CheckpointDType(geometry.dtype), dtype != .int32 else {
+        guard targetInputCount > 1, let dtype = CBv2CheckpointDType(geometry.dtype), dtype.isFloatingPoint else {
             return nil
         }
         return try? [

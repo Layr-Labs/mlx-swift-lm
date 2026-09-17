@@ -244,6 +244,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .qwen35
         }
 
+        // Native Qwen4 shares this framed tool wire format, not Qwen3.5's
+        // model architecture. Accept both published XML and framed JSON while
+        // retaining the ordinary schema/selection validation boundary.
+        if type == "qwen4_exp" || type == "qwen4_exp_text" {
+            return .qwen35
+        }
+
         // Qwen3-Next family (qwen3_next, etc.)
         if type.hasPrefix("qwen3_next") {
             return .xmlFunction
