@@ -1,0 +1,53 @@
+import Foundation
+import XCTest
+@testable import MLXLMCommon
+
+final class PrismHadamardCheckpointTests: XCTestCase {
+    private func fixture() -> [String: Any] {
+        [
+            "schema_version": 1, "model_type": "prism_hadamard_qwen35",
+            "base_model_type": "qwen3_5", "gdn_activation_layout": "grouped",
+            "tensor_namespace": "mlx-vlm-qwen3_5", "hadamard_config": "hadamard.json",
+            "components": ["text": true, "vision": true, "mtp": false],
+            "quantization": ["bits": 2, "group_size": 128, "mode": "affine"],
+            "text_config": ["mtp_num_hidden_layers": 0],
+            "modules": [
+                ["path": "model.embed_tokens", "block": 1024, "embedding": true, "dtype": "float16"],
+                ["path": "lm_head", "block": 1024, "embedding": false, "dtype": "float16"],
+            ],
+        ]
+    }
+    private func decode(_ value: [String: Any]) throws -> PrismHadamardCheckpointConfiguration {
+        try JSONDecoder().decode(PrismHadamardCheckpointConfiguration.self,
+            from: JSONSerialization.data(withJSONObject: value))
+    }
+    func testExplicitVisionWithoutMTPContract() throws {
+        let value = try decode(fixture())
+        XCTAssertTrue(value.hasVision)
+        XCTAssertEqual(value.modules.count, 2)
+    }
+    func testRejectsDifferentPackingLayoutAndInventedHeads() throws {
+        for (key, replacement) in [
+            ("schema_version", 2), ("base_model_type", "qwen4_exp"),
+            ("gdn_activation_layout", "tiled"), ("hadamard_config", "../hadamard.json"),
+            ("quantization", ["bits": 4, "group_size": 128, "mode": "affine"]),
+            ("components", ["text": true, "vision": true, "mtp": true]),
+            ("text_config", ["mtp_num_hidden_layers": 1]),
+        ] as [(String, Any)] {
+            var value = fixture()
+            value[key] = replacement
+            XCTAssertThrowsError(try decode(value), key)
+        }
+    }
+    func testRejectsDuplicateAndUnsafeModulePaths() {
+        var value = fixture()
+        var modules = value["modules"] as! [[String: Any]]
+        modules.append(modules[0])
+        value["modules"] = modules
+        XCTAssertThrowsError(try decode(value))
+        modules.removeLast()
+        modules[1]["path"] = "../lm_head"
+        value["modules"] = modules
+        XCTAssertThrowsError(try decode(value))
+    }
+}
