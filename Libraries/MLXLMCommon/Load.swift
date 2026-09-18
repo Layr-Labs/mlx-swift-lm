@@ -250,6 +250,12 @@ public func loadWeights(
     }
     mark("read shards (parallel)")
 
+    let prism = try (model as? any PrismHadamardLoading).map {
+        try PrismHadamardCheckpoint(directory: modelDirectory,
+            configuration: $0.prismCheckpoint, weights: weights)
+    }
+    if prism != nil { weights = weights.filter { !$0.key.hasSuffix(".signs") } }
+
     // Stage the checkpoint's quantization policy for sanitizers whose
     // module-topology decisions depend on it (e.g. the Qwen3.5 routed-expert
     // gate/up fusion, which must keep heterogeneous pairs split).
@@ -281,6 +287,7 @@ public func loadWeights(
         }
     }
     mark("quantize wire")
+    try prism?.install(model: model, weights: weights)
 
     // apply the loaded weights
     var parameters = ModuleParameters.unflattened(weights)
@@ -308,7 +315,7 @@ public func loadWeights(
     //
     // Controlled by DARKBLOOM_BF16_WEIGHTS (default: ON, set to "0" to disable).
     let bf16Env = ProcessInfo.processInfo.environment["DARKBLOOM_BF16_WEIGHTS"] ?? "1"
-    if bf16Env == "1" {
+    if bf16Env == "1" && prism == nil {
         convertToBFloat16(model: model)
         mark("bf16 convert")
     }

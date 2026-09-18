@@ -242,6 +242,18 @@ def:
             - "Tests/MLXLMTests/QwenImageBudgetTests.swift"
             - "Tests/MLXLMTests/GatedDelta*.swift"
             - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
+        - title: "Ternary Bonsai 2 (packed dense Qwen)"
+          description: |
+            Native dense Qwen text and vision wrappers for Prism's schema-2
+            signed-Hadamard 2-bit pack. Strict metadata/sign/shape validation,
+            FP16 packing with FP32 transform arithmetic, native CBv2 state,
+            and no MTP capability for the headless published artifact.
+          globs:
+            - "Libraries/MLXLLM/Models/PrismHadamardQwen35.swift"
+            - "Libraries/MLXLMCommon/PrismHadamardCheckpoint.swift"
+            - "Tests/MLXLMTests/PrismHadamardCheckpointTests.swift"
+            - "Tests/MLXLMTests/PrismRecurrentOwnershipTests.swift"
+            - "docs/bonsai2.md"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
             Native Qwen4-Exp text and multimodal support, distinct from Qwen3.5:

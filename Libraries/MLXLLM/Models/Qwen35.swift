@@ -613,7 +613,13 @@ final class Qwen35GatedDeltaNet: Module {
 
         let convInput = concatenated([qwen4Keep(convState), qwen4Keep(qkv)], axis: 1)
         let nKeep = convKernelSize - 1
-        let newConvState = qwen4Keep(convInput[0..., (convInput.dim(1) - nKeep)...])
+        let convTail = convInput[0..., (convInput.dim(1) - nKeep)...]
+        // Prism's FP32 prefill tail is only three rows, but Slice aliases the
+        // entire chunk. Retaining that parent in every recurrent transaction
+        // costs gigabytes. Contiguous materializes oversized backing without
+        // changing any bits; leave other model families and decode untouched.
+        let newConvState = qwen4Keep(
+            S > 1 && inProjQKV is HadamardQuantizedLinear ? contiguous(convTail) : convTail)
         let convOut = qwen4Keep(convActivation(conv1d(convInput)))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
@@ -1674,6 +1680,15 @@ public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
+
+    /// Metadata-only inspection for packed variants whose normalizers promote
+    /// activations. No tensor evaluation or serving arithmetic changes.
+    var cbv2UniformLayerNormDType: DType? {
+        guard let dtype = layers.first?.inputLayerNorm.weight.dtype,
+            layers.allSatisfy({ $0.inputLayerNorm.weight.dtype == dtype
+                && $0.postAttentionLayerNorm.weight.dtype == dtype }) else { return nil }
+        return dtype
+    }
     let norm: RMSNorm
 
     let ssmIdx: Int
