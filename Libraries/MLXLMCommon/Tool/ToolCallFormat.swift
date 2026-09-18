@@ -240,7 +240,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // <tool_call> frame; a pure XML parser returns nil on those and the
         // call is lost as plain text. `.qwen35` tries XML first (existing
         // behavior unchanged) and falls back to framed JSON.
-        if type.hasPrefix("qwen3_5") {
+        if type.hasPrefix("qwen3_5") || type == "prism_hadamard_qwen35" {
             return .qwen35
         }
 

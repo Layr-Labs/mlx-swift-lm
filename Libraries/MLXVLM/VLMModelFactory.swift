@@ -88,6 +88,7 @@ public enum VLMTypeRegistry {
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_vl_moe": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
+        "prism_hadamard_qwen35": { try PrismHadamardQwen35(configurationData: $0) },
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "qwen4_exp": create(Qwen4ExpVLMConfiguration.self, Qwen4Exp.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
@@ -460,6 +461,7 @@ extension VLMModelFactory {
         switch modelType {
         case "mistral3": "Mistral3Processor"
         case "qwen4_exp": "Qwen4ExpProcessor"
+        case "prism_hadamard_qwen35": "Qwen3VLProcessor"
         default: declaredClass
         }
     }
