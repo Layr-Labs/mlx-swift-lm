@@ -188,9 +188,10 @@ def:
             signed-Hadamard 2-bit pack. Strict metadata/sign/shape validation,
             FP16 packing with FP32 transform arithmetic, native CBv2 state,
             and no MTP capability for the headless published artifact.
-            A private, default-off prefill carry-submission experiment keeps
+            Default-on eligible prefill carry submission keeps
             native arithmetic and engine-owned final evaluation/retirement,
             with explicit deferred-input and late-fault qualification tests.
+            `DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC=0` restores the prior schedule.
           globs:
             - "Libraries/MLXLLM/Models/PrismHadamardQwen35.swift"
             - "Libraries/MLXLMCommon/PrismHadamardCheckpoint.swift"

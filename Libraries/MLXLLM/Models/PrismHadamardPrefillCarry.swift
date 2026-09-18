@@ -2,12 +2,16 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-/// Private opt-in prefill experiment. The lexical scope borrows caches only
+/// Default-on eligible packed prefill scheduling. The lexical scope borrows caches only
 /// while the owning engine builds its forward; no task or array stores it.
 /// Final evaluation, commit/rollback and retirement remain engine-owned.
 enum PrismHadamardPrefillCarry {
-    static let enabled = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC"] == "1"
+    static let enabled = isEnabled(environmentValue: ProcessInfo.processInfo.environment[
+        "DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC"])
+
+    static func isEnabled(environmentValue: String?) -> Bool {
+        environmentValue == nil || environmentValue == "1"
+    }
     private static let diagnose = ProcessInfo.processInfo.environment[
         "DARKBLOOM_BONSAI_PREFILL_CARRY_DIAGNOSTICS"] == "1"
     private static let lock = NSLock()

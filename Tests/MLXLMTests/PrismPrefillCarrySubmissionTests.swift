@@ -4,13 +4,29 @@ import XCTest
 @testable import MLXLLM
 @testable import MLXLMCommon
 
+final class PrismPrefillCarryPolicyTests: XCTestCase {
+    func testDefaultAndExplicitPolicy() {
+        XCTAssertTrue(PrismHadamardPrefillCarry.isEnabled(environmentValue: nil))
+        XCTAssertTrue(PrismHadamardPrefillCarry.isEnabled(environmentValue: "1"))
+        for value in ["0", "", "false", "true", "off", "on", " 1", "invalid"] {
+            XCTAssertFalse(PrismHadamardPrefillCarry.isEnabled(environmentValue: value))
+        }
+    }
+
+    func testProcessOverrideMatchesLatchedPolicy() {
+        let override = ProcessInfo.processInfo.environment["DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC"]
+        XCTAssertEqual(PrismHadamardPrefillCarry.enabled, override == nil || override == "1")
+        XCTAssertNil(PrismHadamardPrefillCarry.context)
+    }
+}
+
 /// Scheduling/retirement tests, not model-quality or throughput evidence.
-/// Run in a dedicated process with the private optimization and witness enabled.
+/// Run in a dedicated process with the exclusive GPU and diagnostic witness enabled.
 final class PrismPrefillCarrySubmissionTests: XCTestCase {
     override func setUpWithError() throws {
         let env = ProcessInfo.processInfo.environment
         try XCTSkipUnless(env["DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST"] == "1"
-            && env["DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC"] == "1"
+            && PrismHadamardPrefillCarry.enabled
             && env["DARKBLOOM_BONSAI_PREFILL_CARRY_DIAGNOSTICS"] == "1")
     }
 

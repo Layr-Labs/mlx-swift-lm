@@ -41,15 +41,18 @@ request admission remain separate from that architectural limit.
 
 ## Qualification
 
-### Opt-in performance qualification profile
+### Default performance profile
 
-This performance follow-up leaves the published weights unchanged. Both
-switches below are **off by default** and must be set
-before starting the provider:
+This performance follow-up leaves the published weights unchanged. Both eligible
+paths are **on by default** when their overrides are absent. Exact `1` also
+enables them; explicit `0` disables them. Other explicit spellings stay disabled.
+Overrides latch per process and must be set before starting the provider.
+
+To restore the previous schedule and repeated constant conversion:
 
 ```sh
-DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC=1
-DARKBLOOM_BONSAI_F16_CONSTANT_CACHE=1
+DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC=0
+DARKBLOOM_BONSAI_F16_CONSTANT_CACHE=0
 ```
 
 The first submits already-compacted recurrent carry arrays earlier, only during
@@ -96,7 +99,7 @@ The public baseline uses the runtime sources approved in Layr-Labs/mlx-swift
 PR #27 (`97b7f13830baa0aa761c979bcb4e94fc86b20cb6`, merged as
 `35e55a6b9f53db22a01fa0b6fb38afef8dd3100d`). This follow-up pins the public
 `Layr-Labs/mlx-swift` performance commit
-`70052b2147f828e6b9bcc2dce599017415387377` for exact constant reuse. Merge the
+`d7c1d3dcd114aa0e96ac6030da633ec7d4bd8254` for default-on exact constant reuse. Merge the
 dependency first, then repin to its observed merged commit and recheck the
 composed build. No floating branch or inaccessible private dependency is used.
 The required Hadamard/2-bit primitives
