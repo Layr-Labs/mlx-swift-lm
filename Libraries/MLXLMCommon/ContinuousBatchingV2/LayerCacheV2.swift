@@ -45,6 +45,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     public var positionOffsets: MLXArray { cachedPositionOffsets }
 
     private var cachedPositionOffsets: MLXArray
+    var gemmaUnifiedPositions: Gemma4UnifiedPositions?
+    var gemmaUnifiedPositionIndex = 0
 
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
@@ -92,6 +94,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     // MARK: - Membership (the ONLY places positionOffsets is host-rebuilt)
 
     public func appendRow(_ row: CBv2SequenceKV) {
+        gemmaUnifiedPositions?.detach()
         precondition(
             kind.sharesKVWithLayer == nil, "CBv2LayerCache: cannot add rows to a KV-shared layer")
         rows.append(row)
@@ -100,6 +103,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     }
 
     public func removeRow(at index: Int) {
+        gemmaUnifiedPositions?.detach()
         rows.remove(at: index)
         rebuildPositionOffsets()
         clearQwen4IndexerState()
@@ -109,6 +113,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// to re-sync `positionOffsets` after out-of-band row mutation
     /// (e.g. rollback during speculative verification).
     public func setRows(_ newRows: [CBv2SequenceKV]) {
+        gemmaUnifiedPositions?.detach()
         precondition(
             kind.sharesKVWithLayer == nil || newRows.isEmpty,
             "CBv2LayerCache: KV-shared layers own no rows")
@@ -123,6 +128,27 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         clearQwen4IndexerState()
     }
 
+    func setRowsForPositionBinding(_ newRows: [CBv2SequenceKV]) {
+        precondition(kind.sharesKVWithLayer == nil)
+        rows = newRows
+    }
+
+    func rebuildUnifiedPosition() -> MLXArray {
+        rebuildPositionOffsets()
+        return cachedPositionOffsets
+    }
+
+    func adoptUnifiedPosition(_ value: MLXArray) -> Bool {
+        guard let owned = Gemma4UnifiedPositions.snapshot(value) else { return false }
+        cachedPositionOffsets = owned
+        return true
+    }
+
+    private func advancePositionOffsets(_ count: Int) {
+        if gemmaUnifiedPositions?.complete(self, count: count) == true { return }
+        cachedPositionOffsets = cachedPositionOffsets + Int32(count)
+    }
+
     // MARK: - CBv2AttendingLayerCache
 
     public func updateAndAttend(
@@ -132,6 +158,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
+        gemmaUnifiedPositions?.prepare(self, count: queries.dim(2))
         let metadata = attentionMetadata?.begin(
             cache: self, queries: queries, keys: keys, values: values, scale: scale,
             sinks: sinks, softcap: attentionSoftcap,
@@ -148,7 +175,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             serializeQueries: mtpSerializesRectangularAttention, metadata: metadata, packet: packet)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        advancePositionOffsets(queries.dim(2))
         return output
     }
 
@@ -188,11 +215,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             !mtpSerializesRectangularAttention,
             "CBv2LayerCache: last-query prefill is never part of an MTP verify round")
+        gemmaUnifiedPositions?.prepare(self, count: keys.dim(2))
         let output = CBv2AttentionV1.updateAndAttendLastQuery(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        advancePositionOffsets(keys.dim(2))
         return output
     }
 

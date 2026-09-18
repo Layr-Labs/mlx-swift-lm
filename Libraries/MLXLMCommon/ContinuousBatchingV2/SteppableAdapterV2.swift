@@ -16,9 +16,13 @@ import MLX
 
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
-public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
+public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel, CBv2CacheOutputCoverageProviding {
 
     private let model: any LanguageModel
+
+    public func cacheOutputCoversAttention(_ scope: Gemma4CacheEvaluationScope) -> Bool {
+        (model as? any CBv2CacheOutputCoverageModel)?.cbv2CacheOutputCoversAttention(scope) ?? false
+    }
 
     public init(_ model: any LanguageModel) {
         self.model = model

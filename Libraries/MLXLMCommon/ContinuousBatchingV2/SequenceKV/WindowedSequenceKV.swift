@@ -116,6 +116,8 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
     }
 
+    private(set) var cacheOutputCoversStorage = false
+
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
@@ -126,6 +128,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             "CBv2WindowedSequenceKV: keys/values token count mismatch")
         precondition(n > 0, "CBv2WindowedSequenceKV: empty update")
 
+        cacheOutputCoversStorage = !speculativeWriteArmed && n == 1
         if speculativeWriteArmed {
             return stageSpeculativeUpdate(newKeys: newKeys, newValues: newValues, count: n)
         }
@@ -246,6 +249,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     }
 
     public func commitSpeculativeWrite() {
+        cacheOutputCoversStorage = false
         speculativeWriteArmed = false
         guard let staged else { return }
         self.staged = nil
@@ -377,6 +381,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     }
 
     public func rollback(_ n: Int) {
+        cacheOutputCoversStorage = false
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
         if let staged {
             // Pure counter move: the staged tokens were never written to

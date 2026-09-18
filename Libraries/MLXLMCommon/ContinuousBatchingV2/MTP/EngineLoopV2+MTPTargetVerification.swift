@@ -160,6 +160,9 @@ extension EngineLoopV2 {
             }
         }
         mtp.recordVerificationStrategy(rectangular: useRectangular)
+        let compactRoots = Gemma4CacheEvaluationRequest.prepare(model: model, caches: caches,
+            scope: .mtpVerify, expectedUpdates: useRectangular ? 1 : columns.count,
+            expectedWidth: useRectangular ? columns.count : 1)
 
         if !useRectangular {
             var scoreColumnsAccum: [MLXArray] = []
@@ -310,7 +313,7 @@ extension EngineLoopV2 {
 
         return (
             scores, hidden, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent)
+            (compactRoots?.roots(forwardOutput: hidden) ?? eagerCacheInnerState(caches)) + capturedInnerState, diagnostics, recurrent)
     }
 
     /// Top-`size` token ids per verify position plus their probability mass

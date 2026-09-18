@@ -794,6 +794,11 @@ private func gemma4AttentionFallback(
 
 // MARK: - Attention
 
+private final class Gemma4RopeIdentity {
+    weak var value: AnyObject?
+    init(_ value: AnyObject) { self.value = value }
+}
+
 private class Gemma4Attention: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -805,6 +810,8 @@ private class Gemma4Attention: Module {
     let useKeqV: Bool
     let usesSharedKV: Bool
     let scale: Float
+    private let qkvNormPolicy = Gemma4QKVNormPolicy()
+    private var qkvRopeIdentity: Gemma4RopeIdentity?
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear?
@@ -877,6 +884,19 @@ private class Gemma4Attention: Module {
         }
 
         super.init()
+        if qkvNormPolicy.enabled { qkvRopeIdentity = Gemma4RopeIdentity(rope as AnyObject) }
+    }
+
+    private func fusedRopeParameters() -> Gemma4QKVNormV1.RopeParameters? {
+        guard qkvNormPolicy.rope, qkvRopeIdentity?.value === (rope as AnyObject) else { return nil }
+        if isSliding, rope is RoPE, config.slidingRopeTheta > 0, config.slidingRopeTheta.isFinite {
+            return .init(log2Base: log2f(config.slidingRopeTheta))
+        }
+        if let proportional = rope as? ProportionalRoPE, type(of: proportional) == ProportionalRoPE.self,
+            let table = proportional.frequencyTable, table.dtype == .float32, table.size == effectiveHeadDim / 2 {
+            return .init(frequencies: table)
+        }
+        return nil
     }
 
     func callAsFunction(
@@ -887,7 +907,8 @@ private class Gemma4Attention: Module {
         positionOffset: Gemma4.PositionOffset? = nil,
         v2SharedSource: (any CBv2AttendingLayerCache)? = nil,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        scheduledPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         // ContinuousBatchingV2: the layer cache owns both the KV update and
         // the attention computation (no masks, no padding — see
@@ -897,7 +918,8 @@ private class Gemma4Attention: Module {
             return forwardV2(
                 x, layerCache: layerCacheV2, source: v2SharedSource,
                 sharedKV: sharedKV, positionOffset: positionOffset,
-                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill)
+                outputStart: outputStart, useLastQueryPrefill: useLastQueryPrefill,
+                scheduledPrefill: scheduledPrefill)
         }
         precondition(
             outputStart == 0 && !useLastQueryPrefill,
@@ -1036,7 +1058,8 @@ private class Gemma4Attention: Module {
         sharedKV: (MLXArray, MLXArray)?,
         positionOffset: Gemma4.PositionOffset?,
         outputStart: Int = 0,
-        useLastQueryPrefill: Bool = false
+        useLastQueryPrefill: Bool = false,
+        scheduledPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
         let (B, L) = (x.dim(0), x.dim(1))
         precondition(
@@ -1061,9 +1084,16 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        var queries = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
-        queries = qNorm(queries)
-        queries = queries.transposed(0, 2, 1, 3)
+        let queryRaw = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        let fusionCandidate = qkvNormPolicy.enabled && !usesSharedKV
+            && gemma4SupportsProductionExpertTopology(config)
+            && type(of: qNorm) == RMSNorm.self && qNorm.eps == Float(1e-6)
+            && kNorm.map { type(of: $0) == RMSNorm.self && $0.eps == qNorm.eps } == true
+            && vNorm?.eps == qNorm.eps
+            && [qProj, kProj, vProj].compactMap { $0 }.allSatisfy {
+                type(of: $0) == Linear.self || type(of: $0) == QuantizedLinear.self
+            }
+        let eagerQueries = fusionCandidate ? nil : qNorm(queryRaw).transposed(0, 2, 1, 3)
 
         if usesSharedKV {
             // KV-shared layer: projects queries only and borrows (K, V) from
@@ -1079,6 +1109,7 @@ private class Gemma4Attention: Module {
                     K/V (threaded by Gemma4TextModelInner)
                     """)
             }
+            var queries = eagerQueries ?? qNorm(queryRaw).transposed(0, 2, 1, 3)
             queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: positionOffset)
             let outputDType = queries.dtype
             let attentionQueries =
@@ -1113,24 +1144,45 @@ private class Gemma4Attention: Module {
             lastQueryCache == nil
             ? captured
             : .batch(capturedOffsets + Int32(outputStart))
-        queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
+        let eagerRotatedQueries = eagerQueries.map { gemma4ApplyRotaryPosition(rope, to: $0, offset: queryPositionOffset) }
 
         let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
-        var k = kNorm(kRaw)
-        k = k.transposed(0, 2, 1, 3)
-        k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+        let eagerKeys = fusionCandidate ? nil : gemma4ApplyRotaryPosition(rope,
+            to: kNorm(kRaw).transposed(0, 2, 1, 3), offset: captured)
 
         // K-eq-V (`attention_k_eq_v: true` on Gemma 4 26B/31B): values reuse
         // the raw key projection (pre-norm) through their own vNorm — same as
         // the legacy path.
-        var v: MLXArray
+        let vRaw: MLXArray
         if let vProj {
-            v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            vRaw = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
         } else {
-            v = kRaw
+            vRaw = kRaw
         }
-        v = vNorm(v)
-        v = v.transposed(0, 2, 1, 3)
+        var queries: MLXArray
+        var k: MLXArray
+        let v: MLXArray
+        if fusionCandidate, type(of: kNorm) == RMSNorm.self,
+            kNorm.eps == qNorm.eps, vNorm.eps == qNorm.eps,
+            let fused = Gemma4QKVNormV1.apply(q: queryRaw, k: kRaw, v: vRaw,
+                qWeight: qNorm.weight, kWeight: kNorm.weight, eps: qNorm.eps,
+                keyValueShared: vProj == nil, positionOffsets: capturedOffsets,
+                rope: fusedRopeParameters(), equalQueryKeyOffsets: lastQueryCache == nil,
+                targetEligible: true, scheduledPrefill: scheduledPrefill, policy: qkvNormPolicy) {
+            queries = fused.q
+            k = fused.k
+            v = fused.v
+            if !fused.appliedRope {
+                queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
+                k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
+            }
+        } else {
+            queries = eagerRotatedQueries ?? gemma4ApplyRotaryPosition(rope,
+                to: qNorm(queryRaw).transposed(0, 2, 1, 3), offset: queryPositionOffset)
+            k = eagerKeys ?? gemma4ApplyRotaryPosition(rope,
+                to: kNorm(kRaw).transposed(0, 2, 1, 3), offset: captured)
+            v = vNorm(vRaw).transposed(0, 2, 1, 3)
+        }
 
         let outputDType = queries.dtype
         let attentionQueries =
@@ -1168,6 +1220,8 @@ private class Gemma4Router: Module {
     let topK: Int
     let eps: Float
     let rootSize: Float
+    private let finalistsPolicy = Gemma4RouterFinalistsPolicy()
+    private let finalistsEligible: Bool
 
     init(_ config: Gemma4TextConfiguration) {
         precondition(
@@ -1178,6 +1232,7 @@ private class Gemma4Router: Module {
         self.topK = config.topKExperts ?? 0
         self.eps = config.rmsNormEps
         self.rootSize = pow(Float(config.hiddenSize), -0.5)
+        self.finalistsEligible = gemma4SupportsProductionExpertTopology(config)
 
         self._proj.wrappedValue = Linear(config.hiddenSize, numExperts, bias: false)
         self._scale.wrappedValue = MLXArray.ones([config.hiddenSize])
@@ -1185,9 +1240,50 @@ private class Gemma4Router: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+    func callAsFunction(_ x: MLXArray, scheduledPrefill: Bool = false) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        return projectNormalized(normed, scheduledPrefill: scheduledPrefill)
+    }
+
+    func routeForExperts(_ x: MLXArray, scheduledPrefill: Bool)
+        -> (topKIndices: MLXArray, topKWeights: MLXArray, b8: Gemma4B8ExpertRouting?) {
+        guard Gemma4B8ExpertExecution.available,
+            Gemma4B8ExpertExecution.policy.admits(targetEligible: finalistsEligible,
+                inputShape: x.shape, inputBF16: x.dtype == .bfloat16,
+                scheduledPrefill: scheduledPrefill, compiledActivation: MLXHardwareInfo.isCompiledDecodeSupported)
+        else {
+            let ordinary = self(x, scheduledPrefill: scheduledPrefill)
+            return (ordinary.topKIndices, ordinary.topKWeights, nil)
+        }
+        let scores = proj(MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps))
+        if let bounded = Gemma4B8ExpertRouting.make(scores: scores, perExpertScale: perExpertScale,
+            finalists: finalistsPlan(scores, scheduledPrefill: false)) {
+            return (bounded.indices, bounded.weights, bounded)
+        }
+        let ordinary = selectScores(scores, scheduledPrefill: scheduledPrefill)
+        return (ordinary.topKIndices, ordinary.topKWeights, nil)
+    }
+
+    /// The identical weak-scalar multiplication used by the ordinary router.
+    /// No cached/folded parameter or new cast is introduced.
+    func effectivePrefillScale() -> MLXArray? {
+        guard eps == Float(1e-6), scale.shape == [2816], scale.dtype == .bfloat16,
+            type(of: proj) == Linear.self || type(of: proj) == QuantizedLinear.self else { return nil }
+        let effective = scale * rootSize
+        return effective.dtype == .bfloat16 ? effective : nil
+    }
+
+    func projectNormalized(_ normed: MLXArray, scheduledPrefill: Bool = false) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let expertScores = proj(normed)
+
+        return selectScores(expertScores, scheduledPrefill: scheduledPrefill)
+    }
+
+    private func selectScores(_ expertScores: MLXArray, scheduledPrefill: Bool = false) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
+        if let plan = finalistsPlan(expertScores, scheduledPrefill: scheduledPrefill),
+            let selected = Gemma4RouterFinalistsV1.apply(scores: expertScores, perExpertScale: perExpertScale, plan: plan) {
+            return (selected.indices, selected.weights)
+        }
 
         let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -1198,6 +1294,25 @@ private class Gemma4Router: Module {
         topKWeights = topKWeights * perExpertScale[topKIndices]
 
         return (topKIndices, topKWeights)
+    }
+
+    private func finalistsPlan(_ scores: MLXArray, scheduledPrefill: Bool) -> Gemma4RouterFinalistsPolicy.Plan? {
+        guard finalistsPolicy.enabled, finalistsEligible else { return nil }
+        return finalistsPolicy.plan(targetEligible: finalistsEligible, shape: scores.shape,
+            scoresBF16: scores.dtype == .bfloat16, scaleBF16: perExpertScale.dtype == .bfloat16,
+            scaleShape: perExpertScale.shape, topK: topK, scheduledPrefill: scheduledPrefill)
+    }
+
+    func routePrefill(_ x: MLXArray, normalized: MLXArray?, context: Gemma4PrefillGluePolicy.Context)
+        -> (topKIndices: MLXArray, topKWeights: MLXArray, bounded: Gemma4PrefillRouting?) {
+        let normed = normalized ?? MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
+        let scores = proj(normed)
+        if topK == 8, let bounded = Gemma4PrefillRouting.make(scores: scores,
+            perExpertScale: perExpertScale, context: context, finalists: finalistsPlan(scores, scheduledPrefill: true)) {
+            return (bounded.indices, bounded.weights, bounded)
+        }
+        let ordinary = selectScores(scores, scheduledPrefill: true)
+        return (ordinary.topKIndices, ordinary.topKWeights, nil)
     }
 }
 
@@ -1229,22 +1344,78 @@ private class Gemma4Experts: Module {
         _ x: MLXArray,
         topKIndices: MLXArray,
         topKWeights: MLXArray,
-        isExpertPrefill: Bool
+        isExpertPrefill: Bool,
+        prefill: Gemma4PrefillGluePolicy.Context? = nil,
+        b8: Gemma4B8ExpertRouting? = nil
     ) -> MLXArray {
+        if !isExpertPrefill, let b8, let output = switchGLU.executeGemmaB8(x, routing: b8) {
+            return output
+        }
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
         // contract; every other case performs the established unsort + sum.
         let (B, S, H) = (x.dim(0), x.dim(1), x.dim(2))
         let K = topKIndices.dim(-1)
-        let y = switchGLU.callAndWeightedReduce(
-            x.reshaped(B * S, H),
-            topKIndices.reshaped(B * S, K),
-            weights: topKWeights.reshaped(B * S, K),
-            fuseSortedReduction: fuseWeightedUnsort,
-            // Ordinary/direct VLM and CBv2 prompt entry points may engage.
-            // Rectangular MTP verification explicitly passes false.
-            isProductionPrefill: isExpertPrefill)
+        let y: MLXArray
+        if let prefill, prefill.geglu {
+            y = switchGLU.callAndWeightedReduceGemmaPrefill(x.reshaped(B * S, H),
+                topKIndices.reshaped(B * S, K), weights: topKWeights.reshaped(B * S, K),
+                fuseSortedReduction: fuseWeightedUnsort, isProductionPrefill: isExpertPrefill,
+                context: prefill)
+        } else {
+            y = switchGLU.callAndWeightedReduce(
+                x.reshaped(B * S, H),
+                topKIndices.reshaped(B * S, K),
+                weights: topKWeights.reshaped(B * S, K),
+                fuseSortedReduction: fuseWeightedUnsort,
+                // Ordinary/direct VLM and CBv2 prompt entry points may engage.
+                // Rectangular MTP verification explicitly passes false.
+                isProductionPrefill: isExpertPrefill)
+        }
         return y.reshaped(B, S, H)
+    }
+
+    func callNormalizingPrefill(_ x: MLXArray, normWeight: MLXArray, normEps: Float,
+        topKIndices: MLXArray, topKWeights: MLXArray, isExpertPrefill: Bool,
+        context: Gemma4PrefillGluePolicy.Context) -> MLXArray? {
+        guard context.scatter, isExpertPrefill,
+            let rows = context.rows(shape: x.shape, inputBF16: x.dtype == .bfloat16,
+                weightShape: normWeight.shape, weightBF16: normWeight.dtype == .bfloat16, eps: normEps),
+            topKIndices.shape == [x.dim(0), x.dim(1), 8], topKWeights.shape == topKIndices.shape
+        else { return nil }
+        guard let output = switchGLU.callAndWeightedReduceNormalizingGemmaPrefill(
+            x, normWeight: normWeight, normEps: normEps,
+            indices: topKIndices.reshaped(rows, 8), weights: topKWeights.reshaped(rows, 8),
+            fuseSortedReduction: fuseWeightedUnsort, context: context) else { return nil }
+        return output.reshaped(x.shape)
+    }
+
+    func prepareTail(_ x: MLXArray, normalizedInput: MLXArray?, normWeight: MLXArray, normEps: Float,
+        topKIndices: MLXArray, topKWeights: MLXArray, isExpertPrefill: Bool,
+        context: Gemma4PrefillGluePolicy.Context) -> Gemma4PrefillExpertProjection? {
+        guard context.expertTail, context.chained, fuseWeightedUnsort, isExpertPrefill,
+            let rows = context.rows(shape: x.shape, inputBF16: x.dtype == .bfloat16,
+                weightShape: normWeight.shape, weightBF16: normWeight.dtype == .bfloat16, eps: normEps),
+            topKIndices.shape == [x.dim(0), x.dim(1), 8], topKWeights.shape == topKIndices.shape
+        else { return nil }
+        let indices = topKIndices.reshaped(rows, 8), weights = topKWeights.reshaped(rows, 8)
+        if let pending = switchGLU.prepareNormalizingGemmaPrefillTail(x,
+            normWeight: normWeight, normEps: normEps, indices: indices, weights: weights,
+            fuseSortedReduction: fuseWeightedUnsort, context: context) { return pending }
+        let normalized = normalizedInput
+            ?? Gemma4PrefillGlueV1.preNorm(x: x, weight: normWeight, eps: normEps, context: context)
+            ?? MLXFast.rmsNorm(x, weight: normWeight, eps: normEps)
+        return switchGLU.prepareGemmaPrefillTail(normalized.reshaped(rows, 2816),
+            indices: indices, weights: weights, fuseSortedReduction: fuseWeightedUnsort, context: context)
+    }
+
+    func executeBounded(_ x: MLXArray, normalizedInput: MLXArray?, normWeight: MLXArray, normEps: Float,
+        routing: Gemma4PrefillRouting, isExpertPrefill: Bool, deferReduction: Bool,
+        context: Gemma4PrefillGluePolicy.Context) -> Gemma4PrefillExpertProjection? {
+        guard isExpertPrefill else { return nil }
+        return switchGLU.executeBoundedGemmaPrefill(x, normalizedInput: normalizedInput,
+            normWeight: normWeight, normEps: normEps, routing: routing,
+            fuseSortedReduction: fuseWeightedUnsort, deferReduction: deferReduction, context: context)
     }
 }
 
@@ -1254,11 +1425,25 @@ private class Gemma4MLP: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
+    private let denseGateUpRequested: Bool
+    private var denseGateUpStorage: Gemma4DenseGateUpStorage?
+
+    /// Prefix fusion moves pure norm work before the MLP. Custom projections
+    /// must retain their ordinary call order and cannot opt in implicitly.
+    var hasStandardProjections: Bool {
+        [gateProj, upProj, downProj].allSatisfy {
+            type(of: $0) == Linear.self || type(of: $0) == QuantizedLinear.self
+        }
+    }
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         let isKvSharedLayer = config.layerUsesSharedKV(layerIdx: layerIdx)
         let useDoubleWide = config.useDoubleWideMlp && isKvSharedLayer
         let intermediateSize = config.intermediateSize * (useDoubleWide ? 2 : 1)
+
+        denseGateUpRequested = Gemma4DenseGateUpPolicy.requested()
+            && gemma4SupportsProductionExpertTopology(config)
+            && intermediateSize == 2112
 
         self._gateProj.wrappedValue = Linear(config.hiddenSize, intermediateSize, bias: false)
         self._downProj.wrappedValue = Linear(intermediateSize, config.hiddenSize, bias: false)
@@ -1267,8 +1452,57 @@ private class Gemma4MLP: Module {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
+    fileprivate func sanitizeDenseGateUp(_ weights: inout [String: MLXArray], layer: Int) {
+        guard denseGateUpRequested else { return }
+        // Every sanitize is a new binding attempt, including incomplete loads.
+        denseGateUpStorage = nil
+        guard let keys = Gemma4DenseGateUpPolicy.parameterKeys(
+            layer: layer, contains: { weights[$0] != nil }) else { return }
+        let values = keys.compactMap { weights[$0] }
+        guard values.count == 6,
+              let storage = Gemma4DenseGateUpStorage(values[0], values[1], values[2],
+                                                    values[3], values[4], values[5])
+        else { return }
+        denseGateUpStorage = storage
+        for (key, value) in zip(keys, storage.splitParameters) { weights[key] = value }
+    }
+
+    private func pairedProjection(_ x: MLXArray) -> MLXArray? {
+        // The default-off path does not inspect tensor metadata or identities.
+        guard denseGateUpRequested, let storage = denseGateUpStorage else { return nil }
+        guard let gate = gateProj as? QuantizedLinear, let up = upProj as? QuantizedLinear,
+            type(of: gate) == QuantizedLinear.self, type(of: up) == QuantizedLinear.self,
+            gate.mode == .affine, up.mode == .affine,
+            gate.bits == 8, up.bits == 8, gate.groupSize == 64, up.groupSize == 64,
+            gate.bias == nil, up.bias == nil,
+            storage.matches(gate: gate, up: up)
+        else {
+            // Parameter replacement/transforms invalidate the pair even on a
+            // prefill or batched call, rather than retaining obsolete storage.
+            denseGateUpStorage = nil
+            return nil
+        }
+        guard x.ndim == 3, x.dtype == .bfloat16,
+            Gemma4DenseGateUpPolicy.admits(enabled: denseGateUpRequested,
+                ndim: x.ndim, batch: x.dim(0), positions: x.dim(1), hidden: x.dim(2),
+                bits: gate.bits, groupSize: gate.groupSize)
+        else { return nil }
+        return storage.project(x)
+    }
+
+    func callAsFunction(_ x: MLXArray, prefill: Gemma4PrefillGluePolicy.Context? = nil) -> MLXArray {
+        if let gateUp = pairedProjection(x) {
+            return downProj(gemma4SafeGeluApproximate(gateUp[.ellipsis, ..<2112])
+                                * gateUp[.ellipsis, 2112...])
+        }
+        if let prefill, prefill.geglu, gemma4CompiledDecodeSupported, hasStandardProjections {
+            let gate = gateProj(x), up = upProj(x)
+            let activated = Gemma4PromptGlueV1.geluProduct(gate: gate, up: up,
+                context: prefill, compiledBaseline: gemma4CompiledDecodeSupported)
+                ?? (gemma4SafeGeluApproximate(gate) * up)
+            return downProj(activated)
+        }
+        return downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
     }
 }
 
@@ -1279,6 +1513,10 @@ private class Gemma4MLP: Module {
 /// plumbing. Consumed by `Gemma4TextModelInner` and by the Gemma 4 MTP
 /// drafter's trunk in `Gemma4MTP`; not intended as a user-facing
 /// composable layer.
+private func gemma4CanFusePrefillNorm(_ norm: RMSNorm) -> Bool {
+    type(of: norm) == RMSNorm.self && norm.eps == Float(1e-6)
+}
+
 public class Gemma4DecoderLayer: Module {
     let config: Gemma4TextConfiguration
     let layerIdx: Int
@@ -1371,6 +1609,28 @@ public class Gemma4DecoderLayer: Module {
         useLastQueryPrefill: Bool = false,
         isExpertPrefill: Bool = false
     ) -> (MLXArray, (MLXArray, MLXArray), Gemma4.PositionOffset) {
+        let result = forwardWithGlue(x, mask: mask, cache: cache,
+            perLayerInput: perLayerInput, sharedKV: sharedKV, positionOffset: positionOffset,
+            v2SharedSource: v2SharedSource, outputTailRows: outputTailRows,
+            useLastQueryPrefill: useLastQueryPrefill, isExpertPrefill: isExpertPrefill,
+            glue: nil, decode: nil, normalizedInput: nil, nextInputNorm: nil)
+        return (result.out, result.kv, result.position)
+    }
+
+    /// Internal routes carry distinct prefill/decode contexts. Rectangle shape
+    /// cannot enable prefill fusion, and decode kernels require L=1. The public
+    /// layer API and MTP capture/return contracts stay unchanged.
+    fileprivate func forwardWithGlue(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode?, cache: KVCache?,
+        perLayerInput: MLXArray?, sharedKV: (MLXArray, MLXArray)?,
+        positionOffset: Gemma4.PositionOffset?,
+        v2SharedSource: (any CBv2AttendingLayerCache)?, outputTailRows: Int?,
+        useLastQueryPrefill: Bool, isExpertPrefill: Bool,
+        glue: Gemma4PrefillGluePolicy.Context?, decode: Gemma4DecodeGluePolicy.Context?,
+        normalizedInput: MLXArray?, nextInputNorm: RMSNorm?
+    ) -> (out: MLXArray, kv: (MLXArray, MLXArray), position: Gemma4.PositionOffset,
+          normalizedNext: MLXArray?, decodeNormalization: Gemma4DecodeNormalizationCarry?) {
         // Prompt-path narrowing (CBv2 only): attention and every K/V write
         // still cover the full chunk; only the token-local work AFTER
         // attention is restricted to the trailing rows CBv2 actually reads.
@@ -1398,15 +1658,49 @@ public class Gemma4DecoderLayer: Module {
             activePerLayerInput = perLayerInput
         }
 
-        let h = inputLayernorm(x)
+        let h: MLXArray
+        if glue != nil || decode != nil, gemma4CanFusePrefillNorm(inputLayernorm),
+            let normalizedInput, normalizedInput.shape == x.shape, normalizedInput.dtype == x.dtype {
+            h = normalizedInput
+        } else {
+            h = inputLayernorm(x)
+        }
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
             h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
             v2SharedSource: v2SharedSource, outputStart: outputStart,
-            useLastQueryPrefill: useLastQueryPrefill)
-        let postAttn = postAttentionLayernorm(attnOut)
-        var out = residual + postAttn
+            useLastQueryPrefill: useLastQueryPrefill, scheduledPrefill: isExpertPrefill)
+        var out: MLXArray
+        var prefix: Gemma4PrefillGlueV1.AttentionBranchPrefix?
+        if let glue, glue.branchPrefix, isMoE, let router, experts != nil, mlp.hasStandardProjections,
+            preFeedforwardLayernorm2 != nil, postFeedforwardLayernorm1 != nil,
+            postFeedforwardLayernorm2 != nil,
+            gemma4CanFusePrefillNorm(postAttentionLayernorm), gemma4CanFusePrefillNorm(preFeedforwardLayernorm),
+            let routerWeight = router.effectivePrefillScale() {
+            prefix = Gemma4PrefillGlueV1.attentionBranchPrefix(attn: attnOut, residual: residual,
+                wPostAttn: postAttentionLayernorm.weight, wDense: preFeedforwardLayernorm.weight,
+                wRouter: routerWeight, eps: config.rmsNormEps, context: glue)
+        }
+        if let decode, gemma4CanFusePrefillNorm(postAttentionLayernorm),
+            let fused = Gemma4DecodeGlueV1.normResidual(x: attnOut, residual: residual,
+                weight: postAttentionLayernorm.weight, eps: postAttentionLayernorm.eps, context: decode) {
+            out = fused
+        } else if let prefix {
+            out = prefix.out
+        } else if let glue, gemma4CanFusePrefillNorm(postAttentionLayernorm),
+            let fused = Gemma4PrefillGlueV1.normResidual(x: attnOut,
+                weight: postAttentionLayernorm.weight, residual: residual,
+                eps: postAttentionLayernorm.eps, context: glue) {
+            out = fused
+        } else {
+            let postAttn = postAttentionLayernorm(attnOut)
+            out = residual + postAttn
+        }
 
         let residual2 = out
+        var tailApplied = false
+        var scalarFolded = false
+        var normalizedNext: MLXArray?
+        var decodeNormalization: Gemma4DecodeNormalizationCarry?
 
         if isMoE,
             let router,
@@ -1415,28 +1709,156 @@ public class Gemma4DecoderLayer: Module {
             let preFeedforwardLayernorm2,
             let postFeedforwardLayernorm2
         {
-            // Dense + sparse branches in parallel, summed into one residual.
-            var h1 = preFeedforwardLayernorm(out)
-            h1 = mlp(h1)
-            h1 = postFeedforwardLayernorm1(h1)
+            if let decode, decode.axis == 2816,
+                [preFeedforwardLayernorm, preFeedforwardLayernorm2, postFeedforwardLayernorm1,
+                 postFeedforwardLayernorm2, postFeedforwardLayernorm].allSatisfy(gemma4CanFusePrefillNorm) {
+                let normalized = Gemma4DecodeGlueV1.dualPreNorm(x: out,
+                    w1: preFeedforwardLayernorm.weight, w2: preFeedforwardLayernorm2.weight,
+                    eps: config.rmsNormEps, context: decode)
+                    ?? (preFeedforwardLayernorm(out), preFeedforwardLayernorm2(out))
+                let h1 = mlp(normalized.0)
+                let routed = router.routeForExperts(out, scheduledPrefill: isExpertPrefill)
+                let h2 = experts(normalized.1, topKIndices: routed.topKIndices,
+                    topKWeights: routed.topKWeights, isExpertPrefill: isExpertPrefill, b8: routed.b8)
+                let hasActivePLE = perLayerInputGate != nil && perLayerProjection != nil
+                    && postPerLayerInputNorm != nil && activePerLayerInput != nil
+                if !hasActivePLE, let nextInputNorm, gemma4CanFusePrefillNorm(nextInputNorm),
+                    let chained = Gemma4DecodeGlueV1.branchTailChained(h1: h1, h2: h2, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight, w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight, layerScalar: layerScalar,
+                        nextWeight: nextInputNorm.weight, eps: config.rmsNormEps, context: decode) {
+                    out = chained.out
+                    decodeNormalization = Gemma4DecodeNormalizationCarry.capture(source: out,
+                        normalized: chained.normalized, weight: nextInputNorm.weight, eps: nextInputNorm.eps)
+                    tailApplied = true
+                    scalarFolded = true
+                } else if !hasActivePLE,
+                    let fused = Gemma4DecodeGlueV1.branchTail(h1: h1, h2: h2, residual: residual2,
+                        w1: postFeedforwardLayernorm1.weight, w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight, layerScalar: layerScalar,
+                        eps: config.rmsNormEps, context: decode) {
+                    out = fused
+                    tailApplied = true
+                    scalarFolded = true
+                } else {
+                    out = postFeedforwardLayernorm1(h1) + postFeedforwardLayernorm2(h2)
+                }
+            } else if let glue,
+                [preFeedforwardLayernorm, preFeedforwardLayernorm2, postFeedforwardLayernorm1,
+                 postFeedforwardLayernorm2, postFeedforwardLayernorm].allSatisfy(gemma4CanFusePrefillNorm) {
+                let denseInput: MLXArray
+                var expertInput: MLXArray?
+                if let prefix {
+                    denseInput = prefix.denseNorm
+                } else if !glue.scatter {
+                    let normalized = Gemma4PrefillGlueV1.dualPreNorm(x: out,
+                        w1: preFeedforwardLayernorm.weight, w2: preFeedforwardLayernorm2.weight,
+                        eps: config.rmsNormEps, context: glue)
+                        ?? (preFeedforwardLayernorm(out), preFeedforwardLayernorm2(out))
+                    denseInput = normalized.0
+                    expertInput = normalized.1
+                } else {
+                    denseInput = Gemma4PrefillGlueV1.preNorm(x: out,
+                        weight: preFeedforwardLayernorm.weight, eps: preFeedforwardLayernorm.eps, context: glue)
+                        ?? preFeedforwardLayernorm(out)
+                }
+                let h1 = mlp(denseInput, prefill: glue)
+                let routed: (topKIndices: MLXArray, topKWeights: MLXArray, bounded: Gemma4PrefillRouting?)
+                if glue.routeCounting {
+                    routed = router.routePrefill(out, normalized: prefix?.routerNorm, context: glue)
+                } else {
+                    let ordinary = prefix.map { router.projectNormalized($0.routerNorm, scheduledPrefill: isExpertPrefill) }
+                        ?? router(out, scheduledPrefill: isExpertPrefill)
+                    routed = (ordinary.topKIndices, ordinary.topKWeights, nil)
+                }
+                let hasActivePLE = perLayerInputGate != nil && perLayerProjection != nil
+                    && postPerLayerInputNorm != nil && activePerLayerInput != nil
+                let pending: Gemma4PrefillExpertProjection?
+                let canDefer = glue.expertTail && glue.chained && !hasActivePLE
+                    && nextInputNorm.map(gemma4CanFusePrefillNorm) == true
+                if let bounded = routed.bounded,
+                    let result = experts.executeBounded(out, normalizedInput: expertInput,
+                        normWeight: preFeedforwardLayernorm2.weight, normEps: preFeedforwardLayernorm2.eps,
+                        routing: bounded, isExpertPrefill: isExpertPrefill,
+                        deferReduction: canDefer, context: glue) {
+                    pending = result
+                } else if glue.expertTail, glue.chained, !hasActivePLE,
+                    let nextInputNorm, gemma4CanFusePrefillNorm(nextInputNorm) {
+                    pending = experts.prepareTail(out, normalizedInput: expertInput,
+                        normWeight: preFeedforwardLayernorm2.weight, normEps: preFeedforwardLayernorm2.eps,
+                        topKIndices: routed.topKIndices, topKWeights: routed.topKWeights,
+                        isExpertPrefill: isExpertPrefill, context: glue)
+                } else {
+                    pending = nil
+                }
+                let fusedExpertTail = pending.flatMap { pending in
+                    nextInputNorm.flatMap { nextNorm in
+                        Gemma4PrefillGlueV1.branchTailChainedUnsort(h1: h1, expert: pending,
+                            w1: postFeedforwardLayernorm1.weight, w2: postFeedforwardLayernorm2.weight,
+                            w3: postFeedforwardLayernorm.weight, residual2: residual2,
+                            layerScalar: layerScalar, nextInputNormWeight: nextNorm.weight,
+                            eps: config.rmsNormEps, context: glue)
+                    }
+                }
+                if let chained = fusedExpertTail {
+                    out = chained.out
+                    normalizedNext = chained.normedNext
+                    tailApplied = true
+                    scalarFolded = true
+                } else {
+                    let h2 = pending?.resolve().reshaped(residual2.shape)
+                        ?? experts.callNormalizingPrefill(out,
+                            normWeight: preFeedforwardLayernorm2.weight, normEps: preFeedforwardLayernorm2.eps,
+                            topKIndices: routed.topKIndices, topKWeights: routed.topKWeights,
+                            isExpertPrefill: isExpertPrefill, context: glue)
+                        ?? experts(expertInput
+                            ?? Gemma4PrefillGlueV1.preNorm(x: out, weight: preFeedforwardLayernorm2.weight,
+                                eps: preFeedforwardLayernorm2.eps, context: glue)
+                            ?? preFeedforwardLayernorm2(out),
+                            topKIndices: routed.topKIndices, topKWeights: routed.topKWeights,
+                            isExpertPrefill: isExpertPrefill, prefill: glue)
+                    if !hasActivePLE, let nextInputNorm, gemma4CanFusePrefillNorm(nextInputNorm),
+                        let chained = Gemma4PrefillGlueV1.branchTailChained(h1: h1, h2: h2,
+                            w1: postFeedforwardLayernorm1.weight, w2: postFeedforwardLayernorm2.weight,
+                            w3: postFeedforwardLayernorm.weight, residual2: residual2,
+                            layerScalar: layerScalar, nextInputNormWeight: nextInputNorm.weight,
+                            eps: config.rmsNormEps, context: glue) {
+                        out = chained.out
+                        normalizedNext = chained.normedNext
+                        tailApplied = true
+                        scalarFolded = true
+                    } else if let fused = Gemma4PrefillGlueV1.branchTail(h1: h1, h2: h2,
+                        w1: postFeedforwardLayernorm1.weight, w2: postFeedforwardLayernorm2.weight,
+                        w3: postFeedforwardLayernorm.weight, residual2: residual2,
+                        eps: config.rmsNormEps, context: glue) {
+                        out = fused
+                        tailApplied = true
+                    } else {
+                        out = postFeedforwardLayernorm1(h1) + postFeedforwardLayernorm2(h2)
+                    }
+                }
+            } else {
+                // Original graph construction/order for every default-OFF path.
+                var h1 = preFeedforwardLayernorm(out)
+                h1 = mlp(h1)
+                h1 = postFeedforwardLayernorm1(h1)
 
-            let (topKIndices, topKWeights) = router(out)
-            var h2 = preFeedforwardLayernorm2(out)
-            h2 = experts(
-                h2,
-                topKIndices: topKIndices,
-                topKWeights: topKWeights,
-                isExpertPrefill: isExpertPrefill)
-            h2 = postFeedforwardLayernorm2(h2)
-
-            out = h1 + h2
+                let routed = router.routeForExperts(out, scheduledPrefill: isExpertPrefill)
+                var h2 = preFeedforwardLayernorm2(out)
+                h2 = experts(h2, topKIndices: routed.topKIndices, topKWeights: routed.topKWeights,
+                    isExpertPrefill: isExpertPrefill, b8: routed.b8)
+                h2 = postFeedforwardLayernorm2(h2)
+                out = h1 + h2
+            }
         } else {
             out = preFeedforwardLayernorm(out)
             out = mlp(out)
         }
 
-        out = postFeedforwardLayernorm(out)
-        out = residual2 + out
+        if !tailApplied {
+            out = postFeedforwardLayernorm(out)
+            out = residual2 + out
+        }
 
         // PLE gating
         if let gate = perLayerInputGate,
@@ -1449,13 +1871,23 @@ public class Gemma4DecoderLayer: Module {
             g = gemma4SafeGeluApproximate(g)
             g = g * perLayerInput
             g = proj(g)
-            g = norm(g)
-            out = residual3 + g
+            if let decode, gemma4CanFusePrefillNorm(norm),
+                let fused = Gemma4DecodeGlueV1.normResidual(x: g, residual: residual3,
+                    weight: norm.weight, eps: norm.eps, context: decode) {
+                out = fused
+            } else if let glue, gemma4CanFusePrefillNorm(norm),
+                let fused = Gemma4PrefillGlueV1.normResidual(x: g, weight: norm.weight,
+                    residual: residual3, eps: norm.eps, context: glue) {
+                out = fused
+            } else {
+                g = norm(g)
+                out = residual3 + g
+            }
         }
 
-        out = out * layerScalar
+        if !scalarFolded { out = out * layerScalar }
 
-        return (out, kvPair, attnPositionOffset)
+        return (out, kvPair, attnPositionOffset, normalizedNext, decodeNormalization)
     }
 }
 
@@ -1470,6 +1902,11 @@ public class Gemma4TextModelInner: Module {
     let config: Gemma4TextConfiguration
     let embedScale: Float
     let hiddenSizePerLayerInput: Int
+    private let prefillGluePolicy = Gemma4PrefillGluePolicy()
+    private let decodeGluePolicy = Gemma4DecodeGluePolicy()
+    private let scaledEmbeddingPolicy = Gemma4ScaledEmbeddingPolicy()
+    private let forcedSharedKV: Bool
+    private var assistantDecodeGlueEligible = false
 
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
     @ModuleInfo(key: "layers") public var layers: [Gemma4DecoderLayer]
@@ -1494,6 +1931,7 @@ public class Gemma4TextModelInner: Module {
         fuseWeightedUnsort: Bool = false
     ) {
         self.config = config
+        self.forcedSharedKV = forceSharedKV
         self.embedScale = Float(config.hiddenSize).squareRoot()
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
 
@@ -1550,6 +1988,43 @@ public class Gemma4TextModelInner: Module {
         self.lastSlidingAttentionNonSharedIdx = lastSliding
 
         super.init()
+    }
+
+    /// Only the validated assistant constructor supplies this role. Shape
+    /// alone must not opt another hidden-1024 model into an assistant path.
+    func markDecodeGlueAssistant(backboneHiddenSize: Int) {
+        assistantDecodeGlueEligible = forcedSharedKV && backboneHiddenSize == 2816
+            && config.hiddenSize == 1024 && config.numHiddenLayers == 4
+            && !config.enableMoeBlock && config.numKvSharedLayers == config.numHiddenLayers
+    }
+
+    /// The drafter owns a shared-KV loop rather than calling this trunk's
+    /// ordinary forward. Admit its one-token layers through the same bounded
+    /// normalization path without changing shared KV, masks or hidden capture.
+    /// An explicit policy is only an internal dependency-injection seam; the
+    /// production caller uses this model's latched policy and validated role.
+    func forwardAssistantLayer(
+        at index: Int, _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        sharedKV: (MLXArray, MLXArray), positionOffset: Gemma4.PositionOffset,
+        policy: Gemma4DecodeGluePolicy? = nil
+    ) -> MLXArray? {
+        guard assistantDecodeGlueEligible,
+            let context = (policy ?? decodeGluePolicy).context(target: false, validatedAssistant: true),
+            x.ndim == 3, x.dim(0) > 0, x.dim(1) == 1, x.dim(2) == 1024,
+            x.dtype == .bfloat16, layers.indices.contains(index),
+            type(of: layers[index]) == Gemma4DecoderLayer.self else { return nil }
+        return layers[index].forwardWithGlue(x, mask: mask, cache: nil,
+            perLayerInput: nil, sharedKV: sharedKV, positionOffset: positionOffset,
+            v2SharedSource: nil, outputTailRows: nil, useLastQueryPrefill: false,
+            isExpertPrefill: false, glue: nil, decode: context,
+            normalizedInput: nil, nextInputNorm: nil).out
+    }
+
+    func scaledEmbedding(_ tokens: MLXArray) -> MLXArray {
+        Gemma4ScaledEmbeddingV1.apply(tokens: tokens, embedding: embedTokens, embedScale: embedScale,
+            hidden: config.hiddenSize, targetEligible: gemma4SupportsProductionExpertTopology(config),
+            policy: scaledEmbeddingPolicy) ?? (embedTokens(tokens) * embedScale)
     }
     public func callAsFunction(
         _ inputs: MLXArray,
@@ -1630,7 +2105,7 @@ public class Gemma4TextModelInner: Module {
         if let inputEmbedding {
             h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
         } else {
-            h = embedTokens(inputs) * embedScale
+            h = scaledEmbedding(inputs)
         }
 
         // Compute per-layer inputs (PLE)
@@ -1725,6 +2200,16 @@ public class Gemma4TextModelInner: Module {
         var intermediates = [(kv: (MLXArray, MLXArray)?, positionOffset: Gemma4.PositionOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
 
+        let prefillGlue = prefillGluePolicy.context(
+            scheduledPrefill: schedulePrefill && isCBv2 && captureHook == nil && !capturePreNorm,
+            eligibleModel: gemma4SupportsProductionExpertTopology(config))
+        // Forward-local only. No task-global memoizer, retained request state,
+        // cross-call parameter binding or MTP capture substitution.
+        var carriedNormalization = Gemma4PrefillNormalizationCarry<MLXArray>()
+        let decodeGlue = decodeGluePolicy.context(target: gemma4SupportsProductionExpertTopology(config),
+                                                  validatedAssistant: assistantDecodeGlueEligible)
+        var decodeCarry: Gemma4DecodeNormalizationCarry?
+
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv
@@ -1755,26 +2240,42 @@ public class Gemma4TextModelInner: Module {
                 sequenceLength: h.dim(1),
                 outputTailRows: outputTailRows,
                 hasCapableCache: fullCache[idx] is any CBv2LastQueryPrefillLayerCache)
-            let (out, kvPair, positionOffset) = layer(
-                h,
-                mask: mask,
-                cache: fullCache[idx],
-                perLayerInput: perLayerInputs[idx],
-                sharedKV: sharedKV,
-                positionOffset: sharedPositionOffset,
-                v2SharedSource: v2SharedSource,
-                outputTailRows: outputTailRows,
-                useLastQueryPrefill: useLastQueryPrefill,
-                // The retained pair is a CBv2 production-prefill optimization.
-                // Ordinary direct forwards keep the established reduction;
-                // enabling it there regressed the raw-prefill control without
-                // affecting the serving path selected by the benchmark.
-                isExpertPrefill: gemma4AllowsWeightedExpertUnsort(
-                    schedulePrefill: schedulePrefill)
-            )
-            h = out
-            intermediates[idx] = (kvPair, positionOffset)
-            captureHook?(idx, kvPair)
+            let result: (out: MLXArray, kv: (MLXArray, MLXArray),
+                         position: Gemma4.PositionOffset, normalizedNext: MLXArray?,
+                         decodeNormalization: Gemma4DecodeNormalizationCarry?)
+            // Do not bypass custom layer dispatch, even when the trunk's
+            // checkpoint topology is otherwise eligible.
+            let decodeForLayer = h.dim(1) == 1 || outputTailRows == 1 ? decodeGlue : nil
+            if prefillGlue != nil || decodeForLayer != nil, type(of: layer) == Gemma4DecoderLayer.self,
+                gemma4SupportsProductionExpertTopology(layer.config)
+                    || (assistantDecodeGlueEligible && layer.config.hiddenSize == 1024) {
+                let nextNorm: RMSNorm? = idx + 1 < layers.count
+                    ? (type(of: layers[idx + 1]) == Gemma4DecoderLayer.self
+                       ? layers[idx + 1].inputLayernorm : nil) : norm
+                let normalizedInput = decodeCarry?.take(source: h, weight: layer.inputLayernorm.weight,
+                                                       eps: layer.inputLayernorm.eps)
+                    ?? carriedNormalization.take(for: h)
+                decodeCarry = nil
+                result = layer.forwardWithGlue(h, mask: mask, cache: fullCache[idx],
+                    perLayerInput: perLayerInputs[idx], sharedKV: sharedKV,
+                    positionOffset: sharedPositionOffset, v2SharedSource: v2SharedSource,
+                    outputTailRows: outputTailRows, useLastQueryPrefill: useLastQueryPrefill,
+                    isExpertPrefill: gemma4AllowsWeightedExpertUnsort(schedulePrefill: schedulePrefill),
+                    glue: prefillGlue, decode: decodeForLayer, normalizedInput: normalizedInput, nextInputNorm: nextNorm)
+            } else {
+                // The retained weighted/R1 pair still has its original gate.
+                let ordinary = layer(h, mask: mask, cache: fullCache[idx],
+                    perLayerInput: perLayerInputs[idx], sharedKV: sharedKV,
+                    positionOffset: sharedPositionOffset, v2SharedSource: v2SharedSource,
+                    outputTailRows: outputTailRows, useLastQueryPrefill: useLastQueryPrefill,
+                    isExpertPrefill: gemma4AllowsWeightedExpertUnsort(schedulePrefill: schedulePrefill))
+                result = (ordinary.0, ordinary.1, ordinary.2, nil, nil)
+            }
+            h = result.out
+            carriedNormalization.publish(source: result.out, normalized: result.normalizedNext)
+            decodeCarry = result.decodeNormalization
+            intermediates[idx] = (result.kv, result.position)
+            captureHook?(idx, result.kv)
 
             let layerNumber = idx + 1
             if gemma4ShouldSubmitPrefillChunkEval(
@@ -1789,7 +2290,17 @@ public class Gemma4TextModelInner: Module {
             }
         }
 
-        let postNorm = norm(h)
+        let postNorm: MLXArray
+        if let normalized = decodeCarry?.take(source: h, weight: norm.weight, eps: norm.eps),
+            gemma4CanFusePrefillNorm(norm), normalized.shape == h.shape, normalized.dtype == h.dtype {
+            postNorm = normalized
+        } else if prefillGlue != nil, let normalized = carriedNormalization.take(for: h),
+            gemma4CanFusePrefillNorm(norm), normalized.shape == h.shape,
+            normalized.dtype == h.dtype {
+            postNorm = normalized
+        } else {
+            postNorm = norm(h)
+        }
         return (postNorm, capturePreNorm ? h : nil)
     }
 }
@@ -2109,6 +2620,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
             sanitized[k] = v
         }
+        // Each target layer owns its pair. Only exact dense-language keys are
+        // considered; VLM's sanitizer calls this with its language prefix intact.
+        for index in model.layers.indices {
+            model.layers[index].mlp.sanitizeDenseGateUp(&sanitized, layer: index)
+        }
         return sanitized
     }
 
@@ -2200,13 +2716,40 @@ extension Gemma4TextModel {
         guard config.useBidirectionalAttention != "all" else {
             throw CBv2CompatibilityError.fullyBidirectionalAttentionUnsupported
         }
-        return try cbv2LayerKinds.enumerated().map { index, kind in
+        let caches = try cbv2LayerKinds.enumerated().map { index, kind in
             try makeLayerCache(index, kind)
         }
+        if Gemma4UnifiedPositionPolicy.enabled, gemma4SupportsProductionExpertTopology(config),
+            config.numKvSharedLayers == 0 {
+            CBv2LayerCache.configureGemmaUnifiedPositions(caches)
+        }
+        return caches
     }
 }
 
 // MARK: - ContinuousBatchingV2 prompt-only output narrowing
+
+extension Gemma4TextModel: CBv2CacheOutputCoverageModel {
+    public func cbv2CacheOutputCoversAttention(_ scope: Gemma4CacheEvaluationScope) -> Bool {
+        func standard(_ linear: Linear) -> Bool {
+            type(of: linear) == Linear.self || type(of: linear) == QuantizedLinear.self
+        }
+        guard type(of: self) == Gemma4TextModel.self, type(of: model) == Gemma4TextModelInner.self,
+            gemma4SupportsProductionExpertTopology(config), config.numKvSharedLayers == 0,
+            config.hiddenSizePerLayerInput == 0, model.layers.count == config.numHiddenLayers,
+            type(of: model.norm) == RMSNorm.self,
+            model.layers.enumerated().allSatisfy({ index, layer in
+                type(of: layer) == Gemma4DecoderLayer.self && layer.layerIdx == index
+                    && !layer.selfAttn.usesSharedKV && standard(layer.selfAttn.oProj)
+                    && type(of: layer.postAttentionLayernorm) == RMSNorm.self
+                    && layer.perLayerInputGate == nil && layer.perLayerProjection == nil
+                    && layer.postPerLayerInputNorm == nil
+            }) else { return false }
+        if scope == .mtpVerify { return true }
+        if let lmHead { return standard(lmHead) }
+        return type(of: model.embedTokens) == Embedding.self || type(of: model.embedTokens) == QuantizedEmbedding.self
+    }
+}
 
 /// CBv2 consumes only the final prompt position, so the public
 /// `LanguageModel` forward contract stays unchanged while the engine's
@@ -2269,7 +2812,7 @@ extension Gemma4TextModel: CBv2EmbeddingForwardable {
     /// VLM wrapper's `prepare` computes the same product before
     /// `maskedScatter`).
     public func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray {
-        model.embedTokens(inputs) * model.embedScale
+        model.scaledEmbedding(inputs)
     }
 
     public func embeddingForward(
