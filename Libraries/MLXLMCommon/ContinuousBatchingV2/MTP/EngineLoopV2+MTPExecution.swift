@@ -399,21 +399,13 @@ extension EngineLoopV2 {
 
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
-        var pieces: [MLXArray] = []
-        var sampledRows: [CBv2RequestID] = []
-        var decodeIndex = 0
-        for row in work {
-            if row.isDecode {
-                pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
-                decodeIndex += 1
-                sampledRows.append(row.rec.id)
-            } else if let sampled = prefillSampled[row.rec.id] {
-                pieces.append(sampled)
-                sampledRows.append(row.rec.id)
-            }
-        }
-        let sampledTokens: MLXArray? =
-            pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+        let sampled = CBv2MTPSampledTokenAssembly.assemble(
+            work: work, decodeCount: decodeRows.count, decodeTokens: decodeSampled,
+            prefillTokens: prefillSampled, id: { $0.rec.id }, isDecode: { $0.isDecode },
+            slice: { tokens, range in tokens[range] },
+            concatenate: { concatenated($0, axis: 0) })
+        let sampledRows = sampled.rows
+        let sampledTokens = sampled.tokens
 
         if let verify { diagnostics.append(contentsOf: verify.diagnostics) }
         var asyncEvalTargets = prefillEvalTargets

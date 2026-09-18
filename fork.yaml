@@ -60,7 +60,41 @@ def:
             with tool-constraint enforcement (`TokenConstraintSamplerV2`, `ToolConstraintV2`), the
             streaming detokenizer (`DetokenizerV2`, character-exact on non-append-only decodes),
             attention metadata/packet capture-and-replay for parity testing, logit diagnostics, request
-            timing stamps, process-memory ownership and allocation projection.
+            timing stamps, process-memory ownership and allocation projection. Stable cache-bank
+            membership avoids temporary identity arrays while retaining canonical rebind/release rules.
+            Default-off Gemma scheduled-prefill glue carries explicit BF16/geometry gates,
+            immutable Metal source definitions and a one-forward normalization handoff.
+            Optional vector reads require nonblocking backing-alignment evidence.
+            One-element layer scalars are reshaped to explicit buffers at the custom
+            kernel boundary, preserving rank-zero values and the retained s[0] ABI.
+            Separately gated attention/router prefix and expert pre-norm scatter use an
+            owned sort/inverse pair; the ordinary sort, projections and weighted reduction
+            remain the fallback and shared implementation.
+            A separately gated expert-reduction tail owns one-shot deferred projection
+            results, descriptor snapshots and the construction stream. Rejected fusion
+            resolves through the same canonical weighted reducer.
+            Direct pre-norm and separately gated prompt GeGLU retain final-challenge
+            arithmetic, explicit split/packed producer layouts and the incumbent
+            compiled-activation opt-out; unaligned accesses use scalar twins.
+            Default-off prefill counting sort is reachable only through a 128-column
+            score-derived routing producer. Histogram, serial/eight-range scan and
+            local-rank/bitset scatter preserve a single owned inverse permutation;
+            raw-index and non-Gemma APIs retain their original sorting paths.
+            Default-off decode glue adapts per-row B1-safe normalization/tails with
+            descriptor-validated forward-local chaining, a separately gated assistant
+            norm, and no fixed-B8 sum-table or MTP-controller replacement.
+            Separately gated router finalists retain stable expert-index ties, explicit
+            decode/prefill admission and optional final weight kernels. Score-derived
+            routing keeps counting-sort bounds valid and the stock weight chain remains.
+            Separately default-off affine-Q4/g64 scaled embedding uses fresh parameter
+            inputs and the original dequantize/store/scale boundaries. Supplied multimodal
+            embeddings bypass it; no checkpoint data or quantization policy is changed.
+            QKV normalization/RoPE candidates retain existing position captures, current
+            proportional frequency tables and all cache/attention entry points. Masked
+            prefill tails keep inactive lanes at barriers; Q4-KV packing is excluded.
+            Fused RoPE alone selects an explicit per-kernel relaxed math mode to match
+            the current stock shader tape. Norm-only kernels and shared defaults remain
+            safe; unsupported OS versions retain the ordinary separate RoPE path.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
@@ -87,7 +121,8 @@ def:
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
             committed-decode and goodput clocks, capture fence, target verification with exact
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
-            target-authoritative. Model-specific drafters live under "Models".
+            target-authoritative. Homogeneous ordinary decode reuses its ordered sampled tensor;
+            mixed rows retain scheduler-order assembly. Model-specific drafters live under "Models".
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
         - title: "Engine v2 contract docs"
@@ -103,7 +138,8 @@ def:
             attention packets, paged backend, prefix reuse, MTP, sampling, detokenizer, multimodal seams),
             paged/complete/historical checkpoint tests, compilable KV cache, speculative walk and drafter
             masks, penalty over long prompts, plus the frozen fixtures they replay (block-hash vectors,
-            assistant configs, MTP prompts).
+            assistant configs, MTP prompts). Separate host-only Gemma catch-up checks compile real
+            binding/assembly helpers with CPU interface doubles; they do not qualify native execution.
           globs:
             - "Tests/MLXLMTests/CBv2*"
             - "Tests/MLXLMTests/Paged*"
@@ -116,6 +152,8 @@ def:
             - "Tests/MLXLMTests/StreamingDetokenizerTests.swift"
             - "Tests/MLXLMTests/PenaltyLongPromptTests.swift"
             - "Tests/MLXLMTests/ContinuousBatchingTestPlan.md"
+            - "Tests/HostOnly/GemmaCatchup/**"
+            - "scripts/test_gemma_host_contracts.py"
             - "Tests/MLXLMTests/Resources/**"
     - title: "Core library changes (MLXLMCommon)"
       description: |
@@ -154,6 +192,28 @@ def:
             Gemma 4 text and MoE (26B-A4B) with shared-KV attention layers, compiled decode, fused
             gate+up experts, bf16 conversion, a frozen-KV MTP drafter for CBv2 (`Gemma4CBv2MTPDrafter`,
             `Gemma4MTP*`), configuration validation, and layer-0 projection diagnostics.
+            The local MLXFast catch-up adds a default-off, B1-only Q8 dense gate/up
+            pair with model-owned descriptor snapshots and fail-closed admission;
+            native equality, lifetime, serving and performance gates remain required.
+            A separately default-off prefill candidate fuses norm/residual and dense/expert
+            branch tails with forward-local next-layer normalization, retaining modern MTP,
+            weighted expert reduction, paged attention and all ordinary fallback paths.
+            The prefill prefix consumes the router's original effective norm weight, while
+            the optional expert normalization/scatter retains the existing reduction gate.
+            A default-off B8 single-token expert candidate uses score-bounded routes, paired-16
+            affine storage, fused GU/GeGLU and tight down grids, with a separate compiled opt-in.
+            Affine bias-sum load helpers use the current core's FP32 input widening.
+            It preserves original parameters and rejects stale descriptors; extra memory,
+            native exactness and end-to-end performance remain unqualified.
+            Separate B8 rank/prefix/direct/fold switches bind tagged route metadata to its
+            producer and preserve raw IDs for generic fallbacks. The folded producer retains
+            the current softmax tape and BF16 close instead of the historical monolithic tail.
+            A separate default-off contiguous-position coordinator shares an integer increment
+            across ordered Gemma owners while retaining independent cache wrappers and all
+            K/V evaluation roots. Paged/shared banks and incompatible cycles retain fallback.
+            Scoped default-off decode/MTP root collection now requires an affirming standard
+            Gemma output path and exact completed-cycle epochs; uncovered sliding-ring and
+            degenerate-context storage roots remain explicit. Native validation is pending.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"

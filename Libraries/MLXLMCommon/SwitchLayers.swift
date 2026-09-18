@@ -32,154 +32,6 @@ public let weightedExpertSum: @Sendable (MLXArray, MLXArray) -> MLXArray = cbv2O
 ) { outputs, weights in
     (outputs * MLX.expandedDimensions(weights, axis: -1)).sum(axis: -2)
 })
-/// Effective-selection count for the direct sorted-expert reduction. Benchmark
-/// callers arm this after warmup and snapshot it only after the engine is idle.
-/// The unarmed hot path reads one plain Bool and performs no atomic operation,
-/// locking, allocation, or clock access.
-public struct WeightedExpertUnsortStats: Sendable, Equatable {
-    public let effectiveCalls: Int
-}
-
-/// Benchmark-facing requested/effective contract for one measured scope.
-public struct WeightedExpertUnsortProvenance: Sendable, Equatable {
-    public let requested: Bool
-    public let effectiveCalls: Int
-
-    public var engaged: Bool { effectiveCalls > 0 }
-    public var missingExpectedEngagement: Bool { requested && !engaged }
-}
-
-private final class WeightedExpertUnsortProbe: @unchecked Sendable {
-    private let lock = NSLock()
-    private var effectiveCalls = 0
-    // Benchmark boundaries guarantee no engine work is in flight while this
-    // plain flag changes. Concurrent recorders only read it while armed.
-    private var enabled = false
-
-    @inline(__always)
-    func recordEffective() {
-        guard enabled else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        // Defensively close a recorder/snapshot lock handoff. The idle-boundary
-        // contract prevents a concurrent unsynchronized flag mutation.
-        guard enabled else { return }
-        effectiveCalls += 1
-    }
-
-    func snapshot() -> WeightedExpertUnsortStats {
-        lock.lock()
-        enabled = false
-        defer { lock.unlock() }
-        return WeightedExpertUnsortStats(effectiveCalls: effectiveCalls)
-    }
-
-    func reset() {
-        lock.lock()
-        effectiveCalls = 0
-        enabled = true
-        lock.unlock()
-    }
-}
-
-private let weightedExpertUnsortProbe = WeightedExpertUnsortProbe()
-
-/// Process-wide provenance snapshot for the weighted expert unsort experiment.
-public func weightedExpertUnsortStats() -> WeightedExpertUnsortStats {
-    weightedExpertUnsortProbe.snapshot()
-}
-
-/// Disarm and snapshot one benchmark scope with its resolved request state.
-public func weightedExpertUnsortProvenance(
-    requested: Bool
-) -> WeightedExpertUnsortProvenance {
-    let stats = weightedExpertUnsortStats()
-    return WeightedExpertUnsortProvenance(
-        requested: requested,
-        effectiveCalls: stats.effectiveCalls)
-}
-
-/// Reset the provenance counters before a benchmark cell.
-public func resetWeightedExpertUnsortStats() {
-    weightedExpertUnsortProbe.reset()
-}
-
-/// Fused inverse-permutation + weighted reduction for the sorted MoE prefill path.
-///
-/// `SwitchGLU` sorts expert assignments before its gathered matrix multiplies.
-/// The regular path restores `[tokens, topK, hidden]` and then reduces it with
-/// ``weightedExpertSum``. This kernel reads those sorted rows through the inverse
-/// permutation and writes `[tokens, hidden]` directly, avoiding that full
-/// `[tokens, topK, hidden]` intermediate.
-private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
-    name: "weighted_expert_unsort",
-    inputNames: ["sorted_outputs", "inverse_order", "weights"],
-    outputNames: ["output"],
-    source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
-
-        T accumulator = (T)0;
-        const uint assignment_base = token * (uint)K;
-        for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
-        }
-        output[token * threads_per_grid.x + feature] = accumulator;
-    """,
-    ensureRowContiguous: true
-)
-
-/// Consume production-shaped sorted expert rows through their inverse
-/// permutation and reduce original top-K slots into `[tokens, hidden]`.
-///
-/// Accepted layouts are bfloat16 `[tokens * K, hidden]` with `hidden % 64 == 0`,
-/// uint32 inverse order, and bfloat16 `[tokens, K]` with `K >= 1` and at least
-/// 64 assignments (the SwitchGLU sorted-prefill threshold). Gemma 4 uses
-/// `K = 8` / hidden 2816; Flash-Next Qwen4 uses `K = 10` / hidden 2560.
-/// Callers must use the legacy scatter + weighted sum for every other dtype,
-/// shape, or layout.
-public func weightedExpertUnsort(
-    sortedOutputs: MLXArray,
-    inverseOrder: MLXArray,
-    weights: MLXArray
-) -> MLXArray {
-    let hidden = sortedOutputs.dim(1)
-    let topK = weights.ndim == 2 ? weights.dim(1) : 0
-    precondition(
-        sortedOutputs.ndim == 2 && (hidden % 64 == 0)
-            && sortedOutputs.dtype == .bfloat16,
-        "weightedExpertUnsort outputs must be bfloat16 [assignments, hidden] with hidden % 64 == 0")
-    precondition(
-        inverseOrder.ndim == 1 && inverseOrder.dtype == .uint32,
-        "weightedExpertUnsort inverse order must be flat uint32")
-    precondition(
-        weights.ndim == 2 && topK >= 1 && weights.size >= 64
-            && weights.dtype == .bfloat16,
-        "weightedExpertUnsort weights must be sorted-prefill bfloat16 [tokens, K]")
-    precondition(
-        sortedOutputs.dim(0) == weights.size && inverseOrder.size == weights.size,
-        "weightedExpertUnsort assignment counts must match")
-
-    let tokens = weights.dim(0)
-    weightedExpertUnsortProbe.recordEffective()
-    return weightedExpertUnsortKernel(
-        [sortedOutputs, inverseOrder, weights],
-        template: [
-            ("T", sortedOutputs.dtype),
-            ("K", topK),
-        ],
-        grid: (hidden, tokens, 1),
-        threadGroup: (64, 4, 1),
-        outputShapes: [[tokens, hidden]],
-        outputDTypes: [.bfloat16]
-    )[0]
-}
 
 
 // MARK: - Compiled activation fusions (vMLX / osaurus-main port)
@@ -487,6 +339,7 @@ public class SwitchGLU: Module {
     /// supplied (we then fall back to `activation(gate) * up`). Upstream ef85ed0.
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let weightedReductionProfile: SwitchGLUWeightedReductionProfile
+    private var gemmaB8Storage: Gemma4B8ExpertStorage?
 
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
@@ -656,7 +509,7 @@ public class SwitchGLU: Module {
     }
 
     private func projectExperts(
-        _ x: MLXArray, _ indices: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, gemmaPrefill: Gemma4PrefillGluePolicy.Context? = nil
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
         let doSort = indices.size >= 64
@@ -667,10 +520,23 @@ public class SwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
+        return projectPreparedExperts(x, idx, inverseOrder: doSort ? inverseOrder : nil,
+                                      gemmaPrefill: gemmaPrefill)
+    }
+
+    /// Both callers use the same projection/activation path. The optional
+    /// prefill producer changes only normalization + input gather, not GEMM.
+    private func projectPreparedExperts(_ x: MLXArray, _ idx: MLXArray, inverseOrder: MLXArray?,
+                                       gemmaPrefill: Gemma4PrefillGluePolicy.Context? = nil)
+        -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
+        let doSort = inverseOrder != nil
+
         let xGate: MLXArray
         let xUp: MLXArray
+        var fusedPlane: MLXArray?
         if let gateUpProj {
             let xGateUp = projectExpert(gateUpProj, x, idx, sortedIndices: doSort)
+            if gemmaPrefill?.geglu == true { fusedPlane = xGateUp }
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
@@ -681,8 +547,24 @@ public class SwitchGLU: Module {
             xGate = projectExpert(gateProj, x, idx, sortedIndices: doSort)
         }
 
+        var promptActivation: MLXArray?
+        if let gemmaPrefill, gemmaPrefill.geglu,
+            case .gemma4ProductionGeGLU = weightedReductionProfile,
+            activationProduct == nil, !isSiluActivation, isGeluActivation,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            MLXHardwareInfo.isCompiledDecodeSupported {
+            if let fusedPlane {
+                promptActivation = Gemma4PromptGlueV1.geluProductFusedPlane(fusedPlane, hidden: hiddenDims,
+                    context: gemmaPrefill, compiledBaseline: MLXHardwareInfo.isCompiledDecodeSupported)
+            } else {
+                promptActivation = Gemma4PromptGlueV1.geluProduct(gate: xGate, up: xUp,
+                    context: gemmaPrefill, compiledBaseline: MLXHardwareInfo.isCompiledDecodeSupported)
+            }
+        }
         let activated: MLXArray
-        if let activationProduct {
+        if let promptActivation {
+            activated = promptActivation
+        } else if let activationProduct {
             activated = activationProduct(xGate, xUp)
         } else if isSiluActivation {
             activated = compiledSwiGLU(xGate, xUp)
@@ -692,8 +574,8 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = projectExpert(downProj, activated, idx, sortedIndices: doSort)
-        return (x, doSort ? inverseOrder : nil, doSort)
+        let output = projectExpert(downProj, activated, idx, sortedIndices: doSort)
+        return (output, inverseOrder, doSort)
     }
 
     private func legacyWeightedReduction(
@@ -798,7 +680,92 @@ public class SwitchGLU: Module {
             return weightedExpertSum(callAsFunction(x, indices), weights)
         }
 
-        let projected = projectExperts(x, indices)
+        return reducePreparedExperts(projectExperts(x, indices), indices: indices, weights: weights)
+    }
+
+    /// Separate score-bounded B8 entry point. Generic/raw-index APIs stay unchanged.
+    public func executeGemmaB8(_ x: MLXArray, routing: Gemma4B8ExpertRouting) -> MLXArray? {
+        guard Gemma4B8ExpertExecution.available, routing.stream == StreamOrDevice.default,
+            x.shape == [8, 1, 2816], x.dtype == .bfloat16,
+            case .gemma4ProductionGeGLU = weightedReductionProfile,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            activationProduct == nil, isGeluActivation, gateUpProj == nil,
+            let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            let down = downProj as? QuantizedSwitchLinear,
+            [gate, up, down].allSatisfy({ type(of: $0) == QuantizedSwitchLinear.self
+                && $0.mode == .affine && $0.bits == 4 && $0.groupSize == 64 && $0.bias == nil }),
+            let gateBias = gate.biases, let upBias = up.biases, let downBias = down.biases else { return nil }
+        let parameters = [gate.weight, gate.scales, gateBias, up.weight, up.scales, upBias,
+                          down.weight, down.scales, downBias]
+        if gemmaB8Storage?.matches(parameters) != true {
+            gemmaB8Storage = nil
+            gemmaB8Storage = Gemma4B8ExpertStorage(parameters)
+        }
+        guard let storage = gemmaB8Storage else { return nil }
+        let identity = MLXArray(0..<64).asType(.uint32)
+        let projected: MLXArray
+        let policy = Gemma4B8ExpertExecution.policy
+        if policy.compiled && policy.tightDown {
+            projected = Gemma4B8ExpertExecution.compiledProject(storage: storage,
+                x: x.reshaped(8, 2816), routing: routing, identity: identity)
+        } else {
+            let activated = Gemma4B8ExpertExecution.gateUp(storage.gateUp
+                + [x.reshaped(8, 2816), routing.rowOrder, routing.executionKeys], tagged: routing.usesPrefixBounds)
+            projected = policy.tightDown
+                ? Gemma4B8ExpertExecution.down(storage.down + [activated, identity, routing.executionKeys], tagged: routing.usesPrefixBounds)
+                : downProj(activated, routing.sortedKeys, sortedIndices: true)
+        }
+        let unsorted = scatterUnsort(x: projected, invOrder: routing.inverseOrder,
+                                    shape: [8, 8]).squeezed(axis: -2)
+        return weightedExpertSum(unsorted, routing.reductionWeights).reshaped(8, 1, 2816)
+    }
+
+    /// Explicit Gemma prefill entry point; the existing generic API is unchanged.
+    /// Both reduction choices retain their original conditions and arithmetic.
+    public func callAndWeightedReduceGemmaPrefill(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray,
+        fuseSortedReduction: Bool, isProductionPrefill: Bool,
+        context: Gemma4PrefillGluePolicy.Context
+    ) -> MLXArray {
+        guard context.geglu, isProductionPrefill, MLXHardwareInfo.isCompiledDecodeSupported,
+            case .gemma4ProductionGeGLU = weightedReductionProfile else {
+            return callAndWeightedReduce(x, indices, weights: weights,
+                fuseSortedReduction: fuseSortedReduction, isProductionPrefill: isProductionPrefill)
+        }
+        let directReduction = fuseSortedReduction && supportsWeightedExpertUnsort(x, indices, weights: weights)
+        let projected = projectExperts(x, indices, gemmaPrefill: context)
+        if directReduction {
+            return reducePreparedExperts(projected, indices: indices, weights: weights)
+        }
+        return legacyWeightedReduction(projected, indices: indices, weights: weights)
+    }
+
+    /// Optional producer-specific Gemma path. A nil result means no projection
+    /// ran: the caller can evaluate its original norm + gathered expert path.
+    public func callAndWeightedReduceNormalizingGemmaPrefill(
+        _ x: MLXArray, normWeight: MLXArray, normEps: Float,
+        indices: MLXArray, weights: MLXArray, fuseSortedReduction: Bool,
+        context: Gemma4PrefillGluePolicy.Context
+    ) -> MLXArray? {
+        guard context.scatter, fuseSortedReduction,
+            case .gemma4ProductionGeGLU = weightedReductionProfile,
+            let rows = context.rows(shape: x.shape, inputBF16: x.dtype == .bfloat16,
+                weightShape: normWeight.shape, weightBF16: normWeight.dtype == .bfloat16,
+                eps: normEps),
+            supportsWeightedExpertUnsort(x.reshaped(rows, 2816), indices, weights: weights),
+            let order = Gemma4PrefillExpertOrder.make(indices: indices, rows: rows, context: context),
+            let plane = Gemma4PrefillGlueV1.preNormScatter(x: x, weight: normWeight,
+                order: order, eps: normEps, context: context) else { return nil }
+        let projected = projectPreparedExperts(plane, order.sortedIndices, inverseOrder: order.inverseOrder,
+                                               gemmaPrefill: context)
+        return reducePreparedExperts(projected, indices: indices, weights: weights)
+    }
+
+    private func reducePreparedExperts(
+        _ projected: (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool),
+        indices: MLXArray, weights: MLXArray
+    ) -> MLXArray {
         guard projected.sorted,
             let inverseOrder = projected.inverseOrder,
             projected.output.ndim == 3,
@@ -813,6 +780,89 @@ public class SwitchGLU: Module {
             sortedOutputs: MLX.squeezed(projected.output, axis: -2),
             inverseOrder: inverseOrder,
             weights: weights)
+    }
+
+    /// Prepare, but do not reduce, an ordinary normalized Gemma expert batch.
+    /// Nil means no projection ran. Only the existing production contract can
+    /// produce a pending result; unexpected output metadata resolves normally.
+    public func prepareGemmaPrefillTail(
+        _ normalized: MLXArray, indices: MLXArray, weights: MLXArray,
+        fuseSortedReduction: Bool, context: Gemma4PrefillGluePolicy.Context
+    ) -> Gemma4PrefillExpertProjection? {
+        guard context.expertTail, context.chained, fuseSortedReduction,
+            case .gemma4ProductionGeGLU = weightedReductionProfile,
+            supportsWeightedExpertUnsort(normalized, indices, weights: weights),
+            let order = Gemma4PrefillExpertOrder.make(indices: indices,
+                rows: normalized.dim(0), context: context) else { return nil }
+        let projected = projectPreparedExperts(order.gatherNormalized(normalized),
+            order.sortedIndices, inverseOrder: order.inverseOrder, gemmaPrefill: context)
+        return pendingGemmaTail(projected, order: order, indices: indices, weights: weights)
+    }
+
+    /// Same pending result, using the separately admitted norm/scatter producer.
+    public func prepareNormalizingGemmaPrefillTail(
+        _ x: MLXArray, normWeight: MLXArray, normEps: Float, indices: MLXArray, weights: MLXArray,
+        fuseSortedReduction: Bool, context: Gemma4PrefillGluePolicy.Context
+    ) -> Gemma4PrefillExpertProjection? {
+        guard context.expertTail, context.chained, context.scatter, fuseSortedReduction,
+            case .gemma4ProductionGeGLU = weightedReductionProfile,
+            let rows = context.rows(shape: x.shape, inputBF16: x.dtype == .bfloat16,
+                weightShape: normWeight.shape, weightBF16: normWeight.dtype == .bfloat16, eps: normEps),
+            supportsWeightedExpertUnsort(x.reshaped(rows, 2816), indices, weights: weights),
+            let order = Gemma4PrefillExpertOrder.make(indices: indices, rows: rows, context: context),
+            let plane = Gemma4PrefillGlueV1.preNormScatter(x: x, weight: normWeight,
+                order: order, eps: normEps, context: context) else { return nil }
+        let projected = projectPreparedExperts(plane, order.sortedIndices, inverseOrder: order.inverseOrder,
+                                               gemmaPrefill: context)
+        return pendingGemmaTail(projected, order: order, indices: indices, weights: weights)
+    }
+
+    private func pendingGemmaTail(
+        _ projected: (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool),
+        order: Gemma4PrefillExpertOrder, indices: MLXArray, weights: MLXArray
+    ) -> Gemma4PrefillExpertProjection {
+        if projected.output.ndim == 3, projected.output.dim(-2) == 1,
+            let pending = Gemma4PrefillExpertProjection(sorted: projected.output.squeezed(axis: -2),
+                order: order, weights: weights) { return pending }
+        return Gemma4PrefillExpertProjection(
+            resolved: reducePreparedExperts(projected, indices: indices, weights: weights))
+    }
+
+    /// Score-derived routing is authoritative for this separate entry point.
+    /// Raw-index APIs retain argSort. All projection/reduction implementations
+    /// remain shared, including scatter, GeGLU and optional deferred tail.
+    public func executeBoundedGemmaPrefill(
+        _ x: MLXArray, normalizedInput: MLXArray?, normWeight: MLXArray, normEps: Float,
+        routing: Gemma4PrefillRouting, fuseSortedReduction: Bool,
+        deferReduction: Bool, context: Gemma4PrefillGluePolicy.Context
+    ) -> Gemma4PrefillExpertProjection? {
+        guard context.routeCounting, routing.stream == StreamOrDevice.default,
+            case .gemma4ProductionGeGLU = weightedReductionProfile,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            let rows = context.rows(shape: x.shape, inputBF16: x.dtype == .bfloat16,
+                weightShape: normWeight.shape, weightBF16: normWeight.dtype == .bfloat16, eps: normEps),
+            rows == routing.rows, Array(x.shape.dropLast()) == routing.tokenShape else { return nil }
+        let indices = routing.flatIndices, weights = routing.flatWeights
+        let direct = fuseSortedReduction && supportsWeightedExpertUnsort(x.reshaped(rows, 2816), indices, weights: weights)
+        let order = Gemma4PrefillExpertOrder.fromRouting(routing)
+        let plane: MLXArray
+        if direct, let scattered = Gemma4PrefillGlueV1.preNormScatter(x: x, weight: normWeight,
+            order: order, eps: normEps, context: context) {
+            plane = scattered
+        } else {
+            let normalized = normalizedInput
+                ?? Gemma4PrefillGlueV1.preNorm(x: x, weight: normWeight, eps: normEps, context: context)
+                ?? MLXFast.rmsNorm(x, weight: normWeight, eps: normEps)
+            plane = order.gatherNormalized(normalized.reshaped(rows, 2816))
+        }
+        let projected = projectPreparedExperts(plane, order.sortedIndices,
+            inverseOrder: order.inverseOrder, gemmaPrefill: context)
+        if direct && deferReduction && context.expertTail && context.chained {
+            return pendingGemmaTail(projected, order: order, indices: indices, weights: weights)
+        }
+        let result = direct ? reducePreparedExperts(projected, indices: indices, weights: weights)
+            : legacyWeightedReduction(projected, indices: indices, weights: weights)
+        return Gemma4PrefillExpertProjection(resolved: result)
     }
 }
 
