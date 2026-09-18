@@ -17,6 +17,25 @@ private func create<C: Codable, M>(
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
 /// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
+private struct NemotronHVariantProbe: Decodable {
+    let layersBlockType: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case layersBlockType = "layers_block_type"
+    }
+}
+
+private func createNemotronH(_ data: Data) throws -> any LanguageModel {
+    let decoder = JSONDecoder.json5()
+    let probe = try decoder.decode(NemotronHVariantProbe.self, from: data)
+    if probe.layersBlockType != nil {
+        return NemotronH35Model(
+            try decoder.decode(NemotronH35Configuration.self, from: data))
+    }
+    return NemotronHModel(
+        try decoder.decode(NemotronHConfiguration.self, from: data))
+}
+
 public enum LLMTypeRegistry {
 
     /// Shared instance with default model types.
@@ -40,6 +59,8 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
+        "qwen4_exp": create(Qwen4ExpConfiguration.self, Qwen4ExpModel.init),
+        "qwen4_exp_text": create(Qwen4ExpTextConfiguration.self, Qwen4ExpTextModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
         "cohere": create(CohereConfiguration.self, CohereModel.init),
@@ -73,7 +94,7 @@ public enum LLMTypeRegistry {
         "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
-        "nemotron_h": create(NemotronHConfiguration.self, NemotronHModel.init),
+        "nemotron_h": createNemotronH,
         "afmoe": create(AfMoEConfiguration.self, AfMoEModel.init),
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
@@ -557,6 +578,10 @@ public final class LLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
+        let pleLoadLease = try Qwen4ExpPLEResidency.acquireLoadLease(
+            directory: modelDirectory, modelType: baseConfig.modelType)
+        defer { pleLoadLease?.release() }
+
         let model: LanguageModel
         do {
             model = try await typeRegistry.createModel(
@@ -566,62 +591,68 @@ public final class LLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
-        var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
-        let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
-        if let generationData = try? Data(contentsOf: generationConfigURL),
-            let generationConfig = try? JSONDecoder.json5().decode(
-                GenerationConfigFile.self, from: generationData),
-            let genEosIds = generationConfig.eosTokenIds?.values
-        {
-            eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
-        }
-
-        // Build a ModelConfiguration with loaded EOS token IDs and tool call format
-        var mutableConfiguration = configuration
-        mutableConfiguration.eosTokenIds = eosTokenIds
-        if mutableConfiguration.toolCallFormat == nil {
-            mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
-                from: baseConfig.modelType, configData: configData)
-        }
-
-        // Load tokenizer and weights in parallel
-        async let tokenizerTask = tokenizerLoader.load(
-            from: configuration.tokenizerDirectory)
-
-        try loadWeights(
-            modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
-
-        let tokenizer = try await tokenizerTask
-
-        let messageGenerator =
-            if let model = model as? LLMModel {
-                model.messageGenerator(tokenizer: tokenizer)
-            } else {
-                DefaultMessageGenerator()
+        do {
+            // Load EOS token IDs from config.json, with optional override from generation_config.json
+            var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+            let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
+            if let generationData = try? Data(contentsOf: generationConfigURL),
+                let generationConfig = try? JSONDecoder.json5().decode(
+                    GenerationConfigFile.self, from: generationData),
+                let genEosIds = generationConfig.eosTokenIds?.values
+            {
+                eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
             }
 
-        // Build a ModelConfiguration for the ModelContext
-        let tokenizerSource: TokenizerSource? =
-            configuration.tokenizerDirectory == modelDirectory
-            ? nil
-            : .directory(configuration.tokenizerDirectory)
-        let modelConfig = ModelConfiguration(
-            directory: modelDirectory,
-            tokenizerSource: tokenizerSource,
-            defaultPrompt: configuration.defaultPrompt,
-            extraEOSTokens: mutableConfiguration.extraEOSTokens,
-            eosTokenIds: mutableConfiguration.eosTokenIds,
-            toolCallFormat: mutableConfiguration.toolCallFormat)
+            // Build a ModelConfiguration with loaded EOS token IDs and tool call format
+            var mutableConfiguration = configuration
+            mutableConfiguration.eosTokenIds = eosTokenIds
+            if mutableConfiguration.toolCallFormat == nil {
+                mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
+                    from: baseConfig.modelType, configData: configData)
+            }
 
-        let processor = LLMUserInputProcessor(
-            tokenizer: tokenizer, configuration: modelConfig,
-            messageGenerator: messageGenerator)
+            // Load tokenizer and weights in parallel
+            async let tokenizerTask = tokenizerLoader.load(
+                from: configuration.tokenizerDirectory)
 
-        return .init(
-            configuration: modelConfig, model: model, processor: processor,
-            tokenizer: tokenizer)
+            try loadWeights(
+                modelDirectory: modelDirectory, model: model,
+                perLayerQuantization: baseConfig.perLayerQuantization)
+            try Qwen4ExpFactoryResources.validate(model)
+
+            let tokenizer = try await tokenizerTask
+
+            let messageGenerator =
+                if let model = model as? LLMModel {
+                    model.messageGenerator(tokenizer: tokenizer)
+                } else {
+                    DefaultMessageGenerator()
+                }
+
+            // Build a ModelConfiguration for the ModelContext
+            let tokenizerSource: TokenizerSource? =
+                configuration.tokenizerDirectory == modelDirectory
+                ? nil
+                : .directory(configuration.tokenizerDirectory)
+            let modelConfig = ModelConfiguration(
+                directory: modelDirectory,
+                tokenizerSource: tokenizerSource,
+                defaultPrompt: configuration.defaultPrompt,
+                extraEOSTokens: mutableConfiguration.extraEOSTokens,
+                eosTokenIds: mutableConfiguration.eosTokenIds,
+                toolCallFormat: mutableConfiguration.toolCallFormat)
+
+            let processor = LLMUserInputProcessor(
+                tokenizer: tokenizer, configuration: modelConfig,
+                messageGenerator: messageGenerator)
+
+            return .init(
+                configuration: modelConfig, model: model, processor: processor,
+                tokenizer: tokenizer)
+        } catch {
+            Qwen4ExpFactoryResources.release(model)
+            throw error
+        }
     }
 
 }

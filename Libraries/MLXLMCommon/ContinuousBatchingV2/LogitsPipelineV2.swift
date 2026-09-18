@@ -282,13 +282,6 @@ public final class LogitsPipelineV2 {
             logits.dim(0) == rowCount,
             "logits rows (\(logits.dim(0))) != configured rows (\(rowCount)) — call setRows")
 
-        if allGreedy && !wantsLogprobs && !anyBias && !anyRepetition
-            && !anyFrequencyPresence && !anyTemperature && !anyTopKPMinP
-            && hardMask == nil
-        {
-            return Output(sampling: logits, rawLogprobs: nil)
-        }
-
         // Work in float32 for numerically stable softmax/cumsum (vLLM does
         // the same). f16→f32 is exact, so greedy argmax is unaffected.
         var x = logits.asType(.float32)
@@ -519,10 +512,15 @@ public enum CBv2Logprobs {
     public static func assemble(
         _ gathered: Gathered, sampledTokens: [Int], topLogprobsPerRow: [Int]
     ) -> [CBv2TokenLogprob?] {
+        // Three host readbacks per logprob segment, each counted (gated
+        // like every CBv2 sync point; the arrays are already evaluated).
         let chosen = gathered.chosen.asArray(Float.self)
+        CBv2CoreInstrumentation.recordHostSync()
         let k = gathered.topValues.dim(-1)
         let values = gathered.topValues.asArray(Float.self)
+        CBv2CoreInstrumentation.recordHostSync()
         let indices = gathered.topIndices.asArray(Int32.self)
+        CBv2CoreInstrumentation.recordHostSync()
         var out = [CBv2TokenLogprob?]()
         out.reserveCapacity(sampledTokens.count)
         for row in 0 ..< sampledTokens.count {
@@ -571,56 +569,5 @@ public struct CBv2StepLogprobs {
     /// readback finds them already computed.
     public var evalTargets: [MLXArray] {
         [gathered.chosen, gathered.topValues, gathered.topIndices]
-    }
-}
-
-// MARK: - Order-only logits (SOFTCAP-SKIP) [r2]
-
-/// A step whose logits are consumed for their ORDER ALONE — every row greedy,
-/// no logprobs, no bias, no penalties — never observes a strictly increasing
-/// map applied to the whole vocabulary axis. Gemma's final-logit softcap
-/// (`tanh(x / 30) * 30`) is exactly such a map, so on those steps the softcap
-/// cannot change the emitted token and the model may skip it.
-///
-/// The engine sets this around the forward that builds the step's logits and
-/// clears it immediately afterwards, so no other consumer can observe an
-/// uncapped tensor. Graph BUILD is what reads the flag (MLX evaluates later),
-/// and the build is synchronous with the forward call, so the bracket is exact.
-///
-/// Filtering transforms (top-k/top-p/min-p) are not part of the predicate
-/// because `LogitsPipelineV2.setRows` only arms them for NON-greedy rows;
-/// `allGreedy` therefore already implies they are inactive. A hard grammar
-/// mask stays safe on its own terms: it sends forbidden ids to `-infinity` in
-/// both worlds and leaves the remaining order untouched.
-public enum CBv2OrderOnlyLogits {
-    nonisolated(unsafe) private static var flag = false
-
-    /// Read by the model while it builds the logits graph.
-    public static var engaged: Bool { flag }
-
-    public static func set(_ value: Bool) { flag = value }
-
-    /// The value-transform set of `LogitsPipelineV2.process`, mirrored on the
-    /// raw params so the engine can decide BEFORE the forward. Any row that
-    /// would take a value-sensitive branch disqualifies the whole step.
-    public static func orderOnly(_ params: [CBv2SamplingParams]) -> Bool {
-        guard !params.isEmpty else { return false }
-        return params.allSatisfy { p in
-            p.temperature < LogitsPipelineV2.greedyEpsilon
-                && p.topLogprobs == 0
-                && p.logitBias.isEmpty
-                && !(p.repetitionPenalty != 1 && p.repetitionContextSize > 0)
-                && p.frequencyPenalty == 0
-                && p.presencePenalty == 0
-        }
-    }
-
-    /// Engage for the duration of one graph build, then clear unconditionally.
-    public static func withOrderOnly<T>(
-        _ params: [CBv2SamplingParams], _ build: () -> T
-    ) -> T {
-        set(orderOnly(params))
-        defer { set(false) }
-        return build()
     }
 }

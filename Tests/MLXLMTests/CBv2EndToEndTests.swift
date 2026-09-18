@@ -109,7 +109,7 @@ final class CBv2EndToEndTests: XCTestCase {
                 paged = try PagedKVBackend(
                     layerKinds: model.layerKinds,
                     config: PagedKVPoolConfig(
-                        capacityBytes: 64 << 20,
+                        capacityBytes: 64 << 20, dtype: .float32,
                         maxPrefillChunk: 64,
                         nominalMaxSequenceLength: 512))
             } catch let error as CBv2KVError {
@@ -564,7 +564,7 @@ final class CBv2EndToEndTests: XCTestCase {
             paged = try PagedKVBackend(
                 layerKinds: model.layerKinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 64 << 20, maxPrefillChunk: 64,
+                    capacityBytes: 64 << 20, dtype: .float32, maxPrefillChunk: 64,
                     nominalMaxSequenceLength: 512))
         } catch let error as CBv2KVError {
             throw XCTSkip("paged backend unavailable on this hardware: \(error)")
@@ -619,15 +619,16 @@ final class CBv2EndToEndTests: XCTestCase {
         let model = makeModel(.paged)
         // One shared page group (both layers are (kvHeads 2, headDim 64)).
         // Per-request worst case at maxLength 308: ceil(308/16)=20 full
-        // pages + ring ceil((16+64)/16)+1=6 pages = 26 pages × 8 KiB
-        // ≈ 208 KiB. 256 KiB holds one request, not two; the byte ledger
-        // (~162 KiB estimate) admits each individually.
+        // pages + ring ceil((16+64)/16)+1=6 pages = 26 pages × 16 KiB
+        // ≈ 416 KiB for native float32 K/V. 512 KiB preserves the original
+        // FP16 fixture's physical page count: one request fits, not two.
+        // The byte ledger admits each individually.
         let paged: PagedKVBackend
         do {
             paged = try PagedKVBackend(
                 layerKinds: model.layerKinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 256 << 10,
+                    capacityBytes: 512 << 10, dtype: .float32,
                     maxPrefillChunk: 64,
                     nominalMaxSequenceLength: 512))
         } catch let error as CBv2KVError {

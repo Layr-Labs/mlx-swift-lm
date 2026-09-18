@@ -215,14 +215,18 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         maximumSequenceLength: Int? = nil,
         nominalFullKVBytesPerToken: Int? = nil,
         fixedWindowCapacityBytes: Int = 0,
-        restoringWindowsAtBoundary: Bool = false
+        restoringWindowsAtBoundary: Bool = false,
+        additionalStagedBackingBytes: Int = 0,
+        reserveFullSequenceTokens: Bool = false
     ) -> CBv2PrefixReusePlan? {
         guard let strategy, unsupportedReason == nil, matchedBoundary > 0 else {
             return nil
         }
         let nominalBytesPerToken =
             nominalFullKVBytesPerToken ?? fullKVBytesPerToken
-        guard nominalBytesPerToken >= 0, fixedWindowCapacityBytes >= 0 else {
+        guard nominalBytesPerToken >= 0, fixedWindowCapacityBytes >= 0,
+            additionalStagedBackingBytes >= 0
+        else {
             return nil
         }
         // A restored window makes the replay unnecessary, but only for the
@@ -234,8 +238,6 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         let replayStart = matchedBoundary - replayTokens
         guard replayStart > 0 || replayTokens == 0 else { return nil }
         let restoredFullTokens =
-            strategy == .frozenFullReplay ? matchedBoundary : replayStart
-        let capacityReservationTokens =
             strategy == .frozenFullReplay ? matchedBoundary : replayStart
         let exactBytesPerToken: Int
         let stagedBytes: Int
@@ -260,6 +262,11 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         let fullCapacityTokens = max(
             restoredFullTokens,
             maximumSequenceLength ?? restoredFullTokens)
+        // Stateful hybrid adoption prepays the entire logical sequence so
+        // AdmissionV2 also reserves its block-rounded auxiliary MTP state.
+        // Progress and replay still start at the actual matched checkpoint.
+        let capacityReservationTokens = reserveFullSequenceTokens
+            ? fullCapacityTokens : restoredFullTokens
         guard
             let exactFullCapacityBytes = Self.multiply(
                 fullCapacityTokens, exactBytesPerToken),
@@ -268,9 +275,11 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         else { return nil }
         let fullCapacityAdjustment = max(
             0, exactFullCapacityBytes - nominalInitiallyReserved)
-        let (initialAdditionalCapacityBytes, capacityOverflow) =
+        let (withWindows, windowOverflow) =
             fullCapacityAdjustment.addingReportingOverflow(fixedWindowCapacityBytes)
-        guard !capacityOverflow else { return nil }
+        let (initialAdditionalCapacityBytes, backingOverflow) =
+            withWindows.addingReportingOverflow(additionalStagedBackingBytes)
+        guard !windowOverflow, !backingOverflow else { return nil }
         return CBv2PrefixReusePlan(
             backend: backend,
             strategy: strategy,
@@ -364,6 +373,8 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     public let replayTokens: Int
     public let prefillTokensSaved: Int
     public let restoredFullTokens: Int
+    /// Logical tokens charged to admission, including auxiliary request state.
+    /// This can cover the full sequence while computed progress remains at C.
     public let capacityReservationTokens: Int
     public let nominalFullKVBytesPerToken: Int
     public let fullKVBytesPerToken: Int
@@ -372,6 +383,10 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     public let fullCapacityTokensReserved: Int
     public let stagedFullKVBytes: Int
     public let residentFullKVBytes: Int
+    /// Recurrent restores must continue the donor's exact chunk geometry.
+    /// Nil for attention-only adoption.
+    public var recurrentChunkSize: Int? = nil
+    public var recurrentPromptLength: Int? = nil
 
     /// A frozen-full plan with nothing to replay: the adopter promised an
     /// EXACT sliding window ending at M for every windowed layer, so both
@@ -396,6 +411,10 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     /// clamp is what keeps a chunk off that boundary.
     public func clampedChunk(start: Int, proposed: Int) -> Int {
         guard proposed > 0 else { return proposed }
+        if let stride = recurrentChunkSize, let length = recurrentPromptLength, start < length {
+            let required = min(stride, length - start)
+            return proposed >= required ? required : 0
+        }
         var result = proposed
         for boundary in [replayStart, matchedBoundary]
         where start < boundary && result > boundary - start {

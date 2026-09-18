@@ -20,7 +20,7 @@ import Testing
 
 @testable import MLXLLM
 
-private func draftTrimConfigJSON(hiddenSize: Int, mtpLayers: Int = 1) -> Data {
+private func draftTrimConfigJSON(hiddenSize: Int, mtpLayers: Int = 1, experts: Int = 0) -> Data {
     Data(
         """
         {
@@ -46,8 +46,10 @@ private func draftTrimConfigJSON(hiddenSize: Int, mtpLayers: Int = 1) -> Data {
             "vocab_size": 32,
             "head_dim": 8,
             "full_attention_interval": 4,
-            "num_experts": 0,
-            "num_experts_per_tok": 0,
+            "num_experts": \(experts),
+            "num_experts_per_tok": \(experts > 0 ? 2 : 0),
+            "moe_intermediate_size": 16,
+            "shared_expert_intermediate_size": 16,
             "mtp_num_hidden_layers": \(mtpLayers)
           }
         }
@@ -60,10 +62,11 @@ private func draftTrimConfigJSON(hiddenSize: Int, mtpLayers: Int = 1) -> Data {
 private func withDraftTrimAssistant(
     hiddenSize: Int = 8,
     mtpLayers: Int = 1,
+    experts: Int = 0,
     _ body: (Qwen35InlineMTPAssistant, Qwen35TextModel) throws -> Void
 ) throws {
     let configData = draftTrimConfigJSON(
-        hiddenSize: hiddenSize, mtpLayers: mtpLayers)
+        hiddenSize: hiddenSize, mtpLayers: mtpLayers, experts: experts)
     let root = try JSONSerialization.jsonObject(with: configData) as! [String: Any]
     let textData = try JSONSerialization.data(withJSONObject: root["text_config"]!)
     let configuration = try JSONDecoder().decode(
@@ -421,6 +424,123 @@ struct Qwen35MTPDraftTrimTests {
         }
     }
 
+    @Test("prefix restoration preserves full trusted history and exact draft chains", arguments: [0, 4])
+    func exactPrefixCheckpointRestoration(experts: Int) throws {
+        try withDraftTrimAssistant(experts: experts) { assistant, _ in
+            let firstTokens = MLXArray([Int32(1), 2, 3, 4]).reshaped([1, 4])
+            let firstHidden = MLXRandom.normal([1, 4, 8])
+            let secondTokens = MLXArray([Int32(5), 6, 7, 8]).reshaped([1, 4])
+            let secondHidden = MLXRandom.normal([1, 4, 8])
+            let donor = assistant.makeRequestState()
+            assistant.observeCommittedTarget(
+                .init(tokens: firstTokens, hidden: firstHidden), requestState: donor)
+            let checkpoint = try #require(assistant.capturePrefixCheckpoint(
+                requestState: donor, targetInputCount: 4))
+            eval(checkpoint.evaluationTargets)
+            #expect(checkpoint.materializedBytes == 4 * 8 * 4 + 3 * 4)
+            #expect(assistant.capturePrefixCheckpoint(requestState: donor, targetInputCount: 3) == nil)
+            assistant.releaseRequestState(donor)
+
+            for accepted in 0 ... 4 {
+                let cold = assistant.makeRequestState()
+                assistant.observeCommittedTarget(
+                    .init(tokens: firstTokens, hidden: firstHidden), requestState: cold)
+                let warm = try #require(assistant.restorePrefixCheckpoint(checkpoint))
+                #expect(warm.committedInputCount == 3)
+                #expect(warm.stagedInputCount == 0)
+                for state in [cold, warm] {
+                    assistant.observeCommittedTarget(
+                        .init(tokens: secondTokens, hidden: secondHidden), requestState: state)
+                }
+                var coldToken = MLXArray([Int32(9)]).reshaped([1, 1])
+                var warmToken = coldToken
+                var coldHidden = secondHidden[0..., 3 ..< 4, 0...]
+                var warmHidden = coldHidden
+                var drafts: [MLXArray] = []
+                for _ in 0 ..< 4 {
+                    let c = assistant.draftStep(
+                        tokens: coldToken, hidden: coldHidden, shortlist: nil, requestState: cold)
+                    let w = assistant.draftStep(
+                        tokens: warmToken, hidden: warmHidden, shortlist: nil, requestState: warm)
+                    eval([c.tokens, c.hidden, w.tokens, w.hidden]
+                        + assistant.evaluationTargets(for: cold) + assistant.evaluationTargets(for: warm))
+                    #expect(c.tokens.asArray(Int32.self) == w.tokens.asArray(Int32.self))
+                    #expect(c.hidden.asArray(Float.self) == w.hidden.asArray(Float.self))
+                    coldToken = c.tokens.reshaped([1, 1]); warmToken = w.tokens.reshaped([1, 1])
+                    coldHidden = c.hidden; warmHidden = w.hidden
+                    drafts.append(coldToken)
+                }
+                #expect(assistant.capturePrefixCheckpoint(requestState: warm, targetInputCount: 8) == nil)
+                let acceptedTokens = accepted == 0 ? emptyTokens() : concatenated(Array(drafts.prefix(accepted)), axis: 1)
+                let acceptedHidden = accepted == 0 ? emptyHidden(8) : MLXRandom.normal([1, accepted, 8])
+                for state in [cold, warm] {
+                    assistant.finalizeRound(
+                        requestState: state, confirmedInputTokens: 1 + accepted,
+                        committedDraftTokens: acceptedTokens, committedTargetHidden: acceptedHidden)
+                }
+                let carry = MLXRandom.normal([1, 1, 8])
+                let c = drafterResult(assistant, state: cold, seedToken: 10, carryHidden: carry)
+                let w = drafterResult(assistant, state: warm, seedToken: 10, carryHidden: carry)
+                #expect(c.token == w.token)
+                #expect(c.hidden.asArray(Float.self) == w.hidden.asArray(Float.self))
+                assistant.releaseRequestState(cold)
+                assistant.releaseRequestState(warm)
+                #expect(cold.materializedBytes == 0 && warm.materializedBytes == 0)
+            }
+            // A fresh assistant instance cannot consume another loaded
+            // model's otherwise shape-compatible checkpoint.
+            try withDraftTrimAssistant(experts: experts) { other, _ in
+                #expect(other.restorePrefixCheckpoint(checkpoint) == nil)
+            }
+        }
+    }
+
+    @Test("disk codec rebinds exact trusted history to a fresh loaded assistant", arguments: [0, 4])
+    func diskCheckpointCodecRestoration(experts: Int) throws {
+        try withDraftTrimAssistant(experts: experts) { donorAssistant, _ in
+            let tokens = [1, 2, 3, 4]
+            let tokenArray = MLXArray(tokens.map(Int32.init)).reshaped([1, 4])
+            let hidden = MLXRandom.normal([1, 4, 8])
+            let donor = donorAssistant.makeRequestState()
+            donorAssistant.observeCommittedTarget(.init(tokens: tokenArray, hidden: hidden), requestState: donor)
+            let checkpoint = try #require(donorAssistant.capturePrefixCheckpoint(requestState: donor, targetInputCount: 4))
+            let arrays = try #require(donorAssistant.encodePrefixCheckpoint(checkpoint))
+            let payload = arrays.map { ($0.asData().data, $0.shape, $0.dtype) }
+            donorAssistant.releaseRequestState(donor)
+            try withDraftTrimAssistant(experts: experts) { restoredAssistant, _ in
+                #expect(restoredAssistant.restorePrefixCheckpoint(checkpoint) == nil)
+                #expect(restoredAssistant.prefixCheckpointCodecID == donorAssistant.prefixCheckpointCodecID)
+                let restoredArrays = payload.map { MLXArray($0.0, $0.1, dtype: $0.2) }
+                let restored = try #require(restoredAssistant.decodePrefixCheckpoint(
+                    tensors: restoredArrays, prefixTokens: tokens))
+                let warm = try #require(restoredAssistant.restorePrefixCheckpoint(restored))
+                let cold = restoredAssistant.makeRequestState()
+                restoredAssistant.observeCommittedTarget(.init(tokens: tokenArray, hidden: hidden), requestState: cold)
+                let carry = hidden[0..., 3 ..< 4, 0...]
+                let expected = drafterResult(restoredAssistant, state: cold, seedToken: 5, carryHidden: carry)
+                let actual = drafterResult(restoredAssistant, state: warm, seedToken: 5, carryHidden: carry)
+                #expect(actual.token == expected.token)
+                #expect(actual.hidden.asArray(Float.self).map(\.bitPattern) == expected.hidden.asArray(Float.self).map(\.bitPattern))
+                let lazyTokens = MLX.where(MLXArray(true), restoredArrays[1], restoredArrays[1])
+                #expect(try lazyTokens.evaluatedBufferInfo() == nil)
+                #expect(restoredAssistant.decodePrefixCheckpoint(
+                    tensors: [restoredArrays[0], lazyTokens, restoredArrays[2]], prefixTokens: tokens) == nil)
+                #expect(try lazyTokens.evaluatedBufferInfo() == nil, "validation must not evaluate or allocate a token copy")
+                #expect(restoredAssistant.decodePrefixCheckpoint(tensors: Array(restoredArrays.dropLast()), prefixTokens: tokens) == nil)
+                #expect(restoredAssistant.decodePrefixCheckpoint(tensors: restoredArrays, prefixTokens: [1, 2, 3, 9]) == nil)
+                #expect(restoredAssistant.decodePrefixCheckpoint(
+                    tensors: [restoredArrays[0], restoredArrays[1].asType(.float32), restoredArrays[2]],
+                    prefixTokens: tokens) == nil)
+                #expect(restoredAssistant.decodePrefixCheckpoint(
+                    tensors: [restoredArrays[0][0..., 0 ..< 2, 0...], restoredArrays[1], restoredArrays[2]],
+                    prefixTokens: tokens) == nil)
+                restoredAssistant.releaseRequestState(cold)
+                restoredAssistant.releaseRequestState(warm)
+                #expect(cold.materializedBytes == 0 && warm.materializedBytes == 0)
+            }
+        }
+    }
+
     @Test("depths one through four trim reject, partial, and full prefixes")
     func chainedDepthTrimMatrix() throws {
         try withDraftTrimAssistant { assistant, _ in
@@ -513,6 +633,11 @@ struct Qwen35MTPDraftTrimTests {
             #expect(assistant.requestStateTokenGranularity == 256)
             #expect(assistant.requestStateTokenAllocationPadding == 4)
             #expect(assistant.maximumDraftTokens == 4)
+            let specs = try #require(assistant.requestStateAllocationSpecs)
+            #expect(specs.map(\.bytesPerToken) == [32, 32, 4])
+            #expect(specs.map(\.allocationCount) == [2, 1, 1])
+            #expect(specs.map(\.partitioned) == [false, true, true])
+
 
             let first = assistant.makeRequestState()
             let second = assistant.makeRequestState()

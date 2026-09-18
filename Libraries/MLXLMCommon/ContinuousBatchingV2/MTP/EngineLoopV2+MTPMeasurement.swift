@@ -28,7 +28,8 @@ extension EngineLoopV2 {
             actualDepth: 0,
             costEligible: pureDecode,
             chained: false,
-            seedOnly: false)
+            seedOnly: false,
+            workloadGeneration: mtp.workloadGeneration)
     }
 
     func attachMTPMeasurement(
@@ -38,11 +39,14 @@ extension EngineLoopV2 {
         guard let measurement, let step else { return }
         let actualDepth = step.mtpRound?.verify?.k ?? 0
         let seedOnly = step.mtpRound != nil && step.mtpRound?.verify == nil
-        step.mtpMeasurement = CBv2MTPStepMeasurement(
+        let attached = CBv2MTPStepMeasurement(
             decision: measurement.decision,
             actualDepth: actualDepth,
             costEligible: measurement.costEligible,
             chained: chained,
-            seedOnly: seedOnly)
+            seedOnly: seedOnly,
+            workloadGeneration: measurement.workloadGeneration)
+        step.mtpMeasurement = attached.excludingAssistantPrefill(
+            step.mtpRound?.verify?.includesAssistantPrefill ?? false)
     }
 }

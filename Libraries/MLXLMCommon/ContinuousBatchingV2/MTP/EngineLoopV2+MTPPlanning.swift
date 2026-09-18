@@ -119,9 +119,6 @@ extension EngineLoopV2 {
     /// Break the chained fast path when the next step must seed or verify.
     func mtpWantsStep(ids: [CBv2RequestID]) -> Bool {
         guard let mtp else { return false }
-        // Target-only policy: no seed or verify step can ever be wanted, so
-        // the chained decode fast path is never broken on MTP's account.
-        if mtp.isTargetOnlyPolicy { return false }
         let rows = ids.compactMap { scheduler.record(for: $0) }
         if mtp.config.fixedDraftTokens == 0, mtp.usesRequestStatefulDrafter {
             return false
@@ -159,26 +156,32 @@ extension EngineLoopV2 {
         }
     }
 
+    /// A depth-k round verifies and can emit k+1 target tokens. Reserve one
+    /// output slot for the mandatory target token, even when a carry already
+    /// exists. A draft with only one output slot left cannot avoid any target
+    /// work. Apply this bound to every offer, including fixed and exploration
+    /// depths, using the shortest row's budget for the common rectangle.
+    static func mtpDepthWithinOutputBudget(
+        offeredDepth: Int, remainingTokens: [Int]
+    ) -> Int {
+        guard offeredDepth > 0, !remainingTokens.isEmpty else { return 0 }
+        return remainingTokens.reduce(offeredDepth) { depth, remaining in
+            min(depth, remaining > 1 ? remaining - 1 : 0)
+        }
+    }
+
     /// Select one controller depth for all decode rows in the scheduler plan.
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
         guard let mtp else { return }
-        // Target-only policy: `planDepth` can only be 0, so everything below
-        // is per-step host bookkeeping for speculation that cannot be planned
-        // — two `scheduler.running` filter allocations, the eligibility
-        // sweeps, the no-op carry invalidation loop, and a locked rebuild of
-        // the controller metric snapshot. Skipping it leaves `planDecision` at
-        // its inactive default (depth 0, bucket 0) and both mark sets empty,
-        // which is exactly the state the full path would have produced: no
-        // carry is ever stored without a round, so the invalidation loop has
-        // nothing to drop.
-        if mtp.isTargetOnlyPolicy { return }
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }
         let withinBatchGate = rows.count <= mtp.config.maxSpeculativeBatch
         let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(rows)
-        mtp.beginPlan(plannedDecodeRows: rows.count, canSpeculate: canSpeculate)
+        mtp.beginPlan(
+            plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
+            rowIDs: rows.map(\.id))
         let eligibleRows = rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)
@@ -204,12 +207,12 @@ extension EngineLoopV2 {
             }
         }
         if mtp.planDepth > 0 {
-            let depth = mtp.planDepth
-            let tailDepth = eligibleRows.map { rec in
-                let remaining = rec.request.maxTokens - rec.generatedTokenCount
-                return mtp.hasValidCarry(for: rec) ? remaining : max(0, remaining - 1)
-            }.min() ?? 0
-            if tailDepth < depth {
+            let tailDepth = Self.mtpDepthWithinOutputBudget(
+                offeredDepth: mtp.planDepth,
+                remainingTokens: eligibleRows.map {
+                    $0.request.maxTokens - $0.generatedTokenCount
+                })
+            if tailDepth < mtp.planDepth {
                 mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
             }
         }
@@ -219,9 +222,7 @@ extension EngineLoopV2 {
             let capacityTokens = rows.reduce(0) { total, rec in
                 let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
                 return total
-                    + (rec.prefixReusePlan?.capacityTokensForChunk(
-                        start: rec.numComputedTokens,
-                        count: count) ?? count)
+                    + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: count)
             }
             if stepTokens > scheduler.config.maxBatchedTokensPerStep {
                 mtp.clampPlanDepth(to: 0, reason: "step_token_budget")

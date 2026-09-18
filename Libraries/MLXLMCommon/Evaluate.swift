@@ -649,6 +649,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        try (model as? any GenericGenerationValidating)?.validateGenericGeneration()
         processor?.prompt(input.text.tokens)
 
         switch try model.prepare(input, cache: cache, windowSize: windowSize) {
@@ -821,6 +822,8 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
     /// Prefill both main and draft models with the prompt, priming caches for generation
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        try (mainModel as? any GenericGenerationValidating)?.validateGenericGeneration()
+        try (draftModel as? any GenericGenerationValidating)?.validateGenericGeneration()
         processor?.prompt(input.text.tokens)
 
         // Prefill main model

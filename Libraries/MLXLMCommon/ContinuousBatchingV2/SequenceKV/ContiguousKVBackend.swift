@@ -237,6 +237,15 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         }
     }
 
+    /// Prepared rows were filled under an external stage reservation. Register
+    /// their exact final allocation atomically before that reservation ends.
+    func adoptPreparedCheckpoint(_ state: [CBv2SequenceKV?]) throws {
+        guard !state.isEmpty, state.allSatisfy({ $0 is CBv2FullSequenceKV }) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        try registerReserving(state, estimates: state.map { $0?.byteCount })
+    }
+
     // MARK: - Private
 
     /// Bytes currently charged against capacity: each live row counts for

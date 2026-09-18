@@ -42,7 +42,8 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Layr-Labs/mlx-swift.git", branch: "main"),
+        .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
+                 revision: "3063bfbfc1ad3011a8a7a971a502b5e348e192c1"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -53,6 +54,8 @@ let package = Package(
             name: "MLXLLM",
             dependencies: [
                 "MLXLMCommon",
+                // Descriptor snapshots for the opt-in model-owned Gemma pair.
+                .product(name: "Cmlx", package: "mlx-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
@@ -95,7 +98,10 @@ let package = Package(
             resources: [
                 // CBv2 paged-attention MSL source, JIT-compiled at runtime
                 // via MLXFast.metalKernel (NOT compiled by SwiftPM).
-                .copy("ContinuousBatchingV2/Paged/pagedattention.metal")
+                .copy("ContinuousBatchingV2/Paged/pagedattention.metal"),
+                // Exact MLX preambles used by native Qwen4 JIT kernels.
+                // Copy as text; SwiftPM must not compile these header fragments.
+                .copy("Resources/Qwen4Metal")
             ]
         ),
         .target(
@@ -184,6 +190,16 @@ let package = Package(
             ]
         ),
         .testTarget(
+            name: "OnboardingQualificationTests",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                "MLXLMCommon",
+                "MLXLLM",
+            ],
+            path: "Tests/OnboardingQualificationTests"
+        ),
+        .testTarget(
             name: "MLXLMServerTests",
             dependencies: [
                 "MLXLMServer",
@@ -191,16 +207,6 @@ let package = Package(
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
             ],
             path: "Tests/MLXLMServerTests"
-        ),
-        // Pure-CPU unit tests for CBv2StepProfiler's aggregation math
-        // (mean/p50/p95/dropFirst). Depends only on MLXLMCommon; loads no
-        // model weights and touches no Metal, so it runs on any host.
-        .testTarget(
-            name: "CBv2StepProfilerTests",
-            dependencies: [
-                "MLXLMCommon",
-            ],
-            path: "Tests/CBv2StepProfilerTests"
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
@@ -217,6 +223,11 @@ let package = Package(
                 "MLXLMCommon",
             ],
             path: "Libraries/MLXHuggingFace"
+        ),
+        .executableTarget(
+            name: "BenchSegmentedDecode",
+            dependencies: ["MLXLMCommon"],
+            path: "Sources/BenchSegmentedDecode"
         ),
         .executableTarget(
             name: "BenchLoad",

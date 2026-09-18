@@ -886,9 +886,12 @@ struct CBv2CoreLayerCacheTests {
         #expect(cache.offset == 10)
     }
 
-    /// A 10-step decode performs ZERO host syncs and ZERO host rebuilds of
-    /// positionOffsets from CBv2 core code (report 10 §4 invariant 7 + the
-    /// engine-thread discipline: graph-build only in the step loop).
+    /// A 10-step decode performs ZERO host rebuilds of positionOffsets from
+    /// CBv2 core code (report 10 §4 invariant 7 + the engine-thread
+    /// discipline: graph-build only in the step loop). The process-global
+    /// host-sync counter is NOT asserted here — concurrent swift-testing
+    /// engine suites make it racy; the serial XCTest timing suite asserts
+    /// it exactly, one sync per executed engine step.
     @Test func decodeLoopPerformsNoHostSyncsOrRebuilds() {
         MLXRandom.seed(5)
         let cache = CBv2LayerCache(layerIndex: 0, kind: kind)
@@ -905,7 +908,6 @@ struct CBv2CoreLayerCacheTests {
             )
         }
 
-        let syncsBefore = CBv2CoreInstrumentation.hostSyncs
         let rebuildsBefore = cache.positionOffsetsHostRebuilds
 
         var outputs: [MLXArray] = []
@@ -918,7 +920,6 @@ struct CBv2CoreLayerCacheTests {
             asyncEval(outputs.last!, cache.innerState())
         }
 
-        #expect(CBv2CoreInstrumentation.hostSyncs - syncsBefore == 0)
         #expect(cache.positionOffsetsHostRebuilds - rebuildsBefore == 0)
 
         // Materialize at the end (outside the step loop) and sanity-check.
@@ -930,11 +931,8 @@ struct CBv2CoreLayerCacheTests {
         let cache = CBv2LayerCache(layerIndex: 0, kind: kind)
         cache.appendRow(prefilledRow(3))
         cache.appendRow(prefilledRow(4))
-        // 2 fixed lazy chains the engine evals each step (positionOffsets +
-        // decodeRingWriteFence) + 2 arrays (K, V) per row. The decodeRingWriteFence
-        // chain was added to innerState() with the decode-ring write path; the old
-        // expectation (5) predates it.
-        #expect(cache.innerState().count == 2 + 2 * 2)
+        // 1 positionOffsets array + 2 arrays (K, V) per row.
+        #expect(cache.innerState().count == 1 + 2 * 2)
         #expect(cache.maxSize == nil)
         #expect(cache.isTrimmable == false)
         #expect(cache.trim(5) == 0)

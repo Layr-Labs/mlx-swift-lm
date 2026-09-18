@@ -35,6 +35,29 @@ struct DecodeToolCallArgumentsTests {
         #expect((flags.first as? NSNumber)?.boolValue == true)
     }
 
+    @Test("Boolean leaves keep their native type while numeric zero and one remain numbers")
+    func booleanTypesSurviveTemplateBridge() throws {
+        let raw = #"{"enabled":true,"disabled":false,"zero":0,"one":1,"nested":{"flags":[true,false,0,1],"value":1.25}}"#
+        let mapping = try #require(decodeToolCallArguments(raw) as? [String: any Sendable])
+        let enabled = try #require(mapping["enabled"])
+        let disabled = try #require(mapping["disabled"])
+        #expect(type(of: enabled) == Bool.self && enabled as? Bool == true)
+        #expect(type(of: disabled) == Bool.self && disabled as? Bool == false)
+        for (key, expected) in [("zero", 0), ("one", 1)] {
+            let value = try #require(mapping[key])
+            #expect(type(of: value) != Bool.self)
+            #expect(value as? Int == expected)
+        }
+        let nested = try #require(mapping["nested"] as? [String: any Sendable])
+        let flags = try #require(nested["flags"] as? [any Sendable])
+        #expect(flags.count == 4)
+        #expect(type(of: flags[0]) == Bool.self && flags[0] as? Bool == true)
+        #expect(type(of: flags[1]) == Bool.self && flags[1] as? Bool == false)
+        #expect(type(of: flags[2]) != Bool.self && flags[2] as? Int == 0)
+        #expect(type(of: flags[3]) != Bool.self && flags[3] as? Int == 1)
+        #expect(nested["value"] as? Double == 1.25)
+    }
+
     @Test("Empty object decodes to an empty mapping")
     func decodesEmptyObject() throws {
         let mapping = try #require(decodeToolCallArguments("{}") as? [String: any Sendable])

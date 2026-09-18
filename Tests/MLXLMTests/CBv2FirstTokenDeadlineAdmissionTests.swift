@@ -1051,6 +1051,60 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
         await engine.shutdown()
     }
 
+    func testRejectedResidentPrefixPricesReplayWithoutRetainingOrWiringPages() async throws {
+        let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)
+        let backend = try PagedKVBackend(
+            layerKinds: [kind],
+            config: PagedKVPoolConfig(
+                pageSize: 16, capacityBytes: 4 << 20,
+                maxPrefillChunk: 32, nominalMaxSequenceLength: 128,
+                maxBufferLength: Int.max),
+            residentPrefixCache: .init(
+                blockSize: 32, promptContractID: "deadline-test", scopeID: "model-test"))
+        let tokens = Array(0 ..< 36)
+        let probe = try XCTUnwrap(backend.preparePrefixProbe(tokens: tokens, cacheSalt: "tenant"))
+        let needs = backend.pageNeeds(layerKinds: [kind], maxLength: 32)
+        try backend.pool.reserve(needs)
+        let donor = PagedSequenceKV(
+            pool: backend.pool, kind: kind, groupKey: backend.pool.groupKey(forLayer: 0), maxLength: 32,
+            reservedPages: PagedKVPool.pageDemand(
+                kind: kind, maxLength: 32, config: backend.pool.config))
+        for _ in 0 ..< 32 { _ = donor.prepareDecodeWrite() }
+        XCTAssertEqual(
+            backend.publishResidentPrefixBlocks(
+                state: [donor], chainHashes: probe.chainHashes, blockIndices: 0 ..< 1), 1)
+        backend.release([donor])
+
+        let engine = EngineV2(
+            model: CBv2SchedScriptedModel(), layerKinds: [kind], backend: backend,
+            cacheProvider: CBv2SchedMockCacheProvider(layerKinds: [kind]),
+            sampler: CBv2GreedySampler(), detokenizerFactory: CBv2SchedScriptedDetokFactory(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
+                prefillChunkSize: 32, maxConcurrentPartialPrefills: 1,
+                maxWaiting: 1, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0))
+        let request = CBv2Request(
+            id: CBv2RequestID(11_014), promptTokens: tokens, maxTokens: 1,
+            cacheSalt: "tenant")
+        let result = try await engine.submit(
+            request, firstTokenDeadline: Self.deadlineAdmission(after: .seconds(3)))
+        guard case .deadlineUnreachable(let work) = result else {
+            await engine.shutdown()
+            return XCTFail("four-token resident tail must miss a three-second budget")
+        }
+        assertBounded(work, tokens: 4, steps: 1, duration: .seconds(4))
+        XCTAssertFalse(backend.slabsAreWired)
+        XCTAssertEqual(backend.bytesReserved, 0)
+        XCTAssertEqual(backend.bytesInUse, 0)
+        XCTAssertEqual(backend.residentPrefixCacheStats?.blockCount, 1)
+        engine.loopForTesting.onEngineQueueSync {
+            XCTAssertNil(engine.loopForTesting.scheduler.record(for: request.id))
+            XCTAssertNil(engine.loopForTesting.residentPrefixCursorByID[request.id])
+        }
+        await engine.shutdown()
+    }
+
     func testPausedLedgerOwnerMakesOtherwiseOpenSlotFailClosed() async throws {
         let harness = CBv2SchedHarness(
             backendCapacity: 32,

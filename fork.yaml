@@ -1,116 +1,367 @@
-title: "Layr-Labs/mlx-swift-lm"
+title: "Layr-Labs/mlx-swift-lm - mlx-swift-lm fork diff overview"
 footer: |
-  [Layr-Labs/mlx-swift-lm](https://github.com/Layr-Labs/mlx-swift-lm) fork overview &middot; created with [Forkdiff](https://github.com/protolambda/forkdiff)
+  Fork-diff overview of [`Layr-Labs/mlx-swift-lm`](https://github.com/Layr-Labs/mlx-swift-lm), a fork of
+  [`ml-explore/mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm) &middot; created with
+  [Forkdiff](https://github.com/protolambda/forkdiff)
 base:
   name: ml-explore/mlx-swift-lm
   url: https://github.com/ml-explore/mlx-swift-lm
-  ## upstream pin (merge-base with fork)
+  # The upstream commit this fork branched from. CI (`scripts/check_forkdiff.py`)
+  # requires this to equal `git merge-base HEAD upstream/main`, so a rebase onto
+  # newer upstream fails the gate until the hash — and the sections below — are
+  # brought up to date. Upstream main as of 2026-04-17; the fork has not rebased
+  # since (upstream fixes were selectively ported instead, see "Selective upstream
+  # port" below).
   hash: 7e2b7107be52ffbfe488f3c7987d3f52c1858b4b
 fork:
   name: Layr-Labs/mlx-swift-lm
   url: https://github.com/Layr-Labs/mlx-swift-lm
-  ## latest fork commit pin
-  hash: 8d1cbcd803aaf056a893a69ac4162b059eab464e
+  ref: refs/heads/main
 def:
-  title: "Layr-Labs mlx-swift-lm Fork Diff Overview"
+  title: "Layr-Labs/mlx-swift-lm"
   description: |
-    The original mlx-swift-lm codebase can be found at [`github.com/ml-explore/mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm).
-    The Layr-Labs fork at [`github.com/Layr-Labs/mlx-swift-lm`](https://github.com/Layr-Labs/mlx-swift-lm) adds continuous batching and Mixture-of-Experts support.
+    This is an overview of the changes in [`Layr-Labs/mlx-swift-lm`](https://github.com/Layr-Labs/mlx-swift-lm),
+    a fork of [`ml-explore/mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm).
 
+    Upstream `mlx-swift-lm` is a single-stream library: one prompt, one generation, one KV cache. The fork
+    turns it into Layr-Labs' production inference serving stack on Apple silicon:
+
+    - **ContinuousBatchingV2** — a ground-up continuous-batching engine with per-request KV state, a
+      unified prefill/decode token budget, a paged KV backend (16-token pages, prefix-block sharing),
+      complete prefix checkpoints, and deadline-based admission.
+    - **MTP speculative decoding** — multi-token-prediction drafters for Gemma 4, Qwen 3.5/3.6,
+      Nemotron-H 3.5 and DeepSeek V4, with exact target verification and transactional KV rollback.
+    - **Production model work** — Gemma 4 (dense + MoE), GPT-OSS 20B (MXFP4 experts), Qwen 3.5/3.6
+      hybrid DeltaNet MoE, Qwen3-VL, Nemotron-H, kernel-level fusions and quantized-constant reuse.
+    - **An OpenAI-compatible server** (`mlx-server`) with chat/completions/responses/embeddings routes,
+      reasoning parsers and streamed tool calls.
+    - **Measurement** — benchmark executables, receipts and reports that back every performance claim.
+
+    The fork tracks the MLX core through [`Layr-Labs/mlx-swift`](https://github.com/Layr-Labs/mlx-swift)
+    rather than upstream `mlx-swift`. Upstream `mlx-swift-lm` has since re-implemented several of these
+    ideas (MTP, batched KV) under a different single-stream architecture, so a full merge is not
+    feasible; high-value upstream fixes are hand-ported instead.
   sub:
-    - title: "Continuous Batching Engine"
+    - title: "ContinuousBatchingV2 engine"
       description: |
-        Adds a full continuous batching inference engine that supports concurrent generation of multiple sequences
-        with iterative prefill/decode scheduling, per-row sampling, and sequence lifecycle management via a state machine.
-        This enables high-throughput serving of LLMs on Apple Silicon.
-
+        The heart of the fork (`Libraries/MLXLMCommon/ContinuousBatchingV2/`). Every production-visible
+        batching bug in the earlier padded-batch design traced back to shared mutable batch state, so v2
+        gives each request its own KV storage and absolute position counter: join = add an object, leave
+        = drop one. Decode is rectangular `[B,1]`; prefill is per-request `[1,chunk]` under a vLLM-style
+        unified token budget. Attention is owned by the layer cache, so backends (per-request SDPA, paged)
+        swap without touching models or the scheduler. The v1 engine was deleted once v2 shipped
+        (Darkbloom v0.7.5 "one engine").
       sub:
-        - title: "Batch Generation & Scheduling"
+        - title: "Core runtime, scheduler, sampling, output"
           description: |
-            The `BatchGenerator` orchestrates the continuous batching loop: it manages a pool of sequences,
-            schedules prefills and decodes, and yields generation results as they complete. It handles
-            adding new sequences, cancelling sequences, and recycling KV cache slots.
+            `EngineV2` / `EngineLoopV2` (the step loop and its forward-shape dispatch), `SchedulerV2`
+            (admission, capacity shrink-retry, solo-prefill stripe, packed prefill, partial-prefill cap),
+            `AdmissionV2` + first-token deadline admission with monotonic phase leases, per-row samplers
+            with tool-constraint enforcement (`TokenConstraintSamplerV2`, `ToolConstraintV2`), the
+            streaming detokenizer (`DetokenizerV2`, character-exact on non-append-only decodes),
+            attention metadata/packet capture-and-replay for parity testing, logit diagnostics, request
+            timing stamps, process-memory ownership and allocation projection. Stable cache-bank
+            membership avoids temporary identity arrays while retaining canonical rebind/release rules.
+            Default-off Gemma scheduled-prefill glue carries explicit BF16/geometry gates,
+            immutable Metal source definitions and a one-forward normalization handoff.
+            Optional vector reads require nonblocking backing-alignment evidence.
+            One-element layer scalars are reshaped to explicit buffers at the custom
+            kernel boundary, preserving rank-zero values and the retained s[0] ABI.
+            Separately gated attention/router prefix and expert pre-norm scatter use an
+            owned sort/inverse pair; the ordinary sort, projections and weighted reduction
+            remain the fallback and shared implementation.
+            A separately gated expert-reduction tail owns one-shot deferred projection
+            results, descriptor snapshots and the construction stream. Rejected fusion
+            resolves through the same canonical weighted reducer.
+            Direct pre-norm and separately gated prompt GeGLU retain final-challenge
+            arithmetic, explicit split/packed producer layouts and the incumbent
+            compiled-activation opt-out; unaligned accesses use scalar twins.
+            Default-off prefill counting sort is reachable only through a 128-column
+            score-derived routing producer. Histogram, serial/eight-range scan and
+            local-rank/bitset scatter preserve a single owned inverse permutation;
+            raw-index and non-Gemma APIs retain their original sorting paths.
+            Default-off decode glue adapts per-row B1-safe normalization/tails with
+            descriptor-validated forward-local chaining, a separately gated assistant
+            norm, and no fixed-B8 sum-table or MTP-controller replacement.
+            Separately gated router finalists retain stable expert-index ties, explicit
+            decode/prefill admission and optional final weight kernels. Score-derived
+            routing keeps counting-sort bounds valid and the stock weight chain remains.
+            Separately default-off affine-Q4/g64 scaled embedding uses fresh parameter
+            inputs and the original dequantize/store/scale boundaries. Supplied multimodal
+            embeddings bypass it; no checkpoint data or quantization policy is changed.
+            QKV normalization/RoPE candidates retain existing position captures, current
+            proportional frequency tables and all cache/attention entry points. Masked
+            prefill tails keep inactive lanes at barriers; Q4-KV packing is excluded.
+            Fused RoPE alone selects an explicit per-kernel relaxed math mode to match
+            the current stock shader tape. Norm-only kernels and shared defaults remain
+            safe; unsupported OS versions retain the ordinary separate RoPE path.
           globs:
-            - "Libraries/MLXLMCommon/BatchGenerator.swift"
-
-        - title: "Generation Batch"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
+        - title: "Paged KV backend"
           description: |
-            `GenerationBatch` holds the model, KV cache, and active sequences for a single batch step.
-            It performs the forward pass over the batch, applies logits processing, and samples tokens
-            per-row using the configured sampler.
+            PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,
+            residency, segments, slab commitment with recoverable commit), a Metal paged-attention kernel
+            plus a reference implementation for parity, query-block attention over prompt chunks,
+            segment dispatch plans/caches, native KV dtype probing, a decode profiler, and prefix-block
+            sharing (`PrefixBlocks/`: block index, free queue, page handles, resident-prefix plan
+            validation). Landed as the v0.8.0 migration, then hardened for 0.9.0 with native paged
+            checkpoint storage.
           globs:
-            - "Libraries/MLXLMCommon/GenerationBatch.swift"
-
-        - title: "Batch KV Cache"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
+        - title: "Prefix checkpoints"
           description: |
-            `BatchKVCache` extends the standard KV cache with paged/batched allocation to support
-            multiple concurrent sequences. It manages slot assignment, cache growth, and efficient
-            batched attention across heterogeneous sequence lengths.
+            Complete and historical prefix checkpoints: capture, codec, manifest coding/memory, tensor
+            sources, import plans and transfers, allocation footprint accounting, and the hybrid-prefix
+            replay that makes reuse exact for recurrent (DeltaNet) targets.
           globs:
-            - "Libraries/MLXLMCommon/BatchKVCache.swift"
-
-        - title: "Prompt Processing (Batched Prefill)"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
+        - title: "MTP speculative decoding (engine side)"
           description: |
-            `PromptProcessingBatch` handles the prefill phase: tokenizing prompts, setting up
-            initial KV cache entries, and processing multiple prompt tokens in a single batched
-            forward pass for throughput.
+            Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
+            committed-decode and goodput clocks, capture fence, target verification with exact
+            speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
+            target-authoritative. Homogeneous ordinary decode reuses its ordered sampled tensor;
+            mixed rows retain scheduler-order assembly. Model-specific drafters live under "Models".
           globs:
-            - "Libraries/MLXLMCommon/PromptProcessingBatch.swift"
-
-        - title: "Per-Row Samplers"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
+        - title: "Engine v2 contract docs"
           description: |
-            `RowSamplers` provides per-sequence sampling strategies within a batch. Each row in
-            the batch can use a different sampling configuration (temperature, top-p, top-k, etc.),
-            enabling heterogeneous generation parameters across concurrent requests.
+            The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix
+            cache, sampling, models, harness, provider), contract-issue logs, kernel research and test
+            plan the engine was built against.
           globs:
-            - "Libraries/MLXLMCommon/RowSamplers.swift"
-
-        - title: "Sequence State Machine"
+            - "docs/engine-v2/**"
+        - title: "Engine tests"
           description: |
-            `SequenceStateMachine` models the lifecycle of each generation sequence through states
-            (waiting, prefilling, decoding, completed, cancelled) and transitions between them,
-            ensuring correct scheduling and resource cleanup.
+            Unit, parity, invariant and end-to-end suites for the engine: `CBv2*` (scheduler, admission,
+            attention packets, paged backend, prefix reuse, MTP, sampling, detokenizer, multimodal seams),
+            paged/complete/historical checkpoint tests, compilable KV cache, speculative walk and drafter
+            masks, penalty over long prompts, plus the frozen fixtures they replay (block-hash vectors,
+            assistant configs, MTP prompts). Separate host-only Gemma catch-up checks compile real
+            binding/assembly helpers with CPU interface doubles; they do not qualify native execution.
           globs:
-            - "Libraries/MLXLMCommon/SequenceStateMachine.swift"
-
-        - title: "KV Cache Extensions"
-          description: |
-            Modifications to the existing `KVCache` to support batched access patterns required
-            by the continuous batching engine, including batched updates and cache state queries.
-          globs:
-            - "Libraries/MLXLMCommon/KVCache.swift"
-
-        - title: "Continuous Batching Tests"
-          description: |
-            Tests validating the continuous batching engine: sequence lifecycle, batch scheduling,
-            cancellation, concurrent generation correctness, and KV cache management.
-          globs:
-            - "Tests/MLXLMTests/ContinuousBatchingTests.swift"
-
-    - title: "Gemma 4 MoE Support"
+            - "Tests/MLXLMTests/CBv2*"
+            - "Tests/MLXLMTests/Paged*"
+            - "Tests/MLXLMTests/HistoricalWindow*"
+            - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
+            - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
+            - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
+            - "Tests/MLXLMTests/SpeculativeWalkTests.swift"
+            - "Tests/MLXLMTests/DrafterMasksTests.swift"
+            - "Tests/MLXLMTests/StreamingDetokenizerTests.swift"
+            - "Tests/MLXLMTests/PenaltyLongPromptTests.swift"
+            - "Tests/MLXLMTests/ContinuousBatchingTestPlan.md"
+            - "Tests/HostOnly/GemmaCatchup/**"
+            - "scripts/test_gemma_host_contracts.py"
+            - "Tests/MLXLMTests/Resources/**"
+    - title: "Core library changes (MLXLMCommon)"
       description: |
-        Extends the Gemma 4 text model to support Mixture-of-Experts variants (specifically the 26B-A4B model).
-        Adds MoE configuration fields (num_experts, top_k_experts, moe_intermediate_size), a MixtureOfExperts
-        module, and shared KV attention layers used in the later transformer blocks of the MoE variant.
+        Changes to upstream's shared library that the engine and models need: compilable KV caches
+        (`CompilableKVCache`, `CompilableRotatingKVCache`) and KV-cache batched access, dynamic slicing,
+        a sequence state machine, RoPE utilities generalized for per-row positions and M-RoPE,
+        `SwitchLayers` fused gate+up and sorted-gather hints for MoE, hardware info, in-memory video
+        assets, load/evaluate/model-container hooks, and the docc pages describing continuous batching.
       globs:
-        - "Libraries/MLXLLM/Models/Gemma4Text.swift"
-
-    - title: "Documentation"
+        - "Libraries/MLXLMCommon/*.swift"
+        - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
+        - "Libraries/MLXLMCommon/Documentation.docc/*"
+    - title: "Tool calling and parsers"
       description: |
-        Adds documentation for the continuous batching feature, including architecture overview
-        and usage guide.
+        Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
+        channel), Qwen 3.5 XML-priority with Hermes-JSON fallback, current Gemma 4 tags, JSON/XML parser
+        hardening, NSNumber 0/1 argument typing, and decoding of OpenAI tool-call arguments before
+        chat-template rendering.
       globs:
-        - "Libraries/MLXLMCommon/Documentation.docc/continuous-batching.md"
-        - "Libraries/MLXLMCommon/Documentation.docc/Documentation.md"
-
-    - title: "Build & Dependencies"
+        - "Libraries/MLXLMCommon/Tool/**"
+        - "Tests/MLXLMTests/ToolTests.swift"
+        - "Tests/MLXLMTests/ChatSessionToolFilterTests.swift"
+        - "Tests/MLXLMTests/GenerateTaskToolFilterTests.swift"
+        - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
+        - "Tests/MLXLMTests/ChatTemplateFallbackTests.swift"
+        - "Tests/MLXLMTests/UserInputTests.swift"
+        - "Tests/MLXLMTests/BaseConfigurationTests.swift"
+    - title: "Models"
       description: |
-        Switches the mlx-swift dependency from the remote SPM package to a local path reference
-        (`../mlx-swift`) for development against a custom mlx-swift build. Also adds the `MLXRandom`
-        product dependency needed by the continuous batching samplers.
+        Production model work in `Libraries/MLXLLM`. Beyond new architectures, each production model
+        gained a CBv2 seam (request-owned state, `targetForward(requirement:)` prompt-output
+        narrowing) and, where the checkpoint ships `mtp.*` weights, an inline MTP drafter.
+      sub:
+        - title: "Gemma 4 (dense, MoE, MTP)"
+          description: |
+            Gemma 4 text and MoE (26B-A4B) with shared-KV attention layers, compiled decode, fused
+            gate+up experts, bf16 conversion, a frozen-KV MTP drafter for CBv2 (`Gemma4CBv2MTPDrafter`,
+            `Gemma4MTP*`), configuration validation, and layer-0 projection diagnostics.
+            The local MLXFast catch-up adds a default-off, B1-only Q8 dense gate/up
+            pair with model-owned descriptor snapshots and fail-closed admission;
+            native equality, lifetime, serving and performance gates remain required.
+            A separately default-off prefill candidate fuses norm/residual and dense/expert
+            branch tails with forward-local next-layer normalization, retaining modern MTP,
+            weighted expert reduction, paged attention and all ordinary fallback paths.
+            The prefill prefix consumes the router's original effective norm weight, while
+            the optional expert normalization/scatter retains the existing reduction gate.
+            A default-off B8 single-token expert candidate uses score-bounded routes, paired-16
+            affine storage, fused GU/GeGLU and tight down grids, with a separate compiled opt-in.
+            Affine bias-sum load helpers use the current core's FP32 input widening.
+            It preserves original parameters and rejects stale descriptors; extra memory,
+            native exactness and end-to-end performance remain unqualified.
+            Separate B8 rank/prefix/direct/fold switches bind tagged route metadata to its
+            producer and preserve raw IDs for generic fallbacks. The folded producer retains
+            the current softmax tape and BF16 close instead of the historical monolithic tail.
+            A separate default-off contiguous-position coordinator shares an integer increment
+            across ordered Gemma owners while retaining independent cache wrappers and all
+            K/V evaluation roots. Paged/shared banks and incompatible cycles retain fallback.
+            Scoped default-off decode/MTP root collection now requires an affirming standard
+            Gemma output path and exact completed-cycle epochs; uncovered sliding-ring and
+            degenerate-context storage roots remain explicit. Native validation is pending.
+          globs:
+            - "Libraries/MLXLLM/Models/Gemma4*.swift"
+            - "Tests/MLXLMTests/Gemma4*.swift"
+        - title: "GPT-OSS 20B"
+          description: |
+            MXFP4 expert path split into focused extensions: checkpoint layout, weight materialization,
+            compiled experts, gate+up fusion, last-query prefill and pruned prefill output.
+          globs:
+            - "Libraries/MLXLLM/Models/GPTOSS*.swift"
+            - "Tests/MLXLMTests/GPTOSS*.swift"
+        - title: "Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet MoE, MTP)"
+          description: |
+            Request-owned recurrent state for the hybrid DeltaNet targets, three-axis M-RoPE seams,
+            A3B decode/prefill optimizations (fused routed-expert gate_up, direct expert reduction,
+            E=256 tile route), complete-checkpoint export, inline MTP loading with top-two drafting, and
+            the dense Qwen 3.8 MTP artifacts.
+          globs:
+            - "Libraries/MLXLLM/Models/Qwen35*.swift"
+            - "Libraries/MLXLLM/Models/Qwen3Next.swift"
+            - "Libraries/MLXLLM/Models/GatedDelta.swift"
+            - "Libraries/MLXLLM/Models/SSM.swift"
+            - "Tests/MLXLMTests/Qwen35*.swift"
+            - "Tests/MLXLMTests/Qwen3VL*.swift"
+            - "Tests/MLXLMTests/Qwen3*.swift"
+            - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
+            - "Tests/MLXLMTests/QwenImageBudgetTests.swift"
+            - "Tests/MLXLMTests/GatedDelta*.swift"
+            - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
+        - title: "Qwen 3.8 Next (native Qwen4 architecture)"
+          description: |
+            Native Qwen4-Exp text and multimodal support, distinct from Qwen3.5:
+            QSA/indexer attention, GDN, hyper-connections, MoE routing, SSD-backed
+            learned PLE/ngram tables, embedded trained MTP, complete prefix
+            checkpoints and media identity/lifecycle validation. The native vision
+            wrapper and processor live under the VLM section. Runtime exactness
+            gates are distinct from model answer-quality and deployment approval.
+            Mixed text/media batches retain per-request implicit versus explicit
+            position provenance through a scoped Qwen4-only forward binding;
+            synthesized rectangle rows do not change the text rotary path.
+            Full-weight tests bind explicit original/selected artifact profiles
+            without replacing numerical oracles or changing production defaults.
+          globs:
+            - "Libraries/MLXLLM/Models/Qwen4Exp*.swift"
+            - "Libraries/MLXLMCommon/Resources/Qwen4Metal/**"
+            - "Tests/MLXLMTests/Qwen4*.swift"
+            - "Tests/MLXLMTests/HybridMedia*.swift"
+            - "docs/qwen4/**"
+        - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
+          description: |
+            Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
+            capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+          globs:
+            - "Libraries/MLXLLM/Models/NemotronH*.swift"
+            - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
+            - "Libraries/MLXLLM/Models/Laguna.swift"
+            - "Libraries/MLXLLM/Models/LFM2MoE.swift"
+            - "Libraries/MLXLLM/LLMModelFactory.swift"
+            - "Tests/MLXLMTests/NemotronH*.swift"
+            - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
+        - title: "Quantized MoE kernels and SwitchGLU"
+          description: |
+            Quantized SDPA, sorted-hint and constant-cast paths for `QuantizedSwitchLinear`, and the
+            shared fused gate+up cache across weight-sharing module trees.
+          globs:
+            - "Tests/MLXLMTests/Quantized*.swift"
+            - "Tests/MLXLMTests/SwitchGLUTests.swift"
+    - title: "Vision-language models"
+      description: |
+        Batched VLM serving: per-image fused SDPA, an image token budget, `takeAlong` M-RoPE, Qwen3-VL
+        30B-A3B and CBv2 DeepStack support, Gemma 4 vision tower with video and multi-image input,
+        bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
+        curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
+        (see "Selective upstream port").
+      globs:
+        - "Libraries/MLXVLM/**"
+        - "Tests/MLXLMTests/MediaProcessing*.swift"
+        - "Tests/MLXLMTests/SmolVLM2TilingTests.swift"
+    - title: "Selective upstream port (embedders, macros, helpers)"
+      description: |
+        A full `git merge upstream/main` is infeasible — both trees rewrote `Gemma4.swift` and the KV
+        cache in opposite directions — so high-value upstream fixes are cherry-picked or hand-ported
+        (PR #50: SSM dtype fixes, VLM crash fixes, embedder load fixes, KV-quant hardening). The files
+        here are the ones touched *only* by that port; other ported fixes sit inside the sections above.
+      globs:
+        - "Libraries/MLXEmbedders/**"
+        - "Libraries/MLXHuggingFaceMacros/**"
+        - "Libraries/IntegrationTestHelpers/**"
+        - "Tests/MLXLMTests/NomicBertTests.swift"
+        - "Tests/MLXLMTests/MaskedEmbedderTests.swift"
+    - title: "OpenAI-compatible server"
+      description: |
+        `mlx-server` and the `MLXLMServer` library: health, models, metrics, chat completions,
+        completions, Responses, embeddings, tokenize/detokenize and chat-template routes; SSE framing;
+        `response_format` (`json_object` / `json_schema`); streaming reasoning parsers (think tags,
+        Gemma 4, Harmony); streamed tool-call handling; a batched engine adapter over CBv2 and a
+        runtime `setMaxNumSeqs` for adaptive concurrency.
+        Responses input replay retains reasoning and adjacent function calls in one assistant turn,
+        preserving tool arguments and explicit message/result boundaries.
+      globs:
+        - "Libraries/MLXLMServer/**"
+        - "Executables/mlx-server/**"
+        - "Tests/MLXLMServerTests/**"
+    - title: "Benchmarks and measurement"
+      description: |
+        Nothing here ships to users; it is how the fork proves its numbers. `BenchCBv2` (real-weights
+        validation of EngineV2 against the legacy engine, with a build-revision stamp plugin so every
+        report names the commit it was built from), `BenchLoad` (cold-cache model load), and
+        `BenchSegmentedDecode`; the Qwen 3.6 A3B campaign (immutable measured prompts, a context
+        matrix, prefill/decode receipts), Qwen3-VL 30B-A3B and Gemma 4 / GPT-OSS composed reports,
+        MTP throughput scripts, and the onboarding qualification tests for mutable Metal inputs.
+      globs:
+        - "Sources/**"
+        - "Plugins/**"
+        - "Tests/BenchCBv2Tests/**"
+        - "Tests/OnboardingQualificationTests/**"
+        - "benchmarks/**"
+        - "script/**"
+        - "scripts/*.sh"
+        - "scripts/build-qwen36-python-contexts.py"
+        - "scripts/patch-qwen36-mtp.py"
+        - "Makefile"
+    - title: "Design plans and specs"
+      description: Dated plans and design specs for the Qwen 3.6 A3B and Qwen3-VL ports and output parity.
+      globs:
+        - "docs/plans/**"
+        - "docs/specs/**"
+    - title: "Build and dependencies"
+      description: |
+        `Package.swift` points MLX at the Layr-Labs `mlx-swift` fork and adds the server, bench and
+        test targets; `patches/` carries the loader patches applied to that dependency; `.gitignore`
+        keeps reference implementations out of the tree and `.gitattributes` protects the immutable
+        benchmark prompt whose byte content is committed alongside its token IDs and receipts.
       globs:
         - "Package.swift"
+        - "patches/**"
+        - ".gitignore"
+        - ".gitattributes"
+    - title: "Fork tooling"
+      description: |
+        This page and the gate that keeps it honest: `check_forkdiff.py` fails CI when `base.hash` is
+        not the merge-base with upstream, or when a file the fork changes is not described by a section
+        above.
+      globs:
+        - "scripts/check_forkdiff.py"
+        - "FORKDIFF.md"
+        - "README.md"
 
+# ignored globally, does not count towards line count
 ignore:
-  - ".git"
-  - "*.sum"
+  - "fork.yaml"
+  - ".github/**"

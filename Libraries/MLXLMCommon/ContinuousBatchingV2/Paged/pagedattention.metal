@@ -193,15 +193,56 @@ inline void load_row(const device T* row, uint lane, thread float* dst) {
 // configs); Gemma-4 global layers (D=512, GQA=8) run HPT=2. The split is
 // per-HEAD, so no head's summation order changes — batch-composition
 // invariance and per-row determinism are untouched.
+// Both storage layouts feed exactly the same attention arithmetic.
+template <typename T> struct PagedKVPage {
+    const device T* key;
+    const device T* value;
+};
+
+template <typename T> struct PagedSlabAccessor {
+    const device T* keys;
+    const device T* values;
+    size_t page_elements;
+    PagedKVPage<T> write_page(int page) const {
+        return {keys + (size_t)page * page_elements, values + (size_t)page * page_elements};
+    }
+    PagedKVPage<T> read_page(const device int32_t* table, int logical, int length) const {
+        return write_page(table[logical % length]);
+    }
+};
+
+// records: row, partition, first logical page, page count, write binding,
+// write local page, max partitions, reserved; followed by (binding, local page).
+template <typename T, int N> struct PagedSegmentAccessor {
+    const device T* buffers[N];
+    const device int64_t* value_offsets;
+    const device int32_t* record;
+    size_t page_elements;
+
+    PagedKVPage<T> page(int binding, int local) const {
+        if (binding < 0 || binding >= N || local < 0
+            || (size_t)local >= (size_t)value_offsets[binding] / page_elements) {
+            binding = 0; local = 0;
+        }
+        const device T* base = buffers[binding] + (size_t)local * page_elements;
+        return {base, base + value_offsets[binding]};
+    }
+    PagedKVPage<T> write_page(int ignored) const { return page(record[4], record[5]); }
+    PagedKVPage<T> read_page(const device int32_t* ignored, int logical, int length) const {
+        const int index = logical - record[2];
+        if (index < 0 || index >= record[3]) return page(0, 0);
+        return page(record[8 + 2 * index], record[9 + 2 * index]);
+    }
+};
+
 template <
     typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, bool HAS_WRITE,
-    bool HAS_SOFTCAP>
-inline void paged_attention_part_impl(
+    bool HAS_SOFTCAP, typename Cache>
+inline void paged_attention_part_cached_impl(
     const device T* q,
     const device T* knew,
     const device T* vnew,
-    const device T* kcache,
-    const device T* vcache,
+    thread const Cache& cache,
     const device int32_t* tables,
     const device int32_t* seqinfo,
     const device float* params,
@@ -261,10 +302,10 @@ inline void paged_attention_part_impl(
     if (HAS_WRITE && hgroup == 0 && part == (attend_len - 1) / PTOK) {
         const int wpage = info[3];
         const int wslot = info[4];
-        const size_t dst =
-            (((size_t)wpage * (size_t)kvh + (size_t)kv_head) * S + (size_t)wslot) * D;
-        device T* kdst = const_cast<device T*>(kcache) + dst;
-        device T* vdst = const_cast<device T*>(vcache) + dst;
+        const auto page = cache.write_page(wpage);
+        const size_t dst = ((size_t)kv_head * S + (size_t)wslot) * D;
+        device T* kdst = const_cast<device T*>(page.key) + dst;
+        device T* vdst = const_cast<device T*>(page.value) + dst;
         for (int i = lin; i < D; i += TG) {
             kdst[i] = knew[tile_src + i];
             vdst[i] = vnew[tile_src + i];
@@ -307,11 +348,10 @@ inline void paged_attention_part_impl(
             const int pos = attend_start + i;
             const int lpage = pos / S;
             const int slot = pos % S;
-            const int phys = table[lpage % table_len];
-            const size_t base =
-                (((size_t)phys * (size_t)kvh + (size_t)kv_head) * S + (size_t)slot) * D;
-            load_row<T, EPT>(kcache + base, lane, kf);
-            load_row<T, EPT>(vcache + base, lane, vf);
+            const auto page = cache.read_page(table, lpage, table_len);
+            const size_t base = ((size_t)kv_head * S + (size_t)slot) * D;
+            load_row<T, EPT>(page.key + base, lane, kf);
+            load_row<T, EPT>(page.value + base, lane, vf);
         }
 
 #pragma unroll
@@ -386,6 +426,36 @@ inline void paged_attention_part_impl(
             meta[slot * 2 + 1] = pl;
         }
     }
+}
+
+template <
+    typename T, int D, int S, int GQA, int HPT, int NSG, int PTOK, bool HAS_WRITE,
+    bool HAS_SOFTCAP>
+inline void paged_attention_part_impl(
+    const device T* q,
+    const device T* knew,
+    const device T* vnew,
+    const device T* kcache,
+    const device T* vcache,
+    const device int32_t* tables,
+    const device int32_t* seqinfo,
+    const device float* params,
+    const int kvh,
+    const int maxp,
+    const int maxpart,
+    threadgroup float* q_smem,   // [HPT * D]
+    threadgroup float* red_smem, // [NSG * HPT * (D + 2)]
+    device float* partials,
+    device float* meta,
+    uint3 tgpig,
+    uint3 tpitg,
+    uint sgitg,
+    uint lane
+) {
+    const PagedSlabAccessor<T> cache{kcache, vcache, (size_t)kvh * S * D};
+    paged_attention_part_cached_impl<T, D, S, GQA, HPT, NSG, PTOK, HAS_WRITE, HAS_SOFTCAP>(
+        q, knew, vnew, cache, tables, seqinfo, params, kvh, maxp, maxpart,
+        q_smem, red_smem, partials, meta, tgpig, tpitg, sgitg, lane);
 }
 
 // Pass B: one threadgroup (a single simdgroup) merges one (sequence, query

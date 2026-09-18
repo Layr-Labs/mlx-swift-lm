@@ -25,6 +25,7 @@ struct CBv2MTPGraphBuild {
     /// Non-sampling prefill handles retained by the in-flight step.
     let prefillEvalTargets: [MLXArray]
     let asyncEvalTargets: [MLXArray]
+    let diagnostics: [CBv2LogitDiagnosticPacket]
     let logprobSegments: [CBv2StepLogprobs]
     let verify: CBv2MTPRoundInFlight.Verify?
     let seedRows: [(id: CBv2RequestID, decodeIndex: Int)]
@@ -60,13 +61,19 @@ extension EngineLoopV2 {
     func mtpPrepareRoundWork(
         _ plan: CBv2StepPlan,
         driver mtp: CBv2MTPRoundDriver,
-        demoteAllRounds: Bool
+        demoteAllRounds: Bool,
+        launchNanos: UInt64
     ) -> [CBv2MTPRowWork] {
         var work: [CBv2MTPRowWork] = []
         work.reserveCapacity(plan.assignments.count)
 
         for (id, assignedTokens) in plan.assignments {
             guard let rec = scheduler.record(for: id) else { continue }
+            // Admission stamp BEFORE `ensureKVState`, mirroring
+            // `executeMixed`: a capacity-requeued row is then already
+            // stamped, so its next waiting→running crossing counts as a
+            // re-admission on both launch paths (same `readmissions`).
+            rec.stampAdmission(launchNanos: launchNanos)
             guard ensureKVState(rec) != nil else { continue }
             var count = assignedTokens
             var preserveHistorySeed = false
@@ -117,11 +124,11 @@ extension EngineLoopV2 {
     }
 
     func mtpBuildRoundGraph(
-        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
-        timing: inout CBv2MTPRoundTiming
-    ) -> CBv2MTPGraphBuild {
+        _ work: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver, launchNanos: UInt64
+    ) throws -> CBv2MTPGraphBuild {
         var cacheInnerState: [MLXArray] = []
         var logprobSegments: [CBv2StepLogprobs] = []
+        var diagnostics: [CBv2LogitDiagnosticPacket] = []
 
         // Plain and seed rows share one eager [B, 1] target batch. Seed rows
         // retain the pre-norm hidden; logits remain identical to plain eager.
@@ -133,12 +140,25 @@ extension EngineLoopV2 {
         var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
         var committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow] = []
         var committedObservationEvalTargets: [MLXArray] = []
+        var observationsTransferred = false
+        defer {
+            if !observationsTransferred {
+                // Keep detached owners alive until the engine fences already
+                // submitted work, then retires the failed cohort explicitly.
+                for observation in committedObservationRows {
+                    mtp.restoreAssistantState(observation.assistantState, for: observation.id)
+                }
+            }
+        }
 
         func observeCommittedTarget(
             row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
-        ) {
+        ) throws {
             guard mtp.tracksPersistentHistory, mtpBasicEligible(row.rec),
-                let state = mtp.takeOrMakeAssistantState(for: row.rec.id)
+                let state = try mtp.takeOrMakeAssistantState(
+                    for: row.rec.id,
+                    maximumSequenceLength: row.rec.request.promptTokens.count
+                        + max(row.rec.request.maxTokens, 1))
             else { return }
             if let carry = row.historyCarry {
                 mtp.observeCommittedTarget(
@@ -162,6 +182,10 @@ extension EngineLoopV2 {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
+            let diagnosticOffsets = logitDiagnostic == nil ? nil : decodeRows.map {
+                Self.positionOffset(kvStates[$0.rec.id]!)
+            }
+            var diagnosticTopTwo: (ids: MLXArray, values: MLXArray)?
             let logits: MLXArray
             let hidden: MLXArray
             if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
@@ -178,9 +202,15 @@ extension EngineLoopV2 {
                 let positionIds = CBv2PositionState.decodePositionIds(
                     states: decodeRows.map(\.rec.request.positionState),
                     cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                let output = recurrentModel.forwardWithHidden(
-                    tokens: inputs, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds)
+                let output = try withQwen4PositionScope(
+                    ids: decodeRows.map(\.rec.id), positionIds: positionIds
+                ) {
+                    try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                        ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                            ? .decode : .mixedFrontier)) { recurrentModel.forwardWithHidden(
+                        tokens: inputs, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds) }
+                }
                 logits = output.logits
                 hidden = output.lastHidden
                 for (row, evaluation) in zip(decodeRows, evaluations) {
@@ -192,7 +222,9 @@ extension EngineLoopV2 {
                     recurrentEvaluations[row.rec.id] = evaluation
                 }
             } else {
-                let output = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier)) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
                 logits = output.logits
                 hidden = output.lastHidden
             }
@@ -218,12 +250,35 @@ extension EngineLoopV2 {
                 let vocabulary = logits.dim(-1)
                 let topTwo = provider.cbv2MTPTopTwo(
                     logits.reshaped([1, decodeRows.count, vocabulary]))
+                if logitDiagnostic != nil {
+                    diagnosticTopTwo = (
+                        topTwo.ids.reshaped([decodeRows.count, 2]),
+                        topTwo.values.reshaped([decodeRows.count, 2]))
+                }
                 seedPolicyTopTwoValues = topTwo.values
                     .reshaped([decodeRows.count, 1, 2])
                     .asType(.float32)
             }
+            if let diagnosticOffsets, let diagnostic = logitDiagnostic {
+                for (index, row) in decodeRows.enumerated()
+                where row.rec.id.raw == diagnostic.configuration.requestID
+                    && row.rec.generatedTokenCount == diagnostic.configuration.outputIndex {
+                    let retainedTopTwo = diagnosticTopTwo.map {
+                        (ids: $0.ids[index], values: $0.values[index])
+                    }
+                    if let packet = makeLogitDiagnostic(
+                        logits: logits[index, -1], requestID: row.rec.id,
+                        outputIndex: row.rec.generatedTokenCount,
+                        phase: row.start < row.rec.request.promptTokens.count ? "prefill"
+                            : row.isSeed ? "seed" : "plain",
+                        batchIndex: index, batchSize: decodeRows.count,
+                        seedToken: row.rec.tokens[row.start], cacheOffset: diagnosticOffsets[index],
+                        policyTopTwo: retainedTopTwo)
+                    { diagnostics.append(packet) }
+                }
+            }
             for (index, row) in decodeRows.enumerated() {
-                observeCommittedTarget(
+                try observeCommittedTarget(
                     row: row,
                     tokens: inputs[index ..< index + 1, 0...],
                     hidden: hidden[index ..< index + 1, 0..., 0...])
@@ -238,14 +293,23 @@ extension EngineLoopV2 {
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
+            let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
             var observedHidden: MLXArray?
-            if let multimodal = multimodalByID[rec.id],
-                !multimodal.spansInChunk(start: row.start, count: row.count).isEmpty
-            {
-                let forward = multimodalChunkForward(
+            // ONE `multimodalByID` lookup per prefill row; the span test
+            // iterates spans without allocating and runs only for rows that
+            // carry multimodal input. The row's prefill-chunk timing stamp
+            // rides the same binding (mirrors `executeMixed`).
+            let multimodal = multimodalByID[rec.id]
+            let visionChunk = multimodal?.hasSpans(start: row.start, count: row.count) ?? false
+            rec.stampPrefillChunkLaunch(
+                tokens: row.count, packed: false, vision: visionChunk,
+                stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
+                launchNanos: launchNanos)
+            if visionChunk, let multimodal {
+                let forward = try multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
                     id: rec.id, multimodal: multimodal, caches: caches,
                     requirement: requirement)
@@ -267,9 +331,11 @@ extension EngineLoopV2 {
                 }
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
-                let forward = recurrentModel.forwardWithHidden(
-                    tokens: inputs, caches: caches, recurrentState: [evaluation],
-                    positionIds: positions)
+                let forward = try withQwen4PositionScope(ids: [rec.id], positionIds: positions) {
+                    try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHiddenForPrefill(
+                        tokens: inputs, caches: caches, recurrentState: [evaluation],
+                        positionIds: positions, requirement: requirement) }
+                }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
                 do {
@@ -284,28 +350,34 @@ extension EngineLoopV2 {
             {
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
-                let forward = targetForward(
+                let forward = try targetForward(
                     tokens: inputs, caches: caches, ids: [rec.id],
-                    positionIds: positions)
+                    positionIds: positions, phase: .prefill)
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 cacheInnerState.append(contentsOf: forward.innerState)
                 recurrentEvaluations.merge(forward.recurrent) { _, _ in
                     preconditionFailure("duplicate recurrent evaluation")
                 }
             } else if mtp.tracksPersistentHistory {
-                let forward = mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                let forward = try checkedModelForward(phase: .prefill) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
             } else {
-                output = prefillOutput(
+                output = try prefillOutput(
                     tokens: inputs, inputEmbeddings: nil, caches: caches,
                     requirement: requirement)
             }
             if let observedHidden {
-                observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
+                try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
+                if logitDiagnostic != nil,
+                    let packet = makeLogitDiagnostic(
+                        logits: output[0], requestID: rec.id, outputIndex: rec.generatedTokenCount,
+                        phase: "prefill", batchIndex: 0, batchSize: 1,
+                        seedToken: slice.last, cacheOffset: diagnosticOffset)
+                { diagnostics.append(packet) }
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
                     params: [rec.request.sampling],
@@ -322,29 +394,22 @@ extension EngineLoopV2 {
         }
 
         let verifyRows = work.filter { $0.carry != nil }
-        let verify = mtpBuildVerifyGraph(
-            verifyRows, driver: mtp, cacheInnerState: &cacheInnerState,
-            timing: &timing)
+        let verify = try mtpBuildVerifyGraph(
+            verifyRows, driver: mtp, cacheInnerState: &cacheInnerState)
 
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
-        var pieces: [MLXArray] = []
-        var sampledRows: [CBv2RequestID] = []
-        var decodeIndex = 0
-        for row in work {
-            if row.isDecode {
-                pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
-                decodeIndex += 1
-                sampledRows.append(row.rec.id)
-            } else if let sampled = prefillSampled[row.rec.id] {
-                pieces.append(sampled)
-                sampledRows.append(row.rec.id)
-            }
-        }
-        let sampledTokens: MLXArray? =
-            pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+        let sampled = CBv2MTPSampledTokenAssembly.assemble(
+            work: work, decodeCount: decodeRows.count, decodeTokens: decodeSampled,
+            prefillTokens: prefillSampled, id: { $0.rec.id }, isDecode: { $0.isDecode },
+            slice: { tokens, range in tokens[range] },
+            concatenate: { concatenated($0, axis: 0) })
+        let sampledRows = sampled.rows
+        let sampledTokens = sampled.tokens
 
+        if let verify { diagnostics.append(contentsOf: verify.diagnostics) }
         var asyncEvalTargets = prefillEvalTargets
+        for packet in diagnostics { asyncEvalTargets.append(contentsOf: packet.evaluationTargets) }
         if let sampledTokens { asyncEvalTargets.append(sampledTokens) }
         for segment in logprobSegments {
             asyncEvalTargets.append(contentsOf: segment.evalTargets)
@@ -369,11 +434,13 @@ extension EngineLoopV2 {
             offsetChainEvalSteps += 1
         }
 
+        observationsTransferred = true
         return CBv2MTPGraphBuild(
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
             prefillEvalTargets: prefillEvalTargets,
             asyncEvalTargets: asyncEvalTargets,
+            diagnostics: diagnostics,
             logprobSegments: logprobSegments,
             verify: verify,
             seedRows: seedRows,
@@ -386,12 +453,9 @@ extension EngineLoopV2 {
     private func mtpBuildVerifyGraph(
         _ verifyRows: [CBv2MTPRowWork],
         driver mtp: CBv2MTPRoundDriver,
-        cacheInnerState: inout [MLXArray],
-        timing: inout CBv2MTPRoundTiming
-    ) -> CBv2MTPRoundInFlight.Verify? {
+        cacheInnerState: inout [MLXArray]
+    ) throws -> CBv2MTPRoundInFlight.Verify? {
         guard !verifyRows.isEmpty else { return nil }
-        timing.rounds = 1
-        let captureStart = CBv2MTPRoundTiming.now()
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
@@ -399,6 +463,19 @@ extension EngineLoopV2 {
         let batch = verifyRows.count
         var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
+        var assistantOwnersTransferred = false
+        defer {
+            if !assistantOwnersTransferred {
+                // Draft column zero may already be evaluating. Restore its
+                // owner before unwinding; request retirement synchronizes and
+                // calls releaseRequestState before returning capacity.
+                for row in rowMetadata {
+                    if let state = row.assistantState {
+                        mtp.restoreAssistantState(state, for: row.id)
+                    }
+                }
+            }
+        }
         var seedTokens: [Int32] = []
         var carryHiddens: [MLXArray] = []
         // Each capture paired with the row it was gathered from, so
@@ -442,18 +519,25 @@ extension EngineLoopV2 {
                     assistantState:
                         mtp.usesRequestStatefulDrafter
                         ? mtp.takeAssistantState(for: row.rec.id) : nil))
+            if let assistantState = rowMetadata.last?.assistantState,
+                let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
+            {
+                try stateful.configureRequestState(
+                    assistantState,
+                    maximumSequenceLength: row.rec.request.promptTokens.count
+                        + max(row.rec.request.maxTokens, 1))
+            }
             seedTokens.append(Int32(carry.token))
             carryHiddens.append(carry.hidden)
         }
 
+        let includesAssistantPrefill = rowMetadata.contains {
+            $0.assistantState?.hasPendingPrefillForCostAccounting == true
+        }
         mtpFreezeCaptures(captured)
-        timing.captureNanos = CBv2MTPRoundTiming.since(captureStart)
-        let draftBuildStart = CBv2MTPRoundTiming.now()
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
-        var runnerUpSteps: [MLXArray] = []
-        runnerUpSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
@@ -487,7 +571,10 @@ extension EngineLoopV2 {
                 // Publish the first mutable head-cache generation before
                 // constructing a deeper generation. This is nonblocking and
                 // joins the round's sole finalize fence.
-                if draftIndex == 0 { asyncEval(stepEvalTargets) }
+                if draftIndex == 0 {
+                    asyncEval(stepEvalTargets)
+                    mtp.recordEarlyDraftSubmission()
+                }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
                 let stepTokens = concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
@@ -496,59 +583,25 @@ extension EngineLoopV2 {
             }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
-            // Runner-up INSTRUMENTATION, not a second draft. This head scores
-            // the whole vocabulary every step, so its rank-2 token is already
-            // paid for; asking for it costs one masked argmax over logits the
-            // forward produced anyway. Nothing in the round branches on it —
-            // it rides the acceptance packet and is counted at finalize, so
-            // the emitted stream is bit-identical with or without it. It
-            // answers the one question tree drafting turns on: when the chain
-            // is rejected, how often WAS the runner-up the target's token
-            // (`CBv2MTPMetrics.runnerUpHitRate`, and see `CBv2MTPTreeShape`).
-            // [engage] MTPLX_MTP_RUNNER_UP_INSTRUMENT, default OFF. This is
-            // instrumentation, not drafting, and it sits on the round's
-            // critical path where nothing overlaps it — see the switch.
-            let wantsRunnerUps =
-                CBv2MTPRoundSwitches.runnerUpInstrument
-                && k > 0 && mtp.drafter.maximumDraftCandidates >= 2
             var draftInput = seedColumn
             var draftHidden = concatenated(carryHiddens, axis: 0)
-            for _ in 0 ..< k {
-                let next: MLXArray
-                let nextHidden: MLXArray
-                var runnerUp: MLXArray? = nil
-                if wantsRunnerUps {
-                    let step = mtp.drafter.draftStepCandidates(
-                        tokens: draftInput, hidden: draftHidden, prepared: prepared,
-                        candidates: 2)
-                    // Rank 0 is the drafter's own `argMax`, so this column is
-                    // the same token `draftStep` would have returned.
-                    next = step.tokens[0..., 0 ..< 1].reshaped([-1])
-                    runnerUp = step.tokens[0..., 1 ..< 2].reshaped([-1])
-                    nextHidden = step.hidden
-                } else {
-                    let step = mtp.drafter.draftStep(
-                        tokens: draftInput, hidden: draftHidden, prepared: prepared)
-                    next = step.tokens
-                    nextHidden = step.hidden
-                }
-                // [engage] MTPLX_MTP_PIPELINED_DRAFT_SUBMIT: start this
-                // forward on the GPU while the host builds the next one and
-                // the verify graph, instead of leaving the whole round
-                // unsubmitted until executeMTPRound's single asyncEval.
-                // Nonblocking; the same arrays still ride the round's
-                // finalize fence, so the emitted stream is unchanged.
-                if CBv2MTPRoundSwitches.pipelinedDraftSubmit {
-                    asyncEval([next, nextHidden] + (runnerUp.map { [$0] } ?? []))
+            for draftIndex in 0 ..< k {
+                let (next, nextHidden) = mtp.drafter.draftStep(
+                    tokens: draftInput, hidden: draftHidden, prepared: prepared)
+                // Captures are already fenced. Overlap the read-only draft
+                // with target graph construction; finalization still joins
+                // this token through the acceptance packet. At depth one,
+                // nextHidden is unused and need not be materialized.
+                if draftIndex == 0 && mtp.drafter.supportsEarlyDraftSubmission {
+                    asyncEval(next)
+                    mtp.recordEarlyDraftSubmission()
                 }
                 draftSteps.append(next)
-                if let runnerUp { runnerUpSteps.append(runnerUp) }
                 draftInput = next.reshaped([batch, 1])
                 draftHidden = nextHidden
             }
         }
         let draftIDs = stacked(draftSteps, axis: 1)
-        timing.draftBuildNanos = CBv2MTPRoundTiming.since(draftBuildStart)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -557,12 +610,12 @@ extension EngineLoopV2 {
         // Windowed rows stage provisional writes; other supported storage
         // backends implement the transaction hooks as exact no-ops/rollback.
         let verifyStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let verifyBuildStart = CBv2MTPRoundTiming.now()
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
-        let target = mtpBuildTargetVerification(
+
+        let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
@@ -570,31 +623,24 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        timing.verifyBuildNanos = CBv2MTPRoundTiming.since(verifyBuildStart)
-        // Segment order is append-only; `CBv2MTPAcceptancePacketLayout` owns
-        // the offsets both this builder and `finalizeMTPRound` read.
-        let layout = CBv2MTPAcceptancePacketLayout(
-            rows: batch, draftDepth: k,
-            hasShortlistMass: target.shortlist != nil,
-            hasRunnerUps: runnerUpSteps.count == k && k > 0)
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
-        if layout.runnerUpsBase != nil {
-            packetParts.append(stacked(runnerUpSteps, axis: 1).reshaped([-1]))
-        }
         let acceptancePacket = concatenated(packetParts, axis: 0)
-        return CBv2MTPRoundInFlight.Verify(
+        assistantOwnersTransferred = true
+        var result = CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
-            layout: layout,
             acceptancePacket: acceptancePacket,
             draftIDs: draftIDs,
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,
             policyTopTwoValues: target.policyTopTwo?.values)
+        result.diagnostics = target.diagnostics
+        result.includesAssistantPrefill = includesAssistantPrefill
+        return result
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes
@@ -609,7 +655,11 @@ extension EngineLoopV2 {
         // false everywhere else, so contiguous stays byte-identical.
         guard backend.requiresMaterializedSnapshots else { return }
         let unfenceable = CBv2MTPCaptureFence.publish(captured)
-        if !unfenceable.isEmpty { eval(unfenceable) }
+        if !unfenceable.isEmpty {
+            // The fence contract's blunt fallback: one host sync, counted.
+            eval(unfenceable)
+            CBv2CoreInstrumentation.recordHostSync()
+        }
     }
 
 }

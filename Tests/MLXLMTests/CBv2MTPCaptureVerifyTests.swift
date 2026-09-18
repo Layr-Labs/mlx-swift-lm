@@ -22,20 +22,6 @@ import XCTest
 
 final class CBv2MTPCaptureVerifyTests: XCTestCase {
 
-    /// XCTest's equivalent of the `.fixtureRandomState` trait the swift-testing
-    /// suites carry: bind a PRNG private to this test around the whole
-    /// invocation, so `fixtureSeed` re-seeds that instead of the process-global
-    /// state seven other suites are also writing in parallel. See
-    /// `CBv2TestRandomState.swift`.
-    override func invokeTest() {
-        let state = MLXRandom.RandomState(seed: CBv2FixtureRandom.baseSeed)
-        CBv2FixtureRandom.$current.withValue(state) {
-            withRandomState(state) {
-                super.invokeTest()
-            }
-        }
-    }
-
     // MARK: - 1. Captured transaction lifecycle
 
     private var scalarSpec: CBv2RecurrentStateSpec {
@@ -151,9 +137,9 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         _ = try captured.evaluate()
         XCTAssertEqual(state.materializedByteCount, 3 * state.byteCount)
 
-        // Committing one position collapses the window back to one copy.
+        // The committed prefix is a view retaining both captured positions.
         try captured.commit(keepPositions: 1)
-        XCTAssertEqual(state.materializedByteCount, state.byteCount)
+        XCTAssertEqual(state.materializedByteCount, 2 * state.byteCount)
     }
 
     func testCompactReplayStrictPrefixFullCommitAndRollback() throws {
@@ -391,8 +377,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
 
     /// After a REJECTED draft the captured commit at keep=1 must reproduce
     /// the state of a control that never speculated (only consumed the seed
-    /// column); after an ACCEPTED draft the captured commit at keep=2 must
-    /// match a control that decoded the same two tokens serially. Outputs
+    /// column); partial and full acceptance must match controls that decoded
+    /// exactly that many tokens serially. Outputs
     /// use the installed W4/g64 exact projection geometry.
     func testExactGDNCapturedWindowMatchesSerialOracle() throws {
         func assertExact(_ actual: MLXArray, _ expected: MLXArray) {
@@ -402,14 +388,14 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             XCTAssertEqual(difference.item(Float.self), 0)
         }
 
-        fixtureSeed(4711)
+        MLXRandom.seed(4711)
         let config = try exactW4G64GDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
         quantize(model: layer, groupSize: 64, bits: 4)
         eval(layer)
 
         let hidden = config.hiddenSize
-        fixtureSeed(90210)
+        MLXRandom.seed(90210)
         let x0 = MLXRandom.normal([1, 1, hidden])
         let x1 = MLXRandom.normal([1, 1, hidden])
         let x2 = MLXRandom.normal([1, 1, hidden])
@@ -427,7 +413,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             return state
         }
 
-        // Serial oracle: two [1, 1] columns through plain transactions.
+        // Serial oracle: three [1, 1] columns through plain transactions.
         let serialState = try freshState()
         let serial0 = try serialState.bind()
         let y0 = layer.cbv2Forward(x0, modelLayerIndex: 0, recurrentState: [serial0])
@@ -440,6 +426,9 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let y1 = layer.cbv2Forward(x1, modelLayerIndex: 0, recurrentState: [serial1])
         _ = try serial1.evaluate()
         try serial1.commit()
+        let afterFirstDraft = serialState.state(modelLayerIndex: 0)!
+        let afterFirstDraftConv = afterFirstDraft.conv! + 0
+        let afterFirstDraftSSM = afterFirstDraft.ssm! + 0
         let serial2 = try serialState.bind()
         let y2 = layer.cbv2Forward(x2, modelLayerIndex: 0, recurrentState: [serial2])
         _ = try serial2.evaluate()
@@ -464,6 +453,19 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         assertExact(rejectedFinal.conv!, afterSeedConv)
         assertExact(rejectedFinal.ssm!, afterSeedSSM)
 
+        // Partial acceptance exercises the strict-prefix replay boundary
+        // between total rejection and full acceptance with the exact oracle.
+        let partialState = try freshState()
+        let partial = try partialState.bind()
+        let partialOut = layer.cbv2ForwardCaptured(
+            window, modelLayerIndex: 0, recurrentState: [partial],
+            exactTargetVerify: true)
+        eval(try partial.evaluate())
+        try partial.commit(keepPositions: 2)
+        let partialFinal = partialState.state(modelLayerIndex: 0)!
+        assertExact(partialFinal.conv!, afterFirstDraftConv)
+        assertExact(partialFinal.ssm!, afterFirstDraftSSM)
+
         // Accepted draft: captured window, keep 3 → state == control that
         // decoded all three tokens serially; window outputs match the serial
         // column outputs.
@@ -480,13 +482,41 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         assertExact(acceptedFinal.ssm!, afterDraft.ssm!)
         XCTAssertTrue(acceptedOut.shape == [1, 3, hidden])
         assertExact(acceptedOut, concatenated([y0, y1, y2], axis: 1))
-        for value in [rejectedOut, acceptedOut] {
+        for value in [rejectedOut, partialOut, acceptedOut] {
             XCTAssertTrue(isFinite(value).all().item(Bool.self))
         }
     }
 
-    func testGDNWideWindowUsesCompactReplayAndMatchesEverySerialPrefix() throws {
-        fixtureSeed(0xC0FFEE)
+    /// Independent recurrence oracle: consumes each already-projected verify
+    /// row once, preserving a snapshot at every prefix. It deliberately does
+    /// not use the production prefix-replay helper or its captured closure.
+    private func tokenwiseRecurrenceOracle(
+        tape: ArraysCache.PrefixReplayTape, layer: Qwen35GatedDeltaNet
+    ) throws -> [(conv: MLXArray, ssm: MLXArray)] {
+        var conv = tape.convInput[0..., 0..<tape.convStateRows, 0...]
+        var ssm = try XCTUnwrap(tape.ssmPre)
+        var snapshots: [(conv: MLXArray, ssm: MLXArray)] = []
+        for row in 0..<tape.rowCount {
+            let next = row..<(row + 1)
+            ssm = gatedDeltaUpdate(
+                q: tape.q[0..., next], k: tape.k[0..., next], v: tape.v[0..., next],
+                a: tape.a[0..., next], b: tape.b[0..., next],
+                aLog: layer.aLog, dtBias: layer.dtBias, state: ssm,
+                mask: tape.mask.map { $0[0..., next] }).1
+            let incoming = tape.convStateRows + row
+            conv = concatenated([
+                conv[0..., 1..., 0...],
+                tape.convInput[0..., incoming..<(incoming + 1), 0...],
+            ], axis: 1)
+            let snapshot = (conv: conv + 0, ssm: ssm + 0)
+            eval(snapshot.conv, snapshot.ssm)
+            snapshots.append(snapshot)
+        }
+        return snapshots
+    }
+
+    func testGDNWideWindowUsesCompactReplayAndMatchesEveryRecurrencePrefix() throws {
+        MLXRandom.seed(0xC0FFEE)
         let config = try smallGDNConfiguration()
         let layer = Qwen35GatedDeltaNet(config)
         eval(layer)
@@ -499,31 +529,29 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
             let state = try CBv2RecurrentRequestState(spec: gdnSpec(config))
             let warm = try state.bind()
             _ = layer.cbv2Forward(history, modelLayerIndex: 0, recurrentState: [warm])
-            _ = try warm.evaluate()
+            eval(try warm.evaluate())
             try warm.commit()
             return state
         }
 
-        let serial = try freshState()
-        var oracle: [(conv: MLXArray, ssm: MLXArray)] = []
-        for column in columns {
-            let step = try serial.bind()
-            _ = layer.cbv2Forward(column, modelLayerIndex: 0, recurrentState: [step])
-            _ = try step.evaluate()
-            try step.commit()
-            let state = serial.state(modelLayerIndex: 0)!
-            let conv = state.conv! + 0
-            let ssm = state.ssm! + 0
-            eval(conv, ssm)
-            oracle.append((conv, ssm))
-        }
+        // Default rectangular arithmetic need not reproduce width-one dense
+        // projection rounding. Obtain a separate same-width tape, then compute
+        // each expected boundary independently one recurrence step at a time.
+        let initial = try freshState().state(modelLayerIndex: 0)!
+        let legacy = MambaCache()
+        legacy[0] = initial.conv
+        legacy[1] = initial.ssm
+        let legacyOutput = layer(window, cache: legacy, nConfirmed: 1)
+        eval([legacyOutput] + legacy.innerState())
+        let tape = try XCTUnwrap(legacy.prefixReplayTape)
+        let oracle = try tokenwiseRecurrenceOracle(tape: tape, layer: layer)
 
         for keep in 1 ... columns.count {
             let compactState = try freshState()
             let compact = try compactState.bind()
             _ = layer.cbv2ForwardCaptured(
                 window, modelLayerIndex: 0, recurrentState: [compact])
-            _ = try compact.evaluate()
+            eval(try compact.evaluate())
             XCTAssertTrue(compact.isCaptured)
             XCTAssertLessThan(
                 compactState.materializedByteCount,
@@ -531,28 +559,52 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                 "wide production verify must not materialize a full state stack")
             try compact.commit(keepPositions: keep)
             let actual = compactState.state(modelLayerIndex: 0)!
-            assertStateClose(
-                actual.conv!, oracle[keep - 1].conv,
-                rtol: 1e-4, atol: capturedConvNearTie,
-                "conv, keep \(keep) of \(columns.count)")
-            assertStateClose(
-                actual.ssm!, oracle[keep - 1].ssm,
-                rtol: 1e-4, atol: capturedSSMNearTie,
-                "ssm, keep \(keep) of \(columns.count)")
+            XCTAssertTrue(
+                allClose(actual.conv!, oracle[keep - 1].conv, rtol: 1e-4, atol: 1e-5)
+                    .item(Bool.self))
+            XCTAssertTrue(
+                allClose(actual.ssm!, oracle[keep - 1].ssm, rtol: 1e-4, atol: 1e-5)
+                    .item(Bool.self))
+        }
+    }
 
-            // The bounds above are near-tie bounds, so on their own they could
-            // absorb a commit that kept the wrong number of positions. This
-            // cannot: a shifted commit moves the whole conv window, which is an
-            // activation-scale change. Require the committed state to sit at
-            // least 20x closer to its own prefix than to a neighbouring one.
-            let own = stateDifference(actual.conv!, oracle[keep - 1].conv).abs
-            for neighbour in [keep - 2, keep] where oracle.indices.contains(neighbour) {
-                let other = stateDifference(actual.conv!, oracle[neighbour].conv).abs
-                XCTAssertGreaterThan(
-                    other, own * 20,
-                    "conv at keep \(keep) is not distinguishable from prefix "
-                        + "\(neighbour + 1): own \(own), neighbour \(other)")
-            }
+    /// Same-width control isolates captured bookkeeping from recomputing
+    /// projections and convolution with a different forward width.
+    func testGDNWideCapturedMatchesOrdinaryWideFromMaterializedState() throws {
+        MLXRandom.seed(0xC0FFEE)
+        let config = try smallGDNConfiguration()
+        let layer = Qwen35GatedDeltaNet(config)
+        eval(layer)
+        let columns = (0 ..< 4).map { _ in MLXRandom.normal([1, 1, config.hiddenSize]) }
+        let window = concatenated(columns, axis: 1)
+        let history = MLXRandom.normal([1, 3, config.hiddenSize])
+        eval(window, history)
+
+        func freshState() throws -> CBv2RecurrentRequestState {
+            let state = try CBv2RecurrentRequestState(spec: gdnSpec(config))
+            let warm = try state.bind()
+            _ = layer.cbv2Forward(history, modelLayerIndex: 0, recurrentState: [warm])
+            eval(try warm.evaluate())
+            try warm.commit()
+            return state
+        }
+        let ordinaryState = try freshState()
+        let ordinary = try ordinaryState.bind()
+        _ = layer.cbv2Forward(window, modelLayerIndex: 0, recurrentState: [ordinary])
+        eval(try ordinary.evaluate())
+        try ordinary.commit()
+
+        let capturedState = try freshState()
+        let captured = try capturedState.bind()
+        _ = layer.cbv2ForwardCaptured(window, modelLayerIndex: 0, recurrentState: [captured])
+        eval(try captured.evaluate())
+        try captured.commit(keepPositions: 4)
+        let actual = capturedState.state(modelLayerIndex: 0)!
+        let expected = ordinaryState.state(modelLayerIndex: 0)!
+        for (name, left, right) in [("conv", actual.conv!, expected.conv!),
+                                  ("ssm", actual.ssm!, expected.ssm!)] {
+            XCTAssertTrue(allClose(left, right, rtol: 1e-4, atol: 1e-5).item(Bool.self),
+                "same-width captured \(name) must match ordinary forward")
         }
     }
 
@@ -668,73 +720,6 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         return output
     }
 
-    // MARK: - Captured wide-window agreement bounds
-    //
-    // `cbv2ForwardCaptured` runs the whole verify window in ONE pass: one
-    // projection over [B, S, ...], one `conv1d` over the padded window, and for
-    // S >= 3 a CHUNKED `gatedDeltaUpdate`. The serial oracle runs the same
-    // recurrence one column at a time, so it takes the per-step path with S = 1
-    // projections and a per-position conv. Same mathematics, different
-    // association order, so the two states are a NEAR-TIE and not bit-equal.
-    //
-    // The engine says so itself: `cbv2ForwardCaptured` carries an
-    // `exactTargetVerify` flag whose only effect is to replace the single
-    // windowed `conv1d` with per-position slices, precisely because the
-    // one-call form is not bit-identical. These tests do not set it, so they
-    // cannot assert bit-exactness — the previous 1e-5 / 1e-6 absolute floors
-    // asserted an exactness the fast path never offered. This is the same class
-    // as the documented `sdpaFrontierNearTie` bound on the last-query prefill
-    // path, and the same order of magnitude.
-    //
-    // Measured on these fixtures (max ABSOLUTE difference; the max RELATIVE
-    // figures are near-zero-denominator artifacts and are not a bound):
-    //
-    //   conv state [1, 3, 192]      0.00091 .. 0.0021
-    //   ssm state  [1, 4, 16, 32]   0.0000058 .. 0.0000126
-    //
-    // The two states are bounded separately because they are two different
-    // scales: the conv state holds raw projected activations, the ssm state a
-    // normalized accumulator. One bound sized for the former would be ~400x
-    // slack on the latter and would hide a real ssm regression.
-    //
-    // A widened bound must not be able to hide an off-by-one in
-    // `commit(keepPositions:)`, so the wide-window test also asserts that the
-    // committed state is closer to its OWN prefix than to either neighbouring
-    // prefix. A shifted commit moves the whole 3-wide conv window and shows up
-    // at activation scale, orders above these bounds.
-    private let capturedConvNearTie: Double = 5e-3
-    private let capturedSSMNearTie: Double = 5e-5
-
-    /// Max absolute and max relative difference between two arrays.
-    ///
-    /// `allClose(...).item(Bool.self)` collapses to a bare `XCTAssertTrue
-    /// failed` with no numbers, which cannot distinguish a reduction-order
-    /// near-tie from a state-tracking bug. These two failure classes need
-    /// different fixes, so the assertion has to report the magnitude.
-    private func stateDifference(_ lhs: MLXArray, _ rhs: MLXArray) -> (abs: Float, rel: Float) {
-        let a = lhs.asType(.float32)
-        let b = rhs.asType(.float32)
-        let absDiff = MLX.abs(a - b)
-        let scale = MLX.maximum(MLX.abs(b), MLXArray(Float(1e-12)))
-        let maxAbs = absDiff.max().item(Float.self)
-        let maxRel = (absDiff / scale).max().item(Float.self)
-        return (maxAbs, maxRel)
-    }
-
-    private func assertStateClose(
-        _ lhs: MLXArray, _ rhs: MLXArray, rtol: Double, atol: Double, _ label: String,
-        file: StaticString = #filePath, line: UInt = #line
-    ) {
-        let close = allClose(lhs, rhs, rtol: rtol, atol: atol).item(Bool.self)
-        if !close {
-            let d = stateDifference(lhs, rhs)
-            XCTFail(
-                "\(label): max abs \(d.abs), max rel \(d.rel) "
-                    + "(rtol \(rtol), atol \(atol)), shape \(lhs.shape)",
-                file: file, line: line)
-        }
-    }
-
     private func assertRecurrentStateEqual(
         _ lhs: [any KVCache],
         _ rhs: [any KVCache],
@@ -747,16 +732,13 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                   let right = rhs[index] as? MambaCache
             else { continue }
             XCTAssertEqual(left.state.count, right.state.count, file: file, line: line)
-            for (slot, pair) in zip(left.state, right.state).enumerated() {
-                let (leftArray, rightArray) = pair
+            for (leftArray, rightArray) in zip(left.state, right.state) {
                 XCTAssertEqual(leftArray.shape, rightArray.shape, file: file, line: line)
-                // MambaCache is two slots: 0 is the conv state, 1 the ssm
-                // accumulator. See the bound note above for why they differ.
-                assertStateClose(
-                    leftArray, rightArray, rtol: 1e-5,
-                    atol: slot == 0 ? capturedConvNearTie : capturedSSMNearTie,
-                    "layer \(index) state slot \(slot)",
-                    file: file, line: line)
+                XCTAssertTrue(
+                    allClose(leftArray, rightArray, rtol: 1e-5, atol: 1e-6)
+                        .item(Bool.self),
+                    file: file,
+                    line: line)
             }
         }
     }
@@ -764,8 +746,8 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// A partially accepted wide verify rebuilds each recurrent layer from its
     /// compact tape, while attention remains at the speculative offset until
     /// the caller trims exactly the rejected suffix.
-    func testRecurrentPrefixReplayMatchesSerialPrefixAndAttentionTrim() throws {
-        fixtureSeed(61_337)
+    func testRecurrentPrefixReplayMatchesRecurrencePrefixAndAttentionTrim() throws {
+        MLXRandom.seed(61_337)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -793,6 +775,16 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                     baseAttentionOffsets[index] + verifyTokens.count)
             }
 
+            var recurrentOracle: [Int: (conv: MLXArray, ssm: MLXArray)] = [:]
+            for (index, cache) in verify.enumerated() {
+                guard let recurrent = cache as? MambaCache else { continue }
+                let tape = try XCTUnwrap(recurrent.prefixReplayTape)
+                let layer = try XCTUnwrap(model.model.namedModules().first {
+                    $0.0 == "layers.\(index).linear_attn"
+                }?.1 as? Qwen35GatedDeltaNet)
+                let prefixes = try tokenwiseRecurrenceOracle(tape: tape, layer: layer)
+                recurrentOracle[index] = prefixes[committedRows - 1]
+            }
             XCTAssertTrue(
                 model.replayRecurrentPrefix(
                     cache: verify, committedRows: committedRows))
@@ -817,6 +809,14 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
                 tokens: Array(verifyTokens.prefix(committedRows)),
                 caches: oracle,
                 nConfirmed: 0)
+            // Ordinary prefix forwarding remains the attention-offset
+            // control. Recurrent numerics use the same wide transformed inputs
+            // as verification, avoiding an unsupported cross-width identity.
+            for (index, expected) in recurrentOracle {
+                let recurrent = try XCTUnwrap(oracle[index] as? MambaCache)
+                recurrent[0] = expected.conv
+                recurrent[1] = expected.ssm
+            }
             assertRecurrentStateEqual(verify, oracle)
             for index in oracle.indices where !(oracle[index] is ArraysCache) {
                 XCTAssertEqual(verify[index].offset, oracle[index].offset)
@@ -827,7 +827,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// Shape-incompatible tapes fail closed before recurrent state mutation and
     /// release every layer's verify-only arrays for the fallback path.
     func testIneligibleRecurrentReplayCleansAllTapesWithoutStateMutation() throws {
-        fixtureSeed(61_338)
+        MLXRandom.seed(61_338)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -870,7 +870,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
     /// Full acceptance explicitly discards the tape without touching state;
     /// an ordinary next forward and a direct cache reset also cannot retain it.
     func testRecurrentReplayTapeCleanupOnTerminalPaths() throws {
-        fixtureSeed(61_339)
+        MLXRandom.seed(61_339)
         let model = Qwen35TextModel(try smallGDNConfiguration())
         eval(model)
 
@@ -925,7 +925,7 @@ final class CBv2MTPCaptureVerifyTests: XCTestCase {
         let row = CBv2SamplerRow(
             id: id, params: params, promptTokens: [1, 2, 3], outputTokens: [])
 
-        fixtureSeed(5)
+        MLXRandom.seed(5)
         let logits0 = MLXRandom.normal([1, vocab])
         let logits1 = MLXRandom.normal([1, vocab])
         eval(logits0, logits1)

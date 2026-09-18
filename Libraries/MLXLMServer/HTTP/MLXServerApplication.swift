@@ -154,9 +154,7 @@ public enum MLXServerApplication {
                     context: context
                 )
                 if responseRequest.stream == true {
-                    let frames = try await service.streamChatCompletionFrames(
-                        request: responseRequest.chatCompletionRequest
-                    )
+                    let frames = try await service.streamResponseFrames(request: responseRequest)
                     return sseResponse(frames)
                 }
                 return try jsonResponse(try await service.createResponse(request: responseRequest))

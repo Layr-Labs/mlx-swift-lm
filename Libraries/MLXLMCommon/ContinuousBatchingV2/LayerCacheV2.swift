@@ -16,37 +16,11 @@
 import Foundation
 import MLX
 
-/// Shared on-device position chain for one contiguous cache bank. The bank
-/// chooses one owning cache to rebuild/advance it; every cache reads the same
-/// value, so the model can snapshot it once before entering the layer loop.
-final class CBv2PositionOffsetsState {
-    var value: MLXArray
-
-    init(rows: [CBv2SequenceKV]) {
-        value = MLXArray(rows.map { Int32($0.absoluteOffset) })
-    }
-
-    func rebuild(from rows: [CBv2SequenceKV]) {
-        value = MLXArray(rows.map { Int32($0.absoluteOffset) })
-    }
-}
-
-/// Per-layer device fence ordering the fused decode ring write.
-///
-/// The fused ring pass A stores this step's K/V into the retained ring
-/// allocation IN PLACE — a side effect the array graph cannot otherwise see.
-/// Threading a one-element int32 through the kernel (in as `write_fence`, out
-/// as `fence`) makes it a real data dependency: the next step's writing pass A
-/// consumes the fence this step produced, so the in-place store is part of the
-/// evaluated chain instead of relying on host timing. `innerState()` publishes
-/// the value so the loop's per-step `asyncEval` collapses that chain, exactly
-/// as it does for the position-offset chain.
-final class CBv2DecodeRingWriteFence {
-    var value = MLXArray.zeros([1], dtype: .int32)
-}
-
 /// Per-layer, batch-facing cache + attention dispatcher for the v2 engine.
 public final class CBv2LayerCache: CBv2AttendingLayerCache {
+
+    var attentionMetadata: CBv2AttentionMetadataForward?
+    var attentionPacket: CBv2AttentionPacketForward?
 
     public let layerIndex: Int
     public let kind: CBv2LayerKind
@@ -68,43 +42,17 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// step (it holds the offsets of the tokens about to be processed), and
     /// KV-shared layers must reuse the SOURCE layer's pre-update capture —
     /// the same discipline as `gemma4CapturePositionOffset`.
-    public var positionOffsets: MLXArray { positionOffsetsState.value }
+    public var positionOffsets: MLXArray { cachedPositionOffsets }
 
-    /// Non-nil only after a cache bank has unified every contiguous layer on
-    /// one position chain. This explicit capability keeps standalone and paged
-    /// cache semantics unchanged.
-    public var unifiedPositionOffsets: MLXArray? {
-        usesUnifiedPositionOffsets ? positionOffsetsState.value : nil
-    }
-
-    /// Stable identity of the bank-owned shared position state. Comparing
-    /// the MLXArray values themselves would evaluate them; the adapter uses
-    /// this host-only identity to prove every layer shares one chain.
-    var unifiedPositionStateIdentity: ObjectIdentifier? {
-        usesUnifiedPositionOffsets ? ObjectIdentifier(positionOffsetsState) : nil
-    }
-
-    /// Explicit ordering root for the fused in-place sliding-ring write.
-    /// Kept in the initial conservative compaction even though the logits
-    /// graph also reaches the multi-output primitive that produces it.
-    var decodeRingWriteFenceEvaluationRoot: MLXArray { decodeRingWriteFence.value }
-
-    private var positionOffsetsState: CBv2PositionOffsetsState
-    private var usesUnifiedPositionOffsets = false
-    private var advancesPositionOffsets = true
-    private let decodeRingWriteFence = CBv2DecodeRingWriteFence()
-
-    /// Whether a KV-shared sibling may still be attending views of this
-    /// layer's storage. `CBv2LayerCacheBank` clears it for every layer nothing
-    /// borrows (see `CBv2KVSourceChunkRetaining`); while it is set, the fused
-    /// in-place ring write is refused and decode keeps the copying
-    /// `SliceUpdate` path, so a borrower can never observe a mutated buffer.
-    private var retainsChunkForBorrowers = true
+    private var cachedPositionOffsets: MLXArray
+    var gemmaUnifiedPositions: Gemma4UnifiedPositions?
+    var gemmaUnifiedPositionIndex = 0
 
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
     /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
     var mtpSerializesRectangularAttention = false
+    var mtpBatchesRectangularAttention = false
 
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.
@@ -122,6 +70,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// text rows sharing a rectangular call.
     private(set) var boundSpanContexts: [CBv2SpanChunkContext?]?
 
+    /// Qwen4 QSA indexer side-state for the currently bound B1 row.
+    public var qwen4IndexKeys: MLXArray?
+    public var qwen4IndexTokenCount: Int?
+    public var qwen4IndexPositionIds: MLXArray?
+    public var qwen4PooledIndexKeys: MLXArray?
+    public var qwen4PooledIndexBlocks: Int = 0
+
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
         attentionSoftcap: Float? = nil
@@ -133,50 +88,65 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
-        self.positionOffsetsState = CBv2PositionOffsetsState(rows: rows)
-    }
-
-    /// Bank-only wiring performed before rows are bound. Exactly one owning
-    /// cache advances the shared chain; all other caches expose it read-only.
-    func unifyPositionOffsets(
-        with state: CBv2PositionOffsetsState, advances: Bool
-    ) {
-        positionOffsetsState = state
-        usesUnifiedPositionOffsets = true
-        advancesPositionOffsets = advances
+        self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
     }
 
     // MARK: - Membership (the ONLY places positionOffsets is host-rebuilt)
 
     public func appendRow(_ row: CBv2SequenceKV) {
+        gemmaUnifiedPositions?.detach()
         precondition(
             kind.sharesKVWithLayer == nil, "CBv2LayerCache: cannot add rows to a KV-shared layer")
         rows.append(row)
         rebuildPositionOffsets()
+        clearQwen4IndexerState()
     }
 
     public func removeRow(at index: Int) {
+        gemmaUnifiedPositions?.detach()
         rows.remove(at: index)
         rebuildPositionOffsets()
+        clearQwen4IndexerState()
     }
 
     /// Replace the whole row set (batch recomposition). Also the correct way
     /// to re-sync `positionOffsets` after out-of-band row mutation
     /// (e.g. rollback during speculative verification).
     public func setRows(_ newRows: [CBv2SequenceKV]) {
-        setRows(newRows, rebuildPositionOffsets: true)
-    }
-
-    /// Bank path: non-canonical unified caches update row bindings without
-    /// rebuilding the one shared host-derived position tensor.
-    func setRows(
-        _ newRows: [CBv2SequenceKV], rebuildPositionOffsets shouldRebuild: Bool
-    ) {
+        gemmaUnifiedPositions?.detach()
         precondition(
             kind.sharesKVWithLayer == nil || newRows.isEmpty,
             "CBv2LayerCache: KV-shared layers own no rows")
+        if rows.count == 1 {
+            CBv2Qwen4IndexerBind.harvest(self, into: rows[0])
+        }
         rows = newRows
-        if shouldRebuild { rebuildPositionOffsets() }
+        rebuildPositionOffsets()
+        if newRows.count == 1, CBv2Qwen4IndexerBind.restore(self, from: newRows[0]) {
+            return
+        }
+        clearQwen4IndexerState()
+    }
+
+    func setRowsForPositionBinding(_ newRows: [CBv2SequenceKV]) {
+        precondition(kind.sharesKVWithLayer == nil)
+        rows = newRows
+    }
+
+    func rebuildUnifiedPosition() -> MLXArray {
+        rebuildPositionOffsets()
+        return cachedPositionOffsets
+    }
+
+    func adoptUnifiedPosition(_ value: MLXArray) -> Bool {
+        guard let owned = Gemma4UnifiedPositions.snapshot(value) else { return false }
+        cachedPositionOffsets = owned
+        return true
+    }
+
+    private func advancePositionOffsets(_ count: Int) {
+        if gemmaUnifiedPositions?.complete(self, count: count) == true { return }
+        cachedPositionOffsets = cachedPositionOffsets + Int32(count)
     }
 
     // MARK: - CBv2AttendingLayerCache
@@ -188,20 +158,47 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             kind.sharesKVWithLayer == nil,
             "CBv2LayerCache: KV-shared layer \(layerIndex) must use attendBorrowing")
+        gemmaUnifiedPositions?.prepare(self, count: queries.dim(2))
+        let metadata = attentionMetadata?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap,
+            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
+        let packet = attentionPacket?.begin(
+            cache: self, queries: queries, keys: keys, values: values, scale: scale,
+            sinks: sinks, softcap: attentionSoftcap,
+            spans: boundSpanContexts?.contains(where: { $0 != nil }) ?? false)
         let output = CBv2AttentionV1.updateAndAttend(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention,
-            decodeRingWriteFence: decodeRingWriteFence,
-            allowFusedRingWrite: !retainsChunkForBorrowers)
-        // Advance offsets ON-DEVICE. A unified bank elects exactly one owning
-        // cache; Gemma snapshots the shared pre-step value before this call.
-        if advancesPositionOffsets {
-            positionOffsetsState.value = positionOffsetsState.value + Int32(queries.dim(2))
-        }
+            serializeQueries: mtpSerializesRectangularAttention, metadata: metadata, packet: packet)
+        // Advance offsets ON-DEVICE. Decode and packed prefill are
+        // rectangular, so L is uniform across every bound row.
+        advancePositionOffsets(queries.dim(2))
         return output
+    }
+
+    /// Write K/V and advance RoPE offsets without running dense SDPA.
+    /// Qwen4 gathered-QSA uses this so 50K prefills do not pay leftover dense
+    /// attention after the indexer has already selected blocks.
+    public func updateKVAndAdvanceOffsets(
+        keys: MLXArray, values: MLXArray
+    ) -> [(keys: MLXArray, values: MLXArray)] {
+        precondition(
+            kind.sharesKVWithLayer == nil,
+            "CBv2LayerCache: KV-shared layer \(layerIndex) owns no storage")
+        precondition(rows.count == keys.dim(0), "CBv2LayerCache: K/V batch does not match rows")
+        var views: [(keys: MLXArray, values: MLXArray)] = []
+        views.reserveCapacity(rows.count)
+        for (rowIndex, row) in rows.enumerated() {
+            views.append(
+                row.update(
+                    keys: keys[rowIndex ..< rowIndex + 1],
+                    values: values[rowIndex ..< rowIndex + 1]))
+        }
+        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        return views
     }
 
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
@@ -218,13 +215,12 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         precondition(
             !mtpSerializesRectangularAttention,
             "CBv2LayerCache: last-query prefill is never part of an MTP verify round")
+        gemmaUnifiedPositions?.prepare(self, count: keys.dim(2))
         let output = CBv2AttentionV1.updateAndAttendLastQuery(
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        if advancesPositionOffsets {
-            positionOffsetsState.value = positionOffsetsState.value + Int32(keys.dim(2))
-        }
+        advancePositionOffsets(keys.dim(2))
         return output
     }
 
@@ -251,19 +247,37 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
-        positionOffsetsState.rebuild(from: rows)
+        cachedPositionOffsets = Self.buildPositionOffsets(rows)
+    }
+
+    private static func buildPositionOffsets(_ rows: [CBv2SequenceKV]) -> MLXArray {
+        MLXArray(rows.map { Int32($0.absoluteOffset) })
     }
 }
 
-// MARK: - Borrower retention (fused ring-write eligibility)
+extension CBv2LayerCache: CBv2Qwen4GatheredCache {
+    public var qwen4SerializesRectangularAttention: Bool { mtpSerializesRectangularAttention }
+}
 
-extension CBv2LayerCache: CBv2KVSourceChunkRetaining {
-    /// The bank owns the borrower map, so it is the only thing that can tell
-    /// a source layer whether anything borrows from it. Cleared here means
-    /// "no sibling attends this layer's buffers", which is what makes an
-    /// in-place decode ring write safe.
-    public func setRetainsChunkForBorrowers(_ retains: Bool) {
-        retainsChunkForBorrowers = retains
+extension CBv2LayerCache: CBv2Qwen4BatchScopeProviding {
+    public func qwen4BeginBatchScope() -> CBv2Qwen4BatchScope {
+        precondition(kind.sharesKVWithLayer == nil && kind.attention == .full)
+        let owners = rows
+        let views = owners.enumerated().map { index, row -> CBv2LayerCache in
+            let view = CBv2LayerCache(
+                layerIndex: layerIndex, kind: kind,
+                attentionSoftcap: attentionSoftcap)
+            view.rows = [row]
+            view.cachedPositionOffsets = cachedPositionOffsets[index ..< index + 1]
+            view.mtpSerializesRectangularAttention = mtpSerializesRectangularAttention
+            _ = CBv2Qwen4IndexerBind.restore(view, from: row)
+            return view
+        }
+        return CBv2Qwen4BatchScope(rows: owners, caches: views) { [self] length in
+            precondition(rows.count == owners.count && zip(rows, owners).allSatisfy { $0 === $1 })
+            cachedPositionOffsets = cachedPositionOffsets + Int32(length)
+            clearQwen4IndexerState()
+        }
     }
 }
 
@@ -301,10 +315,13 @@ extension CBv2LayerCache: KVCache {
     /// The engine loop evaluates cache inner state each step (asyncEval) to
     /// collapse lazy chains: per-row storage plus the positionOffsets chain.
     public func innerState() -> [MLXArray] {
-        var arrays = [positionOffsetsState.value, decodeRingWriteFence.value]
+        var arrays = [cachedPositionOffsets]
         for row in rows {
             if let provider = row as? CBv2InnerStateProviding {
                 arrays.append(contentsOf: provider.cbv2InnerState())
+            }
+            if rows.count > 1 {
+                arrays.append(contentsOf: CBv2Qwen4IndexerFrontier.evaluationState(row))
             }
         }
         return arrays

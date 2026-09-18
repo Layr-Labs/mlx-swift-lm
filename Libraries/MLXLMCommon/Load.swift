@@ -47,11 +47,48 @@ private final class ParallelShardState: @unchecked Sendable {
         results[index] = result
     }
 
+    /// Called only after concurrentPerform joined and aggregation completed.
+    /// Fused-output materialization must not retain all original shard arrays.
+    func releaseResults() {
+        lock.lock()
+        defer { lock.unlock() }
+        results.removeAll(keepingCapacity: false)
+    }
+
     func recordError(_ error: Error) {
         lock.lock()
         defer { lock.unlock() }
         if firstError == nil { firstError = error }
     }
+}
+
+/// A model-supplied checkpoint-key filter applied immediately after each
+/// safetensors header is decoded and BEFORE any array from that shard is
+/// evaluated/materialized.
+///
+/// This differs intentionally from `sanitize(weights:)`: sanitization may
+/// rename, reshape, or fuse arrays that have already been loaded. A loading
+/// filter is only for checkpoint tensors the model proves it will never
+/// materialize (for example Qwen4's SSD-backed learned PLE table).
+public typealias CheckpointWeightLoadFilter = @Sendable (String) -> Bool
+
+/// Implemented by models that must exclude some checkpoint tensors before
+/// bulk materialization. The returned closure must capture only immutable,
+/// Sendable configuration; shard reads invoke it concurrently.
+public protocol CheckpointWeightLoadFiltering {
+    /// Return true for a checkpoint key that should enter the ordinary
+    /// in-memory load/update path, false for one owned by an external exact
+    /// row source or otherwise absent from this model topology.
+    var checkpointWeightLoadFilter: CheckpointWeightLoadFilter { get }
+
+    /// Whole-file read-ahead must be skipped when an excluded tensor is
+    /// intentionally kept cold on external storage. Filters used only to
+    /// remove topology-absent tensors may leave read-ahead enabled.
+    var skipWholeShardPrefetch: Bool { get }
+}
+
+extension CheckpointWeightLoadFiltering {
+    public var skipWholeShardPrefetch: Bool { true }
 }
 
 /// Implemented by models whose ``BaseLanguageModel/sanitize(weights:)``
@@ -109,89 +146,13 @@ public protocol QuantizationPolicyReceiving: AnyObject {
     var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization? { get set }
 }
 
-/// A separately-pinned weight tree to merge into the next ``loadWeights`` call.
-///
-/// `keyPrefix` is prepended to every tensor name the tree carries, which is how a
-/// checkpoint published with BARE names (`fc.weight`, `layers.0.*`, `norm.weight`)
-/// becomes the `mtp.*` namespace the loading model expects.
-public struct AdditionalWeightSource: Sendable {
-    public let directory: URL
-    public let keyPrefix: String
-
-    public init(directory: URL, keyPrefix: String) {
-        self.directory = directory
-        self.keyPrefix = keyPrefix
-    }
-}
-
-/// Extra weight trees merged by the next ``loadWeights`` call, before `sanitize`.
-///
-/// Set immediately before a load and cleared immediately after; it exists because the
-/// model factory's `_load` is a fixed protocol requirement that cannot carry a second
-/// directory. Same idiom, same lifetime discipline as `_qwen35MTPEnabled`.
-public nonisolated(unsafe) var _additionalWeightSources: [AdditionalWeightSource] = []
-
-/// Prefix stripped from the PRIMARY directory's tensor names by the next
-/// ``loadWeights`` call, before `sanitize`.
-///
-/// This exists for one specific, checked-in shape: a checkpoint whose tensors are named
-/// for a multimodal WRAPPER (`language_model.model.*`, `language_model.lm_head.weight`)
-/// while its `config.json` declares the bare TEXT model. Such a tree is internally
-/// consistent only if the loader strips the wrapper prefix — which is exactly what this
-/// repository's own eager loader (`RuntimeWeightNameTracker`) already does for the same
-/// tree, by the same rule.
-///
-/// DO NOT SET THIS FOR A WRAPPER MODEL. `Qwen35Model.sanitize` deliberately ADDS
-/// `language_model.` so the parameters address its `language_model` child; stripping it
-/// first would leave every tensor addressed to nothing. The caller decides from the
-/// config's declared `model_type`, which is the only place the answer is written down.
-public nonisolated(unsafe) var _primaryWeightKeyPrefixStrip: String?
-
-/// Drop `prefix` from every key that carries it.
-///
-/// Pure and model-free so the rename rule is testable without loading anything.
-/// A collision after the rename means the tree carried BOTH spellings of a
-/// tensor and one of them would silently win, so it throws instead — the same
-/// stance this repository's eager loader (`RuntimeWeightNameTracker`) takes on
-/// the identical rename.
-public func strippingWeightKeyPrefix(
-    _ prefix: String, from weights: [String: MLXArray]
-) throws -> [String: MLXArray] {
-    guard !prefix.isEmpty else { return weights }
-    var renamed = [String: MLXArray]()
-    renamed.reserveCapacity(weights.count)
-    for (key, value) in weights {
-        let name = key.hasPrefix(prefix)
-            ? String(key.dropFirst(prefix.count)) : key
-        guard renamed.updateValue(value, forKey: name) == nil else {
-            throw ModelFactoryError.configurationFileError(
-                "model.safetensors.index.json",
-                "weight names collide after stripping '\(prefix)': \(name)",
-                NSError(domain: "MLXLMCommon", code: 1)
-            )
-        }
-    }
-    return renamed
-}
-
-/// Load a directory's safetensors into one dictionary, without any model coupling.
-public func loadArrays(directory: URL) throws -> [String: MLXArray] {
-    var urls: [URL] = []
-    if let enumerator = FileManager.default.enumerator(
-        at: directory, includingPropertiesForKeys: nil)
-    {
-        for case let url as URL in enumerator where url.pathExtension == "safetensors" {
-            urls.append(url)
-        }
-    }
-    urls.sort { $0.lastPathComponent < $1.lastPathComponent }
-    var out = [String: MLXArray]()
-    for url in urls {
-        for (key, value) in try loadArrays(url: url) {
-            out[key] = value
-        }
-    }
-    return out
+/// Opt-in load-time materialization for a model whose sanitizer creates
+/// large lazy packed-weight copies. Other models retain the existing load
+/// sequence. The hook runs after strict update and removal of both loader
+/// staging owners, before dtype conversion and the final model eval.
+public protocol IncrementalCheckpointMaterializing: AnyObject {
+    var needsIncrementalCheckpointMaterialization: Bool { get }
+    func materializeCheckpointWeightsIncrementally() throws
 }
 
 /// Load model weights.
@@ -227,14 +188,26 @@ public func loadWeights(
     }
     shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
 
+    let filterOwner = model as? any CheckpointWeightLoadFiltering
+    let checkpointFilter = filterOwner?.checkpointWeightLoadFilter
+
     // Hand the kernel a head start on every shard. F_RDADVISE is Darwin's
     // async-prefetch primitive — it issues a non-blocking advisory read into
     // the unified buffer cache, letting the SSD start streaming pages before
     // we ask for them. Net cost is one open/fcntl/close per shard. By the
     // time the DispatchQueue.concurrentPerform tasks below try to read, the
     // pages may already be resident.
-    prefetchShards(shardURLs)
-    mark("rdadvise")
+    //
+    // Do NOT advise whole files for an externally-backed model. Qwen4's PLE
+    // tensors share safetensor files with compute weights; whole-file advice
+    // would explicitly pull the 30 GiB SSD table into the unified buffer
+    // cache even though the key filter below never evaluates those arrays.
+    if filterOwner?.skipWholeShardPrefetch != true {
+        prefetchShards(shardURLs)
+        mark("rdadvise")
+    } else {
+        mark("rdadvise skipped (checkpoint filter)")
+    }
 
     // Load shards in parallel. Each task forces eval() on its arrays so MLX
     // actually performs the disk read inside the task rather than deferring all
@@ -247,10 +220,19 @@ public func loadWeights(
     DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
         do {
             let (w, m) = try loadArraysAndMetadata(url: urls[idx])
-            if !w.isEmpty {
-                eval(Array(w.values))
+            // Filter before eval: excluded arrays remain lazy views over the
+            // file and disappear with `w` at the end of this task. Retained
+            // arrays alone fault their exact ranges into memory.
+            let selected =
+                if let checkpointFilter {
+                    w.filter { checkpointFilter($0.key) }
+                } else {
+                    w
+                }
+            if !selected.isEmpty {
+                eval(Array(selected.values))
             }
-            shared.store(index: idx, result: (w, m))
+            shared.store(index: idx, result: (selected, m))
         } catch {
             shared.recordError(error)
         }
@@ -267,35 +249,6 @@ public func loadWeights(
         if i == 0 || metadata.isEmpty { metadata = m }
     }
     mark("read shards (parallel)")
-
-    // Merge any separately-pinned weight trees BEFORE sanitize and BEFORE the
-    // quantization wiring below. Both orderings are load-bearing: `sanitize` is
-    // where a model decides what an extra key MEANS, and `quantize(model:)`
-    // decides which submodules become quantized layers by asking whether
-    // `weights["<path>.scales"]` exists -- so a tree merged after that walk
-    // would arrive as quantized tensors addressed to unquantized layers and
-    // fail `update(parameters:verify:)`.
-    //
-    // WHY A GLOBAL. The factory's `_load` is a protocol requirement with a
-    // fixed signature, so an extra directory cannot be threaded through it
-    // without changing every conformance. `_qwen35MTPEnabled` (Qwen35MTP.swift)
-    // already establishes this exact idiom in this fork: a global set
-    // immediately before the load, read during it. Callers must clear it after
-    // the load; see `Qwen36MTPHeadAttachment` on the consumer side.
-    // Strip the wrapper prefix from the primary tree FIRST, so an additional
-    // source merged below lands in the same namespace the model addresses.
-    if let strip = _primaryWeightKeyPrefixStrip, !strip.isEmpty {
-        weights = try strippingWeightKeyPrefix(strip, from: weights)
-        mark("strip \(strip)*")
-    }
-
-    for source in _additionalWeightSources {
-        let extra = try loadArrays(directory: source.directory)
-        for (key, value) in extra {
-            weights[source.keyPrefix + key] = value
-        }
-        mark("merge \(source.keyPrefix)*")
-    }
 
     // Stage the checkpoint's quantization policy for sanitizers whose
     // module-topology decisions depend on it (e.g. the Qwen3.5 routed-expert
@@ -330,13 +283,21 @@ public func loadWeights(
     mark("quantize wire")
 
     // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
+    var parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
     mark("update params")
 
     // Drop the staging dictionary before dtype conversion so we don't keep
     // two copies of safetensor arrays alive during the bf16 pass.
     weights.removeAll(keepingCapacity: false)
+    if let materializing = model as? IncrementalCheckpointMaterializing,
+        materializing.needsIncrementalCheckpointMaterialization
+    {
+        parameters = ModuleParameters()
+        shared.releaseResults()
+        try materializing.materializeCheckpointWeightsIncrementally()
+        mark("incremental checkpoint materialization")
+    }
     MLX.Memory.clearCache()
 
     // Convert fp16 parameters to bf16 to eliminate AsType cascades.

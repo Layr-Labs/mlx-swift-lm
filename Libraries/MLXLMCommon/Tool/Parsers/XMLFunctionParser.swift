@@ -7,10 +7,33 @@ import Foundation
 public struct XMLFunctionParser: ToolCallParser, Sendable {
     public let startTag: String?
     public let endTag: String?
+    private let acceptBareFunction: Bool
 
-    public init(startTag: String, endTag: String) {
+    public init(startTag: String, endTag: String, acceptBareFunction: Bool = false) {
         self.startTag = startTag
         self.endTag = endTag
+        self.acceptBareFunction = acceptBareFunction
+    }
+
+    public var alternateStartTags: [String] { acceptBareFunction ? ["<function="] : [] }
+
+    public func endTags(forStartTag tag: String) -> [String] {
+        if acceptBareFunction, tag == "<function=" { return ["</function>"] }
+        return [endTag].compactMap { $0 }
+    }
+
+    public func parseEOS(_ buffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        if !acceptBareFunction {
+            return buffer.components(separatedBy: startTag ?? "<tool_call>")
+                .filter { !$0.isEmpty }.compactMap { parse(content: $0, tools: tools) }
+        }
+        guard let regex = try? NSRegularExpression(pattern: #"<function=[\s\S]*?</function>"#)
+        else { return [] }
+        return regex.matches(in: buffer, range: NSRange(buffer.startIndex..., in: buffer))
+            .compactMap { match in
+                guard let range = Range(match.range, in: buffer) else { return nil }
+                return parse(content: String(buffer[range]), tools: tools)
+            }
     }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
@@ -40,7 +63,10 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             guard
                 let nameEnd = paramSection.range(
                     of: ">", range: paramStart.upperBound ..< paramSection.endIndex)
-            else { break }
+            else {
+                if acceptBareFunction { return nil }
+                break
+            }
 
             let paramName = String(paramSection[paramStart.upperBound ..< nameEnd.lowerBound])
 
@@ -48,9 +74,13 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
             guard
                 let paramEnd = paramSection.range(
                     of: "</parameter>", range: nameEnd.upperBound ..< paramSection.endIndex)
-            else { break }
+            else {
+                if acceptBareFunction { return nil }
+                break
+            }
 
             var paramValue = String(paramSection[nameEnd.upperBound ..< paramEnd.lowerBound])
+            if acceptBareFunction, arguments[paramName] != nil { return nil }
 
             // Trim leading/trailing newlines (matching Python behavior)
             if paramValue.hasPrefix("\n") {

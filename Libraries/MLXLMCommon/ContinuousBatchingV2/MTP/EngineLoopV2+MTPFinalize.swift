@@ -39,6 +39,7 @@ extension EngineLoopV2 {
         if let seedHidden = round.seedHidden {
             let seedPolicyTopTwo =
                 round.seedPolicyTopTwoValues?.asArray(Float.self)
+            if seedPolicyTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
                     let rec = scheduler.record(for: id)
@@ -59,20 +60,20 @@ extension EngineLoopV2 {
 
         guard let verify = round.verify else { return }
         let k = verify.k
-        // THE round's host sync. Nothing is queued behind it — MTP rounds do
-        // not chain — so this wait is the round's GPU time as the host sees
-        // it, and everything after it is the fixed cost.
-        let packetWaitStart = CBv2MTPRoundTiming.now()
+        // Host readbacks of the MTP round, each counted: an MTP-round
+        // finalize adds up to three syncs to the step's one (seed policy
+        // margin above, acceptance packet, verify policy margin). Serial
+        // target verification adds one blocking eval per column at launch
+        // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
+        // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
+        // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
+        // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
+        CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
-        round.timing.packetWaitNanos = CBv2MTPRoundTiming.since(packetWaitStart)
-        let acceptWalkStart = CBv2MTPRoundTiming.now()
-        defer {
-            mtp.recordRoundTiming(round.timing)
-            mtp.lastRoundFinalizeEndNanos = CBv2MTPRoundTiming.now()
-        }
-        let layout = verify.layout
-        let targetWidth = layout.targetWidth
+        if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        let draftCount = verify.rows.count * k
+        let targetWidth = 1 + k
         var anyRejected = false
 
         struct RowOutcome {
@@ -107,11 +108,9 @@ extension EngineLoopV2 {
                 continue
             }
             let rec = scheduler.record(for: id)!
-            let drafts = (0 ..< k).map {
-                Int(host[layout.draftIndex(row: batchIndex, position: $0)])
-            }
+            let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
             let targets = (0 ..< targetWidth).map {
-                Int(host[layout.targetIndex(row: batchIndex, column: $0)])
+                Int(host[draftCount + batchIndex * targetWidth + $0])
             }
 
             var accepted = 0
@@ -138,7 +137,8 @@ extension EngineLoopV2 {
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
         round.claimedSeedCostNanos = mtp.claimPendingSeedCost(
             decodeRowBucket: mtp.planDecodeRowBucket,
-            finalizedVerifyIDs: round.finalizedVerifyIDs)
+            finalizedVerifyIDs: round.finalizedVerifyIDs,
+            measurement: step.mtpMeasurement)
 
         if !outcomes.isEmpty {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
@@ -149,11 +149,9 @@ extension EngineLoopV2 {
                 drafted: k,
                 accepted: stepAccepted,
                 observedDrafts: observedDrafts,
-                decodeRowBucket: mtp.planDecodeRowBucket)
+                decodeRowBucket: mtp.planDecodeRowBucket,
+                measurement: step.mtpMeasurement)
         }
-
-        round.timing.acceptWalkNanos = CBv2MTPRoundTiming.since(acceptWalkStart)
-        let rowFinalizeStart = CBv2MTPRoundTiming.now()
 
         for outcome in outcomes {
             let batchIndex = outcome.batchIndex
@@ -192,6 +190,14 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
+            round.committedVerifyTokenCount += kept.filter {
+                !rec.request.stopTokens.contains($0)
+            }.count
+            for packet in verify.diagnostics where packet.requestID == id {
+                let drafts = (0..<k).map { Int(host[batchIndex * k + $0]) }
+                packet.reconcile(
+                    accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
+            }
             let rejected = (1 + k) - confirmed
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
@@ -253,6 +259,13 @@ extension EngineLoopV2 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
             }
+            // The speculative suffix is now reconciled in BOTH the page tables
+            // and scheduler record. Publish only the accepted frontier; doing
+            // this before rollback would make a rejected block cache-visible.
+            let launchedEnd = step.computedRanges[id]?.upperBound ?? rec.numComputedTokens
+            publishFinalizedResidentBlocks(
+                requestID: id,
+                safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
             if hasStopStrings {
                 stream(for: id)?.emit(
@@ -272,40 +285,17 @@ extension EngineLoopV2 {
             }
 
             let observedAccepted = min(accepted, confirmed)
-            // Acceptance/rollback audit record (observability, 2026-08-25):
-            // every value is already on the host at this boundary. The
-            // scheduler fields are read AFTER recordSampled/rollbackComputed
-            // above, so the record states the row's post-round accounting —
-            // the boundary invariant a consumer checks is
-            // `numComputedAfter == tokensCountAfter - 1`.
-            mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed,
-                audit: CBv2MTPRoundAuditRecord(
-                    requestID: id.raw,
-                    k: k,
-                    draftTokens: Array(
-                        host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
-                    targetTokens: outcome.targets,
-                    accepted: accepted,
-                    confirmed: confirmed,
-                    rejected: rejected,
-                    tokensCountAfter: rec.tokens.count,
-                    numComputedAfter: rec.numComputedTokens,
-                    generatedAfter: rec.generatedTokenCount,
-                    finishReason: finishReason.map { String(describing: $0) }))
-            let rejectionObserved = accepted < k && confirmed > accepted
-            // Instrumentation for tree drafting: the divergence is at draft
-            // position `accepted`, where `drafts[accepted] != targets[accepted]`.
-            // Ask whether the drafter's runner-up from that same forward WAS
-            // the target's token. Gated on `rejectionObserved` so a round cut
-            // short by a stop token or the output budget — which never reached
-            // the comparison — cannot bias `r` toward zero.
-            if rejectionObserved, layout.runnerUpsBase != nil {
-                let runnerUp = Int(
-                    host[layout.runnerUpIndex(row: batchIndex, position: accepted)])
-                mtp.recordRunnerUp(
-                    position: accepted, hit: runnerUp == outcome.targets[accepted])
+            // Per-request timing: this verify row confirmed at the step's
+            // readback-done instant (already read by `finalize`).
+            rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
+            rec.recordMTPRound(drafted: k, accepted: observedAccepted)
+            if confirmed > 0 {
+                rec.timing.decodeSteps &+= 1
+                decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
+            mtp.recordRound(
+                drafted: k, accepted: observedAccepted, emitted: confirmed)
+            let rejectionObserved = accepted < k && confirmed > accepted
             let acceptanceTruncated =
                 !rejectionObserved && confirmed <= accepted && confirmed < k
             mtp.observeRequestAcceptance(
@@ -339,8 +329,8 @@ extension EngineLoopV2 {
                 // head for that round.
                 var carryShortlist: MLXArray?
                 if let shortlistIDs = verify.shortlistIDs {
-                    let mass = host[
-                        layout.shortlistMassIndex(row: batchIndex, column: hiddenColumn)]
+                    let massBase = draftCount + verify.rows.count * targetWidth
+                    let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
                     if mass >= Self.mtpShortlistMassThresholdPPM {
                         carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
                     }
@@ -375,6 +365,5 @@ extension EngineLoopV2 {
         if anyRejected {
             eagerCompositionStale = true
         }
-        round.timing.rowFinalizeNanos = CBv2MTPRoundTiming.since(rowFinalizeStart)
     }
 }

@@ -375,105 +375,31 @@ func qwen35A3BTimewiseProjection(
 func qwen35A3BExactW4G64Projection(
     _ linear: Linear, _ input: MLXArray
 ) -> MLXArray {
-    let quantized = unsafeDowncast(linear, to: QuantizedLinear.self)
-    let quantizationBiases = quantized.biases!
-    let batch = input.dim(0)
-    let width = input.dim(1)
-    let inputSize = input.dim(2)
-    let outputSize = quantized.weight.dim(0)
-    return qwen35A3BExactW4G64VerifyKernel(
-        [input, quantized.weight, quantized.scales, quantizationBiases],
-        template: [
-            ("T", input.dtype),
-            ("VERIFY_T", width),
-            ("K_SIZE", inputSize),
-            ("N_SIZE", outputSize),
-        ],
-        grid: (32, 2 * (outputSize / 4), batch),
-        threadGroup: (32, 2, 1),
-        outputShapes: [[batch, width, outputSize]],
-        outputDTypes: [input.dtype])[0]
+    // The fused verify kernel is not bit-exact to MLX's one-row QMV on the
+    // current pinned runtime. Correctness support keeps the canonical M1
+    // arithmetic; a fused replacement must first pass the independent oracle.
+    qwen35A3BTimewiseProjection(input) { linear($0) }
 }
 
 func qwen35A3BExactW4G64ProjectionPair(
     _ first: Linear, _ second: Linear, _ input: MLXArray
 ) -> (MLXArray, MLXArray) {
-    let firstQuantized = unsafeDowncast(first, to: QuantizedLinear.self)
-    let secondQuantized = unsafeDowncast(second, to: QuantizedLinear.self)
-    let batch = input.dim(0)
-    let width = input.dim(1)
-    let inputSize = input.dim(2)
-    let outputSize = firstQuantized.weight.dim(0)
-    let outputs = qwen35A3BExactW4G64PairVerifyKernel(
-        [
-            input,
-            firstQuantized.weight, firstQuantized.scales, firstQuantized.biases!,
-            secondQuantized.weight, secondQuantized.scales, secondQuantized.biases!,
-        ],
-        template: [
-            ("T", input.dtype),
-            ("VERIFY_T", width),
-            ("K_SIZE", inputSize),
-            ("N_SIZE", outputSize),
-            ("TILES_PER_MATRIX", outputSize / 4),
-        ],
-        grid: (32, 4 * (outputSize / 4), batch),
-        threadGroup: (32, 2, 1),
-        outputShapes: [
-            [batch, width, outputSize], [batch, width, outputSize],
-        ],
-        outputDTypes: [input.dtype, input.dtype])
-    return (outputs[0], outputs[1])
+    (
+        qwen35A3BTimewiseProjection(input) { first($0) },
+        qwen35A3BTimewiseProjection(input) { second($0) }
+    )
 }
 
 func qwen35A3BExactW4G64ProjectionQuad(
     _ first: Linear, _ second: Linear, _ third: Linear, _ fourth: Linear,
     _ input: MLXArray
 ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
-    let q0 = unsafeDowncast(first, to: QuantizedLinear.self)
-    let q1 = unsafeDowncast(second, to: QuantizedLinear.self)
-    let q2 = unsafeDowncast(third, to: QuantizedLinear.self)
-    let q3 = unsafeDowncast(fourth, to: QuantizedLinear.self)
-    let batch = input.dim(0)
-    let width = input.dim(1)
-    let inputSize = input.dim(2)
-    let n0 = q0.weight.dim(0)
-    let n1 = q1.weight.dim(0)
-    let n2 = q2.weight.dim(0)
-    let n3 = q3.weight.dim(0)
-    let tiles0 = n0 / 4
-    let tiles01 = tiles0 + n1 / 4
-    let tiles012 = tiles01 + n2 / 4
-    let outputs = qwen35A3BExactW4G64QuadVerifyKernel(
-        [
-            input,
-            q0.weight, q0.scales, q0.biases!,
-            q1.weight, q1.scales, q1.biases!,
-            q2.weight, q2.scales, q2.biases!,
-            q3.weight, q3.scales, q3.biases!,
-        ],
-        template: [
-            ("T", input.dtype),
-            ("VERIFY_T", width),
-            ("K_SIZE", inputSize),
-            ("N0_SIZE", n0),
-            ("N1_SIZE", n1),
-            ("N2_SIZE", n2),
-            ("N3_SIZE", n3),
-            ("TILES0", tiles0),
-            ("TILES01", tiles01),
-            ("TILES012", tiles012),
-        ],
-        grid: (32, 2 * (tiles012 + n3 / 4), batch),
-        threadGroup: (32, 2, 1),
-        outputShapes: [
-            [batch, width, n0],
-            [batch, width, n1],
-            [batch, width, n2],
-            [batch, width, n3],
-        ],
-        outputDTypes: [input.dtype, input.dtype, input.dtype, input.dtype])
-    return (outputs[0], outputs[1], outputs[2], outputs[3])
+    (
+        qwen35A3BTimewiseProjection(input) { first($0) },
+        qwen35A3BTimewiseProjection(input) { second($0) },
+        qwen35A3BTimewiseProjection(input) { third($0) },
+        qwen35A3BTimewiseProjection(input) { fourth($0) }
+    )
 }
 
 /// Installed W8/unquantized route. Its matrices are small enough that explicit

@@ -34,10 +34,19 @@ public struct Qwen3VLProcessor: UserInputProcessor {
 
     private let config: Qwen3VLProcessorConfiguration
     private let tokenizer: any Tokenizer
+    private let checkpointImageBounds: (min: Int, max: Int)?
 
     public init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
+        self.checkpointImageBounds = nil
+    }
+
+    init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer,
+         checkpointImageBounds: (min: Int, max: Int)) {
+        self.config = config
+        self.tokenizer = tokenizer
+        self.checkpointImageBounds = checkpointImageBounds
     }
 
     private func preprocess(image: CIImage, resizedSize: CGSize) -> CIImage {
@@ -80,13 +89,24 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         let factor = config.patchSize * config.mergeSize
         let maxPixels =
             processing?.maxPixels
+            ?? checkpointImageBounds?.max
             ?? Self.defaultVisionTokenBudgetPixels(factor: factor, ceiling: config.size.maxPixels)
-        let (resizedHeight, resizedWidth) = try QwenVL.targetSize(
-            height: Int(extent.height),
-            width: Int(extent.width),
-            factor: factor,
-            minPixels: processing?.minPixels ?? min(config.size.minPixels, maxPixels),
-            maxPixels: maxPixels)
+        let resizedHeight: Int
+        let resizedWidth: Int
+        if let bounds = checkpointImageBounds {
+            guard extent.height.isFinite, extent.width.isFinite,
+                  extent.height > 0, extent.width > 0,
+                  extent.height < CGFloat(Int.max), extent.width < CGFloat(Int.max) else {
+                throw VLMError.imageProcessingFailure("Qwen4 image has invalid dimensions")
+            }
+            let size = try Qwen4ExpMediaGeometry.image(height: Int(extent.height), width: Int(extent.width),
+                factor: factor, minPixels: processing?.minPixels ?? bounds.min, maxPixels: maxPixels)
+            (resizedHeight, resizedWidth) = (size.height, size.width)
+        } else {
+            (resizedHeight, resizedWidth) = try QwenVL.targetSize(
+                height: Int(extent.height), width: Int(extent.width), factor: factor,
+                minPixels: processing?.minPixels ?? min(config.size.minPixels, maxPixels), maxPixels: maxPixels)
+        }
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
 
@@ -370,10 +390,10 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
         public var deepstackVisualIndexes: [Int] { _deepstackVisualIndexes ?? [] }
 
         func visionMLPApproximationForConstruction() -> GELU.Approximation {
-            guard modelType == "qwen3_vl_moe" else { return .fast }
+            guard modelType == "qwen3_vl_moe" || modelType == "qwen4_exp" else { return .fast }
             precondition(
                 hiddenAct == "gelu_pytorch_tanh",
-                "Qwen3-VL MoE vision blocks require gelu_pytorch_tanh")
+                "Qwen3-VL MoE and Qwen4 vision blocks require gelu_pytorch_tanh")
             return .tanh
         }
 

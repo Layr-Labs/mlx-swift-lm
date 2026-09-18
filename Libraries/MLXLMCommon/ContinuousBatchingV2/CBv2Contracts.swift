@@ -109,6 +109,9 @@ public struct CBv2Request: Sendable {
     /// cache-offset path byte-for-byte. Multiaxis users provide an evaluated
     /// prompt tensor plus host decode deltas; no model-global state is shared.
     public var positionState: CBv2PositionState?
+    /// Opaque provider-authenticated media/position binding for complete
+    /// recurrent checkpoint reuse. Unbound out-of-band inputs fail closed.
+    public var hybridPrefixIdentity: CBv2HybridPrefixIdentity?
     /// Optional inference-time token automaton. nil preserves the ordinary
     /// sampler byte-for-byte. Required/named/none tool choices install a
     /// row-local machine compiled before submission.
@@ -120,6 +123,7 @@ public struct CBv2Request: Sendable {
         cacheSalt: String? = nil, prefixCacheEnabled: Bool = true,
         multimodal: CBv2MultimodalInput? = nil,
         positionState: CBv2PositionState? = nil,
+        hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
         tokenConstraint: (any CBv2TokenConstraint)? = nil
     ) {
@@ -134,6 +138,7 @@ public struct CBv2Request: Sendable {
         self.prefixCacheEnabled = prefixCacheEnabled
         self.multimodal = multimodal
         self.positionState = positionState
+        self.hybridPrefixIdentity = hybridPrefixIdentity
         self.prefixCacheReceiptID = prefixCacheReceiptID
         self.tokenConstraint = tokenConstraint
     }
@@ -346,10 +351,16 @@ public struct CBv2LayerKind: Sendable, Equatable {
     /// storage index == model layer index.
     public var modelLayerIndex: Int?
 
+    /// Model-owned state alongside K/V; zero for ordinary attention.
+    public var extraStorageBytesPerToken: Int
+    /// Structural QSA side-state geometry, absent on other attention families.
+    public var qwen4IndexerCompressRatio: Int?
+
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
         isBidirectional: Bool = false,
-        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil
+        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil,
+        extraStorageBytesPerToken: Int = 0, qwen4IndexerCompressRatio: Int? = nil
     ) {
         self.attention = attention
         self.sharesKVWithLayer = sharesKVWithLayer
@@ -359,6 +370,8 @@ public struct CBv2LayerKind: Sendable, Equatable {
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
         self.modelLayerIndex = modelLayerIndex
+        self.extraStorageBytesPerToken = max(0, extraStorageBytesPerToken)
+        self.qwen4IndexerCompressRatio = qwen4IndexerCompressRatio
     }
 }
 
@@ -451,15 +464,6 @@ extension CBv2SequenceKV {
     /// Default: no-op.
     public func commitSpeculativeWrite() {}
 }
-
-/// Affirmative storage proof for decode evaluation-root compaction.
-///
-/// Conformance means every mutation an ordinary one-token decode performs is
-/// ordered by either the K/V views consumed by the attention output or the
-/// owning `CBv2LayerCache`'s explicit fused-ring-write fence. Unknown/custom
-/// row implementations make no such claim, so the engine must keep their full
-/// cache inner state as evaluation roots.
-public protocol CBv2DecodeRootCompactionCapableSequenceKV: CBv2SequenceKV {}
 
 /// Factory for per-sequence KV state; implemented by the v1 contiguous
 /// backend and the v2 paged backend.
@@ -754,9 +758,9 @@ public struct CBv2SchedulerConfig: Sendable {
     public var maxConcurrentPartialPrefills: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
-    /// Prefix-cache participation (lookup+adopt on submit, donate on
-    /// finish). Off by default; requires a `CBv2PrefixCache` instance to be
-    /// supplied at engine construction as well.
+    /// Prefix-cache participation (lookup+adopt on submit, publish/donate on
+    /// finalized work). Off by default; requires a resident paged cache, a
+    /// `CBv2PrefixCache` snapshot tier, or both.
     public var enablePrefixCache: Bool
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
@@ -803,12 +807,106 @@ public enum CBv2Event: Sendable {
     case finished(reason: CBv2FinishReason, usage: CBv2Usage)
 }
 
+/// Engine-side per-request timing and step-participation counters, exported
+/// once on the terminal `CBv2Usage`. NUMERICS ONLY: never token ids, text,
+/// hashes, or pointers — the provider copies this verbatim onto the wire.
+///
+/// Instants are nanosecond OFFSETS from the engine enqueue instant in the
+/// `DispatchTime.now().uptimeNanoseconds` domain (the loop's existing
+/// convention). `0` means "not observed"; every observed offset is clamped
+/// to `>= 1`. Durations (`*NanosSum`, `pausedNanos`, `detokDelayFirstNanos`,
+/// `prefix*Nanos`) are plain elapsed nanoseconds.
+///
+/// Stamps are written only by the engine thread and reuse the step's
+/// existing clock reads (`CBv2InFlightStep.wallStartedNanos` at launch, the
+/// readback-done instant in `finalize`) — no per-row clock reads.
+public struct CBv2RequestTiming: Sendable, Equatable {
+    /// First step whose plan included this row (`wallStartedNanos` of that
+    /// step). Queue wait == this value.
+    public var admittedNanos: UInt64 = 0
+    /// Per-layer KV state allocated (`ensureKVState`).
+    public var kvAllocatedNanos: UInt64 = 0
+    /// First step whose plan included one of this row's prefill chunks
+    /// (`wallStartedNanos` of that step).
+    public var prefillFirstLaunchNanos: UInt64 = 0
+    /// Finalize of the step where `numComputedTokens >= promptTokens`.
+    public var promptComputedNanos: UInt64 = 0
+    /// Finalize of the step that confirmed the first generated token
+    /// (engine-side; excludes the detokenization hop).
+    public var firstTokenNanos: UInt64 = 0
+    /// `finishRequest` instant.
+    public var finishedNanos: UInt64 = 0
+    /// Waiting→running crossings after the first admission (preemption
+    /// and capacity requeues).
+    public var readmissions: UInt32 = 0
+    public var preemptions: UInt32 = 0
+    public var capacityRequeues: UInt32 = 0
+    /// Prefill chunk forwards launched for this row (all shapes).
+    public var prefillChunks: UInt32 = 0
+    /// Of `prefillChunks`, those that rode a rectangular `[B, chunk]` cohort.
+    public var packedPrefillChunks: UInt32 = 0
+    /// Of `prefillChunks`, those carrying image spans.
+    public var visionChunks: UInt32 = 0
+    /// Of `prefillChunks`, solo chunks wider than `prefillChunkSize` (the
+    /// solo-prefill stripe).
+    public var soloStripeChunks: UInt32 = 0
+    public var prefillChunkTokensMax: UInt32 = 0
+    /// Finalized steps in which this row confirmed a token beyond its first
+    /// (an MTP verify round with ≥1 confirmed token counts once).
+    public var decodeSteps: UInt32 = 0
+    /// Of the participated steps, those launched on the chained-decode path.
+    public var chainedDecodeSteps: UInt32 = 0
+    /// Σ over participated steps of the token-producing row count.
+    public var batchRowsSum: UInt64 = 0
+    public var batchRowsMin: UInt32 = 0
+    public var batchRowsMax: UInt32 = 0
+    /// Σ (readback-done instant − `wallStartedNanos`) over participated steps.
+    public var stepLatencyNanosSum: UInt64 = 0
+    public var stepLatencyNanosMax: UInt64 = 0
+    public var mtpRounds: UInt32 = 0
+    public var mtpProposed: UInt32 = 0
+    public var mtpAccepted: UInt32 = 0
+    /// Total backpressure-paused time and pause transitions.
+    public var pausedNanos: UInt64 = 0
+    public var pauseCount: UInt32 = 0
+    /// FIRST token only, passthrough rows: engine confirm → detokenized
+    /// emit, measured inside the output stream's existing lock.
+    public var detokDelayFirstNanos: UInt64 = 0
+    /// Submit-thread prefix-cache lookup duration (hashing + lookup + plan).
+    public var prefixLookupNanos: UInt64 = 0
+    /// `applyAdoption` duration on the engine thread.
+    public var prefixAdoptionNanos: UInt64 = 0
+    public init() {}
+}
+
+/// Immutable heap box for `CBv2Usage.timing`. Keeps `CBv2Usage` — and every
+/// enum/struct/`async let` result that carries it — one pointer larger
+/// instead of ~170 bytes larger: the Swift 6.3 runtime frees `async let`
+/// result buffers above a size threshold out of order ("freed pointer was
+/// not the last allocation" in `asyncLet_finish_after_task_completion`),
+/// reproduced on the UNMODIFIED engine by padding a test result struct.
+/// Allocated only when `timing` is written (once per request at finish —
+/// never on the step path); the zero value is a shared instance.
+final class CBv2RequestTimingBox: Sendable {
+    let value: CBv2RequestTiming
+    init(_ value: CBv2RequestTiming) { self.value = value }
+    static let zero = CBv2RequestTimingBox(CBv2RequestTiming())
+}
+
 public struct CBv2Usage: Sendable {
     public var promptTokens: Int
     public var completionTokens: Int
-    /// Final per-request prefix lookup/adoption result. This describes the
-    /// in-memory engine tier only; SSD staging remains a provider concern.
+    /// Engine per-request timing (defaulted; folded in at `finishRequest`).
+    /// Boxed storage — see `CBv2RequestTimingBox`.
+    public var timing: CBv2RequestTiming {
+        get { timingBox.value }
+        set { timingBox = CBv2RequestTimingBox(newValue) }
+    }
+    private var timingBox: CBv2RequestTimingBox = .zero
+    /// Final per-request prefix lookup/adoption result.
     public var prefixCacheOutcome: CBv2PrefixCacheOutcome
+    /// Physical source of an adopted hit; nil for every non-hit.
+    public var prefixCacheTier: CBv2PrefixCacheTier?
     /// Whole-block tokens matched by lookup before the model-specific
     /// recompute bound and backend adoption are applied.
     public var prefixCacheMatchedTokens: Int
@@ -826,6 +924,7 @@ public struct CBv2Usage: Sendable {
     public init(
         promptTokens: Int, completionTokens: Int, prefixCacheHitTokens: Int = 0,
         prefixCacheOutcome: CBv2PrefixCacheOutcome = .disabled,
+        prefixCacheTier: CBv2PrefixCacheTier? = nil,
         prefixCacheMatchedTokens: Int = 0,
         prefixCachePrefillTokensSaved: Int = 0,
         prefixCacheStrategy: CBv2PrefixReuseStrategy? = nil,
@@ -835,6 +934,7 @@ public struct CBv2Usage: Sendable {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.prefixCacheOutcome = prefixCacheOutcome
+        self.prefixCacheTier = prefixCacheTier
         self.prefixCacheMatchedTokens = prefixCacheMatchedTokens
         self.prefixCachePrefillTokensSaved = prefixCachePrefillTokensSaved
         self.prefixCacheStrategy = prefixCacheStrategy
@@ -842,6 +942,14 @@ public struct CBv2Usage: Sendable {
         self.prefixCacheBoundarySplits = prefixCacheBoundarySplits
         self.prefixCacheHitTokens = prefixCacheHitTokens
     }
+}
+
+/// Physical source of a successful engine-level prefix adoption.
+public enum CBv2PrefixCacheTier: String, Sendable, Equatable {
+    /// Zero-copy physical pages already resident in the paged KV pool.
+    case resident
+    /// Materialized KV snapshots supplied through `CBv2PrefixCache`.
+    case snapshot
 }
 
 /// Engine-local prefix-cache result. The provider maps this to its wire
@@ -868,40 +976,36 @@ public struct CBv2CapacitySnapshot: Sendable {
     public var activeRequests: Int
     public var waitingRequests: Int
     public var kvBytesInUse: Int
-    /// The ADMISSION ceiling (runtime-resizable soft ledger). On the
-    /// contiguous backend this equals the backend's capacity (resize fans
-    /// out to both); on the paged backend a re-slice moves only this
-    /// ledger — the physically preallocated slabs stay at
-    /// `kvBytesBackendCapacity`.
+    /// Runtime admission ceiling, including request KV and auxiliary state.
     public var kvBytesCapacity: Int
-    /// The backend's PHYSICAL byte capacity (paged: pageCount × pageBytes
-    /// over all groups, construction-fixed; contiguous: == the admission
-    /// ceiling). Capacity planning binds to min(kvBytesCapacity, this)
-    /// ONLY WHEN THIS IS NONZERO — after a ledger GROW past pool truth the
-    /// pool is what actually admits. 0 means UNKNOWN (snapshots built
-    /// through the backwards-compatible initializer, e.g. test stubs) and
-    /// must never be read as zero capacity.
+    /// Backend ceiling. Contiguous and segmented paged grants resize; the
+    /// fixed-slab reference keeps its construction capacity. Zero means an
+    /// older/test snapshot did not report a separate backend ceiling.
     public var kvBytesBackendCapacity: Int
-    /// Bytes NOT available for new admissions: the backend's admission
-    /// truth — bytes PROMISED to admitted sequences (the paged pool's
-    /// atomic worst-case page charges; the contiguous backend's per-row
-    /// `max(allocated, reservation)`) — PLUS the compiled decode path's
-    /// live padding carve (`AdmissionV2.bytesExternallyReserved`, 0 after
-    /// a warmup refund and always 0 on paged backends, where compiled
-    /// decode is vetoed). `kvBytesInUse` lags this — storage materializes
-    /// lazily as tokens are written — so capacity planning (provider
-    /// heartbeats) must subtract RESERVED, not in-use, or several
-    /// admitted-but-cold requests look like free headroom.
+    /// Bytes unavailable to new admissions: promised target KV plus tracked
+    /// recurrent/assistant state and transfer reservations. In-use page bytes
+    /// can be smaller because admitted rows have not filled their reservation.
     public var kvBytesReserved: Int
     public var activeTokens: Int
     /// Monotonic count of engine steps executed. Providers use this as a
     /// direct liveness/wedge signal (a stalled engine stops incrementing)
     /// instead of proxying via event counts.
     public var stepsExecuted: Int
+    /// Cumulative Σ over finalized steps of (readback-done instant −
+    /// `wallStartedNanos`), i.e. launch→confirm wall time. Monotonic;
+    /// `stepWallNanosTotal / stepsExecuted` is the mean step latency.
+    public var stepWallNanosTotal: UInt64 = 0
+    /// Cumulative Σ over finalized steps of rows that confirmed a token
+    /// beyond their first (decode rows). Monotonic;
+    /// `decodeRowsTotal / stepsExecuted` is the mean decode batch size.
+    public var decodeRowsTotal: UInt64 = 0
+    /// Queue-captured segmented-pool ownership; nil for other backends.
+    public var pagedStorage: PagedKVStorageSnapshot?
     public init(
         activeRequests: Int, waitingRequests: Int, kvBytesInUse: Int, kvBytesCapacity: Int,
         kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0, activeTokens: Int,
-        stepsExecuted: Int = 0
+        stepsExecuted: Int = 0, stepWallNanosTotal: UInt64 = 0, decodeRowsTotal: UInt64 = 0,
+        pagedStorage: PagedKVStorageSnapshot? = nil
     ) {
         self.activeRequests = activeRequests
         self.waitingRequests = waitingRequests
@@ -911,6 +1015,9 @@ public struct CBv2CapacitySnapshot: Sendable {
         self.kvBytesReserved = kvBytesReserved
         self.activeTokens = activeTokens
         self.stepsExecuted = stepsExecuted
+        self.stepWallNanosTotal = stepWallNanosTotal
+        self.decodeRowsTotal = decodeRowsTotal
+        self.pagedStorage = pagedStorage
     }
 }
 
@@ -1113,6 +1220,19 @@ public struct CBv2PackedPrefillActivity: Sendable, Equatable {
         isSupported: false, rowsExecuted: 0, groupsExecuted: 0)
 }
 
+/// Advisory result from the resident physical-page tier before submission.
+/// It never pins pages: allocator reuse may invalidate it before `submit`, in
+/// which case the engine safely falls back to ordinary prefill.
+public struct CBv2ResidentPrefixCandidate: Sendable, Equatable {
+    public let matchedTokens: Int
+    public let prefillTokensSaved: Int
+
+    public init(matchedTokens: Int, prefillTokensSaved: Int) {
+        self.matchedTokens = matchedTokens
+        self.prefillTokensSaved = prefillTokensSaved
+    }
+}
+
 /// `Sendable`: engine handles cross concurrency domains by design (the
 /// provider submits from request tasks, cancels from disconnect handlers,
 /// and reads capacity from heartbeat timers). Implementations synchronize
@@ -1133,6 +1253,13 @@ public protocol CBv2Engine: AnyObject, Sendable {
     /// Cancel promptly: in-flight step completes, row is dropped O(1).
     func cancel(_ id: CBv2RequestID)
     func capacity() -> CBv2CapacitySnapshot
+    /// Non-mutating, non-pinning resident-prefix preflight. Providers use a
+    /// positive result to avoid reading a slower snapshot/SSD tier before
+    /// submission. nil means absent, ineligible, or unsupported. The real
+    /// lookup and generation-checked claim still happen inside `submit`.
+    func residentPrefixCandidate(
+        for request: CBv2Request
+    ) -> CBv2ResidentPrefixCandidate?
     /// Packed-prefill capability AND cumulative execution evidence. Cheap
     /// (plain counter reads); safe to poll from a benchmark harness or
     /// heartbeat. Fail-closed default: `.none`.
@@ -1198,6 +1325,9 @@ public protocol CBv2Engine: AnyObject, Sendable {
 
 extension CBv2Engine {
     public func updateKVBytesCapacity(_ bytes: Int) {}
+    public func residentPrefixCandidate(
+        for request: CBv2Request
+    ) -> CBv2ResidentPrefixCandidate? { nil }
     /// An engine with no packed-prefill path reports neither capability nor
     /// execution.
     public func packedPrefillActivity() -> CBv2PackedPrefillActivity { .none }
