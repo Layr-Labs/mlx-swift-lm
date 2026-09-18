@@ -78,6 +78,13 @@ struct PrismHadamardCheckpoint {
             let size = values.fileSize, size > 0, size <= 8 * 1024 * 1024
         else { throw PrismCheckpointError.invalid("unsafe transform metadata") }
         transforms = try JSONDecoder().decode(PrismHadamardConfiguration.self, from: Data(contentsOf: file))
+        let normalizers = weights.filter {
+            $0.key.hasPrefix("language_model.model.layers.")
+                && ($0.key.hasSuffix(".input_layernorm.weight") || $0.key.hasSuffix(".post_attention_layernorm.weight"))
+        }
+        guard !normalizers.isEmpty, normalizers.values.allSatisfy({ $0.dtype == .float32 }) else {
+            throw PrismCheckpointError.invalid("schema-2 native state requires the published FP32 normalizers")
+        }
         let forward = Set(configuration.modules.filter { !$0.embedding }.map { "language_model.\($0.path).weight" })
         let inverse = Set(configuration.modules.filter(\.embedding).map { "language_model.\($0.path).weight" })
         guard transforms.gdnVGrouped, Set(transforms.weightNames) == forward,

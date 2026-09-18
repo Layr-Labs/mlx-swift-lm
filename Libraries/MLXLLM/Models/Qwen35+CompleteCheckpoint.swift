@@ -11,7 +11,11 @@ extension Qwen35TextModel: CBv2CompleteCheckpointKVTypeProviding {
         let dtype: DType
         if let embedding = model.embedTokens as? HadamardQuantizedEmbedding {
             guard let biases = embedding.biases, embedding.scales.dtype == biases.dtype else { return nil }
-            dtype = embedding.scales.dtype
+            // The published Prism pack keeps FP32 normalizers. RMSNorm promotes
+            // the FP16 embedding output before projections, so native KV and
+            // recurrent convolution rows are FP32, not the packed scale dtype.
+            guard model.cbv2UniformLayerNormDType == .float32 else { return nil }
+            dtype = .float32
         } else if let embedding = model.embedTokens as? QuantizedEmbedding {
             guard embedding.mode == .affine, let biases = embedding.biases,
                 embedding.scales.dtype == biases.dtype

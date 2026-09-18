@@ -7,9 +7,12 @@ Qwen4 Flash-Next model.
 
 ## Artifact contract
 
-- Schema 2, affine 2-bit/group 128, FP16 packed scales and activations.
+- Schema 2, affine 2-bit/group 128 with FP16 packed scales. Published language
+  normalizers remain FP32; native normalization promotes downstream activations
+  and KV/recurrent convolution rows to FP32. Do not infer state precision from
+  embedding or packed scale storage alone.
 - Signed block-Hadamard metadata in `hadamard.json`; FP32 transform arithmetic
-  followed by restoration of the input dtype. Generic BF16 weight conversion
+  followed by restoration of the incoming dtype. Generic BF16 weight conversion
   is not applied to this artifact.
 - Explicit grouped GDN layout, without a second output-head permutation.
 - The selected weights contain 2,390 tensors: 402 sign vectors, 333 vision

@@ -1674,6 +1674,15 @@ public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
+
+    /// Metadata-only inspection for packed variants whose normalizers promote
+    /// activations. No tensor evaluation or serving arithmetic changes.
+    var cbv2UniformLayerNormDType: DType? {
+        guard let dtype = layers.first?.inputLayerNorm.weight.dtype,
+            layers.allSatisfy({ $0.inputLayerNorm.weight.dtype == dtype
+                && $0.postAttentionLayerNorm.weight.dtype == dtype }) else { return nil }
+        return dtype
+    }
     let norm: RMSNorm
 
     let ssmIdx: Int

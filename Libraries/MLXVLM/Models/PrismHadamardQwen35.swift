@@ -33,7 +33,7 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var cbv2LayerKinds: [CBv2LayerKind] { languageModel.cbv2LayerKinds }
     public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
-        textConfiguration.cbv2RecurrentStateSpec(activationDType: .float16)
+        languageModel.cbv2RecurrentStateSpec
     }
     public var cbv2Capabilities: CBv2ModelCapabilities {
         var value = languageModel.cbv2Capabilities

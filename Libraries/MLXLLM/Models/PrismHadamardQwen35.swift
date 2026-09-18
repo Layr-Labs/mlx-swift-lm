@@ -21,7 +21,7 @@ public final class PrismHadamardQwen35TextModel: Qwen35Model, PrismHadamardLoadi
         return value
     }
     public override var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
-        textConfiguration.cbv2RecurrentStateSpec(activationDType: .float16)
+        super.cbv2RecurrentStateSpec
     }
     public var checkpointWeightLoadFilter: CheckpointWeightLoadFilter {
         { !$0.hasPrefix("vision_tower.") }

@@ -56,11 +56,11 @@ final class PrismHadamardCheckpointTests: XCTestCase {
 
     func testPackedEmbeddingAdvertisesFloatingCacheState() throws {
         let config = try JSONDecoder().decode(Qwen35TextConfiguration.self, from: Data("""
-            {"model_type":"qwen3_5_text","hidden_size":512,"num_hidden_layers":1,
+            {"model_type":"qwen3_5_text","hidden_size":512,"num_hidden_layers":4,
              "intermediate_size":512,"num_attention_heads":8,"num_key_value_heads":2,
              "head_dim":64,"linear_num_value_heads":1,"linear_num_key_heads":1,
              "linear_key_head_dim":64,"linear_value_head_dim":64,"linear_conv_kernel_dim":4,
-             "full_attention_interval":1,"vocab_size":4,"mtp_num_hidden_layers":0}
+             "full_attention_interval":4,"vocab_size":4,"mtp_num_hidden_layers":0}
             """.utf8))
         let model = Qwen35TextModel(config)
         let embedding = try HadamardQuantizedEmbedding(
@@ -69,7 +69,8 @@ final class PrismHadamardCheckpointTests: XCTestCase {
             groupSize: 128, bits: 2,
             transform: SignedBlockHadamard(blockSize: 512, signs: Array(repeating: 1, count: 512)))
         model.update(modules: ModuleChildren.unflattened([("model.embed_tokens", embedding)]))
-        XCTAssertEqual(model.cbv2CheckpointActivationDType, .float16)
-        XCTAssertEqual(model.cbv2CompleteCheckpointKVDTypes, [.float16])
+        XCTAssertEqual(model.cbv2CheckpointActivationDType, .float32)
+        XCTAssertEqual(model.cbv2CompleteCheckpointKVDTypes, [.float32])
+        XCTAssertEqual(model.cbv2RecurrentStateSpec.layers.map(\.convDType), [.float32, .float32, .float32])
     }
 }
