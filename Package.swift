@@ -43,7 +43,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
-                 revision: "35e55a6b9f53db22a01fa0b6fb38afef8dd3100d"),
+                 revision: "70052b2147f828e6b9bcc2dce599017415387377"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),

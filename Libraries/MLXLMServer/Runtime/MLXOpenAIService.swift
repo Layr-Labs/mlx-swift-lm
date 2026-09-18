@@ -87,8 +87,15 @@ public struct MLXOpenAIService: Sendable {
     public func streamChatCompletionFrames(
         request: OpenAIChatCompletionRequest
     ) async throws -> AsyncThrowingStream<String, Error> {
+        try await streamChatCompletionFrames(request: request, frameGenerationErrors: false)
+    }
+
+    public func streamChatCompletionFrames(
+        request: OpenAIChatCompletionRequest,
+        frameGenerationErrors: Bool
+    ) async throws -> AsyncThrowingStream<String, Error> {
         await metrics.recordChatRequest()
-        let generationRequest = try OpenAIResponseFormatSupport.preparedRequest(request)
+        let generationRequest = try OpenAIRequestValidation.preparedRequest(request)
         let stream = try await engine.streamChatCompletion(request: generationRequest)
         let id = idProvider("chatcmpl")
         let created = Int(Date().timeIntervalSince1970)
@@ -261,7 +268,25 @@ public struct MLXOpenAIService: Sendable {
                     continuation.finish()
                 } catch {
                     await metrics.recordError()
-                    continuation.finish(throwing: error)
+                    // Direct service clients retain the throwing contract.
+                    // HTTP callers have committed headers and need a complete
+                    // error event, not an abruptly truncated transfer. Consumer
+                    // cancellation still propagates without a terminal frame.
+                    guard frameGenerationErrors, !Task.isCancelled,
+                        !(error is CancellationError)
+                    else {
+                        continuation.finish(throwing: error)
+                        return
+                    }
+                    do {
+                        continuation.yield(try ChatStreamFailure.encode(
+                            error, id: id, model: request.model, created: created,
+                            usage: includeUsage ? usage : nil))
+                        await metrics.recordUsage(usage)
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
             continuation.onTermination = { _ in
@@ -274,7 +299,7 @@ public struct MLXOpenAIService: Sendable {
         request: OpenAIResponseRequest
     ) async throws -> AsyncThrowingStream<String, Error> {
         await metrics.recordResponseRequest()
-        let generationRequest = try OpenAIResponseFormatSupport.preparedRequest(request.chatCompletionRequest)
+        let generationRequest = try OpenAIRequestValidation.preparedRequest(request.chatCompletionRequest)
         let stream = try await engine.streamChatCompletion(request: generationRequest)
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -399,7 +424,7 @@ public struct MLXOpenAIService: Sendable {
     private func collectChatOutput(
         request: OpenAIChatCompletionRequest
     ) async throws -> CollectedChatOutput {
-        let generationRequest = try OpenAIResponseFormatSupport.preparedRequest(request)
+        let generationRequest = try OpenAIRequestValidation.preparedRequest(request)
         let stream = try await engine.streamChatCompletion(request: generationRequest)
         var output = CollectedChatOutput()
 

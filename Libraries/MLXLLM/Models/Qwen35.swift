@@ -620,6 +620,9 @@ final class Qwen35GatedDeltaNet: Module {
         // changing any bits; leave other model families and decode untouched.
         let newConvState = qwen4Keep(
             S > 1 && inProjQKV is HadamardQuantizedLinear ? contiguous(convTail) : convTail)
+        if S > 1 && inProjQKV is HadamardQuantizedLinear {
+            PrismHadamardPrefillCarry.submit(newConvState)
+        }
         let convOut = qwen4Keep(convActivation(conv1d(convInput)))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
@@ -1819,30 +1822,37 @@ public class Qwen35TextModelInner: Module {
         let shapeCall = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
-        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
-        var attentionIndex = 0
-        for (modelLayerIndex, layer) in layers.enumerated() {
-            let attentionCache: (any CBv2AttendingLayerCache)?
-            if layer.isLinear {
-                attentionCache = nil
-            } else {
-                attentionCache = caches[attentionIndex]
-                precondition(
-                    attentionCache!.kind.modelLayerIndex == nil
-                        || attentionCache!.kind.modelLayerIndex == modelLayerIndex,
-                    "Qwen35 CBv2 attention cache mapped to the wrong model layer")
-                attentionIndex += 1
+        return PrismHadamardPrefillCarry.withScope(
+            isPacked: embedTokens is HadamardQuantizedEmbedding,
+            batch: inputs.dim(0), width: inputs.dim(1),
+            hasEmbeddings: inputEmbeddings != nil, hasPositions: positionIds != nil,
+            capturesState: captureRecurrentWindow, caches: caches
+        ) {
+            var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
+            var attentionIndex = 0
+            for (modelLayerIndex, layer) in layers.enumerated() {
+                let attentionCache: (any CBv2AttendingLayerCache)?
+                if layer.isLinear {
+                    attentionCache = nil
+                } else {
+                    attentionCache = caches[attentionIndex]
+                    precondition(
+                        attentionCache!.kind.modelLayerIndex == nil
+                            || attentionCache!.kind.modelLayerIndex == modelLayerIndex,
+                        "Qwen35 CBv2 attention cache mapped to the wrong model layer")
+                    attentionIndex += 1
+                }
+                hiddenStates = layer.cbv2Forward(
+                    hiddenStates,
+                    modelLayerIndex: modelLayerIndex,
+                    attentionCache: attentionCache,
+                    recurrentState: recurrentState,
+                    positionIds: positionIds,
+                    captureRecurrentWindow: captureRecurrentWindow,
+                    exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
             }
-            hiddenStates = layer.cbv2Forward(
-                hiddenStates,
-                modelLayerIndex: modelLayerIndex,
-                attentionCache: attentionCache,
-                recurrentState: recurrentState,
-                positionIds: positionIds,
-                captureRecurrentWindow: captureRecurrentWindow,
-                exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
+            return hiddenStates
         }
-        return hiddenStates
     }
 }
 
