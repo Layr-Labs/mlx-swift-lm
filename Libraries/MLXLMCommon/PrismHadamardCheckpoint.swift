@@ -35,7 +35,7 @@ public struct PrismHadamardCheckpointConfiguration: Decodable, Sendable {
         let components = try c.decode(Components.self, forKey: .components)
         let quantization = try c.decode(Quantization.self, forKey: .quantization)
         let text = try c.decode(Text.self, forKey: .text)
-        guard try c.decode(Int.self, forKey: .schemaVersion) == 1,
+        guard try c.decode(Int.self, forKey: .schemaVersion) == 2,
             try c.decode(String.self, forKey: .modelType) == "prism_hadamard_qwen35",
             try c.decode(String.self, forKey: .baseType) == "qwen3_5",
             try c.decode(String.self, forKey: .layout) == "grouped",
@@ -70,9 +70,11 @@ struct PrismHadamardCheckpoint {
     init(directory: URL, configuration: PrismHadamardCheckpointConfiguration,
          weights: [String: MLXArray]) throws {
         self.configuration = configuration
-        let file = directory.appendingPathComponent("hadamard.json")
-        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true,
+        // Hugging Face snapshots normally symlink immutable blobs. Resolve the
+        // fixed metadata filename before the bounded regular-file check.
+        let file = directory.appendingPathComponent("hadamard.json").resolvingSymlinksInPath()
+        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true,
             let size = values.fileSize, size > 0, size <= 8 * 1024 * 1024
         else { throw PrismCheckpointError.invalid("unsafe transform metadata") }
         transforms = try JSONDecoder().decode(PrismHadamardConfiguration.self, from: Data(contentsOf: file))

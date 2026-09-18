@@ -9,7 +9,10 @@ extension Qwen35TextModel: CBv2CompleteCheckpointKVTypeProviding {
     /// constructing an embedding graph or enabling unvalidated formats.
     var cbv2CheckpointActivationDType: DType? {
         let dtype: DType
-        if let embedding = model.embedTokens as? QuantizedEmbedding {
+        if let embedding = model.embedTokens as? HadamardQuantizedEmbedding {
+            guard let biases = embedding.biases, embedding.scales.dtype == biases.dtype else { return nil }
+            dtype = embedding.scales.dtype
+        } else if let embedding = model.embedTokens as? QuantizedEmbedding {
             guard embedding.mode == .affine, let biases = embedding.biases,
                 embedding.scales.dtype == biases.dtype
             else { return nil }

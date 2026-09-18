@@ -7,7 +7,7 @@ Qwen4 Flash-Next model.
 
 ## Artifact contract
 
-- Schema 1, affine 2-bit/group 128, FP16 packed scales and activations.
+- Schema 2, affine 2-bit/group 128, FP16 packed scales and activations.
 - Signed block-Hadamard metadata in `hadamard.json`; FP32 transform arithmetic
   followed by restoration of the input dtype. Generic BF16 weight conversion
   is not applied to this artifact.
@@ -47,7 +47,7 @@ the pinned config, actual tensor inventory and Hugging Face Git/LFS hashes.
 ## Composition and attribution
 
 Requires Layr-Labs/mlx-swift PR #27, pinned at
-`c2de5d17e72ca2d389c2b6c12e310f6f8f5d9af7`. The required Hadamard/2-bit primitives
+`d895357621825b97e40e21e8effa5786ab373600`. The required Hadamard/2-bit primitives
 already exist in the pinned MLX core; no whole-fork substitution is required.
 The signed-transform layers are adapted from Prism's MIT-licensed Swift work
 at `6d3a84de28225d1f5bc0a56f5c781596997242f9`; pack semantics are checked against
