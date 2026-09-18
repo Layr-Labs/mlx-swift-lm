@@ -192,6 +192,7 @@ def:
             - "Libraries/MLXLLM/Models/PrismHadamardQwen35.swift"
             - "Libraries/MLXLMCommon/PrismHadamardCheckpoint.swift"
             - "Tests/MLXLMTests/PrismHadamardCheckpointTests.swift"
+            - "Tests/MLXLMTests/PrismRecurrentOwnershipTests.swift"
             - "docs/bonsai2.md"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |

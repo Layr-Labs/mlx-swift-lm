@@ -613,7 +613,13 @@ final class Qwen35GatedDeltaNet: Module {
 
         let convInput = concatenated([qwen4Keep(convState), qwen4Keep(qkv)], axis: 1)
         let nKeep = convKernelSize - 1
-        let newConvState = qwen4Keep(convInput[0..., (convInput.dim(1) - nKeep)...])
+        let convTail = convInput[0..., (convInput.dim(1) - nKeep)...]
+        // Prism's FP32 prefill tail is only three rows, but Slice aliases the
+        // entire chunk. Retaining that parent in every recurrent transaction
+        // costs gigabytes. Contiguous materializes oversized backing without
+        // changing any bits; leave other model families and decode untouched.
+        let newConvState = qwen4Keep(
+            S > 1 && inProjQKV is HadamardQuantizedLinear ? contiguous(convTail) : convTail)
         let convOut = qwen4Keep(convActivation(conv1d(convInput)))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)

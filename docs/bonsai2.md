@@ -11,6 +11,10 @@ Qwen4 Flash-Next model.
   normalizers remain FP32; native normalization promotes downstream activations
   and KV/recurrent convolution rows to FP32. Do not infer state precision from
   embedding or packed scale storage alone.
+- Packed recurrent prefill materializes the small convolution carry before
+  retaining it. A slice otherwise owns the entire prefill-chunk allocation;
+  this is a bit-preserving storage change, not a precision or recurrence change.
+  Other model families and single-token decode keep their existing path.
 - Signed block-Hadamard metadata in `hadamard.json`; FP32 transform arithmetic
   followed by restoration of the incoming dtype. Generic BF16 weight conversion
   is not applied to this artifact.
