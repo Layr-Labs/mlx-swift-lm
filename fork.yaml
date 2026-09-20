@@ -188,11 +188,17 @@ def:
             signed-Hadamard 2-bit pack. Strict metadata/sign/shape validation,
             FP16 packing with FP32 transform arithmetic, native CBv2 state,
             and no MTP capability for the headless published artifact.
+            Default-on eligible prefill carry submission keeps
+            native arithmetic and engine-owned final evaluation/retirement,
+            with explicit deferred-input and late-fault qualification tests.
+            `DARKBLOOM_BONSAI_PREFILL_CARRY_ASYNC=0` restores the prior schedule.
           globs:
             - "Libraries/MLXLLM/Models/PrismHadamardQwen35.swift"
             - "Libraries/MLXLMCommon/PrismHadamardCheckpoint.swift"
             - "Tests/MLXLMTests/PrismHadamardCheckpointTests.swift"
             - "Tests/MLXLMTests/PrismRecurrentOwnershipTests.swift"
+            - "Libraries/MLXLLM/Models/PrismHadamardPrefillCarry.swift"
+            - "Tests/MLXLMTests/PrismPrefillCarrySubmissionTests.swift"
             - "docs/bonsai2.md"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
@@ -264,10 +270,15 @@ def:
         runtime `setMaxNumSeqs` for adaptive concurrency.
         Responses input replay retains reasoning and adjacent function calls in one assistant turn,
         preserving tool arguments and explicit message/result boundaries.
+        Shared service preparation rejects negative output-token limits before engine invocation
+        or streaming headers, preserving zero, positive and omitted limits.
+        HTTP Chat/Completions late failures emit a sanitized terminal error chunk instead of
+        truncating the transfer; direct service throwing and cancellation semantics are retained.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"
         - "Tests/MLXLMServerTests/**"
+        - "docs/server-request-validation.md"
     - title: "Benchmarks and measurement"
       description: |
         Nothing here ships to users; it is how the fork proves its numbers. `BenchCBv2` (real-weights
