@@ -42,6 +42,18 @@ def:
     ideas (MTP, batched KV) under a different single-stream architecture, so a full merge is not
     feasible; high-value upstream fixes are hand-ported instead.
   sub:
+    - title: "Native System One decisions"
+      description: |
+        `MLXDecisions` runs Laya's bidirectional ModernBERT encoder and decision
+        heads natively, preserving ordered question formatting, calibration,
+        zero generated-token accounting, bounded batching and cancellation.
+        The local `laya-probe` executable and Python-reference qualification
+        compare tokenization, logits and typed results on real checkpoints.
+      globs:
+        - "Libraries/MLXDecisions/**"
+        - "Executables/laya-probe/**"
+        - "Tests/MLXDecisionsTests/**"
+        - "scripts/qualify-laya.py"
     - title: "ContinuousBatchingV2 engine"
       description: |
         The heart of the fork (`Libraries/MLXLMCommon/ContinuousBatchingV2/`). Every production-visible

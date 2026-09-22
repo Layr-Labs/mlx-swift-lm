@@ -1,0 +1,16 @@
+Laya native Swift inference implementation
+
+The model architecture, prompt construction and calibrated answer conversion
+are adapted from:
+
+Laya, Copyright (c) Convai Innovations / Nandakishor M
+https://github.com/NandhaKishorM/laya
+https://huggingface.co/convaiinnovations/laya
+
+Laya-MLX, Copyright (c) Laya-MLX contributors
+https://github.com/mizorewww/laya-mlx
+Reference revision: fc1df62828a3fedf4d8229fdac1cbd85f1cdf337
+
+Both are distributed under the Apache License, Version 2.0.
+The Swift implementation is an independent port; it is not an official
+TypeSafe or Convai Innovations release. Model weights are downloaded separately.
