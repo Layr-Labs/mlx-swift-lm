@@ -13,10 +13,11 @@ struct DiffusionGemmaExpertReductionTests {
         dtype: DType = .bfloat16
     ) -> (MLXArray, MLXArray, MLXArray) {
         let count = tokens * topK
-        let rows = MLXArray(
-            (0 ..< (count * hidden)).map { Float(($0 * 37 + 17) % 1009 - 504) / 137 }
-        )
-        .reshaped(count, 1, hidden).asType(dtype)
+        let values: [Float] = (0 ..< (count * hidden)).map { index in
+            let centered: Int = (index * 37 + 17) % 1009 - 504
+            return Float(centered) / 137
+        }
+        let rows = MLXArray(values).reshaped(count, 1, hidden).asType(dtype)
         let inverse = MLXArray((0 ..< count).reversed().map(UInt32.init))
         let weights = softmax(
             MLXArray((0 ..< count).map { Float(($0 * 13) % 17) / 8 })

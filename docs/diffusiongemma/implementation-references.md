@@ -192,3 +192,19 @@ actual-processor gate: bind `DARKBLOOM_DIFFUSION_PIXEL_REFERENCE_LIVE=1` and a
 synthetic oracle directory using `DARKBLOOM_DIFFUSION_PIXEL_REFERENCE_DIR`.
 It compares original FP32 pixels and preserves separate, non-overwritten outputs;
 successful geometry or a correct color-name answer does not substitute for it.
+
+## Reproducing full-artifact tests
+
+`Tests/MLXLMTests/DiffusionGemmaArtifactFixture.swift` pins every file, size and
+SHA-256 checksum of `mlx-community/diffusiongemma-26B-A4B-it-4bit` revision
+`a7a81407613811e8ba63af92ac0d852b809e191f`. Download that revision with `hf download`
+and set `DARKBLOOM_DIFFUSION_MODEL_DIR` to its snapshot directory. The portable
+state test verifies the real bytes rather than depending on a private locally
+produced manifest. The provider encrypted-handler test imports the same fixture.
+
+The portable-state test also requires the source-matched `mlx.metallib` beside
+its executable and the identical bytes in the nested `mlx-swift_Cmlx.bundle`
+resource path. In the provider checkout, `scripts/stage-test-metallib.sh` stages
+both after the SDK tests are built against the local pinned MLX Swift sources.
+The checkpoint identity records the current executable and library hashes;
+an old compiler-specific Metal digest is not portable across builds.

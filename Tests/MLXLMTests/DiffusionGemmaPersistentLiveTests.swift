@@ -36,8 +36,7 @@ struct DiffusionGemmaPersistentLiveTests {
         let directory = URL(fileURLWithPath: try #require(selectedPath))
         let config = try Data(contentsOf: directory.appendingPathComponent("config.json"))
         try #require(sha(config) == "b41320c97651075363f2895e2cbb3d1580670ee11edb653a14290a35bbf7cac5")
-        let artifactHash = sha(try Data(contentsOf: directory.appendingPathComponent("local-verified-manifest.json")))
-        try #require(artifactHash == "33eb488387819e31d1a848e7d0f20465ae6ad0ae1ed31dac7aa4cb5e0461d53d")
+        let artifactHash = try DiffusionGemmaArtifactFixture.verify(directory: directory)
         // Register the source-bound test resource bundle before Metal use.
         _ = try #require(Bundle.module.url(forResource: "diffusiongemma-text-config", withExtension: "json"))
         let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
@@ -47,7 +46,11 @@ struct DiffusionGemmaPersistentLiveTests {
         let resources = try #require(Bundle(for: DiffusionPersistentTestAnchor.self).resourceURL)
         let metal = resources.appendingPathComponent("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib")
         let metalHash = sha(try Data(contentsOf: metal))
-        try #require(metalHash == "38ceb8a1113b373ccaa89355d895fc8ded3bafc81076dc4ffdb426e2eee03a93")
+        // The test setup stages the same source-matched artifact in both
+        // locations. Bind identity to that executable's library, not an old
+        // machine/compiler-specific hash.
+        let runtimeMetal = executable.deletingLastPathComponent().appendingPathComponent("mlx.metallib")
+        try #require(sha(try Data(contentsOf: runtimeMetal)) == metalHash)
         let nativeIdentity = CBv2CompleteCheckpointIdentity(modelAggregateHash: artifactHash,
             promptContractID: sha(try Data(contentsOf: directory.appendingPathComponent("chat_template.jinja"))),
             buildID: buildHash,
