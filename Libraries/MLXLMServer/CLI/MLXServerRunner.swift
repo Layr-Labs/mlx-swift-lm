@@ -2,10 +2,25 @@
 
 import Foundation
 import Hummingbird
+import MLXDecisions
 import MLXLMCommon
 
 public enum MLXServer {
     public static func run(configuration: MLXServerConfiguration) async throws {
+        if configuration.modelType == "laya" {
+            let directory = URL(
+                fileURLWithPath: (configuration.model as NSString).expandingTildeInPath)
+            let runtime = try await LayaRuntime.load(directory: directory)
+            let app = MLXServerApplication.buildSystemOneApplication(
+                host: configuration.host, port: configuration.port,
+                predict: { try await runtime.predict(data: $0) })
+            do { try await app.runService() } catch {
+                await runtime.shutdown()
+                throw error
+            }
+            await runtime.shutdown()
+            return
+        }
         var primaryModelConfiguration = modelConfiguration(
             for: configuration.model,
             revision: configuration.revision
@@ -66,12 +81,15 @@ public enum MLXServer {
         try await app.runService()
     }
 
-    static func modelConfiguration(for idOrPath: String, revision: String = "main") -> ModelConfiguration {
+    static func modelConfiguration(for idOrPath: String, revision: String = "main")
+        -> ModelConfiguration
+    {
         let expandedPath: String
         if idOrPath == "~" {
             expandedPath = FileManager.default.homeDirectoryForCurrentUser.path
         } else if idOrPath.hasPrefix("~/") {
-            expandedPath = FileManager.default.homeDirectoryForCurrentUser
+            expandedPath =
+                FileManager.default.homeDirectoryForCurrentUser
                 .appending(path: String(idOrPath.dropFirst(2)))
                 .path
         } else {
