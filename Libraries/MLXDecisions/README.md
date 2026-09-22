@@ -101,7 +101,7 @@ python scripts/qualify-laya.py --probe /path/to/laya-probe \
 ```
 
 The comparison covers mixed question types, padding and one-option choices,
-structured Unicode input, the context boundary, option-count calibration, and
+structured Unicode and numeric input, the context boundary, option-count calibration, and
 an 18-question request spanning batches. It requires exact tokens, markers,
 labels, model identity, and usage. Numeric thresholds are recorded in its JSON
 report. These checks establish implementation parity; they do not establish

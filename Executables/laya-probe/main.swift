@@ -40,10 +40,13 @@ import MLXDecisions
                 elapsed.append(Double(delta.seconds) * 1000 + Double(delta.attoseconds) / 1e15)
             }
             elapsed.sort()
+            let median = count.isMultiple(of: 2)
+                ? (elapsed[count / 2 - 1] + elapsed[count / 2]) / 2
+                : elapsed[count / 2]
             FileHandle.standardOutput.write(response)
             let timing: [String: Any] = [
                 "iterations": count, "warmup": count > 1 ? 5 : 0,
-                "median_ms": elapsed[count / 2], "min_ms": elapsed.first!, "max_ms": elapsed.last!,
+                "median_ms": median, "min_ms": elapsed.first!, "max_ms": elapsed.last!,
                 "load_duration": String(describing: loadTime),
                 "active_memory_bytes": Memory.activeMemory,
                 "peak_memory_bytes": Memory.peakMemory,
