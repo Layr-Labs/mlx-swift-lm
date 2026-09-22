@@ -225,7 +225,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Gemma4 `<|tool_call>` tags too, so we do not need upstream's separate
         // `.gemma4` format (8c61800). This is enforced by ToolTests /
         // ToolCallParserIntegrationTests.
-        if type.hasPrefix("gemma") {
+        if type.hasPrefix("gemma") || type == "diffusion_gemma" {
             return .gemma
         }
 

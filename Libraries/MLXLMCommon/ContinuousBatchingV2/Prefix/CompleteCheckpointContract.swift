@@ -113,6 +113,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let layout = "native-contiguous-full-recurrent-v1"
     public static let pagedLayout = "native-paged-full-recurrent-v1"
     public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
+    public static let diffusionBlockLayout = "native-block-diffusiongemma-v2"
 
     public let schemaVersion: Int
     public let identity: CBv2CompleteCheckpointIdentity
@@ -127,6 +128,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public let assistantCodecID: String?
     public let mediaIdentity: CBv2HybridPrefixIdentity?
     public let mediaTargetOnly: Bool
+    public let nativeBlockState: CBv2NativeBlockCheckpointState?
     /// Shares the same ownership boundary as prefixTokens, including shape arrays.
     public var tensors: [CBv2CheckpointTensorDescriptor] { metadata.tensors }
     public var attentionLayers: [CBv2CheckpointAttentionLayer]? { metadata.attentionLayers }
@@ -137,18 +139,21 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         prefixTokens: [Int], cacheSalt: String?, assistantCodecID: String?,
         tensors: [CBv2CheckpointTensorDescriptor], backendLayout: String = Self.layout,
         attentionLayers: [CBv2CheckpointAttentionLayer]? = nil,
-        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
+        nativeBlockState: CBv2NativeBlockCheckpointState? = nil
     ) {
         self.init(schemaVersion: Self.currentSchemaVersion, identity: identity,
                   backendLayout: backendLayout, position: position, chunkSize: chunkSize,
                   cacheSalt: cacheSalt, assistantCodecID: assistantCodecID,
                   mediaIdentity: mediaIdentity, mediaTargetOnly: mediaTargetOnly,
+                  nativeBlockState: nativeBlockState,
                   metadata: .init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers))
     }
 
     init(schemaVersion: Int, identity: CBv2CompleteCheckpointIdentity, backendLayout: String,
          position: Int, chunkSize: Int, cacheSalt: String?, assistantCodecID: String?,
          mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
+         nativeBlockState: CBv2NativeBlockCheckpointState? = nil,
          metadata: CBv2CheckpointManifestMemory) {
         self.schemaVersion = schemaVersion
         self.identity = identity
@@ -159,6 +164,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         self.assistantCodecID = assistantCodecID
         self.mediaIdentity = mediaIdentity
         self.mediaTargetOnly = mediaTargetOnly
+        self.nativeBlockState = nativeBlockState
         self.metadata = metadata
     }
 
@@ -172,12 +178,13 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         defer { withExtendedLifetime(metadata) {} }
         guard schemaVersion == Self.currentSchemaVersion, identity.isValid,
             (backendLayout == Self.layout || backendLayout == Self.pagedLayout
-                || backendLayout == Self.historicalAttentionLayout),
+                || backendLayout == Self.historicalAttentionLayout || backendLayout == Self.diffusionBlockLayout),
             (backendLayout == Self.historicalAttentionLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil),
-            position > 1, chunkSize > 1,
-            position % chunkSize == 0, prefixTokens.count == position,
+            position > 1, (backendLayout == Self.diffusionBlockLayout ? chunkSize > 0 : chunkSize > 1),
+            ((backendLayout == Self.diffusionBlockLayout && mediaIdentity != nil)
+                || position % chunkSize == 0), prefixTokens.count == position,
             position <= Self.maximumEncodedBytes / 2,
             prefixTokens.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }),
             !tensors.isEmpty, tensors.count <= 4096,
@@ -185,6 +192,14 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             (assistantCodecID?.utf8.count ?? 0) <= 512,
             !mediaTargetOnly || (mediaIdentity != nil && assistantCodecID == nil)
         else { throw CBv2CompleteCheckpointError.invalidManifest }
+        if backendLayout == Self.diffusionBlockLayout {
+            guard let nativeBlockState, assistantCodecID == nil, !mediaTargetOnly else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            try nativeBlockState.validate()
+        } else if nativeBlockState != nil {
+            throw CBv2CompleteCheckpointError.invalidManifest
+        }
         var total = 0
         var roles = Set<String>()
         for tensor in tensors {

@@ -30,6 +30,8 @@ public class ToolCallProcessor {
     private let tools: [[String: any Sendable]]?
     private let qwenStructuredFrames: Bool
     private var qwenFrameScanner: Qwen35ToolFrameScanner?
+    private let strictGemma: Bool
+    private var gemmaFrameScanner: GemmaToolFrameScanner?
     private var state = State.normal
     private var toolCallBuffer = ""
     private var activeEndTags: [String]?
@@ -54,8 +56,9 @@ public class ToolCallProcessor {
     /// - Parameters:
     ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
     ///   - tools: Optional tool schemas for type-aware parsing
-    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
-        self.parser = format.createParser()
+    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil, strictGemma: Bool = false) {
+        self.strictGemma = strictGemma && format == .gemma
+        self.parser = self.strictGemma ? GemmaFunctionParser(strict: true) : format.createParser()
         self.tools = tools
         self.qwenStructuredFrames = format == .qwen35
     }
@@ -116,6 +119,7 @@ public class ToolCallProcessor {
             state = .normal
             activeEndTags = nil
             qwenFrameScanner = nil
+            gemmaFrameScanner = nil
             return nil
         }
 
@@ -128,6 +132,7 @@ public class ToolCallProcessor {
         state = .normal
         activeEndTags = nil
         qwenFrameScanner = nil
+        gemmaFrameScanner = nil
 
         if returnBufferedText && parsed.isEmpty {
             return buffered
@@ -307,6 +312,7 @@ public class ToolCallProcessor {
                 state = .normal
                 activeEndTags = nil
                 qwenFrameScanner = nil
+                gemmaFrameScanner = nil
                 toolCallBuffer = ""
 
                 // If the token contains the start character, there may be more tool calls to come
@@ -350,6 +356,21 @@ public class ToolCallProcessor {
     }
 
     private func completedEndRange(_ endTags: [String], appendedChunk: String) -> Range<String.Index>? {
+        if strictGemma, let start = parser.startTag, let end = parser.endTag {
+            let input = gemmaFrameScanner == nil ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
+            var scanner = gemmaFrameScanner ?? GemmaToolFrameScanner()
+            let scalars = input.unicodeScalars
+            for index in scalars.indices {
+                if scanner.consume(scalars[index]) {
+                    let remaining = scalars.distance(from: scalars.index(after: index), to: scalars.endIndex)
+                    let upper = toolCallBuffer.unicodeScalars.index(toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
+                    gemmaFrameScanner = scanner
+                    return toolCallBuffer.unicodeScalars.index(upper, offsetBy: -end.unicodeScalars.count)..<upper
+                }
+            }
+            gemmaFrameScanner = scanner
+            return nil
+        }
         if qwenStructuredFrames, let start = parser.startTag, let end = parser.endTag {
             // The first pass includes any split opening wrapper. Subsequent
             // passes scan only newly appended characters, never the entire
