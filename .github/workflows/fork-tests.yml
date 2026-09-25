@@ -28,27 +28,30 @@ jobs:
 
       - name: Select an Xcode with Swift 6.3 or newer
         id: xcode
-        # mlx-swift declares swift-tools-version 6.3. The default Xcode comes
-        # first, then the other installed versions.
+        # Selects the newest release of Xcode 26. Beta and release candidate
+        # apps are left out, so a new beta on the runner image cannot change
+        # CI without a pull request. mlx-swift declares swift-tools-version 6.3.
         run: |
           ls -d /Applications/Xcode*
-          selected=""
-          for app in /Applications/Xcode.app /Applications/Xcode_*.app; do
-            version=$(DEVELOPER_DIR="$app/Contents/Developer" xcrun swift --version 2>/dev/null \
-              | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p') || true
-            read -r major minor <<< "$version"
-            if (( major > 6 || (major == 6 && minor >= 3) )); then
-              selected=$app
-              break
+          version=$(for app in /Applications/Xcode_26.*.app; do
+            name=${app#/Applications/Xcode_}
+            name=${name%.app}
+            if [[ "$name" =~ ^26(\.[0-9]+)+$ ]]; then
+              echo "$name"
             fi
-          done
-          if [ -z "$selected" ]; then
-            echo "::error::No installed Xcode has Swift 6.3 or newer."
+          done | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::No release of Xcode 26 is on this runner."
             exit 1
           fi
-          sudo xcode-select -s "$selected"
+          sudo xcode-select -s "/Applications/Xcode_$version.app"
           xcodebuild -version
           swift --version
+          read -r major minor <<< "$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p')"
+          if ! (( major > 6 || (major == 6 && minor >= 3) )); then
+            echo "::error::Xcode $version has Swift $major.$minor. mlx-swift needs Swift 6.3 or newer."
+            exit 1
+          fi
           xcrun -sdk macosx metal --version
           echo "version=$(xcodebuild -version | awk 'NR == 1 { v = $2 } /Build version/ { b = $3 } END { print v "-" b }')" >> "$GITHUB_OUTPUT"
 
