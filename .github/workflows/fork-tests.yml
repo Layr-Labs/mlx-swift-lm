@@ -56,7 +56,6 @@ jobs:
         run: |
           sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
           df -h "$GITHUB_WORKSPACE"
-          system_profiler SPDisplaysDataType
 
       - name: Restore the SwiftPM cache
         id: cache
