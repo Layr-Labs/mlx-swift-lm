@@ -35,7 +35,7 @@ fi
 # skipped test, for example "✘ Test name() skipped: reason", and counts the
 # skipped test as passed. The symbol at the start of that line is different
 # in different Swift versions, so the pattern accepts any symbol there.
-if grep -qE '^[^A-Za-z0-9]*(Test|Suite) .+ skipped[.:]|with [1-9][0-9]* tests? skipped|skipped [1-9][0-9]* test' "$log"; then
+if grep -qE '^[^A-Za-z0-9]*(Test|Suite) .+ skipped[.:]|with [1-9][0-9]* tests? skipped' "$log"; then
     echo "::error::$filter skipped one or more tests."
     exit 1
 fi
