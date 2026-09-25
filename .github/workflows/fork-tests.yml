@@ -26,6 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Test the suite runner script
+        # Checks that scripts/run-nested-suite.sh fails when a suite executes
+        # zero tests or skips a test. It uses a fake swift command.
+        run: scripts/test-run-nested-suite.sh
+
       - name: Select an Xcode with Swift 6.3 or newer
         id: xcode
         # mlx-swift declares swift-tools-version 6.3. The default Xcode comes
