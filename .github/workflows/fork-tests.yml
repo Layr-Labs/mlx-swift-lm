@@ -2,7 +2,8 @@ name: Fork Tests
 
 # Builds the fork and runs its hermetic Metal test suites on a GitHub-hosted
 # Mac. These suites use tiny test models. They need no model weights, no
-# network access at test time, and no secrets.
+# network access at test time, and no secrets. The job also reports the line
+# coverage of the fork's sources.
 
 on:
   pull_request:
@@ -79,11 +80,12 @@ jobs:
 
       - name: Build the package and its tests
         id: build
+        # The coverage instrumentation is for the last test step.
         run: |
           start=$(date +%s)
-          swift build --build-tests
+          swift build --build-tests --enable-code-coverage
           elapsed=$(( $(date +%s) - start ))
-          echo "swift build --build-tests took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
+          echo "swift build --build-tests --enable-code-coverage took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
       - name: Build and stage the full Metal library
         id: metallib
@@ -220,12 +222,50 @@ jobs:
         run: scripts/run-nested-suite.sh ToolCallParserIntegrationTests
 
       - name: Run all test suites once
+        id: all-tests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
         # Runs every suite in the package once, also the suites above. This
         # step does not check for skipped tests, because some tests skip when
-        # they do not find model weights or an environment variable.
-        timeout-minutes: 60
-        run: swift test --skip-build
+        # they do not find model weights or an environment variable. The step
+        # first deletes coverage data that the SwiftPM cache can contain.
+        timeout-minutes: 90
+        run: |
+          rm -rf "$(swift build --show-bin-path)/codecov"
+          swift test --skip-build --enable-code-coverage
+
+      - name: Report the line coverage
+        id: coverage
+        if: ${{ !cancelled() && steps.all-tests.outcome == 'success' }}
+        # Counts the fork's sources only: the report leaves out the test
+        # sources and the dependencies in .build. There is no minimum.
+        timeout-minutes: 15
+        run: |
+          bin=$(swift build --show-bin-path)
+          xcrun llvm-cov report \
+            "$bin/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests" \
+            -instr-profile "$bin/codecov/default.profdata" \
+            -ignore-filename-regex '/Tests/' \
+            -ignore-filename-regex '/\.build/' \
+            > "$RUNNER_TEMP/coverage-report.txt"
+          if ! total=$(grep '^TOTAL' "$RUNNER_TEMP/coverage-report.txt"); then
+            echo "::error::The coverage report has no TOTAL line."
+            exit 1
+          fi
+          echo "$total"
+          # In the TOTAL line, field 10 is the line coverage.
+          line_coverage=$(awk '{ print $10 }' <<< "$total")
+          {
+            echo "| Component | Line coverage |"
+            echo "|---|---|"
+            echo "| mlx-swift-lm sources (without Tests and .build) | $line_coverage |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the coverage report
+        if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-report
+          path: ${{ runner.temp }}/coverage-report.txt
 
       - name: Save the SwiftPM cache
         # Save only on pushes to main. Pull requests only restore.
