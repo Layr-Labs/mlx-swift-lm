@@ -2,7 +2,8 @@ name: Fork Tests
 
 # Builds the fork and runs its self-contained Metal test suites on a GitHub-hosted
 # Mac. These suites use tiny test models. They need no model weights, no
-# network access at test time, and no secrets.
+# network access at test time, and no secrets. The job also reports the line
+# coverage of the fork's sources.
 
 on:
   pull_request:
@@ -83,11 +84,14 @@ jobs:
 
       - name: Build the package and its tests
         id: build
+        # --enable-code-coverage instruments the test binaries. Every suite
+        # step runs these instrumented binaries. Only the last test step
+        # collects the coverage data and reports it.
         run: |
           start=$(date +%s)
-          swift build --build-tests
+          swift build --build-tests --enable-code-coverage
           elapsed=$(( $(date +%s) - start ))
-          echo "swift build --build-tests took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
+          echo "swift build --build-tests --enable-code-coverage took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
       - name: Build and stage the full Metal library
         id: metallib
@@ -143,6 +147,152 @@ jobs:
         # model. A skip here means that the paged backend is not available.
         timeout-minutes: 10
         run: scripts/run-nested-suite.sh CBv2KVSharingParityTests
+
+      # The next suites are the SDK suites that the Provider Tests job of
+      # d-inference runs. They also use tiny test models.
+
+      - name: Run SSMDecodeBoundsTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh SSMDecodeBoundsTests
+
+      - name: Run NemotronHTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh NemotronHTests
+
+      - name: Run NemotronH35BackendParityTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # This suite takes about 5 minutes on the hosted runner.
+        timeout-minutes: 20
+        run: scripts/run-nested-suite.sh NemotronH35BackendParityTests
+
+      - name: Run NemotronH35StorageParityTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh NemotronH35StorageParityTests
+
+      - name: Run NemotronH35MTPTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh NemotronH35MTPTests
+
+      - name: Run NemotronH35MTPPrimingTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh NemotronH35MTPPrimingTests
+
+      - name: Run MutableInputKernelTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh MutableInputKernelTests
+
+      - name: Run MutableInputExportTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh MutableInputExportTests
+
+      - name: Run CBv2QwenMTPIntegrationTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2QwenMTPIntegrationTests
+
+      - name: Run CBv2MTPDepthControllerTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2MTPDepthControllerTests
+
+      - name: Run PagedMTPBatchedColumnsTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh PagedMTPBatchedColumnsTests
+
+      - name: Run CBv2CompleteCheckpointEngineTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2CompleteCheckpointEngineTests
+
+      - name: Run NemotronH35ProductionDefaultsTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh NemotronH35ProductionDefaultsTests
+
+      - name: Run OpenAIServiceTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh OpenAIServiceTests
+
+      - name: Run ToolCallParserIntegrationTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh ToolCallParserIntegrationTests
+
+      - name: Run all test suites once
+        id: all-tests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Runs every suite in the package once, also the suites above, and
+        # collects the coverage data. The step fails when a test fails, and
+        # when XCTest or Swift Testing ran zero tests. It does not fail on
+        # skipped tests, because some tests skip when they do not find model
+        # weights or an environment variable. After a failure, it shows each
+        # error line of the log as an annotation in the job summary. The step
+        # first deletes coverage data that the SwiftPM cache can contain.
+        timeout-minutes: 90
+        run: |
+          set -o pipefail
+          rm -rf "$(swift build --show-bin-path)/codecov"
+          log=$RUNNER_TEMP/all-tests.log
+          status=0
+          swift test --skip-build --enable-code-coverage 2>&1 | tee "$log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            # XCTest failures and crashes print "error:" lines. Swift Testing
+            # failures print "recorded an issue" lines.
+            grep -E '^(/[^ ]+:[0-9]+: )?error: |^[^A-Za-z0-9]*Test .+ recorded an issue' "$log" \
+              | sed -e 's/%/%25/g' -e 's/^/::error::/' || true
+            exit "$status"
+          fi
+          if ! grep -qE 'Executed [1-9][0-9]* tests?' "$log"; then
+            echo "::error::XCTest executed zero tests."
+            exit 1
+          fi
+          if ! grep -qE 'Test run with [1-9][0-9]* tests?' "$log"; then
+            echo "::error::Swift Testing ran zero tests."
+            exit 1
+          fi
+
+      - name: Report the line coverage
+        id: coverage
+        if: ${{ !cancelled() && steps.all-tests.outcome == 'success' }}
+        # Counts the fork's sources only: the report leaves out the test
+        # sources and the dependencies in .build. There is no minimum.
+        timeout-minutes: 15
+        run: |
+          bin=$(swift build --show-bin-path)
+          xcrun llvm-cov report \
+            "$bin/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests" \
+            -instr-profile "$bin/codecov/default.profdata" \
+            -ignore-filename-regex '/Tests/' \
+            -ignore-filename-regex '/\.build/' \
+            > "$RUNNER_TEMP/coverage-report.txt"
+          if ! total=$(grep '^TOTAL' "$RUNNER_TEMP/coverage-report.txt"); then
+            echo "::error::The coverage report has no TOTAL line."
+            exit 1
+          fi
+          echo "$total"
+          # In the TOTAL line, field 10 is the line coverage.
+          line_coverage=$(awk '{ print $10 }' <<< "$total")
+          {
+            echo "| Component | Line coverage |"
+            echo "|---|---|"
+            echo "| mlx-swift-lm sources (without Tests and .build) | $line_coverage |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the coverage report
+        if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: ${{ runner.temp }}/coverage-report.txt
 
       - name: Remove the Metal libraries and coverage data before saving
         # The next run builds its own Metal library and coverage data.

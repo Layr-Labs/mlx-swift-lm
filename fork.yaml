@@ -324,6 +324,7 @@ def:
 
         The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package on a GitHub-hosted Mac.
         It runs the self-contained Metal test suites, one suite at a time.
+        A last step runs every test in the package once and writes the line coverage of the fork's sources to the job summary.
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
         A suite fails when it executes zero tests or skips a test.
       globs:
