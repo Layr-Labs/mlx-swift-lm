@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 # Build the full MLX Metal library (mlx.metallib) with cmake.
 #
-# SwiftPM compiles only part of the MLX kernels into default.metallib.
-# Some tests need kernels that are not in that library, and MLX stops the
-# test process when a kernel is missing. This script compiles every kernel
-# ahead of time (-DMLX_METAL_JIT=OFF). It uses the MLX source that SwiftPM
-# checked out for the mlx-swift revision in Package.swift.
+# `swift build` makes no Metal library. The pinned mlx-swift excludes the MLX
+# kernel sources and nojit_kernels.cpp from its Cmlx target, so SwiftPM builds
+# MLX in JIT mode. Without a staged mlx.metallib, every MLX operation in the
+# tests traps with "Failed to load the default metallib". (xcodebuild compiles
+# the .metal files in Source/Cmlx/mlx-generated into a partial
+# default.metallib of about 459 symbols. This workflow does not use
+# xcodebuild.)
+#
+# This script compiles every kernel ahead of time (-DMLX_METAL_JIT=OFF). It
+# uses the MLX source that SwiftPM checked out for the mlx-swift revision in
+# Package.swift.
 #
 # Usage: scripts/build-metallib.sh <output file>
 # Run it from the package root after `swift build`.
@@ -20,8 +26,9 @@ output=$1
 mlx_source=.build/checkouts/mlx-swift/Source/Cmlx/mlx
 # MLX compiles the NAX kernels only for a deployment target of 26.2 or later.
 deployment_target=26.2
-# The partial SwiftPM library has about 500 symbols. The full library has
-# about 17,000.
+# The full library has about 17,000 symbols. A JIT-mode build
+# (-DMLX_METAL_JIT=ON) or an incomplete build has far fewer. The check at the
+# end rejects a library with fewer than 10,000 symbols.
 minimum_symbols=10000
 
 if [[ ! -f "$mlx_source/mlx/version.h" ]]; then
@@ -50,6 +57,6 @@ symbols=$(xcrun -sdk macosx metal-nm "$output" | wc -l | tr -d ' ')
 bytes=$(stat -f %z "$output")
 echo "Wrote $output: $symbols symbols, $bytes bytes"
 if (( symbols < minimum_symbols )); then
-    echo "The library has fewer than $minimum_symbols symbols. It is not complete." >&2
+    echo "The library has fewer than $minimum_symbols symbols. It is a JIT-mode or incomplete build." >&2
     exit 1
 fi
