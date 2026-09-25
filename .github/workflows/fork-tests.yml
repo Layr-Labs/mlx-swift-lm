@@ -84,7 +84,9 @@ jobs:
 
       - name: Build the package and its tests
         id: build
-        # The coverage instrumentation is for the last test step.
+        # --enable-code-coverage instruments the test binaries. Every suite
+        # step runs these instrumented binaries. Only the last test step
+        # collects the coverage data and reports it.
         run: |
           start=$(date +%s)
           swift build --build-tests --enable-code-coverage
@@ -228,14 +230,35 @@ jobs:
       - name: Run all test suites once
         id: all-tests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
-        # Runs every suite in the package once, also the suites above. This
-        # step does not check for skipped tests, because some tests skip when
-        # they do not find model weights or an environment variable. The step
+        # Runs every suite in the package once, also the suites above, and
+        # collects the coverage data. The step fails when a test fails, and
+        # when XCTest or Swift Testing ran zero tests. It does not fail on
+        # skipped tests, because some tests skip when they do not find model
+        # weights or an environment variable. After a failure, it shows each
+        # error line of the log as an annotation in the job summary. The step
         # first deletes coverage data that the SwiftPM cache can contain.
         timeout-minutes: 90
         run: |
+          set -o pipefail
           rm -rf "$(swift build --show-bin-path)/codecov"
-          swift test --skip-build --enable-code-coverage
+          log=$RUNNER_TEMP/all-tests.log
+          status=0
+          swift test --skip-build --enable-code-coverage 2>&1 | tee "$log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            # XCTest failures and crashes print "error:" lines. Swift Testing
+            # failures print "recorded an issue" lines.
+            grep -E '^(/[^ ]+:[0-9]+: )?error: |^[^A-Za-z0-9]*Test .+ recorded an issue' "$log" \
+              | sed -e 's/%/%25/g' -e 's/^/::error::/' || true
+            exit "$status"
+          fi
+          if ! grep -qE 'Executed [1-9][0-9]* tests?' "$log"; then
+            echo "::error::XCTest executed zero tests."
+            exit 1
+          fi
+          if ! grep -qE 'Test run with [1-9][0-9]* tests?' "$log"; then
+            echo "::error::Swift Testing ran zero tests."
+            exit 1
+          fi
 
       - name: Report the line coverage
         id: coverage
@@ -266,7 +289,7 @@ jobs:
 
       - name: Upload the coverage report
         if: ${{ !cancelled() && steps.coverage.outcome == 'success' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: ${{ runner.temp }}/coverage-report.txt
