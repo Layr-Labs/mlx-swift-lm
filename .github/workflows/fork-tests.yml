@@ -1,6 +1,6 @@
 name: Fork Tests
 
-# Builds the fork and runs its hermetic Metal test suites on a GitHub-hosted
+# Builds the fork and runs its self-contained Metal test suites on a GitHub-hosted
 # Mac. These suites use tiny test models. They need no model weights, no
 # network access at test time, and no secrets.
 
@@ -15,7 +15,8 @@ permissions:
 
 concurrency:
   group: fork-tests-${{ github.ref }}
-  # A new push to a pull request cancels the older run. Runs on main finish.
+  # A new push to a pull request cancels the older run. Runs on main are not
+  # cancelled once they start.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
