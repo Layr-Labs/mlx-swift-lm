@@ -1,0 +1,153 @@
+name: Fork Tests
+
+# Builds the fork and runs its hermetic Metal test suites on a GitHub-hosted
+# Mac. These suites use tiny test models. They need no model weights, no
+# network access at test time, and no secrets.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-tests-${{ github.ref }}
+  # A new push to a pull request cancels the older run. Runs on main finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Select an Xcode with Swift 6.3 or newer
+        id: xcode
+        # mlx-swift declares swift-tools-version 6.3. The default Xcode comes
+        # first, then the other installed versions.
+        run: |
+          ls -d /Applications/Xcode*
+          selected=""
+          for app in /Applications/Xcode.app /Applications/Xcode_*.app; do
+            version=$(DEVELOPER_DIR="$app/Contents/Developer" xcrun swift --version 2>/dev/null \
+              | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p') || true
+            read -r major minor <<< "$version"
+            if (( major > 6 || (major == 6 && minor >= 3) )); then
+              selected=$app
+              break
+            fi
+          done
+          if [ -z "$selected" ]; then
+            echo "::error::No installed Xcode has Swift 6.3 or newer."
+            exit 1
+          fi
+          sudo xcode-select -s "$selected"
+          xcodebuild -version
+          swift --version
+          xcrun -sdk macosx metal --version
+          echo "version=$(xcodebuild -version | awk 'NR == 1 { v = $2 } /Build version/ { b = $3 } END { print v "-" b }')" >> "$GITHUB_OUTPUT"
+
+      - name: Show the runner hardware
+        run: |
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          df -h "$GITHUB_WORKSPACE"
+          system_profiler SPDisplaysDataType
+
+      - name: Restore the SwiftPM cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            .build
+          key: spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-
+
+      - name: Remove cached Metal libraries
+        # A cached library can come from other MLX sources. A later step
+        # builds a new one from the current sources.
+        run: |
+          if [ -d .build ]; then
+            find .build -type f -name mlx.metallib -delete
+          fi
+
+      - name: Build the package and its tests
+        id: build
+        run: |
+          start=$(date +%s)
+          swift build --build-tests
+          elapsed=$(( $(date +%s) - start ))
+          echo "swift build --build-tests took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
+
+      - name: Build and stage the full Metal library
+        id: metallib
+        run: |
+          start=$(date +%s)
+          scripts/build-metallib.sh "$RUNNER_TEMP/mlx.metallib"
+          scripts/stage-test-metallib.sh "$RUNNER_TEMP/mlx.metallib" "$(swift build --show-bin-path)"
+          elapsed=$(( $(date +%s) - start ))
+          echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
+
+      # One step for each suite, so the job summary shows which suite failed.
+      # Each suite step runs when the Metal library step succeeded, also after
+      # an earlier suite failed. scripts/run-nested-suite.sh fails the step
+      # when the suite executed zero tests or skipped a test.
+
+      - name: Run CBv2PagedSafetyTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Runs the paged Metal kernels that are compiled at run time.
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2PagedSafetyTests
+
+      - name: Run CBv2PrefixCacheHasherTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Checks the prompt hash of the prefix cache. Pure Swift.
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2PrefixCacheHasherTests
+
+      - name: Run CBv2PagedEligibilityTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Checks the threadgroup memory budget. Pure Swift, no GPU work.
+        timeout-minutes: 5
+        run: scripts/run-nested-suite.sh CBv2PagedEligibilityTests
+
+      - name: Run CBv2PagedBackendTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Checks the page pool, the page tables, the windowed rings, and the
+        # backend lifecycle. Uses small MLX arrays.
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2PagedBackendTests
+
+      - name: Run CBv2PagedKernelTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Compares the paged decode kernel with an fp32 reference, checks that
+        # batch composition does not change the output, and runs a 200-step
+        # greedy decode. The script runs the batch composition test in its
+        # own process.
+        timeout-minutes: 20
+        run: scripts/run-paged-kernel-tests.sh
+
+      - name: Run CBv2KVSharingParityTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Compares contiguous and paged KV storage on the tiny KV-sharing
+        # model. A skip here means that the paged backend is not available.
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2KVSharingParityTests
+
+      - name: Save the SwiftPM cache
+        # Save only on pushes to main. Pull requests only restore.
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/org.swift.swiftpm
+            .build
+          key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -294,7 +294,9 @@ def:
         - "Tests/OnboardingQualificationTests/**"
         - "benchmarks/**"
         - "script/**"
-        - "scripts/*.sh"
+        - "scripts/benchmark-mtp.sh"
+        - "scripts/build-qwen36-a3b-bench.sh"
+        - "scripts/stamp-bench-revision.sh"
         - "scripts/build-qwen36-python-contexts.py"
         - "scripts/patch-qwen36-mtp.py"
         - "Makefile"
@@ -319,8 +321,17 @@ def:
         This page and the gate that keeps it honest: `check_forkdiff.py` fails CI when `base.hash` is
         not the merge-base with upstream, or when a file the fork changes is not described by a section
         above.
+
+        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package on a
+        GitHub-hosted Mac and runs the hermetic Metal test suites. Its scripts build the full MLX Metal
+        library with cmake, copy it next to the test binaries, and run one suite at a time. A suite
+        fails when it executes zero tests or skips a test.
       globs:
         - "scripts/check_forkdiff.py"
+        - "scripts/build-metallib.sh"
+        - "scripts/stage-test-metallib.sh"
+        - "scripts/run-nested-suite.sh"
+        - "scripts/run-paged-kernel-tests.sh"
         - "FORKDIFF.md"
         - "README.md"
 
