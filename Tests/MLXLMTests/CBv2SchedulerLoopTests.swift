@@ -228,15 +228,22 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         let harness = CBv2SchedHarness(
             schedulerConfig: CBv2SchedulerConfig(
                 maxConcurrentRequests: 1, maxBatchedTokensPerStep: 256,
-                prefillChunkSize: 16, maxWaiting: 1))
-        // Hog pins the single RUNNING slot for many steps… (wait on the
-        // PUBLISHED gauge, not the backend, so the waiter's submit-side
-        // fast path is guaranteed to see the waiting queue as empty).
+                prefillChunkSize: 16, maxWaiting: 1),
+            loopConfig: CBv2EngineLoopConfig(eventBufferCapacity: 4))
+        // Hog pins the single RUNNING slot, and the test owns its lifetime:
+        // its unread stream hits backpressure, so it pauses with its slot
+        // retained until the test drains it below. (Left to run, it finished
+        // its 60 scripted tokens in milliseconds, and the poll could miss
+        // it.) Also wait on the PUBLISHED gauge, not the backend, so the
+        // waiter's submit-side fast path is guaranteed to see the waiting
+        // queue as empty.
+        let hogID = CBv2RequestID(9101)
         let hogStream = try harness.engine.submit(
-            CBv2Request(id: CBv2RequestID(9101), promptTokens: [3], maxTokens: 60))
+            CBv2Request(id: hogID, promptTokens: [3], maxTokens: 60))
         let hogRunning = await cbv2SchedWait {
             let snapshot = harness.engine.capacity()
-            return snapshot.activeRequests == 1 && snapshot.waitingRequests == 0
+            return harness.engine.loopForTesting.pausedIDsSnapshot() == [hogID]
+                && snapshot.activeRequests == 1 && snapshot.waitingRequests == 0
         }
         XCTAssertTrue(hogRunning, "hog must be running before filling the waiting queue")
         // …and the waiter fills the single WAITING slot (it cannot be
@@ -262,6 +269,7 @@ final class CBv2SchedulerLoopTests: XCTestCase {
             message, "token_budget_exhausted: request queue full",
             "backstop rejection must carry the provider's canonical queue-full marker")
 
+        // Draining the hog's stream resumes it, and it finishes its 60 tokens.
         let hog = await cbv2SchedCollect(hogStream)
         let waiter = await cbv2SchedCollect(waiterStream)
         await harness.engine.shutdown()
