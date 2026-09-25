@@ -155,7 +155,8 @@ jobs:
 
       - name: Run NemotronH35BackendParityTests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
-        timeout-minutes: 10
+        # This suite takes about 5 minutes on the hosted runner.
+        timeout-minutes: 20
         run: scripts/run-nested-suite.sh NemotronH35BackendParityTests
 
       - name: Run NemotronH35StorageParityTests
