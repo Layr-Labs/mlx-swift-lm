@@ -68,7 +68,7 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
-          key: spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ github.sha }}
           restore-keys: |
             spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-
 
@@ -143,8 +143,17 @@ jobs:
         timeout-minutes: 10
         run: scripts/run-nested-suite.sh CBv2KVSharingParityTests
 
+      - name: Remove the Metal libraries and coverage data before saving
+        # The next run builds its own Metal library and coverage data.
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
+        run: |
+          find .build -type f -name mlx.metallib -delete
+          rm -rf "$(swift build --show-bin-path)/codecov"
+
       - name: Save the SwiftPM cache
-        # Save only on pushes to main. Pull requests only restore.
+        # Save only on pushes to main. Pull requests only restore. Each push
+        # to main saves a new entry, and a run restores the newest entry for
+        # the same Xcode.
         if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
