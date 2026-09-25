@@ -14,18 +14,33 @@ jobs:
         with:
           fetch-depth: 2 # the merge commit and the tip of the base branch
 
-      - name: Lint the Swift files that this pull request changes
-        # The job uses the swift-format of the default Xcode and the rules in
-        # .swift-format. It checks the files that .pre-commit-config.yaml
-        # formats, the Swift files. Main is not clean under this command, so
-        # the job checks only the Swift files that the pull request adds or
-        # changes.
+      - name: Select the newest release of Xcode 26
+        # Beta and release candidate apps are left out, so a new beta on the
+        # runner image cannot change CI without a pull request.
         run: |
+          version=$(for app in /Applications/Xcode_26.*.app; do
+            name=${app#/Applications/Xcode_}
+            name=${name%.app}
+            if [[ "$name" =~ ^26(\.[0-9]+)+$ ]]; then
+              echo "$name"
+            fi
+          done | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::No release of Xcode 26 is on this runner."
+            exit 1
+          fi
+          sudo xcode-select -s "/Applications/Xcode_$version.app"
           xcodebuild -version
           swift format --version
-          git diff -z --name-only --diff-filter=d HEAD^1 HEAD -- '*.swift' > "$RUNNER_TEMP/changed-swift-files"
-          if [ ! -s "$RUNNER_TEMP/changed-swift-files" ]; then
-            echo "This pull request changes no Swift file."
-            exit 0
-          fi
-          xargs -0 swift format lint --strict --configuration .swift-format < "$RUNNER_TEMP/changed-swift-files"
+
+      - name: Check the format of the Swift files that this pull request changes
+        # Runs the formatter of .pre-commit-config.yaml with .swift-format on
+        # the Swift files that the pull request adds or changes. The step
+        # fails when the formatter changed a file. Main is not formatted, so
+        # the step checks only the changed files. HEAD is the merge commit of
+        # the pull request, and HEAD^1 is the tip of the base branch.
+        run: |
+          set -o pipefail
+          git diff -z --name-only --diff-filter=ACMR HEAD^1...HEAD -- '*.swift' \
+            | xargs -0 swift format format --in-place --configuration .swift-format
+          git diff --exit-code
