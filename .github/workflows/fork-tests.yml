@@ -1,6 +1,6 @@
 name: Fork Tests
 
-# Builds the fork and runs its hermetic Metal test suites on a GitHub-hosted
+# Builds the fork and runs its self-contained Metal test suites on a GitHub-hosted
 # Mac. These suites use tiny test models. They need no model weights, no
 # network access at test time, and no secrets.
 
@@ -15,7 +15,8 @@ permissions:
 
 concurrency:
   group: fork-tests-${{ github.ref }}
-  # A new push to a pull request cancels the older run. Runs on main finish.
+  # A new push to a pull request cancels the older run. Runs on main are not
+  # cancelled once they start.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -33,27 +34,30 @@ jobs:
 
       - name: Select an Xcode with Swift 6.3 or newer
         id: xcode
-        # mlx-swift declares swift-tools-version 6.3. The default Xcode comes
-        # first, then the other installed versions.
+        # Selects the newest release of Xcode 26. Beta and release candidate
+        # apps are left out, so a new beta on the runner image cannot change
+        # CI without a pull request. mlx-swift declares swift-tools-version 6.3.
         run: |
           ls -d /Applications/Xcode*
-          selected=""
-          for app in /Applications/Xcode.app /Applications/Xcode_*.app; do
-            version=$(DEVELOPER_DIR="$app/Contents/Developer" xcrun swift --version 2>/dev/null \
-              | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p') || true
-            read -r major minor <<< "$version"
-            if (( major > 6 || (major == 6 && minor >= 3) )); then
-              selected=$app
-              break
+          version=$(for app in /Applications/Xcode_26.*.app; do
+            name=${app#/Applications/Xcode_}
+            name=${name%.app}
+            if [[ "$name" =~ ^26(\.[0-9]+)+$ ]]; then
+              echo "$name"
             fi
-          done
-          if [ -z "$selected" ]; then
-            echo "::error::No installed Xcode has Swift 6.3 or newer."
+          done | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::No release of Xcode 26 is on this runner."
             exit 1
           fi
-          sudo xcode-select -s "$selected"
+          sudo xcode-select -s "/Applications/Xcode_$version.app"
           xcodebuild -version
           swift --version
+          read -r major minor <<< "$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p')"
+          if ! (( major > 6 || (major == 6 && minor >= 3) )); then
+            echo "::error::Xcode $version has Swift $major.$minor. mlx-swift needs Swift 6.3 or newer."
+            exit 1
+          fi
           xcrun -sdk macosx metal --version
           echo "version=$(xcodebuild -version | awk 'NR == 1 { v = $2 } /Build version/ { b = $3 } END { print v "-" b }')" >> "$GITHUB_OUTPUT"
 
@@ -70,7 +74,7 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
-          key: spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ github.sha }}
           restore-keys: |
             spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-
 
@@ -145,8 +149,17 @@ jobs:
         timeout-minutes: 10
         run: scripts/run-nested-suite.sh CBv2KVSharingParityTests
 
+      - name: Remove the Metal libraries and coverage data before saving
+        # The next run builds its own Metal library and coverage data.
+        if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
+        run: |
+          find .build -type f -name mlx.metallib -delete
+          rm -rf "$(swift build --show-bin-path)/codecov"
+
       - name: Save the SwiftPM cache
-        # Save only on pushes to main. Pull requests only restore.
+        # Save only on pushes to main. Pull requests only restore. Each push
+        # to main saves a new entry, and a run restores the newest entry for
+        # the same Xcode.
         if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
