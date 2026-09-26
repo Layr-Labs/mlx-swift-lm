@@ -127,13 +127,25 @@ final class CBv2SchedulerLoopTests: XCTestCase {
                 maxConcurrentRequests: 2, maxBatchedTokensPerStep: 256,
                 prefillChunkSize: 16, maxWaiting: 8))
         harness.backend.maxLiveStates = 1
-        async let a = cbv2SchedCollect(
-            try harness.engine.submit(
-                CBv2SchedFixtures.request(prompt: Array(0 ..< 6), maxTokens: 4)))
-        async let b = cbv2SchedCollect(
-            try harness.engine.submit(
-                CBv2SchedFixtures.request(prompt: Array(6 ..< 12), maxTokens: 4)))
-        let (ra, rb) = try await (a, b)
+        // The test owns the race it asserts on. It mints and submits both
+        // requests on this task: minting inside two `async let` children
+        // races on `CBv2SchedFixtures.nextID`, so both requests can get the
+        // same id and the second submit throws `duplicateRequestID`. It also
+        // holds the step loop until both requests wait, so both compete for
+        // the single KV slot. Without the hold, the first request can finish
+        // before the second one arrives, and nothing is requeued.
+        let loop = harness.engine.loopForTesting
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 0 }
+        let first = try harness.engine.submit(
+            CBv2SchedFixtures.request(prompt: Array(0 ..< 6), maxTokens: 4))
+        let second = try harness.engine.submit(
+            CBv2SchedFixtures.request(prompt: Array(6 ..< 12), maxTokens: 4))
+        let bothWaiting = loop.onEngineQueueSync { loop.scheduler.waitingCount == 2 }
+        XCTAssertTrue(bothWaiting, "both requests must wait before the first step")
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+        async let a = cbv2SchedCollect(first)
+        async let b = cbv2SchedCollect(second)
+        let (ra, rb) = await (a, b)
         await harness.engine.shutdown()
         XCTAssertEqual(ra.finishReason, .length, "first request must complete")
         XCTAssertEqual(
