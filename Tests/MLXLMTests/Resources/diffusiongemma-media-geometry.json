@@ -1,0 +1,327 @@
+{
+  "source": "e79b0e041677ec4ca5333ba750376bb4e8c434cb",
+  "harnessSHA256": "2d0189d64ba84105d73a7838f5eea98eb1e7b4646a58f8f20181c4da9e216d25",
+  "scope": "reference geometry only; pixel/serving qualification separate",
+  "cases": [
+    {
+      "width": 1,
+      "height": 1,
+      "budget": 70,
+      "resizedWidth": 384,
+      "resizedHeight": 384,
+      "softTokens": 64
+    },
+    {
+      "width": 64,
+      "height": 64,
+      "budget": 70,
+      "resizedWidth": 384,
+      "resizedHeight": 384,
+      "softTokens": 64
+    },
+    {
+      "width": 512,
+      "height": 512,
+      "budget": 70,
+      "resizedWidth": 384,
+      "resizedHeight": 384,
+      "softTokens": 64
+    },
+    {
+      "width": 200,
+      "height": 100,
+      "budget": 70,
+      "resizedWidth": 528,
+      "resizedHeight": 240,
+      "softTokens": 55
+    },
+    {
+      "width": 4000,
+      "height": 1,
+      "budget": 70,
+      "resizedWidth": 3360,
+      "resizedHeight": 48,
+      "softTokens": 70
+    },
+    {
+      "width": 1,
+      "height": 4000,
+      "budget": 70,
+      "resizedWidth": 48,
+      "resizedHeight": 3360,
+      "softTokens": 70
+    },
+    {
+      "width": 1280,
+      "height": 719,
+      "budget": 70,
+      "resizedWidth": 528,
+      "resizedHeight": 288,
+      "softTokens": 66
+    },
+    {
+      "width": 719,
+      "height": 1280,
+      "budget": 70,
+      "resizedWidth": 288,
+      "resizedHeight": 528,
+      "softTokens": 66
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "budget": 140,
+      "resizedWidth": 528,
+      "resizedHeight": 528,
+      "softTokens": 121
+    },
+    {
+      "width": 64,
+      "height": 64,
+      "budget": 140,
+      "resizedWidth": 528,
+      "resizedHeight": 528,
+      "softTokens": 121
+    },
+    {
+      "width": 512,
+      "height": 512,
+      "budget": 140,
+      "resizedWidth": 528,
+      "resizedHeight": 528,
+      "softTokens": 121
+    },
+    {
+      "width": 200,
+      "height": 100,
+      "budget": 140,
+      "resizedWidth": 768,
+      "resizedHeight": 384,
+      "softTokens": 128
+    },
+    {
+      "width": 4000,
+      "height": 1,
+      "budget": 140,
+      "resizedWidth": 6720,
+      "resizedHeight": 48,
+      "softTokens": 140
+    },
+    {
+      "width": 1,
+      "height": 4000,
+      "budget": 140,
+      "resizedWidth": 48,
+      "resizedHeight": 6720,
+      "softTokens": 140
+    },
+    {
+      "width": 1280,
+      "height": 719,
+      "budget": 140,
+      "resizedWidth": 720,
+      "resizedHeight": 384,
+      "softTokens": 120
+    },
+    {
+      "width": 719,
+      "height": 1280,
+      "budget": 140,
+      "resizedWidth": 384,
+      "resizedHeight": 720,
+      "softTokens": 120
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "budget": 280,
+      "resizedWidth": 768,
+      "resizedHeight": 768,
+      "softTokens": 256
+    },
+    {
+      "width": 64,
+      "height": 64,
+      "budget": 280,
+      "resizedWidth": 768,
+      "resizedHeight": 768,
+      "softTokens": 256
+    },
+    {
+      "width": 512,
+      "height": 512,
+      "budget": 280,
+      "resizedWidth": 768,
+      "resizedHeight": 768,
+      "softTokens": 256
+    },
+    {
+      "width": 200,
+      "height": 100,
+      "budget": 280,
+      "resizedWidth": 1104,
+      "resizedHeight": 528,
+      "softTokens": 253
+    },
+    {
+      "width": 4000,
+      "height": 1,
+      "budget": 280,
+      "resizedWidth": 13440,
+      "resizedHeight": 48,
+      "softTokens": 280
+    },
+    {
+      "width": 1,
+      "height": 4000,
+      "budget": 280,
+      "resizedWidth": 48,
+      "resizedHeight": 13440,
+      "softTokens": 280
+    },
+    {
+      "width": 1280,
+      "height": 719,
+      "budget": 280,
+      "resizedWidth": 1056,
+      "resizedHeight": 576,
+      "softTokens": 264
+    },
+    {
+      "width": 719,
+      "height": 1280,
+      "budget": 280,
+      "resizedWidth": 576,
+      "resizedHeight": 1056,
+      "softTokens": 264
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "budget": 560,
+      "resizedWidth": 1104,
+      "resizedHeight": 1104,
+      "softTokens": 529
+    },
+    {
+      "width": 64,
+      "height": 64,
+      "budget": 560,
+      "resizedWidth": 1104,
+      "resizedHeight": 1104,
+      "softTokens": 529
+    },
+    {
+      "width": 512,
+      "height": 512,
+      "budget": 560,
+      "resizedWidth": 1104,
+      "resizedHeight": 1104,
+      "softTokens": 529
+    },
+    {
+      "width": 200,
+      "height": 100,
+      "budget": 560,
+      "resizedWidth": 1584,
+      "resizedHeight": 768,
+      "softTokens": 528
+    },
+    {
+      "width": 4000,
+      "height": 1,
+      "budget": 560,
+      "resizedWidth": 26880,
+      "resizedHeight": 48,
+      "softTokens": 560
+    },
+    {
+      "width": 1,
+      "height": 4000,
+      "budget": 560,
+      "resizedWidth": 48,
+      "resizedHeight": 26880,
+      "softTokens": 560
+    },
+    {
+      "width": 1280,
+      "height": 719,
+      "budget": 560,
+      "resizedWidth": 1488,
+      "resizedHeight": 816,
+      "softTokens": 527
+    },
+    {
+      "width": 719,
+      "height": 1280,
+      "budget": 560,
+      "resizedWidth": 816,
+      "resizedHeight": 1488,
+      "softTokens": 527
+    },
+    {
+      "width": 1,
+      "height": 1,
+      "budget": 1120,
+      "resizedWidth": 1584,
+      "resizedHeight": 1584,
+      "softTokens": 1089
+    },
+    {
+      "width": 64,
+      "height": 64,
+      "budget": 1120,
+      "resizedWidth": 1584,
+      "resizedHeight": 1584,
+      "softTokens": 1089
+    },
+    {
+      "width": 512,
+      "height": 512,
+      "budget": 1120,
+      "resizedWidth": 1584,
+      "resizedHeight": 1584,
+      "softTokens": 1089
+    },
+    {
+      "width": 200,
+      "height": 100,
+      "budget": 1120,
+      "resizedWidth": 2256,
+      "resizedHeight": 1104,
+      "softTokens": 1081
+    },
+    {
+      "width": 4000,
+      "height": 1,
+      "budget": 1120,
+      "resizedWidth": 53760,
+      "resizedHeight": 48,
+      "softTokens": 1120
+    },
+    {
+      "width": 1,
+      "height": 4000,
+      "budget": 1120,
+      "resizedWidth": 48,
+      "resizedHeight": 53760,
+      "softTokens": 1120
+    },
+    {
+      "width": 1280,
+      "height": 719,
+      "budget": 1120,
+      "resizedWidth": 2112,
+      "resizedHeight": 1200,
+      "softTokens": 1100
+    },
+    {
+      "width": 719,
+      "height": 1280,
+      "budget": 1120,
+      "resizedWidth": 1200,
+      "resizedHeight": 2112,
+      "softTokens": 1100
+    }
+  ]
+}

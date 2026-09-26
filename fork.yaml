@@ -157,6 +157,22 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+        - title: "DiffusionGemma native block generation"
+          description: |
+            Gemma4-derived encoder and bidirectional block decoder with native
+            self-conditioning and refinement controls, committed-only output,
+            image/video processing, and request-owned paged/prefix state.
+            Includes exact configuration/tensor/media/sampler oracles and
+            lifecycle qualification. This is diffusion, not an AR MTP drafter;
+            model-quality and release limits remain explicit in the native docs.
+          globs:
+            - "Libraries/MLXLLM/Models/DiffusionGemma*.swift"
+            - "Libraries/MLXVLM/DiffusionGemma*.swift"
+            - "Libraries/MLXVLM/Models/DiffusionGemma*.swift"
+            - "Tests/MLXLMTests/DiffusionGemma*.swift"
+            - "Tests/MLXLMTests/NativeBlock*.swift"
+            - "Tests/MLXLMTests/NativeDiffusionLiveTests.swift"
+            - "docs/diffusiongemma/**"
         - title: "GPT-OSS 20B"
           description: |
             MXFP4 expert path split into focused extensions: checkpoint layout, weight materialization,

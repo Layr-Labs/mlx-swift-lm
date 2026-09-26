@@ -94,6 +94,9 @@ public struct CBv2Request: Sendable {
     /// from silently becoming an unscoped shared cache. Defaults true for
     /// local and backwards-compatible direct engine callers.
     public var prefixCacheEnabled: Bool
+    /// Native bridge's process-ledger reservation, never a wire/body control.
+    /// A changed cache budget may force cold serving, not a larger allocation.
+    public var nativeReservationBytes: Int?
     /// Correlation identity for prefix-cache donation receipts. This is
     /// deliberately separate from `id`, which remains the sampler and
     /// scheduler identity and may be reused after a request finishes. nil
@@ -121,6 +124,7 @@ public struct CBv2Request: Sendable {
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
         maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0,
         cacheSalt: String? = nil, prefixCacheEnabled: Bool = true,
+        nativeReservationBytes: Int? = nil,
         multimodal: CBv2MultimodalInput? = nil,
         positionState: CBv2PositionState? = nil,
         hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
@@ -136,6 +140,7 @@ public struct CBv2Request: Sendable {
         self.priority = priority
         self.cacheSalt = cacheSalt
         self.prefixCacheEnabled = prefixCacheEnabled
+        self.nativeReservationBytes = nativeReservationBytes
         self.multimodal = multimodal
         self.positionState = positionState
         self.hybridPrefixIdentity = hybridPrefixIdentity
@@ -948,6 +953,8 @@ public struct CBv2Usage: Sendable {
 public enum CBv2PrefixCacheTier: String, Sendable, Equatable {
     /// Zero-copy physical pages already resident in the paged KV pool.
     case resident
+    /// Complete in-memory snapshots, not zero-copy paged residency or SSD.
+    case memorySnapshot = "memory_snapshot"
     /// Materialized KV snapshots supplied through `CBv2PrefixCache`.
     case snapshot
 }

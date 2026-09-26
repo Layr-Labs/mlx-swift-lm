@@ -177,7 +177,14 @@ public struct TokenizerLoaderMacro: ExpressionMacro {
                         //
                         // import Tokenizers
                         //
-                        let upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
+                        let upstream: any Tokenizers.Tokenizer
+                        if let inputs = try MLXLMCommon.DiffusionGemmaTokenizerConfiguration.load(from: directory) {
+                            upstream = try Tokenizers.PreTrainedTokenizer(
+                                tokenizerConfig: .init(inputs.configurationDictionary()),
+                                tokenizerData: .init(inputs.dataDictionary()))
+                        } else {
+                            upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
+                        }
                         return #adaptHuggingFaceTokenizer(upstream)
                     }
                 }

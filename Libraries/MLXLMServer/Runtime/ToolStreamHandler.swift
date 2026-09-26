@@ -17,9 +17,9 @@ public final class BatchedToolStreamHandler: @unchecked Sendable {
     private let processor: ToolCallProcessor
     private var residualText: String?
 
-    public init(format: ToolCallFormat, tools: [[String: any Sendable]]?) {
+    public init(format: ToolCallFormat, tools: [[String: any Sendable]]?, strictGemma: Bool = false) {
         self.format = format
-        self.processor = ToolCallProcessor(format: format, tools: tools)
+        self.processor = ToolCallProcessor(format: format, tools: tools, strictGemma: strictGemma)
     }
 
     public func processChunk(_ chunk: String) -> String? {
