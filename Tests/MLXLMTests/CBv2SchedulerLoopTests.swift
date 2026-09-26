@@ -136,6 +136,8 @@ final class CBv2SchedulerLoopTests: XCTestCase {
         // before the second one arrives, and nothing is requeued.
         let loop = harness.engine.loopForTesting
         loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 0 }
+        // A throwing submit must not leave the step loop held.
+        defer { loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil } }
         let first = try harness.engine.submit(
             CBv2SchedFixtures.request(prompt: Array(0 ..< 6), maxTokens: 4))
         let second = try harness.engine.submit(
