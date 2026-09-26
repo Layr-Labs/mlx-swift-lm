@@ -148,6 +148,21 @@ public protocol CBv2StepSampler: AnyObject {
         requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> MLXArray?
 
+    /// `mtpVerifySample` plus the typical-acceptance decision
+    /// (`CBv2MTPAcceptance.typical`). `draftIDs` is `[B, D]` int32 with
+    /// `D <= W`: the draft proposed at each of the first `D` window
+    /// positions. Returns the same lazy `[B, W]` tokens `mtpVerifySample`
+    /// would return, plus a lazy `[B, D]` bool mask: true where the draft is
+    /// kept. Stochastic rows keep a draft when the filtered target row gives
+    /// it probability strictly above `min(1, delta * exp(-H))`; greedy rows
+    /// keep a draft only when it equals the argmax. Same purity contract as
+    /// `mtpVerifySample`. nil when unsupported (callers then fall back to
+    /// `mtpVerifySample` and exact acceptance).
+    func mtpVerifyTypical(
+        logits: MLXArray, draftIDs: MLXArray, delta: Float,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> (tokens: MLXArray, accept: MLXArray)?
+
     /// An MTP round confirmed tokens for `requestIDs` OUTSIDE `sample`
     /// (verify rows never pass through it). Stateful samplers must drop the
     /// affected row configuration so the next `sample` reconfigures from
@@ -167,6 +182,10 @@ extension CBv2StepSampler {
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> MLXArray? { nil }
+    public func mtpVerifyTypical(
+        logits: MLXArray, draftIDs: MLXArray, delta: Float,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> (tokens: MLXArray, accept: MLXArray)? { nil }
     public func mtpRoundDidCommit(requestIDs: [CBv2RequestID]) {}
 }
 

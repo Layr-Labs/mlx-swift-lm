@@ -104,9 +104,10 @@ final class CBv2MTPRoundInFlight {
         let rows: [VerifyRow]
         /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
         /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
-        /// all [B, 1+k] shortlist probability masses in parts-per-million.
-        /// One `asArray` at finalize reads everything, preserving the single
-        /// host-sync boundary.
+        /// all [B, 1+k] shortlist probability masses in parts-per-million,
+        /// then — iff `hasAcceptMask` — all [B, k] typical-acceptance
+        /// decisions (1 = keep the draft). One `asArray` at finalize reads
+        /// everything, preserving the single host-sync boundary.
         let acceptancePacket: MLXArray
         /// Lazy [B,k] draft ids retained for exact accepted-prefix slicing
         /// into stateful assistant finalization.
@@ -125,6 +126,10 @@ final class CBv2MTPRoundInFlight {
         /// IDs feed greedy scoring on device; values are read only after the
         /// existing acceptance-packet fence.
         let policyTopTwoValues: MLXArray?
+        /// True when the packet ends with the [B, k] typical-acceptance mask
+        /// (`CBv2MTPAcceptance.typical` on a target-prefix batch). Finalize
+        /// then walks the mask instead of comparing drafts to targets.
+        let hasAcceptMask: Bool
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
 
@@ -354,6 +359,7 @@ final class CBv2MTPRoundDriver {
             useCommittedDecodeBaseline: drafter.supportsTargetPrefixAcceptance
                 && !(drafter is any CBv2MTPRequestStatefulDrafter))
         self.metrics.verificationMode = self.config.verificationMode
+        self.metrics.acceptance = self.config.acceptance
         self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
     }
 

@@ -27,10 +27,16 @@ extension EngineLoopV2 {
     /// with genuine target samples drawn with the request's real sampler
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
+    ///
+    /// `accept` is non-nil only under `CBv2MTPAcceptance.typical` with a
+    /// target-prefix batch: a lazy `[B, k]` bool mask, true where the draft
+    /// is kept (`CBv2StepSampler.mtpVerifyTypical`). Finalize walks the mask
+    /// instead of comparing drafts to `scores`; the committed correction and
+    /// bonus token remain `scores`.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) throws -> (
-        scores: MLXArray, hidden: MLXArray,
+        scores: MLXArray, accept: MLXArray?, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
@@ -40,6 +46,7 @@ extension EngineLoopV2 {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
         let scores: MLXArray
+        var accept: MLXArray?
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
@@ -72,20 +79,45 @@ extension EngineLoopV2 {
         // (already confirmed output) was drawn at index base-1, so position j
         // of the window is output index base + j.
         let verifyStepBases = rows.map(\.rec.generatedTokenCount)
+        // Typical acceptance rides the target-prefix path only: an all-greedy
+        // batch keeps the argmax packet, and rounds without drafts have no
+        // position to decide.
+        let typicalDelta: Float? = {
+            guard useTargetPrefix, columns.count > 1,
+                case .typical(let delta) = mtp.config.acceptance
+            else { return nil }
+            return delta
+        }()
+        var typicalUnsupported = false
 
-        func scoreColumns(_ logits: MLXArray, columnOffset: Int) -> MLXArray {
+        /// `drafts` is `[B, D]` (the draft proposed at each of the first `D`
+        /// columns of `logits`) when typical acceptance needs a decision for
+        /// this call; nil otherwise.
+        func scoreColumns(
+            _ logits: MLXArray, columnOffset: Int, drafts: MLXArray?
+        ) -> (scores: MLXArray, accept: MLXArray?) {
             guard useTargetPrefix else {
-                return argMax(logits, axis: -1).asType(.int32)
+                return (argMax(logits, axis: -1).asType(.int32), nil)
+            }
+            let stepBases = verifyStepBases.map { $0 + columnOffset }
+            if let typicalDelta, let drafts {
+                if let scored = sampler.mtpVerifyTypical(
+                    logits: logits, draftIDs: drafts, delta: typicalDelta,
+                    params: verifyParams, requestIDs: verifyIDs, stepBases: stepBases)
+                {
+                    return (scored.tokens, scored.accept)
+                }
+                typicalUnsupported = true
             }
             guard
                 let sampled = sampler.mtpVerifySample(
                     logits: logits, params: verifyParams, requestIDs: verifyIDs,
-                    stepBases: verifyStepBases.map { $0 + columnOffset })
+                    stepBases: stepBases)
             else {
                 preconditionFailure(
                     "CBv2 MTP: sampler advertised target-prefix support but returned nil")
             }
-            return sampled
+            return (sampled, nil)
         }
 
         func captureDiagnostics(
@@ -174,6 +206,7 @@ extension EngineLoopV2 {
 
         if !useRectangular {
             var scoreColumnsAccum: [MLXArray] = []
+            var acceptColumnsAccum: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
             scoreColumnsAccum.reserveCapacity(columns.count)
             hiddenColumns.reserveCapacity(columns.count)
@@ -220,13 +253,23 @@ extension EngineLoopV2 {
                 }
                 captureDiagnostics(
                     output.logits, columnOffset: columnIndex, phase: "serial_verify")
-                let columnScores = scoreColumns(output.logits, columnOffset: columnIndex)
+                // Column c scores the draft at column c + 1; the bonus column
+                // has no draft to decide.
+                let columnDrafts: MLXArray? =
+                    typicalDelta != nil && columnIndex + 1 < columns.count
+                    ? columns[columnIndex + 1] : nil
+                let scored = scoreColumns(
+                    output.logits, columnOffset: columnIndex, drafts: columnDrafts)
+                let columnScores = scored.scores
+                if let columnAccept = scored.accept {
+                    acceptColumnsAccum.append(columnAccept)
+                }
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
                 // each canonical target step before constructing the next.
                 var evaluationTargets =
-                    [columnScores, output.lastHidden] + eagerCacheInnerState(caches)
-                    + recurrentArrays
+                    [columnScores, output.lastHidden] + (scored.accept.map { [$0] } ?? [])
+                    + eagerCacheInnerState(caches) + recurrentArrays
                 for packet in diagnostics where packet.column == columnIndex {
                     evaluationTargets.append(contentsOf: packet.evaluationTargets)
                 }
@@ -243,6 +286,9 @@ extension EngineLoopV2 {
                 hiddenColumns.append(output.lastHidden)
             }
             scores = concatenated(scoreColumnsAccum, axis: 1)
+            if !acceptColumnsAccum.isEmpty {
+                accept = concatenated(acceptColumnsAccum, axis: 1)
+            }
             hidden = concatenated(hiddenColumns, axis: 1)
 
         } else {
@@ -321,7 +367,12 @@ extension EngineLoopV2 {
                 )
             }
             if useTargetPrefix {
-                scores = scoreColumns(output.logits, columnOffset: 0)
+                let drafts: MLXArray? =
+                    typicalDelta != nil
+                    ? concatenated(Array(columns.dropFirst()), axis: 1) : nil
+                let scored = scoreColumns(output.logits, columnOffset: 0, drafts: drafts)
+                scores = scored.scores
+                accept = scored.accept
             } else if let policyTopTwo {
                 scores = policyTopTwo.ids[0..., 0..., 0]
             } else {
@@ -342,8 +393,12 @@ extension EngineLoopV2 {
             }
         }
 
+        if typicalUnsupported {
+            mtp.recordControllerFallback("typical_acceptance_unsupported")
+        }
+
         return (
-            scores, hidden, shortlist, policyTopTwo,
+            scores, accept, hidden, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent
         )
     }
