@@ -406,6 +406,39 @@ struct HistoricalWindowCheckpointTests {
         #expect(values(row).count == 17 * 64, "typed optional failure leaves serving target fence intact")
     }
 
+    @Test("An interior position captures while its window is resident and is refused once the ring moved on")
+    func interiorWindowResidency() throws {
+        let fixture = try fixture()
+        var original = try donor(fixture)
+        defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
+        let row = try #require(original[0] as? PagedSequenceKV)
+        // The fixture ring holds exactly one chunk (maxPrefillChunk == chunkSize).
+        #expect(row.ringPages! * row.pool.config.pageSize == chunkSize)
+        write(original, start: 0, count: chunkSize)
+        write(original, start: chunkSize, count: chunkSize)
+        #expect(row.absoluteOffset == 2 * chunkSize && row.oldestValidPosition == chunkSize)
+        // [c + 17 - 17, c + 17) is still resident; [c - 17, c) is not.
+        let resident = try CBv2HistoricalWindow(row: row, position: chunkSize + 17, admission: fixture.admission)
+        try resident.finishEvaluation()
+        #expect(resident.start == chunkSize && resident.position == chunkSize + 17)
+        let bytes = 17 * 64 * row.groupKey.dtype.size
+        let keys = try resident.read(values: false, byteOffset: 0, maximumBytes: bytes)
+        let expected = MLXArray((chunkSize ..< chunkSize + 17).flatMap { Array(repeating: Float($0), count: 64) },
+                                [17, 64]).asType(row.groupKey.dtype)
+        #expect(keys == expected.asData(),
+                "an interior window copies the exact rows the frontier left behind in the ring")
+        #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
+            try CBv2HistoricalWindow(row: row, position: chunkSize, admission: fixture.admission)
+        }
+        #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
+            try CBv2HistoricalWindow(row: row, position: 2 * chunkSize + 1, admission: fixture.admission)
+        }
+        let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
+        #expect(try capture.prepareHistorical(position: chunkSize, chunkSize: chunkSize, state: original) == nil,
+                "an evicted interior window is skipped, never a stale copy")
+        capture.close()
+    }
+
     /// Real catalog window geometry, one owning sliding layer per model. The
     /// per-checkpoint charge is that figure times the model's owner count; it
     /// is what `historicalStagedByteBudget` and K = 8 are sized against.
@@ -438,6 +471,25 @@ struct HistoricalWindowCheckpointTests {
         let row = try #require(state[0] as? PagedSequenceKV)
         #expect(row.ringPages == 2 * stride / row.pool.config.pageSize,
                 "the ring holds max(window + speculative span, maxPrefillChunk) tokens")
+        // Interior residency at production geometry: after the solo stripe
+        // [0, 2048) both models can capture 1,024; after a company chunk
+        // shifted the stripe to [512, 2560) only gpt-oss (W = 128) still
+        // holds [1024 - W, 1024), gemma-4 (W = 1,024) has lost it.
+        _ = try CBv2HistoricalWindow.reservationBytes(row: row, position: stride)
+        for entry in state {
+            guard let row = entry as? PagedSequenceKV else { continue }
+            row.write(keys: MLXArray.zeros([kvHeads, stride / 2, headDim], dtype: dtype),
+                      values: MLXArray.zeros([kvHeads, stride / 2, headDim], dtype: dtype))
+        }
+        #expect(row.absoluteOffset == 2 * stride + stride / 2)
+        if window < stride / 2 {
+            _ = try CBv2HistoricalWindow.reservationBytes(row: row, position: stride)
+        } else {
+            #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
+                try CBv2HistoricalWindow.reservationBytes(row: row, position: stride)
+            }
+        }
+        _ = try CBv2HistoricalWindow.reservationBytes(row: row, position: 2 * stride)
         let perLayer = try CBv2HistoricalWindow.reservationBytes(row: row, position: 2 * stride)
         let logical = 2 * kvHeads * window * headDim * dtype.size
         let perCheckpoint = perLayer * owners

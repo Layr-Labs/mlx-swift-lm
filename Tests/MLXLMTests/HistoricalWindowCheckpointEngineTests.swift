@@ -108,7 +108,9 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))
         let cold = await cbv2SchedCollect(try first.submit(request))
         XCTAssertEqual(cold.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [4 * chunk, 2 * chunk])
+        // Interior boundaries land too: c inside [0, 2c), 3c inside [2c, 4c)
+        // and 5c inside the ragged tail [4c, 5c + 1).
+        XCTAssertEqual(store.saved.map(\.manifest.position), [5 * chunk, 4 * chunk, 3 * chunk, 2 * chunk, chunk])
         XCTAssertTrue(store.saved.allSatisfy { $0.manifest.position % $0.manifest.chunkSize == 0 })
         XCTAssertEqual(first.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(firstBackend.bytesWired, 0)
@@ -126,6 +128,23 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(secondBackend.bytesWired, 0)
         await second.shutdown()
+
+        // Interior boundaries were copied out of the ring after their stripe
+        // had already advanced the frontier: 3c inside [2c, 4c) and 5c inside
+        // the ragged tail. Both restore exactly.
+        for (id, position) in [(3, 3 * chunk), (5, 5 * chunk)] {
+            let interior = CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == position })
+            let (third, thirdBackend) = try engine(interior, stripe: true)
+            let interiorRequest = CBv2Request(id: .init(UInt64(id)), promptTokens: tokens, maxTokens: 4,
+                cacheSalt: "tenant", prefixCacheReceiptID: .init(UInt64(1000 + id)))
+            XCTAssertTrue(try interior.stage(engine: third, request: interiorRequest))
+            let fromInterior = await cbv2SchedCollect(try third.submit(interiorRequest))
+            XCTAssertEqual(fromInterior.tokens, cold.tokens, "restore at \(position)")
+            XCTAssertEqual(fromInterior.usage?.prefixCachePrefillTokensSaved, position)
+            XCTAssertEqual(third.admissionForTesting.bytesReserved, 0)
+            XCTAssertEqual(thirdBackend.bytesWired, 0)
+            await third.shutdown()
+        }
     }
 
     /// The prod failure in miniature: the donor's first range is a solo
@@ -204,7 +223,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         let donor = await cbv2SchedCollect(try first.submit(.init(id: .init(1), promptTokens: donorTokens,
             maxTokens: 2, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))))
         XCTAssertEqual(donor.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, 2 * chunk, chunk])
         await first.shutdown()
 
         // The long prompt shares the donor's first 3c + 1 tokens exactly.
@@ -230,10 +249,11 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         XCTAssertLessThan(second.stepCount, coldEngine.stepCount,
                           "historical adoption must resume on the solo stripe, not the donor's chunk size")
         XCTAssertEqual(second.stepCount, coldEngine.stepCount - 1)
-        // Resumed at 2c, the adopter's own stripes [2c, 4c) and [4c, 6c)
-        // donate their ends; [6c, 7c + 1) ends at the prompt. (The reopened
+        // Resumed at 2c, the adopter's own stripes [2c, 4c), [4c, 6c) and the
+        // tail [6c, 7c + 1) donate every boundary they cover. (The reopened
         // store's first archive is the donor's 2c it was seeded with.)
-        XCTAssertEqual(Array(reopened.saved.map(\.manifest.position).dropFirst()), [6 * chunk, 4 * chunk])
+        XCTAssertEqual(Array(reopened.saved.map(\.manifest.position).dropFirst()),
+                       [7 * chunk, 6 * chunk, 5 * chunk, 4 * chunk, 3 * chunk])
         XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(secondBackend.bytesWired, 0)
         await second.shutdown()

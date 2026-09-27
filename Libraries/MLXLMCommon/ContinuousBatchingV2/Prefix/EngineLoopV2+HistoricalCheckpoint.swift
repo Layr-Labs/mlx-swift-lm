@@ -88,9 +88,11 @@ extension EngineLoopV2 {
                 promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id), stride: stride)
             recurrentCheckpointGeometry[id] = geometry
-            // Capture lands only at the range end for now: interior positions
-            // need the sliding rings to prove residency behind the frontier.
-            for position in positions where position == range.upperBound {
+            // Interior positions are exact while every sliding ring still holds
+            // `[p - W, p)`; `CBv2HistoricalWindow` refuses the rest, and the
+            // gathers land in this step's own asyncEval before any successor
+            // may write the ring (`permitsChainedSuccessor`).
+            for position in positions {
                 guard position < rec.request.promptTokens.count,
                       let candidate = try capture.prepareHistorical(position: position, chunkSize: stride, state: state)
                 else { continue }
