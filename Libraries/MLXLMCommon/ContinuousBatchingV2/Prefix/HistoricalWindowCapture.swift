@@ -28,9 +28,15 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
 
     static func reservationBytes(row: PagedSequenceKV, position: Int) throws -> Int {
         guard let window = row.windowSize, row.pool.segmentGrant != nil,
-              position == row.absoluteOffset, position > 1 else {
+              position <= row.absoluteOffset, position > 1 else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
+        // An interior position (behind the frontier) is exact only while the
+        // ring still holds its whole window: the ring keeps
+        // `max(window + speculative span, maxPrefillChunk)` tokens behind the
+        // highest written position, so a 1,024-aligned point inside a 2,048
+        // stripe qualifies for gpt-oss (W = 128) and, at the stripe's own
+        // alignment, for gemma-4 (W = 1,024). Anything older is refused here.
         let count = min(window, position)
         guard position - count >= row.oldestValidPosition else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
