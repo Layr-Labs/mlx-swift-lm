@@ -73,8 +73,15 @@ extension EngineV2 {
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
                 plan = recurrentPlan
             }
-            plan.recurrentChunkSize = staged.manifest.chunkSize
-            plan.recurrentPromptLength = request.promptTokens.count
+            if staged.codec.historicalLayout == nil {
+                // Only recurrent state must continue the donor's exact chunk
+                // geometry. A historical adopter holds complete attention rows
+                // and resumes at `matched` under ordinary scheduling: solo
+                // stripes, plain chunks and the first-token projection all
+                // apply, and no bounded geometry wait can cold-restart it.
+                plan.recurrentChunkSize = staged.manifest.chunkSize
+                plan.recurrentPromptLength = request.promptTokens.count
+            }
             return .init(
                 adoption: .init(
                     requestID: receiptID, tokens: request.promptTokens, matched: matched,

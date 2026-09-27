@@ -101,7 +101,12 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             manifest.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint,
             manifest.position < request.promptTokens.count,
             manifest.prefixTokens.elementsEqual(request.promptTokens.prefix(manifest.position)),
-            manifest.chunkSize >= minimumChunkSize, manifest.chunkSize <= maximumChunkSize,
+            // Recurrent adopters continue the donor's exact chunk geometry, so
+            // its stride must be one this engine can schedule. Historical
+            // layouts resume with ordinary chunking; their recorded stride is
+            // only the manifest's position alignment.
+            historicalLayout != nil
+                || (manifest.chunkSize >= minimumChunkSize && manifest.chunkSize <= maximumChunkSize),
             CBv2AttentionV1.queryBlockSize <= 0 || manifest.chunkSize % CBv2AttentionV1.queryBlockSize == 0,
             manifest.assistantCodecID == (manifest.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID),
             manifest.attentionLayers == historicalLayout?.layers,
