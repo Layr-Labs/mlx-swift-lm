@@ -15,9 +15,10 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     var historicalRetention: [CBv2RequestID: CBv2HistoricalCheckpointRetention] = [:]
     /// Staged window copies share the slot's ordinary admission ceiling
     /// (`AdmissionV2.reserveTransient`). Over 1/16 of that capacity a donor
-    /// gives up its fork target and keeps the first/latest pair. Windows per
-    /// checkpoint: gpt-oss-20b ~7 MB (12 owners x 128 tokens, float32 K/V),
-    /// gemma-4-26b ~216 MB (25 owners x 1,024 tokens, 16-bit K/V).
+    /// gives up its first, then its fork target, and always keeps its rolling
+    /// latest: the same order as the slot-wide cap. Windows per checkpoint:
+    /// gpt-oss-20b ~7 MB (12 owners x 128 tokens, float32 K/V), gemma-4-26b
+    /// ~216 MB (25 owners x 1,024 tokens, 16-bit K/V).
     static let historicalStagedByteBudgetDivisor = 16
     /// Test seam; production reads the admission capacity at every commit so
     /// a resized slot budget is honored by requests already in flight.

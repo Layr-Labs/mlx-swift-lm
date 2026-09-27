@@ -660,33 +660,62 @@ struct HistoricalWindowCheckpointTests {
             + "capped=\(capped.reserved) uncapped=\(uncapped.reserved)")
     }
 
-    @Test("The byte budget gives up the fork target but never the first/latest pair")
+    @Test("The byte budget sheds the first, then the target, and always keeps the latest")
     func retentionByteBudget() throws {
         let fixture = try fixture()
-        var original = try donor(fixture, maxLength: 8 * chunkSize)
-        defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
+        let ids: [CBv2RequestID] = [.init(9001), .init(9002)]
+        var states = try ids.map { try donor(fixture, maxLength: 8 * chunkSize, id: $0) }
+        defer {
+            for (state, id) in zip(states, ids) { fixture.backend.release(state); fixture.admission.releaseAll(id: id) }
+            states.removeAll()
+        }
         let capture = retentionCapture(fixture)
-        let before = fixture.admission.bytesReserved
-        let perCheckpoint = try commit(capture, state: original, positions: [chunkSize], hint: 3 * chunkSize)
-        #expect(perCheckpoint > 0)
-        #expect(fixture.admission.bytesReserved == before + perCheckpoint)
+        let before = fixture.admission.transientBytesReserved
+        func stagedBytes() -> Int {
+            capture.queue.sync {}
+            return fixture.admission.transientBytesReserved - before
+        }
+        let hint = 3 * chunkSize + 5
+        let perCheckpoint = try commit(capture, state: states[0], positions: [chunkSize], hint: hint, id: ids[0])
+        #expect(perCheckpoint > 0 && stagedBytes() == perCheckpoint)
+
+        // Room for two: latest + target outlive the first.
         capture.historicalStagedByteBudgetOverride = perCheckpoint * 5 / 2
-        _ = try commit(capture, state: original, positions: [2 * chunkSize, 3 * chunkSize], hint: 3 * chunkSize)
-        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 3 * chunkSize])
-        // The third staged boundary exceeds 2.5 checkpoints: the target goes.
-        _ = try commit(capture, state: original, positions: [4 * chunkSize, 5 * chunkSize], hint: 3 * chunkSize)
-        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 5 * chunkSize])
-        capture.queue.sync {}
-        #expect(fixture.admission.bytesReserved == before + 2 * perCheckpoint)
+        _ = try commit(capture, state: states[0], positions: [2 * chunkSize, 3 * chunkSize], hint: hint, id: ids[0])
+        #expect(staged(capture, ids[0]) == [chunkSize, 3 * chunkSize])
+        _ = try commit(capture, state: states[0], positions: [4 * chunkSize], hint: hint, id: ids[0])
+        #expect(staged(capture, ids[0]) == [3 * chunkSize, 4 * chunkSize], "room for two keeps latest + target")
+        #expect(capture.historicalRetention[ids[0]]?.first == chunkSize, "a shed first is not reopened")
+        #expect(stagedBytes() == 2 * perCheckpoint)
+        _ = try commit(capture, state: states[0], positions: [5 * chunkSize], hint: hint, id: ids[0])
+        #expect(staged(capture, ids[0]) == [3 * chunkSize, 5 * chunkSize])
+
+        // Room for one: the latest outlives the target.
+        capture.historicalStagedByteBudgetOverride = perCheckpoint * 3 / 2
+        _ = try commit(capture, state: states[0], positions: [6 * chunkSize], hint: hint, id: ids[0])
+        #expect(staged(capture, ids[0]) == [6 * chunkSize], "room for one keeps the latest")
+        #expect(stagedBytes() == perCheckpoint)
+        // No room at all: the latest is still the one boundary kept.
         capture.historicalStagedByteBudgetOverride = 0
-        _ = try commit(capture, state: original, positions: [6 * chunkSize], hint: 3 * chunkSize)
-        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 6 * chunkSize],
-                "a zero budget still keeps the older first/latest pair")
+        _ = try commit(capture, state: states[0], positions: [7 * chunkSize], hint: hint, id: ids[0])
+        #expect(staged(capture, ids[0]) == [7 * chunkSize])
+        #expect(stagedBytes() == perCheckpoint)
+        dropAndWait(capture, id: ids[0])
+        #expect(stagedBytes() == 0)
+
+        // Without a target the pair first + latest is kept exactly as before.
+        capture.historicalStagedByteBudgetOverride = perCheckpoint * 5 / 2
+        _ = try commit(capture, state: states[1], positions: (1 ... 4).map { $0 * chunkSize }, id: ids[1])
+        #expect(staged(capture, ids[1]) == [chunkSize, 4 * chunkSize], "no target: first + latest")
+        #expect(stagedBytes() == 2 * perCheckpoint)
+        capture.historicalStagedByteBudgetOverride = perCheckpoint * 3 / 2
+        _ = try commit(capture, state: states[1], positions: [5 * chunkSize], id: ids[1])
+        #expect(staged(capture, ids[1]) == [5 * chunkSize], "room for one keeps the latest, not the first")
         capture.historicalStagedByteBudgetOverride = nil
         #expect(capture.historicalStagedByteBudget == fixture.admission.bytesCapacity / 16,
                 "production reads the admission capacity at every commit")
-        dropAndWait(capture)
-        #expect(fixture.admission.bytesReserved == before)
+        dropAndWait(capture, id: ids[1])
+        #expect(stagedBytes() == 0)
         capture.close()
     }
 
@@ -785,7 +814,7 @@ struct HistoricalWindowCheckpointTests {
 
     /// Real catalog window geometry, one owning sliding layer per model. The
     /// per-checkpoint charge is that figure times the model's owner count; it
-    /// is what `historicalStagedByteBudget` and K = 8 are sized against.
+    /// is what the per-donor budget and the slot-wide cap are sized against.
     /// K/V storage type is what the loaded model's projections and RoPE
     /// produce, not the weight type: the live gpt-oss-20b manifest reports
     /// float32 for 23 of its 24 layers (one sliding owner is bfloat16);
