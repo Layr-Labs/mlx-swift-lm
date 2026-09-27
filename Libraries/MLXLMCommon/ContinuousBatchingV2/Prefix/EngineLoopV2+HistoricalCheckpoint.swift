@@ -164,6 +164,14 @@ extension CBv2CompleteCheckpointCapture {
         return prepared.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
     }
 
+    /// A prepared candidate that will not be staged: its step was discarded,
+    /// its request preempted, or its copy failed. Closing it releases its
+    /// windows; it is no longer in flight either way.
+    func discardHistorical(_ candidate: CBv2CapturedCompleteCheckpoint) {
+        inFlightHistoricalBytes = max(0, inFlightHistoricalBytes - candidate.stagedHistoricalBytes)
+        candidate.finishEvaluationAndClose()
+    }
+
     /// Stage one evaluated boundary under `CBv2HistoricalCheckpointRetention`:
     /// at most the first, the fork target and the rolling latest stay staged.
     /// Over the donor's byte budget the claim order is the slot-wide cap's:
@@ -260,7 +268,7 @@ extension EngineLoopV2 {
                 do {
                     try candidate.finishEvaluation()
                     if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0 {
-                        candidate.finishEvaluationAndClose()
+                        capture.discardHistorical(candidate)
                     } else {
                         let rec = scheduler.record(for: id)
                         capture.commitHistorical(
@@ -270,7 +278,7 @@ extension EngineLoopV2 {
                     }
                 } catch {
                     if let error = error as? MLXError { nativeFailure = nativeFailure ?? error }
-                    candidate.finishEvaluationAndClose()
+                    capture.discardHistorical(candidate)
                 }
             }
         }
