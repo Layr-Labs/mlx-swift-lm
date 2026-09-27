@@ -26,6 +26,26 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         historicalStagedByteBudgetOverride
             ?? max(0, codec.admission.bytesCapacity) / Self.historicalStagedByteBudgetDivisor
     }
+    /// Staged historical windows across ALL donors may hold at most 1/8 of
+    /// the slot's admission capacity (`CBv2HistoricalStagingCap`), read at
+    /// each capture because the slot can be re-sliced at runtime. Test seam.
+    var historicalSlotStagedByteCapOverride: Int?
+    var historicalSlotStagedByteCap: Int {
+        historicalSlotStagedByteCapOverride
+            ?? max(0, codec.admission.bytesCapacity) / CBv2HistoricalStagingCap.capacityDivisor
+    }
+    /// Window bytes of every donor's staged historical checkpoints.
+    var stagedHistoricalBytes: Int {
+        staged.values.reduce(0) { total, captures in
+            captures.reduce(total) { $0 + $1.stagedHistoricalBytes }
+        }
+    }
+    /// Net window bytes prepared by the step now launching and not yet
+    /// committed: candidates minus the rolling latest each replaces. A step
+    /// holding candidates never chains a successor
+    /// (`CBv2InFlightStep.permitsChainedSuccessor`), so every candidate is
+    /// committed or closed before the next step prepares and resets this.
+    var inFlightHistoricalBytes = 0
     var historicalCheckpointStrideTokens = CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens
     // Deterministic native construction/evaluation fault seam, engine-queue
     // only. Production always uses the ordinary private historical owner.

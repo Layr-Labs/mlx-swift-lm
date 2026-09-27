@@ -142,6 +142,57 @@ final class CBv2HistoricalCheckpointRetentionTests: XCTestCase {
         XCTAssertEqual(retention.retained, [1024, 4096])
     }
 
+    func testSlotCapArithmetic() {
+        let w = 216_295_625  // one gemma-4 checkpoint's staged windows
+        let cap = (16 << 30) / CBv2HistoricalStagingCap.capacityDivisor
+        XCTAssertEqual(CBv2HistoricalStagingCap.capacityDivisor, 8)
+        XCTAssertEqual(cap / w, 9, "a 16 GB slot stages nine gemma-4 checkpoints")
+        func displaced(_ slotWindows: Int, replacing: Int = 0, sheddable: [Int] = [], cap: Int = cap) -> Int? {
+            CBv2HistoricalStagingCap.displaced(candidateBytes: w, slotBytes: slotWindows * w,
+                replacingBytes: replacing, sheddable: sheddable, cap: cap)
+        }
+        XCTAssertEqual(displaced(0), 0)
+        XCTAssertEqual(displaced(8), 0, "the ninth window fits")
+        XCTAssertNil(displaced(9), "the tenth is refused")
+        XCTAssertEqual(displaced(9, replacing: w), 0, "a donor at the cap rolls its latest")
+        XCTAssertEqual(displaced(9, sheddable: [w, w]), 1, "one boundary given up is enough")
+        XCTAssertEqual(displaced(10, sheddable: [w, w]), 2)
+        XCTAssertNil(displaced(11, sheddable: [w, w]), "giving up everything it may is still not enough")
+        XCTAssertNil(displaced(0, cap: w - 1), "a slot smaller than one checkpoint stages none")
+        XCTAssertEqual(displaced(0, cap: w), 0)
+        XCTAssertNil(CBv2HistoricalStagingCap.displaced(
+            candidateBytes: .max, slotBytes: 1, replacingBytes: 0, sheddable: [], cap: .max))
+        XCTAssertNil(CBv2HistoricalStagingCap.displaced(
+            candidateBytes: -1, slotBytes: 0, replacingBytes: 0, sheddable: [], cap: cap))
+    }
+
+    func testSheddingOrderIsFirstThenTargetAndNeverForAFirst() {
+        var (retention, _) = run(hint: 3072, through: 6144)
+        XCTAssertEqual(retention.retained, [1024, 3072, 6144])
+        XCTAssertEqual(retention.replaceableLatest, 6144)
+        XCTAssertEqual(retention.sheddable(for: .latest), [1024, 3072])
+        XCTAssertEqual(retention.sheddable(for: .target), [1024])
+        XCTAssertEqual(retention.sheddable(for: .first), [])
+        retention.shed(1024)
+        XCTAssertEqual(retention.retained, [3072, 6144])
+        XCTAssertEqual(retention.first, 1024)
+        XCTAssertFalse(retention.firstIsOpen, "a given-up first is not reopened")
+        XCTAssertEqual(retention.sheddable(for: .latest), [3072])
+        XCTAssertEqual(retention.commit(7168), [6144])
+        XCTAssertEqual(retention.retained, [3072, 7168])
+
+        // A latest that is also the first or the target is not replaceable.
+        let (single, _) = run(hint: nil, through: 1024)
+        XCTAssertNil(single.replaceableLatest)
+        XCTAssertEqual(single.sheddable(for: .latest), [1024])
+        let (atTarget, _) = run(hint: 3072, through: 3072)
+        XCTAssertNil(atTarget.replaceableLatest)
+        // One boundary that is both first and target goes as the target.
+        let (both, _) = run(hint: 1024, through: 4096)
+        XCTAssertEqual(both.sheddable(for: .target), [])
+        XCTAssertEqual(both.sheddable(for: .latest), [1024])
+    }
+
     func testDegenerateStrideHasNoTarget() {
         XCTAssertNil(CBv2HistoricalCheckpointRetention(stride: 1, hintTokens: 4096).target)
         XCTAssertNil(CBv2HistoricalCheckpointRetention(stride: 0, hintTokens: 4096).target)

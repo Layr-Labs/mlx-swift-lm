@@ -45,9 +45,11 @@ struct HistoricalWindowCheckpointTests {
         return .init(backend: backend, admission: admission, codec: codec, request: request, kinds: kinds)
     }
 
-    private func donor(_ fixture: Fixture, maxLength: Int? = nil) throws -> [CBv2SequenceKV?] {
+    private func donor(_ fixture: Fixture, maxLength: Int? = nil, id: CBv2RequestID = .init(9001))
+        throws -> [CBv2SequenceKV?]
+    {
         let maxLength = maxLength ?? maximumLength
-        try fixture.admission.reserve(id: .init(9001), additionalTokens: maxLength)
+        try fixture.admission.reserve(id: id, additionalTokens: maxLength)
         return try fixture.backend.makeSequenceState(layerKinds: fixture.kinds,
             promptLength: fixture.request.promptTokens.count, maxLength: maxLength)
     }
@@ -421,6 +423,241 @@ struct HistoricalWindowCheckpointTests {
         prepared.forEach { $0.finishEvaluationAndClose() }
         dropAndWait(capture)
         capture.close(); bounded.close()
+    }
+
+    /// One donor's next chunk, captured the way the engine does it: every
+    /// stride boundary of the range offered, retention and the slot-wide cap
+    /// deciding which are copied. Returns the positions that were copied.
+    private func stageRange(_ capture: CBv2CompleteCheckpointCapture, state: [CBv2SequenceKV?],
+                            id: CBv2RequestID, through position: Int, hint: Int? = nil) throws -> [Int] {
+        write(state, start: position - chunkSize, count: chunkSize)
+        let stride = capture.historicalCheckpointStrideTokens
+        let positions = Array(Swift.stride(from: position - chunkSize + stride, through: position, by: stride))
+        let retention = capture.historicalRetention(requestID: id, hintTokens: hint, resumedAt: 0)
+        let prepared = try capture.prepareHistorical(
+            positions: positions, retention: retention, state: state, requestID: id)
+        let copied = prepared.compactMap(\.position)
+        for candidate in prepared {
+            try candidate.finishEvaluation()
+            capture.commitHistorical(candidate, requestID: id, hintTokens: hint)
+        }
+        #expect(capture.staged[id]?.compactMap(\.position) == capture.historicalRetention[id]?.retained
+            || (capture.staged[id] == nil && capture.historicalRetention[id]?.retained.isEmpty != false))
+        return copied
+    }
+
+    private func staged(_ capture: CBv2CompleteCheckpointCapture, _ id: CBv2RequestID) -> [Int] {
+        capture.staged[id]?.compactMap(\.position) ?? []
+    }
+
+    @Test("The slot-wide cap refuses the donor that would exceed it, admits it once another releases, and lets a donor at the cap roll its latest")
+    func slotCapAcrossDonors() throws {
+        let fixture = try fixture()
+        let ids: [CBv2RequestID] = [.init(9001), .init(9002), .init(9003)]
+        var states = try ids.map { try donor(fixture, maxLength: 8 * chunkSize, id: $0) }
+        defer {
+            for (state, id) in zip(states, ids) { fixture.backend.release(state); fixture.admission.releaseAll(id: id) }
+            states.removeAll()
+        }
+        let capture = retentionCapture(fixture)
+        #expect(capture.historicalSlotStagedByteCap == fixture.admission.bytesCapacity / 8,
+                "production reads the slot capacity at every capture")
+        let before = fixture.admission.transientBytesReserved
+        func stagedBytes() -> Int {
+            capture.queue.sync {}
+            return fixture.admission.transientBytesReserved - before
+        }
+        let first = try stageRange(capture, state: states[0], id: ids[0], through: chunkSize)
+        #expect(first == [chunkSize])
+        let window = stagedBytes()
+        #expect(window > 0 && capture.stagedHistoricalBytes == window)
+        capture.historicalSlotStagedByteCapOverride = 4 * window
+
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: 2 * chunkSize)
+        _ = try stageRange(capture, state: states[1], id: ids[1], through: chunkSize)
+        _ = try stageRange(capture, state: states[1], id: ids[1], through: 2 * chunkSize)
+        #expect(staged(capture, ids[0]) == [chunkSize, 2 * chunkSize])
+        #expect(staged(capture, ids[1]) == [chunkSize, 2 * chunkSize])
+        #expect(stagedBytes() == 4 * window && capture.stagedHistoricalBytes == 4 * window, "the cap is full")
+
+        // A donor at the cap still rolls its latest: the replacement does not raise the total.
+        let rolled = try stageRange(capture, state: states[1], id: ids[1], through: 3 * chunkSize)
+        #expect(rolled == [3 * chunkSize])
+        #expect(staged(capture, ids[1]) == [chunkSize, 3 * chunkSize])
+        #expect(stagedBytes() == 4 * window)
+
+        // The third donor is refused: nothing copied, nothing reserved.
+        var copies = 0
+        capture.makeHistoricalWindow = { row, position, admission in
+            copies += 1
+            return try CBv2HistoricalWindow(row: row, position: position, admission: admission)
+        }
+        let refused = try stageRange(capture, state: states[2], id: ids[2], through: chunkSize)
+        #expect(refused.isEmpty && copies == 0 && capture.staged[ids[2]] == nil)
+        #expect(stagedBytes() == 4 * window)
+        #expect(capture.inFlightHistoricalBytes == 0)
+
+        // Releasing one donor admits the next.
+        dropAndWait(capture, id: ids[0])
+        #expect(stagedBytes() == 2 * window)
+        let admitted = try stageRange(capture, state: states[2], id: ids[2], through: 2 * chunkSize)
+        #expect(admitted == [2 * chunkSize] && copies == 1)
+        _ = try stageRange(capture, state: states[2], id: ids[2], through: 3 * chunkSize)
+        #expect(staged(capture, ids[2]) == [2 * chunkSize, 3 * chunkSize])
+        #expect(stagedBytes() == 4 * window)
+        let again = try stageRange(capture, state: states[2], id: ids[2], through: 4 * chunkSize)
+        #expect(again == [4 * chunkSize] && stagedBytes() == 4 * window)
+
+        dropAndWait(capture, id: ids[1])
+        dropAndWait(capture, id: ids[2])
+        #expect(stagedBytes() == 0 && capture.stagedHistoricalBytes == 0)
+        capture.close()
+    }
+
+    @Test("Under the slot-wide cap a donor keeps its latest over its target over its first")
+    func slotCapPriorityWithinDonor() throws {
+        let fixture = try fixture()
+        let ids: [CBv2RequestID] = [.init(9001), .init(9002)]
+        var states = try ids.map { try donor(fixture, maxLength: 8 * chunkSize, id: $0) }
+        defer {
+            for (state, id) in zip(states, ids) { fixture.backend.release(state); fixture.admission.releaseAll(id: id) }
+            states.removeAll()
+        }
+        let capture = retentionCapture(fixture)
+        let before = fixture.admission.transientBytesReserved
+        func stagedBytes() -> Int {
+            capture.queue.sync {}
+            return fixture.admission.transientBytesReserved - before
+        }
+        let hint = 3 * chunkSize + 5
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: chunkSize, hint: hint)
+        let window = stagedBytes()
+        capture.historicalSlotStagedByteCapOverride = 2 * window
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: 2 * chunkSize, hint: hint)
+        #expect(staged(capture, ids[0]) == [chunkSize, 2 * chunkSize] && stagedBytes() == 2 * window)
+        // The fork target replaces the role-less latest.
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: 3 * chunkSize, hint: hint)
+        #expect(staged(capture, ids[0]) == [chunkSize, 3 * chunkSize])
+        // A new latest beside a full cap: the first is given up, the target kept.
+        let latest = try stageRange(capture, state: states[0], id: ids[0], through: 4 * chunkSize, hint: hint)
+        #expect(latest == [4 * chunkSize])
+        #expect(staged(capture, ids[0]) == [3 * chunkSize, 4 * chunkSize], "latest over target over first")
+        #expect(capture.historicalRetention[ids[0]]?.first == chunkSize, "a given-up first is not reopened")
+        #expect(stagedBytes() == 2 * window)
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: 5 * chunkSize, hint: hint)
+        #expect(staged(capture, ids[0]) == [3 * chunkSize, 5 * chunkSize])
+        // The slot shrinks to one window: the latest outlives the target.
+        capture.historicalSlotStagedByteCapOverride = window
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: 6 * chunkSize, hint: hint)
+        #expect(staged(capture, ids[0]) == [6 * chunkSize])
+        #expect(stagedBytes() == window)
+        // A first never displaces anything: another donor finds no room.
+        let other = try stageRange(capture, state: states[1], id: ids[1], through: chunkSize)
+        #expect(other.isEmpty && capture.staged[ids[1]] == nil)
+        // With no room at all even the latest is refused and what is staged stays.
+        capture.historicalSlotStagedByteCapOverride = window - 1
+        let none = try stageRange(capture, state: states[0], id: ids[0], through: 7 * chunkSize, hint: hint)
+        #expect(none.isEmpty && staged(capture, ids[0]) == [6 * chunkSize])
+        dropAndWait(capture, id: ids[0])
+        #expect(stagedBytes() == 0)
+        capture.close()
+    }
+
+    @Test("With room for one more boundary in a range, the fork target is copied before the first")
+    func slotCapTargetBeforeFirst() throws {
+        let fixture = try fixture()
+        var original = try donor(fixture, maxLength: 8 * chunkSize)
+        defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
+        let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
+        let stride = chunkSize / 4
+        capture.historicalCheckpointStrideTokens = stride
+        let before = fixture.admission.transientBytesReserved
+        write(original, start: 0, count: chunkSize)
+        let row = try #require(original[0] as? PagedSequenceKV)
+        let window = try CBv2HistoricalWindow.reservationBytes(row: row, position: 4 * stride)
+        capture.historicalSlotStagedByteCapOverride = 2 * window
+        let hint = 2 * stride + 1
+        let retention = capture.historicalRetention(requestID: .init(9001), hintTokens: hint, resumedAt: 0)
+        let prepared = try capture.prepareHistorical(positions: (1 ... 4).map { $0 * stride },
+            retention: retention, state: original, requestID: .init(9001))
+        #expect(prepared.compactMap(\.position) == [2 * stride, 4 * stride], "latest, then target; no room for the first")
+        #expect(capture.inFlightHistoricalBytes == 2 * window)
+        for candidate in prepared {
+            try candidate.finishEvaluation()
+            capture.commitHistorical(candidate, requestID: .init(9001), hintTokens: hint)
+        }
+        #expect(capture.inFlightHistoricalBytes == 0)
+        #expect(staged(capture, .init(9001)) == [2 * stride, 4 * stride])
+        capture.queue.sync {}
+        #expect(fixture.admission.transientBytesReserved == before + 2 * window)
+        dropAndWait(capture)
+        #expect(fixture.admission.transientBytesReserved == before)
+        capture.close()
+    }
+
+    /// The ledger the scheduler reserves chunks against is the one staged
+    /// windows are charged to. Three donors that each want three staged
+    /// boundaries: capped to three windows in all, a request's reservation
+    /// fits; uncapped (nine windows), the SAME reservation exhausts the
+    /// ledger, which in the scheduler is a preemption or a refused admission.
+    @Test("Capped staged windows leave the ledger room a request's chunk reservation needs")
+    func slotCapLeavesRoomForServing() throws {
+        func arm(capped: Bool, tokens: Int?) throws -> (tokens: Int, window: Int, windows: Int, reserved: Bool) {
+            let fixture = try fixture()
+            let ids: [CBv2RequestID] = [.init(9001), .init(9002), .init(9003)]
+            var states = try ids.map { try donor(fixture, maxLength: 4 * chunkSize, id: $0) }
+            defer {
+                for (state, id) in zip(states, ids) { fixture.backend.release(state); fixture.admission.releaseAll(id: id) }
+                states.removeAll()
+            }
+            let capture = retentionCapture(fixture)
+            capture.historicalStagedByteBudgetOverride = .max
+            let before = fixture.admission.transientBytesReserved
+            capture.historicalSlotStagedByteCapOverride = .max
+            _ = try stageRange(capture, state: states[0], id: ids[0], through: chunkSize, hint: 2 * chunkSize)
+            capture.queue.sync {}
+            let window = fixture.admission.transientBytesReserved - before
+            try #require(window > 0)
+            capture.historicalSlotStagedByteCapOverride = capped ? 3 * window : .max
+            for (index, (state, id)) in zip(states, ids).enumerated() {
+                for multiple in 1 ... 3 where index > 0 || multiple > 1 {
+                    _ = try stageRange(capture, state: state, id: id, through: multiple * chunkSize,
+                                       hint: 2 * chunkSize)
+                }
+            }
+            capture.queue.sync {}
+            let stagedBytes = fixture.admission.transientBytesReserved - before
+            #expect(stagedBytes == capture.stagedHistoricalBytes)
+            #expect(stagedBytes <= capture.historicalSlotStagedByteCap)
+            let free = fixture.admission.admissibleBytesCapacity - fixture.admission.bytesReserved
+            // The largest request that fits beside the CAPPED set with half a
+            // window to spare; the uncapped arm is handed the same request.
+            var need = tokens ?? 0
+            if tokens == nil {
+                var low = 0, high = 1 << 24
+                while low < high {
+                    let middle = (low + high + 1) / 2
+                    if fixture.admission.allocatedBytes(forTokens: middle) <= free - window / 2 { low = middle }
+                    else { high = middle - 1 }
+                }
+                need = low
+            }
+            var reserved = true
+            do { try fixture.admission.reserve(id: .init(7777), additionalTokens: need) }
+            catch { reserved = false }
+            fixture.admission.releaseAll(id: .init(7777))
+            for id in ids where capture.staged[id] != nil { dropAndWait(capture, id: id) }
+            capture.close()
+            return (need, window, stagedBytes / window, reserved)
+        }
+        let capped = try arm(capped: true, tokens: nil)
+        #expect(capped.windows == 3 && capped.reserved && capped.tokens > 0)
+        let uncapped = try arm(capped: false, tokens: capped.tokens)
+        #expect(uncapped.windows == 9, "every donor staged its first, target and latest")
+        #expect(!uncapped.reserved, "the same reservation no longer fits beside nine staged windows")
+        print("[slot-cap-ledger] window=\(capped.window) cappedWindows=\(capped.windows) "
+            + "uncappedWindows=\(uncapped.windows) requestTokens=\(capped.tokens) "
+            + "capped=\(capped.reserved) uncapped=\(uncapped.reserved)")
     }
 
     @Test("The byte budget gives up the fork target but never the first/latest pair")
