@@ -437,17 +437,22 @@ final class CBv2SchedScriptedPrefixCache: CBv2PrefixCache, @unchecked Sendable {
 // MARK: - Builders
 
 enum CBv2SchedFixtures {
-    // Tests mint ids from the main thread / one test at a time; the unsafe
-    // opt-out just silences strict-concurrency for this test-only counter.
+    // Async tests mint ids on any thread, and parallel tests mint at the
+    // same time. `idLock` guards `nextID`, so each caller gets a new id.
+    // The unsafe opt-out silences strict concurrency; the lock makes it safe.
+    static let idLock = NSLock()
     nonisolated(unsafe) static var nextID: UInt64 = 0
 
     static func request(
         prompt: [Int], maxTokens: Int, priority: Int = 0,
         stopTokens: Set<Int> = [], stopStrings: [String] = []
     ) -> CBv2Request {
-        nextID += 1
+        let id = idLock.withLock {
+            nextID += 1
+            return nextID
+        }
         return CBv2Request(
-            id: CBv2RequestID(nextID), promptTokens: prompt, maxTokens: maxTokens,
+            id: CBv2RequestID(id), promptTokens: prompt, maxTokens: maxTokens,
             stopTokens: stopTokens, stopStrings: stopStrings, priority: priority)
     }
 
