@@ -45,13 +45,14 @@ final class Qwen35MoECompleteCheckpointTests: XCTestCase {
         let kinds = model.cbv2LayerKinds
         let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 64 << 20, kvDType: dtype))
         let caches = model.newCacheV2 { index, kind in CBv2LayerCache(layerIndex: index, kind: kind) }
-        return (EngineV2(
+        let engine = EngineV2(
             model: CBv2SteppableLanguageModelAdapter(model), layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: caches), sampler: CBv2GreedySampler(),
             schedulerConfig: .init(
                 maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
                 prefillChunkSize: chunk, maxWaiting: 4, enablePrefixCache: store != nil),
-            admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store), backend)
+            admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
+        return (engine, backend)
     }
 
     func testMoETopologyRetainsExactBackendAndActivationGates() throws {

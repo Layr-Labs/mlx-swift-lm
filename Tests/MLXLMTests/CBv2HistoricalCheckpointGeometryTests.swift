@@ -84,66 +84,96 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
         XCTAssertFalse(geometry.isArmed, "a stride of one is never a checkpoint geometry")
     }
 
-    func testRecurrentRuleStillRequiresUniformAlignedChunks() {
-        // Qwen keeps the exact-geometry contract: a cap change disarms.
-        var mixed = CBv2RecurrentCheckpointGeometry()
-        XCTAssertTrue(mixed.record(range: 0 ..< 512, cap: 512, promptLength: prompt, packed: false))
-        XCTAssertTrue(mixed.record(range: 512 ..< 1024, cap: 512, promptLength: prompt, packed: false))
-        XCTAssertFalse(mixed.record(range: 1024 ..< 3072, cap: 2048, promptLength: prompt, packed: false))
-        XCTAssertFalse(mixed.isArmed)
-        var ragged = CBv2RecurrentCheckpointGeometry()
-        XCTAssertTrue(ragged.record(range: 0 ..< 2048, cap: 2048, promptLength: prompt, packed: false))
-        XCTAssertFalse(ragged.record(range: 2048 ..< 2560, cap: 2048, promptLength: prompt, packed: false))
-        XCTAssertFalse(ragged.isArmed)
-        var misaligned = CBv2RecurrentCheckpointGeometry(position: 1024, chunkSize: 1024)
-        XCTAssertFalse(misaligned.record(range: 1024 ..< 3072, cap: 2048, promptLength: prompt, packed: false))
+    /// Recurrent capture is chunk-agnostic: a boundary is any contiguous
+    /// range end aligned to the 256-token stride and the query block,
+    /// whatever chunk produced it or the ranges before it. The parity
+    /// experiment showed the state at such a boundary is bit-identical on
+    /// the dense Qwen target across every partition.
+    func testRecurrentBoundariesAtEveryAlignedRangeEndAcrossMixedSchedules() {
+        func ends(_ schedule: [Int], prompt: Int) -> (captured: [Int], geometry: CBv2RecurrentCheckpointGeometry) {
+            var geometry = CBv2RecurrentCheckpointGeometry()
+            var captured: [Int] = []
+            var position = 0
+            for cap in schedule {
+                let upper = min(position + cap, prompt)
+                if geometry.record(range: position ..< upper, cap: cap, promptLength: prompt, packed: false) {
+                    captured.append(upper)
+                }
+                XCTAssertTrue(geometry.isArmed, "schedule \(schedule) disarmed at \(position)")
+                XCTAssertNil(geometry.disarmReason)
+                XCTAssertEqual(geometry.chunkSize, cap, "the last range's cap is the manifest's provenance")
+                position = upper
+            }
+            return (captured, geometry)
+        }
+        // A 2,048 stripe, then company arrives and the rest runs in 512s.
+        XCTAssertEqual(ends([2048, 512, 512, 512, 512, 512], prompt: 4608).captured,
+                       [2048, 2560, 3072, 3584, 4096, 4608])
+        // 512s under company, then the company leaves and stripes resume.
+        XCTAssertEqual(ends([512, 512, 512, 512, 2048, 2048], prompt: 6144).captured,
+                       [512, 1024, 1536, 2048, 4096, 6144])
+        // 512, 2,048, 2,048 and a ragged tail: the tail is no boundary but
+        // does not disarm either.
+        let ragged = ends([512, 2048, 2048, 2048], prompt: 4700)
+        XCTAssertEqual(ragged.captured, [512, 2560, 4608])
+        XCTAssertTrue(ragged.geometry.isArmed)
+        XCTAssertEqual(ragged.geometry.position, 4700)
+        // A range end off the stride is a boundary only as the end of a
+        // full chunk of its own cap (the old rule's boundaries): 384 is,
+        // 512 = 384 + 128 is 256-aligned, 612 = 512 + 100 is neither.
+        XCTAssertEqual(ends([384, 128, 100, 412], prompt: 1024).captured, [384, 512, 1024])
+        // The production 4,096 stripe alone.
+        XCTAssertEqual(ends([4096, 4096], prompt: 9171).captured, [4096, 8192])
     }
 
-    /// Only a cap change is attributed to the uniform-chunk rule, so its
-    /// count sizes what relaxing that rule would recover. Packing and every
-    /// other geometry failure keep their own reasons, and a disarmed request
-    /// reports its reason once: later ranges return false without a change.
-    func testRecurrentDisarmReasonAttributesOnlyCapChangesToTheUniformRule() {
-        var solo = CBv2RecurrentCheckpointGeometry()
-        XCTAssertNil(solo.disarmReason)
-        XCTAssertTrue(solo.record(range: 0 ..< 4096, cap: 4096, promptLength: prompt, packed: false))
-        XCTAssertNil(solo.disarmReason)
-        // Company arrived: the next range is a plain 512 chunk.
-        XCTAssertFalse(solo.record(range: 4096 ..< 4608, cap: 512, promptLength: prompt, packed: false))
-        XCTAssertEqual(solo.disarmReason, .chunkSizeChanged)
-        XCTAssertFalse(solo.record(range: 4608 ..< 5120, cap: 512, promptLength: prompt, packed: false))
-        XCTAssertEqual(solo.disarmReason, .chunkSizeChanged, "the reason is set once")
+    func testRecurrentCapChangeNoLongerDisarms() {
+        var geometry = CBv2RecurrentCheckpointGeometry()
+        XCTAssertTrue(geometry.record(range: 0 ..< 4096, cap: 4096, promptLength: prompt, packed: false))
+        XCTAssertTrue(geometry.record(range: 4096 ..< 4608, cap: 512, promptLength: prompt, packed: false))
+        XCTAssertTrue(geometry.isArmed)
+        XCTAssertNil(geometry.disarmReason, "`.chunkSizeChanged` is retired and never produced")
+        XCTAssertEqual(geometry.chunkSize, 512)
+        // An adopter restored under one chunk continues under another.
+        var adopter = CBv2RecurrentCheckpointGeometry(position: 1024, chunkSize: 1024)
+        XCTAssertTrue(adopter.record(range: 1024 ..< 3072, cap: 2048, promptLength: prompt, packed: false))
+        XCTAssertNil(adopter.disarmReason)
+    }
 
-        // A cap change on a ragged final range is still the cap change.
-        var raggedChange = CBv2RecurrentCheckpointGeometry()
-        XCTAssertTrue(raggedChange.record(range: 0 ..< 4096, cap: 4096, promptLength: 4400, packed: false))
-        XCTAssertFalse(raggedChange.record(range: 4096 ..< 4400, cap: 512, promptLength: 4400, packed: false))
-        XCTAssertEqual(raggedChange.disarmReason, .chunkSizeChanged)
-
-        // The ragged final range of a solo prompt under an unchanged cap.
-        var ragged = CBv2RecurrentCheckpointGeometry()
-        XCTAssertTrue(ragged.record(range: 0 ..< 4096, cap: 4096, promptLength: 6200, packed: false))
-        XCTAssertFalse(ragged.record(range: 4096 ..< 6200, cap: 4096, promptLength: 6200, packed: false))
-        XCTAssertEqual(ragged.disarmReason, .geometry)
-
+    /// Packing, a non-contiguous range and an overrun still disarm for the
+    /// rest of the prompt, each with its own reason, reported once.
+    func testRecurrentPackingGapAndOverrunStillDisarm() {
         var packed = CBv2RecurrentCheckpointGeometry()
         XCTAssertFalse(packed.record(range: 0 ..< 512, cap: 512, promptLength: prompt, packed: true))
         XCTAssertEqual(packed.disarmReason, .packed)
-        // Packed wins over a simultaneous cap change: the row never ran solo.
-        var packedChange = CBv2RecurrentCheckpointGeometry(position: 2048, chunkSize: 2048)
-        XCTAssertFalse(packedChange.record(range: 2048 ..< 2560, cap: 512, promptLength: prompt, packed: true))
-        XCTAssertEqual(packedChange.disarmReason, .packed)
+        XCTAssertFalse(packed.record(range: 512 ..< 1024, cap: 512, promptLength: prompt, packed: false))
+        XCTAssertEqual(packed.disarmReason, .packed, "the reason is set once")
 
         var gap = CBv2RecurrentCheckpointGeometry(position: 2048, chunkSize: 2048)
         XCTAssertFalse(gap.record(range: 4096 ..< 6144, cap: 2048, promptLength: prompt, packed: false))
         XCTAssertEqual(gap.disarmReason, .geometry)
+
         var overrun = CBv2RecurrentCheckpointGeometry()
-        XCTAssertFalse(overrun.record(range: 0 ..< 2048, cap: 2048, promptLength: 1000, packed: false))
+        XCTAssertTrue(overrun.record(range: 0 ..< 1024, cap: 1024, promptLength: 1024, packed: false))
+        // The decode range past the last prompt token.
+        XCTAssertFalse(overrun.record(range: 1024 ..< 1025, cap: 1, promptLength: 1024, packed: false))
         XCTAssertEqual(overrun.disarmReason, .geometry)
-        // An adopter whose first range is misaligned to the new cap: the cap
-        // itself changed from the checkpoint's chunk, and that is the reason.
-        var adopter = CBv2RecurrentCheckpointGeometry(position: 1024, chunkSize: 1024)
-        XCTAssertFalse(adopter.record(range: 1024 ..< 3072, cap: 2048, promptLength: prompt, packed: false))
-        XCTAssertEqual(adopter.disarmReason, .chunkSizeChanged)
+    }
+
+    func testRecurrentStrideSeamAndQueryBlockAlignment() {
+        // A smaller stride (test fixtures) still requires query-block alignment.
+        let block = CBv2AttentionV1.queryBlockSize
+        XCTAssertTrue(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(256))
+        XCTAssertFalse(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(384))
+        XCTAssertFalse(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(0))
+        if block > 1 {
+            XCTAssertTrue(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(block, stride: block))
+            XCTAssertFalse(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(block / 2, stride: block / 2),
+                           "a stride below the query block cannot outrun the block alignment")
+        }
+        var geometry = CBv2RecurrentCheckpointGeometry()
+        XCTAssertTrue(geometry.record(range: 0 ..< 100, cap: 100, promptLength: prompt, packed: false, stride: 256),
+                      "a full chunk end of its own cap, whatever the block")
+        XCTAssertTrue(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(384, chunkSize: 384))
+        XCTAssertFalse(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(640, chunkSize: 100, stride: 256))
     }
 }

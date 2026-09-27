@@ -383,8 +383,10 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     public let fullCapacityTokensReserved: Int
     public let stagedFullKVBytes: Int
     public let residentFullKVBytes: Int
-    /// Recurrent restores must continue the donor's exact chunk geometry.
-    /// Nil for attention-only adoption.
+    /// Resident-bank recurrent restores continue the donor's chunk geometry
+    /// (`EngineV2.hybridPrefixLookup`). Nil for attention-only adoption and
+    /// for every complete-checkpoint adopter, which resumes under ordinary
+    /// chunking (`completeCheckpointLookup`).
     public var recurrentChunkSize: Int? = nil
     public var recurrentPromptLength: Int? = nil
     /// Keeps this adopted row out of rectangular packed prefill. A complete

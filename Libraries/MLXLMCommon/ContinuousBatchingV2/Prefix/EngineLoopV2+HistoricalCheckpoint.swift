@@ -123,11 +123,12 @@ extension CBv2CompleteCheckpointCapture {
             }
             return result
         }
+        let stride = retention.stride ?? historicalCheckpointStrideTokens
         var prepared: [CBv2CapturedCompleteCheckpoint] = []
         var latest: Int?
         for position in positions.reversed() {
             guard let candidate = try prepareHistorical(
-                position: position, chunkSize: retention.stride, state: state,
+                position: position, chunkSize: stride, state: state,
                 allowance: allowance(.latest)) else { continue }
             prepared.append(candidate)
             latest = position
@@ -135,9 +136,9 @@ extension CBv2CompleteCheckpointCapture {
         }
         guard let latest else { return [] }
         let below = positions.filter { $0 < latest }
-        if let target = retention.target, below.contains(target),
+        if let target = retention.plannedTarget, below.contains(target),
            let candidate = try prepareHistorical(
-               position: target, chunkSize: retention.stride, state: state, allowance: allowance(.target))
+               position: target, chunkSize: stride, state: state, allowance: allowance(.target))
         {
             prepared.append(candidate)
         }
@@ -146,7 +147,7 @@ extension CBv2CompleteCheckpointCapture {
             let lowest = prepared.compactMap(\.position).min() ?? latest
             for position in below where position < lowest {
                 guard let candidate = try prepareHistorical(
-                    position: position, chunkSize: retention.stride, state: state,
+                    position: position, chunkSize: stride, state: state,
                     allowance: allowance(.first)) else { continue }
                 prepared.append(candidate)
                 break

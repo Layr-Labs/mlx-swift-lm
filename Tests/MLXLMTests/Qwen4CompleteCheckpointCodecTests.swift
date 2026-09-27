@@ -107,24 +107,20 @@ final class Qwen4CompleteCheckpointCodecTests: XCTestCase {
                 case 3: changed.multimodal = nil; changed.positionState = nil
                 default: changed.prefixCacheEnabled = false
                 }
-                XCTAssertThrowsError(try codec.plan(manifest: decoded, request: changed,
-                    minimumChunkSize: chunk, maximumChunkSize: chunk), "media identity negative \(variant)")
+                XCTAssertThrowsError(try codec.plan(manifest: decoded, request: changed), "media identity negative \(variant)")
             }
         }
         XCTAssertThrowsError(try codec.tensorDescriptors(position: chunk),
             "QSA checkpoints must never silently omit indexer side-state")
         let otherTenant = CBv2Request(id: .init(12), promptTokens: request.promptTokens,
             maxTokens: 4, cacheSalt: "tenant-b")
-        XCTAssertThrowsError(try codec.plan(manifest: manifest, request: otherTenant,
-            minimumChunkSize: chunk, maximumChunkSize: chunk))
+        XCTAssertThrowsError(try codec.plan(manifest: manifest, request: otherTenant))
         let incomplete = CBv2CompleteCheckpointManifest(identity: identity, position: chunk, chunkSize: chunk,
             prefixTokens: manifest.prefixTokens, cacheSalt: request.checkpointCacheSalt, assistantCodecID: nil,
             tensors: manifest.tensors.filter { !$0.role.isQwen4Indexer }, backendLayout: codec.backendLayout,
             mediaIdentity: mediaIdentity, mediaTargetOnly: media)
-        XCTAssertThrowsError(try codec.plan(manifest: incomplete, request: request,
-            minimumChunkSize: chunk, maximumChunkSize: chunk))
-        let plan = try codec.plan(manifest: manifest, request: request,
-            minimumChunkSize: chunk, maximumChunkSize: chunk)
+        XCTAssertThrowsError(try codec.plan(manifest: incomplete, request: request))
+        let plan = try codec.plan(manifest: manifest, request: request)
         let sink = try plan.allocate {}
         for (index, descriptor) in manifest.tensors.enumerated() {
             var offset = 0

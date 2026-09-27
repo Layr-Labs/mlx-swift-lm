@@ -75,10 +75,23 @@ struct CBv2HybridPrefixHit {
     let kvBackingBytes: Int
 }
 
-/// Recurrent exactness requires every donor chunk below a checkpoint to have
-/// identical launch geometry: GDN/SSM state exists only at chunk ends and its
-/// value depends on the chunk partition. Packed rows, ragged chunks and
-/// preemption disarm capture.
+/// Where a recurrent (GDN/SSM) donor's complete checkpoints may be taken.
+///
+/// A recurrent checkpoint is the model's exact state at a token position:
+/// full-attention K/V rows, conv and SSM state and MTP history. Measured on
+/// real weights (Qwen3.5-9B dense; the chunk-partition parity experiment),
+/// that state at a boundary is bit-identical whatever chunk partition
+/// produced it (uniform 512, uniform 2,048, the 4,096 stripe, 2,048 then
+/// 512s, 512s then 2,048, with or without decode company), and a restore
+/// continues token-exactly under any partition. On the MoE (Qwen3.6-35B-A3B)
+/// the state depends on the partition from layer 1 on, but so does a cold
+/// run's output, so a uniform-chunk rule guards a property serving never
+/// had there. Capture is therefore chunk-agnostic: a boundary exists at
+/// every contiguous computed-range end that is a multiple of
+/// `recurrentCheckpointStrideTokens` (the provider's 256-token block hash)
+/// and of the attention query block. Packed rows, a non-contiguous range
+/// and an overrun past the prompt still disarm the request for the rest of
+/// its prompt; preemption and media are refused before this rule runs.
 ///
 /// Historical (attention-only) layouts carry no such state: a checkpoint at
 /// `p` is the full-attention rows `[0, p)` plus each sliding row's `[p-W, p)`,
@@ -94,17 +107,26 @@ struct CBv2RecurrentCheckpointGeometry {
     enum DisarmReason: Equatable, Sendable {
         /// The range ran in a packed cohort.
         case packed
-        /// The chunk cap changed between ranges (a solo stripe gaining or
-        /// losing company). Counted whether or not the range was also
-        /// ragged: the uniform-chunk clause is what disarmed it, and the
-        /// count sizes what relaxing that clause would recover.
+        /// Retired. The uniform-chunk rule disarmed when the chunk cap
+        /// changed between ranges; capture is now chunk-agnostic and this
+        /// reason is never produced. It stays so the provider's
+        /// `recurrent_capture_disarmed_chunk_change_total` counter keeps its
+        /// meaning (it must now read zero) and a regression would show there.
         case chunkSizeChanged
-        /// A non-contiguous, overrunning, ragged or misaligned range under
-        /// an unchanged cap, including the ragged final range of a prompt.
+        /// A non-contiguous range, or one overrunning the prompt (the decode
+        /// range after the last prompt token).
         case geometry
     }
 
+    /// Recurrent boundaries are captured at multiples of this many tokens,
+    /// the provider's block-hash size (`PrefixCachePolicy.blockSize`), so
+    /// every boundary is also a routing anchor. The store's effective-token
+    /// floor and block alignment remain the provider's.
+    static let recurrentCheckpointStrideTokens = 256
+
     var position: Int = 0
+    /// The chunk cap of the last recorded range: provenance for the
+    /// manifest, not a constraint on the next range.
     var chunkSize: Int?
     var isArmed = true
     /// Set once, by the `record` that disarmed; nil while armed.
@@ -115,17 +137,37 @@ struct CBv2RecurrentCheckpointGeometry {
         self.chunkSize = chunkSize
     }
 
-    mutating func record(range: Range<Int>, cap: Int, promptLength: Int, packed: Bool) -> Bool {
+    /// Advance over one computed range and say whether its end is a
+    /// boundary: contiguous with the previous range, inside the prompt, and
+    /// aligned to the attention query block and to `stride` or to the
+    /// range's own cap (a full chunk end, the old rule's boundaries; a
+    /// no-op in production, where every cap is a multiple of the stride).
+    /// The cap is recorded as provenance, never compared with earlier ranges.
+    mutating func record(
+        range: Range<Int>, cap: Int, promptLength: Int, packed: Bool,
+        stride: Int = Self.recurrentCheckpointStrideTokens
+    ) -> Bool {
         guard isArmed else { return false }
         guard !packed else { return disarm(.packed) }
-        guard cap > 1, range.lowerBound == position, range.upperBound <= promptLength else {
-            return disarm(.geometry)
-        }
-        if let chunkSize, chunkSize != cap { return disarm(.chunkSizeChanged) }
-        guard range.count == cap, range.lowerBound % cap == 0 else { return disarm(.geometry) }
+        guard cap > 0, stride > 0, !range.isEmpty, range.lowerBound == position,
+            range.upperBound <= promptLength
+        else { return disarm(.geometry) }
         position = range.upperBound
         chunkSize = cap
-        return true
+        return Self.isRecurrentBoundary(position, chunkSize: cap, stride: stride)
+    }
+
+    /// Alignment shared by capture and manifest validation: a multiple of
+    /// `stride` that is also query-block aligned, or the end of a full chunk
+    /// of `chunkSize` (the old rule's boundaries, whose caps the scheduler
+    /// already keeps query-block aligned).
+    static func isRecurrentBoundary(
+        _ position: Int, chunkSize: Int = 0, stride: Int = recurrentCheckpointStrideTokens
+    ) -> Bool {
+        guard position > 0 else { return false }
+        if chunkSize > 0, position % chunkSize == 0 { return true }
+        let block = CBv2AttentionV1.queryBlockSize
+        return stride > 0 && position % stride == 0 && (block <= 0 || position % block == 0)
     }
 
     private mutating func disarm(_ reason: DisarmReason) -> Bool {

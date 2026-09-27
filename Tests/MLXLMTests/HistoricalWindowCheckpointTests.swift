@@ -75,8 +75,7 @@ struct HistoricalWindowCheckpointTests {
     private func stageSource(_ source: CBv2CompleteCheckpointExport, fixture: Fixture)
         throws -> CBv2StagedCompleteCheckpoint
     {
-        let plan = try fixture.codec.plan(manifest: source.manifest, request: fixture.request,
-            minimumChunkSize: chunkSize, maximumChunkSize: chunkSize)
+        let plan = try fixture.codec.plan(manifest: source.manifest, request: fixture.request)
         let sink = try plan.allocate(onRelease: {})
         defer { sink.close() }
         for (index, descriptor) in source.manifest.tensors.enumerated() {
@@ -214,8 +213,7 @@ struct HistoricalWindowCheckpointTests {
             prefixTokens: Array(fixture.request.promptTokens.prefix(chunkSize)), cacheSalt: fixture.request.cacheSalt,
             assistantCodecID: nil, tensors: descriptors,
             backendLayout: CBv2CompleteCheckpointManifest.historicalAttentionLayout, attentionLayers: layout.layers)
-        _ = try fixture.codec.plan(manifest: base, request: fixture.request,
-            minimumChunkSize: chunkSize, maximumChunkSize: chunkSize)
+        _ = try fixture.codec.plan(manifest: base, request: fixture.request)
         let encoded = try JSONEncoder().encode(base)
         for mutation in ["owner", "window", "dtype", "tokens"] {
             let decoded = try JSONSerialization.jsonObject(with: encoded)
@@ -231,7 +229,7 @@ struct HistoricalWindowCheckpointTests {
             let corrupt = try JSONDecoder().decode(CBv2CompleteCheckpointManifest.self,
                 from: JSONSerialization.data(withJSONObject: object))
             #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
-                try fixture.codec.plan(manifest: corrupt, request: fixture.request, minimumChunkSize: chunkSize, maximumChunkSize: chunkSize)
+                try fixture.codec.plan(manifest: corrupt, request: fixture.request)
             }
         }
         #expect(fixture.admission.bytesReserved == 0 && fixture.backend.bytesWired == 0)
@@ -298,6 +296,7 @@ struct HistoricalWindowCheckpointTests {
     private func retentionCapture(_ fixture: Fixture) -> CBv2CompleteCheckpointCapture {
         let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
         capture.historicalCheckpointStrideTokens = chunkSize
+        capture.targetAdjacencyTokens = chunkSize
         return capture
     }
 
@@ -377,6 +376,7 @@ struct HistoricalWindowCheckpointTests {
         // Four boundaries per chunk; the fixture ring holds one whole chunk.
         let stride = chunkSize / 4
         capture.historicalCheckpointStrideTokens = stride
+        capture.targetAdjacencyTokens = stride
         var copied: [Int] = []
         capture.makeHistoricalWindow = { row, position, admission in
             copied.append(position)
@@ -413,6 +413,7 @@ struct HistoricalWindowCheckpointTests {
         let bounded = CBv2CompleteCheckpointCapture(codec: fixture.codec,
             store: CompleteCheckpointFixtureStore(maximumPosition: 15 * stride))
         bounded.historicalCheckpointStrideTokens = stride
+        bounded.targetAdjacencyTokens = stride
         bounded.makeHistoricalWindow = capture.makeHistoricalWindow
         write(original, start: 3 * chunkSize, count: chunkSize)
         copied.removeAll()
@@ -527,6 +528,7 @@ struct HistoricalWindowCheckpointTests {
         let store = CompleteCheckpointFixtureStore(gate: gate)
         let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: store)
         capture.historicalCheckpointStrideTokens = chunkSize
+        capture.targetAdjacencyTokens = chunkSize
         let before = fixture.admission.transientBytesReserved
         func stagedBytes() -> Int {
             capture.queue.sync {}
@@ -666,6 +668,7 @@ struct HistoricalWindowCheckpointTests {
         let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
         let stride = chunkSize / 4
         capture.historicalCheckpointStrideTokens = stride
+        capture.targetAdjacencyTokens = stride
         let before = fixture.admission.transientBytesReserved
         write(original, start: 0, count: chunkSize)
         let row = try #require(original[0] as? PagedSequenceKV)

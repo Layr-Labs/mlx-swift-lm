@@ -61,6 +61,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     /// committed or closed before the next step prepares and resets this.
     var inFlightHistoricalBytes = 0
     var historicalCheckpointStrideTokens = CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens
+    /// A fork target within this many tokens of the final deepest boundary
+    /// is dropped at publication, for every layout. Test seam.
+    var targetAdjacencyTokens = CBv2CheckpointRetention.defaultTargetAdjacencyTokens
     // Deterministic native construction/evaluation fault seam, engine-queue
     // only. Production always uses the ordinary private historical owner.
     var makeHistoricalWindow: (PagedSequenceKV, Int, AdmissionV2) throws -> CBv2HistoricalWindow = {
@@ -108,22 +111,26 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
 
     /// The retention verdicts for this request so far, or a fresh plan when
     /// nothing is staged yet. Read-only: state is stored at commit. `stride`
-    /// is the historical stride or the recurrent chunk size; a request's
-    /// stride never changes once its first boundary is staged.
+    /// is the historical stride, which names the fork target ahead of
+    /// capture; nil for a recurrent donor, whose target is the deepest
+    /// captured boundary at or below the hint.
     func retention(
-        requestID: CBv2RequestID, stride: Int, hintTokens: Int?, resumedAt: Int
+        requestID: CBv2RequestID, stride: Int?, hintTokens: Int?, resumedAt: Int
     ) -> CBv2CheckpointRetention {
-        retentions[requestID] ?? .init(stride: stride, hintTokens: hintTokens, resumedAt: resumedAt)
+        retentions[requestID] ?? .init(stride: stride, hintTokens: hintTokens, resumedAt: resumedAt,
+                                       targetAdjacencyTokens: targetAdjacencyTokens)
     }
 
     /// Reserve before any checkpoint copy graph is constructed. The extra
     /// allowance covers allocator padding, concatenate/copy intermediates and
     /// entire retained SSM backing; it survives until every alias retires.
     ///
-    /// Recurrent boundaries are chunk ends, so `CBv2CheckpointRetention`
-    /// runs with `chunkSize` as its stride: the first captured chunk end,
-    /// the deepest chunk end at or below `hintTokens`, and the rolling
-    /// latest stay staged; every other boundary retires at the next commit.
+    /// Recurrent boundaries are whatever aligned range ends land, so
+    /// `CBv2CheckpointRetention` runs its dynamic rule (no stride): the first
+    /// captured boundary, the deepest captured boundary at or below
+    /// `hintTokens`, and the rolling latest stay staged; every other boundary
+    /// retires at the next commit. `chunkSize` is the chunk that ended at
+    /// this boundary, recorded in the manifest as provenance only.
     /// Retention changes only after the copy is staged, so a refused
     /// reservation leaves the previously retained boundaries as they were,
     /// and the transient peak (the new copy is reserved before the old
@@ -145,7 +152,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
         hintTokens: Int? = nil, resumedAt: Int = 0
     ) -> [MLXArray] {
-        guard !isClosed, position > 1, chunkSize > 1, position % chunkSize == 0,
+        guard !isClosed, position > 1, chunkSize > 0,
+            CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize),
             !mediaTargetOnly || mediaIdentity != nil,
             !(staged[requestID]?.contains { $0.checkpoint?.position == position } ?? false)
         else { return [] }
@@ -196,7 +204,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             }
             let captured = CBv2CapturedCompleteCheckpoint(checkpoint: checkpoint, reservation: reservation)
             var verdicts = self.retention(
-                requestID: requestID, stride: chunkSize, hintTokens: hintTokens, resumedAt: resumedAt)
+                requestID: requestID, stride: nil, hintTokens: hintTokens, resumedAt: resumedAt)
             let retired = Set(verdicts.commit(position))
             guard !retired.contains(position) else {
                 queue.async { captured.finishEvaluationAndClose() }

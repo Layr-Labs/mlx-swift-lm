@@ -135,6 +135,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
                        CBv2CompleteCheckpointManifest.historicalAttentionLayout)
         engine.loopForTesting.onEngineQueueSync {
             engine.completeCheckpointCapture?.historicalCheckpointStrideTokens = chunk
+            engine.completeCheckpointCapture?.targetAdjacencyTokens = chunk
         }
         return (engine, backend)
     }

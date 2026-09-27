@@ -182,9 +182,17 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             (backendLayout == Self.historicalAttentionLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil),
-            position > 1, (backendLayout == Self.diffusionBlockLayout ? chunkSize > 0 : chunkSize > 1),
+            position > 1, chunkSize > 0,
+            // Historical and diffusion layouts sit on their recorded stride;
+            // a recurrent checkpoint sits on any 256-token boundary (its
+            // `chunkSize` is the chunk that ended there, provenance only) or,
+            // for files written under the earlier uniform-chunk rule, on a
+            // multiple of that chunk.
             ((backendLayout == Self.diffusionBlockLayout && mediaIdentity != nil)
-                || position % chunkSize == 0), prefixTokens.count == position,
+                || position % chunkSize == 0
+                || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout)
+                    && position % CBv2RecurrentCheckpointGeometry.recurrentCheckpointStrideTokens == 0)),
+            prefixTokens.count == position,
             position <= Self.maximumEncodedBytes / 2,
             prefixTokens.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }),
             !tensors.isEmpty, tensors.count <= 4096,

@@ -6,21 +6,29 @@ extension EngineLoopV2 {
         guard hybridPrefixCache != nil || completeCheckpointCapture != nil else { return }
         var roots: [MLXArray] = []
         for (id, range) in step.computedRanges {
+            recurrentGeometryObserverForTesting?(
+                id, range, step.recurrentCheckpointChunkSizes[id],
+                step.packedPrefixRows.contains(id), "range", "")
             guard !step.discard.contains(id), step.recurrentEvaluations[id] != nil,
                 let rec = scheduler.record(for: id),
                 rec.request.permitsHybridCheckpoint(layerKinds: layerKinds), rec.preemptionCount == 0,
-                let cap = step.recurrentCheckpointChunkSizes[id],
-                cap >= scheduler.config.prefillChunkSize,
-                CBv2AttentionV1.queryBlockSize <= 0 || cap % CBv2AttentionV1.queryBlockSize == 0
+                let cap = step.recurrentCheckpointChunkSizes[id]
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             let wasArmed = geometry.isArmed
+            // The cap is provenance for the manifest; the boundary rule is
+            // position alignment alone, whatever chunk produced the range.
             let capture = geometry.record(
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id))
             recurrentCheckpointGeometry[id] = geometry
-            // The geometry stays disarmed for the rest of the prompt, so the
-            // armed-to-disarmed edge happens once per request.
+            recurrentGeometryObserverForTesting?(
+                id, range, cap, step.packedPrefixRows.contains(id), "record",
+                capture ? "capture" : (geometry.isArmed ? "skip" : "disarm"))
+            // Retired condition, kept wired: chunk-agnostic capture never
+            // produces `.chunkSizeChanged`, so the provider counter reads
+            // zero and a regression would show there. The geometry stays
+            // disarmed for the rest of the prompt, so the edge is once.
             if wasArmed, !geometry.isArmed, geometry.disarmReason == .chunkSizeChanged {
                 completeCheckpointCapture?.store.recordRecurrentCaptureDisarmed(
                     chunkSizeChangedAt: range.lowerBound)
