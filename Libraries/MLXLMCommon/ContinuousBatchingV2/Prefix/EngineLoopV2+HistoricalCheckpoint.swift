@@ -166,8 +166,9 @@ extension CBv2CompleteCheckpointCapture {
 
     /// Stage one evaluated boundary under `CBv2HistoricalCheckpointRetention`:
     /// at most the first, the fork target and the rolling latest stay staged.
-    /// Over the byte budget the target goes first; the first/latest pair is
-    /// never split, so a large-window model keeps the older rule's coverage.
+    /// Over the donor's byte budget the claim order is the slot-wide cap's:
+    /// the first goes, then the target, and the rolling latest is always
+    /// kept. Without a target that is the first/latest pair, as before.
     func commitHistorical(
         _ candidate: CBv2CapturedCompleteCheckpoint, requestID: CBv2RequestID,
         hintTokens: Int? = nil, resumedAt: Int = 0
@@ -181,11 +182,17 @@ extension CBv2CompleteCheckpointCapture {
             requestID: requestID, hintTokens: hintTokens, resumedAt: resumedAt)
         var retired = Set(retention.commit(position))
         var checkpoints = (staged[requestID] ?? []) + [candidate]
-        let bytes = checkpoints.reduce(0) {
+        let bytesByPosition = Dictionary(
+            checkpoints.map { ($0.position ?? 0, $0.stagedHistoricalBytes) }, uniquingKeysWith: { $0 + $1 })
+        var bytes = checkpoints.reduce(0) {
             $0 + (retired.contains($1.position ?? 0) ? 0 : $1.stagedHistoricalBytes)
         }
-        if bytes > historicalStagedByteBudget, let dropped = retention.dropInterior() {
-            retired.insert(dropped)
+        let budget = historicalStagedByteBudget
+        for shed in retention.sheddable(for: .latest)
+        where bytes > budget && shed != retention.retained.last {
+            retention.shed(shed)
+            retired.insert(shed)
+            bytes -= bytesByPosition[shed] ?? 0
         }
         let retiring = checkpoints.filter { retired.contains($0.position ?? 0) }
         checkpoints.removeAll { retired.contains($0.position ?? 0) }

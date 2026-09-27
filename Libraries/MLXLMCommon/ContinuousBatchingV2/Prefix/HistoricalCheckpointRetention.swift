@@ -53,13 +53,6 @@ struct CBv2HistoricalCheckpointRetention: Equatable, Sendable {
         return retired
     }
 
-    /// Byte pressure gives up the fork target and keeps the first/latest
-    /// pair. Returns the dropped position, nil when only that pair remains.
-    mutating func dropInterior() -> Int? {
-        guard retained.count > 2 else { return nil }
-        return retained.remove(at: 1)
-    }
-
     /// The rolling latest when it holds no other role: the next boundary to
     /// commit retires it, so a candidate replacing it adds nothing.
     var replaceableLatest: Int? {
@@ -68,10 +61,11 @@ struct CBv2HistoricalCheckpointRetention: Equatable, Sendable {
     }
 
     /// Retained boundaries this donor gives up, lowest priority first, to
-    /// make room under the slot-wide cap for a candidate of `role`. The
-    /// order is the value of what each serves: the rolling latest (the next
-    /// turn of the same conversation) over the fork target (observed demand)
-    /// over the first (a guess at a shared preamble).
+    /// make room for a candidate of `role` under the slot-wide cap, or under
+    /// its own byte budget once the candidate is the latest. The order is
+    /// the value of what each serves: the rolling latest (the next turn of
+    /// the same conversation) over the fork target (observed demand) over
+    /// the first (a guess at a shared preamble).
     func sheddable(for role: CBv2HistoricalStagingCap.Role) -> [Int] {
         var result: [Int] = []
         if role != .first, let first, first != target, retained.contains(first) { result.append(first) }
@@ -79,8 +73,9 @@ struct CBv2HistoricalCheckpointRetention: Equatable, Sendable {
         return result
     }
 
-    /// Give up one retained boundary under the slot-wide cap. Its role stays
-    /// taken: boundaries arrive ascending, so nothing later can fill it.
+    /// Give up one retained boundary under the slot-wide cap or the donor's
+    /// byte budget. Its role stays taken: boundaries arrive ascending, so
+    /// nothing later can fill it.
     mutating func shed(_ position: Int) {
         retained.removeAll { $0 == position }
     }

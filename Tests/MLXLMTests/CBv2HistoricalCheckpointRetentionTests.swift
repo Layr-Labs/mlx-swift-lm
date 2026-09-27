@@ -133,13 +133,32 @@ final class CBv2HistoricalCheckpointRetentionTests: XCTestCase {
         XCTAssertEqual(retention.retained, [2048, 4096])
     }
 
-    func testBytePressureGivesUpTheTargetAndNeverThePair() {
+    /// The donor's byte budget sheds in the slot-wide cap's order: the first,
+    /// then the target, never the rolling latest. Without a target the pair
+    /// first + latest is what stays.
+    func testBytePressureShedsFirstThenTargetAndKeepsTheLatest() {
         var (retention, _) = run(hint: 2048, through: 4096)
         XCTAssertEqual(retention.retained, [1024, 2048, 4096])
-        XCTAssertEqual(retention.dropInterior(), 2048)
-        XCTAssertEqual(retention.retained, [1024, 4096])
-        XCTAssertNil(retention.dropInterior())
-        XCTAssertEqual(retention.retained, [1024, 4096])
+        let order = retention.sheddable(for: .latest).filter { $0 != retention.retained.last }
+        XCTAssertEqual(order, [1024, 2048], "first before target; the latest is never offered")
+        retention.shed(1024)
+        XCTAssertEqual(retention.retained, [2048, 4096], "room for two keeps latest + target")
+        retention.shed(2048)
+        XCTAssertEqual(retention.retained, [4096], "room for one keeps the latest")
+        XCTAssertEqual(retention.commit(5120), [4096])
+        XCTAssertEqual(retention.retained, [5120], "a shed first or target is not reopened")
+
+        var (pair, _) = run(hint: nil, through: 4096)
+        XCTAssertEqual(pair.retained, [1024, 4096])
+        XCTAssertEqual(pair.sheddable(for: .latest).filter { $0 != pair.retained.last }, [1024])
+        pair.shed(1024)
+        XCTAssertEqual(pair.retained, [4096])
+
+        // A target that is the latest, or the first, is never shed as a target.
+        let (atLatest, _) = run(hint: 4096, through: 4096)
+        XCTAssertEqual(atLatest.sheddable(for: .latest).filter { $0 != atLatest.retained.last }, [1024])
+        let (single, _) = run(hint: nil, through: 1024)
+        XCTAssertEqual(single.sheddable(for: .latest).filter { $0 != single.retained.last }, [])
     }
 
     func testSlotCapArithmetic() {
