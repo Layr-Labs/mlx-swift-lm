@@ -10,7 +10,7 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
 
     func testDefaultStrideMatchesProviderFloorAlignment() {
         XCTAssertEqual(CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens, 1024)
-        XCTAssertEqual(CBv2CompleteCheckpointCapture.maximumStagedHistoricalCheckpoints, 8)
+        XCTAssertEqual(CBv2HistoricalCheckpointRetention.maximumRetained, 3)
     }
 
     func testCompanyChunksThenSoloStripeCaptureEveryStrideMultiple() {

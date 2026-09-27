@@ -3067,7 +3067,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
-                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil else { continue }
+                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil,
+                    row.rec.prefixReusePlan?.excludesPackedPrefill != true
+                else { continue }
                 // A multimodal request's text-only chunks remain packable.
                 // A span-bearing chunk needs explicit rectangular embedding
                 // and row-mask capability from both model and cache provider.

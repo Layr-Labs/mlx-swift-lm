@@ -6,7 +6,7 @@ import XCTest
 
 /// Both the earlier window and its dependent full layer affect every later
 /// logit. Borrowed layers read their owner's cache, never a synthetic own row.
-private final class HistoricalAttentionModel: CBv2SteppableModel, CBv2HistoricalAttentionCheckpointProviding {
+private class HistoricalAttentionModel: CBv2SteppableModel, CBv2HistoricalAttentionCheckpointProviding {
     let cbv2SupportsHistoricalAttentionCheckpoint = true
 
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
@@ -28,6 +28,30 @@ private final class HistoricalAttentionModel: CBv2SteppableModel, CBv2Historical
     }
 }
 
+/// The same model claiming rectangular packed prefill (as gemma-4 does), and
+/// recording the batch dimension of every prompt forward it is given.
+private final class PackableHistoricalAttentionModel: HistoricalAttentionModel,
+    CBv2PackedPrefillSteppableModel
+{
+    let supportsPackedPrefill = true
+    private let lock = NSLock()
+    private var shapes: [[Int]] = []
+    var packedShapes: [[Int]] { lock.withLock { shapes.filter { $0[0] > 1 } } }
+    var soloPrefills: Int { lock.withLock { shapes.filter { $0[0] == 1 && $0[1] > 1 }.count } }
+
+    func prefill(
+        tokens: MLXArray, inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache], requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        lock.withLock { shapes.append(tokens.shape) }
+        let logits = forward(tokens: tokens, caches: caches)
+        switch requirement {
+        case .evaluationOnly: return logits[0..., -1, 0 ..< 1]
+        case .lastPositionLogits: return logits[0..., -1, 0...]
+        }
+    }
+}
+
 final class HistoricalWindowCheckpointEngineTests: XCTestCase {
     private var chunk: Int { max(32, CBv2AttentionV1.queryBlockSize) }
 
@@ -36,7 +60,8 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
     /// `EngineV2Factory` sizes it to `max(prefillChunkSize, soloStripe)`).
     /// The capture stride is lowered to one chunk so the tiny model exercises
     /// the same rule production applies at 1,024 tokens.
-    private func engine(_ store: CompleteCheckpointFixtureStore, stripe: Bool = false)
+    private func engine(_ store: CompleteCheckpointFixtureStore, stripe: Bool = false,
+                        model: CBv2SteppableModel = HistoricalAttentionModel(), rowsPerStep: Int = 1)
         throws -> (EngineV2, PagedKVBackend)
     {
         let kinds = [
@@ -50,9 +75,9 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         let largest = stripe ? 2 * chunk : chunk
         let backend = try PagedKVBackend(layerKinds: kinds, config: .init(capacityBytes: 256 << 20,
             maxPrefillChunk: largest, segmentSizeBytes: 64 << 10, layerDTypes: Array(repeating: .float32, count: 4)))
-        let engine = EngineV2(model: HistoricalAttentionModel(), layerKinds: kinds, backend: backend,
+        let engine = EngineV2(model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()), sampler: CBv2GreedySampler(),
-            schedulerConfig: .init(maxConcurrentRequests: 2, maxBatchedTokensPerStep: largest,
+            schedulerConfig: .init(maxConcurrentRequests: 2, maxBatchedTokensPerStep: rowsPerStep * largest,
                 prefillChunkSize: chunk, soloPrefillStripeTokens: stripe ? largest : nil,
                 maxWaiting: 4, enablePrefixCache: true),
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
@@ -72,9 +97,10 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))
         let cold = await cbv2SchedCollect(try first.submit(request))
         XCTAssertEqual(cold.finishReason, .length)
-        // Every chunk end under K is retained and published deepest first.
-        XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, 2 * chunk, chunk])
-        XCTAssertEqual(store.saved.map(\.manifest.chunkSize), [chunk, chunk, chunk])
+        // Without a hint the donor keeps the deepest and the first boundary,
+        // published deepest first; the interior 2c is never written.
+        XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.chunkSize), [chunk, chunk])
         XCTAssertEqual(first.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(firstBackend.bytesWired, 0)
         await first.shutdown()
@@ -97,59 +123,56 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
 
     /// Production geometry in miniature: a solo request prefills in
     /// `2 * chunk` stripes and its `5 * chunk + 1` prompt ends in a ragged
-    /// `[4c, 5c + 1)` range. Every stripe end below the prompt end is a
-    /// checkpoint, the manifests carry the stride as their alignment, and the
-    /// deepest one restores exactly.
+    /// `[4c, 5c + 1)` range. Retention keeps the first boundary, the fork
+    /// target the coordinator named and the deepest; here all three sit
+    /// strictly INSIDE a computed range (c in `[0, 2c)`, 3c in `[2c, 4c)`, 5c
+    /// in the ragged tail), were copied out of the ring after the frontier
+    /// had moved past them, and each restores exactly.
     func testStripeBoundariesCaptureAndRestoreExactly() async throws {
+        let tokens = (0 ..< 5 * chunk + 1).map { ($0 * 5) % 29 }
+        // No hint: first + deepest.
+        let plain = CompleteCheckpointFixtureStore(segmentBytes: 258)
+        let (unhinted, unhintedBackend) = try engine(plain, stripe: true)
+        let cold = await cbv2SchedCollect(try unhinted.submit(.init(id: .init(1), promptTokens: tokens,
+            maxTokens: 4, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))))
+        XCTAssertEqual(cold.finishReason, .length)
+        XCTAssertEqual(plain.saved.map(\.manifest.position), [5 * chunk, chunk])
+        XCTAssertEqual(unhinted.admissionForTesting.bytesReserved, 0)
+        XCTAssertEqual(unhintedBackend.bytesWired, 0)
+        await unhinted.shutdown()
+
+        // Other prompts share 3c + 7 tokens: the fork boundary 3c is kept.
         let store = CompleteCheckpointFixtureStore(segmentBytes: 258)
         let (first, firstBackend) = try engine(store, stripe: true)
-        let tokens = (0 ..< 5 * chunk + 1).map { ($0 * 5) % 29 }
-        let request = CBv2Request(id: .init(1), promptTokens: tokens, maxTokens: 4,
-            cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))
-        let cold = await cbv2SchedCollect(try first.submit(request))
-        XCTAssertEqual(cold.finishReason, .length)
-        // Interior boundaries land too: c inside [0, 2c), 3c inside [2c, 4c)
-        // and 5c inside the ragged tail [4c, 5c + 1).
-        XCTAssertEqual(store.saved.map(\.manifest.position), [5 * chunk, 4 * chunk, 3 * chunk, 2 * chunk, chunk])
+        let hinted = await cbv2SchedCollect(try first.submit(.init(id: .init(1), promptTokens: tokens,
+            maxTokens: 4, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001),
+            prefixCheckpointTargetTokens: 3 * chunk + 7)))
+        XCTAssertEqual(hinted.tokens, cold.tokens, "a retention hint never changes what is generated")
+        XCTAssertEqual(store.saved.map(\.manifest.position), [5 * chunk, 3 * chunk, chunk])
         XCTAssertTrue(store.saved.allSatisfy { $0.manifest.position % $0.manifest.chunkSize == 0 })
         XCTAssertEqual(first.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(firstBackend.bytesWired, 0)
         await first.shutdown()
 
-        let reopened = CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == 4 * chunk })
-        let (second, secondBackend) = try engine(reopened, stripe: true)
-        let warmRequest = CBv2Request(id: .init(2), promptTokens: tokens, maxTokens: 4,
-            cacheSalt: "tenant", prefixCacheReceiptID: .init(2002))
-        XCTAssertTrue(try reopened.stage(engine: second, request: warmRequest))
-        let warm = await cbv2SchedCollect(try second.submit(warmRequest))
-        XCTAssertEqual(warm.tokens, cold.tokens)
-        XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, 4 * chunk)
-        XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
-        XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(secondBackend.bytesWired, 0)
-        await second.shutdown()
-
-        // Interior boundaries were copied out of the ring after their stripe
-        // had already advanced the frontier: 3c inside [2c, 4c) and 5c inside
-        // the ragged tail. Both restore exactly.
-        for (id, position) in [(3, 3 * chunk), (5, 5 * chunk)] {
-            let interior = CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == position })
-            let (third, thirdBackend) = try engine(interior, stripe: true)
-            let interiorRequest = CBv2Request(id: .init(UInt64(id)), promptTokens: tokens, maxTokens: 4,
-                cacheSalt: "tenant", prefixCacheReceiptID: .init(UInt64(1000 + id)))
-            XCTAssertTrue(try interior.stage(engine: third, request: interiorRequest))
-            let fromInterior = await cbv2SchedCollect(try third.submit(interiorRequest))
-            XCTAssertEqual(fromInterior.tokens, cold.tokens, "restore at \(position)")
-            XCTAssertEqual(fromInterior.usage?.prefixCachePrefillTokensSaved, position)
-            XCTAssertEqual(third.admissionForTesting.bytesReserved, 0)
-            XCTAssertEqual(thirdBackend.bytesWired, 0)
-            await third.shutdown()
+        for (id, position) in [(2, chunk), (3, 3 * chunk), (5, 5 * chunk)] {
+            let reopened = CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == position })
+            let (second, secondBackend) = try engine(reopened, stripe: true)
+            let warmRequest = CBv2Request(id: .init(UInt64(id)), promptTokens: tokens, maxTokens: 4,
+                cacheSalt: "tenant", prefixCacheReceiptID: .init(UInt64(2000 + id)))
+            XCTAssertTrue(try reopened.stage(engine: second, request: warmRequest))
+            let warm = await cbv2SchedCollect(try second.submit(warmRequest))
+            XCTAssertEqual(warm.tokens, cold.tokens, "restore at \(position)")
+            XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, position)
+            XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
+            XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
+            XCTAssertEqual(secondBackend.bytesWired, 0)
+            await second.shutdown()
         }
     }
 
     /// The prod failure in miniature: the donor's first range is a solo
     /// `2c` stripe; a second request arrives while that step is launching, so
-    /// every later range is a plain `c` chunk. The uniform-cap rule disarmed
+    /// the next range is a plain `c` chunk. The uniform-cap rule disarmed
     /// at the cap change and kept only `2c`; the historical rule keeps
     /// capturing, and the deepest boundary restores exactly.
     func testCapChangeMidPromptKeepsCapturing() async throws {
@@ -159,8 +182,13 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         let release = DispatchSemaphore(value: 0)
         let firstCapture = DispatchSemaphore(value: 0)
         firstCapture.signal()
+        let frontierLock = NSLock()
+        var frontiers: [Int] = []
         engine.loopForTesting.onEngineQueueSync {
             engine.completeCheckpointCapture?.makeHistoricalWindow = { row, position, admission in
+                // The row frontier at capture is the end of the range just
+                // launched: it names the chunk geometry of that range.
+                frontierLock.withLock { frontiers.append(row.absoluteOffset) }
                 if firstCapture.wait(timeout: .now()) == .success {
                     entered.signal()
                     _ = release.wait(timeout: .now() + 10)
@@ -170,7 +198,8 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         }
         let tokens = (0 ..< 5 * chunk + 1).map { ($0 * 5) % 29 }
         let request = CBv2Request(id: .init(1), promptTokens: tokens, maxTokens: 4,
-            cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1001),
+            prefixCheckpointTargetTokens: 3 * chunk + 1)
         let stream = try engine.submit(request)
         let collected = Task { await cbv2SchedCollect(stream) }
         let blocked = await withCheckedContinuation { continuation in
@@ -191,10 +220,11 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         XCTAssertEqual(donor.finishReason, .length)
         XCTAssertEqual(companyResult.tokens.count, 2)
         let positions = store.saved.map(\.manifest.position)
-        XCTAssertEqual(positions, positions.sorted(by: >), "published deepest first")
-        XCTAssertTrue(positions.contains(2 * chunk), "the solo stripe's end: \(positions)")
-        XCTAssertTrue(positions.contains(3 * chunk), "a plain-chunk end after the cap change: \(positions)")
-        XCTAssertTrue(positions.allSatisfy { $0 % chunk == 0 && $0 < tokens.count })
+        let observed = frontierLock.withLock { frontiers }
+        XCTAssertTrue(observed.contains(2 * chunk), "the first range was the solo stripe [0, 2c): \(observed)")
+        XCTAssertTrue(observed.contains(3 * chunk), "the next range was a plain chunk [2c, 3c): \(observed)")
+        // Deepest, the fork target captured after the cap change, the first.
+        XCTAssertEqual(positions, [5 * chunk, 3 * chunk, chunk])
         XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(backend.bytesWired, 0)
         await engine.shutdown()
@@ -214,8 +244,9 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
     }
 
     /// A historical adopter is not held to the donor's chunk geometry: it
-    /// resumes under ordinary scheduling (here the solo stripe) and donates
-    /// its own deeper boundaries from the restored rows.
+    /// resumes under ordinary scheduling (here the solo stripe). It captures
+    /// only above its restored boundary: no first, and a fork target only
+    /// when the hint names one above the restore point.
     func testHistoricalAdopterResumesWithOrdinaryChunkingAndDonatesDeeper() async throws {
         let store = CompleteCheckpointFixtureStore(segmentBytes: 258)
         let (first, _) = try engine(store, stripe: true)
@@ -223,7 +254,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         let donor = await cbv2SchedCollect(try first.submit(.init(id: .init(1), promptTokens: donorTokens,
             maxTokens: 2, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))))
         XCTAssertEqual(donor.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, 2 * chunk, chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, chunk])
         await first.shutdown()
 
         // The long prompt shares the donor's first 3c + 1 tokens exactly.
@@ -233,30 +264,90 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             maxTokens: 4, cacheSalt: "tenant", prefixCacheReceiptID: .init(3003))))
         await coldEngine.shutdown()
 
-        let reopened = CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == 2 * chunk })
-        let (second, secondBackend) = try engine(reopened, stripe: true)
-        let warmRequest = CBv2Request(id: .init(2), promptTokens: longTokens, maxTokens: 4,
-            cacheSalt: "tenant", prefixCacheReceiptID: .init(2002))
-        XCTAssertTrue(try reopened.stage(engine: second, request: warmRequest))
-        let warm = await cbv2SchedCollect(try second.submit(warmRequest))
-        XCTAssertEqual(warm.tokens, cold.tokens)
-        XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, 2 * chunk)
-        XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
-        // Cold ran four 2c stripes over [0, 7c + 1) then three decodes (7
-        // steps); the adopter resumes at 2c in three stripes (6). Under the
-        // donor's forced stride it would take five c chunks plus the tail:
-        // 9 steps, MORE than cold rather than fewer.
-        XCTAssertLessThan(second.stepCount, coldEngine.stepCount,
-                          "historical adoption must resume on the solo stripe, not the donor's chunk size")
-        XCTAssertEqual(second.stepCount, coldEngine.stepCount - 1)
-        // Resumed at 2c, the adopter's own stripes [2c, 4c), [4c, 6c) and the
-        // tail [6c, 7c + 1) donate every boundary they cover. (The reopened
-        // store's first archive is the donor's 2c it was seeded with.)
-        XCTAssertEqual(Array(reopened.saved.map(\.manifest.position).dropFirst()),
-                       [7 * chunk, 6 * chunk, 5 * chunk, 4 * chunk, 3 * chunk])
-        XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
-        XCTAssertEqual(secondBackend.bytesWired, 0)
-        await second.shutdown()
+        for (hint, expected) in [(nil, [7 * chunk]), (5 * chunk + 3, [7 * chunk, 5 * chunk]),
+                                 (3 * chunk, [7 * chunk]), (6 * chunk, [7 * chunk])] as [(Int?, [Int])] {
+            let reopened = CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == 3 * chunk })
+            let (second, secondBackend) = try engine(reopened, stripe: true)
+            let warmRequest = CBv2Request(id: .init(2), promptTokens: longTokens, maxTokens: 4,
+                cacheSalt: "tenant", prefixCacheReceiptID: .init(2002), prefixCheckpointTargetTokens: hint)
+            XCTAssertTrue(try reopened.stage(engine: second, request: warmRequest))
+            let warm = await cbv2SchedCollect(try second.submit(warmRequest))
+            XCTAssertEqual(warm.tokens, cold.tokens)
+            XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, 3 * chunk)
+            XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
+            // Cold ran four 2c stripes over [0, 7c + 1) then three decodes (7
+            // steps); the adopter resumes at 3c in [3c, 5c), [5c, 7c) and the
+            // one-token tail (6). Under the donor's forced stride it would
+            // take four c chunks plus the tail: 8 steps, MORE than cold.
+            XCTAssertEqual(second.stepCount, coldEngine.stepCount - 1,
+                           "historical adoption must resume on the solo stripe, not the donor's chunk size")
+            // Nothing at or below the restored 3c is recaptured. (The reopened
+            // store's first archive is the donor's 3c it was seeded with.) A
+            // target at the restore point is already durable; one adjacent to
+            // the final deepest boundary is dropped at publication.
+            XCTAssertEqual(Array(reopened.saved.map(\.manifest.position).dropFirst()), expected,
+                           "hint \(String(describing: hint))")
+            XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
+            XCTAssertEqual(secondBackend.bytesWired, 0)
+            await second.shutdown()
+        }
+    }
+
+    /// Review F6. A historical adopter no longer carries a recurrent chunk
+    /// size, which is what used to keep it out of rectangular packed prefill.
+    /// Two cold rows with equal chunks DO pack on this model (the control);
+    /// an adopter beside a cold row must keep its solo forward.
+    func testHistoricalAdopterStaysOutOfPackedPrefill() async throws {
+        let donorTokens = (0 ..< 4 * chunk + 1).map { ($0 * 3) % 29 }
+        let otherTokens = (0 ..< 4 * chunk + 1).map { ($0 * 11 + 5) % 29 }
+        func solo(_ tokens: [Int], store: CompleteCheckpointFixtureStore) async throws -> [Int] {
+            let (engine, _) = try engine(store, model: PackableHistoricalAttentionModel(), rowsPerStep: 2)
+            let result = await cbv2SchedCollect(try engine.submit(.init(id: .init(1), promptTokens: tokens,
+                maxTokens: 3, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))))
+            await engine.shutdown()
+            return result.tokens
+        }
+        let store = CompleteCheckpointFixtureStore(segmentBytes: 258)
+        let donorAlone = try await solo(donorTokens, store: store)
+        let otherAlone = try await solo(otherTokens, store: CompleteCheckpointFixtureStore())
+        XCTAssertEqual(store.saved.map(\.manifest.position), [4 * chunk, chunk])
+
+        func pair(adopting: Bool) async throws -> (PackableHistoricalAttentionModel, EngineV2, [Int], [Int], Int) {
+            let model = PackableHistoricalAttentionModel()
+            let reopened = CompleteCheckpointFixtureStore(
+                archives: adopting ? store.saved.filter { $0.manifest.position == chunk } : [])
+            let (engine, backend) = try engine(reopened, model: model, rowsPerStep: 2)
+            XCTAssertTrue(engine.packedPrefillActivity().isSupported)
+            let adopter = CBv2Request(id: .init(1), promptTokens: donorTokens, maxTokens: 3,
+                cacheSalt: "tenant", prefixCacheReceiptID: .init(2001))
+            if adopting { XCTAssertTrue(try reopened.stage(engine: engine, request: adopter)) }
+            let first = try engine.submit(adopter)
+            let second = try engine.submit(.init(id: .init(2), promptTokens: otherTokens, maxTokens: 3,
+                cacheSalt: "other", prefixCacheReceiptID: .init(2002)))
+            async let left = cbv2SchedCollect(first)
+            async let right = cbv2SchedCollect(second)
+            let (a, b) = await (left, right)
+            XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+            XCTAssertEqual(backend.bytesWired, 0)
+            return (model, engine, a.tokens, b.tokens, a.usage?.prefixCachePrefillTokensSaved ?? -1)
+        }
+
+        let control = try await pair(adopting: false)
+        XCTAssertFalse(control.0.packedShapes.isEmpty, "two cold rows with equal chunks must pack on this model")
+        XCTAssertTrue(control.1.packedPrefillActivity().didExecute)
+        XCTAssertEqual(control.2, donorAlone)
+        XCTAssertEqual(control.3, otherAlone)
+        await control.1.shutdown()
+
+        let adopted = try await pair(adopting: true)
+        XCTAssertEqual(adopted.4, chunk, "the first row restored the checkpoint")
+        XCTAssertTrue(adopted.0.packedShapes.isEmpty,
+                      "a historical adopter must keep its solo forward: \(adopted.0.packedShapes)")
+        XCTAssertEqual(adopted.1.packedPrefillActivity().groupsExecuted, 0)
+        XCTAssertGreaterThanOrEqual(adopted.0.soloPrefills, 7, "3 adopter chunks and 4 cold chunks ran solo")
+        XCTAssertEqual(adopted.2, donorAlone)
+        XCTAssertEqual(adopted.3, otherAlone)
+        await adopted.1.shutdown()
     }
 
     func testExpiredStageClosesBeforeSubmissionAndFallsBackToCold() async throws {

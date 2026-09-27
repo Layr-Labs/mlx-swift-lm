@@ -81,6 +81,11 @@ extension EngineV2 {
                 // apply, and no bounded geometry wait can cold-restart it.
                 plan.recurrentChunkSize = staged.manifest.chunkSize
                 plan.recurrentPromptLength = request.promptTokens.count
+            } else {
+                // Chunk sizing is free; packing is not. The adopter keeps the
+                // solo forward it had before this plan stopped carrying a
+                // recurrent chunk size.
+                plan.excludesPackedPrefill = true
             }
             return .init(
                 adoption: .init(
