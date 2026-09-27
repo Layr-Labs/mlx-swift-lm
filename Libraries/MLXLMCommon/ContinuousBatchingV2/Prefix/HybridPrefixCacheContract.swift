@@ -140,16 +140,18 @@ struct CBv2RecurrentCheckpointGeometry {
     }
 
     /// Advance over one computed range and say whether its end is a
-    /// boundary: contiguous with the previous range, strictly inside the
-    /// prompt, and aligned to the attention query block and to `stride` or
-    /// to the range's own cap (a full chunk end, the old rule's boundaries;
-    /// a no-op in production, where every cap is a multiple of the stride).
-    /// The prompt end itself is never a boundary: export requires a token
-    /// after the checkpoint (`checkpoint.position < tokens.count`), so a
-    /// terminal capture could only be staged, never written, and would
-    /// stand in for the deepest boundary when publication drops a target
-    /// adjacent to it. The historical path filters the same way. The cap is
-    /// recorded as provenance, never compared with earlier ranges.
+    /// boundary: contiguous with the previous range, inside the prompt
+    /// (the prompt end included), and aligned to the attention query block
+    /// and to `stride` or to the range's own cap (a full chunk end, the old
+    /// rule's boundaries; a no-op in production, where every cap is a
+    /// multiple of the stride). The two consumers differ on the prompt end:
+    /// the resident bank keeps it, since its radix lookup reuses that
+    /// endpoint when the next turn extends the prompt, while the durable
+    /// path skips it (`EngineLoopV2.captureRecurrentCheckpoints`), because
+    /// export requires a token after the checkpoint and a staged terminal
+    /// copy would only stand in for the deepest boundary in the adjacency
+    /// drop. The cap is recorded as provenance, never compared with earlier
+    /// ranges.
     mutating func record(
         range: Range<Int>, cap: Int, promptLength: Int, packed: Bool,
         stride: Int = Self.recurrentCheckpointStrideTokens
@@ -161,8 +163,7 @@ struct CBv2RecurrentCheckpointGeometry {
         else { return disarm(.geometry) }
         position = range.upperBound
         chunkSize = cap
-        return position < promptLength
-            && Self.isRecurrentBoundary(position, chunkSize: cap, stride: stride)
+        return Self.isRecurrentBoundary(position, chunkSize: cap, stride: stride)
     }
 
     /// Alignment shared by capture and manifest validation: a multiple of

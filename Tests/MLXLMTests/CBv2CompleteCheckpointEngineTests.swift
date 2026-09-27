@@ -290,8 +290,10 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
     }
 
     /// A prompt ending exactly on a boundary never stages that terminal
-    /// checkpoint: export refuses `position == tokens.count`, so it could
-    /// only have displaced the real deepest boundary in the adjacency drop.
+    /// checkpoint on the durable path: export refuses `position ==
+    /// tokens.count`, so it could only have displaced the real deepest
+    /// boundary in the adjacency drop (the loop skips it; the resident bank
+    /// keeps its endpoint, see `CBv2RecurrentStateTests`).
     /// With a 3-chunk prompt and a hint at the second chunk end, the second
     /// boundary is both target and deepest and is published beside the first;
     /// staging the terminal 3c would have dropped 2c as adjacent to it and

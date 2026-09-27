@@ -334,6 +334,52 @@ final class CBv2RecurrentStateTests: XCTestCase {
         XCTAssertEqual(engine.hybridPrefixCache?.stats.retainedBytes, 0)
     }
 
+    /// The resident bank keeps a checkpoint at the prompt end: its radix
+    /// lookup reuses that endpoint when the next turn extends the prompt.
+    /// Only the durable path skips the terminal boundary (export needs a
+    /// token after it). A donor ending exactly on its second chunk end
+    /// publishes both chunk ends, and a longer next turn restores the
+    /// terminal one.
+    func testResidentBankKeepsTheTerminalBoundaryForTheNextTurn() async throws {
+        final class Publications: @unchecked Sendable {
+            let lock = NSLock()
+            private var values: [[Int]] = []
+            func append(_ positions: [Int]) { lock.lock(); values.append(positions); lock.unlock() }
+            var snapshot: [[Int]] { lock.lock(); defer { lock.unlock() }; return values }
+        }
+        let chunk = max(32, CBv2AttentionV1.queryBlockSize)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        let engine = EngineV2(
+            model: RecurrentFixtureModel(checkpoints: true), layerKinds: kinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: true),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: .init(
+                maximumBytes: 128 << 10, modelID: "fixture",
+                promptContractID: "fixture-template", buildID: "fixture-build"))
+        let publications = Publications()
+        engine.setResidentPrefixPublicationHandler { publications.append($1) }
+        let donor = await cbv2SchedCollect(try engine.submit(.init(
+            id: .init(78), promptTokens: Array(repeating: 1, count: 2 * chunk), maxTokens: 1,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1011))))
+        XCTAssertEqual(donor.finishReason, .length)
+        XCTAssertEqual(publications.snapshot.last, [chunk, 2 * chunk],
+                       "the terminal boundary is published to the resident bank")
+        let next = await cbv2SchedCollect(try engine.submit(.init(
+            id: .init(79), promptTokens: Array(repeating: 1, count: 3 * chunk + 1), maxTokens: 1,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1012))))
+        XCTAssertEqual(next.finishReason, .length)
+        XCTAssertEqual(next.usage?.prefixCacheTier, .resident)
+        XCTAssertEqual(next.usage?.prefixCachePrefillTokensSaved, 2 * chunk,
+                       "the next turn restores the donor's terminal endpoint")
+        XCTAssertEqual(backend.bytesReserved, 0)
+        await engine.shutdown()
+        XCTAssertEqual(engine.hybridPrefixCache?.stats.retainedBytes, 0)
+    }
+
     func testMalformedCheckpointFallsBackAndReleasesAdoptionPinAndRequestState() async throws {
         let chunk = max(32, CBv2AttentionV1.queryBlockSize)
         let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]

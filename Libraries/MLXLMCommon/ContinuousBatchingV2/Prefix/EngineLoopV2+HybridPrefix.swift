@@ -37,6 +37,13 @@ extension EngineLoopV2 {
                 let layers = recurrentStates[id]?.confirmedStateSnapshot()
             else { continue }
             if let completeCheckpointCapture {
+                // Export refuses a checkpoint at the prompt end (it needs a
+                // token after it), so a terminal capture could only be
+                // staged, never written, and would stand in for the deepest
+                // boundary when publication drops an adjacent target. The
+                // historical path filters `< promptTokens.count` the same
+                // way; the resident bank below keeps the endpoint.
+                guard range.upperBound < rec.request.promptTokens.count else { continue }
                 let assistantState = step.mtpRound?.committedObservationRows.first(where: { $0.id == id })?.assistantState
                 roots.append(contentsOf: completeCheckpointCapture.capture(
                     requestID: id, position: range.upperBound, chunkSize: cap,

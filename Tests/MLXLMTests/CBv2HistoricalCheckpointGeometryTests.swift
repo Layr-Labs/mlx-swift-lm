@@ -85,12 +85,12 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
     }
 
     /// Recurrent capture is chunk-agnostic: a boundary is any contiguous
-    /// range end strictly inside the prompt, aligned to the 256-token stride
-    /// and the query block, whatever chunk produced it or the ranges before
-    /// it. The prompt end is never one (export needs a token after the
-    /// checkpoint). The parity experiment showed the state at such a
-    /// boundary is bit-identical on the dense Qwen target across every
-    /// partition.
+    /// range end inside the prompt (the prompt end included; the durable
+    /// path skips that one itself, the resident bank keeps it), aligned to
+    /// the 256-token stride and the query block, whatever chunk produced it
+    /// or the ranges before it. The parity experiment showed the state at
+    /// such a boundary is bit-identical on the dense Qwen target across
+    /// every partition.
     func testRecurrentBoundariesAtEveryAlignedRangeEndAcrossMixedSchedules() {
         func ends(_ schedule: [Int], prompt: Int) -> (captured: [Int], geometry: CBv2RecurrentCheckpointGeometry) {
             var geometry = CBv2RecurrentCheckpointGeometry()
@@ -108,14 +108,11 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
             }
             return (captured, geometry)
         }
-        // A 2,048 stripe, then company arrives and the rest runs in 512s;
-        // the prompt ends on the last chunk end, which is no boundary.
+        // A 2,048 stripe, then company arrives and the rest runs in 512s.
         XCTAssertEqual(ends([2048, 512, 512, 512, 512, 512], prompt: 4608).captured,
-                       [2048, 2560, 3072, 3584, 4096])
+                       [2048, 2560, 3072, 3584, 4096, 4608])
         // 512s under company, then the company leaves and stripes resume.
         XCTAssertEqual(ends([512, 512, 512, 512, 2048, 2048], prompt: 6144).captured,
-                       [512, 1024, 1536, 2048, 4096])
-        XCTAssertEqual(ends([512, 512, 512, 512, 2048, 2048], prompt: 6145).captured,
                        [512, 1024, 1536, 2048, 4096, 6144])
         // 512, 2,048, 2,048 and a ragged tail: the tail is no boundary but
         // does not disarm either.
@@ -126,7 +123,7 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
         // A range end off the stride is a boundary only as the end of a
         // full chunk of its own cap (the old rule's boundaries): 384 is,
         // 512 = 384 + 128 is 256-aligned, 612 = 512 + 100 is neither.
-        XCTAssertEqual(ends([384, 128, 100, 412], prompt: 1025).captured, [384, 512, 1024])
+        XCTAssertEqual(ends([384, 128, 100, 412], prompt: 1024).captured, [384, 512, 1024])
         // The production 4,096 stripe alone.
         XCTAssertEqual(ends([4096, 4096], prompt: 9171).captured, [4096, 8192])
     }
@@ -158,14 +155,10 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
         XCTAssertEqual(gap.disarmReason, .geometry)
 
         var overrun = CBv2RecurrentCheckpointGeometry()
-        XCTAssertTrue(overrun.record(range: 0 ..< 1024, cap: 1024, promptLength: 2048, packed: false))
-        // The final prompt range ends on the prompt: contiguous and armed,
-        // but no boundary, since export needs a token after it.
-        XCTAssertFalse(overrun.record(range: 1024 ..< 2048, cap: 1024, promptLength: 2048, packed: false))
-        XCTAssertTrue(overrun.isArmed)
-        XCTAssertNil(overrun.disarmReason)
+        XCTAssertTrue(overrun.record(range: 0 ..< 1024, cap: 1024, promptLength: 1024, packed: false),
+                      "the prompt end is a boundary at the geometry level; the durable path skips it")
         // The decode range past the last prompt token.
-        XCTAssertFalse(overrun.record(range: 2048 ..< 2049, cap: 1, promptLength: 2048, packed: false))
+        XCTAssertFalse(overrun.record(range: 1024 ..< 1025, cap: 1, promptLength: 1024, packed: false))
         XCTAssertEqual(overrun.disarmReason, .geometry)
     }
 
