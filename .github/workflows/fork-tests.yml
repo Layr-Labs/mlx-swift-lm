@@ -279,6 +279,18 @@ jobs:
             exit 1
           fi
 
+      - name: Upload the crash reports
+        # A crash of a test process writes a report with the backtrace of
+        # each thread to ~/Library/Logs/DiagnosticReports. The test log
+        # names no test after a crash, so the report is the evidence.
+        if: ${{ failure() && steps.all-tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crash-reports
+          path: ~/Library/Logs/DiagnosticReports/*
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Report the line coverage
         id: coverage
         if: ${{ !cancelled() && steps.all-tests.outcome == 'success' }}
