@@ -85,8 +85,13 @@ struct CBv2HybridPrefixHit {
 /// 512s, 512s then 2,048, with or without decode company), and a restore
 /// continues token-exactly under any partition. On the MoE (Qwen3.6-35B-A3B)
 /// the state depends on the partition from layer 1 on, but so does a cold
-/// run's output, so a uniform-chunk rule guards a property serving never
-/// had there. Capture is therefore chunk-agnostic: a boundary exists at
+/// run's output (it already differs by chunk width and by decode batch
+/// width), so a uniform-chunk rule guards a property serving never had
+/// there: a restore reproduces its donor partition's cold run, one of the
+/// outputs cold serving produces for that prompt, and continuing the
+/// donor's chunk on the adopter would not make a hit match an uncached
+/// request in the adopter's own workload, whose prefix partition and decode
+/// company both differ anyway. Capture is therefore chunk-agnostic: a boundary exists at
 /// every contiguous computed-range end that is a multiple of
 /// `recurrentCheckpointStrideTokens` (the provider's 256-token block hash)
 /// and of the attention query block. Packed rows, a non-contiguous range
@@ -135,11 +140,16 @@ struct CBv2RecurrentCheckpointGeometry {
     }
 
     /// Advance over one computed range and say whether its end is a
-    /// boundary: contiguous with the previous range, inside the prompt, and
-    /// aligned to the attention query block and to `stride` or to the
-    /// range's own cap (a full chunk end, the old rule's boundaries; a
-    /// no-op in production, where every cap is a multiple of the stride).
-    /// The cap is recorded as provenance, never compared with earlier ranges.
+    /// boundary: contiguous with the previous range, strictly inside the
+    /// prompt, and aligned to the attention query block and to `stride` or
+    /// to the range's own cap (a full chunk end, the old rule's boundaries;
+    /// a no-op in production, where every cap is a multiple of the stride).
+    /// The prompt end itself is never a boundary: export requires a token
+    /// after the checkpoint (`checkpoint.position < tokens.count`), so a
+    /// terminal capture could only be staged, never written, and would
+    /// stand in for the deepest boundary when publication drops a target
+    /// adjacent to it. The historical path filters the same way. The cap is
+    /// recorded as provenance, never compared with earlier ranges.
     mutating func record(
         range: Range<Int>, cap: Int, promptLength: Int, packed: Bool,
         stride: Int = Self.recurrentCheckpointStrideTokens
@@ -151,7 +161,8 @@ struct CBv2RecurrentCheckpointGeometry {
         else { return disarm(.geometry) }
         position = range.upperBound
         chunkSize = cap
-        return Self.isRecurrentBoundary(position, chunkSize: cap, stride: stride)
+        return position < promptLength
+            && Self.isRecurrentBoundary(position, chunkSize: cap, stride: stride)
     }
 
     /// Alignment shared by capture and manifest validation: a multiple of

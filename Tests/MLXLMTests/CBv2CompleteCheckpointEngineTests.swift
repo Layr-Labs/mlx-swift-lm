@@ -289,6 +289,35 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
         }
     }
 
+    /// A prompt ending exactly on a boundary never stages that terminal
+    /// checkpoint: export refuses `position == tokens.count`, so it could
+    /// only have displaced the real deepest boundary in the adjacency drop.
+    /// With a 3-chunk prompt and a hint at the second chunk end, the second
+    /// boundary is both target and deepest and is published beside the first;
+    /// staging the terminal 3c would have dropped 2c as adjacent to it and
+    /// then failed to export 3c, leaving only c.
+    func testRecurrentPromptEndingOnABoundaryPublishesTheLastInteriorOne() async throws {
+        for (length, hint, expected) in [
+            (3 * chunk, 2 * chunk, [2 * chunk, chunk]),
+            (3 * chunk, nil, [2 * chunk, chunk]),
+            (6 * chunk, 4 * chunk, [5 * chunk, chunk]),
+            (6 * chunk, 3 * chunk, [5 * chunk, 3 * chunk, chunk]),
+        ] as [(Int, Int?, [Int])] {
+            let store = CompleteCheckpointFixtureStore()
+            let (engine, backend) = engine(store)
+            let result = await cbv2SchedCollect(try engine.submit(CBv2Request(
+                id: .init(23), promptTokens: Array(repeating: 1, count: length), maxTokens: 2,
+                cacheSalt: "tenant", prefixCacheReceiptID: .init(1023), prefixCheckpointTargetTokens: hint)))
+            XCTAssertEqual(result.finishReason, .length)
+            XCTAssertEqual(positions(store), expected, "length \(length) hint \(String(describing: hint))")
+            XCTAssertFalse(store.saved.contains { $0.manifest.position == length },
+                           "the prompt end must never reach the store")
+            XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+            XCTAssertEqual(backend.bytesReserved, 0)
+            await engine.shutdown()
+        }
+    }
+
     /// An adopter restored at `M` recaptures nothing at or below `M`: no
     /// first, and a fork target only when the hint names one above `M`.
     func testRecurrentAdopterCapturesOnlyAboveItsRestoredBoundary() async throws {
