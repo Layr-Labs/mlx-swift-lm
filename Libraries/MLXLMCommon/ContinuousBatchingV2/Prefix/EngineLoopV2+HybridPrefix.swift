@@ -25,13 +25,13 @@ extension EngineLoopV2 {
             recurrentGeometryObserverForTesting?(
                 id, range, cap, step.packedPrefixRows.contains(id), "record",
                 capture ? "capture" : (geometry.isArmed ? "skip" : "disarm"))
-            // Retired condition, kept wired: chunk-agnostic capture never
-            // produces `.chunkSizeChanged`, so the provider counter reads
-            // zero and a regression would show there. The geometry stays
-            // disarmed for the rest of the prompt, so the edge is once.
-            if wasArmed, !geometry.isArmed, geometry.disarmReason == .chunkSizeChanged {
+            // A packed range disarms this donor for the rest of its prompt
+            // (the geometry never re-arms), so the armed-to-disarmed edge
+            // fires at most once per request: the provider's counter reads
+            // requests, not ranges. Geometry disarms are not reported.
+            if wasArmed, !geometry.isArmed, geometry.disarmReason == .packed {
                 completeCheckpointCapture?.store.recordRecurrentCaptureDisarmed(
-                    chunkSizeChangedAt: range.lowerBound)
+                    packedAt: range.lowerBound)
             }
             guard capture,
                 let layers = recurrentStates[id]?.confirmedStateSnapshot()

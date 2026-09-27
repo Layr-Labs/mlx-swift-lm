@@ -104,15 +104,12 @@ struct CBv2RecurrentCheckpointGeometry {
     static let historicalCheckpointStrideTokens = 1024
 
     /// Why the recurrent rule stopped capturing for the rest of the prompt.
+    /// A cap change between ranges is no reason: capture is chunk-agnostic.
     enum DisarmReason: Equatable, Sendable {
-        /// The range ran in a packed cohort.
+        /// The range ran in a packed cohort. The engine reports this one to
+        /// the provider store (`CBv2CompletePrefixCache
+        /// .recordRecurrentCaptureDisarmed(packedAt:)`), once per request.
         case packed
-        /// Retired. The uniform-chunk rule disarmed when the chunk cap
-        /// changed between ranges; capture is now chunk-agnostic and this
-        /// reason is never produced. It stays so the provider's
-        /// `recurrent_capture_disarmed_chunk_change_total` counter keeps its
-        /// meaning (it must now read zero) and a regression would show there.
-        case chunkSizeChanged
         /// A non-contiguous range, or one overrunning the prompt (the decode
         /// range after the last prompt token).
         case geometry
@@ -160,12 +157,14 @@ struct CBv2RecurrentCheckpointGeometry {
     /// Alignment shared by capture and manifest validation: a multiple of
     /// `stride` that is also query-block aligned, or the end of a full chunk
     /// of `chunkSize` (the old rule's boundaries, whose caps the scheduler
-    /// already keeps query-block aligned).
+    /// already keeps query-block aligned). A `chunkSize` of 1 or less has no
+    /// chunk clause, since every position ends a "chunk" of 1; only the
+    /// stride rule applies then.
     static func isRecurrentBoundary(
         _ position: Int, chunkSize: Int = 0, stride: Int = recurrentCheckpointStrideTokens
     ) -> Bool {
         guard position > 0 else { return false }
-        if chunkSize > 0, position % chunkSize == 0 { return true }
+        if chunkSize > 1, position % chunkSize == 0 { return true }
         let block = CBv2AttentionV1.queryBlockSize
         return stride > 0 && position % stride == 0 && (block <= 0 || position % block == 0)
     }

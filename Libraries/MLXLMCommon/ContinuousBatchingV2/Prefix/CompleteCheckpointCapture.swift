@@ -132,9 +132,11 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     /// retires at the next commit. `chunkSize` is the chunk that ended at
     /// this boundary, recorded in the manifest as provenance only.
     /// Retention changes only after the copy is staged, so a refused
-    /// reservation leaves the previously retained boundaries as they were,
-    /// and the transient peak (the new copy is reserved before the old
-    /// latest retires) is unchanged from the first/latest rule.
+    /// reservation leaves the previously retained boundaries as they were.
+    /// The new copy is reserved before the old latest retires, so a donor
+    /// rolling its latest transiently holds one copy more than it retains:
+    /// up to four staged under the three-way rule, as it was three under
+    /// the first/latest rule. What is unchanged is that +1, not the peak.
     ///
     /// Unlike historical windows there is no slot-wide cap here. Each
     /// staged checkpoint is one `reserveTransient` on the admission ledger,
@@ -143,8 +145,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     /// The third slot is judged small enough not to need it: about 51 MB of
     /// conv/SSM state per checkpoint for Qwen3.5-9B (plus MTP history in
     /// production) against ~210 MB per Gemma 4 window, so N concurrent
-    /// donors stage at most N x 3 x ~51 MB. Revisit if capture geometry or
-    /// state sizes grow.
+    /// donors retain at most N x 3 x ~51 MB, one copy more each while a
+    /// latest rolls. Revisit if capture geometry or state sizes grow.
     func capture(
         requestID: CBv2RequestID, position: Int, chunkSize: Int,
         layers: [Int: CBv2RecurrentLayerState], assistantState: (any CBv2MTPRequestState)?,
@@ -152,7 +154,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
         hintTokens: Int? = nil, resumedAt: Int = 0
     ) -> [MLXArray] {
-        guard !isClosed, position > 1, chunkSize > 0,
+        guard !isClosed, position > 1, chunkSize > 1,
             CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize),
             !mediaTargetOnly || mediaIdentity != nil,
             !(staged[requestID]?.contains { $0.checkpoint?.position == position } ?? false)

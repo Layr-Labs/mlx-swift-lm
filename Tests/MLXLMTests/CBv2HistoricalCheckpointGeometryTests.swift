@@ -131,7 +131,7 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
         XCTAssertTrue(geometry.record(range: 0 ..< 4096, cap: 4096, promptLength: prompt, packed: false))
         XCTAssertTrue(geometry.record(range: 4096 ..< 4608, cap: 512, promptLength: prompt, packed: false))
         XCTAssertTrue(geometry.isArmed)
-        XCTAssertNil(geometry.disarmReason, "`.chunkSizeChanged` is retired and never produced")
+        XCTAssertNil(geometry.disarmReason, "a cap change is not a disarm reason")
         XCTAssertEqual(geometry.chunkSize, 512)
         // An adopter restored under one chunk continues under another.
         var adopter = CBv2RecurrentCheckpointGeometry(position: 1024, chunkSize: 1024)
@@ -175,5 +175,11 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
                       "a full chunk end of its own cap, whatever the block")
         XCTAssertTrue(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(384, chunkSize: 384))
         XCTAssertFalse(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(640, chunkSize: 100, stride: 256))
+        // A chunk of 1 (as the overrun case above records) has no chunk
+        // clause: only the stride rule applies, else every position would
+        // be a boundary.
+        XCTAssertFalse(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(7, chunkSize: 1))
+        XCTAssertFalse(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(1025, chunkSize: 1))
+        XCTAssertTrue(CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(1024, chunkSize: 1))
     }
 }

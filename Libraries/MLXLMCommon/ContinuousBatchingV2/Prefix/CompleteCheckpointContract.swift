@@ -182,7 +182,11 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             (backendLayout == Self.historicalAttentionLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil),
-            position > 1, chunkSize > 0,
+            position > 1,
+            // A chunk of 1 would put every position on a chunk end; only the
+            // diffusion block layout, which sits on its media identity rather
+            // than on a chunk, may record one.
+            (backendLayout == Self.diffusionBlockLayout ? chunkSize > 0 : chunkSize > 1),
             // Historical and diffusion layouts sit on their recorded stride;
             // a recurrent checkpoint sits on any 256-token boundary (its
             // `chunkSize` is the chunk that ended there, provenance only) or,
@@ -275,15 +279,17 @@ public protocol CBv2CompletePrefixCache: AnyObject, Sendable {
 
     func close()
 
-    /// A recurrent donor stopped capturing because its chunk cap changed
-    /// between ranges (`CBv2RecurrentCheckpointGeometry.DisarmReason
-    /// .chunkSizeChanged`): once per request, on the engine queue.
-    /// `position` is the token offset of the range that changed cap, a
-    /// number only. Packed, preempted and media disarms are not reported.
-    func recordRecurrentCaptureDisarmed(chunkSizeChangedAt position: Int)
+    /// A recurrent donor stopped capturing because one of its prompt ranges
+    /// ran in a packed prefill cohort (`CBv2RecurrentCheckpointGeometry
+    /// .DisarmReason.packed`): once per request, on the engine queue, since
+    /// the disarm holds for the rest of the prompt. `position` is the token
+    /// offset at which the packed range began, a number only. Geometry
+    /// disarms (a non-contiguous range, an overrun past the prompt) and
+    /// preemption or media refusals are not reported.
+    func recordRecurrentCaptureDisarmed(packedAt position: Int)
 }
 
 extension CBv2CompletePrefixCache {
     public func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool { true }
-    public func recordRecurrentCaptureDisarmed(chunkSizeChangedAt position: Int) {}
+    public func recordRecurrentCaptureDisarmed(packedAt position: Int) {}
 }
