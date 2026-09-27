@@ -3,6 +3,8 @@ import MLX
 extension CBv2CompleteCheckpointCapture {
     /// Engine queue, before asyncEval and before constructing any successor.
     /// A candidate never enters the durable publication set before commit.
+    /// `position` may sit below the row frontier: full pages are immutable
+    /// below the frontier and each window copy proves its own ring residency.
     func prepareHistorical(
         position: Int, chunkSize: Int, state: [CBv2SequenceKV?]
     ) throws -> CBv2CapturedCompleteCheckpoint? {
@@ -29,7 +31,7 @@ extension CBv2CompleteCheckpointCapture {
                     continue
                 }
                 guard let row = state[index] as? PagedSequenceKV,
-                      row.absoluteOffset == position, row.pool.layerKinds == codec.layerKinds,
+                      row.absoluteOffset >= position, row.pool.layerKinds == codec.layerKinds,
                       row.groupKey.dtype == layer.dtype.mlxDType
                 else { return nil }
                 if layer.window != nil {
@@ -41,61 +43,84 @@ extension CBv2CompleteCheckpointCapture {
         catch { return nil }
     }
 
+    /// Keep the first checkpoint and the deepest of the rest. Over the count
+    /// or byte cap, the shallowest interior checkpoint retires first; the
+    /// byte cap never drops the set below two so a large-window model keeps
+    /// at least the older first/latest pair.
     func commitHistorical(_ candidate: CBv2CapturedCompleteCheckpoint, requestID: CBv2RequestID) {
         guard !isClosed,
               !(staged[requestID]?.contains { $0.position == candidate.position } ?? false)
         else { candidate.finishEvaluationAndClose(); return }
-        if staged[requestID, default: []].count == 2 {
-            let previous = staged[requestID]!.removeLast()
-            queue.async { previous.finishEvaluationAndClose() }
+        var checkpoints = staged[requestID] ?? []
+        checkpoints.append(candidate)
+        var bytes = checkpoints.reduce(0) { $0 + $1.stagedHistoricalBytes }
+        var retiring: [CBv2CapturedCompleteCheckpoint] = []
+        while checkpoints.count > max(2, maximumStagedHistoricalCheckpoints)
+            || (checkpoints.count > 2 && bytes > historicalStagedByteBudget)
+        {
+            let previous = checkpoints.remove(at: 1)
+            bytes -= previous.stagedHistoricalBytes
+            retiring.append(previous)
         }
-        staged[requestID, default: []].append(candidate)
+        staged[requestID] = checkpoints
+        if !retiring.isEmpty {
+            queue.async { retiring.forEach { $0.finishEvaluationAndClose() } }
+        }
     }
 }
 
 extension EngineLoopV2 {
     /// Exact scalar geometry advances on launch. It belongs to that immutable
     /// step; scheduler cursors and mutable windows may already be ahead when
-    /// finalize runs. Preemption/ragged/packed history disarms this generation.
+    /// finalize runs. Preemption/packed history disarms this generation; the
+    /// chunk cap is not part of the historical rule (see
+    /// `CBv2RecurrentCheckpointGeometry.recordHistorical`).
     func prepareHistoricalCheckpoints(_ step: CBv2InFlightStep) throws -> [MLXArray] {
         guard let capture = completeCheckpointCapture, capture.codec.historicalLayout != nil else { return [] }
+        let stride = capture.historicalCheckpointStrideTokens
         for (id, range) in step.computedRanges {
             guard let rec = scheduler.record(for: id), rec.request.prefixCacheEnabled,
                   rec.request.multimodal == nil, rec.request.positionState == nil, rec.preemptionCount == 0,
-                  let cap = step.recurrentCheckpointChunkSizes[id], cap >= scheduler.config.prefillChunkSize,
-                  CBv2AttentionV1.queryBlockSize <= 0 || cap % CBv2AttentionV1.queryBlockSize == 0,
                   let state = kvStates[id]
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
-            let eligible = geometry.record(range: range, cap: cap,
-                promptLength: rec.request.promptTokens.count, packed: step.packedPrefixRows.contains(id))
+            let positions = geometry.recordHistorical(range: range,
+                promptLength: rec.request.promptTokens.count,
+                packed: step.packedPrefixRows.contains(id), stride: stride)
             recurrentCheckpointGeometry[id] = geometry
-            guard eligible, range.upperBound < rec.request.promptTokens.count,
-                  let candidate = try capture.prepareHistorical(position: range.upperBound, chunkSize: cap, state: state)
-            else { continue }
-            step.historicalCheckpoints[id] = candidate
+            // Capture lands only at the range end for now: interior positions
+            // need the sliding rings to prove residency behind the frontier.
+            for position in positions where position == range.upperBound {
+                guard position < rec.request.promptTokens.count,
+                      let candidate = try capture.prepareHistorical(position: position, chunkSize: stride, state: state)
+                else { continue }
+                step.historicalCheckpoints[id, default: []].append(candidate)
+            }
         }
-        let roots = step.historicalCheckpoints.values.flatMap(\.evaluationRoots)
-        for candidate in step.historicalCheckpoints.values { candidate.historical?.markSubmitted() }
+        let candidates = step.historicalCheckpoints.values.flatMap { $0 }
+        let roots = candidates.flatMap(\.evaluationRoots)
+        for candidate in candidates { candidate.historical?.markSubmitted() }
         return roots
     }
 
     func commitHistoricalCheckpoints(_ step: CBv2InFlightStep) -> MLXError? {
         guard let capture = completeCheckpointCapture else { return nil }
         var nativeFailure: MLXError?
-        for (id, candidate) in step.historicalCheckpoints {
-            // This step's sample can finish before its final gather witness.
-            // Wait for the already submitted roots before promotion/retirement.
-            do {
-                try candidate.finishEvaluation()
-                if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0 {
+        for (id, candidates) in step.historicalCheckpoints {
+            for candidate in candidates {
+                // This step's sample can finish before its final gather witness.
+                // Wait for the already submitted roots before promotion/retirement.
+                do {
+                    try candidate.finishEvaluation()
+                    if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0 {
+                        candidate.finishEvaluationAndClose()
+                    } else {
+                        capture.commitHistorical(candidate, requestID: id)
+                    }
+                } catch {
+                    if let error = error as? MLXError { nativeFailure = nativeFailure ?? error }
                     candidate.finishEvaluationAndClose()
-                } else {
-                    capture.commitHistorical(candidate, requestID: id)
                 }
-            } catch {
-                if let error = error as? MLXError { nativeFailure = nativeFailure ?? error }
-                candidate.finishEvaluationAndClose()
             }
         }
         step.historicalCheckpoints.removeAll()

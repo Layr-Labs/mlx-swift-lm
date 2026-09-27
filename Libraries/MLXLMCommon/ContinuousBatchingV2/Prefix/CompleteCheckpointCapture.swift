@@ -8,6 +8,20 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     let store: any CBv2CompletePrefixCache
     let queue = DispatchQueue(label: "cbv2.complete-checkpoint-retirement", qos: .utility)
     var staged: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
+    /// Historical layouts keep the first checkpoint plus the deepest
+    /// `maximumStagedHistoricalCheckpoints - 1`, evicting the shallowest
+    /// interior one first. K = 2 is exactly the older first/latest rule.
+    static let maximumStagedHistoricalCheckpoints = 8
+    /// Staged window copies share the slot's ordinary admission ceiling
+    /// (`AdmissionV2.reserveTransient`). Bound them per request so a long
+    /// prompt cannot stage away the pool: 1/16 of capacity, never below two
+    /// checkpoints. gpt-oss-20b windows are ~4 MB per checkpoint (12 x 128 x
+    /// 2 KB); gemma-4-26b is ~200 MB (25 x 1024 x 8 KB), so Gemma keeps
+    /// fewer on small slots while gpt-oss always reaches K.
+    static let historicalStagedByteBudgetDivisor = 16
+    var maximumStagedHistoricalCheckpoints = CBv2CompleteCheckpointCapture.maximumStagedHistoricalCheckpoints
+    var historicalStagedByteBudget: Int
+    var historicalCheckpointStrideTokens = CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens
     // Deterministic native construction/evaluation fault seam, engine-queue
     // only. Production always uses the ordinary private historical owner.
     var makeHistoricalWindow: (PagedSequenceKV, Int, AdmissionV2) throws -> CBv2HistoricalWindow = {
@@ -20,6 +34,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     init(codec: CBv2CompleteCheckpointCodec, store: any CBv2CompletePrefixCache) {
         self.codec = codec
         self.store = store
+        historicalStagedByteBudget = max(0, codec.admission.bytesCapacity)
+            / Self.historicalStagedByteBudgetDivisor
     }
 
     func setPublicationHandler(_ handler: (@Sendable (CBv2RequestID, [Int]) -> Void)?) {
@@ -141,7 +157,13 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         state: [CBv2SequenceKV?],
         completion: @escaping @Sendable ([Int]) -> Void
     ) {
-        let captures = staged.removeValue(forKey: intent.requestID) ?? []
+        // Historical donors publish deepest first: the store's queue, quota
+        // and demand gates see the most valuable endpoint before a shallower
+        // one can consume them. Recurrent publication order is unchanged.
+        var captures = staged.removeValue(forKey: intent.requestID) ?? []
+        if codec.historicalLayout != nil {
+            captures.sort { ($0.position ?? 0) > ($1.position ?? 0) }
+        }
         var exports: [CBv2CompleteCheckpointExport] = []
         for capture in captures where intent.allowsCompletePublication {
             if let checkpoint = capture.historical {
@@ -188,6 +210,8 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     private(set) var historical: CBv2HistoricalCompleteCheckpoint?
     var evaluationRoots: [MLXArray] { checkpoint?.evaluationRoots ?? historical?.evaluationRoots ?? [] }
     var position: Int? { checkpoint?.position ?? historical?.position }
+    /// Transient admission bytes this staged historical capture holds.
+    var stagedHistoricalBytes: Int { historical?.reservedBytes ?? 0 }
     private var reservation: CBv2CheckpointReservation?
 
     init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation) {

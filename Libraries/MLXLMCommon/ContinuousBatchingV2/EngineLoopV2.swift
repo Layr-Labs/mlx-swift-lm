@@ -392,7 +392,7 @@ final class CBv2InFlightStep {
     var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
     var forwardShapes: CBv2ForwardShapeStep?
     var recurrentCheckpointChunkSizes: [CBv2RequestID: Int] = [:]
-    var historicalCheckpoints: [CBv2RequestID: CBv2CapturedCompleteCheckpoint] = [:]
+    var historicalCheckpoints: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
     var permitsChainedSuccessor: Bool {
         mtpRound == nil && historicalCheckpoints.isEmpty && attentionPacket == nil
     }

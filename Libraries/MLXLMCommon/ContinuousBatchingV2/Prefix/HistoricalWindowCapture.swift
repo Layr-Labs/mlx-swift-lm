@@ -11,6 +11,8 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
     let heads: Int
     let headDim: Int
     let dtype: DType
+    /// Transient admission bytes charged for this window until retirement.
+    let reservedBytes: Int
     private var combined: MLXArray?
     private var reservation: CBv2CheckpointReservation?
     private enum Evaluation { case pending, ready, failed }
@@ -63,6 +65,7 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         let bytes = try Self.reservationBytes(row: row, position: position)
         let permit = try admission.reserveTransient(bytes: bytes)
         self.position = position
+        reservedBytes = bytes
         start = max(0, position - row.windowSize!)
         heads = row.groupKey.kvHeads
         headDim = row.groupKey.headDim
