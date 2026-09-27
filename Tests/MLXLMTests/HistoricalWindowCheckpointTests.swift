@@ -277,7 +277,8 @@ struct HistoricalWindowCheckpointTests {
     }
 
     private func commit(_ capture: CBv2CompleteCheckpointCapture, state: [CBv2SequenceKV?],
-                        positions: [Int], id: CBv2RequestID = .init(9001)) throws -> Int {
+                        positions: [Int], hint: Int? = nil, resumedAt: Int = 0,
+                        id: CBv2RequestID = .init(9001)) throws -> Int {
         var bytesPerCheckpoint = 0
         for position in positions {
             write(state, start: position - chunkSize, count: chunkSize)
@@ -285,76 +286,182 @@ struct HistoricalWindowCheckpointTests {
             let candidate = try #require(prepared)
             try candidate.finishEvaluation()
             bytesPerCheckpoint = candidate.stagedHistoricalBytes
-            capture.commitHistorical(candidate, requestID: id)
+            capture.commitHistorical(candidate, requestID: id, hintTokens: hint, resumedAt: resumedAt)
+            #expect((capture.staged[id]?.count ?? 0) <= CBv2HistoricalCheckpointRetention.maximumRetained)
+            #expect(capture.staged[id]?.compactMap(\.position) == capture.historicalRetention[id]?.retained)
         }
         return bytesPerCheckpoint
     }
 
-    @Test("Retention keeps the first and the deepest K-1; the shallowest interior boundary retires first")
+    private func retentionCapture(_ fixture: Fixture) -> CBv2CompleteCheckpointCapture {
+        let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
+        capture.historicalCheckpointStrideTokens = chunkSize
+        return capture
+    }
+
+    private func dropAndWait(_ capture: CBv2CompleteCheckpointCapture, id: CBv2RequestID = .init(9001)) {
+        let done = DispatchSemaphore(value: 0)
+        let dropped = capture.drop(requestID: id, completion: { done.signal() })
+        #expect(dropped)
+        #expect(done.wait(timeout: .now() + 10) == .success)
+        capture.queue.sync {}
+        #expect(capture.historicalRetention[id] == nil && capture.staged[id] == nil)
+    }
+
+    @Test("Without a hint a donor stages the first and the rolling latest; retired windows refund their charge")
     func retentionKeepsFirstAndDeepest() throws {
         let fixture = try fixture()
         var original = try donor(fixture, maxLength: 8 * chunkSize)
         defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
-        let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
-        #expect(capture.maximumStagedHistoricalCheckpoints == 8)
+        let capture = retentionCapture(fixture)
         #expect(capture.historicalStagedByteBudget == fixture.admission.bytesCapacity / 16)
-        capture.maximumStagedHistoricalCheckpoints = 3
         let before = fixture.admission.bytesReserved
         let bytes = try commit(capture, state: original, positions: (1 ... 6).map { $0 * chunkSize })
         #expect(bytes > 0)
-        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 5 * chunkSize, 6 * chunkSize])
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 6 * chunkSize])
+        capture.queue.sync {}
+        #expect(fixture.admission.bytesReserved == before + 2 * bytes)
         // A duplicate boundary is refused without touching the retained set.
         let duplicate = try #require(try capture.prepareHistorical(position: 6 * chunkSize, chunkSize: chunkSize,
                                                                    state: original))
         try duplicate.finishEvaluation()
         capture.commitHistorical(duplicate, requestID: .init(9001))
-        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 5 * chunkSize, 6 * chunkSize])
-        let done = DispatchSemaphore(value: 0)
-        let dropped = capture.drop(requestID: .init(9001), completion: { done.signal() })
-        #expect(dropped)
-        #expect(done.wait(timeout: .now() + 10) == .success)
-        capture.queue.sync {}
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 6 * chunkSize])
+        dropAndWait(capture)
         #expect(fixture.admission.bytesReserved == before, "retired interior windows refund their transient charge")
         capture.close()
     }
 
-    @Test("The byte budget bounds staged windows but never drops below the first/latest pair")
-    func retentionByteBudget() throws {
+    @Test("A fork hint stages first, target and latest; an adopter stages nothing at or below its restore point")
+    func retentionKeepsForkTarget() throws {
+        let fixture = try fixture()
+        var original = try donor(fixture, maxLength: 8 * chunkSize)
+        defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
+        let capture = retentionCapture(fixture)
+        let before = fixture.admission.bytesReserved
+        let bytes = try commit(capture, state: original, positions: (1 ... 6).map { $0 * chunkSize },
+                               hint: 3 * chunkSize + 9)
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 3 * chunkSize, 6 * chunkSize])
+        #expect(capture.historicalRetention[.init(9001)]?.publication.publish
+            == [6 * chunkSize, 3 * chunkSize, chunkSize])
+        capture.queue.sync {}
+        #expect(fixture.admission.bytesReserved == before + 3 * bytes)
+        dropAndWait(capture)
+        #expect(fixture.admission.bytesReserved == before)
+
+        // The same rows seen by an adopter that restored at 3c with the same
+        // hint: the first and the target are already durable below it.
+        var adopted = try fixture.backend.makeSequenceState(layerKinds: fixture.kinds,
+            promptLength: fixture.request.promptTokens.count, maxLength: 8 * chunkSize)
+        try fixture.admission.reserve(id: .init(9002), additionalTokens: 8 * chunkSize)
+        defer { fixture.backend.release(adopted); adopted.removeAll(); fixture.admission.releaseAll(id: .init(9002)) }
+        write(adopted, start: 0, count: chunkSize)
+        write(adopted, start: chunkSize, count: chunkSize)
+        write(adopted, start: 2 * chunkSize, count: chunkSize)
+        _ = try commit(capture, state: adopted, positions: (4 ... 6).map { $0 * chunkSize },
+                       hint: 3 * chunkSize + 9, resumedAt: 3 * chunkSize, id: .init(9002))
+        #expect(capture.staged[.init(9002)]?.compactMap(\.position) == [6 * chunkSize])
+        #expect(capture.historicalRetention[.init(9002)]?.first == nil)
+        dropAndWait(capture, id: .init(9002))
+        capture.close()
+    }
+
+    @Test("One range copies only the boundaries retention keeps: the latest, an open first and the target")
+    func prepareCopiesOnlyRetainedBoundaries() throws {
         let fixture = try fixture()
         var original = try donor(fixture, maxLength: 8 * chunkSize)
         defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
         let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
+        // Four boundaries per chunk; the fixture ring holds one whole chunk.
+        let stride = chunkSize / 4
+        capture.historicalCheckpointStrideTokens = stride
+        var copied: [Int] = []
+        capture.makeHistoricalWindow = { row, position, admission in
+            copied.append(position)
+            return try CBv2HistoricalWindow(row: row, position: position, admission: admission)
+        }
+        func range(_ index: Int, hint: Int?) throws -> [Int] {
+            write(original, start: index * chunkSize, count: chunkSize)
+            copied.removeAll()
+            let positions = (1 ... 4).map { index * chunkSize + $0 * stride }
+            let retention = capture.historicalRetention(requestID: .init(9001), hintTokens: hint, resumedAt: 0)
+            let prepared = try capture.prepareHistorical(positions: positions, retention: retention, state: original)
+            #expect(prepared.compactMap(\.position) == prepared.compactMap(\.position).sorted())
+            for candidate in prepared {
+                try candidate.finishEvaluation()
+                capture.commitHistorical(candidate, requestID: .init(9001), hintTokens: hint)
+            }
+            return copied
+        }
+        let hint = chunkSize + 2 * stride + 3
+        // First range: the deepest boundary, then the open first below it.
+        let firstRange = try range(0, hint: hint)
+        #expect(firstRange == [4 * stride, stride])
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [stride, 4 * stride])
+        // Second range: the deepest and the fork target; two interior
+        // boundaries are never copied.
+        let secondRange = try range(1, hint: hint)
+        #expect(secondRange == [8 * stride, 6 * stride])
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [stride, 6 * stride, 8 * stride])
+        // Third range: only the rolling latest.
+        let thirdRange = try range(2, hint: hint)
+        #expect(thirdRange == [12 * stride])
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [stride, 6 * stride, 12 * stride])
+        // A refused deepest boundary hands the latest to the next one down.
+        let bounded = CBv2CompleteCheckpointCapture(codec: fixture.codec,
+            store: CompleteCheckpointFixtureStore(maximumPosition: 15 * stride))
+        bounded.historicalCheckpointStrideTokens = stride
+        bounded.makeHistoricalWindow = capture.makeHistoricalWindow
+        write(original, start: 3 * chunkSize, count: chunkSize)
+        copied.removeAll()
+        let retention = bounded.historicalRetention(requestID: .init(9003), hintTokens: nil, resumedAt: 2 * chunkSize)
+        let prepared = try bounded.prepareHistorical(positions: (13 ... 16).map { $0 * stride },
+                                                     retention: retention, state: original)
+        #expect(prepared.compactMap(\.position) == [15 * stride] && copied == [15 * stride])
+        prepared.forEach { $0.finishEvaluationAndClose() }
+        dropAndWait(capture)
+        capture.close(); bounded.close()
+    }
+
+    @Test("The byte budget gives up the fork target but never the first/latest pair")
+    func retentionByteBudget() throws {
+        let fixture = try fixture()
+        var original = try donor(fixture, maxLength: 8 * chunkSize)
+        defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
+        let capture = retentionCapture(fixture)
         let before = fixture.admission.bytesReserved
-        let perCheckpoint = try commit(capture, state: original, positions: [chunkSize])
+        let perCheckpoint = try commit(capture, state: original, positions: [chunkSize], hint: 3 * chunkSize)
         #expect(perCheckpoint > 0)
         #expect(fixture.admission.bytesReserved == before + perCheckpoint)
-        capture.historicalStagedByteBudget = perCheckpoint * 5 / 2
-        _ = try commit(capture, state: original, positions: (2 ... 5).map { $0 * chunkSize })
+        capture.historicalStagedByteBudgetOverride = perCheckpoint * 5 / 2
+        _ = try commit(capture, state: original, positions: [2 * chunkSize, 3 * chunkSize], hint: 3 * chunkSize)
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 3 * chunkSize])
+        // The third staged boundary exceeds 2.5 checkpoints: the target goes.
+        _ = try commit(capture, state: original, positions: [4 * chunkSize, 5 * chunkSize], hint: 3 * chunkSize)
         #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 5 * chunkSize])
         capture.queue.sync {}
         #expect(fixture.admission.bytesReserved == before + 2 * perCheckpoint)
-        capture.historicalStagedByteBudget = 0
-        _ = try commit(capture, state: original, positions: [6 * chunkSize])
+        capture.historicalStagedByteBudgetOverride = 0
+        _ = try commit(capture, state: original, positions: [6 * chunkSize], hint: 3 * chunkSize)
         #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 6 * chunkSize],
                 "a zero budget still keeps the older first/latest pair")
-        let done = DispatchSemaphore(value: 0)
-        let dropped = capture.drop(requestID: .init(9001), completion: { done.signal() })
-        #expect(dropped)
-        #expect(done.wait(timeout: .now() + 10) == .success)
-        capture.queue.sync {}
+        capture.historicalStagedByteBudgetOverride = nil
+        #expect(capture.historicalStagedByteBudget == fixture.admission.bytesCapacity / 16,
+                "production reads the admission capacity at every commit")
+        dropAndWait(capture)
         #expect(fixture.admission.bytesReserved == before)
         capture.close()
     }
 
-    @Test("Rolling retirement keeps every boundary under K and cancellation drops all generations")
+    @Test("Rolling retirement preserves first/latest and cancellation drops both generations")
     func rollingRetirement() throws {
         let fixture = try fixture()
         var original = try donor(fixture)
         defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
-        let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: CompleteCheckpointFixtureStore())
+        let capture = retentionCapture(fixture)
         let before = fixture.admission.bytesReserved
         _ = try commit(capture, state: original, positions: [chunkSize, 2 * chunkSize, 3 * chunkSize])
-        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 2 * chunkSize, 3 * chunkSize])
+        #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 3 * chunkSize])
         let done = DispatchSemaphore(value: 0)
         let retirementStarted = capture.drop(requestID: .init(9001), completion: { done.signal() })
         #expect(retirementStarted)
@@ -442,15 +549,19 @@ struct HistoricalWindowCheckpointTests {
     /// Real catalog window geometry, one owning sliding layer per model. The
     /// per-checkpoint charge is that figure times the model's owner count; it
     /// is what `historicalStagedByteBudget` and K = 8 are sized against.
+    /// K/V storage type is what the loaded model's projections and RoPE
+    /// produce, not the weight type: the live gpt-oss-20b manifest reports
+    /// float32 for 23 of its 24 layers (one sliding owner is bfloat16);
+    /// gemma-4-26b stores 16-bit K/V.
     @Test("Per-checkpoint window reservation for the historical catalog models",
-          arguments: [("gpt-oss-20b", 128, 8, 64, 64, 12), ("gemma-4-26b", 1024, 8, 256, 16, 25)])
+          arguments: [("gpt-oss-20b", 128, 8, 64, 64, 12, 4), ("gemma-4-26b", 1024, 8, 256, 16, 25, 2)])
     func catalogWindowReservation(model: String, window: Int, kvHeads: Int, headDim: Int,
-                                  queryHeads: Int, owners: Int) throws {
+                                  queryHeads: Int, owners: Int, elementBytes: Int) throws {
         let kinds = [
             CBv2LayerKind(attention: .slidingWindow(window), headDim: headDim, kvHeads: kvHeads, queryHeads: queryHeads),
             CBv2LayerKind(attention: .full, headDim: headDim, kvHeads: kvHeads, queryHeads: queryHeads),
         ]
-        let dtype = DType.bfloat16
+        let dtype: DType = elementBytes == 4 ? .float32 : .bfloat16
         let stride = CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens
         let config = PagedKVPoolConfig(capacityBytes: 256 << 20, maxPrefillChunk: 2 * stride,
             segmentSizeBytes: 8 << 20, layerDTypes: Array(repeating: dtype, count: kinds.count))
@@ -493,12 +604,15 @@ struct HistoricalWindowCheckpointTests {
         let perLayer = try CBv2HistoricalWindow.reservationBytes(row: row, position: 2 * stride)
         let logical = 2 * kvHeads * window * headDim * dtype.size
         let perCheckpoint = perLayer * owners
+        let retained = CBv2HistoricalCheckpointRetention.maximumRetained
         print("[historical-window-reservation] model=\(model) owners=\(owners) window=\(window) "
-            + "logicalPerLayer=\(logical) reservedPerLayer=\(perLayer) perCheckpoint=\(perCheckpoint) "
-            + "K8=\(8 * perCheckpoint)")
+            + "dtype=\(dtype) logicalPerLayer=\(logical) reservedPerLayer=\(perLayer) "
+            + "perCheckpoint=\(perCheckpoint) staged\(retained)=\(retained * perCheckpoint)")
         #expect(perLayer >= logical && perLayer < 2 * logical + (1 << 20))
         if model == "gpt-oss-20b" {
-            #expect(perCheckpoint < 8 << 20, "gpt-oss stages a few MB per checkpoint; K = 8 is tens of MB")
+            #expect(logical == 524_288, "float32 K/V: 2 x 8 heads x 128 tokens x 64 x 4 bytes")
+            #expect(perCheckpoint > 6 << 20 && perCheckpoint < 12 << 20,
+                    "gpt-oss stages ~7 MB per checkpoint; three are ~22 MB")
         } else {
             #expect(perCheckpoint > 128 << 20 && perCheckpoint < 512 << 20,
                     "gemma-4 stages ~200 MB per checkpoint; the byte budget, not K, bounds it")

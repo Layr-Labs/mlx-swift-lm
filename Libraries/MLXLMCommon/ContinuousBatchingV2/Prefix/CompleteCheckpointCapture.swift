@@ -8,19 +8,24 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     let store: any CBv2CompletePrefixCache
     let queue = DispatchQueue(label: "cbv2.complete-checkpoint-retirement", qos: .utility)
     var staged: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
-    /// Historical layouts keep the first checkpoint plus the deepest
-    /// `maximumStagedHistoricalCheckpoints - 1`, evicting the shallowest
-    /// interior one first. K = 2 is exactly the older first/latest rule.
-    static let maximumStagedHistoricalCheckpoints = 8
+    /// Historical donors keep at most the first boundary, the coordinator's
+    /// fork target and the rolling latest (`CBv2HistoricalCheckpointRetention`).
+    /// Engine-queue owned, created with a request's first staged checkpoint
+    /// and removed with its staged list.
+    var historicalRetention: [CBv2RequestID: CBv2HistoricalCheckpointRetention] = [:]
     /// Staged window copies share the slot's ordinary admission ceiling
-    /// (`AdmissionV2.reserveTransient`). Bound them per request so a long
-    /// prompt cannot stage away the pool: 1/16 of capacity, never below two
-    /// checkpoints. gpt-oss-20b windows are ~4 MB per checkpoint (12 x 128 x
-    /// 2 KB); gemma-4-26b is ~200 MB (25 x 1024 x 8 KB), so Gemma keeps
-    /// fewer on small slots while gpt-oss always reaches K.
+    /// (`AdmissionV2.reserveTransient`). Over 1/16 of that capacity a donor
+    /// gives up its fork target and keeps the first/latest pair. Windows per
+    /// checkpoint: gpt-oss-20b ~7 MB (12 owners x 128 tokens, float32 K/V),
+    /// gemma-4-26b ~216 MB (25 owners x 1,024 tokens, 16-bit K/V).
     static let historicalStagedByteBudgetDivisor = 16
-    var maximumStagedHistoricalCheckpoints = CBv2CompleteCheckpointCapture.maximumStagedHistoricalCheckpoints
-    var historicalStagedByteBudget: Int
+    /// Test seam; production reads the admission capacity at every commit so
+    /// a resized slot budget is honored by requests already in flight.
+    var historicalStagedByteBudgetOverride: Int?
+    var historicalStagedByteBudget: Int {
+        historicalStagedByteBudgetOverride
+            ?? max(0, codec.admission.bytesCapacity) / Self.historicalStagedByteBudgetDivisor
+    }
     var historicalCheckpointStrideTokens = CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens
     // Deterministic native construction/evaluation fault seam, engine-queue
     // only. Production always uses the ordinary private historical owner.
@@ -34,8 +39,6 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     init(codec: CBv2CompleteCheckpointCodec, store: any CBv2CompletePrefixCache) {
         self.codec = codec
         self.store = store
-        historicalStagedByteBudget = max(0, codec.admission.bytesCapacity)
-            / Self.historicalStagedByteBudgetDivisor
     }
 
     func setPublicationHandler(_ handler: (@Sendable (CBv2RequestID, [Int]) -> Void)?) {
@@ -142,6 +145,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     /// A final queued drop follows that request's rolling retirement copies.
     /// The engine counts this callback in its existing shutdown drain barrier.
     func drop(requestID: CBv2RequestID, completion: @escaping @Sendable () -> Void) -> Bool {
+        historicalRetention.removeValue(forKey: requestID)
         guard let captures = staged.removeValue(forKey: requestID) else { return false }
         queue.async {
             captures.forEach { $0.finishEvaluationAndClose() }
@@ -157,12 +161,21 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         state: [CBv2SequenceKV?],
         completion: @escaping @Sendable ([Int]) -> Void
     ) {
-        // Historical donors publish deepest first: the store's queue, quota
-        // and demand gates see the most valuable endpoint before a shallower
-        // one can consume them. Recurrent publication order is unchanged.
+        // Historical donors publish deepest first, then the fork target, then
+        // the first: the store's queue, quota and demand gates see the most
+        // valuable endpoint before a shallower one can consume them. A target
+        // that turned out adjacent to the final deepest boundary is retired
+        // unwritten. Recurrent publication order is unchanged.
         var captures = staged.removeValue(forKey: intent.requestID) ?? []
+        let retention = historicalRetention.removeValue(forKey: intent.requestID)
         if codec.historicalLayout != nil {
+            let dropped = Set(retention?.publication.drop ?? [])
+            let retiring = captures.filter { $0.position.map(dropped.contains) ?? false }
+            captures.removeAll { $0.position.map(dropped.contains) ?? false }
             captures.sort { ($0.position ?? 0) > ($1.position ?? 0) }
+            if !retiring.isEmpty {
+                queue.async { retiring.forEach { $0.finishEvaluationAndClose() } }
+            }
         }
         var exports: [CBv2CompleteCheckpointExport] = []
         for capture in captures where intent.allowsCompletePublication {
